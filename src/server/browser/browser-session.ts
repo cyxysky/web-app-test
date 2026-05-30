@@ -105,26 +105,19 @@ export class BrowserSession {
 
   async start() {
     const { chromium } = await import('playwright');
-    // Run the browser maximized / full screen and let the page viewport follow the real window size
-    // (viewport: null) instead of forcing a fixed width. Coordinate mapping is ratio-based, so it
-    // still works at any resolution. In headless mode there is no window manager, so we fall back to a
-    // large explicit window size (configurable via BROWSER_WINDOW_WIDTH/HEIGHT).
-    const headless = process.env.HEADLESS_BROWSER === 'true';
-    const windowWidth = Number(process.env.BROWSER_WINDOW_WIDTH || 1920);
-    const windowHeight = Number(process.env.BROWSER_WINDOW_HEIGHT || 1080);
+    // Use a fixed full-HD viewport so the page (and screenshot) is exactly 1920x1080 regardless of the
+    // host screen size or taskbar. deviceScaleFactor:1 keeps screenshot pixels == CSS pixels, so the
+    // screenshot->viewport coordinate mapping stays an exact 1:1 ratio. Configurable via env.
+    const viewportWidth = Number(process.env.BROWSER_VIEWPORT_WIDTH || 1920);
+    const viewportHeight = Number(process.env.BROWSER_VIEWPORT_HEIGHT || 1080);
     this.browser = await chromium.launch({
-      headless,
+      headless: process.env.HEADLESS_BROWSER === 'true',
       slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
-      args: [
-        '--start-maximized',
-        '--force-device-scale-factor=1',
-        '--high-dpi-support=1',
-        ...(headless ? [`--window-size=${windowWidth},${windowHeight}`] : []),
-      ],
+      args: [`--window-size=${viewportWidth},${viewportHeight + 120}`, '--force-device-scale-factor=1', '--high-dpi-support=1'],
     });
     const context = await this.browser.newContext({
-      // null viewport => use the actual (maximized) browser window size for the page.
-      viewport: null,
+      viewport: { width: viewportWidth, height: viewportHeight },
+      deviceScaleFactor: 1,
     });
     context.on('page', (page) => {
       this.page = page;
@@ -1015,9 +1008,10 @@ export class BrowserSession {
       });
 
       const lineColor = 'rgba(0, 122, 255, 0.28)';
-      // Compact labels so every gridline can carry its own value without too much clutter.
+      // x labels are rendered VERTICALLY (writing-mode) so adjacent labels along the dense bottom edge
+      // don't overlap horizontally — each only takes ~1 char width. y labels stay horizontal on the left.
       const xLabelCss =
-        'position:absolute;font:700 16px/16px Arial,sans-serif;color:#fff;background:rgba(0,90,200,0.82);padding:1px 2px;border-radius:2px;white-space:nowrap;transform:translateX(-50%);';
+        'position:absolute;font:700 16px/16px Arial,sans-serif;color:#fff;background:rgba(0,90,200,0.82);padding:2px 1px;border-radius:2px;white-space:nowrap;writing-mode:vertical-rl;text-orientation:mixed;transform:translateX(-50%);';
       const yLabelCss =
         'position:absolute;font:700 16px/16px Arial,sans-serif;color:#fff;background:rgba(180,60,0,0.82);padding:1px 2px;border-radius:2px;white-space:nowrap;transform:translateY(-50%);';
 
