@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { generateText, stepCountIs, tool } from 'ai';
 import { z } from 'zod';
-import type { StepExecutionResult, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import type { StepExecutionResult, StepToolCall, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel } from '@/server/ai/model';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult } from '@/server/browser/browser-session';
@@ -52,16 +52,22 @@ const manualIssuePattern = new RegExp(
   'i',
 );
 
+function isCoordinateClickMode() {
+  const raw = process.env.isClick ?? process.env.IS_CLICK ?? 'true';
+  return raw.toLowerCase() !== 'false';
+}
+
 function modelSupportsScreenshotInput() {
   if (process.env.SEND_SCREENSHOT_TO_AI === 'true') return true;
   if (process.env.SEND_SCREENSHOT_TO_AI === 'false') return false;
 
-  const provider = (process.env.AI_PROVIDER || '').toLowerCase();
-  const model = (process.env.AI_MODEL || 'deepseek-v4-flash').toLowerCase();
+  const provider = (process.env.AI_PROVIDER || 'openrouter').toLowerCase();
+  const model = (process.env.AI_MODEL || 'z-ai/glm-5.1').toLowerCase();
   return provider !== 'deepseek' && !model.startsWith('deepseek');
 }
 
 function jsonSafe(value: unknown) {
+  if (value === undefined) return undefined;
   return JSON.parse(JSON.stringify(value, (_key, item) => {
     if (typeof item === 'bigint') return item.toString();
     if (Buffer.isBuffer(item)) return `[Buffer ${item.length} bytes]`;
@@ -99,6 +105,26 @@ function requirementOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.userRequirement || testCase.description) || testCase.description || testCase.title;
 }
 
+function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
+  return traces.map((trace) => ({
+    name: trace.name,
+    input: jsonSafe(trace.input),
+    ok: trace.result.ok,
+    result: trimDebugText(trace.result.actual, 800),
+  }));
+}
+
+function recentToolCallContext(steps: StepExecutionResult[], limit = 5) {
+  const calls = steps.flatMap((step) => (step.tools || []).map((tool) => ({
+    stepIndex: step.index,
+    name: tool.name,
+    input: tool.input,
+    ok: tool.ok,
+    result: tool.result,
+  })));
+  return calls.slice(-limit);
+}
+
 function makeBrowserTools(
   session: BrowserSession,
   targetUrl: string,
@@ -113,7 +139,7 @@ function makeBrowserTools(
     return result;
   }
 
-  return {
+  const sharedTools = {
     openPage: tool({
       description: 'Open or navigate to a URL in the browser.',
       inputSchema: z.object({
@@ -121,50 +147,19 @@ function makeBrowserTools(
       }),
       execute: ({ url }) => record('openPage', { url }, () => session.open(url || targetUrl)),
     }),
-    clickAt: tool({
-      description: 'Click a coordinate on the latest screenshot image. Use the screenshot pixel coordinate, not CSS viewport coordinate. The backend maps it to the real browser viewport.',
-      inputSchema: z.object({
-        x: z.number().describe('X coordinate measured on the attached screenshot image from its left edge.'),
-        y: z.number().describe('Y coordinate measured on the attached screenshot image from its top edge.'),
-      }),
-      execute: ({ x, y }) => record('clickAt', { x, y }, () => session.clickAt(x, y)),
-    }),
-    doubleClickAt: tool({
-      description: 'Double-click a coordinate on the latest screenshot image. The backend maps it to the real browser viewport.',
-      inputSchema: z.object({
-        x: z.number().describe('X coordinate measured on the attached screenshot image from its left edge.'),
-        y: z.number().describe('Y coordinate measured on the attached screenshot image from its top edge.'),
-      }),
-      execute: ({ x, y }) => record('doubleClickAt', { x, y }, () => session.doubleClickAt(x, y)),
-    }),
-    rightClickAt: tool({
-      description: 'Right-click a coordinate on the latest screenshot image. The backend maps it to the real browser viewport.',
-      inputSchema: z.object({
-        x: z.number().describe('X coordinate measured on the attached screenshot image from its left edge.'),
-        y: z.number().describe('Y coordinate measured on the attached screenshot image from its top edge.'),
-      }),
-      execute: ({ x, y }) => record('rightClickAt', { x, y }, () => session.rightClickAt(x, y)),
-    }),
-    drag: tool({
-      description: 'Drag between two coordinates on the latest screenshot image. The backend maps them to the real browser viewport.',
-      inputSchema: z.object({
-        startX: z.number(),
-        startY: z.number(),
-        endX: z.number(),
-        endY: z.number(),
-      }),
-      execute: ({ startX, startY, endX, endY }) => record('drag', { startX, startY, endX, endY }, () => session.drag(startX, startY, endX, endY)),
-    }),
     scrollViewport: tool({
-      description: 'Scroll the visible page before locating or clicking elements outside the current viewport.',
+      description: 'Scroll a selected scroll container. In coordinate mode, pass screenshot x/y inside the table/list/panel to scroll. In DOM mode, pass domPath for the table/list/panel or one of its children. Use this for virtual scroll containers instead of blindly scrolling the page.',
       inputSchema: z.object({
         deltaY: z.number().describe('Vertical scroll delta. Positive scrolls down, negative scrolls up.'),
         deltaX: z.number().optional().describe('Horizontal scroll delta.'),
+        x: z.number().optional().describe('Coordinate-mode only: X coordinate on the latest screenshot inside the scrollable element to scroll.'),
+        y: z.number().optional().describe('Coordinate-mode only: Y coordinate on the latest screenshot inside the scrollable element to scroll.'),
+        domPath: z.string().optional().describe('DOM-mode only: bracket path for the scrollable element or one of its children, such as 0.1.2.'),
       }),
-      execute: ({ deltaY, deltaX }) => record('scrollViewport', { deltaY, deltaX }, () => session.scroll(deltaY, deltaX || 0)),
+      execute: ({ deltaY, deltaX, x, y, domPath }) => record('scrollViewport', { deltaY, deltaX, x, y, domPath }, () => session.scroll(deltaY, deltaX || 0, { screenshotX: x, screenshotY: y, domPath })),
     }),
     typeText: tool({
-      description: 'Type text into the currently focused element. First use clickAt to focus the input based on screenshot coordinates.',
+      description: 'Type text into the currently focused element. In coordinate mode, first use clickAt; in DOM mode, first use focusDomNode.',
       inputSchema: z.object({
         text: z.string().describe('Text to enter.'),
       }),
@@ -204,6 +199,69 @@ function makeBrowserTools(
       execute: ({ index }) => record('switchTab', { index }, () => session.switchTab(index)),
     }),
   };
+
+  const coordinateTools = {
+    clickAt: tool({
+      description: 'Click a coordinate on the latest screenshot image. Use the screenshot pixel coordinate, not CSS viewport coordinate. The backend maps it to the real browser viewport.',
+      inputSchema: z.object({
+        x: z.number().describe('X coordinate measured on the attached screenshot image from its left edge.'),
+        y: z.number().describe('Y coordinate measured on the attached screenshot image from its top edge.'),
+      }),
+      execute: ({ x, y }) => record('clickAt', { x, y }, () => session.clickAt(x, y)),
+    }),
+    doubleClickAt: tool({
+      description: 'Double-click a coordinate on the latest screenshot image. The backend maps it to the real browser viewport.',
+      inputSchema: z.object({
+        x: z.number().describe('X coordinate measured on the attached screenshot image from its left edge.'),
+        y: z.number().describe('Y coordinate measured on the attached screenshot image from its top edge.'),
+      }),
+      execute: ({ x, y }) => record('doubleClickAt', { x, y }, () => session.doubleClickAt(x, y)),
+    }),
+    rightClickAt: tool({
+      description: 'Right-click a coordinate on the latest screenshot image. The backend maps it to the real browser viewport.',
+      inputSchema: z.object({
+        x: z.number().describe('X coordinate measured on the attached screenshot image from its left edge.'),
+        y: z.number().describe('Y coordinate measured on the attached screenshot image from its top edge.'),
+      }),
+      execute: ({ x, y }) => record('rightClickAt', { x, y }, () => session.rightClickAt(x, y)),
+    }),
+    drag: tool({
+      description: 'Drag between two coordinates on the latest screenshot image. The backend maps them to the real browser viewport.',
+      inputSchema: z.object({
+        startX: z.number(),
+        startY: z.number(),
+        endX: z.number(),
+        endY: z.number(),
+      }),
+      execute: ({ startX, startY, endX, endY }) => record('drag', { startX, startY, endX, endY }, () => session.drag(startX, startY, endX, endY)),
+    }),
+  };
+
+  const domTools = {
+    getDomTree: tool({
+      description: 'Return the current tab simplified DOM tree. It keeps only hierarchy, tag name, id, and class. Script/style/template/meta/link/svg nodes are removed.',
+      inputSchema: z.object({}),
+      execute: (input) => record('getDomTree', input, () => session.getSimplifiedDomTree()),
+    }),
+    clickDomNode: tool({
+      description: 'Click a node from the simplified DOM tree by its bracket path, for example "0.1.2".',
+      inputSchema: z.object({
+        path: z.string().describe('The bracket path shown in the simplified DOM tree, such as 0.1.2.'),
+      }),
+      execute: ({ path }) => record('clickDomNode', { path }, () => session.clickDomNode(path)),
+    }),
+    focusDomNode: tool({
+      description: 'Focus a node from the simplified DOM tree by its bracket path before typing.',
+      inputSchema: z.object({
+        path: z.string().describe('The bracket path shown in the simplified DOM tree, such as 0.1.2.'),
+      }),
+      execute: ({ path }) => record('focusDomNode', { path }, () => session.focusDomNode(path)),
+    }),
+  };
+
+  return isCoordinateClickMode()
+    ? { ...sharedTools, ...coordinateTools }
+    : { ...sharedTools, ...domTools };
 }
 
 function runtimePrompt(input: {
@@ -218,6 +276,37 @@ function runtimePrompt(input: {
   const viewport = pageContext.viewport || { width: 'unknown', height: 'unknown' };
   const viewportMetrics = pageContext.viewportMetrics || viewport;
   const screenshot = screenshotMetrics?.image || { width: 'unknown', height: 'unknown' };
+  const coordinateMode = isCoordinateClickMode();
+  const interactionRules = coordinateMode
+    ? [
+        'Mouse coordinate rules:',
+        `- Latest screenshot image size is ${JSON.stringify(screenshot)}.`,
+        `- Current browser viewport size is ${JSON.stringify(viewport)}.`,
+        `- Current viewport metrics JSON is ${JSON.stringify(viewportMetrics)}.`,
+        `- Screenshot coordinate scale is ${screenshotMetrics?.scale || 'unknown'}; when it is "css", screenshot pixels are intended to match browser viewport CSS pixels.`,
+        '- IMPORTANT: all mouse tools expect coordinates measured on the latest screenshot image. Do NOT return CSS viewport coordinates.',
+        '- The backend converts screenshot-image pixels into browser viewport coordinates using the screenshot content area, captured visual viewport, and current visual viewport.',
+        '- There is no click snapping or automatic target correction. Your coordinate must land inside the intended visible target.',
+        '- If you visually identify a target at the center of the screenshot image, use that screenshot-image x/y directly.',
+        '- Prefer real user-like mouse operations: clickAt, doubleClickAt, rightClickAt, drag, scrollViewport.',
+        '- Estimate coordinates visually from the screenshot. Use the center of the visible clickable/control area, not the text baseline or the outer page margin.',
+        '- For dense search result lists or links, click near the center-left of the visible link text line, avoiding icons, whitespace, and overlapping hover panels.',
+        '- For scrolling, call scrollViewport with x/y inside the specific scrollable table/list/panel. This intentionally scrolls the selected container under that point, which is required for virtual-scroll tables.',
+        '- If the target is outside the viewport, call scrollViewport on the relevant scroll container, inspect the next screenshot in the next runtime step, then continue. Do not rely on DOM element locating.',
+        '- For text entry: first clickAt the visible input caret area from the screenshot, then call typeText. If the input already contains wrong text, use Ctrl+A/Backspace via pressKey before typing.',
+        '- For keyboard submission, use pressKey only after the screenshot shows the intended input/control is focused or the previous click clearly focused it.',
+      ]
+    : [
+        'DOM interaction rules:',
+        '- Coordinate click tools are disabled because isClick=false.',
+        '- Use the provided simplified DOM tree and getDomTree tool to locate elements by bracket path. The DOM tree intentionally keeps only hierarchy, tag name, id, and class.',
+        '- Use clickDomNode(path) to click an element and focusDomNode(path) before typing. Use paths exactly as shown, for example "0.1.2".',
+        '- The screenshot remains the primary evidence for visual state and completion. Use the DOM tree only for locating the element to operate.',
+        '- For scrolling, call scrollViewport with domPath for the specific scrollable table/list/panel or one of its visible children. This is required for virtual-scroll tables.',
+        '- If the target is outside the viewport or not present in the DOM tree, call scrollViewport on the relevant scroll container, inspect the next screenshot/DOM tree, then continue.',
+        '- For text entry: focusDomNode(path), then typeText. If the field contains wrong text, use Ctrl+A/Backspace via pressKey before typing.',
+        '- For keyboard submission, use pressKey only after the intended input/control is focused.',
+      ];
 
   return [
     'You are an AI browser testing agent. The test case does NOT contain preset steps.',
@@ -225,31 +314,19 @@ function runtimePrompt(input: {
     '',
     'Vision-first decision policy:',
     '- The screenshot is the primary evidence for everything: what page is visible, what controls exist, where to click, whether the requirement is complete, whether a CAPTCHA/security page is blocking the flow, and whether the last click marker landed correctly.',
-    '- URL, title, open tab list, and readable page text are only auxiliary hints. Never declare success from URL/title/text alone if the screenshot does not visually support it.',
-    '- When the screenshot contradicts text context, trust the screenshot and explain the contradiction in actual.',
+    '- URL, tab list, focused element, screenshot metrics, DOM tree in DOM mode, and the last five tool calls are only auxiliary hints.',
+    '- When the screenshot contradicts auxiliary context, trust the screenshot and explain the contradiction in actual.',
     '- The red marker in the screenshot shows the previous AI mouse target. If the marker is clearly misplaced or no UI change happened, correct the next coordinate instead of repeating the same click.',
     '- If a click was intended to open a search result/link but the next screenshot still shows the same normal results page, treat it as a missed/ineffective click and retry with a better coordinate. Do not call it CAPTCHA/security verification unless the screenshot visibly shows a verification challenge.',
     '- The focused element summary tells you whether the current tab focus is on the intended input/control. Before typing or pressing Enter for a form, verify the focus summary matches the visible target; if it is body/document or the wrong element, click the target input again at a better coordinate.',
     '- Prefer one purposeful user-like operation per runtime step. Do not perform a long chain of blind clicks. Observe, act once, then let the next screenshot confirm the result.',
     '- If the visible page is still loading, ambiguous, or transitioning, use waitForPage once before deciding the next UI action.',
-    '- Do not claim CAPTCHA/security/manual verification unless the screenshot visibly contains a verification challenge OR "Manual verification detected" is "yes". If the page is a normal search/results/content page, continue with a better coordinate instead of blocking.',
-    '- Do not use DOM/text assertion tools. You must judge completion yourself from the screenshot and return the judgment in JSON.',
+    '- Do not claim CAPTCHA/security/manual verification unless the screenshot visibly contains a verification challenge. If the page is a normal search/results/content page, continue with a better operation instead of blocking.',
+    coordinateMode
+      ? '- Do not use DOM/text assertion tools. You must judge completion yourself from the screenshot and return the judgment in JSON.'
+      : '- Do not use DOM/text as the sole success evidence. You must judge completion yourself from the screenshot and return the judgment in JSON.',
     '',
-    'Mouse coordinate rules:',
-    `- Latest screenshot image size is ${JSON.stringify(screenshot)}.`,
-    `- Current browser viewport size is ${JSON.stringify(viewport)}.`,
-    `- Current viewport metrics JSON is ${JSON.stringify(viewportMetrics)}.`,
-    `- Screenshot coordinate scale is ${screenshotMetrics?.scale || 'unknown'}; when it is "css", screenshot pixels are intended to match browser viewport CSS pixels.`,
-    '- IMPORTANT: all mouse tools expect coordinates measured on the latest screenshot image. Do NOT return CSS viewport coordinates.',
-    '- The backend automatically converts screenshot coordinates to real browser viewport coordinates using the stored screenshot width/height and current viewport width/height.',
-    '- There is no click snapping or automatic target correction. Your coordinate must land inside the intended visible target.',
-    '- If you visually identify a target at the center of the screenshot image, use that screenshot-image x/y directly.',
-    '- Prefer real user-like mouse operations: clickAt, doubleClickAt, rightClickAt, drag, scrollViewport.',
-    '- Estimate coordinates visually from the screenshot. Use the center of the visible clickable/control area, not the text baseline or the outer page margin.',
-    '- For dense search result lists or links, click near the center-left of the visible link text line, avoiding icons, whitespace, and overlapping hover panels.',
-    '- If the target is outside the viewport, call scrollViewport, inspect the next screenshot in the next runtime step, then continue. Do not rely on DOM element locating.',
-    '- For text entry: first clickAt the visible input caret area from the screenshot, then call typeText. If the input already contains wrong text, use Ctrl+A/Backspace via pressKey before typing.',
-    '- For keyboard submission, use pressKey only after the screenshot shows the intended input/control is focused or the previous click clearly focused it.',
+    ...interactionRules,
     '- After any click that may open a new tab/window, call listTabs. If a new relevant tab exists, call switchTab before continuing.',
     '- If current tab is not the page needed by the user requirement, call listTabs and switchTab to move to the correct tab before acting.',
     '- If a click opens a new tab but the visible screenshot still shows the old tab, switch to the relevant tab before further visual judgment.',
@@ -263,18 +340,13 @@ function runtimePrompt(input: {
     'Return exactly one JSON object after tool calls:',
     '{"action":"Chinese summary of what you actually did or observed in this step","expected":"Chinese visual success criteria for this step","actual":"Chinese result based mainly on the screenshot after your action","status":"passed|failed|blocked","done":false}',
     '',
-    `Runtime step index: ${stepIndex}`,
     `User requirement: ${requirementOf(testCase)}`,
     `Target URL: ${testCase.targetUrl}`,
     `Current URL: ${pageContext.url}`,
-    `Current title: ${pageContext.title || '-'}`,
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
     `Current tab focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    `Manual verification detected: ${pageContext.isManualVerification ? 'yes' : 'no'}`,
-    `Manual verification evidence: ${pageContext.manualVerification?.evidence || '-'}`,
-    `Completed runtime steps JSON: ${JSON.stringify(completedSteps)}`,
-    `Auxiliary readable page text (${pageContext.textLength} chars total, truncated; use only as secondary evidence):`,
-    pageContext.text || '[no readable text]',
+    `Last 5 AI tool calls JSON: ${JSON.stringify(recentToolCallContext(completedSteps, 5))}`,
+    !coordinateMode ? `Simplified current tab DOM tree:\n${pageContext.domTree || '[empty DOM tree]'}` : '',
     modelSupportsScreenshotInput()
       ? 'The current viewport screenshot is attached as an image input.'
       : `Current viewport screenshot path: ${beforeScreenshotPath}`,
@@ -312,9 +384,14 @@ async function executeRuntimeStep(input: {
   completedSteps: StepExecutionResult[];
   abortSignal?: AbortSignal;
   onDebug?: ExecutionDebug;
+  onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
 }) {
-  const { session, testCase, stepIndex, beforeScreenshotPath, completedSteps, abortSignal, onDebug } = input;
-  const pageContext = await session.getPageContext();
+  const { session, testCase, stepIndex, beforeScreenshotPath, completedSteps, abortSignal, onDebug, onToolTrace } = input;
+  const pageContext = await session.getPageContext({
+    includeDomTree: !isCoordinateClickMode(),
+    includeText: false,
+    includeManualVerification: false,
+  });
   const prompt = runtimePrompt({
     testCase,
     pageContext,
@@ -333,14 +410,15 @@ async function executeRuntimeStep(input: {
     const result = await generateTextWithTimeout({
       model: getModel(),
       messages: [{ role: 'user', content: messageContent }],
-      tools: makeBrowserTools(session, testCase.targetUrl, traces, (trace) =>
-        onDebug?.({
+      tools: makeBrowserTools(session, testCase.targetUrl, traces, async (trace) => {
+        await onToolTrace?.(trace);
+        await onDebug?.({
           phase: 'ai:tool',
           stepIndex,
           message: `${trace.name} -> ${trace.result.ok ? 'ok' : 'failed'}`,
           details: trace,
-        }),
-      ),
+        });
+      }),
       stopWhen: stepCountIs(Number(process.env.AI_TEST_AGENT_MAX_STEPS || 5)),
       temperature: 0.1,
       maxRetries: 0,
@@ -394,6 +472,15 @@ function infrastructureError(error: unknown) {
   return error.message;
 }
 
+function serializeError(error: unknown) {
+  if (!(error instanceof Error)) return { message: String(error) };
+  return {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+  };
+}
+
 function shouldKeepBrowserOpenAfterError(error: unknown) {
   if (process.env.KEEP_BROWSER_OPEN_ON_AI_ERROR === 'false') return false;
   return true;
@@ -413,6 +500,30 @@ function createSkippedStep(stepIndex: number, beforeScreenshotPath?: string, aft
     beforeScreenshotPath,
     afterScreenshotPath,
     screenshotPath: afterScreenshotPath,
+  };
+}
+
+async function createRecoverableRuntimeErrorStep(input: {
+  session: BrowserSession;
+  runId: string;
+  stepIndex: number;
+  beforeScreenshotPath?: string;
+  error: unknown;
+  tools?: StepToolCall[];
+}): Promise<StepExecutionResult> {
+  const { session, runId, stepIndex, beforeScreenshotPath, error, tools } = input;
+  const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after').catch(() => undefined);
+
+  return {
+    index: stepIndex,
+    action: 'AI 本轮请求或响应处理失败，已自动继续下一轮',
+    expected: '单次 AI 请求、工具调用或响应解析失败不应暂停测试流程；下一轮会基于最新浏览器截图继续判断。',
+    actual: `${infrastructureError(error)}。本次失败已记录为可恢复失败，流程会继续；只有检测到真实验证或测试已完成时才会暂停或结束。`,
+    status: 'failed',
+    beforeScreenshotPath,
+    afterScreenshotPath,
+    screenshotPath: afterScreenshotPath,
+    tools,
   };
 }
 
@@ -508,6 +619,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         });
       }
 
+      const liveToolTraces: ToolTrace[] = [];
       let actionResult: Awaited<ReturnType<typeof executeRuntimeStep>>;
       try {
         actionResult = await executeRuntimeStep({
@@ -519,6 +631,15 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         completedSteps: steps,
         abortSignal: abortController.signal,
         onDebug,
+        onToolTrace: async (trace) => {
+          liveToolTraces.push(trace);
+          await onProgress?.({
+            ...runningStep,
+            beforeScreenshotPath,
+            actual: 'AI 已调用浏览器工具，正在等待页面反馈。',
+            tools: summarizeToolTraces(liveToolTraces),
+          });
+        },
         });
       } catch (error) {
         if (await shouldSkipStep?.(stepIndex)) {
@@ -528,7 +649,28 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           clearStepAbortController(runId, stepIndex);
           continue;
         }
-        throw error;
+        const recoverableStep = await createRecoverableRuntimeErrorStep({
+          session,
+          runId,
+          stepIndex,
+          beforeScreenshotPath,
+          error,
+          tools: summarizeToolTraces(liveToolTraces),
+        });
+        steps.push(recoverableStep);
+        await onProgress?.(recoverableStep);
+        await onDebug?.({
+          phase: 'ai:runtime:recoverable-error',
+          stepIndex,
+          message: '本轮 AI 请求或响应处理失败，已记录为失败步骤并继续下一轮。',
+          details: {
+            error: serializeError(error),
+            screenshotPath: recoverableStep.screenshotPath,
+          },
+        });
+        clearStepAbortController(runId, stepIndex);
+        await session.wait(500).catch(() => undefined);
+        continue;
       }
 
       const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
@@ -543,35 +685,11 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       }
 
       const decision = parseDecision(actionResult.text, actionResult.traces);
-      const afterPageContext = await session.getPageContext();
       if (
         decision.status === 'blocked' &&
         !decision.done &&
         manualIssuePattern.test(`${decision.action}\n${decision.expected}\n${decision.actual}`)
       ) {
-        if (!afterPageContext.isManualVerification) {
-          const correctedStep: StepExecutionResult = {
-            index: stepIndex,
-            action: decision.action,
-            expected: decision.expected,
-            actual: `${decision.actual} 系统复核当前截图和页面文本后未检测到验证码/安全验证特征，本次不进入人工介入；下一轮将继续基于新截图修正操作。`,
-            status: 'failed',
-            beforeScreenshotPath,
-            afterScreenshotPath,
-            screenshotPath: afterScreenshotPath,
-          };
-          steps.push(correctedStep);
-          await onProgress?.(correctedStep);
-          await onDebug?.({
-            phase: 'manual:false-positive',
-            stepIndex,
-            message: 'AI 提到人工验证，但浏览器复核未检测到验证页面，已跳过人工介入并继续执行。',
-            details: { decision, pageContext: afterPageContext, screenshotPath: afterScreenshotPath },
-          });
-          clearStepAbortController(runId, stepIndex);
-          continue;
-        }
-
         if (manuallyResumedSteps.has(stepIndex)) {
           const completedStep: StepExecutionResult = {
             index: stepIndex,
@@ -582,6 +700,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
             beforeScreenshotPath,
             afterScreenshotPath,
             screenshotPath: afterScreenshotPath,
+            tools: summarizeToolTraces(actionResult.traces),
           };
           steps.push(completedStep);
           await onProgress?.(completedStep);
@@ -645,6 +764,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         stepIndex -= 1;
         continue;
       }
+
       const completedStep: StepExecutionResult = {
         index: stepIndex,
         action: decision.action,
@@ -654,6 +774,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         beforeScreenshotPath,
         afterScreenshotPath,
         screenshotPath: afterScreenshotPath,
+        tools: summarizeToolTraces(actionResult.traces),
       };
       steps.push(completedStep);
       await onProgress?.(completedStep);
@@ -683,14 +804,14 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       action: '达到 AI 最大运行步数',
       expected: `AI 应在 ${maxRuntimeSteps} 步内完成或明确阻塞用户需求。`,
       actual: `已执行 ${maxRuntimeSteps} 个运行时步骤，但 AI 尚未判定需求完成。`,
-      status: 'blocked',
+      status: 'failed',
     };
     steps.push(timeoutStep);
     await onProgress?.(timeoutStep);
-    keepBrowserOpen = true;
+    allowBrowserClose = true;
 
     return {
-      status: 'blocked' as const,
+      status: 'failed' as const,
       result: {
         steps,
         consoleErrors: session.getConsoleErrors(),

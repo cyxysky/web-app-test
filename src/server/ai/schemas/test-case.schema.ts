@@ -46,9 +46,17 @@ export type StepExecutionResult = {
   operation?: TestStep['operation'];
   actual: string;
   status: 'queued' | 'running' | 'passed' | 'failed' | 'blocked';
+  tools?: StepToolCall[];
   screenshotPath?: string;
   beforeScreenshotPath?: string;
   afterScreenshotPath?: string;
+};
+
+export type StepToolCall = {
+  name: string;
+  input?: unknown;
+  ok?: boolean;
+  result?: string;
 };
 
 export type TestGroupRecord = {

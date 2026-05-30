@@ -1381,7 +1381,7 @@ select {
   align-items: center;
   display: flex;
   flex: 0 0 auto;
-  gap: 10px;
+  gap: 20px;
 }
 
 .report-screenshot-list {
@@ -1484,7 +1484,6 @@ select {
   gap: 8px;
   max-height: 720px;
   overflow: auto;
-  padding: 10px;
 }
 
 .rail-step {
@@ -2204,6 +2203,42 @@ select {
   line-height: 1.65;
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.tool-call-list {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tool-call-list li {
+  align-items: flex-start;
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+}
+
+.tool-call-list strong {
+  font-size: 13px;
+}
+
+.tool-call-list code {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted-strong);
+  display: block;
+  font-size: 12px;
+  line-height: 1.45;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 7px;
+  white-space: pre-wrap;
 }
 
 .link-button {

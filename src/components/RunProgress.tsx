@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { Bug, CheckCircle2, ChevronRight, CircleAlert, Clock3, Eye, Loader2, Maximize2, Minus, Plus, Radar, SkipForward, X } from 'lucide-react';
+import { Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, Plus, Radar, SkipForward, Wrench, X } from 'lucide-react';
 import { MarkdownReport } from '@/components/MarkdownReport';
 import { RunMetaDrawer } from '@/components/RunMetaDrawer';
 import type { RunDebugEvent, StepExecutionResult, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
@@ -27,9 +27,7 @@ function statusLabel(status: string) {
 
 function StepIcon({ status }: { status: string }) {
   if (status === 'running') return <Loader2 className="spin" size={16} />;
-  if (status === 'passed') return <CheckCircle2 size={16} />;
-  if (status === 'failed' || status === 'blocked') return <CircleAlert size={16} />;
-  return <Clock3 size={16} />;
+  return <Wrench size={16} />;
 }
 
 function selectedOrLatest(steps: StepExecutionResult[], selectedIndex?: number) {
@@ -37,12 +35,20 @@ function selectedOrLatest(steps: StepExecutionResult[], selectedIndex?: number) 
   return steps.find((step) => step.index === selectedIndex) || steps[steps.length - 1];
 }
 
-function userFacingActual(actual: string) {
-  if (!actual) return 'AI 正在观察页面并生成判定。';
-  if (/\b(openPage|clickAt|doubleClickAt|rightClickAt|drag|typeText|pressKey|waitForPage|waitForHumanVerification)\(/.test(actual)) {
-    return '这是旧运行记录中的工具日志。新运行会显示 AI 基于上下文、页面状态和截图生成的判定。';
+function formatToolInput(input: unknown) {
+  if (input === undefined || input === null) return '';
+  if (typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length === 0) return '';
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return String(input);
   }
-  return actual;
+}
+
+function stepToolSummary(step: StepExecutionResult) {
+  const tools = step.tools || [];
+  if (!tools.length) return '未调用工具';
+  return tools.map((tool) => tool.name).join(' · ');
 }
 
 function formatDetails(details: unknown) {
@@ -209,7 +215,6 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   const steps = run.result?.steps || [];
   const allImages = collectStepImages(steps);
   const selectedStep = selectedOrLatest(steps, selectedIndex);
-  const completedCount = steps.filter((step) => step.status !== 'running' && step.status !== 'queued').length;
   const runningStep = steps.find((step) => step.status === 'running');
   const debugEnabled = Boolean(run.debug?.enabled);
   const manualIntervention = run.control?.manualIntervention;
@@ -237,8 +242,8 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   const progressText = useMemo(() => {
     if (!steps.length) return run.status === 'running' ? 'AI 正在启动浏览器' : '暂无执行步骤';
-    if (runningStep) return `正在执行步骤 ${runningStep.index}`;
-    return `已记录 ${steps.length} 个步骤`;
+    if (runningStep) return `正在记录步骤 ${runningStep.index}`;
+    return `已记录 ${steps.length} 个操作`;
   }, [run.status, runningStep, steps]);
 
   function openImageByUrl(url: string) {
@@ -277,7 +282,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
       <div className="cockpit-toolbar">
         <div style={{display: "flex", gap: "16px", alignItems: "center"}}>
           <span>{progressText}</span>
-          <span>{completedCount}/{steps.length} 完成</span>
+          <span>{steps.length} 条操作</span>
           {run.report?.markdown ? (
             <button className="link-button" onClick={() => setReportOpen(true)} type="button">
               查看最终报告
@@ -318,7 +323,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                 查看当前截图
               </button>
             ) : null}
-            <button className="button compact-button" onClick={resumeManualIntervention} type="button">
+            <button className="link-button" onClick={resumeManualIntervention} type="button">
               <CheckCircle2 size={16} />
               执行完毕
             </button>
@@ -330,10 +335,10 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
         <aside className="step-rail" aria-label="执行步骤">
           {steps.map((step) => (
             <button className={selectedStep?.index === step.index ? 'rail-step active' : 'rail-step'} key={step.index} onClick={() => setSelectedIndex(step.index)} type="button">
-              <span className={`rail-icon status-${step.status}`}><StepIcon status={step.status} /></span>
+              <span className="rail-icon"><StepIcon status={step.status} /></span>
               <span className="rail-copy">
                 <strong>{step.action}</strong>
-                <small>步骤 {step.index} · {statusLabel(step.status)}</small>
+                <small>步骤 {step.index} · {stepToolSummary(step)}</small>
               </span>
             </button>
           ))}
@@ -344,10 +349,10 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
             <>
               <header className="evidence-title">
                 <div>
-                  <span className={`rail-icon status-${selectedStep.status}`}><StepIcon status={selectedStep.status} /></span>
+                  <span className="rail-icon"><StepIcon status={selectedStep.status} /></span>
                   <div>
                     <h3>{selectedStep.action}</h3>
-                    <p>步骤 {selectedStep.index} · {statusLabel(selectedStep.status)}</p>
+                    <p>步骤 {selectedStep.index}</p>
                   </div>
                 </div>
                 <div className="evidence-actions">
@@ -361,12 +366,28 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
               </header>
               <dl className="evidence-properties">
                 <div>
-                  <dt>判断标准</dt>
-                  <dd>{selectedStep.expected}</dd>
+                  <dt>AI 操作</dt>
+                  <dd>{selectedStep.action}</dd>
                 </div>
                 <div>
-                  <dt>AI 判定</dt>
-                  <dd>{userFacingActual(selectedStep.actual)}</dd>
+                  <dt>工具调用</dt>
+                  <dd>
+                    {selectedStep.tools?.length ? (
+                      <ol className="tool-call-list">
+                        {selectedStep.tools.map((tool, index) => {
+                          const input = formatToolInput(tool.input);
+                          return (
+                            <li key={`${tool.name}-${index}`}>
+                              <strong>{tool.name}</strong>
+                              {input ? <code>{input}</code> : null}
+                            </li>
+                          );
+                        })}
+                      </ol>
+                    ) : (
+                      '本步未调用浏览器工具'
+                    )}
+                  </dd>
                 </div>
                 <div>
                   <dt>执行前截图</dt>

@@ -18,16 +18,35 @@ function artifactUrl(filePath?: string) {
   return `/api/artifacts/${relative}`;
 }
 
+function formatToolInput(input: unknown) {
+  if (input === undefined || input === null) return '';
+  if (typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length === 0) return '';
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return String(input);
+  }
+}
+
+function toolMarkdown(step: StepExecutionResult) {
+  if (!step.tools?.length) return '- 工具调用：无';
+  return [
+    '- 工具调用：',
+    ...step.tools.map((tool) => {
+      const input = formatToolInput(tool.input);
+      return `  - ${tool.name}${input ? ` ${input}` : ''}`;
+    }),
+  ].join('\n');
+}
+
 function stepMarkdown(step: StepExecutionResult) {
   const before = artifactUrl(step.beforeScreenshotPath);
   const after = artifactUrl(step.afterScreenshotPath || step.screenshotPath);
 
   return `### 步骤 ${step.index}
 
-- 状态：${statusText(step.status)}
-- 操作：${step.action}
-- 预期：${step.expected}
-- 实际：${step.actual}
+- AI 操作：${step.action}
+${toolMarkdown(step)}
 ${before ? `\n![步骤 ${step.index} 执行前](${before})` : ''}
 ${after ? `\n![步骤 ${step.index} 执行后](${after})` : ''}`;
 }

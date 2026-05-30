@@ -60,6 +60,15 @@ type ViewportPoint = {
   note?: string;
 };
 
+type ScreenshotMetrics = {
+  path: string;
+  image: { width: number; height: number };
+  viewport: { width: number; height: number };
+  viewportMetrics: ViewportMetrics;
+  devicePixelRatio: number;
+  scale: 'css';
+};
+
 type ManualVerificationDetails = {
   detected: boolean;
   evidence?: string;
@@ -89,13 +98,7 @@ export class BrowserSession {
   private page?: Page;
   private consoleErrors: string[] = [];
   private networkErrors: string[] = [];
-  private lastScreenshotMetrics?: {
-    path: string;
-    image: { width: number; height: number };
-    viewport: { width: number; height: number };
-    devicePixelRatio: number;
-    scale: 'css';
-  };
+  private lastScreenshotMetrics?: ScreenshotMetrics;
 
   async start() {
     const { chromium } = await import('playwright');
@@ -147,15 +150,19 @@ export class BrowserSession {
     return this.activePage.locator('body').innerText({ timeout: 5000 }).catch(() => '');
   }
 
-  async getPageContext() {
-    const [title, text, viewportMetrics, focusedElement] = await Promise.all([
+  async getPageContext(options: { includeDomTree?: boolean; includeText?: boolean; includeManualVerification?: boolean } = {}) {
+    const includeText = options.includeText !== false || options.includeManualVerification !== false;
+    const [title, text, viewportMetrics, focusedElement, domTree] = await Promise.all([
       this.activePage.title().catch(() => ''),
-      this.readPageText(),
+      includeText ? this.readPageText() : Promise.resolve(''),
       this.getViewportMetrics(),
       this.getFocusedElement(),
+      options.includeDomTree ? this.readSimplifiedDomTree().catch((error) => `Unable to read DOM tree: ${error instanceof Error ? error.message : String(error)}`) : Promise.resolve(undefined),
     ]);
 
-    const manualVerification = this.detectManualVerificationDetails(title, this.activePage.url(), text);
+    const manualVerification = options.includeManualVerification === false
+      ? { detected: false }
+      : this.detectManualVerificationDetails(title, this.activePage.url(), text);
 
     return {
       url: this.activePage.url(),
@@ -170,6 +177,7 @@ export class BrowserSession {
         active: page === this.activePage,
       })),
       focusedElement,
+      domTree,
       manualVerification,
       isManualVerification: manualVerification.detected,
     };
@@ -189,6 +197,7 @@ export class BrowserSession {
       path: filePath,
       image,
       viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
+      viewportMetrics,
       devicePixelRatio: viewportMetrics.devicePixelRatio,
       scale: 'css',
     };
@@ -201,6 +210,7 @@ export class BrowserSession {
 
   async clickAt(x: number, y: number): Promise<BrowserActionResult> {
     const point = await this.screenshotPointToViewport(x, y);
+    const targetNote = await this.inspectViewportPoint(point.x, point.y);
     const context = this.activePage.context();
     const beforePages = context.pages().length;
     const popup = this.activePage.waitForEvent('popup', { timeout: 3000 }).catch(() => undefined);
@@ -217,25 +227,27 @@ export class BrowserSession {
     }
     const note = await this.waitAfterAction();
     await this.showClickMarker(point.x, point.y, 'click');
-    return { ok: true, actual: `Clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${note}` };
+    return { ok: true, actual: `Clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${targetNote}${note}` };
   }
 
   async doubleClickAt(x: number, y: number): Promise<BrowserActionResult> {
     const point = await this.screenshotPointToViewport(x, y);
+    const targetNote = await this.inspectViewportPoint(point.x, point.y);
     await this.activePage.mouse.dblclick(point.x, point.y);
     await this.showClickMarker(point.x, point.y, 'double');
     const note = await this.waitAfterAction();
     await this.showClickMarker(point.x, point.y, 'double');
-    return { ok: true, actual: `Double-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${note}` };
+    return { ok: true, actual: `Double-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${targetNote}${note}` };
   }
 
   async rightClickAt(x: number, y: number): Promise<BrowserActionResult> {
     const point = await this.screenshotPointToViewport(x, y);
+    const targetNote = await this.inspectViewportPoint(point.x, point.y);
     await this.activePage.mouse.click(point.x, point.y, { button: 'right' });
     await this.showClickMarker(point.x, point.y, 'right');
     const note = await this.waitAfterAction();
     await this.showClickMarker(point.x, point.y, 'right');
-    return { ok: true, actual: `Right-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${note}` };
+    return { ok: true, actual: `Right-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${targetNote}${note}` };
   }
 
   async drag(startX: number, startY: number, endX: number, endY: number): Promise<BrowserActionResult> {
@@ -251,10 +263,34 @@ export class BrowserSession {
     return { ok: true, actual: `Dragged screenshot coordinates (${startX}, ${startY}) -> (${endX}, ${endY}), mapped to viewport (${start.x}, ${start.y}) -> (${end.x}, ${end.y}).${note}` };
   }
 
-  async scroll(deltaY: number, deltaX = 0): Promise<BrowserActionResult> {
+  async getSimplifiedDomTree(): Promise<BrowserActionResult> {
+    return { ok: true, actual: await this.readSimplifiedDomTree() };
+  }
+
+  async clickDomNode(path: string): Promise<BrowserActionResult> {
+    const target = await this.resolveDomPathToClickablePoint(path);
+    if (!target) return { ok: false, actual: `DOM path ${path} was not found or is not visible.` };
+    await this.activePage.mouse.click(target.x, target.y);
+    await this.showClickMarker(target.x, target.y, 'click');
+    const note = await this.waitAfterAction();
+    await this.showClickMarker(target.x, target.y, 'click');
+    return { ok: true, actual: `Clicked DOM node ${path} (${target.descriptor}) at viewport coordinate (${target.x}, ${target.y}).${note}` };
+  }
+
+  async focusDomNode(path: string): Promise<BrowserActionResult> {
+    const target = await this.resolveDomPathToClickablePoint(path);
+    if (!target) return { ok: false, actual: `DOM path ${path} was not found or is not visible.` };
+    await this.activePage.mouse.click(target.x, target.y);
+    const note = await this.waitAfterAction();
+    return { ok: true, actual: `Focused DOM node ${path} (${target.descriptor}) at viewport coordinate (${target.x}, ${target.y}).${note}` };
+  }
+
+  async scroll(deltaY: number, deltaX = 0, target: { screenshotX?: number; screenshotY?: number; domPath?: string } = {}): Promise<BrowserActionResult> {
+    const scrollTarget = await this.resolveScrollTarget(target);
+    await this.activePage.mouse.move(scrollTarget.x, scrollTarget.y);
     await this.activePage.mouse.wheel(deltaX, deltaY);
     const note = await this.waitAfterAction();
-    return { ok: true, actual: `Scrolled viewport by x=${deltaX}, y=${deltaY}.${note}` };
+    return { ok: true, actual: `Scrolled ${scrollTarget.descriptor} at viewport coordinate (${scrollTarget.x}, ${scrollTarget.y}) by x=${deltaX}, y=${deltaY}.${scrollTarget.note}${note}` };
   }
 
   async listTabs(): Promise<BrowserActionResult> {
@@ -464,43 +500,239 @@ export class BrowserSession {
   private async getViewportMetrics(): Promise<ViewportMetrics> {
     const fallback = this.activePage.viewportSize() || { width: 1280, height: 720 };
     return this.activePage.evaluate(() => ({
-      width: Math.round(window.innerWidth),
-      height: Math.round(window.innerHeight),
+      width: window.innerWidth,
+      height: window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
       visualViewport: window.visualViewport
         ? {
-            width: Math.round(window.visualViewport.width),
-            height: Math.round(window.visualViewport.height),
-            offsetLeft: Math.round(window.visualViewport.offsetLeft),
-            offsetTop: Math.round(window.visualViewport.offsetTop),
+            width: window.visualViewport.width,
+            height: window.visualViewport.height,
+            offsetLeft: window.visualViewport.offsetLeft,
+            offsetTop: window.visualViewport.offsetTop,
             scale: window.visualViewport.scale || 1,
           }
         : undefined,
     })).catch(() => ({ ...fallback, devicePixelRatio: 1 }));
   }
 
+  private viewportContentSize(metrics: ViewportMetrics) {
+    const visual = metrics.visualViewport;
+    if (!visual || visual.width <= 0 || visual.height <= 0) {
+      return { width: metrics.width, height: metrics.height, source: 'layout viewport' };
+    }
+
+    return {
+      width: visual.width,
+      height: visual.height,
+      source: `visual viewport scale=${visual.scale}, offset=${visual.offsetLeft},${visual.offsetTop}`,
+    };
+  }
+
   private async screenshotPointToViewport(x: number, y: number): Promise<ViewportPoint> {
     const metrics = this.lastScreenshotMetrics;
-    const currentViewport = await this.getViewportSize();
+    const currentMetrics = await this.getViewportMetrics();
+    const currentViewport = { width: currentMetrics.width, height: currentMetrics.height };
     if (!metrics || metrics.image.width <= 0 || metrics.image.height <= 0) {
       const point = this.normalizePoint(x, y, currentViewport);
       return { ...point, note: ' No screenshot metrics were available; coordinate was treated as viewport CSS pixels.' };
     }
 
-    const mappedX = (x / metrics.image.width) * currentViewport.width;
-    const mappedY = (y / metrics.image.height) * currentViewport.height;
+    const capturedContent = this.viewportContentSize(metrics.viewportMetrics);
+    const currentContent = this.viewportContentSize(currentMetrics);
+    const normalizedX = x / metrics.image.width;
+    const normalizedY = y / metrics.image.height;
+    const mappedX = normalizedX * currentContent.width;
+    const mappedY = normalizedY * currentContent.height;
     const point = this.normalizePoint(mappedX, mappedY, currentViewport);
-    const sourceViewport = `${metrics.viewport.width}x${metrics.viewport.height}`;
+    const capturedViewport = `${metrics.viewport.width}x${metrics.viewport.height}`;
     const targetViewport = `${currentViewport.width}x${currentViewport.height}`;
-    const note = ` Coordinate mapping used screenshot=${metrics.image.width}x${metrics.image.height}, screenshotViewport=${sourceViewport}, currentViewport=${targetViewport}, scale=${metrics.scale}, dpr=${metrics.devicePixelRatio}.`;
+    const note = [
+      ` Coordinate mapping used screenshot=${metrics.image.width}x${metrics.image.height}`,
+      `capturedViewport=${capturedViewport}`,
+      `capturedContent=${Math.round(capturedContent.width)}x${Math.round(capturedContent.height)} (${capturedContent.source})`,
+      `currentViewport=${targetViewport}`,
+      `currentContent=${Math.round(currentContent.width)}x${Math.round(currentContent.height)} (${currentContent.source})`,
+      `normalized=${normalizedX.toFixed(4)},${normalizedY.toFixed(4)}`,
+      `scale=${metrics.scale}`,
+      `dpr=${metrics.devicePixelRatio}`,
+    ].join(', ') + '.';
     return { ...point, note };
   }
 
   private normalizePoint(x: number, y: number, viewport: { width: number; height: number }): ViewportPoint {
     return {
-      x: Math.min(Math.max(Math.round(x), 0), viewport.width - 1),
-      y: Math.min(Math.max(Math.round(y), 0), viewport.height - 1),
+      x: Math.min(Math.max(Number(x.toFixed(2)), 0), viewport.width - 1),
+      y: Math.min(Math.max(Number(y.toFixed(2)), 0), viewport.height - 1),
     };
+  }
+
+  private async inspectViewportPoint(x: number, y: number) {
+    return this.activePage.evaluate(({ x: pointX, y: pointY }) => {
+      const element = document.elementFromPoint(pointX, pointY);
+      if (!element) return ' Target element at mapped point: none.';
+      const tag = element.tagName.toLowerCase();
+      const id = element.id ? `#${element.id}` : '';
+      const className = typeof element.className === 'string'
+        ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
+        : '';
+      const rect = element.getBoundingClientRect();
+      return ` Target element at mapped point: ${tag}${id}${className} rect=${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(rect.width)}x${Math.round(rect.height)}.`;
+    }, { x, y }).catch(() => '');
+  }
+
+  private async readSimplifiedDomTree() {
+    const maxNodes = Number(process.env.DOM_TREE_MAX_NODES || 260);
+    const maxDepth = Number(process.env.DOM_TREE_MAX_DEPTH || 12);
+    return this.activePage.evaluate(({ maxNodes: nodeLimit, maxDepth: depthLimit }) => {
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path']);
+      let count = 0;
+
+      function visibleElementChildren(element: Element) {
+        return Array.from(element.children).filter((child) => !skippedTags.has(child.tagName.toLowerCase()));
+      }
+
+      function describe(element: Element, path: number[]) {
+        const tag = element.tagName.toLowerCase();
+        const id = element.id ? `#${CSS.escape(element.id)}` : '';
+        const classes = typeof element.className === 'string'
+          ? element.className.split(/\s+/).filter(Boolean).slice(0, 6).map((item) => `.${CSS.escape(item)}`).join('')
+          : '';
+        return `[${path.join('.')}] ${tag}${id}${classes}`;
+      }
+
+      const lines: string[] = [];
+      function walk(element: Element, path: number[], depth: number) {
+        if (count >= nodeLimit || depth > depthLimit) return;
+        lines.push(`${'  '.repeat(depth)}${describe(element, path)}`);
+        count += 1;
+        const children = visibleElementChildren(element);
+        for (let index = 0; index < children.length; index += 1) {
+          walk(children[index], [...path, index], depth + 1);
+          if (count >= nodeLimit) break;
+        }
+      }
+
+      walk(document.documentElement, [0], 0);
+      if (count >= nodeLimit) lines.push(`... truncated at ${nodeLimit} nodes`);
+      return lines.join('\n');
+    }, { maxNodes, maxDepth });
+  }
+
+  private async resolveDomPathToClickablePoint(pathValue: string) {
+    return this.activePage.evaluate((path) => {
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path']);
+      const parts = path.split('.').map((item) => Number(item.trim())).filter((item) => Number.isInteger(item) && item >= 0);
+      if (!parts.length || parts[0] !== 0) return undefined;
+
+      function visibleElementChildren(element: Element) {
+        return Array.from(element.children).filter((child) => !skippedTags.has(child.tagName.toLowerCase()));
+      }
+
+      let element: Element | undefined = document.documentElement;
+      for (const index of parts.slice(1)) {
+        element = visibleElementChildren(element)[index];
+        if (!element) return undefined;
+      }
+
+      element.scrollIntoView({ block: 'center', inline: 'center' });
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return undefined;
+      const tag = element.tagName.toLowerCase();
+      const id = element.id ? `#${element.id}` : '';
+      const classes = typeof element.className === 'string'
+        ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
+        : '';
+      return {
+        x: Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1),
+        y: Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1),
+        descriptor: `${tag}${id}${classes}`,
+      };
+    }, pathValue).catch(() => undefined);
+  }
+
+  private async resolveScrollTarget(target: { screenshotX?: number; screenshotY?: number; domPath?: string }) {
+    const point = typeof target.screenshotX === 'number' && typeof target.screenshotY === 'number'
+      ? await this.screenshotPointToViewport(target.screenshotX, target.screenshotY)
+      : undefined;
+
+    return this.activePage.evaluate(({ x, y, domPath }) => {
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path']);
+
+      function visibleElementChildren(element: Element) {
+        return Array.from(element.children).filter((child) => !skippedTags.has(child.tagName.toLowerCase()));
+      }
+
+      function elementFromDomPath(pathValue?: string) {
+        if (!pathValue) return undefined;
+        const parts = pathValue.split('.').map((item) => Number(item.trim())).filter((item) => Number.isInteger(item) && item >= 0);
+        if (!parts.length || parts[0] !== 0) return undefined;
+        let element: Element | undefined = document.documentElement;
+        for (const index of parts.slice(1)) {
+          element = visibleElementChildren(element)[index];
+          if (!element) return undefined;
+        }
+        return element;
+      }
+
+      function descriptor(element: Element | Document) {
+        if (element === document) return 'document';
+        const targetElement = element as Element;
+        const tag = targetElement.tagName.toLowerCase();
+        const id = targetElement.id ? `#${targetElement.id}` : '';
+        const classes = typeof targetElement.className === 'string'
+          ? targetElement.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
+          : '';
+        return `${tag}${id}${classes}`;
+      }
+
+      function isScrollable(element: Element) {
+        const style = window.getComputedStyle(element);
+        const overflowY = style.overflowY;
+        const overflowX = style.overflowX;
+        const canScrollY = element.scrollHeight > element.clientHeight + 1 && /(auto|scroll|overlay)/i.test(overflowY);
+        const canScrollX = element.scrollWidth > element.clientWidth + 1 && /(auto|scroll|overlay)/i.test(overflowX);
+        return canScrollY || canScrollX;
+      }
+
+      function closestScrollable(element?: Element | null) {
+        let current: Element | null | undefined = element;
+        while (current && current !== document.documentElement) {
+          if (isScrollable(current)) return current;
+          current = current.parentElement;
+        }
+        return document.scrollingElement || document.documentElement;
+      }
+
+      const sourceElement =
+        elementFromDomPath(domPath) ||
+        (typeof x === 'number' && typeof y === 'number' ? document.elementFromPoint(x, y) : undefined) ||
+        document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2) ||
+        document.documentElement;
+      const scrollElement = closestScrollable(sourceElement);
+      const rect = scrollElement.getBoundingClientRect();
+      const targetX = scrollElement === document.documentElement || scrollElement === document.body || scrollElement === document.scrollingElement
+        ? (typeof x === 'number' ? x : window.innerWidth / 2)
+        : rect.left + rect.width / 2;
+      const targetY = scrollElement === document.documentElement || scrollElement === document.body || scrollElement === document.scrollingElement
+        ? (typeof y === 'number' ? y : window.innerHeight / 2)
+        : rect.top + rect.height / 2;
+
+      return {
+        x: Math.min(Math.max(targetX, 0), window.innerWidth - 1),
+        y: Math.min(Math.max(targetY, 0), window.innerHeight - 1),
+        descriptor: descriptor(scrollElement),
+        note: ` Source element: ${descriptor(sourceElement)}.`,
+      };
+    }, {
+      x: point?.x,
+      y: point?.y,
+      domPath: target.domPath,
+    }).catch(() => ({
+      x: point?.x ?? 1,
+      y: point?.y ?? 1,
+      descriptor: 'document',
+      note: ' Scroll target resolution failed; fell back to document.',
+    }));
   }
 
   private async readPngSize(filePath: string) {
