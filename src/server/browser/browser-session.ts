@@ -202,7 +202,10 @@ export class BrowserSession {
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    const gridEnabled = process.env.SCREENSHOT_COORDINATE_GRID !== 'false';
+    // The coordinate grid only makes sense for coordinate-based clicking. When isClick=false the model
+    // uses DOM-node tools, so the grid must not be drawn on the screenshot.
+    const coordinateClickMode = (process.env.isClick ?? process.env.IS_CLICK ?? 'true').toLowerCase() !== 'false';
+    const gridEnabled = coordinateClickMode && process.env.SCREENSHOT_COORDINATE_GRID !== 'false';
     if (gridEnabled) await this.drawCoordinateGrid();
     try {
       await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
@@ -1039,32 +1042,44 @@ export class BrowserSession {
         grid.appendChild(label);
       }
 
+      const minorColor = 'rgba(0, 122, 255, 0.16)';
+      const majorColor = 'rgba(0, 122, 255, 0.34)';
+      const halo = 'text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;';
+
       if (origin === 'center') {
         // Cartesian plane: origin at the image center, x grows right (negative left), y grows UP
         // (negative down). Axes drawn in red; labels are pixel offsets from the center.
         const cx = Math.round(width / 2);
         const cy = Math.round(height / 2);
         const xLabelCss =
-          'position:absolute;font:700 13px/13px Arial,sans-serif;color:#0a5ac8;text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;transform:translateX(-50%);';
+          `position:absolute;font:700 13px/13px Arial,sans-serif;color:#0a5ac8;${halo}white-space:nowrap;transform:translateX(-50%);`;
         const yLabelCss =
-          'position:absolute;font:700 13px/13px Arial,sans-serif;color:#c0440a;text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;transform:translateY(-50%);';
+          `position:absolute;font:700 13px/13px Arial,sans-serif;color:#c0440a;${halo}white-space:nowrap;transform:translateY(-50%);`;
 
         // Vertical gridlines + x labels (placed just below the horizontal axis).
         for (let x = cx % step; x < width; x += step) {
           const value = x - cx;
+          const axis = value === 0;
+          const major = (value / step) % 5 === 0;
           // Always draw the red axis (value 0); other gridlines only when showLines is on.
-          if (value === 0 || showLines) addLine({ left: `${x}px`, top: '0', width: '1px', height: `${height}px`, background: value === 0 ? axisColor : lineColor });
-          if (value !== 0) addLabel(`${value}`, `${xLabelCss}left:${x}px;top:${cy + 3}px;`);
+          if (axis || showLines) addLine({ left: `${x}px`, top: '0', width: axis ? '2px' : '1px', marginLeft: axis ? '-1px' : '0', height: `${height}px`, background: axis ? axisColor : (major ? majorColor : minorColor) });
+          if (!axis) addLabel(`${value}`, `${xLabelCss}left:${x}px;top:${cy + 4}px;`);
         }
-        // Horizontal gridlines + y labels (placed just left of the vertical axis).
+        // Horizontal gridlines + y labels (placed just right of the vertical axis).
         for (let y = cy % step; y < height; y += step) {
           const value = cy - y;
-          if (value === 0 || showLines) addLine({ left: '0', top: `${y}px`, width: `${width}px`, height: '1px', background: value === 0 ? axisColor : lineColor });
-          if (value !== 0) addLabel(`${value}`, `${yLabelCss}left:${cx + 4}px;top:${y}px;`);
+          const axis = value === 0;
+          const major = (value / step) % 5 === 0;
+          if (axis || showLines) addLine({ left: '0', top: `${y}px`, width: `${width}px`, height: axis ? '2px' : '1px', marginTop: axis ? '-1px' : '0', background: axis ? axisColor : (major ? majorColor : minorColor) });
+          if (!axis) addLabel(`${value}`, `${yLabelCss}left:${cx + 5}px;top:${y}px;`);
         }
-        addLabel('0', `position:absolute;left:${cx + 4}px;top:${cy + 3}px;font:700 13px/13px Arial,sans-serif;color:#fff;background:${axisColor};padding:1px 2px;border-radius:2px;`);
-        addLabel('x→', `position:absolute;right:2px;top:${cy - 18}px;font:700 16px/16px Arial,sans-serif;color:#c00000;`);
-        addLabel('↑y', `position:absolute;left:${cx + 4}px;top:2px;font:700 16px/16px Arial,sans-serif;color:#c00000;`);
+        // Arrowheads on the positive ends of each axis (right for x, top for y).
+        addLabel('', `position:absolute;top:${cy}px;right:0;transform:translateY(-50%);width:0;height:0;border-top:6px solid transparent;border-bottom:6px solid transparent;border-left:11px solid ${axisColor};`);
+        addLabel('', `position:absolute;left:${cx}px;top:0;transform:translateX(-50%);width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:11px solid ${axisColor};`);
+        // Origin marker + axis letters (no color box, just red text with a white halo).
+        addLabel('0', `position:absolute;left:${cx + 5}px;top:${cy + 4}px;font:700 13px/13px Arial,sans-serif;color:#c00000;${halo}`);
+        addLabel('x', `position:absolute;right:5px;top:${cy + 7}px;font:800 15px/15px Arial,sans-serif;color:#c00000;${halo}`);
+        addLabel('y', `position:absolute;left:${cx + 9}px;top:4px;font:800 15px/15px Arial,sans-serif;color:#c00000;${halo}`);
       } else {
         // Bottom/top-left origin: x labels vertical along the bottom, y labels horizontal along the left.
         const xLabelCss =
@@ -1073,14 +1088,14 @@ export class BrowserSession {
           'position:absolute;font:700 16px/16px Arial,sans-serif;color:#c0440a;text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;transform:translateY(-50%);';
 
         for (let x = step; x < width; x += step) {
-          if (showLines) addLine({ left: `${x}px`, top: '0', width: '1px', height: `${height}px` });
+          if (showLines) addLine({ left: `${x}px`, top: '0', width: '1px', height: `${height}px`, background: (x / step) % 5 === 0 ? majorColor : minorColor });
           addLabel(`x=${x}`, `${xLabelCss}left:${x}px;bottom:1px;`);
         }
         for (let y = step; y < height; y += step) {
-          if (showLines) addLine({ left: '0', top: `${y}px`, width: `${width}px`, height: '1px' });
+          if (showLines) addLine({ left: '0', top: `${y}px`, width: `${width}px`, height: '1px', background: (y / step) % 5 === 0 ? majorColor : minorColor });
           addLabel(`y=${y}`, `${yLabelCss}left:1px;top:${y}px;`);
         }
-        addLabel('0,0  x→  y↓', 'position:absolute;left:1px;top:1px;font:700 16px/16px Arial,sans-serif;color:#fff;background:rgba(200,0,0,0.85);padding:1px 2px;border-radius:2px;white-space:nowrap;');
+        addLabel('0,0 x→ y↓', `position:absolute;left:2px;top:1px;font:700 12px/12px Arial,sans-serif;color:#c00000;${halo}white-space:nowrap;`);
       }
 
       document.documentElement.appendChild(grid);
