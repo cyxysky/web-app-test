@@ -1,0 +1,58 @@
+'use client';
+
+import { useState } from 'react';
+import { Info, X } from 'lucide-react';
+import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+
+export function RunMetaDrawer({ run, testCaseTitle }: { run: TestRunRecord; testCaseTitle: string }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <>
+      <button className="icon-text-button" onClick={() => setOpen(true)} type="button">
+        <Info size={16} />
+        运行信息
+      </button>
+      {open ? (
+        <div className="drawer-overlay" role="presentation" onClick={() => setOpen(false)}>
+          <aside className="run-drawer" role="dialog" aria-label="运行信息" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <h2>运行信息</h2>
+              </div>
+              <button className="icon-button" onClick={() => setOpen(false)} type="button" aria-label="关闭">
+                <X size={18} />
+              </button>
+            </header>
+            <dl className="drawer-form-list">
+              <div>
+                <dt>运行 ID</dt>
+                <dd>{run.id}</dd>
+              </div>
+              <div>
+                <dt>当前用例</dt>
+                <dd>{testCaseTitle}</dd>
+              </div>
+              <div>
+                <dt>开始时间</dt>
+                <dd>{run.startedAt || '-'}</dd>
+              </div>
+              <div>
+                <dt>结束时间</dt>
+                <dd>{run.endedAt || '-'}</dd>
+              </div>
+              <div>
+                <dt>步骤记录</dt>
+                <dd>{run.result?.steps.length || 0}</dd>
+              </div>
+              <div>
+                <dt>报告状态</dt>
+                <dd>{run.report ? '已生成' : '生成中'}</dd>
+              </div>
+            </dl>
+          </aside>
+        </div>
+      ) : null}
+    </>
+  );
+}

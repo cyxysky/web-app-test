@@ -1,33 +1,54 @@
-import type { TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import path from 'node:path';
+import type { StepExecutionResult, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import { richTextToPlainText } from '@/lib/rich-text';
 
-function escapeTableCell(value: string) {
-  return value.replace(/\|/g, '\\|').replace(/\r?\n/g, '<br />');
+function statusText(status: TestRunRecord['status'] | StepExecutionResult['status']) {
+  if (status === 'passed') return '通过';
+  if (status === 'failed') return '失败';
+  if (status === 'blocked') return '阻塞';
+  if (status === 'running') return '运行中';
+  return '排队中';
+}
+
+function artifactUrl(filePath?: string) {
+  if (!filePath) return undefined;
+  const root = path.resolve(process.cwd(), 'artifacts');
+  const relative = path.relative(root, filePath).replace(/\\/g, '/');
+  if (relative.startsWith('..')) return undefined;
+  return `/api/artifacts/${relative}`;
+}
+
+function stepMarkdown(step: StepExecutionResult) {
+  const before = artifactUrl(step.beforeScreenshotPath);
+  const after = artifactUrl(step.afterScreenshotPath || step.screenshotPath);
+
+  return `### 步骤 ${step.index}
+
+- 状态：${statusText(step.status)}
+- 操作：${step.action}
+- 预期：${step.expected}
+- 实际：${step.actual}
+${before ? `\n![步骤 ${step.index} 执行前](${before})` : ''}
+${after ? `\n![步骤 ${step.index} 执行后](${after})` : ''}`;
 }
 
 export function writeReport(testCase: TestCaseRecord, run: TestRunRecord) {
   const result = run.result;
   const status = run.status;
-  const rows = (result?.steps || [])
-    .map(
-      (step) =>
-        `| ${step.index} | ${step.operation || 'auto'} | ${escapeTableCell(step.action)} | ${escapeTableCell(
-          step.expected,
-        )} | ${escapeTableCell(step.actual)} | ${step.status} |`,
-    )
-    .join('\n');
+  const stepBlocks = (result?.steps || []).map(stepMarkdown).join('\n\n');
 
   const summary =
     status === 'passed'
       ? '所有可执行步骤均已完成，未发现阻塞性问题。'
       : status === 'failed'
-        ? '测试执行发现失败步骤，需要进一步修复页面行为、定位提示或测试数据。'
-        : '测试被阻塞，通常由安全限制、页面不可访问、目标元素不可定位或环境问题导致。';
+        ? '测试执行发现失败步骤，请优先检查页面状态、定位提示和测试数据。'
+        : '测试被阻塞，通常由安全验证、目标页面不可访问、浏览器环境或高风险操作拦截导致。';
 
   const markdown = `# 测试报告：${testCase.title}
 
 ## 测试结论
 
-状态：${status}
+状态：${statusText(status)}
 
 ${summary}
 
@@ -39,25 +60,23 @@ ${summary}
 
 ## 测试用例
 
-${testCase.description}
+${richTextToPlainText(testCase.content.userRequirement || '') || testCase.description}
 
 ## 执行步骤
 
-| 步骤 | 操作类型 | 操作 | 预期结果 | 实际结果 | 状态 |
-|---|---|---|---|---|---|
-${rows || '| - | - | - | - | - | - |'}
+${stepBlocks || '- 暂无执行步骤。'}
 
 ## Console 错误
 
-${result?.consoleErrors.length ? result.consoleErrors.map((item) => `- ${item}`).join('\n') : '未采集到 Console 错误。'}
+${result?.consoleErrors.length ? result.consoleErrors.map((item) => `- ${item}`).join('\n') : '未采集到关键 Console 错误。'}
 
 ## 网络异常
 
-${result?.networkErrors.length ? result.networkErrors.map((item) => `- ${item}`).join('\n') : '未采集到网络异常。'}
+${result?.networkErrors.length ? result.networkErrors.map((item) => `- ${item}`).join('\n') : '未采集到关键网络异常。'}
 
 ## 分析与建议
 
-${status === 'passed' ? '- 可以将该用例加入回归测试集合。' : '- 优先检查目标地址、测试账号、页面选择器和域名白名单配置。'}
+${status === 'passed' ? '- 可以将该用例加入回归测试集合。' : '- 优先检查失败步骤的执行前后截图、页面登录态、选择器和测试账号。'}
 - 涉及真实支付、删除或通知发送时，请使用隔离测试环境和模拟数据。`;
 
   return {

@@ -1,13 +1,15 @@
 'use client';
 
 import { FormEvent, useState } from 'react';
-import { ImageUp, Loader2, Sparkles } from 'lucide-react';
+import { ImageUp, Loader2, Sparkles, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import { RichTextEditor } from '@/components/RichTextEditor';
+import { richTextToPlainText } from '@/lib/rich-text';
 
-export function NewTestCaseForm() {
+export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
   const router = useRouter();
   const [prompt, setPrompt] = useState('');
-  const [targetUrl, setTargetUrl] = useState('https://example.com');
+  const [targetUrl, setTargetUrl] = useState('https://www.zhihu.com');
   const [imageNames, setImageNames] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -15,9 +17,9 @@ export function NewTestCaseForm() {
 
   async function uploadImage(file: File) {
     setUploading(true);
+    setError('');
     const form = new FormData();
     form.append('file', file);
-
     try {
       const response = await fetch('/api/uploads', { method: 'POST', body: form });
       const data = await response.json();
@@ -30,14 +32,17 @@ export function NewTestCaseForm() {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!richTextToPlainText(prompt)) {
+      setError('请输入测试目标');
+      return;
+    }
     setLoading(true);
     setError('');
-
     try {
       const response = await fetch('/api/test-cases/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, targetUrl, imageNames }),
+        body: JSON.stringify({ prompt, targetUrl, imageNames, groupId }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '生成失败');
@@ -51,34 +56,27 @@ export function NewTestCaseForm() {
   }
 
   return (
-    <form className="form" onSubmit={submit}>
+    <form className="form designer-form" onSubmit={submit}>
       <div className="field">
         <label htmlFor="targetUrl">目标地址</label>
-        <input
-          className="input"
-          id="targetUrl"
-          onChange={(event) => setTargetUrl(event.target.value)}
-          placeholder="https://staging.example.com"
-          required
-          value={targetUrl}
-        />
+        <input className="input" id="targetUrl" onChange={(event) => setTargetUrl(event.target.value)} required value={targetUrl} />
       </div>
       <div className="field">
-        <label htmlFor="prompt">测试需求</label>
-        <textarea
-          className="textarea"
+        <label htmlFor="prompt">测试目标</label>
+        <RichTextEditor
           id="prompt"
-          onChange={(event) => setPrompt(event.target.value)}
-          placeholder="例如：测试登录、错误密码提示、记住我、登录后的跳转。请尽量写清楚账号、入口和预期结果。"
-          required
+          onChange={setPrompt}
+          placeholder="例如：进入知乎，搜索 gpt，并确认结果页可读"
           value={prompt}
         />
       </div>
       <div className="field">
         <label className="file-label" htmlFor="image">
-          <ImageUp size={16} /> 图片上下文
+          <ImageUp size={16} />
+          图片上下文
         </label>
         <input
+          className="file-input"
           id="image"
           type="file"
           accept="image/*"
@@ -87,11 +85,22 @@ export function NewTestCaseForm() {
             if (file) void uploadImage(file).catch((err) => setError(err.message));
           }}
         />
-        {uploading ? <div className="meta">正在上传图片...</div> : null}
-        {imageNames.length > 0 ? <div className="meta">已上传：{imageNames.join(', ')}</div> : null}
+        {uploading ? <div className="hint">正在上传图片...</div> : null}
+        {imageNames.length ? (
+          <div className="upload-list">
+            {imageNames.map((name) => (
+              <span className="upload-chip" key={name}>
+                {name}
+                <button aria-label={`移除 ${name}`} onClick={() => setImageNames((current) => current.filter((item) => item !== name))} type="button">
+                  <X size={12} />
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
       </div>
       {error ? <div className="error">{error}</div> : null}
-      <button className="button" disabled={loading || uploading} type="submit">
+      <button className="button full-width" disabled={loading || uploading} type="submit">
         {loading ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
         {loading ? '正在生成' : '生成测试用例'}
       </button>

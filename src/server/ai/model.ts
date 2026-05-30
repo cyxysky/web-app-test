@@ -1,12 +1,9 @@
+import { createDeepSeek } from '@ai-sdk/deepseek';
 import { createOpenAI } from '@ai-sdk/openai';
+import type { LanguageModel } from 'ai';
+import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 
-/**
- * OpenAI-compatible GPT model through the internal mirror.
- *
- * The mirror exposes an OpenAI-style chat endpoint. Using the Azure provider with
- * baseURL builds deployment URLs such as /openai/{model}/chat/completions, which
- * can make the mirror close the socket before it returns a response.
- */
+
 const openAI = createOpenAI({
   baseURL: process.env.OPENAI_BASE_URL || 'http://mirrors.shterm.com:8801/openai',
   apiKey: process.env.OPENAI_API_KEY || '-',
@@ -14,8 +11,15 @@ const openAI = createOpenAI({
   name: 'mirror-openai',
 });
 
+const deepseek = createDeepSeek({
+  apiKey: process.env.DEEPSEEK_API_KEY ?? '',
+});
+
+const openrouter = createOpenRouter({
+  apiKey: process.env.OPENROUTER_API_KEY ?? '',
+});
+
 export function getModel() {
-  return openAI.chat(process.env.AI_MODEL || 'gpt-5.4', {
-    structuredOutputs: false,
-  });
+  return openrouter.chat("qwen/qwen3.6-plus")
+  return deepseek("deepseek-v4-flash");
 }

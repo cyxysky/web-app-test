@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { RunDebugEvent, StepExecutionResult, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -28,7 +28,6 @@ const seedContent: TestCaseContent = {
       index: 2,
       operation: 'fill',
       action: 'Submit an invalid password',
-      selectorHint: 'email/password/login button',
       input: 'wrong-password',
       expected: 'The page shows an error and does not enter the app',
       riskLevel: 'safe',
@@ -37,7 +36,6 @@ const seedContent: TestCaseContent = {
       index: 3,
       operation: 'fill',
       action: 'Submit the configured test account',
-      selectorHint: 'email/password/login button',
       input: 'configured test credential',
       expected: 'Login succeeds and navigates to the dashboard or home page',
       riskLevel: 'warning',
@@ -50,6 +48,7 @@ const seedContent: TestCaseContent = {
 type StoreData = {
   testCases: TestCaseRecord[];
   runs: TestRunRecord[];
+  groups?: TestGroupRecord[];
 };
 
 const seedRecord: TestCaseRecord = {
@@ -67,30 +66,74 @@ const seedRecord: TestCaseRecord = {
 
 function writeData(data: StoreData) {
   mkdirSync(path.dirname(storePath), { recursive: true });
-  writeFileSync(storePath, JSON.stringify(data, null, 2), 'utf8');
+  const tempPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf8');
+  renameSync(tempPath, storePath);
+}
+
+function sleepSync(ms: number) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function readData(): StoreData {
   if (!existsSync(storePath)) {
-    const seed: StoreData = { testCases: [seedRecord], runs: [] };
+    const seed: StoreData = { testCases: [seedRecord], runs: [], groups: [] };
     writeData(seed);
     return seed;
   }
 
-  return JSON.parse(readFileSync(storePath, 'utf8')) as StoreData;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const data = JSON.parse(readFileSync(storePath, 'utf8')) as StoreData;
+      return { ...data, groups: data.groups || [] };
+    } catch (error) {
+      lastError = error;
+      sleepSync(25);
+    }
+  }
+  throw lastError;
 }
 
 export const store = {
   listTestCases() {
     return readData().testCases.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   },
+  listGroups() {
+    return readData().groups || [];
+  },
+  createGroup(name: string, parentId?: string) {
+    const data = readData();
+    const group: TestGroupRecord = {
+      id: id('grp'),
+      parentId,
+      name,
+      createdAt: now(),
+      updatedAt: now(),
+    };
+    data.groups = [...(data.groups || []), group];
+    writeData(data);
+    return group;
+  },
+  updateGroup(groupId: string, patch: Partial<Pick<TestGroupRecord, 'name' | 'parentId'>>) {
+    const data = readData();
+    let updated: TestGroupRecord | undefined;
+    data.groups = (data.groups || []).map((group) => {
+      if (group.id !== groupId) return group;
+      updated = { ...group, ...patch, updatedAt: now() };
+      return updated;
+    });
+    writeData(data);
+    return updated;
+  },
   getTestCase(testCaseId: string) {
     return readData().testCases.find((item) => item.id === testCaseId);
   },
-  createTestCase(content: TestCaseContent, imageNames: string[]) {
+  createTestCase(content: TestCaseContent, imageNames: string[], groupId?: string) {
     const data = readData();
     const record: TestCaseRecord = {
       id: id('tc'),
+      groupId,
       title: content.title,
       description: content.description,
       targetUrl: content.targetUrl,
@@ -112,6 +155,37 @@ export const store = {
     );
     writeData(data);
   },
+  moveTestCase(testCaseId: string, groupId?: string) {
+    const data = readData();
+    let updated: TestCaseRecord | undefined;
+    data.testCases = data.testCases.map((record) => {
+      if (record.id !== testCaseId) return record;
+      updated = { ...record, groupId, updatedAt: now() };
+      return updated;
+    });
+    writeData(data);
+    return updated;
+  },
+  updateTestCase(testCaseId: string, content: TestCaseContent, imageNames?: string[]) {
+    const data = readData();
+    let updated: TestCaseRecord | undefined;
+    data.testCases = data.testCases.map((record) => {
+      if (record.id !== testCaseId) return record;
+      updated = {
+        ...record,
+        title: content.title,
+        description: content.description,
+        targetUrl: content.targetUrl,
+        priority: content.priority,
+        content,
+        imageNames: imageNames ?? record.imageNames,
+        updatedAt: now(),
+      };
+      return updated;
+    });
+    writeData(data);
+    return updated;
+  },
   createRun(testCaseId: string) {
     const data = readData();
     const run: TestRunRecord = {
@@ -132,6 +206,114 @@ export const store = {
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
     return updated;
+  },
+  updateRunStep(runId: string, step: StepExecutionResult) {
+    const data = readData();
+    const run = data.runs.find((item) => item.id === runId);
+    if (!run) return undefined;
+
+    const result = run.result || { steps: [], consoleErrors: [], networkErrors: [] };
+    const exists = result.steps.some((item) => item.index === step.index);
+    const steps = exists
+      ? result.steps.map((item) => (item.index === step.index ? { ...item, ...step } : item))
+      : [...result.steps, step].sort((a, b) => a.index - b.index);
+
+    const updated = { ...run, result: { ...result, steps } };
+    data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
+    writeData(data);
+    return updated;
+  },
+  appendRunDebug(runId: string, event: Omit<RunDebugEvent, 'time'>) {
+    const data = readData();
+    const run = data.runs.find((item) => item.id === runId);
+    if (!run) return undefined;
+    const debug = run.debug || { enabled: false, phase: '', events: [] };
+    const updatedDebug = {
+      ...debug,
+      phase: event.phase,
+      stepIndex: event.stepIndex,
+      events: [...debug.events, { ...event, time: now() }].slice(-200),
+    };
+    const updated = { ...run, debug: updatedDebug };
+    data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
+    writeData(data);
+    return updated;
+  },
+  requestRunSkip(runId: string, stepIndex?: number) {
+    const data = readData();
+    const run = data.runs.find((item) => item.id === runId);
+    if (!run) return undefined;
+    const updated = {
+      ...run,
+      control: {
+        ...run.control,
+        skipRequestedAt: now(),
+        skipStepIndex: stepIndex,
+      },
+    };
+    data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
+    writeData(data);
+    return updated;
+  },
+  requestRunResume(runId: string, stepIndex?: number) {
+    const data = readData();
+    const run = data.runs.find((item) => item.id === runId);
+    if (!run) return undefined;
+    const updated = {
+      ...run,
+      control: {
+        ...run.control,
+        resumeRequestedAt: now(),
+        resumeStepIndex: stepIndex,
+        manualIntervention: undefined,
+      },
+    };
+    data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
+    writeData(data);
+    return updated;
+  },
+  setRunManualIntervention(runId: string, manualIntervention?: NonNullable<TestRunRecord['control']>['manualIntervention']) {
+    const data = readData();
+    const run = data.runs.find((item) => item.id === runId);
+    if (!run) return undefined;
+    const updated = {
+      ...run,
+      control: {
+        ...run.control,
+        manualIntervention,
+      },
+    };
+    data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
+    writeData(data);
+    return updated;
+  },
+  consumeRunSkip(runId: string, stepIndex: number) {
+    const data = readData();
+    const run = data.runs.find((item) => item.id === runId);
+    const requested = run?.control?.skipRequestedAt && (!run.control.skipStepIndex || run.control.skipStepIndex === stepIndex);
+    if (!run || !requested) return false;
+    const updated = { ...run, control: { ...run.control, skipRequestedAt: undefined, skipStepIndex: undefined } };
+    data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
+    writeData(data);
+    return true;
+  },
+  consumeRunResume(runId: string, stepIndex: number) {
+    const data = readData();
+    const run = data.runs.find((item) => item.id === runId);
+    const requested = run?.control?.resumeRequestedAt && (!run.control.resumeStepIndex || run.control.resumeStepIndex === stepIndex);
+    if (!run || !requested) return false;
+    const updated = {
+      ...run,
+      control: {
+        ...run.control,
+        resumeRequestedAt: undefined,
+        resumeStepIndex: undefined,
+        manualIntervention: undefined,
+      },
+    };
+    data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
+    writeData(data);
+    return true;
   },
   getRun(runId: string) {
     return readData().runs.find((item) => item.id === runId);

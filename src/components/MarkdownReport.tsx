@@ -2,6 +2,70 @@ function parseInline(text: string) {
   return text.split(/(<br \/>)/g).map((part, index) => (part === '<br />' ? <br key={index} /> : part));
 }
 
+function parseImage(trimmed: string, key: number, onImageClick?: (url: string) => void) {
+  const match = trimmed.match(/^!\[(.*)]\((.*)\)$/);
+  if (!match) return undefined;
+
+  return (
+    <figure className="report-shot" key={key}>
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img alt={match[1]} onClick={onImageClick ? () => onImageClick(match[2]) : undefined} src={match[2]} />
+      <figcaption>{match[1]}</figcaption>
+    </figure>
+  );
+}
+
+function parseStepSection(lines: string[], startIndex: number, onImageClick?: (url: string) => void) {
+  const title = lines[startIndex].trim().slice(4);
+  const children: React.ReactNode[] = [];
+  let index = startIndex + 1;
+
+  while (index < lines.length) {
+    const trimmed = lines[index].trim();
+    if (trimmed.startsWith('# ') || trimmed.startsWith('## ') || trimmed.startsWith('### ')) break;
+    if (!trimmed) {
+      index += 1;
+      continue;
+    }
+
+    const image = parseImage(trimmed, index, onImageClick);
+    if (image) {
+      children.push(image);
+      index += 1;
+      continue;
+    }
+
+    if (trimmed.startsWith('- ')) {
+      const items: string[] = [];
+      while (index < lines.length && lines[index].trim().startsWith('- ')) {
+        items.push(lines[index].trim().slice(2));
+        index += 1;
+      }
+      children.push(
+        <ul className="report-step-list" key={index}>
+          {items.map((item, itemIndex) => (
+            <li key={itemIndex}>{parseInline(item)}</li>
+          ))}
+        </ul>,
+      );
+      continue;
+    }
+
+    children.push(<p key={index}>{parseInline(trimmed)}</p>);
+    index += 1;
+  }
+
+  return {
+    node: (
+      <section className="report-step-card" key={startIndex}>
+        <h3>{title}</h3>
+        {children}
+      </section>
+    ),
+    nextIndex: index,
+  };
+}
+
 function parseTable(lines: string[], startIndex: number) {
   const tableLines: string[] = [];
   let index = startIndex;
@@ -52,7 +116,7 @@ function splitTableRow(line: string) {
     .map((cell) => cell.replace(/\\\|/g, '|').trim());
 }
 
-export function MarkdownReport({ markdown }: { markdown: string }) {
+export function MarkdownReport({ markdown, onImageClick }: { markdown: string; onImageClick?: (url: string) => void }) {
   const lines = markdown.split(/\r?\n/);
   const nodes: React.ReactNode[] = [];
   let index = 0;
@@ -73,12 +137,20 @@ export function MarkdownReport({ markdown }: { markdown: string }) {
       continue;
     }
 
-    if (trimmed.startsWith('# ')) {
+    if (trimmed.startsWith('### ')) {
+      const section = parseStepSection(lines, index, onImageClick);
+      nodes.push(section.node);
+      index = section.nextIndex;
+      continue;
+    }
+
+    const image = parseImage(trimmed, index, onImageClick);
+    if (image) {
+      nodes.push(image);
+    } else if (trimmed.startsWith('# ')) {
       nodes.push(<h1 key={index}>{trimmed.slice(2)}</h1>);
     } else if (trimmed.startsWith('## ')) {
       nodes.push(<h2 key={index}>{trimmed.slice(3)}</h2>);
-    } else if (trimmed.startsWith('### ')) {
-      nodes.push(<h3 key={index}>{trimmed.slice(4)}</h3>);
     } else if (trimmed.startsWith('- ')) {
       const items: string[] = [];
       while (index < lines.length && lines[index].trim().startsWith('- ')) {
@@ -86,7 +158,7 @@ export function MarkdownReport({ markdown }: { markdown: string }) {
         index += 1;
       }
       nodes.push(
-        <ul key={index}>
+        <ul key={index} style={{width: "100%", overflow: "hidden", whiteSpace: "pre-wrap", wordBreak: "break-all"}}>
           {items.map((item, itemIndex) => (
             <li key={itemIndex}>{parseInline(item)}</li>
           ))}

@@ -1,84 +1,54 @@
-import Link from 'next/link';
-import { Activity, Bot, Globe2, Plus, ShieldCheck } from 'lucide-react';
-import { NewTestCaseForm } from '@/components/NewTestCaseForm';
+import { Activity, Bot, CheckCircle2, Globe2, ListChecks } from 'lucide-react';
+import { DashboardWorkspace } from '@/components/DashboardWorkspace';
 import { store } from '@/server/db/mock-store';
 
 export const dynamic = 'force-dynamic';
 
 export default function DashboardPage() {
   const testCases = store.listTestCases();
+  const groups = store.listGroups();
   const readyCount = testCases.filter((item) => item.status === 'ready' || item.status === 'generated').length;
+  const runningCount = testCases.filter((item) => item.status === 'running').length;
   const finishedCount = testCases.filter((item) => ['passed', 'failed', 'blocked'].includes(item.status)).length;
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
+    <main className="dashboard-v2">
+      <header className="dashboard-v2-head">
         <div>
-          <p className="eyebrow">AI Browser Testing</p>
-          <h1 className="page-title">Web 自动化测试控制台</h1>
-          <p className="page-subtitle">输入目标地址和测试目标，生成可执行步骤，并由 Playwright 浏览器完成点击、输入、断言与截图。</p>
+          <h1>自动化测试工作台</h1>
+          <span>用自然语言定义测试目标，由 AI 在真实浏览器中决定操作并产出证据。</span>
         </div>
-        <a className="button secondary" href="#new-case">
-          <Plus size={16} />
-          新建用例
-        </a>
       </header>
 
-      <section className="metric-grid">
-        <div className="metric">
-          <Activity size={18} />
+      <section className="dashboard-v2-metrics" aria-label="测试概览">
+        <div>
+          <Activity size={17} />
           <span>用例总数</span>
           <strong>{testCases.length}</strong>
         </div>
-        <div className="metric">
-          <Bot size={18} />
+        <div>
+          <Bot size={17} />
+          <span>运行中</span>
+          <strong>{runningCount}</strong>
+        </div>
+        <div>
+          <ListChecks size={17} />
           <span>待执行</span>
           <strong>{readyCount}</strong>
         </div>
-        <div className="metric">
-          <ShieldCheck size={18} />
+        <div>
+          <CheckCircle2 size={17} />
           <span>已完成</span>
           <strong>{finishedCount}</strong>
         </div>
-        <div className="metric">
-          <Globe2 size={18} />
+        <div>
+          <Globe2 size={17} />
           <span>模型</span>
-          <strong>{process.env.AI_MODEL || 'gpt-5.4'}</strong>
+          <strong>{process.env.AI_MODEL || 'deepseek-v4-flash'}</strong>
         </div>
       </section>
 
-      <section className="workspace">
-        <div className="panel">
-          <div className="panel-heading">
-            <h2>历史测试用例</h2>
-            <span>{testCases.length} 条</span>
-          </div>
-          <div className="case-list">
-            {testCases.map((item) => (
-              <Link className="case-row" href={`/test-cases/${item.id}`} key={item.id}>
-                <div className="case-row-main">
-                  <strong>{item.title}</strong>
-                  <span>{item.description}</span>
-                </div>
-                <div className="meta">
-                  <span className={`badge status-${item.status}`}>{item.status}</span>
-                  <span>{item.priority}</span>
-                  <span>{item.targetUrl}</span>
-                  <span>{new Date(item.updatedAt).toLocaleString()}</span>
-                </div>
-              </Link>
-            ))}
-          </div>
-        </div>
-
-        <aside className="panel new-case-panel" id="new-case">
-          <div className="panel-heading">
-            <h2>AI 新建测试用例</h2>
-            <span>结构化生成</span>
-          </div>
-          <NewTestCaseForm />
-        </aside>
-      </section>
+      <DashboardWorkspace testCases={testCases} groups={groups} />
     </main>
   );
 }

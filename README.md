@@ -11,14 +11,14 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-The app uses the OpenAI-compatible mirror by default:
+The app uses DeepSeek by default:
 
-```ts
-createOpenAI({
-  baseURL: 'http://mirrors.shterm.com:8801/openai',
-  apiKey: '-',
-  compatibility: 'compatible',
-}).chat('gpt-5.4')
+```bash
+DEEPSEEK_API_KEY=your_key
+AI_MODEL=deepseek-v4-flash
 ```
 
-You can override `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `AI_MODEL` in `.env.local`. If the model call fails, generation falls back to a local structured test case so the app remains usable.
+You can override `AI_PROVIDER`, `AI_MODEL`, `DEEPSEEK_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` in `.env.local`.
+If the model call fails, generation falls back to a local structured test case and records the failure reason in the test case risks.
+
+Browser execution accepts `http` and `https` target URLs by default. Set `ALLOWED_TEST_DOMAINS=localhost,127.0.0.1,example.com` to restrict runs to a domain allowlist.
