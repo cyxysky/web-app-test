@@ -105,11 +105,12 @@ export class BrowserSession {
 
   async start() {
     const { chromium } = await import('playwright');
-    // Use a fixed full-HD viewport so the page (and screenshot) is exactly 1920x1080 regardless of the
-    // host screen size or taskbar. deviceScaleFactor:1 keeps screenshot pixels == CSS pixels, so the
-    // screenshot->viewport coordinate mapping stays an exact 1:1 ratio. Configurable via env.
-    const viewportWidth = Number(process.env.BROWSER_VIEWPORT_WIDTH || 1920);
-    const viewportHeight = Number(process.env.BROWSER_VIEWPORT_HEIGHT || 1080);
+    // Use a fixed, moderate viewport. A huge screenshot gets downsampled by the vision model, which is
+    // a major cause of imprecise clicks; a moderate resolution keeps the screenshot close to the
+    // model's effective resolution and makes the screenshot->viewport mapping an exact 1:1 ratio.
+    // deviceScaleFactor:1 keeps screenshot pixels == CSS pixels. Configurable via env.
+    const viewportWidth = Number(process.env.BROWSER_VIEWPORT_WIDTH || 1280);
+    const viewportHeight = Number(process.env.BROWSER_VIEWPORT_HEIGHT || 800);
     this.browser = await chromium.launch({
       headless: process.env.HEADLESS_BROWSER === 'true',
       slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
@@ -553,9 +554,23 @@ export class BrowserSession {
     const metrics = this.lastScreenshotMetrics;
     const currentMetrics = await this.getViewportMetrics();
     const currentViewport = { width: currentMetrics.width, height: currentMetrics.height };
+
+    // When the grid uses a CENTER origin, the model reports coordinates relative to the image center
+    // with y pointing UP. Convert those back to raw top-left image pixels before the ratio mapping.
+    let imgX = x;
+    let imgY = y;
+    let originNote = '';
+    if ((process.env.SCREENSHOT_GRID_ORIGIN || 'bottom').toLowerCase() === 'center') {
+      const baseW = (metrics && metrics.image.width > 0 ? metrics.image.width : currentViewport.width);
+      const baseH = (metrics && metrics.image.height > 0 ? metrics.image.height : currentViewport.height);
+      imgX = baseW / 2 + x;
+      imgY = baseH / 2 - y;
+      originNote = ` Center-origin input (${x}, ${y}) mapped to image pixel (${imgX.toFixed(1)}, ${imgY.toFixed(1)}).`;
+    }
+
     if (!metrics || metrics.image.width <= 0 || metrics.image.height <= 0) {
-      const point = this.normalizePoint(x, y, currentViewport);
-      return { ...point, note: ' No screenshot metrics were available; coordinate was treated as viewport CSS pixels.' };
+      const point = this.normalizePoint(imgX, imgY, currentViewport);
+      return { ...point, note: ` No screenshot metrics were available; coordinate was treated as viewport CSS pixels.${originNote}` };
     }
 
     // The screenshot is captured with scale:'css', so 1 image pixel maps to 1 CSS pixel of the
@@ -571,14 +586,14 @@ export class BrowserSession {
     if (zoomed && visual) {
       const scaleX = visual.width / metrics.image.width;
       const scaleY = visual.height / metrics.image.height;
-      mappedX = visual.offsetLeft + x * scaleX;
-      mappedY = visual.offsetTop + y * scaleY;
+      mappedX = visual.offsetLeft + imgX * scaleX;
+      mappedY = visual.offsetTop + imgY * scaleY;
       basis = `visual viewport ${Math.round(visual.width)}x${Math.round(visual.height)} scale=${visual.scale} offset=${Math.round(visual.offsetLeft)},${Math.round(visual.offsetTop)}`;
     } else {
       const scaleX = currentViewport.width / metrics.image.width;
       const scaleY = currentViewport.height / metrics.image.height;
-      mappedX = x * scaleX;
-      mappedY = y * scaleY;
+      mappedX = imgX * scaleX;
+      mappedY = imgY * scaleY;
       basis = `layout viewport ${currentViewport.width}x${currentViewport.height}, scaleX=${scaleX.toFixed(4)}, scaleY=${scaleY.toFixed(4)}`;
     }
 
@@ -588,7 +603,7 @@ export class BrowserSession {
       `mappedTo=${basis}`,
       `scale=${metrics.scale}`,
       `dpr=${metrics.devicePixelRatio}`,
-    ].join(', ') + '.';
+    ].join(', ') + '.' + originNote;
     return { ...point, note };
   }
 
@@ -988,7 +1003,9 @@ export class BrowserSession {
    */
   private async drawCoordinateGrid() {
     const step = Math.max(10, Number(process.env.SCREENSHOT_GRID_STEP || 50));
-    await this.activePage.evaluate((step) => {
+    const origin = (process.env.SCREENSHOT_GRID_ORIGIN || 'bottom').toLowerCase() === 'center' ? 'center' : 'bottom';
+    const showLines = (process.env.SCREENSHOT_GRID_LINES || 'true').toLowerCase() !== 'false';
+    await this.activePage.evaluate(({ step, origin, showLines }) => {
       const existing = document.getElementById('__ai_coord_grid__');
       if (existing) existing.remove();
       const width = window.innerWidth;
@@ -1008,60 +1025,66 @@ export class BrowserSession {
       });
 
       const lineColor = 'rgba(0, 122, 255, 0.28)';
-      // x labels are rendered VERTICALLY (writing-mode) so adjacent labels along the dense bottom edge
-      // don't overlap horizontally — each only takes ~1 char width. y labels stay horizontal on the left.
-      const xLabelCss =
-        'position:absolute;font:700 16px/16px Arial,sans-serif;color:#fff;background:rgba(0,90,200,0.82);padding:2px 1px;border-radius:2px;white-space:nowrap;writing-mode:vertical-rl;text-orientation:mixed;transform:translateX(-50%);';
-      const yLabelCss =
-        'position:absolute;font:700 16px/16px Arial,sans-serif;color:#fff;background:rgba(180,60,0,0.82);padding:1px 2px;border-radius:2px;white-space:nowrap;transform:translateY(-50%);';
+      const axisColor = 'rgba(210, 0, 0, 0.85)';
 
-      // Vertical lines = constant X. EVERY line gets an "x=" label sitting on the line (bottom edge).
-      for (let x = step; x < width; x += step) {
+      function addLine(style: Partial<CSSStyleDeclaration>) {
         const line = document.createElement('div');
-        Object.assign(line.style, {
-          position: 'absolute',
-          left: `${x}px`,
-          top: '0',
-          width: '1px',
-          height: `${height}px`,
-          background: lineColor,
-        });
+        Object.assign(line.style, { position: 'absolute', background: lineColor }, style);
         grid.appendChild(line);
+      }
+      function addLabel(text: string, css: string) {
         const label = document.createElement('div');
-        label.textContent = `x=${x}`;
-        label.setAttribute('style', `${xLabelCss}left:${x}px;bottom:1px;`);
+        label.textContent = text;
+        label.setAttribute('style', css);
         grid.appendChild(label);
       }
 
-      // Horizontal lines = constant Y. EVERY line gets a "y=" label sitting on the line (left edge).
-      for (let y = step; y < height; y += step) {
-        const line = document.createElement('div');
-        Object.assign(line.style, {
-          position: 'absolute',
-          left: '0',
-          top: `${y}px`,
-          width: `${width}px`,
-          height: '1px',
-          background: lineColor,
-        });
-        grid.appendChild(line);
-        const label = document.createElement('div');
-        label.textContent = `y=${y}`;
-        label.setAttribute('style', `${yLabelCss}left:1px;top:${y}px;`);
-        grid.appendChild(label);
-      }
+      if (origin === 'center') {
+        // Cartesian plane: origin at the image center, x grows right (negative left), y grows UP
+        // (negative down). Axes drawn in red; labels are pixel offsets from the center.
+        const cx = Math.round(width / 2);
+        const cy = Math.round(height / 2);
+        const xLabelCss =
+          'position:absolute;font:700 13px/13px Arial,sans-serif;color:#0a5ac8;text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;transform:translateX(-50%);';
+        const yLabelCss =
+          'position:absolute;font:700 13px/13px Arial,sans-serif;color:#c0440a;text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;transform:translateY(-50%);';
 
-      // Single origin/legend marker at the top-left corner explaining the axes direction.
-      const legend = document.createElement('div');
-      legend.textContent = '0,0  x→  y↓';
-      legend.setAttribute(
-        'style',
-        'position:absolute;left:1px;top:1px;font:700 10px/10px Arial,sans-serif;color:#fff;background:rgba(200,0,0,0.85);padding:1px 2px;border-radius:2px;white-space:nowrap;',
-      );
-      grid.appendChild(legend);
+        // Vertical gridlines + x labels (placed just below the horizontal axis).
+        for (let x = cx % step; x < width; x += step) {
+          const value = x - cx;
+          // Always draw the red axis (value 0); other gridlines only when showLines is on.
+          if (value === 0 || showLines) addLine({ left: `${x}px`, top: '0', width: '1px', height: `${height}px`, background: value === 0 ? axisColor : lineColor });
+          if (value !== 0) addLabel(`${value}`, `${xLabelCss}left:${x}px;top:${cy + 3}px;`);
+        }
+        // Horizontal gridlines + y labels (placed just left of the vertical axis).
+        for (let y = cy % step; y < height; y += step) {
+          const value = cy - y;
+          if (value === 0 || showLines) addLine({ left: '0', top: `${y}px`, width: `${width}px`, height: '1px', background: value === 0 ? axisColor : lineColor });
+          if (value !== 0) addLabel(`${value}`, `${yLabelCss}left:${cx + 4}px;top:${y}px;`);
+        }
+        addLabel('0', `position:absolute;left:${cx + 4}px;top:${cy + 3}px;font:700 13px/13px Arial,sans-serif;color:#fff;background:${axisColor};padding:1px 2px;border-radius:2px;`);
+        addLabel('x→', `position:absolute;right:2px;top:${cy - 18}px;font:700 16px/16px Arial,sans-serif;color:#c00000;`);
+        addLabel('↑y', `position:absolute;left:${cx + 4}px;top:2px;font:700 16px/16px Arial,sans-serif;color:#c00000;`);
+      } else {
+        // Bottom/top-left origin: x labels vertical along the bottom, y labels horizontal along the left.
+        const xLabelCss =
+          'position:absolute;font:700 16px/16px Arial,sans-serif;color:#0a5ac8;text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;writing-mode:vertical-rl;text-orientation:mixed;transform:translateX(-50%);';
+        const yLabelCss =
+          'position:absolute;font:700 16px/16px Arial,sans-serif;color:#c0440a;text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;transform:translateY(-50%);';
+
+        for (let x = step; x < width; x += step) {
+          if (showLines) addLine({ left: `${x}px`, top: '0', width: '1px', height: `${height}px` });
+          addLabel(`x=${x}`, `${xLabelCss}left:${x}px;bottom:1px;`);
+        }
+        for (let y = step; y < height; y += step) {
+          if (showLines) addLine({ left: '0', top: `${y}px`, width: `${width}px`, height: '1px' });
+          addLabel(`y=${y}`, `${yLabelCss}left:1px;top:${y}px;`);
+        }
+        addLabel('0,0  x→  y↓', 'position:absolute;left:1px;top:1px;font:700 16px/16px Arial,sans-serif;color:#fff;background:rgba(200,0,0,0.85);padding:1px 2px;border-radius:2px;white-space:nowrap;');
+      }
 
       document.documentElement.appendChild(grid);
-    }, step).catch(() => undefined);
+    }, { step, origin, showLines }).catch(() => undefined);
   }
 
   private async removeCoordinateGrid() {
