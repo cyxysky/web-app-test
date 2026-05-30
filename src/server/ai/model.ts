@@ -20,6 +20,6 @@ const openrouter = createOpenRouter({
 });
 
 export function getModel() {
-  return openrouter.chat("z-ai/glm-5.1")
+  return openrouter.chat("qwen/qwen3.6-plus")
   return deepseek("deepseek-v4-flash");
 }

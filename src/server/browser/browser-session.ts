@@ -269,20 +269,32 @@ export class BrowserSession {
 
   async clickDomNode(path: string): Promise<BrowserActionResult> {
     const target = await this.resolveDomPathToClickablePoint(path);
-    if (!target) return { ok: false, actual: `DOM path ${path} was not found or is not visible.` };
+    if (!target) {
+      return {
+        ok: false,
+        actual: `DOM path ${path} was not found or is not visible. Call getDomTree again to get fresh paths; the DOM may have changed or the node is hidden.`,
+      };
+    }
+    const offscreenNote = target.offscreen ? ' Note: the node center was outside the viewport and was clamped; scroll it into view first for a reliable click.' : '';
     await this.activePage.mouse.click(target.x, target.y);
     await this.showClickMarker(target.x, target.y, 'click');
     const note = await this.waitAfterAction();
     await this.showClickMarker(target.x, target.y, 'click');
-    return { ok: true, actual: `Clicked DOM node ${path} (${target.descriptor}) at viewport coordinate (${target.x}, ${target.y}).${note}` };
+    return { ok: true, actual: `Clicked DOM node ${path} (${target.descriptor}) at viewport coordinate (${target.x}, ${target.y}).${offscreenNote}${note}` };
   }
 
   async focusDomNode(path: string): Promise<BrowserActionResult> {
     const target = await this.resolveDomPathToClickablePoint(path);
-    if (!target) return { ok: false, actual: `DOM path ${path} was not found or is not visible.` };
+    if (!target) {
+      return {
+        ok: false,
+        actual: `DOM path ${path} was not found or is not visible. Call getDomTree again to get fresh paths; the DOM may have changed or the node is hidden.`,
+      };
+    }
+    const offscreenNote = target.offscreen ? ' Note: the node center was outside the viewport and was clamped; scroll it into view first for a reliable focus.' : '';
     await this.activePage.mouse.click(target.x, target.y);
     const note = await this.waitAfterAction();
-    return { ok: true, actual: `Focused DOM node ${path} (${target.descriptor}) at viewport coordinate (${target.x}, ${target.y}).${note}` };
+    return { ok: true, actual: `Focused DOM node ${path} (${target.descriptor}) at viewport coordinate (${target.x}, ${target.y}).${offscreenNote}${note}` };
   }
 
   async scroll(deltaY: number, deltaX = 0, target: { screenshotX?: number; screenshotY?: number; domPath?: string } = {}): Promise<BrowserActionResult> {
@@ -515,19 +527,6 @@ export class BrowserSession {
     })).catch(() => ({ ...fallback, devicePixelRatio: 1 }));
   }
 
-  private viewportContentSize(metrics: ViewportMetrics) {
-    const visual = metrics.visualViewport;
-    if (!visual || visual.width <= 0 || visual.height <= 0) {
-      return { width: metrics.width, height: metrics.height, source: 'layout viewport' };
-    }
-
-    return {
-      width: visual.width,
-      height: visual.height,
-      source: `visual viewport scale=${visual.scale}, offset=${visual.offsetLeft},${visual.offsetTop}`,
-    };
-  }
-
   private async screenshotPointToViewport(x: number, y: number): Promise<ViewportPoint> {
     const metrics = this.lastScreenshotMetrics;
     const currentMetrics = await this.getViewportMetrics();
@@ -537,22 +536,34 @@ export class BrowserSession {
       return { ...point, note: ' No screenshot metrics were available; coordinate was treated as viewport CSS pixels.' };
     }
 
-    const capturedContent = this.viewportContentSize(metrics.viewportMetrics);
-    const currentContent = this.viewportContentSize(currentMetrics);
-    const normalizedX = x / metrics.image.width;
-    const normalizedY = y / metrics.image.height;
-    const mappedX = normalizedX * currentContent.width;
-    const mappedY = normalizedY * currentContent.height;
+    // The screenshot is captured with scale:'css', so 1 image pixel maps to 1 CSS pixel of the
+    // layout viewport. Mouse coordinates are also layout/CSS pixels. The most accurate mapping is a
+    // direct ratio between the current layout viewport and the captured image dimensions. We only
+    // route through the visual viewport when the page is actually pinch-zoomed (scale != 1).
+    const visual = currentMetrics.visualViewport;
+    const zoomed = !!visual && Math.abs((visual.scale || 1) - 1) > 0.01;
+
+    let mappedX: number;
+    let mappedY: number;
+    let basis: string;
+    if (zoomed && visual) {
+      const scaleX = visual.width / metrics.image.width;
+      const scaleY = visual.height / metrics.image.height;
+      mappedX = visual.offsetLeft + x * scaleX;
+      mappedY = visual.offsetTop + y * scaleY;
+      basis = `visual viewport ${Math.round(visual.width)}x${Math.round(visual.height)} scale=${visual.scale} offset=${Math.round(visual.offsetLeft)},${Math.round(visual.offsetTop)}`;
+    } else {
+      const scaleX = currentViewport.width / metrics.image.width;
+      const scaleY = currentViewport.height / metrics.image.height;
+      mappedX = x * scaleX;
+      mappedY = y * scaleY;
+      basis = `layout viewport ${currentViewport.width}x${currentViewport.height}, scaleX=${scaleX.toFixed(4)}, scaleY=${scaleY.toFixed(4)}`;
+    }
+
     const point = this.normalizePoint(mappedX, mappedY, currentViewport);
-    const capturedViewport = `${metrics.viewport.width}x${metrics.viewport.height}`;
-    const targetViewport = `${currentViewport.width}x${currentViewport.height}`;
     const note = [
       ` Coordinate mapping used screenshot=${metrics.image.width}x${metrics.image.height}`,
-      `capturedViewport=${capturedViewport}`,
-      `capturedContent=${Math.round(capturedContent.width)}x${Math.round(capturedContent.height)} (${capturedContent.source})`,
-      `currentViewport=${targetViewport}`,
-      `currentContent=${Math.round(currentContent.width)}x${Math.round(currentContent.height)} (${currentContent.source})`,
-      `normalized=${normalizedX.toFixed(4)},${normalizedY.toFixed(4)}`,
+      `mappedTo=${basis}`,
       `scale=${metrics.scale}`,
       `dpr=${metrics.devicePixelRatio}`,
     ].join(', ') + '.';
@@ -581,23 +592,94 @@ export class BrowserSession {
   }
 
   private async readSimplifiedDomTree() {
-    const maxNodes = Number(process.env.DOM_TREE_MAX_NODES || 260);
-    const maxDepth = Number(process.env.DOM_TREE_MAX_DEPTH || 12);
+    const maxNodes = Number(process.env.DOM_TREE_MAX_NODES || 320);
+    const maxDepth = Number(process.env.DOM_TREE_MAX_DEPTH || 14);
     return this.activePage.evaluate(({ maxNodes: nodeLimit, maxDepth: depthLimit }) => {
-      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path']);
+      // NOTE: the child-filtering predicate below (skippedTags + aiIsRendered + aiChildren +
+      // aiElementFromPath) MUST stay byte-identical to the one used in resolveDomPathToClickablePoint
+      // and resolveScrollTarget, otherwise the bracket paths printed here will not resolve to the
+      // same elements when the model clicks/focuses them.
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      function aiIsRendered(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        const tag = element.tagName.toLowerCase();
+        if (skippedTags.has(tag)) return false;
+        if (element.hasAttribute('hidden')) return false;
+        if (element.getAttribute('aria-hidden') === 'true') return false;
+        const style = window.getComputedStyle(element);
+        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        return true;
+      }
+      function aiChildren(element: Element) {
+        return Array.from(element.children).filter(aiIsRendered);
+      }
+
       let count = 0;
 
-      function visibleElementChildren(element: Element) {
-        return Array.from(element.children).filter((child) => !skippedTags.has(child.tagName.toLowerCase()));
+      function ownText(element: Element) {
+        let text = '';
+        for (const node of Array.from(element.childNodes)) {
+          if (node.nodeType === 3) text += node.textContent || '';
+        }
+        text = text.replace(/\s+/g, ' ').trim();
+        if (!text) {
+          const inner = (element as HTMLElement).innerText || element.textContent || '';
+          const condensed = inner.replace(/\s+/g, ' ').trim();
+          if (condensed && condensed.length <= 40) text = condensed;
+        }
+        return text.slice(0, 60);
+      }
+
+      function attrSummary(element: Element) {
+        const parts: string[] = [];
+        const push = (key: string, value: string | null | undefined) => {
+          if (!value) return;
+          const clean = String(value).replace(/\s+/g, ' ').trim().slice(0, 40);
+          if (clean) parts.push(`${key}="${clean}"`);
+        };
+        const tag = element.tagName.toLowerCase();
+        if (tag === 'input' || tag === 'button') push('type', element.getAttribute('type'));
+        push('name', element.getAttribute('name'));
+        push('placeholder', element.getAttribute('placeholder'));
+        push('aria-label', element.getAttribute('aria-label'));
+        push('role', element.getAttribute('role'));
+        push('title', element.getAttribute('title'));
+        push('alt', element.getAttribute('alt'));
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+          const value = (element as HTMLInputElement).value;
+          push('value', value);
+        }
+        if (tag === 'a') push('href', element.getAttribute('href'));
+        return parts.length ? ` {${parts.join(' ')}}` : '';
+      }
+
+      function isClickable(element: Element) {
+        const tag = element.tagName.toLowerCase();
+        if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary', 'option'].includes(tag)) return true;
+        const role = element.getAttribute('role');
+        if (role && ['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'tab', 'checkbox', 'radio', 'switch', 'option'].includes(role)) return true;
+        if (element.hasAttribute('onclick')) return true;
+        const tabindex = element.getAttribute('tabindex');
+        if (tabindex !== null && tabindex !== '-1') return true;
+        try {
+          if (window.getComputedStyle(element).cursor === 'pointer') return true;
+        } catch {
+          /* ignore */
+        }
+        return false;
       }
 
       function describe(element: Element, path: number[]) {
         const tag = element.tagName.toLowerCase();
         const id = element.id ? `#${CSS.escape(element.id)}` : '';
         const classes = typeof element.className === 'string'
-          ? element.className.split(/\s+/).filter(Boolean).slice(0, 6).map((item) => `.${CSS.escape(item)}`).join('')
+          ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${CSS.escape(item)}`).join('')
           : '';
-        return `[${path.join('.')}] ${tag}${id}${classes}`;
+        const clickable = isClickable(element) ? ' *' : '';
+        const attrs = attrSummary(element);
+        const text = ownText(element);
+        const textPart = text ? ` "${text}"` : '';
+        return `[${path.join('.')}] ${tag}${id}${classes}${clickable}${attrs}${textPart}`;
       }
 
       const lines: string[] = [];
@@ -605,7 +687,7 @@ export class BrowserSession {
         if (count >= nodeLimit || depth > depthLimit) return;
         lines.push(`${'  '.repeat(depth)}${describe(element, path)}`);
         count += 1;
-        const children = visibleElementChildren(element);
+        const children = aiChildren(element);
         for (let index = 0; index < children.length; index += 1) {
           walk(children[index], [...path, index], depth + 1);
           if (count >= nodeLimit) break;
@@ -613,39 +695,72 @@ export class BrowserSession {
       }
 
       walk(document.documentElement, [0], 0);
+      const legend = 'Legend: [path] tag#id.class * {attrs} "text" — "*" marks clickable/interactive elements; "text" is the node text; only visible (rendered) elements are listed.';
       if (count >= nodeLimit) lines.push(`... truncated at ${nodeLimit} nodes`);
-      return lines.join('\n');
+      return `${legend}\n${lines.join('\n')}`;
     }, { maxNodes, maxDepth });
   }
 
   private async resolveDomPathToClickablePoint(pathValue: string) {
     return this.activePage.evaluate((path) => {
-      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path']);
-      const parts = path.split('.').map((item) => Number(item.trim())).filter((item) => Number.isInteger(item) && item >= 0);
-      if (!parts.length || parts[0] !== 0) return undefined;
-
-      function visibleElementChildren(element: Element) {
-        return Array.from(element.children).filter((child) => !skippedTags.has(child.tagName.toLowerCase()));
+      // Keep this predicate byte-identical to readSimplifiedDomTree so paths resolve consistently.
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      function aiIsRendered(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        const tag = element.tagName.toLowerCase();
+        if (skippedTags.has(tag)) return false;
+        if (element.hasAttribute('hidden')) return false;
+        if (element.getAttribute('aria-hidden') === 'true') return false;
+        const style = window.getComputedStyle(element);
+        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        return true;
       }
+      function aiChildren(element: Element) {
+        return Array.from(element.children).filter(aiIsRendered);
+      }
+
+      const parts = String(path).split('.').map((item) => Number(String(item).trim()));
+      if (!parts.length || parts[0] !== 0 || parts.some((item) => !Number.isInteger(item) || item < 0)) return undefined;
 
       let element: Element | undefined = document.documentElement;
       for (const index of parts.slice(1)) {
-        element = visibleElementChildren(element)[index];
+        element = aiChildren(element)[index];
         if (!element) return undefined;
       }
+      if (!element) return undefined;
 
       element.scrollIntoView({ block: 'center', inline: 'center' });
-      const rect = element.getBoundingClientRect();
+      let rect = element.getBoundingClientRect();
+      // Some wrappers have zero size but contain a visible interactive child. Descend to the first
+      // rendered descendant that actually has a box so the click lands on something visible.
+      if (rect.width <= 0 || rect.height <= 0) {
+        const queue = aiChildren(element);
+        while (queue.length) {
+          const candidate = queue.shift() as Element;
+          const candidateRect = candidate.getBoundingClientRect();
+          if (candidateRect.width > 0 && candidateRect.height > 0) {
+            element = candidate;
+            rect = candidateRect;
+            break;
+          }
+          queue.push(...aiChildren(candidate));
+        }
+      }
       if (rect.width <= 0 || rect.height <= 0) return undefined;
+
       const tag = element.tagName.toLowerCase();
       const id = element.id ? `#${element.id}` : '';
       const classes = typeof element.className === 'string'
         ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
         : '';
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const offscreen = centerY < 0 || centerY > window.innerHeight || centerX < 0 || centerX > window.innerWidth;
       return {
-        x: Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1),
-        y: Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1),
+        x: Math.min(Math.max(centerX, 0), window.innerWidth - 1),
+        y: Math.min(Math.max(centerY, 0), window.innerHeight - 1),
         descriptor: `${tag}${id}${classes}`,
+        offscreen,
       };
     }, pathValue).catch(() => undefined);
   }
@@ -656,19 +771,29 @@ export class BrowserSession {
       : undefined;
 
     return this.activePage.evaluate(({ x, y, domPath }) => {
-      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path']);
-
-      function visibleElementChildren(element: Element) {
-        return Array.from(element.children).filter((child) => !skippedTags.has(child.tagName.toLowerCase()));
+      // Keep this predicate byte-identical to readSimplifiedDomTree so domPath indexes line up.
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      function aiIsRendered(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        const tag = element.tagName.toLowerCase();
+        if (skippedTags.has(tag)) return false;
+        if (element.hasAttribute('hidden')) return false;
+        if (element.getAttribute('aria-hidden') === 'true') return false;
+        const style = window.getComputedStyle(element);
+        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        return true;
+      }
+      function aiChildren(element: Element) {
+        return Array.from(element.children).filter(aiIsRendered);
       }
 
       function elementFromDomPath(pathValue?: string) {
         if (!pathValue) return undefined;
-        const parts = pathValue.split('.').map((item) => Number(item.trim())).filter((item) => Number.isInteger(item) && item >= 0);
-        if (!parts.length || parts[0] !== 0) return undefined;
+        const parts = String(pathValue).split('.').map((item) => Number(String(item).trim()));
+        if (!parts.length || parts[0] !== 0 || parts.some((item) => !Number.isInteger(item) || item < 0)) return undefined;
         let element: Element | undefined = document.documentElement;
         for (const index of parts.slice(1)) {
-          element = visibleElementChildren(element)[index];
+          element = aiChildren(element)[index];
           if (!element) return undefined;
         }
         return element;
@@ -737,6 +862,10 @@ export class BrowserSession {
 
   private async readPngSize(filePath: string) {
     const buffer = await readFile(filePath);
+    return this.readPngSizeFromBuffer(buffer);
+  }
+
+  private async readPngSizeFromBuffer(buffer: Buffer) {
     const isPng =
       buffer.length >= 24 &&
       buffer[0] === 0x89 &&

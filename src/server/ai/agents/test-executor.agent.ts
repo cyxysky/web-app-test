@@ -239,7 +239,7 @@ function makeBrowserTools(
 
   const domTools = {
     getDomTree: tool({
-      description: 'Return the current tab simplified DOM tree. It keeps only hierarchy, tag name, id, and class. Script/style/template/meta/link/svg nodes are removed.',
+      description: 'Return the current tab simplified DOM tree of currently visible elements. Each line is "[path] tag#id.class * {attrs} \\"text\\"": "*" marks clickable elements, {attrs} holds key attributes (placeholder/aria-label/role/href/value...), and "text" is the node\'s own text. Hidden nodes (display:none, visibility:hidden, aria-hidden, script/style/svg) are removed, so paths line up with what is on screen.',
       inputSchema: z.object({}),
       execute: (input) => record('getDomTree', input, () => session.getSimplifiedDomTree()),
     }),
@@ -285,8 +285,7 @@ function runtimePrompt(input: {
         `- Current viewport metrics JSON is ${JSON.stringify(viewportMetrics)}.`,
         `- Screenshot coordinate scale is ${screenshotMetrics?.scale || 'unknown'}; when it is "css", screenshot pixels are intended to match browser viewport CSS pixels.`,
         '- IMPORTANT: all mouse tools expect coordinates measured on the latest screenshot image. Do NOT return CSS viewport coordinates.',
-        '- The backend converts screenshot-image pixels into browser viewport coordinates using the screenshot content area, captured visual viewport, and current visual viewport.',
-        '- There is no click snapping or automatic target correction. Your coordinate must land inside the intended visible target.',
+        '- The backend converts screenshot-image pixels into browser viewport coordinates by a direct ratio between the current viewport and the screenshot image (1 image pixel ≈ 1 CSS pixel). There is no click snapping; your coordinate must land inside the intended visible target.',
         '- If you visually identify a target at the center of the screenshot image, use that screenshot-image x/y directly.',
         '- Prefer real user-like mouse operations: clickAt, doubleClickAt, rightClickAt, drag, scrollViewport.',
         '- Estimate coordinates visually from the screenshot. Use the center of the visible clickable/control area, not the text baseline or the outer page margin.',
@@ -299,7 +298,9 @@ function runtimePrompt(input: {
     : [
         'DOM interaction rules:',
         '- Coordinate click tools are disabled because isClick=false.',
-        '- Use the provided simplified DOM tree and getDomTree tool to locate elements by bracket path. The DOM tree intentionally keeps only hierarchy, tag name, id, and class.',
+        '- Use the provided simplified DOM tree and getDomTree tool to locate elements by bracket path. Each line is "[path] tag#id.class * {attrs} \\"text\\"": "*" marks a clickable/interactive element, {attrs} lists key attributes (placeholder/aria-label/role/href/value...), and "text" is the node\'s own visible text. Only currently visible (rendered) elements are listed.',
+        '- Pick the path whose text/attributes match the control you want. Prefer a node marked "*". Use paths exactly as shown.',
+        '- If clickDomNode/focusDomNode reports the path was not found, the DOM changed or the node scrolled away: call getDomTree again to get fresh paths instead of reusing the old ones or inventing a path.',
         '- Use clickDomNode(path) to click an element and focusDomNode(path) before typing. Use paths exactly as shown, for example "0.1.2".',
         '- The screenshot remains the primary evidence for visual state and completion. Use the DOM tree only for locating the element to operate.',
         '- For scrolling, call scrollViewport with domPath for the specific scrollable table/list/panel or one of its visible children. This is required for virtual-scroll tables.',
@@ -314,6 +315,11 @@ function runtimePrompt(input: {
     '',
     'Vision-first decision policy:',
     '- The screenshot is the primary evidence for everything: what page is visible, what controls exist, where to click, whether the requirement is complete, whether a CAPTCHA/security page is blocking the flow, and whether the last click marker landed correctly.',
+    '- The attached screenshot is the page state at the START of this step. You will NOT receive a new screenshot after your action inside this same step; the result of your action is shown to you as the screenshot at the start of the NEXT step.',
+    '- Therefore perform exactly ONE browser action this step, then immediately output the JSON summary. The only time you may call a second tool in the same step is when it is strictly required to complete the first (for example focusDomNode/clickAt an input and then typeText into it).',
+    '- Do NOT chain multiple navigations/clicks in one step and do NOT repeat an action that already succeeded, because you cannot see the intermediate results until the next step.',
+    '- Do not declare the page wrong, incomplete, or failed before you have actually acted; if the start screenshot already shows the page the requirement needs (and the URL matches), do NOT re-open or re-navigate to it, just do the next concrete action toward the requirement.',
+    '- If the screenshot looks blank, still loading, or mid-transition, your single action this step should be waitForPage, then judge on the next screenshot.',
     '- URL, tab list, focused element, screenshot metrics, DOM tree in DOM mode, and the last five tool calls are only auxiliary hints.',
     '- When the screenshot contradicts auxiliary context, trust the screenshot and explain the contradiction in actual.',
     '- The red marker in the screenshot shows the previous AI mouse target. If the marker is clearly misplaced or no UI change happened, correct the next coordinate instead of repeating the same click.',
