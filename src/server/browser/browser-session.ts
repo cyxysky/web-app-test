@@ -83,6 +83,9 @@ type InteractiveCandidate = {
   clickable: boolean;
   input: boolean;
   disabled: boolean;
+  /** True when the element lives inside a shadow root, so its DOM-index path
+   * cannot be resolved from the light tree and clicks must use coordinates. */
+  shadow?: boolean;
 };
 
 type ManualVerificationDetails = {
@@ -718,6 +721,7 @@ export class BrowserSession {
         clickable: boolean;
         input: boolean;
         disabled: boolean;
+        shadow?: boolean;
       };
 
       type WindowWithAiListeners = Window & {
@@ -744,6 +748,52 @@ export class BrowserSession {
 
       function isOverlay(element: Element) {
         return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__'));
+      }
+
+      function shadowRootOf(element: Element) {
+        return (element as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot || undefined;
+      }
+
+      // Walk the *composed* (flattened) tree upwards, crossing shadow boundaries
+      // via the shadow root's host. Plain `parentElement` / `Node.contains` stop
+      // at shadow boundaries, which breaks containment checks for shadow content.
+      function flatParentElement(node: Node): Element | undefined {
+        const parent = node.parentNode;
+        if (!parent) return undefined;
+        if (parent.nodeType === 1) return parent as Element;
+        const host = (parent as ShadowRoot).host;
+        return host || undefined;
+      }
+
+      function composedContains(ancestor: Element, node: Element) {
+        let current: Element | undefined = node;
+        let guard = 0;
+        while (current && guard < 256) {
+          if (current === ancestor) return true;
+          current = flatParentElement(current);
+          guard += 1;
+        }
+        return false;
+      }
+
+      function isInsideShadow(element: Element) {
+        const root = element.getRootNode();
+        return Boolean(root && (root as ShadowRoot).host);
+      }
+
+      // `cursor: pointer` is inherited, so nested children of a clickable region
+      // all report it. Only treat it as a click signal when this element actually
+      // introduces it (its flattened parent does not already use a pointer cursor),
+      // which marks the real clickable boundary instead of every descendant.
+      function hasOwnPointerCursor(element: Element) {
+        try {
+          if (window.getComputedStyle(element).cursor !== 'pointer') return false;
+          const parent = flatParentElement(element);
+          if (!parent) return true;
+          return window.getComputedStyle(parent).cursor !== 'pointer';
+        } catch {
+          return false;
+        }
       }
 
       function isRenderable(element: Element) {
@@ -775,8 +825,20 @@ export class BrowserSession {
         return Boolean(visibleRectOf(element));
       }
 
+      // Traversal must NOT require a visible box: layout wrappers with zero height
+      // (common on SPAs like Bing) sit between the root and real interactive
+      // children. Filtering them out breaks the walk and skips entire subtrees.
+      function isTraversable(element: Element) {
+        return isRenderable(element);
+      }
+
       function children(element: Element) {
-        return Array.from(element.children).filter(isVisibleInViewport);
+        const list = Array.from(element.children);
+        const root = shadowRootOf(element);
+        if (root) {
+          for (const child of Array.from(root.children)) list.push(child);
+        }
+        return list.filter(isTraversable);
       }
 
       function ownText(element: Element) {
@@ -815,34 +877,14 @@ export class BrowserSession {
         return false;
       }
 
-      function hasClickableStyle(element: Element) {
-        try {
-          const style = window.getComputedStyle(element);
-          if (style.cursor === 'pointer') return true;
-          const borderWidth =
-            Number.parseFloat(style.borderTopWidth || '0') +
-            Number.parseFloat(style.borderRightWidth || '0') +
-            Number.parseFloat(style.borderBottomWidth || '0') +
-            Number.parseFloat(style.borderLeftWidth || '0');
-          const radius = Number.parseFloat(style.borderTopLeftRadius || '0') + Number.parseFloat(style.borderTopRightRadius || '0');
-          const background = style.backgroundColor || '';
-          const hasBackground = background && !/^rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,?\s*0?\s*\)$/i.test(background) && background !== 'transparent';
-          return borderWidth > 0 || radius > 6 || hasBackground;
-        } catch {
-          return false;
-        }
-      }
-
-      function looksLikeClickableSurface(element: Element) {
-        const tag = element.tagName.toLowerCase();
-        if (!['div', 'span', 'li', 'article', 'section', 'p'].includes(tag)) return false;
-        const rect = visibleRectOf(element);
-        if (!rect) return false;
-        if (rect.width < 24 || rect.height < 16 || rect.width > 560 || rect.height > 140) return false;
-        const label = nameOf(element) || ownText(element);
-        if (!label || label.length > 220) return false;
-        if (!hasClickableStyle(element) && !hasActionAttribute(element)) return false;
-        return true;
+      // A direct, element-level signal that this node is itself the click target
+      // (as opposed to merely containing clickable descendants).
+      function hasOwnClickSignal(element: Element) {
+        if (element.hasAttribute('onclick')) return true;
+        if (hasActionAttribute(element)) return true;
+        if (hasRecordedClickListener(element)) return true;
+        if (hasOwnPointerCursor(element)) return true;
+        return false;
       }
 
       function clickableReason(element: Element) {
@@ -856,17 +898,17 @@ export class BrowserSession {
         const tabindex = element.getAttribute('tabindex');
         if (tabindex !== null && tabindex !== '-1') return true;
         if ((element as HTMLElement).isContentEditable) return true;
-        try {
-          if (window.getComputedStyle(element).cursor === 'pointer') return true;
-        } catch {
-          /* ignore */
-        }
-        return looksLikeClickableSurface(element);
+        // Only an element that *introduces* a pointer cursor (not one inheriting it
+        // from a clickable ancestor) counts. This prevents every nested wrapper of a
+        // clickable region from being flagged, which produced duplicate parent/child
+        // E markers, while still catching real clickable cards / rows / div-buttons.
+        if (hasOwnPointerCursor(element)) return true;
+        return false;
       }
 
       function hasClickableAncestor(element: Element) {
-        let current = element.parentElement;
-        for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
+        let current = flatParentElement(element);
+        for (let depth = 0; current && depth < 6; depth += 1, current = flatParentElement(current)) {
           if (!isVisibleInViewport(current)) continue;
           if (clickableReason(current)) return true;
         }
@@ -899,34 +941,80 @@ export class BrowserSession {
           .slice(0, 180);
       }
 
-      function pointBelongsToElement(element: Element, x: number, y: number) {
-        const stack = document.elementsFromPoint(x, y).filter((item) => isRenderable(item) && !isOverlay(item));
-        const top = stack[0];
-        if (!top) return false;
-        return top === element || element.contains(top);
+      // Topmost renderable element at a point, drilling through shadow roots so a
+      // shadow-hosted element is reported instead of just its host. `elementsFromPoint`
+      // on the document stops at shadow boundaries; we recurse via the shadow root's
+      // own hit-test to reach the real element painted there.
+      function topmostRenderableAt(x: number, y: number) {
+        let root: Document | ShadowRoot = document;
+        let found: Element | undefined;
+        let guard = 0;
+        while (guard < 24) {
+          guard += 1;
+          const stack = root.elementsFromPoint(x, y) as Element[];
+          let top: Element | undefined;
+          for (const item of stack) {
+            if (isRenderable(item) && !isOverlay(item)) {
+              top = item;
+              break;
+            }
+          }
+          if (!top) break;
+          found = top;
+          const sub = shadowRootOf(top);
+          if (!sub) break;
+          root = sub;
+        }
+        return found;
       }
 
-      function visiblePointForElement(element: Element, rect: ReturnType<typeof visibleRectOf>) {
+      // Sample a grid across the element's visible box and hit-test every point.
+      // `elementsFromPoint` returns elements in paint/stacking order, so this
+      // naturally respects z-index: a higher z-index popup / dialog / selector
+      // panel that paints over this element is reported as the topmost element.
+      function computeVisibility(element: Element, rect: ReturnType<typeof visibleRectOf>) {
         if (!rect) return undefined;
-        const insetX = Math.min(10, Math.max(1, rect.width / 4));
-        const insetY = Math.min(10, Math.max(1, rect.height / 4));
-        const samples = [
+        const cols = rect.width >= 80 ? 5 : 3;
+        const rows = rect.height >= 60 ? 5 : 3;
+        const points: Array<[number, number]> = [
           [rect.left + rect.width / 2, rect.top + rect.height / 2],
-          [rect.left + insetX, rect.top + rect.height / 2],
-          [rect.right - insetX, rect.top + rect.height / 2],
-          [rect.left + rect.width / 2, rect.top + insetY],
-          [rect.left + rect.width / 2, rect.bottom - insetY],
-          [rect.left + insetX, rect.top + insetY],
-          [rect.right - insetX, rect.top + insetY],
-          [rect.left + insetX, rect.bottom - insetY],
-          [rect.right - insetX, rect.bottom - insetY],
         ];
-        for (const [x, y] of samples) {
+        for (let row = 0; row < rows; row += 1) {
+          for (let col = 0; col < cols; col += 1) {
+            points.push([
+              rect.left + ((col + 0.5) / cols) * rect.width,
+              rect.top + ((row + 0.5) / rows) * rect.height,
+            ]);
+          }
+        }
+
+        let owned = 0;
+        let covered = 0;
+        let visiblePoint: { x: number; y: number } | undefined;
+        for (const [x, y] of points) {
           const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
           const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
-          if (pointBelongsToElement(element, px, py)) return { x: px, y: py };
+          const top = topmostRenderableAt(px, py);
+          if (!top) continue;
+          if (top === element || composedContains(element, top)) {
+            // The element (or one of its descendants) is the topmost layer here.
+            owned += 1;
+            if (!visiblePoint) visiblePoint = { x: Math.round(px), y: Math.round(py) };
+          } else if (!composedContains(top, element)) {
+            // An unrelated element with a higher stacking order paints over this
+            // point (e.g. an open modal / dropdown), so the element is occluded here.
+            covered += 1;
+          }
+          // If `top` is an ancestor, the element's own box is simply transparent
+          // at this point; treat it as neither owned nor occluded.
         }
-        return undefined;
+
+        const total = points.length;
+        return {
+          visiblePoint,
+          ownedRatio: owned / total,
+          coveredRatio: covered / total,
+        };
       }
 
       function candidateFrom(element: Element, path: number[], id: string): Candidate | undefined {
@@ -941,12 +1029,22 @@ export class BrowserSession {
           Boolean(role && interactiveRoles.has(role)) ||
           isInput;
         if (hasClickableAncestor(element) && !semanticTarget) return undefined;
-        if (!semanticTarget && !hasRecordedClickListener(element) && hasInteractiveDescendant(element)) return undefined;
+        // Drop a non-semantic wrapper only when it has no click signal of its own
+        // and merely contains interactive descendants. Keep genuinely clickable
+        // cards / rows (cursor:pointer, onclick, data-action, click listeners),
+        // which previously slipped through because frameworks delegate events.
+        if (!semanticTarget && !hasOwnClickSignal(element) && hasInteractiveDescendant(element)) return undefined;
 
         const rect = visibleRectOf(element);
         if (!rect) return undefined;
-        const visiblePoint = visiblePointForElement(element, rect);
-        if (!visiblePoint) return undefined;
+        const visibility = computeVisibility(element, rect);
+        if (!visibility || !visibility.visiblePoint) return undefined;
+        // Suppress elements that sit behind a higher z-index layer (popup, dialog,
+        // dropdown / selector options): when most of the element is painted over by
+        // an unrelated element on top, it is not actually clickable at this spot, so
+        // the lower element must not get an E marker.
+        if (visibility.coveredRatio > 0.5 && visibility.ownedRatio < 0.35) return undefined;
+        const visiblePoint = visibility.visiblePoint;
         const viewportArea = window.innerWidth * window.innerHeight;
         const area = rect.width * rect.height;
         if (area > viewportArea * 0.75 && !['input', 'textarea', 'select', 'button', 'a'].includes(tag)) return undefined;
@@ -993,6 +1091,7 @@ export class BrowserSession {
           clickable,
           input: isInput,
           disabled: Boolean((input as HTMLInputElement).disabled || element.getAttribute('aria-disabled') === 'true'),
+          shadow: isInsideShadow(element),
         };
       }
 
@@ -1000,6 +1099,9 @@ export class BrowserSession {
         return descendantPath.startsWith(`${ancestorPath}.`);
       }
 
+      // Keep the deepest candidate in each DOM branch: when both a wrapper and its
+      // descendant are flagged, only the innermost one gets an E marker. This
+      // removes duplicate parent/child labels (e.g. search-bar container + input).
       function dropParentWhenChildExists(items: Candidate[]) {
         return items.filter(
           (candidate) =>
@@ -1021,7 +1123,14 @@ export class BrowserSession {
         const perBand = Math.max(1, Math.ceil(limit / bandCount));
         const selected: Candidate[] = [];
         for (const band of bands) {
-          band.sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y);
+          // Prefer smaller, more specific targets so band limits are not consumed
+          // by large wrapper elements.
+          band.sort(
+            (a, b) =>
+              a.rect.width * a.rect.height - b.rect.width * b.rect.height ||
+              a.rect.y - b.rect.y ||
+              a.rect.x - b.rect.x,
+          );
           selected.push(...band.slice(0, perBand));
         }
         return selected
@@ -1029,18 +1138,54 @@ export class BrowserSession {
           .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
       }
 
+      function domPathOf(element: Element) {
+        if (isInsideShadow(element)) return undefined;
+        const segments: number[] = [];
+        let current: Element | undefined = element;
+        while (current && current !== document.documentElement) {
+          const parent = flatParentElement(current);
+          if (!parent) return undefined;
+          const siblings = children(parent);
+          const index = siblings.indexOf(current);
+          if (index < 0) return undefined;
+          segments.unshift(index);
+          current = parent;
+        }
+        if (current !== document.documentElement) return undefined;
+        return [0, ...segments];
+      }
+
       const raw: Candidate[] = [];
       function walk(element: Element, path: number[], depth: number) {
-        if (depth > 18) return;
+        if (depth > 24) return;
         const candidate = candidateFrom(element, path, '');
         if (candidate) raw.push(candidate);
-        const visibleChildren = children(element);
-        for (let index = 0; index < visibleChildren.length; index += 1) {
-          walk(visibleChildren[index], [...path, index], depth + 1);
+        const childNodes = children(element);
+        for (let index = 0; index < childNodes.length; index += 1) {
+          walk(childNodes[index], [...path, index], depth + 1);
         }
       }
 
       walk(document.documentElement, [0], 0);
+
+      // Flat scan catches interactive nodes the tree walk may still miss (e.g. when
+      // a selector query reaches them faster than a deep branch walk).
+      const seenPaths = new Set(raw.map((item) => item.path));
+      const flatSelectors =
+        'a[href],button,input:not([type="hidden"]),select,textarea,label,summary,option,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="option"],[tabindex]:not([tabindex="-1"])';
+      for (const element of Array.from(document.querySelectorAll(flatSelectors))) {
+        if (!isTraversable(element) || !isVisibleInViewport(element)) continue;
+        const pathParts = domPathOf(element);
+        if (!pathParts) continue;
+        const pathKey = pathParts.join('.');
+        if (seenPaths.has(pathKey)) continue;
+        const extra = candidateFrom(element, pathParts, '');
+        if (extra) {
+          raw.push(extra);
+          seenPaths.add(pathKey);
+        }
+      }
+
       const deduped = dropParentWhenChildExists(raw);
       deduped.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
       return selectCandidatesAcrossViewport(deduped, candidateLimit).map((candidate, index) => ({
@@ -1086,6 +1231,19 @@ export class BrowserSession {
       return { candidate, error: `Candidate ${candidate.id} is disabled: ${this.describeCandidate(candidate)}` };
     }
 
+    // Shadow-DOM candidates have no resolvable light-tree index path, so click them
+    // by their captured viewport coordinates (which share the host document's space).
+    if (candidate.shadow) {
+      const point = await this.resolveShadowCandidatePoint(candidate);
+      if (!point) {
+        return {
+          candidate,
+          error: `Candidate ${candidate.id} (shadow DOM) is no longer at its captured position. Call getInteractiveCandidates again; the DOM likely changed.`,
+        };
+      }
+      return { candidate, target: point };
+    }
+
     const target = await this.resolveDomPathToClickablePoint(candidate.path);
     if (!target) {
       return {
@@ -1095,6 +1253,42 @@ export class BrowserSession {
     }
 
     return { candidate, target };
+  }
+
+  private async resolveShadowCandidatePoint(candidate: InteractiveCandidate) {
+    const px = candidate.center?.x;
+    const py = candidate.center?.y;
+    if (typeof px !== 'number' || typeof py !== 'number') return undefined;
+    return this.activePage
+      .evaluate(({ x, y }) => {
+        if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return undefined;
+        function deepTopmost(pointX: number, pointY: number) {
+          let root: Document | ShadowRoot = document;
+          let found: Element | undefined;
+          for (let depth = 0; depth < 24; depth += 1) {
+            const stack = root.elementsFromPoint(pointX, pointY) as Element[];
+            let top: Element | undefined;
+            for (const item of stack) {
+              if (!item) continue;
+              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) continue;
+              top = item;
+              break;
+            }
+            if (!top) break;
+            found = top;
+            const sub = (top as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+            if (!sub) break;
+            root = sub;
+          }
+          return found;
+        }
+        const element = deepTopmost(x, y);
+        if (!element) return undefined;
+        const tag = element.tagName.toLowerCase();
+        const id = element.id ? `#${element.id}` : '';
+        return { x, y, descriptor: `${tag}${id}`, offscreen: false };
+      }, { x: px, y: py })
+      .catch(() => undefined);
   }
 
   private async readSimplifiedDomTree() {
@@ -1137,7 +1331,7 @@ export class BrowserSession {
         return Boolean(aiVisibleRect(element));
       }
       function aiChildren(element: Element) {
-        return Array.from(element.children).filter(aiIsRendered);
+        return Array.from(element.children).filter(aiIsRenderable);
       }
 
       let count = 0;
@@ -1256,13 +1450,16 @@ export class BrowserSession {
 
       const lines: string[] = [];
       function walk(element: Element, path: number[], depth: number) {
-        if (count >= nodeLimit || depth > depthLimit) return;
-        lines.push(`${'  '.repeat(depth)}${describe(element, path)}`);
-        count += 1;
-        const children = aiChildren(element);
-        for (let index = 0; index < children.length; index += 1) {
-          walk(children[index], [...path, index], depth + 1);
+        if (depth > depthLimit) return;
+        const rect = aiVisibleRect(element);
+        if (rect && count < nodeLimit) {
+          lines.push(`${'  '.repeat(depth)}${describe(element, path)}`);
+          count += 1;
+        }
+        const childNodes = aiChildren(element);
+        for (let index = 0; index < childNodes.length; index += 1) {
           if (count >= nodeLimit) break;
+          walk(childNodes[index], [...path, index], rect ? depth + 1 : depth);
         }
       }
 
@@ -1305,7 +1502,7 @@ export class BrowserSession {
         return Boolean(aiVisibleRect(element));
       }
       function aiChildren(element: Element) {
-        return Array.from(element.children).filter(aiIsRendered);
+        return Array.from(element.children).filter(aiIsRenderable);
       }
       function pointBelongsToElement(element: Element, x: number, y: number) {
         const top = document.elementsFromPoint(x, y).find((item) => aiIsRenderable(item));
@@ -1391,7 +1588,7 @@ export class BrowserSession {
   private async dispatchDomPathClick(pathValue: string) {
     return this.activePage.evaluate((path) => {
       const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
-      function aiIsRendered(element: Element) {
+      function aiIsRenderable(element: Element) {
         if (!element || element.nodeType !== 1) return false;
         if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
         const tag = element.tagName.toLowerCase();
@@ -1401,13 +1598,17 @@ export class BrowserSession {
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
         if (Number(style.opacity || '1') <= 0.01) return false;
+        return true;
+      }
+      function aiIsRendered(element: Element) {
+        if (!aiIsRenderable(element)) return false;
         const rect = element.getBoundingClientRect();
         const visibleWidth = Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0);
         const visibleHeight = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
         return visibleWidth > 2 && visibleHeight > 2;
       }
       function aiChildren(element: Element) {
-        return Array.from(element.children).filter(aiIsRendered);
+        return Array.from(element.children).filter(aiIsRenderable);
       }
 
       const parts = String(path).split('.').map((item) => Number(String(item).trim()));
@@ -1449,7 +1650,7 @@ export class BrowserSession {
         return visibleWidth > 2 && visibleHeight > 2;
       }
       function aiChildren(element: Element) {
-        return Array.from(element.children).filter(aiIsRendered);
+        return Array.from(element.children).filter(aiIsRenderable);
       }
 
       function elementFromDomPath(pathValue?: string) {

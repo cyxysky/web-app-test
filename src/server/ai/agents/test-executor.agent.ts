@@ -216,11 +216,6 @@ function makeBrowserTools(
       }),
       execute: ({ deltaY, deltaX, domPath }) => record('scrollViewport', { deltaY, deltaX, domPath }, () => session.scroll(deltaY, deltaX || 0, { domPath })),
     }),
-    getInteractiveCandidates: tool({
-      description: 'Return the current visible interactable candidates as JSON. Each candidate has id (E1...), tag/role/name/text, href/host for links, visible box/center position, and nearbyText. Use this if the screenshot labels or candidate list look stale.',
-      inputSchema: z.object({}),
-      execute: (input) => record('getInteractiveCandidates', input, () => session.getInteractiveCandidates()),
-    }),
     clickCandidate: tool({
       description: 'Click a visible candidate by its E-number label from the screenshot/candidate list. Prefer this over DOM paths because the backend validates and clicks the candidate center.',
       inputSchema: z.object({
@@ -278,6 +273,11 @@ function makeBrowserTools(
   };
 
   const domTools = {
+    getInteractiveCandidates: tool({
+      description: 'Fallback only (DOM mode): return visible interactable candidates as JSON when the screenshot E labels are missing or stale. Each candidate has id (E1...), tag/role/name/text, href/host, visible box/center, and nearbyText.',
+      inputSchema: z.object({}),
+      execute: (input) => record('getInteractiveCandidates', input, () => session.getInteractiveCandidates()),
+    }),
     getDomTree: tool({
       description: 'Return the current tab simplified DOM tree of currently visible elements. Each line is "[path] tag#id.class * @x,y,w,h {attrs} \\"text\\"": "*" marks clickable elements, @ is the visible viewport box, {attrs} holds key attributes (placeholder/aria-label/role/href/value...), and "text" is the node\'s own text. Hidden nodes are removed, so paths line up with what is on screen.',
       inputSchema: z.object({}),
@@ -481,15 +481,16 @@ function runtimePrompt(input: {
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
   const visualMode = isVisualClickMode();
   const candidateRules = [
-    'Candidate grounding rules (preferred):',
-    '- The screenshot is annotated with colored boxes labeled E1, E2, ... for visible interactable elements. Blue usually means link, green input/control, orange generic clickable.',
-    '- The "Interactive candidates JSON" below lists the same E ids with text/name, href/host for links, visible rect/center, and nearbyText.',
-    '- Prefer clickCandidate(id) or focusCandidate(id) over DOM paths whenever the intended target has an E id.',
+    'Candidate grounding rules (screenshot-first):',
+    '- The annotated screenshot is the PRIMARY and authoritative source for E ids. Colored boxes labeled E1, E2, ... mark visible leaf interactable elements. Blue = link, green = input/control, orange = generic clickable.',
+    '- FIRST look at the screenshot and pick the E id that matches the visible target by position, label text, and context. Only if the screenshot shows no usable E label for that target, fall back to the Interactive candidates JSON below.',
+    visualMode
+      ? '- Visual mode: getInteractiveCandidates is NOT available. Never try to refresh candidates — trust the screenshot E labels and act with clickCandidate/focusCandidate/doubleClickCandidate/rightClickCandidate/dragCandidate.'
+      : '- DOM mode fallback: if the screenshot shows no E label for the intended target, call getInteractiveCandidates once, then act. Do not call it repeatedly in a loop.',
+    '- Prefer clickCandidate(id) or focusCandidate(id) over DOM paths whenever the intended target has an E id on the screenshot.',
+    '- When the user requirement says 双击/double-click, use doubleClickCandidate(id) — NOT clickCandidate and NOT getInteractiveCandidates.',
     '- For links/search results, never choose by title text alone. Cross-check: screenshot label position + candidate text/name + href/host + nearbyText. If a candidate points to the wrong host/URL, do not click it even if its visible text looks right.',
     `- Target URL host is ${targetHost}; treat it as the starting page, not necessarily the final destination. When the user asks for a specific website/domain, prefer candidates whose href host exactly matches or is a credible subdomain of that requested site; avoid ads, mirrors, login traps, and unrelated search results.`,
-    visualMode
-      ? '- If the correct visual target is visible but no candidate id exists, call getInteractiveCandidates once for a fresh candidate list; if it is still missing, use a visual click tool.'
-      : '- If the correct visual target is visible but no candidate id exists, call getInteractiveCandidates/getDomTree once for a fresh candidate list instead of inventing a DOM path.',
   ];
   const domInteractionRules = [
     ...candidateRules,
@@ -511,13 +512,14 @@ function runtimePrompt(input: {
   const visualInteractionRules = [
     ...candidateRules,
     'Visual click mode rules:',
-    '- isClick/IS_CLICK is enabled, so DOM-path click/focus tools are intentionally unavailable in this mode.',
-    '- Visual mode depends on E labels: choose the intended visible E id from the annotated screenshot, then call the candidate tool matching the action type.',
-    '- Available E-based actions are clickCandidate(id), focusCandidate(id), doubleClickCandidate(id), rightClickCandidate(id), and dragCandidate(fromId,toId).',
-    '- Do NOT output raw screenshot coordinates. The backend resolves the chosen E id to the element visible center and performs the mouse action there.',
-    '- If a visible target has no E label, call getInteractiveCandidates once for a refreshed E list. If it is still missing, use a nearby labeled parent/child candidate rather than inventing coordinates.',
+    '- isClick/IS_CLICK is enabled, so DOM-path tools and getInteractiveCandidates are intentionally unavailable.',
+    '- Screenshot E labels are your only candidate source. Choose the intended visible E id from the annotated screenshot, then call the matching candidate tool.',
+    '- Available E-based actions: clickCandidate(id), focusCandidate(id), doubleClickCandidate(id), rightClickCandidate(id), dragCandidate(fromId,toId).',
+    '- Do NOT output raw screenshot coordinates. The backend resolves the chosen E id to the element visible center.',
+    '- Do NOT call getInteractiveCandidates — it does not exist in visual mode. If you see the target on the screenshot with an E label, act immediately.',
+    '- For 双击/double-click requirements: identify the target link/button on the screenshot and call doubleClickCandidate(id) directly.',
     '- For text entry: focusCandidate(id), then typeText on the next step after focus is confirmed.',
-    '- If a candidate click misses, use the red previous-click marker on the next screenshot to choose a better E candidate or refresh the candidate list.',
+    '- If a candidate click misses, use the red previous-click marker on the next screenshot to choose a better E candidate.',
   ];
   const interactionRules = visualMode ? visualInteractionRules : domInteractionRules;
 
@@ -532,7 +534,8 @@ function runtimePrompt(input: {
     '- Do NOT repeat an action that already succeeded in a previous step, and do NOT re-open or re-navigate to a page when the current URL and screenshot already show it. Look at the last tool calls and the screenshot first.',
     '',
     'Vision-first decision policy:',
-    '- The screenshot is the primary evidence for everything: what page is visible, what controls exist, where to click, whether the requirement is complete, whether a CAPTCHA/security page is blocking the flow, and whether the last click marker landed correctly.',
+    '- The screenshot is the primary evidence for everything: what page is visible, what controls exist, which E id to click/double-click, whether the requirement is complete, whether a CAPTCHA/security page is blocking the flow, and whether the last click marker landed correctly.',
+    '- The annotated E labels on the screenshot take priority over the Interactive candidates JSON. Use the JSON only to confirm href/host/text when the screenshot label is ambiguous.',
     '- Do not declare the page wrong, incomplete, or failed before you have actually acted; if the start screenshot already shows the page the requirement needs (and the URL matches), do NOT re-open or re-navigate to it, just do the next concrete action toward the requirement.',
     '- If the screenshot looks blank, still loading, or mid-transition, your single action this step should be waitForPage, then judge on the next screenshot.',
     '- URL, tab list, focused element, screenshot metrics, candidate list, DOM tree, and the last five tool calls are auxiliary hints.',
@@ -574,7 +577,7 @@ function runtimePrompt(input: {
     `Current URL: ${pageContext.url}`,
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
     `Current tab focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    `Interactive candidates JSON (same ids as screenshot labels; prefer clickCandidate/focusCandidate):\n${formatInteractiveCandidates(pageContext.interactiveCandidates)}`,
+    `Interactive candidates JSON (auxiliary; screenshot E labels are authoritative):\n${formatInteractiveCandidates(pageContext.interactiveCandidates)}`,
     `Your recent progress notes (oldest first), so you know what you already did and planned:\n${recentProgressNotes(completedSteps, 8).join('\n') || '[no notes yet]'}`,
     `Your recent tool calls (oldest first), each {name, input, result:{ok, actual}}:\n${JSON.stringify(recentToolCallContext(completedSteps, 8), null, 2)}`,
     visualMode
