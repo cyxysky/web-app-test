@@ -996,20 +996,57 @@ export class BrowserSession {
         };
       }
 
-      const output: Candidate[] = [];
+      function isDomPathAncestor(ancestorPath: string, descendantPath: string) {
+        return descendantPath.startsWith(`${ancestorPath}.`);
+      }
+
+      function dropParentWhenChildExists(items: Candidate[]) {
+        return items.filter(
+          (candidate) =>
+            !items.some(
+              (other) => other !== candidate && isDomPathAncestor(candidate.path, other.path),
+            ),
+        );
+      }
+
+      function selectCandidatesAcrossViewport(items: Candidate[], limit: number) {
+        if (items.length <= limit) return items;
+        const bandCount = 5;
+        const bandHeight = Math.max(1, window.innerHeight / bandCount);
+        const bands: Candidate[][] = Array.from({ length: bandCount }, () => []);
+        for (const candidate of items) {
+          const band = Math.min(bandCount - 1, Math.floor(candidate.center.y / bandHeight));
+          bands[band].push(candidate);
+        }
+        const perBand = Math.max(1, Math.ceil(limit / bandCount));
+        const selected: Candidate[] = [];
+        for (const band of bands) {
+          band.sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y);
+          selected.push(...band.slice(0, perBand));
+        }
+        return selected
+          .slice(0, limit)
+          .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+      }
+
+      const raw: Candidate[] = [];
       function walk(element: Element, path: number[], depth: number) {
-        if (output.length >= candidateLimit || depth > 18) return;
-        const candidate = candidateFrom(element, path, `E${output.length + 1}`);
-        if (candidate) output.push(candidate);
+        if (depth > 18) return;
+        const candidate = candidateFrom(element, path, '');
+        if (candidate) raw.push(candidate);
         const visibleChildren = children(element);
         for (let index = 0; index < visibleChildren.length; index += 1) {
           walk(visibleChildren[index], [...path, index], depth + 1);
-          if (output.length >= candidateLimit) break;
         }
       }
 
       walk(document.documentElement, [0], 0);
-      return output;
+      const deduped = dropParentWhenChildExists(raw);
+      deduped.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+      return selectCandidatesAcrossViewport(deduped, candidateLimit).map((candidate, index) => ({
+        ...candidate,
+        id: `E${index + 1}`,
+      }));
     }, { limit }).catch(() => [] as InteractiveCandidate[]);
 
     this.lastInteractiveCandidates = candidates;
@@ -1505,9 +1542,8 @@ export class BrowserSession {
   }
 
   private async drawCandidateOverlay(candidates: InteractiveCandidate[]) {
-    const visible = candidates
-      .slice(0, Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 120)))
-      .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+    const labelLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
+    const visible = candidates.slice(0, labelLimit);
     await this.activePage.evaluate((items) => {
       document.getElementById('__ai_candidate_overlay__')?.remove();
       const overlay = document.createElement('div');
