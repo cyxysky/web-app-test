@@ -26,6 +26,9 @@ export function getModel() {
   // qwen/qwen3.7-max
   // moonshotai/kimi-k2.6
   // xiaomi/mimo-v2.5
-  return openrouter.chat("qwen/qwen3.6-plus")
+  // openai/gpt-5.4
+  // x-ai/grok-4.3
+  // x-ai/grok-build-0.1
+  return openrouter.chat("x-ai/grok-4.3")
   return deepseek("deepseek-v4-flash");
 }
