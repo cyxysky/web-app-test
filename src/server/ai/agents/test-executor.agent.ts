@@ -31,6 +31,7 @@ type RuntimeDecision = {
   actual: string;
   status: 'passed' | 'failed' | 'blocked';
   done: boolean;
+  note?: string;
 };
 
 const manualIssuePattern = new RegExp(
@@ -114,15 +115,20 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   }));
 }
 
-function recentToolCallContext(steps: StepExecutionResult[], limit = 5) {
+function recentToolCallContext(steps: StepExecutionResult[], limit = 8) {
   const calls = steps.flatMap((step) => (step.tools || []).map((tool) => ({
-    stepIndex: step.index,
     name: tool.name,
     input: tool.input,
-    ok: tool.ok,
-    result: tool.result,
+    result: { ok: tool.ok, actual: tool.result },
   })));
   return calls.slice(-limit);
+}
+
+function recentProgressNotes(steps: StepExecutionResult[], limit = 8) {
+  return steps
+    .filter((step) => step.note && step.note.trim())
+    .slice(-limit)
+    .map((step) => `Step ${step.index}: ${step.note}`);
 }
 
 function makeBrowserTools(
@@ -131,7 +137,23 @@ function makeBrowserTools(
   traces: ToolTrace[],
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>,
 ) {
+  // Enforce a single executed tool per AI request. makeBrowserTools is created fresh for each
+  // request, so this flag guarantees that even if the model emits several tool calls in one
+  // response (parallel/chained), only the first one actually runs. The rest are ignored, which
+  // keeps every browser action paired with a fresh screenshot on the next step and prevents the
+  // duplicate-operation problem seen when a request was retried mid-chain.
+  let toolExecutedThisRequest = false;
+
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
+    if (toolExecutedThisRequest) {
+      // Do not execute or trace extra calls; just tell the model to stop. This keeps the recorded
+      // step clean (one real action) and avoids any duplicate side effect.
+      return {
+        ok: false,
+        actual: 'Ignored: only one tool call is allowed per step. Stop now; you will get a fresh screenshot at the start of the next step and can act again then.',
+      } satisfies BrowserActionResult;
+    }
+    toolExecutedThisRequest = true;
     const result = await action();
     const trace = { name, input, result };
     traces.push(trace);
@@ -283,12 +305,18 @@ function runtimePrompt(input: {
         `- Latest screenshot image size is ${JSON.stringify(screenshot)}.`,
         `- Current browser viewport size is ${JSON.stringify(viewport)}.`,
         `- Current viewport metrics JSON is ${JSON.stringify(viewportMetrics)}.`,
-        `- Screenshot coordinate scale is ${screenshotMetrics?.scale || 'unknown'}; when it is "css", screenshot pixels are intended to match browser viewport CSS pixels.`,
+        `- Screenshot coordinate scale is ${screenshotMetrics?.scale || 'unknown'}; when it is "css", screenshot pixels match browser viewport CSS pixels 1:1.`,
+        '- The screenshot contains ONLY the web page content. It does NOT include the browser window, address/URL bar, tabs, or any toolbar. So image y=0 is the very top of the page viewport, not below a URL bar. Measure coordinates straight from the image edges.',
+        `- COORDINATE GRID: the screenshot has a blue reference grid drawn on it, spaced ${Math.max(10, Number(process.env.SCREENSHOT_GRID_STEP || 50))} px apart. EVERY vertical line (X axis) is labeled right ON the line at the BOTTOM edge as "x=<value>" (blue). EVERY horizontal line (Y axis) is labeled ON the line at the LEFT edge as "y=<value>" (orange). The top-left corner shows "0,0 x→ y↓" meaning X grows to the right and Y grows downward.`,
+        '- HOW TO READ COORDINATES: for your target, find the two "x=" lines it sits between and interpolate its X; separately find the two "y=" lines it sits between and interpolate its Y. The X value ONLY comes from the bottom "x=" labels and the Y value ONLY comes from the left "y=" labels — never mix them up and never reuse a previous Y. Report that interpolated x and y.',
         '- IMPORTANT: all mouse tools expect coordinates measured on the latest screenshot image. Do NOT return CSS viewport coordinates.',
-        '- The backend converts screenshot-image pixels into browser viewport coordinates by a direct ratio between the current viewport and the screenshot image (1 image pixel ≈ 1 CSS pixel). There is no click snapping; your coordinate must land inside the intended visible target.',
+        '- The backend maps screenshot pixels to viewport pixels by an exact 1:1 ratio (no offset, no snapping). Whatever pixel you give is exactly where the click lands, so your coordinate must sit ON the intended target.',
+        '- MANDATORY SELF-CORRECTION: if the screenshot shows a solid red dot/circle, that is exactly where your LAST click landed. You MUST do this before clicking again: (1) read the red dot\'s grid coordinates, (2) read the target\'s grid coordinates, (3) compute deltaX and deltaY between them, (4) apply that exact correction to your next click. If the red dot is BELOW the target, your new Y MUST be smaller; if ABOVE, larger; same logic for X. This is not optional — a miss means your coordinate was wrong and must change.',
+        '- ABSOLUTELY NEVER submit the same or near-identical (x, y) as a click that just failed. Repeating coordinates is treated as a hard error. If the last click did not visibly change the page or the red dot missed, your next coordinate MUST differ by at least 20-40 px in the direction the grid shows you missed (the miss is most often on Y, so re-derive Y from the left "y=" labels every time).',
+        '- If you are unsure or have already missed twice, aim for the clear visual CENTER of the target box and bias Y a little upward, then verify against the grid before submitting.',
         '- If you visually identify a target at the center of the screenshot image, use that screenshot-image x/y directly.',
         '- Prefer real user-like mouse operations: clickAt, doubleClickAt, rightClickAt, drag, scrollViewport.',
-        '- Estimate coordinates visually from the screenshot. Use the center of the visible clickable/control area, not the text baseline or the outer page margin.',
+        '- Estimate coordinates visually from the screenshot. Use the vertical and horizontal CENTER of the visible clickable/control box, not the text baseline, not the bottom edge, and not the outer page margin.',
         '- For dense search result lists or links, click near the center-left of the visible link text line, avoiding icons, whitespace, and overlapping hover panels.',
         '- For scrolling, call scrollViewport with x/y inside the specific scrollable table/list/panel. This intentionally scrolls the selected container under that point, which is required for virtual-scroll tables.',
         '- If the target is outside the viewport, call scrollViewport on the relevant scroll container, inspect the next screenshot in the next runtime step, then continue. Do not rely on DOM element locating.',
@@ -311,18 +339,22 @@ function runtimePrompt(input: {
 
   return [
     'You are an AI browser testing agent. The test case does NOT contain preset steps.',
-    'Your job is to read the user requirement, inspect the current viewport screenshot as the primary source of truth, decide the next single browser operation, call tools to perform it, then return a JSON summary for the step you actually executed.',
+    'Your job is to read the user requirement, inspect the current viewport screenshot as the primary source of truth, then take EXACTLY ONE browser action that makes progress, or (only when finished) return a JSON summary.',
+    '',
+    'CRITICAL one-action protocol (strictly enforced by the system):',
+    '- You may call AT MOST ONE tool per response. After your single tool call the system immediately stops you, captures a fresh screenshot, and starts the next step. Any extra tool calls you emit in the same response are ignored and wasted.',
+    '- The attached screenshot is the page state at the START of this step. You will NOT see the result of your action until the screenshot at the START of the next step.',
+    '- So pick the single most useful next action and call exactly one tool. Do NOT chain actions: even "focus then type" must be split — focus/click the field this step, then type on the next step after you confirm focus from the new screenshot.',
+    '- Do NOT repeat an action that already succeeded in a previous step, and do NOT re-open or re-navigate to a page when the current URL and screenshot already show it. Look at the last tool calls and the screenshot first.',
     '',
     'Vision-first decision policy:',
     '- The screenshot is the primary evidence for everything: what page is visible, what controls exist, where to click, whether the requirement is complete, whether a CAPTCHA/security page is blocking the flow, and whether the last click marker landed correctly.',
-    '- The attached screenshot is the page state at the START of this step. You will NOT receive a new screenshot after your action inside this same step; the result of your action is shown to you as the screenshot at the start of the NEXT step.',
-    '- Therefore perform exactly ONE browser action this step, then immediately output the JSON summary. The only time you may call a second tool in the same step is when it is strictly required to complete the first (for example focusDomNode/clickAt an input and then typeText into it).',
-    '- Do NOT chain multiple navigations/clicks in one step and do NOT repeat an action that already succeeded, because you cannot see the intermediate results until the next step.',
     '- Do not declare the page wrong, incomplete, or failed before you have actually acted; if the start screenshot already shows the page the requirement needs (and the URL matches), do NOT re-open or re-navigate to it, just do the next concrete action toward the requirement.',
     '- If the screenshot looks blank, still loading, or mid-transition, your single action this step should be waitForPage, then judge on the next screenshot.',
     '- URL, tab list, focused element, screenshot metrics, DOM tree in DOM mode, and the last five tool calls are only auxiliary hints.',
     '- When the screenshot contradicts auxiliary context, trust the screenshot and explain the contradiction in actual.',
-    '- The red marker in the screenshot shows the previous AI mouse target. If the marker is clearly misplaced or no UI change happened, correct the next coordinate instead of repeating the same click.',
+    '- The red marker (solid red dot/circle) in the screenshot shows where your PREVIOUS click actually landed. Use it as ground truth to self-correct: measure the gap between the red dot and the target you wanted, then move your next coordinate by that gap in the opposite direction. If the marker is on/near the target but nothing changed, the element may need a different spot or a wait, not a repeat of the identical point.',
+    '- The "Last 5 AI tool calls JSON" lists the exact coordinates you already tried. Before clicking, check it and make sure your new coordinate is meaningfully different from any recent failed click.',
     '- If a click was intended to open a search result/link but the next screenshot still shows the same normal results page, treat it as a missed/ineffective click and retry with a better coordinate. Do not call it CAPTCHA/security verification unless the screenshot visibly shows a verification challenge.',
     '- The focused element summary tells you whether the current tab focus is on the intended input/control. Before typing or pressing Enter for a form, verify the focus summary matches the visible target; if it is body/document or the wrong element, click the target input again at a better coordinate.',
     '- Prefer one purposeful user-like operation per runtime step. Do not perform a long chain of blind clicks. Observe, act once, then let the next screenshot confirm the result.',
@@ -343,15 +375,20 @@ function runtimePrompt(input: {
     '- If the screenshot shows an error page, empty broken page, access-denied state, or the requirement is impossible from the current state, return done=true with status="failed" or "blocked" as appropriate.',
     '- If unsure whether the requirement is complete, continue with the smallest reasonable next action instead of declaring success.',
     '',
-    'Return exactly one JSON object after tool calls:',
-    '{"action":"Chinese summary of what you actually did or observed in this step","expected":"Chinese visual success criteria for this step","actual":"Chinese result based mainly on the screenshot after your action","status":"passed|failed|blocked","done":false}',
+    'How to respond:',
+    '- To act: call exactly ONE tool. In the SAME response, also write ONE short plain-text line in this exact format (this is your memory carried into the next step): "PROGRESS: <what you just accomplished / what the screenshot shows> NEXT: <the single next action you intend>". Keep it to one concise sentence each. Do not output JSON when acting.',
+    '- Before deciding, READ your "recent progress notes" and "recent tool calls" in the context so you continue from where you left off and never redo a finished action.',
+    '- To finish (requirement complete, blocked by verification, or impossible): call NO tool and return exactly one JSON object describing the final state:',
+    '{"action":"Chinese summary of what was observed","expected":"Chinese visual success criteria","actual":"Chinese result based on the current screenshot","status":"passed|failed|blocked","done":true}',
+    '- Use done=true with status="passed" only when the screenshot clearly shows the requirement is satisfied. Use status="blocked" (done=false) when a CAPTCHA/login/security verification is visible. Otherwise keep acting one step at a time instead of guessing completion.',
     '',
     `User requirement: ${requirementOf(testCase)}`,
     `Target URL: ${testCase.targetUrl}`,
     `Current URL: ${pageContext.url}`,
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
     `Current tab focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    `Last 5 AI tool calls JSON: ${JSON.stringify(recentToolCallContext(completedSteps, 5))}`,
+    `Your recent progress notes (oldest first), so you know what you already did and planned:\n${recentProgressNotes(completedSteps, 8).join('\n') || '[no notes yet]'}`,
+    `Your recent tool calls (oldest first), each {name, input, result:{ok, actual}}:\n${JSON.stringify(recentToolCallContext(completedSteps, 8), null, 2)}`,
     !coordinateMode ? `Simplified current tab DOM tree:\n${pageContext.domTree || '[empty DOM tree]'}` : '',
     modelSupportsScreenshotInput()
       ? 'The current viewport screenshot is attached as an image input.'
@@ -359,7 +396,45 @@ function runtimePrompt(input: {
   ].join('\n');
 }
 
-function parseDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
+function summarizeToolInput(input: unknown) {
+  if (input && typeof input === 'object') {
+    const entries = Object.entries(input as Record<string, unknown>)
+      .filter(([, value]) => value !== undefined && value !== null && value !== '')
+      .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
+    return entries.length ? ` (${entries.join(', ')})` : '';
+  }
+  return '';
+}
+
+function extractProgressNote(text: string) {
+  if (!text) return undefined;
+  // The model is asked to emit a single "PROGRESS: ... NEXT: ..." line alongside its tool call.
+  const match = text.match(/PROGRESS\s*[:：][\s\S]*/i);
+  const note = (match ? match[0] : text).replace(/```[\s\S]*?```/g, '').replace(/\s+/g, ' ').trim();
+  return note ? note.slice(0, 400) : undefined;
+}
+
+function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
+  // When a tool actually executed this step, the step result is derived from the action itself. We
+  // never trust JSON done/status in the same response as a tool call, so the model cannot accidentally
+  // declare the requirement complete before seeing the next screenshot.
+  if (traces.length > 0) {
+    const executed = traces.filter((trace) => trace.name);
+    const last = executed.at(-1);
+    const failed = executed.find((trace) => !trace.result.ok);
+    const names = executed.map((trace) => `${trace.name}${summarizeToolInput(trace.input)}`).join('、');
+    const note = extractProgressNote(text);
+    return {
+      action: note || `AI 执行操作：${names || last?.name || '浏览器操作'}`,
+      expected: '本步操作推进用户需求；操作结果将在下一步的最新截图中确认。',
+      actual: last?.result.actual || '已完成本步工具调用，等待下一步截图确认效果。',
+      status: failed ? 'failed' : 'passed',
+      done: false,
+      note,
+    };
+  }
+
+  // No tool executed: the model is reporting completion/blocked/failed via JSON.
   try {
     return z.object({
       action: z.string().min(1),
@@ -369,13 +444,11 @@ function parseDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
       done: z.boolean(),
     }).parse(extractJson(text));
   } catch {
-    const lastTrace = traces.at(-1);
-    const failedTrace = traces.find((trace) => !trace.result.ok);
     return {
-      action: lastTrace ? `AI 调用工具：${lastTrace.name}` : 'AI 观察当前页面状态',
+      action: 'AI 观察当前页面状态',
       expected: '本轮操作能够推进用户需求，或确认需求是否已经完成。',
-      actual: lastTrace?.result.actual || text || 'AI 没有返回可解析的步骤总结。',
-      status: failedTrace ? 'failed' : 'passed',
+      actual: text || 'AI 既没有调用工具，也没有返回可解析的步骤总结。',
+      status: 'failed',
       done: false,
     };
   }
@@ -413,41 +486,62 @@ async function executeRuntimeStep(input: {
     const messageContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: prompt }];
     if (includeImage && screenshot) messageContent.push({ type: 'image', image: screenshot });
 
-    const result = await generateTextWithTimeout({
-      model: getModel(),
-      messages: [{ role: 'user', content: messageContent }],
-      tools: makeBrowserTools(session, testCase.targetUrl, traces, async (trace) => {
-        await onToolTrace?.(trace);
+    try {
+      const result = await generateTextWithTimeout({
+        model: getModel(),
+        messages: [{ role: 'user', content: messageContent }],
+        tools: makeBrowserTools(session, testCase.targetUrl, traces, async (trace) => {
+          await onToolTrace?.(trace);
+          await onDebug?.({
+            phase: 'ai:tool',
+            stepIndex,
+            message: `${trace.name} -> ${trace.result.ok ? 'ok' : 'failed'}`,
+            details: trace,
+          });
+        }),
+        // One model round per step so each browser action is always paired with a fresh screenshot
+        // on the next step. The record() guard additionally enforces a single executed tool.
+        stopWhen: stepCountIs(Number(process.env.AI_TEST_AGENT_MAX_STEPS || 1)),
+        temperature: 0.1,
+        maxRetries: 0,
+        abortSignal,
+      });
+
+      await onDebug?.({
+        phase: 'ai:runtime:response',
+        stepIndex,
+        message: trimDebugText(result.text || 'AI 没有返回文本内容，仅完成了工具调用。', 300),
+        details: jsonSafe({
+          text: result.text || '',
+          toolCalls: (result as unknown as { toolCalls?: unknown }).toolCalls,
+          toolResults: (result as unknown as { toolResults?: unknown }).toolResults,
+          steps: (result as unknown as { steps?: unknown }).steps,
+          traces,
+        }),
+      });
+
+      return { text: result.text || '', traces };
+    } catch (error) {
+      // If a browser tool already ran before the request failed (e.g. response/parse timeout after
+      // the action completed), do NOT rethrow. Rethrowing would trigger a retry that re-executes the
+      // same browser action — the exact duplicate-operation bug. Keep the executed result and let the
+      // next step continue from the fresh screenshot.
+      if (traces.length > 0 && !abortSignal?.aborted) {
         await onDebug?.({
-          phase: 'ai:tool',
+          phase: 'ai:runtime:partial',
           stepIndex,
-          message: `${trace.name} -> ${trace.result.ok ? 'ok' : 'failed'}`,
-          details: trace,
+          message: 'AI 请求在工具执行后中断，已保留本步已执行的操作并继续下一步，不重试以避免重复操作。',
+          details: { error: error instanceof Error ? error.message : String(error), traces },
         });
-      }),
-      stopWhen: stepCountIs(Number(process.env.AI_TEST_AGENT_MAX_STEPS || 5)),
-      temperature: 0.1,
-      maxRetries: 0,
-      abortSignal,
-    });
-
-    await onDebug?.({
-      phase: 'ai:runtime:response',
-      stepIndex,
-      message: trimDebugText(result.text || 'AI 没有返回文本内容，仅完成了工具调用。', 300),
-      details: jsonSafe({
-        text: result.text || '',
-        toolCalls: (result as unknown as { toolCalls?: unknown }).toolCalls,
-        toolResults: (result as unknown as { toolResults?: unknown }).toolResults,
-        steps: (result as unknown as { steps?: unknown }).steps,
-        traces,
-      }),
-    });
-
-    return { text: result.text || '', traces };
+        return { text: '', traces };
+      }
+      throw error;
+    }
   }
 
-  const attempts = screenshot ? [true, false, false] : [false, false];
+  // Only retry when nothing executed yet (pure request failure). The runAgent catch above guarantees
+  // a retry can never re-run an already-executed browser action.
+  const attempts = screenshot ? [true, true] : [false];
   let lastError: unknown;
 
   for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
@@ -455,11 +549,9 @@ async function executeRuntimeStep(input: {
     try {
       if (attemptIndex > 0) {
         await onDebug?.({
-          phase: includeImage ? 'ai:runtime:retry' : 'ai:runtime:text-retry',
+          phase: 'ai:runtime:retry',
           stepIndex,
-          message: attemptIndex === 1 && screenshot
-            ? 'AI 请求失败，立即降级为文本上下文重试。'
-            : 'AI 请求失败，立即进行一次重试。',
+          message: 'AI 请求失败且未执行任何操作，立即重试一次。',
           details: lastError instanceof Error ? lastError.message : String(lastError),
         });
       }
@@ -537,7 +629,8 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
   const { onProgress, onDebug, shouldSkipStep, shouldResumeStep, onManualIntervention, onManualInterventionCleared } = options;
   const session = new BrowserSession();
   const steps: StepExecutionResult[] = [];
-  const maxRuntimeSteps = Number(process.env.AI_TEST_RUNTIME_MAX_STEPS || 12);
+  // Each runtime step now performs a single browser action, so allow more steps overall.
+  const maxRuntimeSteps = Number(process.env.AI_TEST_RUNTIME_MAX_STEPS || 30);
   const manuallyResumedSteps = new Set<number>();
   let keepBrowserOpen = false;
   let allowBrowserClose = false;
@@ -690,7 +783,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         continue;
       }
 
-      const decision = parseDecision(actionResult.text, actionResult.traces);
+      const decision = deriveDecision(actionResult.text, actionResult.traces);
       if (
         decision.status === 'blocked' &&
         !decision.done &&
@@ -777,6 +870,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         expected: decision.expected,
         actual: decision.actual,
         status: decision.status,
+        note: decision.note,
         beforeScreenshotPath,
         afterScreenshotPath,
         screenshotPath: afterScreenshotPath,

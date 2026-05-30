@@ -1,8 +1,8 @@
 import Link from 'next/link';
-import { notFound, redirect } from 'next/navigation';
-import { ArrowLeft, Play } from 'lucide-react';
+import { notFound } from 'next/navigation';
+import { ArrowLeft } from 'lucide-react';
 import { TestCaseEditor } from '@/components/TestCaseEditor';
-import { startTestCaseRun } from '@/server/ai/agents/test-runner.service';
+import { RunTestButton } from '@/components/RunTestButton';
 import { store } from '@/server/db/mock-store';
 
 export const dynamic = 'force-dynamic';
@@ -16,12 +16,6 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
   const testCase = store.getTestCase(id);
   if (!testCase) notFound();
 
-  async function runAction() {
-    'use server';
-    const run = startTestCaseRun(id);
-    redirect(`/runs/${run.id}`);
-  }
-
   return (
     <main className="case-workspace">
       <header className="case-inline-header">
@@ -29,12 +23,7 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
           <ArrowLeft size={15} />
           工作台
         </Link>
-        <form action={runAction}>
-          <button className="icon-text-button" type="submit">
-            <Play size={16} />
-            启动 AI 浏览器测试
-          </button>
-        </form>
+        <RunTestButton testCaseId={id} />
       </header>
 
       <TestCaseEditor testCase={testCase} />

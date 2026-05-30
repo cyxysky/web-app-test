@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Save } from 'lucide-react';
+import { Loader2, Save } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { RichTextEditor } from '@/components/RichTextEditor';
 import { richTextToPlainText } from '@/lib/rich-text';
@@ -62,8 +62,8 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
           <p>这里不再预设执行步骤。运行时 AI 会读取当前界面截图和这段需求，自行决定下一步操作，并把实际执行结果记录成步骤。</p>
         </div>
         <button className="icon-text-button" disabled={saving} onClick={save} type="button">
-          <Save size={16} />
-          保存需求
+          {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+          {saving ? '保存中' : '保存需求'}
         </button>
       </div>
 

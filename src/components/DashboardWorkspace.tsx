@@ -1,8 +1,8 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useMemo, useState } from 'react';
-import { Folder, FolderPlus, PlayCircle, X } from 'lucide-react';
+import { useEffect, useMemo, useState, useTransition } from 'react';
+import { Folder, FolderPlus, Loader2, PlayCircle, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { NewTestCaseModal } from '@/components/NewTestCaseModal';
 import { richTextToPlainText } from '@/lib/rich-text';
@@ -60,9 +60,12 @@ function GroupNode({
 
 export function DashboardWorkspace({ testCases, groups }: { testCases: TestCaseRecord[]; groups: TestGroupRecord[] }) {
   const router = useRouter();
+  const [, startTransition] = useTransition();
   const [selectedGroupId, setSelectedGroupId] = useState<string | undefined>();
   const [groupName, setGroupName] = useState('');
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [movingCaseId, setMovingCaseId] = useState<string | null>(null);
   const rootGroups = useMemo(() => groups.filter((group) => !group.parentId), [groups]);
   const visibleCases = testCases.filter((item) => item.groupId === selectedGroupId);
   const completedCases = visibleCases.filter((item) => ['passed', 'failed', 'blocked'].includes(item.status));
@@ -75,24 +78,34 @@ export function DashboardWorkspace({ testCases, groups }: { testCases: TestCaseR
 
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
-    if (!name) return;
-    await fetch('/api/groups', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, parentId }),
-    });
-    setGroupName('');
-    setGroupDialogOpen(false);
-    router.refresh();
+    if (!name || creatingGroup) return;
+    setCreatingGroup(true);
+    try {
+      await fetch('/api/groups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, parentId }),
+      });
+      setGroupName('');
+      setGroupDialogOpen(false);
+      startTransition(() => router.refresh());
+    } finally {
+      setCreatingGroup(false);
+    }
   }
 
   async function moveCase(testCaseId: string, groupId?: string) {
-    await fetch(`/api/test-cases/${testCaseId}/move`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupId }),
-    });
-    router.refresh();
+    setMovingCaseId(testCaseId);
+    try {
+      await fetch(`/api/test-cases/${testCaseId}/move`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ groupId }),
+      });
+      startTransition(() => router.refresh());
+    } finally {
+      setMovingCaseId(null);
+    }
   }
 
   return (
@@ -131,13 +144,13 @@ export function DashboardWorkspace({ testCases, groups }: { testCases: TestCaseR
                 </Link>
                 <span className={`badge status-${item.status}`}>{statusLabel(item.status)}</span>
                 <span>{item.status === 'running' ? '执行中' : ['passed', 'failed', 'blocked'].includes(item.status) ? '已完成' : '待执行'}</span>
-                <select className="input compact-select" value={item.groupId || ''} onChange={(event) => moveCase(item.id, event.target.value || undefined)}>
+                <select className="input compact-select" disabled={movingCaseId === item.id} value={item.groupId || ''} onChange={(event) => moveCase(item.id, event.target.value || undefined)}>
                   <option value="">未分组</option>
                   {groups.map((group) => (
                     <option key={group.id} value={group.id}>{groupPath(groups, group.id)}</option>
                   ))}
                 </select>
-                <Link href={`/test-cases/${item.id}`}><PlayCircle size={18} /></Link>
+                {movingCaseId === item.id ? <Loader2 className="spin" size={16} /> : <Link href={`/test-cases/${item.id}`}><PlayCircle size={18} /></Link>}
               </div>
             ))
           ) : (
@@ -161,8 +174,9 @@ export function DashboardWorkspace({ testCases, groups }: { testCases: TestCaseR
               分组名称
               <input autoFocus className="input" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
             </label>
-            <button className="button full-width" onClick={() => createGroup(selectedGroupId)} type="button">
-              创建
+            <button className="button full-width" disabled={creatingGroup} onClick={() => createGroup(selectedGroupId)} type="button">
+              {creatingGroup ? <Loader2 className="spin" size={16} /> : null}
+              {creatingGroup ? '创建中' : '创建'}
             </button>
           </section>
         </div>

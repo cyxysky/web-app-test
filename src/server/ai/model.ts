@@ -20,6 +20,12 @@ const openrouter = createOpenRouter({
 });
 
 export function getModel() {
+  // z-ai/glm-5.1
+  // qwen/qwen3.6-plus
+  // deepseek/deepseek-v4-pro
+  // qwen/qwen3.7-max
+  // moonshotai/kimi-k2.6
+  // xiaomi/mimo-v2.5
   return openrouter.chat("qwen/qwen3.6-plus")
   return deepseek("deepseek-v4-flash");
 }

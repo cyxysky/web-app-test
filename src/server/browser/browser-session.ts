@@ -1,3 +1,4 @@
+import { fsync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Browser, Page } from 'playwright';
@@ -99,15 +100,32 @@ export class BrowserSession {
   private consoleErrors: string[] = [];
   private networkErrors: string[] = [];
   private lastScreenshotMetrics?: ScreenshotMetrics;
+  private lastClickPoint?: { x: number; y: number };
+  private repeatClickCount = 0;
 
   async start() {
     const { chromium } = await import('playwright');
+    // Run the browser maximized / full screen and let the page viewport follow the real window size
+    // (viewport: null) instead of forcing a fixed width. Coordinate mapping is ratio-based, so it
+    // still works at any resolution. In headless mode there is no window manager, so we fall back to a
+    // large explicit window size (configurable via BROWSER_WINDOW_WIDTH/HEIGHT).
+    const headless = process.env.HEADLESS_BROWSER === 'true';
+    const windowWidth = Number(process.env.BROWSER_WINDOW_WIDTH || 1920);
+    const windowHeight = Number(process.env.BROWSER_WINDOW_HEIGHT || 1080);
     this.browser = await chromium.launch({
-      headless: process.env.HEADLESS_BROWSER === 'true',
+      headless,
       slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
-      args: ['--start-maximized'],
+      args: [
+        '--start-maximized',
+        '--force-device-scale-factor=1',
+        '--high-dpi-support=1',
+        ...(headless ? [`--window-size=${windowWidth},${windowHeight}`] : []),
+      ],
     });
-    const context = await this.browser.newContext({ viewport: process.env.HEADLESS_BROWSER === 'true' ? { width: 1440, height: 960 } : null });
+    const context = await this.browser.newContext({
+      // null viewport => use the actual (maximized) browser window size for the page.
+      viewport: null,
+    });
     context.on('page', (page) => {
       this.page = page;
       this.attachPageListeners(page);
@@ -141,6 +159,8 @@ export class BrowserSession {
   }
 
   async open(url: string): Promise<BrowserActionResult> {
+    this.lastClickPoint = undefined;
+    this.repeatClickCount = 0;
     await this.activePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     const note = await this.waitAfterAction();
     return { ok: true, actual: `Opened page: ${url}${note}` };
@@ -188,7 +208,13 @@ export class BrowserSession {
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
+    const gridEnabled = process.env.SCREENSHOT_COORDINATE_GRID !== 'false';
+    if (gridEnabled) await this.drawCoordinateGrid();
+    try {
+      await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
+    } finally {
+      if (gridEnabled) await this.removeCoordinateGrid();
+    }
     const [image, viewportMetrics] = await Promise.all([
       this.readPngSize(filePath),
       this.getViewportMetrics(),
@@ -209,7 +235,8 @@ export class BrowserSession {
   }
 
   async clickAt(x: number, y: number): Promise<BrowserActionResult> {
-    const point = await this.screenshotPointToViewport(x, y);
+    const point = await this.resolveClickPoint(x, y);
+    const repeatNote = this.noteRepeatClick(point.x, point.y);
     const targetNote = await this.inspectViewportPoint(point.x, point.y);
     const context = this.activePage.context();
     const beforePages = context.pages().length;
@@ -227,27 +254,29 @@ export class BrowserSession {
     }
     const note = await this.waitAfterAction();
     await this.showClickMarker(point.x, point.y, 'click');
-    return { ok: true, actual: `Clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${targetNote}${note}` };
+    return { ok: true, actual: `Clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${repeatNote}${targetNote}${note}` };
   }
 
   async doubleClickAt(x: number, y: number): Promise<BrowserActionResult> {
-    const point = await this.screenshotPointToViewport(x, y);
+    const point = await this.resolveClickPoint(x, y);
+    const repeatNote = this.noteRepeatClick(point.x, point.y);
     const targetNote = await this.inspectViewportPoint(point.x, point.y);
     await this.activePage.mouse.dblclick(point.x, point.y);
     await this.showClickMarker(point.x, point.y, 'double');
     const note = await this.waitAfterAction();
     await this.showClickMarker(point.x, point.y, 'double');
-    return { ok: true, actual: `Double-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${targetNote}${note}` };
+    return { ok: true, actual: `Double-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${repeatNote}${targetNote}${note}` };
   }
 
   async rightClickAt(x: number, y: number): Promise<BrowserActionResult> {
-    const point = await this.screenshotPointToViewport(x, y);
+    const point = await this.resolveClickPoint(x, y);
+    const repeatNote = this.noteRepeatClick(point.x, point.y);
     const targetNote = await this.inspectViewportPoint(point.x, point.y);
     await this.activePage.mouse.click(point.x, point.y, { button: 'right' });
     await this.showClickMarker(point.x, point.y, 'right');
     const note = await this.waitAfterAction();
     await this.showClickMarker(point.x, point.y, 'right');
-    return { ok: true, actual: `Right-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${targetNote}${note}` };
+    return { ok: true, actual: `Right-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${repeatNote}${targetNote}${note}` };
   }
 
   async drag(startX: number, startY: number, endX: number, endY: number): Promise<BrowserActionResult> {
@@ -577,6 +606,85 @@ export class BrowserSession {
     };
   }
 
+  private async resolveClickPoint(x: number, y: number): Promise<ViewportPoint> {
+    const mapped = await this.screenshotPointToViewport(x, y);
+    // Snapping is opt-in (CLICK_SNAP_TO_TARGET=true). When enabled, it corrects small visual
+    // estimation errors by clicking the center of the clickable element under the mapped point.
+    if (process.env.CLICK_SNAP_TO_TARGET !== 'true') return mapped;
+    const refined = await this.refineClickPoint(mapped.x, mapped.y);
+    return { x: refined.x, y: refined.y, note: `${mapped.note || ''}${refined.note || ''}` };
+  }
+
+  private noteRepeatClick(x: number, y: number) {
+    const threshold = 6;
+    if (
+      this.lastClickPoint &&
+      Math.abs(this.lastClickPoint.x - x) <= threshold &&
+      Math.abs(this.lastClickPoint.y - y) <= threshold
+    ) {
+      this.repeatClickCount += 1;
+      this.lastClickPoint = { x, y };
+      return ` ❌ REPEATED CLICK ERROR (repeat #${this.repeatClickCount}): you clicked the SAME coordinate as last time and it already failed. STOP repeating it. In the next screenshot, read the red marker's grid position and the target's grid position, compute the difference, and MOVE your next click by at least 20-40px in the corrected direction (recheck Y from the left "y=" labels). Do NOT submit this coordinate again.`;
+    }
+    this.repeatClickCount = 0;
+    this.lastClickPoint = { x, y };
+    return '';
+  }
+
+  /**
+   * Opt-in click correction (CLICK_SNAP_TO_TARGET=true). Snaps the mapped point to the center of the
+   * clickable element it landed on. It only snaps when the recomputed center still hits the same
+   * element, so it never moves the click onto an unrelated element.
+   */
+  private async refineClickPoint(x: number, y: number): Promise<ViewportPoint> {
+    const refined = await this.activePage
+      .evaluate(({ px, py }) => {
+        function isClickable(node: Element | null): boolean {
+          if (!node || node.nodeType !== 1) return false;
+          const tag = node.tagName.toLowerCase();
+          if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary', 'option'].includes(tag)) return true;
+          const role = node.getAttribute('role');
+          if (role && ['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'tab', 'checkbox', 'radio', 'switch', 'option'].includes(role)) return true;
+          if (node.hasAttribute('onclick')) return true;
+          const tabindex = node.getAttribute('tabindex');
+          if (tabindex !== null && tabindex !== '-1') return true;
+          try {
+            if (window.getComputedStyle(node).cursor === 'pointer') return true;
+          } catch {
+            /* ignore */
+          }
+          return false;
+        }
+
+        const hit = document.elementFromPoint(px, py);
+        if (!hit) return { x: px, y: py, note: ' no element under mapped point; not snapped.' };
+
+        let target: Element | null = hit;
+        for (let depth = 0; depth < 6 && target; depth += 1) {
+          if (isClickable(target)) break;
+          target = target.parentElement;
+        }
+        if (!target || !isClickable(target)) {
+          return { x: px, y: py, note: ` mapped point on <${hit.tagName.toLowerCase()}>; no clickable ancestor, not snapped.` };
+        }
+
+        const rect = target.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return { x: px, y: py, note: '' };
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const atCenter = document.elementFromPoint(cx, cy);
+        const stillTarget = !!atCenter && (atCenter === target || target.contains(atCenter) || atCenter.contains(target));
+        if (!stillTarget) {
+          return { x: px, y: py, note: ` clickable <${target.tagName.toLowerCase()}> center is occluded; clicked original point.` };
+        }
+        return { x: cx, y: cy, note: ` snapped to <${target.tagName.toLowerCase()}> center.` };
+      }, { px: x, py: y })
+      .catch(() => ({ x, y, note: '' }));
+
+    const clamped = this.normalizePoint(refined.x, refined.y, await this.getViewportSize());
+    return { x: clamped.x, y: clamped.y, note: refined.note };
+  }
+
   private async inspectViewportPoint(x: number, y: number) {
     return this.activePage.evaluate(({ x: pointX, y: pointY }) => {
       const element = document.elementFromPoint(pointX, pointY);
@@ -877,6 +985,98 @@ export class BrowserSession {
       width: buffer.readUInt32BE(16),
       height: buffer.readUInt32BE(20),
     };
+  }
+
+  /**
+   * Overlay a labeled coordinate grid on the page so the screenshot sent to the model carries an
+   * explicit reference frame. Lines every `step` px; EVERY line is labeled right on it — x values on
+   * the bottom edge, y values on the left edge — so the model can read the target's x/y instead of
+   * guessing. This is the main aid for accurate clicks. Removed again right after the screenshot.
+   */
+  private async drawCoordinateGrid() {
+    const step = Math.max(10, Number(process.env.SCREENSHOT_GRID_STEP || 50));
+    await this.activePage.evaluate((step) => {
+      const existing = document.getElementById('__ai_coord_grid__');
+      if (existing) existing.remove();
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      const grid = document.createElement('div');
+      grid.id = '__ai_coord_grid__';
+      Object.assign(grid.style, {
+        position: 'fixed',
+        left: '0',
+        top: '0',
+        width: `${width}px`,
+        height: `${height}px`,
+        pointerEvents: 'none',
+        zIndex: '2147483646',
+        margin: '0',
+        padding: '0',
+      });
+
+      const lineColor = 'rgba(0, 122, 255, 0.28)';
+      // Compact labels so every gridline can carry its own value without too much clutter.
+      const xLabelCss =
+        'position:absolute;font:700 16px/16px Arial,sans-serif;color:#fff;background:rgba(0,90,200,0.82);padding:1px 2px;border-radius:2px;white-space:nowrap;transform:translateX(-50%);';
+      const yLabelCss =
+        'position:absolute;font:700 16px/16px Arial,sans-serif;color:#fff;background:rgba(180,60,0,0.82);padding:1px 2px;border-radius:2px;white-space:nowrap;transform:translateY(-50%);';
+
+      // Vertical lines = constant X. EVERY line gets an "x=" label sitting on the line (bottom edge).
+      for (let x = step; x < width; x += step) {
+        const line = document.createElement('div');
+        Object.assign(line.style, {
+          position: 'absolute',
+          left: `${x}px`,
+          top: '0',
+          width: '1px',
+          height: `${height}px`,
+          background: lineColor,
+        });
+        grid.appendChild(line);
+        const label = document.createElement('div');
+        label.textContent = `x=${x}`;
+        label.setAttribute('style', `${xLabelCss}left:${x}px;bottom:1px;`);
+        grid.appendChild(label);
+      }
+
+      // Horizontal lines = constant Y. EVERY line gets a "y=" label sitting on the line (left edge).
+      for (let y = step; y < height; y += step) {
+        const line = document.createElement('div');
+        Object.assign(line.style, {
+          position: 'absolute',
+          left: '0',
+          top: `${y}px`,
+          width: `${width}px`,
+          height: '1px',
+          background: lineColor,
+        });
+        grid.appendChild(line);
+        const label = document.createElement('div');
+        label.textContent = `y=${y}`;
+        label.setAttribute('style', `${yLabelCss}left:1px;top:${y}px;`);
+        grid.appendChild(label);
+      }
+
+      // Single origin/legend marker at the top-left corner explaining the axes direction.
+      const legend = document.createElement('div');
+      legend.textContent = '0,0  x→  y↓';
+      legend.setAttribute(
+        'style',
+        'position:absolute;left:1px;top:1px;font:700 10px/10px Arial,sans-serif;color:#fff;background:rgba(200,0,0,0.85);padding:1px 2px;border-radius:2px;white-space:nowrap;',
+      );
+      grid.appendChild(legend);
+
+      document.documentElement.appendChild(grid);
+    }, step).catch(() => undefined);
+  }
+
+  private async removeCoordinateGrid() {
+    await this.activePage
+      .evaluate(() => {
+        const grid = document.getElementById('__ai_coord_grid__');
+        if (grid) grid.remove();
+      })
+      .catch(() => undefined);
   }
 
   private async showClickMarker(x: number, y: number, kind: string) {

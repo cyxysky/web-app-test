@@ -47,6 +47,8 @@ export type StepExecutionResult = {
   actual: string;
   status: 'queued' | 'running' | 'passed' | 'failed' | 'blocked';
   tools?: StepToolCall[];
+  /** The model's own short "what I did / what's next" note for this step, carried into later context. */
+  note?: string;
   screenshotPath?: string;
   beforeScreenshotPath?: string;
   afterScreenshotPath?: string;
