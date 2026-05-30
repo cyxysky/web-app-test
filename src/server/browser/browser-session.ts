@@ -55,12 +55,6 @@ type ViewportMetrics = {
   };
 };
 
-type ViewportPoint = {
-  x: number;
-  y: number;
-  note?: string;
-};
-
 type ScreenshotMetrics = {
   path: string;
   image: { width: number; height: number };
@@ -70,9 +64,34 @@ type ScreenshotMetrics = {
   scale: 'css';
 };
 
+type InteractiveCandidate = {
+  id: string;
+  path: string;
+  tag: string;
+  role?: string;
+  type?: string;
+  name?: string;
+  text?: string;
+  nearbyText?: string;
+  href?: string;
+  host?: string;
+  placeholder?: string;
+  ariaLabel?: string;
+  title?: string;
+  rect: { x: number; y: number; width: number; height: number };
+  center: { x: number; y: number };
+  clickable: boolean;
+  input: boolean;
+  disabled: boolean;
+};
+
 type ManualVerificationDetails = {
   detected: boolean;
   evidence?: string;
+  /** Visible captcha/OTP-like inputs on the page. */
+  captchaFields?: Array<{ label: string; valueLength: number; filled: boolean }>;
+  /** True when any captcha-like input already has user-entered content. */
+  captchaAppearsFilled?: boolean;
 };
 
 const manualVerificationUrlPattern = /captcha|security-check|safecheck|abnormal|robot|challenge/i;
@@ -100,8 +119,7 @@ export class BrowserSession {
   private consoleErrors: string[] = [];
   private networkErrors: string[] = [];
   private lastScreenshotMetrics?: ScreenshotMetrics;
-  private lastClickPoint?: { x: number; y: number };
-  private repeatClickCount = 0;
+  private lastInteractiveCandidates: InteractiveCandidate[] = [];
 
   async start() {
     const { chromium } = await import('playwright');
@@ -119,6 +137,27 @@ export class BrowserSession {
     const context = await this.browser.newContext({
       viewport: { width: viewportWidth, height: viewportHeight },
       deviceScaleFactor: 1,
+    });
+    await context.addInitScript(() => {
+      const originalAddEventListener = EventTarget.prototype.addEventListener;
+      const listenerTypes = new WeakMap<EventTarget, Set<string>>();
+      const interestingEvents = /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/i;
+      Object.defineProperty(window, '__aiGetEventListenerTypes', {
+        value(target: EventTarget) {
+          return Array.from(listenerTypes.get(target) || []);
+        },
+      });
+      EventTarget.prototype.addEventListener = function addEventListener(type, listener, options) {
+        if (this instanceof Element && interestingEvents.test(String(type))) {
+          let types = listenerTypes.get(this);
+          if (!types) {
+            types = new Set<string>();
+            listenerTypes.set(this, types);
+          }
+          types.add(String(type));
+        }
+        return originalAddEventListener.call(this, type, listener, options);
+      };
     });
     context.on('page', (page) => {
       this.page = page;
@@ -153,8 +192,6 @@ export class BrowserSession {
   }
 
   async open(url: string): Promise<BrowserActionResult> {
-    this.lastClickPoint = undefined;
-    this.repeatClickCount = 0;
     await this.activePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     const note = await this.waitAfterAction();
     return { ok: true, actual: `Opened page: ${url}${note}` };
@@ -166,17 +203,18 @@ export class BrowserSession {
 
   async getPageContext(options: { includeDomTree?: boolean; includeText?: boolean; includeManualVerification?: boolean } = {}) {
     const includeText = options.includeText !== false || options.includeManualVerification !== false;
-    const [title, text, viewportMetrics, focusedElement, domTree] = await Promise.all([
+    const [title, text, viewportMetrics, focusedElement, domTree, interactiveCandidates] = await Promise.all([
       this.activePage.title().catch(() => ''),
       includeText ? this.readPageText() : Promise.resolve(''),
       this.getViewportMetrics(),
       this.getFocusedElement(),
       options.includeDomTree ? this.readSimplifiedDomTree().catch((error) => `Unable to read DOM tree: ${error instanceof Error ? error.message : String(error)}`) : Promise.resolve(undefined),
+      this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
     ]);
 
     const manualVerification = options.includeManualVerification === false
       ? { detected: false }
-      : this.detectManualVerificationDetails(title, this.activePage.url(), text);
+      : await this.detectManualVerificationContext(title, this.activePage.url(), text);
 
     return {
       url: this.activePage.url(),
@@ -192,9 +230,62 @@ export class BrowserSession {
       })),
       focusedElement,
       domTree,
+      interactiveCandidates,
       manualVerification,
-      isManualVerification: manualVerification.detected,
+      isManualVerification: manualVerification.detected && !manualVerification.captchaAppearsFilled,
     };
+  }
+
+  private async detectManualVerificationContext(title: string, url: string, text: string): Promise<ManualVerificationDetails> {
+    const base = this.detectManualVerificationDetails(title, url, text);
+    const captchaFields = await this.scanCaptchaInputFields();
+    const captchaAppearsFilled = captchaFields.some((field) => field.filled);
+    return { ...base, captchaFields, captchaAppearsFilled };
+  }
+
+  private async scanCaptchaInputFields() {
+    return this.activePage.evaluate(() => {
+      function isVisible(element: Element) {
+        const style = window.getComputedStyle(element);
+        if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      }
+
+      function isCaptchaLikeInput(element: Element) {
+        if (element.tagName.toLowerCase() !== 'input' && element.tagName.toLowerCase() !== 'textarea') return false;
+        const input = element as HTMLInputElement;
+        const hint = [
+          input.placeholder,
+          input.name,
+          input.id,
+          input.getAttribute('aria-label'),
+          input.getAttribute('autocomplete'),
+          input.labels?.length ? Array.from(input.labels).map((l) => l.textContent).join(' ') : '',
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        if (/验证码|captcha|verify\s*code|verification\s*code|otp|sms\s*code|动态码|校验码|图形验证/.test(hint)) return true;
+        if ((input.type === 'tel' || input.type === 'text' || input.type === 'number') && /code|verify|验证/.test(hint)) return true;
+        return false;
+      }
+
+      const fields: Array<{ label: string; valueLength: number; filled: boolean }> = [];
+      for (const element of Array.from(document.querySelectorAll('input, textarea'))) {
+        if (!isVisible(element) || !isCaptchaLikeInput(element)) continue;
+        const input = element as HTMLInputElement;
+        const valueLength = (input.value || '').trim().length;
+        const label =
+          input.placeholder ||
+          input.getAttribute('aria-label') ||
+          input.name ||
+          input.id ||
+          'captcha-input';
+        fields.push({ label: label.slice(0, 80), valueLength, filled: valueLength > 0 });
+      }
+      return fields;
+    }).catch(() => [] as Array<{ label: string; valueLength: number; filled: boolean }>);
   }
 
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' = 'after') {
@@ -202,15 +293,15 @@ export class BrowserSession {
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    // The coordinate grid only makes sense for coordinate-based clicking. When isClick=false the model
-    // uses DOM-node tools, so the grid must not be drawn on the screenshot.
-    const coordinateClickMode = (process.env.isClick ?? process.env.IS_CLICK ?? 'true').toLowerCase() !== 'false';
-    const gridEnabled = coordinateClickMode && process.env.SCREENSHOT_COORDINATE_GRID !== 'false';
-    if (gridEnabled) await this.drawCoordinateGrid();
+    const candidateLabelsEnabled = phase === 'before' && process.env.SCREENSHOT_ELEMENT_LABELS !== 'false';
+    const candidates = candidateLabelsEnabled
+      ? await this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[])
+      : [];
+    if (candidateLabelsEnabled) await this.drawCandidateOverlay(candidates);
     try {
       await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
     } finally {
-      if (gridEnabled) await this.removeCoordinateGrid();
+      if (candidateLabelsEnabled) await this.removeCandidateOverlay();
     }
     const [image, viewportMetrics] = await Promise.all([
       this.readPngSize(filePath),
@@ -231,15 +322,26 @@ export class BrowserSession {
     return this.lastScreenshotMetrics;
   }
 
-  async clickAt(x: number, y: number): Promise<BrowserActionResult> {
-    const point = await this.resolveClickPoint(x, y);
-    const repeatNote = this.noteRepeatClick(point.x, point.y);
-    const targetNote = await this.inspectViewportPoint(point.x, point.y);
+  async getInteractiveCandidates(): Promise<BrowserActionResult> {
+    const candidates = await this.refreshInteractiveCandidates();
+    return { ok: true, actual: JSON.stringify(candidates, null, 2) };
+  }
+
+  async getSimplifiedDomTree(): Promise<BrowserActionResult> {
+    return { ok: true, actual: await this.readSimplifiedDomTree() };
+  }
+
+  async clickCandidate(candidateId: string): Promise<BrowserActionResult> {
+    const resolved = await this.resolveCandidateTarget(candidateId);
+    if (!resolved.target) return { ok: false, actual: resolved.error };
+
+    const { candidate, target } = resolved;
     const context = this.activePage.context();
     const beforePages = context.pages().length;
+    const beforeUrl = this.activePage.url();
     const popup = this.activePage.waitForEvent('popup', { timeout: 3000 }).catch(() => undefined);
-    await this.activePage.mouse.click(point.x, point.y);
-    await this.showClickMarker(point.x, point.y, 'click');
+    await this.activePage.mouse.click(target.x, target.y);
+    await this.showClickMarker(target.x, target.y, 'click');
     const newPage = await popup;
     if (newPage) {
       this.page = newPage;
@@ -249,48 +351,89 @@ export class BrowserSession {
       this.page = context.pages().at(-1);
       await this.page?.bringToFront();
     }
-    const note = await this.waitAfterAction();
-    await this.showClickMarker(point.x, point.y, 'click');
-    return { ok: true, actual: `Clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${repeatNote}${targetNote}${note}` };
+    let note = await this.waitAfterAction();
+    let fallbackNote = '';
+    if (candidate.href && this.activePage.url() === beforeUrl && !newPage) {
+      const fallback = await this.dispatchDomPathClick(candidate.path);
+      if (fallback) {
+        fallbackNote += ` Primary mouse click did not navigate; retried ${fallback} with DOM click.`;
+        note += await this.waitAfterAction();
+      }
+      if (this.activePage.url() === beforeUrl && /^https?:\/\//i.test(candidate.href)) {
+        await this.activePage.goto(candidate.href, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
+        fallbackNote += ' Link href was opened directly as a final fallback.';
+        note += await this.waitAfterAction();
+      }
+    }
+    await this.showClickMarker(target.x, target.y, 'click');
+    return {
+      ok: true,
+      actual: `Clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${note}`,
+    };
   }
 
-  async doubleClickAt(x: number, y: number): Promise<BrowserActionResult> {
-    const point = await this.resolveClickPoint(x, y);
-    const repeatNote = this.noteRepeatClick(point.x, point.y);
-    const targetNote = await this.inspectViewportPoint(point.x, point.y);
-    await this.activePage.mouse.dblclick(point.x, point.y);
-    await this.showClickMarker(point.x, point.y, 'double');
+  async doubleClickCandidate(candidateId: string): Promise<BrowserActionResult> {
+    const resolved = await this.resolveCandidateTarget(candidateId);
+    if (!resolved.target) return { ok: false, actual: resolved.error };
+
+    const { candidate, target } = resolved;
+    await this.activePage.mouse.dblclick(target.x, target.y);
+    await this.showClickMarker(target.x, target.y, 'double');
     const note = await this.waitAfterAction();
-    await this.showClickMarker(point.x, point.y, 'double');
-    return { ok: true, actual: `Double-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${repeatNote}${targetNote}${note}` };
+    await this.showClickMarker(target.x, target.y, 'double');
+    return {
+      ok: true,
+      actual: `Double-clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before double-clicking.' : ''}${note}`,
+    };
   }
 
-  async rightClickAt(x: number, y: number): Promise<BrowserActionResult> {
-    const point = await this.resolveClickPoint(x, y);
-    const repeatNote = this.noteRepeatClick(point.x, point.y);
-    const targetNote = await this.inspectViewportPoint(point.x, point.y);
-    await this.activePage.mouse.click(point.x, point.y, { button: 'right' });
-    await this.showClickMarker(point.x, point.y, 'right');
+  async rightClickCandidate(candidateId: string): Promise<BrowserActionResult> {
+    const resolved = await this.resolveCandidateTarget(candidateId);
+    if (!resolved.target) return { ok: false, actual: resolved.error };
+
+    const { candidate, target } = resolved;
+    await this.activePage.mouse.click(target.x, target.y, { button: 'right' });
+    await this.showClickMarker(target.x, target.y, 'right');
     const note = await this.waitAfterAction();
-    await this.showClickMarker(point.x, point.y, 'right');
-    return { ok: true, actual: `Right-clicked screenshot coordinate (${x}, ${y}) mapped to viewport coordinate (${point.x}, ${point.y}).${point.note || ''}${repeatNote}${targetNote}${note}` };
+    await this.showClickMarker(target.x, target.y, 'right');
+    return {
+      ok: true,
+      actual: `Right-clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before right-clicking.' : ''}${note}`,
+    };
   }
 
-  async drag(startX: number, startY: number, endX: number, endY: number): Promise<BrowserActionResult> {
-    const start = await this.screenshotPointToViewport(startX, startY);
-    const end = await this.screenshotPointToViewport(endX, endY);
-    await this.activePage.mouse.move(start.x, start.y);
+  async dragCandidate(fromCandidateId: string, toCandidateId: string): Promise<BrowserActionResult> {
+    const fromResolved = await this.resolveCandidateTarget(fromCandidateId);
+    if (!fromResolved.target) return { ok: false, actual: fromResolved.error };
+    const toResolved = await this.resolveCandidateTarget(toCandidateId);
+    if (!toResolved.target) return { ok: false, actual: toResolved.error };
+
+    const { candidate: fromCandidate, target: fromTarget } = fromResolved;
+    const { candidate: toCandidate, target: toTarget } = toResolved;
+    await this.activePage.mouse.move(fromTarget.x, fromTarget.y);
     await this.activePage.mouse.down();
-    await this.activePage.mouse.move(end.x, end.y, { steps: 12 });
+    await this.activePage.mouse.move(toTarget.x, toTarget.y, { steps: 12 });
     await this.activePage.mouse.up();
-    await this.showClickMarker(end.x, end.y, 'drag');
+    await this.showClickMarker(toTarget.x, toTarget.y, 'drag');
     const note = await this.waitAfterAction();
-    await this.showClickMarker(end.x, end.y, 'drag');
-    return { ok: true, actual: `Dragged screenshot coordinates (${startX}, ${startY}) -> (${endX}, ${endY}), mapped to viewport (${start.x}, ${start.y}) -> (${end.x}, ${end.y}).${note}` };
+    await this.showClickMarker(toTarget.x, toTarget.y, 'drag');
+    return {
+      ok: true,
+      actual: `Dragged candidate ${fromCandidate.id} (${this.describeCandidate(fromCandidate)}) to candidate ${toCandidate.id} (${this.describeCandidate(toCandidate)}).${fromTarget.offscreen || toTarget.offscreen ? ' One or both candidates were scrolled/clamped before dragging.' : ''}${note}`,
+    };
   }
 
-  async getSimplifiedDomTree(): Promise<BrowserActionResult> {
-    return { ok: true, actual: await this.readSimplifiedDomTree() };
+  async focusCandidate(candidateId: string): Promise<BrowserActionResult> {
+    const resolved = await this.resolveCandidateTarget(candidateId);
+    if (!resolved.target) return { ok: false, actual: resolved.error };
+
+    const { candidate, target } = resolved;
+    await this.activePage.mouse.click(target.x, target.y);
+    const note = await this.waitAfterAction();
+    return {
+      ok: true,
+      actual: `Focused candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before focusing.' : ''}${note}`,
+    };
   }
 
   async clickDomNode(path: string): Promise<BrowserActionResult> {
@@ -306,7 +449,7 @@ export class BrowserSession {
     await this.showClickMarker(target.x, target.y, 'click');
     const note = await this.waitAfterAction();
     await this.showClickMarker(target.x, target.y, 'click');
-    return { ok: true, actual: `Clicked DOM node ${path} (${target.descriptor}) at viewport coordinate (${target.x}, ${target.y}).${offscreenNote}${note}` };
+    return { ok: true, actual: `Clicked DOM node ${path} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${offscreenNote}${note}` };
   }
 
   async focusDomNode(path: string): Promise<BrowserActionResult> {
@@ -320,15 +463,15 @@ export class BrowserSession {
     const offscreenNote = target.offscreen ? ' Note: the node center was outside the viewport and was clamped; scroll it into view first for a reliable focus.' : '';
     await this.activePage.mouse.click(target.x, target.y);
     const note = await this.waitAfterAction();
-    return { ok: true, actual: `Focused DOM node ${path} (${target.descriptor}) at viewport coordinate (${target.x}, ${target.y}).${offscreenNote}${note}` };
+    return { ok: true, actual: `Focused DOM node ${path} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${offscreenNote}${note}` };
   }
 
-  async scroll(deltaY: number, deltaX = 0, target: { screenshotX?: number; screenshotY?: number; domPath?: string } = {}): Promise<BrowserActionResult> {
+  async scroll(deltaY: number, deltaX = 0, target: { domPath?: string } = {}): Promise<BrowserActionResult> {
     const scrollTarget = await this.resolveScrollTarget(target);
     await this.activePage.mouse.move(scrollTarget.x, scrollTarget.y);
     await this.activePage.mouse.wheel(deltaX, deltaY);
     const note = await this.waitAfterAction();
-    return { ok: true, actual: `Scrolled ${scrollTarget.descriptor} at viewport coordinate (${scrollTarget.x}, ${scrollTarget.y}) by x=${deltaX}, y=${deltaY}.${scrollTarget.note}${note}` };
+    return { ok: true, actual: `Scrolled ${scrollTarget.descriptor} at browser point (${scrollTarget.x}, ${scrollTarget.y}) by x=${deltaX}, y=${deltaY}.${scrollTarget.note}${note}` };
   }
 
   async listTabs(): Promise<BrowserActionResult> {
@@ -553,161 +696,368 @@ export class BrowserSession {
     })).catch(() => ({ ...fallback, devicePixelRatio: 1 }));
   }
 
-  private async screenshotPointToViewport(x: number, y: number): Promise<ViewportPoint> {
-    const metrics = this.lastScreenshotMetrics;
-    const currentMetrics = await this.getViewportMetrics();
-    const currentViewport = { width: currentMetrics.width, height: currentMetrics.height };
+  private async refreshInteractiveCandidates() {
+    const limit = Math.max(10, Number(process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
+    const candidates = await this.activePage.evaluate(({ limit: candidateLimit }) => {
+      type Candidate = {
+        id: string;
+        path: string;
+        tag: string;
+        role?: string;
+        type?: string;
+        name?: string;
+        text?: string;
+        nearbyText?: string;
+        href?: string;
+        host?: string;
+        placeholder?: string;
+        ariaLabel?: string;
+        title?: string;
+        rect: { x: number; y: number; width: number; height: number };
+        center: { x: number; y: number };
+        clickable: boolean;
+        input: boolean;
+        disabled: boolean;
+      };
 
-    // When the grid uses a CENTER origin, the model reports coordinates relative to the image center
-    // with y pointing UP. Convert those back to raw top-left image pixels before the ratio mapping.
-    let imgX = x;
-    let imgY = y;
-    let originNote = '';
-    if ((process.env.SCREENSHOT_GRID_ORIGIN || 'bottom').toLowerCase() === 'center') {
-      const baseW = (metrics && metrics.image.width > 0 ? metrics.image.width : currentViewport.width);
-      const baseH = (metrics && metrics.image.height > 0 ? metrics.image.height : currentViewport.height);
-      imgX = baseW / 2 + x;
-      imgY = baseH / 2 - y;
-      originNote = ` Center-origin input (${x}, ${y}) mapped to image pixel (${imgX.toFixed(1)}, ${imgY.toFixed(1)}).`;
-    }
+      type WindowWithAiListeners = Window & {
+        __aiGetEventListenerTypes?: (target: EventTarget) => string[];
+      };
 
-    if (!metrics || metrics.image.width <= 0 || metrics.image.height <= 0) {
-      const point = this.normalizePoint(imgX, imgY, currentViewport);
-      return { ...point, note: ` No screenshot metrics were available; coordinate was treated as viewport CSS pixels.${originNote}` };
-    }
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      const interactiveRoles = new Set([
+        'button',
+        'link',
+        'menuitem',
+        'menuitemcheckbox',
+        'menuitemradio',
+        'tab',
+        'checkbox',
+        'radio',
+        'switch',
+        'option',
+        'searchbox',
+        'combobox',
+        'textbox',
+        'listbox',
+      ]);
 
-    // The screenshot is captured with scale:'css', so 1 image pixel maps to 1 CSS pixel of the
-    // layout viewport. Mouse coordinates are also layout/CSS pixels. The most accurate mapping is a
-    // direct ratio between the current layout viewport and the captured image dimensions. We only
-    // route through the visual viewport when the page is actually pinch-zoomed (scale != 1).
-    const visual = currentMetrics.visualViewport;
-    const zoomed = !!visual && Math.abs((visual.scale || 1) - 1) > 0.01;
+      function isOverlay(element: Element) {
+        return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__'));
+      }
 
-    let mappedX: number;
-    let mappedY: number;
-    let basis: string;
-    if (zoomed && visual) {
-      const scaleX = visual.width / metrics.image.width;
-      const scaleY = visual.height / metrics.image.height;
-      mappedX = visual.offsetLeft + imgX * scaleX;
-      mappedY = visual.offsetTop + imgY * scaleY;
-      basis = `visual viewport ${Math.round(visual.width)}x${Math.round(visual.height)} scale=${visual.scale} offset=${Math.round(visual.offsetLeft)},${Math.round(visual.offsetTop)}`;
-    } else {
-      const scaleX = currentViewport.width / metrics.image.width;
-      const scaleY = currentViewport.height / metrics.image.height;
-      mappedX = imgX * scaleX;
-      mappedY = imgY * scaleY;
-      basis = `layout viewport ${currentViewport.width}x${currentViewport.height}, scaleX=${scaleX.toFixed(4)}, scaleY=${scaleY.toFixed(4)}`;
-    }
+      function isRenderable(element: Element) {
+        if (!element || element.nodeType !== 1 || isOverlay(element)) return false;
+        const tag = element.tagName.toLowerCase();
+        if (skippedTags.has(tag)) return false;
+        if (element.hasAttribute('hidden')) return false;
+        if (element.getAttribute('aria-hidden') === 'true') return false;
+        const style = window.getComputedStyle(element);
+        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (Number(style.opacity || '1') <= 0.01) return false;
+        return true;
+      }
 
-    const point = this.normalizePoint(mappedX, mappedY, currentViewport);
-    const note = [
-      ` Coordinate mapping used screenshot=${metrics.image.width}x${metrics.image.height}`,
-      `mappedTo=${basis}`,
-      `scale=${metrics.scale}`,
-      `dpr=${metrics.devicePixelRatio}`,
-    ].join(', ') + '.' + originNote;
-    return { ...point, note };
-  }
+      function visibleRectOf(element: Element) {
+        if (!isRenderable(element)) return undefined;
+        const rect = element.getBoundingClientRect();
+        const left = Math.max(rect.left, 0);
+        const top = Math.max(rect.top, 0);
+        const right = Math.min(rect.right, window.innerWidth);
+        const bottom = Math.min(rect.bottom, window.innerHeight);
+        const width = right - left;
+        const height = bottom - top;
+        if (width <= 2 || height <= 2) return undefined;
+        return { left, top, right, bottom, width, height, raw: rect };
+      }
 
-  private normalizePoint(x: number, y: number, viewport: { width: number; height: number }): ViewportPoint {
-    return {
-      x: Math.min(Math.max(Number(x.toFixed(2)), 0), viewport.width - 1),
-      y: Math.min(Math.max(Number(y.toFixed(2)), 0), viewport.height - 1),
-    };
-  }
+      function isVisibleInViewport(element: Element) {
+        return Boolean(visibleRectOf(element));
+      }
 
-  private async resolveClickPoint(x: number, y: number): Promise<ViewportPoint> {
-    const mapped = await this.screenshotPointToViewport(x, y);
-    // Snapping is opt-in (CLICK_SNAP_TO_TARGET=true). When enabled, it corrects small visual
-    // estimation errors by clicking the center of the clickable element under the mapped point.
-    if (process.env.CLICK_SNAP_TO_TARGET !== 'true') return mapped;
-    const refined = await this.refineClickPoint(mapped.x, mapped.y);
-    return { x: refined.x, y: refined.y, note: `${mapped.note || ''}${refined.note || ''}` };
-  }
+      function children(element: Element) {
+        return Array.from(element.children).filter(isVisibleInViewport);
+      }
 
-  private noteRepeatClick(x: number, y: number) {
-    const threshold = 6;
-    if (
-      this.lastClickPoint &&
-      Math.abs(this.lastClickPoint.x - x) <= threshold &&
-      Math.abs(this.lastClickPoint.y - y) <= threshold
-    ) {
-      this.repeatClickCount += 1;
-      this.lastClickPoint = { x, y };
-      return ` ❌ REPEATED CLICK ERROR (repeat #${this.repeatClickCount}): you clicked the SAME coordinate as last time and it already failed. STOP repeating it. In the next screenshot, read the red marker's grid position and the target's grid position, compute the difference, and MOVE your next click by at least 20-40px in the corrected direction (recheck Y from the left "y=" labels). Do NOT submit this coordinate again.`;
-    }
-    this.repeatClickCount = 0;
-    this.lastClickPoint = { x, y };
-    return '';
-  }
+      function ownText(element: Element) {
+        let text = '';
+        for (const node of Array.from(element.childNodes)) {
+          if (node.nodeType === 3) text += node.textContent || '';
+        }
+        text = text.replace(/\s+/g, ' ').trim();
+        const inner = ((element as HTMLElement).innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+        return (text || inner).slice(0, 140);
+      }
 
-  /**
-   * Opt-in click correction (CLICK_SNAP_TO_TARGET=true). Snaps the mapped point to the center of the
-   * clickable element it landed on. It only snaps when the recomputed center still hits the same
-   * element, so it never moves the click onto an unrelated element.
-   */
-  private async refineClickPoint(x: number, y: number): Promise<ViewportPoint> {
-    const refined = await this.activePage
-      .evaluate(({ px, py }) => {
-        function isClickable(node: Element | null): boolean {
-          if (!node || node.nodeType !== 1) return false;
-          const tag = node.tagName.toLowerCase();
-          if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary', 'option'].includes(tag)) return true;
-          const role = node.getAttribute('role');
-          if (role && ['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'tab', 'checkbox', 'radio', 'switch', 'option'].includes(role)) return true;
-          if (node.hasAttribute('onclick')) return true;
-          const tabindex = node.getAttribute('tabindex');
-          if (tabindex !== null && tabindex !== '-1') return true;
-          try {
-            if (window.getComputedStyle(node).cursor === 'pointer') return true;
-          } catch {
-            /* ignore */
-          }
+      function contextText(element: Element) {
+        const container = element.closest('li, article, tr, form, [role="listitem"], [role="row"], section, main') || element.parentElement || element;
+        const text = ((container as HTMLElement).innerText || container.textContent || '').replace(/\s+/g, ' ').trim();
+        return text.slice(0, 220);
+      }
+
+      function recordedEventTypes(element: Element) {
+        try {
+          return ((window as WindowWithAiListeners).__aiGetEventListenerTypes?.(element) || []).map((item) => item.toLowerCase());
+        } catch {
+          return [];
+        }
+      }
+
+      function hasRecordedClickListener(element: Element) {
+        return recordedEventTypes(element).some((type) => /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/.test(type));
+      }
+
+      function hasActionAttribute(element: Element) {
+        if (element.hasAttribute('jsaction')) return true;
+        for (const attr of Array.from(element.attributes)) {
+          if (/^(data-.+?(click|action|href|url|target)|ng-click|@click|v-on:click)$/i.test(attr.name) && attr.value !== 'false') return true;
+        }
+        return false;
+      }
+
+      function hasClickableStyle(element: Element) {
+        try {
+          const style = window.getComputedStyle(element);
+          if (style.cursor === 'pointer') return true;
+          const borderWidth =
+            Number.parseFloat(style.borderTopWidth || '0') +
+            Number.parseFloat(style.borderRightWidth || '0') +
+            Number.parseFloat(style.borderBottomWidth || '0') +
+            Number.parseFloat(style.borderLeftWidth || '0');
+          const radius = Number.parseFloat(style.borderTopLeftRadius || '0') + Number.parseFloat(style.borderTopRightRadius || '0');
+          const background = style.backgroundColor || '';
+          const hasBackground = background && !/^rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,?\s*0?\s*\)$/i.test(background) && background !== 'transparent';
+          return borderWidth > 0 || radius > 6 || hasBackground;
+        } catch {
           return false;
         }
+      }
 
-        const hit = document.elementFromPoint(px, py);
-        if (!hit) return { x: px, y: py, note: ' no element under mapped point; not snapped.' };
+      function looksLikeClickableSurface(element: Element) {
+        const tag = element.tagName.toLowerCase();
+        if (!['div', 'span', 'li', 'article', 'section', 'p'].includes(tag)) return false;
+        const rect = visibleRectOf(element);
+        if (!rect) return false;
+        if (rect.width < 24 || rect.height < 16 || rect.width > 560 || rect.height > 140) return false;
+        const label = nameOf(element) || ownText(element);
+        if (!label || label.length > 220) return false;
+        if (!hasClickableStyle(element) && !hasActionAttribute(element)) return false;
+        return true;
+      }
 
-        let target: Element | null = hit;
-        for (let depth = 0; depth < 6 && target; depth += 1) {
-          if (isClickable(target)) break;
-          target = target.parentElement;
+      function clickableReason(element: Element) {
+        const tag = element.tagName.toLowerCase();
+        if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary', 'option'].includes(tag)) return true;
+        const role = element.getAttribute('role');
+        if (role && interactiveRoles.has(role)) return true;
+        if (element.hasAttribute('onclick')) return true;
+        if (hasRecordedClickListener(element)) return true;
+        if (hasActionAttribute(element)) return true;
+        const tabindex = element.getAttribute('tabindex');
+        if (tabindex !== null && tabindex !== '-1') return true;
+        if ((element as HTMLElement).isContentEditable) return true;
+        try {
+          if (window.getComputedStyle(element).cursor === 'pointer') return true;
+        } catch {
+          /* ignore */
         }
-        if (!target || !isClickable(target)) {
-          return { x: px, y: py, note: ` mapped point on <${hit.tagName.toLowerCase()}>; no clickable ancestor, not snapped.` };
+        return looksLikeClickableSurface(element);
+      }
+
+      function hasClickableAncestor(element: Element) {
+        let current = element.parentElement;
+        for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
+          if (!isVisibleInViewport(current)) continue;
+          if (clickableReason(current)) return true;
+        }
+        return false;
+      }
+
+      function hasInteractiveDescendant(element: Element) {
+        const descendants = Array.from(element.querySelectorAll('a,button,input,select,textarea,label,summary,[role],[tabindex],[onclick],[jsaction]')).slice(0, 60);
+        return descendants.some((child) => child !== element && isVisibleInViewport(child) && clickableReason(child));
+      }
+
+      function nameOf(element: Element) {
+        const input = element as HTMLInputElement;
+        const labelText = input.labels?.length ? Array.from(input.labels).map((label) => label.textContent || '').join(' ') : '';
+        const imageAlt = Array.from(element.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ');
+        return [
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+          element.getAttribute('alt'),
+          imageAlt,
+          input.placeholder,
+          labelText,
+          ownText(element),
+          input.value,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 180);
+      }
+
+      function pointBelongsToElement(element: Element, x: number, y: number) {
+        const stack = document.elementsFromPoint(x, y).filter((item) => isRenderable(item) && !isOverlay(item));
+        const top = stack[0];
+        if (!top) return false;
+        return top === element || element.contains(top);
+      }
+
+      function visiblePointForElement(element: Element, rect: ReturnType<typeof visibleRectOf>) {
+        if (!rect) return undefined;
+        const insetX = Math.min(10, Math.max(1, rect.width / 4));
+        const insetY = Math.min(10, Math.max(1, rect.height / 4));
+        const samples = [
+          [rect.left + rect.width / 2, rect.top + rect.height / 2],
+          [rect.left + insetX, rect.top + rect.height / 2],
+          [rect.right - insetX, rect.top + rect.height / 2],
+          [rect.left + rect.width / 2, rect.top + insetY],
+          [rect.left + rect.width / 2, rect.bottom - insetY],
+          [rect.left + insetX, rect.top + insetY],
+          [rect.right - insetX, rect.top + insetY],
+          [rect.left + insetX, rect.bottom - insetY],
+          [rect.right - insetX, rect.bottom - insetY],
+        ];
+        for (const [x, y] of samples) {
+          const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
+          const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
+          if (pointBelongsToElement(element, px, py)) return { x: px, y: py };
+        }
+        return undefined;
+      }
+
+      function candidateFrom(element: Element, path: number[], id: string): Candidate | undefined {
+        const tag = element.tagName.toLowerCase();
+        const role = element.getAttribute('role') || undefined;
+        const input = element as HTMLInputElement;
+        const isInput = ['input', 'textarea', 'select'].includes(tag) || Boolean((element as HTMLElement).isContentEditable);
+        const clickable = clickableReason(element);
+        if (!clickable && !isInput) return undefined;
+        const semanticTarget =
+          ['a', 'button', 'input', 'textarea', 'select', 'label', 'summary', 'option'].includes(tag) ||
+          Boolean(role && interactiveRoles.has(role)) ||
+          isInput;
+        if (hasClickableAncestor(element) && !semanticTarget) return undefined;
+        if (!semanticTarget && !hasRecordedClickListener(element) && hasInteractiveDescendant(element)) return undefined;
+
+        const rect = visibleRectOf(element);
+        if (!rect) return undefined;
+        const visiblePoint = visiblePointForElement(element, rect);
+        if (!visiblePoint) return undefined;
+        const viewportArea = window.innerWidth * window.innerHeight;
+        const area = rect.width * rect.height;
+        if (area > viewportArea * 0.75 && !['input', 'textarea', 'select', 'button', 'a'].includes(tag)) return undefined;
+
+        const href = tag === 'a' ? ((element as HTMLAnchorElement).href || element.getAttribute('href') || undefined) : undefined;
+        let host: string | undefined;
+        try {
+          host = href ? new URL(href).hostname : undefined;
+        } catch {
+          host = undefined;
         }
 
-        const rect = target.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return { x: px, y: py, note: '' };
-        const cx = rect.left + rect.width / 2;
-        const cy = rect.top + rect.height / 2;
-        const atCenter = document.elementFromPoint(cx, cy);
-        const stillTarget = !!atCenter && (atCenter === target || target.contains(atCenter) || atCenter.contains(target));
-        if (!stillTarget) {
-          return { x: px, y: py, note: ` clickable <${target.tagName.toLowerCase()}> center is occluded; clicked original point.` };
-        }
-        return { x: cx, y: cy, note: ` snapped to <${target.tagName.toLowerCase()}> center.` };
-      }, { px: x, py: y })
-      .catch(() => ({ x, y, note: '' }));
+        const text = ownText(element);
+        const name = nameOf(element);
+        const placeholder = input.placeholder || undefined;
+        const ariaLabel = element.getAttribute('aria-label') || undefined;
+        const title = element.getAttribute('title') || undefined;
+        const type = tag === 'input' || tag === 'button' ? element.getAttribute('type') || undefined : undefined;
 
-    const clamped = this.normalizePoint(refined.x, refined.y, await this.getViewportSize());
-    return { x: clamped.x, y: clamped.y, note: refined.note };
+        return {
+          id,
+          path: path.join('.'),
+          tag,
+          role,
+          type,
+          name: name || undefined,
+          text: text || undefined,
+          nearbyText: contextText(element) || undefined,
+          href,
+          host,
+          placeholder,
+          ariaLabel,
+          title,
+          rect: {
+            x: Math.round(rect.left),
+            y: Math.round(rect.top),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          },
+          center: {
+            x: Math.round(visiblePoint.x),
+            y: Math.round(visiblePoint.y),
+          },
+          clickable,
+          input: isInput,
+          disabled: Boolean((input as HTMLInputElement).disabled || element.getAttribute('aria-disabled') === 'true'),
+        };
+      }
+
+      const output: Candidate[] = [];
+      function walk(element: Element, path: number[], depth: number) {
+        if (output.length >= candidateLimit || depth > 18) return;
+        const candidate = candidateFrom(element, path, `E${output.length + 1}`);
+        if (candidate) output.push(candidate);
+        const visibleChildren = children(element);
+        for (let index = 0; index < visibleChildren.length; index += 1) {
+          walk(visibleChildren[index], [...path, index], depth + 1);
+          if (output.length >= candidateLimit) break;
+        }
+      }
+
+      walk(document.documentElement, [0], 0);
+      return output;
+    }, { limit }).catch(() => [] as InteractiveCandidate[]);
+
+    this.lastInteractiveCandidates = candidates;
+    return candidates;
   }
 
-  private async inspectViewportPoint(x: number, y: number) {
-    return this.activePage.evaluate(({ x: pointX, y: pointY }) => {
-      const element = document.elementFromPoint(pointX, pointY);
-      if (!element) return ' Target element at mapped point: none.';
-      const tag = element.tagName.toLowerCase();
-      const id = element.id ? `#${element.id}` : '';
-      const className = typeof element.className === 'string'
-        ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
-        : '';
-      const rect = element.getBoundingClientRect();
-      return ` Target element at mapped point: ${tag}${id}${className} rect=${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(rect.width)}x${Math.round(rect.height)}.`;
-    }, { x, y }).catch(() => '');
+  private describeCandidate(candidate: InteractiveCandidate) {
+    const parts = [
+      candidate.tag,
+      candidate.role ? `role=${candidate.role}` : '',
+      candidate.name ? `name="${candidate.name.slice(0, 80)}"` : '',
+      candidate.href ? `href=${candidate.href.slice(0, 140)}` : '',
+      `box=${candidate.rect.x},${candidate.rect.y},${candidate.rect.width}x${candidate.rect.height}`,
+    ].filter(Boolean);
+    return parts.join(' ');
+  }
+
+  private async resolveCandidateTarget(candidateId: string) {
+    const normalized = candidateId.trim().toUpperCase();
+    let candidate = this.lastInteractiveCandidates.find((item) => item.id.toUpperCase() === normalized);
+    if (!candidate) {
+      await this.refreshInteractiveCandidates();
+      candidate = this.lastInteractiveCandidates.find((item) => item.id.toUpperCase() === normalized);
+    }
+
+    if (!candidate) {
+      const available = this.lastInteractiveCandidates
+        .slice(0, 30)
+        .map((item) => `${item.id}: ${this.describeCandidate(item)}`)
+        .join('\n');
+      return {
+        error: `Candidate ${candidateId} was not found. Use getInteractiveCandidates for fresh IDs. Available candidates:\n${available || '[none]'}`,
+      };
+    }
+
+    if (candidate.disabled) {
+      return { candidate, error: `Candidate ${candidate.id} is disabled: ${this.describeCandidate(candidate)}` };
+    }
+
+    const target = await this.resolveDomPathToClickablePoint(candidate.path);
+    if (!target) {
+      return {
+        candidate,
+        error: `Candidate ${candidate.id} could not be resolved from DOM path ${candidate.path}. Call getInteractiveCandidates again; the DOM likely changed.`,
+      };
+    }
+
+    return { candidate, target };
   }
 
   private async readSimplifiedDomTree() {
@@ -718,16 +1068,36 @@ export class BrowserSession {
       // aiElementFromPath) MUST stay byte-identical to the one used in resolveDomPathToClickablePoint
       // and resolveScrollTarget, otherwise the bracket paths printed here will not resolve to the
       // same elements when the model clicks/focuses them.
+      type WindowWithAiListeners = Window & {
+        __aiGetEventListenerTypes?: (target: EventTarget) => string[];
+      };
       const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
-      function aiIsRendered(element: Element) {
+      function aiIsRenderable(element: Element) {
         if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
         const tag = element.tagName.toLowerCase();
         if (skippedTags.has(tag)) return false;
         if (element.hasAttribute('hidden')) return false;
         if (element.getAttribute('aria-hidden') === 'true') return false;
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (Number(style.opacity || '1') <= 0.01) return false;
         return true;
+      }
+      function aiVisibleRect(element: Element) {
+        if (!aiIsRenderable(element)) return undefined;
+        const rect = element.getBoundingClientRect();
+        const left = Math.max(rect.left, 0);
+        const top = Math.max(rect.top, 0);
+        const right = Math.min(rect.right, window.innerWidth);
+        const bottom = Math.min(rect.bottom, window.innerHeight);
+        const width = right - left;
+        const height = bottom - top;
+        if (width <= 2 || height <= 2) return undefined;
+        return { left, top, right, bottom, width, height };
+      }
+      function aiIsRendered(element: Element) {
+        return Boolean(aiVisibleRect(element));
       }
       function aiChildren(element: Element) {
         return Array.from(element.children).filter(aiIsRendered);
@@ -751,9 +1121,9 @@ export class BrowserSession {
 
       function attrSummary(element: Element) {
         const parts: string[] = [];
-        const push = (key: string, value: string | null | undefined) => {
+        const push = (key: string, value: string | null | undefined, maxLength = 40) => {
           if (!value) return;
-          const clean = String(value).replace(/\s+/g, ' ').trim().slice(0, 40);
+          const clean = String(value).replace(/\s+/g, ' ').trim().slice(0, maxLength);
           if (clean) parts.push(`${key}="${clean}"`);
         };
         const tag = element.tagName.toLowerCase();
@@ -768,8 +1138,48 @@ export class BrowserSession {
           const value = (element as HTMLInputElement).value;
           push('value', value);
         }
-        if (tag === 'a') push('href', element.getAttribute('href'));
+        if (tag === 'a') push('href', (element as HTMLAnchorElement).href || element.getAttribute('href'), 140);
         return parts.length ? ` {${parts.join(' ')}}` : '';
+      }
+
+      function recordedEventTypes(element: Element) {
+        try {
+          return ((window as WindowWithAiListeners).__aiGetEventListenerTypes?.(element) || []).map((item) => item.toLowerCase());
+        } catch {
+          return [];
+        }
+      }
+
+      function hasActionAttribute(element: Element) {
+        if (element.hasAttribute('jsaction')) return true;
+        for (const attr of Array.from(element.attributes)) {
+          if (/^(data-.+?(click|action|href|url|target)|ng-click|@click|v-on:click)$/i.test(attr.name) && attr.value !== 'false') return true;
+        }
+        return false;
+      }
+
+      function looksLikeClickableSurface(element: Element) {
+        const tag = element.tagName.toLowerCase();
+        if (!['div', 'span', 'li', 'article', 'section', 'p'].includes(tag)) return false;
+        const rect = aiVisibleRect(element);
+        if (!rect) return false;
+        if (rect.width < 24 || rect.height < 16 || rect.width > 560 || rect.height > 140) return false;
+        const text = ownText(element);
+        if (!text || text.length > 220) return false;
+        try {
+          const style = window.getComputedStyle(element);
+          const borderWidth =
+            Number.parseFloat(style.borderTopWidth || '0') +
+            Number.parseFloat(style.borderRightWidth || '0') +
+            Number.parseFloat(style.borderBottomWidth || '0') +
+            Number.parseFloat(style.borderLeftWidth || '0');
+          const radius = Number.parseFloat(style.borderTopLeftRadius || '0') + Number.parseFloat(style.borderTopRightRadius || '0');
+          const background = style.backgroundColor || '';
+          const hasBackground = background && !/^rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,?\s*0?\s*\)$/i.test(background) && background !== 'transparent';
+          return style.cursor === 'pointer' || borderWidth > 0 || radius > 6 || hasBackground || hasActionAttribute(element);
+        } catch {
+          return hasActionAttribute(element);
+        }
       }
 
       function isClickable(element: Element) {
@@ -778,6 +1188,8 @@ export class BrowserSession {
         const role = element.getAttribute('role');
         if (role && ['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'tab', 'checkbox', 'radio', 'switch', 'option'].includes(role)) return true;
         if (element.hasAttribute('onclick')) return true;
+        if (recordedEventTypes(element).length) return true;
+        if (hasActionAttribute(element)) return true;
         const tabindex = element.getAttribute('tabindex');
         if (tabindex !== null && tabindex !== '-1') return true;
         try {
@@ -785,7 +1197,7 @@ export class BrowserSession {
         } catch {
           /* ignore */
         }
-        return false;
+        return looksLikeClickableSurface(element);
       }
 
       function describe(element: Element, path: number[]) {
@@ -795,10 +1207,14 @@ export class BrowserSession {
           ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${CSS.escape(item)}`).join('')
           : '';
         const clickable = isClickable(element) ? ' *' : '';
+        const rect = aiVisibleRect(element);
+        const box = rect
+          ? ` @${Math.round(rect.left)},${Math.round(rect.top)},${Math.round(rect.width)}x${Math.round(rect.height)}`
+          : '';
         const attrs = attrSummary(element);
         const text = ownText(element);
         const textPart = text ? ` "${text}"` : '';
-        return `[${path.join('.')}] ${tag}${id}${classes}${clickable}${attrs}${textPart}`;
+        return `[${path.join('.')}] ${tag}${id}${classes}${clickable}${box}${attrs}${textPart}`;
       }
 
       const lines: string[] = [];
@@ -814,7 +1230,7 @@ export class BrowserSession {
       }
 
       walk(document.documentElement, [0], 0);
-      const legend = 'Legend: [path] tag#id.class * {attrs} "text" — "*" marks clickable/interactive elements; "text" is the node text; only visible (rendered) elements are listed.';
+      const legend = 'Legend: [path] tag#id.class * @x,y,w,h {attrs} "text" - "*" marks clickable/interactive elements; @ is the visible viewport box; "text" is the node text; only visible (rendered) elements are listed.';
       if (count >= nodeLimit) lines.push(`... truncated at ${nodeLimit} nodes`);
       return `${legend}\n${lines.join('\n')}`;
     }, { maxNodes, maxDepth });
@@ -824,18 +1240,62 @@ export class BrowserSession {
     return this.activePage.evaluate((path) => {
       // Keep this predicate byte-identical to readSimplifiedDomTree so paths resolve consistently.
       const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
-      function aiIsRendered(element: Element) {
+      function aiIsRenderable(element: Element) {
         if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
         const tag = element.tagName.toLowerCase();
         if (skippedTags.has(tag)) return false;
         if (element.hasAttribute('hidden')) return false;
         if (element.getAttribute('aria-hidden') === 'true') return false;
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (Number(style.opacity || '1') <= 0.01) return false;
         return true;
+      }
+      function aiVisibleRect(element: Element) {
+        if (!aiIsRenderable(element)) return undefined;
+        const rect = element.getBoundingClientRect();
+        const left = Math.max(rect.left, 0);
+        const top = Math.max(rect.top, 0);
+        const right = Math.min(rect.right, window.innerWidth);
+        const bottom = Math.min(rect.bottom, window.innerHeight);
+        const width = right - left;
+        const height = bottom - top;
+        if (width <= 2 || height <= 2) return undefined;
+        return { left, top, right, bottom, width, height, raw: rect };
+      }
+      function aiIsRendered(element: Element) {
+        return Boolean(aiVisibleRect(element));
       }
       function aiChildren(element: Element) {
         return Array.from(element.children).filter(aiIsRendered);
+      }
+      function pointBelongsToElement(element: Element, x: number, y: number) {
+        const top = document.elementsFromPoint(x, y).find((item) => aiIsRenderable(item));
+        return Boolean(top && (top === element || element.contains(top)));
+      }
+      function visiblePointForElement(element: Element) {
+        const rect = aiVisibleRect(element);
+        if (!rect) return undefined;
+        const insetX = Math.min(10, Math.max(1, rect.width / 4));
+        const insetY = Math.min(10, Math.max(1, rect.height / 4));
+        const samples = [
+          [rect.left + rect.width / 2, rect.top + rect.height / 2],
+          [rect.left + insetX, rect.top + rect.height / 2],
+          [rect.right - insetX, rect.top + rect.height / 2],
+          [rect.left + rect.width / 2, rect.top + insetY],
+          [rect.left + rect.width / 2, rect.bottom - insetY],
+          [rect.left + insetX, rect.top + insetY],
+          [rect.right - insetX, rect.top + insetY],
+          [rect.left + insetX, rect.bottom - insetY],
+          [rect.right - insetX, rect.bottom - insetY],
+        ];
+        for (const [x, y] of samples) {
+          const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
+          const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
+          if (pointBelongsToElement(element, px, py)) return { x: px, y: py };
+        }
+        return undefined;
       }
 
       const parts = String(path).split('.').map((item) => Number(String(item).trim()));
@@ -848,33 +1308,40 @@ export class BrowserSession {
       }
       if (!element) return undefined;
 
-      element.scrollIntoView({ block: 'center', inline: 'center' });
       let rect = element.getBoundingClientRect();
+      let point = visiblePointForElement(element);
+      if (!point) {
+        element.scrollIntoView({ block: 'center', inline: 'center' });
+        rect = element.getBoundingClientRect();
+        point = visiblePointForElement(element);
+      }
       // Some wrappers have zero size but contain a visible interactive child. Descend to the first
       // rendered descendant that actually has a box so the click lands on something visible.
-      if (rect.width <= 0 || rect.height <= 0) {
+      if (!point || rect.width <= 0 || rect.height <= 0) {
         const queue = aiChildren(element);
         while (queue.length) {
           const candidate = queue.shift() as Element;
           const candidateRect = candidate.getBoundingClientRect();
-          if (candidateRect.width > 0 && candidateRect.height > 0) {
+          const candidatePoint = visiblePointForElement(candidate);
+          if (candidateRect.width > 0 && candidateRect.height > 0 && candidatePoint) {
             element = candidate;
             rect = candidateRect;
+            point = candidatePoint;
             break;
           }
           queue.push(...aiChildren(candidate));
         }
       }
-      if (rect.width <= 0 || rect.height <= 0) return undefined;
+      if (!point || rect.width <= 0 || rect.height <= 0) return undefined;
 
       const tag = element.tagName.toLowerCase();
       const id = element.id ? `#${element.id}` : '';
       const classes = typeof element.className === 'string'
         ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
         : '';
-      const centerX = rect.left + rect.width / 2;
-      const centerY = rect.top + rect.height / 2;
-      const offscreen = centerY < 0 || centerY > window.innerHeight || centerX < 0 || centerX > window.innerWidth;
+      const centerX = point.x;
+      const centerY = point.y;
+      const offscreen = rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth;
       return {
         x: Math.min(Math.max(centerX, 0), window.innerWidth - 1),
         y: Math.min(Math.max(centerY, 0), window.innerHeight - 1),
@@ -884,23 +1351,65 @@ export class BrowserSession {
     }, pathValue).catch(() => undefined);
   }
 
-  private async resolveScrollTarget(target: { screenshotX?: number; screenshotY?: number; domPath?: string }) {
-    const point = typeof target.screenshotX === 'number' && typeof target.screenshotY === 'number'
-      ? await this.screenshotPointToViewport(target.screenshotX, target.screenshotY)
-      : undefined;
-
-    return this.activePage.evaluate(({ x, y, domPath }) => {
-      // Keep this predicate byte-identical to readSimplifiedDomTree so domPath indexes line up.
+  private async dispatchDomPathClick(pathValue: string) {
+    return this.activePage.evaluate((path) => {
       const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
       function aiIsRendered(element: Element) {
         if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
         const tag = element.tagName.toLowerCase();
         if (skippedTags.has(tag)) return false;
         if (element.hasAttribute('hidden')) return false;
         if (element.getAttribute('aria-hidden') === 'true') return false;
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (Number(style.opacity || '1') <= 0.01) return false;
+        const rect = element.getBoundingClientRect();
+        const visibleWidth = Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0);
+        const visibleHeight = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
+        return visibleWidth > 2 && visibleHeight > 2;
+      }
+      function aiChildren(element: Element) {
+        return Array.from(element.children).filter(aiIsRendered);
+      }
+
+      const parts = String(path).split('.').map((item) => Number(String(item).trim()));
+      if (!parts.length || parts[0] !== 0 || parts.some((item) => !Number.isInteger(item) || item < 0)) return undefined;
+      let element: Element | undefined = document.documentElement;
+      for (const index of parts.slice(1)) {
+        element = aiChildren(element)[index];
+        if (!element) return undefined;
+      }
+      if (!element) return undefined;
+      const tag = element.tagName.toLowerCase();
+      const id = element.id ? `#${element.id}` : '';
+      (element as HTMLElement).click();
+      return `${tag}${id}`;
+    }, pathValue).catch(() => undefined);
+  }
+
+  private async resolveScrollTarget(target: { domPath?: string }) {
+    return this.activePage.evaluate(({ domPath }) => {
+      // Keep this predicate byte-identical to readSimplifiedDomTree so domPath indexes line up.
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      function aiIsRenderable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        const tag = element.tagName.toLowerCase();
+        if (skippedTags.has(tag)) return false;
+        if (element.hasAttribute('hidden')) return false;
+        if (element.getAttribute('aria-hidden') === 'true') return false;
+        const style = window.getComputedStyle(element);
+        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (Number(style.opacity || '1') <= 0.01) return false;
         return true;
+      }
+      function aiIsRendered(element: Element) {
+        if (!aiIsRenderable(element)) return false;
+        const rect = element.getBoundingClientRect();
+        const visibleWidth = Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0);
+        const visibleHeight = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
+        return visibleWidth > 2 && visibleHeight > 2;
       }
       function aiChildren(element: Element) {
         return Array.from(element.children).filter(aiIsRendered);
@@ -949,16 +1458,15 @@ export class BrowserSession {
 
       const sourceElement =
         elementFromDomPath(domPath) ||
-        (typeof x === 'number' && typeof y === 'number' ? document.elementFromPoint(x, y) : undefined) ||
         document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2) ||
         document.documentElement;
       const scrollElement = closestScrollable(sourceElement);
       const rect = scrollElement.getBoundingClientRect();
       const targetX = scrollElement === document.documentElement || scrollElement === document.body || scrollElement === document.scrollingElement
-        ? (typeof x === 'number' ? x : window.innerWidth / 2)
+        ? window.innerWidth / 2
         : rect.left + rect.width / 2;
       const targetY = scrollElement === document.documentElement || scrollElement === document.body || scrollElement === document.scrollingElement
-        ? (typeof y === 'number' ? y : window.innerHeight / 2)
+        ? window.innerHeight / 2
         : rect.top + rect.height / 2;
 
       return {
@@ -968,12 +1476,10 @@ export class BrowserSession {
         note: ` Source element: ${descriptor(sourceElement)}.`,
       };
     }, {
-      x: point?.x,
-      y: point?.y,
       domPath: target.domPath,
     }).catch(() => ({
-      x: point?.x ?? 1,
-      y: point?.y ?? 1,
+      x: 1,
+      y: 1,
       descriptor: 'document',
       note: ' Scroll target resolution failed; fell back to document.',
     }));
@@ -998,115 +1504,112 @@ export class BrowserSession {
     };
   }
 
-  /**
-   * Overlay a labeled coordinate grid on the page so the screenshot sent to the model carries an
-   * explicit reference frame. Lines every `step` px; EVERY line is labeled right on it — x values on
-   * the bottom edge, y values on the left edge — so the model can read the target's x/y instead of
-   * guessing. This is the main aid for accurate clicks. Removed again right after the screenshot.
-   */
-  private async drawCoordinateGrid() {
-    const step = Math.max(10, Number(process.env.SCREENSHOT_GRID_STEP || 50));
-    const origin = (process.env.SCREENSHOT_GRID_ORIGIN || 'bottom').toLowerCase() === 'center' ? 'center' : 'bottom';
-    const showLines = (process.env.SCREENSHOT_GRID_LINES || 'true').toLowerCase() !== 'false';
-    await this.activePage.evaluate(({ step, origin, showLines }) => {
-      const existing = document.getElementById('__ai_coord_grid__');
-      if (existing) existing.remove();
-      const width = window.innerWidth;
-      const height = window.innerHeight;
-      const grid = document.createElement('div');
-      grid.id = '__ai_coord_grid__';
-      Object.assign(grid.style, {
+  private async drawCandidateOverlay(candidates: InteractiveCandidate[]) {
+    const visible = candidates
+      .slice(0, Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 120)))
+      .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+    await this.activePage.evaluate((items) => {
+      document.getElementById('__ai_candidate_overlay__')?.remove();
+      const overlay = document.createElement('div');
+      overlay.id = '__ai_candidate_overlay__';
+      Object.assign(overlay.style, {
         position: 'fixed',
-        left: '0',
-        top: '0',
-        width: `${width}px`,
-        height: `${height}px`,
+        inset: '0',
         pointerEvents: 'none',
-        zIndex: '2147483646',
+        zIndex: '2147483647',
         margin: '0',
         padding: '0',
       });
 
-      const lineColor = 'rgba(0, 122, 255, 0.28)';
-      const axisColor = 'rgba(210, 0, 0, 0.85)';
-
-      function addLine(style: Partial<CSSStyleDeclaration>) {
-        const line = document.createElement('div');
-        Object.assign(line.style, { position: 'absolute', background: lineColor }, style);
-        grid.appendChild(line);
+      const placedLabels: Array<{ left: number; top: number; right: number; bottom: number }> = [];
+      function overlaps(a: { left: number; top: number; right: number; bottom: number }, b: { left: number; top: number; right: number; bottom: number }) {
+        return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
       }
-      function addLabel(text: string, css: string) {
+      function labelPosition(rect: { x: number; y: number; width: number; height: number }, labelWidth: number, labelHeight: number) {
+        const baseLeft = Math.max(0, rect.x);
+        const baseTop = Math.max(0, rect.y);
+        const candidates = [
+          { left: baseLeft, top: Math.max(0, rect.y - labelHeight) },
+          { left: baseLeft, top: baseTop },
+          { left: Math.max(0, rect.x + rect.width - labelWidth), top: baseTop },
+          { left: Math.min(window.innerWidth - labelWidth, rect.x + rect.width + 2), top: baseTop },
+          { left: baseLeft, top: Math.min(window.innerHeight - labelHeight, rect.y + rect.height + 2) },
+        ];
+        for (let offset = 0; offset <= 80; offset += 20) {
+          candidates.push({ left: baseLeft, top: Math.min(window.innerHeight - labelHeight, baseTop + offset) });
+          candidates.push({ left: Math.max(0, baseLeft - labelWidth - 2), top: Math.min(window.innerHeight - labelHeight, baseTop + offset) });
+        }
+        for (const option of candidates) {
+          const left = Math.max(0, Math.min(window.innerWidth - labelWidth, option.left));
+          const top = Math.max(0, Math.min(window.innerHeight - labelHeight, option.top));
+          const box = { left, top, right: left + labelWidth, bottom: top + labelHeight };
+          if (!placedLabels.some((placed) => overlaps(box, placed))) {
+            placedLabels.push(box);
+            return box;
+          }
+        }
+        const fallback = {
+          left: Math.max(0, Math.min(window.innerWidth - labelWidth, baseLeft)),
+          top: Math.max(0, Math.min(window.innerHeight - labelHeight, baseTop)),
+          right: 0,
+          bottom: 0,
+        };
+        fallback.right = fallback.left + labelWidth;
+        fallback.bottom = fallback.top + labelHeight;
+        placedLabels.push(fallback);
+        return fallback;
+      }
+
+      for (const item of items) {
+        const rect = item.rect;
+        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+
+        const box = document.createElement('div');
+        const color = item.href ? '#1d4ed8' : item.input ? '#047857' : '#b45309';
+        Object.assign(box.style, {
+          position: 'absolute',
+          left: `${Math.max(0, rect.x)}px`,
+          top: `${Math.max(0, rect.y)}px`,
+          width: `${Math.max(1, rect.width)}px`,
+          height: `${Math.max(1, rect.height)}px`,
+          border: `2px solid ${color}`,
+          borderRadius: '3px',
+          background: 'rgba(255,255,255,0.04)',
+          boxShadow: '0 0 0 1px rgba(255,255,255,0.95)',
+        });
+
         const label = document.createElement('div');
-        label.textContent = text;
-        label.setAttribute('style', css);
-        grid.appendChild(label);
+        label.textContent = item.id;
+        const labelWidth = Math.max(24, item.id.length * 8 + 8);
+        const labelBox = labelPosition(rect, labelWidth, 18);
+        Object.assign(label.style, {
+          position: 'absolute',
+          left: `${labelBox.left}px`,
+          top: `${labelBox.top}px`,
+          width: `${labelWidth}px`,
+          height: '18px',
+          padding: '0 4px',
+          boxSizing: 'border-box',
+          borderRadius: '3px',
+          background: color,
+          color: '#fff',
+          font: '800 12px/18px Arial, sans-serif',
+          textAlign: 'center',
+          boxShadow: '0 1px 4px rgba(0,0,0,0.24), 0 0 0 1px rgba(255,255,255,0.9)',
+        });
+
+        overlay.appendChild(box);
+        overlay.appendChild(label);
       }
 
-      const minorColor = 'rgba(0, 122, 255, 0.16)';
-      const majorColor = 'rgba(0, 122, 255, 0.34)';
-      const halo = 'text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;';
-
-      if (origin === 'center') {
-        // Cartesian plane: origin at the image center, x grows right (negative left), y grows UP
-        // (negative down). Axes drawn in red; labels are pixel offsets from the center.
-        const cx = Math.round(width / 2);
-        const cy = Math.round(height / 2);
-        const xLabelCss =
-          `position:absolute;font:700 13px/13px Arial,sans-serif;color:#0a5ac8;${halo}white-space:nowrap;transform:translateX(-50%);`;
-        const yLabelCss =
-          `position:absolute;font:700 13px/13px Arial,sans-serif;color:#c0440a;${halo}white-space:nowrap;transform:translateY(-50%);`;
-
-        // Vertical gridlines + x labels (placed just below the horizontal axis).
-        for (let x = cx % step; x < width; x += step) {
-          const value = x - cx;
-          const axis = value === 0;
-          const major = (value / step) % 5 === 0;
-          // Always draw the red axis (value 0); other gridlines only when showLines is on.
-          if (axis || showLines) addLine({ left: `${x}px`, top: '0', width: axis ? '2px' : '1px', marginLeft: axis ? '-1px' : '0', height: `${height}px`, background: axis ? axisColor : (major ? majorColor : minorColor) });
-          if (!axis) addLabel(`${value}`, `${xLabelCss}left:${x}px;top:${cy + 4}px;`);
-        }
-        // Horizontal gridlines + y labels (placed just right of the vertical axis).
-        for (let y = cy % step; y < height; y += step) {
-          const value = cy - y;
-          const axis = value === 0;
-          const major = (value / step) % 5 === 0;
-          if (axis || showLines) addLine({ left: '0', top: `${y}px`, width: `${width}px`, height: axis ? '2px' : '1px', marginTop: axis ? '-1px' : '0', background: axis ? axisColor : (major ? majorColor : minorColor) });
-          if (!axis) addLabel(`${value}`, `${yLabelCss}left:${cx + 5}px;top:${y}px;`);
-        }
-        // Arrowheads on the positive ends of each axis (right for x, top for y).
-        addLabel('', `position:absolute;top:${cy}px;right:0;transform:translateY(-50%);width:0;height:0;border-top:6px solid transparent;border-bottom:6px solid transparent;border-left:11px solid ${axisColor};`);
-        addLabel('', `position:absolute;left:${cx}px;top:0;transform:translateX(-50%);width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:11px solid ${axisColor};`);
-        // Origin marker + axis letters (no color box, just red text with a white halo).
-        addLabel('0', `position:absolute;left:${cx + 5}px;top:${cy + 4}px;font:700 13px/13px Arial,sans-serif;color:#c00000;${halo}`);
-        addLabel('x', `position:absolute;right:5px;top:${cy + 7}px;font:800 15px/15px Arial,sans-serif;color:#c00000;${halo}`);
-        addLabel('y', `position:absolute;left:${cx + 9}px;top:4px;font:800 15px/15px Arial,sans-serif;color:#c00000;${halo}`);
-      } else {
-        // Bottom/top-left origin: x labels vertical along the bottom, y labels horizontal along the left.
-        const xLabelCss =
-          'position:absolute;font:700 16px/16px Arial,sans-serif;color:#0a5ac8;text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;writing-mode:vertical-rl;text-orientation:mixed;transform:translateX(-50%);';
-        const yLabelCss =
-          'position:absolute;font:700 16px/16px Arial,sans-serif;color:#c0440a;text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;transform:translateY(-50%);';
-
-        for (let x = step; x < width; x += step) {
-          if (showLines) addLine({ left: `${x}px`, top: '0', width: '1px', height: `${height}px`, background: (x / step) % 5 === 0 ? majorColor : minorColor });
-          addLabel(`x=${x}`, `${xLabelCss}left:${x}px;bottom:1px;`);
-        }
-        for (let y = step; y < height; y += step) {
-          if (showLines) addLine({ left: '0', top: `${y}px`, width: `${width}px`, height: '1px', background: (y / step) % 5 === 0 ? majorColor : minorColor });
-          addLabel(`y=${y}`, `${yLabelCss}left:1px;top:${y}px;`);
-        }
-        addLabel('0,0 x→ y↓', `position:absolute;left:2px;top:1px;font:700 12px/12px Arial,sans-serif;color:#c00000;${halo}white-space:nowrap;`);
-      }
-
-      document.documentElement.appendChild(grid);
-    }, { step, origin, showLines }).catch(() => undefined);
+      document.documentElement.appendChild(overlay);
+    }, visible).catch(() => undefined);
   }
 
-  private async removeCoordinateGrid() {
+  private async removeCandidateOverlay() {
     await this.activePage
       .evaluate(() => {
-        const grid = document.getElementById('__ai_coord_grid__');
-        if (grid) grid.remove();
+        document.getElementById('__ai_candidate_overlay__')?.remove();
       })
       .catch(() => undefined);
   }

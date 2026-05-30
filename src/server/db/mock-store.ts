@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { RunDebugEvent, StepExecutionResult, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
@@ -66,9 +66,31 @@ const seedRecord: TestCaseRecord = {
 
 function writeData(data: StoreData) {
   mkdirSync(path.dirname(storePath), { recursive: true });
-  const tempPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
+  const tempPath = `${storePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf8');
-  renameSync(tempPath, storePath);
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      renameSync(tempPath, storePath);
+      return;
+    } catch (error) {
+      lastError = error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(code || '')) {
+        rmSync(tempPath, { force: true });
+        throw error;
+      }
+      sleepSync(25 * (attempt + 1));
+    }
+  }
+
+  try {
+    copyFileSync(tempPath, storePath);
+  } finally {
+    rmSync(tempPath, { force: true });
+  }
+  if (!existsSync(storePath) && lastError) throw lastError;
 }
 
 function sleepSync(ms: number) {
@@ -255,14 +277,37 @@ export const store = {
     writeData(data);
     return updated;
   },
+  requestRunPause(runId: string, stepIndex?: number) {
+    const data = readData();
+    const run = data.runs.find((item) => item.id === runId);
+    if (!run) return undefined;
+    const pausedAt = now();
+    const updated = {
+      ...run,
+      status: 'paused' as const,
+      control: {
+        ...run.control,
+        pauseRequestedAt: pausedAt,
+        pauseStepIndex: stepIndex,
+        pausedAt,
+      },
+    };
+    data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
+    writeData(data);
+    return updated;
+  },
   requestRunResume(runId: string, stepIndex?: number) {
     const data = readData();
     const run = data.runs.find((item) => item.id === runId);
     if (!run) return undefined;
     const updated = {
       ...run,
+      status: run.status === 'paused' ? ('running' as const) : run.status,
       control: {
         ...run.control,
+        pauseRequestedAt: undefined,
+        pauseStepIndex: undefined,
+        pausedAt: undefined,
         resumeRequestedAt: now(),
         resumeStepIndex: stepIndex,
         manualIntervention: undefined,
@@ -271,6 +316,10 @@ export const store = {
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
     return updated;
+  },
+  isRunPaused(runId: string) {
+    const run = readData().runs.find((item) => item.id === runId);
+    return Boolean(run?.control?.pausedAt);
   },
   setRunManualIntervention(runId: string, manualIntervention?: NonNullable<TestRunRecord['control']>['manualIntervention']) {
     const data = readData();

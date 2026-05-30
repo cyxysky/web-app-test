@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, Plus, Radar, SkipForward, Wrench, X } from 'lucide-react';
+import { Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, PauseCircle, PlayCircle, Plus, Radar, SkipForward, Wrench, X } from 'lucide-react';
 import { MarkdownReport } from '@/components/MarkdownReport';
 import { RunMetaDrawer } from '@/components/RunMetaDrawer';
 import type { RunDebugEvent, StepExecutionResult, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
@@ -22,7 +22,7 @@ function isFinished(status: TestRunRecord['status']) {
 }
 
 function statusLabel(status: string) {
-  return ({ queued: '排队中', running: '运行中', passed: '通过', failed: '失败', blocked: '阻塞' } as Record<string, string>)[status] || status;
+  return ({ queued: '排队中', running: '运行中', paused: '已暂停', passed: '通过', failed: '失败', blocked: '阻塞' } as Record<string, string>)[status] || status;
 }
 
 function StepIcon({ status }: { status: string }) {
@@ -219,6 +219,9 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   const debugEnabled = Boolean(run.debug?.enabled);
   const manualIntervention = run.control?.manualIntervention;
   const visibleManualIntervention = manualIntervention?.stepIndex === resumePendingStep ? undefined : manualIntervention;
+  const canPause = run.status === 'running' || run.status === 'queued';
+  const canResumeRun = run.status === 'paused';
+  const canContinueBlockedRun = run.status === 'blocked';
 
   useEffect(() => {
     if (isFinished(run.status) && run.report?.markdown) return;
@@ -241,6 +244,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   }, [manualIntervention, resumePendingStep]);
 
   const progressText = useMemo(() => {
+    if (run.status === 'paused') return 'AI 测试已暂停';
     if (!steps.length) return run.status === 'running' ? 'AI 正在启动浏览器' : '暂无执行步骤';
     if (runningStep) return `正在记录步骤 ${runningStep.index}`;
     return `已记录 ${steps.length} 个操作`;
@@ -258,6 +262,35 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ stepIndex: selectedStep.index }),
+    });
+    if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+  }
+
+  async function pauseRun() {
+    if (!canPause) return;
+    const response = await fetch(`/api/runs/${run.id}/pause`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stepIndex: runningStep?.index || selectedStep?.index }),
+    });
+    if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+  }
+
+  async function resumeRun() {
+    if (!canResumeRun) return;
+    const response = await fetch(`/api/runs/${run.id}/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stepIndex: run.control?.pauseStepIndex || runningStep?.index || selectedStep?.index }),
+    });
+    if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+  }
+
+  async function continueBlockedRun() {
+    if (!canContinueBlockedRun) return;
+    const response = await fetch(`/api/runs/${run.id}/continue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
     });
     if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
   }
@@ -302,6 +335,24 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
           ) : null}
         </div>
         <div style={{display: "flex", gap: "16px"}}>
+          {canPause ? (
+            <button className="link-button" onClick={pauseRun} type="button">
+              <PauseCircle size={16} />
+              暂停
+            </button>
+          ) : null}
+          {canResumeRun ? (
+            <button className="link-button" onClick={resumeRun} type="button">
+              <PlayCircle size={16} />
+              继续
+            </button>
+          ) : null}
+          {canContinueBlockedRun ? (
+            <button className="link-button" onClick={continueBlockedRun} type="button">
+              <PlayCircle size={16} />
+              继续运行
+            </button>
+          ) : null}
           <RunMetaDrawer run={run} testCaseTitle={testCaseTitle} />
           <span className={`run-status-large status-${run.status}`}>
             <Radar size={18} />

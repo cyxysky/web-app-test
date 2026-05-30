@@ -80,7 +80,7 @@ export type RunDebugEvent = {
 export type TestRunRecord = {
   id: string;
   testCaseId: string;
-  status: 'queued' | 'running' | 'passed' | 'failed' | 'blocked';
+  status: 'queued' | 'running' | 'paused' | 'passed' | 'failed' | 'blocked';
   startedAt?: string;
   endedAt?: string;
   result?: {
@@ -103,6 +103,9 @@ export type TestRunRecord = {
   control?: {
     skipRequestedAt?: string;
     skipStepIndex?: number;
+    pauseRequestedAt?: string;
+    pauseStepIndex?: number;
+    pausedAt?: string;
     resumeRequestedAt?: string;
     resumeStepIndex?: number;
     manualIntervention?: {

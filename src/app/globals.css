@@ -338,6 +338,7 @@ select {
 }
 
 .status-running,
+.status-paused,
 .status-ready,
 .status-generated,
 .status-draft,
