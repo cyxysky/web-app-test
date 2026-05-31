@@ -2,8 +2,6 @@ node_modules
 .next
 out
 dist
-.env
-.env.local
 playwright-report
 test-results
 uploads
