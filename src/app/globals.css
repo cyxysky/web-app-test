@@ -1504,7 +1504,6 @@ select {
 
 .rail-step.active {
   border-color: #9aa8ff;
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.08);
 }
 
 .rail-icon {
@@ -2240,6 +2239,25 @@ select {
   overflow-wrap: anywhere;
   padding: 7px;
   white-space: pre-wrap;
+}
+
+.tool-call-reason {
+  background: #ffffff;
+  border-left: 3px solid #304081;
+  border-radius: 6px;
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 0;
+  padding: 8px 10px;
+}
+
+.tool-call-reason span {
+  color: #304081;
+  display: block;
+  font-size: 12px;
+  font-weight: 850;
+  margin-bottom: 2px;
 }
 
 .link-button {

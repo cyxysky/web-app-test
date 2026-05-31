@@ -57,6 +57,7 @@ export type StepExecutionResult = {
 export type StepToolCall = {
   name: string;
   input?: unknown;
+  reason?: string;
   ok?: boolean;
   result?: string;
 };

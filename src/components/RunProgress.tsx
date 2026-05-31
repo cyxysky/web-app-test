@@ -313,7 +313,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   return (
     <div className="test-cockpit">
       <div className="cockpit-toolbar">
-        <div style={{display: "flex", gap: "16px", alignItems: "center"}}>
+        <div style={{ display: "flex", gap: "16px", alignItems: "center" }}>
           <span>{progressText}</span>
           <span>{steps.length} 条操作</span>
           {run.report?.markdown ? (
@@ -334,7 +334,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
             </span>
           ) : null}
         </div>
-        <div style={{display: "flex", gap: "16px"}}>
+        <div style={{ display: "flex", gap: "16px" }}>
           {canPause ? (
             <button className="link-button" onClick={pauseRun} type="button">
               <PauseCircle size={16} />
@@ -435,6 +435,24 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                           );
                         })}
                       </ol>
+                    ) : (
+                      '本步未调用浏览器工具'
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt>调用原因</dt>
+                  <dd>
+                    {selectedStep.tools?.length ? (
+                      <div style={{border: "none",padding: "8px 0px 0px 0px"}}>
+                        {selectedStep.tools.map((tool, index) => {
+                          return (
+                            <div style={{padding: "0px", border: "none"}}>
+                              {tool.reason}
+                            </div>
+                          );
+                        })}
+                      </div>
                     ) : (
                       '本步未调用浏览器工具'
                     )}

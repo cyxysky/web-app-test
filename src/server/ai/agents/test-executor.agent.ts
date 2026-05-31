@@ -84,6 +84,19 @@ function trimDebugText(value: string, max = 4000) {
   return value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
+function splitToolInputAndReason(input: unknown) {
+  const safeInput = jsonSafe(input);
+  if (!safeInput || typeof safeInput !== 'object' || Array.isArray(safeInput)) {
+    return { input: safeInput, reason: undefined };
+  }
+  const { reason, ...rest } = safeInput as Record<string, unknown>;
+  const compactInput = Object.keys(rest).length ? rest : undefined;
+  return {
+    input: compactInput,
+    reason: typeof reason === 'string' && reason.trim() ? trimDebugText(reason.trim(), 300) : undefined,
+  };
+}
+
 async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
   const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
   const timeoutController = new AbortController();
@@ -111,18 +124,23 @@ function requirementOf(testCase: TestCaseRecord) {
 }
 
 function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
-  return traces.map((trace) => ({
-    name: trace.name,
-    input: jsonSafe(trace.input),
-    ok: trace.result.ok,
-    result: trimDebugText(trace.result.actual, 800),
-  }));
+  return traces.map((trace) => {
+    const { input, reason } = splitToolInputAndReason(trace.input);
+    return {
+      name: trace.name,
+      input,
+      reason,
+      ok: trace.result.ok,
+      result: trimDebugText(trace.result.actual, 800),
+    };
+  });
 }
 
 function recentToolCallContext(steps: StepExecutionResult[], limit = 8) {
   const calls = steps.flatMap((step) => (step.tools || []).map((tool) => ({
     name: tool.name,
     input: tool.input,
+    reason: tool.reason,
     result: { ok: tool.ok, actual: tool.result },
   })));
   return calls.slice(-limit);
@@ -181,6 +199,7 @@ function makeBrowserTools(
   // keeps every browser action paired with a fresh screenshot on the next step and prevents the
   // duplicate-operation problem seen when a request was retried mid-chain.
   let toolExecutedThisRequest = false;
+  const toolReasonInput = z.string().min(1).max(300).describe('Required: concise reason for this exact tool call, based on the current screenshot, requirement, and recent progress.');
 
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
     if (toolExecutedThisRequest) {
@@ -203,124 +222,152 @@ function makeBrowserTools(
     openPage: tool({
       description: 'Open or navigate to a URL in the browser.',
       inputSchema: z.object({
+        reason: toolReasonInput,
         url: z.string().optional().describe('The URL to open. Defaults to the test target URL.'),
       }),
-      execute: ({ url }) => record('openPage', { url }, () => session.open(url || targetUrl)),
+      execute: ({ url, reason }) => record('openPage', { url, reason }, () => session.open(url || targetUrl)),
     }),
     scrollViewport: tool({
       description: 'Scroll a selected scroll container. Pass domPath for the table/list/panel or one of its visible children. Use this for virtual scroll containers instead of blindly scrolling the page.',
       inputSchema: z.object({
+        reason: toolReasonInput,
         deltaY: z.number().describe('Vertical scroll delta. Positive scrolls down, negative scrolls up.'),
         deltaX: z.number().optional().describe('Horizontal scroll delta.'),
         domPath: z.string().optional().describe('Bracket path for the scrollable element or one of its children, such as 0.1.2.'),
       }),
-      execute: ({ deltaY, deltaX, domPath }) => record('scrollViewport', { deltaY, deltaX, domPath }, () => session.scroll(deltaY, deltaX || 0, { domPath })),
+      execute: ({ deltaY, deltaX, domPath, reason }) => record('scrollViewport', { deltaY, deltaX, domPath, reason }, () => session.scroll(deltaY, deltaX || 0, { domPath })),
     }),
     clickCandidate: tool({
-      description: 'Click a visible candidate by its E-number label from the screenshot/candidate list. Prefer this over DOM paths because the backend validates and clicks the candidate center.',
+      description: 'Click a visible candidate by its numbered label from the screenshot/candidate list. Prefer this over DOM paths because the backend validates and clicks the candidate center.',
       inputSchema: z.object({
-        id: z.string().describe('Candidate id such as E1, E12. Must come from the current screenshot labels or interactive candidate list.'),
+        reason: toolReasonInput,
+        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
       }),
-      execute: ({ id }) => record('clickCandidate', { id }, () => session.clickCandidate(id)),
+      execute: ({ id, reason }) => record('clickCandidate', { id, reason }, () => session.clickCandidate(id)),
     }),
     focusCandidate: tool({
-      description: 'Focus a visible input/control candidate by its E-number label before typing. Prefer this over DOM paths for text entry.',
+      description: 'Focus a visible input/control candidate by its numbered label before typing. Prefer this over DOM paths for text entry.',
       inputSchema: z.object({
-        id: z.string().describe('Candidate id such as E1, E12. Must come from the current screenshot labels or interactive candidate list.'),
+        reason: toolReasonInput,
+        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
       }),
-      execute: ({ id }) => record('focusCandidate', { id }, () => session.focusCandidate(id)),
+      execute: ({ id, reason }) => record('focusCandidate', { id, reason }, () => session.focusCandidate(id)),
+    }),
+    hoverCandidate: tool({
+      description: 'Move the mouse over a visible candidate by its numbered label. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
+      inputSchema: z.object({
+        reason: toolReasonInput,
+        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
+      }),
+      execute: ({ id, reason }) => record('hoverCandidate', { id, reason }, () => session.hoverCandidate(id)),
     }),
     typeText: tool({
       description: 'Type text into the currently focused element. First use focusCandidate/clickCandidate or focusDomNode to focus the intended field.',
       inputSchema: z.object({
+        reason: toolReasonInput,
         text: z.string().describe('Text to enter.'),
       }),
-      execute: ({ text }) => record('typeText', { text }, () => session.typeText(text)),
+      execute: ({ text, reason }) => record('typeText', { text, reason }, () => session.typeText(text)),
     }),
     pressKey: tool({
       description: 'Press a keyboard key on the currently focused element or page.',
       inputSchema: z.object({
+        reason: toolReasonInput,
         key: z.string().describe('Keyboard key, for example Enter, Escape, Tab.'),
       }),
-      execute: ({ key }) => record('pressKey', { key }, () => session.press(key)),
+      execute: ({ key, reason }) => record('pressKey', { key, reason }, () => session.press(key)),
     }),
     waitForPage: tool({
       description: 'Wait for the page to settle after navigation or UI changes.',
       inputSchema: z.object({
+        reason: toolReasonInput,
         ms: z.number().optional().describe('Optional wait time in milliseconds.'),
       }),
-      execute: ({ ms }) => record('waitForPage', { ms }, () => (ms ? session.wait(ms) : session.waitForPage())),
+      execute: ({ ms, reason }) => record('waitForPage', { ms, reason }, () => (ms ? session.wait(ms) : session.waitForPage())),
     }),
     waitForHumanVerification: tool({
       description: 'Wait while the user completes a visible CAPTCHA, login verification, or security check in the non-headless browser.',
       inputSchema: z.object({
+        reason: toolReasonInput,
         maxMs: z.number().optional().describe('Maximum wait time in milliseconds. Defaults to MANUAL_VERIFICATION_TIMEOUT_MS or 180000.'),
       }),
-      execute: ({ maxMs }) => record('waitForHumanVerification', { maxMs }, () => session.waitForManualVerification(maxMs)),
+      execute: ({ maxMs, reason }) => record('waitForHumanVerification', { maxMs, reason }, () => session.waitForManualVerification(maxMs)),
     }),
     listTabs: tool({
       description: 'List all currently open browser tabs with their index and URL.',
-      inputSchema: z.object({}),
+      inputSchema: z.object({
+        reason: toolReasonInput,
+      }),
       execute: (input) => record('listTabs', input, () => session.listTabs()),
     }),
     switchTab: tool({
       description: 'Switch to a browser tab by index when the workflow opened a new tab.',
       inputSchema: z.object({
+        reason: toolReasonInput,
         index: z.number().describe('The tab index from listTabs.'),
       }),
-      execute: ({ index }) => record('switchTab', { index }, () => session.switchTab(index)),
+      execute: ({ index, reason }) => record('switchTab', { index, reason }, () => session.switchTab(index)),
     }),
   };
 
   const domTools = {
     getInteractiveCandidates: tool({
-      description: 'Fallback only (DOM mode): return visible interactable candidates as JSON when the screenshot E labels are missing or stale. Each candidate has id (E1...), tag/role/name/text, href/host, visible box/center, and nearbyText.',
-      inputSchema: z.object({}),
+      description: 'Fallback only (DOM mode): return visible interactable candidates as JSON when the screenshot number labels are missing or stale. Each candidate has id (1...), tag/role/name/text, href/host, visible box/center, and nearbyText.',
+      inputSchema: z.object({
+        reason: toolReasonInput,
+      }),
       execute: (input) => record('getInteractiveCandidates', input, () => session.getInteractiveCandidates()),
     }),
     getDomTree: tool({
       description: 'Return the current tab simplified DOM tree of currently visible elements. Each line is "[path] tag#id.class * @x,y,w,h {attrs} \\"text\\"": "*" marks clickable elements, @ is the visible viewport box, {attrs} holds key attributes (placeholder/aria-label/role/href/value...), and "text" is the node\'s own text. Hidden nodes are removed, so paths line up with what is on screen.',
-      inputSchema: z.object({}),
+      inputSchema: z.object({
+        reason: toolReasonInput,
+      }),
       execute: (input) => record('getDomTree', input, () => session.getSimplifiedDomTree()),
     }),
     clickDomNode: tool({
-      description: 'Fallback only: click a node from the simplified DOM tree by its bracket path, for example "0.1.2". Prefer clickCandidate when an E-number candidate exists.',
+      description: 'Fallback only: click a node from the simplified DOM tree by its bracket path, for example "0.1.2". Prefer clickCandidate when a numbered candidate exists.',
       inputSchema: z.object({
+        reason: toolReasonInput,
         path: z.string().describe('The bracket path shown in the simplified DOM tree, such as 0.1.2.'),
       }),
-      execute: ({ path }) => record('clickDomNode', { path }, () => session.clickDomNode(path)),
+      execute: ({ path, reason }) => record('clickDomNode', { path, reason }, () => session.clickDomNode(path)),
     }),
     focusDomNode: tool({
-      description: 'Fallback only: focus a node from the simplified DOM tree by its bracket path before typing. Prefer focusCandidate when an E-number candidate exists.',
+      description: 'Fallback only: focus a node from the simplified DOM tree by its bracket path before typing. Prefer focusCandidate when a numbered candidate exists.',
       inputSchema: z.object({
+        reason: toolReasonInput,
         path: z.string().describe('The bracket path shown in the simplified DOM tree, such as 0.1.2.'),
       }),
-      execute: ({ path }) => record('focusDomNode', { path }, () => session.focusDomNode(path)),
+      execute: ({ path, reason }) => record('focusDomNode', { path, reason }, () => session.focusDomNode(path)),
     }),
   };
 
   const visualTools = {
     doubleClickCandidate: tool({
-      description: 'Visual mode: double-click a visible candidate by its E-number label. The backend clicks the candidate visible center.',
+      description: 'Visual mode: double-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
       inputSchema: z.object({
-        id: z.string().describe('Candidate id such as E1, E12. Must come from the current screenshot labels or interactive candidate list.'),
+        reason: toolReasonInput,
+        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
       }),
-      execute: ({ id }) => record('doubleClickCandidate', { id }, () => session.doubleClickCandidate(id)),
+      execute: ({ id, reason }) => record('doubleClickCandidate', { id, reason }, () => session.doubleClickCandidate(id)),
     }),
     rightClickCandidate: tool({
-      description: 'Visual mode: right-click a visible candidate by its E-number label. The backend clicks the candidate visible center.',
+      description: 'Visual mode: right-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
       inputSchema: z.object({
-        id: z.string().describe('Candidate id such as E1, E12. Must come from the current screenshot labels or interactive candidate list.'),
+        reason: toolReasonInput,
+        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
       }),
-      execute: ({ id }) => record('rightClickCandidate', { id }, () => session.rightClickCandidate(id)),
+      execute: ({ id, reason }) => record('rightClickCandidate', { id, reason }, () => session.rightClickCandidate(id)),
     }),
     dragCandidate: tool({
-      description: 'Visual mode: drag from one E-number candidate center to another E-number candidate center.',
+      description: 'Visual mode: drag from one numbered candidate center to another numbered candidate center.',
       inputSchema: z.object({
-        fromId: z.string().describe('Start candidate id such as E1.'),
-        toId: z.string().describe('End candidate id such as E2.'),
+        reason: toolReasonInput,
+        fromId: z.string().describe('Start candidate id such as 1.'),
+        toId: z.string().describe('End candidate id such as 2.'),
       }),
-      execute: ({ fromId, toId }) => record('dragCandidate', { fromId, toId }, () => session.dragCandidate(fromId, toId)),
+      execute: ({ fromId, toId, reason }) => record('dragCandidate', { fromId, toId, reason }, () => session.dragCandidate(fromId, toId)),
     }),
   };
 
@@ -482,13 +529,14 @@ function runtimePrompt(input: {
   const visualMode = isVisualClickMode();
   const candidateRules = [
     'Candidate grounding rules (screenshot-first):',
-    '- The annotated screenshot is the PRIMARY and authoritative source for E ids. Colored boxes labeled E1, E2, ... mark visible leaf interactable elements. Blue = link, green = input/control, orange = generic clickable.',
-    '- FIRST look at the screenshot and pick the E id that matches the visible target by position, label text, and context. Only if the screenshot shows no usable E label for that target, fall back to the Interactive candidates JSON below.',
+    '- The annotated screenshot is the PRIMARY and authoritative source for candidate ids. Colored boxes labeled 1, 2, ... mark visible leaf interactable elements. Blue = link, green = input/control, orange = generic clickable.',
+    '- FIRST look at the screenshot and pick the numbered id that matches the visible target by position, label text, and context. Only if the screenshot shows no usable number label for that target, fall back to the Interactive candidates JSON below.',
     visualMode
-      ? '- Visual mode: getInteractiveCandidates is NOT available. Never try to refresh candidates — trust the screenshot E labels and act with clickCandidate/focusCandidate/doubleClickCandidate/rightClickCandidate/dragCandidate.'
-      : '- DOM mode fallback: if the screenshot shows no E label for the intended target, call getInteractiveCandidates once, then act. Do not call it repeatedly in a loop.',
-    '- Prefer clickCandidate(id) or focusCandidate(id) over DOM paths whenever the intended target has an E id on the screenshot.',
+      ? '- Visual mode: getInteractiveCandidates is NOT available. Never try to refresh candidates — trust the screenshot number labels and act with clickCandidate/focusCandidate/hoverCandidate/doubleClickCandidate/rightClickCandidate/dragCandidate.'
+      : '- DOM mode fallback: if the screenshot shows no number label for the intended target, call getInteractiveCandidates once, then act. Do not call it repeatedly in a loop.',
+    '- Prefer clickCandidate(id), focusCandidate(id), or hoverCandidate(id) over DOM paths whenever the intended target has a numbered id on the screenshot.',
     '- When the user requirement says 双击/double-click, use doubleClickCandidate(id) — NOT clickCandidate and NOT getInteractiveCandidates.',
+    '- If a menu, tooltip, dropdown, or hidden control appears only after mouse hover, call hoverCandidate(id) on the visible trigger first, then inspect the next screenshot for the revealed numbered candidates.',
     '- For links/search results, never choose by title text alone. Cross-check: screenshot label position + candidate text/name + href/host + nearbyText. If a candidate points to the wrong host/URL, do not click it even if its visible text looks right.',
     `- Target URL host is ${targetHost}; treat it as the starting page, not necessarily the final destination. When the user asks for a specific website/domain, prefer candidates whose href host exactly matches or is a credible subdomain of that requested site; avoid ads, mirrors, login traps, and unrelated search results.`,
   ];
@@ -501,25 +549,27 @@ function runtimePrompt(input: {
     '- Pick the path whose text/attributes AND @box position match the visible control in the screenshot. Prefer a node marked "*". Use paths exactly as shown.',
     '- For links/search results, cross-check the visible title text, href/domain, and @box location against the screenshot. Do not click a different URL just because the text is similar.',
     '- If clickDomNode/focusDomNode reports the path was not found, the DOM changed or the node scrolled away: call getDomTree again to get fresh paths instead of reusing the old ones or inventing a path.',
-    '- Use clickDomNode(path) only as fallback when no E candidate is available. Use paths exactly as shown, for example "0.1.2".',
+    '- Use clickDomNode(path) only as fallback when no numbered candidate is available. Use paths exactly as shown, for example "0.1.2".',
     '- Clicks target the element’s interactive center (DOM click uses element center when possible).',
     '- The screenshot remains the primary evidence for visual state and completion. Use the DOM tree only for locating the element to operate.',
     '- For scrolling, call scrollViewport with domPath for the specific scrollable table/list/panel or one of its visible children. This is required for virtual-scroll tables.',
     '- If the target is outside the viewport or not present in the candidate list/DOM tree, call scrollViewport on the relevant scroll container, inspect the next screenshot/DOM tree, then continue.',
     '- For text entry: focusCandidate(id) when available, then typeText. If using fallback DOM, focusDomNode(path), then typeText. If the field contains wrong text, use Ctrl+A/Backspace via pressKey before typing.',
+    '- For hover-revealed controls, use hoverCandidate(id) on the visible trigger, wait for the next screenshot, then operate the newly visible candidate.',
     '- For keyboard submission, use pressKey only after the intended input/control is focused.',
   ];
   const visualInteractionRules = [
     ...candidateRules,
     'Visual click mode rules:',
     '- isClick/IS_CLICK is enabled, so DOM-path tools and getInteractiveCandidates are intentionally unavailable.',
-    '- Screenshot E labels are your only candidate source. Choose the intended visible E id from the annotated screenshot, then call the matching candidate tool.',
-    '- Available E-based actions: clickCandidate(id), focusCandidate(id), doubleClickCandidate(id), rightClickCandidate(id), dragCandidate(fromId,toId).',
-    '- Do NOT output raw screenshot coordinates. The backend resolves the chosen E id to the element visible center.',
-    '- Do NOT call getInteractiveCandidates — it does not exist in visual mode. If you see the target on the screenshot with an E label, act immediately.',
+    '- Screenshot number labels are your only candidate source. Choose the intended visible numbered id from the annotated screenshot, then call the matching candidate tool.',
+    '- Available numbered-candidate actions: clickCandidate(id), focusCandidate(id), hoverCandidate(id), doubleClickCandidate(id), rightClickCandidate(id), dragCandidate(fromId,toId).',
+    '- Do NOT output raw screenshot coordinates. The backend resolves the chosen numbered id to the element visible center.',
+    '- Do NOT call getInteractiveCandidates — it does not exist in visual mode. If you see the target on the screenshot with a number label, act immediately.',
     '- For 双击/double-click requirements: identify the target link/button on the screenshot and call doubleClickCandidate(id) directly.',
     '- For text entry: focusCandidate(id), then typeText on the next step after focus is confirmed.',
-    '- If a candidate click misses, use the red previous-click marker on the next screenshot to choose a better E candidate.',
+    '- For hover menus/tooltips/dropdowns: call hoverCandidate(id) on the visible trigger, then use the next screenshot to choose the revealed numbered candidate.',
+    '- If a candidate click misses, use the red previous-click marker on the next screenshot to choose a better numbered candidate.',
   ];
   const interactionRules = visualMode ? visualInteractionRules : domInteractionRules;
 
@@ -534,13 +584,13 @@ function runtimePrompt(input: {
     '- Do NOT repeat an action that already succeeded in a previous step, and do NOT re-open or re-navigate to a page when the current URL and screenshot already show it. Look at the last tool calls and the screenshot first.',
     '',
     'Vision-first decision policy:',
-    '- The screenshot is the primary evidence for everything: what page is visible, what controls exist, which E id to click/double-click, whether the requirement is complete, whether a CAPTCHA/security page is blocking the flow, and whether the last click marker landed correctly.',
-    '- The annotated E labels on the screenshot take priority over the Interactive candidates JSON. Use the JSON only to confirm href/host/text when the screenshot label is ambiguous.',
+    '- The screenshot is the primary evidence for everything: what page is visible, what controls exist, which numbered id to click/double-click, whether the requirement is complete, whether a CAPTCHA/security page is blocking the flow, and whether the last click marker landed correctly.',
+    '- The annotated number labels on the screenshot take priority over the Interactive candidates JSON. Use the JSON only to confirm href/host/text when the screenshot label is ambiguous.',
     '- Do not declare the page wrong, incomplete, or failed before you have actually acted; if the start screenshot already shows the page the requirement needs (and the URL matches), do NOT re-open or re-navigate to it, just do the next concrete action toward the requirement.',
     '- If the screenshot looks blank, still loading, or mid-transition, your single action this step should be waitForPage, then judge on the next screenshot.',
     '- URL, tab list, focused element, screenshot metrics, candidate list, DOM tree, and the last five tool calls are auxiliary hints.',
     '- When the screenshot contradicts auxiliary context, trust the screenshot and explain the contradiction in actual.',
-    '- The red marker (solid red dot/circle) in the screenshot shows where your PREVIOUS click landed. Use it to decide whether the previous candidate was ineffective, then choose a better E candidate or fresh candidate list.',
+    '- The red marker (solid red dot/circle) in the screenshot shows where your PREVIOUS click landed. Use it to decide whether the previous candidate was ineffective, then choose a better numbered candidate or fresh candidate list.',
     '- If a click was intended to open a search result/link but the next screenshot still shows the same normal results page, treat it as a missed/ineffective candidate and retry with a better candidate. Do not call it CAPTCHA/security verification unless the screenshot visibly shows a verification challenge.',
     '- The focused element summary tells you whether the current tab focus is on the intended input/control. Before typing or pressing Enter for a form, verify the focus summary matches the visible target; if it is body/document or the wrong element, focus the target input candidate again.',
     '- Prefer one purposeful user-like operation per runtime step. Do not perform a long chain of blind clicks. Observe, act once, then let the next screenshot confirm the result.',
@@ -564,7 +614,8 @@ function runtimePrompt(input: {
     '- If ANY part of the requirement is still outstanding, do NOT return done=true — call one more tool instead.',
     '',
     'How to respond:',
-    '- To act: call exactly ONE tool. In the SAME response, also write ONE short plain-text line in this exact format (this is your memory carried into the next step): "PROGRESS: <what you just accomplished / what the screenshot shows> NEXT: <the single next action you intend>". Keep it to one concise sentence each. Do not output JSON when acting.',
+    '- To act: call exactly ONE tool and include the required tool input field reason. The reason must say why this tool is the best next action now, grounded in the screenshot and recent progress.',
+    '- In the SAME response, also write ONE short plain-text line in this exact format (this is your memory carried into the next step): "PROGRESS: <what you just accomplished / what the screenshot shows> NEXT: <the single next action you intend>". Keep it to one concise sentence each. Do not output JSON when acting.',
     '- Before deciding, READ your "recent progress notes" and "recent tool calls" in the context so you continue from where you left off and never redo a finished action.',
     '- To finish (entire requirement complete, blocked by verification, or impossible): call NO tool and return exactly one JSON object:',
     '{"action":"Chinese summary of what was observed","expected":"Chinese visual success criteria","actual":"Chinese result based on the current screenshot — cite evidence for EACH requirement clause","status":"passed|failed|blocked","done":true}',
@@ -577,9 +628,9 @@ function runtimePrompt(input: {
     `Current URL: ${pageContext.url}`,
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
     `Current tab focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    `Interactive candidates JSON (auxiliary; screenshot E labels are authoritative):\n${formatInteractiveCandidates(pageContext.interactiveCandidates)}`,
+    `Interactive candidates JSON (auxiliary; screenshot number labels are authoritative):\n${formatInteractiveCandidates(pageContext.interactiveCandidates)}`,
     `Your recent progress notes (oldest first), so you know what you already did and planned:\n${recentProgressNotes(completedSteps, 8).join('\n') || '[no notes yet]'}`,
-    `Your recent tool calls (oldest first), each {name, input, result:{ok, actual}}:\n${JSON.stringify(recentToolCallContext(completedSteps, 8), null, 2)}`,
+    `Your recent tool calls (oldest first), each {name, input, reason, result:{ok, actual}}:\n${JSON.stringify(recentToolCallContext(completedSteps, 8), null, 2)}`,
     visualMode
       ? 'Simplified current tab DOM tree: [disabled because isClick visual mode is enabled]'
       : `Simplified current tab DOM tree:\n${pageContext.domTree || '[empty DOM tree]'}`,
@@ -592,7 +643,7 @@ function runtimePrompt(input: {
 function summarizeToolInput(input: unknown) {
   if (input && typeof input === 'object') {
     const entries = Object.entries(input as Record<string, unknown>)
-      .filter(([, value]) => value !== undefined && value !== null && value !== '')
+      .filter(([key, value]) => key !== 'reason' && value !== undefined && value !== null && value !== '')
       .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
     return entries.length ? ` (${entries.join(', ')})` : '';
   }
@@ -617,8 +668,9 @@ function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
     const failed = executed.find((trace) => !trace.result.ok);
     const names = executed.map((trace) => `${trace.name}${summarizeToolInput(trace.input)}`).join('、');
     const note = extractProgressNote(text);
+    const toolReason = executed.map((trace) => splitToolInputAndReason(trace.input).reason).find(Boolean);
     return {
-      action: note || `AI 执行操作：${names || last?.name || '浏览器操作'}`,
+      action: note || toolReason || `AI 执行操作：${names || last?.name || '浏览器操作'}`,
       expected: '本步操作推进用户需求；操作结果将在下一步的最新截图中确认。',
       actual: last?.result.actual || '已完成本步工具调用，等待下一步截图确认效果。',
       status: failed ? 'failed' : 'passed',

@@ -144,7 +144,7 @@ export class BrowserSession {
     await context.addInitScript(() => {
       const originalAddEventListener = EventTarget.prototype.addEventListener;
       const listenerTypes = new WeakMap<EventTarget, Set<string>>();
-      const interestingEvents = /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/i;
+      const interestingEvents = /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown|mouseenter|mouseover|pointerenter|pointerover)$/i;
       Object.defineProperty(window, '__aiGetEventListenerTypes', {
         value(target: EventTarget) {
           return Array.from(listenerTypes.get(target) || []);
@@ -402,6 +402,19 @@ export class BrowserSession {
     return {
       ok: true,
       actual: `Right-clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before right-clicking.' : ''}${note}`,
+    };
+  }
+
+  async hoverCandidate(candidateId: string): Promise<BrowserActionResult> {
+    const resolved = await this.resolveCandidateTarget(candidateId);
+    if (!resolved.target) return { ok: false, actual: resolved.error };
+
+    const { candidate, target } = resolved;
+    await this.activePage.mouse.move(target.x, target.y);
+    const note = await this.waitAfterAction();
+    return {
+      ok: true,
+      actual: `Hovered candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before hovering.' : ''}${note}`,
     };
   }
 
@@ -869,6 +882,10 @@ export class BrowserSession {
         return recordedEventTypes(element).some((type) => /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/.test(type));
       }
 
+      function hasRecordedHoverListener(element: Element) {
+        return recordedEventTypes(element).some((type) => /^(mouseenter|mouseover|pointerenter|pointerover)$/.test(type));
+      }
+
       function hasActionAttribute(element: Element) {
         if (element.hasAttribute('jsaction')) return true;
         for (const attr of Array.from(element.attributes)) {
@@ -884,6 +901,15 @@ export class BrowserSession {
         if (hasActionAttribute(element)) return true;
         if (hasRecordedClickListener(element)) return true;
         if (hasOwnPointerCursor(element)) return true;
+        return false;
+      }
+
+      function hasOwnHoverSignal(element: Element) {
+        if (element.hasAttribute('onmouseenter')) return true;
+        if (element.hasAttribute('onmouseover')) return true;
+        if (element.hasAttribute('onpointerenter')) return true;
+        if (element.hasAttribute('onpointerover')) return true;
+        if (hasRecordedHoverListener(element)) return true;
         return false;
       }
 
@@ -1023,7 +1049,8 @@ export class BrowserSession {
         const input = element as HTMLInputElement;
         const isInput = ['input', 'textarea', 'select'].includes(tag) || Boolean((element as HTMLElement).isContentEditable);
         const clickable = clickableReason(element);
-        if (!clickable && !isInput) return undefined;
+        const hoverable = hasOwnHoverSignal(element);
+        if (!clickable && !isInput && !hoverable) return undefined;
         const semanticTarget =
           ['a', 'button', 'input', 'textarea', 'select', 'label', 'summary', 'option'].includes(tag) ||
           Boolean(role && interactiveRoles.has(role)) ||
@@ -1033,7 +1060,7 @@ export class BrowserSession {
         // and merely contains interactive descendants. Keep genuinely clickable
         // cards / rows (cursor:pointer, onclick, data-action, click listeners),
         // which previously slipped through because frameworks delegate events.
-        if (!semanticTarget && !hasOwnClickSignal(element) && hasInteractiveDescendant(element)) return undefined;
+        if (!semanticTarget && !hasOwnClickSignal(element) && !hoverable && hasInteractiveDescendant(element)) return undefined;
 
         const rect = visibleRectOf(element);
         if (!rect) return undefined;
@@ -1190,7 +1217,7 @@ export class BrowserSession {
       deduped.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
       return selectCandidatesAcrossViewport(deduped, candidateLimit).map((candidate, index) => ({
         ...candidate,
-        id: `E${index + 1}`,
+        id: `${index + 1}`,
       }));
     }, { limit }).catch(() => [] as InteractiveCandidate[]);
 
@@ -1210,7 +1237,7 @@ export class BrowserSession {
   }
 
   private async resolveCandidateTarget(candidateId: string) {
-    const normalized = candidateId.trim().toUpperCase();
+    const normalized = candidateId.trim().toUpperCase().replace(/^E(?=\d+$)/, '');
     let candidate = this.lastInteractiveCandidates.find((item) => item.id.toUpperCase() === normalized);
     if (!candidate) {
       await this.refreshInteractiveCandidates();
@@ -1762,39 +1789,40 @@ export class BrowserSession {
       function overlaps(a: { left: number; top: number; right: number; bottom: number }, b: { left: number; top: number; right: number; bottom: number }) {
         return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
       }
+      function expanded(box: { left: number; top: number; right: number; bottom: number }, padding: number) {
+        return {
+          left: box.left - padding,
+          top: box.top - padding,
+          right: box.right + padding,
+          bottom: box.bottom + padding,
+        };
+      }
+      function clamp(value: number, min: number, max: number) {
+        return Math.max(min, Math.min(max, value));
+      }
       function labelPosition(rect: { x: number; y: number; width: number; height: number }, labelWidth: number, labelHeight: number) {
-        const baseLeft = Math.max(0, rect.x);
-        const baseTop = Math.max(0, rect.y);
-        const candidates = [
-          { left: baseLeft, top: Math.max(0, rect.y - labelHeight) },
-          { left: baseLeft, top: baseTop },
-          { left: Math.max(0, rect.x + rect.width - labelWidth), top: baseTop },
-          { left: Math.min(window.innerWidth - labelWidth, rect.x + rect.width + 2), top: baseTop },
-          { left: baseLeft, top: Math.min(window.innerHeight - labelHeight, rect.y + rect.height + 2) },
+        const maxLeft = Math.max(0, window.innerWidth - labelWidth);
+        const maxTop = Math.max(0, window.innerHeight - labelHeight);
+        const preferred = [
+          { left: rect.x + rect.width - labelWidth, top: rect.y + rect.height - labelHeight },
+          { left: rect.x + rect.width, top: rect.y + rect.height - labelHeight },
+          { left: rect.x + rect.width - labelWidth, top: rect.y + rect.height },
+          { left: rect.x + rect.width - labelWidth, top: rect.y },
         ];
-        for (let offset = 0; offset <= 80; offset += 20) {
-          candidates.push({ left: baseLeft, top: Math.min(window.innerHeight - labelHeight, baseTop + offset) });
-          candidates.push({ left: Math.max(0, baseLeft - labelWidth - 2), top: Math.min(window.innerHeight - labelHeight, baseTop + offset) });
-        }
-        for (const option of candidates) {
-          const left = Math.max(0, Math.min(window.innerWidth - labelWidth, option.left));
-          const top = Math.max(0, Math.min(window.innerHeight - labelHeight, option.top));
+        for (const option of preferred) {
+          const left = clamp(option.left, 0, maxLeft);
+          const top = clamp(option.top, 0, maxTop);
           const box = { left, top, right: left + labelWidth, bottom: top + labelHeight };
-          if (!placedLabels.some((placed) => overlaps(box, placed))) {
+          if (!placedLabels.some((placed) => overlaps(expanded(box, 1), expanded(placed, 1)))) {
             placedLabels.push(box);
             return box;
           }
         }
-        const fallback = {
-          left: Math.max(0, Math.min(window.innerWidth - labelWidth, baseLeft)),
-          top: Math.max(0, Math.min(window.innerHeight - labelHeight, baseTop)),
-          right: 0,
-          bottom: 0,
-        };
-        fallback.right = fallback.left + labelWidth;
-        fallback.bottom = fallback.top + labelHeight;
-        placedLabels.push(fallback);
-        return fallback;
+        const left = clamp(rect.x + rect.width - labelWidth, 0, maxLeft);
+        const top = clamp(rect.y + rect.height - labelHeight, 0, maxTop);
+        const finalBox = { left, top, right: left + labelWidth, bottom: top + labelHeight };
+        placedLabels.push(finalBox);
+        return finalBox;
       }
 
       for (const item of items) {
@@ -1817,22 +1845,23 @@ export class BrowserSession {
 
         const label = document.createElement('div');
         label.textContent = item.id;
-        const labelWidth = Math.max(24, item.id.length * 8 + 8);
-        const labelBox = labelPosition(rect, labelWidth, 18);
+        const labelWidth = Math.max(14, item.id.length * 6 + 2);
+        const labelHeight = 12;
+        const labelBox = labelPosition(rect, labelWidth, labelHeight);
         Object.assign(label.style, {
           position: 'absolute',
           left: `${labelBox.left}px`,
           top: `${labelBox.top}px`,
           width: `${labelWidth}px`,
-          height: '18px',
-          padding: '0 4px',
+          height: `${labelHeight}px`,
+          padding: '0',
           boxSizing: 'border-box',
-          borderRadius: '3px',
-          background: color,
+          background: 'transparent',
           color: '#fff',
-          font: '800 12px/18px Arial, sans-serif',
+          font: `900 10px/10px Arial, sans-serif`,
+          letterSpacing: '0',
           textAlign: 'center',
-          boxShadow: '0 1px 4px rgba(0,0,0,0.24), 0 0 0 1px rgba(255,255,255,0.9)',
+          textShadow: '-1px -1px 0 #000, 0 -1px 0 #000, 1px -1px 0 #000, -1px 0 0 #000, 1px 0 0 #000, -1px 1px 0 #000, 0 1px 0 #000, 1px 1px 0 #000',
         });
 
         overlay.appendChild(box);

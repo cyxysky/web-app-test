@@ -34,7 +34,7 @@ function toolMarkdown(step: StepExecutionResult) {
     '- 工具调用：',
     ...step.tools.map((tool) => {
       const input = formatToolInput(tool.input);
-      return `  - ${tool.name}${input ? ` ${input}` : ''}`;
+      return `  - ${tool.name}${input ? ` ${input}` : ''}${tool.reason ? `\n    - 调用原因：${tool.reason}` : ''}`;
     }),
   ].join('\n');
 }
