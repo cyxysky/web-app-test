@@ -22,3 +22,23 @@ You can override `AI_PROVIDER`, `AI_MODEL`, `DEEPSEEK_API_KEY`, `OPENAI_BASE_URL
 If the model call fails, generation falls back to a local structured test case and records the failure reason in the test case risks.
 
 Browser execution accepts `http` and `https` target URLs by default. Set `ALLOWED_TEST_DOMAINS=localhost,127.0.0.1,example.com` to restrict runs to a domain allowlist.
+
+## Package and Run with Docker
+
+Docker is the recommended packaging path because the app depends on Playwright and a headless Chromium runtime.
+
+1. Copy `.env.example` to `.env` and fill the provider key you want to use.
+2. Build and start:
+
+```bash
+npm run docker:up
+```
+
+Then open `http://localhost:3000`.
+
+The compose setup keeps runtime data outside the image:
+
+- `.data/store.json` stores test cases and runs.
+- `artifacts/` stores screenshots and reports.
+
+For production-like packaged runs, keep `HEADLESS_BROWSER=true`.

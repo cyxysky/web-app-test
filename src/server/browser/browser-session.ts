@@ -741,7 +741,7 @@ export class BrowserSession {
         __aiGetEventListenerTypes?: (target: EventTarget) => string[];
       };
 
-      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
       const interactiveRoles = new Set([
         'button',
         'link',
@@ -794,21 +794,6 @@ export class BrowserSession {
         return Boolean(root && (root as ShadowRoot).host);
       }
 
-      // `cursor: pointer` is inherited, so nested children of a clickable region
-      // all report it. Only treat it as a click signal when this element actually
-      // introduces it (its flattened parent does not already use a pointer cursor),
-      // which marks the real clickable boundary instead of every descendant.
-      function hasOwnPointerCursor(element: Element) {
-        try {
-          if (window.getComputedStyle(element).cursor !== 'pointer') return false;
-          const parent = flatParentElement(element);
-          if (!parent) return true;
-          return window.getComputedStyle(parent).cursor !== 'pointer';
-        } catch {
-          return false;
-        }
-      }
-
       function isRenderable(element: Element) {
         if (!element || element.nodeType !== 1 || isOverlay(element)) return false;
         const tag = element.tagName.toLowerCase();
@@ -817,6 +802,7 @@ export class BrowserSession {
         if (element.getAttribute('aria-hidden') === 'true') return false;
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (style.pointerEvents === 'none') return false;
         if (Number(style.opacity || '1') <= 0.01) return false;
         return true;
       }
@@ -838,11 +824,14 @@ export class BrowserSession {
         return Boolean(visibleRectOf(element));
       }
 
-      // Traversal must NOT require a visible box: layout wrappers with zero height
-      // (common on SPAs like Bing) sit between the root and real interactive
-      // children. Filtering them out breaks the walk and skips entire subtrees.
+      // Traversal must not depend on visual/clickability CSS. A parent can be a
+      // hidden or pointer-disabled wrapper while a deeper child still supplies the
+      // actual interactive target, so candidate eligibility is checked only in
+      // candidateFrom().
       function isTraversable(element: Element) {
-        return isRenderable(element);
+        if (!element || element.nodeType !== 1 || isOverlay(element)) return false;
+        const tag = element.tagName.toLowerCase();
+        return !skippedTags.has(tag);
       }
 
       function children(element: Element) {
@@ -894,22 +883,49 @@ export class BrowserSession {
         return false;
       }
 
-      // A direct, element-level signal that this node is itself the click target
-      // (as opposed to merely containing clickable descendants).
-      function hasOwnClickSignal(element: Element) {
-        if (element.hasAttribute('onclick')) return true;
-        if (hasActionAttribute(element)) return true;
-        if (hasRecordedClickListener(element)) return true;
-        if (hasOwnPointerCursor(element)) return true;
-        return false;
-      }
-
       function hasOwnHoverSignal(element: Element) {
         if (element.hasAttribute('onmouseenter')) return true;
         if (element.hasAttribute('onmouseover')) return true;
         if (element.hasAttribute('onpointerenter')) return true;
         if (element.hasAttribute('onpointerover')) return true;
         if (hasRecordedHoverListener(element)) return true;
+        return false;
+      }
+
+      const hoverSelectors = (() => {
+        const selectors: string[] = [];
+        for (const sheet of Array.from(document.styleSheets)) {
+          let rules: CSSRuleList | undefined;
+          try {
+            rules = sheet.cssRules;
+          } catch {
+            continue;
+          }
+          for (const rule of Array.from(rules || [])) {
+            const selectorText = (rule as CSSStyleRule).selectorText;
+            if (!selectorText || !selectorText.includes(':hover')) continue;
+            for (const part of selectorText.split(',')) {
+              const normalized = part
+                .replace(/:hover\b/g, '')
+                .replace(/:(active|focus|focus-visible|focus-within|visited|link)\b/g, '')
+                .trim();
+              if (normalized && !/[>+~]\s*$/.test(normalized)) selectors.push(normalized);
+            }
+          }
+        }
+        return Array.from(new Set(selectors)).slice(0, 600);
+      })();
+
+      function hasCssHoverEffect(element: Element) {
+        const className = typeof element.className === 'string' ? element.className : '';
+        if (/(^|\s)hover[:_-]/.test(className)) return true;
+        for (const selector of hoverSelectors) {
+          try {
+            if (element.matches(selector)) return true;
+          } catch {
+            // Ignore selectors that cannot be used with matches().
+          }
+        }
         return false;
       }
 
@@ -924,26 +940,7 @@ export class BrowserSession {
         const tabindex = element.getAttribute('tabindex');
         if (tabindex !== null && tabindex !== '-1') return true;
         if ((element as HTMLElement).isContentEditable) return true;
-        // Only an element that *introduces* a pointer cursor (not one inheriting it
-        // from a clickable ancestor) counts. This prevents every nested wrapper of a
-        // clickable region from being flagged, which produced duplicate parent/child
-        // E markers, while still catching real clickable cards / rows / div-buttons.
-        if (hasOwnPointerCursor(element)) return true;
         return false;
-      }
-
-      function hasClickableAncestor(element: Element) {
-        let current = flatParentElement(element);
-        for (let depth = 0; current && depth < 6; depth += 1, current = flatParentElement(current)) {
-          if (!isVisibleInViewport(current)) continue;
-          if (clickableReason(current)) return true;
-        }
-        return false;
-      }
-
-      function hasInteractiveDescendant(element: Element) {
-        const descendants = Array.from(element.querySelectorAll('a,button,input,select,textarea,label,summary,[role],[tabindex],[onclick],[jsaction]')).slice(0, 60);
-        return descendants.some((child) => child !== element && isVisibleInViewport(child) && clickableReason(child));
       }
 
       function nameOf(element: Element) {
@@ -1049,18 +1046,8 @@ export class BrowserSession {
         const input = element as HTMLInputElement;
         const isInput = ['input', 'textarea', 'select'].includes(tag) || Boolean((element as HTMLElement).isContentEditable);
         const clickable = clickableReason(element);
-        const hoverable = hasOwnHoverSignal(element);
+        const hoverable = hasOwnHoverSignal(element) || hasCssHoverEffect(element);
         if (!clickable && !isInput && !hoverable) return undefined;
-        const semanticTarget =
-          ['a', 'button', 'input', 'textarea', 'select', 'label', 'summary', 'option'].includes(tag) ||
-          Boolean(role && interactiveRoles.has(role)) ||
-          isInput;
-        if (hasClickableAncestor(element) && !semanticTarget) return undefined;
-        // Drop a non-semantic wrapper only when it has no click signal of its own
-        // and merely contains interactive descendants. Keep genuinely clickable
-        // cards / rows (cursor:pointer, onclick, data-action, click listeners),
-        // which previously slipped through because frameworks delegate events.
-        if (!semanticTarget && !hasOwnClickSignal(element) && !hoverable && hasInteractiveDescendant(element)) return undefined;
 
         const rect = visibleRectOf(element);
         if (!rect) return undefined;
@@ -1126,9 +1113,9 @@ export class BrowserSession {
         return descendantPath.startsWith(`${ancestorPath}.`);
       }
 
-      // Keep the deepest candidate in each DOM branch: when both a wrapper and its
-      // descendant are flagged, only the innermost one gets an E marker. This
-      // removes duplicate parent/child labels (e.g. search-bar container + input).
+      // If both a parent and a child are independently interactive, keep the child.
+      // This matches the click target the model should use and avoids broad toolbar
+      // / menu wrappers swallowing their icon buttons.
       function dropParentWhenChildExists(items: Candidate[]) {
         return items.filter(
           (candidate) =>
@@ -1195,12 +1182,10 @@ export class BrowserSession {
 
       walk(document.documentElement, [0], 0);
 
-      // Flat scan catches interactive nodes the tree walk may still miss (e.g. when
-      // a selector query reaches them faster than a deep branch walk).
+      // Flat scan all elements as a backup to the composed-tree walk. Candidate
+      // filtering still happens in candidateFrom; this is not a selector whitelist.
       const seenPaths = new Set(raw.map((item) => item.path));
-      const flatSelectors =
-        'a[href],button,input:not([type="hidden"]),select,textarea,label,summary,option,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="option"],[tabindex]:not([tabindex="-1"])';
-      for (const element of Array.from(document.querySelectorAll(flatSelectors))) {
+      for (const element of Array.from(document.querySelectorAll('*'))) {
         if (!isTraversable(element) || !isVisibleInViewport(element)) continue;
         const pathParts = domPathOf(element);
         if (!pathParts) continue;
@@ -1329,7 +1314,7 @@ export class BrowserSession {
       type WindowWithAiListeners = Window & {
         __aiGetEventListenerTypes?: (target: EventTarget) => string[];
       };
-      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
       function aiIsRenderable(element: Element) {
         if (!element || element.nodeType !== 1) return false;
         if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
@@ -1339,8 +1324,14 @@ export class BrowserSession {
         if (element.getAttribute('aria-hidden') === 'true') return false;
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (style.pointerEvents === 'none') return false;
         if (Number(style.opacity || '1') <= 0.01) return false;
         return true;
+      }
+      function aiIsTraversable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        return !skippedTags.has(element.tagName.toLowerCase());
       }
       function aiVisibleRect(element: Element) {
         if (!aiIsRenderable(element)) return undefined;
@@ -1358,7 +1349,7 @@ export class BrowserSession {
         return Boolean(aiVisibleRect(element));
       }
       function aiChildren(element: Element) {
-        return Array.from(element.children).filter(aiIsRenderable);
+        return Array.from(element.children).filter(aiIsTraversable);
       }
 
       let count = 0;
@@ -1416,46 +1407,18 @@ export class BrowserSession {
         return false;
       }
 
-      function looksLikeClickableSurface(element: Element) {
-        const tag = element.tagName.toLowerCase();
-        if (!['div', 'span', 'li', 'article', 'section', 'p'].includes(tag)) return false;
-        const rect = aiVisibleRect(element);
-        if (!rect) return false;
-        if (rect.width < 24 || rect.height < 16 || rect.width > 560 || rect.height > 140) return false;
-        const text = ownText(element);
-        if (!text || text.length > 220) return false;
-        try {
-          const style = window.getComputedStyle(element);
-          const borderWidth =
-            Number.parseFloat(style.borderTopWidth || '0') +
-            Number.parseFloat(style.borderRightWidth || '0') +
-            Number.parseFloat(style.borderBottomWidth || '0') +
-            Number.parseFloat(style.borderLeftWidth || '0');
-          const radius = Number.parseFloat(style.borderTopLeftRadius || '0') + Number.parseFloat(style.borderTopRightRadius || '0');
-          const background = style.backgroundColor || '';
-          const hasBackground = background && !/^rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,?\s*0?\s*\)$/i.test(background) && background !== 'transparent';
-          return style.cursor === 'pointer' || borderWidth > 0 || radius > 6 || hasBackground || hasActionAttribute(element);
-        } catch {
-          return hasActionAttribute(element);
-        }
-      }
-
       function isClickable(element: Element) {
         const tag = element.tagName.toLowerCase();
         if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary', 'option'].includes(tag)) return true;
         const role = element.getAttribute('role');
         if (role && ['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'tab', 'checkbox', 'radio', 'switch', 'option'].includes(role)) return true;
         if (element.hasAttribute('onclick')) return true;
-        if (recordedEventTypes(element).length) return true;
+        if (recordedEventTypes(element).some((type) => /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown|mouseenter|mouseover|pointerenter|pointerover)$/.test(type))) return true;
         if (hasActionAttribute(element)) return true;
         const tabindex = element.getAttribute('tabindex');
         if (tabindex !== null && tabindex !== '-1') return true;
-        try {
-          if (window.getComputedStyle(element).cursor === 'pointer') return true;
-        } catch {
-          /* ignore */
-        }
-        return looksLikeClickableSurface(element);
+        if ((element as HTMLElement).isContentEditable) return true;
+        return false;
       }
 
       function describe(element: Element, path: number[]) {
@@ -1500,7 +1463,7 @@ export class BrowserSession {
   private async resolveDomPathToClickablePoint(pathValue: string) {
     return this.activePage.evaluate((path) => {
       // Keep this predicate byte-identical to readSimplifiedDomTree so paths resolve consistently.
-      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
       function aiIsRenderable(element: Element) {
         if (!element || element.nodeType !== 1) return false;
         if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
@@ -1510,8 +1473,14 @@ export class BrowserSession {
         if (element.getAttribute('aria-hidden') === 'true') return false;
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (style.pointerEvents === 'none') return false;
         if (Number(style.opacity || '1') <= 0.01) return false;
         return true;
+      }
+      function aiIsTraversable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        return !skippedTags.has(element.tagName.toLowerCase());
       }
       function aiVisibleRect(element: Element) {
         if (!aiIsRenderable(element)) return undefined;
@@ -1529,7 +1498,7 @@ export class BrowserSession {
         return Boolean(aiVisibleRect(element));
       }
       function aiChildren(element: Element) {
-        return Array.from(element.children).filter(aiIsRenderable);
+        return Array.from(element.children).filter(aiIsTraversable);
       }
       function pointBelongsToElement(element: Element, x: number, y: number) {
         const top = document.elementsFromPoint(x, y).find((item) => aiIsRenderable(item));
@@ -1614,7 +1583,7 @@ export class BrowserSession {
 
   private async dispatchDomPathClick(pathValue: string) {
     return this.activePage.evaluate((path) => {
-      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
       function aiIsRenderable(element: Element) {
         if (!element || element.nodeType !== 1) return false;
         if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
@@ -1624,8 +1593,14 @@ export class BrowserSession {
         if (element.getAttribute('aria-hidden') === 'true') return false;
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (style.pointerEvents === 'none') return false;
         if (Number(style.opacity || '1') <= 0.01) return false;
         return true;
+      }
+      function aiIsTraversable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        return !skippedTags.has(element.tagName.toLowerCase());
       }
       function aiIsRendered(element: Element) {
         if (!aiIsRenderable(element)) return false;
@@ -1635,7 +1610,7 @@ export class BrowserSession {
         return visibleWidth > 2 && visibleHeight > 2;
       }
       function aiChildren(element: Element) {
-        return Array.from(element.children).filter(aiIsRenderable);
+        return Array.from(element.children).filter(aiIsTraversable);
       }
 
       const parts = String(path).split('.').map((item) => Number(String(item).trim()));
@@ -1656,7 +1631,7 @@ export class BrowserSession {
   private async resolveScrollTarget(target: { domPath?: string }) {
     return this.activePage.evaluate(({ domPath }) => {
       // Keep this predicate byte-identical to readSimplifiedDomTree so domPath indexes line up.
-      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'svg', 'path', 'head', 'br', 'hr', 'wbr']);
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
       function aiIsRenderable(element: Element) {
         if (!element || element.nodeType !== 1) return false;
         if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
@@ -1666,8 +1641,14 @@ export class BrowserSession {
         if (element.getAttribute('aria-hidden') === 'true') return false;
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (style.pointerEvents === 'none') return false;
         if (Number(style.opacity || '1') <= 0.01) return false;
         return true;
+      }
+      function aiIsTraversable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        return !skippedTags.has(element.tagName.toLowerCase());
       }
       function aiIsRendered(element: Element) {
         if (!aiIsRenderable(element)) return false;
@@ -1677,7 +1658,7 @@ export class BrowserSession {
         return visibleWidth > 2 && visibleHeight > 2;
       }
       function aiChildren(element: Element) {
-        return Array.from(element.children).filter(aiIsRenderable);
+        return Array.from(element.children).filter(aiIsTraversable);
       }
 
       function elementFromDomPath(pathValue?: string) {

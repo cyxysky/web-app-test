@@ -1,0 +1,17 @@
+services:
+  web-app-test:
+    build: .
+    image: web-app-test:latest
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      HEADLESS_BROWSER: "true"
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+    volumes:
+      - ./.data:/app/.data
+      - ./artifacts:/app/artifacts
+    restart: unless-stopped

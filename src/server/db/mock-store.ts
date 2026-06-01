@@ -151,6 +151,11 @@ export const store = {
   getTestCase(testCaseId: string) {
     return readData().testCases.find((item) => item.id === testCaseId);
   },
+  listRunsForTestCase(testCaseId: string) {
+    return readData().runs
+      .filter((item) => item.testCaseId === testCaseId)
+      .sort((a, b) => (b.startedAt || b.createdAt).localeCompare(a.startedAt || a.createdAt));
+  },
   createTestCase(content: TestCaseContent, imageNames: string[], groupId?: string) {
     const data = readData();
     const record: TestCaseRecord = {
