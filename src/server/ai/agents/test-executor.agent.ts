@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { generateText, stepCountIs, tool } from 'ai';
 import { z } from 'zod';
-import type { StepExecutionResult, StepToolCall, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, StepExecutionResult, StepToolCall, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult } from '@/server/browser/browser-session';
@@ -121,6 +121,10 @@ function extractJson(text: string) {
 
 function requirementOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.userRequirement || testCase.description) || testCase.description || testCase.title;
+}
+
+function systemPromptOf(testCase: TestCaseRecord) {
+  return richTextToPlainText(testCase.content.systemPrompt || '').trim();
 }
 
 function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
@@ -527,6 +531,7 @@ function runtimePrompt(input: {
   const { testCase, pageContext, completedSteps, beforeScreenshotPath } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
   const visualMode = isVisualClickMode();
+  const caseSystemPrompt = systemPromptOf(testCase);
   const candidateRules = [
     'Candidate grounding rules (screenshot-first):',
     '- The annotated screenshot is the PRIMARY and authoritative source for candidate ids. Colored boxes labeled 1, 2, ... mark visible leaf interactable elements. Blue = link, green = input/control, orange = generic clickable.',
@@ -597,6 +602,9 @@ function runtimePrompt(input: {
     '- If the visible page is still loading, ambiguous, or transitioning, use waitForPage once before deciding the next UI action.',
     '- Do not claim CAPTCHA/security/manual verification unless the screenshot visibly contains a verification challenge AND no captcha code input is already filled (see verification rules below). If the page is a normal search/results/content page, continue with a better operation instead of blocking.',
     '- Do not use DOM/text as the sole success evidence. You must judge completion yourself from the screenshot and return the judgment in JSON.',
+    caseSystemPrompt
+      ? `\nTest-case-specific operation instructions (follow these before choosing any action):\n${caseSystemPrompt}`
+      : '',
     '',
     ...buildVerificationPromptLines(pageContext),
     ...buildCompletionPromptLines(requirementOf(testCase)),
@@ -628,7 +636,7 @@ function runtimePrompt(input: {
     `Current URL: ${pageContext.url}`,
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
     `Current tab focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    `Interactive candidates JSON (auxiliary; screenshot number labels are authoritative):\n${formatInteractiveCandidates(pageContext.interactiveCandidates)}`,
+    process.env.isClick ? `` :  `Interactive candidates JSON (auxiliary; screenshot number labels are authoritative):\n${formatInteractiveCandidates(pageContext.interactiveCandidates)}`,
     `Your recent progress notes (oldest first), so you know what you already did and planned:\n${recentProgressNotes(completedSteps, 8).join('\n') || '[no notes yet]'}`,
     `Your recent tool calls (oldest first), each {name, input, reason, result:{ok, actual}}:\n${JSON.stringify(recentToolCallContext(completedSteps, 8), null, 2)}`,
     visualMode
@@ -648,6 +656,58 @@ function summarizeToolInput(input: unknown) {
     return entries.length ? ` (${entries.join(', ')})` : '';
   }
   return '';
+}
+
+function runtimeToolNames() {
+  const tools = [
+    'openUrl',
+    'waitForPage',
+    'listTabs',
+    'switchTab',
+    'clickCandidate',
+    'focusCandidate',
+    'hoverCandidate',
+    'doubleClickCandidate',
+    'rightClickCandidate',
+    'dragCandidate',
+    'typeText',
+    'pressKey',
+    'scrollViewport',
+  ];
+  if (isVisualClickMode()) return tools;
+  return [...tools, 'getInteractiveCandidates', 'getDomTree', 'clickDomNode', 'focusDomNode'];
+}
+
+function createAiRequestSnapshot(input: {
+  kind: AiRequestSnapshot['kind'];
+  stepIndex: number;
+  prompt: string;
+  screenshotPath?: string;
+  imageAttached: boolean;
+  tools?: string[];
+  options?: Record<string, unknown>;
+}): AiRequestSnapshot {
+  const { provider, model } = getModelSettings();
+  return {
+    kind: input.kind,
+    stepIndex: input.stepIndex,
+    createdAt: new Date().toISOString(),
+    provider,
+    model,
+    screenshotPath: input.screenshotPath,
+    imageAttached: input.imageAttached,
+    tools: input.tools,
+    options: input.options,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: input.prompt },
+          ...(input.screenshotPath ? [{ type: 'image' as const, imagePath: input.screenshotPath, attached: input.imageAttached }] : []),
+        ],
+      },
+    ],
+  };
 }
 
 function extractProgressNote(text: string) {
@@ -725,11 +785,29 @@ async function executeRuntimeStep(input: {
     screenshotMetrics: session.getLastScreenshotMetrics(),
   });
   const screenshot = modelSupportsScreenshotInput() ? await readFile(beforeScreenshotPath) : undefined;
+  let lastAiRequest: AiRequestSnapshot | undefined;
 
   async function runAgent(includeImage: boolean) {
     const traces: ToolTrace[] = [];
     const messageContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: prompt }];
     if (includeImage && screenshot) messageContent.push({ type: 'image', image: screenshot });
+    const aiRequest = createAiRequestSnapshot({
+      kind: 'runtime',
+      stepIndex,
+      prompt,
+      screenshotPath: beforeScreenshotPath,
+      imageAttached: Boolean(includeImage && screenshot),
+      tools: runtimeToolNames(),
+      options: {
+        temperature: 0.1,
+        maxRetries: 0,
+        stopWhenStepCount: Number(process.env.AI_TEST_AGENT_MAX_STEPS || 1),
+        includeImage,
+        modelSupportsScreenshotInput: modelSupportsScreenshotInput(),
+        visualClickMode: isVisualClickMode(),
+      },
+    });
+    lastAiRequest = aiRequest;
 
     try {
       const result = await generateTextWithTimeout({
@@ -765,7 +843,7 @@ async function executeRuntimeStep(input: {
         }),
       });
 
-      return { text: result.text || '', traces };
+      return { text: result.text || '', traces, aiRequest };
     } catch (error) {
       // If a browser tool already ran before the request failed (e.g. response/parse timeout after
       // the action completed), do NOT rethrow. Rethrowing would trigger a retry that re-executes the
@@ -778,7 +856,10 @@ async function executeRuntimeStep(input: {
           message: 'AI 请求在工具执行后中断，已保留本步已执行的操作并继续下一步，不重试以避免重复操作。',
           details: { error: error instanceof Error ? error.message : String(error), traces },
         });
-        return { text: '', traces };
+        return { text: '', traces, aiRequest };
+      }
+      if (error && typeof error === 'object') {
+        (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
       }
       throw error;
     }
@@ -807,7 +888,14 @@ async function executeRuntimeStep(input: {
     }
   }
 
-  throw lastError;
+  if (lastError && typeof lastError === 'object') {
+    (lastError as { aiRequest?: AiRequestSnapshot }).aiRequest ??= lastAiRequest;
+    throw lastError;
+  }
+
+  const wrapped = new Error(String(lastError || 'AI request failed before a response was returned'));
+  (wrapped as { aiRequest?: AiRequestSnapshot }).aiRequest = lastAiRequest;
+  throw wrapped;
 }
 
 function infrastructureError(error: unknown) {
@@ -853,8 +941,9 @@ async function createRecoverableRuntimeErrorStep(input: {
   beforeScreenshotPath?: string;
   error: unknown;
   tools?: StepToolCall[];
+  aiRequest?: AiRequestSnapshot;
 }): Promise<StepExecutionResult> {
-  const { session, runId, stepIndex, beforeScreenshotPath, error, tools } = input;
+  const { session, runId, stepIndex, beforeScreenshotPath, error, tools, aiRequest } = input;
   const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after').catch(() => undefined);
 
   return {
@@ -867,6 +956,7 @@ async function createRecoverableRuntimeErrorStep(input: {
     afterScreenshotPath,
     screenshotPath: afterScreenshotPath,
     tools,
+    aiRequest,
   };
 }
 
@@ -1044,6 +1134,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           beforeScreenshotPath,
           error,
           tools: summarizeToolTraces(liveToolTraces),
+          aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
         });
         steps.push(recoverableStep);
         await onProgress?.(recoverableStep);
@@ -1054,6 +1145,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           details: {
             error: serializeError(error),
             screenshotPath: recoverableStep.screenshotPath,
+            aiRequest: recoverableStep.aiRequest,
           },
         });
         clearStepAbortController(runId, stepIndex);
@@ -1187,6 +1279,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         actual: decision.actual,
         status: decision.status,
         note: decision.note,
+        aiRequest: actionResult.aiRequest,
         beforeScreenshotPath,
         afterScreenshotPath,
         screenshotPath: afterScreenshotPath,

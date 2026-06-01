@@ -126,20 +126,25 @@ export class BrowserSession {
 
   async start() {
     const { chromium } = await import('playwright');
-    // Use a fixed, moderate viewport. A huge screenshot gets downsampled by the vision model, which is
-    // a major cause of imprecise clicks; a moderate resolution keeps the screenshot close to the
-    // model's effective resolution and makes the screenshot->viewport mapping an exact 1:1 ratio.
-    // deviceScaleFactor:1 keeps screenshot pixels == CSS pixels. Configurable via env.
-    const viewportWidth = Number(process.env.BROWSER_VIEWPORT_WIDTH || 1280);
-    const viewportHeight = Number(process.env.BROWSER_VIEWPORT_HEIGHT || 800);
+    const headless = process.env.HEADLESS_BROWSER === 'true';
+    const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
+    const hasExplicitViewport = Boolean(process.env.BROWSER_VIEWPORT_WIDTH || process.env.BROWSER_VIEWPORT_HEIGHT);
+    const viewportWidth = Number(process.env.BROWSER_VIEWPORT_WIDTH || (fullscreen ? 1920 : 1280));
+    const viewportHeight = Number(process.env.BROWSER_VIEWPORT_HEIGHT || (fullscreen ? 1080 : 800));
     this.browser = await chromium.launch({
-      headless: process.env.HEADLESS_BROWSER === 'true',
+      headless,
       slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
-      args: [`--window-size=${viewportWidth},${viewportHeight + 120}`, '--force-device-scale-factor=1', '--high-dpi-support=1'],
+      args: [
+        `--window-size=${viewportWidth},${viewportHeight + 120}`,
+        fullscreen ? '--start-maximized' : '',
+        '--force-device-scale-factor=1',
+        '--high-dpi-support=1',
+      ].filter(Boolean),
     });
+    const useNativeFullscreenViewport = fullscreen && !headless && !hasExplicitViewport;
     const context = await this.browser.newContext({
-      viewport: { width: viewportWidth, height: viewportHeight },
-      deviceScaleFactor: 1,
+      viewport: useNativeFullscreenViewport ? null : { width: viewportWidth, height: viewportHeight },
+      ...(useNativeFullscreenViewport ? {} : { deviceScaleFactor: 1 }),
     });
     await context.addInitScript(() => {
       const originalAddEventListener = EventTarget.prototype.addEventListener;
@@ -1766,11 +1771,12 @@ export class BrowserSession {
         padding: '0',
       });
 
-      const placedLabels: Array<{ left: number; top: number; right: number; bottom: number }> = [];
-      function overlaps(a: { left: number; top: number; right: number; bottom: number }, b: { left: number; top: number; right: number; bottom: number }) {
+      type LabelBox = { left: number; top: number; right: number; bottom: number };
+      const placedLabels: LabelBox[] = [];
+      function overlaps(a: LabelBox, b: LabelBox) {
         return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
       }
-      function expanded(box: { left: number; top: number; right: number; bottom: number }, padding: number) {
+      function expanded(box: LabelBox, padding: number) {
         return {
           left: box.left - padding,
           top: box.top - padding,
@@ -1786,10 +1792,12 @@ export class BrowserSession {
         const maxTop = Math.max(0, window.innerHeight - labelHeight);
         const preferred = [
           { left: rect.x + rect.width - labelWidth, top: rect.y + rect.height - labelHeight },
-          { left: rect.x + rect.width, top: rect.y + rect.height - labelHeight },
-          { left: rect.x + rect.width - labelWidth, top: rect.y + rect.height },
+          { left: rect.x + rect.width - labelWidth, top: rect.y + rect.height - labelHeight - 3 },
+          { left: rect.x + rect.width - labelWidth - 3, top: rect.y + rect.height - labelHeight },
           { left: rect.x + rect.width - labelWidth, top: rect.y },
+          { left: rect.x, top: rect.y + rect.height - labelHeight },
         ];
+
         for (const option of preferred) {
           const left = clamp(option.left, 0, maxLeft);
           const top = clamp(option.top, 0, maxTop);
@@ -1799,6 +1807,7 @@ export class BrowserSession {
             return box;
           }
         }
+
         const left = clamp(rect.x + rect.width - labelWidth, 0, maxLeft);
         const top = clamp(rect.y + rect.height - labelHeight, 0, maxTop);
         const finalBox = { left, top, right: left + labelWidth, bottom: top + labelHeight };
@@ -1839,7 +1848,7 @@ export class BrowserSession {
           boxSizing: 'border-box',
           background: 'transparent',
           color: '#fff',
-          font: `900 10px/10px Arial, sans-serif`,
+          font: `900 9px/9px Arial, sans-serif`,
           letterSpacing: '0',
           textAlign: 'center',
           textShadow: '-1px -1px 0 #000, 0 -1px 0 #000, 1px -1px 0 #000, -1px 0 0 #000, 1px 0 0 #000, -1px 1px 0 #000, 0 1px 0 #000, 1px 1px 0 #000',

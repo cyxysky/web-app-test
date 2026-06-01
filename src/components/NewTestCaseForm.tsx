@@ -9,6 +9,7 @@ import { richTextToPlainText } from '@/lib/rich-text';
 export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
   const router = useRouter();
   const [prompt, setPrompt] = useState('');
+  const [systemPrompt, setSystemPrompt] = useState('');
   const [targetUrl, setTargetUrl] = useState('https://www.zhihu.com');
   const [imageNames, setImageNames] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
@@ -42,7 +43,7 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
       const response = await fetch('/api/test-cases/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, targetUrl, imageNames, groupId }),
+        body: JSON.stringify({ prompt, systemPrompt, targetUrl, imageNames, groupId }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '生成失败');
@@ -68,6 +69,16 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
           onChange={setPrompt}
           placeholder="例如：进入知乎，搜索 gpt，并确认结果页可读"
           value={prompt}
+        />
+      </div>
+      <div className="field">
+        <label htmlFor="systemPrompt">AI 操作提示词</label>
+        <RichTextEditor
+          id="systemPrompt"
+          onChange={setSystemPrompt}
+          placeholder="例如：遇到级联选择器时，必须逐级展开并选择到叶子节点，不能点击一级选项后就认为完成。"
+          value={systemPrompt}
+          minHeight={160}
         />
       </div>
       <div className="field">

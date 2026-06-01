@@ -15,6 +15,7 @@ export const testCaseContentSchema = z.object({
   targetUrl: z.string(),
   priority: z.enum(['low', 'medium', 'high', 'critical']),
   userRequirement: z.string().optional(),
+  systemPrompt: z.string().optional(),
   preconditions: z.array(z.string()),
   testData: z.record(z.string()),
   steps: z.array(testStepSchema).default([]),
@@ -47,11 +48,31 @@ export type StepExecutionResult = {
   actual: string;
   status: 'queued' | 'running' | 'passed' | 'failed' | 'blocked';
   tools?: StepToolCall[];
+  aiRequest?: AiRequestSnapshot;
   /** The model's own short "what I did / what's next" note for this step, carried into later context. */
   note?: string;
   screenshotPath?: string;
   beforeScreenshotPath?: string;
   afterScreenshotPath?: string;
+};
+
+export type AiRequestSnapshot = {
+  kind: 'runtime' | 'completion-verification';
+  stepIndex: number;
+  createdAt: string;
+  provider: string;
+  model: string;
+  screenshotPath?: string;
+  imageAttached: boolean;
+  tools?: string[];
+  options?: Record<string, unknown>;
+  messages: Array<{
+    role: 'user' | 'system' | 'assistant';
+    content: Array<
+      | { type: 'text'; text: string }
+      | { type: 'image'; imagePath?: string; attached: boolean }
+    >;
+  }>;
 };
 
 export type StepToolCall = {

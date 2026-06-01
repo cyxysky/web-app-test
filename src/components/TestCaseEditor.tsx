@@ -12,6 +12,7 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
   const [draft, setDraft] = useState<TestCaseContent>({
     ...testCase.content,
     userRequirement: testCase.content.userRequirement || testCase.description,
+    systemPrompt: testCase.content.systemPrompt || '',
     steps: [],
   });
   const [saving, setSaving] = useState(false);
@@ -83,6 +84,16 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
             value={draft.userRequirement || draft.description}
             onChange={(value) => update({ userRequirement: value, description: richTextToPlainText(value) })}
             minHeight={260}
+          />
+        </label>
+        <label className="wide">
+          AI 操作提示词
+          <RichTextEditor
+            id="systemPrompt"
+            value={draft.systemPrompt || ''}
+            onChange={(value) => update({ systemPrompt: value })}
+            placeholder="例如：遇到级联选择器时，必须逐级展开并选择到叶子节点，不能点击一级选项后就认为完成。"
+            minHeight={180}
           />
         </label>
       </div>

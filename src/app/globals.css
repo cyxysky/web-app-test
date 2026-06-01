@@ -2488,6 +2488,23 @@ select {
   width: min(92vw, 980px);
 }
 
+.ai-request-modal {
+  width: min(94vw, 1180px);
+}
+
+.ai-request-pre {
+  background: #111827;
+  border-radius: 8px;
+  color: #e5e7eb;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  margin: 0;
+  max-height: 70vh;
+  overflow: auto;
+  padding: 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .new-case-modal header,
 .image-modal header,
 .report-modal header,

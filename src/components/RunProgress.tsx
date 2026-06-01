@@ -211,6 +211,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   const [selectedIndex, setSelectedIndex] = useState<number | undefined>(() => initialRun.result?.steps.at(-1)?.index);
   const [imagePreview, setImagePreview] = useState<{ images: ImageItem[]; index: number } | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
+  const [requestOpen, setRequestOpen] = useState(false);
   const [resumePendingStep, setResumePendingStep] = useState<number | undefined>();
   const steps = run.result?.steps || [];
   const allImages = collectStepImages(steps);
@@ -242,6 +243,10 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   useEffect(() => {
     if (!manualIntervention || manualIntervention.stepIndex !== resumePendingStep) setResumePendingStep(undefined);
   }, [manualIntervention, resumePendingStep]);
+
+  useEffect(() => {
+    setRequestOpen(false);
+  }, [selectedStep?.index]);
 
   const progressText = useMemo(() => {
     if (run.status === 'paused') return 'AI 测试已暂停';
@@ -407,6 +412,12 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                   </div>
                 </div>
                 <div className="evidence-actions">
+                  {selectedStep.aiRequest ? (
+                    <button className="link-button" onClick={() => setRequestOpen(true)} type="button">
+                      <Bug size={14} />
+                      查看请求内容
+                    </button>
+                  ) : null}
                   {selectedStep.status === 'running' ? (
                     <button className="text-danger-button" onClick={skipSelectedStep} type="button">
                       <SkipForward size={15} />
@@ -494,6 +505,18 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
             </header>
             <ReportEvidence run={run} images={allImages} openImage={openImageByUrl} />
             <MarkdownReport markdown={run.report.markdown} onImageClick={openImageByUrl} />
+          </section>
+        </div>
+      ) : null}
+
+      {requestOpen && selectedStep?.aiRequest ? (
+        <div className="modal-overlay" onClick={() => setRequestOpen(false)} role="presentation">
+          <section className="report-modal ai-request-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="AI 请求内容">
+            <header>
+              <h2>AI 请求内容 · 步骤 {selectedStep.index}</h2>
+              <button className="icon-button" onClick={() => setRequestOpen(false)} type="button" aria-label="关闭"><X size={18} /></button>
+            </header>
+            <pre className="ai-request-pre">{JSON.stringify(selectedStep.aiRequest, null, 2)}</pre>
           </section>
         </div>
       ) : null}

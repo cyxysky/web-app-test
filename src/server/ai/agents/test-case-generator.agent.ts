@@ -3,6 +3,7 @@ import { richTextToPlainText } from '@/lib/rich-text';
 
 type GenerateInput = {
   prompt: string;
+  systemPrompt?: string;
   targetUrl?: string;
   imageNames?: string[];
 };
@@ -22,6 +23,7 @@ export async function generateTestCase(input: GenerateInput): Promise<TestCaseCo
     description: plainPrompt,
     targetUrl,
     userRequirement: prompt,
+    systemPrompt: input.systemPrompt,
     priority: 'high',
     preconditions: [],
     testData: {
