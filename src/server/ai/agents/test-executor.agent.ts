@@ -534,8 +534,9 @@ function runtimePrompt(input: {
   const caseSystemPrompt = systemPromptOf(testCase);
   const candidateRules = [
     'Candidate grounding rules (screenshot-first):',
-    '- The annotated screenshot is the PRIMARY and authoritative source for candidate ids. Colored boxes labeled 1, 2, ... mark visible leaf interactable elements. Blue = link, green = input/control, orange = generic clickable.',
-    '- FIRST look at the screenshot and pick the numbered id that matches the visible target by position, label text, and context. Only if the screenshot shows no usable number label for that target, fall back to the Interactive candidates JSON below.',
+    '- The annotated screenshot is the PRIMARY and authoritative source for candidate ids. Colored outlines mark visible leaf interactable elements. Blue = link, green = input/control, orange = generic clickable.',
+    '- Number badges may sit inside large targets or just outside small targets. If a badge is outside, follow its thin leader line to the outlined target; do not treat the badge itself as the clickable UI.',
+    '- FIRST look at the screenshot and pick the numbered id that matches the visible target by outline/leader-line position, visible text, and context. Only if the screenshot shows no usable number label for that target, fall back to the Interactive candidates JSON below.',
     visualMode
       ? '- Visual mode: getInteractiveCandidates is NOT available. Never try to refresh candidates — trust the screenshot number labels and act with clickCandidate/focusCandidate/hoverCandidate/doubleClickCandidate/rightClickCandidate/dragCandidate.'
       : '- DOM mode fallback: if the screenshot shows no number label for the intended target, call getInteractiveCandidates once, then act. Do not call it repeatedly in a loop.',
@@ -574,6 +575,7 @@ function runtimePrompt(input: {
     '- For 双击/double-click requirements: identify the target link/button on the screenshot and call doubleClickCandidate(id) directly.',
     '- For text entry: focusCandidate(id), then typeText on the next step after focus is confirmed.',
     '- For hover menus/tooltips/dropdowns: call hoverCandidate(id) on the visible trigger, then use the next screenshot to choose the revealed numbered candidate.',
+    '- For icon-only controls, use the visible icon shape in the screenshot. Do not require a text label when the icon itself clearly matches the intended action.',
     '- If a candidate click misses, use the red previous-click marker on the next screenshot to choose a better numbered candidate.',
   ];
   const interactionRules = visualMode ? visualInteractionRules : domInteractionRules;
@@ -636,7 +638,7 @@ function runtimePrompt(input: {
     `Current URL: ${pageContext.url}`,
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
     `Current tab focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    process.env.isClick ? `` :  `Interactive candidates JSON (auxiliary; screenshot number labels are authoritative):\n${formatInteractiveCandidates(pageContext.interactiveCandidates)}`,
+    visualMode ? `` :  `Interactive candidates JSON (auxiliary; screenshot number labels are authoritative):\n${formatInteractiveCandidates(pageContext.interactiveCandidates)}`,
     `Your recent progress notes (oldest first), so you know what you already did and planned:\n${recentProgressNotes(completedSteps, 8).join('\n') || '[no notes yet]'}`,
     `Your recent tool calls (oldest first), each {name, input, reason, result:{ok, actual}}:\n${JSON.stringify(recentToolCallContext(completedSteps, 8), null, 2)}`,
     visualMode

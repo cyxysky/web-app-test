@@ -1773,6 +1773,15 @@ export class BrowserSession {
 
       type LabelBox = { left: number; top: number; right: number; bottom: number };
       const placedLabels: LabelBox[] = [];
+      const targetBoxes: LabelBox[] = items
+        .map((item) => item.rect)
+        .filter((rect) => rect && rect.width > 0 && rect.height > 0)
+        .map((rect) => ({
+          left: Math.max(0, rect.x),
+          top: Math.max(0, rect.y),
+          right: Math.min(window.innerWidth, rect.x + rect.width),
+          bottom: Math.min(window.innerHeight, rect.y + rect.height),
+        }));
       function overlaps(a: LabelBox, b: LabelBox) {
         return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
       }
@@ -1787,24 +1796,66 @@ export class BrowserSession {
       function clamp(value: number, min: number, max: number) {
         return Math.max(min, Math.min(max, value));
       }
+      function canPlace(box: LabelBox, avoidTargets: boolean) {
+        const padded = expanded(box, 1);
+        if (placedLabels.some((placed) => overlaps(padded, expanded(placed, 1)))) return false;
+        if (avoidTargets && targetBoxes.some((target) => overlaps(padded, expanded(target, 1)))) return false;
+        return true;
+      }
       function labelPosition(rect: { x: number; y: number; width: number; height: number }, labelWidth: number, labelHeight: number) {
-        const maxLeft = Math.max(0, window.innerWidth - labelWidth);
-        const maxTop = Math.max(0, window.innerHeight - labelHeight);
-        const preferred = [
+        const safeInset = 6;
+        const minLeft = Math.min(safeInset, Math.max(0, window.innerWidth - labelWidth));
+        const minTop = Math.min(safeInset, Math.max(0, window.innerHeight - labelHeight));
+        const maxLeft = Math.max(minLeft, window.innerWidth - labelWidth - safeInset);
+        const maxTop = Math.max(minTop, window.innerHeight - labelHeight - safeInset);
+        const gap = 5;
+        const centerX = rect.x + rect.width / 2;
+        const centerY = rect.y + rect.height / 2;
+        const currentTarget = {
+          left: Math.max(0, rect.x),
+          top: Math.max(0, rect.y),
+          right: Math.min(window.innerWidth, rect.x + rect.width),
+          bottom: Math.min(window.innerHeight, rect.y + rect.height),
+        };
+        const currentTargetArea = Math.max(1, (currentTarget.right - currentTarget.left) * (currentTarget.bottom - currentTarget.top));
+        const labelArea = labelWidth * labelHeight;
+        const preferExternal = rect.width < labelWidth + 10 || rect.height < labelHeight + 8 || labelArea / currentTargetArea > 0.16;
+        const external = [
+          { left: rect.x + rect.width + gap, top: centerY - labelHeight / 2 },
+          { left: rect.x - labelWidth - gap, top: centerY - labelHeight / 2 },
+          { left: centerX - labelWidth / 2, top: rect.y - labelHeight - gap },
+          { left: centerX - labelWidth / 2, top: rect.y + rect.height + gap },
+          { left: rect.x + rect.width + gap, top: rect.y - 1 },
+          { left: rect.x - labelWidth - gap, top: rect.y - 1 },
+          { left: rect.x + rect.width + gap, top: rect.y + rect.height - labelHeight + 1 },
+          { left: rect.x - labelWidth - gap, top: rect.y + rect.height - labelHeight + 1 },
+        ];
+        const internal = [
           { left: rect.x + rect.width - labelWidth, top: rect.y + rect.height - labelHeight },
-          { left: rect.x + rect.width - labelWidth, top: rect.y + rect.height - labelHeight - 3 },
-          { left: rect.x + rect.width - labelWidth - 3, top: rect.y + rect.height - labelHeight },
           { left: rect.x + rect.width - labelWidth, top: rect.y },
           { left: rect.x, top: rect.y + rect.height - labelHeight },
+          { left: rect.x, top: rect.y },
         ];
+        const preferred = preferExternal ? [...external, ...internal] : [...internal, ...external];
 
         for (const option of preferred) {
           const left = clamp(option.left, 0, maxLeft);
           const top = clamp(option.top, 0, maxTop);
           const box = { left, top, right: left + labelWidth, bottom: top + labelHeight };
-          if (!placedLabels.some((placed) => overlaps(expanded(box, 1), expanded(placed, 1)))) {
+          const labelOverlapsCurrentTarget = overlaps(box, currentTarget);
+          if (canPlace(box, preferExternal || !labelOverlapsCurrentTarget)) {
             placedLabels.push(box);
-            return box;
+            return { ...box, external: !labelOverlapsCurrentTarget };
+          }
+        }
+
+        for (const option of external) {
+          const left = clamp(option.left, 0, maxLeft);
+          const top = clamp(option.top, 0, maxTop);
+          const box = { left, top, right: left + labelWidth, bottom: top + labelHeight };
+          if (canPlace(box, false)) {
+            placedLabels.push(box);
+            return { ...box, external: !overlaps(box, currentTarget) };
           }
         }
 
@@ -1812,8 +1863,76 @@ export class BrowserSession {
         const top = clamp(rect.y + rect.height - labelHeight, 0, maxTop);
         const finalBox = { left, top, right: left + labelWidth, bottom: top + labelHeight };
         placedLabels.push(finalBox);
-        return finalBox;
+        return { ...finalBox, external: !overlaps(finalBox, currentTarget) };
       }
+      function edgePoint(rect: { x: number; y: number; width: number; height: number }, box: LabelBox) {
+        const rectCenterX = rect.x + rect.width / 2;
+        const rectCenterY = rect.y + rect.height / 2;
+        const boxCenterX = (box.left + box.right) / 2;
+        const boxCenterY = (box.top + box.bottom) / 2;
+        const dx = boxCenterX - rectCenterX;
+        const dy = boxCenterY - rectCenterY;
+        if (Math.abs(dx / Math.max(1, rect.width)) > Math.abs(dy / Math.max(1, rect.height))) {
+          return {
+            x: dx >= 0 ? rect.x + rect.width : rect.x,
+            y: clamp(boxCenterY, rect.y, rect.y + rect.height),
+          };
+        }
+        return {
+          x: clamp(boxCenterX, rect.x, rect.x + rect.width),
+          y: dy >= 0 ? rect.y + rect.height : rect.y,
+        };
+      }
+      function labelEdgePoint(rect: { x: number; y: number; width: number; height: number }, box: LabelBox) {
+        const rectCenterX = rect.x + rect.width / 2;
+        const rectCenterY = rect.y + rect.height / 2;
+        const boxCenterX = (box.left + box.right) / 2;
+        const boxCenterY = (box.top + box.bottom) / 2;
+        const dx = rectCenterX - boxCenterX;
+        const dy = rectCenterY - boxCenterY;
+        if (Math.abs(dx / Math.max(1, box.right - box.left)) > Math.abs(dy / Math.max(1, box.bottom - box.top))) {
+          return {
+            x: dx >= 0 ? box.right : box.left,
+            y: clamp(rectCenterY, box.top, box.bottom),
+          };
+        }
+        return {
+          x: clamp(rectCenterX, box.left, box.right),
+          y: dy >= 0 ? box.bottom : box.top,
+        };
+      }
+      function drawLeader(rect: { x: number; y: number; width: number; height: number }, box: LabelBox, color: string, width = 2) {
+        const start = edgePoint(rect, box);
+        const end = labelEdgePoint(rect, box);
+        for (const stroke of [
+          { color: 'rgba(255,255,255,0.96)', width: String(width + 2) },
+          { color, width: String(width) },
+        ]) {
+          const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+          line.setAttribute('x1', String(start.x));
+          line.setAttribute('y1', String(start.y));
+          line.setAttribute('x2', String(end.x));
+          line.setAttribute('y2', String(end.y));
+          line.setAttribute('stroke', stroke.color);
+          line.setAttribute('stroke-width', stroke.width);
+          line.setAttribute('stroke-linecap', 'round');
+          line.setAttribute('vector-effect', 'non-scaling-stroke');
+          svg.appendChild(line);
+        }
+      }
+
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      Object.assign(svg.style, {
+        position: 'absolute',
+        left: '0',
+        top: '0',
+        width: '100%',
+        height: '100%',
+        overflow: 'visible',
+      });
+      svg.setAttribute('width', String(window.innerWidth));
+      svg.setAttribute('height', String(window.innerHeight));
+      overlay.appendChild(svg);
 
       for (const item of items) {
         const rect = item.rect;
@@ -1821,23 +1940,31 @@ export class BrowserSession {
 
         const box = document.createElement('div');
         const color = item.href ? '#1d4ed8' : item.input ? '#047857' : '#b45309';
+        const boxLeft = clamp(rect.x, 1, Math.max(1, window.innerWidth - 2));
+        const boxTop = clamp(rect.y, 1, Math.max(1, window.innerHeight - 2));
+        const boxWidth = Math.max(1, Math.min(rect.width, window.innerWidth - boxLeft - 1));
+        const boxHeight = Math.max(1, Math.min(rect.height, window.innerHeight - boxTop - 1));
         Object.assign(box.style, {
           position: 'absolute',
-          left: `${Math.max(0, rect.x)}px`,
-          top: `${Math.max(0, rect.y)}px`,
-          width: `${Math.max(1, rect.width)}px`,
-          height: `${Math.max(1, rect.height)}px`,
+          left: `${boxLeft}px`,
+          top: `${boxTop}px`,
+          width: `${boxWidth}px`,
+          height: `${boxHeight}px`,
           border: `2px solid ${color}`,
           borderRadius: '3px',
-          background: 'rgba(255,255,255,0.04)',
-          boxShadow: '0 0 0 1px rgba(255,255,255,0.95)',
+          boxSizing: 'border-box',
+          background: 'transparent',
+          boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.9)',
         });
 
         const label = document.createElement('div');
         label.textContent = item.id;
-        const labelWidth = Math.max(14, item.id.length * 6 + 2);
-        const labelHeight = 12;
+        const labelWidth = Math.max(24, item.id.length * 10 + 9);
+        const labelHeight = 20;
         const labelBox = labelPosition(rect, labelWidth, labelHeight);
+        if (labelBox.external) {
+          drawLeader(rect, labelBox, color, 2);
+        }
         Object.assign(label.style, {
           position: 'absolute',
           left: `${labelBox.left}px`,
@@ -1846,12 +1973,18 @@ export class BrowserSession {
           height: `${labelHeight}px`,
           padding: '0',
           boxSizing: 'border-box',
-          background: 'transparent',
+          background: color,
           color: '#fff',
-          font: `900 9px/9px Arial, sans-serif`,
+          border: '1px solid rgba(255,255,255,0.98)',
+          borderRadius: '999px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          font: `900 13px/15px Arial, sans-serif`,
           letterSpacing: '0',
           textAlign: 'center',
-          textShadow: '-1px -1px 0 #000, 0 -1px 0 #000, 1px -1px 0 #000, -1px 0 0 #000, 1px 0 0 #000, -1px 1px 0 #000, 0 1px 0 #000, 1px 1px 0 #000',
+          boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
+          textShadow: '0 1px 1px rgba(0,0,0,0.85)',
         });
 
         overlay.appendChild(box);

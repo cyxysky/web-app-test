@@ -8,3 +8,4 @@
 /artifacts
 /.data
 *.tsbuildinfo
+.env
