@@ -17,6 +17,7 @@ export function RunTestButton({ testCaseId }: { testCaseId: string }) {
       const response = await fetch(`/api/test-cases/${testCaseId}/run`, { method: 'POST' });
       const data = await response.json();
       if (!response.ok || !data.runId) throw new Error(data.error || '启动失败');
+      window.dispatchEvent(new Event('navigation-loading:start'));
       router.push(`/runs/${data.runId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : '启动失败');

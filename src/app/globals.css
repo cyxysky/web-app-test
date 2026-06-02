@@ -44,6 +44,52 @@ body {
   overflow-x: hidden;
 }
 
+.navigation-loading-overlay {
+  align-items: center;
+  animation: fade-in 0.12s ease both;
+  background: rgba(246, 245, 241, 0.82);
+  backdrop-filter: blur(8px);
+  color: var(--foreground);
+  display: grid;
+  gap: 14px;
+  inset: 0;
+  justify-content: center;
+  place-items: center;
+  position: fixed;
+  z-index: 2147483000;
+}
+
+.navigation-loading-overlay p {
+  color: var(--muted-strong);
+  font-size: 13px;
+  font-weight: 850;
+  margin: 0;
+}
+
+.navigation-loading-mark {
+  height: 46px;
+  position: relative;
+  width: 46px;
+}
+
+.navigation-loading-mark span {
+  border: 3px solid rgba(23, 23, 23, 0.14);
+  border-radius: 999px;
+  inset: 0;
+  position: absolute;
+}
+
+.navigation-loading-mark span:first-child {
+  border-top-color: var(--foreground);
+  animation: nav-loading-spin 0.78s linear infinite;
+}
+
+.navigation-loading-mark span:last-child {
+  border-left-color: var(--muted);
+  inset: 9px;
+  animation: nav-loading-spin 1.05s linear infinite reverse;
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -1010,6 +1056,12 @@ select {
 }
 
 @keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes nav-loading-spin {
   to {
     transform: rotate(360deg);
   }
@@ -2185,7 +2237,6 @@ select {
   min-height: 74px;
   padding: 12px 14px;
   position: relative;
-  text-decoration: none;
   transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
 }
 
@@ -2305,8 +2356,42 @@ select {
   line-height: 1;
 }
 
+.run-history-actions {
+  align-items: center;
+  display: inline-flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.run-history-replay {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 800;
+  gap: 5px;
+  height: 32px;
+  padding: 0 10px;
+  white-space: nowrap;
+}
+
+.run-history-replay:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.run-history-replay:not(:disabled):hover {
+  border-color: var(--accent-strong);
+  color: var(--accent-strong);
+}
+
 .run-history-open {
   color: var(--muted);
+  display: inline-flex;
 }
 
 .goal-steps {

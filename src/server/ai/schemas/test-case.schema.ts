@@ -9,6 +9,13 @@ export const testStepSchema = z.object({
   riskLevel: z.enum(['safe', 'warning', 'dangerous']),
 });
 
+export const recordedFlowStepSchema = z.object({
+  index: z.number(),
+  name: z.string(),
+  input: z.unknown().optional(),
+  reason: z.string().optional(),
+});
+
 export const testCaseContentSchema = z.object({
   title: z.string(),
   description: z.string(),
@@ -17,13 +24,14 @@ export const testCaseContentSchema = z.object({
   userRequirement: z.string().optional(),
   systemPrompt: z.string().optional(),
   preconditions: z.array(z.string()),
-  testData: z.record(z.string()),
+  testData: z.record(z.string(), z.string()),
   steps: z.array(testStepSchema).default([]),
   expectedResults: z.array(z.string()),
   risks: z.array(z.string()),
 });
 
 export type TestStep = z.infer<typeof testStepSchema>;
+export type RecordedFlowStep = z.infer<typeof recordedFlowStepSchema>;
 export type TestCaseContent = z.infer<typeof testCaseContentSchema>;
 
 export type TestCaseRecord = {

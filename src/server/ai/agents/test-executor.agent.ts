@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { generateText, stepCountIs, tool } from 'ai';
+import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiRequestSnapshot, StepExecutionResult, StepToolCall, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, RecordedFlowStep, StepExecutionResult, StepToolCall, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult } from '@/server/browser/browser-session';
@@ -21,6 +22,7 @@ type ExecutionOptions = {
   onResumed?: (stepIndex: number) => void | Promise<void>;
   onManualIntervention?: (manualIntervention: ManualIntervention) => void | Promise<void>;
   onManualInterventionCleared?: (stepIndex: number) => void | Promise<void>;
+  recordedFlow?: RecordedFlowStep[];
 };
 
 type ToolTrace = {
@@ -57,6 +59,7 @@ const manualIssuePattern = new RegExp(
   'i',
 );
 
+// 判断当前模型配置是否支持图片输入；这只是模型能力判断，不代表一定会发送截图。
 function modelSupportsScreenshotInput() {
   if (process.env.SEND_SCREENSHOT_TO_AI === 'true') return true;
   if (process.env.SEND_SCREENSHOT_TO_AI === 'false') return false;
@@ -71,6 +74,12 @@ function isVisualClickMode() {
   return /^(true|1|yes|visual|vision|click)$/i.test(String(raw || ''));
 }
 
+// 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
+function shouldSendScreenshotToAi() {
+  return isVisualClickMode() && modelSupportsScreenshotInput();
+}
+
+// 将调试数据转成可安全 JSON 序列化的结构，避免 Buffer/BigInt 破坏持久化。
 function jsonSafe(value: unknown) {
   if (value === undefined) return undefined;
   return JSON.parse(JSON.stringify(value, (_key, item) => {
@@ -80,10 +89,62 @@ function jsonSafe(value: unknown) {
   }));
 }
 
+function aiScreenshotMaxBytes() {
+  const raw = process.env.AI_SCREENSHOT_MAX_KB || process.env.SCREENSHOT_MAX_KB || '';
+  const kb = Number(raw);
+  if (!Number.isFinite(kb) || kb <= 0) return undefined;
+  return Math.max(1, Math.floor(kb * 1024));
+}
+
+async function compressScreenshotForAi(buffer: Buffer, maxBytes: number) {
+  if (buffer.length <= maxBytes) return buffer;
+
+  const metadata = await sharp(buffer, { failOn: 'none' }).rotate().metadata();
+  const originalWidth = metadata.width || 0;
+  const originalHeight = metadata.height || 0;
+  const qualities = [80, 65, 50, 35, 25];
+  let best = buffer;
+
+  async function render(width: number | undefined, quality: number) {
+    const pipeline = width
+      ? sharp(buffer, { failOn: 'none' }).rotate().resize({ width, withoutEnlargement: true })
+      : sharp(buffer, { failOn: 'none' }).rotate();
+    return pipeline.jpeg({ quality, mozjpeg: true }).toBuffer();
+  }
+
+  for (const quality of qualities) {
+    const output = await render(undefined, quality);
+    if (output.length < best.length) best = output;
+    if (output.length <= maxBytes) return output;
+  }
+
+  if (!originalWidth || !originalHeight) return best;
+
+  let scale = Math.sqrt(maxBytes / Math.max(best.length, 1)) * 0.92;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const width = Math.max(320, Math.floor(originalWidth * Math.max(0.18, Math.min(0.9, scale))));
+    const output = await render(width, attempt < 4 ? 45 : 32);
+    if (output.length < best.length) best = output;
+    if (output.length <= maxBytes) return output;
+    if (width <= 320) return best;
+    scale *= Math.sqrt(maxBytes / Math.max(output.length, 1)) * 0.9;
+  }
+
+  return best;
+}
+
+async function readScreenshotForAi(filePath: string) {
+  const buffer = await readFile(filePath);
+  const maxBytes = aiScreenshotMaxBytes();
+  if (!maxBytes) return buffer;
+  return compressScreenshotForAi(buffer, maxBytes).catch(() => buffer);
+}
+
 function trimDebugText(value: string, max = 4000) {
   return value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
+// 拆分工具参数和 AI 给出的调用原因，便于历史步骤里单独展示。
 function splitToolInputAndReason(input: unknown) {
   const safeInput = jsonSafe(input);
   if (!safeInput || typeof safeInput !== 'object' || Array.isArray(safeInput)) {
@@ -97,6 +158,7 @@ function splitToolInputAndReason(input: unknown) {
   };
 }
 
+// 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
 async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
   const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
   const timeoutController = new AbortController();
@@ -110,6 +172,7 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
   }
 }
 
+// 从模型回复中提取 JSON，兼容模型把 JSON 包在 markdown 代码块里的情况。
 function extractJson(text: string) {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const raw = fenced?.[1] || text;
@@ -119,14 +182,17 @@ function extractJson(text: string) {
   return JSON.parse(raw.slice(start, end + 1));
 }
 
+// 将测试需求富文本转为纯文本，作为执行器理解目标的主输入。
 function requirementOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.userRequirement || testCase.description) || testCase.description || testCase.title;
 }
 
+// 读取测试用例上的额外系统提示词，例如级联选择器必须选到叶子节点。
 function systemPromptOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.systemPrompt || '').trim();
 }
 
+// 将浏览器工具调用轨迹压缩为步骤证据，保存到运行历史中。
 function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   return traces.map((trace) => {
     const { input, reason } = splitToolInputAndReason(trace.input);
@@ -140,7 +206,7 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   });
 }
 
-function recentToolCallContext(steps: StepExecutionResult[], limit = 8) {
+function recentToolCallContext(steps: StepExecutionResult[], limit = 5) {
   const calls = steps.flatMap((step) => (step.tools || []).map((tool) => ({
     name: tool.name,
     input: tool.input,
@@ -150,7 +216,7 @@ function recentToolCallContext(steps: StepExecutionResult[], limit = 8) {
   return calls.slice(-limit);
 }
 
-function recentProgressNotes(steps: StepExecutionResult[], limit = 8) {
+function recentProgressNotes(steps: StepExecutionResult[], limit = 5) {
   return steps
     .filter((step) => step.note && step.note.trim())
     .slice(-limit)
@@ -165,7 +231,7 @@ function hostOf(url: string) {
   }
 }
 
-function formatInteractiveCandidates(candidates: unknown, limit = 80) {
+function formatInteractiveCandidates(candidates: unknown, limit = 50) {
   if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive candidates]';
   return JSON.stringify(
     candidates.slice(0, limit).map((item) => {
@@ -183,6 +249,8 @@ function formatInteractiveCandidates(candidates: unknown, limit = 80) {
         center: candidate.center,
         input: candidate.input,
         disabled: candidate.disabled,
+        framePath: candidate.framePath,
+        frameUrl: candidate.frameUrl,
         nearbyText: candidate.nearbyText,
       };
     }),
@@ -203,7 +271,7 @@ function makeBrowserTools(
   // keeps every browser action paired with a fresh screenshot on the next step and prevents the
   // duplicate-operation problem seen when a request was retried mid-chain.
   let toolExecutedThisRequest = false;
-  const toolReasonInput = z.string().min(1).max(300).describe('Required: concise reason for this exact tool call, based on the current screenshot, requirement, and recent progress.');
+  const toolReasonInput = z.string().min(1).max(300).describe('Required: concise reason for this exact tool call, based on the current page context, requirement, and recent progress.');
 
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
     if (toolExecutedThisRequest) {
@@ -242,26 +310,28 @@ function makeBrowserTools(
       execute: ({ deltaY, deltaX, domPath, reason }) => record('scrollViewport', { deltaY, deltaX, domPath, reason }, () => session.scroll(deltaY, deltaX || 0, { domPath })),
     }),
     clickCandidate: tool({
-      description: 'Click a visible candidate by its numbered label from the screenshot/candidate list. Prefer this over DOM paths because the backend validates and clicks the candidate center.',
+      description: 'Click a visible candidate by its numbered label from the current candidate list or visual labels. If text is provided, type it immediately after the click.',
       inputSchema: z.object({
         reason: toolReasonInput,
-        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
+        id: z.string().describe('Candidate id such as 1, 12. Must come from the current visual labels or interactive candidate list.'),
+        text: z.string().optional().describe('Optional text to type immediately after clicking, useful when the click focuses an input or editable control.'),
       }),
-      execute: ({ id, reason }) => record('clickCandidate', { id, reason }, () => session.clickCandidate(id)),
+      execute: ({ id, text, reason }) => record('clickCandidate', { id, text, reason }, () => session.clickCandidate(id, text)),
     }),
     focusCandidate: tool({
-      description: 'Focus a visible input/control candidate by its numbered label before typing. Prefer this over DOM paths for text entry.',
+      description: 'Focus a visible input/control candidate by its numbered label. If text is provided, type it immediately after focusing.',
       inputSchema: z.object({
         reason: toolReasonInput,
-        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
+        id: z.string().describe('Candidate id such as 1, 12. Must come from the current visual labels or interactive candidate list.'),
+        text: z.string().optional().describe('Optional text to type immediately after focusing the input or editable control.'),
       }),
-      execute: ({ id, reason }) => record('focusCandidate', { id, reason }, () => session.focusCandidate(id)),
+      execute: ({ id, text, reason }) => record('focusCandidate', { id, text, reason }, () => session.focusCandidate(id, text)),
     }),
     hoverCandidate: tool({
       description: 'Move the mouse over a visible candidate by its numbered label. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
       inputSchema: z.object({
         reason: toolReasonInput,
-        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
+        id: z.string().describe('Candidate id such as 1, 12. Must come from the current visual labels or interactive candidate list.'),
       }),
       execute: ({ id, reason }) => record('hoverCandidate', { id, reason }, () => session.hoverCandidate(id)),
     }),
@@ -316,7 +386,7 @@ function makeBrowserTools(
 
   const domTools = {
     getInteractiveCandidates: tool({
-      description: 'Fallback only (DOM mode): return visible interactable candidates as JSON when the screenshot number labels are missing or stale. Each candidate has id (1...), tag/role/name/text, href/host, visible box/center, and nearbyText.',
+      description: 'Fallback only (DOM mode): return visible interactable candidates as JSON when the candidate context needs refresh. Each candidate has id (1...), tag/role/name/text, href/host, visible box/center, and nearbyText.',
       inputSchema: z.object({
         reason: toolReasonInput,
       }),
@@ -378,21 +448,16 @@ function makeBrowserTools(
   return isVisualClickMode() ? { ...sharedTools, ...visualTools } : { ...sharedTools, ...domTools };
 }
 
-function buildCompletionPromptLines(requirement: string) {
+// 构造完成判定规则；视觉模式用截图作证据，DOM 模式用文本化页面上下文作证据。
+function buildCompletionPromptLines(requirement: string, usesScreenshot = shouldSendScreenshotToAi()) {
+  const evidence = usesScreenshot ? 'screenshot' : 'textual page context / candidates / DOM / URL / focus';
   return [
-    'Completion rules (done=true) — read carefully:',
-    `- Full user requirement to satisfy:\n${requirement}`,
-    '- Return JSON with done=true ONLY when EVERY part of the requirement above is visibly completed on the current screenshot — not one step, not halfway, not "in progress".',
-    '- Partial progress is NOT completion. Examples that must stay done=false and keep using tools:',
-    '  • Only opened the target site or logged in, but later steps in the requirement were not done.',
-    '  • Only typed in search box but did not submit, or results not verified as required.',
-    '  • Only clicked one item when the requirement asks to browse multiple items or confirm an outcome.',
-    '  • Page looks "close enough" but a required assertion (specific text, element, URL, or state) is not yet visible.',
-    '- Before done=true, mentally check off each clause in the requirement; if any clause is unchecked, call a tool for the next missing piece.',
-    '- When unsure whether everything is done, default to done=false and take one more concrete action.',
-    '- done=true with status="passed" only when the screenshot proves all requirement clauses succeeded.',
-    '- done=true with status="failed" only when the requirement is impossible or clearly failed end-to-end; not because one sub-step failed while others remain undone.',
-    '- NEVER use done=true together with status="blocked". Blocked means waiting for the user; the run must continue with done=false.',
+    'Completion rules:',
+    `- Requirement: ${requirement}`,
+    `- done=true only when EVERY requirement clause is proven by ${evidence}. Partial progress is not completion.`,
+    '- If anything is still missing or uncertain, call one more tool instead of finishing.',
+    '- status=blocked only for manual verification/security/login wait; blocked must use done=false.',
+    '- status=failed only when the requirement is clearly impossible or failed end-to-end.',
   ];
 }
 
@@ -420,6 +485,7 @@ type CompletionVerification = {
   remainingWork: string;
 };
 
+// 当执行器声称完成时，用独立校验请求再判断一次，减少“只完成一半就结束”的误判。
 async function verifyRuntimeCompletion(input: {
   testCase: TestCaseRecord;
   screenshotPath: string;
@@ -430,9 +496,12 @@ async function verifyRuntimeCompletion(input: {
 }): Promise<CompletionVerification> {
   const { testCase, screenshotPath, proposed, completedSteps, pageContext, abortSignal } = input;
   const requirement = requirementOf(testCase);
+  const attachScreenshot = shouldSendScreenshotToAi();
   const prompt = [
     'You are an independent completion judge. The executor agent claims the user requirement is FULLY complete.',
-    'Verify using ONLY the attached viewport screenshot and the requirement text. Be strict — partial progress is NOT complete.',
+    attachScreenshot
+      ? 'Verify using ONLY the attached viewport screenshot and the requirement text. Be strict — partial progress is NOT complete.'
+      : 'Verify using ONLY the textual browser context and the requirement text. No screenshot image is attached because visual mode is disabled. Be strict — partial progress is NOT complete.',
     '',
     `User requirement (every clause must be visibly satisfied for verified=true):\n${requirement}`,
     '',
@@ -445,10 +514,12 @@ async function verifyRuntimeCompletion(input: {
     '',
     `Current URL: ${pageContext.url}`,
     `Verification scan JSON: ${JSON.stringify(pageContext.manualVerification ?? null)}`,
-    `Recent progress notes (oldest first):\n${recentProgressNotes(completedSteps, 8).join('\n') || '[none]'}`,
+    `Recent progress notes (oldest first):\n${recentProgressNotes(completedSteps, 5).join('\n') || '[none]'}`,
     '',
     'Rules:',
-    '- verified=true only if the screenshot clearly proves ALL parts of the requirement are done.',
+    attachScreenshot
+      ? '- verified=true only if the screenshot clearly proves ALL parts of the requirement are done.'
+      : '- verified=true only if the textual browser context clearly proves ALL parts of the requirement are done.',
     '- Empty captcha/OTP, login not finished, or waiting for user input → verified=false, status="blocked".',
     '- Wrong page or missing required outcome → verified=false; set remainingWork to concrete next steps.',
     '- If the requirement is visibly impossible, verified=true with status="failed" is allowed.',
@@ -458,13 +529,13 @@ async function verifyRuntimeCompletion(input: {
     '- remainingWork: required when verified=false; list what the executor should do next (Chinese OK). Empty string when verified=true.',
   ].join('\n');
 
-  const screenshot = modelSupportsScreenshotInput() ? await readFile(screenshotPath) : undefined;
+  const screenshot = attachScreenshot ? await readScreenshotForAi(screenshotPath) : undefined;
   const messageContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [
     {
       type: 'text',
-      text: modelSupportsScreenshotInput()
+      text: attachScreenshot
         ? prompt
-        : `${prompt}\n\nScreenshot file path (not attached): ${screenshotPath}`,
+        : `${prompt}\n\nScreenshot image input is disabled for this request.`,
     },
   ];
   if (screenshot) messageContent.push({ type: 'image', image: screenshot });
@@ -495,29 +566,17 @@ async function verifyRuntimeCompletion(input: {
   }
 }
 
-function buildVerificationPromptLines(pageContext: Awaited<ReturnType<BrowserSession['getPageContext']>>) {
+// 根据当前模式生成验证码/安全校验规则，DOM 模式不要求 AI 读取截图。
+function buildVerificationPromptLines(pageContext: Awaited<ReturnType<BrowserSession['getPageContext']>>, usesScreenshot = shouldSendScreenshotToAi()) {
   const mv = pageContext.manualVerification;
   if (!mv?.detected && !mv?.captchaFields?.length) return [];
-
-  const lines = [
-    'Verification / login page rules:',
-    `Verification scan JSON: ${JSON.stringify(mv)}`,
+  const source = usesScreenshot ? 'screenshot' : 'page context';
+  return [
+    'Verification rules:',
+    `- Verification scan: ${JSON.stringify(mv)}`,
+    '- If captchaAppearsFilled=true, do not block; submit/login and continue.',
+    `- If ${source} shows an empty captcha/OTP/security challenge that cannot proceed, return done=false status=blocked.`,
   ];
-
-  if (mv.captchaAppearsFilled) {
-    lines.push(
-      '- A captcha/OTP/verification-code input on the page ALREADY HAS TEXT (valueLength > 0). The human has entered the code.',
-      '- Do NOT return status="blocked" or done=false because of captcha. Treat verification as handled.',
-      '- Your next action should be: click the Login / 登录 / Submit / 确认 / 下一步 button, or press Enter in the code field, then continue the user requirement on the next screenshot.',
-    );
-  } else {
-    lines.push(
-      '- If the screenshot shows an EMPTY captcha/OTP input and login cannot proceed, return done=false with status="blocked" so the user can fill it manually.',
-      '- If only a slider puzzle or image captcha is shown with no text field, return blocked for manual handling.',
-    );
-  }
-
-  return lines;
 }
 
 function runtimePrompt(input: {
@@ -528,128 +587,67 @@ function runtimePrompt(input: {
   beforeScreenshotPath: string;
   screenshotMetrics?: ReturnType<BrowserSession['getLastScreenshotMetrics']>;
 }) {
-  const { testCase, pageContext, completedSteps, beforeScreenshotPath } = input;
+  const { testCase, pageContext, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
   const visualMode = isVisualClickMode();
+  const attachScreenshot = shouldSendScreenshotToAi();
   const caseSystemPrompt = systemPromptOf(testCase);
-  const candidateRules = [
-    'Candidate grounding rules (screenshot-first):',
-    '- The annotated screenshot is the PRIMARY and authoritative source for candidate ids. Colored outlines mark visible leaf interactable elements. Blue = link, green = input/control, orange = generic clickable.',
-    '- Number badges may sit inside large targets or just outside small targets. If a badge is outside, follow its thin leader line to the outlined target; do not treat the badge itself as the clickable UI.',
-    '- FIRST look at the screenshot and pick the numbered id that matches the visible target by outline/leader-line position, visible text, and context. Only if the screenshot shows no usable number label for that target, fall back to the Interactive candidates JSON below.',
-    visualMode
-      ? '- Visual mode: getInteractiveCandidates is NOT available. Never try to refresh candidates — trust the screenshot number labels and act with clickCandidate/focusCandidate/hoverCandidate/doubleClickCandidate/rightClickCandidate/dragCandidate.'
-      : '- DOM mode fallback: if the screenshot shows no number label for the intended target, call getInteractiveCandidates once, then act. Do not call it repeatedly in a loop.',
-    '- Prefer clickCandidate(id), focusCandidate(id), or hoverCandidate(id) over DOM paths whenever the intended target has a numbered id on the screenshot.',
-    '- When the user requirement says 双击/double-click, use doubleClickCandidate(id) — NOT clickCandidate and NOT getInteractiveCandidates.',
-    '- If a menu, tooltip, dropdown, or hidden control appears only after mouse hover, call hoverCandidate(id) on the visible trigger first, then inspect the next screenshot for the revealed numbered candidates.',
-    '- For links/search results, never choose by title text alone. Cross-check: screenshot label position + candidate text/name + href/host + nearbyText. If a candidate points to the wrong host/URL, do not click it even if its visible text looks right.',
-    `- Target URL host is ${targetHost}; treat it as the starting page, not necessarily the final destination. When the user asks for a specific website/domain, prefer candidates whose href host exactly matches or is a credible subdomain of that requested site; avoid ads, mirrors, login traps, and unrelated search results.`,
-  ];
-  const domInteractionRules = [
-    ...candidateRules,
-    'DOM interaction rules:',
-    '- You still receive the current screenshot. Use BOTH the screenshot and candidate list/DOM tree: screenshot decides what is visually present and intended; candidate id or DOM path is only the handle used to operate that visible element.',
-    '- Prefer the Interactive candidates JSON over the full DOM tree. The full DOM tree is fallback context for containers and unusual widgets.',
-    '- Use the provided simplified DOM tree and getDomTree tool to locate elements by bracket path. Each line is "[path] tag#id.class * @x,y,w,h {attrs} \\"text\\"": "*" marks a clickable/interactive element, @ gives its visible viewport box, {attrs} lists key attributes (placeholder/aria-label/role/href/value...), and "text" is the node\'s own visible text. Only currently visible (rendered) elements are listed.',
-    '- Pick the path whose text/attributes AND @box position match the visible control in the screenshot. Prefer a node marked "*". Use paths exactly as shown.',
-    '- For links/search results, cross-check the visible title text, href/domain, and @box location against the screenshot. Do not click a different URL just because the text is similar.',
-    '- If clickDomNode/focusDomNode reports the path was not found, the DOM changed or the node scrolled away: call getDomTree again to get fresh paths instead of reusing the old ones or inventing a path.',
-    '- Use clickDomNode(path) only as fallback when no numbered candidate is available. Use paths exactly as shown, for example "0.1.2".',
-    '- Clicks target the element’s interactive center (DOM click uses element center when possible).',
-    '- The screenshot remains the primary evidence for visual state and completion. Use the DOM tree only for locating the element to operate.',
-    '- For scrolling, call scrollViewport with domPath for the specific scrollable table/list/panel or one of its visible children. This is required for virtual-scroll tables.',
-    '- If the target is outside the viewport or not present in the candidate list/DOM tree, call scrollViewport on the relevant scroll container, inspect the next screenshot/DOM tree, then continue.',
-    '- For text entry: focusCandidate(id) when available, then typeText. If using fallback DOM, focusDomNode(path), then typeText. If the field contains wrong text, use Ctrl+A/Backspace via pressKey before typing.',
-    '- For hover-revealed controls, use hoverCandidate(id) on the visible trigger, wait for the next screenshot, then operate the newly visible candidate.',
-    '- For keyboard submission, use pressKey only after the intended input/control is focused.',
-  ];
-  const visualInteractionRules = [
-    ...candidateRules,
-    'Visual click mode rules:',
-    '- isClick/IS_CLICK is enabled, so DOM-path tools and getInteractiveCandidates are intentionally unavailable.',
-    '- Screenshot number labels are your only candidate source. Choose the intended visible numbered id from the annotated screenshot, then call the matching candidate tool.',
-    '- Available numbered-candidate actions: clickCandidate(id), focusCandidate(id), hoverCandidate(id), doubleClickCandidate(id), rightClickCandidate(id), dragCandidate(fromId,toId).',
-    '- Do NOT output raw screenshot coordinates. The backend resolves the chosen numbered id to the element visible center.',
-    '- Do NOT call getInteractiveCandidates — it does not exist in visual mode. If you see the target on the screenshot with a number label, act immediately.',
-    '- For 双击/double-click requirements: identify the target link/button on the screenshot and call doubleClickCandidate(id) directly.',
-    '- For text entry: focusCandidate(id), then typeText on the next step after focus is confirmed.',
-    '- For hover menus/tooltips/dropdowns: call hoverCandidate(id) on the visible trigger, then use the next screenshot to choose the revealed numbered candidate.',
-    '- For icon-only controls, use the visible icon shape in the screenshot. Do not require a text label when the icon itself clearly matches the intended action.',
-    '- If a candidate click misses, use the red previous-click marker on the next screenshot to choose a better numbered candidate.',
-  ];
-  const interactionRules = visualMode ? visualInteractionRules : domInteractionRules;
+  const requirement = requirementOf(testCase);
+  const recentNotes = recentProgressNotes(completedSteps, 5);
+  const recentTools = recentToolCallContext(completedSteps, 5);
+  const domTree = visualMode ? '[disabled because visual mode is enabled]' : trimDebugText(pageContext.domTree || '[empty DOM tree]', 12000);
+  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
+  const candidateContext = visualMode ? '[disabled because visual mode uses screenshot labels]' : formatInteractiveCandidates(pageContext.interactiveCandidates, candidateLimit);
+  const evidence = attachScreenshot ? 'the attached annotated screenshot' : 'Interactive candidates JSON, DOM tree, URL, tabs, and focused element';
 
   return [
-    'You are an AI browser testing agent. The test case does NOT contain preset steps.',
-    'Your job is to read the user requirement, inspect the current viewport screenshot as the primary source of truth, then take EXACTLY ONE browser action that makes progress, or (only when finished) return a JSON summary.',
-    '',
-    'CRITICAL one-action protocol (strictly enforced by the system):',
-    '- You may call AT MOST ONE tool per response. After your single tool call the system immediately stops you, captures a fresh screenshot, and starts the next step. Any extra tool calls you emit in the same response are ignored and wasted.',
-    '- The attached screenshot is the page state at the START of this step. You will NOT see the result of your action until the screenshot at the START of the next step.',
-    '- So pick the single most useful next action and call exactly one tool. Do NOT chain actions: even "focus then type" must be split — focus/click the field this step, then type on the next step after you confirm focus from the new screenshot.',
-    '- Do NOT repeat an action that already succeeded in a previous step, and do NOT re-open or re-navigate to a page when the current URL and screenshot already show it. Look at the last tool calls and the screenshot first.',
-    '',
-    'Vision-first decision policy:',
-    '- The screenshot is the primary evidence for everything: what page is visible, what controls exist, which numbered id to click/double-click, whether the requirement is complete, whether a CAPTCHA/security page is blocking the flow, and whether the last click marker landed correctly.',
-    '- The annotated number labels on the screenshot take priority over the Interactive candidates JSON. Use the JSON only to confirm href/host/text when the screenshot label is ambiguous.',
-    '- Do not declare the page wrong, incomplete, or failed before you have actually acted; if the start screenshot already shows the page the requirement needs (and the URL matches), do NOT re-open or re-navigate to it, just do the next concrete action toward the requirement.',
-    '- If the screenshot looks blank, still loading, or mid-transition, your single action this step should be waitForPage, then judge on the next screenshot.',
-    '- URL, tab list, focused element, screenshot metrics, candidate list, DOM tree, and the last five tool calls are auxiliary hints.',
-    '- When the screenshot contradicts auxiliary context, trust the screenshot and explain the contradiction in actual.',
-    '- The red marker (solid red dot/circle) in the screenshot shows where your PREVIOUS click landed. Use it to decide whether the previous candidate was ineffective, then choose a better numbered candidate or fresh candidate list.',
-    '- If a click was intended to open a search result/link but the next screenshot still shows the same normal results page, treat it as a missed/ineffective candidate and retry with a better candidate. Do not call it CAPTCHA/security verification unless the screenshot visibly shows a verification challenge.',
-    '- The focused element summary tells you whether the current tab focus is on the intended input/control. Before typing or pressing Enter for a form, verify the focus summary matches the visible target; if it is body/document or the wrong element, focus the target input candidate again.',
-    '- Prefer one purposeful user-like operation per runtime step. Do not perform a long chain of blind clicks. Observe, act once, then let the next screenshot confirm the result.',
-    '- If the visible page is still loading, ambiguous, or transitioning, use waitForPage once before deciding the next UI action.',
-    '- Do not claim CAPTCHA/security/manual verification unless the screenshot visibly contains a verification challenge AND no captcha code input is already filled (see verification rules below). If the page is a normal search/results/content page, continue with a better operation instead of blocking.',
-    '- Do not use DOM/text as the sole success evidence. You must judge completion yourself from the screenshot and return the judgment in JSON.',
-    caseSystemPrompt
-      ? `\nTest-case-specific operation instructions (follow these before choosing any action):\n${caseSystemPrompt}`
-      : '',
-    '',
-    ...buildVerificationPromptLines(pageContext),
-    ...buildCompletionPromptLines(requirementOf(testCase)),
-    ...interactionRules,
-    '- After any click that may open a new tab/window, call listTabs. If a new relevant tab exists, call switchTab before continuing.',
-    '- If current tab is not the page needed by the user requirement, call listTabs and switchTab to move to the correct tab before acting.',
-    '- If a click opens a new tab but the visible screenshot still shows the old tab, switch to the relevant tab before further visual judgment.',
-    '',
-    'Stop condition:',
-    '- See "Completion rules" above: done=true only when the ENTIRE user requirement is finished — never because a single sub-step succeeded.',
-    '- If every clause of the requirement is visibly satisfied on the screenshot, stop tools and return done=true with status="passed".',
-    '- If the screenshot shows CAPTCHA/login/security verification with an EMPTY code input (and verification scan says captcha not filled), return done=false with status="blocked" so the runtime can pause for the user.',
-    '- If verification scan says captchaAppearsFilled=true, or the screenshot shows a verification input that already contains digits/text, do NOT block — click login/submit and continue.',
-    '- If the screenshot shows an error page, empty broken page, access-denied state, or the requirement is impossible from the current state, return done=true with status="failed" or "blocked" as appropriate.',
-    '- If ANY part of the requirement is still outstanding, do NOT return done=true — call one more tool instead.',
-    '',
-    'How to respond:',
-    '- To act: call exactly ONE tool and include the required tool input field reason. The reason must say why this tool is the best next action now, grounded in the screenshot and recent progress.',
-    '- In the SAME response, also write ONE short plain-text line in this exact format (this is your memory carried into the next step): "PROGRESS: <what you just accomplished / what the screenshot shows> NEXT: <the single next action you intend>". Keep it to one concise sentence each. Do not output JSON when acting.',
-    '- Before deciding, READ your "recent progress notes" and "recent tool calls" in the context so you continue from where you left off and never redo a finished action.',
-    '- To finish (entire requirement complete, blocked by verification, or impossible): call NO tool and return exactly one JSON object:',
-    '{"action":"Chinese summary of what was observed","expected":"Chinese visual success criteria","actual":"Chinese result based on the current screenshot — cite evidence for EACH requirement clause","status":"passed|failed|blocked","done":true}',
-    '- done=true is allowed ONLY when the full requirement is complete. Mid-task progress must use a tool with done omitted/false — never done=true after doing only part of the job.',
-    '- Use done=false with status="blocked" only when verification is still required AND the captcha/code field is empty. Never block when the code field already has content.',
-    '',
-    `User requirement: ${requirementOf(testCase)}`,
+    'You are an AI browser testing agent. Choose exactly ONE next browser action, or finish with JSON only when the full requirement is complete.',
+    `Requirement: ${requirement}`,
     `Target URL: ${testCase.targetUrl}`,
     `Target host: ${targetHost}`,
     `Current URL: ${pageContext.url}`,
+    '',
+    'Hard rules:',
+    '- Call at most ONE tool. Extra tool calls are ignored.',
+    `- Use ${evidence} as the current page state.`,
+    '- Do not repeat successful prior actions; use recent notes/tools to continue.',
+    '- If page is loading/transitioning, call waitForPage once.',
+    '- For text entry on a numbered candidate, prefer focusCandidate(id,text) or clickCandidate(id,text) in one tool call. Use typeText only after a DOM-path focus fallback.',
+    '- For hover-only menus, call hoverCandidate on the visible trigger, then act on the revealed target in the next step.',
+    '- For scrollable tables/lists/panels, call scrollViewport with the relevant domPath when available.',
+    '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
+    '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
+    '- Finish only when EVERY requirement clause is satisfied; otherwise call one more useful tool.',
+    attachScreenshot
+      ? '- Visual mode: use screenshot number labels as primary targets. getInteractiveCandidates/getDomTree are unavailable.'
+      : '- DOM mode: no screenshot image/path is attached. Use candidates first; use DOM tree as fallback. Do not infer from screenshots.',
+    caseSystemPrompt ? `Test-case-specific instructions:
+${caseSystemPrompt}` : '',
+    '',
+    ...buildVerificationPromptLines(pageContext, attachScreenshot),
+    ...buildCompletionPromptLines(requirement, attachScreenshot),
+    '',
+    'Response:',
+    '- To act: call exactly ONE tool and include reason grounded in current context.',
+    '- When acting, also output: PROGRESS: <what changed / observed> NEXT: <next intended action>.',
+    '- To finish/block/fail: call NO tool and return JSON: {"action":string,"expected":string,"actual":string,"status":"passed"|"failed"|"blocked","done":true}.',
+    '',
+    'Current context:',
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
-    `Current tab focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    visualMode ? `` :  `Interactive candidates JSON (auxiliary; screenshot number labels are authoritative):\n${formatInteractiveCandidates(pageContext.interactiveCandidates)}`,
-    `Your recent progress notes (oldest first), so you know what you already did and planned:\n${recentProgressNotes(completedSteps, 8).join('\n') || '[no notes yet]'}`,
-    `Your recent tool calls (oldest first), each {name, input, reason, result:{ok, actual}}:\n${JSON.stringify(recentToolCallContext(completedSteps, 8), null, 2)}`,
-    visualMode
-      ? 'Simplified current tab DOM tree: [disabled because isClick visual mode is enabled]'
-      : `Simplified current tab DOM tree:\n${pageContext.domTree || '[empty DOM tree]'}`,
-    modelSupportsScreenshotInput()
-      ? 'The current viewport screenshot is attached as an image input.'
-      : `Current viewport screenshot path: ${beforeScreenshotPath}`,
-  ].join('\n');
+    `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
+    `Interactive candidates JSON:
+${candidateContext}`,
+    `Simplified DOM tree:
+${domTree}`,
+    `Recent progress notes (last 5, oldest first):
+${recentNotes.join('\n') || '[none]'}`,
+    `Recent tool calls (last 5, oldest first):
+${JSON.stringify(recentTools, null, 2)}`,
+    attachScreenshot
+      ? 'Screenshot image is attached.'
+      : 'Screenshot image/path is not attached.',
+  ].filter(Boolean).join('\n');
 }
-
 function summarizeToolInput(input: unknown) {
   if (input && typeof input === 'object') {
     const entries = Object.entries(input as Record<string, unknown>)
@@ -680,6 +678,7 @@ function runtimeToolNames() {
   return [...tools, 'getInteractiveCandidates', 'getDomTree', 'clickDomNode', 'focusDomNode'];
 }
 
+// 记录一次 AI 请求的可展示上下文；图片只在真实发送给 AI 时写入 messages。
 function createAiRequestSnapshot(input: {
   kind: AiRequestSnapshot['kind'];
   stepIndex: number;
@@ -690,6 +689,9 @@ function createAiRequestSnapshot(input: {
   options?: Record<string, unknown>;
 }): AiRequestSnapshot {
   const { provider, model } = getModelSettings();
+  const imageContent = input.imageAttached && input.screenshotPath
+    ? [{ type: 'image' as const, imagePath: input.screenshotPath, attached: true }]
+    : [];
   return {
     kind: input.kind,
     stepIndex: input.stepIndex,
@@ -705,7 +707,7 @@ function createAiRequestSnapshot(input: {
         role: 'user',
         content: [
           { type: 'text', text: input.prompt },
-          ...(input.screenshotPath ? [{ type: 'image' as const, imagePath: input.screenshotPath, attached: input.imageAttached }] : []),
+          ...imageContent,
         ],
       },
     ],
@@ -761,6 +763,7 @@ function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
   }
 }
 
+// 执行单个运行时步骤：采集页面上下文，调用 AI 选择一个动作，并记录请求快照。
 async function executeRuntimeStep(input: {
   session: BrowserSession;
   testCase: TestCaseRecord;
@@ -777,6 +780,7 @@ async function executeRuntimeStep(input: {
     includeDomTree: !isVisualClickMode(),
     includeText: false,
     includeManualVerification: false,
+    useCachedInteractiveCandidates: true,
   });
   const prompt = runtimePrompt({
     testCase,
@@ -786,7 +790,7 @@ async function executeRuntimeStep(input: {
     beforeScreenshotPath,
     screenshotMetrics: session.getLastScreenshotMetrics(),
   });
-  const screenshot = modelSupportsScreenshotInput() ? await readFile(beforeScreenshotPath) : undefined;
+  const screenshot = shouldSendScreenshotToAi() ? await readScreenshotForAi(beforeScreenshotPath) : undefined;
   let lastAiRequest: AiRequestSnapshot | undefined;
 
   async function runAgent(includeImage: boolean) {
@@ -806,6 +810,7 @@ async function executeRuntimeStep(input: {
         stopWhenStepCount: Number(process.env.AI_TEST_AGENT_MAX_STEPS || 1),
         includeImage,
         modelSupportsScreenshotInput: modelSupportsScreenshotInput(),
+        screenshotInputEnabled: shouldSendScreenshotToAi(),
         visualClickMode: isVisualClickMode(),
       },
     });
@@ -962,7 +967,218 @@ async function createRecoverableRuntimeErrorStep(input: {
   };
 }
 
+function flowInput(input: unknown) {
+  return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+}
+
+function normalizeBrowserUrl(url: string) {
+  const trimmed = url.trim();
+  if (!trimmed) return '';
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) || /^(about|data|file|blob):/i.test(trimmed)) return trimmed;
+  if (/^(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(trimmed)) return `http://${trimmed}`;
+  return `https://${trimmed}`;
+}
+
+async function waitAfterRecordedTool(session: BrowserSession) {
+  await session.waitForPage().catch(() => undefined);
+  const configuredDelay = Number(process.env.REPLAY_STEP_DELAY_MS || 1000);
+  const delayMs = Number.isFinite(configuredDelay) ? configuredDelay : 1000;
+  if (delayMs > 0) await session.wait(delayMs).catch(() => undefined);
+}
+
+async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep): Promise<BrowserActionResult> {
+  const input = flowInput(flow.input);
+  const text = typeof input.text === 'string' ? input.text : undefined;
+  const domPath = typeof input.domPath === 'string' ? input.domPath : undefined;
+  const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
+
+  switch (flow.name) {
+    case 'openPage':
+    case 'openUrl':
+      {
+        const rawUrl = typeof input.url === 'string' && input.url.trim() ? input.url : targetUrl;
+        const url = normalizeBrowserUrl(rawUrl);
+        if (!url) return { ok: false, actual: 'Recorded openPage/openUrl failed because the target URL is empty.' };
+        return session.open(url);
+      }
+    case 'scrollViewport':
+      return session.scroll(
+        typeof input.deltaY === 'number' ? input.deltaY : 0,
+        typeof input.deltaX === 'number' ? input.deltaX : 0,
+        { domPath },
+      );
+    case 'clickCandidate':
+      return session.clickCandidate(String(input.id || ''), text);
+    case 'focusCandidate':
+      return session.focusCandidate(String(input.id || ''), text);
+    case 'hoverCandidate':
+      return session.hoverCandidate(String(input.id || ''));
+    case 'doubleClickCandidate':
+      return session.doubleClickCandidate(String(input.id || ''));
+    case 'rightClickCandidate':
+      return session.rightClickCandidate(String(input.id || ''));
+    case 'dragCandidate':
+      return session.dragCandidate(String(input.fromId || ''), String(input.toId || ''));
+    case 'clickDomNode':
+      return session.clickDomNode(String(input.path || ''));
+    case 'focusDomNode':
+      return session.focusDomNode(String(input.path || ''));
+    case 'typeText':
+      return session.typeText(String(input.text || ''));
+    case 'pressKey':
+      return session.press(String(input.key || ''));
+    case 'waitForPage':
+      return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
+    case 'waitForHumanVerification':
+      return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
+    case 'listTabs':
+      return session.listTabs();
+    case 'switchTab':
+      return session.switchTab(typeof input.index === 'number' ? input.index : Number(input.index || 0));
+    case 'getInteractiveCandidates':
+      return session.getInteractiveCandidates();
+    case 'getDomTree':
+      return session.getSimplifiedDomTree();
+    default:
+      return { ok: false, actual: `Unsupported recorded tool: ${flow.name}.${reason}` };
+  }
+}
+
+async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, recordedFlow: RecordedFlowStep[], options: ExecutionOptions) {
+  const {
+    onProgress,
+    onDebug,
+    shouldSkipStep,
+    shouldPauseRun,
+    onPaused,
+    onResumed,
+  } = options;
+  const session = new BrowserSession();
+  const steps: StepExecutionResult[] = [];
+  let allowBrowserClose = false;
+
+  async function waitWhilePaused(stepIndex: number) {
+    if (!shouldPauseRun) return false;
+    let paused = false;
+    while (await shouldPauseRun(stepIndex)) {
+      if (!paused) {
+        paused = true;
+        await onPaused?.(stepIndex);
+        await onDebug?.({ phase: 'recorded:paused', stepIndex, message: 'Recorded flow paused by user; waiting for resume.' });
+      }
+      await sleep(800);
+    }
+    if (paused) {
+      await onResumed?.(stepIndex);
+      await onDebug?.({ phase: 'recorded:resumed', stepIndex, message: 'Recorded flow resumed.' });
+    }
+    return paused;
+  }
+
+  try {
+    await onDebug?.({ phase: 'recorded:start', message: `Using recorded flow with ${recordedFlow.length} tool calls; AI runtime requests are skipped.` });
+    await session.start();
+
+    for (let index = 0; index < recordedFlow.length; index += 1) {
+      const flow = recordedFlow[index];
+      const stepIndex = index + 1;
+      await waitWhilePaused(stepIndex);
+
+      if (await shouldSkipStep?.(stepIndex)) {
+        const skippedStep = createSkippedStep(stepIndex);
+        steps.push(skippedStep);
+        await onProgress?.(skippedStep);
+        continue;
+      }
+
+      const beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
+      const runningStep: StepExecutionResult = {
+        index: stepIndex,
+        action: `回放固定流程工具：${flow.name}`,
+        expected: '固定流程工具应按录制时的参数成功执行。',
+        actual: '正在执行录制工具调用。',
+        status: 'running',
+        beforeScreenshotPath,
+        tools: [{ name: flow.name, input: flow.input, reason: flow.reason }],
+      };
+      await onProgress?.(runningStep);
+
+      const result = await runRecordedTool(session, testCase.targetUrl, flow).catch((error) => ({
+        ok: false,
+        actual: infrastructureError(error),
+      }));
+      await waitAfterRecordedTool(session);
+      const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
+      const completedStep: StepExecutionResult = {
+        index: stepIndex,
+        action: `回放固定流程工具：${flow.name}`,
+        expected: '固定流程工具应按录制时的参数成功执行。',
+        actual: result.actual,
+        status: result.ok ? 'passed' : 'failed',
+        beforeScreenshotPath,
+        afterScreenshotPath,
+        screenshotPath: afterScreenshotPath,
+        tools: [{ name: flow.name, input: flow.input, reason: flow.reason, ok: result.ok, result: result.actual }],
+      };
+      steps.push(completedStep);
+      await onProgress?.(completedStep);
+      await onDebug?.({
+        phase: 'recorded:step',
+        stepIndex,
+        message: `${flow.name} -> ${result.ok ? 'ok' : 'failed'}`,
+        details: { flow, result },
+      });
+
+      if (!result.ok) {
+        allowBrowserClose = true;
+        return {
+          status: 'failed' as const,
+          result: {
+            steps,
+            consoleErrors: session.getConsoleErrors(),
+            networkErrors: session.getNetworkErrors(),
+          },
+        };
+      }
+    }
+
+    allowBrowserClose = true;
+    return {
+      status: 'passed' as const,
+      result: {
+        steps,
+        consoleErrors: session.getConsoleErrors(),
+        networkErrors: session.getNetworkErrors(),
+      },
+    };
+  } catch (error) {
+    const blockedStep: StepExecutionResult = {
+      index: steps.length + 1,
+      action: '固定流程回放中断',
+      expected: '录制的工具流程可以稳定回放。',
+      actual: infrastructureError(error),
+      status: 'blocked',
+    };
+    steps.push(blockedStep);
+    await onProgress?.(blockedStep);
+    return {
+      status: 'blocked' as const,
+      result: {
+        steps,
+        consoleErrors: session.getConsoleErrors(),
+        networkErrors: session.getNetworkErrors(),
+      },
+    };
+  } finally {
+    await session.close({ keepOpen: !allowBrowserClose });
+  }
+}
+
 export async function executeTestCase(testCase: TestCaseRecord, runId: string, options: ExecutionOptions = {}) {
+  if (!options.initialSteps?.length && options.recordedFlow?.length) {
+    return executeRecordedFlow(testCase, runId, options.recordedFlow, options);
+  }
+
   const {
     onProgress,
     onDebug,

@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { ArrowLeft, Clock3, ExternalLink, FileText } from 'lucide-react';
 import { TestCaseEditor } from '@/components/TestCaseEditor';
+import { ReplayRunButton } from '@/components/ReplayRunButton';
 import { RunTestButton } from '@/components/RunTestButton';
 import { store } from '@/server/db/mock-store';
 import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
@@ -75,10 +76,11 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
             {runs.map((run) => {
               const completedStepCount = run.result?.steps.filter((step) => step.status !== 'queued').length || 0;
               const totalStepCount = run.result?.steps.length || 0;
+              const replayable = Boolean(run.result?.steps.some((step) => step.tools?.some((tool) => tool.name && tool.ok !== false)));
               const startedAt = formatRunTime(run.startedAt || run.createdAt);
               const endedAt = run.endedAt ? formatRunTime(run.endedAt) : undefined;
               return (
-                <Link className="run-history-row" href={`/runs/${run.id}`} key={run.id}>
+                <div className="run-history-row" key={run.id}>
                   <span className={`run-history-status status-${run.status}`}>{runStatusLabel(run.status)}</span>
                   <span className="run-history-main">
                     <strong>{run.report?.title || `运行 ${run.id}`}</strong>
@@ -97,8 +99,13 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
                     <FileText size={14} />
                     {run.report ? '报告已生成' : '报告生成中'}
                   </span>
-                  <ExternalLink className="run-history-open" size={16} />
-                </Link>
+                  <span className="run-history-actions">
+                    <ReplayRunButton disabled={!replayable || run.status === 'running' || run.status === 'queued' || run.status === 'paused'} runId={run.id} />
+                    <Link className="run-history-open" href={`/runs/${run.id}`} title="Open details">
+                      <ExternalLink size={16} />
+                    </Link>
+                  </span>
+                </div>
               );
             })}
           </div>

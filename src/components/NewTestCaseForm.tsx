@@ -47,6 +47,7 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '生成失败');
+      window.dispatchEvent(new Event('navigation-loading:start'));
       router.push(`/test-cases/${data.testCaseId}`);
       router.refresh();
     } catch (err) {

@@ -1,7 +1,7 @@
 import { fsync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { Browser, Page } from 'playwright';
+import type { Browser, Frame, Page } from 'playwright';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
   if (errorText === 'net::ERR_ABORTED' && /analytics|collector|apm|beacon|log|track/i.test(url)) return true;
@@ -83,6 +83,8 @@ type InteractiveCandidate = {
   clickable: boolean;
   input: boolean;
   disabled: boolean;
+  framePath?: string;
+  frameUrl?: string;
   /** True when the element lives inside a shadow root, so its DOM-index path
    * cannot be resolved from the light tree and clicks must use coordinates. */
   shadow?: boolean;
@@ -124,6 +126,7 @@ export class BrowserSession {
   private lastScreenshotMetrics?: ScreenshotMetrics;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
 
+  // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
     const { chromium } = await import('playwright');
     const headless = process.env.HEADLESS_BROWSER === 'true';
@@ -131,12 +134,14 @@ export class BrowserSession {
     const hasExplicitViewport = Boolean(process.env.BROWSER_VIEWPORT_WIDTH || process.env.BROWSER_VIEWPORT_HEIGHT);
     const viewportWidth = Number(process.env.BROWSER_VIEWPORT_WIDTH || (fullscreen ? 1920 : 1280));
     const viewportHeight = Number(process.env.BROWSER_VIEWPORT_HEIGHT || (fullscreen ? 1080 : 800));
+    const ignoreHTTPSErrors = process.env.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
     this.browser = await chromium.launch({
       headless,
       slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
       args: [
         `--window-size=${viewportWidth},${viewportHeight + 120}`,
         fullscreen ? '--start-maximized' : '',
+        ignoreHTTPSErrors ? '--ignore-certificate-errors' : '',
         '--force-device-scale-factor=1',
         '--high-dpi-support=1',
       ].filter(Boolean),
@@ -144,6 +149,7 @@ export class BrowserSession {
     const useNativeFullscreenViewport = fullscreen && !headless && !hasExplicitViewport;
     const context = await this.browser.newContext({
       viewport: useNativeFullscreenViewport ? null : { width: viewportWidth, height: viewportHeight },
+      ignoreHTTPSErrors,
       ...(useNativeFullscreenViewport ? {} : { deviceScaleFactor: 1 }),
     });
     await context.addInitScript(() => {
@@ -175,6 +181,7 @@ export class BrowserSession {
     this.attachPageListeners(this.page);
   }
 
+  // 绑定 console 和网络失败监听，只记录会影响测试判断的关键异常。
   private attachPageListeners(page: Page) {
     page.setDefaultTimeout(8000);
     page.on('console', (message) => {
@@ -188,6 +195,7 @@ export class BrowserSession {
     });
   }
 
+  // 获取当前可用页面；如果活动页关闭，会从浏览器上下文中寻找替代页面。
   private get activePage() {
     if (!this.page) throw new Error('Browser session has not started');
     if (this.page.isClosed()) {
@@ -199,17 +207,20 @@ export class BrowserSession {
     return this.page;
   }
 
+  // 打开目标页面并等待基础加载完成。
   async open(url: string): Promise<BrowserActionResult> {
     await this.activePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     const note = await this.waitAfterAction();
     return { ok: true, actual: `Opened page: ${url}${note}` };
   }
 
+  // 读取当前页面正文文本，主要用于验证码/人工介入等文本判断。
   async readPageText() {
     return this.activePage.locator('body').innerText({ timeout: 5000 }).catch(() => '');
   }
 
-  async getPageContext(options: { includeDomTree?: boolean; includeText?: boolean; includeManualVerification?: boolean } = {}) {
+  // 汇总当前页面上下文，包括 URL、标题、焦点、候选元素、DOM 树和人工验证状态。
+  async getPageContext(options: { includeDomTree?: boolean; includeText?: boolean; includeManualVerification?: boolean; useCachedInteractiveCandidates?: boolean } = {}) {
     const includeText = options.includeText !== false || options.includeManualVerification !== false;
     const [title, text, viewportMetrics, focusedElement, domTree, interactiveCandidates] = await Promise.all([
       this.activePage.title().catch(() => ''),
@@ -217,7 +228,9 @@ export class BrowserSession {
       this.getViewportMetrics(),
       this.getFocusedElement(),
       options.includeDomTree ? this.readSimplifiedDomTree().catch((error) => `Unable to read DOM tree: ${error instanceof Error ? error.message : String(error)}`) : Promise.resolve(undefined),
-      this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
+      options.useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
+        ? Promise.resolve(this.lastInteractiveCandidates)
+        : this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
     ]);
 
     const manualVerification = options.includeManualVerification === false
@@ -244,6 +257,7 @@ export class BrowserSession {
     };
   }
 
+  // 结合页面文本和输入框扫描，判断是否需要人工处理验证码或安全校验。
   private async detectManualVerificationContext(title: string, url: string, text: string): Promise<ManualVerificationDetails> {
     const base = this.detectManualVerificationDetails(title, url, text);
     const captchaFields = await this.scanCaptchaInputFields();
@@ -251,6 +265,7 @@ export class BrowserSession {
     return { ...base, captchaFields, captchaAppearsFilled };
   }
 
+  // 扫描可见的验证码/OTP 输入框，并判断用户是否已经填入内容。
   private async scanCaptchaInputFields() {
     return this.activePage.evaluate(() => {
       function isVisible(element: Element) {
@@ -296,13 +311,15 @@ export class BrowserSession {
     }).catch(() => [] as Array<{ label: string; valueLength: number; filled: boolean }>);
   }
 
+  // 截取当前 viewport，并在 before 阶段按需绘制交互候选标识。
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' = 'after') {
     const dir = path.join(process.cwd(), 'artifacts', runId);
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    const candidateLabelsEnabled = phase === 'before' && process.env.SCREENSHOT_ELEMENT_LABELS !== 'false';
-    const candidates = candidateLabelsEnabled
+    const shouldCaptureCandidates = phase === 'before';
+    const candidateLabelsEnabled = shouldCaptureCandidates && process.env.SCREENSHOT_ELEMENT_LABELS !== 'false';
+    const candidates = shouldCaptureCandidates
       ? await this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[])
       : [];
     if (candidateLabelsEnabled) await this.drawCandidateOverlay(candidates);
@@ -326,20 +343,24 @@ export class BrowserSession {
     return filePath;
   }
 
+  // 返回最近一次截图的尺寸和 viewport 信息，供 AI 请求上下文引用。
   getLastScreenshotMetrics() {
     return this.lastScreenshotMetrics;
   }
 
+  // 返回当前可见交互候选元素，供 DOM 模式在无截图输入时定位控件。
   async getInteractiveCandidates(): Promise<BrowserActionResult> {
     const candidates = await this.refreshInteractiveCandidates();
     return { ok: true, actual: JSON.stringify(candidates, null, 2) };
   }
 
+  // 返回简化后的 DOM 树文本，作为候选列表不足时的兜底定位信息。
   async getSimplifiedDomTree(): Promise<BrowserActionResult> {
     return { ok: true, actual: await this.readSimplifiedDomTree() };
   }
 
-  async clickCandidate(candidateId: string): Promise<BrowserActionResult> {
+  // 点击指定编号的候选元素中心点。
+  async clickCandidate(candidateId: string, text?: string): Promise<BrowserActionResult> {
     const resolved = await this.resolveCandidateTarget(candidateId);
     if (!resolved.target) return { ok: false, actual: resolved.error };
 
@@ -350,6 +371,9 @@ export class BrowserSession {
     const popup = this.activePage.waitForEvent('popup', { timeout: 3000 }).catch(() => undefined);
     await this.activePage.mouse.click(target.x, target.y);
     await this.showClickMarker(target.x, target.y, 'click');
+    if (text !== undefined) {
+      await this.activePage.keyboard.type(text);
+    }
     const newPage = await popup;
     if (newPage) {
       this.page = newPage;
@@ -361,8 +385,10 @@ export class BrowserSession {
     }
     let note = await this.waitAfterAction();
     let fallbackNote = '';
-    if (candidate.href && this.activePage.url() === beforeUrl && !newPage) {
-      const fallback = await this.dispatchDomPathClick(candidate.path);
+    if (text === undefined && candidate.href && this.activePage.url() === beforeUrl && !newPage) {
+      const fallback = candidate.framePath
+        ? await this.dispatchFrameDomPathClick(candidate)
+        : await this.dispatchDomPathClick(candidate.path);
       if (fallback) {
         fallbackNote += ` Primary mouse click did not navigate; retried ${fallback} with DOM click.`;
         note += await this.waitAfterAction();
@@ -376,10 +402,11 @@ export class BrowserSession {
     await this.showClickMarker(target.x, target.y, 'click');
     return {
       ok: true,
-      actual: `Clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${note}`,
+      actual: `Clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${note}`,
     };
   }
 
+  // 双击指定编号的候选元素，用于打开链接、表格行等双击场景。
   async doubleClickCandidate(candidateId: string): Promise<BrowserActionResult> {
     const resolved = await this.resolveCandidateTarget(candidateId);
     if (!resolved.target) return { ok: false, actual: resolved.error };
@@ -395,6 +422,7 @@ export class BrowserSession {
     };
   }
 
+  // 右键点击指定候选元素，用于上下文菜单类操作。
   async rightClickCandidate(candidateId: string): Promise<BrowserActionResult> {
     const resolved = await this.resolveCandidateTarget(candidateId);
     if (!resolved.target) return { ok: false, actual: resolved.error };
@@ -410,6 +438,7 @@ export class BrowserSession {
     };
   }
 
+  // 悬停指定候选元素，用于触发下拉菜单、tooltip 或 hover 展开控件。
   async hoverCandidate(candidateId: string): Promise<BrowserActionResult> {
     const resolved = await this.resolveCandidateTarget(candidateId);
     if (!resolved.target) return { ok: false, actual: resolved.error };
@@ -423,6 +452,7 @@ export class BrowserSession {
     };
   }
 
+  // 将一个候选元素从起点拖拽到另一个候选元素位置。
   async dragCandidate(fromCandidateId: string, toCandidateId: string): Promise<BrowserActionResult> {
     const fromResolved = await this.resolveCandidateTarget(fromCandidateId);
     if (!fromResolved.target) return { ok: false, actual: fromResolved.error };
@@ -444,19 +474,24 @@ export class BrowserSession {
     };
   }
 
-  async focusCandidate(candidateId: string): Promise<BrowserActionResult> {
+  // 聚焦指定候选元素，通常在输入文本前调用。
+  async focusCandidate(candidateId: string, text?: string): Promise<BrowserActionResult> {
     const resolved = await this.resolveCandidateTarget(candidateId);
     if (!resolved.target) return { ok: false, actual: resolved.error };
 
     const { candidate, target } = resolved;
     await this.activePage.mouse.click(target.x, target.y);
+    if (text !== undefined) {
+      await this.activePage.keyboard.type(text);
+    }
     const note = await this.waitAfterAction();
     return {
       ok: true,
-      actual: `Focused candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before focusing.' : ''}${note}`,
+      actual: `Focused candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${text !== undefined ? ` Typed ${text.length} characters after focusing.` : ''}${target.offscreen ? ' It was scrolled/clamped before focusing.' : ''}${note}`,
     };
   }
 
+  // 通过简化 DOM 路径解析元素并点击，作为候选编号不可用时的兜底操作。
   async clickDomNode(path: string): Promise<BrowserActionResult> {
     const target = await this.resolveDomPathToClickablePoint(path);
     if (!target) {
@@ -473,6 +508,7 @@ export class BrowserSession {
     return { ok: true, actual: `Clicked DOM node ${path} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${offscreenNote}${note}` };
   }
 
+  // 通过简化 DOM 路径解析元素并聚焦，作为文本输入前的兜底聚焦方式。
   async focusDomNode(path: string): Promise<BrowserActionResult> {
     const target = await this.resolveDomPathToClickablePoint(path);
     if (!target) {
@@ -487,6 +523,7 @@ export class BrowserSession {
     return { ok: true, actual: `Focused DOM node ${path} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${offscreenNote}${note}` };
   }
 
+  // 滚动页面或指定滚动容器，支持虚拟表格/列表的局部滚动。
   async scroll(deltaY: number, deltaX = 0, target: { domPath?: string } = {}): Promise<BrowserActionResult> {
     const scrollTarget = await this.resolveScrollTarget(target);
     await this.activePage.mouse.move(scrollTarget.x, scrollTarget.y);
@@ -495,6 +532,7 @@ export class BrowserSession {
     return { ok: true, actual: `Scrolled ${scrollTarget.descriptor} at browser point (${scrollTarget.x}, ${scrollTarget.y}) by x=${deltaX}, y=${deltaY}.${scrollTarget.note}${note}` };
   }
 
+  // 列出当前浏览器上下文中的所有标签页，供 AI 判断是否需要切换。
   async listTabs(): Promise<BrowserActionResult> {
     const pages = this.activePage.context().pages();
     return {
@@ -503,6 +541,7 @@ export class BrowserSession {
     };
   }
 
+  // 切换到指定标签页，并把它设为后续操作的活动页。
   async switchTab(index: number): Promise<BrowserActionResult> {
     const page = this.activePage.context().pages()[index];
     if (!page) return { ok: false, actual: `Tab ${index} not found.` };
@@ -511,18 +550,21 @@ export class BrowserSession {
     return { ok: true, actual: `Switched to tab ${index}: ${page.url()}` };
   }
 
+  // 向当前焦点元素输入文本。
   async typeText(input: string): Promise<BrowserActionResult> {
     await this.activePage.keyboard.type(input, { delay: 20 });
     const note = await this.waitAfterAction();
     return { ok: true, actual: `Typed text into the currently focused element: ${input}${note}` };
   }
 
+  // 发送键盘按键，例如 Enter、Escape、Ctrl+A。
   async press(input: string): Promise<BrowserActionResult> {
     await this.activePage.keyboard.press(input);
     const note = await this.waitAfterAction();
     return { ok: true, actual: `Pressed key: ${input}${note}` };
   }
 
+  // 等待页面进入较稳定状态，用于加载、跳转或动画后的观察。
   async waitForPage(): Promise<BrowserActionResult> {
     await this.activePage.waitForLoadState('domcontentloaded').catch((error) => {
       if (!this.isTargetClosedError(error)) throw error;
@@ -532,11 +574,13 @@ export class BrowserSession {
     return { ok: true, actual: `Page wait completed.${note}` };
   }
 
+  // 等待固定时间，给短动画、下拉面板或异步更新留出渲染时间。
   async wait(ms = 800): Promise<BrowserActionResult> {
     await this.waitForStableViewport(Math.min(Math.max(ms, 100), 5000));
     return { ok: true, actual: `Waited ${ms}ms.` };
   }
 
+  // 等待用户手动完成验证码/安全校验，超时后返回阻塞信息。
   async waitForManualVerification(maxMs = Number(process.env.MANUAL_VERIFICATION_TIMEOUT_MS || 180000)): Promise<BrowserActionResult> {
     const note = await this.manualVerificationNote();
     return {
@@ -547,14 +591,17 @@ export class BrowserSession {
     };
   }
 
+  // 返回本次会话采集到的关键 console 错误。
   getConsoleErrors() {
     return this.consoleErrors;
   }
 
+  // 返回本次会话采集到的关键网络失败。
   getNetworkErrors() {
     return this.networkErrors;
   }
 
+  // 关闭浏览器；调试场景可选择保留窗口。
   async close(options: { keepOpen?: boolean } = {}) {
     if (options.keepOpen || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true') return;
     await this.browser?.close().catch(() => undefined);
@@ -719,7 +766,8 @@ export class BrowserSession {
 
   private async refreshInteractiveCandidates() {
     const limit = Math.max(10, Number(process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
-    const candidates = await this.activePage.evaluate(({ limit: candidateLimit }) => {
+    const scanLimit = Math.max(limit * 2, limit + 50);
+    const mainCandidates = await this.activePage.evaluate(({ limit: candidateLimit }) => {
       type Candidate = {
         id: string;
         path: string;
@@ -776,7 +824,7 @@ export class BrowserSession {
       // via the shadow root's host. Plain `parentElement` / `Node.contains` stop
       // at shadow boundaries, which breaks containment checks for shadow content.
       function flatParentElement(node: Node): Element | undefined {
-        const parent = node.parentNode;
+        const parent: Node | null = node.parentNode;
         if (!parent) return undefined;
         if (parent.nodeType === 1) return parent as Element;
         const host = (parent as ShadowRoot).host;
@@ -1162,7 +1210,7 @@ export class BrowserSession {
         const segments: number[] = [];
         let current: Element | undefined = element;
         while (current && current !== document.documentElement) {
-          const parent = flatParentElement(current);
+          const parent: Element | undefined = flatParentElement(current);
           if (!parent) return undefined;
           const siblings = children(parent);
           const index = siblings.indexOf(current);
@@ -1209,10 +1257,396 @@ export class BrowserSession {
         ...candidate,
         id: `${index + 1}`,
       }));
-    }, { limit }).catch(() => [] as InteractiveCandidate[]);
+    }, { limit: scanLimit }).catch(() => [] as InteractiveCandidate[]);
 
+    const frameCandidates = await this.refreshFrameInteractiveCandidates(scanLimit);
+    const candidates = [...mainCandidates, ...frameCandidates]
+      .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height)
+      .slice(0, limit)
+      .map((candidate, index) => ({
+        ...candidate,
+        id: `${index + 1}`,
+      }));
     this.lastInteractiveCandidates = candidates;
     return candidates;
+  }
+
+  private async refreshFrameInteractiveCandidates(limit: number): Promise<InteractiveCandidate[]> {
+    const frames = this.activePage.frames().filter((frame) => frame !== this.activePage.mainFrame());
+    const viewport = await this.getViewportMetrics().catch(() => ({ width: 0, height: 0, devicePixelRatio: 1 }));
+    const all: InteractiveCandidate[] = [];
+
+    for (const frame of frames) {
+      const framePath = this.getFramePath(frame);
+      if (!framePath) continue;
+
+      const box = await frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined);
+      if (!box || box.width <= 2 || box.height <= 2) continue;
+
+      const localCandidates = await frame.evaluate(({ limit: candidateLimit }) => {
+        type Candidate = {
+          id: string;
+          path: string;
+          tag: string;
+          role?: string;
+          type?: string;
+          name?: string;
+          text?: string;
+          nearbyText?: string;
+          href?: string;
+          host?: string;
+          placeholder?: string;
+          ariaLabel?: string;
+          title?: string;
+          rect: { x: number; y: number; width: number; height: number };
+          center: { x: number; y: number };
+          clickable: boolean;
+          input: boolean;
+          disabled: boolean;
+        };
+
+        type WindowWithAiListeners = Window & {
+          __aiGetEventListenerTypes?: (target: EventTarget) => string[];
+        };
+
+        const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
+        const interactiveRoles = new Set([
+          'button',
+          'link',
+          'menuitem',
+          'menuitemcheckbox',
+          'menuitemradio',
+          'tab',
+          'checkbox',
+          'radio',
+          'switch',
+          'option',
+          'searchbox',
+          'combobox',
+          'textbox',
+          'listbox',
+        ]);
+
+        function isOverlay(element: Element) {
+          return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__'));
+        }
+
+        function isRenderable(element: Element) {
+          if (!element || element.nodeType !== 1 || isOverlay(element)) return false;
+          const tag = element.tagName.toLowerCase();
+          if (skippedTags.has(tag)) return false;
+          if (element.hasAttribute('hidden')) return false;
+          if (element.getAttribute('aria-hidden') === 'true') return false;
+          const style = window.getComputedStyle(element);
+          if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+          if (style.pointerEvents === 'none') return false;
+          if (Number(style.opacity || '1') <= 0.01) return false;
+          return true;
+        }
+
+        function isTraversable(element: Element) {
+          if (!element || element.nodeType !== 1 || isOverlay(element)) return false;
+          return !skippedTags.has(element.tagName.toLowerCase());
+        }
+
+        function children(element: Element) {
+          return Array.from(element.children).filter(isTraversable);
+        }
+
+        function visibleRectOf(element: Element) {
+          if (!isRenderable(element)) return undefined;
+          const rect = element.getBoundingClientRect();
+          const left = Math.max(rect.left, 0);
+          const top = Math.max(rect.top, 0);
+          const right = Math.min(rect.right, window.innerWidth);
+          const bottom = Math.min(rect.bottom, window.innerHeight);
+          const width = right - left;
+          const height = bottom - top;
+          if (width <= 2 || height <= 2) return undefined;
+          return { left, top, right, bottom, width, height };
+        }
+
+        function recordedEventTypes(element: Element) {
+          try {
+            return ((window as WindowWithAiListeners).__aiGetEventListenerTypes?.(element) || []).map((item) => item.toLowerCase());
+          } catch {
+            return [];
+          }
+        }
+
+        function hasRecordedClickListener(element: Element) {
+          return recordedEventTypes(element).some((type) => /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/.test(type));
+        }
+
+        function hasRecordedHoverListener(element: Element) {
+          return recordedEventTypes(element).some((type) => /^(mouseenter|mouseover|pointerenter|pointerover)$/.test(type));
+        }
+
+        function hasOwnHoverSignal(element: Element) {
+          if (element.hasAttribute('onmouseenter')) return true;
+          if (element.hasAttribute('onmouseover')) return true;
+          if (element.hasAttribute('onpointerenter')) return true;
+          if (element.hasAttribute('onpointerover')) return true;
+          if (hasRecordedHoverListener(element)) return true;
+          return false;
+        }
+
+        function hasActionAttribute(element: Element) {
+          if (element.hasAttribute('jsaction')) return true;
+          for (const attr of Array.from(element.attributes)) {
+            if (/^(data-.+?(click|action|href|url|target)|ng-click|@click|v-on:click)$/i.test(attr.name) && attr.value !== 'false') return true;
+          }
+          return false;
+        }
+
+        const hoverSelectors = (() => {
+          const selectors: string[] = [];
+          for (const sheet of Array.from(document.styleSheets)) {
+            let rules: CSSRuleList | undefined;
+            try {
+              rules = sheet.cssRules;
+            } catch {
+              continue;
+            }
+            for (const rule of Array.from(rules || [])) {
+              const selectorText = (rule as CSSStyleRule).selectorText;
+              if (!selectorText || !selectorText.includes(':hover')) continue;
+              for (const part of selectorText.split(',')) {
+                const normalized = part
+                  .replace(/:hover\b/g, '')
+                  .replace(/:(active|focus|focus-visible|focus-within|visited|link)\b/g, '')
+                  .trim();
+                if (normalized && !/[>+~]\s*$/.test(normalized)) selectors.push(normalized);
+              }
+            }
+          }
+          return Array.from(new Set(selectors)).slice(0, 600);
+        })();
+
+        function hasCssHoverEffect(element: Element) {
+          const className = typeof element.className === 'string' ? element.className : '';
+          if (/(^|\s)hover[:_-]/.test(className)) return true;
+          for (const selector of hoverSelectors) {
+            try {
+              if (element.matches(selector)) return true;
+            } catch {
+              // Ignore selectors that cannot be used with matches().
+            }
+          }
+          return false;
+        }
+
+        function clickableReason(element: Element) {
+          const tag = element.tagName.toLowerCase();
+          if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary', 'option'].includes(tag)) return true;
+          const role = element.getAttribute('role');
+          if (role && interactiveRoles.has(role)) return true;
+          if (element.hasAttribute('onclick')) return true;
+          if (hasRecordedClickListener(element)) return true;
+          if (hasActionAttribute(element)) return true;
+          const tabindex = element.getAttribute('tabindex');
+          if (tabindex !== null && tabindex !== '-1') return true;
+          if ((element as HTMLElement).isContentEditable) return true;
+          return false;
+        }
+
+        function ownText(element: Element) {
+          let text = '';
+          for (const node of Array.from(element.childNodes)) {
+            if (node.nodeType === 3) text += node.textContent || '';
+          }
+          text = text.replace(/\s+/g, ' ').trim();
+          const inner = ((element as HTMLElement).innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+          return (text || inner).slice(0, 140);
+        }
+
+        function contextText(element: Element) {
+          const container = element.closest('li, article, tr, form, [role="listitem"], [role="row"], section, main') || element.parentElement || element;
+          const text = ((container as HTMLElement).innerText || container.textContent || '').replace(/\s+/g, ' ').trim();
+          return text.slice(0, 220);
+        }
+
+        function nameOf(element: Element) {
+          const input = element as HTMLInputElement;
+          const labelText = input.labels?.length ? Array.from(input.labels).map((label) => label.textContent || '').join(' ') : '';
+          const imageAlt = Array.from(element.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ');
+          return [
+            element.getAttribute('aria-label'),
+            element.getAttribute('title'),
+            element.getAttribute('alt'),
+            imageAlt,
+            input.placeholder,
+            labelText,
+            ownText(element),
+            input.value,
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 180);
+        }
+
+        function pointBelongsToElement(element: Element, x: number, y: number) {
+          const top = document.elementsFromPoint(x, y).find((item) => isRenderable(item));
+          return Boolean(top && (top === element || element.contains(top)));
+        }
+
+        function visiblePointForElement(element: Element, rect: ReturnType<typeof visibleRectOf>) {
+          if (!rect) return undefined;
+          const insetX = Math.min(10, Math.max(1, rect.width / 4));
+          const insetY = Math.min(10, Math.max(1, rect.height / 4));
+          const samples = [
+            [rect.left + rect.width / 2, rect.top + rect.height / 2],
+            [rect.left + insetX, rect.top + rect.height / 2],
+            [rect.right - insetX, rect.top + rect.height / 2],
+            [rect.left + rect.width / 2, rect.top + insetY],
+            [rect.left + rect.width / 2, rect.bottom - insetY],
+            [rect.left + insetX, rect.top + insetY],
+            [rect.right - insetX, rect.top + insetY],
+            [rect.left + insetX, rect.bottom - insetY],
+            [rect.right - insetX, rect.bottom - insetY],
+          ];
+          for (const [x, y] of samples) {
+            const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
+            const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
+            if (pointBelongsToElement(element, px, py)) return { x: Math.round(px), y: Math.round(py) };
+          }
+          return undefined;
+        }
+
+        function domPathOf(element: Element) {
+          const segments: number[] = [];
+          let current: Element | undefined = element;
+          while (current && current !== document.documentElement) {
+            const parent: Element | null = current.parentElement;
+            if (!parent) return undefined;
+            const siblings = children(parent);
+            const index = siblings.indexOf(current);
+            if (index < 0) return undefined;
+            segments.unshift(index);
+            current = parent;
+          }
+          if (current !== document.documentElement) return undefined;
+          return [0, ...segments];
+        }
+
+        function candidateFrom(element: Element, path: number[]): Candidate | undefined {
+          const tag = element.tagName.toLowerCase();
+          const role = element.getAttribute('role') || undefined;
+          const input = element as HTMLInputElement;
+          const isInput = ['input', 'textarea', 'select'].includes(tag) || Boolean((element as HTMLElement).isContentEditable);
+          const clickable = clickableReason(element);
+          const hoverable = hasOwnHoverSignal(element) || hasCssHoverEffect(element);
+          if (!clickable && !isInput && !hoverable) return undefined;
+
+          const rect = visibleRectOf(element);
+          if (!rect) return undefined;
+          const point = visiblePointForElement(element, rect);
+          if (!point) return undefined;
+
+          const viewportArea = window.innerWidth * window.innerHeight;
+          const area = rect.width * rect.height;
+          if (area > viewportArea * 0.75 && !['input', 'textarea', 'select', 'button', 'a'].includes(tag)) return undefined;
+
+          const href = tag === 'a' ? ((element as HTMLAnchorElement).href || element.getAttribute('href') || undefined) : undefined;
+          const host = ((): string | undefined => {
+            if (!href) return undefined;
+            try {
+              return new URL(href).hostname;
+            } catch {
+              return undefined;
+            }
+          })();
+
+          const text = ownText(element);
+          const name = nameOf(element);
+          const placeholder = input.placeholder || undefined;
+          const ariaLabel = element.getAttribute('aria-label') || undefined;
+          const title = element.getAttribute('title') || undefined;
+          const type = tag === 'input' || tag === 'button' ? element.getAttribute('type') || undefined : undefined;
+
+          return {
+            id: '',
+            path: path.join('.'),
+            tag,
+            role,
+            type,
+            name: name || undefined,
+            text: text || undefined,
+            nearbyText: contextText(element) || undefined,
+            href,
+            host,
+            placeholder,
+            ariaLabel,
+            title,
+            rect: {
+              x: Math.round(rect.left),
+              y: Math.round(rect.top),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height),
+            },
+            center: point,
+            clickable,
+            input: isInput,
+            disabled: Boolean((input as HTMLInputElement).disabled || element.getAttribute('aria-disabled') === 'true'),
+          };
+        }
+
+        function isDomPathAncestor(ancestorPath: string, descendantPath: string) {
+          return descendantPath.startsWith(`${ancestorPath}.`);
+        }
+
+        const raw: Candidate[] = [];
+        const seenPaths = new Set<string>();
+        for (const element of Array.from(document.querySelectorAll('*'))) {
+          if (!isTraversable(element)) continue;
+          const path = domPathOf(element);
+          if (!path) continue;
+          const key = path.join('.');
+          if (seenPaths.has(key)) continue;
+          const candidate = candidateFrom(element, path);
+          if (candidate) {
+            raw.push(candidate);
+            seenPaths.add(key);
+          }
+        }
+
+        const deduped = raw.filter(
+          (candidate) =>
+            !raw.some(
+              (other) => other !== candidate && isDomPathAncestor(candidate.path, other.path),
+            ),
+        );
+        return deduped
+          .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height)
+          .slice(0, candidateLimit);
+      }, { limit }).catch(() => [] as Omit<InteractiveCandidate, 'framePath' | 'frameUrl' | 'shadow'>[]);
+
+      for (const candidate of localCandidates) {
+        const rect = {
+          x: Math.round(box.x + candidate.rect.x),
+          y: Math.round(box.y + candidate.rect.y),
+          width: candidate.rect.width,
+          height: candidate.rect.height,
+        };
+        const center = {
+          x: Math.round(box.x + candidate.center.x),
+          y: Math.round(box.y + candidate.center.y),
+        };
+        if (center.x < 0 || center.y < 0 || center.x >= viewport.width || center.y >= viewport.height) continue;
+        all.push({
+          ...candidate,
+          id: '',
+          rect,
+          center,
+          framePath,
+          frameUrl: frame.url() || undefined,
+        });
+      }
+    }
+
+    return all;
   }
 
   private describeCandidate(candidate: InteractiveCandidate) {
@@ -1221,6 +1655,7 @@ export class BrowserSession {
       candidate.role ? `role=${candidate.role}` : '',
       candidate.name ? `name="${candidate.name.slice(0, 80)}"` : '',
       candidate.href ? `href=${candidate.href.slice(0, 140)}` : '',
+      candidate.framePath ? `frame=${candidate.framePath}` : '',
       `box=${candidate.rect.x},${candidate.rect.y},${candidate.rect.width}x${candidate.rect.height}`,
     ].filter(Boolean);
     return parts.join(' ');
@@ -1248,6 +1683,17 @@ export class BrowserSession {
       return { candidate, error: `Candidate ${candidate.id} is disabled: ${this.describeCandidate(candidate)}` };
     }
 
+    if (candidate.framePath) {
+      const point = await this.resolveFrameCandidatePoint(candidate);
+      if (!point) {
+        return {
+          candidate,
+          error: `Candidate ${candidate.id} (iframe ${candidate.framePath}) is no longer resolvable. Call getInteractiveCandidates again; the frame DOM likely changed.`,
+        };
+      }
+      return { candidate, target: point };
+    }
+
     // Shadow-DOM candidates have no resolvable light-tree index path, so click them
     // by their captured viewport coordinates (which share the host document's space).
     if (candidate.shadow) {
@@ -1270,6 +1716,175 @@ export class BrowserSession {
     }
 
     return { candidate, target };
+  }
+
+  private getFramePath(frame: Frame) {
+    const segments: number[] = [];
+    let current: Frame | null = frame;
+    while (current && current !== this.activePage.mainFrame()) {
+      const parent: Frame | null = current.parentFrame();
+      if (!parent) return undefined;
+      const index = parent.childFrames().indexOf(current);
+      if (index < 0) return undefined;
+      segments.unshift(index);
+      current = parent;
+    }
+    return segments.join('.');
+  }
+
+  private frameFromPath(pathValue?: string) {
+    if (!pathValue) return this.activePage.mainFrame();
+    const parts = String(pathValue).split('.').map((item) => Number(String(item).trim()));
+    if (parts.some((item) => !Number.isInteger(item) || item < 0)) return undefined;
+    let frame: Frame | undefined = this.activePage.mainFrame();
+    for (const index of parts) {
+      frame = frame.childFrames()[index];
+      if (!frame) return undefined;
+    }
+    return frame;
+  }
+
+  private async resolveFrameCandidatePoint(candidate: InteractiveCandidate) {
+    const frame = this.frameFromPath(candidate.framePath);
+    if (!frame) return this.resolveCapturedCandidatePoint(candidate, 'iframe');
+    const box = await frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined);
+    if (!box) return this.resolveCapturedCandidatePoint(candidate, 'iframe');
+    const local = await this.resolveFrameDomPathToClickablePoint(frame, candidate.path);
+    if (!local) return this.resolveCapturedCandidatePoint(candidate, 'iframe');
+    const x = Math.round(box.x + local.x);
+    const y = Math.round(box.y + local.y);
+    const viewport = await this.getViewportMetrics().catch(() => ({ width: 0, height: 0, devicePixelRatio: 1 }));
+    if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
+      return this.resolveCapturedCandidatePoint(candidate, 'iframe');
+    }
+    return {
+      x,
+      y,
+      descriptor: `iframe ${candidate.framePath} -> ${local.descriptor}`,
+      offscreen: local.offscreen,
+    };
+  }
+
+  private resolveCapturedCandidatePoint(candidate: InteractiveCandidate, descriptor: string) {
+    const px = candidate.center?.x;
+    const py = candidate.center?.y;
+    if (typeof px !== 'number' || typeof py !== 'number') return undefined;
+    return {
+      x: px,
+      y: py,
+      descriptor: `${descriptor} captured ${this.describeCandidate(candidate)}`,
+      offscreen: false,
+    };
+  }
+
+  private async resolveFrameDomPathToClickablePoint(frame: Frame, pathValue: string) {
+    return frame.evaluate((path) => {
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
+      function aiIsRenderable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        const tag = element.tagName.toLowerCase();
+        if (skippedTags.has(tag)) return false;
+        if (element.hasAttribute('hidden')) return false;
+        if (element.getAttribute('aria-hidden') === 'true') return false;
+        const style = window.getComputedStyle(element);
+        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (style.pointerEvents === 'none') return false;
+        if (Number(style.opacity || '1') <= 0.01) return false;
+        return true;
+      }
+      function aiIsTraversable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        return !skippedTags.has(element.tagName.toLowerCase());
+      }
+      function aiVisibleRect(element: Element) {
+        if (!aiIsRenderable(element)) return undefined;
+        const rect = element.getBoundingClientRect();
+        const left = Math.max(rect.left, 0);
+        const top = Math.max(rect.top, 0);
+        const right = Math.min(rect.right, window.innerWidth);
+        const bottom = Math.min(rect.bottom, window.innerHeight);
+        const width = right - left;
+        const height = bottom - top;
+        if (width <= 2 || height <= 2) return undefined;
+        return { left, top, right, bottom, width, height, raw: rect };
+      }
+      function aiChildren(element: Element) {
+        return Array.from(element.children).filter(aiIsTraversable);
+      }
+      function pointBelongsToElement(element: Element, x: number, y: number) {
+        const top = document.elementsFromPoint(x, y).find((item) => aiIsRenderable(item));
+        return Boolean(top && (top === element || element.contains(top)));
+      }
+      function visiblePointForElement(element: Element) {
+        const rect = aiVisibleRect(element);
+        if (!rect) return undefined;
+        const insetX = Math.min(10, Math.max(1, rect.width / 4));
+        const insetY = Math.min(10, Math.max(1, rect.height / 4));
+        const samples = [
+          [rect.left + rect.width / 2, rect.top + rect.height / 2],
+          [rect.left + insetX, rect.top + rect.height / 2],
+          [rect.right - insetX, rect.top + rect.height / 2],
+          [rect.left + rect.width / 2, rect.top + insetY],
+          [rect.left + rect.width / 2, rect.bottom - insetY],
+          [rect.left + insetX, rect.top + insetY],
+          [rect.right - insetX, rect.top + insetY],
+          [rect.left + insetX, rect.bottom - insetY],
+          [rect.right - insetX, rect.bottom - insetY],
+        ];
+        for (const [x, y] of samples) {
+          const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
+          const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
+          if (pointBelongsToElement(element, px, py)) return { x: px, y: py };
+        }
+        return undefined;
+      }
+
+      const parts = String(path).split('.').map((item) => Number(String(item).trim()));
+      if (!parts.length || parts[0] !== 0 || parts.some((item) => !Number.isInteger(item) || item < 0)) return undefined;
+      let element: Element | undefined = document.documentElement;
+      for (const index of parts.slice(1)) {
+        element = aiChildren(element)[index];
+        if (!element) return undefined;
+      }
+      if (!element) return undefined;
+      let rect = element.getBoundingClientRect();
+      let point = visiblePointForElement(element);
+      if (!point) {
+        element.scrollIntoView({ block: 'center', inline: 'center' });
+        rect = element.getBoundingClientRect();
+        point = visiblePointForElement(element);
+      }
+      if (!point || rect.width <= 0 || rect.height <= 0) {
+        const queue = aiChildren(element);
+        while (queue.length) {
+          const candidate = queue.shift() as Element;
+          const candidateRect = candidate.getBoundingClientRect();
+          const candidatePoint = visiblePointForElement(candidate);
+          if (candidateRect.width > 0 && candidateRect.height > 0 && candidatePoint) {
+            element = candidate;
+            rect = candidateRect;
+            point = candidatePoint;
+            break;
+          }
+          queue.push(...aiChildren(candidate));
+        }
+      }
+      if (!point || rect.width <= 0 || rect.height <= 0) return undefined;
+      const tag = element.tagName.toLowerCase();
+      const id = element.id ? `#${element.id}` : '';
+      const classes = typeof element.className === 'string'
+        ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
+        : '';
+      const offscreen = rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth;
+      return {
+        x: Math.min(Math.max(point.x, 0), window.innerWidth - 1),
+        y: Math.min(Math.max(point.y, 0), window.innerHeight - 1),
+        descriptor: `${tag}${id}${classes}`,
+        offscreen,
+      };
+    }, pathValue).catch(() => undefined);
   }
 
   private async resolveShadowCandidatePoint(candidate: InteractiveCandidate) {
@@ -1631,6 +2246,35 @@ export class BrowserSession {
       (element as HTMLElement).click();
       return `${tag}${id}`;
     }, pathValue).catch(() => undefined);
+  }
+
+  private async dispatchFrameDomPathClick(candidate: InteractiveCandidate) {
+    const frame = this.frameFromPath(candidate.framePath);
+    if (!frame) return undefined;
+    return frame.evaluate((path) => {
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
+      function aiIsTraversable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        return !skippedTags.has(element.tagName.toLowerCase());
+      }
+      function aiChildren(element: Element) {
+        return Array.from(element.children).filter(aiIsTraversable);
+      }
+
+      const parts = String(path).split('.').map((item) => Number(String(item).trim()));
+      if (!parts.length || parts[0] !== 0 || parts.some((item) => !Number.isInteger(item) || item < 0)) return undefined;
+      let element: Element | undefined = document.documentElement;
+      for (const index of parts.slice(1)) {
+        element = aiChildren(element)[index];
+        if (!element) return undefined;
+      }
+      if (!element) return undefined;
+      const tag = element.tagName.toLowerCase();
+      const id = element.id ? `#${element.id}` : '';
+      (element as HTMLElement).click();
+      return `iframe DOM click ${tag}${id}`;
+    }, candidate.path).catch(() => undefined);
   }
 
   private async resolveScrollTarget(target: { domPath?: string }) {

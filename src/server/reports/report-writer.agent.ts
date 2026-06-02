@@ -2,6 +2,7 @@ import path from 'node:path';
 import type { StepExecutionResult, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { richTextToPlainText } from '@/lib/rich-text';
 
+// 将运行状态转换成报告里展示的中文文案。
 function statusText(status: TestRunRecord['status'] | StepExecutionResult['status']) {
   if (status === 'passed') return '通过';
   if (status === 'failed') return '失败';
@@ -10,6 +11,7 @@ function statusText(status: TestRunRecord['status'] | StepExecutionResult['statu
   return '排队中';
 }
 
+// 把本地 artifacts 文件路径转换成受保护的 API 访问路径。
 function artifactUrl(filePath?: string) {
   if (!filePath) return undefined;
   const root = path.resolve(process.cwd(), 'artifacts');
@@ -18,6 +20,7 @@ function artifactUrl(filePath?: string) {
   return `/api/artifacts/${relative}`;
 }
 
+// 格式化工具参数，保证报告中可以直接看到 AI 调用浏览器工具时传了什么。
 function formatToolInput(input: unknown) {
   if (input === undefined || input === null) return '';
   if (typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length === 0) return '';
@@ -28,6 +31,7 @@ function formatToolInput(input: unknown) {
   }
 }
 
+// 生成单个步骤的工具调用 markdown 片段。
 function toolMarkdown(step: StepExecutionResult) {
   if (!step.tools?.length) return '- 工具调用：无';
   return [
@@ -39,6 +43,7 @@ function toolMarkdown(step: StepExecutionResult) {
   ].join('\n');
 }
 
+// 生成单个执行步骤的 markdown，包含执行前后截图和工具调用。
 function stepMarkdown(step: StepExecutionResult) {
   const before = artifactUrl(step.beforeScreenshotPath);
   const after = artifactUrl(step.afterScreenshotPath || step.screenshotPath);
@@ -51,6 +56,7 @@ ${before ? `\n![步骤 ${step.index} 执行前](${before})` : ''}
 ${after ? `\n![步骤 ${step.index} 执行后](${after})` : ''}`;
 }
 
+// 汇总测试用例、运行结果和步骤证据，生成最终测试报告对象。
 export function writeReport(testCase: TestCaseRecord, run: TestRunRecord) {
   const result = run.result;
   const status = run.status;

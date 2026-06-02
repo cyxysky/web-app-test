@@ -452,24 +452,6 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                   </dd>
                 </div>
                 <div>
-                  <dt>调用原因</dt>
-                  <dd>
-                    {selectedStep.tools?.length ? (
-                      <div style={{border: "none",padding: "8px 0px 0px 0px"}}>
-                        {selectedStep.tools.map((tool, index) => {
-                          return (
-                            <div style={{padding: "0px", border: "none"}}>
-                              {tool.reason}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ) : (
-                      '本步未调用浏览器工具'
-                    )}
-                  </dd>
-                </div>
-                <div>
                   <dt>执行前截图</dt>
                   <dd>{before ? <button className="link-button" onClick={() => openImageByUrl(before)} type="button"><Eye size={14} />查看</button> : '暂无'}</dd>
                 </div>
