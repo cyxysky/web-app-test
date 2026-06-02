@@ -1443,8 +1443,6 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         await onManualInterventionCleared?.(stepIndex);
         await onDebug?.({ phase: 'manual:resumed', stepIndex, message: '用户确认验证已完成，立即重新采集截图并发起 AI 请求。' });
         manuallyResumedSteps.add(stepIndex);
-        await session.waitForPage();
-        await sleep(1200);
         beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
         await onProgress?.({
           ...runningStep,
@@ -1511,7 +1509,6 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           },
         });
         clearStepAbortController(runId, stepIndex);
-        await session.wait(500).catch(() => undefined);
         continue;
       }
 
@@ -1584,8 +1581,6 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
             details: { decision, screenshotPath: afterScreenshotPath },
           });
           await onManualInterventionCleared?.(stepIndex);
-          await session.waitForPage();
-          await sleep(1200);
           clearStepAbortController(runId, stepIndex);
           stepIndex -= 1;
           continue;
@@ -1627,8 +1622,6 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         await onManualInterventionCleared?.(stepIndex);
         await onDebug?.({ phase: 'manual:resumed', stepIndex, message: '用户确认验证已完成，立即重新发起本步骤 AI 请求。' });
         manuallyResumedSteps.add(stepIndex);
-        await session.waitForPage();
-        await sleep(1200);
         clearStepAbortController(runId, stepIndex);
         stepIndex -= 1;
         continue;

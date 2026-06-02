@@ -6,7 +6,13 @@ const currentDir = dirname(fileURLToPath(import.meta.url));
 
 const nextConfig: NextConfig = {
   outputFileTracingRoot: currentDir,
-  serverExternalPackages: ['playwright'],
+  serverExternalPackages: [
+    'playwright',
+    'ai-sdk-provider-gemini-cli',
+    '@google/gemini-cli-core',
+    'tree-sitter-bash',
+    'web-tree-sitter',
+  ],
 };
 
 export default nextConfig;

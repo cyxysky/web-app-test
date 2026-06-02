@@ -608,7 +608,7 @@ export class BrowserSession {
   }
 
   private async waitAfterAction() {
-    const settleMs = Number(process.env.BROWSER_ACTION_SETTLE_MS || 120);
+    const settleMs = Number(process.env.BROWSER_ACTION_SETTLE_MS || 0);
     await this.activePage.waitForLoadState('domcontentloaded').catch(() => undefined);
     if (Number.isFinite(settleMs) && settleMs > 0) {
       await this.waitForStableViewport(Math.min(Math.max(settleMs, 0), 2000));

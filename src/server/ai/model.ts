@@ -5,11 +5,14 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import type { generateText } from 'ai';
 import { createCodexCli, type ReasoningEffort } from 'ai-sdk-provider-codex-cli';
+import { createGeminiProvider } from 'ai-sdk-provider-gemini-cli';
 
 type GenerateTextModel = Parameters<typeof generateText>[0]['model'];
-type AiProvider = 'azure-openai' | 'codex' | 'deepseek' | 'google' | 'openai' | 'openrouter';
+type AiProvider = 'azure-openai' | 'codex' | 'deepseek' | 'gemini' | 'google' | 'openai' | 'openrouter';
 type ApprovalMode = 'never' | 'on-failure' | 'on-request' | 'untrusted';
 type SandboxMode = 'danger-full-access' | 'read-only' | 'workspace-write';
+
+const gemini = createGeminiProvider({ authType: 'oauth-personal' });
 
 const azureOpenAI = createAzure({
   baseURL: 'http://mirrors.shterm.com:8801/openai',
@@ -47,6 +50,7 @@ const codexCli = createCodexCli({
 
 export function getModel(): GenerateTextModel {
   const { provider, model } = getModelSettings();
+  if (provider === 'gemini') return gemini(model) as unknown as GenerateTextModel;
   if (provider === 'codex') return codexCli(model) as unknown as GenerateTextModel;
   if (provider === 'deepseek') return deepseek(model) as unknown as GenerateTextModel;
   if (provider === 'google') return google(model) as unknown as GenerateTextModel;
@@ -61,9 +65,10 @@ export function getModelSettings() {
     'azure-openai': 'gpt-5.5',
     codex: 'gpt-5.5',
     deepseek: 'deepseek-v4-flash',
-    google: 'gemini-3.5-flash',
+    google: 'gemini-3-flash-preview',
     openai: 'gpt-5.5',
     openrouter: 'qwen/qwen3.6-27b',
+    gemini: 'gemini-3.1-pro-preview',
   };
 
   return {
@@ -77,7 +82,8 @@ function normalizeProvider(value: string | undefined): AiProvider {
   if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
   if (provider === 'codex' || provider === 'codex-cli') return 'codex';
   if (provider === 'deepseek') return 'deepseek';
-  if (provider === 'google' || provider === 'gemini') return 'google';
+  if (provider === 'gemini' || provider === 'gemini-cli') return 'gemini';
+  if (provider === 'google') return 'google';
   if (provider === 'openai') return 'openai';
   return 'openrouter';
 }

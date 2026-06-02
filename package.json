@@ -23,6 +23,7 @@
     "ai": "^6.0.193",
     "ai-sdk-provider-codex-app-server": "^1.1.7",
     "ai-sdk-provider-codex-cli": "^1.2.1",
+    "ai-sdk-provider-gemini-cli": "^2.0.1",
     "clsx": "^2.1.1",
     "lucide-react": "^0.511.0",
     "next": "^15.3.3",
