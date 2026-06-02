@@ -608,8 +608,11 @@ export class BrowserSession {
   }
 
   private async waitAfterAction() {
+    const settleMs = Number(process.env.BROWSER_ACTION_SETTLE_MS || 120);
     await this.activePage.waitForLoadState('domcontentloaded').catch(() => undefined);
-    await this.waitForStableViewport(350);
+    if (Number.isFinite(settleMs) && settleMs > 0) {
+      await this.waitForStableViewport(Math.min(Math.max(settleMs, 0), 2000));
+    }
     const [manualNote, focusNote] = await Promise.all([this.manualVerificationNote(), this.focusNote()]);
     return `${manualNote}${focusNote}`;
   }
@@ -984,7 +987,7 @@ export class BrowserSession {
 
       function clickableReason(element: Element) {
         const tag = element.tagName.toLowerCase();
-        if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary', 'option'].includes(tag)) return true;
+        if (['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag)) return true;
         const role = element.getAttribute('role');
         if (role && interactiveRoles.has(role)) return true;
         if (element.hasAttribute('onclick')) return true;
@@ -1438,7 +1441,7 @@ export class BrowserSession {
 
         function clickableReason(element: Element) {
           const tag = element.tagName.toLowerCase();
-          if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary', 'option'].includes(tag)) return true;
+          if (['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag)) return true;
           const role = element.getAttribute('role');
           if (role && interactiveRoles.has(role)) return true;
           if (element.hasAttribute('onclick')) return true;
@@ -2029,7 +2032,7 @@ export class BrowserSession {
 
       function isClickable(element: Element) {
         const tag = element.tagName.toLowerCase();
-        if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary', 'option'].includes(tag)) return true;
+        if (['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag)) return true;
         const role = element.getAttribute('role');
         if (role && ['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'tab', 'checkbox', 'radio', 'switch', 'option'].includes(role)) return true;
         if (element.hasAttribute('onclick')) return true;
@@ -2545,24 +2548,23 @@ export class BrowserSession {
           y: dy >= 0 ? box.bottom : box.top,
         };
       }
-      function drawLeader(rect: { x: number; y: number; width: number; height: number }, box: LabelBox, color: string, width = 2) {
+      function drawLeader(rect: { x: number; y: number; width: number; height: number }, box: LabelBox, color: string, width = 1) {
         const start = edgePoint(rect, box);
         const end = labelEdgePoint(rect, box);
-        for (const stroke of [
-          { color: 'rgba(255,255,255,0.96)', width: String(width + 2) },
-          { color, width: String(width) },
-        ]) {
-          const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-          line.setAttribute('x1', String(start.x));
-          line.setAttribute('y1', String(start.y));
-          line.setAttribute('x2', String(end.x));
-          line.setAttribute('y2', String(end.y));
-          line.setAttribute('stroke', stroke.color);
-          line.setAttribute('stroke-width', stroke.width);
-          line.setAttribute('stroke-linecap', 'round');
-          line.setAttribute('vector-effect', 'non-scaling-stroke');
-          svg.appendChild(line);
-        }
+        const dx = end.x - start.x;
+        const dy = end.y - start.y;
+        const length = Math.max(1, Math.hypot(dx, dy));
+        const outsideGap = 2;
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute('x1', String(start.x + (dx / length) * outsideGap));
+        line.setAttribute('y1', String(start.y + (dy / length) * outsideGap));
+        line.setAttribute('x2', String(end.x));
+        line.setAttribute('y2', String(end.y));
+        line.setAttribute('stroke', color);
+        line.setAttribute('stroke-width', String(width));
+        line.setAttribute('stroke-linecap', 'butt');
+        line.setAttribute('vector-effect', 'non-scaling-stroke');
+        svg.appendChild(line);
       }
 
       const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -2583,7 +2585,7 @@ export class BrowserSession {
         if (!rect || rect.width <= 0 || rect.height <= 0) continue;
 
         const box = document.createElement('div');
-        const color = item.href ? '#1d4ed8' : item.input ? '#047857' : '#b45309';
+        const color = '#2563eb';
         const boxLeft = clamp(rect.x, 1, Math.max(1, window.innerWidth - 2));
         const boxTop = clamp(rect.y, 1, Math.max(1, window.innerHeight - 2));
         const boxWidth = Math.max(1, Math.min(rect.width, window.innerWidth - boxLeft - 1));
@@ -2594,20 +2596,20 @@ export class BrowserSession {
           top: `${boxTop}px`,
           width: `${boxWidth}px`,
           height: `${boxHeight}px`,
-          border: `2px solid ${color}`,
+          border: `1px solid ${color}`,
           borderRadius: '3px',
           boxSizing: 'border-box',
           background: 'transparent',
-          boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.9)',
+          boxShadow: 'none',
         });
 
         const label = document.createElement('div');
         label.textContent = item.id;
-        const labelWidth = Math.max(24, item.id.length * 10 + 9);
-        const labelHeight = 20;
+        const labelWidth = Math.max(18, item.id.length * 8 + 7);
+        const labelHeight = 16;
         const labelBox = labelPosition(rect, labelWidth, labelHeight);
         if (labelBox.external) {
-          drawLeader(rect, labelBox, color, 2);
+          drawLeader(rect, labelBox, color, 1);
         }
         Object.assign(label.style, {
           position: 'absolute',
@@ -2619,12 +2621,12 @@ export class BrowserSession {
           boxSizing: 'border-box',
           background: color,
           color: '#fff',
-          border: '1px solid rgba(255,255,255,0.98)',
+          border: '0',
           borderRadius: '999px',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          font: `900 13px/15px Arial, sans-serif`,
+          font: `900 11px/13px Arial, sans-serif`,
           letterSpacing: '0',
           textAlign: 'center',
           boxShadow: '0 1px 4px rgba(0,0,0,0.35)',

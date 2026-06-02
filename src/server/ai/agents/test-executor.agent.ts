@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { generateText, stepCountIs, tool } from 'ai';
+import { generateObject, generateText, stepCountIs, tool } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
 import type { AiRequestSnapshot, RecordedFlowStep, StepExecutionResult, StepToolCall, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
@@ -39,6 +39,39 @@ type RuntimeDecision = {
   done: boolean;
   note?: string;
 };
+
+const codexRuntimeObjectSchema = z.object({
+  type: z.string().min(1).describe('Tool type to execute, or finish/block/fail when the requirement is complete, blocked, or impossible.'),
+  params: z.object({
+    reason: z.string().nullable(),
+    url: z.string().nullable(),
+    id: z.string().nullable(),
+    text: z.string().nullable(),
+    key: z.string().nullable(),
+    path: z.string().nullable(),
+    domPath: z.string().nullable(),
+    fromId: z.string().nullable(),
+    toId: z.string().nullable(),
+    index: z.number().nullable(),
+    ms: z.number().nullable(),
+    maxMs: z.number().nullable(),
+    deltaX: z.number().nullable(),
+    deltaY: z.number().nullable(),
+    action: z.string().nullable(),
+    expected: z.string().nullable(),
+    actual: z.string().nullable(),
+    status: z.enum(['passed', 'failed', 'blocked']).nullable(),
+    done: z.boolean().nullable(),
+  }).describe('Parameters for the selected tool. Include every listed key; set unused keys to null. Include reason when choosing a tool.'),
+});
+
+const terminalCodexActionSchema = z.object({
+  action: z.string().nullable().optional(),
+  expected: z.string().nullable().optional(),
+  actual: z.string().nullable().optional(),
+  status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
+  done: z.boolean().nullable().optional(),
+});
 
 const manualIssuePattern = new RegExp(
   [
@@ -167,6 +200,19 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
   const abortSignal = upstream ? AbortSignal.any([upstream, timeoutController.signal]) : timeoutController.signal;
   try {
     return await generateText({ ...options, abortSignal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function generateObjectWithTimeout(options: Parameters<typeof generateObject>[0]) {
+  const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
+  const upstream = options.abortSignal;
+  const abortSignal = upstream ? AbortSignal.any([upstream, timeoutController.signal]) : timeoutController.signal;
+  try {
+    return await generateObject({ ...options, abortSignal });
   } finally {
     clearTimeout(timer);
   }
@@ -318,15 +364,6 @@ function makeBrowserTools(
       }),
       execute: ({ id, text, reason }) => record('clickCandidate', { id, text, reason }, () => session.clickCandidate(id, text)),
     }),
-    focusCandidate: tool({
-      description: 'Focus a visible input/control candidate by its numbered label. If text is provided, type it immediately after focusing.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-        id: z.string().describe('Candidate id such as 1, 12. Must come from the current visual labels or interactive candidate list.'),
-        text: z.string().optional().describe('Optional text to type immediately after focusing the input or editable control.'),
-      }),
-      execute: ({ id, text, reason }) => record('focusCandidate', { id, text, reason }, () => session.focusCandidate(id, text)),
-    }),
     hoverCandidate: tool({
       description: 'Move the mouse over a visible candidate by its numbered label. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
       inputSchema: z.object({
@@ -336,7 +373,7 @@ function makeBrowserTools(
       execute: ({ id, reason }) => record('hoverCandidate', { id, reason }, () => session.hoverCandidate(id)),
     }),
     typeText: tool({
-      description: 'Type text into the currently focused element. First use focusCandidate/clickCandidate or focusDomNode to focus the intended field.',
+      description: 'Type text into the currently focused element. Prefer clickCandidate(id,text) for numbered inputs; use this only after a fallback click already focused the field.',
       inputSchema: z.object({
         reason: toolReasonInput,
         text: z.string().describe('Text to enter.'),
@@ -406,14 +443,6 @@ function makeBrowserTools(
         path: z.string().describe('The bracket path shown in the simplified DOM tree, such as 0.1.2.'),
       }),
       execute: ({ path, reason }) => record('clickDomNode', { path, reason }, () => session.clickDomNode(path)),
-    }),
-    focusDomNode: tool({
-      description: 'Fallback only: focus a node from the simplified DOM tree by its bracket path before typing. Prefer focusCandidate when a numbered candidate exists.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-        path: z.string().describe('The bracket path shown in the simplified DOM tree, such as 0.1.2.'),
-      }),
-      execute: ({ path, reason }) => record('focusDomNode', { path, reason }, () => session.focusDomNode(path)),
     }),
   };
 
@@ -523,6 +552,7 @@ async function verifyRuntimeCompletion(input: {
     '- Empty captcha/OTP, login not finished, or waiting for user input → verified=false, status="blocked".',
     '- Wrong page or missing required outcome → verified=false; set remainingWork to concrete next steps.',
     '- If the requirement is visibly impossible, verified=true with status="failed" is allowed.',
+    '- summary and remainingWork must be written in Chinese.',
     '',
     'Reply with JSON only (no tools):',
     '{ "verified": boolean, "status": "passed"|"failed"|"blocked", "summary": string, "remainingWork": string }',
@@ -609,10 +639,11 @@ function runtimePrompt(input: {
     '',
     'Hard rules:',
     '- Call at most ONE tool. Extra tool calls are ignored.',
+    '- 所有面向用户的说明、reason、PROGRESS/NEXT、完成 JSON 字段内容都必须使用中文。',
     `- Use ${evidence} as the current page state.`,
     '- Do not repeat successful prior actions; use recent notes/tools to continue.',
     '- If page is loading/transitioning, call waitForPage once.',
-    '- For text entry on a numbered candidate, prefer focusCandidate(id,text) or clickCandidate(id,text) in one tool call. Use typeText only after a DOM-path focus fallback.',
+    '- For text entry on a numbered candidate, use clickCandidate(id,text) in one tool call. Use typeText only after a fallback click has already focused the field.',
     '- For hover-only menus, call hoverCandidate on the visible trigger, then act on the revealed target in the next step.',
     '- For scrollable tables/lists/panels, call scrollViewport with the relevant domPath when available.',
     '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
@@ -629,7 +660,7 @@ ${caseSystemPrompt}` : '',
     '',
     'Response:',
     '- To act: call exactly ONE tool and include reason grounded in current context.',
-    '- When acting, also output: PROGRESS: <what changed / observed> NEXT: <next intended action>.',
+    '- When acting, also output Chinese text: PROGRESS: <本步观察/变化> NEXT: <下一步意图>.',
     '- To finish/block/fail: call NO tool and return JSON: {"action":string,"expected":string,"actual":string,"status":"passed"|"failed"|"blocked","done":true}.',
     '',
     'Current context:',
@@ -660,12 +691,12 @@ function summarizeToolInput(input: unknown) {
 
 function runtimeToolNames() {
   const tools = [
+    'openPage',
     'openUrl',
     'waitForPage',
     'listTabs',
     'switchTab',
     'clickCandidate',
-    'focusCandidate',
     'hoverCandidate',
     'doubleClickCandidate',
     'rightClickCandidate',
@@ -675,7 +706,48 @@ function runtimeToolNames() {
     'scrollViewport',
   ];
   if (isVisualClickMode()) return tools;
-  return [...tools, 'getInteractiveCandidates', 'getDomTree', 'clickDomNode', 'focusDomNode'];
+  return [...tools, 'getInteractiveCandidates', 'getDomTree', 'clickDomNode'];
+}
+
+function isCodexProvider() {
+  return getModelSettings().provider === 'codex';
+}
+
+function codexObjectPrompt(prompt: string, allowedTypes: string[]) {
+  return [
+    prompt,
+    '',
+    'Codex local mode:',
+    '- AI SDK tools are unavailable for this provider. Do NOT attempt to call tools.',
+    '- Return exactly one object with shape: { "type": string, "params": object }.',
+    '- All user-facing params strings such as reason/action/expected/actual must be Chinese.',
+    `- type must be one of: ${[...allowedTypes, 'finish', 'block', 'fail'].join(', ')}.`,
+    '- params MUST include every schema key: reason,url,id,text,key,path,domPath,fromId,toId,index,ms,maxMs,deltaX,deltaY,action,expected,actual,status,done. Set unused keys to null.',
+    '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
+    '- For completion, use type="finish" and params={action, expected, actual, status:"passed", done:true}.',
+    '- For manual verification/security wait, use type="block" and params={action, expected, actual, status:"blocked", done:false}.',
+    '- For impossible/end-to-end failure, use type="fail" and params={action, expected, actual, status:"failed", done:true}.',
+  ].join('\n');
+}
+
+function codexTerminalText(type: string, params: Record<string, unknown>) {
+  const parsed = terminalCodexActionSchema.safeParse(params);
+  const status =
+    type === 'block'
+      ? 'blocked'
+      : type === 'fail'
+        ? 'failed'
+        : parsed.success && parsed.data.status
+          ? parsed.data.status
+          : 'passed';
+  const done = type === 'block' ? false : parsed.success && typeof parsed.data.done === 'boolean' ? parsed.data.done : true;
+  return JSON.stringify({
+    action: parsed.success && parsed.data.action ? parsed.data.action : `Codex returned ${type}`,
+    expected: parsed.success && parsed.data.expected ? parsed.data.expected : 'Codex object response should summarize the current test state.',
+    actual: parsed.success && parsed.data.actual ? parsed.data.actual : JSON.stringify(params),
+    status,
+    done,
+  });
 }
 
 // 记录一次 AI 请求的可展示上下文；图片只在真实发送给 AI 时写入 messages。
@@ -795,15 +867,18 @@ async function executeRuntimeStep(input: {
 
   async function runAgent(includeImage: boolean) {
     const traces: ToolTrace[] = [];
-    const messageContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: prompt }];
+    const codexMode = isCodexProvider();
+    const allowedToolTypes = runtimeToolNames();
+    const requestPrompt = codexMode ? codexObjectPrompt(prompt, allowedToolTypes) : prompt;
+    const messageContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: requestPrompt }];
     if (includeImage && screenshot) messageContent.push({ type: 'image', image: screenshot });
     const aiRequest = createAiRequestSnapshot({
       kind: 'runtime',
       stepIndex,
-      prompt,
+      prompt: requestPrompt,
       screenshotPath: beforeScreenshotPath,
       imageAttached: Boolean(includeImage && screenshot),
-      tools: runtimeToolNames(),
+      tools: allowedToolTypes,
       options: {
         temperature: 0.1,
         maxRetries: 0,
@@ -812,11 +887,41 @@ async function executeRuntimeStep(input: {
         modelSupportsScreenshotInput: modelSupportsScreenshotInput(),
         screenshotInputEnabled: shouldSendScreenshotToAi(),
         visualClickMode: isVisualClickMode(),
+        codexObjectMode: codexMode,
       },
     });
     lastAiRequest = aiRequest;
 
     try {
+      if (codexMode) {
+        const result = await generateObjectWithTimeout({
+          model: getModel(),
+          messages: [{ role: 'user', content: messageContent }],
+          schema: codexRuntimeObjectSchema,
+          temperature: 0.1,
+          maxRetries: 0,
+          abortSignal,
+        });
+        const object = result.object as z.infer<typeof codexRuntimeObjectSchema>;
+        const execution = await executeCodexRuntimeObject({
+          session,
+          targetUrl: testCase.targetUrl,
+          stepIndex,
+          type: object.type,
+          params: object.params,
+          allowedTypes: allowedToolTypes,
+          traces,
+          onToolTrace,
+        });
+        await onDebug?.({
+          phase: 'ai:runtime:object',
+          stepIndex,
+          message: `Codex object -> ${object.type}`,
+          details: jsonSafe({ object, traces }),
+        });
+        return { text: execution.text, traces, aiRequest };
+      }
+
       const result = await generateTextWithTimeout({
         model: getModel(),
         messages: [{ role: 'user', content: messageContent }],
@@ -981,8 +1086,8 @@ function normalizeBrowserUrl(url: string) {
 
 async function waitAfterRecordedTool(session: BrowserSession) {
   await session.waitForPage().catch(() => undefined);
-  const configuredDelay = Number(process.env.REPLAY_STEP_DELAY_MS || 1000);
-  const delayMs = Number.isFinite(configuredDelay) ? configuredDelay : 1000;
+  const configuredDelay = Number(process.env.REPLAY_STEP_DELAY_MS || 0);
+  const delayMs = Number.isFinite(configuredDelay) ? configuredDelay : 0;
   if (delayMs > 0) await session.wait(delayMs).catch(() => undefined);
 }
 
@@ -1010,7 +1115,7 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
     case 'clickCandidate':
       return session.clickCandidate(String(input.id || ''), text);
     case 'focusCandidate':
-      return session.focusCandidate(String(input.id || ''), text);
+      return session.clickCandidate(String(input.id || ''), text);
     case 'hoverCandidate':
       return session.hoverCandidate(String(input.id || ''));
     case 'doubleClickCandidate':
@@ -1022,7 +1127,7 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
     case 'clickDomNode':
       return session.clickDomNode(String(input.path || ''));
     case 'focusDomNode':
-      return session.focusDomNode(String(input.path || ''));
+      return session.clickDomNode(String(input.path || ''));
     case 'typeText':
       return session.typeText(String(input.text || ''));
     case 'pressKey':
@@ -1042,6 +1147,45 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
     default:
       return { ok: false, actual: `Unsupported recorded tool: ${flow.name}.${reason}` };
   }
+}
+
+async function executeCodexRuntimeObject(input: {
+  session: BrowserSession;
+  targetUrl: string;
+  stepIndex: number;
+  type: string;
+  params: Record<string, unknown>;
+  allowedTypes: string[];
+  traces: ToolTrace[];
+  onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
+}) {
+  const { session, targetUrl, stepIndex, type, params, allowedTypes, traces, onToolTrace } = input;
+  if (type === 'finish' || type === 'block' || type === 'fail') {
+    return { text: codexTerminalText(type, params), executed: false };
+  }
+  if (!allowedTypes.includes(type)) {
+    return {
+      text: codexTerminalText('fail', {
+        action: `Codex returned unsupported action type: ${type}`,
+        expected: `Codex object type should be one of: ${allowedTypes.join(', ')}, finish, block, fail.`,
+        actual: JSON.stringify({ type, params }),
+        status: 'failed',
+        done: false,
+      }),
+      executed: false,
+    };
+  }
+
+  const result = await runRecordedTool(session, targetUrl, {
+    index: stepIndex,
+    name: type,
+    input: params,
+    reason: typeof params.reason === 'string' ? params.reason : undefined,
+  });
+  const trace = { name: type, input: params, result };
+  traces.push(trace);
+  await onToolTrace?.(trace);
+  return { text: '', executed: true };
 }
 
 async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, recordedFlow: RecordedFlowStep[], options: ExecutionOptions) {

@@ -58,11 +58,11 @@ export function getModel(): GenerateTextModel {
 export function getModelSettings() {
   const provider = normalizeProvider(process.env.AI_PROVIDER);
   const defaults: Record<AiProvider, string> = {
-    'azure-openai': 'gpt-4o',
-    codex: 'gpt-5.4',
+    'azure-openai': 'gpt-5.5',
+    codex: 'gpt-5.5',
     deepseek: 'deepseek-v4-flash',
     google: 'gemini-3.5-flash',
-    openai: 'gpt-4o',
+    openai: 'gpt-5.5',
     openrouter: 'qwen/qwen3.6-27b',
   };
 
