@@ -11,6 +11,7 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
   const router = useRouter();
   const [draft, setDraft] = useState<TestCaseContent>({
     ...testCase.content,
+    browserMode: testCase.content.browserMode || 'default',
     userRequirement: testCase.content.userRequirement || testCase.description,
     systemPrompt: testCase.content.systemPrompt || '',
     steps: [],
@@ -76,6 +77,19 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
         <label>
           目标地址
           <input className="input" value={draft.targetUrl} onChange={(event) => update({ targetUrl: event.target.value })} />
+        </label>
+        <label>
+          浏览器操作模式
+          <select
+            className="input"
+            value={draft.browserMode}
+            onChange={(event) => update({ browserMode: event.target.value as TestCaseContent['browserMode'] })}
+          >
+            <option value="default">默认配置</option>
+            <option value="dom">DOM 交互</option>
+            <option value="visual-markers">视觉标识</option>
+            <option value="visual-coordinate">纯视觉坐标</option>
+          </select>
         </label>
         <label className="wide">
           用户需求

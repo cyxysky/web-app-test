@@ -5,12 +5,14 @@ import { ImageUp, Loader2, Sparkles, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { RichTextEditor } from '@/components/RichTextEditor';
 import { richTextToPlainText } from '@/lib/rich-text';
+import type { TestCaseContent } from '@/server/ai/schemas/test-case.schema';
 
 export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
   const router = useRouter();
   const [prompt, setPrompt] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
   const [targetUrl, setTargetUrl] = useState('https://www.zhihu.com');
+  const [browserMode, setBrowserMode] = useState<TestCaseContent['browserMode']>('default');
   const [imageNames, setImageNames] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -43,7 +45,7 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
       const response = await fetch('/api/test-cases/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, systemPrompt, targetUrl, imageNames, groupId }),
+        body: JSON.stringify({ prompt, systemPrompt, targetUrl, browserMode, imageNames, groupId }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '生成失败');
@@ -62,6 +64,20 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
       <div className="field">
         <label htmlFor="targetUrl">目标地址</label>
         <input className="input" id="targetUrl" onChange={(event) => setTargetUrl(event.target.value)} required value={targetUrl} />
+      </div>
+      <div className="field">
+        <label htmlFor="browserMode">浏览器操作模式</label>
+        <select
+          className="input"
+          id="browserMode"
+          value={browserMode}
+          onChange={(event) => setBrowserMode(event.target.value as TestCaseContent['browserMode'])}
+        >
+          <option value="default">默认配置</option>
+          <option value="dom">DOM 交互</option>
+          <option value="visual-markers">视觉标识</option>
+          <option value="visual-coordinate">纯视觉坐标</option>
+        </select>
       </div>
       <div className="field">
         <label htmlFor="prompt">测试目标</label>

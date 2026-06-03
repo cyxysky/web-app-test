@@ -23,6 +23,15 @@ If the model call fails, generation falls back to a local structured test case a
 
 Browser execution accepts `http` and `https` target URLs by default. Set `ALLOWED_TEST_DOMAINS=localhost,127.0.0.1,example.com` to restrict runs to a domain allowlist.
 
+Each test case can choose a browser operation mode:
+
+- `Default configuration` keeps compatibility with `isClick` / `AI_BROWSER_MODE`.
+- `DOM interaction` uses textual interactive candidates and the simplified DOM tree.
+- `Visual markers` sends a clean screenshot plus a numbered marker map.
+- `Pure visual coordinates` sends only the clean screenshot and lets the model click, hover, drag, and scroll with normalized `0-999` coordinates.
+
+Pure visual coordinate mode requires a model that supports image input.
+
 ## Package and Run with Docker
 
 Docker is the recommended packaging path because the app depends on Playwright and a headless Chromium runtime.

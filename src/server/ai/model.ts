@@ -68,9 +68,9 @@ export function getModelSettings() {
     google: 'gemini-3-flash-preview',
     openai: 'gpt-5.5',
     openrouter: 'qwen/qwen3.6-27b',
-    gemini: 'gemini-3.1-pro-preview',
+    gemini: 'gemini-3-flash-preview',
   };
-
+  // gemini-3.1-pro-preview
   return {
     provider,
     model: process.env.AI_MODEL || defaults[provider],

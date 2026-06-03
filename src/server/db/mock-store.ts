@@ -11,6 +11,7 @@ const seedContent: TestCaseContent = {
   description: 'Verify the login page loads, rejects an invalid password, and supports a successful test login.',
   targetUrl: 'https://example.com',
   priority: 'high',
+  browserMode: 'default',
   preconditions: ['The test environment is reachable', 'A test account is available', 'The target domain is allowlisted'],
   testData: {
     username: 'demo@example.com',

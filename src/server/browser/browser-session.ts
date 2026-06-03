@@ -15,6 +15,18 @@ function shouldIgnoreConsoleError(text: string) {
   );
 }
 
+export type BrowserSessionMode = 'dom' | 'visual-markers' | 'visual-coordinate';
+
+function browserSessionModeFromEnv(): BrowserSessionMode {
+  const raw = process.env.AI_BROWSER_MODE;
+  if (/^(coordinate|coordinates|visual-coordinate|pure-visual|computer-use)$/i.test(String(raw || ''))) {
+    return 'visual-coordinate';
+  }
+  return /^(true|1|yes|visual|vision|click|visual-markers)$/i.test(String(raw || ''))
+    ? 'visual-markers'
+    : 'dom';
+}
+
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
@@ -83,6 +95,9 @@ type InteractiveCandidate = {
   clickable: boolean;
   input: boolean;
   disabled: boolean;
+  /** True when the screenshot scan found a meaningful interior click area that
+   * belongs to this element without passing through another interactive descendant. */
+  hasIndependentClickArea?: boolean;
   framePath?: string;
   frameUrl?: string;
   /** True when the element lives inside a shadow root, so its DOM-index path
@@ -125,6 +140,10 @@ export class BrowserSession {
   private networkErrors: string[] = [];
   private lastScreenshotMetrics?: ScreenshotMetrics;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
+  private lastScreenshotCandidates: InteractiveCandidate[] = [];
+  private lastCandidateMarkerScreenshotPath?: string;
+
+  constructor(private readonly mode: BrowserSessionMode = browserSessionModeFromEnv()) {}
 
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
@@ -220,16 +239,27 @@ export class BrowserSession {
   }
 
   // 汇总当前页面上下文，包括 URL、标题、焦点、候选元素、DOM 树和人工验证状态。
-  async getPageContext(options: { includeDomTree?: boolean; includeText?: boolean; includeManualVerification?: boolean; useCachedInteractiveCandidates?: boolean } = {}) {
+  async getPageContext(options: {
+    includeDomTree?: boolean;
+    includeText?: boolean;
+    includeManualVerification?: boolean;
+    includeInteractiveCandidates?: boolean;
+    useCachedInteractiveCandidates?: boolean;
+  } = {}) {
     const includeText = options.includeText !== false || options.includeManualVerification !== false;
+    const includeInteractiveCandidates = options.includeInteractiveCandidates ?? this.mode !== 'visual-coordinate';
     const [title, text, viewportMetrics, focusedElement, domTree, interactiveCandidates] = await Promise.all([
       this.activePage.title().catch(() => ''),
       includeText ? this.readPageText() : Promise.resolve(''),
       this.getViewportMetrics(),
       this.getFocusedElement(),
       options.includeDomTree ? this.readSimplifiedDomTree().catch((error) => `Unable to read DOM tree: ${error instanceof Error ? error.message : String(error)}`) : Promise.resolve(undefined),
-      options.useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
-        ? Promise.resolve(this.lastInteractiveCandidates)
+      !includeInteractiveCandidates
+        ? Promise.resolve([] as InteractiveCandidate[])
+        : options.useCachedInteractiveCandidates && this.lastScreenshotCandidates.length
+        ? Promise.resolve(this.lastScreenshotCandidates)
+        : options.useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
+          ? Promise.resolve(this.lastInteractiveCandidates)
         : this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
     ]);
 
@@ -311,22 +341,40 @@ export class BrowserSession {
     }).catch(() => [] as Array<{ label: string; valueLength: number; filled: boolean }>);
   }
 
-  // 截取当前 viewport，并在 before 阶段按需绘制交互候选标识。
+  // 截取当前 viewport；视觉点击模式在 before 阶段额外生成一张与原图像素对齐的纯标识图。
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' = 'after') {
     const dir = path.join(process.cwd(), 'artifacts', runId);
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    const shouldCaptureCandidates = phase === 'before';
-    const candidateLabelsEnabled = shouldCaptureCandidates && process.env.SCREENSHOT_ELEMENT_LABELS !== 'false';
+    const shouldCaptureCandidates = phase === 'before' && this.mode !== 'visual-coordinate';
+    const candidateLabelsEnabled = shouldCaptureCandidates && this.mode === 'visual-markers' && process.env.SCREENSHOT_ELEMENT_LABELS !== 'false';
     const candidates = shouldCaptureCandidates
       ? await this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[])
       : [];
-    if (candidateLabelsEnabled) await this.drawCandidateOverlay(candidates);
-    try {
-      await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
-    } finally {
-      if (candidateLabelsEnabled) await this.removeCandidateOverlay();
+    if (shouldCaptureCandidates) {
+      // This immutable-by-convention snapshot is the only source of candidate IDs
+      // for the following AI request and click. Later context scans must not make a
+      // screenshot label point at a different element.
+      this.lastScreenshotCandidates = candidates.map((candidate) => ({
+        ...candidate,
+        rect: { ...candidate.rect },
+        center: { ...candidate.center },
+      }));
+    }
+    this.lastCandidateMarkerScreenshotPath = undefined;
+    await this.removeCandidateOverlay();
+    if (phase === 'before') await this.removeClickMarker();
+    await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
+    if (candidateLabelsEnabled) {
+      const markerFilePath = path.join(dir, `step-${stepIndex}-before-markers.png`);
+      await this.drawCandidateOverlay(candidates, true);
+      try {
+        await this.activePage.screenshot({ path: markerFilePath, fullPage: false, scale: 'css', timeout: 15000 });
+        this.lastCandidateMarkerScreenshotPath = markerFilePath;
+      } finally {
+        await this.removeCandidateOverlay();
+      }
     }
     const [image, viewportMetrics] = await Promise.all([
       this.readPngSize(filePath),
@@ -346,6 +394,11 @@ export class BrowserSession {
   // 返回最近一次截图的尺寸和 viewport 信息，供 AI 请求上下文引用。
   getLastScreenshotMetrics() {
     return this.lastScreenshotMetrics;
+  }
+
+  // 返回最近一次操作前截图对应的纯标识图路径，视觉模式会把它作为第二张图片发送给 AI。
+  getLastCandidateMarkerScreenshotPath() {
+    return this.lastCandidateMarkerScreenshotPath;
   }
 
   // 返回当前可见交互候选元素，供 DOM 模式在无截图输入时定位控件。
@@ -488,6 +541,103 @@ export class BrowserSession {
     return {
       ok: true,
       actual: `Focused candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${text !== undefined ? ` Typed ${text.length} characters after focusing.` : ''}${target.offscreen ? ' It was scrolled/clamped before focusing.' : ''}${note}`,
+    };
+  }
+
+  // 按纯视觉模型返回的 0-999 归一化坐标点击当前 viewport；可选文本会在点击后立即输入。
+  async clickAt(x: number, y: number, text?: string): Promise<BrowserActionResult> {
+    const target = await this.normalizedViewportPoint(x, y);
+    const context = this.activePage.context();
+    const beforePages = context.pages().length;
+    const popup = this.activePage.waitForEvent('popup', { timeout: 3000 }).catch(() => undefined);
+    await this.activePage.mouse.click(target.x, target.y);
+    await this.showClickMarker(target.x, target.y, 'click');
+    if (text !== undefined) await this.activePage.keyboard.type(text);
+
+    const newPage = await Promise.race([
+      popup,
+      this.activePage.waitForTimeout(200).then(() => undefined).catch(() => undefined),
+    ]);
+    if (newPage) {
+      this.page = newPage;
+      this.attachPageListeners(newPage);
+      await newPage.bringToFront();
+    } else if (context.pages().length > beforePages) {
+      this.page = context.pages().at(-1);
+      await this.page?.bringToFront();
+    }
+
+    const note = await this.waitAfterAction();
+    await this.showClickMarker(target.x, target.y, 'click');
+    return {
+      ok: true,
+      actual: `Clicked normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${note}`,
+    };
+  }
+
+  // 按纯视觉坐标双击当前 viewport。
+  async doubleClickAt(x: number, y: number): Promise<BrowserActionResult> {
+    const target = await this.normalizedViewportPoint(x, y);
+    await this.activePage.mouse.dblclick(target.x, target.y);
+    await this.showClickMarker(target.x, target.y, 'double');
+    const note = await this.waitAfterAction();
+    await this.showClickMarker(target.x, target.y, 'double');
+    return {
+      ok: true,
+      actual: `Double-clicked normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}) at browser point (${target.x}, ${target.y}).${note}`,
+    };
+  }
+
+  // 按纯视觉坐标右键点击当前 viewport。
+  async rightClickAt(x: number, y: number): Promise<BrowserActionResult> {
+    const target = await this.normalizedViewportPoint(x, y);
+    await this.activePage.mouse.click(target.x, target.y, { button: 'right' });
+    await this.showClickMarker(target.x, target.y, 'right');
+    const note = await this.waitAfterAction();
+    await this.showClickMarker(target.x, target.y, 'right');
+    return {
+      ok: true,
+      actual: `Right-clicked normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}) at browser point (${target.x}, ${target.y}).${note}`,
+    };
+  }
+
+  // 按纯视觉坐标悬停，用于展开 hover 菜单或 tooltip。
+  async hoverAt(x: number, y: number): Promise<BrowserActionResult> {
+    const target = await this.normalizedViewportPoint(x, y);
+    await this.activePage.mouse.move(target.x, target.y);
+    const note = await this.waitAfterAction();
+    return {
+      ok: true,
+      actual: `Hovered normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}) at browser point (${target.x}, ${target.y}).${note}`,
+    };
+  }
+
+  // 按纯视觉坐标从一个截图位置拖拽到另一个截图位置。
+  async dragAt(fromX: number, fromY: number, toX: number, toY: number): Promise<BrowserActionResult> {
+    const from = await this.normalizedViewportPoint(fromX, fromY);
+    const to = await this.normalizedViewportPoint(toX, toY);
+    await this.activePage.mouse.move(from.x, from.y);
+    await this.activePage.mouse.down();
+    await this.activePage.mouse.move(to.x, to.y, { steps: 12 });
+    await this.activePage.mouse.up();
+    await this.showClickMarker(to.x, to.y, 'drag');
+    const note = await this.waitAfterAction();
+    await this.showClickMarker(to.x, to.y, 'drag');
+    return {
+      ok: true,
+      actual: `Dragged normalized screenshot coordinate (${from.normalizedX}, ${from.normalizedY}) to (${to.normalizedX}, ${to.normalizedY}), browser points (${from.x}, ${from.y}) to (${to.x}, ${to.y}).${note}`,
+    };
+  }
+
+  // 在纯视觉模型指定的截图位置执行滚轮操作，使局部表格、侧边栏和弹窗可被直接滚动。
+  async scrollAt(x: number, y: number, deltaY: number, deltaX = 0): Promise<BrowserActionResult> {
+    const target = await this.normalizedViewportPoint(x, y);
+    await this.activePage.mouse.move(target.x, target.y);
+    await this.activePage.mouse.wheel(deltaX, deltaY);
+    const note = await this.waitAfterAction();
+    return {
+      ok: true,
+      actual: `Scrolled at normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}), browser point (${target.x}, ${target.y}), by x=${deltaX}, y=${deltaY}.${note}`,
     };
   }
 
@@ -767,6 +917,22 @@ export class BrowserSession {
     })).catch(() => ({ ...fallback, devicePixelRatio: 1 }));
   }
 
+  // 将模型返回的 0-999 截图归一化坐标映射为 Playwright 使用的 CSS viewport 坐标。
+  private async normalizedViewportPoint(x: number, y: number) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      throw new Error(`Invalid normalized screenshot coordinate: (${x}, ${y}).`);
+    }
+    const normalizedX = Math.min(999, Math.max(0, Math.round(x)));
+    const normalizedY = Math.min(999, Math.max(0, Math.round(y)));
+    const viewport = await this.getViewportMetrics();
+    return {
+      normalizedX,
+      normalizedY,
+      x: Math.round((normalizedX / 999) * Math.max(0, viewport.width - 1)),
+      y: Math.round((normalizedY / 999) * Math.max(0, viewport.height - 1)),
+    };
+  }
+
   private async refreshInteractiveCandidates() {
     const limit = Math.max(10, Number(process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
     const scanLimit = Math.max(limit * 2, limit + 50);
@@ -790,6 +956,7 @@ export class BrowserSession {
         clickable: boolean;
         input: boolean;
         disabled: boolean;
+        hasIndependentClickArea?: boolean;
         shadow?: boolean;
       };
 
@@ -995,8 +1162,62 @@ export class BrowserSession {
         if (hasActionAttribute(element)) return true;
         const tabindex = element.getAttribute('tabindex');
         if (tabindex !== null && tabindex !== '-1') return true;
-        if ((element as HTMLElement).isContentEditable) return true;
+        if (isContentEditableOwner(element)) return true;
         return false;
+      }
+
+      function isContentEditableOwner(element: Element) {
+        const value = element.getAttribute('contenteditable');
+        return value !== null && value.toLowerCase() !== 'false';
+      }
+
+      function isInteractiveDescendant(element: Element) {
+        const tag = element.tagName.toLowerCase();
+        if (tag === 'label') return true;
+        const isInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(element);
+        return clickableReason(element) || isInput || hasOwnHoverSignal(element) || hasCssHoverEffect(element);
+      }
+
+      function hasStrongOwnInteractionSemantics(element: Element) {
+        const tag = element.tagName.toLowerCase();
+        if (['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag)) return true;
+        if (isContentEditableOwner(element)) return true;
+        const role = (element.getAttribute('role') || '').toLowerCase();
+        if (['combobox', 'textbox', 'listbox', 'checkbox', 'radio', 'switch', 'slider', 'spinbutton'].includes(role)) return true;
+        return Boolean(
+          element.getAttribute('aria-label')?.trim() ||
+          element.getAttribute('title')?.trim() ||
+          element.getAttribute('placeholder')?.trim(),
+        );
+      }
+
+      function hasMeaningfulContentOutsideInteractiveDescendants(element: Element) {
+        let found = false;
+        let visited = 0;
+        const visualContentTags = new Set(['img', 'svg', 'canvas', 'video']);
+
+        function visit(parent: Element) {
+          if (found || visited > 2000) return;
+          visited += 1;
+          for (const node of Array.from(parent.childNodes)) {
+            if (found) return;
+            if (node.nodeType === Node.TEXT_NODE) {
+              if ((node.textContent || '').replace(/\s+/g, ' ').trim()) found = true;
+              continue;
+            }
+            if (node.nodeType !== Node.ELEMENT_NODE) continue;
+            const child = node as Element;
+            if (!isRenderable(child) || isInteractiveDescendant(child)) continue;
+            if (visualContentTags.has(child.tagName.toLowerCase()) && visibleRectOf(child)) {
+              found = true;
+              return;
+            }
+            visit(child);
+          }
+        }
+
+        visit(element);
+        return found;
       }
 
       function nameOf(element: Element) {
@@ -1047,6 +1268,61 @@ export class BrowserSession {
         return found;
       }
 
+      function isIndependentPointForOwner(owner: Element, top: Element) {
+        if (top !== owner && !composedContains(owner, top)) return false;
+        let current: Element | undefined = top;
+        let guard = 0;
+        while (current && current !== owner && guard < 256) {
+          if (isInteractiveDescendant(current)) return false;
+          current = flatParentElement(current);
+          guard += 1;
+        }
+        return current === owner;
+      }
+
+      function isInteriorSamplePoint(rect: NonNullable<ReturnType<typeof visibleRectOf>>, x: number, y: number) {
+        const insetX = Math.min(12, Math.max(4, rect.width * 0.12));
+        const insetY = Math.min(12, Math.max(4, rect.height * 0.12));
+        if (rect.width <= insetX * 2 || rect.height <= insetY * 2) return false;
+        return (
+          x >= rect.left + insetX &&
+          x <= rect.right - insetX &&
+          y >= rect.top + insetY &&
+          y <= rect.bottom - insetY
+        );
+      }
+
+      function interactiveDescendantRects(owner: Element) {
+        const rects: Array<NonNullable<ReturnType<typeof visibleRectOf>>> = [];
+        const queue = [...children(owner)];
+        let guard = 0;
+        while (queue.length && guard < 4000) {
+          const child = queue.shift() as Element;
+          if (isInteractiveDescendant(child)) {
+            const rect = visibleRectOf(child);
+            if (rect) rects.push(rect);
+          }
+          queue.push(...children(child));
+          guard += 1;
+        }
+        return rects;
+      }
+
+      function isSeparatedFromInteractiveDescendants(
+        descendantRects: Array<NonNullable<ReturnType<typeof visibleRectOf>>>,
+        x: number,
+        y: number,
+      ) {
+        const clearance = 10;
+        return descendantRects.every(
+          (rect) =>
+            x < rect.left - clearance ||
+            x > rect.right + clearance ||
+            y < rect.top - clearance ||
+            y > rect.bottom + clearance,
+        );
+      }
+
       // Sample a grid across the element's visible box and hit-test every point.
       // `elementsFromPoint` returns elements in paint/stacking order, so this
       // naturally respects z-index: a higher z-index popup / dialog / selector
@@ -1055,30 +1331,64 @@ export class BrowserSession {
         if (!rect) return undefined;
         const cols = rect.width >= 80 ? 5 : 3;
         const rows = rect.height >= 60 ? 5 : 3;
-        const points: Array<[number, number]> = [
-          [rect.left + rect.width / 2, rect.top + rect.height / 2],
+        const points: Array<{ x: number; y: number; gridRow?: number; gridCol?: number }> = [
+          { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
         ];
+        const edgeInsetX = Math.min(2, Math.max(0.5, rect.width / 8));
+        const edgeInsetY = Math.min(2, Math.max(0.5, rect.height / 8));
+        points.push(
+          { x: rect.left + edgeInsetX, y: rect.top + edgeInsetY },
+          { x: rect.right - edgeInsetX, y: rect.top + edgeInsetY },
+          { x: rect.left + edgeInsetX, y: rect.bottom - edgeInsetY },
+          { x: rect.right - edgeInsetX, y: rect.bottom - edgeInsetY },
+          { x: rect.left + edgeInsetX, y: rect.top + rect.height / 2 },
+          { x: rect.right - edgeInsetX, y: rect.top + rect.height / 2 },
+          { x: rect.left + rect.width / 2, y: rect.top + edgeInsetY },
+          { x: rect.left + rect.width / 2, y: rect.bottom - edgeInsetY },
+        );
         for (let row = 0; row < rows; row += 1) {
           for (let col = 0; col < cols; col += 1) {
-            points.push([
-              rect.left + ((col + 0.5) / cols) * rect.width,
-              rect.top + ((row + 0.5) / rows) * rect.height,
-            ]);
+            points.push({
+              x: rect.left + ((col + 0.5) / cols) * rect.width,
+              y: rect.top + ((row + 0.5) / rows) * rect.height,
+              gridRow: row,
+              gridCol: col,
+            });
           }
         }
 
         let owned = 0;
         let covered = 0;
         let visiblePoint: { x: number; y: number } | undefined;
-        for (const [x, y] of points) {
+        let independentInteriorPoint: { x: number; y: number } | undefined;
+        let interiorPointCount = 0;
+        const independentGridPoints = new Set<string>();
+        const descendantRects = interactiveDescendantRects(element);
+        for (const point of points) {
+          const { x, y, gridRow, gridCol } = point;
           const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
           const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
+          const isInteriorGridPoint =
+            gridRow !== undefined &&
+            gridCol !== undefined &&
+            isInteriorSamplePoint(rect, px, py);
+          if (isInteriorGridPoint) interiorPointCount += 1;
           const top = topmostRenderableAt(px, py);
           if (!top) continue;
           if (top === element || composedContains(element, top)) {
             // The element (or one of its descendants) is the topmost layer here.
             owned += 1;
             if (!visiblePoint) visiblePoint = { x: Math.round(px), y: Math.round(py) };
+            if (
+              isInteriorGridPoint &&
+              isIndependentPointForOwner(element, top) &&
+              isSeparatedFromInteractiveDescendants(descendantRects, px, py)
+            ) {
+              independentGridPoints.add(`${gridRow}:${gridCol}`);
+              if (!independentInteriorPoint) {
+                independentInteriorPoint = { x: Math.round(px), y: Math.round(py) };
+              }
+            }
           } else if (!composedContains(top, element)) {
             // An unrelated element with a higher stacking order paints over this
             // point (e.g. an open modal / dropdown), so the element is occluded here.
@@ -1088,33 +1398,78 @@ export class BrowserSession {
           // at this point; treat it as neither owned nor occluded.
         }
 
+        const hasAdjacentIndependentPoints = Array.from(independentGridPoints).some((key) => {
+          const [row, col] = key.split(':').map(Number);
+          return (
+            independentGridPoints.has(`${row - 1}:${col}`) ||
+            independentGridPoints.has(`${row + 1}:${col}`) ||
+            independentGridPoints.has(`${row}:${col - 1}`) ||
+            independentGridPoints.has(`${row}:${col + 1}`)
+          );
+        });
         const total = points.length;
         return {
           visiblePoint,
+          independentInteriorPoint,
+          independentInteriorPointCount: independentGridPoints.size,
+          interiorPointCount,
+          hasAdjacentIndependentPoints,
           ownedRatio: owned / total,
           coveredRatio: covered / total,
         };
       }
 
+      function visibleProxyForZeroSizeOwner(element: Element) {
+        const queue = [...children(element)];
+        while (queue.length) {
+          const child = queue.shift() as Element;
+          const tag = child.tagName.toLowerCase();
+          const childInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(child);
+          const childInteractive = clickableReason(child) || childInput || hasOwnHoverSignal(child) || hasCssHoverEffect(child);
+          const rect = visibleRectOf(child);
+          if (tag !== 'label' && !childInteractive && rect) {
+            const visibility = computeVisibility(element, rect);
+            if (visibility?.visiblePoint && !(visibility.coveredRatio > 0.5 && visibility.ownedRatio < 0.35)) {
+              return { rect, visibility };
+            }
+          }
+          queue.push(...children(child));
+        }
+        return undefined;
+      }
+
       function candidateFrom(element: Element, path: number[], id: string): Candidate | undefined {
         const tag = element.tagName.toLowerCase();
+        if (tag === 'label') return undefined;
         const role = element.getAttribute('role') || undefined;
         const input = element as HTMLInputElement;
-        const isInput = ['input', 'textarea', 'select'].includes(tag) || Boolean((element as HTMLElement).isContentEditable);
+        const isInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(element);
         const clickable = clickableReason(element);
         const hoverable = hasOwnHoverSignal(element) || hasCssHoverEffect(element);
         if (!clickable && !isInput && !hoverable) return undefined;
 
-        const rect = visibleRectOf(element);
+        let rect = visibleRectOf(element);
+        let visibility = rect ? computeVisibility(element, rect) : undefined;
+        if (!rect && clickable) {
+          const proxy = visibleProxyForZeroSizeOwner(element);
+          rect = proxy?.rect;
+          visibility = proxy?.visibility;
+        }
         if (!rect) return undefined;
-        const visibility = computeVisibility(element, rect);
         if (!visibility || !visibility.visiblePoint) return undefined;
         // Suppress elements that sit behind a higher z-index layer (popup, dialog,
         // dropdown / selector options): when most of the element is painted over by
         // an unrelated element on top, it is not actually clickable at this spot, so
         // the lower element must not get an E marker.
         if (visibility.coveredRatio > 0.5 && visibility.ownedRatio < 0.35) return undefined;
-        const visiblePoint = visibility.visiblePoint;
+        const hasIndependentClickArea =
+          clickable &&
+          visibility.hasAdjacentIndependentPoints &&
+          visibility.independentInteriorPointCount >= 2 &&
+          visibility.independentInteriorPointCount / Math.max(1, visibility.interiorPointCount) >= 0.15;
+        const visiblePoint = hasIndependentClickArea
+          ? visibility.independentInteriorPoint || visibility.visiblePoint
+          : visibility.visiblePoint;
         const viewportArea = window.innerWidth * window.innerHeight;
         const area = rect.width * rect.height;
         if (area > viewportArea * 0.75 && !['input', 'textarea', 'select', 'button', 'a'].includes(tag)) return undefined;
@@ -1161,6 +1516,7 @@ export class BrowserSession {
           clickable,
           input: isInput,
           disabled: Boolean((input as HTMLInputElement).disabled || element.getAttribute('aria-disabled') === 'true'),
+          hasIndependentClickArea,
           shadow: isInsideShadow(element),
         };
       }
@@ -1169,16 +1525,19 @@ export class BrowserSession {
         return descendantPath.startsWith(`${ancestorPath}.`);
       }
 
-      // If both a parent and a child are independently interactive, keep the child.
-      // This matches the click target the model should use and avoids broad toolbar
-      // / menu wrappers swallowing their icon buttons.
-      function dropParentWhenChildExists(items: Candidate[]) {
-        return items.filter(
-          (candidate) =>
-            !items.some(
-              (other) => other !== candidate && isDomPathAncestor(candidate.path, other.path),
-            ),
-        );
+      function dropParentWhenChildExists(items: Candidate[], sourceElements: Map<string, Element>) {
+        return items.filter((candidate) => {
+          const hasChildCandidate = items.some(
+            (other) => other !== candidate && isDomPathAncestor(candidate.path, other.path),
+          );
+          if (!hasChildCandidate) return true;
+          if (!candidate.hasIndependentClickArea) return false;
+          const element = sourceElements.get(candidate.path);
+          return Boolean(
+            element &&
+            (hasStrongOwnInteractionSemantics(element) || hasMeaningfulContentOutsideInteractiveDescendants(element)),
+          );
+        });
       }
 
       function selectCandidatesAcrossViewport(items: Candidate[], limit: number) {
@@ -1226,10 +1585,14 @@ export class BrowserSession {
       }
 
       const raw: Candidate[] = [];
+      const sourceElements = new Map<string, Element>();
       function walk(element: Element, path: number[], depth: number) {
         if (depth > 24) return;
         const candidate = candidateFrom(element, path, '');
-        if (candidate) raw.push(candidate);
+        if (candidate) {
+          raw.push(candidate);
+          sourceElements.set(candidate.path, element);
+        }
         const childNodes = children(element);
         for (let index = 0; index < childNodes.length; index += 1) {
           walk(childNodes[index], [...path, index], depth + 1);
@@ -1250,11 +1613,12 @@ export class BrowserSession {
         const extra = candidateFrom(element, pathParts, '');
         if (extra) {
           raw.push(extra);
+          sourceElements.set(extra.path, element);
           seenPaths.add(pathKey);
         }
       }
 
-      const deduped = dropParentWhenChildExists(raw);
+      const deduped = dropParentWhenChildExists(raw, sourceElements);
       deduped.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
       return selectCandidatesAcrossViewport(deduped, candidateLimit).map((candidate, index) => ({
         ...candidate,
@@ -1263,7 +1627,12 @@ export class BrowserSession {
     }, { limit: scanLimit }).catch(() => [] as InteractiveCandidate[]);
 
     const frameCandidates = await this.refreshFrameInteractiveCandidates(scanLimit);
-    const candidates = [...mainCandidates, ...frameCandidates]
+    const combinedCandidates: InteractiveCandidate[] = [...mainCandidates, ...frameCandidates];
+    const candidates = combinedCandidates
+      .filter((candidate) => {
+        if (candidate.framePath) return true;
+        return !frameCandidates.some((frameCandidate) => this.rectContains(candidate.rect, frameCandidate.rect));
+      })
       .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height)
       .slice(0, limit)
       .map((candidate, index) => ({
@@ -1272,6 +1641,19 @@ export class BrowserSession {
       }));
     this.lastInteractiveCandidates = candidates;
     return candidates;
+  }
+
+  private rectContains(
+    outer: { x: number; y: number; width: number; height: number },
+    inner: { x: number; y: number; width: number; height: number },
+  ) {
+    const tolerance = 2;
+    return (
+      inner.x >= outer.x - tolerance &&
+      inner.y >= outer.y - tolerance &&
+      inner.x + inner.width <= outer.x + outer.width + tolerance &&
+      inner.y + inner.height <= outer.y + outer.height + tolerance
+    );
   }
 
   private async refreshFrameInteractiveCandidates(limit: number): Promise<InteractiveCandidate[]> {
@@ -1306,6 +1688,7 @@ export class BrowserSession {
           clickable: boolean;
           input: boolean;
           disabled: boolean;
+          hasIndependentClickArea?: boolean;
         };
 
         type WindowWithAiListeners = Window & {
@@ -1449,8 +1832,62 @@ export class BrowserSession {
           if (hasActionAttribute(element)) return true;
           const tabindex = element.getAttribute('tabindex');
           if (tabindex !== null && tabindex !== '-1') return true;
-          if ((element as HTMLElement).isContentEditable) return true;
+          if (isContentEditableOwner(element)) return true;
           return false;
+        }
+
+        function isContentEditableOwner(element: Element) {
+          const value = element.getAttribute('contenteditable');
+          return value !== null && value.toLowerCase() !== 'false';
+        }
+
+        function isInteractiveDescendant(element: Element) {
+          const tag = element.tagName.toLowerCase();
+          if (tag === 'label') return true;
+          const isInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(element);
+          return clickableReason(element) || isInput || hasOwnHoverSignal(element) || hasCssHoverEffect(element);
+        }
+
+        function hasStrongOwnInteractionSemantics(element: Element) {
+          const tag = element.tagName.toLowerCase();
+          if (['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag)) return true;
+          if (isContentEditableOwner(element)) return true;
+          const role = (element.getAttribute('role') || '').toLowerCase();
+          if (['combobox', 'textbox', 'listbox', 'checkbox', 'radio', 'switch', 'slider', 'spinbutton'].includes(role)) return true;
+          return Boolean(
+            element.getAttribute('aria-label')?.trim() ||
+            element.getAttribute('title')?.trim() ||
+            element.getAttribute('placeholder')?.trim(),
+          );
+        }
+
+        function hasMeaningfulContentOutsideInteractiveDescendants(element: Element) {
+          let found = false;
+          let visited = 0;
+          const visualContentTags = new Set(['img', 'svg', 'canvas', 'video']);
+
+          function visit(parent: Element) {
+            if (found || visited > 2000) return;
+            visited += 1;
+            for (const node of Array.from(parent.childNodes)) {
+              if (found) return;
+              if (node.nodeType === Node.TEXT_NODE) {
+                if ((node.textContent || '').replace(/\s+/g, ' ').trim()) found = true;
+                continue;
+              }
+              if (node.nodeType !== Node.ELEMENT_NODE) continue;
+              const child = node as Element;
+              if (!isRenderable(child) || isInteractiveDescendant(child)) continue;
+              if (visualContentTags.has(child.tagName.toLowerCase()) && visibleRectOf(child)) {
+                found = true;
+                return;
+              }
+              visit(child);
+            }
+          }
+
+          visit(element);
+          return found;
         }
 
         function ownText(element: Element) {
@@ -1490,30 +1927,153 @@ export class BrowserSession {
             .slice(0, 180);
         }
 
-        function pointBelongsToElement(element: Element, x: number, y: number) {
-          const top = document.elementsFromPoint(x, y).find((item) => isRenderable(item));
-          return Boolean(top && (top === element || element.contains(top)));
+        function topmostRenderableAt(x: number, y: number) {
+          return document.elementsFromPoint(x, y).find((item) => isRenderable(item));
         }
 
-        function visiblePointForElement(element: Element, rect: ReturnType<typeof visibleRectOf>) {
+        function isIndependentPointForOwner(owner: Element, top: Element) {
+          if (top !== owner && !owner.contains(top)) return false;
+          let current: Element | null = top;
+          while (current && current !== owner) {
+            if (isInteractiveDescendant(current)) return false;
+            current = current.parentElement;
+          }
+          return current === owner;
+        }
+
+        function isInteriorSamplePoint(rect: NonNullable<ReturnType<typeof visibleRectOf>>, x: number, y: number) {
+          const insetX = Math.min(12, Math.max(4, rect.width * 0.12));
+          const insetY = Math.min(12, Math.max(4, rect.height * 0.12));
+          if (rect.width <= insetX * 2 || rect.height <= insetY * 2) return false;
+          return (
+            x >= rect.left + insetX &&
+            x <= rect.right - insetX &&
+            y >= rect.top + insetY &&
+            y <= rect.bottom - insetY
+          );
+        }
+
+        function interactiveDescendantRects(owner: Element) {
+          const rects: Array<NonNullable<ReturnType<typeof visibleRectOf>>> = [];
+          const queue = [...children(owner)];
+          let guard = 0;
+          while (queue.length && guard < 4000) {
+            const child = queue.shift() as Element;
+            if (isInteractiveDescendant(child)) {
+              const rect = visibleRectOf(child);
+              if (rect) rects.push(rect);
+            }
+            queue.push(...children(child));
+            guard += 1;
+          }
+          return rects;
+        }
+
+        function isSeparatedFromInteractiveDescendants(
+          descendantRects: Array<NonNullable<ReturnType<typeof visibleRectOf>>>,
+          x: number,
+          y: number,
+        ) {
+          const clearance = 10;
+          return descendantRects.every(
+            (rect) =>
+              x < rect.left - clearance ||
+              x > rect.right + clearance ||
+              y < rect.top - clearance ||
+              y > rect.bottom + clearance,
+          );
+        }
+
+        function visibilityForElement(element: Element, rect: ReturnType<typeof visibleRectOf>) {
           if (!rect) return undefined;
-          const insetX = Math.min(10, Math.max(1, rect.width / 4));
-          const insetY = Math.min(10, Math.max(1, rect.height / 4));
-          const samples = [
-            [rect.left + rect.width / 2, rect.top + rect.height / 2],
-            [rect.left + insetX, rect.top + rect.height / 2],
-            [rect.right - insetX, rect.top + rect.height / 2],
-            [rect.left + rect.width / 2, rect.top + insetY],
-            [rect.left + rect.width / 2, rect.bottom - insetY],
-            [rect.left + insetX, rect.top + insetY],
-            [rect.right - insetX, rect.top + insetY],
-            [rect.left + insetX, rect.bottom - insetY],
-            [rect.right - insetX, rect.bottom - insetY],
+          const cols = rect.width >= 80 ? 5 : 3;
+          const rows = rect.height >= 60 ? 5 : 3;
+          const samples: Array<{ x: number; y: number; gridRow?: number; gridCol?: number }> = [
+            { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
           ];
-          for (const [x, y] of samples) {
+          const edgeInsetX = Math.min(2, Math.max(0.5, rect.width / 8));
+          const edgeInsetY = Math.min(2, Math.max(0.5, rect.height / 8));
+          samples.push(
+            { x: rect.left + edgeInsetX, y: rect.top + edgeInsetY },
+            { x: rect.right - edgeInsetX, y: rect.top + edgeInsetY },
+            { x: rect.left + edgeInsetX, y: rect.bottom - edgeInsetY },
+            { x: rect.right - edgeInsetX, y: rect.bottom - edgeInsetY },
+            { x: rect.left + edgeInsetX, y: rect.top + rect.height / 2 },
+            { x: rect.right - edgeInsetX, y: rect.top + rect.height / 2 },
+            { x: rect.left + rect.width / 2, y: rect.top + edgeInsetY },
+            { x: rect.left + rect.width / 2, y: rect.bottom - edgeInsetY },
+          );
+          for (let row = 0; row < rows; row += 1) {
+            for (let col = 0; col < cols; col += 1) {
+              samples.push({
+                x: rect.left + ((col + 0.5) / cols) * rect.width,
+                y: rect.top + ((row + 0.5) / rows) * rect.height,
+                gridRow: row,
+                gridCol: col,
+              });
+            }
+          }
+          let visiblePoint: { x: number; y: number } | undefined;
+          let independentInteriorPoint: { x: number; y: number } | undefined;
+          let interiorPointCount = 0;
+          const independentGridPoints = new Set<string>();
+          const descendantRects = interactiveDescendantRects(element);
+          for (const sample of samples) {
+            const { x, y, gridRow, gridCol } = sample;
             const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
             const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
-            if (pointBelongsToElement(element, px, py)) return { x: Math.round(px), y: Math.round(py) };
+            const isInteriorGridPoint =
+              gridRow !== undefined &&
+              gridCol !== undefined &&
+              isInteriorSamplePoint(rect, px, py);
+            if (isInteriorGridPoint) interiorPointCount += 1;
+            const top = topmostRenderableAt(px, py);
+            if (!top || (top !== element && !element.contains(top))) continue;
+            if (!visiblePoint) visiblePoint = { x: Math.round(px), y: Math.round(py) };
+            if (
+              isInteriorGridPoint &&
+              isIndependentPointForOwner(element, top) &&
+              isSeparatedFromInteractiveDescendants(descendantRects, px, py)
+            ) {
+              independentGridPoints.add(`${gridRow}:${gridCol}`);
+              if (!independentInteriorPoint) {
+                independentInteriorPoint = { x: Math.round(px), y: Math.round(py) };
+              }
+            }
+          }
+          const hasAdjacentIndependentPoints = Array.from(independentGridPoints).some((key) => {
+            const [row, col] = key.split(':').map(Number);
+            return (
+              independentGridPoints.has(`${row - 1}:${col}`) ||
+              independentGridPoints.has(`${row + 1}:${col}`) ||
+              independentGridPoints.has(`${row}:${col - 1}`) ||
+              independentGridPoints.has(`${row}:${col + 1}`)
+            );
+          });
+          return visiblePoint
+            ? {
+                visiblePoint,
+                independentInteriorPoint,
+                independentInteriorPointCount: independentGridPoints.size,
+                interiorPointCount,
+                hasAdjacentIndependentPoints,
+              }
+            : undefined;
+        }
+
+        function visibleProxyForZeroSizeOwner(element: Element) {
+          const queue = [...children(element)];
+          while (queue.length) {
+            const child = queue.shift() as Element;
+            const tag = child.tagName.toLowerCase();
+            const childInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(child);
+            const childInteractive = clickableReason(child) || childInput || hasOwnHoverSignal(child) || hasCssHoverEffect(child);
+            const rect = visibleRectOf(child);
+            if (tag !== 'label' && !childInteractive && rect) {
+              const visibility = visibilityForElement(element, rect);
+              if (visibility?.visiblePoint) return { rect, visibility };
+            }
+            queue.push(...children(child));
           }
           return undefined;
         }
@@ -1536,17 +2096,31 @@ export class BrowserSession {
 
         function candidateFrom(element: Element, path: number[]): Candidate | undefined {
           const tag = element.tagName.toLowerCase();
+          if (tag === 'label') return undefined;
           const role = element.getAttribute('role') || undefined;
           const input = element as HTMLInputElement;
-          const isInput = ['input', 'textarea', 'select'].includes(tag) || Boolean((element as HTMLElement).isContentEditable);
+          const isInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(element);
           const clickable = clickableReason(element);
           const hoverable = hasOwnHoverSignal(element) || hasCssHoverEffect(element);
           if (!clickable && !isInput && !hoverable) return undefined;
 
-          const rect = visibleRectOf(element);
+          let rect = visibleRectOf(element);
+          let visibility = rect ? visibilityForElement(element, rect) : undefined;
+          if (!rect && clickable) {
+            const proxy = visibleProxyForZeroSizeOwner(element);
+            rect = proxy?.rect;
+            visibility = proxy?.visibility;
+          }
           if (!rect) return undefined;
-          const point = visiblePointForElement(element, rect);
-          if (!point) return undefined;
+          if (!visibility?.visiblePoint) return undefined;
+          const hasIndependentClickArea =
+            clickable &&
+            visibility.hasAdjacentIndependentPoints &&
+            visibility.independentInteriorPointCount >= 2 &&
+            visibility.independentInteriorPointCount / Math.max(1, visibility.interiorPointCount) >= 0.15;
+          const point = hasIndependentClickArea
+            ? visibility.independentInteriorPoint || visibility.visiblePoint
+            : visibility.visiblePoint;
 
           const viewportArea = window.innerWidth * window.innerHeight;
           const area = rect.width * rect.height;
@@ -1593,6 +2167,7 @@ export class BrowserSession {
             clickable,
             input: isInput,
             disabled: Boolean((input as HTMLInputElement).disabled || element.getAttribute('aria-disabled') === 'true'),
+            hasIndependentClickArea,
           };
         }
 
@@ -1601,6 +2176,7 @@ export class BrowserSession {
         }
 
         const raw: Candidate[] = [];
+        const sourceElements = new Map<string, Element>();
         const seenPaths = new Set<string>();
         for (const element of Array.from(document.querySelectorAll('*'))) {
           if (!isTraversable(element)) continue;
@@ -1611,16 +2187,23 @@ export class BrowserSession {
           const candidate = candidateFrom(element, path);
           if (candidate) {
             raw.push(candidate);
+            sourceElements.set(candidate.path, element);
             seenPaths.add(key);
           }
         }
 
-        const deduped = raw.filter(
-          (candidate) =>
-            !raw.some(
-              (other) => other !== candidate && isDomPathAncestor(candidate.path, other.path),
-            ),
-        );
+        const deduped = raw.filter((candidate) => {
+          const hasChildCandidate = raw.some(
+            (other) => other !== candidate && isDomPathAncestor(candidate.path, other.path),
+          );
+          if (!hasChildCandidate) return true;
+          if (!candidate.hasIndependentClickArea) return false;
+          const element = sourceElements.get(candidate.path);
+          return Boolean(
+            element &&
+            (hasStrongOwnInteractionSemantics(element) || hasMeaningfulContentOutsideInteractiveDescendants(element)),
+          );
+        });
         return deduped
           .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height)
           .slice(0, candidateLimit);
@@ -1664,21 +2247,148 @@ export class BrowserSession {
     return parts.join(' ');
   }
 
+  private candidateIdentityPayload(candidate: InteractiveCandidate) {
+    return {
+      tag: candidate.tag,
+      role: candidate.role,
+      type: candidate.type,
+      href: candidate.href,
+      ariaLabel: candidate.ariaLabel,
+      placeholder: candidate.placeholder,
+      title: candidate.title,
+      text: candidate.text,
+      name: candidate.name,
+    };
+  }
+
+  private async validateMainCandidateIdentity(candidate: InteractiveCandidate) {
+    return this.activePage.evaluate(({ path, expected }) => {
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
+      function traversableChildren(element: Element) {
+        return Array.from(element.children).filter((child) => !skippedTags.has(child.tagName.toLowerCase()));
+      }
+      function elementFromPath(pathValue: string) {
+        const parts = String(pathValue).split('.').map((item) => Number(String(item).trim()));
+        if (!parts.length || parts[0] !== 0 || parts.some((item) => !Number.isInteger(item) || item < 0)) return undefined;
+        let element: Element | undefined = document.documentElement;
+        for (const index of parts.slice(1)) {
+          element = traversableChildren(element)[index];
+          if (!element) return undefined;
+        }
+        return element;
+      }
+      function normalized(value?: string | null) {
+        return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+      }
+      function ownText(element: Element) {
+        let text = '';
+        for (const node of Array.from(element.childNodes)) {
+          if (node.nodeType === 3) text += node.textContent || '';
+        }
+        const inner = ((element as HTMLElement).innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+        return normalized(text || inner).slice(0, 140);
+      }
+      function currentName(element: Element) {
+        const input = element as HTMLInputElement;
+        const labelText = input.labels?.length ? Array.from(input.labels).map((label) => label.textContent || '').join(' ') : '';
+        const imageAlt = Array.from(element.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ');
+        return normalized([
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+          element.getAttribute('alt'),
+          imageAlt,
+          input.placeholder,
+          labelText,
+          ownText(element),
+          input.value,
+        ].filter(Boolean).join(' '));
+      }
+      function compare(label: string, expectedValue?: string, actualValue?: string | null) {
+        const left = normalized(expectedValue);
+        const right = normalized(actualValue);
+        if (!left) return undefined;
+        return left === right ? undefined : `${label} changed from "${left}" to "${right || '[empty]'}"`;
+      }
+
+      const element = elementFromPath(path);
+      if (!element) return { ok: false, reason: `DOM path ${path} no longer exists` };
+      const input = element as HTMLInputElement;
+      const actualTag = element.tagName.toLowerCase();
+      if (actualTag !== expected.tag) return { ok: false, reason: `tag changed from ${expected.tag} to ${actualTag}` };
+      const mismatches = [
+        compare('role', expected.role, element.getAttribute('role')),
+        compare('type', expected.type, element.getAttribute('type')),
+        compare('href', expected.href, actualTag === 'a' ? (element as HTMLAnchorElement).href || element.getAttribute('href') : undefined),
+        compare('aria-label', expected.ariaLabel, element.getAttribute('aria-label')),
+        compare('placeholder', expected.placeholder, input.placeholder),
+        compare('title', expected.title, element.getAttribute('title')),
+      ].filter(Boolean);
+      if (mismatches.length) return { ok: false, reason: mismatches.join('; ') };
+
+      const expectedText = normalized(expected.text);
+      const expectedName = normalized(expected.name);
+      const actualText = ownText(element);
+      const actualName = currentName(element);
+      if (expectedText && actualText && expectedText !== actualText && expectedName && actualName && expectedName !== actualName) {
+        return { ok: false, reason: `text/name changed from "${expectedText}" to "${actualText}"` };
+      }
+      return { ok: true, reason: '' };
+    }, { path: candidate.path, expected: this.candidateIdentityPayload(candidate) }).catch((error) => ({
+      ok: false,
+      reason: error instanceof Error ? error.message : String(error),
+    }));
+  }
+
+  private async validateFrameCandidateIdentity(candidate: InteractiveCandidate) {
+    const frame = this.frameFromPath(candidate.framePath);
+    if (!frame) return { ok: false, reason: `iframe ${candidate.framePath} no longer exists` };
+    return frame.evaluate(({ path, expected }) => {
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
+      function children(element: Element) {
+        return Array.from(element.children).filter((child) => !skippedTags.has(child.tagName.toLowerCase()));
+      }
+      const parts = String(path).split('.').map((item) => Number(String(item).trim()));
+      if (!parts.length || parts[0] !== 0 || parts.some((item) => !Number.isInteger(item) || item < 0)) {
+        return { ok: false, reason: `invalid DOM path ${path}` };
+      }
+      let element: Element | undefined = document.documentElement;
+      for (const index of parts.slice(1)) {
+        element = children(element)[index];
+        if (!element) return { ok: false, reason: `DOM path ${path} no longer exists` };
+      }
+      const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+      const actualTag = element.tagName.toLowerCase();
+      if (actualTag !== expected.tag) return { ok: false, reason: `tag changed from ${expected.tag} to ${actualTag}` };
+      for (const [label, expectedValue, actualValue] of [
+        ['role', expected.role, element.getAttribute('role')],
+        ['type', expected.type, element.getAttribute('type')],
+        ['aria-label', expected.ariaLabel, element.getAttribute('aria-label')],
+        ['placeholder', expected.placeholder, (element as HTMLInputElement).placeholder],
+        ['title', expected.title, element.getAttribute('title')],
+      ] as Array<[string, string | undefined, string | null | undefined]>) {
+        if (normalize(expectedValue) && normalize(expectedValue) !== normalize(actualValue)) {
+          return { ok: false, reason: `${label} changed from "${normalize(expectedValue)}" to "${normalize(actualValue) || '[empty]'}"` };
+        }
+      }
+      return { ok: true, reason: '' };
+    }, { path: candidate.path, expected: this.candidateIdentityPayload(candidate) }).catch((error) => ({
+      ok: false,
+      reason: error instanceof Error ? error.message : String(error),
+    }));
+  }
+
   private async resolveCandidateTarget(candidateId: string) {
     const normalized = candidateId.trim().toUpperCase().replace(/^E(?=\d+$)/, '');
-    let candidate = this.lastInteractiveCandidates.find((item) => item.id.toUpperCase() === normalized);
-    if (!candidate) {
-      await this.refreshInteractiveCandidates();
-      candidate = this.lastInteractiveCandidates.find((item) => item.id.toUpperCase() === normalized);
-    }
+    const candidates = this.lastScreenshotCandidates;
+    const candidate = candidates.find((item) => item.id.toUpperCase() === normalized);
 
     if (!candidate) {
-      const available = this.lastInteractiveCandidates
+      const available = candidates
         .slice(0, 30)
         .map((item) => `${item.id}: ${this.describeCandidate(item)}`)
         .join('\n');
       return {
-        error: `Candidate ${candidateId} was not found. Use getInteractiveCandidates for fresh IDs. Available candidates:\n${available || '[none]'}`,
+        error: `Candidate ${candidateId} was not found in the current screenshot snapshot. Candidate clicks are only allowed after a fresh step screenshot. Available candidates:\n${available || '[none]'}`,
       };
     }
 
@@ -1687,11 +2397,18 @@ export class BrowserSession {
     }
 
     if (candidate.framePath) {
-      const point = await this.resolveFrameCandidatePoint(candidate);
+      const identity = await this.validateFrameCandidateIdentity(candidate);
+      if (!identity.ok) {
+        return {
+          candidate,
+          error: `Candidate ${candidate.id} no longer matches the element shown in the screenshot: ${identity.reason}`,
+        };
+      }
+      const point = this.resolveCapturedCandidatePoint(candidate, `iframe ${candidate.framePath} screenshot`);
       if (!point) {
         return {
           candidate,
-          error: `Candidate ${candidate.id} (iframe ${candidate.framePath}) is no longer resolvable. Call getInteractiveCandidates again; the frame DOM likely changed.`,
+          error: `Candidate ${candidate.id} (iframe ${candidate.framePath}) has no valid point in the current screenshot snapshot.`,
         };
       }
       return { candidate, target: point };
@@ -1710,11 +2427,18 @@ export class BrowserSession {
       return { candidate, target: point };
     }
 
-    const target = await this.resolveDomPathToClickablePoint(candidate.path);
+    const identity = await this.validateMainCandidateIdentity(candidate);
+    if (!identity.ok) {
+      return {
+        candidate,
+        error: `Candidate ${candidate.id} no longer matches the element shown in the screenshot: ${identity.reason}`,
+      };
+    }
+    const target = this.resolveCapturedCandidatePoint(candidate, 'screenshot');
     if (!target) {
       return {
         candidate,
-        error: `Candidate ${candidate.id} could not be resolved from DOM path ${candidate.path}. Call getInteractiveCandidates again; the DOM likely changed.`,
+        error: `Candidate ${candidate.id} has no valid point in the current screenshot snapshot.`,
       };
     }
 
@@ -1772,6 +2496,8 @@ export class BrowserSession {
     const px = candidate.center?.x;
     const py = candidate.center?.y;
     if (typeof px !== 'number' || typeof py !== 'number') return undefined;
+    const viewport = this.lastScreenshotMetrics?.viewport;
+    if (viewport && (px < 0 || py < 0 || px >= viewport.width || py >= viewport.height)) return undefined;
     return {
       x: px,
       y: py,
@@ -1895,7 +2621,7 @@ export class BrowserSession {
     const py = candidate.center?.y;
     if (typeof px !== 'number' || typeof py !== 'number') return undefined;
     return this.activePage
-      .evaluate(({ x, y }) => {
+      .evaluate(({ x, y, expected }) => {
         if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return undefined;
         function deepTopmost(pointX: number, pointY: number) {
           let root: Document | ShadowRoot = document;
@@ -1920,9 +2646,14 @@ export class BrowserSession {
         const element = deepTopmost(x, y);
         if (!element) return undefined;
         const tag = element.tagName.toLowerCase();
+        if (tag !== expected.tag) return undefined;
+        const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+        if (normalize(expected.role) && normalize(expected.role) !== normalize(element.getAttribute('role'))) return undefined;
+        if (normalize(expected.ariaLabel) && normalize(expected.ariaLabel) !== normalize(element.getAttribute('aria-label'))) return undefined;
+        if (normalize(expected.title) && normalize(expected.title) !== normalize(element.getAttribute('title'))) return undefined;
         const id = element.id ? `#${element.id}` : '';
         return { x, y, descriptor: `${tag}${id}`, offscreen: false };
-      }, { x: px, y: py })
+      }, { x: px, y: py, expected: this.candidateIdentityPayload(candidate) })
       .catch(() => undefined);
   }
 
@@ -2040,7 +2771,8 @@ export class BrowserSession {
         if (hasActionAttribute(element)) return true;
         const tabindex = element.getAttribute('tabindex');
         if (tabindex !== null && tabindex !== '-1') return true;
-        if ((element as HTMLElement).isContentEditable) return true;
+        const contentEditable = element.getAttribute('contenteditable');
+        if (contentEditable !== null && contentEditable.toLowerCase() !== 'false') return true;
         return false;
       }
 
@@ -2402,10 +3134,10 @@ export class BrowserSession {
     };
   }
 
-  private async drawCandidateOverlay(candidates: InteractiveCandidate[]) {
+  private async drawCandidateOverlay(candidates: InteractiveCandidate[], markersOnly = false) {
     const labelLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
     const visible = candidates.slice(0, labelLimit);
-    await this.activePage.evaluate((items) => {
+    await this.activePage.evaluate(({ items, markersOnly: hidePageContent }) => {
       document.getElementById('__ai_candidate_overlay__')?.remove();
       const overlay = document.createElement('div');
       overlay.id = '__ai_candidate_overlay__';
@@ -2416,14 +3148,25 @@ export class BrowserSession {
         zIndex: '2147483647',
         margin: '0',
         padding: '0',
+        background: hidePageContent ? '#ffffff' : 'transparent',
       });
 
+      type Point = { x: number; y: number };
       type LabelBox = { left: number; top: number; right: number; bottom: number };
+      type TargetBox = LabelBox & { index: number };
+      type Leader = { start: Point; end: Point };
+      type LabelLayout = LabelBox & {
+        external: boolean;
+        compact: boolean;
+        leader?: Leader;
+      };
       const placedLabels: LabelBox[] = [];
-      const targetBoxes: LabelBox[] = items
-        .map((item) => item.rect)
-        .filter((rect) => rect && rect.width > 0 && rect.height > 0)
-        .map((rect) => ({
+      const placedLeaders: Leader[] = [];
+      const targetBoxes: TargetBox[] = items
+        .map((item, index) => ({ rect: item.rect, index }))
+        .filter(({ rect }) => rect && rect.width > 0 && rect.height > 0)
+        .map(({ rect, index }) => ({
+          index,
           left: Math.max(0, rect.x),
           top: Math.max(0, rect.y),
           right: Math.min(window.innerWidth, rect.x + rect.width),
@@ -2443,74 +3186,89 @@ export class BrowserSession {
       function clamp(value: number, min: number, max: number) {
         return Math.max(min, Math.min(max, value));
       }
-      function canPlace(box: LabelBox, avoidTargets: boolean) {
-        const padded = expanded(box, 1);
-        if (placedLabels.some((placed) => overlaps(padded, expanded(placed, 1)))) return false;
-        if (avoidTargets && targetBoxes.some((target) => overlaps(padded, expanded(target, 1)))) return false;
+      function pointInside(box: LabelBox, point: Point) {
+        return point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom;
+      }
+      function segmentIntersectsBox(segment: Leader, box: LabelBox, padding = 0) {
+        const target = expanded(box, padding);
+        if (pointInside(target, segment.start) || pointInside(target, segment.end)) return true;
+        const dx = segment.end.x - segment.start.x;
+        const dy = segment.end.y - segment.start.y;
+        let minT = 0;
+        let maxT = 1;
+        const checks: Array<[number, number]> = [
+          [-dx, segment.start.x - target.left],
+          [dx, target.right - segment.start.x],
+          [-dy, segment.start.y - target.top],
+          [dy, target.bottom - segment.start.y],
+        ];
+        for (const [p, q] of checks) {
+          if (Math.abs(p) < 0.0001) {
+            if (q < 0) return false;
+            continue;
+          }
+          const ratio = q / p;
+          if (p < 0) minT = Math.max(minT, ratio);
+          else maxT = Math.min(maxT, ratio);
+          if (minT > maxT) return false;
+        }
         return true;
       }
-      function labelPosition(rect: { x: number; y: number; width: number; height: number }, labelWidth: number, labelHeight: number) {
-        const safeInset = 6;
-        const minLeft = Math.min(safeInset, Math.max(0, window.innerWidth - labelWidth));
-        const minTop = Math.min(safeInset, Math.max(0, window.innerHeight - labelHeight));
-        const maxLeft = Math.max(minLeft, window.innerWidth - labelWidth - safeInset);
-        const maxTop = Math.max(minTop, window.innerHeight - labelHeight - safeInset);
-        const gap = 5;
-        const centerX = rect.x + rect.width / 2;
-        const centerY = rect.y + rect.height / 2;
-        const currentTarget = {
-          left: Math.max(0, rect.x),
-          top: Math.max(0, rect.y),
-          right: Math.min(window.innerWidth, rect.x + rect.width),
-          bottom: Math.min(window.innerHeight, rect.y + rect.height),
+      function segmentsIntersect(a: Leader, b: Leader) {
+        function orientation(p: Point, q: Point, r: Point) {
+          return (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y);
+        }
+        const o1 = orientation(a.start, a.end, b.start);
+        const o2 = orientation(a.start, a.end, b.end);
+        const o3 = orientation(b.start, b.end, a.start);
+        const o4 = orientation(b.start, b.end, a.end);
+        return o1 * o2 < 0 && o3 * o4 < 0;
+      }
+      function canPlaceLabel(box: LabelBox, avoidTargets: boolean, currentTargetIndex: number) {
+        const padded = expanded(box, 1);
+        if (placedLabels.some((placed) => overlaps(padded, expanded(placed, 1)))) return false;
+        if (placedLeaders.some((leader) => segmentIntersectsBox(leader, padded))) return false;
+        if (
+          avoidTargets &&
+          targetBoxes.some(
+            (target) => target.index !== currentTargetIndex && overlaps(padded, expanded(target, 1)),
+          )
+        ) return false;
+        return true;
+      }
+      function canPlaceExternal(box: LabelBox, leader: Leader, currentTargetIndex: number) {
+        if (!canPlaceLabel(box, true, currentTargetIndex)) return false;
+        if (
+          targetBoxes.some(
+            (target) => target.index !== currentTargetIndex && segmentIntersectsBox(leader, target, 1),
+          )
+        ) return false;
+        if (placedLabels.some((placed) => segmentIntersectsBox(leader, placed, 1))) return false;
+        if (placedLeaders.some((placed) => segmentsIntersect(leader, placed))) return false;
+        return true;
+      }
+      function isDenseSmallTarget(rect: { x: number; y: number; width: number; height: number }) {
+        if (rect.width > 56 || rect.height > 36) return false;
+        const current = {
+          left: rect.x,
+          top: rect.y,
+          right: rect.x + rect.width,
+          bottom: rect.y + rect.height,
         };
-        const currentTargetArea = Math.max(1, (currentTarget.right - currentTarget.left) * (currentTarget.bottom - currentTarget.top));
-        const labelArea = labelWidth * labelHeight;
-        const preferExternal = rect.width < labelWidth + 10 || rect.height < labelHeight + 8 || labelArea / currentTargetArea > 0.16;
-        const external = [
-          { left: rect.x + rect.width + gap, top: centerY - labelHeight / 2 },
-          { left: rect.x - labelWidth - gap, top: centerY - labelHeight / 2 },
-          { left: centerX - labelWidth / 2, top: rect.y - labelHeight - gap },
-          { left: centerX - labelWidth / 2, top: rect.y + rect.height + gap },
-          { left: rect.x + rect.width + gap, top: rect.y - 1 },
-          { left: rect.x - labelWidth - gap, top: rect.y - 1 },
-          { left: rect.x + rect.width + gap, top: rect.y + rect.height - labelHeight + 1 },
-          { left: rect.x - labelWidth - gap, top: rect.y + rect.height - labelHeight + 1 },
-        ];
-        const internal = [
-          { left: rect.x + rect.width - labelWidth, top: rect.y + rect.height - labelHeight },
-          { left: rect.x + rect.width - labelWidth, top: rect.y },
-          { left: rect.x, top: rect.y + rect.height - labelHeight },
-          { left: rect.x, top: rect.y },
-        ];
-        const preferred = preferExternal ? [...external, ...internal] : [...internal, ...external];
-
-        for (const option of preferred) {
-          const left = clamp(option.left, 0, maxLeft);
-          const top = clamp(option.top, 0, maxTop);
-          const box = { left, top, right: left + labelWidth, bottom: top + labelHeight };
-          const labelOverlapsCurrentTarget = overlaps(box, currentTarget);
-          if (canPlace(box, preferExternal || !labelOverlapsCurrentTarget)) {
-            placedLabels.push(box);
-            return { ...box, external: !labelOverlapsCurrentTarget };
-          }
+        let nearby = 0;
+        for (const target of targetBoxes) {
+          const same =
+            Math.abs(target.left - current.left) < 0.5 &&
+            Math.abs(target.top - current.top) < 0.5 &&
+            Math.abs(target.right - current.right) < 0.5 &&
+            Math.abs(target.bottom - current.bottom) < 0.5;
+          if (same) continue;
+          const gapX = Math.max(0, Math.max(target.left - current.right, current.left - target.right));
+          const gapY = Math.max(0, Math.max(target.top - current.bottom, current.top - target.bottom));
+          if (gapX <= 6 && gapY <= 6) nearby += 1;
+          if (nearby >= 2) return true;
         }
-
-        for (const option of external) {
-          const left = clamp(option.left, 0, maxLeft);
-          const top = clamp(option.top, 0, maxTop);
-          const box = { left, top, right: left + labelWidth, bottom: top + labelHeight };
-          if (canPlace(box, false)) {
-            placedLabels.push(box);
-            return { ...box, external: !overlaps(box, currentTarget) };
-          }
-        }
-
-        const left = clamp(rect.x + rect.width - labelWidth, 0, maxLeft);
-        const top = clamp(rect.y + rect.height - labelHeight, 0, maxTop);
-        const finalBox = { left, top, right: left + labelWidth, bottom: top + labelHeight };
-        placedLabels.push(finalBox);
-        return { ...finalBox, external: !overlaps(finalBox, currentTarget) };
+        return false;
       }
       function edgePoint(rect: { x: number; y: number; width: number; height: number }, box: LabelBox) {
         const rectCenterX = rect.x + rect.width / 2;
@@ -2548,18 +3306,167 @@ export class BrowserSession {
           y: dy >= 0 ? box.bottom : box.top,
         };
       }
-      function drawLeader(rect: { x: number; y: number; width: number; height: number }, box: LabelBox, color: string, width = 1) {
+      function leaderFor(rect: { x: number; y: number; width: number; height: number }, box: LabelBox) {
         const start = edgePoint(rect, box);
         const end = labelEdgePoint(rect, box);
         const dx = end.x - start.x;
         const dy = end.y - start.y;
         const length = Math.max(1, Math.hypot(dx, dy));
-        const outsideGap = 2;
+        const outsideGap = Math.min(2, length / 2);
+        return {
+          start: {
+            x: start.x + (dx / length) * outsideGap,
+            y: start.y + (dy / length) * outsideGap,
+          },
+          end,
+        };
+      }
+      function externalOptions(
+        rect: { x: number; y: number; width: number; height: number },
+        labelWidth: number,
+        labelHeight: number,
+      ) {
+        const centerX = rect.x + rect.width / 2;
+        const centerY = rect.y + rect.height / 2;
+        const distances = [6, 16, 28, 44, 64];
+        const options: Array<{ left: number; top: number }> = [];
+        for (const gap of distances) {
+          options.push(
+            { left: rect.x + rect.width + gap, top: centerY - labelHeight / 2 },
+            { left: rect.x - labelWidth - gap, top: centerY - labelHeight / 2 },
+            { left: centerX - labelWidth / 2, top: rect.y - labelHeight - gap },
+            { left: centerX - labelWidth / 2, top: rect.y + rect.height + gap },
+          );
+        }
+        return options;
+      }
+      function labelPosition(
+        rect: { x: number; y: number; width: number; height: number },
+        normalLabelWidth: number,
+        normalLabelHeight: number,
+        compactLabelWidth: number,
+        compactLabelHeight: number,
+        denseSmall: boolean,
+        currentTargetIndex: number,
+      ): LabelLayout {
+        const safeInset = 6;
+        const minLeft = Math.min(safeInset, Math.max(0, window.innerWidth - normalLabelWidth));
+        const minTop = Math.min(safeInset, Math.max(0, window.innerHeight - normalLabelHeight));
+        const maxLeft = Math.max(minLeft, window.innerWidth - normalLabelWidth - safeInset);
+        const maxTop = Math.max(minTop, window.innerHeight - normalLabelHeight - safeInset);
+        const centerX = rect.x + rect.width / 2;
+        const centerY = rect.y + rect.height / 2;
+        const currentTarget = {
+          left: Math.max(0, rect.x),
+          top: Math.max(0, rect.y),
+          right: Math.min(window.innerWidth, rect.x + rect.width),
+          bottom: Math.min(window.innerHeight, rect.y + rect.height),
+        };
+        const currentTargetArea = Math.max(1, (currentTarget.right - currentTarget.left) * (currentTarget.bottom - currentTarget.top));
+        const labelArea = normalLabelWidth * normalLabelHeight;
+        const preferExternal =
+          denseSmall ||
+          rect.width < normalLabelWidth + 10 ||
+          rect.height < normalLabelHeight + 8 ||
+          labelArea / currentTargetArea > 0.16;
+        const external = externalOptions(rect, normalLabelWidth, normalLabelHeight);
+        const internal = [
+          { left: rect.x + rect.width - normalLabelWidth, top: rect.y + rect.height - normalLabelHeight },
+          { left: rect.x + rect.width - normalLabelWidth, top: rect.y },
+          { left: rect.x, top: rect.y + rect.height - normalLabelHeight },
+          { left: rect.x, top: rect.y },
+        ];
+
+        if (preferExternal) {
+          for (const option of external) {
+            if (
+              option.left < safeInset ||
+              option.top < safeInset ||
+              option.left + normalLabelWidth > window.innerWidth - safeInset ||
+              option.top + normalLabelHeight > window.innerHeight - safeInset
+            ) continue;
+            const box = {
+              left: option.left,
+              top: option.top,
+              right: option.left + normalLabelWidth,
+              bottom: option.top + normalLabelHeight,
+            };
+            const leader = leaderFor(rect, box);
+            if (canPlaceExternal(box, leader, currentTargetIndex)) {
+              placedLabels.push(box);
+              placedLeaders.push(leader);
+              return { ...box, external: true, compact: false, leader };
+            }
+          }
+        }
+
+        if (!denseSmall) {
+          const preferred = preferExternal ? internal : [...internal, ...external];
+          for (const option of preferred) {
+            const left = clamp(option.left, 0, maxLeft);
+            const top = clamp(option.top, 0, maxTop);
+            const box = {
+              left,
+              top,
+              right: left + normalLabelWidth,
+              bottom: top + normalLabelHeight,
+            };
+            const labelOverlapsCurrentTarget = overlaps(box, currentTarget);
+            if (!labelOverlapsCurrentTarget) {
+              const leader = leaderFor(rect, box);
+              if (!canPlaceExternal(box, leader, currentTargetIndex)) continue;
+              placedLabels.push(box);
+              placedLeaders.push(leader);
+              return { ...box, external: true, compact: false, leader };
+            }
+            if (!canPlaceLabel(box, false, currentTargetIndex)) continue;
+            placedLabels.push(box);
+            return { ...box, external: false, compact: false };
+          }
+        }
+
+        const compactMinLeft = Math.min(1, Math.max(0, window.innerWidth - compactLabelWidth));
+        const compactMinTop = Math.min(1, Math.max(0, window.innerHeight - compactLabelHeight));
+        const compactMaxLeft = Math.max(compactMinLeft, window.innerWidth - compactLabelWidth - 1);
+        const compactMaxTop = Math.max(compactMinTop, window.innerHeight - compactLabelHeight - 1);
+        const compactInternal = [
+          { left: rect.x + rect.width - compactLabelWidth - 1, top: rect.y + rect.height - compactLabelHeight - 1 },
+          { left: rect.x + rect.width - compactLabelWidth - 1, top: rect.y + 1 },
+          { left: rect.x + 1, top: rect.y + rect.height - compactLabelHeight - 1 },
+          { left: rect.x + 1, top: rect.y + 1 },
+        ];
+        for (const option of compactInternal) {
+          const left = clamp(option.left, compactMinLeft, compactMaxLeft);
+          const top = clamp(option.top, compactMinTop, compactMaxTop);
+          const box = {
+            left,
+            top,
+            right: left + compactLabelWidth,
+            bottom: top + compactLabelHeight,
+          };
+          if (canPlaceLabel(box, false, currentTargetIndex)) {
+            placedLabels.push(box);
+            return { ...box, external: false, compact: true };
+          }
+        }
+
+        const left = clamp(rect.x + rect.width - compactLabelWidth - 1, compactMinLeft, compactMaxLeft);
+        const top = clamp(rect.y + rect.height - compactLabelHeight - 1, compactMinTop, compactMaxTop);
+        const finalBox = {
+          left,
+          top,
+          right: left + compactLabelWidth,
+          bottom: top + compactLabelHeight,
+        };
+        placedLabels.push(finalBox);
+        return { ...finalBox, external: false, compact: true };
+      }
+      function drawLeader(leader: Leader, color: string, width = 1) {
         const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-        line.setAttribute('x1', String(start.x + (dx / length) * outsideGap));
-        line.setAttribute('y1', String(start.y + (dy / length) * outsideGap));
-        line.setAttribute('x2', String(end.x));
-        line.setAttribute('y2', String(end.y));
+        line.setAttribute('x1', String(leader.start.x));
+        line.setAttribute('y1', String(leader.start.y));
+        line.setAttribute('x2', String(leader.end.x));
+        line.setAttribute('y2', String(leader.end.y));
         line.setAttribute('stroke', color);
         line.setAttribute('stroke-width', String(width));
         line.setAttribute('stroke-linecap', 'butt');
@@ -2580,7 +3487,8 @@ export class BrowserSession {
       svg.setAttribute('height', String(window.innerHeight));
       overlay.appendChild(svg);
 
-      for (const item of items) {
+      for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+        const item = items[itemIndex];
         const rect = item.rect;
         if (!rect || rect.width <= 0 || rect.height <= 0) continue;
 
@@ -2605,11 +3513,24 @@ export class BrowserSession {
 
         const label = document.createElement('div');
         label.textContent = item.id;
-        const labelWidth = Math.max(18, item.id.length * 8 + 7);
-        const labelHeight = 16;
-        const labelBox = labelPosition(rect, labelWidth, labelHeight);
-        if (labelBox.external) {
-          drawLeader(rect, labelBox, color, 1);
+        const denseSmall = isDenseSmallTarget(rect);
+        const normalLabelWidth = Math.max(18, item.id.length * 8 + 7);
+        const normalLabelHeight = 16;
+        const compactLabelWidth = Math.max(8, Math.min(normalLabelWidth, item.id.length * 4 + 3, Math.max(8, rect.width - 2)));
+        const compactLabelHeight = Math.max(7, Math.min(9, Math.max(7, rect.height - 2)));
+        const labelBox = labelPosition(
+          rect,
+          normalLabelWidth,
+          normalLabelHeight,
+          compactLabelWidth,
+          compactLabelHeight,
+          denseSmall,
+          itemIndex,
+        );
+        const labelWidth = labelBox.right - labelBox.left;
+        const labelHeight = labelBox.bottom - labelBox.top;
+        if (labelBox.external && labelBox.leader) {
+          drawLeader(labelBox.leader, color, 1);
         }
         Object.assign(label.style, {
           position: 'absolute',
@@ -2622,14 +3543,16 @@ export class BrowserSession {
           background: color,
           color: '#fff',
           border: '0',
-          borderRadius: '999px',
+          borderRadius: labelBox.compact ? '2px' : '999px',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          font: `900 11px/13px Arial, sans-serif`,
+          font: labelBox.compact
+            ? `900 ${item.id.length >= 3 ? 6 : 7}px/${labelHeight}px Arial, sans-serif`
+            : `900 11px/13px Arial, sans-serif`,
           letterSpacing: '0',
           textAlign: 'center',
-          boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
+          boxShadow: labelBox.compact ? 'none' : '0 1px 4px rgba(0,0,0,0.35)',
           textShadow: '0 1px 1px rgba(0,0,0,0.85)',
         });
 
@@ -2638,13 +3561,22 @@ export class BrowserSession {
       }
 
       document.documentElement.appendChild(overlay);
-    }, visible).catch(() => undefined);
+    }, { items: visible, markersOnly }).catch(() => undefined);
   }
 
   private async removeCandidateOverlay() {
     await this.activePage
       .evaluate(() => {
         document.getElementById('__ai_candidate_overlay__')?.remove();
+      })
+      .catch(() => undefined);
+  }
+
+  // 操作前原图不应包含上一轮注入的点击位置标记。
+  private async removeClickMarker() {
+    await this.activePage
+      .evaluate(() => {
+        document.getElementById('__ai_last_click_marker__')?.remove();
       })
       .catch(() => undefined);
   }
