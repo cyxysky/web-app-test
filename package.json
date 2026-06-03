@@ -17,6 +17,7 @@
     "@ai-sdk/deepseek": "^2.0.35",
     "@ai-sdk/google": "^3.0.80",
     "@ai-sdk/openai": "^3.0.67",
+    "@ai-sdk/openai-compatible": "^2.0.48",
     "@openrouter/ai-sdk-provider": "^2.9.0",
     "@prisma/client": "^6.8.2",
     "@tinymce/tinymce-react": "^6.3.0",
