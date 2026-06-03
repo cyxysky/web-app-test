@@ -21,6 +21,7 @@ export const testCaseContentSchema = z.object({
   description: z.string(),
   targetUrl: z.string(),
   priority: z.enum(['low', 'medium', 'high', 'critical']),
+  browserMode: z.enum(['default', 'dom', 'visual-markers', 'visual-coordinate']).default('default'),
   userRequirement: z.string().optional(),
   systemPrompt: z.string().optional(),
   preconditions: z.array(z.string()),

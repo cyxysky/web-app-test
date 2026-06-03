@@ -6,6 +6,7 @@ type GenerateInput = {
   systemPrompt?: string;
   targetUrl?: string;
   imageNames?: string[];
+  browserMode?: TestCaseContent['browserMode'];
 };
 
 function titleFromPrompt(prompt: string) {
@@ -25,6 +26,7 @@ export async function generateTestCase(input: GenerateInput): Promise<TestCaseCo
     userRequirement: prompt,
     systemPrompt: input.systemPrompt,
     priority: 'high',
+    browserMode: input.browserMode || 'default',
     preconditions: [],
     testData: {
       userRequirement: plainPrompt,

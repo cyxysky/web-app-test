@@ -10,12 +10,21 @@ export async function POST(request: NextRequest) {
   const targetUrl = body.targetUrl ? String(body.targetUrl) : undefined;
   const imageNames = Array.isArray(body.imageNames) ? body.imageNames.map(String) : [];
   const groupId = body.groupId ? String(body.groupId) : undefined;
+  const browserMode = body.browserMode ? String(body.browserMode) : undefined;
 
   if (!richTextToPlainText(prompt)) {
     return NextResponse.json({ error: 'Prompt is required' }, { status: 400 });
   }
 
-  const content = await generateTestCase({ prompt, systemPrompt, targetUrl, imageNames });
+  const content = await generateTestCase({
+    prompt,
+    systemPrompt,
+    targetUrl,
+    imageNames,
+    browserMode: ['default', 'dom', 'visual-markers', 'visual-coordinate'].includes(browserMode || '')
+      ? browserMode as 'default' | 'dom' | 'visual-markers' | 'visual-coordinate'
+      : undefined,
+  });
   const testCase = store.createTestCase(content, imageNames, groupId);
 
   return NextResponse.json({ testCaseId: testCase.id, status: testCase.status, testCase });
