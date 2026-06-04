@@ -566,6 +566,21 @@ select {
   color: var(--muted);
 }
 
+.inline-check {
+  align-items: center;
+  color: var(--text);
+  display: inline-flex;
+  font-size: 14px;
+  font-weight: 750;
+  gap: 8px;
+}
+
+.inline-check input {
+  accent-color: var(--primary);
+  height: 16px;
+  width: 16px;
+}
+
 .detail-shell,
 .run-shell {
   display: grid;

@@ -1,0 +1,2 @@
+& "C:\Users\chenjf\.unsloth\studio\unsloth_studio\Scripts\python.exe" scripts\a_share_quant_filter.py --provider ashare --min-volume-ratio 1.5 --workers 4
+& "C:\Users\chenjf\.unsloth\studio\unsloth_studio\Scripts\python.exe" scripts\a_share_quant_filter.py --provider zhitu --zhitu-token 你的token --workers 4

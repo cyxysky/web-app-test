@@ -57,12 +57,6 @@ const codexRuntimeObjectSchema = z.object({
     maxMs: z.number().nullable(),
     deltaX: z.number().nullable(),
     deltaY: z.number().nullable(),
-    x: z.number().nullable(),
-    y: z.number().nullable(),
-    fromX: z.number().nullable(),
-    fromY: z.number().nullable(),
-    toX: z.number().nullable(),
-    toY: z.number().nullable(),
     action: z.string().nullable(),
     expected: z.string().nullable(),
     actual: z.string().nullable(),
@@ -110,9 +104,6 @@ function modelSupportsScreenshotInput() {
 
 function browserModeFromEnv(): BrowserSessionMode {
   const raw = process.env.AI_BROWSER_MODE;
-  if (/^(coordinate|coordinates|visual-coordinate|pure-visual|computer-use)$/i.test(String(raw || ''))) {
-    return 'visual-coordinate';
-  }
   return /^(true|1|yes|visual|vision|click|visual-markers)$/i.test(String(raw || ''))
     ? 'visual-markers'
     : 'dom';
@@ -120,7 +111,7 @@ function browserModeFromEnv(): BrowserSessionMode {
 
 function browserModeOf(testCase: TestCaseRecord): BrowserSessionMode {
   const configured = testCase.content.browserMode;
-  if (configured === 'dom' || configured === 'visual-markers' || configured === 'visual-coordinate') {
+  if (configured === 'dom' || configured === 'visual-markers') {
     return configured;
   }
   return browserModeFromEnv();
@@ -130,8 +121,16 @@ function isVisualMode(mode: BrowserSessionMode) {
   return mode !== 'dom';
 }
 
-function isCoordinateMode(mode: BrowserSessionMode) {
-  return mode === 'visual-coordinate';
+// 是否启用视觉候选标识。关闭时仍发送截图，但候选元素只以文本摘要进入 prompt。
+function visualMarkersEnabledFor(testCase: TestCaseRecord) {
+  if (typeof testCase.content.isMarked === 'boolean') return testCase.content.isMarked;
+  if (process.env.VISUAL_MARKERS_IS_MARKED === 'false' || process.env.SCREENSHOT_IS_MARKED === 'false') return false;
+  return true;
+}
+
+// 兼容旧双截图链路；默认 false，标识直接叠加在当前截图里。
+function usesSeparateMarkerMap() {
+  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
 }
 
 // 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
@@ -349,6 +348,32 @@ function formatInteractiveCandidates(candidates: unknown, limit = 50) {
   );
 }
 
+function formatVisualInteractiveElements(candidates: unknown, limit = 80) {
+  if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive elements detected]';
+  return candidates.slice(0, limit).map((item, index) => {
+    const candidate = item as Record<string, unknown>;
+    const label = [
+      candidate.name,
+      candidate.text,
+      candidate.ariaLabel,
+      candidate.placeholder,
+      candidate.title,
+      candidate.nearbyText,
+    ]
+      .map((value) => (typeof value === 'string' ? value.trim() : ''))
+      .find(Boolean) || '[unlabeled]';
+    const role = [candidate.tag, candidate.role, candidate.type].filter(Boolean).join('/');
+    const rect = candidate.rect ? ` rect=${JSON.stringify(candidate.rect)}` : '';
+    const state = [
+      candidate.input ? 'input' : '',
+      candidate.disabled ? 'disabled' : '',
+      candidate.href ? `href=${candidate.href}` : '',
+      candidate.framePath ? `frame=${candidate.framePath}` : '',
+    ].filter(Boolean).join(', ');
+    return `${index + 1}. id=${candidate.id} ${role || 'element'} "${String(label).slice(0, 120)}"${state ? ` (${state})` : ''}${rect}`;
+  }).join('\n');
+}
+
 function makeBrowserTools(
   session: BrowserSession,
   targetUrl: string,
@@ -404,7 +429,7 @@ function makeBrowserTools(
       description: 'Click a visible candidate by its numbered label from the current step screenshot snapshot. Choose the smallest/tightest candidate that directly encloses the intended visible text, icon, or control; avoid larger containing wrapper boxes. A successful tool result only confirms the click was delivered, not that the UI changed. The same visible target may be attempted at most twice because the first click can dismiss an overlay while the second activates the target. If text is provided, type it immediately after the click.',
       inputSchema: z.object({
         reason: toolReasonInput,
-        id: z.string().describe('Candidate id such as 1, 12. Must come from the current visual labels or interactive candidate list. Never choose a larger overlapping wrapper when a tighter candidate represents the same visible target.'),
+        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current visual labels or interactive candidate list. Never choose a larger overlapping wrapper when a tighter candidate represents the same visible target.'),
         text: z.string().optional().describe('Optional text to type immediately after clicking, useful when the click focuses an input or editable control.'),
       }),
       execute: ({ id, text, reason }) => record('clickCandidate', { id, text, reason }, () => session.clickCandidate(id, text)),
@@ -413,14 +438,12 @@ function makeBrowserTools(
       description: 'Move the mouse over a visible candidate by its numbered label. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
       inputSchema: z.object({
         reason: toolReasonInput,
-        id: z.string().describe('Candidate id such as 1, 12. Must come from the current visual labels or interactive candidate list.'),
+        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current visual labels or interactive candidate list.'),
       }),
       execute: ({ id, reason }) => record('hoverCandidate', { id, reason }, () => session.hoverCandidate(id)),
     }),
     typeText: tool({
-      description: mode === 'visual-coordinate'
-        ? 'Type text into the currently focused element. Prefer clickAt(x,y,text) for visible inputs; use this only when a previous coordinate action already focused the field.'
-        : 'Type text into the currently focused element. Prefer clickCandidate(id,text) for numbered inputs; use this only after a fallback click already focused the field.',
+      description: 'Type text into the currently focused element. Prefer clickCandidate(id,text) for numbered inputs; use this only after a fallback click already focused the field.',
       inputSchema: z.object({
         reason: toolReasonInput,
         text: z.string().describe('Text to enter.'),
@@ -498,7 +521,7 @@ function makeBrowserTools(
       description: 'Visual mode: double-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
       inputSchema: z.object({
         reason: toolReasonInput,
-        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
+        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current screenshot labels or interactive candidate list.'),
       }),
       execute: ({ id, reason }) => record('doubleClickCandidate', { id, reason }, () => session.doubleClickCandidate(id)),
     }),
@@ -506,7 +529,7 @@ function makeBrowserTools(
       description: 'Visual mode: right-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
       inputSchema: z.object({
         reason: toolReasonInput,
-        id: z.string().describe('Candidate id such as 1, 12. Must come from the current screenshot labels or interactive candidate list.'),
+        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current screenshot labels or interactive candidate list.'),
       }),
       execute: ({ id, reason }) => record('rightClickCandidate', { id, reason }, () => session.rightClickCandidate(id)),
     }),
@@ -521,78 +544,6 @@ function makeBrowserTools(
     }),
   };
 
-  const coordinate = z.number().min(0).max(999).describe('Normalized screenshot coordinate from 0 to 999. 0 is the left/top edge and 999 is the right/bottom edge.');
-  const coordinateTools = {
-    clickAt: tool({
-      description: 'Pure visual coordinate mode: click the center of a visible target using normalized screenshot coordinates. If text is provided, type it immediately after clicking.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-        x: coordinate,
-        y: coordinate,
-        text: z.string().optional().describe('Optional text to type immediately after clicking a visible input or editable area.'),
-      }),
-      execute: ({ x, y, text, reason }) => record('clickAt', { x, y, text, reason }, () => session.clickAt(x, y, text)),
-    }),
-    hoverAt: tool({
-      description: 'Pure visual coordinate mode: move the mouse over a visible target to reveal hover-only UI.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-        x: coordinate,
-        y: coordinate,
-      }),
-      execute: ({ x, y, reason }) => record('hoverAt', { x, y, reason }, () => session.hoverAt(x, y)),
-    }),
-    doubleClickAt: tool({
-      description: 'Pure visual coordinate mode: double-click a visible target using normalized screenshot coordinates.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-        x: coordinate,
-        y: coordinate,
-      }),
-      execute: ({ x, y, reason }) => record('doubleClickAt', { x, y, reason }, () => session.doubleClickAt(x, y)),
-    }),
-    rightClickAt: tool({
-      description: 'Pure visual coordinate mode: right-click a visible target using normalized screenshot coordinates.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-        x: coordinate,
-        y: coordinate,
-      }),
-      execute: ({ x, y, reason }) => record('rightClickAt', { x, y, reason }, () => session.rightClickAt(x, y)),
-    }),
-    dragAt: tool({
-      description: 'Pure visual coordinate mode: drag from one visible screenshot position to another.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-        fromX: coordinate,
-        fromY: coordinate,
-        toX: coordinate,
-        toY: coordinate,
-      }),
-      execute: ({ fromX, fromY, toX, toY, reason }) => record('dragAt', { fromX, fromY, toX, toY, reason }, () => session.dragAt(fromX, fromY, toX, toY)),
-    }),
-    scrollAt: tool({
-      description: 'Pure visual coordinate mode: scroll at a visible point inside the page, table, side panel, dropdown, or modal that should receive the wheel event.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-        x: coordinate,
-        y: coordinate,
-        deltaY: z.number().describe('Vertical scroll delta. Positive scrolls down, negative scrolls up.'),
-        deltaX: z.number().optional().describe('Horizontal scroll delta.'),
-      }),
-      execute: ({ x, y, deltaY, deltaX, reason }) => record('scrollAt', { x, y, deltaY, deltaX, reason }, () => session.scrollAt(x, y, deltaY, deltaX || 0)),
-    }),
-  };
-
-  if (mode === 'visual-coordinate') {
-    const {
-      scrollViewport: _scrollViewport,
-      clickCandidate: _clickCandidate,
-      hoverCandidate: _hoverCandidate,
-      ...coordinateSharedTools
-    } = sharedTools;
-    return { ...coordinateSharedTools, ...coordinateTools };
-  }
   return mode === 'visual-markers' ? { ...sharedTools, ...visualTools } : { ...sharedTools, ...domTools };
 }
 
@@ -735,31 +686,48 @@ function runtimePrompt(input: {
   stepIndex: number;
   beforeScreenshotPath: string;
   hasMarkerScreenshot?: boolean;
-  screenshotMetrics?: ReturnType<BrowserSession['getLastScreenshotMetrics']>;
+  markerOverlayInScreenshot?: boolean;
 }) {
   const { testCase, pageContext, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
   const mode = browserModeOf(testCase);
   const visualMode = isVisualMode(mode);
-  const coordinateMode = isCoordinateMode(mode);
   const attachScreenshot = shouldSendScreenshotToAi(mode);
+  const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
+  const visualMarkersWithoutOverlay = mode === 'visual-markers' && !markerEnabled;
+  const markerOverlayInScreenshot = Boolean(markerEnabled && input.markerOverlayInScreenshot);
+  const separateMarkerScreenshot = Boolean(markerEnabled && input.hasMarkerScreenshot);
   const caseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
   const recentNotes = recentProgressNotes(completedSteps, 5);
   const recentTools = recentToolCallContext(completedSteps, 5);
   const domTree = visualMode ? '[disabled because visual mode is enabled]' : trimDebugText(pageContext.domTree || '[empty DOM tree]', 12000);
   const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
-  const candidateContext = visualMode ? '[disabled because visual mode uses screenshot labels]' : formatInteractiveCandidates(pageContext.interactiveCandidates, candidateLimit);
+  const candidateContext = visualMode
+    ? visualMarkersWithoutOverlay
+      ? formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)
+      : '[disabled because visual mode uses screenshot labels]'
+    : formatInteractiveCandidates(pageContext.interactiveCandidates, candidateLimit);
+  // 视觉模式有三种输入形态：单图内嵌标识、双图标识图、无标识但带文本候选摘要。
   const evidence = attachScreenshot
-    ? mode === 'visual-markers' && input.hasMarkerScreenshot
+    ? mode === 'visual-markers' && separateMarkerScreenshot
       ? 'the two attached screenshots'
-      : 'the attached clean viewport screenshot'
+      : mode === 'visual-markers' && markerOverlayInScreenshot
+        ? 'the attached viewport screenshot with marker labels overlaid'
+      : visualMarkersWithoutOverlay
+        ? 'the attached clean viewport screenshot plus the visible interactive elements list'
+        : 'the attached clean viewport screenshot'
     : 'Interactive candidates JSON, DOM tree, URL, tabs, and focused element';
-  const markerTargetRules = mode === 'visual-markers' && attachScreenshot
+  const markerSourceRule = separateMarkerScreenshot
+    ? '- Image 1 is the source of truth for what the page means. Image 2 only maps visible regions to candidate IDs.'
+    : markerOverlayInScreenshot
+      ? '- The attached screenshot is the source of truth and already contains marker labels overlaid on visible candidate regions.'
+      : '- The attached screenshot is the source of truth for what the page means.';
+  const markerTargetRules = mode === 'visual-markers' && attachScreenshot && markerEnabled
     ? [
         '',
         'Visual target selection and no-progress recovery:',
-        '- Image 1 is the source of truth for what the page means. Image 2 only maps visible regions to candidate IDs.',
+        markerSourceRule,
         '- A tool result with ok=true only confirms that the browser received the action. It does NOT prove the target was correct or that the page changed.',
         '- When multiple candidate boxes overlap, contain one another, or point at the same visible text/icon/control, choose the smallest and tightest box that directly encloses the intended target. Treat larger containing boxes as wrapper elements unless the requirement explicitly needs the container blank area.',
         '- Never choose a candidate merely because its box is larger, its number is closer to the text, or it appears easier to click.',
@@ -770,31 +738,12 @@ function runtimePrompt(input: {
         '- Do not repeatedly alternate between overlapping parent and child boxes without new visual evidence.',
       ]
     : [];
-  const coordinateTargetRules = coordinateMode && attachScreenshot
-    ? [
-        '',
-        'Pure visual coordinate rules:',
-        '- The clean viewport screenshot is the ONLY source of truth for visible controls and page state. There are no candidate IDs, marker boxes, DOM nodes, or hidden element descriptions.',
-        '- All x/y values use a normalized 0-999 screenshot coordinate system: (0,0) is the top-left corner and (999,999) is the bottom-right corner. Click the visible center of the intended target.',
-        '- A tool result with ok=true only confirms that the browser received the action. It does NOT prove the target was correct or that the page changed.',
-        '- Before clicking, inspect whether a dropdown, popup, tooltip, modal, mask, or floating panel covers the intended target. If it does, close the overlay first with Escape or clickAt on a visibly neutral outside area, then inspect the next screenshot before targeting the control beneath it.',
-        '- For tiny icons, toolbar buttons, date cells, checkboxes, and narrow arrows, aim at the visual center and avoid borders, gaps, adjacent controls, and text baselines.',
-        '- The same visible target and action may be attempted at most TWO consecutive times. A second attempt is allowed only after a fresh screenshot shows a plausible overlay dismissal, focus change, loading completion, or other visible state change.',
-        '- If two attempts do not produce the expected visible result, do not click the same visual target a third time. Choose a different visible trigger, hover, use a keyboard action, scroll, or take another navigation path.',
-      ]
-    : [];
-  const modeActionRules = coordinateMode
-    ? [
-        '- For text entry, use clickAt(x,y,text) in one tool call when the input is visible. Use typeText only when a previous action already focused the field.',
-        '- For hover-only menus, call hoverAt on the visible trigger, then act on the revealed target in the next step.',
-        '- For scrollable tables/lists/panels/dropdowns, call scrollAt at a visible point inside the intended scroll container.',
-      ]
-    : [
-        '- Candidate IDs belong only to the current step screenshot snapshot. Never reuse an ID from an older screenshot.',
-        '- For text entry on a numbered candidate, use clickCandidate(id,text) in one tool call. Use typeText only after a fallback click already focused the field.',
-        '- For hover-only menus, call hoverCandidate on the visible trigger, then act on the revealed target in the next step.',
-        '- For scrollable tables/lists/panels, call scrollViewport with the relevant domPath when available.',
-      ];
+  const modeActionRules = [
+    '- Candidate IDs belong only to the current step screenshot snapshot. Never reuse an ID from an older screenshot.',
+    '- For text entry on a numbered candidate, use clickCandidate(id,text) in one tool call. Use typeText only after a fallback click already focused the field.',
+    '- For hover-only menus, call hoverCandidate on the visible trigger, then act on the revealed target in the next step.',
+    '- For scrollable tables/lists/panels, call scrollViewport with the relevant domPath when available.',
+  ];
 
   return [
     'You are an AI browser testing agent. Choose exactly ONE next browser action, or finish with JSON only when the full requirement is complete.',
@@ -808,21 +757,23 @@ function runtimePrompt(input: {
     '- 所有面向用户的说明、reason、PROGRESS/NEXT、完成 JSON 字段内容都必须使用中文。',
     `- Use ${evidence} as the current page state.`,
     '- Use recent notes/tools as attempt memory. The same visible target and action may be tried at most twice; after two ineffective attempts, do not repeat it again.',
+    '- If a white mouse-pointer marker is visible in the screenshot, it indicates the last browser action location only. Do not treat it as a page control, candidate marker, tooltip, cursor state, or evidence that the target remains selected.',
     '- If recent progress notes contain "[完成校验未通过]", do not finish again immediately. Re-observe the new screenshot; a previously attempted visual target may be tried only if it has fewer than two attempts and the screenshot shows a plausible overlay-dismissal or state-change reason. Otherwise perform a different corrective action.',
     '- If page is loading/transitioning, call waitForPage once.',
     ...modeActionRules,
     '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
     '- Finish only when EVERY requirement clause is satisfied; otherwise call one more useful tool.',
-    coordinateMode
-      ? '- Pure visual coordinate mode: use only the attached clean viewport screenshot and coordinate tools. Candidate IDs, marker images, getInteractiveCandidates, getDomTree, clickCandidate, and hoverCandidate are unavailable.'
-      : attachScreenshot
-      ? input.hasMarkerScreenshot
-        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map containing only numbered candidate outlines and labels. Understand the page from image 1, then choose a candidate ID from image 2. getInteractiveCandidates/getDomTree are unavailable.'
-        : '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. getInteractiveCandidates/getDomTree are unavailable.'
+    attachScreenshot
+      ? separateMarkerScreenshot
+        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map containing numbered candidate outlines. Understand the page from image 1, then choose a candidate ID from image 2. getInteractiveCandidates/getDomTree are unavailable.'
+        : markerOverlayInScreenshot
+          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. Marker numbers may appear as white text with a dark shadow and no filled background. Choose a numbered candidate id from the screenshot. getInteractiveCandidates/getDomTree are unavailable.'
+        : markerEnabled
+          ? '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. getInteractiveCandidates/getDomTree are unavailable.'
+          : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomTree are unavailable.'
       : '- DOM mode: no screenshot image/path is attached. Use candidates first; use DOM tree as fallback. Do not infer from screenshots.',
     ...markerTargetRules,
-    ...coordinateTargetRules,
     caseSystemPrompt ? `Test-case-specific instructions:
 ${caseSystemPrompt}` : '',
     '',
@@ -831,16 +782,15 @@ ${caseSystemPrompt}` : '',
     '',
     'Response:',
     '- To act: call exactly ONE tool and include reason grounded in current context.',
-    coordinateMode
-      ? '- For coordinate tools, reason must name the visible control, explain why the chosen point is its center, and state the expected observable page change.'
-      : '- For clickCandidate/hoverCandidate, reason must name the visible control, explain why this is the most specific current candidate, and state the expected observable page change.',
+    '- For clickCandidate/hoverCandidate, reason must name the visible control, explain why this is the most specific current candidate, and state the expected observable page change.',
     '- When acting, also output Chinese text: PROGRESS: <本步选择的视觉目标和操作> NEXT: <下一张截图中应出现的可观察变化>.',
     '- To finish/block/fail: call NO tool and return JSON: {"action":string,"expected":string,"actual":string,"status":"passed"|"failed"|"blocked","done":true}.',
     '',
     'Current context:',
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
-    coordinateMode ? `Screenshot/viewport metrics JSON: ${JSON.stringify(input.screenshotMetrics || null)}` : '',
     visualMode ? '' : `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
+    visualMarkersWithoutOverlay ? `Visible interactive elements:
+${candidateContext}` : '',
     visualMode ? '' : `Interactive candidates JSON:
 ${candidateContext}`,
     visualMode ? '' : `Simplified DOM tree:
@@ -850,8 +800,10 @@ ${recentNotes.join('\n') || '[none]'}`,
     `Recent tool calls (last 5, oldest first):
 ${JSON.stringify(recentTools, null, 2)}`,
     attachScreenshot
-      ? mode === 'visual-markers' && input.hasMarkerScreenshot
+      ? mode === 'visual-markers' && separateMarkerScreenshot
         ? 'Two screenshot images are attached in this order: clean viewport, marker map.'
+        : mode === 'visual-markers' && markerOverlayInScreenshot
+          ? 'One screenshot image is attached with marker labels overlaid on the page.'
         : 'Clean viewport screenshot image is attached.'
       : 'Screenshot image/path is not attached.',
   ].filter(Boolean).join('\n');
@@ -876,17 +828,6 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'typeText',
     'pressKey',
   ];
-  if (mode === 'visual-coordinate') {
-    return [
-      ...sharedTools,
-      'clickAt',
-      'hoverAt',
-      'doubleClickAt',
-      'rightClickAt',
-      'dragAt',
-      'scrollAt',
-    ];
-  }
   const candidateTools = [
     ...sharedTools,
     'clickCandidate',
@@ -913,7 +854,7 @@ function codexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- Return exactly one object with shape: { "type": string, "params": object }.',
     '- All user-facing params strings such as reason/action/expected/actual must be Chinese.',
     `- type must be one of: ${[...allowedTypes, 'finish', 'block', 'fail'].join(', ')}.`,
-    '- params MUST include every schema key: reason,url,id,text,key,path,domPath,fromId,toId,index,ms,maxMs,deltaX,deltaY,x,y,fromX,fromY,toX,toY,action,expected,actual,status,done. Set unused keys to null.',
+    '- params MUST include every schema key: reason,url,id,text,key,path,domPath,fromId,toId,index,ms,maxMs,deltaX,deltaY,action,expected,actual,status,done. Set unused keys to null.',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
     '- For completion, use type="finish" and params={action, expected, actual, status:"passed", done:true}.',
     '- For manual verification/security wait, use type="block" and params={action, expected, actual, status:"blocked", done:false}.',
@@ -1051,17 +992,18 @@ async function executeRuntimeStep(input: {
   const { session, testCase, stepIndex, beforeScreenshotPath, completedSteps, abortSignal, onDebug, onToolTrace } = input;
   const mode = browserModeOf(testCase);
   const screenshotInputEnabled = shouldSendScreenshotToAi(mode);
-  if (mode === 'visual-coordinate' && !screenshotInputEnabled) {
-    throw new Error('Pure visual coordinate mode requires a model that supports screenshot image input. Check AI_PROVIDER, AI_MODEL, and SEND_SCREENSHOT_TO_AI.');
-  }
-  const markerScreenshotPath = mode === 'visual-markers' && screenshotInputEnabled
+  const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
+  // 标识模式默认单图叠加；separateMarkerMap=true 时保留旧的第二张标识图。
+  const separateMarkerMap = markerEnabled && usesSeparateMarkerMap();
+  const markerOverlayInScreenshot = markerEnabled && !separateMarkerMap;
+  const markerScreenshotPath = separateMarkerMap && screenshotInputEnabled
     ? session.getLastCandidateMarkerScreenshotPath()
     : undefined;
   const pageContext = await session.getPageContext({
     includeDomTree: mode === 'dom',
     includeText: false,
     includeManualVerification: false,
-    includeInteractiveCandidates: mode !== 'visual-coordinate',
+    includeInteractiveCandidates: true,
     useCachedInteractiveCandidates: true,
   });
   const screenshot = screenshotInputEnabled ? await readScreenshotForAi(beforeScreenshotPath) : undefined;
@@ -1075,7 +1017,7 @@ async function executeRuntimeStep(input: {
     stepIndex,
     beforeScreenshotPath,
     hasMarkerScreenshot: Boolean(markerScreenshot),
-    screenshotMetrics: session.getLastScreenshotMetrics(),
+    markerOverlayInScreenshot,
   });
   let lastAiRequest: AiRequestSnapshot | undefined;
 
@@ -1105,11 +1047,13 @@ async function executeRuntimeStep(input: {
         includeImage,
         imageCount: attachedImagePaths.length,
         markerScreenshotPath,
+        isMarked: markerEnabled,
+        markerOverlayInScreenshot,
+        separateMarkerMap,
         modelSupportsScreenshotInput: modelSupportsScreenshotInput(),
         screenshotInputEnabled,
         browserMode: mode,
         visualClickMode: mode === 'visual-markers',
-        visualCoordinateMode: mode === 'visual-coordinate',
         codexObjectMode: codexMode,
       },
     });
@@ -1299,11 +1243,6 @@ function flowInput(input: unknown) {
   return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
 }
 
-function flowNumber(input: Record<string, unknown>, key: string) {
-  const value = input[key];
-  return typeof value === 'number' && Number.isFinite(value) ? value : Number.NaN;
-}
-
 function normalizeBrowserUrl(url: string) {
   const trimmed = url.trim();
   if (!trimmed) return '';
@@ -1352,28 +1291,6 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.rightClickCandidate(String(input.id || ''));
     case 'dragCandidate':
       return session.dragCandidate(String(input.fromId || ''), String(input.toId || ''));
-    case 'clickAt':
-      return session.clickAt(flowNumber(input, 'x'), flowNumber(input, 'y'), text);
-    case 'hoverAt':
-      return session.hoverAt(flowNumber(input, 'x'), flowNumber(input, 'y'));
-    case 'doubleClickAt':
-      return session.doubleClickAt(flowNumber(input, 'x'), flowNumber(input, 'y'));
-    case 'rightClickAt':
-      return session.rightClickAt(flowNumber(input, 'x'), flowNumber(input, 'y'));
-    case 'dragAt':
-      return session.dragAt(
-        flowNumber(input, 'fromX'),
-        flowNumber(input, 'fromY'),
-        flowNumber(input, 'toX'),
-        flowNumber(input, 'toY'),
-      );
-    case 'scrollAt':
-      return session.scrollAt(
-        flowNumber(input, 'x'),
-        flowNumber(input, 'y'),
-        typeof input.deltaY === 'number' ? input.deltaY : 0,
-        typeof input.deltaX === 'number' ? input.deltaX : 0,
-      );
     case 'clickDomNode':
       return session.clickDomNode(String(input.path || ''));
     case 'focusDomNode':
@@ -1447,7 +1364,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
     onPaused,
     onResumed,
   } = options;
-  const session = new BrowserSession(browserModeOf(testCase));
+  const session = new BrowserSession(browserModeOf(testCase), { isMarked: visualMarkersEnabledFor(testCase) });
   const steps: StepExecutionResult[] = [];
   let allowBrowserClose = false;
 
@@ -1574,9 +1491,6 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
   }
 
   const runtimeMode = browserModeOf(testCase);
-  if (runtimeMode === 'visual-coordinate' && !shouldSendScreenshotToAi(runtimeMode)) {
-    throw new Error('Pure visual coordinate mode requires a model that supports screenshot image input. Check AI_PROVIDER, AI_MODEL, and SEND_SCREENSHOT_TO_AI.');
-  }
 
   const {
     onProgress,
@@ -1590,7 +1504,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
     onManualIntervention,
     onManualInterventionCleared,
   } = options;
-  const session = new BrowserSession(runtimeMode);
+  const session = new BrowserSession(runtimeMode, { isMarked: visualMarkersEnabledFor(testCase) });
   const steps: StepExecutionResult[] = [...(initialSteps || [])];
   // Each runtime step now performs a single browser action, so allow more steps overall.
   const maxRuntimeSteps = Number(process.env.AI_TEST_RUNTIME_MAX_STEPS || 30);
@@ -1641,9 +1555,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         index: stepIndex,
         action: 'AI 正在根据用户需求和当前截图判断下一步',
         expected: 'AI 应调用浏览器工具推进需求，或判断需求已经完成。',
-        actual: runtimeMode === 'visual-coordinate'
-          ? 'AI 正在观察干净截图、定位可见目标坐标并调用工具。'
-          : 'AI 正在观察页面、选择交互目标并调用工具。',
+        actual: 'AI is choosing the next browser action from the current page context.',
         status: 'running',
         beforeScreenshotPath,
       };
