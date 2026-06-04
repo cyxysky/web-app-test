@@ -15,16 +15,23 @@ function shouldIgnoreConsoleError(text: string) {
   );
 }
 
-export type BrowserSessionMode = 'dom' | 'visual-markers' | 'visual-coordinate';
+function shouldUseSeparateMarkerMap() {
+  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
+}
 
+export type BrowserSessionMode = 'dom' | 'visual-markers';
+
+export type BrowserSessionOptions = {
+  isMarked?: boolean;
+};
+
+/**
+ * 浏览器请求鉴定模式
+ * @returns 鉴定模式
+ */
 function browserSessionModeFromEnv(): BrowserSessionMode {
   const raw = process.env.AI_BROWSER_MODE;
-  if (/^(coordinate|coordinates|visual-coordinate|pure-visual|computer-use)$/i.test(String(raw || ''))) {
-    return 'visual-coordinate';
-  }
-  return /^(true|1|yes|visual|vision|click|visual-markers)$/i.test(String(raw || ''))
-    ? 'visual-markers'
-    : 'dom';
+  return raw as BrowserSessionMode
 }
 
 export type BrowserActionResult = {
@@ -143,7 +150,10 @@ export class BrowserSession {
   private lastScreenshotCandidates: InteractiveCandidate[] = [];
   private lastCandidateMarkerScreenshotPath?: string;
 
-  constructor(private readonly mode: BrowserSessionMode = browserSessionModeFromEnv()) {}
+  constructor(
+    private readonly mode: BrowserSessionMode = browserSessionModeFromEnv(),
+    private readonly options: BrowserSessionOptions = {},
+  ) { }
 
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
@@ -247,7 +257,7 @@ export class BrowserSession {
     useCachedInteractiveCandidates?: boolean;
   } = {}) {
     const includeText = options.includeText !== false || options.includeManualVerification !== false;
-    const includeInteractiveCandidates = options.includeInteractiveCandidates ?? this.mode !== 'visual-coordinate';
+    const includeInteractiveCandidates = options.includeInteractiveCandidates ?? true;
     const [title, text, viewportMetrics, focusedElement, domTree, interactiveCandidates] = await Promise.all([
       this.activePage.title().catch(() => ''),
       includeText ? this.readPageText() : Promise.resolve(''),
@@ -257,10 +267,10 @@ export class BrowserSession {
       !includeInteractiveCandidates
         ? Promise.resolve([] as InteractiveCandidate[])
         : options.useCachedInteractiveCandidates && this.lastScreenshotCandidates.length
-        ? Promise.resolve(this.lastScreenshotCandidates)
-        : options.useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
-          ? Promise.resolve(this.lastInteractiveCandidates)
-        : this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
+          ? Promise.resolve(this.lastScreenshotCandidates)
+          : options.useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
+            ? Promise.resolve(this.lastInteractiveCandidates)
+            : this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
     ]);
 
     const manualVerification = options.includeManualVerification === false
@@ -341,14 +351,18 @@ export class BrowserSession {
     }).catch(() => [] as Array<{ label: string; valueLength: number; filled: boolean }>);
   }
 
-  // 截取当前 viewport；视觉点击模式在 before 阶段额外生成一张与原图像素对齐的纯标识图。
+  // 截取当前 viewport。视觉标识模式默认把候选编号叠加到 before 截图；
+  // 仅在 VISUAL_MARKER_SEPARATE_MAP=true 时额外生成一张像素对齐的纯标识图。
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' = 'after') {
     const dir = path.join(process.cwd(), 'artifacts', runId);
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    const shouldCaptureCandidates = phase === 'before' && this.mode !== 'visual-coordinate';
-    const candidateLabelsEnabled = shouldCaptureCandidates && this.mode === 'visual-markers' && process.env.SCREENSHOT_ELEMENT_LABELS !== 'false';
+    const shouldCaptureCandidates = phase === 'before';
+    const candidateLabelsEnabled = shouldCaptureCandidates
+      && this.mode === 'visual-markers'
+      && this.options.isMarked !== false
+      && process.env.SCREENSHOT_ELEMENT_LABELS !== 'false';
     const candidates = shouldCaptureCandidates
       ? await this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[])
       : [];
@@ -363,10 +377,21 @@ export class BrowserSession {
       }));
     }
     this.lastCandidateMarkerScreenshotPath = undefined;
+    // 默认把标识直接叠到当前截图上；只有兼容旧链路时才额外生成纯 marker 图。
+    const separateMarkerMap = candidateLabelsEnabled && shouldUseSeparateMarkerMap();
     await this.removeCandidateOverlay();
     if (phase === 'before') await this.removeClickMarker();
-    await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
-    if (candidateLabelsEnabled) {
+    if (candidateLabelsEnabled && !separateMarkerMap) {
+      await this.drawCandidateOverlay(candidates, false);
+    }
+    try {
+      await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
+    } finally {
+      if (candidateLabelsEnabled && !separateMarkerMap) {
+        await this.removeCandidateOverlay();
+      }
+    }
+    if (separateMarkerMap) {
       const markerFilePath = path.join(dir, `step-${stepIndex}-before-markers.png`);
       await this.drawCandidateOverlay(candidates, true);
       try {
@@ -396,7 +421,7 @@ export class BrowserSession {
     return this.lastScreenshotMetrics;
   }
 
-  // 返回最近一次操作前截图对应的纯标识图路径，视觉模式会把它作为第二张图片发送给 AI。
+  // 返回最近一次操作前截图对应的纯标识图路径；仅双截图兼容模式会使用。
   getLastCandidateMarkerScreenshotPath() {
     return this.lastCandidateMarkerScreenshotPath;
   }
@@ -423,7 +448,6 @@ export class BrowserSession {
     const beforeUrl = this.activePage.url();
     const popup = this.activePage.waitForEvent('popup', { timeout: 3000 }).catch(() => undefined);
     await this.activePage.mouse.click(target.x, target.y);
-    await this.showClickMarker(target.x, target.y, 'click');
     if (text !== undefined) {
       await this.activePage.keyboard.type(text);
     }
@@ -466,7 +490,6 @@ export class BrowserSession {
 
     const { candidate, target } = resolved;
     await this.activePage.mouse.dblclick(target.x, target.y);
-    await this.showClickMarker(target.x, target.y, 'double');
     const note = await this.waitAfterAction();
     await this.showClickMarker(target.x, target.y, 'double');
     return {
@@ -482,7 +505,6 @@ export class BrowserSession {
 
     const { candidate, target } = resolved;
     await this.activePage.mouse.click(target.x, target.y, { button: 'right' });
-    await this.showClickMarker(target.x, target.y, 'right');
     const note = await this.waitAfterAction();
     await this.showClickMarker(target.x, target.y, 'right');
     return {
@@ -518,7 +540,6 @@ export class BrowserSession {
     await this.activePage.mouse.down();
     await this.activePage.mouse.move(toTarget.x, toTarget.y, { steps: 12 });
     await this.activePage.mouse.up();
-    await this.showClickMarker(toTarget.x, toTarget.y, 'drag');
     const note = await this.waitAfterAction();
     await this.showClickMarker(toTarget.x, toTarget.y, 'drag');
     return {
@@ -544,103 +565,6 @@ export class BrowserSession {
     };
   }
 
-  // 按纯视觉模型返回的 0-999 归一化坐标点击当前 viewport；可选文本会在点击后立即输入。
-  async clickAt(x: number, y: number, text?: string): Promise<BrowserActionResult> {
-    const target = await this.normalizedViewportPoint(x, y);
-    const context = this.activePage.context();
-    const beforePages = context.pages().length;
-    const popup = this.activePage.waitForEvent('popup', { timeout: 3000 }).catch(() => undefined);
-    await this.activePage.mouse.click(target.x, target.y);
-    await this.showClickMarker(target.x, target.y, 'click');
-    if (text !== undefined) await this.activePage.keyboard.type(text);
-
-    const newPage = await Promise.race([
-      popup,
-      this.activePage.waitForTimeout(200).then(() => undefined).catch(() => undefined),
-    ]);
-    if (newPage) {
-      this.page = newPage;
-      this.attachPageListeners(newPage);
-      await newPage.bringToFront();
-    } else if (context.pages().length > beforePages) {
-      this.page = context.pages().at(-1);
-      await this.page?.bringToFront();
-    }
-
-    const note = await this.waitAfterAction();
-    await this.showClickMarker(target.x, target.y, 'click');
-    return {
-      ok: true,
-      actual: `Clicked normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${note}`,
-    };
-  }
-
-  // 按纯视觉坐标双击当前 viewport。
-  async doubleClickAt(x: number, y: number): Promise<BrowserActionResult> {
-    const target = await this.normalizedViewportPoint(x, y);
-    await this.activePage.mouse.dblclick(target.x, target.y);
-    await this.showClickMarker(target.x, target.y, 'double');
-    const note = await this.waitAfterAction();
-    await this.showClickMarker(target.x, target.y, 'double');
-    return {
-      ok: true,
-      actual: `Double-clicked normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}) at browser point (${target.x}, ${target.y}).${note}`,
-    };
-  }
-
-  // 按纯视觉坐标右键点击当前 viewport。
-  async rightClickAt(x: number, y: number): Promise<BrowserActionResult> {
-    const target = await this.normalizedViewportPoint(x, y);
-    await this.activePage.mouse.click(target.x, target.y, { button: 'right' });
-    await this.showClickMarker(target.x, target.y, 'right');
-    const note = await this.waitAfterAction();
-    await this.showClickMarker(target.x, target.y, 'right');
-    return {
-      ok: true,
-      actual: `Right-clicked normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}) at browser point (${target.x}, ${target.y}).${note}`,
-    };
-  }
-
-  // 按纯视觉坐标悬停，用于展开 hover 菜单或 tooltip。
-  async hoverAt(x: number, y: number): Promise<BrowserActionResult> {
-    const target = await this.normalizedViewportPoint(x, y);
-    await this.activePage.mouse.move(target.x, target.y);
-    const note = await this.waitAfterAction();
-    return {
-      ok: true,
-      actual: `Hovered normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}) at browser point (${target.x}, ${target.y}).${note}`,
-    };
-  }
-
-  // 按纯视觉坐标从一个截图位置拖拽到另一个截图位置。
-  async dragAt(fromX: number, fromY: number, toX: number, toY: number): Promise<BrowserActionResult> {
-    const from = await this.normalizedViewportPoint(fromX, fromY);
-    const to = await this.normalizedViewportPoint(toX, toY);
-    await this.activePage.mouse.move(from.x, from.y);
-    await this.activePage.mouse.down();
-    await this.activePage.mouse.move(to.x, to.y, { steps: 12 });
-    await this.activePage.mouse.up();
-    await this.showClickMarker(to.x, to.y, 'drag');
-    const note = await this.waitAfterAction();
-    await this.showClickMarker(to.x, to.y, 'drag');
-    return {
-      ok: true,
-      actual: `Dragged normalized screenshot coordinate (${from.normalizedX}, ${from.normalizedY}) to (${to.normalizedX}, ${to.normalizedY}), browser points (${from.x}, ${from.y}) to (${to.x}, ${to.y}).${note}`,
-    };
-  }
-
-  // 在纯视觉模型指定的截图位置执行滚轮操作，使局部表格、侧边栏和弹窗可被直接滚动。
-  async scrollAt(x: number, y: number, deltaY: number, deltaX = 0): Promise<BrowserActionResult> {
-    const target = await this.normalizedViewportPoint(x, y);
-    await this.activePage.mouse.move(target.x, target.y);
-    await this.activePage.mouse.wheel(deltaX, deltaY);
-    const note = await this.waitAfterAction();
-    return {
-      ok: true,
-      actual: `Scrolled at normalized screenshot coordinate (${target.normalizedX}, ${target.normalizedY}), browser point (${target.x}, ${target.y}), by x=${deltaX}, y=${deltaY}.${note}`,
-    };
-  }
-
   // 通过简化 DOM 路径解析元素并点击，作为候选编号不可用时的兜底操作。
   async clickDomNode(path: string): Promise<BrowserActionResult> {
     const target = await this.resolveDomPathToClickablePoint(path);
@@ -652,7 +576,6 @@ export class BrowserSession {
     }
     const offscreenNote = target.offscreen ? ' Note: the node center was outside the viewport and was clamped; scroll it into view first for a reliable click.' : '';
     await this.activePage.mouse.click(target.x, target.y);
-    await this.showClickMarker(target.x, target.y, 'click');
     const note = await this.waitAfterAction();
     await this.showClickMarker(target.x, target.y, 'click');
     return { ok: true, actual: `Clicked DOM node ${path} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${offscreenNote}${note}` };
@@ -907,30 +830,14 @@ export class BrowserSession {
       devicePixelRatio: window.devicePixelRatio || 1,
       visualViewport: window.visualViewport
         ? {
-            width: window.visualViewport.width,
-            height: window.visualViewport.height,
-            offsetLeft: window.visualViewport.offsetLeft,
-            offsetTop: window.visualViewport.offsetTop,
-            scale: window.visualViewport.scale || 1,
-          }
+          width: window.visualViewport.width,
+          height: window.visualViewport.height,
+          offsetLeft: window.visualViewport.offsetLeft,
+          offsetTop: window.visualViewport.offsetTop,
+          scale: window.visualViewport.scale || 1,
+        }
         : undefined,
     })).catch(() => ({ ...fallback, devicePixelRatio: 1 }));
-  }
-
-  // 将模型返回的 0-999 截图归一化坐标映射为 Playwright 使用的 CSS viewport 坐标。
-  private async normalizedViewportPoint(x: number, y: number) {
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      throw new Error(`Invalid normalized screenshot coordinate: (${x}, ${y}).`);
-    }
-    const normalizedX = Math.min(999, Math.max(0, Math.round(x)));
-    const normalizedY = Math.min(999, Math.max(0, Math.round(y)));
-    const viewport = await this.getViewportMetrics();
-    return {
-      normalizedX,
-      normalizedY,
-      x: Math.round((normalizedX / 999) * Math.max(0, viewport.width - 1)),
-      y: Math.round((normalizedY / 999) * Math.max(0, viewport.height - 1)),
-    };
   }
 
   private async refreshInteractiveCandidates() {
@@ -2052,12 +1959,12 @@ export class BrowserSession {
           });
           return visiblePoint
             ? {
-                visiblePoint,
-                independentInteriorPoint,
-                independentInteriorPointCount: independentGridPoints.size,
-                interiorPointCount,
-                hasAdjacentIndependentPoints,
-              }
+              visiblePoint,
+              independentInteriorPoint,
+              independentInteriorPointCount: independentGridPoints.size,
+              interiorPointCount,
+              hasAdjacentIndependentPoints,
+            }
             : undefined;
         }
 
@@ -3514,10 +3421,11 @@ export class BrowserSession {
         const label = document.createElement('div');
         label.textContent = item.id;
         const denseSmall = isDenseSmallTarget(rect);
-        const normalLabelWidth = Math.max(18, item.id.length * 8 + 7);
-        const normalLabelHeight = 16;
-        const compactLabelWidth = Math.max(8, Math.min(normalLabelWidth, item.id.length * 4 + 3, Math.max(8, rect.width - 2)));
-        const compactLabelHeight = Math.max(7, Math.min(9, Math.max(7, rect.height - 2)));
+        // 标签只保留白字和黑色描边阴影，尽量减少对页面文字的遮挡。
+        const normalLabelWidth = Math.max(12, item.id.length * 7 + 2);
+        const normalLabelHeight = 12;
+        const compactLabelWidth = Math.max(7, Math.min(normalLabelWidth, item.id.length * 4 + 2, Math.max(7, rect.width - 1)));
+        const compactLabelHeight = Math.max(7, Math.min(9, Math.max(7, rect.height - 1)));
         const labelBox = labelPosition(
           rect,
           normalLabelWidth,
@@ -3540,20 +3448,27 @@ export class BrowserSession {
           height: `${labelHeight}px`,
           padding: '0',
           boxSizing: 'border-box',
-          background: color,
+          background: 'transparent',
           color: '#fff',
           border: '0',
-          borderRadius: labelBox.compact ? '2px' : '999px',
+          borderRadius: '0',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
           font: labelBox.compact
             ? `900 ${item.id.length >= 3 ? 6 : 7}px/${labelHeight}px Arial, sans-serif`
-            : `900 11px/13px Arial, sans-serif`,
+            : `900 11px/${labelHeight}px Arial, sans-serif`,
           letterSpacing: '0',
           textAlign: 'center',
-          boxShadow: labelBox.compact ? 'none' : '0 1px 4px rgba(0,0,0,0.35)',
-          textShadow: '0 1px 1px rgba(0,0,0,0.85)',
+          boxShadow: 'none',
+          WebkitTextStroke: '2px rgba(0,0,0,0.9)',
+          paintOrder: 'stroke fill',
+          textShadow: [
+            '0 1px 2px rgba(0,0,0,0.95)',
+            '1px 0 2px rgba(0,0,0,0.95)',
+            '-1px 0 2px rgba(0,0,0,0.95)',
+            '0 -1px 2px rgba(0,0,0,0.95)',
+          ].join(', '),
         });
 
         overlay.appendChild(box);
@@ -3581,28 +3496,64 @@ export class BrowserSession {
       .catch(() => undefined);
   }
 
+  // 在页面上留下上一次鼠标动作的位置。下一轮截图会看到这个鼠标指针，
+  // 便于人工和模型理解刚才点在哪里；扫描候选元素时会主动忽略它。
   private async showClickMarker(x: number, y: number, kind: string) {
     await this.activePage.evaluate(({ x: markerX, y: markerY, kind: markerKind }) => {
       const previous = document.getElementById('__ai_last_click_marker__');
       previous?.remove();
       const marker = document.createElement('div');
       marker.id = '__ai_last_click_marker__';
-      marker.textContent = markerKind === 'double' ? '2x' : markerKind === 'right' ? 'R' : markerKind === 'drag' ? 'D' : '';
+      marker.setAttribute('aria-hidden', 'true');
+      const badgeText = markerKind === 'double' ? '2x' : markerKind === 'right' ? 'R' : markerKind === 'drag' ? 'D' : '';
+      const cursorSvg = [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="42" viewBox="0 0 32 42">',
+        '<path d="M4 3v28.5l7.3-6.9 4.7 12.2 5.6-2.2-4.8-11.8h10.6L4 3z" fill="white" stroke="#111827" stroke-width="2.2" stroke-linejoin="round"/>',
+        '<path d="M11.2 24.6 16 36.8" stroke="rgba(255,255,255,.65)" stroke-width="1.1"/>',
+        '</svg>',
+      ].join('');
+      const cursor = document.createElement('div');
+      Object.assign(cursor.style, {
+        position: 'absolute',
+        left: '0',
+        top: '0',
+        width: '32px',
+        height: '42px',
+        backgroundImage: `url("data:image/svg+xml,${encodeURIComponent(cursorSvg)}")`,
+        backgroundRepeat: 'no-repeat',
+        backgroundSize: '32px 42px',
+        filter: 'drop-shadow(0 5px 8px rgba(0, 0, 0, 0.42))',
+      });
+      marker.appendChild(cursor);
+      if (badgeText) {
+        const badge = document.createElement('div');
+        badge.textContent = badgeText;
+        Object.assign(badge.style, {
+          position: 'absolute',
+          left: '17px',
+          top: '21px',
+          minWidth: '17px',
+          height: '17px',
+          padding: '0 3px',
+          borderRadius: '999px',
+          background: '#2563eb',
+          color: '#fff',
+          border: '2px solid #fff',
+          boxSizing: 'border-box',
+          font: '900 10px/13px Arial, sans-serif',
+          textAlign: 'center',
+          boxShadow: '0 2px 7px rgba(0,0,0,0.32)',
+        });
+        marker.appendChild(badge);
+      }
       Object.assign(marker.style, {
         position: 'fixed',
         left: `${markerX}px`,
         top: `${markerY}px`,
-        width: '22px',
-        height: '22px',
-        marginLeft: '-11px',
-        marginTop: '-11px',
-        borderRadius: '999px',
-        background: 'rgba(239, 68, 68, 0.92)',
-        border: '4px solid rgba(255, 255, 255, 0.98)',
-        boxShadow: '0 0 0 7px rgba(239, 68, 68, 0.28), 0 10px 26px rgba(0, 0, 0, 0.32)',
-        color: '#fff',
-        font: '700 10px/16px Arial, sans-serif',
-        textAlign: 'center',
+        width: '42px',
+        height: '48px',
+        marginLeft: '-2px',
+        marginTop: '-2px',
         pointerEvents: 'none',
         zIndex: '2147483647',
       });

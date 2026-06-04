@@ -12,6 +12,7 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
   const [draft, setDraft] = useState<TestCaseContent>({
     ...testCase.content,
     browserMode: testCase.content.browserMode || 'default',
+    isMarked: testCase.content.isMarked ?? true,
     userRequirement: testCase.content.userRequirement || testCase.description,
     systemPrompt: testCase.content.systemPrompt || '',
     steps: [],
@@ -88,9 +89,22 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
             <option value="default">默认配置</option>
             <option value="dom">DOM 交互</option>
             <option value="visual-markers">视觉标识</option>
-            <option value="visual-coordinate">纯视觉坐标</option>
           </select>
         </label>
+        {draft.browserMode === 'visual-markers' ? (
+          <label>
+            视觉标记截图
+            <span className="inline-check">
+              <input
+                type="checkbox"
+                checked={draft.isMarked ?? true}
+                onChange={(event) => update({ isMarked: event.target.checked })}
+              />
+              启用截图 marker
+            </span>
+            <span className="hint">关闭后只发送原始截图，并在提示词中加入可交互元素摘要。</span>
+          </label>
+        ) : null}
         <label className="wide">
           用户需求
           <RichTextEditor

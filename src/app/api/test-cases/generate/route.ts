@@ -11,6 +11,7 @@ export async function POST(request: NextRequest) {
   const imageNames = Array.isArray(body.imageNames) ? body.imageNames.map(String) : [];
   const groupId = body.groupId ? String(body.groupId) : undefined;
   const browserMode = body.browserMode ? String(body.browserMode) : undefined;
+  const isMarked = typeof body.isMarked === 'boolean' ? body.isMarked : undefined;
 
   if (!richTextToPlainText(prompt)) {
     return NextResponse.json({ error: 'Prompt is required' }, { status: 400 });
@@ -21,9 +22,10 @@ export async function POST(request: NextRequest) {
     systemPrompt,
     targetUrl,
     imageNames,
-    browserMode: ['default', 'dom', 'visual-markers', 'visual-coordinate'].includes(browserMode || '')
-      ? browserMode as 'default' | 'dom' | 'visual-markers' | 'visual-coordinate'
+    browserMode: ['default', 'dom', 'visual-markers'].includes(browserMode || '')
+      ? browserMode as 'default' | 'dom' | 'visual-markers'
       : undefined,
+    isMarked,
   });
   const testCase = store.createTestCase(content, imageNames, groupId);
 

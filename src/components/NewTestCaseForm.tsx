@@ -13,6 +13,7 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [targetUrl, setTargetUrl] = useState('https://www.zhihu.com');
   const [browserMode, setBrowserMode] = useState<TestCaseContent['browserMode']>('default');
+  const [isMarked, setIsMarked] = useState(true);
   const [imageNames, setImageNames] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -45,7 +46,7 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
       const response = await fetch('/api/test-cases/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, systemPrompt, targetUrl, browserMode, imageNames, groupId }),
+        body: JSON.stringify({ prompt, systemPrompt, targetUrl, browserMode, isMarked, imageNames, groupId }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '生成失败');
@@ -76,9 +77,22 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
           <option value="default">默认配置</option>
           <option value="dom">DOM 交互</option>
           <option value="visual-markers">视觉标识</option>
-          <option value="visual-coordinate">纯视觉坐标</option>
         </select>
       </div>
+      {browserMode === 'visual-markers' ? (
+        <label className="field">
+          <span>视觉标记截图</span>
+          <span className="inline-check">
+            <input
+              type="checkbox"
+              checked={isMarked}
+              onChange={(event) => setIsMarked(event.target.checked)}
+            />
+            启用截图 marker
+          </span>
+          <span className="hint">关闭后只发送原始截图，并在提示词中加入可交互元素摘要。</span>
+        </label>
+      ) : null}
       <div className="field">
         <label htmlFor="prompt">测试目标</label>
         <RichTextEditor

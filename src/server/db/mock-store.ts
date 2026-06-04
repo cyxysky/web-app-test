@@ -12,6 +12,7 @@ const seedContent: TestCaseContent = {
   targetUrl: 'https://example.com',
   priority: 'high',
   browserMode: 'default',
+  isMarked: true,
   preconditions: ['The test environment is reachable', 'A test account is available', 'The target domain is allowlisted'],
   testData: {
     username: 'demo@example.com',

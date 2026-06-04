@@ -27,10 +27,7 @@ Each test case can choose a browser operation mode:
 
 - `Default configuration` keeps compatibility with `isClick` / `AI_BROWSER_MODE`.
 - `DOM interaction` uses textual interactive candidates and the simplified DOM tree.
-- `Visual markers` sends a clean screenshot plus a numbered marker map.
-- `Pure visual coordinates` sends only the clean screenshot and lets the model click, hover, drag, and scroll with normalized `0-999` coordinates.
-
-Pure visual coordinate mode requires a model that supports image input.
+- `Visual markers` sends one viewport screenshot with numbered marker labels overlaid by default.
 
 ## Package and Run with Docker
 
