@@ -5,18 +5,20 @@ A 股量化筛选脚本。
   pip install akshare pandas requests tqdm
 
 示例:
-  python scripts/a_share_quant_filter.py --fxyz-token 你的token --output artifacts/a_share_filter.csv
+  python scripts/a_share_quant_filter.py --provider ashare --output artifacts/a_share_filter.csv
+  python scripts/a_share_quant_filter.py --provider zhitu --zhitu-token 你的token --output artifacts/a_share_filter.csv
 
 策略条件:
   0. 股票池只保留沪深主板，排除创业板、科创板、北交所和 ST/退市股票。
-  1. 使用当天实时行情判断：近 12 日平均成交量 > 近 50 日平均成交量。
+  1. 使用当天最新日 K 判断：近 12 日平均成交量 > 近 50 日平均成交量。
   2. 最近 5 次满足条件 1 的历史信号中，按信号日收盘价买入后，
      后续 2 个交易日内最高价涨幅 > 5% 的成功次数 > 4。
+  3. 默认只保留量能倍数 >= 1.5，且只保留最新交易日信号。
 
 数据源:
   股票池：akshare / 东方财富。
-  历史 K：api.fxyz.site /wolf/time/kline。
-  实时行情：api.fxyz.site /wolf/time。
+  provider=ashare：mpquant/Ashare。
+  provider=zhitu：智兔 API。
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ from typing import Any, Iterable
 
 pd: Any = None
 
-FXYZ_BASE_URL = "http://api.fxyz.site"
+ZHITU_BASE_URL = "https://api.zhituapi.com"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,8 +49,7 @@ class StrategyConfig:
     forward_days: int = 2
     profit_threshold: float = 0.05
     history_days: int = 420
-    cq: str = "1"
-    period: str = "1d"
+    zhitu_adjust: str = "f"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,6 +60,7 @@ class StockResult:
     close: float
     avg_volume_12: float
     avg_volume_50: float
+    volume_ratio: float
     success_count: int
     recent_signal_dates: str
     recent_signal_returns: str
@@ -66,32 +68,34 @@ class StockResult:
 
 @dataclasses.dataclass(frozen=True)
 class MarketClient:
+    provider: str
     akshare: Any
     requests: Any
-    token: str
+    ashare_get_price: Any | None = None
+    zhitu_token: str = ""
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="筛选满足策略条件的中国 A 股股票。")
-    parser.add_argument("--fxyz-token", default="", help="fxyz token；为空时读取环境变量或 .env 中的 FXYZ_TOKEN。")
+    parser.add_argument("--provider", default="ashare", choices=["ashare", "zhitu"], help="行情数据源：ashare 或 zhitu。")
+    parser.add_argument("--zhitu-token", default="", help="智兔 API token；为空时读取环境变量或 .env 中的 ZHITU_TOKEN。")
+    parser.add_argument("--zhitu-adjust", default="f", choices=["n", "f", "b", "fr", "br"], help="智兔复权方式：n 不复权，f 前复权，b 后复权。")
     parser.add_argument("--output", default="artifacts/a_share_quant_filter.csv", help="结果 CSV 输出路径。")
     parser.add_argument("--workers", type=int, default=4, help="并发拉取股票行情的线程数。")
     parser.add_argument("--sleep", type=float, default=0.05, help="每只股票请求后的休眠秒数，避免数据源限流。")
     parser.add_argument("--history-days", type=int, default=420, help="向前拉取的自然日数量。")
-    parser.add_argument("--period", default="1d", help="fxyz 历史 K 周期，默认 1d。")
-    parser.add_argument("--cq", default="1", help="fxyz 历史 K 复权参数，默认 1。")
+    parser.add_argument("--min-volume-ratio", type=float, default=1.5, help="近 12 日均量 / 近 50 日均量阈值，默认 1.5。")
+    parser.add_argument("--keep-non-latest", action="store_true", help="保留非最新交易日信号。默认只保留最新交易日。")
     parser.add_argument("--retries", type=int, default=3, help="接口请求失败后的重试次数。")
     parser.add_argument("--progress-interval", type=int, default=50, help="每完成多少只股票输出一次进度。")
     return parser.parse_args()
 
 
 def log(message: str) -> None:
-    """立即输出进度，避免长时间请求时控制台看起来没有响应。"""
     print(message, flush=True)
 
 
 def read_dotenv_value(key: str, env_path: str = ".env") -> str:
-    """读取简单 .env 键值，避免额外引入 python-dotenv。"""
     path = Path(env_path)
     if not path.exists():
         return ""
@@ -127,26 +131,47 @@ def import_required(package_names: list[str]) -> dict[str, Any]:
     return modules
 
 
-def load_market_client(fxyz_token: str) -> MarketClient:
-    """加载东方财富股票池依赖和 fxyz 行情接口依赖。"""
+def import_ashare_get_price():
+    try:
+        return importlib.import_module("Ashare").get_price
+    except ImportError:
+        pass
+
+    # mpquant/Ashare 不是标准 pip 包；缺少本地模块时从官方单文件源码加载。
+    import requests
+
+    url = "https://raw.githubusercontent.com/mpquant/Ashare/master/Ashare.py"
+    response = requests.get(url, timeout=20)
+    response.raise_for_status()
+    namespace: dict[str, Any] = {}
+    exec(compile(response.text, "Ashare.py", "exec"), namespace)
+    return namespace["get_price"]
+
+
+def load_market_client(provider: str, zhitu_token: str) -> MarketClient:
     modules = import_required(["akshare", "pandas", "requests"])
     global pd
     pd = modules["pandas"]
 
-    token = fxyz_token or os.getenv("FXYZ_TOKEN", "") or read_dotenv_value("FXYZ_TOKEN")
-    if not token:
-        raise SystemExit("缺少 fxyz token。请在 .env 中添加 FXYZ_TOKEN=你的token，或运行时传入 --fxyz-token。")
+    if provider == "ashare":
+        return MarketClient(
+            provider="ashare",
+            akshare=modules["akshare"],
+            requests=modules["requests"],
+            ashare_get_price=import_ashare_get_price(),
+        )
 
-    return MarketClient(akshare=modules["akshare"], requests=modules["requests"], token=token)
+    token = zhitu_token or os.getenv("ZHITU_TOKEN", "") or read_dotenv_value("ZHITU_TOKEN")
+    if not token:
+        raise SystemExit("缺少智兔 token。请在 .env 中添加 ZHITU_TOKEN=你的token，或运行时传入 --zhitu-token。")
+    return MarketClient(provider="zhitu", akshare=modules["akshare"], requests=modules["requests"], zhitu_token=token)
 
 
 def is_main_board_code(code: str) -> bool:
-    """沪深主板代码：上证 60 开头、深证 00 开头；排除 30/68/8/4 等板块。"""
     return code.startswith(("60", "00"))
 
 
 def is_non_st_name(name: str) -> bool:
-    """排除 ST、*ST、SST 以及名称里带退市标记的股票。"""
     normalized = name.upper().replace(" ", "")
     return "ST" not in normalized and "退" not in name
 
@@ -164,7 +189,6 @@ def normalize_stock_list(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def retry_call(label: str, attempts: int, func):
-    """对网络请求做有限重试。"""
     last_error: Exception | None = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
@@ -177,7 +201,6 @@ def retry_call(label: str, attempts: int, func):
 
 
 def fetch_stock_list(client: MarketClient, retries: int) -> pd.DataFrame:
-    """股票池依旧使用东方财富，只做静态过滤，不参与历史/实时行情。"""
     log("[股票池] 正在从东方财富获取 A 股列表...")
 
     def request():
@@ -190,135 +213,115 @@ def fetch_stock_list(client: MarketClient, retries: int) -> pd.DataFrame:
     return stocks
 
 
-def history_start_date(history_days: int) -> str:
-    return (dt.date.today() - dt.timedelta(days=history_days)).strftime("%Y-%m-%d")
+def market_code(code: str, dot_suffix: bool) -> str:
+    suffix = "SH" if code.startswith("6") else "SZ"
+    return f"{code}.{suffix}" if dot_suffix else f"{suffix.lower()}{code}"
 
 
-def fxyz_get(client: MarketClient, path: str, params: dict[str, str], retries: int) -> Any:
-    """调用 fxyz 接口并统一处理 code/message/data。"""
+def normalize_daily_frame(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(column).strip() for column in df.columns]
+    if "" in df.columns and "日期" not in df.columns:
+        df = df.rename(columns={"": "日期"})
+    if "日期" not in df.columns and "date" not in df.columns and "time" not in df.columns:
+        index_name = df.index.name or "日期"
+        df = df.reset_index().rename(columns={index_name: "日期", "index": "日期"})
+        df.columns = [str(column).strip() for column in df.columns]
+        if "" in df.columns and "日期" not in df.columns:
+            df = df.rename(columns={"": "日期"})
 
-    def request():
-        response = client.requests.get(f"{FXYZ_BASE_URL}{path}", params=params, timeout=20)
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict) and payload.get("code") not in (None, 0, "0", 200, "200"):
-            raise RuntimeError(f"{payload.get('message') or payload}")
-        return payload.get("data", payload) if isinstance(payload, dict) else payload
+    rename_map = {
+        "date": "日期",
+        "time": "日期",
+        "day": "日期",
+        "datetime": "日期",
+        "trade_date": "日期",
+        "close": "收盘",
+        "price": "收盘",
+        "now": "收盘",
+        "last": "收盘",
+        "high": "最高",
+        "volume": "成交量",
+        "vol": "成交量",
+    }
+    data = df.rename(columns={key: value for key, value in rename_map.items() if key in df.columns}).copy()
+    required = ["日期", "收盘", "最高", "成交量"]
+    missing = [column for column in required if column not in data.columns]
+    if missing:
+        raise ValueError(f"{code} 缺少字段: {missing}; columns={list(df.columns)}")
 
-    return retry_call(f"[fxyz] {path} {params.get('code', '')}", retries, request)
-
-
-def first_present(record: dict[str, Any], names: list[str]) -> Any:
-    for name in names:
-        if name in record and record[name] not in (None, ""):
-            return record[name]
-    return None
+    data = data[required].copy()
+    data["日期"] = pd.to_datetime(data["日期"]).dt.normalize()
+    for column in ["收盘", "最高", "成交量"]:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    return data.dropna(subset=required).sort_values("日期").reset_index(drop=True)
 
 
 def flatten_records(value: Any) -> list[dict[str, Any]]:
-    """兼容 data/list/items/kline 嵌套结构，提取记录列表。"""
     if isinstance(value, list):
         return [item for item in value if isinstance(item, dict)]
     if not isinstance(value, dict):
         return []
-
-    for key in ["list", "items", "rows", "data", "kline", "klines", "values"]:
-        child = value.get(key)
-        records = flatten_records(child)
+    for key in ["data", "list", "items", "rows", "kline", "klines"]:
+        records = flatten_records(value.get(key))
         if records:
             return records
-
-    # 实时接口常见返回是单个 dict。
-    if any(key in value for key in ["close", "price", "最新价", "成交量", "volume", "vol"]):
+    if any(key in value for key in ["close", "price", "high", "volume", "vol"]):
         return [value]
     return []
 
 
-def parse_date_value(value: Any) -> pd.Timestamp:
-    if value in (None, ""):
-        return pd.Timestamp.today().normalize()
-    if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
-        number = int(value)
-        unit = "ms" if number > 10_000_000_000 else "s"
-        return pd.to_datetime(number, unit=unit).normalize()
-    return pd.to_datetime(value).normalize()
+def fetch_ashare_daily(client: MarketClient, code: str, history_days: int, retries: int) -> pd.DataFrame:
+    assert client.ashare_get_price is not None
+    symbol = market_code(code, dot_suffix=False)
+
+    def request():
+        return client.ashare_get_price(symbol, frequency="1d", count=max(history_days, 80))
+
+    df = retry_call(f"[Ashare] {code}", retries, request)
+    return normalize_daily_frame(df if isinstance(df, pd.DataFrame) else pd.DataFrame(df), code)
 
 
-def normalize_kline_records(records: list[dict[str, Any]], code: str, realtime: bool = False) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for record in records:
-        close = first_present(record, ["close", "收盘", "c", "price", "最新价", "last", "now"])
-        high = first_present(record, ["high", "最高", "h"])
-        volume = first_present(record, ["volume", "成交量", "vol", "v"])
-        date_value = first_present(record, ["date", "日期", "time", "timestamp", "day", "trade_date", "datetime"])
+def zhitu_get(client: MarketClient, path: str, params: dict[str, str], retries: int) -> Any:
+    def request():
+        response = client.requests.get(f"{ZHITU_BASE_URL}{path}", params=params, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict) and str(payload.get("code", "0")) not in ("0", "200"):
+            raise RuntimeError(payload.get("message") or payload)
+        return payload.get("data", payload) if isinstance(payload, dict) else payload
 
-        # 实时快照如果没有 high，则用当前价作为最高价兜底；成交量必须存在，否则无法判断均量。
-        if realtime and high in (None, ""):
-            high = close
-        if close in (None, "") or high in (None, "") or volume in (None, ""):
-            continue
+    return retry_call(f"[智兔] {path}", retries, request)
 
-        rows.append(
-            {
-                "日期": parse_date_value(date_value),
-                "收盘": close,
-                "最高": high,
-                "成交量": volume,
-            }
-        )
 
-    if not rows:
-        raise ValueError(f"{code} 没有可解析的 K 线数据")
-
-    df = pd.DataFrame(rows)
-    for column in ["收盘", "最高", "成交量"]:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
-    return df.dropna(subset=["日期", "收盘", "最高", "成交量"]).sort_values("日期").reset_index(drop=True)
+def fetch_zhitu_daily(client: MarketClient, code: str, config: StrategyConfig, retries: int) -> pd.DataFrame:
+    symbol = market_code(code, dot_suffix=True)
+    end = dt.date.today().strftime("%Y-%m-%d")
+    start = (dt.date.today() - dt.timedelta(days=config.history_days)).strftime("%Y-%m-%d")
+    history = zhitu_get(
+        client,
+        f"/hs/history/{symbol}/d/{config.zhitu_adjust}",
+        {"token": client.zhitu_token, "st": start, "et": end},
+        retries,
+    )
+    latest = zhitu_get(
+        client,
+        f"/hs/latest/{symbol}/d/{config.zhitu_adjust}",
+        {"token": client.zhitu_token, "limit": "1"},
+        retries,
+    )
+    df = normalize_daily_frame(pd.DataFrame(flatten_records(history)), code)
+    latest_df = normalize_daily_frame(pd.DataFrame(flatten_records(latest)), code)
+    if not latest_df.empty:
+        df = df[df["日期"] != latest_df.iloc[-1]["日期"]]
+        df = pd.concat([df, latest_df.tail(1)], ignore_index=True)
+    return df.sort_values("日期").reset_index(drop=True)
 
 
 def fetch_daily_history(client: MarketClient, code: str, config: StrategyConfig, retries: int) -> pd.DataFrame:
-    data = fxyz_get(
-        client,
-        "/wolf/time/kline",
-        {
-            "symbol": "stock",
-            "code": code,
-            "period": config.period,
-            "cq": config.cq,
-            "startDate": history_start_date(config.history_days),
-            "endDate": "2050-01-01",
-            "token": client.token,
-        },
-        retries,
-    )
-    return normalize_kline_records(flatten_records(data), code)
-
-
-def fetch_realtime_row(client: MarketClient, code: str, retries: int) -> pd.Series:
-    data = fxyz_get(
-        client,
-        "/wolf/time",
-        {"symbol": "stock", "code": code, "token": client.token},
-        retries,
-    )
-    df = normalize_kline_records(flatten_records(data), code, realtime=True)
-    return df.iloc[-1]
-
-
-def merge_realtime_row(history: pd.DataFrame, realtime_row: pd.Series) -> pd.DataFrame:
-    """实时行情只用于覆盖/追加当天，判断今天是否满足买入条件。"""
-    realtime = pd.DataFrame(
-        [
-            {
-                "日期": realtime_row["日期"],
-                "收盘": realtime_row["收盘"],
-                "最高": realtime_row["最高"],
-                "成交量": realtime_row["成交量"],
-            }
-        ]
-    )
-    history = history[history["日期"] != realtime.iloc[0]["日期"]]
-    return pd.concat([history, realtime], ignore_index=True).sort_values("日期").reset_index(drop=True)
+    if client.provider == "ashare":
+        return fetch_ashare_daily(client, code, config.history_days, retries)
+    return fetch_zhitu_daily(client, code, config, retries)
 
 
 def add_volume_signal(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
@@ -348,23 +351,22 @@ def evaluate_stock(
     config: StrategyConfig,
     retries: int,
     sleep_seconds: float,
+    min_volume_ratio: float,
 ) -> StockResult | None:
     try:
-        history = fetch_daily_history(client, code, config, retries)
-        realtime_row = fetch_realtime_row(client, code, retries)
-        data = add_volume_signal(merge_realtime_row(history, realtime_row), config)
+        data = add_volume_signal(fetch_daily_history(client, code, config, retries), config)
         time.sleep(sleep_seconds)
-
         min_rows = config.long_volume_window + config.forward_days + config.recent_signal_count
         if len(data) < min_rows:
             return None
 
-        # 条件 1：用包含当天实时行情的最新一行判断今天是否可以买入。
         latest = data.iloc[-1]
         if not bool(latest["volume_signal"]):
             return None
+        volume_ratio = float(latest["avg_volume_12"] / latest["avg_volume_50"])
+        if volume_ratio < min_volume_ratio:
+            return None
 
-        # 条件 2：只用有完整后续 2 个交易日的历史信号统计胜率，不把今天信号纳入回看。
         eligible = data.iloc[: -config.forward_days].copy()
         signal_indices = eligible.index[eligible["volume_signal"]].tolist()[-config.recent_signal_count :]
         if len(signal_indices) < config.recent_signal_count:
@@ -388,6 +390,7 @@ def evaluate_stock(
             close=float(latest["收盘"]),
             avg_volume_12=float(latest["avg_volume_12"]),
             avg_volume_50=float(latest["avg_volume_50"]),
+            volume_ratio=volume_ratio,
             success_count=success_count,
             recent_signal_dates=",".join(data.loc[signal_indices, "日期"].dt.strftime("%Y-%m-%d")),
             recent_signal_returns=",".join(f"{value:.2%}" for value in returns),
@@ -405,6 +408,7 @@ def iter_results(
     retries: int,
     sleep_seconds: float,
     progress_interval: int,
+    min_volume_ratio: float,
 ) -> Iterable[StockResult]:
     total = len(stocks)
     completed = 0
@@ -415,7 +419,7 @@ def iter_results(
     log(f"[筛选] 开始并发筛选，共 {total} 只股票，线程数: {max(1, workers)}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = [
-            executor.submit(evaluate_stock, client, row.code, row.name, config, retries, sleep_seconds)
+            executor.submit(evaluate_stock, client, row.code, row.name, config, retries, sleep_seconds, min_volume_ratio)
             for row in stocks.itertuples(index=False)
         ]
         log(f"[筛选] 已提交 {len(futures)} 个股票任务，开始等待结果...")
@@ -431,25 +435,42 @@ def iter_results(
                 log(f"[筛选] 进度 {completed}/{total}，命中 {hits}，速度 {speed:.1f} 只/秒")
 
 
-def save_results(results: list[StockResult], output: str) -> None:
+def save_results(results: list[StockResult], output: str, keep_non_latest: bool) -> None:
     path = Path(output)
     log(f"[输出] 正在保存结果到 {path}...")
     path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(dataclasses.asdict(item) for item in results)
     if not df.empty:
-        df = df.sort_values(["success_count", "avg_volume_12"], ascending=[False, False])
+        if not keep_non_latest:
+            latest_signal_date = df["signal_date"].max()
+            before_count = len(df)
+            df = df[df["signal_date"] == latest_signal_date].copy()
+            log(f"[过滤] 只保留最新交易日 {latest_signal_date} 信号: {before_count} -> {len(df)}")
+        df = df.sort_values(["success_count", "volume_ratio", "avg_volume_12"], ascending=[False, False, False])
     df.to_csv(path, index=False, encoding="utf-8-sig")
     log(f"[完成] 筛选完成，共 {len(df)} 只股票满足条件，结果已保存: {path}")
 
 
 def main() -> None:
     args = parse_args()
-    config = StrategyConfig(history_days=args.history_days, cq=args.cq, period=args.period)
-    client = load_market_client(args.fxyz_token)
+    config = StrategyConfig(history_days=args.history_days, zhitu_adjust=args.zhitu_adjust)
+    client = load_market_client(args.provider, args.zhitu_token)
     stocks = fetch_stock_list(client, args.retries)
-    log(f"[配置] 行情数据源: fxyz，股票池: 东方财富，待筛选股票数: {len(stocks)}")
-    results = list(iter_results(client, stocks, config, args.workers, args.retries, args.sleep, args.progress_interval))
-    save_results(results, args.output)
+    log(f"[配置] 行情 provider: {client.provider}，股票池: 东方财富，待筛选股票数: {len(stocks)}")
+    log(f"[配置] 量能倍数阈值: {args.min_volume_ratio}，仅最新交易日: {not args.keep_non_latest}")
+    results = list(
+        iter_results(
+            client,
+            stocks,
+            config,
+            args.workers,
+            args.retries,
+            args.sleep,
+            args.progress_interval,
+            args.min_volume_ratio,
+        )
+    )
+    save_results(results, args.output, args.keep_non_latest)
 
 
 if __name__ == "__main__":
