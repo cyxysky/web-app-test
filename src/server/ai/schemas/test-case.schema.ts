@@ -72,6 +72,37 @@ export type StepExecutionResult = {
   screenshotPath?: string;
   beforeScreenshotPath?: string;
   afterScreenshotPath?: string;
+  visualContext?: {
+    current?: VisualFrameRecord;
+    history: VisualFrameRecord[];
+  };
+  workingMemory?: RuntimeWorkingMemory;
+};
+
+export type VisualFrameRecord = {
+  id: string;
+  path: string;
+  markerPath?: string;
+  role: 'current' | 'history' | 'pinned';
+  reason: string;
+  group?: string;
+  stepIndex: number;
+  toolName?: string;
+  createdAt: string;
+};
+
+export type RuntimeWorkingMemory = {
+  taskGoal: string;
+  phase: string;
+  completed: string[];
+  findings: string[];
+  blockers: string[];
+  lastAction?: string;
+  lastResult?: string;
+  pageUnderstanding?: string;
+  scrollSummary?: string;
+  userConstraints: string[];
+  nextStep?: string;
 };
 
 export type AiRequestSnapshot = {
@@ -99,6 +130,16 @@ export type StepToolCall = {
   reason?: string;
   ok?: boolean;
   result?: string;
+  visualAfter?: {
+    capture?: 'auto' | 'viewport' | 'fullPage' | 'region' | 'none';
+    retention?: 'auto' | 'replace' | 'append' | 'appendScrollSequence' | 'keepBeforeAfter' | 'clearAndReplace' | 'pinEvidence';
+    reason?: string;
+  };
+  screenshots?: Array<{
+    title: string;
+    path: string;
+    kind?: 'current' | 'history' | 'pinned' | 'after' | 'marker' | 'other';
+  }>;
 };
 
 export type TestGroupRecord = {

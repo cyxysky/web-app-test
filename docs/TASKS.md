@@ -1,91 +1,221 @@
-# AI 自动化 Web 测试应用任务文档
+进行修改
+1.进入 Agent Loop
+每一步循环：
+AI 看到当前视觉上下文
+AI 选择一个工具操作
+工具执行浏览器动作
+系统等待页面稳定
+系统自动截取新图并重新编号
+Visual Context Manager 判断新图是 replace、append、保留 before/after，还是清空旧图
+保存完整步骤记录
+更新 working memory
+进入下一步
+2.增加 Visual Context Manager
+新增一个核心模块：Visual Context Manager。
+它负责管理当前给 AI 看的图片，而不是让 AI SDK 默认把所有图片历史都累积进 messages。
+它内部维护几类图片：
+current：
+当前可操作截图。
+这是唯一允许 AI 使用编号进行点击、输入、滚动定位的截图。
+history：
+历史截图，只能参考，不能操作。
+3.所有操作工具增加 visualAfter 参数
+每个工具都允许 AI 声明操作后的截图处理方式。
+visualAfter 可以包含：
+capture：
+auto
+viewport
+fullPage
+region
+none
+retention：
+auto
+replace
+append
+appendScrollSequence
+keepBeforeAfter
+clearAndReplace
+pinEvidence
+例如点击普通按钮：
+visualAfter.retention = replace
+例如滚动长页面：
+visualAfter.retention = appendScrollSequence
+例如点击展开按钮：
+visualAfter.retention = keepBeforeAfter
+例如进入新页面：
+visualAfter.retention = clearAndReplace
+例如发现关键证据：
+visualAfter.retention = pinEvidence
+4.新增 manageVisualContext 工具
+可以增加一个低频工具：
+manageVisualContext。
+用途：
+清理历史图片
+只保留最新图片
+固定当前图为证据
+压缩滚动序列
+5.使用 AI SDK 的 agent loop。
 
-## 任务目标
+可以用：
 
-在 `web-app-test` 目录下生成一个 Node.js 测试应用。应用需要覆盖 Dashboard、AI 对话生成测试用例、图片上传、测试执行、浏览器自动化、测试报告输出等完整流程。
+streamText 或 generateText
+tools
+stopWhen
+prepareStep
+onStepFinish
 
-## 用户流程要求
+整体结构：
 
-- [x] 用户进入 Dashboard 页面。
-- [x] Dashboard 展示历史测试用例列表。
-- [x] 用户可以新建测试用例。
-- [x] 新建流程通过 AI 对话完成。
-- [x] 用户可以上传图片作为 AI 生成测试用例的上下文。
-- [x] AI 生成完整测试用例流程。
-- [x] 用户选择或新建测试用例后可进入测试阶段。
-- [x] 测试阶段由 AI/Agent 调用浏览器执行测试。
-- [x] 测试完成后输出详细测试文档。
-- [x] 用户在整个流程中只需要提供提示词、文本和图片。
+初始化第一张截图
 
-## 技术要求
+把 currentFrame 放入 Visual Context Manager
 
-- [x] 使用 Node.js 应用结构。
-- [x] 使用 Next.js 作为 Web 应用框架。
-- [x] 使用 AI SDK 作为 AI 框架。
-- [x] 使用 Playwright 作为浏览器自动化执行层。
-- [x] 使用 Zod 定义 AI 结构化输出。
-- [x] 预留 Prisma 数据模型。
-- [x] 支持无 API Key 的本地 fallback，便于本地启动体验。
+进入 streamText / generateText
 
-## Agent 任务拆分
+每一步：
 
-- [x] 创建测试用例生成 Agent：`TestCaseGeneratorAgent`。
-- [x] 创建测试执行 Agent：`TestExecutorAgent`。
-- [x] 创建报告生成 Agent：`ReportWriterAgent`。
-- [x] 创建浏览器执行封装：`BrowserSession`。
-- [x] 创建安全域名校验与执行拦截。
+prepareStep 重新构建 messages
 
-## 页面任务
+AI 调用工具
 
-- [x] 创建首页重定向到 Dashboard。
-- [x] 创建 Dashboard 页面。
-- [x] 创建测试用例详情页。
-- [x] 创建测试运行报告页。
-- [x] 创建图片上传与提示词输入表单。
-- [x] 创建测试执行入口。
+工具执行后自动截图
 
-## API 任务
+Visual Context Manager 更新图片上下文
 
-- [x] `GET /api/test-cases`：获取测试用例列表。
-- [x] `POST /api/test-cases/generate`：基于提示词和图片生成测试用例。
-- [x] `POST /api/test-cases/:id/run`：执行指定测试用例。
-- [x] `GET /api/runs/:runId`：获取测试运行状态。
-- [x] `GET /api/runs/:runId/report`：获取测试报告。
-- [x] `POST /api/uploads`：接收图片上传。
+onStepFinish 记录步骤并更新 memory
 
-## 数据模型任务
+继续下一步
 
-- [x] 设计 `User` 模型。
-- [x] 设计 `TestCase` 模型。
-- [x] 设计 `TestRun` 模型。
-- [x] 设计 `Artifact` 模型。
-- [x] 设计 JSON 字段保存结构化测试用例、执行结果和报告。
+prepareStep 的职责
 
-## 安全要求
+prepareStep 是上下文控制的关键。
 
-- [x] 域名白名单校验。
-- [x] 高风险操作标记。
-- [x] 报告输出中避免暴露敏感凭据。
-- [x] 执行层集中封装，避免 Agent 直接访问任意系统能力。
+它不要直接沿用完整历史 messages。
 
-## 已完成产物
+每一步都重新构造模型上下文。
 
-- [x] 项目配置文件：`package.json`、`tsconfig.json`、`next.config.ts`。
-- [x] 应用页面：`src/app`。
-- [x] API 路由：`src/app/api`。
-- [x] AI Agent：`src/server/ai/agents`。
-- [x] 浏览器执行封装：`src/server/browser`。
-- [x] 报告生成模块：`src/server/reports`。
-- [x] 数据库设计：`prisma/schema.prisma`。
-- [x] 任务文档：`docs/TASKS.md`。
+包含：
 
-## 后续可增强任务
+system prompt
+用户任务目标
+当前 working memory
+最近 3 到 5 步文字摘要
+当前 Visual Context Manager 渲染出的图片上下文
+当前工具规则
+6.工作记忆 Working Memory
 
-- [ ] 接入真实 PostgreSQL 持久化，替换内存存储。
-- [ ] 增加 BullMQ 队列与 Worker 进程。
-- [ ] 增加 WebSocket 或 SSE 实时执行日志。
-- [ ] 增加 PDF 导出。
-- [ ] 增加 Playwright trace viewer。
-- [ ] 增加多浏览器并发执行。
-- [ ] 增加团队、项目、权限管理。
-- [ ] 增加 CI/CD 集成入口。
+不要把每一步完整过程都传给 AI。
+
+维护一个短 working memory。
+
+内容包括：
+
+任务目标
+当前阶段
+已完成事项
+重要发现
+阻塞点
+最近一次动作
+最近一次结果
+当前页面理解
+滚动阅读摘要
+用户限制条件
+
+例如：
+
+当前阶段：
+
+正在查看搜索结果列表。
+
+已完成：
+
+已经打开目标网页，输入关键词并提交搜索。
+
+重要发现：
+
+列表中前 3 项没有符合条件的结果。
+
+滚动摘要：
+
+已查看页面顶部和第一屏结果，当前位于结果列表中段。
+
+下一步：
+
+继续向下滚动，查找目标按钮。
+7.最终报告生成
+
+最终报告不要只依赖 agent 最后一轮。
+
+应该基于完整 trace store 生成。
+
+报告内容：
+
+用户目标
+执行结果
+关键步骤
+成功路径
+失败点
+页面变化
+关键截图
+AI 判断依据
+工具调用记录
+建议优化
+下次执行策略
+基于这些点进行修改
+
+ai loop时进行上下文检测，超过70，将历史上下文内容压缩，并新开一个对话轮次
+
+
+已完成
+已按你的架构方向做了一版可运行改造，核心链路现在变成：
+
+prepareStep 重建上下文 -> AI 调一个工具 -> 工具执行 -> 系统等待稳定 -> 自动截图并重新编号 -> Visual Context Manager 更新 current/history -> 更新 working memory -> 下一轮继续
+
+主要改动：
+
+新增 VisualContextManager
+
+维护 current 和 history
+current 是唯一允许 AI 使用编号操作的截图
+history 只作为参考
+支持 replace / append / appendScrollSequence / keepBeforeAfter / clearAndReplace / pinEvidence
+所有工具参数增加 visualAfter
+
+工具执行后会自动截图
+自动调用 takeScreenshot(..., visual-N)
+visual-N 截图会重新生成候选编号
+截图路径写入工具 trace，前端和报告都能展示
+新增 manageVisualContext 工具
+
+clearHistory
+keepLatestOnly
+pinCurrent
+compressScrollSequence
+runtime loop 改成 prepareStep 模式
+
+不再把完整 messages 历史一直塞给模型
+每轮重新构建上下文
+包含任务目标、working memory、最近工具摘要、VCM 图片上下文
+图片由 VCM 控制，现读现传
+新增 workingMemory
+
+保存阶段、已完成、发现、阻塞、最近动作、最近结果、页面理解、滚动摘要、下一步等
+每次工具调用后根据 tool input/result 更新
+步骤记录扩展
+
+visualContext
+workingMemory
+tool.visualAfter
+tool.screenshots
+前端运行页更新
+
+工具调用下面展示自动截图缩略图
+点击可放大查看
+图片总览也会包含工具截图
+报告生成更新
+
+工具调用会输出 visualAfter
+工具自动截图会进入最终报告
+验证：npm run typecheck 通过。没有跑 npm run build。
+
+一个注意点：visualAfter.capture 目前 schema 支持 auto / viewport / fullPage / region / none，但实际第一版执行里 auto/viewport/fullPage/region 都先按 viewport 截图处理；fullPage/region 后面可以继续扩展到真实全页/区域截图。

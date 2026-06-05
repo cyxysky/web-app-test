@@ -402,7 +402,7 @@ export class BrowserSession {
 
   // 截取当前 viewport。视觉标识模式默认把候选编号叠加到 before 截图；
   // 仅在 VISUAL_MARKER_SEPARATE_MAP=true 时额外生成一张像素对齐的纯标识图。
-  async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' = 'after') {
+  async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after') {
     const stabilizeMs = Number(process.env.SCREENSHOT_STABILIZE_MS || 1000);
     if (Number.isFinite(stabilizeMs) && stabilizeMs > 0) {
       await this.waitForStableViewport(Math.min(Math.max(stabilizeMs, 0), 5000));
@@ -411,7 +411,7 @@ export class BrowserSession {
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    const shouldCaptureCandidates = phase === 'before';
+    const shouldCaptureCandidates = phase === 'before' || String(phase).startsWith('visual-');
     const candidateLabelsEnabled = shouldCaptureCandidates
       && this.mode === 'visual-markers'
       && this.options.isMarked !== false
@@ -439,7 +439,7 @@ export class BrowserSession {
     // 默认把标识直接叠到当前截图上；只有兼容旧链路时才额外生成纯 marker 图。
     const separateMarkerMap = candidateLabelsEnabled && shouldUseSeparateMarkerMap();
     await this.removeCandidateOverlay();
-    if (phase === 'before') await this.removeClickMarker();
+    if (phase === 'before' || String(phase).startsWith('visual-')) await this.removeClickMarker();
     if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
       await this.drawCandidateOverlay(
         candidateLabelsEnabled ? candidates : [],
@@ -455,7 +455,7 @@ export class BrowserSession {
       }
     }
     if (separateMarkerMap) {
-      const markerFilePath = path.join(dir, `step-${stepIndex}-before-markers.png`);
+      const markerFilePath = path.join(dir, `step-${stepIndex}-${phase}-markers.png`);
       await this.drawCandidateOverlay(candidates, true, scrollAreaLabelsEnabled ? scrollAreas : []);
       try {
         await this.activePage.screenshot({ path: markerFilePath, fullPage: false, scale: 'css', timeout: 15000 });

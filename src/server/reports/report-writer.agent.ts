@@ -33,17 +33,23 @@ function formatToolInput(input: unknown) {
 
 // 生成单个步骤的工具调用 markdown 片段。
 function toolMarkdown(step: StepExecutionResult) {
-  if (!step.tools?.length) return '- 工具调用：无';
+  if (!step.tools?.length) return '- ??????';
   return [
-    '- 工具调用：',
+    '- ?????',
     ...step.tools.map((tool) => {
       const input = formatToolInput(tool.input);
-      return `  - ${tool.name}${input ? ` ${input}` : ''}${tool.reason ? `\n    - 调用原因：${tool.reason}` : ''}`;
+      const shots = (tool.screenshots || [])
+        .map((shot) => {
+          const url = artifactUrl(shot.path);
+          return url ? `    - ![${shot.title}](${url})` : '';
+        })
+        .filter(Boolean)
+        .join('\n');
+      return `  - ${tool.name}${input ? ` ${input}` : ''}${tool.reason ? `\n    - ?????${tool.reason}` : ''}${tool.visualAfter ? `\n    - visualAfter: ${formatToolInput(tool.visualAfter)}` : ''}${shots ? `\n${shots}` : ''}`;
     }),
   ].join('\n');
 }
 
-// 生成单个执行步骤的 markdown，包含执行前后截图和工具调用。
 function stepMarkdown(step: StepExecutionResult) {
   const before = artifactUrl(step.beforeScreenshotPath);
   const after = artifactUrl(step.afterScreenshotPath || step.screenshotPath);

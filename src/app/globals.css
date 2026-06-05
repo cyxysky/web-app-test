@@ -2595,6 +2595,44 @@ select {
   white-space: pre-wrap;
 }
 
+.tool-shot-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.tool-shot-button {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: zoom-in;
+  display: grid;
+  gap: 6px;
+  overflow: hidden;
+  padding: 6px;
+  text-align: left;
+}
+
+.tool-shot-button:hover {
+  border-color: #304081;
+  box-shadow: 0 8px 20px rgba(36, 47, 58, 0.1);
+}
+
+.tool-shot-button img {
+  aspect-ratio: 16 / 9;
+  background: var(--panel-soft);
+  border-radius: 6px;
+  object-fit: cover;
+  width: 100%;
+}
+
+.tool-shot-button span {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 750;
+  overflow-wrap: anywhere;
+}
+
 .tool-call-reason {
   background: #ffffff;
   border-left: 3px solid #304081;

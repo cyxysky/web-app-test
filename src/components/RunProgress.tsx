@@ -70,10 +70,27 @@ function collectStepImages(steps: StepExecutionResult[]) {
   for (const step of steps) {
     const before = artifactUrl(step.beforeScreenshotPath);
     const after = artifactUrl(step.afterScreenshotPath || step.screenshotPath);
-    if (before) images.push({ title: `步骤 ${step.index} 执行前截图`, url: before });
-    if (after) images.push({ title: `步骤 ${step.index} 执行后截图`, url: after });
+    if (before) images.push({ title: `Step ${step.index} before screenshot`, url: before });
+    if (after) images.push({ title: `Step ${step.index} after screenshot`, url: after });
+    for (const tool of step.tools || []) {
+      for (const [shotIndex, shot] of (tool.screenshots || []).entries()) {
+        const url = artifactUrl(shot.path);
+        if (url) images.push({ title: `Step ${step.index} ? ${tool.name} ? ${shot.title || `visual ${shotIndex + 1}`}`, url });
+      }
+    }
   }
   return images;
+}
+
+function toolScreenshotItems(step: StepExecutionResult, toolIndex: number) {
+  const tool = step.tools?.[toolIndex];
+  if (!tool?.screenshots?.length) return [];
+  const items: ImageItem[] = [];
+  for (const [shotIndex, shot] of tool.screenshots.entries()) {
+    const url = artifactUrl(shot.path);
+    if (url) items.push({ title: shot.title || `${tool.name} visual ${shotIndex + 1}`, url });
+  }
+  return items;
 }
 
 function DebugEventRow({ event }: { event: RunDebugEvent }) {
@@ -478,10 +495,22 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                       <ol className="tool-call-list">
                         {selectedStep.tools.map((tool, index) => {
                           const input = formatToolInput(tool.input);
+                          const screenshots = toolScreenshotItems(selectedStep, index);
                           return (
                             <li key={`${tool.name}-${index}`}>
                               <strong>{tool.name}</strong>
                               {input ? <code>{input}</code> : null}
+                              {screenshots.length ? (
+                                <div className="tool-shot-grid">
+                                  {screenshots.map((shot) => (
+                                    <button className="tool-shot-button" key={shot.url} onClick={() => openImageByUrl(shot.url)} type="button">
+                                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                                      <img alt={shot.title} src={shot.url} />
+                                      <span>{shot.title}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              ) : null}
                             </li>
                           );
                         })}
