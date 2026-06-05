@@ -10,10 +10,10 @@ A 股量化筛选脚本。
 
 策略条件:
   0. 股票池只保留沪深主板，排除创业板、科创板、北交所和 ST/退市股票。
-  1. 使用当天最新日 K 判断：近 12 日平均成交量 > 近 50 日平均成交量。
-  2. 最近 5 次满足条件 1 的历史信号中，按信号日收盘价买入后，
-     后续 2 个交易日内最高价涨幅 > 5% 的成功次数 > 4。
-  3. 默认只保留量能倍数 >= 1.5，且只保留最新交易日信号。
+  1. 同花顺买入口径：上一交易日刚触发“近 12 日平均成交量 > 近 50 日平均成交量”，
+     当前最新交易日作为买入日。
+  2. 历史胜率默认只计算展示，不作为过滤条件；需要时可用 --min-success-count 开启。
+  3. 默认过滤信号日涨幅 > 5% 的次日追高信号，且只保留最新买入日信号。
 
 数据源:
   股票池：akshare / 东方财富。
@@ -44,7 +44,10 @@ ZHITU_BASE_URL = "https://api.zhituapi.com"
 @dataclasses.dataclass(frozen=True)
 class StrategyConfig:
     short_volume_window: int = 12
-    long_volume_window: int = 50
+    long_volume_window: int = 20
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
     recent_signal_count: int = 5
     forward_days: int = 2
     profit_threshold: float = 0.05
@@ -57,10 +60,11 @@ class StockResult:
     code: str
     name: str
     signal_date: str
+    buy_date: str
     close: float
-    avg_volume_12: float
-    avg_volume_50: float
-    volume_ratio: float
+    signal_fast: float
+    signal_slow: float
+    signal_score: float
     success_count: int
     recent_signal_dates: str
     recent_signal_returns: str
@@ -84,7 +88,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4, help="并发拉取股票行情的线程数。")
     parser.add_argument("--sleep", type=float, default=0.05, help="每只股票请求后的休眠秒数，避免数据源限流。")
     parser.add_argument("--history-days", type=int, default=420, help="向前拉取的自然日数量。")
-    parser.add_argument("--min-volume-ratio", type=float, default=1.5, help="近 12 日均量 / 近 50 日均量阈值，默认 1.5。")
+    parser.add_argument("--short-volume-window", type=int, default=12, help="短周期均量窗口，默认 12。")
+    parser.add_argument("--long-volume-window", type=int, default=20, help="长周期均量窗口，默认 20。")
+    parser.add_argument("--min-volume-ratio", type=float, default=1.0, help="短周期均量 / 长周期均量阈值，默认 1.0。")
+    parser.add_argument("--signal-type", default="volume", choices=["volume", "macd"], help="信号类型：volume 均量策略；macd MACD 金叉。")
+    parser.add_argument("--macd-fast", type=int, default=12, help="MACD 快线 EMA 周期，默认 12。")
+    parser.add_argument("--macd-slow", type=int, default=26, help="MACD 慢线 EMA 周期，默认 26。")
+    parser.add_argument("--macd-signal", type=int, default=9, help="MACD 信号线 DEA 周期，默认 9。")
+    parser.add_argument(
+        "--entry-mode",
+        default="ths-pullback-today",
+        choices=["ths-pullback-today", "ths-buy-today", "latest-signal"],
+        help=(
+            "买入口径：ths-pullback-today=上一交易日刚触发、今天放量回落确认；"
+            "ths-buy-today=上一交易日刚触发、今天买入；latest-signal=最新交易日持续满足即可。"
+        ),
+    )
+    parser.add_argument(
+        "--min-success-count",
+        type=int,
+        default=0,
+        help="最近 5 次历史信号中，2 日内最高价涨幅 >5%% 的最少次数；0 表示不按历史胜率过滤。",
+    )
+    parser.add_argument(
+        "--max-signal-day-pct-change",
+        type=float,
+        default=0.05,
+        help="ths-buy-today 模式下，信号日自身最大涨幅；默认 0.05，用于过滤信号日已大涨的次日追高。",
+    )
     parser.add_argument("--keep-non-latest", action="store_true", help="保留非最新交易日信号。默认只保留最新交易日。")
     parser.add_argument("--retries", type=int, default=3, help="接口请求失败后的重试次数。")
     parser.add_argument("--progress-interval", type=int, default=50, help="每完成多少只股票输出一次进度。")
@@ -332,6 +363,27 @@ def add_volume_signal(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     return data
 
 
+def add_macd_signal(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
+    data = df.copy()
+    fast = data["收盘"].ewm(span=config.macd_fast, adjust=False).mean()
+    slow = data["收盘"].ewm(span=config.macd_slow, adjust=False).mean()
+    data["macd_dif"] = fast - slow
+    data["macd_dea"] = data["macd_dif"].ewm(span=config.macd_signal, adjust=False).mean()
+    data["macd_hist"] = (data["macd_dif"] - data["macd_dea"]) * 2
+    data["volume_signal"] = data["macd_dif"] > data["macd_dea"]
+    data["avg_volume_12"] = data["macd_dif"]
+    data["avg_volume_50"] = data["macd_dea"]
+    return data
+
+
+def add_strategy_signal(df: pd.DataFrame, config: StrategyConfig, signal_type: str) -> pd.DataFrame:
+    if signal_type == "volume":
+        return add_volume_signal(df, config)
+    if signal_type == "macd":
+        return add_macd_signal(df, config)
+    raise ValueError(f"未知 signal_type: {signal_type}")
+
+
 def forward_max_return(data: pd.DataFrame, signal_index: int, config: StrategyConfig) -> float | None:
     start = signal_index + 1
     end = signal_index + config.forward_days + 1
@@ -344,6 +396,31 @@ def forward_max_return(data: pd.DataFrame, signal_index: int, config: StrategyCo
     return float(future["最高"].max() / buy_close - 1)
 
 
+def is_new_volume_signal(data: pd.DataFrame, index: int) -> bool:
+    if index <= 0:
+        return bool(data.iloc[index]["volume_signal"])
+    return bool(data.iloc[index]["volume_signal"]) and not bool(data.iloc[index - 1]["volume_signal"])
+
+
+def select_entry_indices(data: pd.DataFrame, entry_mode: str) -> tuple[int, int] | None:
+    if entry_mode == "latest-signal":
+        latest_index = len(data) - 1
+        if not bool(data.iloc[latest_index]["volume_signal"]):
+            return None
+        return latest_index, latest_index
+
+    if entry_mode in ("ths-buy-today", "ths-pullback-today"):
+        if len(data) < 2:
+            return None
+        signal_index = len(data) - 2
+        buy_index = len(data) - 1
+        if not is_new_volume_signal(data, signal_index):
+            return None
+        return signal_index, buy_index
+
+    raise ValueError(f"未知 entry_mode: {entry_mode}")
+
+
 def evaluate_stock(
     client: MarketClient,
     code: str,
@@ -352,45 +429,75 @@ def evaluate_stock(
     retries: int,
     sleep_seconds: float,
     min_volume_ratio: float,
+    entry_mode: str,
+    signal_type: str,
+    min_success_count: int,
+    max_signal_day_pct_change: float | None,
 ) -> StockResult | None:
     try:
-        data = add_volume_signal(fetch_daily_history(client, code, config, retries), config)
+        data = add_strategy_signal(fetch_daily_history(client, code, config, retries), config, signal_type)
         time.sleep(sleep_seconds)
         min_rows = config.long_volume_window + config.forward_days + config.recent_signal_count
         if len(data) < min_rows:
             return None
 
-        latest = data.iloc[-1]
-        if not bool(latest["volume_signal"]):
+        entry_indices = select_entry_indices(data, entry_mode)
+        if entry_indices is None:
             return None
-        volume_ratio = float(latest["avg_volume_12"] / latest["avg_volume_50"])
-        if volume_ratio < min_volume_ratio:
-            return None
+        signal_index, buy_index = entry_indices
+        signal_row = data.iloc[signal_index]
+        buy_row = data.iloc[buy_index]
+
+        if entry_mode == "ths-pullback-today":
+            if float(buy_row["收盘"]) >= float(signal_row["收盘"]):
+                return None
+            if float(buy_row["成交量"]) <= float(signal_row["成交量"]):
+                return None
+
+        if entry_mode == "ths-buy-today" and max_signal_day_pct_change is not None and signal_index > 0:
+            previous_close = float(data.iloc[signal_index - 1]["收盘"])
+            if previous_close > 0:
+                signal_day_pct_change = float(signal_row["收盘"] / previous_close - 1)
+                if signal_day_pct_change > max_signal_day_pct_change:
+                    return None
+
+        if signal_type == "macd":
+            signal_fast = float(signal_row["macd_dif"])
+            signal_slow = float(signal_row["macd_dea"])
+            signal_score = float(signal_row["macd_hist"])
+        else:
+            signal_fast = float(signal_row["avg_volume_12"])
+            signal_slow = float(signal_row["avg_volume_50"])
+            signal_score = float(signal_row["avg_volume_12"] / signal_row["avg_volume_50"])
+            if signal_score < min_volume_ratio:
+                return None
 
         eligible = data.iloc[: -config.forward_days].copy()
         signal_indices = eligible.index[eligible["volume_signal"]].tolist()[-config.recent_signal_count :]
-        if len(signal_indices) < config.recent_signal_count:
+        if min_success_count > 0 and len(signal_indices) < config.recent_signal_count:
             return None
 
         returns: list[float] = []
-        for signal_index in signal_indices:
-            value = forward_max_return(data, signal_index, config)
-            if value is None:
+        for historical_signal_index in signal_indices:
+            value = forward_max_return(data, historical_signal_index, config)
+            if value is None and min_success_count > 0:
                 return None
-            returns.append(value)
+            if value is not None:
+                returns.append(value)
 
         success_count = sum(value > config.profit_threshold for value in returns)
-        if success_count <= 4:
+        if min_success_count > 0 and success_count < min_success_count:
             return None
 
         return StockResult(
             code=code,
             name=name,
-            signal_date=latest["日期"].strftime("%Y-%m-%d"),
-            close=float(latest["收盘"]),
-            avg_volume_12=float(latest["avg_volume_12"]),
-            avg_volume_50=float(latest["avg_volume_50"]),
-            volume_ratio=volume_ratio,
+            signal_date=signal_row["日期"].strftime("%Y-%m-%d"),
+            buy_date=buy_row["日期"].strftime("%Y-%m-%d"),
+            close=float(buy_row["收盘"]),
+            signal_fast=signal_fast,
+            signal_slow=signal_slow,
+            signal_score=signal_score,
             success_count=success_count,
             recent_signal_dates=",".join(data.loc[signal_indices, "日期"].dt.strftime("%Y-%m-%d")),
             recent_signal_returns=",".join(f"{value:.2%}" for value in returns),
@@ -409,6 +516,10 @@ def iter_results(
     sleep_seconds: float,
     progress_interval: int,
     min_volume_ratio: float,
+    entry_mode: str,
+    signal_type: str,
+    min_success_count: int,
+    max_signal_day_pct_change: float | None,
 ) -> Iterable[StockResult]:
     total = len(stocks)
     completed = 0
@@ -419,7 +530,20 @@ def iter_results(
     log(f"[筛选] 开始并发筛选，共 {total} 只股票，线程数: {max(1, workers)}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = [
-            executor.submit(evaluate_stock, client, row.code, row.name, config, retries, sleep_seconds, min_volume_ratio)
+            executor.submit(
+                evaluate_stock,
+                client,
+                row.code,
+                row.name,
+                config,
+                retries,
+                sleep_seconds,
+                min_volume_ratio,
+                entry_mode,
+                signal_type,
+                min_success_count,
+                max_signal_day_pct_change,
+            )
             for row in stocks.itertuples(index=False)
         ]
         log(f"[筛选] 已提交 {len(futures)} 个股票任务，开始等待结果...")
@@ -442,22 +566,36 @@ def save_results(results: list[StockResult], output: str, keep_non_latest: bool)
     df = pd.DataFrame(dataclasses.asdict(item) for item in results)
     if not df.empty:
         if not keep_non_latest:
-            latest_signal_date = df["signal_date"].max()
+            date_column = "buy_date" if "buy_date" in df.columns else "signal_date"
+            latest_signal_date = df[date_column].max()
             before_count = len(df)
-            df = df[df["signal_date"] == latest_signal_date].copy()
-            log(f"[过滤] 只保留最新交易日 {latest_signal_date} 信号: {before_count} -> {len(df)}")
-        df = df.sort_values(["success_count", "volume_ratio", "avg_volume_12"], ascending=[False, False, False])
+            df = df[df[date_column] == latest_signal_date].copy()
+            log(f"[过滤] 只保留最新交易日 {latest_signal_date} 买入信号: {before_count} -> {len(df)}")
+        df = df.sort_values(["success_count", "signal_score", "signal_fast"], ascending=[False, False, False])
     df.to_csv(path, index=False, encoding="utf-8-sig")
     log(f"[完成] 筛选完成，共 {len(df)} 只股票满足条件，结果已保存: {path}")
 
 
 def main() -> None:
     args = parse_args()
-    config = StrategyConfig(history_days=args.history_days, zhitu_adjust=args.zhitu_adjust)
+    config = StrategyConfig(
+        short_volume_window=args.short_volume_window,
+        long_volume_window=args.long_volume_window,
+        macd_fast=args.macd_fast,
+        macd_slow=args.macd_slow,
+        macd_signal=args.macd_signal,
+        history_days=args.history_days,
+        zhitu_adjust=args.zhitu_adjust,
+    )
     client = load_market_client(args.provider, args.zhitu_token)
     stocks = fetch_stock_list(client, args.retries)
     log(f"[配置] 行情 provider: {client.provider}，股票池: 东方财富，待筛选股票数: {len(stocks)}")
-    log(f"[配置] 量能倍数阈值: {args.min_volume_ratio}，仅最新交易日: {not args.keep_non_latest}")
+    log(
+        f"[配置] signal_type: {args.signal_type}，entry_mode: {args.entry_mode}，量能倍数阈值: {args.min_volume_ratio}，"
+        f"MACD: {args.macd_fast}/{args.macd_slow}/{args.macd_signal}，"
+        f"历史胜率最少成功次数: {args.min_success_count}，"
+        f"信号日最大涨幅: {args.max_signal_day_pct_change}，仅最新交易日: {not args.keep_non_latest}"
+    )
     results = list(
         iter_results(
             client,
@@ -468,6 +606,10 @@ def main() -> None:
             args.sleep,
             args.progress_interval,
             args.min_volume_ratio,
+            args.entry_mode,
+            args.signal_type,
+            args.min_success_count,
+            args.max_signal_day_pct_change,
         )
     )
     save_results(results, args.output, args.keep_non_latest)

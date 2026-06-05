@@ -6,11 +6,18 @@ import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import type { generateText } from 'ai';
 import { createCodexCli, type ReasoningEffort } from 'ai-sdk-provider-codex-cli';
 import { createGeminiProvider } from 'ai-sdk-provider-gemini-cli';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+
 
 type GenerateTextModel = Parameters<typeof generateText>[0]['model'];
 type AiProvider = 'azure-openai' | 'codex' | 'deepseek' | 'gemini' | 'google' | 'openai' | 'openrouter';
 type ApprovalMode = 'never' | 'on-failure' | 'on-request' | 'untrusted';
 type SandboxMode = 'danger-full-access' | 'read-only' | 'workspace-write';
+
+const lmstudio = createOpenAICompatible({
+  name: 'lmstudio',
+  baseURL: 'http://localhost:1234/v1',
+})('qwen3-vl-2b-instruct');
 
 const gemini = createGeminiProvider({ authType: 'oauth-personal' });
 
@@ -49,6 +56,7 @@ const codexCli = createCodexCli({
 });
 
 export function getModel(): GenerateTextModel {
+  return lmstudio;
   const { provider, model } = getModelSettings();
   if (provider === 'gemini') return gemini(model) as unknown as GenerateTextModel;
   if (provider === 'codex') return codexCli(model) as unknown as GenerateTextModel;
