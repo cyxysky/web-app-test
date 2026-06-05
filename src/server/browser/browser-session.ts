@@ -1,7 +1,7 @@
 import { fsync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { Browser, Frame, Page } from 'playwright';
+import type { Browser, BrowserContext, Frame, Page } from 'playwright';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
   if (errorText === 'net::ERR_ABORTED' && /analytics|collector|apm|beacon|log|track/i.test(url)) return true;
@@ -112,6 +112,29 @@ type InteractiveCandidate = {
   shadow?: boolean;
 };
 
+type ScrollableArea = {
+  id: string;
+  path: string;
+  tag: string;
+  role?: string;
+  name?: string;
+  text?: string;
+  rect: { x: number; y: number; width: number; height: number };
+  center: { x: number; y: number };
+  scroll: {
+    top: number;
+    left: number;
+    height: number;
+    width: number;
+    clientHeight: number;
+    clientWidth: number;
+    canScrollUp: boolean;
+    canScrollDown: boolean;
+    canScrollLeft: boolean;
+    canScrollRight: boolean;
+  };
+};
+
 type ManualVerificationDetails = {
   detected: boolean;
   evidence?: string;
@@ -142,12 +165,14 @@ const manualVerificationTextPatterns = [
 
 export class BrowserSession {
   private browser?: Browser;
+  private context?: BrowserContext;
   private page?: Page;
   private consoleErrors: string[] = [];
   private networkErrors: string[] = [];
   private lastScreenshotMetrics?: ScreenshotMetrics;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
   private lastScreenshotCandidates: InteractiveCandidate[] = [];
+  private lastScrollableAreas: ScrollableArea[] = [];
   private lastCandidateMarkerScreenshotPath?: string;
 
   constructor(
@@ -181,6 +206,7 @@ export class BrowserSession {
       ignoreHTTPSErrors,
       ...(useNativeFullscreenViewport ? {} : { deviceScaleFactor: 1 }),
     });
+    this.context = context;
     await context.addInitScript(() => {
       const originalAddEventListener = EventTarget.prototype.addEventListener;
       const listenerTypes = new WeakMap<EventTarget, Set<string>>();
@@ -208,6 +234,25 @@ export class BrowserSession {
     });
     this.page = await context.newPage();
     this.attachPageListeners(this.page);
+  }
+
+  async startTrace(runId: string) {
+    if (!this.context || process.env.PLAYWRIGHT_TRACE === 'false') return;
+    await this.context.tracing.start({
+      screenshots: true,
+      snapshots: true,
+      sources: true,
+      title: `AI browser run ${runId}`,
+    }).catch(() => undefined);
+  }
+
+  async stopTrace(runId: string) {
+    if (!this.context || process.env.PLAYWRIGHT_TRACE === 'false') return undefined;
+    const dir = path.join(process.cwd(), 'artifacts', runId);
+    await mkdir(dir, { recursive: true });
+    const tracePath = path.join(dir, 'trace.zip');
+    await this.context.tracing.stop({ path: tracePath }).catch(() => undefined);
+    return tracePath;
   }
 
   // 绑定 console 和网络失败监听，只记录会影响测试判断的关键异常。
@@ -258,7 +303,7 @@ export class BrowserSession {
   } = {}) {
     const includeText = options.includeText !== false || options.includeManualVerification !== false;
     const includeInteractiveCandidates = options.includeInteractiveCandidates ?? true;
-    const [title, text, viewportMetrics, focusedElement, domTree, interactiveCandidates] = await Promise.all([
+    const [title, text, viewportMetrics, focusedElement, domTree, interactiveCandidates, scrollableAreas, pageScrollState] = await Promise.all([
       this.activePage.title().catch(() => ''),
       includeText ? this.readPageText() : Promise.resolve(''),
       this.getViewportMetrics(),
@@ -269,8 +314,10 @@ export class BrowserSession {
         : options.useCachedInteractiveCandidates && this.lastScreenshotCandidates.length
           ? Promise.resolve(this.lastScreenshotCandidates)
           : options.useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
-            ? Promise.resolve(this.lastInteractiveCandidates)
-            : this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
+          ? Promise.resolve(this.lastInteractiveCandidates)
+          : this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
+      this.refreshScrollableAreas().catch(() => this.lastScrollableAreas),
+      this.getPageScrollState().catch(() => undefined),
     ]);
 
     const manualVerification = options.includeManualVerification === false
@@ -292,6 +339,8 @@ export class BrowserSession {
       focusedElement,
       domTree,
       interactiveCandidates,
+      scrollableAreas,
+      pageScrollState,
       manualVerification,
       isManualVerification: manualVerification.detected && !manualVerification.captchaAppearsFilled,
     };
@@ -354,6 +403,10 @@ export class BrowserSession {
   // 截取当前 viewport。视觉标识模式默认把候选编号叠加到 before 截图；
   // 仅在 VISUAL_MARKER_SEPARATE_MAP=true 时额外生成一张像素对齐的纯标识图。
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' = 'after') {
+    const stabilizeMs = Number(process.env.SCREENSHOT_STABILIZE_MS || 1000);
+    if (Number.isFinite(stabilizeMs) && stabilizeMs > 0) {
+      await this.waitForStableViewport(Math.min(Math.max(stabilizeMs, 0), 5000));
+    }
     const dir = path.join(process.cwd(), 'artifacts', runId);
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
@@ -363,8 +416,14 @@ export class BrowserSession {
       && this.mode === 'visual-markers'
       && this.options.isMarked !== false
       && process.env.SCREENSHOT_ELEMENT_LABELS !== 'false';
+    const scrollAreaLabelsEnabled = shouldCaptureCandidates
+      && this.mode === 'visual-markers'
+      && process.env.SCREENSHOT_SCROLL_AREA_LABELS !== 'false';
     const candidates = shouldCaptureCandidates
       ? await this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[])
+      : [];
+    const scrollAreas = shouldCaptureCandidates
+      ? await this.refreshScrollableAreas().catch(() => this.lastScrollableAreas)
       : [];
     if (shouldCaptureCandidates) {
       // This immutable-by-convention snapshot is the only source of candidate IDs
@@ -381,19 +440,23 @@ export class BrowserSession {
     const separateMarkerMap = candidateLabelsEnabled && shouldUseSeparateMarkerMap();
     await this.removeCandidateOverlay();
     if (phase === 'before') await this.removeClickMarker();
-    if (candidateLabelsEnabled && !separateMarkerMap) {
-      await this.drawCandidateOverlay(candidates, false);
+    if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
+      await this.drawCandidateOverlay(
+        candidateLabelsEnabled ? candidates : [],
+        false,
+        scrollAreaLabelsEnabled ? scrollAreas : [],
+      );
     }
     try {
       await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
     } finally {
-      if (candidateLabelsEnabled && !separateMarkerMap) {
+      if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
         await this.removeCandidateOverlay();
       }
     }
     if (separateMarkerMap) {
       const markerFilePath = path.join(dir, `step-${stepIndex}-before-markers.png`);
-      await this.drawCandidateOverlay(candidates, true);
+      await this.drawCandidateOverlay(candidates, true, scrollAreaLabelsEnabled ? scrollAreas : []);
       try {
         await this.activePage.screenshot({ path: markerFilePath, fullPage: false, scale: 'css', timeout: 15000 });
         this.lastCandidateMarkerScreenshotPath = markerFilePath;
@@ -446,7 +509,10 @@ export class BrowserSession {
     const context = this.activePage.context();
     const beforePages = context.pages().length;
     const beforeUrl = this.activePage.url();
-    const popup = this.activePage.waitForEvent('popup', { timeout: 3000 }).catch(() => undefined);
+    const popupWaitMs = Math.min(Math.max(Number(process.env.BROWSER_POPUP_WAIT_MS || 600), 0), 3000);
+    const popup = popupWaitMs > 0
+      ? this.activePage.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
+      : Promise.resolve(undefined);
     await this.activePage.mouse.click(target.x, target.y);
     if (text !== undefined) {
       await this.activePage.keyboard.type(text);
@@ -603,6 +669,29 @@ export class BrowserSession {
     await this.activePage.mouse.wheel(deltaX, deltaY);
     const note = await this.waitAfterAction();
     return { ok: true, actual: `Scrolled ${scrollTarget.descriptor} at browser point (${scrollTarget.x}, ${scrollTarget.y}) by x=${deltaX}, y=${deltaY}.${scrollTarget.note}${note}` };
+  }
+
+  // 按可滚动区域编号滚动任意滚动容器。编号来自 getPageContext().scrollableAreas。
+  async scrollArea(areaId: string, deltaY: number, deltaX = 0): Promise<BrowserActionResult> {
+    const area = this.lastScrollableAreas.find((item) => item.id === areaId)
+      || (await this.refreshScrollableAreas()).find((item) => item.id === areaId);
+    if (!area) {
+      return {
+        ok: false,
+        actual: `Scrollable area ${areaId} was not found. Use the latest scrollableAreas list and choose an id such as S1.`,
+      };
+    }
+    await this.activePage.mouse.move(area.center.x, area.center.y);
+    await this.activePage.mouse.wheel(deltaX, deltaY);
+    const note = await this.waitAfterAction();
+    const updated = (await this.refreshScrollableAreas().catch(() => [])).find((item) => item.id === areaId);
+    const state = updated
+      ? ` New scroll: top=${updated.scroll.top}/${updated.scroll.height - updated.scroll.clientHeight}, left=${updated.scroll.left}/${updated.scroll.width - updated.scroll.clientWidth}.`
+      : '';
+    return {
+      ok: true,
+      actual: `Scrolled area ${area.id} (${area.tag}${area.name ? ` "${area.name}"` : ''}) at (${area.center.x}, ${area.center.y}) by x=${deltaX}, y=${deltaY}.${state}${note}`,
+    };
   }
 
   // 列出当前浏览器上下文中的所有标签页，供 AI 判断是否需要切换。
@@ -838,6 +927,135 @@ export class BrowserSession {
         }
         : undefined,
     })).catch(() => ({ ...fallback, devicePixelRatio: 1 }));
+  }
+
+  private async getPageScrollState() {
+    return this.activePage.evaluate(() => {
+      const root = document.scrollingElement || document.documentElement;
+      return {
+        top: Math.round(root.scrollTop),
+        left: Math.round(root.scrollLeft),
+        height: Math.round(root.scrollHeight),
+        width: Math.round(root.scrollWidth),
+        clientHeight: Math.round(root.clientHeight),
+        clientWidth: Math.round(root.clientWidth),
+        canScrollUp: root.scrollTop > 1,
+        canScrollDown: root.scrollTop + root.clientHeight < root.scrollHeight - 1,
+        canScrollLeft: root.scrollLeft > 1,
+        canScrollRight: root.scrollLeft + root.clientWidth < root.scrollWidth - 1,
+      };
+    });
+  }
+
+  private async refreshScrollableAreas(): Promise<ScrollableArea[]> {
+    const areas = await this.activePage.evaluate(() => {
+      function aiChildren(element: Element) {
+        return Array.from(element.children).filter((child) => {
+          if (child.closest && child.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+          return true;
+        });
+      }
+
+      function domPathOf(element: Element) {
+        const segments: number[] = [];
+        let current: Element | undefined = element;
+        while (current && current !== document.documentElement) {
+          const parent: Element | null = current.parentElement;
+          if (!parent) return undefined;
+          const siblings = aiChildren(parent);
+          const index = siblings.indexOf(current);
+          if (index < 0) return undefined;
+          segments.unshift(index);
+          current = parent;
+        }
+        if (current !== document.documentElement) return undefined;
+        return [0, ...segments].join('.');
+      }
+
+      function visibleRectOf(element: Element) {
+        const rect = element.getBoundingClientRect();
+        const left = Math.max(0, rect.left);
+        const top = Math.max(0, rect.top);
+        const right = Math.min(window.innerWidth, rect.right);
+        const bottom = Math.min(window.innerHeight, rect.bottom);
+        const width = right - left;
+        const height = bottom - top;
+        if (width < 24 || height < 24) return undefined;
+        return { x: Math.round(left), y: Math.round(top), width: Math.round(width), height: Math.round(height) };
+      }
+
+      function isScrollable(element: Element) {
+        const style = window.getComputedStyle(element);
+        const overflowY = style.overflowY;
+        const overflowX = style.overflowX;
+        const canScrollY = element.scrollHeight > element.clientHeight + 2 && /(auto|scroll|overlay)/i.test(overflowY);
+        const canScrollX = element.scrollWidth > element.clientWidth + 2 && /(auto|scroll|overlay)/i.test(overflowX);
+        return canScrollY || canScrollX;
+      }
+
+      function textOf(element: Element) {
+        const text = ((element as HTMLElement).innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+        return text.slice(0, 160);
+      }
+
+      function nameOf(element: Element) {
+        return [
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+          element.getAttribute('role'),
+          textOf(element),
+        ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+      }
+
+      const root = document.scrollingElement || document.documentElement;
+      const elements = [root, ...Array.from(document.querySelectorAll('*')).filter(isScrollable)];
+      const seen = new Set<Element>();
+      const output: Array<Omit<ScrollableArea, 'id'>> = [];
+      for (const element of elements) {
+        if (seen.has(element)) continue;
+        seen.add(element);
+        const rect = element === root
+          ? { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight }
+          : visibleRectOf(element);
+        if (!rect) continue;
+        const path = element === root ? 'document' : domPathOf(element);
+        if (!path) continue;
+        const tag = element === root ? 'document' : element.tagName.toLowerCase();
+        const role = element === root ? undefined : element.getAttribute('role') || undefined;
+        output.push({
+          path,
+          tag,
+          role,
+          name: element === root ? 'page viewport' : nameOf(element),
+          text: element === root ? undefined : textOf(element),
+          rect,
+          center: { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) },
+          scroll: {
+            top: Math.round(element.scrollTop),
+            left: Math.round(element.scrollLeft),
+            height: Math.round(element.scrollHeight),
+            width: Math.round(element.scrollWidth),
+            clientHeight: Math.round(element.clientHeight),
+            clientWidth: Math.round(element.clientWidth),
+            canScrollUp: element.scrollTop > 1,
+            canScrollDown: element.scrollTop + element.clientHeight < element.scrollHeight - 1,
+            canScrollLeft: element.scrollLeft > 1,
+            canScrollRight: element.scrollLeft + element.clientWidth < element.scrollWidth - 1,
+          },
+        });
+      }
+      return output
+        .sort((a, b) => {
+          const aPage = a.path === 'document' ? -1 : 0;
+          const bPage = b.path === 'document' ? -1 : 0;
+          if (aPage !== bPage) return aPage - bPage;
+          return (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height);
+        })
+        .slice(0, 30)
+        .map((area, index) => ({ id: `S${index + 1}`, ...area }));
+    });
+    this.lastScrollableAreas = areas;
+    return areas;
   }
 
   private async refreshInteractiveCandidates() {
@@ -1525,9 +1743,22 @@ export class BrowserSession {
         }
       }
 
+      function pathParts(value: string) {
+        return value.split('.').map((item) => Number(item));
+      }
+      function comparePath(a: string, b: string) {
+        const ap = pathParts(a);
+        const bp = pathParts(b);
+        const length = Math.min(ap.length, bp.length);
+        for (let index = 0; index < length; index += 1) {
+          if (ap[index] !== bp[index]) return ap[index] - bp[index];
+        }
+        return ap.length - bp.length;
+      }
+
       const deduped = dropParentWhenChildExists(raw, sourceElements);
-      deduped.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
-      return selectCandidatesAcrossViewport(deduped, candidateLimit).map((candidate, index) => ({
+      deduped.sort((a, b) => comparePath(a.path, b.path) || a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+      return deduped.slice(0, candidateLimit).map((candidate, index) => ({
         ...candidate,
         id: `${index + 1}`,
       }));
@@ -1540,7 +1771,7 @@ export class BrowserSession {
         if (candidate.framePath) return true;
         return !frameCandidates.some((frameCandidate) => this.rectContains(candidate.rect, frameCandidate.rect));
       })
-      .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height)
+      .sort((a, b) => this.compareCandidateOrder(a, b))
       .slice(0, limit)
       .map((candidate, index) => ({
         ...candidate,
@@ -2352,6 +2583,29 @@ export class BrowserSession {
     return { candidate, target };
   }
 
+  private compareCandidateOrder(a: InteractiveCandidate, b: InteractiveCandidate) {
+    const frameCompare =
+      (a.framePath || '').localeCompare(b.framePath || '') ||
+      a.rect.y - b.rect.y ||
+      a.rect.x - b.rect.x;
+    if (a.framePath || b.framePath) {
+      const sameFrame = (a.framePath || '') === (b.framePath || '');
+      if (!sameFrame) return frameCompare;
+    }
+    const pathCompare = this.comparePathString(a.path, b.path);
+    return pathCompare || a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height;
+  }
+
+  private comparePathString(a: string, b: string) {
+    const ap = a.split('.').map((item) => Number(item));
+    const bp = b.split('.').map((item) => Number(item));
+    const length = Math.min(ap.length, bp.length);
+    for (let index = 0; index < length; index += 1) {
+      if (ap[index] !== bp[index]) return ap[index] - bp[index];
+    }
+    return ap.length - bp.length;
+  }
+
   private getFramePath(frame: Frame) {
     const segments: number[] = [];
     let current: Frame | null = frame;
@@ -3041,10 +3295,11 @@ export class BrowserSession {
     };
   }
 
-  private async drawCandidateOverlay(candidates: InteractiveCandidate[], markersOnly = false) {
+  private async drawCandidateOverlay(candidates: InteractiveCandidate[], markersOnly = false, scrollAreas: ScrollableArea[] = []) {
     const labelLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
     const visible = candidates.slice(0, labelLimit);
-    await this.activePage.evaluate(({ items, markersOnly: hidePageContent }) => {
+    const visibleScrollAreas = scrollAreas.slice(0, Math.max(1, Number(process.env.SCREENSHOT_SCROLL_AREA_LABEL_LIMIT || 12)));
+    await this.activePage.evaluate(({ items, scrollAreas: areas, markersOnly: hidePageContent }) => {
       document.getElementById('__ai_candidate_overlay__')?.remove();
       const overlay = document.createElement('div');
       overlay.id = '__ai_candidate_overlay__';
@@ -3095,6 +3350,58 @@ export class BrowserSession {
       }
       function pointInside(box: LabelBox, point: Point) {
         return point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom;
+      }
+      function drawScrollArea(area: {
+        id: string;
+        rect: { x: number; y: number; width: number; height: number };
+        scroll: { canScrollUp: boolean; canScrollDown: boolean; canScrollLeft: boolean; canScrollRight: boolean };
+      }) {
+        if (!area.rect || area.rect.width <= 0 || area.rect.height <= 0) return;
+        const color = '#059669';
+        const boxLeft = clamp(area.rect.x, 1, Math.max(1, window.innerWidth - 2));
+        const boxTop = clamp(area.rect.y, 1, Math.max(1, window.innerHeight - 2));
+        const boxWidth = Math.max(1, Math.min(area.rect.width, window.innerWidth - boxLeft - 1));
+        const boxHeight = Math.max(1, Math.min(area.rect.height, window.innerHeight - boxTop - 1));
+        const box = document.createElement('div');
+        Object.assign(box.style, {
+          position: 'absolute',
+          left: `${boxLeft}px`,
+          top: `${boxTop}px`,
+          width: `${boxWidth}px`,
+          height: `${boxHeight}px`,
+          border: `2px dashed ${color}`,
+          borderRadius: '4px',
+          boxSizing: 'border-box',
+          background: 'transparent',
+          pointerEvents: 'none',
+        });
+        const label = document.createElement('div');
+        const directions = [
+          area.scroll.canScrollUp ? '↑' : '',
+          area.scroll.canScrollDown ? '↓' : '',
+          area.scroll.canScrollLeft ? '←' : '',
+          area.scroll.canScrollRight ? '→' : '',
+        ].filter(Boolean).join('');
+        label.textContent = `${area.id}${directions ? ` ${directions}` : ''}`;
+        Object.assign(label.style, {
+          position: 'absolute',
+          left: `${clamp(boxLeft + 4, 1, Math.max(1, window.innerWidth - 90))}px`,
+          top: `${clamp(boxTop + 4, 1, Math.max(1, window.innerHeight - 20))}px`,
+          minWidth: '22px',
+          height: '18px',
+          padding: '0 5px',
+          borderRadius: '4px',
+          background: color,
+          color: '#fff',
+          border: '1px solid #fff',
+          boxSizing: 'border-box',
+          font: '900 11px/16px Arial, sans-serif',
+          textAlign: 'center',
+          boxShadow: '0 2px 6px rgba(0,0,0,0.28)',
+          pointerEvents: 'none',
+        });
+        overlay.appendChild(box);
+        overlay.appendChild(label);
       }
       function segmentIntersectsBox(segment: Leader, box: LabelBox, padding = 0) {
         const target = expanded(box, padding);
@@ -3394,6 +3701,10 @@ export class BrowserSession {
       svg.setAttribute('height', String(window.innerHeight));
       overlay.appendChild(svg);
 
+      for (const area of areas) {
+        drawScrollArea(area);
+      }
+
       for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
         const item = items[itemIndex];
         const rect = item.rect;
@@ -3476,7 +3787,7 @@ export class BrowserSession {
       }
 
       document.documentElement.appendChild(overlay);
-    }, { items: visible, markersOnly }).catch(() => undefined);
+    }, { items: visible, scrollAreas: visibleScrollAreas, markersOnly }).catch(() => undefined);
   }
 
   private async removeCandidateOverlay() {
@@ -3507,7 +3818,7 @@ export class BrowserSession {
       marker.setAttribute('aria-hidden', 'true');
       const badgeText = markerKind === 'double' ? '2x' : markerKind === 'right' ? 'R' : markerKind === 'drag' ? 'D' : '';
       const cursorSvg = [
-        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="42" viewBox="0 0 32 42">',
+        '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="29" viewBox="0 0 32 42">',
         '<path d="M4 3v28.5l7.3-6.9 4.7 12.2 5.6-2.2-4.8-11.8h10.6L4 3z" fill="white" stroke="#111827" stroke-width="2.2" stroke-linejoin="round"/>',
         '<path d="M11.2 24.6 16 36.8" stroke="rgba(255,255,255,.65)" stroke-width="1.1"/>',
         '</svg>',
@@ -3517,12 +3828,12 @@ export class BrowserSession {
         position: 'absolute',
         left: '0',
         top: '0',
-        width: '32px',
-        height: '42px',
+        width: '22px',
+        height: '29px',
         backgroundImage: `url("data:image/svg+xml,${encodeURIComponent(cursorSvg)}")`,
         backgroundRepeat: 'no-repeat',
-        backgroundSize: '32px 42px',
-        filter: 'drop-shadow(0 5px 8px rgba(0, 0, 0, 0.42))',
+        backgroundSize: '22px 29px',
+        filter: 'drop-shadow(0 3px 5px rgba(0, 0, 0, 0.38))',
       });
       marker.appendChild(cursor);
       if (badgeText) {
@@ -3530,19 +3841,19 @@ export class BrowserSession {
         badge.textContent = badgeText;
         Object.assign(badge.style, {
           position: 'absolute',
-          left: '17px',
-          top: '21px',
-          minWidth: '17px',
-          height: '17px',
-          padding: '0 3px',
+          left: '12px',
+          top: '14px',
+          minWidth: '13px',
+          height: '13px',
+          padding: '0 2px',
           borderRadius: '999px',
           background: '#2563eb',
           color: '#fff',
-          border: '2px solid #fff',
+          border: '1px solid #fff',
           boxSizing: 'border-box',
-          font: '900 10px/13px Arial, sans-serif',
+          font: '900 8px/11px Arial, sans-serif',
           textAlign: 'center',
-          boxShadow: '0 2px 7px rgba(0,0,0,0.32)',
+          boxShadow: '0 1px 4px rgba(0,0,0,0.28)',
         });
         marker.appendChild(badge);
       }
@@ -3550,10 +3861,10 @@ export class BrowserSession {
         position: 'fixed',
         left: `${markerX}px`,
         top: `${markerY}px`,
-        width: '42px',
-        height: '48px',
-        marginLeft: '-2px',
-        marginTop: '-2px',
+        width: '30px',
+        height: '34px',
+        marginLeft: '-1px',
+        marginTop: '-1px',
         pointerEvents: 'none',
         zIndex: '2147483647',
       });

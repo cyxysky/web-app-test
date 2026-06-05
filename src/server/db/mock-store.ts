@@ -1,6 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { RunDebugEvent, StepExecutionResult, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -51,6 +51,8 @@ type StoreData = {
   testCases: TestCaseRecord[];
   runs: TestRunRecord[];
   groups?: TestGroupRecord[];
+  runtimeEnv?: RuntimeEnvRecord[];
+  schedules?: RunScheduleRecord[];
 };
 
 const seedRecord: TestCaseRecord = {
@@ -65,6 +67,52 @@ const seedRecord: TestCaseRecord = {
   createdAt: now(),
   updatedAt: now(),
 };
+
+function compactText(value?: string, max = 220) {
+  const text = (value || '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function stepMemoryLine(step: StepExecutionResult) {
+  const reasons = (step.tools || []).map((tool) => tool.reason).filter(Boolean).join('；');
+  const tools = (step.tools || []).map((tool) => tool.name).filter(Boolean).join(',');
+  const parts = [
+    step.observation ? `观察：${compactText(step.observation, 100)}` : '',
+    step.note ? `进展：${compactText(step.note, 100)}` : '',
+    reasons ? `原因：${compactText(reasons, 140)}` : '',
+    step.findings?.length ? `发现：${compactText(step.findings.join('；'), 140)}` : '',
+    step.status === 'failed' || step.status === 'blocked' ? `异常：${compactText(step.actual, 160)}` : '',
+  ].filter(Boolean);
+  return `Step ${step.index} [${step.status}${tools ? `/${tools}` : ''}]: ${parts.join(' | ') || compactText(step.action || step.actual)}`;
+}
+
+function buildMemory(steps: StepExecutionResult[], previous?: NonNullable<NonNullable<TestRunRecord['result']>['memory']>) {
+  const timeline = steps.map(stepMemoryLine).slice(-40);
+  const findings = Array.from(new Set([
+    ...(previous?.findings || []),
+    ...steps.flatMap((step) => step.findings || []),
+  ].map((item) => compactText(item, 260)).filter(Boolean))).slice(-40);
+  const failedAttempts = Array.from(new Set([
+    ...(previous?.failedAttempts || []),
+    ...steps
+      .filter((step) => step.status === 'failed' || step.status === 'blocked')
+      .map((step) => `Step ${step.index}: ${compactText(step.action, 100)} -> ${compactText(step.actual, 220)}`),
+  ])).slice(-20);
+  const memoryItems = Array.from(new Set(steps.flatMap((step) => step.memoryItems || []).map((item) => compactText(item, 260)).filter(Boolean))).slice(-24);
+  const summary = [
+    `已执行 ${steps.length} 步。`,
+    steps.length ? `最近进展：${steps.slice(-6).map((step) => `S${step.index}:${compactText(step.observation || step.note || step.action, 80)}`).join('；')}` : '',
+    findings.length ? `重要发现：${findings.slice(-8).join('；')}` : '',
+    memoryItems.length ? `后续记忆：${memoryItems.slice(-8).join('；')}` : '',
+  ].filter(Boolean).join('\n').slice(0, 1800);
+  return {
+    summary,
+    timeline,
+    findings,
+    failedAttempts,
+    updatedAt: now(),
+  };
+}
 
 // 原子写入本地 JSON 数据文件，避免运行中断时写出半截内容。
 function writeData(data: StoreData) {
@@ -104,7 +152,7 @@ function sleepSync(ms: number) {
 // 读取本地存储数据；文件不存在时初始化默认数据。
 function readData(): StoreData {
   if (!existsSync(storePath)) {
-    const seed: StoreData = { testCases: [seedRecord], runs: [], groups: [] };
+    const seed: StoreData = { testCases: [seedRecord], runs: [], groups: [], runtimeEnv: [], schedules: [] };
     writeData(seed);
     return seed;
   }
@@ -113,7 +161,12 @@ function readData(): StoreData {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const data = JSON.parse(readFileSync(storePath, 'utf8')) as StoreData;
-      return { ...data, groups: data.groups || [] };
+      return {
+        ...data,
+        groups: data.groups || [],
+        runtimeEnv: data.runtimeEnv || [],
+        schedules: data.schedules || [],
+      };
     } catch (error) {
       lastError = error;
       sleepSync(25);
@@ -130,6 +183,90 @@ export const store = {
   // 列出全部测试分组。
   listGroups() {
     return readData().groups || [];
+  },
+  // 列出保存到网页配置里的运行时环境变量。
+  listRuntimeEnv() {
+    return readData().runtimeEnv || [];
+  },
+  // 保存网页配置的环境变量，服务端会在运行前加载 enabled=true 的配置。
+  saveRuntimeEnv(items: Array<Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'>>) {
+    const data = readData();
+    data.runtimeEnv = items
+      .filter((item) => item.key.trim())
+      .map((item) => ({
+        key: item.key.trim(),
+        value: item.value,
+        enabled: item.enabled,
+        secret: item.secret,
+        updatedAt: now(),
+      }));
+    writeData(data);
+    return data.runtimeEnv;
+  },
+  // 把已启用的网页配置同步到当前 Node 进程。
+  applyRuntimeEnv() {
+    const items = readData().runtimeEnv || [];
+    for (const item of items) {
+      if (item.enabled) process.env[item.key] = item.value;
+    }
+    return items;
+  },
+  // 列出定时回归任务。
+  listSchedules() {
+    return readData().schedules || [];
+  },
+  // 创建或更新定时回归任务。
+  upsertSchedule(input: {
+    id?: string;
+    name: string;
+    enabled: boolean;
+    testCaseIds: string[];
+    intervalMinutes: number;
+    nextRunAt?: string;
+  }) {
+    const data = readData();
+    const schedules = data.schedules || [];
+    const existing = input.id ? schedules.find((item) => item.id === input.id) : undefined;
+    const schedule: RunScheduleRecord = {
+      id: existing?.id || id('sch'),
+      name: input.name.trim() || '定时回归',
+      enabled: input.enabled,
+      testCaseIds: Array.from(new Set(input.testCaseIds)),
+      intervalMinutes: Math.max(1, Math.floor(input.intervalMinutes || 60)),
+      nextRunAt: input.nextRunAt || existing?.nextRunAt || new Date(Date.now() + Math.max(1, input.intervalMinutes || 60) * 60_000).toISOString(),
+      lastRunAt: existing?.lastRunAt,
+      createdAt: existing?.createdAt || now(),
+      updatedAt: now(),
+    };
+    data.schedules = existing
+      ? schedules.map((item) => (item.id === schedule.id ? schedule : item))
+      : [...schedules, schedule];
+    writeData(data);
+    return schedule;
+  },
+  // 删除定时回归任务。
+  deleteSchedule(scheduleId: string) {
+    const data = readData();
+    data.schedules = (data.schedules || []).filter((item) => item.id !== scheduleId);
+    writeData(data);
+  },
+  // 标记定时任务已经触发，并计算下一次运行时间。
+  markScheduleTriggered(scheduleId: string) {
+    const data = readData();
+    let updated: RunScheduleRecord | undefined;
+    data.schedules = (data.schedules || []).map((schedule) => {
+      if (schedule.id !== scheduleId) return schedule;
+      const base = Date.now();
+      updated = {
+        ...schedule,
+        lastRunAt: now(),
+        nextRunAt: new Date(base + schedule.intervalMinutes * 60_000).toISOString(),
+        updatedAt: now(),
+      };
+      return updated;
+    });
+    writeData(data);
+    return updated;
   },
   // 创建测试分组，并可挂到父分组下。
   createGroup(name: string, parentId?: string) {
@@ -187,6 +324,14 @@ export const store = {
     writeData(data);
     return record;
   },
+  // 删除一条执行记录。这里只移除历史元数据，artifact 文件保留，避免误删仍被报告引用的证据。
+  deleteRun(runId: string) {
+    const data = readData();
+    const before = data.runs.length;
+    data.runs = data.runs.filter((run) => run.id !== runId);
+    writeData(data);
+    return data.runs.length !== before;
+  },
   // 更新测试用例的整体执行状态。
   updateTestCaseStatus(testCaseId: string, status: TestCaseRecord['status']) {
     const data = readData();
@@ -241,6 +386,31 @@ export const store = {
     writeData(data);
     return run;
   },
+  // 更新运行记录的队列元信息。
+  updateRunQueue(runId: string, queue: TestRunRecord['queue']) {
+    const data = readData();
+    const run = data.runs.find((item) => item.id === runId);
+    if (!run) return undefined;
+    const updated = { ...run, queue };
+    data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
+    writeData(data);
+    return updated;
+  },
+  // 合并历史失败沉淀出的操作策略，后续运行会进入 AI prompt。
+  appendTestCaseStrategyMemory(testCaseId: string, hints: string[]) {
+    const cleanHints = hints.map((hint) => hint.trim()).filter(Boolean);
+    if (!cleanHints.length) return this.getTestCase(testCaseId);
+    const data = readData();
+    let updated: TestCaseRecord | undefined;
+    data.testCases = data.testCases.map((record) => {
+      if (record.id !== testCaseId) return record;
+      const memory = Array.from(new Set([...(record.strategyMemory || []), ...cleanHints])).slice(-12);
+      updated = { ...record, strategyMemory: memory, updatedAt: now() };
+      return updated;
+    });
+    writeData(data);
+    return updated;
+  },
   // 局部更新运行记录，并自动刷新更新时间。
   updateRun(runId: string, patch: Partial<TestRunRecord>) {
     const data = readData();
@@ -263,7 +433,7 @@ export const store = {
       ? result.steps.map((item) => (item.index === step.index ? { ...item, ...step } : item))
       : [...result.steps, step].sort((a, b) => a.index - b.index);
 
-    const updated = { ...run, result: { ...result, steps } };
+    const updated = { ...run, result: { ...result, steps, memory: buildMemory(steps, result.memory) } };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
     return updated;

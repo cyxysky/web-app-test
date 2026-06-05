@@ -9,7 +9,7 @@ export function NewTestCaseModal({ groupId }: { groupId?: string } = {}) {
 
   return (
     <>
-      <button className="button" onClick={() => setOpen(true)} type="button">
+      <button className="icon-text-button" onClick={() => setOpen(true)} type="button">
         <CirclePlus size={16} />
         新增测试用例
       </button>

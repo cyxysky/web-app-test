@@ -52,6 +52,8 @@ function stepMarkdown(step: StepExecutionResult) {
 
 - AI 操作：${step.action}
 ${toolMarkdown(step)}
+${step.observation ? `\n- 助手观察：${step.observation}` : ''}
+${step.findings?.length ? `\n- 重要发现：\n${step.findings.map((item) => `  - ${item}`).join('\n')}` : ''}
 ${before ? `\n![步骤 ${step.index} 执行前](${before})` : ''}
 ${after ? `\n![步骤 ${step.index} 执行后](${after})` : ''}`;
 }
@@ -61,6 +63,7 @@ export function writeReport(testCase: TestCaseRecord, run: TestRunRecord) {
   const result = run.result;
   const status = run.status;
   const stepBlocks = (result?.steps || []).map(stepMarkdown).join('\n\n');
+  const memory = result?.memory;
 
   const summary =
     status === 'passed'
@@ -90,6 +93,12 @@ ${richTextToPlainText(testCase.content.userRequirement || '') || testCase.descri
 ## 执行步骤
 
 ${stepBlocks || '- 暂无执行步骤。'}
+
+## 运行记忆与累计发现
+
+${memory?.summary || '暂无运行记忆。'}
+
+${memory?.findings.length ? memory.findings.map((item) => `- ${item}`).join('\n') : '- 暂无累计发现。'}
 
 ## Console 错误
 

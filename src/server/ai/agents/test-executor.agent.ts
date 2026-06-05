@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { generateObject, generateText, stepCountIs, tool } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiRequestSnapshot, RecordedFlowStep, StepExecutionResult, StepToolCall, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, RecordedFlowStep, StepExecutionResult, StepToolCall, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode } from '@/server/browser/browser-session';
@@ -38,10 +38,28 @@ type RuntimeDecision = {
   status: 'passed' | 'failed' | 'blocked';
   done: boolean;
   note?: string;
+  observation?: string;
+  findings?: string[];
+  memoryItems?: string[];
+};
+
+type RunMemory = NonNullable<NonNullable<TestRunRecord['result']>['memory']>;
+
+type ScreenshotReference = {
+  id: string;
+  path: string;
+  stepIndex: number;
+  phase: 'before' | 'after' | 'screenshot';
+  sameInterfaceGroup?: string;
+  description: string;
+};
+
+type SelectedScreenshotReference = ScreenshotReference & {
+  selectionReason?: string;
 };
 
 const codexRuntimeObjectSchema = z.object({
-  type: z.string().min(1).describe('Tool type to execute, or finish/block/fail when the requirement is complete, blocked, or impossible.'),
+  type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op observation.'),
   params: z.object({
     reason: z.string().nullable(),
     url: z.string().nullable(),
@@ -62,15 +80,13 @@ const codexRuntimeObjectSchema = z.object({
     actual: z.string().nullable(),
     status: z.enum(['passed', 'failed', 'blocked']).nullable(),
     done: z.boolean().nullable(),
+    observation: z.string().nullable(),
+    findings: z.string().nullable(),
+    memory: z.string().nullable(),
+    ids: z.array(z.string()).nullable(),
+    selectionReason: z.string().nullable(),
+    sameInterfaceGroup: z.string().nullable(),
   }).describe('Parameters for the selected tool. Include every listed key; set unused keys to null. Include reason when choosing a tool.'),
-});
-
-const terminalCodexActionSchema = z.object({
-  action: z.string().nullable().optional(),
-  expected: z.string().nullable().optional(),
-  actual: z.string().nullable().optional(),
-  status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
-  done: z.boolean().nullable().optional(),
 });
 
 const manualIssuePattern = new RegExp(
@@ -92,7 +108,7 @@ const manualIssuePattern = new RegExp(
   'i',
 );
 
-// 判断当前模型配置是否支持图片输入；这只是模型能力判断，不代表一定会发送截图。
+// 鍒ゆ柇褰撳墠妯″瀷閰嶇疆鏄惁鏀寔鍥剧墖杈撳叆锛涜繖鍙槸妯″瀷鑳藉姏鍒ゆ柇锛屼笉浠ｈ〃涓€瀹氫細鍙戦€佹埅鍥俱€?
 function modelSupportsScreenshotInput() {
   if (process.env.SEND_SCREENSHOT_TO_AI === 'true') return true;
   if (process.env.SEND_SCREENSHOT_TO_AI === 'false') return false;
@@ -121,24 +137,24 @@ function isVisualMode(mode: BrowserSessionMode) {
   return mode !== 'dom';
 }
 
-// 是否启用视觉候选标识。关闭时仍发送截图，但候选元素只以文本摘要进入 prompt。
+// 鏄惁鍚敤瑙嗚鍊欓€夋爣璇嗐€傚叧闂椂浠嶅彂閫佹埅鍥撅紝浣嗗€欓€夊厓绱犲彧浠ユ枃鏈憳瑕佽繘鍏?prompt銆?
 function visualMarkersEnabledFor(testCase: TestCaseRecord) {
   if (typeof testCase.content.isMarked === 'boolean') return testCase.content.isMarked;
   if (process.env.VISUAL_MARKERS_IS_MARKED === 'false' || process.env.SCREENSHOT_IS_MARKED === 'false') return false;
   return true;
 }
 
-// 兼容旧双截图链路；默认 false，标识直接叠加在当前截图里。
+// 鍏煎鏃у弻鎴浘閾捐矾锛涢粯璁?false锛屾爣璇嗙洿鎺ュ彔鍔犲湪褰撳墠鎴浘閲屻€?
 function usesSeparateMarkerMap() {
   return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
 }
 
-// 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
+// 鍙湁瑙嗚鐐瑰嚮妯″紡鎵嶅厑璁告妸鎴浘浣滀负 AI 杈撳叆锛汥OM 妯″紡鍗充娇妯″瀷鏀寔鍥剧墖涔熶笉浼氬彂閫併€?
 function shouldSendScreenshotToAi(mode: BrowserSessionMode) {
   return isVisualMode(mode) && modelSupportsScreenshotInput();
 }
 
-// 将调试数据转成可安全 JSON 序列化的结构，避免 Buffer/BigInt 破坏持久化。
+// 灏嗚皟璇曟暟鎹浆鎴愬彲瀹夊叏 JSON 搴忓垪鍖栫殑缁撴瀯锛岄伩鍏?Buffer/BigInt 鐮村潖鎸佷箙鍖栥€?
 function jsonSafe(value: unknown) {
   if (value === undefined) return undefined;
   return JSON.parse(JSON.stringify(value, (_key, item) => {
@@ -199,7 +215,7 @@ async function readScreenshotForAi(filePath: string) {
   return compressScreenshotForAi(buffer, maxBytes).catch(() => buffer);
 }
 
-// 纯标识图必须跟随原图最终发送尺寸缩放，否则两张图经过压缩后会失去像素对齐关系。
+// 绾爣璇嗗浘蹇呴』璺熼殢鍘熷浘鏈€缁堝彂閫佸昂瀵哥缉鏀撅紝鍚﹀垯涓ゅ紶鍥剧粡杩囧帇缂╁悗浼氬け鍘诲儚绱犲榻愬叧绯汇€?
 async function readMarkerScreenshotForAi(filePath: string, referenceScreenshot: Buffer) {
   const markerBuffer = await readFile(filePath);
   const [referenceMetadata, markerMetadata] = await Promise.all([
@@ -220,7 +236,11 @@ function trimDebugText(value: string, max = 4000) {
   return value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
-// 拆分工具参数和 AI 给出的调用原因，便于历史步骤里单独展示。
+function elapsedSince(startedAt: number) {
+  return Date.now() - startedAt;
+}
+
+// 鎷嗗垎宸ュ叿鍙傛暟鍜?AI 缁欏嚭鐨勮皟鐢ㄥ師鍥狅紝渚夸簬鍘嗗彶姝ラ閲屽崟鐙睍绀恒€?
 function splitToolInputAndReason(input: unknown) {
   const safeInput = jsonSafe(input);
   if (!safeInput || typeof safeInput !== 'object' || Array.isArray(safeInput)) {
@@ -234,7 +254,7 @@ function splitToolInputAndReason(input: unknown) {
   };
 }
 
-// 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
+// 涓烘瘡娆?AI 璇锋眰鍔犺秴鏃朵繚鎶わ紝閬垮厤妯″瀷闀挎椂闂存棤鍝嶅簲瀵艰嚧鏁存鎵ц鍗℃銆?
 async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
   const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
   const timeoutController = new AbortController();
@@ -261,7 +281,7 @@ async function generateObjectWithTimeout(options: Parameters<typeof generateObje
   }
 }
 
-// 从模型回复中提取 JSON，兼容模型把 JSON 包在 markdown 代码块里的情况。
+// 浠庢ā鍨嬪洖澶嶄腑鎻愬彇 JSON锛屽吋瀹规ā鍨嬫妸 JSON 鍖呭湪 markdown 浠ｇ爜鍧楅噷鐨勬儏鍐点€?
 function extractJson(text: string) {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const raw = fenced?.[1] || text;
@@ -271,17 +291,17 @@ function extractJson(text: string) {
   return JSON.parse(raw.slice(start, end + 1));
 }
 
-// 将测试需求富文本转为纯文本，作为执行器理解目标的主输入。
+// 灏嗘祴璇曢渶姹傚瘜鏂囨湰杞负绾枃鏈紝浣滀负鎵ц鍣ㄧ悊瑙ｇ洰鏍囩殑涓昏緭鍏ャ€?
 function requirementOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.userRequirement || testCase.description) || testCase.description || testCase.title;
 }
 
-// 读取测试用例上的额外系统提示词，例如级联选择器必须选到叶子节点。
+// 璇诲彇娴嬭瘯鐢ㄤ緥涓婄殑棰濆绯荤粺鎻愮ず璇嶏紝渚嬪绾ц仈閫夋嫨鍣ㄥ繀椤婚€夊埌鍙跺瓙鑺傜偣銆?
 function systemPromptOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.systemPrompt || '').trim();
 }
 
-// 将浏览器工具调用轨迹压缩为步骤证据，保存到运行历史中。
+// 灏嗘祻瑙堝櫒宸ュ叿璋冪敤杞ㄨ抗鍘嬬缉涓烘楠よ瘉鎹紝淇濆瓨鍒拌繍琛屽巻鍙蹭腑銆?
 function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   return traces.map((trace) => {
     const { input, reason } = splitToolInputAndReason(trace.input);
@@ -290,19 +310,51 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       input,
       reason,
       ok: trace.result.ok,
-      result: trimDebugText(trace.result.actual, 800),
+      result: trimDebugText(trace.result.actual, 360),
     };
   });
 }
 
-function recentToolCallContext(steps: StepExecutionResult[], limit = 5) {
+function recentToolCallContext(steps: StepExecutionResult[], limit = 3) {
   const calls = steps.flatMap((step) => (step.tools || []).map((tool) => ({
     name: tool.name,
-    input: tool.input,
-    reason: tool.reason,
-    result: { ok: tool.ok, actual: tool.result },
+    reason: concise(tool.reason, 120),
+    input: summarizeToolInputForPrompt(tool.input),
+    result: { ok: tool.ok, actual: concise(tool.result, 180) },
   })));
   return calls.slice(-limit);
+}
+
+function summarizeToolInputForPrompt(input: unknown) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+  const raw = input as Record<string, unknown>;
+  const keepKeys = ['url', 'id', 'text', 'key', 'path', 'areaId', 'deltaX', 'deltaY', 'index', 'action', 'status', 'done'];
+  const output: Record<string, unknown> = {};
+  for (const key of keepKeys) {
+    if (raw[key] !== undefined && raw[key] !== null && raw[key] !== '') {
+      output[key] = typeof raw[key] === 'string' ? concise(String(raw[key]), 120) : raw[key];
+    }
+  }
+  if (typeof raw.observation === 'string') output.observation = concise(raw.observation, 120);
+  if (typeof raw.findings === 'string' && raw.findings !== '无') output.findings = concise(raw.findings, 120);
+  return output;
+}
+
+function recentScrollContinuityContext(steps: StepExecutionResult[], limit = 8) {
+  return steps
+    .flatMap((step) => (step.tools || [])
+      .filter((toolCall) => toolCall.name === 'scrollArea' || toolCall.name === 'scrollViewport')
+      .map((toolCall) => {
+        const input = toolCall.input && typeof toolCall.input === 'object' ? toolCall.input as Record<string, unknown> : {};
+        return [
+          `Step ${step.index}: ${toolCall.name}`,
+          input.areaId ? `area=${input.areaId}` : '',
+          input.deltaY !== undefined ? `deltaY=${input.deltaY}` : '',
+          input.deltaX !== undefined ? `deltaX=${input.deltaX}` : '',
+          toolCall.result ? `result=${trimDebugText(toolCall.result, 260)}` : '',
+        ].filter(Boolean).join(' ');
+      }))
+    .slice(-limit);
 }
 
 function recentProgressNotes(steps: StepExecutionResult[], limit = 5) {
@@ -310,6 +362,152 @@ function recentProgressNotes(steps: StepExecutionResult[], limit = 5) {
     .filter((step) => step.note && step.note.trim())
     .slice(-limit)
     .map((step) => `Step ${step.index}: ${step.note}`);
+}
+
+function screenshotPhaseLabel(phase: ScreenshotReference['phase']) {
+  if (phase === 'before') return 'before action';
+  if (phase === 'after') return 'after action';
+  return 'step screenshot';
+}
+
+function screenshotReferenceGroupOf(step: StepExecutionResult, phase: ScreenshotReference['phase']) {
+  const scrollTool = (step.tools || []).find((toolCall) => toolCall.name === 'scrollArea' || toolCall.name === 'scrollViewport');
+  if (!scrollTool) return undefined;
+  const input = scrollTool.input && typeof scrollTool.input === 'object' && !Array.isArray(scrollTool.input)
+    ? scrollTool.input as Record<string, unknown>
+    : {};
+  const area = typeof input.areaId === 'string' ? input.areaId : typeof input.domPath === 'string' ? input.domPath : 'page';
+  return `scroll-step-${step.index}-${area}`;
+}
+
+function buildAvailableScreenshotReferences(steps: StepExecutionResult[], limit = Number(process.env.AI_PROMPT_SCREENSHOT_REFERENCE_LIMIT || 8)): ScreenshotReference[] {
+  const refs: ScreenshotReference[] = [];
+  for (const step of steps) {
+    const entries: Array<{ phase: ScreenshotReference['phase']; path?: string }> = [
+      { phase: 'before', path: step.beforeScreenshotPath },
+      { phase: 'after', path: step.afterScreenshotPath },
+      { phase: 'screenshot', path: step.screenshotPath },
+    ];
+    const seenPaths = new Set<string>();
+    for (const entry of entries) {
+      if (!entry.path || seenPaths.has(entry.path)) continue;
+      seenPaths.add(entry.path);
+      const group = screenshotReferenceGroupOf(step, entry.phase);
+      refs.push({
+        id: `step-${step.index}-${entry.phase}`,
+        path: entry.path,
+        stepIndex: step.index,
+        phase: entry.phase,
+        sameInterfaceGroup: group,
+        description: [
+          `Step ${step.index} ${screenshotPhaseLabel(entry.phase)}`,
+          `status=${step.status}`,
+          step.tools?.length ? `tools=${step.tools.map((toolCall) => toolCall.name).join(',')}` : '',
+          step.observation ? `observation=${concise(step.observation, 90)}` : '',
+          step.note ? `note=${concise(step.note, 90)}` : '',
+          group ? `sameInterfaceGroup=${group}; likely same page with different scroll offset around this step` : '',
+        ].filter(Boolean).join(' | '),
+      });
+    }
+  }
+  return refs.slice(-limit);
+}
+
+function formatScreenshotReferences(refs: ScreenshotReference[]) {
+  if (!refs.length) return '[none]';
+  return refs.map((ref) => [
+    `- id=${ref.id}`,
+    `step=${ref.stepIndex}`,
+    `phase=${ref.phase}`,
+    ref.sameInterfaceGroup ? `sameInterfaceGroup=${ref.sameInterfaceGroup}` : '',
+    `description=${ref.description}`,
+  ].filter(Boolean).join(' | ')).join('\n');
+}
+
+function concise(value?: string, max = 220) {
+  const text = (value || '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function isInfrastructureNoise(value?: string) {
+  if (!value) return false;
+  return /No capacity available|Request aborted|Active browser page has been closed|Execution context was destroyed|ECONNRESET|ETIMEDOUT|timeout|rate limit|model .*server|Failed after \d+ attempts/i.test(value);
+}
+
+function isUsefulHistoryStep(step: StepExecutionResult) {
+  const text = `${step.action}\n${step.actual}\n${step.note || ''}`;
+  if (isInfrastructureNoise(text)) return false;
+  return Boolean(
+    step.status === 'passed'
+    || step.observation
+    || step.findings?.length
+    || step.memoryItems?.length
+    || step.tools?.length,
+  );
+}
+
+function stepTimelineItem(step: StepExecutionResult) {
+  const toolReasons = (step.tools || [])
+    .map((toolCall) => toolCall.reason)
+    .filter((value): value is string => Boolean(value && value.trim()));
+  const toolNames = (step.tools || []).map((toolCall) => toolCall.name).filter(Boolean).join(', ');
+  const parts = [
+    step.observation ? `observation=${concise(step.observation, 120)}` : '',
+    step.note ? `note=${concise(step.note, 120)}` : '',
+    toolReasons.length ? `reason=${concise(toolReasons.join('; '), 160)}` : '',
+    step.findings?.length ? `findings=${concise(step.findings.join('; '), 160)}` : '',
+    step.status === 'failed' || step.status === 'blocked' ? `issue=${concise(step.actual, 180)}` : '',
+  ].filter(Boolean);
+  return `Step ${step.index} [${step.status}${toolNames ? `/${toolNames}` : ''}]: ${parts.join(' | ') || concise(step.action || step.actual)}`;
+}
+
+function buildRunMemory(steps: StepExecutionResult[], previous?: RunMemory): RunMemory {
+  const usefulSteps = steps.filter(isUsefulHistoryStep);
+  const timeline = usefulSteps.map(stepTimelineItem).slice(-Number(process.env.RUN_MEMORY_TIMELINE_LIMIT || 10));
+  const findings = Array.from(new Set([
+    ...(previous?.findings || []),
+    ...steps.flatMap((step) => step.findings || []),
+  ].map((item) => concise(item, 220)).filter((item) => item && !isInfrastructureNoise(item)))).slice(-16);
+  const failedAttempts = Array.from(new Set([
+    ...(previous?.failedAttempts || []),
+    ...steps
+      .filter((step) => step.status === 'failed' || step.status === 'blocked')
+      .filter((step) => !isInfrastructureNoise(`${step.action}\n${step.actual}`))
+      .map((step) => `Step ${step.index}: ${concise(step.action, 90)} -> ${concise(step.actual, 160)}`),
+  ].filter((item) => !isInfrastructureNoise(item)))).slice(-6);
+  const durableItems = Array.from(new Set([
+    ...steps.flatMap((step) => step.memoryItems || []),
+    ...failedAttempts,
+  ].map((item) => concise(item, 220)).filter((item) => item && !isInfrastructureNoise(item)))).slice(-10);
+  const completed = steps.filter((step) => step.status === 'passed').length;
+  const failed = steps.filter((step) => step.status === 'failed').length;
+  const blocked = steps.filter((step) => step.status === 'blocked').length;
+  const latest = usefulSteps.slice(-5).map((step) => `S${step.index}:${concise(step.observation || step.note || step.action, 80)}`).join('; ');
+  const summary = [
+    `已执行 ${steps.length} 步：通过 ${completed}，失败 ${failed}，阻塞 ${blocked}。`,
+    latest ? `最近有效进展：${latest}` : '',
+    findings.length ? `重要发现：${findings.slice(-5).join('；')}` : '',
+    durableItems.length ? `后续记忆：${durableItems.slice(-5).join('；')}` : '',
+  ].filter(Boolean).join('\n').slice(0, Number(process.env.RUN_MEMORY_SUMMARY_MAX_CHARS || 1000));
+
+  return {
+    summary,
+    timeline,
+    findings,
+    failedAttempts,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function formatRunMemory(steps: StepExecutionResult[]) {
+  const memory = buildRunMemory(steps);
+  const includeTimeline = process.env.AI_PROMPT_INCLUDE_FULL_TIMELINE === 'true';
+  return [
+    `Run memory:\n${memory.summary || '[none]'}`,
+    memory.findings.length ? `Findings:\n${memory.findings.slice(-8).map((item, index) => `${index + 1}. ${item}`).join('\n')}` : '',
+    memory.failedAttempts.length ? `Ineffective business attempts:\n${memory.failedAttempts.slice(-4).map((item, index) => `${index + 1}. ${item}`).join('\n')}` : '',
+    includeTimeline ? `Useful recent timeline:\n${memory.timeline.join('\n') || '[none]'}` : '',
+  ].filter(Boolean).join('\n\n');
 }
 
 function hostOf(url: string) {
@@ -380,6 +578,14 @@ function makeBrowserTools(
   mode: BrowserSessionMode,
   traces: ToolTrace[],
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>,
+  referenceOptions?: {
+    availableReferenceIds?: Set<string>;
+    onSelectReferenceScreenshots?: (input: {
+      ids: string[];
+      selectionReason: string;
+      sameInterfaceGroup?: string;
+    }) => void | Promise<void>;
+  },
 ) {
   // Enforce a single executed tool per AI request. makeBrowserTools is created fresh for each
   // request, so this flag guarantees that even if the model emits several tool calls in one
@@ -388,6 +594,13 @@ function makeBrowserTools(
   // duplicate-operation problem seen when a request was retried mid-chain.
   let toolExecutedThisRequest = false;
   const toolReasonInput = z.string().min(1).max(300).describe('Required: concise Chinese reason for this exact tool call. Name the visible target and the observable page change expected; do not merely repeat a candidate ID.');
+  const toolContextShape = {
+    reason: toolReasonInput,
+    observation: z.string().min(1).max(800).describe('Required Chinese observation of the current page/task state. Include visible errors, requirement content, business state, or "鏃犳槑鏄炬柊澧炶瀵?.'),
+    findings: z.string().min(1).max(1000).describe('Required Chinese findings from this step. Include product errors, requirements, rules, risks, or summaries. Use "鏃? if none. Separate multiple items with semicolons.'),
+    memory: z.string().min(1).max(1000).describe('Required Chinese memory for later steps. Include facts that may affect future actions. Use "鏃? if none. Separate multiple items with semicolons.'),
+  };
+  const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
 
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
     if (toolExecutedThisRequest) {
@@ -409,150 +622,174 @@ function makeBrowserTools(
   const sharedTools = {
     openPage: tool({
       description: 'Open or navigate to a URL in the browser.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         url: z.string().optional().describe('The URL to open. Defaults to the test target URL.'),
       }),
-      execute: ({ url, reason }) => record('openPage', { url, reason }, () => session.open(url || targetUrl)),
+      execute: (input) => record('openPage', input, () => session.open(input.url || targetUrl)),
     }),
-    scrollViewport: tool({
-      description: 'Scroll a selected scroll container. Pass domPath for the table/list/panel or one of its visible children. Use this for virtual scroll containers instead of blindly scrolling the page.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+    scrollArea: tool({
+      description: 'Scroll a visible scrollable area by its area id from current scrollableAreas, such as S1 for page viewport or S2 for a table/list/panel/modal.',
+      inputSchema: browserToolInput({
+        areaId: z.string().describe('Scrollable area id from current scrollableAreas, such as S1, S2, or S3.'),
         deltaY: z.number().describe('Vertical scroll delta. Positive scrolls down, negative scrolls up.'),
-        deltaX: z.number().optional().describe('Horizontal scroll delta.'),
-        domPath: z.string().optional().describe('Bracket path for the scrollable element or one of its children, such as 0.1.2.'),
+        deltaX: z.number().optional().describe('Horizontal scroll delta. Positive scrolls right, negative scrolls left.'),
       }),
-      execute: ({ deltaY, deltaX, domPath, reason }) => record('scrollViewport', { deltaY, deltaX, domPath, reason }, () => session.scroll(deltaY, deltaX || 0, { domPath })),
+      execute: (input) => record('scrollArea', input, () => session.scrollArea(input.areaId, input.deltaY, input.deltaX || 0)),
     }),
     clickCandidate: tool({
       description: 'Click a visible candidate by its numbered label from the current step screenshot snapshot. Choose the smallest/tightest candidate that directly encloses the intended visible text, icon, or control; avoid larger containing wrapper boxes. A successful tool result only confirms the click was delivered, not that the UI changed. The same visible target may be attempted at most twice because the first click can dismiss an overlay while the second activates the target. If text is provided, type it immediately after the click.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         id: z.string().describe('Candidate id such as 1 or 12. Must come from the current visual labels or interactive candidate list. Never choose a larger overlapping wrapper when a tighter candidate represents the same visible target.'),
         text: z.string().optional().describe('Optional text to type immediately after clicking, useful when the click focuses an input or editable control.'),
       }),
-      execute: ({ id, text, reason }) => record('clickCandidate', { id, text, reason }, () => session.clickCandidate(id, text)),
+      execute: (input) => record('clickCandidate', input, () => session.clickCandidate(input.id, input.text)),
     }),
     hoverCandidate: tool({
       description: 'Move the mouse over a visible candidate by its numbered label. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         id: z.string().describe('Candidate id such as 1 or 12. Must come from the current visual labels or interactive candidate list.'),
       }),
-      execute: ({ id, reason }) => record('hoverCandidate', { id, reason }, () => session.hoverCandidate(id)),
+      execute: (input) => record('hoverCandidate', input, () => session.hoverCandidate(input.id)),
     }),
     typeText: tool({
       description: 'Type text into the currently focused element. Prefer clickCandidate(id,text) for numbered inputs; use this only after a fallback click already focused the field.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         text: z.string().describe('Text to enter.'),
       }),
-      execute: ({ text, reason }) => record('typeText', { text, reason }, () => session.typeText(text)),
+      execute: (input) => record('typeText', input, () => session.typeText(input.text)),
     }),
     pressKey: tool({
       description: 'Press a keyboard key on the currently focused element or page.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         key: z.string().describe('Keyboard key, for example Enter, Escape, Tab.'),
       }),
-      execute: ({ key, reason }) => record('pressKey', { key, reason }, () => session.press(key)),
+      execute: (input) => record('pressKey', input, () => session.press(input.key)),
     }),
     waitForPage: tool({
       description: 'Wait for the page to settle after navigation or UI changes.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         ms: z.number().optional().describe('Optional wait time in milliseconds.'),
       }),
-      execute: ({ ms, reason }) => record('waitForPage', { ms, reason }, () => (ms ? session.wait(ms) : session.waitForPage())),
+      execute: (input) => record('waitForPage', input, () => (input.ms ? session.wait(input.ms) : session.waitForPage())),
     }),
     waitForHumanVerification: tool({
       description: 'Wait while the user completes a visible CAPTCHA, login verification, or security check in the non-headless browser.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         maxMs: z.number().optional().describe('Maximum wait time in milliseconds. Defaults to MANUAL_VERIFICATION_TIMEOUT_MS or 180000.'),
       }),
-      execute: ({ maxMs, reason }) => record('waitForHumanVerification', { maxMs, reason }, () => session.waitForManualVerification(maxMs)),
+      execute: (input) => record('waitForHumanVerification', input, () => session.waitForManualVerification(input.maxMs)),
     }),
     listTabs: tool({
       description: 'List all currently open browser tabs with their index and URL.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-      }),
+      inputSchema: browserToolInput({}),
       execute: (input) => record('listTabs', input, () => session.listTabs()),
     }),
     switchTab: tool({
       description: 'Switch to a browser tab by index when the workflow opened a new tab.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         index: z.number().describe('The tab index from listTabs.'),
       }),
-      execute: ({ index, reason }) => record('switchTab', { index, reason }, () => session.switchTab(index)),
+      execute: (input) => record('switchTab', input, () => session.switchTab(input.index)),
+    }),
+    reportState: tool({
+      description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or you only need to record observations/findings/memory. This tool does not change the browser.',
+      inputSchema: browserToolInput({
+        action: z.string().min(1).describe('Chinese summary of the current assistant state or final conclusion.'),
+        expected: z.string().min(1).describe('Chinese expected condition or remaining goal.'),
+        actual: z.string().min(1).describe('Chinese evidence-based actual state, including important details.'),
+        status: z.enum(['passed', 'failed', 'blocked']).describe('passed for complete or non-terminal observation, failed for impossible/end-to-end failure, blocked for manual verification/security/user input.'),
+        done: z.boolean().describe('true only when the full requirement is complete or impossible. false when more useful browser work remains or user/manual intervention is needed.'),
+      }),
+      execute: (input) => record('reportState', input, async () => ({
+        ok: true,
+        actual: `Reported state without browser action: ${input.actual}`,
+      })),
+    }),
+    selectReferenceScreenshots: tool({
+      description: 'No-op context tool. Select previous screenshot reference ids from Available previous screenshot references so those images will be attached to the NEXT AI request. The tool output is text only; it does not include image content and does not change the browser.',
+      inputSchema: browserToolInput({
+        ids: z.array(z.string().min(1)).max(6).describe('Reference ids to attach next request, such as step-3-before or step-4-after. Use an empty array to clear selected references.'),
+        selectionReason: z.string().min(1).max(800).describe('Chinese explanation of why these previous screenshots are useful, especially whether they are the same interface at different scroll positions.'),
+        sameInterfaceGroup: z.string().optional().describe('Optional group label when the selected screenshots are believed to be the same interface with different scroll offsets.'),
+      }),
+      execute: (input) => record('selectReferenceScreenshots', input, async () => {
+        const allowed = referenceOptions?.availableReferenceIds;
+        const validIds = allowed
+          ? input.ids.filter((id) => allowed.has(id))
+          : input.ids;
+        await referenceOptions?.onSelectReferenceScreenshots?.({
+          ids: validIds,
+          selectionReason: input.selectionReason,
+          sameInterfaceGroup: input.sameInterfaceGroup,
+        });
+        const skipped = input.ids.filter((id) => !validIds.includes(id));
+        return {
+          ok: true,
+          actual: [
+            validIds.length
+              ? `Selected screenshot references for the next request: ${validIds.join(', ')}.`
+              : 'Cleared selected screenshot references for the next request.',
+            skipped.length ? ` Ignored unavailable ids: ${skipped.join(', ')}.` : '',
+            ` Reason: ${input.selectionReason}`,
+          ].join(''),
+        };
+      }),
     }),
   };
 
   const domTools = {
     getInteractiveCandidates: tool({
       description: 'Fallback only (DOM mode): return visible interactable candidates as JSON when the candidate context needs refresh. Each candidate has id (1...), tag/role/name/text, href/host, visible box/center, and nearbyText.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-      }),
+      inputSchema: browserToolInput({}),
       execute: (input) => record('getInteractiveCandidates', input, () => session.getInteractiveCandidates()),
     }),
     getDomTree: tool({
       description: 'Return the current tab simplified DOM tree of currently visible elements. Each line is "[path] tag#id.class * @x,y,w,h {attrs} \\"text\\"": "*" marks clickable elements, @ is the visible viewport box, {attrs} holds key attributes (placeholder/aria-label/role/href/value...), and "text" is the node\'s own text. Hidden nodes are removed, so paths line up with what is on screen.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
-      }),
+      inputSchema: browserToolInput({}),
       execute: (input) => record('getDomTree', input, () => session.getSimplifiedDomTree()),
     }),
     clickDomNode: tool({
       description: 'Fallback only: click a node from the simplified DOM tree by its bracket path, for example "0.1.2". Prefer clickCandidate when a numbered candidate exists.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         path: z.string().describe('The bracket path shown in the simplified DOM tree, such as 0.1.2.'),
       }),
-      execute: ({ path, reason }) => record('clickDomNode', { path, reason }, () => session.clickDomNode(path)),
+      execute: (input) => record('clickDomNode', input, () => session.clickDomNode(input.path)),
     }),
   };
 
   const visualTools = {
     doubleClickCandidate: tool({
       description: 'Visual mode: double-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         id: z.string().describe('Candidate id such as 1 or 12. Must come from the current screenshot labels or interactive candidate list.'),
       }),
-      execute: ({ id, reason }) => record('doubleClickCandidate', { id, reason }, () => session.doubleClickCandidate(id)),
+      execute: (input) => record('doubleClickCandidate', input, () => session.doubleClickCandidate(input.id)),
     }),
     rightClickCandidate: tool({
       description: 'Visual mode: right-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         id: z.string().describe('Candidate id such as 1 or 12. Must come from the current screenshot labels or interactive candidate list.'),
       }),
-      execute: ({ id, reason }) => record('rightClickCandidate', { id, reason }, () => session.rightClickCandidate(id)),
+      execute: (input) => record('rightClickCandidate', input, () => session.rightClickCandidate(input.id)),
     }),
     dragCandidate: tool({
       description: 'Visual mode: drag from one numbered candidate center to another numbered candidate center.',
-      inputSchema: z.object({
-        reason: toolReasonInput,
+      inputSchema: browserToolInput({
         fromId: z.string().describe('Start candidate id such as 1.'),
         toId: z.string().describe('End candidate id such as 2.'),
       }),
-      execute: ({ fromId, toId, reason }) => record('dragCandidate', { fromId, toId, reason }, () => session.dragCandidate(fromId, toId)),
+      execute: (input) => record('dragCandidate', input, () => session.dragCandidate(input.fromId, input.toId)),
     }),
   };
 
   return mode === 'visual-markers' ? { ...sharedTools, ...visualTools } : { ...sharedTools, ...domTools };
 }
 
-// 构造完成判定规则；视觉模式用截图作证据，DOM 模式用文本化页面上下文作证据。
-function buildCompletionPromptLines(requirement: string, usesScreenshot: boolean) {
+// 鏋勯€犲畬鎴愬垽瀹氳鍒欙紱瑙嗚妯″紡鐢ㄦ埅鍥句綔璇佹嵁锛孌OM 妯″紡鐢ㄦ枃鏈寲椤甸潰涓婁笅鏂囦綔璇佹嵁銆?
+function buildCompletionPromptLines(usesScreenshot: boolean) {
   const evidence = usesScreenshot ? 'screenshot' : 'textual page context / candidates / DOM / URL / focus';
   return [
     'Completion rules:',
-    `- Requirement: ${requirement}`,
     `- done=true only when EVERY requirement clause is proven by ${evidence}. Partial progress is not completion.`,
     '- If anything is still missing or uncertain, call one more tool instead of finishing.',
     '- status=blocked only for manual verification/security/login wait; blocked must use done=false.',
@@ -584,7 +821,7 @@ type CompletionVerification = {
   remainingWork: string;
 };
 
-// 当执行器声称完成时，用独立校验请求再判断一次，减少“只完成一半就结束”的误判。
+// 褰撴墽琛屽櫒澹扮О瀹屾垚鏃讹紝鐢ㄧ嫭绔嬫牎楠岃姹傚啀鍒ゆ柇涓€娆★紝鍑忓皯鈥滃彧瀹屾垚涓€鍗婂氨缁撴潫鈥濈殑璇垽銆?
 async function verifyRuntimeCompletion(input: {
   testCase: TestCaseRecord;
   screenshotPath: string;
@@ -599,8 +836,8 @@ async function verifyRuntimeCompletion(input: {
   const prompt = [
     'You are an independent completion judge. The executor agent claims the user requirement is FULLY complete.',
     attachScreenshot
-      ? 'Verify using ONLY the attached viewport screenshot and the requirement text. Be strict — partial progress is NOT complete.'
-      : 'Verify using ONLY the textual browser context and the requirement text. No screenshot image is attached because visual mode is disabled. Be strict — partial progress is NOT complete.',
+      ? 'Verify using ONLY the attached viewport screenshot and the requirement text. Be strict 鈥?partial progress is NOT complete.'
+      : 'Verify using ONLY the textual browser context and the requirement text. No screenshot image is attached because visual mode is disabled. Be strict 鈥?partial progress is NOT complete.',
     '',
     `User requirement (every clause must be visibly satisfied for verified=true):\n${requirement}`,
     '',
@@ -619,8 +856,8 @@ async function verifyRuntimeCompletion(input: {
     attachScreenshot
       ? '- verified=true only if the screenshot clearly proves ALL parts of the requirement are done.'
       : '- verified=true only if the textual browser context clearly proves ALL parts of the requirement are done.',
-    '- Empty captcha/OTP, login not finished, or waiting for user input → verified=false, status="blocked".',
-    '- Wrong page or missing required outcome → verified=false; set remainingWork to concrete next steps.',
+    '- Empty captcha/OTP, login not finished, or waiting for user input 鈫?verified=false, status="blocked".',
+    '- Wrong page or missing required outcome 鈫?verified=false; set remainingWork to concrete next steps.',
     '- If the requirement is visibly impossible, verified=true with status="failed" is allowed.',
     '- summary and remainingWork must be written in Chinese.',
     '',
@@ -660,13 +897,13 @@ async function verifyRuntimeCompletion(input: {
     return {
       verified: false,
       status: 'passed',
-      summary: '完成校验响应无法解析，视为未完成并继续执行。',
-      remainingWork: '根据截图与用户需求继续推进，直至全部条款在截图上可见完成。',
+      summary: 'Completion verification response could not be parsed; continue execution.',
+      remainingWork: 'Continue from the latest screenshot until every requirement clause is satisfied.',
     };
   }
 }
 
-// 根据当前模式生成验证码/安全校验规则，DOM 模式不要求 AI 读取截图。
+// 鏍规嵁褰撳墠妯″紡鐢熸垚楠岃瘉鐮?瀹夊叏鏍￠獙瑙勫垯锛孌OM 妯″紡涓嶈姹?AI 璇诲彇鎴浘銆?
 function buildVerificationPromptLines(pageContext: Awaited<ReturnType<BrowserSession['getPageContext']>>, usesScreenshot: boolean) {
   const mv = pageContext.manualVerification;
   if (!mv?.detected && !mv?.captchaFields?.length) return [];
@@ -687,6 +924,8 @@ function runtimePrompt(input: {
   beforeScreenshotPath: string;
   hasMarkerScreenshot?: boolean;
   markerOverlayInScreenshot?: boolean;
+  availableScreenshotReferences?: ScreenshotReference[];
+  selectedScreenshotReferences?: SelectedScreenshotReference[];
 }) {
   const { testCase, pageContext, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
@@ -699,8 +938,21 @@ function runtimePrompt(input: {
   const separateMarkerScreenshot = Boolean(markerEnabled && input.hasMarkerScreenshot);
   const caseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
-  const recentNotes = recentProgressNotes(completedSteps, 5);
-  const recentTools = recentToolCallContext(completedSteps, 5);
+  const recentNotes = recentProgressNotes(completedSteps, 3);
+  const recentTools = recentToolCallContext(completedSteps, 3);
+  const recentScrollContinuity = recentScrollContinuityContext(completedSteps, 4);
+  const runMemoryContext = formatRunMemory(completedSteps);
+  const availableScreenshotReferences = input.availableScreenshotReferences || [];
+  const selectedScreenshotReferences = input.selectedScreenshotReferences || [];
+  const strategyMemory = (testCase.strategyMemory || [])
+    .filter((hint) => !isInfrastructureNoise(hint))
+    .map((hint) => concise(hint, 220))
+    .slice(-4);
+  const recentFailures = completedSteps
+    .filter((step) => step.status === 'failed' || step.status === 'blocked')
+    .filter((step) => !isInfrastructureNoise(`${step.action}\n${step.actual}`))
+    .slice(-2)
+    .map((step) => `Step ${step.index}: ${concise(step.action, 90)} -> ${concise(step.actual, 160)}`);
   const domTree = visualMode ? '[disabled because visual mode is enabled]' : trimDebugText(pageContext.domTree || '[empty DOM tree]', 12000);
   const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
   const candidateContext = visualMode
@@ -708,7 +960,6 @@ function runtimePrompt(input: {
       ? formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)
       : '[disabled because visual mode uses screenshot labels]'
     : formatInteractiveCandidates(pageContext.interactiveCandidates, candidateLimit);
-  // 视觉模式有三种输入形态：单图内嵌标识、双图标识图、无标识但带文本候选摘要。
   const evidence = attachScreenshot
     ? mode === 'visual-markers' && separateMarkerScreenshot
       ? 'the two attached screenshots'
@@ -729,41 +980,45 @@ function runtimePrompt(input: {
         'Visual target selection and no-progress recovery:',
         markerSourceRule,
         '- A tool result with ok=true only confirms that the browser received the action. It does NOT prove the target was correct or that the page changed.',
-        '- When multiple candidate boxes overlap, contain one another, or point at the same visible text/icon/control, choose the smallest and tightest box that directly encloses the intended target. Treat larger containing boxes as wrapper elements unless the requirement explicitly needs the container blank area.',
-        '- Never choose a candidate merely because its box is larger, its number is closer to the text, or it appears easier to click.',
-        '- Before acting, compare the intended visible target with recent tool reasons and progress notes. Candidate IDs may change, so count attempts by the visible control and intended action, not only by ID.',
-        '- The same visible target and action may be attempted at most TWO consecutive times. This exception exists because the first click can dismiss an open dropdown, popup, tooltip, or modal mask while the second click activates the intended target beneath it.',
-        '- A second attempt is allowed only after inspecting the new screenshot. If the overlay disappeared, the target became exposed, focus changed, or another visible state changed, click the same target once more. Never issue two clicks from one screenshot.',
-        '- If two attempts on the same visible target still do not produce the expected result, treat that target as ineffective. Do not target it a third time even if its candidate ID changed; choose a more specific child candidate, another visible trigger, hover, wait only when loading is visible, or use another navigation path.',
-        '- Do not repeatedly alternate between overlapping parent and child boxes without new visual evidence.',
+        '- Candidate ids in attached reference screenshots are historical only. For the next action, use only ids that are visible in the current screenshot/marker map.',
+        '- For overlapping boxes, choose the smallest/tightest box that directly encloses the intended visible text/icon/control.',
+        '- Count repeated attempts by visible target + action, not only by id. After two ineffective attempts, choose another evidence-based path.',
+        '- Never issue two clicks from one screenshot. Re-inspect the new screenshot before a second attempt.',
       ]
     : [];
   const modeActionRules = [
-    '- Candidate IDs belong only to the current step screenshot snapshot. Never reuse an ID from an older screenshot.',
+    '- Candidate IDs belong only to the CURRENT step screenshot snapshot. In visual-markers mode, every click/hover/drag id must be re-read from the current screenshot evidence; never carry over an id from a previous screenshot even if the visible control looks similar.',
     '- For text entry on a numbered candidate, use clickCandidate(id,text) in one tool call. Use typeText only after a fallback click already focused the field.',
     '- For hover-only menus, call hoverCandidate on the visible trigger, then act on the revealed target in the next step.',
-    '- For scrollable tables/lists/panels, call scrollViewport with the relevant domPath when available.',
+    '- When the current screenshot/scrollableAreas show a scrollbar and the next needed content or control may be outside the visible area, consider scrollArea(areaId) instead of assuming the content is absent.',
+    '- Green dashed S-labels mark scrollable regions. If a target likely belongs inside a table, list, panel, modal, or page viewport with more content, choose the relevant S area from current scrollableAreas.',
+    '- Previous screenshots are not visible unless they are attached as selected references. Use current screenshot ids for actions; use selected references, Recent scroll continuity, pageScrollState, and scrollableAreas only as background context.',
   ];
 
   return [
-    'You are an AI browser testing agent. Choose exactly ONE next browser action, or finish with JSON only when the full requirement is complete.',
+    'You are an AI browser testing agent. You MUST call exactly ONE tool on every AI request. Use reportState when no browser action is needed.',
     `Requirement: ${requirement}`,
     `Target URL: ${testCase.targetUrl}`,
     `Target host: ${targetHost}`,
     `Current URL: ${pageContext.url}`,
     '',
     'Hard rules:',
-    '- Call at most ONE tool. Extra tool calls are ignored.',
-    '- 所有面向用户的说明、reason、PROGRESS/NEXT、完成 JSON 字段内容都必须使用中文。',
+    '- Call exactly ONE tool. Extra tool calls are ignored. Never respond with only text or only JSON.',
+    '- All user-facing tool fields must be Chinese.',
+    '- You are both a test executor and a continuous AI browser assistant; every tool call must include reason, observation, findings, and memory.',
+    '- Record visible product errors, requirements, business rules, warnings, state changes, and constraints in findings or memory even when the flow can continue.',
     `- Use ${evidence} as the current page state.`,
     '- Use recent notes/tools as attempt memory. The same visible target and action may be tried at most twice; after two ineffective attempts, do not repeat it again.',
+    '- Failure self-healing: when the previous action did not visibly change the page, do not repeat the same visible target again. Re-observe the page and choose a different selector, a tighter child candidate, keyboard input, scrolling, hover, tab switching, or a different navigation path.',
+    '- Do not mark the run failed just because one action failed. First try a reasonable corrective path unless the page is unreachable, the requirement is impossible, or manual verification is required.',
+    '- If a historical strategy hint conflicts with the current screenshot, trust the current screenshot and explain the updated choice in reason.',
     '- If a white mouse-pointer marker is visible in the screenshot, it indicates the last browser action location only. Do not treat it as a page control, candidate marker, tooltip, cursor state, or evidence that the target remains selected.',
-    '- If recent progress notes contain "[完成校验未通过]", do not finish again immediately. Re-observe the new screenshot; a previously attempted visual target may be tried only if it has fewer than two attempts and the screenshot shows a plausible overlay-dismissal or state-change reason. Otherwise perform a different corrective action.',
+    '- If recent progress notes contain "[瀹屾垚鏍￠獙鏈€氳繃]", do not finish again immediately. Re-observe the new screenshot; a previously attempted visual target may be tried only if it has fewer than two attempts and the screenshot shows a plausible overlay-dismissal or state-change reason. Otherwise perform a different corrective action.',
     '- If page is loading/transitioning, call waitForPage once.',
     ...modeActionRules,
     '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
-    '- Finish only when EVERY requirement clause is satisfied; otherwise call one more useful tool.',
+    '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only recording observations.',
     attachScreenshot
       ? separateMarkerScreenshot
         ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map containing numbered candidate outlines. Understand the page from image 1, then choose a candidate ID from image 2. getInteractiveCandidates/getDomTree are unavailable.'
@@ -776,18 +1031,24 @@ function runtimePrompt(input: {
     ...markerTargetRules,
     caseSystemPrompt ? `Test-case-specific instructions:
 ${caseSystemPrompt}` : '',
+    strategyMemory.length ? `Historical failure strategy memory:
+${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : '',
     '',
     ...buildVerificationPromptLines(pageContext, attachScreenshot),
-    ...buildCompletionPromptLines(requirement, attachScreenshot),
+    ...buildCompletionPromptLines(attachScreenshot),
     '',
     'Response:',
-    '- To act: call exactly ONE tool and include reason grounded in current context.',
+    '- Always call exactly ONE tool.',
+    '- To act: call exactly ONE browser tool and include reason/observation/findings/memory grounded in current context.',
     '- For clickCandidate/hoverCandidate, reason must name the visible control, explain why this is the most specific current candidate, and state the expected observable page change.',
-    '- When acting, also output Chinese text: PROGRESS: <本步选择的视觉目标和操作> NEXT: <下一张截图中应出现的可观察变化>.',
-    '- To finish/block/fail: call NO tool and return JSON: {"action":string,"expected":string,"actual":string,"status":"passed"|"failed"|"blocked","done":true}.',
+    '- Tool arguments must carry assistant state: reason, observation, findings, memory. Use "无" for empty findings/memory.',
+    '- To finish/block/fail or only record an observation, call reportState. Do not return standalone JSON.',
+    '- To inspect earlier scroll positions on the NEXT request, call selectReferenceScreenshots with ids from Available previous screenshot references. Its result is text only; selected images are attached on the next AI request.',
     '',
     'Current context:',
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
+    `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
+    `Scrollable areas JSON: ${JSON.stringify(pageContext.scrollableAreas)}`,
     visualMode ? '' : `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
     visualMarkersWithoutOverlay ? `Visible interactive elements:
 ${candidateContext}` : '',
@@ -795,16 +1056,28 @@ ${candidateContext}` : '',
 ${candidateContext}`,
     visualMode ? '' : `Simplified DOM tree:
 ${domTree}`,
-    `Recent progress notes (last 5, oldest first):
+    `Recent progress notes (last 3, oldest first):
 ${recentNotes.join('\n') || '[none]'}`,
-    `Recent tool calls (last 5, oldest first):
+    recentFailures.length ? `Recent business failed/blocked steps:
+${recentFailures.join('\n')}` : '',
+    `Recent scroll continuity:
+${recentScrollContinuity.join('\n') || '[none]'}`,
+    `Available previous screenshot references (text index only; not images unless selected):
+${formatScreenshotReferences(availableScreenshotReferences)}`,
+    `Selected reference screenshots attached after the current screenshot images:
+${formatScreenshotReferences(selectedScreenshotReferences)}`,
+    selectedScreenshotReferences.length
+      ? 'Reference screenshot rule: selected reference images help connect scroll continuity or compare earlier page state. They may show the same interface at different scroll offsets when sameInterfaceGroup matches, but their candidate ids are historical and must never be used for the current action.'
+      : '',
+    runMemoryContext,
+    `Recent tool calls (last 3, oldest first):
 ${JSON.stringify(recentTools, null, 2)}`,
     attachScreenshot
       ? mode === 'visual-markers' && separateMarkerScreenshot
-        ? 'Two screenshot images are attached in this order: clean viewport, marker map.'
+        ? `Screenshot images are attached in this order: Image 1 current clean viewport, Image 2 current marker map${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
         : mode === 'visual-markers' && markerOverlayInScreenshot
-          ? 'One screenshot image is attached with marker labels overlaid on the page.'
-        : 'Clean viewport screenshot image is attached.'
+          ? `Screenshot images are attached in this order: Image 1 current page with marker labels overlaid${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
+        : `Screenshot images are attached in this order: Image 1 current clean viewport${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
       : 'Screenshot image/path is not attached.',
   ].filter(Boolean).join('\n');
 }
@@ -827,6 +1100,9 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'switchTab',
     'typeText',
     'pressKey',
+    'reportState',
+    'scrollArea',
+    'selectReferenceScreenshots',
   ];
   const candidateTools = [
     ...sharedTools,
@@ -835,7 +1111,6 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'doubleClickCandidate',
     'rightClickCandidate',
     'dragCandidate',
-    'scrollViewport',
   ];
   if (mode === 'visual-markers') return candidateTools;
   return [...candidateTools, 'getInteractiveCandidates', 'getDomTree', 'clickDomNode'];
@@ -853,36 +1128,14 @@ function codexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- AI SDK tools are unavailable for this provider. Do NOT attempt to call tools.',
     '- Return exactly one object with shape: { "type": string, "params": object }.',
     '- All user-facing params strings such as reason/action/expected/actual must be Chinese.',
-    `- type must be one of: ${[...allowedTypes, 'finish', 'block', 'fail'].join(', ')}.`,
-    '- params MUST include every schema key: reason,url,id,text,key,path,domPath,fromId,toId,index,ms,maxMs,deltaX,deltaY,action,expected,actual,status,done. Set unused keys to null.',
+    `- type must be one of: ${allowedTypes.join(', ')}.`,
+    '- params MUST include every schema key: reason,url,id,text,key,path,domPath,fromId,toId,index,ms,maxMs,deltaX,deltaY,action,expected,actual,status,done,observation,findings,memory,ids,selectionReason,sameInterfaceGroup. Set unused keys to null.',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
-    '- For completion, use type="finish" and params={action, expected, actual, status:"passed", done:true}.',
-    '- For manual verification/security wait, use type="block" and params={action, expected, actual, status:"blocked", done:false}.',
-    '- For impossible/end-to-end failure, use type="fail" and params={action, expected, actual, status:"failed", done:true}.',
+    '- For completion, manual verification, failure, or pure observation, use type="reportState".',
   ].join('\n');
 }
 
-function codexTerminalText(type: string, params: Record<string, unknown>) {
-  const parsed = terminalCodexActionSchema.safeParse(params);
-  const status =
-    type === 'block'
-      ? 'blocked'
-      : type === 'fail'
-        ? 'failed'
-        : parsed.success && parsed.data.status
-          ? parsed.data.status
-          : 'passed';
-  const done = type === 'block' ? false : parsed.success && typeof parsed.data.done === 'boolean' ? parsed.data.done : true;
-  return JSON.stringify({
-    action: parsed.success && parsed.data.action ? parsed.data.action : `Codex returned ${type}`,
-    expected: parsed.success && parsed.data.expected ? parsed.data.expected : 'Codex object response should summarize the current test state.',
-    actual: parsed.success && parsed.data.actual ? parsed.data.actual : JSON.stringify(params),
-    status,
-    done,
-  });
-}
-
-// 记录一次 AI 请求的可展示上下文；图片只在真实发送给 AI 时写入 messages。
+// 璁板綍涓€娆?AI 璇锋眰鐨勫彲灞曠ず涓婁笅鏂囷紱鍥剧墖鍙湪鐪熷疄鍙戦€佺粰 AI 鏃跺啓鍏?messages銆?
 function createAiRequestSnapshot(input: {
   kind: AiRequestSnapshot['kind'];
   stepIndex: number;
@@ -931,9 +1184,38 @@ function createAiRequestSnapshot(input: {
 function extractProgressNote(text: string) {
   if (!text) return undefined;
   // The model is asked to emit a single "PROGRESS: ... NEXT: ..." line alongside its tool call.
-  const match = text.match(/PROGRESS\s*[:：][\s\S]*/i);
+  const match = text.match(/PROGRESS\s*[:锛歖[\s\S]*/i);
   const note = (match ? match[0] : text).replace(/```[\s\S]*?```/g, '').replace(/\s+/g, ' ').trim();
   return note ? note.slice(0, 400) : undefined;
+}
+
+function parseListLike(text?: string) {
+  if (!text || /^(无|none)$/i.test(text.trim())) return [];
+  return text
+    .split(/(?:[；;]\s*|\n+|\s(?:\d+\.|[-*])\s)/)
+    .map((item) => item.replace(/^[\d.\s、*-]+/, '').trim())
+    .filter((item) => item && !/^(无|none)$/i.test(item))
+    .slice(0, 8);
+}
+
+function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[]): Pick<RuntimeDecision, 'observation' | 'findings' | 'memoryItems'> {
+  const observations: string[] = [];
+  const findings: string[] = [];
+  const memoryItems: string[] = [];
+  for (const trace of traces) {
+    if (!trace.input || typeof trace.input !== 'object' || Array.isArray(trace.input)) continue;
+    const input = trace.input as Record<string, unknown>;
+    if (typeof input.observation === 'string' && input.observation.trim() && !/^鏃?|^none$/i.test(input.observation.trim())) {
+      observations.push(input.observation.trim());
+    }
+    if (typeof input.findings === 'string') findings.push(...parseListLike(input.findings));
+    if (typeof input.memory === 'string') memoryItems.push(...parseListLike(input.memory));
+  }
+  return {
+    observation: observations.length ? observations.at(-1)?.slice(0, 800) : undefined,
+    findings: Array.from(new Set(findings)).slice(0, 8),
+    memoryItems: Array.from(new Set(memoryItems)).slice(0, 8),
+  };
 }
 
 function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
@@ -944,40 +1226,46 @@ function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
     const executed = traces.filter((trace) => trace.name);
     const last = executed.at(-1);
     const failed = executed.find((trace) => !trace.result.ok);
-    const names = executed.map((trace) => `${trace.name}${summarizeToolInput(trace.input)}`).join('、');
+    const names = executed.map((trace) => `${trace.name}${summarizeToolInput(trace.input)}`).join('; ');
     const note = extractProgressNote(text);
+    const assistantInfo = extractAssistantStepInfoFromToolInputs(executed);
     const toolReason = executed.map((trace) => splitToolInputAndReason(trace.input).reason).find(Boolean);
+
+    if (last?.name === 'reportState' && last.input && typeof last.input === 'object' && !Array.isArray(last.input)) {
+      const input = last.input as Record<string, unknown>;
+      const status = input.status === 'failed' || input.status === 'blocked' || input.status === 'passed' ? input.status : 'passed';
+      return {
+                action: typeof input.action === 'string' ? input.action : assistantInfo.observation || toolReason || 'AI reported current state',
+                expected: typeof input.expected === 'string' ? input.expected : 'AI should report progress or conclusion based on current page state.',
+        actual: typeof input.actual === 'string' ? input.actual : last.result.actual,
+        status,
+        done: typeof input.done === 'boolean' ? input.done : status === 'failed',
+        note,
+        ...assistantInfo,
+      };
+    }
+
     return {
-      action: note || toolReason || `AI 执行操作：${names || last?.name || '浏览器操作'}`,
-      expected: '本步操作推进用户需求；操作结果将在下一步的最新截图中确认。',
-      actual: last?.result.actual || '已完成本步工具调用，等待下一步截图确认效果。',
+      action: note || assistantInfo.observation || toolReason || `AI executed browser action: ${names || last?.name || 'browser action'}`,
+            expected: 'This action should advance the user requirement; the next screenshot will verify the result.',
+            actual: last?.result.actual || 'Tool call finished; waiting for next screenshot to confirm effect.',
       status: failed ? 'failed' : 'passed',
       done: false,
       note,
+      ...assistantInfo,
     };
   }
 
-  // No tool executed: the model is reporting completion/blocked/failed via JSON.
-  try {
-    return z.object({
-      action: z.string().min(1),
-      expected: z.string().min(1),
-      actual: z.string().min(1),
-      status: z.enum(['passed', 'failed', 'blocked']),
-      done: z.boolean(),
-    }).parse(extractJson(text));
-  } catch {
-    return {
-      action: 'AI 观察当前页面状态',
-      expected: '本轮操作能够推进用户需求，或确认需求是否已经完成。',
-      actual: text || 'AI 既没有调用工具，也没有返回可解析的步骤总结。',
-      status: 'failed',
-      done: false,
-    };
-  }
+  return {
+        action: 'AI did not call a tool',
+        expected: 'Every AI response must call exactly one tool; pure description, completion, block, and failure must use reportState.',
+        actual: text || 'AI did not call any tool.',
+    status: 'failed',
+    done: false,
+  };
 }
 
-// 执行单个运行时步骤：采集页面上下文，调用 AI 选择一个动作，并记录请求快照。
+// 鎵ц鍗曚釜杩愯鏃舵楠わ細閲囬泦椤甸潰涓婁笅鏂囷紝璋冪敤 AI 閫夋嫨涓€涓姩浣滐紝骞惰褰曡姹傚揩鐓с€?
 async function executeRuntimeStep(input: {
   session: BrowserSession;
   testCase: TestCaseRecord;
@@ -985,20 +1273,38 @@ async function executeRuntimeStep(input: {
   stepIndex: number;
   beforeScreenshotPath: string;
   completedSteps: StepExecutionResult[];
+  selectedScreenshotReferences?: SelectedScreenshotReference[];
+  onSelectReferenceScreenshots?: (selection: {
+    ids: string[];
+    selectionReason: string;
+    sameInterfaceGroup?: string;
+    availableReferences: ScreenshotReference[];
+  }) => void | Promise<void>;
   abortSignal?: AbortSignal;
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
 }) {
-  const { session, testCase, stepIndex, beforeScreenshotPath, completedSteps, abortSignal, onDebug, onToolTrace } = input;
+  const {
+    session,
+    testCase,
+    stepIndex,
+    beforeScreenshotPath,
+    completedSteps,
+    selectedScreenshotReferences = [],
+    onSelectReferenceScreenshots,
+    abortSignal,
+    onDebug,
+    onToolTrace,
+  } = input;
   const mode = browserModeOf(testCase);
   const screenshotInputEnabled = shouldSendScreenshotToAi(mode);
   const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
-  // 标识模式默认单图叠加；separateMarkerMap=true 时保留旧的第二张标识图。
   const separateMarkerMap = markerEnabled && usesSeparateMarkerMap();
   const markerOverlayInScreenshot = markerEnabled && !separateMarkerMap;
   const markerScreenshotPath = separateMarkerMap && screenshotInputEnabled
     ? session.getLastCandidateMarkerScreenshotPath()
     : undefined;
+  const contextStartedAt = Date.now();
   const pageContext = await session.getPageContext({
     includeDomTree: mode === 'dom',
     includeText: false,
@@ -1006,10 +1312,22 @@ async function executeRuntimeStep(input: {
     includeInteractiveCandidates: true,
     useCachedInteractiveCandidates: true,
   });
+  const contextMs = elapsedSince(contextStartedAt);
+  const screenshotReadStartedAt = Date.now();
   const screenshot = screenshotInputEnabled ? await readScreenshotForAi(beforeScreenshotPath) : undefined;
   const markerScreenshot = screenshot && markerScreenshotPath
     ? await readMarkerScreenshotForAi(markerScreenshotPath, screenshot).catch(() => undefined)
     : undefined;
+  const selectedReferenceScreenshots = screenshotInputEnabled
+    ? await Promise.all(selectedScreenshotReferences.map(async (ref) => ({
+        ref,
+        image: await readScreenshotForAi(ref.path).catch(() => undefined),
+      })))
+    : [];
+  const screenshotReadMs = elapsedSince(screenshotReadStartedAt);
+  const availableScreenshotReferences = buildAvailableScreenshotReferences(completedSteps);
+  const availableReferenceIds = new Set(availableScreenshotReferences.map((ref) => ref.id));
+  const promptStartedAt = Date.now();
   const prompt = runtimePrompt({
     testCase,
     pageContext,
@@ -1018,6 +1336,24 @@ async function executeRuntimeStep(input: {
     beforeScreenshotPath,
     hasMarkerScreenshot: Boolean(markerScreenshot),
     markerOverlayInScreenshot,
+    availableScreenshotReferences,
+    selectedScreenshotReferences,
+  });
+  const promptMs = elapsedSince(promptStartedAt);
+  await onDebug?.({
+    phase: 'perf:runtime-input',
+    stepIndex,
+    message: `Runtime input prepared: page context ${contextMs}ms, screenshot read/compress ${screenshotReadMs}ms, prompt build ${promptMs}ms.`,
+    details: {
+      contextMs,
+      screenshotReadMs,
+      promptMs,
+      screenshotInputEnabled,
+      screenshotBytes: screenshot?.length,
+      markerScreenshotBytes: markerScreenshot?.length,
+      selectedReferenceScreenshotCount: selectedReferenceScreenshots.filter((item) => item.image).length,
+      browserMode: mode,
+    },
   });
   let lastAiRequest: AiRequestSnapshot | undefined;
 
@@ -1029,8 +1365,17 @@ async function executeRuntimeStep(input: {
     const messageContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: requestPrompt }];
     if (includeImage && screenshot) messageContent.push({ type: 'image', image: screenshot });
     if (includeImage && markerScreenshot) messageContent.push({ type: 'image', image: markerScreenshot });
+    if (includeImage) {
+      for (const item of selectedReferenceScreenshots) {
+        if (item.image) messageContent.push({ type: 'image', image: item.image });
+      }
+    }
     const attachedImagePaths = includeImage
-      ? [screenshot ? beforeScreenshotPath : undefined, markerScreenshot ? markerScreenshotPath : undefined].filter((value): value is string => Boolean(value))
+      ? [
+          screenshot ? beforeScreenshotPath : undefined,
+          markerScreenshot ? markerScreenshotPath : undefined,
+          ...selectedReferenceScreenshots.map((item) => item.image ? item.ref.path : undefined),
+        ].filter((value): value is string => Boolean(value))
       : [];
     const aiRequest = createAiRequestSnapshot({
       kind: 'runtime',
@@ -1047,6 +1392,9 @@ async function executeRuntimeStep(input: {
         includeImage,
         imageCount: attachedImagePaths.length,
         markerScreenshotPath,
+        selectedReferenceScreenshotIds: includeImage
+          ? selectedReferenceScreenshots.filter((item) => item.image).map((item) => item.ref.id)
+          : [],
         isMarked: markerEnabled,
         markerOverlayInScreenshot,
         separateMarkerMap,
@@ -1058,6 +1406,7 @@ async function executeRuntimeStep(input: {
       },
     });
     lastAiRequest = aiRequest;
+    const aiStartedAt = Date.now();
 
     try {
       if (codexMode) {
@@ -1079,12 +1428,20 @@ async function executeRuntimeStep(input: {
           allowedTypes: allowedToolTypes,
           traces,
           onToolTrace,
+          onSelectReferenceScreenshots: async (selection) => {
+            const validIds = selection.ids.filter((id) => availableReferenceIds.has(id));
+            await onSelectReferenceScreenshots?.({
+              ...selection,
+              ids: validIds,
+              availableReferences: availableScreenshotReferences,
+            });
+          },
         });
         await onDebug?.({
           phase: 'ai:runtime:object',
           stepIndex,
-          message: `Codex object -> ${object.type}`,
-          details: jsonSafe({ object, traces }),
+          message: `Codex object -> ${object.type}; AI+tool ${elapsedSince(aiStartedAt)}ms`,
+          details: jsonSafe({ object, traces, elapsedMs: elapsedSince(aiStartedAt) }),
         });
         return { text: execution.text, traces, aiRequest };
       }
@@ -1092,15 +1449,30 @@ async function executeRuntimeStep(input: {
       const result = await generateTextWithTimeout({
         model: getModel(),
         messages: [{ role: 'user', content: messageContent }],
-        tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, async (trace) => {
-          await onToolTrace?.(trace);
-          await onDebug?.({
-            phase: 'ai:tool',
-            stepIndex,
-            message: `${trace.name} -> ${trace.result.ok ? 'ok' : 'failed'}`,
-            details: trace,
-          });
-        }),
+        tools: makeBrowserTools(
+          session,
+          testCase.targetUrl,
+          mode,
+          traces,
+          async (trace) => {
+            await onToolTrace?.(trace);
+            await onDebug?.({
+              phase: 'ai:tool',
+              stepIndex,
+              message: `${trace.name} -> ${trace.result.ok ? 'ok' : 'failed'}`,
+              details: trace,
+            });
+          },
+          {
+            availableReferenceIds,
+            onSelectReferenceScreenshots: async (selection) => {
+              await onSelectReferenceScreenshots?.({
+                ...selection,
+                availableReferences: availableScreenshotReferences,
+              });
+            },
+          },
+        ),
         // One model round per step so each browser action is always paired with a fresh screenshot
         // on the next step. The record() guard additionally enforces a single executed tool.
         stopWhen: stepCountIs(Number(process.env.AI_TEST_AGENT_MAX_STEPS || 1)),
@@ -1112,13 +1484,14 @@ async function executeRuntimeStep(input: {
       await onDebug?.({
         phase: 'ai:runtime:response',
         stepIndex,
-        message: trimDebugText(result.text || 'AI 没有返回文本内容，仅完成了工具调用。', 300),
+        message: `${trimDebugText(result.text || 'AI returned no text; tool call completed.', 220)}; AI+tool ${elapsedSince(aiStartedAt)}ms`,
         details: jsonSafe({
           text: result.text || '',
           toolCalls: (result as unknown as { toolCalls?: unknown }).toolCalls,
           toolResults: (result as unknown as { toolResults?: unknown }).toolResults,
           steps: (result as unknown as { steps?: unknown }).steps,
           traces,
+          elapsedMs: elapsedSince(aiStartedAt),
         }),
       });
 
@@ -1126,13 +1499,13 @@ async function executeRuntimeStep(input: {
     } catch (error) {
       // If a browser tool already ran before the request failed (e.g. response/parse timeout after
       // the action completed), do NOT rethrow. Rethrowing would trigger a retry that re-executes the
-      // same browser action — the exact duplicate-operation bug. Keep the executed result and let the
+      // same browser action 鈥?the exact duplicate-operation bug. Keep the executed result and let the
       // next step continue from the fresh screenshot.
       if (traces.length > 0 && !abortSignal?.aborted) {
         await onDebug?.({
           phase: 'ai:runtime:partial',
           stepIndex,
-          message: 'AI 请求在工具执行后中断，已保留本步已执行的操作并继续下一步，不重试以避免重复操作。',
+                    message: 'AI request stopped after a tool executed; keeping the action and continuing to the next step.',
           details: { error: error instanceof Error ? error.message : String(error), traces },
         });
         return { text: '', traces, aiRequest };
@@ -1156,7 +1529,7 @@ async function executeRuntimeStep(input: {
         await onDebug?.({
           phase: 'ai:runtime:retry',
           stepIndex,
-          message: 'AI 请求失败且未执行任何操作，立即重试一次。',
+                    message: 'AI request failed before any tool executed; retrying once.',
           details: lastError instanceof Error ? lastError.message : String(lastError),
         });
       }
@@ -1203,9 +1576,9 @@ function sleep(ms: number) {
 function createSkippedStep(stepIndex: number, beforeScreenshotPath?: string, afterScreenshotPath?: string): StepExecutionResult {
   return {
     index: stepIndex,
-    action: '用户跳过当前 AI 运行步骤',
-    expected: '当前步骤被手动跳过后，流程继续进入下一轮 AI 判断。',
-    actual: '用户手动跳过了该步骤。',
+    action: '鐢ㄦ埛璺宠繃褰撳墠 AI 杩愯姝ラ',
+        expected: 'After this skipped step, continue to the next AI decision.',
+        actual: 'User skipped this step manually.',
     status: 'blocked',
     beforeScreenshotPath,
     afterScreenshotPath,
@@ -1227,9 +1600,9 @@ async function createRecoverableRuntimeErrorStep(input: {
 
   return {
     index: stepIndex,
-    action: 'AI 本轮请求或响应处理失败，已自动继续下一轮',
-    expected: '单次 AI 请求、工具调用或响应解析失败不应暂停测试流程；下一轮会基于最新浏览器截图继续判断。',
-    actual: `${infrastructureError(error)}。本次失败已记录为可恢复失败，流程会继续；只有检测到真实验证或测试已完成时才会暂停或结束。`,
+        action: 'AI request or response handling failed; continuing automatically',
+        expected: 'A single AI request/tool/parse failure should not stop the flow; the next round will continue from the latest screenshot.',
+    actual: `${infrastructureError(error)}. Recorded as recoverable; flow will continue unless real verification, completion, or impossibility is detected.`,
     status: 'failed',
     beforeScreenshotPath,
     afterScreenshotPath,
@@ -1279,6 +1652,12 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         typeof input.deltaX === 'number' ? input.deltaX : 0,
         { domPath },
       );
+    case 'scrollArea':
+      return session.scrollArea(
+        String(input.areaId || ''),
+        typeof input.deltaY === 'number' ? input.deltaY : 0,
+        typeof input.deltaX === 'number' ? input.deltaX : 0,
+      );
     case 'clickCandidate':
       return session.clickCandidate(String(input.id || ''), text);
     case 'focusCandidate':
@@ -1307,6 +1686,10 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.listTabs();
     case 'switchTab':
       return session.switchTab(typeof input.index === 'number' ? input.index : Number(input.index || 0));
+    case 'reportState':
+      return { ok: true, actual: `Reported state without browser action: ${String(input.actual || input.reason || '')}` };
+    case 'selectReferenceScreenshots':
+      return { ok: true, actual: `Selected screenshot references for context only: ${(Array.isArray(input.ids) ? input.ids : []).join(', ') || '[none]'}.` };
     case 'getInteractiveCandidates':
       return session.getInteractiveCandidates();
     case 'getDomTree':
@@ -1325,22 +1708,26 @@ async function executeCodexRuntimeObject(input: {
   allowedTypes: string[];
   traces: ToolTrace[];
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
+  onSelectReferenceScreenshots?: (selection: {
+    ids: string[];
+    selectionReason: string;
+    sameInterfaceGroup?: string;
+  }) => void | Promise<void>;
 }) {
-  const { session, targetUrl, stepIndex, type, params, allowedTypes, traces, onToolTrace } = input;
-  if (type === 'finish' || type === 'block' || type === 'fail') {
-    return { text: codexTerminalText(type, params), executed: false };
-  }
+  const { session, targetUrl, stepIndex, type, params, allowedTypes, traces, onToolTrace, onSelectReferenceScreenshots } = input;
   if (!allowedTypes.includes(type)) {
     return {
-      text: codexTerminalText('fail', {
-        action: `Codex returned unsupported action type: ${type}`,
-        expected: `Codex object type should be one of: ${allowedTypes.join(', ')}, finish, block, fail.`,
-        actual: JSON.stringify({ type, params }),
-        status: 'failed',
-        done: false,
-      }),
+      text: `Codex returned unsupported action type: ${type}. It must call exactly one allowed tool, usually reportState for no-op reporting.`,
       executed: false,
     };
+  }
+
+  if (type === 'selectReferenceScreenshots') {
+    await onSelectReferenceScreenshots?.({
+      ids: Array.isArray(params.ids) ? params.ids.filter((id): id is string => typeof id === 'string') : [],
+      selectionReason: typeof params.selectionReason === 'string' ? params.selectionReason : String(params.reason || ''),
+      sameInterfaceGroup: typeof params.sameInterfaceGroup === 'string' ? params.sameInterfaceGroup : undefined,
+    });
   }
 
   const result = await runRecordedTool(session, targetUrl, {
@@ -1405,9 +1792,9 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
       const beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
       const runningStep: StepExecutionResult = {
         index: stepIndex,
-        action: `回放固定流程工具：${flow.name}`,
-        expected: '固定流程工具应按录制时的参数成功执行。',
-        actual: '正在执行录制工具调用。',
+        action: `鍥炴斁鍥哄畾娴佺▼宸ュ叿锛?{flow.name}`,
+                expected: 'Recorded tool should execute with recorded parameters.',
+                actual: 'Executing recorded tool call.',
         status: 'running',
         beforeScreenshotPath,
         tools: [{ name: flow.name, input: flow.input, reason: flow.reason }],
@@ -1422,8 +1809,8 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
       const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
       const completedStep: StepExecutionResult = {
         index: stepIndex,
-        action: `回放固定流程工具：${flow.name}`,
-        expected: '固定流程工具应按录制时的参数成功执行。',
+        action: `鍥炴斁鍥哄畾娴佺▼宸ュ叿锛?{flow.name}`,
+                expected: 'Recorded tool should execute with recorded parameters.',
         actual: result.actual,
         status: result.ok ? 'passed' : 'failed',
         beforeScreenshotPath,
@@ -1465,8 +1852,8 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
   } catch (error) {
     const blockedStep: StepExecutionResult = {
       index: steps.length + 1,
-      action: '固定流程回放中断',
-      expected: '录制的工具流程可以稳定回放。',
+      action: '鍥哄畾娴佺▼鍥炴斁涓柇',
+            expected: 'Recorded tool flow should replay stably.',
       actual: infrastructureError(error),
       status: 'blocked',
     };
@@ -1511,8 +1898,10 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
   const startStepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
   const finalStepIndex = startStepIndex + maxRuntimeSteps - 1;
   const manuallyResumedSteps = new Set<number>();
+  let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
   let keepBrowserOpen = false;
   let allowBrowserClose = false;
+  let tracePath: string | undefined;
 
   async function waitWhilePaused(stepIndex: number) {
     if (!shouldPauseRun) return false;
@@ -1533,14 +1922,15 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
   }
 
   try {
-    await onDebug?.({ phase: 'browser:start', message: '正在启动可见浏览器' });
+    await onDebug?.({ phase: 'browser:start', message: 'Starting visible browser.' });
     await session.start();
-    await onDebug?.({ phase: 'browser:ready', message: '浏览器已启动，AI 将根据用户需求动态决定每一步操作' });
+    await session.startTrace(runId);
+    await onDebug?.({ phase: 'browser:ready', message: 'Browser is ready; AI will decide each next action from the current page.' });
 
     for (let stepIndex = startStepIndex; stepIndex <= finalStepIndex; stepIndex += 1) {
       await waitWhilePaused(stepIndex);
       const abortController = registerStepAbortController(runId, stepIndex);
-      await onDebug?.({ phase: 'step:start', stepIndex, message: `开始运行时步骤 ${stepIndex}` });
+      await onDebug?.({ phase: 'step:start', stepIndex, message: `寮€濮嬭繍琛屾椂姝ラ ${stepIndex}` });
 
       if (await shouldSkipStep?.(stepIndex)) {
         const skippedStep = createSkippedStep(stepIndex);
@@ -1550,17 +1940,23 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         continue;
       }
 
+      const beforeScreenshotStartedAt = Date.now();
       let beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
       const runningStep: StepExecutionResult = {
         index: stepIndex,
-        action: 'AI 正在根据用户需求和当前截图判断下一步',
-        expected: 'AI 应调用浏览器工具推进需求，或判断需求已经完成。',
+                action: 'AI is choosing the next browser action from the current screenshot',
+                expected: 'AI should call a browser tool to advance the requirement or decide the requirement is complete.',
         actual: 'AI is choosing the next browser action from the current page context.',
         status: 'running',
         beforeScreenshotPath,
       };
       await onProgress?.(runningStep);
-      await onDebug?.({ phase: 'step:before-screenshot', stepIndex, message: '已采集当前 viewport 截图' });
+      await onDebug?.({
+        phase: 'perf:before-screenshot',
+        stepIndex,
+        message: `鎿嶄綔鍓嶆埅鍥捐€楁椂 ${elapsedSince(beforeScreenshotStartedAt)}ms`,
+        details: { elapsedMs: elapsedSince(beforeScreenshotStartedAt), screenshotPath: beforeScreenshotPath },
+      });
 
       if (await waitWhilePaused(stepIndex)) {
         clearStepAbortController(runId, stepIndex);
@@ -1574,7 +1970,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         await onDebug?.({
           phase: 'manual:still-detected-after-resume',
           stepIndex,
-          message: '用户已确认人工介入完成；当前页仍命中验证特征，本轮不再重复弹出人工介入确认，继续交给 AI 基于新截图判断。',
+                    message: 'User confirmed manual intervention; page still looks like verification, so continue with AI judgment without prompting again.',
           details: { url: pageContext.url, title: pageContext.title, screenshotPath: beforeScreenshotPath },
         });
       } else if (pageContext.isManualVerification) {
@@ -1583,12 +1979,12 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         await onDebug?.({
           phase: 'manual:required',
           stepIndex,
-          message: '检测到需要用户介入的验证页面，运行已暂停，等待用户点击“执行完毕”。',
+                    message: 'Manual verification page detected; run paused for user intervention.',
           details: { url: pageContext.url, title: pageContext.title, screenshotPath: beforeScreenshotPath },
         });
         await onProgress?.({
           ...runningStep,
-          actual: `${reason} 完成后请回到运行报告点击“执行完毕”，AI 会立即重新观察页面并继续。`,
+          actual: `${reason} 完成后请回到运行报告点击“执行完毕”，AI 会重新观察页面并继续。`,
         });
 
         while (true) {
@@ -1610,13 +2006,20 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         }
 
         await onManualInterventionCleared?.(stepIndex);
-        await onDebug?.({ phase: 'manual:resumed', stepIndex, message: '用户确认验证已完成，立即重新采集截图并发起 AI 请求。' });
+        await onDebug?.({ phase: 'manual:resumed', stepIndex, message: 'User confirmed verification complete; collecting a fresh screenshot for AI.' });
         manuallyResumedSteps.add(stepIndex);
+        const manualScreenshotStartedAt = Date.now();
         beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
+        await onDebug?.({
+          phase: 'perf:manual-resume-screenshot',
+          stepIndex,
+          message: `Manual-resume screenshot took ${elapsedSince(manualScreenshotStartedAt)}ms`,
+          details: { elapsedMs: elapsedSince(manualScreenshotStartedAt), screenshotPath: beforeScreenshotPath },
+        });
         await onProgress?.({
           ...runningStep,
           beforeScreenshotPath,
-          actual: '用户已完成验证，AI 正在基于新的页面截图继续执行。',
+                    actual: 'User completed verification; AI is continuing from the latest screenshot.',
         });
       }
 
@@ -1630,6 +2033,25 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         stepIndex,
         beforeScreenshotPath,
         completedSteps: steps,
+        selectedScreenshotReferences,
+        onSelectReferenceScreenshots: async (selection) => {
+          selectedScreenshotReferences = selection.ids
+            .map((id) => selection.availableReferences.find((ref) => ref.id === id))
+            .filter((ref): ref is ScreenshotReference => Boolean(ref))
+            .map((ref) => ({
+              ...ref,
+              selectionReason: selection.selectionReason,
+              sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
+            }));
+          await onDebug?.({
+            phase: 'ai:reference-screenshots:selected',
+            stepIndex,
+            message: selectedScreenshotReferences.length
+              ? `Selected reference screenshots for next AI request: ${selectedScreenshotReferences.map((ref) => ref.id).join(', ')}`
+              : 'Cleared reference screenshots for next AI request.',
+            details: { selection, selectedScreenshotReferences },
+          });
+        },
         abortSignal: abortController.signal,
         onDebug,
         onToolTrace: async (trace) => {
@@ -1637,7 +2059,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           await onProgress?.({
             ...runningStep,
             beforeScreenshotPath,
-            actual: 'AI 已调用浏览器工具，正在等待页面反馈。',
+                          actual: 'AI called a browser tool; waiting for page feedback.',
             tools: summarizeToolTraces(liveToolTraces),
           });
         },
@@ -1670,7 +2092,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         await onDebug?.({
           phase: 'ai:runtime:recoverable-error',
           stepIndex,
-          message: '本轮 AI 请求或响应处理失败，已记录为失败步骤并继续下一轮。',
+                    message: 'This AI request or response handling failed; recorded as failed step and continuing.',
           details: {
             error: serializeError(error),
             screenshotPath: recoverableStep.screenshotPath,
@@ -1681,8 +2103,14 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         continue;
       }
 
+      const afterScreenshotStartedAt = Date.now();
       const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
-      await onDebug?.({ phase: 'step:after-screenshot', stepIndex, message: '已采集操作后 viewport 截图' });
+      await onDebug?.({
+        phase: 'perf:after-screenshot',
+        stepIndex,
+        message: `鎿嶄綔鍚庢埅鍥捐€楁椂 ${elapsedSince(afterScreenshotStartedAt)}ms`,
+        details: { elapsedMs: elapsedSince(afterScreenshotStartedAt), screenshotPath: afterScreenshotPath },
+      });
 
       if (await shouldSkipStep?.(stepIndex)) {
         const skippedStep = createSkippedStep(stepIndex, beforeScreenshotPath, afterScreenshotPath);
@@ -1700,6 +2128,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           includeText: false,
           includeManualVerification: true,
         });
+        const verificationStartedAt = Date.now();
         const verification = await verifyRuntimeCompletion({
           testCase,
           screenshotPath: afterScreenshotPath,
@@ -1712,15 +2141,15 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           phase: 'completion:verify',
           stepIndex,
           message: verification.verified
-            ? '完成校验通过，结束运行'
-            : `完成校验未通过，继续执行：${verification.remainingWork || verification.summary}`,
-          details: { verification, proposed: decision },
+            ? 'Completion verification passed; ending run.'
+            : `Completion verification failed; continuing: ${verification.remainingWork || verification.summary}`,
+          details: { verification, proposed: decision, elapsedMs: elapsedSince(verificationStartedAt) },
         });
 
         if (!verification.verified) {
           const retryInstruction = `[完成校验未通过] ${verification.summary}${
             verification.remainingWork ? ` 待继续：${verification.remainingWork}` : ''
-          }。下一步必须重新基于新截图观察页面。同一视觉目标和动作最多允许连续尝试两次：如果第一次点击可能只是关闭浮层，且新截图显示目标已经暴露，可以再点击一次；若已尝试两次仍未产生预期可见结果，即使标识编号或目标坐标变化也不得再次选择，应改用更具体的可见触发器、键盘操作、滚动或不同纠正路径。不要直接再次声明完成。`;
+          }。下一步必须基于新截图继续观察，不要直接再次声明完成。`;
           decision = {
             ...decision,
             done: false,
@@ -1747,7 +2176,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           await onDebug?.({
             phase: 'manual:retry-after-user-resume',
             stepIndex,
-            message: '用户已确认人工介入完成；AI 仍返回验证阻塞，重新采集截图并重试本步骤，不终止运行、不二次弹出人工介入。',
+                        message: 'User confirmed manual intervention; AI still returned verification block, retrying this step instead of ending.',
             details: { decision, screenshotPath: afterScreenshotPath },
           });
           await onManualInterventionCleared?.(stepIndex);
@@ -1761,7 +2190,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         await onDebug?.({
           phase: 'manual:ai-detected',
           stepIndex,
-          message: 'AI 判断截图中存在需要人工介入的验证，运行已暂停。',
+                    message: 'AI detected manual verification in the screenshot; run paused.',
           details: { decision, screenshotPath: afterScreenshotPath },
         });
         await onProgress?.({
@@ -1769,7 +2198,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           beforeScreenshotPath,
           afterScreenshotPath,
           screenshotPath: afterScreenshotPath,
-          actual: `${reason} 完成后请回到运行报告点击“执行完毕”，AI 会立即重新请求并继续。`,
+          actual: `${reason} 完成后请回到运行报告点击“执行完毕”，AI 会重新请求并继续。`,
         });
 
         let skippedAfterAiManual = false;
@@ -1790,7 +2219,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         if (skippedAfterAiManual) continue;
 
         await onManualInterventionCleared?.(stepIndex);
-        await onDebug?.({ phase: 'manual:resumed', stepIndex, message: '用户确认验证已完成，立即重新发起本步骤 AI 请求。' });
+        await onDebug?.({ phase: 'manual:resumed', stepIndex, message: 'User confirmed verification complete; retrying this AI step.' });
         manuallyResumedSteps.add(stepIndex);
         clearStepAbortController(runId, stepIndex);
         stepIndex -= 1;
@@ -1804,6 +2233,9 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         actual: decision.actual,
         status: decision.status,
         note: decision.note,
+        observation: decision.observation,
+        findings: decision.findings,
+        memoryItems: decision.memoryItems,
         aiRequest: actionResult.aiRequest,
         beforeScreenshotPath,
         afterScreenshotPath,
@@ -1815,7 +2247,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       await onDebug?.({
         phase: 'step:done',
         stepIndex,
-        message: `运行时步骤 ${stepIndex} 完成：${decision.status}${decision.done ? '，AI 判定需求已结束' : ''}`,
+          message: `Runtime step ${stepIndex} completed: ${decision.status}${decision.done ? '; AI marked requirement finished' : ''}`,
         details: { decision, traces: actionResult.traces },
       });
       clearStepAbortController(runId, stepIndex);
@@ -1828,6 +2260,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
             steps,
             consoleErrors: session.getConsoleErrors(),
             networkErrors: session.getNetworkErrors(),
+            tracePath,
           },
         };
       }
@@ -1835,9 +2268,9 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
 
     const timeoutStep: StepExecutionResult = {
       index: steps.length + 1,
-      action: '达到 AI 最大运行步数',
-      expected: `AI 应在 ${maxRuntimeSteps} 步内完成或明确阻塞用户需求。`,
-      actual: `已执行 ${maxRuntimeSteps} 个运行时步骤，但 AI 尚未判定需求完成。`,
+            action: 'Reached maximum AI runtime steps',
+      expected: `AI should complete or clearly block within ${maxRuntimeSteps} runtime steps.`,
+      actual: `Executed ${maxRuntimeSteps} runtime steps, but AI has not marked the requirement complete.`,
       status: 'failed',
     };
     steps.push(timeoutStep);
@@ -1850,15 +2283,16 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         steps,
         consoleErrors: session.getConsoleErrors(),
         networkErrors: session.getNetworkErrors(),
+        tracePath,
       },
     };
   } catch (error) {
     keepBrowserOpen = shouldKeepBrowserOpenAfterError(error);
     const blockedStep: StepExecutionResult = {
       index: steps.length + 1,
-      action: 'AI 浏览器运行中断',
-      expected: 'AI 能够根据用户需求继续操作浏览器。',
-      actual: `${infrastructureError(error)}${keepBrowserOpen ? '。浏览器已保留现场，便于继续排查。' : ''}`,
+            action: 'AI browser run interrupted',
+            expected: 'AI should continue operating the browser according to the user requirement.',
+      actual: `${infrastructureError(error)}${keepBrowserOpen ? ' Browser is kept open for investigation.' : ''}`,
       status: 'blocked',
     };
     steps.push(blockedStep);
@@ -1869,9 +2303,11 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         steps,
         consoleErrors: session.getConsoleErrors(),
         networkErrors: session.getNetworkErrors(),
+        tracePath,
       },
     };
   } finally {
+    tracePath = await session.stopTrace(runId);
     await session.close({ keepOpen: keepBrowserOpen || !allowBrowserClose });
   }
 }

@@ -17,6 +17,7 @@ const contentTypes: Record<string, string> = {
   '.png': 'image/png',
   '.txt': 'text/plain; charset=utf-8',
   '.webp': 'image/webp',
+  '.zip': 'application/zip',
 };
 
 function resolveArtifactPath(segments: string[]) {

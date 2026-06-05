@@ -30,6 +30,7 @@ export const testCaseContentSchema = z.object({
   steps: z.array(testStepSchema).default([]),
   expectedResults: z.array(z.string()),
   risks: z.array(z.string()),
+  recordedFlow: z.array(recordedFlowStepSchema).optional(),
 });
 
 export type TestStep = z.infer<typeof testStepSchema>;
@@ -46,6 +47,7 @@ export type TestCaseRecord = {
   priority: TestCaseContent['priority'];
   content: TestCaseContent;
   imageNames: string[];
+  strategyMemory?: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -61,6 +63,12 @@ export type StepExecutionResult = {
   aiRequest?: AiRequestSnapshot;
   /** The model's own short "what I did / what's next" note for this step, carried into later context. */
   note?: string;
+  /** Assistant-facing observation of the current page/task state, not limited to tool-call reason. */
+  observation?: string;
+  /** Important findings such as product errors, requirements discovered, risks, or content summaries. */
+  findings?: string[];
+  /** Durable memory items that should influence later steps in the same run. */
+  memoryItems?: string[];
   screenshotPath?: string;
   beforeScreenshotPath?: string;
   afterScreenshotPath?: string;
@@ -113,18 +121,48 @@ export type TestRunRecord = {
   id: string;
   testCaseId: string;
   status: 'queued' | 'running' | 'paused' | 'passed' | 'failed' | 'blocked';
+  queue?: {
+    position?: number;
+    attempts: number;
+    enqueuedAt: string;
+    startedAt?: string;
+    workerId?: string;
+    source?: 'single' | 'batch' | 'schedule' | 'replay' | 'continue';
+  };
   startedAt?: string;
   endedAt?: string;
   result?: {
     steps: StepExecutionResult[];
     consoleErrors: string[];
     networkErrors: string[];
+    tracePath?: string;
+    memory?: {
+      summary: string;
+      timeline: string[];
+      findings: string[];
+      failedAttempts: string[];
+      updatedAt: string;
+    };
   };
   report?: {
     title: string;
     summary: string;
     markdown: string;
     suggestions: string[];
+  };
+  analysis?: {
+    pageChanges: Array<{
+      stepIndex: number;
+      changed: boolean;
+      changeScore: number;
+      summary: string;
+    }>;
+    repairSuggestions: string[];
+    promptHints: string[];
+    selfHealing: {
+      applied: string[];
+      nextRunStrategy: string[];
+    };
   };
   debug?: {
     enabled: boolean;
@@ -148,4 +186,24 @@ export type TestRunRecord = {
     };
   };
   createdAt: string;
+};
+
+export type RuntimeEnvRecord = {
+  key: string;
+  value: string;
+  enabled: boolean;
+  secret?: boolean;
+  updatedAt: string;
+};
+
+export type RunScheduleRecord = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  testCaseIds: string[];
+  intervalMinutes: number;
+  nextRunAt: string;
+  lastRunAt?: string;
+  createdAt: string;
+  updatedAt: string;
 };

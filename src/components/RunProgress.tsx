@@ -17,6 +17,10 @@ function artifactUrl(filePath?: string) {
   return `/api/artifacts/${normalized.slice(index + marker.length)}`;
 }
 
+function traceUrl(run: TestRunRecord) {
+  return artifactUrl(run.result?.tracePath);
+}
+
 function isFinished(status: TestRunRecord['status']) {
   return status === 'passed' || status === 'failed' || status === 'blocked';
 }
@@ -226,6 +230,16 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   useEffect(() => {
     if (isFinished(run.status) && run.report?.markdown) return;
+    if (typeof EventSource !== 'undefined') {
+      const events = new EventSource(`/api/runs/${run.id}/events`);
+      events.addEventListener('run', (event) => {
+        setRun(JSON.parse((event as MessageEvent).data) as TestRunRecord);
+      });
+      events.addEventListener('error', () => {
+        events.close();
+      });
+      return () => events.close();
+    }
     const timer = window.setInterval(async () => {
       const response = await fetch(`/api/runs/${run.id}`, { cache: 'no-store' });
       if (!response.ok) return;
@@ -331,6 +345,16 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
               导出 PDF
             </a>
           ) : null}
+          {traceUrl(run) ? (
+            <a className="link-button" href={traceUrl(run)} target="_blank">
+              下载 Trace
+            </a>
+          ) : null}
+          {isFinished(run.status) && steps.some((step) => step.tools?.some((tool) => tool.ok !== false)) ? (
+            <a className="link-button" href={`/api/runs/${run.id}/recorded-flow`} target="_blank">
+              导出录制流
+            </a>
+          ) : null}
           {debugEnabled ? (
             <span className="debug-phase">
               <Bug size={14} />
@@ -432,6 +456,22 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                   <dd>{selectedStep.action}</dd>
                 </div>
                 <div>
+                  <dt>助手观察</dt>
+                  <dd>{selectedStep.observation || selectedStep.note || '暂无观察记录'}</dd>
+                </div>
+                <div>
+                  <dt>重要发现</dt>
+                  <dd>
+                    {selectedStep.findings?.length ? (
+                      <ul className="compact-bullet-list">
+                        {selectedStep.findings.map((item, index) => <li key={index}>{item}</li>)}
+                      </ul>
+                    ) : (
+                      '暂无发现'
+                    )}
+                  </dd>
+                </div>
+                <div>
                   <dt>工具调用</dt>
                   <dd>
                     {selectedStep.tools?.length ? (
@@ -475,6 +515,70 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
               <DebugEventRow event={event} key={`${event.time}-${index}`} />
             ))}
           </ol>
+        </section>
+      ) : null}
+
+      {run.analysis ? (
+        <section className="debug-timeline run-analysis-panel">
+          <div className="section-head">
+            <div>
+              <h2>失败自愈与页面变化分析</h2>
+              <p>运行结束后自动生成，用于下次优化 prompt 和操作策略。</p>
+            </div>
+          </div>
+          <div className="analysis-grid">
+            <div>
+              <h3>修复建议</h3>
+              <ul>
+                {run.analysis.repairSuggestions.map((item, index) => <li key={index}>{item}</li>)}
+              </ul>
+            </div>
+            <div>
+              <h3>下次策略</h3>
+              <ul>
+                {(run.analysis.selfHealing.nextRunStrategy.length ? run.analysis.selfHealing.nextRunStrategy : run.analysis.selfHealing.applied).map((item, index) => <li key={index}>{item}</li>)}
+              </ul>
+            </div>
+            <div className="wide">
+              <h3>页面变化检测</h3>
+              <ol>
+                {run.analysis.pageChanges.map((item) => (
+                  <li key={item.stepIndex}>
+                    步骤 {item.stepIndex} · {item.changed ? '有变化' : '变化很小'} · {item.changeScore}: {item.summary}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {run.result?.memory ? (
+        <section className="debug-timeline run-memory-panel">
+          <div className="section-head">
+            <div>
+              <h2>运行记忆</h2>
+              <p>由所有步骤的原因、观察、发现和异常压缩生成，后续 AI 请求会持续引用。</p>
+            </div>
+          </div>
+          <div className="analysis-grid">
+            <div>
+              <h3>摘要</h3>
+              <p className="memory-summary">{run.result.memory.summary || '暂无摘要'}</p>
+            </div>
+            <div>
+              <h3>累计发现</h3>
+              <ul>
+                {(run.result.memory.findings.length ? run.result.memory.findings : ['暂无发现']).slice(-12).map((item, index) => <li key={index}>{item}</li>)}
+              </ul>
+            </div>
+            <div className="wide">
+              <h3>压缩时间线</h3>
+              <ol>
+                {run.result.memory.timeline.slice(-20).map((item, index) => <li key={index}>{item}</li>)}
+              </ol>
+            </div>
+          </div>
         </section>
       ) : null}
 

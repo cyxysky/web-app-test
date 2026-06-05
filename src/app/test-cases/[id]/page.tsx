@@ -2,7 +2,9 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { ArrowLeft, Clock3, ExternalLink, FileText } from 'lucide-react';
 import { TestCaseEditor } from '@/components/TestCaseEditor';
+import { DeleteRunButton } from '@/components/DeleteRunButton';
 import { ReplayRunButton } from '@/components/ReplayRunButton';
+import { RecordedFlowToCaseButton } from '@/components/RecordedFlowToCaseButton';
 import { RunTestButton } from '@/components/RunTestButton';
 import { store } from '@/server/db/mock-store';
 import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
@@ -101,6 +103,8 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
                   </span>
                   <span className="run-history-actions">
                     <ReplayRunButton disabled={!replayable || run.status === 'running' || run.status === 'queued' || run.status === 'paused'} runId={run.id} />
+                    <RecordedFlowToCaseButton disabled={!replayable || run.status === 'running' || run.status === 'queued' || run.status === 'paused'} runId={run.id} />
+                    <DeleteRunButton disabled={run.status === 'running' || run.status === 'queued' || run.status === 'paused'} runId={run.id} />
                     <Link className="run-history-open" href={`/runs/${run.id}`} title="Open details">
                       <ExternalLink size={16} />
                     </Link>
