@@ -219,3 +219,40 @@ tool.screenshots
 验证：npm run typecheck 通过。没有跑 npm run build。
 
 一个注意点：visualAfter.capture 目前 schema 支持 auto / viewport / fullPage / region / none，但实际第一版执行里 auto/viewport/fullPage/region 都先按 viewport 截图处理；fullPage/region 后面可以继续扩展到真实全页/区域截图。
+
+继续完成
+
+已补齐 visualAfter.capture 的真实截图行为：
+
+viewport / auto：继续按当前视口截图
+fullPage：调用 Playwright fullPage 截图
+region：支持 visualAfter.region = { x, y, width, height }，按当前 viewport CSS 像素裁剪区域截图
+region 坐标会做安全校验和视口边界裁剪；如果没有合法 region，会回退到 viewport，避免中断运行
+marker map 会复用同一套 capture / region 参数，保证和主截图尺寸一致
+
+Visual Context Manager 继续增强：
+
+VisualFrameRecord 增加 capture / region
+prepareStep 渲染 VCM 文本时会显示每张图的 capture 类型和 region 坐标
+工具 trace 的截图标题会标明 viewport / fullPage / region
+
+已补齐上下文检测与压缩：
+
+每次 prepareStep 构建消息前估算上下文大小
+默认上下文窗口按 32000 tokens 估算
+默认超过 70% 触发压缩
+可通过 AI_CONTEXT_WINDOW_TOKENS / AI_MODEL_CONTEXT_TOKENS 调整窗口
+可通过 AI_CONTEXT_COMPRESSION_THRESHOLD / AI_CONTEXT_COMPRESSION_RATIO 调整阈值
+图片按 AI_IMAGE_CONTEXT_ESTIMATE_TOKENS 估算，默认每张 1200 tokens
+触发后会压缩历史 visual frames、裁剪 working memory，并用压缩后的 current visual context + compact memory + 最近工具摘要开启新的 prepareStep 对话轮次
+如果一次压缩后仍超过阈值，会进一步 keepLatestOnly，只保留 current 视觉帧给下一轮
+压缩事件会写入 debug：ai:context-compressed
+
+验证：
+
+npm run typecheck 通过
+npm run build 通过
+
+备注：
+
+npm run build 命令末尾仍打印了几行 SyntaxError: Unexpected end of JSON input，但退出码为 0，Next build 已成功完成；当前仓库里的 package-lock.json 是 0 字节，这个提示更像既有锁文件/JSON 读取噪声，未纳入本次功能改动。

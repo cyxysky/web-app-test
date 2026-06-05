@@ -25,17 +25,23 @@ function formatToolInput(input: unknown) {
   if (input === undefined || input === null) return '';
   if (typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length === 0) return '';
   try {
-    return JSON.stringify(input);
+    return JSON.stringify(input, null, 2);
   } catch {
     return String(input);
   }
 }
 
+function sameDisplayText(a?: string, b?: string) {
+  const left = (a || '').replace(/\s+/g, ' ').trim();
+  const right = (b || '').replace(/\s+/g, ' ').trim();
+  return Boolean(left && right && left === right);
+}
+
 // 生成单个步骤的工具调用 markdown 片段。
 function toolMarkdown(step: StepExecutionResult) {
-  if (!step.tools?.length) return '- ??????';
+  if (!step.tools?.length) return '- 暂无工具调用。';
   return [
-    '- ?????',
+    '- 工具调用：',
     ...step.tools.map((tool) => {
       const input = formatToolInput(tool.input);
       const shots = (tool.screenshots || [])
@@ -45,7 +51,7 @@ function toolMarkdown(step: StepExecutionResult) {
         })
         .filter(Boolean)
         .join('\n');
-      return `  - ${tool.name}${input ? ` ${input}` : ''}${tool.reason ? `\n    - ?????${tool.reason}` : ''}${tool.visualAfter ? `\n    - visualAfter: ${formatToolInput(tool.visualAfter)}` : ''}${shots ? `\n${shots}` : ''}`;
+      return `  - ${tool.name}${input ? ` ${input}` : ''}${tool.reason ? `\n    - 调用原因：${tool.reason}` : ''}${tool.visualAfter ? `\n    - visualAfter: ${formatToolInput(tool.visualAfter)}` : ''}${shots ? `\n${shots}` : ''}`;
     }),
   ].join('\n');
 }
@@ -53,12 +59,13 @@ function toolMarkdown(step: StepExecutionResult) {
 function stepMarkdown(step: StepExecutionResult) {
   const before = artifactUrl(step.beforeScreenshotPath);
   const after = artifactUrl(step.afterScreenshotPath || step.screenshotPath);
+  const observation = step.observation && !sameDisplayText(step.observation, step.action) ? step.observation : '';
 
   return `### 步骤 ${step.index}
 
 - AI 操作：${step.action}
 ${toolMarkdown(step)}
-${step.observation ? `\n- 助手观察：${step.observation}` : ''}
+${observation ? `\n- 页面观察：${observation}` : ''}
 ${step.findings?.length ? `\n- 重要发现：\n${step.findings.map((item) => `  - ${item}`).join('\n')}` : ''}
 ${before ? `\n![步骤 ${step.index} 执行前](${before})` : ''}
 ${after ? `\n![步骤 ${step.index} 执行后](${after})` : ''}`;

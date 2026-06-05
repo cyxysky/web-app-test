@@ -1,4 +1,3 @@
-import { fsync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Browser, BrowserContext, Frame, Page } from 'playwright';
@@ -81,6 +80,22 @@ type ScreenshotMetrics = {
   viewportMetrics: ViewportMetrics;
   devicePixelRatio: number;
   scale: 'css';
+  capture: ScreenshotCaptureMode;
+  region?: ScreenshotRegion;
+};
+
+export type ScreenshotCaptureMode = 'viewport' | 'fullPage' | 'region';
+
+export type ScreenshotRegion = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type ScreenshotCaptureOptions = {
+  capture?: ScreenshotCaptureMode;
+  region?: ScreenshotRegion;
 };
 
 type InteractiveCandidate = {
@@ -402,11 +417,18 @@ export class BrowserSession {
 
   // 截取当前 viewport。视觉标识模式默认把候选编号叠加到 before 截图；
   // 仅在 VISUAL_MARKER_SEPARATE_MAP=true 时额外生成一张像素对齐的纯标识图。
-  async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after') {
+  async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
     const stabilizeMs = Number(process.env.SCREENSHOT_STABILIZE_MS || 1000);
     if (Number.isFinite(stabilizeMs) && stabilizeMs > 0) {
       await this.waitForStableViewport(Math.min(Math.max(stabilizeMs, 0), 5000));
     }
+    const requestedCapture = options.capture || 'viewport';
+    const region = requestedCapture === 'region' ? await this.normalizeScreenshotRegion(options.region) : undefined;
+    const capture: ScreenshotCaptureMode = requestedCapture === 'fullPage'
+      ? 'fullPage'
+      : region
+        ? 'region'
+        : 'viewport';
     const dir = path.join(process.cwd(), 'artifacts', runId);
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
@@ -447,8 +469,15 @@ export class BrowserSession {
         scrollAreaLabelsEnabled ? scrollAreas : [],
       );
     }
+    const screenshotOptions = {
+      path: filePath,
+      fullPage: capture === 'fullPage',
+      ...(capture === 'region' && region ? { clip: region } : {}),
+      scale: 'css' as const,
+      timeout: 15000,
+    };
     try {
-      await this.activePage.screenshot({ path: filePath, fullPage: false, scale: 'css', timeout: 15000 });
+      await this.activePage.screenshot(screenshotOptions);
     } finally {
       if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
         await this.removeCandidateOverlay();
@@ -458,7 +487,7 @@ export class BrowserSession {
       const markerFilePath = path.join(dir, `step-${stepIndex}-${phase}-markers.png`);
       await this.drawCandidateOverlay(candidates, true, scrollAreaLabelsEnabled ? scrollAreas : []);
       try {
-        await this.activePage.screenshot({ path: markerFilePath, fullPage: false, scale: 'css', timeout: 15000 });
+        await this.activePage.screenshot({ ...screenshotOptions, path: markerFilePath });
         this.lastCandidateMarkerScreenshotPath = markerFilePath;
       } finally {
         await this.removeCandidateOverlay();
@@ -475,6 +504,8 @@ export class BrowserSession {
       viewportMetrics,
       devicePixelRatio: viewportMetrics.devicePixelRatio,
       scale: 'css',
+      capture,
+      region,
     };
     return filePath;
   }
@@ -746,10 +777,10 @@ export class BrowserSession {
   async waitForManualVerification(maxMs = Number(process.env.MANUAL_VERIFICATION_TIMEOUT_MS || 180000)): Promise<BrowserActionResult> {
     const note = await this.manualVerificationNote();
     return {
-      ok: !note,
+      ok: true,
       actual: note
         ? `Manual verification is visible. The run is paused for user intervention instead of waiting ${maxMs}ms inside the AI request.`
-        : 'No manual verification page is currently detected.',
+        : 'AI requested a manual verification pause. Ask the user to inspect the browser and continue after completing any required verification.',
     };
   }
 
@@ -909,6 +940,20 @@ export class BrowserSession {
   private async getViewportSize() {
     const viewport = await this.getViewportMetrics();
     return { width: viewport.width, height: viewport.height };
+  }
+
+  private async normalizeScreenshotRegion(region?: ScreenshotRegion): Promise<ScreenshotRegion | undefined> {
+    if (!region) return undefined;
+    const viewport = await this.getViewportMetrics();
+    const x = Math.max(0, Math.floor(Number(region.x)));
+    const y = Math.max(0, Math.floor(Number(region.y)));
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x >= viewport.width || y >= viewport.height) return undefined;
+    const maxWidth = Math.max(1, viewport.width - x);
+    const maxHeight = Math.max(1, viewport.height - y);
+    const width = Math.min(maxWidth, Math.max(1, Math.floor(Number(region.width))));
+    const height = Math.min(maxHeight, Math.max(1, Math.floor(Number(region.height))));
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return undefined;
+    return { x, y, width, height };
   }
 
   private async getViewportMetrics(): Promise<ViewportMetrics> {
@@ -1663,33 +1708,6 @@ export class BrowserSession {
             (hasStrongOwnInteractionSemantics(element) || hasMeaningfulContentOutsideInteractiveDescendants(element)),
           );
         });
-      }
-
-      function selectCandidatesAcrossViewport(items: Candidate[], limit: number) {
-        if (items.length <= limit) return items;
-        const bandCount = 5;
-        const bandHeight = Math.max(1, window.innerHeight / bandCount);
-        const bands: Candidate[][] = Array.from({ length: bandCount }, () => []);
-        for (const candidate of items) {
-          const band = Math.min(bandCount - 1, Math.floor(candidate.center.y / bandHeight));
-          bands[band].push(candidate);
-        }
-        const perBand = Math.max(1, Math.ceil(limit / bandCount));
-        const selected: Candidate[] = [];
-        for (const band of bands) {
-          // Prefer smaller, more specific targets so band limits are not consumed
-          // by large wrapper elements.
-          band.sort(
-            (a, b) =>
-              a.rect.width * a.rect.height - b.rect.width * b.rect.height ||
-              a.rect.y - b.rect.y ||
-              a.rect.x - b.rect.x,
-          );
-          selected.push(...band.slice(0, perBand));
-        }
-        return selected
-          .slice(0, limit)
-          .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
       }
 
       function domPathOf(element: Element) {
@@ -2534,6 +2552,17 @@ export class BrowserSession {
       return { candidate, error: `Candidate ${candidate.id} is disabled: ${this.describeCandidate(candidate)}` };
     }
 
+    if (this.mode === 'visual-markers') {
+      const point = this.resolveCapturedCandidatePoint(candidate, candidate.framePath ? `iframe ${candidate.framePath} screenshot` : 'screenshot');
+      if (!point) {
+        return {
+          candidate,
+          error: `Candidate ${candidate.id} has no valid point in the current visual marker screenshot snapshot.`,
+        };
+      }
+      return { candidate, target: point };
+    }
+
     if (candidate.framePath) {
       const identity = await this.validateFrameCandidateIdentity(candidate);
       if (!identity.ok) {
@@ -2632,27 +2661,6 @@ export class BrowserSession {
     return frame;
   }
 
-  private async resolveFrameCandidatePoint(candidate: InteractiveCandidate) {
-    const frame = this.frameFromPath(candidate.framePath);
-    if (!frame) return this.resolveCapturedCandidatePoint(candidate, 'iframe');
-    const box = await frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined);
-    if (!box) return this.resolveCapturedCandidatePoint(candidate, 'iframe');
-    const local = await this.resolveFrameDomPathToClickablePoint(frame, candidate.path);
-    if (!local) return this.resolveCapturedCandidatePoint(candidate, 'iframe');
-    const x = Math.round(box.x + local.x);
-    const y = Math.round(box.y + local.y);
-    const viewport = await this.getViewportMetrics().catch(() => ({ width: 0, height: 0, devicePixelRatio: 1 }));
-    if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
-      return this.resolveCapturedCandidatePoint(candidate, 'iframe');
-    }
-    return {
-      x,
-      y,
-      descriptor: `iframe ${candidate.framePath} -> ${local.descriptor}`,
-      offscreen: local.offscreen,
-    };
-  }
-
   private resolveCapturedCandidatePoint(candidate: InteractiveCandidate, descriptor: string) {
     const px = candidate.center?.x;
     const py = candidate.center?.y;
@@ -2665,116 +2673,6 @@ export class BrowserSession {
       descriptor: `${descriptor} captured ${this.describeCandidate(candidate)}`,
       offscreen: false,
     };
-  }
-
-  private async resolveFrameDomPathToClickablePoint(frame: Frame, pathValue: string) {
-    return frame.evaluate((path) => {
-      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
-      function aiIsRenderable(element: Element) {
-        if (!element || element.nodeType !== 1) return false;
-        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
-        const tag = element.tagName.toLowerCase();
-        if (skippedTags.has(tag)) return false;
-        if (element.hasAttribute('hidden')) return false;
-        if (element.getAttribute('aria-hidden') === 'true') return false;
-        const style = window.getComputedStyle(element);
-        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
-        if (style.pointerEvents === 'none') return false;
-        if (Number(style.opacity || '1') <= 0.01) return false;
-        return true;
-      }
-      function aiIsTraversable(element: Element) {
-        if (!element || element.nodeType !== 1) return false;
-        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
-        return !skippedTags.has(element.tagName.toLowerCase());
-      }
-      function aiVisibleRect(element: Element) {
-        if (!aiIsRenderable(element)) return undefined;
-        const rect = element.getBoundingClientRect();
-        const left = Math.max(rect.left, 0);
-        const top = Math.max(rect.top, 0);
-        const right = Math.min(rect.right, window.innerWidth);
-        const bottom = Math.min(rect.bottom, window.innerHeight);
-        const width = right - left;
-        const height = bottom - top;
-        if (width <= 2 || height <= 2) return undefined;
-        return { left, top, right, bottom, width, height, raw: rect };
-      }
-      function aiChildren(element: Element) {
-        return Array.from(element.children).filter(aiIsTraversable);
-      }
-      function pointBelongsToElement(element: Element, x: number, y: number) {
-        const top = document.elementsFromPoint(x, y).find((item) => aiIsRenderable(item));
-        return Boolean(top && (top === element || element.contains(top)));
-      }
-      function visiblePointForElement(element: Element) {
-        const rect = aiVisibleRect(element);
-        if (!rect) return undefined;
-        const insetX = Math.min(10, Math.max(1, rect.width / 4));
-        const insetY = Math.min(10, Math.max(1, rect.height / 4));
-        const samples = [
-          [rect.left + rect.width / 2, rect.top + rect.height / 2],
-          [rect.left + insetX, rect.top + rect.height / 2],
-          [rect.right - insetX, rect.top + rect.height / 2],
-          [rect.left + rect.width / 2, rect.top + insetY],
-          [rect.left + rect.width / 2, rect.bottom - insetY],
-          [rect.left + insetX, rect.top + insetY],
-          [rect.right - insetX, rect.top + insetY],
-          [rect.left + insetX, rect.bottom - insetY],
-          [rect.right - insetX, rect.bottom - insetY],
-        ];
-        for (const [x, y] of samples) {
-          const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
-          const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
-          if (pointBelongsToElement(element, px, py)) return { x: px, y: py };
-        }
-        return undefined;
-      }
-
-      const parts = String(path).split('.').map((item) => Number(String(item).trim()));
-      if (!parts.length || parts[0] !== 0 || parts.some((item) => !Number.isInteger(item) || item < 0)) return undefined;
-      let element: Element | undefined = document.documentElement;
-      for (const index of parts.slice(1)) {
-        element = aiChildren(element)[index];
-        if (!element) return undefined;
-      }
-      if (!element) return undefined;
-      let rect = element.getBoundingClientRect();
-      let point = visiblePointForElement(element);
-      if (!point) {
-        element.scrollIntoView({ block: 'center', inline: 'center' });
-        rect = element.getBoundingClientRect();
-        point = visiblePointForElement(element);
-      }
-      if (!point || rect.width <= 0 || rect.height <= 0) {
-        const queue = aiChildren(element);
-        while (queue.length) {
-          const candidate = queue.shift() as Element;
-          const candidateRect = candidate.getBoundingClientRect();
-          const candidatePoint = visiblePointForElement(candidate);
-          if (candidateRect.width > 0 && candidateRect.height > 0 && candidatePoint) {
-            element = candidate;
-            rect = candidateRect;
-            point = candidatePoint;
-            break;
-          }
-          queue.push(...aiChildren(candidate));
-        }
-      }
-      if (!point || rect.width <= 0 || rect.height <= 0) return undefined;
-      const tag = element.tagName.toLowerCase();
-      const id = element.id ? `#${element.id}` : '';
-      const classes = typeof element.className === 'string'
-        ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
-        : '';
-      const offscreen = rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth;
-      return {
-        x: Math.min(Math.max(point.x, 0), window.innerWidth - 1),
-        y: Math.min(Math.max(point.y, 0), window.innerHeight - 1),
-        descriptor: `${tag}${id}${classes}`,
-        offscreen,
-      };
-    }, pathValue).catch(() => undefined);
   }
 
   private async resolveShadowCandidatePoint(candidate: InteractiveCandidate) {
@@ -2859,9 +2757,6 @@ export class BrowserSession {
         const height = bottom - top;
         if (width <= 2 || height <= 2) return undefined;
         return { left, top, right, bottom, width, height };
-      }
-      function aiIsRendered(element: Element) {
-        return Boolean(aiVisibleRect(element));
       }
       function aiChildren(element: Element) {
         return Array.from(element.children).filter(aiIsTraversable);
@@ -3010,9 +2905,6 @@ export class BrowserSession {
         if (width <= 2 || height <= 2) return undefined;
         return { left, top, right, bottom, width, height, raw: rect };
       }
-      function aiIsRendered(element: Element) {
-        return Boolean(aiVisibleRect(element));
-      }
       function aiChildren(element: Element) {
         return Array.from(element.children).filter(aiIsTraversable);
       }
@@ -3100,30 +2992,10 @@ export class BrowserSession {
   private async dispatchDomPathClick(pathValue: string) {
     return this.activePage.evaluate((path) => {
       const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
-      function aiIsRenderable(element: Element) {
-        if (!element || element.nodeType !== 1) return false;
-        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
-        const tag = element.tagName.toLowerCase();
-        if (skippedTags.has(tag)) return false;
-        if (element.hasAttribute('hidden')) return false;
-        if (element.getAttribute('aria-hidden') === 'true') return false;
-        const style = window.getComputedStyle(element);
-        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
-        if (style.pointerEvents === 'none') return false;
-        if (Number(style.opacity || '1') <= 0.01) return false;
-        return true;
-      }
       function aiIsTraversable(element: Element) {
         if (!element || element.nodeType !== 1) return false;
         if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
         return !skippedTags.has(element.tagName.toLowerCase());
-      }
-      function aiIsRendered(element: Element) {
-        if (!aiIsRenderable(element)) return false;
-        const rect = element.getBoundingClientRect();
-        const visibleWidth = Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0);
-        const visibleHeight = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
-        return visibleWidth > 2 && visibleHeight > 2;
       }
       function aiChildren(element: Element) {
         return Array.from(element.children).filter(aiIsTraversable);
@@ -3177,30 +3049,10 @@ export class BrowserSession {
     return this.activePage.evaluate(({ domPath }) => {
       // Keep this predicate byte-identical to readSimplifiedDomTree so domPath indexes line up.
       const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
-      function aiIsRenderable(element: Element) {
-        if (!element || element.nodeType !== 1) return false;
-        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
-        const tag = element.tagName.toLowerCase();
-        if (skippedTags.has(tag)) return false;
-        if (element.hasAttribute('hidden')) return false;
-        if (element.getAttribute('aria-hidden') === 'true') return false;
-        const style = window.getComputedStyle(element);
-        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
-        if (style.pointerEvents === 'none') return false;
-        if (Number(style.opacity || '1') <= 0.01) return false;
-        return true;
-      }
       function aiIsTraversable(element: Element) {
         if (!element || element.nodeType !== 1) return false;
         if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
         return !skippedTags.has(element.tagName.toLowerCase());
-      }
-      function aiIsRendered(element: Element) {
-        if (!aiIsRenderable(element)) return false;
-        const rect = element.getBoundingClientRect();
-        const visibleWidth = Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0);
-        const visibleHeight = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
-        return visibleWidth > 2 && visibleHeight > 2;
       }
       function aiChildren(element: Element) {
         return Array.from(element.children).filter(aiIsTraversable);
@@ -3568,8 +3420,6 @@ export class BrowserSession {
         const minTop = Math.min(safeInset, Math.max(0, window.innerHeight - normalLabelHeight));
         const maxLeft = Math.max(minLeft, window.innerWidth - normalLabelWidth - safeInset);
         const maxTop = Math.max(minTop, window.innerHeight - normalLabelHeight - safeInset);
-        const centerX = rect.x + rect.width / 2;
-        const centerY = rect.y + rect.height / 2;
         const currentTarget = {
           left: Math.max(0, rect.x),
           top: Math.max(0, rect.y),

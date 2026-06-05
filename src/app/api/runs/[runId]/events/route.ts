@@ -11,35 +11,49 @@ function isFinished(status?: string) {
 
 export async function GET(_request: Request, context: RouteContext) {
   const { runId } = await context.params;
+  const streamState: { closed: boolean; stopTimer?: () => void } = { closed: false };
 
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
       let previous = '';
-      let closed = false;
-      let timer: ReturnType<typeof setInterval> | undefined;
 
       const close = () => {
-        if (closed) return;
-        closed = true;
-        if (timer) clearInterval(timer);
-        controller.close();
+        if (streamState.closed) return;
+        streamState.closed = true;
+        streamState.stopTimer?.();
+        try {
+          controller.close();
+        } catch {
+          // The client may have already closed the stream.
+        }
+      };
+
+      const enqueue = (chunk: string) => {
+        if (streamState.closed) return false;
+        try {
+          controller.enqueue(encoder.encode(chunk));
+          return true;
+        } catch {
+          close();
+          return false;
+        }
       };
 
       const send = () => {
-        if (closed) return;
+        if (streamState.closed) return;
         const run = store.getRun(runId);
         if (!run) {
-          controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: 'Run not found' })}\n\n`));
+          enqueue(`event: error\ndata: ${JSON.stringify({ error: 'Run not found' })}\n\n`);
           close();
           return;
         }
         const payload = JSON.stringify(run);
         if (payload !== previous) {
           previous = payload;
-          controller.enqueue(encoder.encode(`event: run\ndata: ${payload}\n\n`));
+          if (!enqueue(`event: run\ndata: ${payload}\n\n`)) return;
         } else {
-          controller.enqueue(encoder.encode(': heartbeat\n\n'));
+          if (!enqueue(': heartbeat\n\n')) return;
         }
         if (isFinished(run.status) && run.report?.markdown) {
           close();
@@ -47,9 +61,15 @@ export async function GET(_request: Request, context: RouteContext) {
       };
 
       send();
-      timer = setInterval(send, 1000);
+      if (!streamState.closed) {
+        const timer = setInterval(send, 1000);
+        streamState.stopTimer = () => clearInterval(timer);
+      }
     },
-    cancel() {},
+    cancel() {
+      streamState.closed = true;
+      streamState.stopTimer?.();
+    },
   });
 
   return new NextResponse(stream, {

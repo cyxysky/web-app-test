@@ -2,19 +2,67 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Loader2, Plus, Save, Trash2 } from 'lucide-react';
-import type { RuntimeEnvRecord } from '@/server/ai/schemas/test-case.schema';
+import { ArrowLeft, Loader2, Save } from 'lucide-react';
+import {
+  modelProviderDefinitions,
+  modelProviderDefinition,
+  runtimeEnvDefinition,
+  type SettingsTab,
+} from '@/config/settings';
+import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/test-case.schema';
 
 type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
-  readonly?: boolean;
-  source?: string;
+  updatedAt?: string;
 };
 
+type ModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
+
+const tabs: Array<{ id: SettingsTab; label: string }> = [
+  { id: 'model', label: '模型配置' },
+  { id: 'browser', label: '浏览器与截图' },
+  { id: 'runtime', label: '运行控制' },
+  { id: 'debug', label: '调试与高级' },
+];
+
+function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
+  const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
+  for (const definition of modelProviderDefinitions) {
+    const current = input?.providers?.[definition.value];
+    providers[definition.value] = {
+      model: current?.model || definition.defaultModel,
+      apiKey: current?.apiKey || '',
+      baseURL: current?.baseURL ?? definition.defaultBaseURL ?? '',
+      updatedAt: current?.updatedAt,
+    };
+  }
+  return {
+    provider: input?.provider || 'openrouter',
+    providers,
+    updatedAt: input?.updatedAt || '',
+  };
+}
+
+function providerSettings(config: ModelConfig, provider: ModelProvider) {
+  const definition = modelProviderDefinition(provider);
+  return config.providers[provider] || {
+    model: definition.defaultModel,
+    apiKey: '',
+    baseURL: definition.defaultBaseURL || '',
+  };
+}
+
+function isSecret(item: EnvRow) {
+  return Boolean(item.secret || runtimeEnvDefinition(item.key)?.secret || /KEY|TOKEN|SECRET|PASSWORD|COOKIE|DATABASE_URL/i.test(item.key));
+}
+
 export function EnvironmentSettings() {
+  const [activeTab, setActiveTab] = useState<SettingsTab>('model');
   const [items, setItems] = useState<EnvRow[]>([]);
-  const [processItems, setProcessItems] = useState<EnvRow[]>([]);
+  const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig());
+  const [modelDraft, setModelDraft] = useState<ModelConfig>(() => createModelConfig());
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [savingEnv, setSavingEnv] = useState(false);
+  const [savingModel, setSavingModel] = useState(false);
 
   useEffect(() => {
     void load();
@@ -23,45 +71,124 @@ export function EnvironmentSettings() {
   async function load() {
     setLoading(true);
     try {
-      const response = await fetch('/api/settings/env', { cache: 'no-store' });
-      const data = await response.json();
-      setItems(data.saved || []);
-      setProcessItems(data.process || []);
+      const [envResponse, modelResponse] = await Promise.all([
+        fetch('/api/settings/env', { cache: 'no-store' }),
+        fetch('/api/settings/model', { cache: 'no-store' }),
+      ]);
+      const envData = await envResponse.json();
+      const modelData = await modelResponse.json();
+      const nextModel = createModelConfig(modelData.config);
+      setItems(envData.saved || []);
+      setModelConfig(nextModel);
+      setModelDraft(nextModel);
     } finally {
       setLoading(false);
     }
   }
 
   function update(index: number, patch: Partial<EnvRow>) {
-    setItems((current) => current.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item)));
+    setItems((current) => current.map((item, itemIndex) => (itemIndex === index ? { ...item, enabled: true, ...patch } : item)));
   }
 
-  function add(row?: EnvRow) {
-    setItems((current) => [
-      ...current,
-      row || { key: '', value: '', enabled: true, secret: false },
-    ]);
-  }
-
-  function remove(index: number) {
-    setItems((current) => current.filter((_item, itemIndex) => itemIndex !== index));
-  }
-
-  async function save() {
-    setSaving(true);
+  async function saveEnv() {
+    setSavingEnv(true);
     try {
       const response = await fetch('/api/settings/env', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items }),
+        body: JSON.stringify({ items: items.map((item) => ({ ...item, enabled: true, secret: isSecret(item) })) }),
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '保存失败');
+      if (!response.ok) throw new Error(data.error || '保存环境配置失败');
       setItems(data.saved || []);
     } finally {
-      setSaving(false);
+      setSavingEnv(false);
     }
   }
+
+  function selectProvider(provider: ModelProvider) {
+    setModelDraft((current) => ({
+      ...createModelConfig(current),
+      provider,
+    }));
+  }
+
+  function updateActiveProviderSettings(patch: Partial<ModelProviderSettings>) {
+    setModelDraft((current) => {
+      const next = createModelConfig(current);
+      const provider = next.provider;
+      return {
+        ...next,
+        providers: {
+          ...next.providers,
+          [provider]: {
+            ...providerSettings(next, provider),
+            ...patch,
+          },
+        },
+      };
+    });
+  }
+
+  async function saveModel() {
+    const payload = createModelConfig(modelDraft || modelConfig);
+    setSavingModel(true);
+    try {
+      const response = await fetch('/api/settings/model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '保存模型配置失败');
+      const nextModel = createModelConfig(data.config);
+      setModelConfig(nextModel);
+      setModelDraft(nextModel);
+    } finally {
+      setSavingModel(false);
+    }
+  }
+
+  function renderRuntimeControl(item: EnvRow, index: number) {
+    const definition = runtimeEnvDefinition(item.key);
+    if (definition?.control === 'boolean') {
+      const checked = item.value === 'true';
+      return (
+        <button className={`settings-toggle${checked ? ' on' : ''}`} onClick={() => update(index, { value: checked ? 'false' : 'true' })} type="button" aria-pressed={checked}>
+          <span />
+        </button>
+      );
+    }
+
+    if (definition?.control === 'select') {
+      return (
+        <select className="input settings-control" value={item.value} onChange={(event) => update(index, { value: event.target.value })}>
+          {(definition.options || []).map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>
+      );
+    }
+
+    return (
+      <input
+        className="input settings-control"
+        inputMode={definition?.control === 'number' ? 'decimal' : undefined}
+        placeholder="未设置"
+        type={definition?.control === 'number' ? 'number' : isSecret(item) ? 'password' : 'text'}
+        value={item.value}
+        onChange={(event) => update(index, { value: event.target.value })}
+      />
+    );
+  }
+
+  const editingModelConfig = createModelConfig(modelDraft || modelConfig);
+  const activeProvider = editingModelConfig.provider;
+  const activeProviderOption = modelProviderDefinition(activeProvider);
+  const activeProviderSettings = providerSettings(editingModelConfig, activeProvider);
+  const visibleEnvItems = items
+    .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
+    .filter(({ definition }) => definition?.tab === activeTab);
 
   return (
     <main className="settings-workspace">
@@ -72,68 +199,123 @@ export function EnvironmentSettings() {
         </Link>
         <div>
           <h1>环境配置</h1>
-          <span>保存后会应用到后续测试运行、模型调用、浏览器模式和队列并发。</span>
+          <span>模型、浏览器、运行控制和调试参数全部在网页配置中管理。</span>
         </div>
       </header>
 
-      <section className="settings-panel">
-        <div className="plain-section-head">
-          <div>
-            <h2>网页保存的环境变量</h2>
-            <span>{items.length} 项</span>
-          </div>
-          <div className="dashboard-actions">
-            <button className="icon-text-button" onClick={() => add()} type="button">
-              <Plus size={15} />
-              新增
-            </button>
-            <button className="icon-text-button" disabled={saving} onClick={save} type="button">
-              {saving ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
-              保存
-            </button>
-          </div>
-        </div>
-        {loading ? (
-          <div className="empty-state">正在读取配置。</div>
-        ) : (
-          <div className="env-table">
-            {items.map((item, index) => (
-              <div className="env-row" key={`${item.key}-${index}`}>
-                <input className="input" placeholder="KEY" value={item.key} onChange={(event) => update(index, { key: event.target.value })} />
-                <input className="input" placeholder="value" type={item.secret ? 'password' : 'text'} value={item.value} onChange={(event) => update(index, { value: event.target.value })} />
-                <label className="inline-check">
-                  <input checked={item.enabled} onChange={(event) => update(index, { enabled: event.target.checked })} type="checkbox" />
-                  启用
-                </label>
-                <label className="inline-check">
-                  <input checked={Boolean(item.secret)} onChange={(event) => update(index, { secret: event.target.checked })} type="checkbox" />
-                  密钥
-                </label>
-                <button className="icon-button" onClick={() => remove(index)} type="button" aria-label="删除">
-                  <Trash2 size={16} />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section className="settings-panel">
-        <div className="plain-section-head">
-          <div>
-            <h2>当前进程变量</h2>
-            <span>可导入到网页配置后修改保存</span>
-          </div>
-        </div>
-        <div className="process-env-list">
-          {processItems.slice(0, 80).map((item) => (
-            <button className="process-env-row" disabled={item.readonly} key={item.key} onClick={() => add({ ...item, enabled: true })} type="button">
-              <strong>{item.key}</strong>
-              <span>{item.secret ? '已隐藏' : item.value}</span>
+      <div className="settings-layout">
+        <nav className="settings-tabs" aria-label="环境配置分类">
+          {tabs.map((tab) => (
+            <button className={activeTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setActiveTab(tab.id)} type="button">
+              {tab.label}
             </button>
           ))}
+        </nav>
+
+        <div className="settings-content">
+          {loading ? (
+            <section className="settings-loading-panel" role="status" aria-live="polite">
+              <Loader2 className="spin" size={18} />
+              <div>
+                <h2>正在读取环境配置</h2>
+                <span>正在加载模型、浏览器、运行控制和调试参数。</span>
+              </div>
+            </section>
+          ) : (
+            <>
+          {activeTab === 'model' ? (
+            <section>
+              <div className="settings-section-head">
+                <div>
+                  <h2>模型配置</h2>
+                  <span>每个服务商独立保存模型、Key 和 Base URL，切换服务商不会串用密钥。</span>
+                </div>
+                <button className="settings-save-button" disabled={savingModel || loading} onClick={saveModel} type="button">
+                  {savingModel ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+                  保存
+                </button>
+              </div>
+              <div className="settings-card">
+                <div className="settings-row">
+                  <div>
+                    <strong>服务商</strong>
+                    <span>选择当前运行使用的 AI 模型服务提供商。</span>
+                  </div>
+                  <select className="input settings-control" value={activeProvider} onChange={(event) => selectProvider(event.target.value as ModelProvider)}>
+                    {modelProviderDefinitions.map((provider) => (
+                      <option key={provider.value} value={provider.value}>{provider.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <strong>模型名称</strong>
+                    <span>仅作用于当前选中的服务商。</span>
+                  </div>
+                  <input className="input settings-control" value={activeProviderSettings.model} onChange={(event) => updateActiveProviderSettings({ model: event.target.value })} placeholder={activeProviderOption.defaultModel} />
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <strong>访问密钥</strong>
+                    <span>{activeProviderOption.keyLabel}</span>
+                  </div>
+                  <input
+                    className="input settings-control"
+                    disabled={Boolean(activeProviderOption.localAuth)}
+                    type="password"
+                    value={activeProviderSettings.apiKey || ''}
+                    onChange={(event) => updateActiveProviderSettings({ apiKey: event.target.value })}
+                    placeholder={activeProviderOption.localAuth ? '本地登录，无需 Key' : '填写该服务商的访问密钥'}
+                  />
+                </div>
+                {activeProviderOption.baseUrlLabel ? (
+                  <div className="settings-row">
+                    <div>
+                      <strong>{activeProviderOption.baseUrlLabel}</strong>
+                      <span>自定义兼容服务地址，留空使用默认地址。</span>
+                    </div>
+                    <input className="input settings-control" value={activeProviderSettings.baseURL || ''} onChange={(event) => updateActiveProviderSettings({ baseURL: event.target.value })} placeholder={activeProviderOption.defaultBaseURL || '默认地址'} />
+                  </div>
+                ) : null}
+              </div>
+            </section>
+          ) : null}
+
+          {activeTab !== 'model' ? (
+            <section>
+              <div className="settings-section-head">
+                <div>
+                  <h2>{tabs.find((tab) => tab.id === activeTab)?.label}</h2>
+                  <span>{visibleEnvItems.length} 项网页配置</span>
+                </div>
+                <button className="settings-save-button" disabled={savingEnv || loading} onClick={saveEnv} type="button">
+                  {savingEnv ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+                  保存
+                </button>
+              </div>
+              {visibleEnvItems.length ? (
+                <div className="settings-card">
+                  {visibleEnvItems.map(({ item, index, definition }) => (
+                    <div className="settings-row settings-env-row" key={item.key}>
+                      <div className="env-name" title={item.key}>
+                        <strong>{definition?.label || item.key}</strong>
+                        <span>{definition?.description || '网页配置项。'}</span>
+                      </div>
+                      <div className="settings-row-control">
+                        {renderRuntimeControl(item, index)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty-state">这个分类暂无配置。</div>
+              )}
+            </section>
+          ) : null}
+            </>
+          )}
         </div>
-      </section>
+      </div>
     </main>
   );
 }

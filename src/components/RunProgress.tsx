@@ -7,6 +7,7 @@ import { RunMetaDrawer } from '@/components/RunMetaDrawer';
 import type { RunDebugEvent, StepExecutionResult, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 type ImageItem = { title: string; url: string };
+type StepToolCallItem = NonNullable<StepExecutionResult['tools']>[number];
 
 function artifactUrl(filePath?: string) {
   if (!filePath) return undefined;
@@ -43,16 +44,66 @@ function formatToolInput(input: unknown) {
   if (input === undefined || input === null) return '';
   if (typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length === 0) return '';
   try {
-    return JSON.stringify(input);
+    return JSON.stringify(input, null, 2);
   } catch {
     return String(input);
   }
 }
 
-function stepToolSummary(step: StepExecutionResult) {
-  const tools = step.tools || [];
-  if (!tools.length) return '未调用工具';
-  return tools.map((tool) => tool.name).join(' · ');
+function toolStatusLabel(ok?: boolean) {
+  if (ok === true) return '成功';
+  if (ok === false) return '失败';
+  return '执行中';
+}
+
+function toolStatusClass(ok?: boolean) {
+  if (ok === false) return 'tool-status failed';
+  if (ok === undefined) return 'tool-status pending';
+  return 'tool-status';
+}
+
+function sameDisplayText(a?: string, b?: string) {
+  const left = (a || '').replace(/\s+/g, ' ').trim();
+  const right = (b || '').replace(/\s+/g, ' ').trim();
+  return Boolean(left && right && left === right);
+}
+
+function visibleStepObservation(step: StepExecutionResult) {
+  const observation = step.observation || step.note || '';
+  return sameDisplayText(observation, step.action) ? '' : observation;
+}
+
+function compactText(value?: string, max = 120) {
+  const text = (value || '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function stepToolBadges(step: StepExecutionResult) {
+  const badges: Array<{ name: string; count: number; ok?: boolean }> = [];
+  for (const tool of step.tools || []) {
+    const current = badges.find((badge) => badge.name === tool.name);
+    if (current) {
+      current.count += 1;
+      if (tool.ok === false) current.ok = false;
+      else if (current.ok !== false && tool.ok === undefined) current.ok = undefined;
+    } else {
+      badges.push({ name: tool.name, count: 1, ok: tool.ok });
+    }
+  }
+  return badges;
+}
+
+function toolBadgeLabel(badge: { name: string; count: number }) {
+  return `${badge.name}${badge.count > 1 ? ` ×${badge.count}` : ''}`;
+}
+
+function toolPreviewText(tool: StepToolCallItem, input: string, screenshotCount: number) {
+  const parts: string[] = [];
+  if (tool.reason) parts.push(`原因：${compactText(tool.reason, 96)}`);
+  else if (tool.result) parts.push(`结果：${compactText(tool.result, 96)}`);
+  else if (input) parts.push(`参数：${compactText(input, 96)}`);
+  if (screenshotCount) parts.push(`${screenshotCount} 张截图`);
+  return parts.join(' · ');
 }
 
 function formatDetails(details: unknown) {
@@ -75,7 +126,7 @@ function collectStepImages(steps: StepExecutionResult[]) {
     for (const tool of step.tools || []) {
       for (const [shotIndex, shot] of (tool.screenshots || []).entries()) {
         const url = artifactUrl(shot.path);
-        if (url) images.push({ title: `Step ${step.index} ? ${tool.name} ? ${shot.title || `visual ${shotIndex + 1}`}`, url });
+        if (url) images.push({ title: `Step ${step.index} · ${tool.name} · ${shot.title || `visual ${shotIndex + 1}`}`, url });
       }
     }
   }
@@ -91,6 +142,73 @@ function toolScreenshotItems(step: StepExecutionResult, toolIndex: number) {
     if (url) items.push({ title: shot.title || `${tool.name} visual ${shotIndex + 1}`, url });
   }
   return items;
+}
+
+function ToolCallCard({
+  expanded,
+  index,
+  onToggle,
+  openImage,
+  step,
+  tool,
+}: {
+  expanded: boolean;
+  index: number;
+  onToggle: () => void;
+  openImage: (url: string) => void;
+  step: StepExecutionResult;
+  tool: StepToolCallItem;
+}) {
+  const input = formatToolInput(tool.input);
+  const screenshots = toolScreenshotItems(step, index);
+  const preview = toolPreviewText(tool, input, screenshots.length);
+
+  return (
+    <li className={expanded ? 'expanded' : undefined}>
+      <button className="tool-call-toggle" onClick={onToggle} type="button" aria-expanded={expanded}>
+        <span className="tool-call-heading">
+          <span className="tool-call-title">
+            <strong>{tool.name}</strong>
+          </span>
+          <span className={toolStatusClass(tool.ok)}>{toolStatusLabel(tool.ok)}</span>
+          <ChevronRight className="tool-call-chevron" size={16} />
+        </span>
+        {preview ? <span className="tool-call-preview">{preview}</span> : null}
+      </button>
+      {expanded ? (
+        <div className="tool-call-details">
+          {tool.reason ? (
+            <p className="tool-call-reason">
+              <span>调用原因</span>
+              {tool.reason}
+            </p>
+          ) : null}
+          {input ? (
+            <div className="tool-call-block">
+              <span>参数</span>
+              <code>{input}</code>
+            </div>
+          ) : null}
+          {tool.result ? (
+            <div className="tool-call-block">
+              <span>结果</span>
+              <p>{tool.result}</p>
+            </div>
+          ) : null}
+          {screenshots.length ? (
+            <div className="tool-shot-grid">
+              {screenshots.map((shot) => (
+                <button className="tool-shot-button" key={shot.url} onClick={() => openImage(shot.url)} type="button">
+                  <img alt={shot.title} src={shot.url} />
+                  <span>{shot.title}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </li>
+  );
 }
 
 function DebugEventRow({ event }: { event: RunDebugEvent }) {
@@ -207,15 +325,7 @@ function ReportAccordion({ title, items }: { title: string; items: string[] }) {
   );
 }
 
-function ReportEvidence({
-  run,
-  images,
-  openImage,
-}: {
-  run: TestRunRecord;
-  images: ImageItem[];
-  openImage: (url: string) => void;
-}) {
+function ReportEvidence({ run }: { run: TestRunRecord }) {
   return (
     <div className="report-evidence">
       <section>
@@ -233,9 +343,10 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   const [imagePreview, setImagePreview] = useState<{ images: ImageItem[]; index: number } | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
   const [requestOpen, setRequestOpen] = useState(false);
+  const [expandedToolCards, setExpandedToolCards] = useState<Record<string, boolean>>({});
   const [resumePendingStep, setResumePendingStep] = useState<number | undefined>();
-  const steps = run.result?.steps || [];
-  const allImages = collectStepImages(steps);
+  const steps = useMemo(() => run.result?.steps || [], [run.result?.steps]);
+  const allImages = useMemo(() => collectStepImages(steps), [steps]);
   const selectedStep = selectedOrLatest(steps, selectedIndex);
   const runningStep = steps.find((step) => step.status === 'running');
   const debugEnabled = Boolean(run.debug?.enabled);
@@ -292,6 +403,21 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
     setImagePreview({ images, index: Math.max(index, 0) });
   }
 
+  function toolCardKey(step: StepExecutionResult, tool: StepToolCallItem, index: number) {
+    return `${step.index}:${index}:${tool.name}`;
+  }
+
+  function isToolCardExpanded(step: StepExecutionResult, tool: StepToolCallItem, index: number) {
+    const key = toolCardKey(step, tool, index);
+    return expandedToolCards[key] ?? tool.ok !== true;
+  }
+
+  function toggleToolCard(step: StepExecutionResult, tool: StepToolCallItem, index: number) {
+    const key = toolCardKey(step, tool, index);
+    const current = isToolCardExpanded(step, tool, index);
+    setExpandedToolCards((state) => ({ ...state, [key]: !current }));
+  }
+
   async function skipSelectedStep() {
     if (!selectedStep) return;
     const response = await fetch(`/api/runs/${run.id}/skip`, {
@@ -342,9 +468,6 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
     if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
     else setResumePendingStep(undefined);
   }
-
-  const before = artifactUrl(selectedStep?.beforeScreenshotPath);
-  const after = artifactUrl(selectedStep?.afterScreenshotPath || selectedStep?.screenshotPath);
 
   return (
     <div className="test-cockpit">
@@ -430,15 +553,34 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
       <section className="cockpit-body">
         <aside className="step-rail" aria-label="执行步骤">
-          {steps.map((step) => (
-            <button className={selectedStep?.index === step.index ? 'rail-step active' : 'rail-step'} key={step.index} onClick={() => setSelectedIndex(step.index)} type="button">
-              <span className="rail-icon"><StepIcon status={step.status} /></span>
-              <span className="rail-copy">
-                <strong>{step.action}</strong>
-                <small>步骤 {step.index} · {stepToolSummary(step)}</small>
-              </span>
-            </button>
-          ))}
+          {steps.map((step) => {
+            const badges = stepToolBadges(step);
+            const visibleBadges = badges.slice(0, 4);
+            const hiddenBadgeCount = Math.max(0, badges.length - visibleBadges.length);
+            const toolPopover = badges.map(toolBadgeLabel).join(' · ');
+            return (
+              <button className={selectedStep?.index === step.index ? 'rail-step active' : 'rail-step'} key={step.index} onClick={() => setSelectedIndex(step.index)} type="button">
+                <span className="rail-icon"><StepIcon status={step.status} /></span>
+                <span className="rail-copy">
+                  <strong>{step.action}</strong>
+                  <small className="rail-step-meta">
+                    <span>步骤 {step.index}</span>
+                    {visibleBadges.length ? (
+                      <span className="rail-tool-chips" aria-label={`工具：${badges.map((badge) => badge.name).join('、')}`}>
+                        {visibleBadges.map((badge) => (
+                          <span className={badge.ok === false ? 'rail-tool-chip failed' : 'rail-tool-chip'} key={badge.name}>
+                            {toolBadgeLabel(badge)}
+                          </span>
+                        ))}
+                        {hiddenBadgeCount ? <span className="rail-tool-chip muted">+{hiddenBadgeCount}</span> : null}
+                      </span>
+                    ) : null}
+                  </small>
+                  {toolPopover ? <span className="rail-tool-popover" role="tooltip">{toolPopover}</span> : null}
+                </span>
+              </button>
+            );
+          })}
         </aside>
 
         <article className="evidence-panel">
@@ -472,10 +614,12 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                   <dt>AI 操作</dt>
                   <dd>{selectedStep.action}</dd>
                 </div>
-                <div>
-                  <dt>助手观察</dt>
-                  <dd>{selectedStep.observation || selectedStep.note || '暂无观察记录'}</dd>
-                </div>
+                {visibleStepObservation(selectedStep) ? (
+                  <div>
+                    <dt>页面观察</dt>
+                    <dd>{visibleStepObservation(selectedStep)}</dd>
+                  </div>
+                ) : null}
                 <div>
                   <dt>重要发现</dt>
                   <dd>
@@ -493,40 +637,22 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                   <dd>
                     {selectedStep.tools?.length ? (
                       <ol className="tool-call-list">
-                        {selectedStep.tools.map((tool, index) => {
-                          const input = formatToolInput(tool.input);
-                          const screenshots = toolScreenshotItems(selectedStep, index);
-                          return (
-                            <li key={`${tool.name}-${index}`}>
-                              <strong>{tool.name}</strong>
-                              {input ? <code>{input}</code> : null}
-                              {screenshots.length ? (
-                                <div className="tool-shot-grid">
-                                  {screenshots.map((shot) => (
-                                    <button className="tool-shot-button" key={shot.url} onClick={() => openImageByUrl(shot.url)} type="button">
-                                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                                      <img alt={shot.title} src={shot.url} />
-                                      <span>{shot.title}</span>
-                                    </button>
-                                  ))}
-                                </div>
-                              ) : null}
-                            </li>
-                          );
-                        })}
+                        {selectedStep.tools.map((tool, index) => (
+                          <ToolCallCard
+                            expanded={isToolCardExpanded(selectedStep, tool, index)}
+                            index={index}
+                            key={`${tool.name}-${index}`}
+                            onToggle={() => toggleToolCard(selectedStep, tool, index)}
+                            openImage={openImageByUrl}
+                            step={selectedStep}
+                            tool={tool}
+                          />
+                        ))}
                       </ol>
                     ) : (
                       '本步未调用浏览器工具'
                     )}
                   </dd>
-                </div>
-                <div>
-                  <dt>执行前截图</dt>
-                  <dd>{before ? <button className="link-button" onClick={() => openImageByUrl(before)} type="button"><Eye size={14} />查看</button> : '暂无'}</dd>
-                </div>
-                <div>
-                  <dt>执行后截图</dt>
-                  <dd>{after ? <button className="link-button" onClick={() => openImageByUrl(after)} type="button"><Eye size={14} />查看</button> : '暂无'}</dd>
                 </div>
               </dl>
             </>
@@ -618,7 +744,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
               <h2>最终报告</h2>
               <button className="icon-button" onClick={() => setReportOpen(false)} type="button" aria-label="关闭"><X size={18} /></button>
             </header>
-            <ReportEvidence run={run} images={allImages} openImage={openImageByUrl} />
+            <ReportEvidence run={run} />
             <MarkdownReport markdown={run.report.markdown} onImageClick={openImageByUrl} />
           </section>
         </div>

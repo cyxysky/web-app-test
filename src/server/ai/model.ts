@@ -10,61 +10,47 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 
 
 type GenerateTextModel = Parameters<typeof generateText>[0]['model'];
-type AiProvider = 'azure-openai' | 'codex' | 'deepseek' | 'gemini' | 'google' | 'openai' | 'openrouter';
+type AiProvider = 'azure-openai' | 'codex' | 'deepseek' | 'gemini' | 'google' | 'lmstudio' | 'openai' | 'openrouter';
 type ApprovalMode = 'never' | 'on-failure' | 'on-request' | 'untrusted';
 type SandboxMode = 'danger-full-access' | 'read-only' | 'workspace-write';
 
-const lmstudio = createOpenAICompatible({
-  name: 'lmstudio',
-  baseURL: 'http://localhost:1234/v1',
-})('qwen3-vl-2b-instruct');
-
-const gemini = createGeminiProvider({ authType: 'oauth-personal' });
-
-const azureOpenAI = createAzure({
-  baseURL: 'http://mirrors.shterm.com:8801/openai',
-  apiKey: '-',
-});
-
-const openAI = createOpenAI({
-  apiKey: process.env.OPENAI_API_KEY || '',
-});
-
-const deepseek = createDeepSeek({
-  apiKey: process.env.DEEPSEEK_API_KEY || '',
-});
-
-const openrouter = createOpenRouter({
-  apiKey: process.env.OPENROUTER_API_KEY || '',
-});
-
-const google = createGoogleGenerativeAI({
-  apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GOOGLE_API_KEY || '',
-});
-
-const codexCli = createCodexCli({
-  defaultSettings: {
-    codexPath: process.env.CODEX_PATH || undefined,
-    cwd: process.env.CODEX_CWD || process.cwd(),
-    approvalMode: parseApprovalMode(process.env.CODEX_APPROVAL_MODE) || 'on-failure',
-    sandboxMode: parseSandboxMode(process.env.CODEX_SANDBOX_MODE) || 'workspace-write',
-    reasoningEffort: parseReasoningEffort(process.env.CODEX_REASONING_EFFORT) || 'medium',
-    verbose: process.env.CODEX_VERBOSE === 'true',
-    skipGitRepoCheck: process.env.CODEX_SKIP_GIT_REPO_CHECK !== 'false',
-    allowNpx: process.env.CODEX_ALLOW_NPX === 'true',
-  },
-});
-
 export function getModel(): GenerateTextModel {
-  return lmstudio;
   const { provider, model } = getModelSettings();
-  if (provider === 'gemini') return gemini(model) as unknown as GenerateTextModel;
-  if (provider === 'codex') return codexCli(model) as unknown as GenerateTextModel;
-  if (provider === 'deepseek') return deepseek(model) as unknown as GenerateTextModel;
-  if (provider === 'google') return google(model) as unknown as GenerateTextModel;
-  if (provider === 'openai') return openAI(model) as unknown as GenerateTextModel;
-  if (provider === 'azure-openai') return azureOpenAI(model) as unknown as GenerateTextModel;
-  return openrouter.chat(model) as unknown as GenerateTextModel;
+  if (provider === 'gemini') return createGeminiProvider({ authType: 'oauth-personal' })(model) as unknown as GenerateTextModel;
+  if (provider === 'codex') return createCodexCli({
+    defaultSettings: {
+      codexPath: process.env.CODEX_PATH || undefined,
+      cwd: process.env.CODEX_CWD || process.cwd(),
+      approvalMode: parseApprovalMode(process.env.CODEX_APPROVAL_MODE) || 'on-failure',
+      sandboxMode: parseSandboxMode(process.env.CODEX_SANDBOX_MODE) || 'workspace-write',
+      reasoningEffort: parseReasoningEffort(process.env.CODEX_REASONING_EFFORT) || 'medium',
+      verbose: process.env.CODEX_VERBOSE === 'true',
+      skipGitRepoCheck: process.env.CODEX_SKIP_GIT_REPO_CHECK !== 'false',
+      allowNpx: process.env.CODEX_ALLOW_NPX === 'true',
+    },
+  })(model) as unknown as GenerateTextModel;
+  if (provider === 'deepseek') return createDeepSeek({
+    apiKey: process.env.DEEPSEEK_API_KEY || '',
+  })(model) as unknown as GenerateTextModel;
+  if (provider === 'google') return createGoogleGenerativeAI({
+    apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GOOGLE_API_KEY || '',
+  })(model) as unknown as GenerateTextModel;
+  if (provider === 'lmstudio') return createOpenAICompatible({
+    name: 'lmstudio',
+    baseURL: process.env.LMSTUDIO_BASE_URL || 'http://localhost:1234/v1',
+    apiKey: process.env.LMSTUDIO_API_KEY || undefined,
+  })(model) as unknown as GenerateTextModel;
+  if (provider === 'openai') return createOpenAI({
+    apiKey: process.env.OPENAI_API_KEY || '',
+    baseURL: process.env.OPENAI_BASE_URL || undefined,
+  })(model) as unknown as GenerateTextModel;
+  if (provider === 'azure-openai') return createAzure({
+    baseURL: process.env.AZURE_OPENAI_BASE_URL || 'http://mirrors.shterm.com:8801/openai',
+    apiKey: process.env.AZURE_OPENAI_API_KEY || '-',
+  })(model) as unknown as GenerateTextModel;
+  return createOpenRouter({
+    apiKey: process.env.OPENROUTER_API_KEY || '',
+  }).chat(model) as unknown as GenerateTextModel;
 }
 
 export function getModelSettings() {
@@ -74,9 +60,10 @@ export function getModelSettings() {
     codex: 'gpt-5.5',
     deepseek: 'deepseek-v4-flash',
     google: 'gemini-3-flash-preview',
+    lmstudio: 'qwen3-vl-2b-instruct',
     openai: 'gpt-5.5',
     openrouter: 'qwen/qwen3.6-27b',
-    gemini: 'gemini-3.1-pro-preview',
+    gemini: 'gemini-3-flash-preview',
   };
   // gemini-3.1-pro-preview
   return {
@@ -92,6 +79,7 @@ function normalizeProvider(value: string | undefined): AiProvider {
   if (provider === 'deepseek') return 'deepseek';
   if (provider === 'gemini' || provider === 'gemini-cli') return 'gemini';
   if (provider === 'google') return 'google';
+  if (provider === 'lmstudio' || provider === 'lm-studio' || provider === 'local') return 'lmstudio';
   if (provider === 'openai') return 'openai';
   return 'openrouter';
 }

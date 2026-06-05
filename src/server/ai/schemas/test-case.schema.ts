@@ -88,6 +88,8 @@ export type VisualFrameRecord = {
   group?: string;
   stepIndex: number;
   toolName?: string;
+  capture?: 'viewport' | 'fullPage' | 'region';
+  region?: { x: number; y: number; width: number; height: number };
   createdAt: string;
 };
 
@@ -134,6 +136,7 @@ export type StepToolCall = {
     capture?: 'auto' | 'viewport' | 'fullPage' | 'region' | 'none';
     retention?: 'auto' | 'replace' | 'append' | 'appendScrollSequence' | 'keepBeforeAfter' | 'clearAndReplace' | 'pinEvidence';
     reason?: string;
+    region?: { x: number; y: number; width: number; height: number };
   };
   screenshots?: Array<{
     title: string;
@@ -234,6 +237,21 @@ export type RuntimeEnvRecord = {
   value: string;
   enabled: boolean;
   secret?: boolean;
+  updatedAt: string;
+};
+
+export type ModelProvider = 'azure-openai' | 'codex' | 'deepseek' | 'gemini' | 'google' | 'lmstudio' | 'openai' | 'openrouter';
+
+export type ModelProviderSettings = {
+  model: string;
+  apiKey?: string;
+  baseURL?: string;
+  updatedAt?: string;
+};
+
+export type ModelConfigRecord = {
+  provider: ModelProvider;
+  providers: Partial<Record<ModelProvider, ModelProviderSettings>>;
   updatedAt: string;
 };
 

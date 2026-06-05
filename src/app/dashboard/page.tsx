@@ -17,13 +17,6 @@ export default function DashboardPage() {
 
   return (
     <main className="dashboard-v2">
-      <header className="dashboard-v2-head">
-        <div>
-          <h1>自动化测试工作台</h1>
-          <span>用自然语言定义测试目标，由 AI 在真实浏览器中决定操作并产出证据。</span>
-        </div>
-      </header>
-
       <section className="dashboard-v2-metrics" aria-label="测试概览">
         <div>
           <Activity size={17} />

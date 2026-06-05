@@ -62,7 +62,6 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
       <div className="section-head">
         <div>
           <h2>测试需求</h2>
-          <p>这里不再预设执行步骤。运行时 AI 会读取当前界面截图和这段需求，自行决定下一步操作，并把实际执行结果记录成步骤。</p>
         </div>
         <button className="icon-text-button" disabled={saving} onClick={save} type="button">
           {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}

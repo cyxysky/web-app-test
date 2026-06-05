@@ -8,7 +8,6 @@ function parseImage(trimmed: string, key: number, onImageClick?: (url: string) =
 
   return (
     <figure className="report-shot" key={key}>
-      {/* eslint-disable-next-line @next/next/no-img-element */}
       <img alt={match[1]} onClick={onImageClick ? () => onImageClick(match[2]) : undefined} src={match[2]} />
       <figcaption>{match[1]}</figcaption>
     </figure>

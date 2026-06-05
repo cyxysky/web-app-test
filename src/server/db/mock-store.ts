@@ -1,6 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import { defaultModelByProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
+import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -52,6 +53,7 @@ type StoreData = {
   runs: TestRunRecord[];
   groups?: TestGroupRecord[];
   runtimeEnv?: RuntimeEnvRecord[];
+  modelConfig?: ModelConfigRecord;
   schedules?: RunScheduleRecord[];
 };
 
@@ -71,6 +73,102 @@ const seedRecord: TestCaseRecord = {
 function compactText(value?: string, max = 220) {
   const text = (value || '').replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function normalizeModelProvider(value: string): ModelProvider {
+  const provider = value.trim().toLowerCase();
+  if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
+  if (provider === 'codex' || provider === 'codex-cli') return 'codex';
+  if (provider === 'deepseek') return 'deepseek';
+  if (provider === 'gemini' || provider === 'gemini-cli') return 'gemini';
+  if (provider === 'google') return 'google';
+  if (provider === 'lmstudio' || provider === 'lm-studio' || provider === 'local') return 'lmstudio';
+  if (provider === 'openai') return 'openai';
+  return 'openrouter';
+}
+
+type LegacyModelConfigRecord = Partial<ModelConfigRecord> & {
+  model?: string;
+  apiKey?: string;
+  baseURL?: string;
+};
+
+function modelApiKeyEnv(provider: ModelProvider) {
+  return ({
+    'azure-openai': 'AZURE_OPENAI_API_KEY',
+    codex: '',
+    deepseek: 'DEEPSEEK_API_KEY',
+    gemini: '',
+    google: 'GOOGLE_GENERATIVE_AI_API_KEY',
+    lmstudio: 'LMSTUDIO_API_KEY',
+    openai: 'OPENAI_API_KEY',
+    openrouter: 'OPENROUTER_API_KEY',
+  } as Record<ModelProvider, string>)[provider];
+}
+
+function modelBaseUrlEnv(provider: ModelProvider) {
+  return ({
+    'azure-openai': 'AZURE_OPENAI_BASE_URL',
+    codex: '',
+    deepseek: '',
+    gemini: '',
+    google: '',
+    lmstudio: 'LMSTUDIO_BASE_URL',
+    openai: 'OPENAI_BASE_URL',
+    openrouter: '',
+  } as Record<ModelProvider, string>)[provider];
+}
+
+function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
+  return {
+    model: defaultModelByProvider[provider],
+    apiKey: '',
+    baseURL: modelProviderDefinition(provider).defaultBaseURL || '',
+  };
+}
+
+function normalizeStoredModelConfig(input?: LegacyModelConfigRecord): ModelConfigRecord | undefined {
+  if (!input) return undefined;
+  const provider = normalizeModelProvider(input.provider || 'openrouter');
+  const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
+  const rawProviders = input.providers || {};
+
+  for (const definition of modelProviderDefinitions) {
+    const current = rawProviders[definition.value];
+    providers[definition.value] = {
+      ...defaultProviderSettings(definition.value),
+      ...current,
+      model: current?.model?.trim() || defaultModelByProvider[definition.value],
+    };
+  }
+
+  if (input.model || input.apiKey || input.baseURL) {
+    providers[provider] = {
+      ...providers[provider],
+      model: input.model?.trim() || providers[provider]?.model || defaultModelByProvider[provider],
+      apiKey: input.apiKey ?? providers[provider]?.apiKey,
+      baseURL: input.baseURL ?? providers[provider]?.baseURL,
+    };
+  }
+
+  return {
+    provider,
+    providers,
+    updatedAt: input.updatedAt || now(),
+  };
+}
+
+function applyModelConfig(config?: LegacyModelConfigRecord) {
+  const normalized = normalizeStoredModelConfig(config);
+  if (!normalized) return;
+  const provider = normalized.provider;
+  const active = normalized.providers[provider] || defaultProviderSettings(provider);
+  process.env.AI_PROVIDER = provider;
+  process.env.AI_MODEL = active.model || defaultModelByProvider[provider];
+  const keyEnv = modelApiKeyEnv(provider);
+  if (keyEnv) process.env[keyEnv] = active.apiKey || '';
+  const baseUrlEnv = modelBaseUrlEnv(provider);
+  if (baseUrlEnv) process.env[baseUrlEnv] = active.baseURL || modelProviderDefinition(provider).defaultBaseURL || '';
 }
 
 function stepMemoryLine(step: StepExecutionResult) {
@@ -165,6 +263,7 @@ function readData(): StoreData {
         ...data,
         groups: data.groups || [],
         runtimeEnv: data.runtimeEnv || [],
+        modelConfig: data.modelConfig,
         schedules: data.schedules || [],
       };
     } catch (error) {
@@ -188,6 +287,40 @@ export const store = {
   listRuntimeEnv() {
     return readData().runtimeEnv || [];
   },
+  getModelConfig() {
+    return normalizeStoredModelConfig(readData().modelConfig as LegacyModelConfigRecord | undefined);
+  },
+  saveModelConfig(input: Pick<ModelConfigRecord, 'provider' | 'providers'>) {
+    const data = readData();
+    const existing = normalizeStoredModelConfig(data.modelConfig as LegacyModelConfigRecord | undefined);
+    const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
+    const timestamp = now();
+
+    for (const definition of modelProviderDefinitions) {
+      const provider = definition.value;
+      const current = input.providers[provider];
+      const previous = existing?.providers[provider];
+      providers[provider] = {
+        ...defaultProviderSettings(provider),
+        ...previous,
+        ...current,
+        model: current?.model?.trim() || previous?.model || defaultModelByProvider[provider],
+        apiKey: current?.apiKey ?? previous?.apiKey ?? '',
+        baseURL: current?.baseURL ?? previous?.baseURL ?? definition.defaultBaseURL ?? '',
+        updatedAt: current ? timestamp : previous?.updatedAt,
+      };
+    }
+
+    const config: ModelConfigRecord = {
+      provider: normalizeModelProvider(input.provider),
+      providers,
+      updatedAt: timestamp,
+    };
+    data.modelConfig = config;
+    writeData(data);
+    applyModelConfig(config);
+    return config;
+  },
   // 保存网页配置的环境变量，服务端会在运行前加载 enabled=true 的配置。
   saveRuntimeEnv(items: Array<Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'>>) {
     const data = readData();
@@ -205,10 +338,15 @@ export const store = {
   },
   // 把已启用的网页配置同步到当前 Node 进程。
   applyRuntimeEnv() {
+    const allowedKeys = new Set(runtimeEnvKeys);
     const items = readData().runtimeEnv || [];
-    for (const item of items) {
-      if (item.enabled) process.env[item.key] = item.value;
+    const savedByKey = new Map(items.filter((item) => allowedKeys.has(item.key)).map((item) => [item.key, item]));
+    for (const definition of runtimeEnvDefinitions) {
+      const item = savedByKey.get(definition.key);
+      if (item?.enabled === false) continue;
+      process.env[definition.key] = item?.value ?? definition.defaultValue;
     }
+    applyModelConfig(readData().modelConfig as LegacyModelConfigRecord | undefined);
     return items;
   },
   // 列出定时回归任务。
@@ -326,11 +464,16 @@ export const store = {
   },
   // 删除一条执行记录。这里只移除历史元数据，artifact 文件保留，避免误删仍被报告引用的证据。
   deleteRun(runId: string) {
+    return this.deleteRuns([runId]) > 0;
+  },
+  deleteRuns(runIds: string[]) {
+    const targetIds = new Set(runIds.filter(Boolean));
+    if (!targetIds.size) return 0;
     const data = readData();
     const before = data.runs.length;
-    data.runs = data.runs.filter((run) => run.id !== runId);
+    data.runs = data.runs.filter((run) => !targetIds.has(run.id));
     writeData(data);
-    return data.runs.length !== before;
+    return before - data.runs.length;
   },
   // 更新测试用例的整体执行状态。
   updateTestCaseStatus(testCaseId: string, status: TestCaseRecord['status']) {

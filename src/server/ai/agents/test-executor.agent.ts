@@ -4,8 +4,9 @@ import sharp from 'sharp';
 import { z } from 'zod';
 import type { AiRequestSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TestCaseRecord, TestRunRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
+import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
-import { BrowserSession, type BrowserActionResult, type BrowserSessionMode } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode, type ScreenshotRegion } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
 
 type ExecutionProgress = (step: StepExecutionResult) => void | Promise<void>;
@@ -41,11 +42,7 @@ type VisualAfterPolicy = {
   capture?: 'auto' | 'viewport' | 'fullPage' | 'region' | 'none';
   retention?: 'auto' | 'replace' | 'append' | 'appendScrollSequence' | 'keepBeforeAfter' | 'clearAndReplace' | 'pinEvidence';
   reason?: string;
-};
-
-type BrowserToolActionResult = BrowserActionResult & {
-  visualAfter?: VisualAfterPolicy;
-  screenshots?: ToolTrace['screenshots'];
+  region?: ScreenshotRegion;
 };
 
 type RuntimeDecision = {
@@ -125,7 +122,7 @@ const manualIssuePattern = new RegExp(
   'i',
 );
 
-// 鍒ゆ柇褰撳墠妯″瀷閰嶇疆鏄惁鏀寔鍥剧墖杈撳叆锛涜繖鍙槸妯″瀷鑳藉姏鍒ゆ柇锛屼笉浠ｈ〃涓€瀹氫細鍙戦€佹埅鍥俱€?
+// 判断当前模型配置是否支持图片输入；这只是模型能力判断，不代表一定会发送截图。
 function modelSupportsScreenshotInput() {
   if (process.env.SEND_SCREENSHOT_TO_AI === 'true') return true;
   if (process.env.SEND_SCREENSHOT_TO_AI === 'false') return false;
@@ -154,24 +151,24 @@ function isVisualMode(mode: BrowserSessionMode) {
   return mode !== 'dom';
 }
 
-// 鏄惁鍚敤瑙嗚鍊欓€夋爣璇嗐€傚叧闂椂浠嶅彂閫佹埅鍥撅紝浣嗗€欓€夊厓绱犲彧浠ユ枃鏈憳瑕佽繘鍏?prompt銆?
+// 是否启用视觉候选标识。关闭时仍发送截图，但候选元素只以文本摘要进入 prompt。
 function visualMarkersEnabledFor(testCase: TestCaseRecord) {
   if (typeof testCase.content.isMarked === 'boolean') return testCase.content.isMarked;
   if (process.env.VISUAL_MARKERS_IS_MARKED === 'false' || process.env.SCREENSHOT_IS_MARKED === 'false') return false;
   return true;
 }
 
-// 鍏煎鏃у弻鎴浘閾捐矾锛涢粯璁?false锛屾爣璇嗙洿鎺ュ彔鍔犲湪褰撳墠鎴浘閲屻€?
+// 兼容旧双截图链路；默认 false，标识直接叠加在当前截图里。
 function usesSeparateMarkerMap() {
   return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
 }
 
-// 鍙湁瑙嗚鐐瑰嚮妯″紡鎵嶅厑璁告妸鎴浘浣滀负 AI 杈撳叆锛汥OM 妯″紡鍗充娇妯″瀷鏀寔鍥剧墖涔熶笉浼氬彂閫併€?
+// 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
 function shouldSendScreenshotToAi(mode: BrowserSessionMode) {
   return isVisualMode(mode) && modelSupportsScreenshotInput();
 }
 
-// 灏嗚皟璇曟暟鎹浆鎴愬彲瀹夊叏 JSON 搴忓垪鍖栫殑缁撴瀯锛岄伩鍏?Buffer/BigInt 鐮村潖鎸佷箙鍖栥€?
+// 将调试数据转成可安全 JSON 序列化的结构，避免 Buffer/BigInt 破坏持久化。
 function jsonSafe(value: unknown) {
   if (value === undefined) return undefined;
   return JSON.parse(JSON.stringify(value, (_key, item) => {
@@ -232,7 +229,7 @@ async function readScreenshotForAi(filePath: string) {
   return compressScreenshotForAi(buffer, maxBytes).catch(() => buffer);
 }
 
-// 绾爣璇嗗浘蹇呴』璺熼殢鍘熷浘鏈€缁堝彂閫佸昂瀵哥缉鏀撅紝鍚﹀垯涓ゅ紶鍥剧粡杩囧帇缂╁悗浼氬け鍘诲儚绱犲榻愬叧绯汇€?
+// 纯标识图必须跟随原图最终发送尺寸缩放，否则两张图经过压缩后会失去像素对齐关系。
 async function readMarkerScreenshotForAi(filePath: string, referenceScreenshot: Buffer) {
   const markerBuffer = await readFile(filePath);
   const [referenceMetadata, markerMetadata] = await Promise.all([
@@ -257,7 +254,7 @@ function elapsedSince(startedAt: number) {
   return Date.now() - startedAt;
 }
 
-// 鎷嗗垎宸ュ叿鍙傛暟鍜?AI 缁欏嚭鐨勮皟鐢ㄥ師鍥狅紝渚夸簬鍘嗗彶姝ラ閲屽崟鐙睍绀恒€?
+// 拆分工具参数和 AI 给出的调用原因，便于历史步骤里单独展示。
 function splitToolInputAndReason(input: unknown) {
   const safeInput = jsonSafe(input);
   if (!safeInput || typeof safeInput !== 'object' || Array.isArray(safeInput)) {
@@ -271,7 +268,7 @@ function splitToolInputAndReason(input: unknown) {
   };
 }
 
-// 涓烘瘡娆?AI 璇锋眰鍔犺秴鏃朵繚鎶わ紝閬垮厤妯″瀷闀挎椂闂存棤鍝嶅簲瀵艰嚧鏁存鎵ц鍗℃銆?
+// 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
 async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
   const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
   const timeoutController = new AbortController();
@@ -298,7 +295,7 @@ async function generateObjectWithTimeout(options: Parameters<typeof generateObje
   }
 }
 
-// 浠庢ā鍨嬪洖澶嶄腑鎻愬彇 JSON锛屽吋瀹规ā鍨嬫妸 JSON 鍖呭湪 markdown 浠ｇ爜鍧楅噷鐨勬儏鍐点€?
+// 从模型回复中提取 JSON，兼容模型把 JSON 包在 markdown 代码块里的情况。
 function extractJson(text: string) {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const raw = fenced?.[1] || text;
@@ -308,17 +305,17 @@ function extractJson(text: string) {
   return JSON.parse(raw.slice(start, end + 1));
 }
 
-// 灏嗘祴璇曢渶姹傚瘜鏂囨湰杞负绾枃鏈紝浣滀负鎵ц鍣ㄧ悊瑙ｇ洰鏍囩殑涓昏緭鍏ャ€?
+// 将测试需求富文本转为纯文本，作为执行器理解目标的主输入。
 function requirementOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.userRequirement || testCase.description) || testCase.description || testCase.title;
 }
 
-// 璇诲彇娴嬭瘯鐢ㄤ緥涓婄殑棰濆绯荤粺鎻愮ず璇嶏紝渚嬪绾ц仈閫夋嫨鍣ㄥ繀椤婚€夊埌鍙跺瓙鑺傜偣銆?
+// 读取测试用例上的额外系统提示词，例如级联选择器必须选到叶子节点。
 function systemPromptOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.systemPrompt || '').trim();
 }
 
-// 灏嗘祻瑙堝櫒宸ュ叿璋冪敤杞ㄨ抗鍘嬬缉涓烘楠よ瘉鎹紝淇濆瓨鍒拌繍琛屽巻鍙蹭腑銆?
+// 将浏览器工具调用轨迹压缩为步骤证据，保存到运行历史中。
 function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   return traces.map((trace) => {
     const { input, reason } = splitToolInputAndReason(trace.input);
@@ -332,31 +329,6 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       screenshots: trace.screenshots,
     };
   });
-}
-
-function recentToolCallContext(steps: StepExecutionResult[], limit = 3) {
-  const calls = steps.flatMap((step) => (step.tools || []).map((tool) => ({
-    name: tool.name,
-    reason: concise(tool.reason, 120),
-    input: summarizeToolInputForPrompt(tool.input),
-    result: { ok: tool.ok, actual: concise(tool.result, 180) },
-  })));
-  return calls.slice(-limit);
-}
-
-function summarizeToolInputForPrompt(input: unknown) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
-  const raw = input as Record<string, unknown>;
-  const keepKeys = ['url', 'id', 'text', 'key', 'path', 'areaId', 'deltaX', 'deltaY', 'index', 'action', 'status', 'done'];
-  const output: Record<string, unknown> = {};
-  for (const key of keepKeys) {
-    if (raw[key] !== undefined && raw[key] !== null && raw[key] !== '') {
-      output[key] = typeof raw[key] === 'string' ? concise(String(raw[key]), 120) : raw[key];
-    }
-  }
-  if (typeof raw.observation === 'string') output.observation = concise(raw.observation, 120);
-  if (typeof raw.findings === 'string' && raw.findings !== '无') output.findings = concise(raw.findings, 120);
-  return output;
 }
 
 function recentScrollContinuityContext(steps: StepExecutionResult[], limit = 8) {
@@ -389,7 +361,7 @@ function screenshotPhaseLabel(phase: ScreenshotReference['phase']) {
   return 'step screenshot';
 }
 
-function screenshotReferenceGroupOf(step: StepExecutionResult, phase: ScreenshotReference['phase']) {
+function screenshotReferenceGroupOf(step: StepExecutionResult) {
   const scrollTool = (step.tools || []).find((toolCall) => toolCall.name === 'scrollArea' || toolCall.name === 'scrollViewport');
   if (!scrollTool) return undefined;
   const input = scrollTool.input && typeof scrollTool.input === 'object' && !Array.isArray(scrollTool.input)
@@ -411,7 +383,7 @@ function buildAvailableScreenshotReferences(steps: StepExecutionResult[], limit 
     for (const entry of entries) {
       if (!entry.path || seenPaths.has(entry.path)) continue;
       seenPaths.add(entry.path);
-      const group = screenshotReferenceGroupOf(step, entry.phase);
+      const group = screenshotReferenceGroupOf(step);
       refs.push({
         id: `step-${step.index}-${entry.phase}`,
         path: entry.path,
@@ -446,6 +418,60 @@ function formatScreenshotReferences(refs: ScreenshotReference[]) {
 function concise(value?: string, max = 220) {
   const text = (value || '').replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
+  const recent = traces.slice(-limit);
+  if (!recent.length) return '[none]';
+  return recent.map((trace, index) => {
+    const { reason } = splitToolInputAndReason(trace.input);
+    const status = trace.result.ok ? 'ok' : `failed: ${concise(trace.result.actual, 180)}`;
+    const shots = trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
+    const why = reason ? `; reason=${concise(reason, 140)}` : '';
+    return `${index + 1}. ${trace.name}: ${status}${why}${shots}`;
+  }).join('\n');
+}
+
+function contextWindowTokens() {
+  const raw = Number(process.env.AI_CONTEXT_WINDOW_TOKENS || process.env.AI_MODEL_CONTEXT_TOKENS || '');
+  if (Number.isFinite(raw) && raw > 1000) return Math.floor(raw);
+  return 32000;
+}
+
+function contextCompressionThresholdRatio() {
+  const raw = Number(process.env.AI_CONTEXT_COMPRESSION_THRESHOLD || process.env.AI_CONTEXT_COMPRESSION_RATIO || 0.7);
+  if (!Number.isFinite(raw) || raw <= 0) return 0.7;
+  return raw > 1 ? Math.min(0.98, raw / 100) : Math.min(0.98, raw);
+}
+
+function estimateTextTokens(text: string) {
+  let ascii = 0;
+  let nonAscii = 0;
+  for (const char of text) {
+    if (char.charCodeAt(0) <= 0x7f) ascii += 1;
+    else nonAscii += 1;
+  }
+  return Math.ceil(ascii / 4 + nonAscii);
+}
+
+function estimateContextTokens(text: string, imageCount: number) {
+  const imageTokens = Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
+  return estimateTextTokens(text) + imageCount * imageTokens;
+}
+
+function compactWorkingMemory(memory: RuntimeWorkingMemory): RuntimeWorkingMemory {
+  return {
+    ...memory,
+    completed: memory.completed.slice(-6),
+    findings: memory.findings.slice(-8),
+    blockers: memory.blockers.slice(-4),
+    lastAction: concise(memory.lastAction, 180),
+    lastResult: concise(memory.lastResult, 180),
+    pageUnderstanding: concise(memory.pageUnderstanding, 260),
+    scrollSummary: concise(memory.scrollSummary, 360),
+    userConstraints: memory.userConstraints.slice(-4).map((item) => concise(item, 180)),
+    nextStep: concise(memory.nextStep, 180),
+  };
 }
 
 function isInfrastructureNoise(value?: string) {
@@ -592,7 +618,7 @@ function formatVisualInteractiveElements(candidates: unknown, limit = 80) {
 }
 
 function defaultVisualAfterForTool(name: string): VisualAfterPolicy {
-  if (name === 'reportState' || name === 'selectReferenceScreenshots' || name === 'manageVisualContext' || name === 'listTabs') {
+  if (name === 'reportState' || name === 'selectReferenceScreenshots' || name === 'manageVisualContext' || name === 'listTabs' || name === 'waitForHumanVerification') {
     return { capture: 'none', retention: 'auto' };
   }
   if (name === 'scrollArea') return { capture: 'viewport', retention: 'appendScrollSequence' };
@@ -601,17 +627,42 @@ function defaultVisualAfterForTool(name: string): VisualAfterPolicy {
   return { capture: 'viewport', retention: 'replace' };
 }
 
+function parseScreenshotRegion(value: unknown): ScreenshotRegion | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const x = Number(raw.x);
+  const y = Number(raw.y);
+  const width = Number(raw.width);
+  const height = Number(raw.height);
+  if (![x, y, width, height].every(Number.isFinite)) return undefined;
+  if (width <= 0 || height <= 0) return undefined;
+  return {
+    x: Math.max(0, Math.floor(x)),
+    y: Math.max(0, Math.floor(y)),
+    width: Math.max(1, Math.floor(width)),
+    height: Math.max(1, Math.floor(height)),
+  };
+}
+
 function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
   const fallback = defaultVisualAfterForTool(name);
   if (!input || typeof input !== 'object' || Array.isArray(input)) return fallback;
   const raw = (input as Record<string, unknown>).visualAfter;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fallback;
   const visualAfter = raw as Record<string, unknown>;
+  const region = parseScreenshotRegion(visualAfter.region);
   return {
     capture: typeof visualAfter.capture === 'string' ? visualAfter.capture as VisualAfterPolicy['capture'] : fallback.capture,
     retention: typeof visualAfter.retention === 'string' ? visualAfter.retention as VisualAfterPolicy['retention'] : fallback.retention,
     reason: typeof visualAfter.reason === 'string' ? visualAfter.reason : undefined,
+    region,
   };
+}
+
+function screenshotOptionsFromVisualAfter(visualAfter: VisualAfterPolicy): { capture: ScreenshotCaptureMode; region?: ScreenshotRegion } {
+  if (visualAfter.capture === 'fullPage') return { capture: 'fullPage' };
+  if (visualAfter.capture === 'region' && visualAfter.region) return { capture: 'region', region: visualAfter.region };
+  return { capture: 'viewport' };
 }
 
 function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolTrace) {
@@ -624,7 +675,7 @@ function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolT
   const remembered = typeof input.memory === 'string' ? parseListLike(input.memory) : [];
   next.lastAction = `${trace.name}${summarizeToolInput(input)}`;
   next.lastResult = concise(trace.result.actual, 240);
-  if (observation && !/^none$|^无$|^閺?/i.test(observation)) next.pageUnderstanding = concise(observation, 400);
+  if (observation && !/^none$|^无$/i.test(observation)) next.pageUnderstanding = concise(observation, 400);
   next.findings = Array.from(new Set([...next.findings, ...findings])).slice(-12);
   next.completed = Array.from(new Set([...next.completed, ...remembered])).slice(-12);
   if (!trace.result.ok) next.blockers = Array.from(new Set([...next.blockers, concise(trace.result.actual, 220)])).slice(-8);
@@ -718,6 +769,24 @@ class VisualContextManager {
     this.trim();
   }
 
+  compressForBudget(reason: string) {
+    const beforeCount = this.frames.length;
+    const current = this.current();
+    const historyLimit = Math.max(0, Number(process.env.AI_VISUAL_COMPRESSED_HISTORY_LIMIT || 2));
+    const pinnedLimit = Math.max(0, Number(process.env.AI_VISUAL_COMPRESSED_PINNED_LIMIT || 2));
+    const keep = new Map<string, VisualFrameRecord>();
+    for (const frame of this.frames.filter((item) => item.role !== 'pinned' && item.id !== this.currentId).slice(-historyLimit)) {
+      keep.set(frame.id, { ...frame, reason: frame.reason || reason });
+    }
+    for (const frame of this.frames.filter((item) => item.role === 'pinned').slice(-pinnedLimit)) {
+      keep.set(frame.id, { ...frame, reason: frame.reason || reason });
+    }
+    if (current) keep.set(current.id, { ...current, reason: current.reason || reason });
+    this.frames = Array.from(keep.values());
+    this.trim();
+    return Math.max(0, beforeCount - this.frames.length);
+  }
+
   current() {
     return this.frames.find((frame) => frame.id === this.currentId);
   }
@@ -732,12 +801,16 @@ class VisualContextManager {
   renderText() {
     const current = this.current();
     const history = this.frames.filter((frame) => frame.id !== this.currentId);
+    const frameSummary = (frame: VisualFrameRecord) => {
+      const region = frame.region ? ` region=${JSON.stringify(frame.region)}` : '';
+      return `${frame.id} ${frame.reason} path=${frame.path}${frame.markerPath ? ` marker=${frame.markerPath}` : ''}${frame.capture ? ` capture=${frame.capture}` : ''}${region}`;
+    };
     return [
       'Visual Context Manager:',
-      `current: ${current ? `${current.id} ${current.reason} path=${current.path}${current.markerPath ? ` marker=${current.markerPath}` : ''}` : '[none]'}`,
+      `current: ${current ? frameSummary(current) : '[none]'}`,
       'current 是唯一允许使用编号进行点击、输入、hover、drag 定位的截图。',
       history.length
-        ? `history 仅供参考，不能使用其中编号操作：\n${history.map((frame) => `- ${frame.id} role=${frame.role} group=${frame.group || '-'} reason=${frame.reason}`).join('\n')}`
+        ? `history 仅供参考，不能使用其中编号操作：\n${history.map((frame) => `- ${frameSummary(frame)} role=${frame.role} group=${frame.group || '-'}`).join('\n')}`
         : 'history: [none]',
     ].join('\n');
   }
@@ -808,13 +881,19 @@ function makeBrowserTools(
   const toolReasonInput = z.string().min(1).max(300).describe('Required: concise Chinese reason for this exact tool call. Name the visible target and the observable page change expected; do not merely repeat a candidate ID.');
   const toolContextShape = {
     reason: toolReasonInput,
-    observation: z.string().min(1).max(800).describe('Required Chinese observation of the current page/task state. Include visible errors, requirement content, business state, or "鏃犳槑鏄炬柊澧炶瀵?.'),
-    findings: z.string().min(1).max(1000).describe('Required Chinese findings from this step. Include product errors, requirements, rules, risks, or summaries. Use "鏃? if none. Separate multiple items with semicolons.'),
-    memory: z.string().min(1).max(1000).describe('Required Chinese memory for later steps. Include facts that may affect future actions. Use "鏃? if none. Separate multiple items with semicolons.'),
+    observation: z.string().min(1).max(800).describe('Required Chinese observation of the current page/task state. Include visible errors, requirement content, business state, or "无明显新增观察".'),
+    findings: z.string().min(1).max(1000).describe('Required Chinese findings from this step. Include product errors, requirements, rules, risks, or summaries. Use "无" if none. Separate multiple items with semicolons.'),
+    memory: z.string().min(1).max(1000).describe('Required Chinese memory for later steps. Include facts that may affect future actions. Use "无" if none. Separate multiple items with semicolons.'),
     visualAfter: z.object({
       capture: z.enum(['auto', 'viewport', 'fullPage', 'region', 'none']).optional().describe('How to capture visual context after this tool. Use viewport/auto for most browser-changing actions; none for report-only tools.'),
       retention: z.enum(['auto', 'replace', 'append', 'appendScrollSequence', 'keepBeforeAfter', 'clearAndReplace', 'pinEvidence']).optional().describe('How Visual Context Manager should retain the after screenshot.'),
       reason: z.string().optional().describe('Short Chinese reason for the visual retention decision.'),
+      region: z.object({
+        x: z.number().describe('Viewport x coordinate in CSS pixels. Required when capture=region; negative values will be clamped by the browser runner.'),
+        y: z.number().describe('Viewport y coordinate in CSS pixels. Required when capture=region; negative values will be clamped by the browser runner.'),
+        width: z.number().describe('Region width in CSS pixels. Required when capture=region; non-positive values fall back to viewport capture.'),
+        height: z.number().describe('Region height in CSS pixels. Required when capture=region; non-positive values fall back to viewport capture.'),
+      }).optional().describe('Optional viewport clip rectangle for capture=region. Coordinates must come from the current screenshot.'),
     }).optional(),
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
@@ -835,18 +914,27 @@ function makeBrowserTools(
     if (result.ok && visualAfter.capture !== 'none' && referenceOptions?.runId && referenceOptions.stepIndex && referenceOptions.visualContext) {
       await session.waitForPage().catch(() => undefined);
       const visualIndex = traces.filter((trace) => trace.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
-      const screenshotPath = await session.takeScreenshot(referenceOptions.runId, referenceOptions.stepIndex, `visual-${visualIndex}`);
+      const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
+      const screenshotPath = await session.takeScreenshot(referenceOptions.runId, referenceOptions.stepIndex, `visual-${visualIndex}`, screenshotOptions);
       const markerPath = session.getLastCandidateMarkerScreenshotPath();
       const frame = referenceOptions.visualContext.apply({
         path: screenshotPath,
         markerPath,
         stepIndex: referenceOptions.stepIndex,
         toolName: name,
+        capture: screenshotOptions.capture,
+        region: screenshotOptions.region,
         reason: visualAfter.reason || `${name} after screenshot`,
       }, visualAfter);
-      screenshots.push({ title: `${name} current after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
+      screenshots.push({ title: `${name} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
       if (markerPath) screenshots.push({ title: `${name} marker map`, path: markerPath, kind: 'marker' });
       await referenceOptions.onVisualContextChange?.(referenceOptions.visualContext.snapshot());
+    } else if (!result.ok && referenceOptions?.visualContext) {
+      const current = referenceOptions.visualContext.current();
+      if (current?.path) {
+        screenshots.push({ title: `${name} failure evidence`, path: current.path, kind: 'other' });
+        if (current.markerPath) screenshots.push({ title: `${name} marker map`, path: current.markerPath, kind: 'marker' });
+      }
     }
     const trace = { name, input, result, visualAfter, screenshots };
     traces.push(trace);
@@ -1035,18 +1123,7 @@ function makeBrowserTools(
   return mode === 'visual-markers' ? { ...sharedTools, ...visualTools } : { ...sharedTools, ...domTools };
 }
 
-// 鏋勯€犲畬鎴愬垽瀹氳鍒欙紱瑙嗚妯″紡鐢ㄦ埅鍥句綔璇佹嵁锛孌OM 妯″紡鐢ㄦ枃鏈寲椤甸潰涓婁笅鏂囦綔璇佹嵁銆?
-function buildCompletionPromptLines(usesScreenshot: boolean) {
-  const evidence = usesScreenshot ? 'screenshot' : 'textual page context / candidates / DOM / URL / focus';
-  return [
-    'Completion rules:',
-    `- done=true only when EVERY requirement clause is proven by ${evidence}. Partial progress is not completion.`,
-    '- If anything is still missing or uncertain, call one more tool instead of finishing.',
-    '- status=blocked only for manual verification/security/login wait; blocked must use done=false.',
-    '- status=failed only when the requirement is clearly impossible or failed end-to-end.',
-  ];
-}
-
+// 构造完成判定规则；视觉模式用截图作证据，DOM 模式用文本化页面上下文作证据。
 function completionVerifyEnabled() {
   const raw = process.env.AI_COMPLETION_VERIFY ?? 'true';
   return raw.toLowerCase() !== 'false';
@@ -1071,7 +1148,7 @@ type CompletionVerification = {
   remainingWork: string;
 };
 
-// 褰撴墽琛屽櫒澹扮О瀹屾垚鏃讹紝鐢ㄧ嫭绔嬫牎楠岃姹傚啀鍒ゆ柇涓€娆★紝鍑忓皯鈥滃彧瀹屾垚涓€鍗婂氨缁撴潫鈥濈殑璇垽銆?
+// 当执行器声称完成时，用独立校验请求再判断一次，减少“只完成一半就结束”的误判。
 async function verifyRuntimeCompletion(input: {
   testCase: TestCaseRecord;
   screenshotPath: string;
@@ -1083,38 +1160,14 @@ async function verifyRuntimeCompletion(input: {
   const { testCase, screenshotPath, proposed, completedSteps, pageContext, abortSignal } = input;
   const requirement = requirementOf(testCase);
   const attachScreenshot = shouldSendScreenshotToAi(browserModeOf(testCase));
-  const prompt = [
-    'You are an independent completion judge. The executor agent claims the user requirement is FULLY complete.',
-    attachScreenshot
-      ? 'Verify using ONLY the attached viewport screenshot and the requirement text. Be strict 鈥?partial progress is NOT complete.'
-      : 'Verify using ONLY the textual browser context and the requirement text. No screenshot image is attached because visual mode is disabled. Be strict 鈥?partial progress is NOT complete.',
-    '',
-    `User requirement (every clause must be visibly satisfied for verified=true):\n${requirement}`,
-    '',
-    'Executor claim:',
-    JSON.stringify(
-      { action: proposed.action, expected: proposed.expected, actual: proposed.actual, status: proposed.status },
-      null,
-      2,
-    ),
-    '',
-    `Current URL: ${pageContext.url}`,
-    `Verification scan JSON: ${JSON.stringify(pageContext.manualVerification ?? null)}`,
-    `Recent progress notes (oldest first):\n${recentProgressNotes(completedSteps, 5).join('\n') || '[none]'}`,
-    '',
-    'Rules:',
-    attachScreenshot
-      ? '- verified=true only if the screenshot clearly proves ALL parts of the requirement are done.'
-      : '- verified=true only if the textual browser context clearly proves ALL parts of the requirement are done.',
-    '- Empty captcha/OTP, login not finished, or waiting for user input 鈫?verified=false, status="blocked".',
-    '- Wrong page or missing required outcome 鈫?verified=false; set remainingWork to concrete next steps.',
-    '- If the requirement is visibly impossible, verified=true with status="failed" is allowed.',
-    '- summary and remainingWork must be written in Chinese.',
-    '',
-    'Reply with JSON only (no tools):',
-    '{ "verified": boolean, "status": "passed"|"failed"|"blocked", "summary": string, "remainingWork": string }',
-    '- remainingWork: required when verified=false; list what the executor should do next (Chinese OK). Empty string when verified=true.',
-  ].join('\n');
+  const prompt = buildCompletionVerificationPrompt({
+    requirement,
+    attachScreenshot,
+    proposedClaim: { action: proposed.action, expected: proposed.expected, actual: proposed.actual, status: proposed.status },
+    currentUrl: pageContext.url,
+    manualVerification: pageContext.manualVerification ?? null,
+    recentProgressNotes: recentProgressNotes(completedSteps, 5),
+  });
 
   const screenshot = attachScreenshot ? await readScreenshotForAi(screenshotPath) : undefined;
   const messageContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [
@@ -1153,19 +1206,7 @@ async function verifyRuntimeCompletion(input: {
   }
 }
 
-// 鏍规嵁褰撳墠妯″紡鐢熸垚楠岃瘉鐮?瀹夊叏鏍￠獙瑙勫垯锛孌OM 妯″紡涓嶈姹?AI 璇诲彇鎴浘銆?
-function buildVerificationPromptLines(pageContext: Awaited<ReturnType<BrowserSession['getPageContext']>>, usesScreenshot: boolean) {
-  const mv = pageContext.manualVerification;
-  if (!mv?.detected && !mv?.captchaFields?.length) return [];
-  const source = usesScreenshot ? 'screenshot' : 'page context';
-  return [
-    'Verification rules:',
-    `- Verification scan: ${JSON.stringify(mv)}`,
-    '- If captchaAppearsFilled=true, do not block; submit/login and continue.',
-    `- If ${source} shows an empty captcha/OTP/security challenge that cannot proceed, return done=false status=blocked.`,
-  ];
-}
-
+// 根据当前模式生成验证码/安全校验规则；DOM 模式不要要求 AI 读取截图。
 function runtimePrompt(input: {
   testCase: TestCaseRecord;
   pageContext: Awaited<ReturnType<BrowserSession['getPageContext']>>;
@@ -1189,7 +1230,6 @@ function runtimePrompt(input: {
   const caseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
   const recentNotes = recentProgressNotes(completedSteps, 3);
-  const recentTools = recentToolCallContext(completedSteps, 3);
   const recentScrollContinuity = recentScrollContinuityContext(completedSteps, 4);
   const runMemoryContext = formatRunMemory(completedSteps);
   const availableScreenshotReferences = input.availableScreenshotReferences || [];
@@ -1263,11 +1303,12 @@ function runtimePrompt(input: {
     '- Do not mark the run failed just because one action failed. First try a reasonable corrective path unless the page is unreachable, the requirement is impossible, or manual verification is required.',
     '- If a historical strategy hint conflicts with the current screenshot, trust the current screenshot and explain the updated choice in reason.',
     '- If a white mouse-pointer marker is visible in the screenshot, it indicates the last browser action location only. Do not treat it as a page control, candidate marker, tooltip, cursor state, or evidence that the target remains selected.',
-    '- If recent progress notes contain "[瀹屾垚鏍￠獙鏈€氳繃]", do not finish again immediately. Re-observe the new screenshot; a previously attempted visual target may be tried only if it has fewer than two attempts and the screenshot shows a plausible overlay-dismissal or state-change reason. Otherwise perform a different corrective action.',
+    '- If recent progress notes contain "[完成校验未通过]", do not finish again immediately. Re-observe the new screenshot; a previously attempted visual target may be tried only if it has fewer than two attempts and the screenshot shows a plausible overlay-dismissal or state-change reason. Otherwise perform a different corrective action.',
     '- If page is loading/transitioning, call waitForPage once.',
     ...modeActionRules,
     '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
+    '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
     '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only recording observations.',
     attachScreenshot
       ? separateMarkerScreenshot
@@ -1320,8 +1361,6 @@ ${formatScreenshotReferences(selectedScreenshotReferences)}`,
       ? 'Reference screenshot rule: selected reference images help connect scroll continuity or compare earlier page state. They may show the same interface at different scroll offsets when sameInterfaceGroup matches, but their candidate ids are historical and must never be used for the current action.'
       : '',
     runMemoryContext,
-    `Recent tool calls (last 3, oldest first):
-${JSON.stringify(recentTools, null, 2)}`,
     attachScreenshot
       ? mode === 'visual-markers' && separateMarkerScreenshot
         ? `Screenshot images are attached in this order: Image 1 current clean viewport, Image 2 current marker map${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
@@ -1346,6 +1385,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'openPage',
     'openUrl',
     'waitForPage',
+    'waitForHumanVerification',
     'listTabs',
     'switchTab',
     'typeText',
@@ -1371,22 +1411,7 @@ function isCodexProvider() {
   return getModelSettings().provider === 'codex';
 }
 
-function codexObjectPrompt(prompt: string, allowedTypes: string[]) {
-  return [
-    prompt,
-    '',
-    'Codex local mode:',
-    '- AI SDK tools are unavailable for this provider. Do NOT attempt to call tools.',
-    '- Return exactly one object with shape: { "type": string, "params": object }.',
-    '- All user-facing params strings such as reason/action/expected/actual must be Chinese.',
-    `- type must be one of: ${allowedTypes.join(', ')}.`,
-    '- params MUST include every schema key: reason,url,id,text,key,path,domPath,fromId,toId,index,ms,maxMs,deltaX,deltaY,action,expected,actual,status,done,observation,findings,memory,ids,selectionReason,sameInterfaceGroup. Set unused keys to null.',
-    '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
-    '- For completion, manual verification, failure, or pure observation, use type="reportState".',
-  ].join('\n');
-}
-
-// 璁板綍涓€娆?AI 璇锋眰鐨勫彲灞曠ず涓婁笅鏂囷紱鍥剧墖鍙湪鐪熷疄鍙戦€佺粰 AI 鏃跺啓鍏?messages銆?
+// 记录一次 AI 请求的可展示上下文；图片只在真实发送给 AI 时写入 messages。
 function createAiRequestSnapshot(input: {
   kind: AiRequestSnapshot['kind'];
   stepIndex: number;
@@ -1435,7 +1460,7 @@ function createAiRequestSnapshot(input: {
 function extractProgressNote(text: string) {
   if (!text) return undefined;
   // The model is asked to emit a single "PROGRESS: ... NEXT: ..." line alongside its tool call.
-  const match = text.match(/PROGRESS\s*[:锛歖[\s\S]*/i);
+  const match = text.match(/PROGRESS\s*[:：][\s\S]*/i);
   const note = (match ? match[0] : text).replace(/```[\s\S]*?```/g, '').replace(/\s+/g, ' ').trim();
   return note ? note.slice(0, 400) : undefined;
 }
@@ -1456,7 +1481,7 @@ function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[]): Pick<Runti
   for (const trace of traces) {
     if (!trace.input || typeof trace.input !== 'object' || Array.isArray(trace.input)) continue;
     const input = trace.input as Record<string, unknown>;
-    if (typeof input.observation === 'string' && input.observation.trim() && !/^鏃?|^none$/i.test(input.observation.trim())) {
+    if (typeof input.observation === 'string' && input.observation.trim() && !/^无$|^none$/i.test(input.observation.trim())) {
       observations.push(input.observation.trim());
     }
     if (typeof input.findings === 'string') findings.push(...parseListLike(input.findings));
@@ -1486,8 +1511,8 @@ function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
       const input = last.input as Record<string, unknown>;
       const status = input.status === 'failed' || input.status === 'blocked' || input.status === 'passed' ? input.status : 'passed';
       return {
-                action: typeof input.action === 'string' ? input.action : assistantInfo.observation || toolReason || 'AI reported current state',
-                expected: typeof input.expected === 'string' ? input.expected : 'AI should report progress or conclusion based on current page state.',
+        action: typeof input.action === 'string' ? input.action : toolReason || 'AI reported current state',
+        expected: typeof input.expected === 'string' ? input.expected : 'AI should report progress or conclusion based on current page state.',
         actual: typeof input.actual === 'string' ? input.actual : last.result.actual,
         status,
         done: typeof input.done === 'boolean' ? input.done : status === 'failed',
@@ -1496,10 +1521,22 @@ function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
       };
     }
 
+    if (last?.name === 'waitForHumanVerification') {
+      return {
+        action: toolReason || '等待人工完成验证',
+        expected: '用户在可见浏览器中完成验证码、登录验证或安全校验后，回到运行报告点击“执行完毕”。',
+        actual: `AI 已请求人工介入：${last.result.actual || '请在浏览器中完成验证后继续。'}`,
+        status: 'blocked',
+        done: false,
+        note,
+        ...assistantInfo,
+      };
+    }
+
     return {
-      action: note || assistantInfo.observation || toolReason || `AI executed browser action: ${names || last?.name || 'browser action'}`,
-            expected: 'This action should advance the user requirement; the next screenshot will verify the result.',
-            actual: last?.result.actual || 'Tool call finished; waiting for next screenshot to confirm effect.',
+      action: note || toolReason || `AI executed browser action: ${names || last?.name || 'browser action'}`,
+      expected: 'This action should advance the user requirement; the next screenshot will verify the result.',
+      actual: last?.result.actual || 'Tool call finished; waiting for next screenshot to confirm effect.',
       status: failed ? 'failed' : 'passed',
       done: false,
       note,
@@ -1516,7 +1553,7 @@ function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
   };
 }
 
-// 鎵ц鍗曚釜杩愯鏃舵楠わ細閲囬泦椤甸潰涓婁笅鏂囷紝璋冪敤 AI 閫夋嫨涓€涓姩浣滐紝骞惰褰曡姹傚揩鐓с€?
+// 执行单个运行时步骤：采集页面上下文，调用 AI 选择一个动作，并记录请求快照。
 async function executeRuntimeStep(input: {
   session: BrowserSession;
   testCase: TestCaseRecord;
@@ -1612,24 +1649,88 @@ async function executeRuntimeStep(input: {
     const traces: ToolTrace[] = [];
     const codexMode = isCodexProvider();
     const allowedToolTypes = runtimeToolNames(mode);
-    const requestPrompt = codexMode ? codexObjectPrompt(prompt, allowedToolTypes) : prompt;
+    const requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
     const visualContext = new VisualContextManager();
-    visualContext.init({ path: beforeScreenshotPath, markerPath: markerScreenshotPath, stepIndex, reason: 'Initial current screenshot for this agent loop' });
+    visualContext.init({ path: beforeScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(testCase), phase: 'Entering Agent Loop; choose one tool from the current visual frame.', completed: [], findings: [], blockers: [],
       pageUnderstanding: '', scrollSummary: '', userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [], nextStep: 'Choose one tool from the current visual context.',
     };
     let latestText = '';
+    let contextCompressionTurns = 0;
     let aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: requestPrompt, screenshotPath: beforeScreenshotPath, imagePaths: includeImage ? visualContext.imagePaths() : [], imageAttached: Boolean(includeImage && screenshot), tools: allowedToolTypes, options: { agentLoop: true, prepareStep: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: includeImage ? visualContext.imagePaths().length : 0, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode } });
     lastAiRequest = aiRequest;
 
     async function prepareStep(turnIndex: number) {
-      const visualPaths = includeImage ? visualContext.imagePaths() : [];
       const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
-      const contextText = [requestPrompt, '', 'Agent Loop / prepareStep context:', '- This turn is rebuilt by prepareStep and does not reuse full historical messages.', '- Images are rendered by Visual Context Manager.', '- current is the only actionable screenshot; history is reference-only and its candidate ids must not be used.', '- Call exactly one tool. After a browser-changing tool, the system waits, captures a new numbered screenshot, and updates Visual Context Manager.', '- Operation tools should set visualAfter to declare capture and retention intent.', '', formatWorkingMemory(workingMemory), '', visualContext.renderText(), '', 'Recent tool trace summary (last 5):\n' + JSON.stringify(summarizeToolTraces(traces).slice(-5), null, 2), 'Loop turn: ' + (turnIndex + 1) + '/' + maxTurns].join('\n');
+      let visualPaths = includeImage ? visualContext.imagePaths() : [];
+      let traceLimit = 5;
+      let compressionDetails: Record<string, unknown> | undefined;
+      const buildContextText = () => {
+        const compressionNote = compressionDetails
+          ? [
+              'Context budget manager:',
+              `- Estimated context exceeded ${Math.round(Number(compressionDetails.thresholdRatio) * 100)}%; historical visual frames and working memory were compressed.`,
+              '- This request is a fresh dialogue turn built from current visual context, compact memory, and recent tool summaries.',
+            ].join('\n')
+          : '';
+        return buildPrepareStepPrompt({
+          requestPrompt,
+          compressionNote,
+          workingMemoryText: formatWorkingMemory(workingMemory),
+          visualContextText: visualContext.renderText(),
+          currentToolAttemptsText: formatCurrentToolAttemptSummary(traces, traceLimit),
+          turnIndex,
+          maxTurns,
+          traceLimit,
+        });
+      };
+      let contextText = buildContextText();
+      const windowTokens = contextWindowTokens();
+      const thresholdRatio = contextCompressionThresholdRatio();
+      const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
+      let estimatedTokens = estimateContextTokens(contextText, visualPaths.length);
+      if (estimatedTokens > thresholdTokens) {
+        const beforeImageCount = visualPaths.length;
+        const removedFrames = visualContext.compressForBudget('Context budget exceeded; compacting historical visual frames.');
+        workingMemory = compactWorkingMemory(workingMemory);
+        contextCompressionTurns += 1;
+        traceLimit = 3;
+        visualPaths = includeImage ? visualContext.imagePaths() : [];
+        compressionDetails = {
+          turn: contextCompressionTurns,
+          estimatedTokensBefore: estimatedTokens,
+          thresholdTokens,
+          thresholdRatio,
+          windowTokens,
+          beforeImageCount,
+          afterImageCount: visualPaths.length,
+          removedFrames,
+        };
+        contextText = buildContextText();
+        estimatedTokens = estimateContextTokens(contextText, visualPaths.length);
+        if (estimatedTokens > thresholdTokens && visualPaths.length > 1) {
+          visualContext.manage('keepLatestOnly', 'Context budget still exceeded after history compression; keeping only current visual frame for the next dialogue turn.');
+          visualPaths = includeImage ? visualContext.imagePaths() : [];
+          compressionDetails = {
+            ...compressionDetails,
+            secondPass: 'keepLatestOnly',
+            estimatedTokensAfterFirstPass: estimatedTokens,
+            afterImageCount: visualPaths.length,
+          };
+          contextText = buildContextText();
+          estimatedTokens = estimateContextTokens(contextText, visualPaths.length);
+        }
+        await onDebug?.({
+          phase: 'ai:context-compressed',
+          stepIndex,
+          message: `Context estimate ${estimatedTokens}/${windowTokens} tokens after compression; opened fresh prepareStep turn ${contextCompressionTurns}.`,
+          details: { ...compressionDetails, estimatedTokensAfter: estimatedTokens, visualContext: visualContext.snapshot(), workingMemory },
+        });
+      }
       const content: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: contextText }];
       for (const imagePath of visualPaths) { const image = await readScreenshotForAi(imagePath).catch(() => undefined); if (image) content.push({ type: 'image', image }); }
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: visualPaths, imageAttached: visualPaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: visualPaths.length, prepareStep: true } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: visualPaths, imageAttached: visualPaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: visualPaths.length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
       lastAiRequest = aiRequest;
       return [{ role: 'user' as const, content }];
     }
@@ -1657,7 +1758,9 @@ async function executeRuntimeStep(input: {
         const newTraces = traces.slice(traceStart);
         const lastTrace = newTraces.at(-1);
         await onDebug?.({ phase: 'ai:runtime:response', stepIndex, message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; turn ' + (turnIndex + 1) + '/' + maxTurns + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms', details: jsonSafe({ text: latestText, traces: newTraces, visualContext: visualContext.snapshot(), workingMemory, elapsedMs: elapsedSince(aiStartedAt) }) });
-        if (!lastTrace || lastTrace.name === 'reportState') return { text: latestText, traces, aiRequest, visualContext: visualContext.snapshot(), workingMemory };
+        if (!lastTrace || lastTrace.name === 'reportState' || lastTrace.name === 'waitForHumanVerification') {
+          return { text: latestText, traces, aiRequest, visualContext: visualContext.snapshot(), workingMemory };
+        }
       } catch (error) {
         if (traces.length > traceStart && !abortSignal?.aborted) {
           await onDebug?.({ phase: 'ai:runtime:partial', stepIndex, message: 'AI request stopped after a tool executed; keeping the action and continuing from Visual Context Manager.', details: { error: error instanceof Error ? error.message : String(error), traces: traces.slice(traceStart), visualContext: visualContext.snapshot() } });
@@ -1717,7 +1820,7 @@ function serializeError(error: unknown) {
   };
 }
 
-function shouldKeepBrowserOpenAfterError(error: unknown) {
+function shouldKeepBrowserOpenAfterError() {
   if (process.env.KEEP_BROWSER_OPEN_ON_AI_ERROR === 'false') return false;
   return true;
 }
@@ -1729,9 +1832,9 @@ function sleep(ms: number) {
 function createSkippedStep(stepIndex: number, beforeScreenshotPath?: string, afterScreenshotPath?: string): StepExecutionResult {
   return {
     index: stepIndex,
-    action: '鐢ㄦ埛璺宠繃褰撳墠 AI 杩愯姝ラ',
-        expected: 'After this skipped step, continue to the next AI decision.',
-        actual: 'User skipped this step manually.',
+    action: '用户跳过当前 AI 运行步骤',
+    expected: 'After this skipped step, continue to the next AI decision.',
+    actual: 'User skipped this step manually.',
     status: 'blocked',
     beforeScreenshotPath,
     afterScreenshotPath,
@@ -1945,9 +2048,9 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
       const beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
       const runningStep: StepExecutionResult = {
         index: stepIndex,
-        action: `鍥炴斁鍥哄畾娴佺▼宸ュ叿锛?{flow.name}`,
-                expected: 'Recorded tool should execute with recorded parameters.',
-                actual: 'Executing recorded tool call.',
+        action: `回放固定流程工具：${flow.name}`,
+        expected: 'Recorded tool should execute with recorded parameters.',
+        actual: 'Executing recorded tool call.',
         status: 'running',
         beforeScreenshotPath,
         tools: [{ name: flow.name, input: flow.input, reason: flow.reason }],
@@ -1962,8 +2065,8 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
       const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
       const completedStep: StepExecutionResult = {
         index: stepIndex,
-        action: `鍥炴斁鍥哄畾娴佺▼宸ュ叿锛?{flow.name}`,
-                expected: 'Recorded tool should execute with recorded parameters.',
+        action: `回放固定流程工具：${flow.name}`,
+        expected: 'Recorded tool should execute with recorded parameters.',
         actual: result.actual,
         status: result.ok ? 'passed' : 'failed',
         beforeScreenshotPath,
@@ -2005,8 +2108,8 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
   } catch (error) {
     const blockedStep: StepExecutionResult = {
       index: steps.length + 1,
-      action: '鍥哄畾娴佺▼鍥炴斁涓柇',
-            expected: 'Recorded tool flow should replay stably.',
+      action: '固定流程回放中断',
+      expected: 'Recorded tool flow should replay stably.',
       actual: infrastructureError(error),
       status: 'blocked',
     };
@@ -2083,7 +2186,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
     for (let stepIndex = startStepIndex; stepIndex <= finalStepIndex; stepIndex += 1) {
       await waitWhilePaused(stepIndex);
       const abortController = registerStepAbortController(runId, stepIndex);
-      await onDebug?.({ phase: 'step:start', stepIndex, message: `寮€濮嬭繍琛屾椂姝ラ ${stepIndex}` });
+      await onDebug?.({ phase: 'step:start', stepIndex, message: `开始执行运行时步骤 ${stepIndex}` });
 
       if (await shouldSkipStep?.(stepIndex)) {
         const skippedStep = createSkippedStep(stepIndex);
@@ -2107,7 +2210,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       await onDebug?.({
         phase: 'perf:before-screenshot',
         stepIndex,
-        message: `鎿嶄綔鍓嶆埅鍥捐€楁椂 ${elapsedSince(beforeScreenshotStartedAt)}ms`,
+        message: `操作前截图耗时 ${elapsedSince(beforeScreenshotStartedAt)}ms`,
         details: { elapsedMs: elapsedSince(beforeScreenshotStartedAt), screenshotPath: beforeScreenshotPath },
       });
 
@@ -2261,7 +2364,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       await onDebug?.({
         phase: 'perf:after-screenshot',
         stepIndex,
-        message: `鎿嶄綔鍚庢埅鍥捐€楁椂 ${elapsedSince(afterScreenshotStartedAt)}ms`,
+        message: `操作后截图耗时 ${elapsedSince(afterScreenshotStartedAt)}ms`,
         details: { elapsedMs: elapsedSince(afterScreenshotStartedAt), screenshotPath: afterScreenshotPath },
       });
 
@@ -2442,7 +2545,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       },
     };
   } catch (error) {
-    keepBrowserOpen = shouldKeepBrowserOpenAfterError(error);
+    keepBrowserOpen = shouldKeepBrowserOpenAfterError();
     const blockedStep: StepExecutionResult = {
       index: steps.length + 1,
             action: 'AI browser run interrupted',

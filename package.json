@@ -8,7 +8,7 @@
     "start": "next start",
     "docker:build": "docker build -t web-app-test:latest .",
     "docker:up": "docker compose up -d --build",
-    "lint": "next lint",
+    "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "prisma:generate": "prisma generate"
   },
@@ -36,6 +36,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@eslint/eslintrc": "^3.3.5",
     "@tailwindcss/postcss": "^4.1.8",
     "@types/node": "^22.15.24",
     "@types/react": "^19.1.6",
