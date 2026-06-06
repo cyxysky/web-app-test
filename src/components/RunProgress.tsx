@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, PauseCircle, PlayCircle, Plus, Radar, SkipForward, Wrench, X } from 'lucide-react';
 import { MarkdownReport } from '@/components/MarkdownReport';
 import { RunMetaDrawer } from '@/components/RunMetaDrawer';
-import type { RunDebugEvent, StepExecutionResult, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { RunDebugEvent, StepExecutionResult, TaskFrame, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 type ImageItem = { title: string; url: string };
 type StepToolCallItem = NonNullable<StepExecutionResult['tools']>[number];
@@ -91,6 +91,68 @@ function stepToolBadges(step: StepExecutionResult) {
     }
   }
   return badges;
+}
+
+function ledgerKey(item: TaskLedgerItem) {
+  return item.id || `${item.dimensionId}:${item.status || ''}:${item.title}`.toLowerCase();
+}
+
+function collectRunTaskFrame(run: TestRunRecord) {
+  return run.result?.taskFrame || run.result?.steps.map((step) => step.taskFrame || step.workingMemory?.taskFrame).filter(Boolean).at(-1);
+}
+
+function collectRunLedgerItems(run: TestRunRecord) {
+  const map = new Map<string, TaskLedgerItem>();
+  const items = [
+    ...(run.result?.ledgerItems || []),
+    ...(run.result?.steps || []).flatMap((step) => step.ledgerItems || []),
+    ...(run.result?.steps || []).flatMap((step) => step.workingMemory?.ledgerItems || []),
+  ];
+  for (const item of items) map.set(ledgerKey(item), item);
+  return [...map.values()];
+}
+
+function dimensionLabel(frame: TaskFrame | undefined, dimensionId: string) {
+  return frame?.dimensions.find((dimension) => dimension.id === dimensionId)?.name || dimensionId || '未分组';
+}
+
+function ledgerStatusLabel(status?: TaskLedgerItem['status']) {
+  return ({
+    covered: '已覆盖',
+    decision: '结论',
+    evidence: '证据',
+    finding: '发现',
+    issue: '问题',
+    question: '疑问',
+    risk: '风险',
+  } as Record<string, string>)[status || 'finding'] || status || '发现';
+}
+
+function ledgerSeverityLabel(severity?: TaskLedgerItem['severity']) {
+  return ({
+    critical: '严重',
+    info: '信息',
+    major: '重要',
+    minor: '一般',
+  } as Record<string, string>)[severity || 'info'] || severity || '信息';
+}
+
+function ledgerToneClass(item: TaskLedgerItem) {
+  if (item.severity === 'critical') return 'critical';
+  if (item.severity === 'major') return 'major';
+  if (item.status === 'issue' || item.status === 'risk') return 'warning';
+  if (item.status === 'covered') return 'covered';
+  return 'neutral';
+}
+
+function ledgerCounts(items: TaskLedgerItem[]) {
+  return {
+    covered: items.filter((item) => item.status === 'covered').length,
+    important: items.filter((item) => item.severity === 'critical' || item.severity === 'major').length,
+    issue: items.filter((item) => item.status === 'issue').length,
+    question: items.filter((item) => item.status === 'question').length,
+    risk: items.filter((item) => item.status === 'risk').length,
+  };
 }
 
 function toolBadgeLabel(badge: { name: string; count: number }) {
@@ -325,6 +387,151 @@ function ReportAccordion({ title, items }: { title: string; items: string[] }) {
   );
 }
 
+function LedgerItemCard({ frame, item, index }: { frame?: TaskFrame; item: TaskLedgerItem; index: number }) {
+  const tone = ledgerToneClass(item);
+  const evidence = item.evidence?.slice(0, 4) || [];
+  const attributes = item.attributes?.slice(0, 6) || [];
+  return (
+    <li className={`ledger-item-card ${tone}`}>
+      <div className="ledger-item-index">{String(index + 1).padStart(2, '0')}</div>
+      <div className="ledger-item-main">
+        <div className="ledger-item-title-row">
+          <strong>{item.title}</strong>
+          <span className={`ledger-pill ${tone}`}>{ledgerStatusLabel(item.status)}</span>
+          <span className={`ledger-pill severity-${item.severity || 'info'}`}>{ledgerSeverityLabel(item.severity)}</span>
+        </div>
+        {item.summary ? <p className="ledger-item-summary">{item.summary}</p> : null}
+        <div className="ledger-meta-row">
+          <span>{dimensionLabel(frame, item.dimensionId)}</span>
+          {item.sourceStep ? <span>Step {item.sourceStep}</span> : null}
+          {typeof item.confidence === 'number' ? <span>置信度 {Math.round(item.confidence * 100)}%</span> : null}
+        </div>
+        {item.expected || item.actual ? (
+          <div className="ledger-compare-grid">
+            {item.expected ? (
+              <div>
+                <b>期望</b>
+                <p>{item.expected}</p>
+              </div>
+            ) : null}
+            {item.actual ? (
+              <div>
+                <b>实际</b>
+                <p>{item.actual}</p>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {attributes.length ? (
+          <div className="ledger-chip-row">
+            {attributes.map((pair, pairIndex) => (
+              <span key={`${pair.key}-${pairIndex}`}>{pair.key}: {pair.value}</span>
+            ))}
+          </div>
+        ) : null}
+        {evidence.length ? (
+          <div className="ledger-evidence-row">
+            <b>证据</b>
+            {evidence.map((itemEvidence, evidenceIndex) => (
+              <span key={`${itemEvidence}-${evidenceIndex}`}>{itemEvidence}</span>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
+function LedgerItemList({ frame, items, limit }: { frame?: TaskFrame; items: TaskLedgerItem[]; limit?: number }) {
+  const visibleItems = typeof limit === 'number' ? items.slice(-limit) : items;
+  if (!visibleItems.length) return <p className="empty-ledger">暂无结构化台账项</p>;
+  return (
+    <ul className="ledger-list">
+      {visibleItems.map((item, index) => (
+        <LedgerItemCard frame={frame} index={index} item={item} key={`${ledgerKey(item)}-${index}`} />
+      ))}
+    </ul>
+  );
+}
+
+function LedgerSectionCard({
+  defaultOpen = false,
+  description,
+  frame,
+  items,
+  limit,
+  title,
+}: {
+  defaultOpen?: boolean;
+  description?: string;
+  frame?: TaskFrame;
+  items: TaskLedgerItem[];
+  limit?: number;
+  title: string;
+}) {
+  const counts = ledgerCounts(items);
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <details className="ledger-section-card" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>
+        <ChevronRight size={16} />
+        <div className="ledger-section-title">
+          <strong>{title}</strong>
+          {description ? <span>{description}</span> : null}
+        </div>
+        <div className="ledger-section-counts">
+          <span>{items.length} 条</span>
+          {counts.important ? <span className="major">{counts.important} 重要</span> : null}
+          {counts.issue ? <span>{counts.issue} 问题</span> : null}
+          {counts.risk ? <span>{counts.risk} 风险</span> : null}
+          {counts.question ? <span>{counts.question} 疑问</span> : null}
+        </div>
+      </summary>
+      <div className="ledger-section-body">
+        <LedgerItemList frame={frame} items={items} limit={limit} />
+      </div>
+    </details>
+  );
+}
+
+function LedgerPanel({ frame, items }: { frame?: TaskFrame; items: TaskLedgerItem[] }) {
+  if (!items.length) return null;
+  const grouped = new Map<string, TaskLedgerItem[]>();
+  for (const item of items) grouped.set(item.dimensionId || 'general', [...(grouped.get(item.dimensionId || 'general') || []), item]);
+  const totals = ledgerCounts(items);
+  return (
+    <section className="task-ledger-panel">
+      <div className="section-head compact">
+        <div>
+          <h2>结构化台账</h2>
+          <p>{items.length} 条由 AI 在执行过程中沉淀的覆盖、发现、问题与风险</p>
+        </div>
+      </div>
+      <div className="ledger-summary-strip">
+        <span>全部 {items.length}</span>
+        <span>已覆盖 {totals.covered}</span>
+        <span>问题 {totals.issue}</span>
+        <span>风险 {totals.risk}</span>
+        <span>疑问 {totals.question}</span>
+        {totals.important ? <span className="major">重要 {totals.important}</span> : null}
+      </div>
+      <div className="ledger-groups">
+        {[...grouped.entries()].map(([dimensionId, dimensionItems]) => (
+          <LedgerSectionCard
+            defaultOpen={dimensionItems.some((item) => item.severity === 'critical' || item.severity === 'major')}
+            description="按执行过程中沉淀的结构化条目汇总"
+            frame={frame}
+            items={dimensionItems}
+            key={dimensionId}
+            limit={24}
+            title={dimensionLabel(frame, dimensionId)}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function ReportEvidence({ run }: { run: TestRunRecord }) {
   return (
     <div className="report-evidence">
@@ -347,7 +554,14 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   const [resumePendingStep, setResumePendingStep] = useState<number | undefined>();
   const steps = useMemo(() => run.result?.steps || [], [run.result?.steps]);
   const allImages = useMemo(() => collectStepImages(steps), [steps]);
+  const taskFrame = useMemo(() => collectRunTaskFrame(run), [run]);
+  const ledgerItems = useMemo(() => collectRunLedgerItems(run), [run]);
   const selectedStep = selectedOrLatest(steps, selectedIndex);
+  const selectedStepLedgerItems = useMemo(() => {
+    if (!selectedStep) return [];
+    if (selectedStep.ledgerItems?.length) return selectedStep.ledgerItems;
+    return (selectedStep.workingMemory?.ledgerItems || []).filter((item) => item.sourceStep === selectedStep.index);
+  }, [selectedStep]);
   const runningStep = steps.find((step) => step.status === 'running');
   const debugEnabled = Boolean(run.debug?.enabled);
   const manualIntervention = run.control?.manualIntervention;
@@ -633,6 +847,19 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                   </dd>
                 </div>
                 <div>
+                  <dt>本步新增台账</dt>
+                  <dd>
+                    <LedgerSectionCard
+                      description={selectedStepLedgerItems.length ? '本步新增的覆盖、发现、问题、风险与疑问' : '本步没有新增结构化台账'}
+                      frame={taskFrame}
+                      items={selectedStepLedgerItems}
+                      key={`step-ledger-${selectedStep.index}`}
+                      limit={8}
+                      title="本步新增台账"
+                    />
+                  </dd>
+                </div>
+                <div>
                   <dt>工具调用</dt>
                   <dd>
                     {selectedStep.tools?.length ? (
@@ -662,6 +889,8 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
         </article>
       </section>
 
+      <LedgerPanel frame={taskFrame} items={ledgerItems} />
+
       {debugEnabled ? (
         <section className="debug-timeline">
           <div className="section-head"><div><h2>Debug 流程</h2><p>显示 AI 请求响应、工具调用、工具结果和当前卡住阶段。</p></div></div>
@@ -670,70 +899,6 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
               <DebugEventRow event={event} key={`${event.time}-${index}`} />
             ))}
           </ol>
-        </section>
-      ) : null}
-
-      {run.analysis ? (
-        <section className="debug-timeline run-analysis-panel">
-          <div className="section-head">
-            <div>
-              <h2>失败自愈与页面变化分析</h2>
-              <p>运行结束后自动生成，用于下次优化 prompt 和操作策略。</p>
-            </div>
-          </div>
-          <div className="analysis-grid">
-            <div>
-              <h3>修复建议</h3>
-              <ul>
-                {run.analysis.repairSuggestions.map((item, index) => <li key={index}>{item}</li>)}
-              </ul>
-            </div>
-            <div>
-              <h3>下次策略</h3>
-              <ul>
-                {(run.analysis.selfHealing.nextRunStrategy.length ? run.analysis.selfHealing.nextRunStrategy : run.analysis.selfHealing.applied).map((item, index) => <li key={index}>{item}</li>)}
-              </ul>
-            </div>
-            <div className="wide">
-              <h3>页面变化检测</h3>
-              <ol>
-                {run.analysis.pageChanges.map((item) => (
-                  <li key={item.stepIndex}>
-                    步骤 {item.stepIndex} · {item.changed ? '有变化' : '变化很小'} · {item.changeScore}: {item.summary}
-                  </li>
-                ))}
-              </ol>
-            </div>
-          </div>
-        </section>
-      ) : null}
-
-      {run.result?.memory ? (
-        <section className="debug-timeline run-memory-panel">
-          <div className="section-head">
-            <div>
-              <h2>运行记忆</h2>
-              <p>由所有步骤的原因、观察、发现和异常压缩生成，后续 AI 请求会持续引用。</p>
-            </div>
-          </div>
-          <div className="analysis-grid">
-            <div>
-              <h3>摘要</h3>
-              <p className="memory-summary">{run.result.memory.summary || '暂无摘要'}</p>
-            </div>
-            <div>
-              <h3>累计发现</h3>
-              <ul>
-                {(run.result.memory.findings.length ? run.result.memory.findings : ['暂无发现']).slice(-12).map((item, index) => <li key={index}>{item}</li>)}
-              </ul>
-            </div>
-            <div className="wide">
-              <h3>压缩时间线</h3>
-              <ol>
-                {run.result.memory.timeline.slice(-20).map((item, index) => <li key={index}>{item}</li>)}
-              </ol>
-            </div>
-          </div>
         </section>
       ) : null}
 

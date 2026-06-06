@@ -2,9 +2,9 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
 import { executeTestCase } from '@/server/ai/agents/test-executor.agent';
-import type { RecordedFlowStep, StepExecutionResult, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { RecordedFlowStep, StepExecutionResult, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
-import { writeReport } from '@/server/reports/report-writer.agent';
+import { writeAiReport } from '@/server/reports/report-writer.agent';
 
 type ExecuteRunOptions = {
   continueExisting?: boolean;
@@ -130,9 +130,13 @@ function buildFinalRunMemory(
       step.findings?.length ? `发现：${compactMemoryText(step.findings.join('；'), 140)}` : '',
     ].filter(Boolean).join(' | ') || compactMemoryText(step.action || step.actual)}`;
   }).slice(-40);
+  const ledgerSummaries = collectTaskLedgerItems(steps)
+    .map((item) => compactMemoryText(`${item.status || 'finding'}:${item.title}${item.summary ? ` - ${item.summary}` : ''}`, 260))
+    .filter(Boolean);
   const findings = Array.from(new Set([
     ...(previous?.findings || []),
     ...steps.flatMap((step) => step.findings || []),
+    ...ledgerSummaries,
   ].map((item) => compactMemoryText(item, 260)).filter(Boolean))).slice(-40);
   const failedAttempts = Array.from(new Set([
     ...(previous?.failedAttempts || []),
@@ -154,6 +158,25 @@ function buildFinalRunMemory(
     failedAttempts,
     updatedAt: new Date().toISOString(),
   };
+}
+
+function taskLedgerKey(item: TaskLedgerItem) {
+  return item.id || `${item.dimensionId}:${item.status || ''}:${item.title}`.toLowerCase();
+}
+
+function collectTaskFrame(steps: StepExecutionResult[]) {
+  return steps.map((step) => step.taskFrame || step.workingMemory?.taskFrame).filter(Boolean).at(-1);
+}
+
+function collectTaskLedgerItems(steps: StepExecutionResult[]) {
+  const map = new Map<string, TaskLedgerItem>();
+  for (const item of [
+    ...steps.flatMap((step) => step.ledgerItems || []),
+    ...steps.flatMap((step) => step.workingMemory?.ledgerItems || []),
+  ]) {
+    map.set(taskLedgerKey(item), item);
+  }
+  return [...map.values()];
 }
 
 function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUrl: string): RecordedFlowStep[] {
@@ -305,12 +328,14 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
       consoleErrors: execution.result.consoleErrors,
       networkErrors: execution.result.networkErrors,
       tracePath: existsSync(tracePath) ? tracePath : executionTracePath,
+      taskFrame: collectTaskFrame(finalSteps) || testCase.content.taskFrame,
+      ledgerItems: collectTaskLedgerItems(finalSteps),
       memory: buildFinalRunMemory(finalSteps, current?.result?.memory),
     },
   });
 
   if (!finished) throw new Error('Run not found after execution');
-  const report = writeReport(testCase, finished);
+  const report = await writeAiReport(testCase, finished);
   const analysis = await analyzeRunOutcome({ ...finished, report });
   const withReport = store.updateRun(runId, { report, analysis });
   if (execution.status === 'failed' || execution.status === 'blocked') {
@@ -497,9 +522,9 @@ function persistBackgroundRunFailure(run: TestRunRecord, testCase: ReturnType<ty
         networkErrors: current.result?.networkErrors || [],
       },
     });
-    if (failed) {
-      const report = writeReport(testCase, failed);
-      void analyzeRunOutcome({ ...failed, report }).then((analysis) => {
+    if (failed && testCase) {
+      void writeAiReport(testCase, failed).then(async (report) => {
+        const analysis = await analyzeRunOutcome({ ...failed, report });
         store.updateRun(run.id, { report, analysis });
         store.appendTestCaseStrategyMemory(run.testCaseId, analysis.promptHints);
       });

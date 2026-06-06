@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Loader2, Save } from 'lucide-react';
+import { Loader2, Save, Sparkles } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { RichTextEditor } from '@/components/RichTextEditor';
 import { richTextToPlainText } from '@/lib/rich-text';
@@ -18,6 +18,10 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
     steps: [],
   });
   const [saving, setSaving] = useState(false);
+  const [generatingFrame, setGeneratingFrame] = useState(false);
+  const [frameText, setFrameText] = useState(() => (
+    testCase.content.taskFrame ? JSON.stringify(testCase.content.taskFrame, null, 2) : ''
+  ));
   const [error, setError] = useState('');
 
   function update(patch: Partial<TestCaseContent>) {
@@ -30,11 +34,22 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
       setError('请输入用户需求');
       return;
     }
+    let taskFrame: TestCaseContent['taskFrame'] | undefined;
+    if (frameText.trim()) {
+      try {
+        const parsed = JSON.parse(frameText);
+        taskFrame = parsed || undefined;
+      } catch {
+        setError('内容框架不是合法 JSON，请修正后再保存');
+        return;
+      }
+    }
     setSaving(true);
     setError('');
     try {
       const payload = {
         ...draft,
+        taskFrame,
         description: plainRequirement,
         testData: {
           ...draft.testData,
@@ -57,16 +72,51 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
     }
   }
 
+  async function generateFrame() {
+    const plainRequirement = richTextToPlainText(draft.userRequirement || draft.description);
+    if (!plainRequirement) {
+      setError('请输入用户需求后再生成内容框架');
+      return;
+    }
+    setGeneratingFrame(true);
+    setError('');
+    try {
+      const response = await fetch(`/api/test-cases/${testCase.id}/task-frame`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userRequirement: draft.userRequirement || draft.description,
+          systemPrompt: draft.systemPrompt || '',
+          targetUrl: draft.targetUrl,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '生成内容框架失败');
+      setFrameText(JSON.stringify(data.taskFrame, null, 2));
+      update({ taskFrame: data.taskFrame });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '生成内容框架失败');
+    } finally {
+      setGeneratingFrame(false);
+    }
+  }
+
   return (
     <section className="content-band test-goal-list">
       <div className="section-head">
         <div>
           <h2>测试需求</h2>
         </div>
-        <button className="icon-text-button" disabled={saving} onClick={save} type="button">
-          {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-          {saving ? '保存中' : '保存需求'}
-        </button>
+        <div className="case-editor-actions">
+          <button className="icon-text-button" disabled={generatingFrame || saving} onClick={generateFrame} type="button">
+            {generatingFrame ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
+            {generatingFrame ? '生成中' : '生成内容框架'}
+          </button>
+          <button className="icon-text-button" disabled={saving} onClick={save} type="button">
+            {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+            {saving ? '保存中' : '保存需求'}
+          </button>
+        </div>
       </div>
 
       <div className="runtime-case-form">
@@ -122,6 +172,16 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
             placeholder="例如：遇到级联选择器时，必须逐级展开并选择到叶子节点，不能点击一级选项后就认为完成。"
             minHeight={180}
           />
+        </label>
+        <label className="wide">
+          AI 内容框架
+          <textarea
+            className="textarea task-frame-json-editor"
+            value={frameText}
+            onChange={(event) => setFrameText(event.target.value)}
+            placeholder="点击“生成内容框架”后，可在这里修改 AI 生成的任务框架 JSON。"
+          />
+          <span className="hint">该框架会作为运行时 AI 的初始 TaskFrame，并进入最终报告。维度应描述需求内容和测试覆盖轴，不应描述登录状态、阅读进度或生成状态。</span>
         </label>
       </div>
 

@@ -81,21 +81,12 @@ type ScreenshotMetrics = {
   devicePixelRatio: number;
   scale: 'css';
   capture: ScreenshotCaptureMode;
-  region?: ScreenshotRegion;
 };
 
-export type ScreenshotCaptureMode = 'viewport' | 'fullPage' | 'region';
-
-export type ScreenshotRegion = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
+export type ScreenshotCaptureMode = 'viewport' | 'fullPage';
 
 type ScreenshotCaptureOptions = {
   capture?: ScreenshotCaptureMode;
-  region?: ScreenshotRegion;
 };
 
 type InteractiveCandidate = {
@@ -422,13 +413,7 @@ export class BrowserSession {
     if (Number.isFinite(stabilizeMs) && stabilizeMs > 0) {
       await this.waitForStableViewport(Math.min(Math.max(stabilizeMs, 0), 5000));
     }
-    const requestedCapture = options.capture || 'viewport';
-    const region = requestedCapture === 'region' ? await this.normalizeScreenshotRegion(options.region) : undefined;
-    const capture: ScreenshotCaptureMode = requestedCapture === 'fullPage'
-      ? 'fullPage'
-      : region
-        ? 'region'
-        : 'viewport';
+    const capture: ScreenshotCaptureMode = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
     const dir = path.join(process.cwd(), 'artifacts', runId);
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
@@ -472,7 +457,6 @@ export class BrowserSession {
     const screenshotOptions = {
       path: filePath,
       fullPage: capture === 'fullPage',
-      ...(capture === 'region' && region ? { clip: region } : {}),
       scale: 'css' as const,
       timeout: 15000,
     };
@@ -505,7 +489,6 @@ export class BrowserSession {
       devicePixelRatio: viewportMetrics.devicePixelRatio,
       scale: 'css',
       capture,
-      region,
     };
     return filePath;
   }
@@ -940,20 +923,6 @@ export class BrowserSession {
   private async getViewportSize() {
     const viewport = await this.getViewportMetrics();
     return { width: viewport.width, height: viewport.height };
-  }
-
-  private async normalizeScreenshotRegion(region?: ScreenshotRegion): Promise<ScreenshotRegion | undefined> {
-    if (!region) return undefined;
-    const viewport = await this.getViewportMetrics();
-    const x = Math.max(0, Math.floor(Number(region.x)));
-    const y = Math.max(0, Math.floor(Number(region.y)));
-    if (!Number.isFinite(x) || !Number.isFinite(y) || x >= viewport.width || y >= viewport.height) return undefined;
-    const maxWidth = Math.max(1, viewport.width - x);
-    const maxHeight = Math.max(1, viewport.height - y);
-    const width = Math.min(maxWidth, Math.max(1, Math.floor(Number(region.width))));
-    const height = Math.min(maxHeight, Math.max(1, Math.floor(Number(region.height))));
-    if (!Number.isFinite(width) || !Number.isFinite(height)) return undefined;
-    return { x, y, width, height };
   }
 
   private async getViewportMetrics(): Promise<ViewportMetrics> {
@@ -3221,7 +3190,7 @@ export class BrowserSession {
           top: `${boxTop}px`,
           width: `${boxWidth}px`,
           height: `${boxHeight}px`,
-          border: `2px dashed ${color}`,
+          border: `3px dashed ${color}`,
           borderRadius: '4px',
           boxSizing: 'border-box',
           background: 'transparent',
@@ -3239,15 +3208,15 @@ export class BrowserSession {
           position: 'absolute',
           left: `${clamp(boxLeft + 4, 1, Math.max(1, window.innerWidth - 90))}px`,
           top: `${clamp(boxTop + 4, 1, Math.max(1, window.innerHeight - 20))}px`,
-          minWidth: '22px',
-          height: '18px',
-          padding: '0 5px',
+          minWidth: '26px',
+          height: '22px',
+          padding: '0 6px',
           borderRadius: '4px',
           background: color,
           color: '#fff',
           border: '1px solid #fff',
           boxSizing: 'border-box',
-          font: '900 11px/16px Arial, sans-serif',
+          font: '900 13px/20px Arial, sans-serif',
           textAlign: 'center',
           boxShadow: '0 2px 6px rgba(0,0,0,0.28)',
           pointerEvents: 'none',
@@ -3572,7 +3541,7 @@ export class BrowserSession {
           top: `${boxTop}px`,
           width: `${boxWidth}px`,
           height: `${boxHeight}px`,
-          border: `1px solid ${color}`,
+          border: `2px solid ${color}`,
           borderRadius: '3px',
           boxSizing: 'border-box',
           background: 'transparent',
@@ -3583,10 +3552,10 @@ export class BrowserSession {
         label.textContent = item.id;
         const denseSmall = isDenseSmallTarget(rect);
         // 标签只保留白字和黑色描边阴影，尽量减少对页面文字的遮挡。
-        const normalLabelWidth = Math.max(12, item.id.length * 7 + 2);
-        const normalLabelHeight = 12;
-        const compactLabelWidth = Math.max(7, Math.min(normalLabelWidth, item.id.length * 4 + 2, Math.max(7, rect.width - 1)));
-        const compactLabelHeight = Math.max(7, Math.min(9, Math.max(7, rect.height - 1)));
+        const normalLabelWidth = Math.max(16, item.id.length * 9 + 4);
+        const normalLabelHeight = 16;
+        const compactLabelWidth = Math.max(9, Math.min(normalLabelWidth, item.id.length * 5 + 3, Math.max(9, rect.width - 1)));
+        const compactLabelHeight = Math.max(9, Math.min(11, Math.max(9, rect.height - 1)));
         const labelBox = labelPosition(
           rect,
           normalLabelWidth,
@@ -3599,7 +3568,7 @@ export class BrowserSession {
         const labelWidth = labelBox.right - labelBox.left;
         const labelHeight = labelBox.bottom - labelBox.top;
         if (labelBox.external && labelBox.leader) {
-          drawLeader(labelBox.leader, color, 1);
+          drawLeader(labelBox.leader, color, 2);
         }
         Object.assign(label.style, {
           position: 'absolute',
@@ -3617,8 +3586,8 @@ export class BrowserSession {
           alignItems: 'center',
           justifyContent: 'center',
           font: labelBox.compact
-            ? `900 ${item.id.length >= 3 ? 6 : 7}px/${labelHeight}px Arial, sans-serif`
-            : `900 11px/${labelHeight}px Arial, sans-serif`,
+            ? `900 ${item.id.length >= 3 ? 8 : 9}px/${labelHeight}px Arial, sans-serif`
+            : `900 14px/${labelHeight}px Arial, sans-serif`,
           letterSpacing: '0',
           textAlign: 'center',
           boxShadow: 'none',

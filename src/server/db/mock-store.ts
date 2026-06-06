@@ -1,7 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { defaultModelByProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
-import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -186,9 +186,13 @@ function stepMemoryLine(step: StepExecutionResult) {
 
 function buildMemory(steps: StepExecutionResult[], previous?: NonNullable<NonNullable<TestRunRecord['result']>['memory']>) {
   const timeline = steps.map(stepMemoryLine).slice(-40);
+  const ledgerSummaries = collectTaskLedgerItems(steps)
+    .map((item) => compactText(`${item.status || 'finding'}:${item.title}${item.summary ? ` - ${item.summary}` : ''}`, 260))
+    .filter(Boolean);
   const findings = Array.from(new Set([
     ...(previous?.findings || []),
     ...steps.flatMap((step) => step.findings || []),
+    ...ledgerSummaries,
   ].map((item) => compactText(item, 260)).filter(Boolean))).slice(-40);
   const failedAttempts = Array.from(new Set([
     ...(previous?.failedAttempts || []),
@@ -213,6 +217,29 @@ function buildMemory(steps: StepExecutionResult[], previous?: NonNullable<NonNul
 }
 
 // 原子写入本地 JSON 数据文件，避免运行中断时写出半截内容。
+function taskLedgerKey(item: TaskLedgerItem) {
+  return item.id || `${item.dimensionId}:${item.status || ''}:${item.title}`.toLowerCase();
+}
+
+function collectTaskFrame(steps: StepExecutionResult[]) {
+  return steps.map((step) => step.taskFrame || step.workingMemory?.taskFrame).filter(Boolean).at(-1);
+}
+
+function collectTaskLedgerItems(steps: StepExecutionResult[]) {
+  const map = new Map<string, TaskLedgerItem>();
+  for (const item of [
+    ...steps.flatMap((step) => step.ledgerItems || []),
+    ...steps.flatMap((step) => step.workingMemory?.ledgerItems || []),
+  ]) {
+    map.set(taskLedgerKey(item), item);
+  }
+  return [...map.values()];
+}
+
+function isUserSkippedStep(step?: StepExecutionResult) {
+  return Boolean(step?.status === 'blocked' && step.actual === 'User skipped this step manually.');
+}
+
 function writeData(data: StoreData) {
   mkdirSync(path.dirname(storePath), { recursive: true });
   const tempPath = `${storePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
@@ -571,12 +598,25 @@ export const store = {
     if (!run) return undefined;
 
     const result = run.result || { steps: [], consoleErrors: [], networkErrors: [] };
+    const existingStep = result.steps.find((item) => item.index === step.index);
+    if (isUserSkippedStep(existingStep) && !isUserSkippedStep(step)) {
+      return run;
+    }
     const exists = result.steps.some((item) => item.index === step.index);
     const steps = exists
       ? result.steps.map((item) => (item.index === step.index ? { ...item, ...step } : item))
       : [...result.steps, step].sort((a, b) => a.index - b.index);
 
-    const updated = { ...run, result: { ...result, steps, memory: buildMemory(steps, result.memory) } };
+    const updated = {
+      ...run,
+      result: {
+        ...result,
+        steps,
+        taskFrame: collectTaskFrame(steps),
+        ledgerItems: collectTaskLedgerItems(steps),
+        memory: buildMemory(steps, result.memory),
+      },
+    };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
     return updated;

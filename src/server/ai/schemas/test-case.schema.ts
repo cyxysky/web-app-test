@@ -16,6 +16,25 @@ export const recordedFlowStepSchema = z.object({
   reason: z.string().optional(),
 });
 
+export const taskFrameDimensionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  focus: z.array(z.string()).optional(),
+  testIdeas: z.array(z.string()).optional(),
+  risks: z.array(z.string()).optional(),
+});
+
+export const taskFrameSchema = z.object({
+  goal: z.string(),
+  successCriteria: z.array(z.string()),
+  dimensions: z.array(taskFrameDimensionSchema),
+  deliverables: z.array(z.string()).optional(),
+  analysisGuidance: z.array(z.string()).optional(),
+  finalOutputRequirements: z.array(z.string()).optional(),
+  version: z.number().optional(),
+});
+
 export const testCaseContentSchema = z.object({
   title: z.string(),
   description: z.string(),
@@ -31,6 +50,7 @@ export const testCaseContentSchema = z.object({
   expectedResults: z.array(z.string()),
   risks: z.array(z.string()),
   recordedFlow: z.array(recordedFlowStepSchema).optional(),
+  taskFrame: taskFrameSchema.optional(),
 });
 
 export type TestStep = z.infer<typeof testStepSchema>;
@@ -52,6 +72,25 @@ export type TestCaseRecord = {
   updatedAt: string;
 };
 
+export type TaskFrameDimension = z.infer<typeof taskFrameDimensionSchema>;
+
+export type TaskFrame = z.infer<typeof taskFrameSchema>;
+
+export type TaskLedgerItem = {
+  id?: string;
+  dimensionId: string;
+  title: string;
+  summary?: string;
+  status?: 'finding' | 'issue' | 'covered' | 'risk' | 'question' | 'evidence' | 'decision';
+  severity?: 'info' | 'minor' | 'major' | 'critical';
+  expected?: string;
+  actual?: string;
+  evidence?: string[];
+  confidence?: number;
+  sourceStep?: number;
+  attributes?: Array<{ key: string; value: string }>;
+};
+
 export type StepExecutionResult = {
   index: number;
   action: string;
@@ -69,6 +108,10 @@ export type StepExecutionResult = {
   findings?: string[];
   /** Durable memory items that should influence later steps in the same run. */
   memoryItems?: string[];
+  /** Dynamic task frame created for this run. Code treats dimensions generically. */
+  taskFrame?: TaskFrame;
+  /** Structured durable items appended by the AI during this step. */
+  ledgerItems?: TaskLedgerItem[];
   screenshotPath?: string;
   beforeScreenshotPath?: string;
   afterScreenshotPath?: string;
@@ -88,8 +131,7 @@ export type VisualFrameRecord = {
   group?: string;
   stepIndex: number;
   toolName?: string;
-  capture?: 'viewport' | 'fullPage' | 'region';
-  region?: { x: number; y: number; width: number; height: number };
+  capture?: 'viewport' | 'fullPage';
   createdAt: string;
 };
 
@@ -102,9 +144,12 @@ export type RuntimeWorkingMemory = {
   lastAction?: string;
   lastResult?: string;
   pageUnderstanding?: string;
+  currentState?: string;
   scrollSummary?: string;
   userConstraints: string[];
   nextStep?: string;
+  taskFrame?: TaskFrame;
+  ledgerItems?: TaskLedgerItem[];
 };
 
 export type AiRequestSnapshot = {
@@ -133,10 +178,9 @@ export type StepToolCall = {
   ok?: boolean;
   result?: string;
   visualAfter?: {
-    capture?: 'auto' | 'viewport' | 'fullPage' | 'region' | 'none';
-    retention?: 'auto' | 'replace' | 'append' | 'appendScrollSequence' | 'keepBeforeAfter' | 'clearAndReplace' | 'pinEvidence';
+    capture?: 'auto' | 'viewport' | 'fullPage';
+    retention?: 'auto' | 'replace' | 'append';
     reason?: string;
-    region?: { x: number; y: number; width: number; height: number };
   };
   screenshots?: Array<{
     title: string;
@@ -180,6 +224,8 @@ export type TestRunRecord = {
     consoleErrors: string[];
     networkErrors: string[];
     tracePath?: string;
+    taskFrame?: TaskFrame;
+    ledgerItems?: TaskLedgerItem[];
     memory?: {
       summary: string;
       timeline: string[];

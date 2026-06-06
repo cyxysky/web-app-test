@@ -2,11 +2,11 @@ import { readFile } from 'node:fs/promises';
 import { generateObject, generateText, stepCountIs, tool } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiRequestSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TestCaseRecord, TestRunRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, TestRunRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
-import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode, type ScreenshotRegion } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
 
 type ExecutionProgress = (step: StepExecutionResult) => void | Promise<void>;
@@ -38,11 +38,15 @@ type ToolTrace = {
   }>;
 };
 
+type ToolTraceProgress = {
+  workingMemory: RuntimeWorkingMemory;
+  visualContext: ReturnType<VisualContextManager['snapshot']>;
+};
+
 type VisualAfterPolicy = {
-  capture?: 'auto' | 'viewport' | 'fullPage' | 'region' | 'none';
-  retention?: 'auto' | 'replace' | 'append' | 'appendScrollSequence' | 'keepBeforeAfter' | 'clearAndReplace' | 'pinEvidence';
+  capture?: 'auto' | 'viewport' | 'fullPage';
+  retention?: 'auto' | 'replace' | 'append';
   reason?: string;
-  region?: ScreenshotRegion;
 };
 
 type RuntimeDecision = {
@@ -55,9 +59,9 @@ type RuntimeDecision = {
   observation?: string;
   findings?: string[];
   memoryItems?: string[];
+  taskFrame?: TaskFrame;
+  ledgerItems?: TaskLedgerItem[];
 };
-
-type RunMemory = NonNullable<NonNullable<TestRunRecord['result']>['memory']>;
 
 type ScreenshotReference = {
   id: string;
@@ -78,6 +82,7 @@ const codexRuntimeObjectSchema = z.object({
     reason: z.string().nullable(),
     url: z.string().nullable(),
     id: z.string().nullable(),
+    areaId: z.string().nullable(),
     text: z.string().nullable(),
     key: z.string().nullable(),
     path: z.string().nullable(),
@@ -94,9 +99,14 @@ const codexRuntimeObjectSchema = z.object({
     actual: z.string().nullable(),
     status: z.enum(['passed', 'failed', 'blocked']).nullable(),
     done: z.boolean().nullable(),
+    currentState: z.string().nullable(),
     observation: z.string().nullable(),
     findings: z.string().nullable(),
     memory: z.string().nullable(),
+    nextGoal: z.string().nullable(),
+    targetVisual: z.string().nullable(),
+    taskFrameJson: z.string().nullable(),
+    ledgerItemsJson: z.string().nullable(),
     ids: z.array(z.string()).nullable(),
     selectionReason: z.string().nullable(),
     sameInterfaceGroup: z.string().nullable(),
@@ -331,23 +341,6 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   });
 }
 
-function recentScrollContinuityContext(steps: StepExecutionResult[], limit = 8) {
-  return steps
-    .flatMap((step) => (step.tools || [])
-      .filter((toolCall) => toolCall.name === 'scrollArea' || toolCall.name === 'scrollViewport')
-      .map((toolCall) => {
-        const input = toolCall.input && typeof toolCall.input === 'object' ? toolCall.input as Record<string, unknown> : {};
-        return [
-          `Step ${step.index}: ${toolCall.name}`,
-          input.areaId ? `area=${input.areaId}` : '',
-          input.deltaY !== undefined ? `deltaY=${input.deltaY}` : '',
-          input.deltaX !== undefined ? `deltaX=${input.deltaX}` : '',
-          toolCall.result ? `result=${trimDebugText(toolCall.result, 260)}` : '',
-        ].filter(Boolean).join(' ');
-      }))
-    .slice(-limit);
-}
-
 function recentProgressNotes(steps: StepExecutionResult[], limit = 5) {
   return steps
     .filter((step) => step.note && step.note.trim())
@@ -371,13 +364,13 @@ function screenshotReferenceGroupOf(step: StepExecutionResult) {
   return `scroll-step-${step.index}-${area}`;
 }
 
-function buildAvailableScreenshotReferences(steps: StepExecutionResult[], limit = Number(process.env.AI_PROMPT_SCREENSHOT_REFERENCE_LIMIT || 8)): ScreenshotReference[] {
+function buildAvailableScreenshotReferences(steps: StepExecutionResult[], limit = Number(process.env.AI_PROMPT_SCREENSHOT_REFERENCE_LIMIT || 2)): ScreenshotReference[] {
   const refs: ScreenshotReference[] = [];
   for (const step of steps) {
     const entries: Array<{ phase: ScreenshotReference['phase']; path?: string }> = [
-      { phase: 'before', path: step.beforeScreenshotPath },
       { phase: 'after', path: step.afterScreenshotPath },
       { phase: 'screenshot', path: step.screenshotPath },
+      { phase: 'before', path: step.beforeScreenshotPath },
     ];
     const seenPaths = new Set<string>();
     for (const entry of entries) {
@@ -390,14 +383,7 @@ function buildAvailableScreenshotReferences(steps: StepExecutionResult[], limit 
         stepIndex: step.index,
         phase: entry.phase,
         sameInterfaceGroup: group,
-        description: [
-          `Step ${step.index} ${screenshotPhaseLabel(entry.phase)}`,
-          `status=${step.status}`,
-          step.tools?.length ? `tools=${step.tools.map((toolCall) => toolCall.name).join(',')}` : '',
-          step.observation ? `observation=${concise(step.observation, 90)}` : '',
-          step.note ? `note=${concise(step.note, 90)}` : '',
-          group ? `sameInterfaceGroup=${group}; likely same page with different scroll offset around this step` : '',
-        ].filter(Boolean).join(' | '),
+        description: `Step ${step.index} ${screenshotPhaseLabel(entry.phase)}`,
       });
     }
   }
@@ -407,11 +393,9 @@ function buildAvailableScreenshotReferences(steps: StepExecutionResult[], limit 
 function formatScreenshotReferences(refs: ScreenshotReference[]) {
   if (!refs.length) return '[none]';
   return refs.map((ref) => [
-    `- id=${ref.id}`,
-    `step=${ref.stepIndex}`,
-    `phase=${ref.phase}`,
-    ref.sameInterfaceGroup ? `sameInterfaceGroup=${ref.sameInterfaceGroup}` : '',
-    `description=${ref.description}`,
+    `- ${ref.id}`,
+    `step ${ref.stepIndex}`,
+    ref.phase,
   ].filter(Boolean).join(' | ')).join('\n');
 }
 
@@ -420,14 +404,18 @@ function concise(value?: string, max = 220) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
+function basenameOfPath(value?: string) {
+  return value ? value.split(/[\\/]/).filter(Boolean).at(-1) || value : '';
+}
+
 function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
   const recent = traces.slice(-limit);
   if (!recent.length) return '[none]';
   return recent.map((trace, index) => {
     const { reason } = splitToolInputAndReason(trace.input);
-    const status = trace.result.ok ? 'ok' : `failed: ${concise(trace.result.actual, 180)}`;
+    const status = trace.result.ok ? 'ok' : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
     const shots = trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
-    const why = reason ? `; reason=${concise(reason, 140)}` : '';
+    const why = reason ? `; reason=${sanitizeHistoricalToolText(reason, 140)}` : '';
     return `${index + 1}. ${trace.name}: ${status}${why}${shots}`;
   }).join('\n');
 }
@@ -468,6 +456,7 @@ function compactWorkingMemory(memory: RuntimeWorkingMemory): RuntimeWorkingMemor
     lastAction: concise(memory.lastAction, 180),
     lastResult: concise(memory.lastResult, 180),
     pageUnderstanding: concise(memory.pageUnderstanding, 260),
+    currentState: concise(memory.currentState, 260),
     scrollSummary: concise(memory.scrollSummary, 360),
     userConstraints: memory.userConstraints.slice(-4).map((item) => concise(item, 180)),
     nextStep: concise(memory.nextStep, 180),
@@ -491,68 +480,82 @@ function isUsefulHistoryStep(step: StepExecutionResult) {
   );
 }
 
-function stepTimelineItem(step: StepExecutionResult) {
-  const toolReasons = (step.tools || [])
-    .map((toolCall) => toolCall.reason)
-    .filter((value): value is string => Boolean(value && value.trim()));
-  const toolNames = (step.tools || []).map((toolCall) => toolCall.name).filter(Boolean).join(', ');
-  const parts = [
-    step.observation ? `observation=${concise(step.observation, 120)}` : '',
-    step.note ? `note=${concise(step.note, 120)}` : '',
-    toolReasons.length ? `reason=${concise(toolReasons.join('; '), 160)}` : '',
-    step.findings?.length ? `findings=${concise(step.findings.join('; '), 160)}` : '',
-    step.status === 'failed' || step.status === 'blocked' ? `issue=${concise(step.actual, 180)}` : '',
-  ].filter(Boolean);
-  return `Step ${step.index} [${step.status}${toolNames ? `/${toolNames}` : ''}]: ${parts.join(' | ') || concise(step.action || step.actual)}`;
+function sanitizeHistoricalToolText(value: unknown, max = 180) {
+  if (typeof value !== 'string') return '';
+  return concise(
+    value
+      .replace(/\b(?:candidate|Candidate)\s*#?\s*\d+\b/g, 'current screenshot target')
+      .replace(/候选\s*\d+/g, '当前截图中的目标标识')
+      .replace(/\b(?:areaId|id|fromId|toId)\s*=\s*["']?[^,\s)]+/gi, '$1=[current]')
+      .replace(/\bS\d+\b/g, '当前截图中的滚动区域')
+      .replace(/\bbox=\d+,\d+,\d+x\d+/gi, '')
+      .replace(/\bat\s*\(\d+\s*,\s*\d+\)/gi, 'at the visible center')
+      .replace(/\b(deltaX|deltaY|x|y)\s*=\s*-?\d+(?:\.\d+)?/gi, '$1=[current]')
+      .replace(/\s+/g, ' ')
+      .trim(),
+    max,
+  );
 }
 
-function buildRunMemory(steps: StepExecutionResult[], previous?: RunMemory): RunMemory {
+function filterRegressiveMemoryItems(items: string[], memory: RuntimeWorkingMemory) {
+  void memory;
+  return items;
+}
+
+function summarizeStepToolCallForPrompt(toolCall: StepToolCall) {
+  const reason = sanitizeHistoricalToolText(toolCall.reason, 140);
+  const result = sanitizeHistoricalToolText(toolCall.result, 140);
+  return `${toolCall.name}${toolCall.ok === false ? ' failed' : ''}${reason ? `: ${reason}` : result ? `: ${result}` : ''}`;
+}
+
+function buildCompactRunContext(steps: StepExecutionResult[], activeMemory?: RuntimeWorkingMemory) {
   const usefulSteps = steps.filter(isUsefulHistoryStep);
-  const timeline = usefulSteps.map(stepTimelineItem).slice(-Number(process.env.RUN_MEMORY_TIMELINE_LIMIT || 10));
-  const findings = Array.from(new Set([
-    ...(previous?.findings || []),
-    ...steps.flatMap((step) => step.findings || []),
-  ].map((item) => concise(item, 220)).filter((item) => item && !isInfrastructureNoise(item)))).slice(-16);
-  const failedAttempts = Array.from(new Set([
-    ...(previous?.failedAttempts || []),
-    ...steps
-      .filter((step) => step.status === 'failed' || step.status === 'blocked')
-      .filter((step) => !isInfrastructureNoise(`${step.action}\n${step.actual}`))
-      .map((step) => `Step ${step.index}: ${concise(step.action, 90)} -> ${concise(step.actual, 160)}`),
-  ].filter((item) => !isInfrastructureNoise(item)))).slice(-6);
-  const durableItems = Array.from(new Set([
-    ...steps.flatMap((step) => step.memoryItems || []),
-    ...failedAttempts,
-  ].map((item) => concise(item, 220)).filter((item) => item && !isInfrastructureNoise(item)))).slice(-10);
-  const completed = steps.filter((step) => step.status === 'passed').length;
-  const failed = steps.filter((step) => step.status === 'failed').length;
-  const blocked = steps.filter((step) => step.status === 'blocked').length;
-  const latest = usefulSteps.slice(-5).map((step) => `S${step.index}:${concise(step.observation || step.note || step.action, 80)}`).join('; ');
-  const summary = [
-    `已执行 ${steps.length} 步：通过 ${completed}，失败 ${failed}，阻塞 ${blocked}。`,
-    latest ? `最近有效进展：${latest}` : '',
-    findings.length ? `重要发现：${findings.slice(-5).join('；')}` : '',
-    durableItems.length ? `后续记忆：${durableItems.slice(-5).join('；')}` : '',
-  ].filter(Boolean).join('\n').slice(0, Number(process.env.RUN_MEMORY_SUMMARY_MAX_CHARS || 1000));
-
-  return {
-    summary,
-    timeline,
-    findings,
-    failedAttempts,
-    updatedAt: new Date().toISOString(),
+  const latestStep = usefulSteps.at(-1);
+  const latestTool = latestStep?.tools?.at(-1);
+  const persistedWorkingMemory = steps.map((step) => step.workingMemory).filter(Boolean).at(-1);
+  const latestWorkingMemory = activeMemory || persistedWorkingMemory;
+  const latestNextGoal = sanitizeNextGoal(activeMemory?.nextStep || persistedWorkingMemory?.nextStep || steps.map((step) => step.workingMemory?.nextStep).filter(Boolean).at(-1));
+  const currentState = sanitizeCurrentState(latestWorkingMemory?.currentState || latestWorkingMemory?.pageUnderstanding || latestStep?.observation || latestStep?.note || '');
+  const nextObjective = latestNextGoal || '根据当前截图和ledgerDigest完成下一个未完成目标';
+  const lastAction = activeMemory?.lastAction
+    ? concise([activeMemory.lastAction, activeMemory.lastResult].filter(Boolean).join(' -> '), 180)
+    : latestTool
+    ? summarizeStepToolCallForPrompt(latestTool)
+    : latestStep ? `Step ${latestStep.index}: ${concise(latestStep.observation || latestStep.note || latestStep.action, 140)}` : '[none]';
+  const taskFrame = latestWorkingMemory?.taskFrame || collectTaskFrameFromSteps(steps);
+  const durableLedgerItems = mergeLedgerItems([], [
+    ...collectLedgerItemsFromSteps(steps),
+    ...(activeMemory?.ledgerItems || []),
+  ], ledgerMemoryLimit());
+  const runState = {
+    currentState: currentState || null,
+    nextObjective,
+    lastActionOrResult: lastAction,
+    taskFrame: taskFrame || null,
+    ledgerDigest: formatLedgerDigest(durableLedgerItems),
+    derivedSignals: {
+      completedSteps: steps.length,
+      ledgerItemCount: durableLedgerItems.length,
+    },
+    stateRule: 'Preserve currentState and ledgerDigest as authoritative compact memory. Do not discard or overwrite prior ledger conclusions unless current evidence truly contradicts them.',
   };
+
+  return [
+    'RunState JSON (authoritative compact state):',
+    JSON.stringify(runState, null, 2),
+  ].join('\n');
 }
 
-function formatRunMemory(steps: StepExecutionResult[]) {
-  const memory = buildRunMemory(steps);
-  const includeTimeline = process.env.AI_PROMPT_INCLUDE_FULL_TIMELINE === 'true';
-  return [
-    `Run memory:\n${memory.summary || '[none]'}`,
-    memory.findings.length ? `Findings:\n${memory.findings.slice(-8).map((item, index) => `${index + 1}. ${item}`).join('\n')}` : '',
-    memory.failedAttempts.length ? `Ineffective business attempts:\n${memory.failedAttempts.slice(-4).map((item, index) => `${index + 1}. ${item}`).join('\n')}` : '',
-    includeTimeline ? `Useful recent timeline:\n${memory.timeline.join('\n') || '[none]'}` : '',
-  ].filter(Boolean).join('\n\n');
+function formatLedgerDigest(items: TaskLedgerItem[], limit = Number(process.env.AI_LEDGER_DIGEST_LIMIT || 1000)) {
+  if (!items.length) return [];
+  return items.slice(-Math.max(1, limit)).map((item) => {
+    const step = item.sourceStep ? `S${item.sourceStep}` : 'S?';
+    const dimension = item.dimensionId || 'general';
+    const status = item.status || 'finding';
+    const severity = item.severity || 'info';
+    const summary = item.summary || item.actual || item.expected || item.evidence?.[0] || '';
+    return `[${step}/${dimension}/${status}/${severity}] ${concise([item.title, summary].filter(Boolean).join(': '), 180)}`;
+  });
 }
 
 function hostOf(url: string) {
@@ -617,31 +620,119 @@ function formatVisualInteractiveElements(candidates: unknown, limit = 80) {
   }).join('\n');
 }
 
-function defaultVisualAfterForTool(name: string): VisualAfterPolicy {
-  if (name === 'reportState' || name === 'selectReferenceScreenshots' || name === 'manageVisualContext' || name === 'listTabs' || name === 'waitForHumanVerification') {
-    return { capture: 'none', retention: 'auto' };
-  }
-  if (name === 'scrollArea') return { capture: 'viewport', retention: 'appendScrollSequence' };
-  if (name === 'openPage' || name === 'switchTab') return { capture: 'viewport', retention: 'clearAndReplace' };
-  if (name === 'hoverCandidate') return { capture: 'viewport', retention: 'keepBeforeAfter' };
-  return { capture: 'viewport', retention: 'replace' };
+function formatScrollableAreaSummary(areas: unknown, limit = 10) {
+  if (!Array.isArray(areas) || !areas.length) return '[no scrollable areas detected]';
+  return areas.slice(0, limit).map((item) => {
+    const area = item as Record<string, unknown>;
+    const scroll = area.scroll && typeof area.scroll === 'object' && !Array.isArray(area.scroll)
+      ? area.scroll as Record<string, unknown>
+      : {};
+    const label = [area.name, area.text, area.role, area.tag]
+      .map((value) => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : ''))
+      .find(Boolean);
+    const directions = [
+      scroll.canScrollUp ? 'up' : '',
+      scroll.canScrollDown ? 'down' : '',
+      scroll.canScrollLeft ? 'left' : '',
+      scroll.canScrollRight ? 'right' : '',
+    ].filter(Boolean).join('/');
+    const top = Number(scroll.top);
+    const height = Number(scroll.height);
+    const clientHeight = Number(scroll.clientHeight);
+    const maxTop = Number.isFinite(height) && Number.isFinite(clientHeight) ? Math.max(0, height - clientHeight) : undefined;
+    const progress = Number.isFinite(top) && maxTop !== undefined ? ` scroll=${Math.round(top)}/${Math.round(maxTop)}` : '';
+    return `${area.id || '?'}${directions ? ` ${directions}` : ''}${progress}${label ? ` "${String(label).slice(0, 60)}"` : ''}`;
+  }).join('\n');
 }
 
-function parseScreenshotRegion(value: unknown): ScreenshotRegion | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const x = Number(raw.x);
-  const y = Number(raw.y);
-  const width = Number(raw.width);
-  const height = Number(raw.height);
-  if (![x, y, width, height].every(Number.isFinite)) return undefined;
-  if (width <= 0 || height <= 0) return undefined;
+function defaultVisualAfterForTool(name: string): VisualAfterPolicy {
+  void name;
+  return { capture: 'auto', retention: 'replace' };
+}
+
+function sanitizeVisualAfterRetention(retention: unknown, fallback: VisualAfterPolicy['retention']) {
+  if (typeof retention !== 'string') return fallback;
+  if (retention === 'auto' || retention === 'replace' || retention === 'append') return retention;
+  return fallback;
+}
+
+function sanitizeNextGoal(value: unknown) {
+  if (typeof value !== 'string') return '';
+  return sanitizeHistoricalToolText(
+    value
+      .replace(/继续\s*(?:点击|双击|右键|拖拽|悬停|输入|按下|滚动|选择)/g, '继续完成')
+      .replace(/(?:点击|双击|右键|拖拽|悬停|输入|按下|滚动|选择)\s*[“"']?([^，。；;]*)[”"']?/g, '完成$1')
+      .replace(/候选(?:ID|id|编号)\s*[:：]?\s*\d+/gi, '当前截图中的对应候选')
+      .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的对应目标')
+      .replace(/\b(?:clickCandidate|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '根据当前截图选择合适工具'),
+    220,
+  );
+}
+
+function sanitizeCurrentState(value: unknown) {
+  if (typeof value !== 'string') return '';
+  return sanitizeHistoricalToolText(
+    value
+      .replace(/\b(?:clickCandidate|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '已执行页面操作')
+      .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的目标'),
+    260,
+  );
+}
+
+function hasConcreteTargetVisual(input: unknown) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
+  const reason = typeof raw.reason === 'string' ? raw.reason.trim() : '';
+  const combined = `${targetVisual} ${reason}`.trim();
+  if (targetVisual.length < 4) return false;
+  if (!/[A-Za-z\u4e00-\u9fff]/.test(targetVisual)) return false;
+  if (/^(?:候选|编号|id|ID|candidate|#|\d|\s|[:：-])+$/i.test(targetVisual)) return false;
+  if (/^(?:下一张|上一张|确定|确认|关闭|按钮|图标|图片|目标|控件)$/i.test(targetVisual)) return false;
+  if (!reason || /^(?:点击|选择|使用)?\s*(?:候选|编号|id|ID|candidate)?\s*\d+$/i.test(reason)) return false;
+  return /[A-Za-z\u4e00-\u9fff]/.test(combined);
+}
+
+function rejectWeakTargetVisual(name: string, input: unknown): BrowserActionResult | undefined {
+  if (hasConcreteTargetVisual(input)) return undefined;
   return {
-    x: Math.max(0, Math.floor(x)),
-    y: Math.max(0, Math.floor(y)),
-    width: Math.max(1, Math.floor(width)),
-    height: Math.max(1, Math.floor(height)),
+    ok: false,
+    actual: `${name} rejected before execution: targetVisual/reason must describe the visible target in the CURRENT screenshot, such as text/icon/position/role. Do not provide only a candidate id or a generic label.`,
   };
+}
+
+function candidateActionId(name: string, input: unknown) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+  if (name === 'dragCandidate') return `${raw.fromId || ''}->${raw.toId || ''}`;
+  return typeof raw.id === 'string' ? raw.id : '';
+}
+
+function rejectStaleRepeatedCandidateAction(name: string, input: unknown, traces: ToolTrace[]): BrowserActionResult | undefined {
+  const id = candidateActionId(name, input);
+  if (!id) return undefined;
+  const repeated = traces.some((trace) => trace.name === name && candidateActionId(name, trace.input) === id);
+  if (!repeated) return undefined;
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+  const reason = typeof raw.reason === 'string' ? raw.reason.trim() : '';
+  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
+  const hasReasonedRepeat = targetVisual.length >= 4 && reason.length >= 10;
+  if (hasReasonedRepeat) return undefined;
+  return {
+    ok: false,
+    actual: `${name} rejected before execution: candidate ${id} was already used in this agent loop. Repeating the same id is allowed, but targetVisual and reason must explain why the current screenshot still supports this same visible target.`,
+  };
+}
+
+function validateCandidateActionBeforeExecution(name: string, input: unknown, traces: ToolTrace[]) {
+  void traces;
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
+  if (!targetVisual) {
+    return {
+      ok: false,
+      actual: `${name} rejected before execution: targetVisual is required for candidate actions so the chosen id is tied to visible evidence from the current screenshot.`,
+    };
+  }
+  return undefined;
 }
 
 function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
@@ -650,31 +741,64 @@ function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
   const raw = (input as Record<string, unknown>).visualAfter;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fallback;
   const visualAfter = raw as Record<string, unknown>;
-  const region = parseScreenshotRegion(visualAfter.region);
+  const capture = typeof visualAfter.capture === 'string' && ['auto', 'viewport', 'fullPage'].includes(visualAfter.capture)
+    ? visualAfter.capture as VisualAfterPolicy['capture']
+    : fallback.capture;
   return {
-    capture: typeof visualAfter.capture === 'string' ? visualAfter.capture as VisualAfterPolicy['capture'] : fallback.capture,
-    retention: typeof visualAfter.retention === 'string' ? visualAfter.retention as VisualAfterPolicy['retention'] : fallback.retention,
+    capture,
+    retention: sanitizeVisualAfterRetention(visualAfter.retention, fallback.retention),
     reason: typeof visualAfter.reason === 'string' ? visualAfter.reason : undefined,
-    region,
   };
 }
 
-function screenshotOptionsFromVisualAfter(visualAfter: VisualAfterPolicy): { capture: ScreenshotCaptureMode; region?: ScreenshotRegion } {
+function shouldCaptureVisualAfter(name: string, visualAfter: VisualAfterPolicy) {
+  if (visualAfter.capture === 'viewport' || visualAfter.capture === 'fullPage') return true;
+  return !['reportState', 'selectReferenceScreenshots', 'manageVisualContext', 'listTabs', 'getInteractiveCandidates', 'getDomTree', 'waitForHumanVerification'].includes(name);
+}
+
+function screenshotOptionsFromVisualAfter(visualAfter: VisualAfterPolicy): { capture: ScreenshotCaptureMode } {
   if (visualAfter.capture === 'fullPage') return { capture: 'fullPage' };
-  if (visualAfter.capture === 'region' && visualAfter.region) return { capture: 'region', region: visualAfter.region };
   return { capture: 'viewport' };
 }
 
-function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolTrace) {
+function summarizeTraceForMemory(trace: ToolTrace) {
+  const input = trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input)
+    ? trace.input as Record<string, unknown>
+    : {};
+  const { reason } = splitToolInputAndReason(input);
+  const semanticAction = [
+    typeof input.action === 'string' ? input.action : '',
+    reason || '',
+    typeof input.targetVisual === 'string' ? input.targetVisual : '',
+    typeof input.expected === 'string' ? input.expected : '',
+  ].map((item) => item.trim()).find((item): item is string => Boolean(item));
+  const result = trace.result.ok
+    ? sanitizeHistoricalToolText(trace.result.actual, 160)
+    : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
+  return [
+    `上一动作：${trace.name}${semanticAction ? ` - ${sanitizeHistoricalToolText(semanticAction, 180)}` : ''}`,
+    `结果：${result}`,
+  ].join('；');
+}
+
+function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolTrace, sourceStep?: number) {
   const input = trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input)
     ? trace.input as Record<string, unknown>
     : {};
   const next: RuntimeWorkingMemory = { ...memory };
-  const observation = typeof input.observation === 'string' ? input.observation.trim() : '';
-  const findings = typeof input.findings === 'string' ? parseListLike(input.findings) : [];
-  const remembered = typeof input.memory === 'string' ? parseListLike(input.memory) : [];
-  next.lastAction = `${trace.name}${summarizeToolInput(input)}`;
+  const currentState = sanitizeCurrentState(input.currentState);
+  const observation = typeof input.observation === 'string' ? sanitizeHistoricalToolText(input.observation.trim(), 800) : '';
+  const findings = typeof input.findings === 'string' ? parseListLike(input.findings).map((item) => sanitizeHistoricalToolText(item, 260)) : [];
+  const remembered = filterRegressiveMemoryItems(typeof input.memory === 'string' ? parseListLike(input.memory).map((item) => sanitizeHistoricalToolText(item, 260)) : [], memory);
+  const nextGoal = sanitizeNextGoal(input.nextGoal);
+  const evidence = (trace.screenshots || []).map((shot) => shot.path).filter(Boolean);
+  const taskFrame = normalizeTaskFrame(input.taskFrameJson, memory.taskFrame, memory.taskGoal);
+  const ledgerItems = parseLedgerItems(input.ledgerItemsJson, sourceStep, evidence);
+  next.lastAction = summarizeTraceForMemory(trace);
   next.lastResult = concise(trace.result.actual, 240);
+  if (currentState) next.currentState = currentState;
+  if (taskFrame) next.taskFrame = taskFrame;
+  next.ledgerItems = mergeLedgerItems(memory.ledgerItems || [], ledgerItems, ledgerMemoryLimit());
   if (observation && !/^none$|^无$/i.test(observation)) next.pageUnderstanding = concise(observation, 400);
   next.findings = Array.from(new Set([...next.findings, ...findings])).slice(-12);
   next.completed = Array.from(new Set([...next.completed, ...remembered])).slice(-12);
@@ -687,23 +811,18 @@ function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolT
   } else {
     next.phase = '正在执行网页操作并等待页面反馈';
   }
-  next.nextStep = trace.name === 'reportState' ? '根据报告状态决定是否结束' : '基于最新 current 截图继续判断下一步';
+  next.nextStep = nextGoal || (trace.name === 'reportState' ? '根据报告状态决定是否结束' : '根据当前截图继续完成上一个未完成目标');
   return next;
 }
 
 function formatWorkingMemory(memory: RuntimeWorkingMemory) {
+  const blockers = memory.blockers.slice(-2).map((item) => concise(item, 120));
+  const constraints = memory.userConstraints.slice(-2).map((item) => concise(item, 120));
   return [
-    `任务目标：${memory.taskGoal}`,
-    `当前阶段：${memory.phase || '尚未开始'}`,
-    `已完成：${memory.completed.length ? memory.completed.join('；') : '暂无'}`,
-    `重要发现：${memory.findings.length ? memory.findings.join('；') : '暂无'}`,
-    `阻塞点：${memory.blockers.length ? memory.blockers.join('；') : '暂无'}`,
-    `最近动作：${memory.lastAction || '暂无'}`,
-    `最近结果：${memory.lastResult || '暂无'}`,
-    `当前页面理解：${memory.pageUnderstanding || '暂无'}`,
-    `滚动阅读摘要：${memory.scrollSummary || '暂无'}`,
-    `用户限制条件：${memory.userConstraints.length ? memory.userConstraints.join('；') : '暂无'}`,
-    `下一步建议：${memory.nextStep || '暂无'}`,
+    'Loop Memory (non-authoritative; durable facts are in RunState.ledgerDigest):',
+    `- Last action/result: ${concise([memory.lastAction, memory.lastResult].filter(Boolean).join(' -> '), 220) || 'none'}`,
+    blockers.length ? `- Recent blockers: ${blockers.join('; ')}` : '',
+    constraints.length ? `- User constraints: ${constraints.join('; ')}` : '',
   ].join('\n');
 }
 
@@ -722,25 +841,10 @@ class VisualContextManager {
   }
 
   apply(frame: Omit<VisualFrameRecord, 'id' | 'role' | 'createdAt'>, policy: VisualAfterPolicy) {
-    const retention = policy.retention || 'auto';
-    if (retention === 'clearAndReplace') {
-      const record = this.createFrame(frame, 'current');
-      this.frames = [record];
-      this.currentId = record.id;
-      return record;
-    }
-    if (retention === 'pinEvidence') {
-      const record = this.createFrame(frame, 'pinned');
-      this.frames.push(record);
-      this.trim();
-      return record;
-    }
-    if (retention === 'append' || retention === 'appendScrollSequence' || retention === 'keepBeforeAfter') {
+    const retention = policy.retention === 'append' ? 'append' : 'replace';
+    if (retention === 'append') {
       this.demoteCurrent();
-      const record = this.createFrame({
-        ...frame,
-        group: retention === 'appendScrollSequence' ? frame.group || 'scroll-sequence' : frame.group,
-      }, 'current');
+      const record = this.createFrame(frame, 'current');
       this.frames.push(record);
       this.currentId = record.id;
       this.trim();
@@ -801,10 +905,9 @@ class VisualContextManager {
   renderText() {
     const current = this.current();
     const history = this.frames.filter((frame) => frame.id !== this.currentId);
-    const frameSummary = (frame: VisualFrameRecord) => {
-      const region = frame.region ? ` region=${JSON.stringify(frame.region)}` : '';
-      return `${frame.id} ${frame.reason} path=${frame.path}${frame.markerPath ? ` marker=${frame.markerPath}` : ''}${frame.capture ? ` capture=${frame.capture}` : ''}${region}`;
-    };
+    const frameSummary = (frame: VisualFrameRecord) => (
+      `${frame.id} ${concise(frame.reason, 80)} image=${basenameOfPath(frame.path)}${frame.markerPath ? ` marker=${basenameOfPath(frame.markerPath)}` : ''}${frame.capture ? ` capture=${frame.capture}` : ''}`
+    );
     return [
       'Visual Context Manager:',
       `current: ${current ? frameSummary(current) : '[none]'}`,
@@ -815,12 +918,13 @@ class VisualContextManager {
     ].join('\n');
   }
 
-  imagePaths() {
+  imagePaths(historyLimit = Number(process.env.AI_VISUAL_ATTACHED_HISTORY_LIMIT || 0)) {
     const paths: string[] = [];
     const current = this.current();
     if (current) paths.push(current.path);
     if (current?.markerPath) paths.push(current.markerPath);
-    for (const frame of this.frames.filter((item) => item.id !== this.currentId)) {
+    const history = this.frames.filter((item) => item.id !== this.currentId).slice(-Math.max(0, historyLimit));
+    for (const frame of history) {
       paths.push(frame.path);
       if (frame.markerPath) paths.push(frame.markerPath);
     }
@@ -878,22 +982,21 @@ function makeBrowserTools(
   // keeps every browser action paired with a fresh screenshot on the next step and prevents the
   // duplicate-operation problem seen when a request was retried mid-chain.
   let toolExecutedThisRequest = false;
-  const toolReasonInput = z.string().min(1).max(300).describe('Required: concise Chinese reason for this exact tool call. Name the visible target and the observable page change expected; do not merely repeat a candidate ID.');
+  const semanticFieldRule = 'Do not include candidate ids, area ids, coordinates, delta values, screenshot ids/file names, marker numbers as business meaning, old tool params, or tool input JSON in this semantic field.';
+  const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${semanticFieldRule}`);
   const toolContextShape = {
     reason: toolReasonInput,
-    observation: z.string().min(1).max(800).describe('Required Chinese observation of the current page/task state. Include visible errors, requirement content, business state, or "无明显新增观察".'),
-    findings: z.string().min(1).max(1000).describe('Required Chinese findings from this step. Include product errors, requirements, rules, risks, or summaries. Use "无" if none. Separate multiple items with semicolons.'),
-    memory: z.string().min(1).max(1000).describe('Required Chinese memory for later steps. Include facts that may affect future actions. Use "无" if none. Separate multiple items with semicolons.'),
+    currentState: z.string().min(1).max(500).describe(`Required Chinese compact current state after reading the CURRENT screenshot and RunState: page/dialog/mode/progress/error/recovery status. This is authoritative state for the next request. ${semanticFieldRule}`),
+    observation: z.string().min(1).max(2200).describe(`Required Chinese observation of the current page/task state. Be concrete and include visible requirement content, business rules, UI state, errors, or "无明显新增观察". ${semanticFieldRule}`),
+    findings: z.string().min(1).max(3000).describe(`Required Chinese findings from this step. For requirement-analysis tasks, include detailed business rules, key points, precise test targets, operation flows, risks, and questions. Use "无" only when truly nothing durable was learned. Separate multiple items with semicolons. ${semanticFieldRule}`),
+    memory: z.string().min(1).max(2500).describe(`Required Chinese memory for later steps. Include durable business facts/progress only; preserve concrete requirement facts and test ideas. Use "无" if none. Separate multiple items with semicolons. ${semanticFieldRule}`),
+    nextGoal: z.string().min(1).max(600).describe(`Required Chinese objective for the NEXT AI request. Describe only the next unfinished target/state, not the concrete operation method, tool name, candidate id, area id, button id, coordinates, or scroll delta. Example: "继续处理尚未覆盖的业务规则并保持已记录结论". ${semanticFieldRule}`),
+    taskFrameJson: z.string().min(1).max(9000).describe('Required JSON string. If no TaskFrame exists yet, create one with goal, successCriteria, deliverables, analysisGuidance, finalOutputRequirements, and task-specific dynamic dimensions for THIS user task. Dimensions must be content/coverage axes, not execution progress/status buckets such as login status, reading progress, or test-case generation status. If unchanged, repeat the current TaskFrame JSON.'),
+    ledgerItemsJson: z.string().min(1).max(10000).describe('Required JSON array string of NEW structured ledger items from this step. Use [] only when nothing durable was found. Each item has dimensionId,title,status,severity,expected,actual,summary,confidence,attributes. For requirement-analysis tasks, ledger items should capture business rules, interface behavior, test flow steps, assertions, risks, and open questions in detail.'),
     visualAfter: z.object({
-      capture: z.enum(['auto', 'viewport', 'fullPage', 'region', 'none']).optional().describe('How to capture visual context after this tool. Use viewport/auto for most browser-changing actions; none for report-only tools.'),
-      retention: z.enum(['auto', 'replace', 'append', 'appendScrollSequence', 'keepBeforeAfter', 'clearAndReplace', 'pinEvidence']).optional().describe('How Visual Context Manager should retain the after screenshot.'),
-      reason: z.string().optional().describe('Short Chinese reason for the visual retention decision.'),
-      region: z.object({
-        x: z.number().describe('Viewport x coordinate in CSS pixels. Required when capture=region; negative values will be clamped by the browser runner.'),
-        y: z.number().describe('Viewport y coordinate in CSS pixels. Required when capture=region; negative values will be clamped by the browser runner.'),
-        width: z.number().describe('Region width in CSS pixels. Required when capture=region; non-positive values fall back to viewport capture.'),
-        height: z.number().describe('Region height in CSS pixels. Required when capture=region; non-positive values fall back to viewport capture.'),
-      }).optional().describe('Optional viewport clip rectangle for capture=region. Coordinates must come from the current screenshot.'),
+      capture: z.enum(['auto', 'viewport', 'fullPage']).optional().describe('Use auto normally. Use viewport/fullPage only when the next model request truly needs that screenshot size.'),
+      retention: z.enum(['auto', 'replace', 'append']).optional().describe('Use replace by default. Use append only when the next decision must compare with, continue from, or analyze together with the previous screenshot.'),
+      reason: z.string().optional().describe(`Short Chinese reason for append/capture choice. ${semanticFieldRule}`),
     }).optional(),
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
@@ -908,27 +1011,46 @@ function makeBrowserTools(
       } satisfies BrowserActionResult;
     }
     toolExecutedThisRequest = true;
-    const result = await action();
-    const visualAfter = visualAfterFromInput(name, input);
+    const beforeFrame = referenceOptions?.visualContext?.current();
     const screenshots: ToolTrace['screenshots'] = [];
-    if (result.ok && visualAfter.capture !== 'none' && referenceOptions?.runId && referenceOptions.stepIndex && referenceOptions.visualContext) {
-      await session.waitForPage().catch(() => undefined);
-      const visualIndex = traces.filter((trace) => trace.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
-      const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
-      const screenshotPath = await session.takeScreenshot(referenceOptions.runId, referenceOptions.stepIndex, `visual-${visualIndex}`, screenshotOptions);
-      const markerPath = session.getLastCandidateMarkerScreenshotPath();
-      const frame = referenceOptions.visualContext.apply({
-        path: screenshotPath,
-        markerPath,
-        stepIndex: referenceOptions.stepIndex,
-        toolName: name,
-        capture: screenshotOptions.capture,
-        region: screenshotOptions.region,
-        reason: visualAfter.reason || `${name} after screenshot`,
-      }, visualAfter);
-      screenshots.push({ title: `${name} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
-      if (markerPath) screenshots.push({ title: `${name} marker map`, path: markerPath, kind: 'marker' });
-      await referenceOptions.onVisualContextChange?.(referenceOptions.visualContext.snapshot());
+    const visualAfter = visualAfterFromInput(name, input);
+    if (beforeFrame?.path) {
+      screenshots.push({ title: `${name} before`, path: beforeFrame.path, kind: 'history' });
+      if (beforeFrame.markerPath) screenshots.push({ title: `${name} before marker map`, path: beforeFrame.markerPath, kind: 'marker' });
+    }
+    let result: BrowserActionResult;
+    try {
+      result = await action();
+    } catch (error) {
+      result = {
+        ok: false,
+        actual: `Tool ${name} threw after execution started: ${infrastructureError(error)}`,
+      };
+    }
+    if (result.ok && shouldCaptureVisualAfter(name, visualAfter) && referenceOptions?.runId && referenceOptions.stepIndex && referenceOptions.visualContext) {
+      try {
+        await session.waitForPage().catch(() => undefined);
+        const visualIndex = traces.filter((trace) => trace.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
+        const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
+        const screenshotPath = await session.takeScreenshot(referenceOptions.runId, referenceOptions.stepIndex, `visual-${visualIndex}`, screenshotOptions);
+        const markerPath = session.getLastCandidateMarkerScreenshotPath();
+        const frame = referenceOptions.visualContext.apply({
+          path: screenshotPath,
+          markerPath,
+          stepIndex: referenceOptions.stepIndex,
+          toolName: name,
+          capture: screenshotOptions.capture,
+          reason: visualAfter.reason || `${name} after screenshot`,
+        }, visualAfter);
+        screenshots.push({ title: `${name} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
+        if (markerPath) screenshots.push({ title: `${name} marker map`, path: markerPath, kind: 'marker' });
+        await referenceOptions.onVisualContextChange?.(referenceOptions.visualContext.snapshot());
+      } catch (error) {
+        result = {
+          ...result,
+          actual: `${result.actual} Visual-after screenshot failed, so the action is kept and will not be retried: ${infrastructureError(error)}`,
+        };
+      }
     } else if (!result.ok && referenceOptions?.visualContext) {
       const current = referenceOptions.visualContext.current();
       if (current?.path) {
@@ -938,7 +1060,11 @@ function makeBrowserTools(
     }
     const trace = { name, input, result, visualAfter, screenshots };
     traces.push(trace);
-    await onToolTrace?.(trace);
+    try {
+      await onToolTrace?.(trace);
+    } catch {
+      // Progress persistence failures must not make a browser action look unexecuted.
+    }
     return result;
   }
 
@@ -951,10 +1077,10 @@ function makeBrowserTools(
       execute: (input) => record('openPage', input, () => session.open(input.url || targetUrl)),
     }),
     scrollArea: tool({
-      description: 'Scroll a visible scrollable area by its area id from current scrollableAreas, such as S1 for page viewport or S2 for a table/list/panel/modal.',
+      description: 'Scroll a visible scrollable area by its green S label in the CURRENT screenshot. One call should scroll about one visible viewport/container height only. Green dashed boxes/green labels mark scrollable regions. S ids are volatile per screenshot/turn; never reuse remembered or historical S ids.',
       inputSchema: browserToolInput({
-        areaId: z.string().describe('Scrollable area id from current scrollableAreas, such as S1, S2, or S3.'),
-        deltaY: z.number().describe('Vertical scroll delta. Positive scrolls down, negative scrolls up.'),
+        areaId: z.string().describe('Scrollable area id copied from a green S label visible in the CURRENT screenshot, such as S1 or S2. Do not invent or reuse an old S id.'),
+        deltaY: z.number().describe('Vertical scroll delta. Positive scrolls down, negative scrolls up. Use roughly one viewport/container height per call; do not request multiple screens of scrolling in one tool call.'),
         deltaX: z.number().optional().describe('Horizontal scroll delta. Positive scrolls right, negative scrolls left.'),
       }),
       execute: (input) => record('scrollArea', input, () => session.scrollArea(input.areaId, input.deltaY, input.deltaX || 0)),
@@ -963,16 +1089,18 @@ function makeBrowserTools(
       description: 'Click a visible candidate by its numbered label from the current step screenshot snapshot. Choose the smallest/tightest candidate that directly encloses the intended visible text, icon, or control; avoid larger containing wrapper boxes. A successful tool result only confirms the click was delivered, not that the UI changed. The same visible target may be attempted at most twice because the first click can dismiss an overlay while the second activates the target. If text is provided, type it immediately after the click.',
       inputSchema: browserToolInput({
         id: z.string().describe('Candidate id such as 1 or 12. Must come from the current visual labels or interactive candidate list. Never choose a larger overlapping wrapper when a tighter candidate represents the same visible target.'),
+        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
         text: z.string().optional().describe('Optional text to type immediately after clicking, useful when the click focuses an input or editable control.'),
       }),
-      execute: (input) => record('clickCandidate', input, () => session.clickCandidate(input.id, input.text)),
+      execute: (input) => record('clickCandidate', input, async () => validateCandidateActionBeforeExecution('clickCandidate', input, traces) || session.clickCandidate(input.id, input.text)),
     }),
     hoverCandidate: tool({
       description: 'Move the mouse over a visible candidate by its numbered label. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
       inputSchema: browserToolInput({
         id: z.string().describe('Candidate id such as 1 or 12. Must come from the current visual labels or interactive candidate list.'),
+        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
       }),
-      execute: (input) => record('hoverCandidate', input, () => session.hoverCandidate(input.id)),
+      execute: (input) => record('hoverCandidate', input, async () => validateCandidateActionBeforeExecution('hoverCandidate', input, traces) || session.hoverCandidate(input.id)),
     }),
     typeText: tool({
       description: 'Type text into the currently focused element. Prefer clickCandidate(id,text) for numbered inputs; use this only after a fallback click already focused the field.',
@@ -1100,23 +1228,26 @@ function makeBrowserTools(
       description: 'Visual mode: double-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
       inputSchema: browserToolInput({
         id: z.string().describe('Candidate id such as 1 or 12. Must come from the current screenshot labels or interactive candidate list.'),
+        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
       }),
-      execute: (input) => record('doubleClickCandidate', input, () => session.doubleClickCandidate(input.id)),
+      execute: (input) => record('doubleClickCandidate', input, async () => validateCandidateActionBeforeExecution('doubleClickCandidate', input, traces) || session.doubleClickCandidate(input.id)),
     }),
     rightClickCandidate: tool({
       description: 'Visual mode: right-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
       inputSchema: browserToolInput({
         id: z.string().describe('Candidate id such as 1 or 12. Must come from the current screenshot labels or interactive candidate list.'),
+        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
       }),
-      execute: (input) => record('rightClickCandidate', input, () => session.rightClickCandidate(input.id)),
+      execute: (input) => record('rightClickCandidate', input, async () => validateCandidateActionBeforeExecution('rightClickCandidate', input, traces) || session.rightClickCandidate(input.id)),
     }),
     dragCandidate: tool({
       description: 'Visual mode: drag from one numbered candidate center to another numbered candidate center.',
       inputSchema: browserToolInput({
         fromId: z.string().describe('Start candidate id such as 1.'),
         toId: z.string().describe('End candidate id such as 2.'),
+        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
       }),
-      execute: (input) => record('dragCandidate', input, () => session.dragCandidate(input.fromId, input.toId)),
+      execute: (input) => record('dragCandidate', input, async () => validateCandidateActionBeforeExecution('dragCandidate', input, traces) || session.dragCandidate(input.fromId, input.toId)),
     }),
   };
 
@@ -1211,6 +1342,7 @@ function runtimePrompt(input: {
   testCase: TestCaseRecord;
   pageContext: Awaited<ReturnType<BrowserSession['getPageContext']>>;
   completedSteps: StepExecutionResult[];
+  workingMemory?: RuntimeWorkingMemory;
   stepIndex: number;
   beforeScreenshotPath: string;
   hasMarkerScreenshot?: boolean;
@@ -1229,20 +1361,13 @@ function runtimePrompt(input: {
   const separateMarkerScreenshot = Boolean(markerEnabled && input.hasMarkerScreenshot);
   const caseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
-  const recentNotes = recentProgressNotes(completedSteps, 3);
-  const recentScrollContinuity = recentScrollContinuityContext(completedSteps, 4);
-  const runMemoryContext = formatRunMemory(completedSteps);
+  const compactRunContext = buildCompactRunContext(completedSteps, input.workingMemory);
   const availableScreenshotReferences = input.availableScreenshotReferences || [];
   const selectedScreenshotReferences = input.selectedScreenshotReferences || [];
   const strategyMemory = (testCase.strategyMemory || [])
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const recentFailures = completedSteps
-    .filter((step) => step.status === 'failed' || step.status === 'blocked')
-    .filter((step) => !isInfrastructureNoise(`${step.action}\n${step.actual}`))
-    .slice(-2)
-    .map((step) => `Step ${step.index}: ${concise(step.action, 90)} -> ${concise(step.actual, 160)}`);
   const domTree = visualMode ? '[disabled because visual mode is enabled]' : trimDebugText(pageContext.domTree || '[empty DOM tree]', 12000);
   const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
   const candidateContext = visualMode
@@ -1260,15 +1385,16 @@ function runtimePrompt(input: {
         : 'the attached clean viewport screenshot'
     : 'Interactive candidates JSON, DOM tree, URL, tabs, and focused element';
   const markerSourceRule = separateMarkerScreenshot
-    ? '- Image 1 is the source of truth for what the page means. Image 2 only maps visible regions to candidate IDs.'
+    ? '- Image 1 is the source of truth for what the page means. Image 2 only maps visible click/scroll positions to candidate IDs.'
     : markerOverlayInScreenshot
-      ? '- The attached screenshot is the source of truth and already contains marker labels overlaid on visible candidate regions.'
+      ? '- The attached screenshot is the source of truth and contains marker labels overlaid only as click/scroll position IDs.'
       : '- The attached screenshot is the source of truth for what the page means.';
   const markerTargetRules = mode === 'visual-markers' && attachScreenshot && markerEnabled
     ? [
         '',
         'Visual target selection and no-progress recovery:',
         markerSourceRule,
+        '- Marker numbers/labels are NOT page content, image/page numbers, item order, progress, status, priority, or business meaning; they only identify where a tool can click/hover/drag/scroll.',
         '- A tool result with ok=true only confirms that the browser received the action. It does NOT prove the target was correct or that the page changed.',
         '- Candidate ids in attached reference screenshots are historical only. For the next action, use only ids that are visible in the current screenshot/marker map.',
         '- For overlapping boxes, choose the smallest/tightest box that directly encloses the intended visible text/icon/control.',
@@ -1277,34 +1403,37 @@ function runtimePrompt(input: {
       ]
     : [];
   const modeActionRules = [
-    '- Candidate IDs belong only to the CURRENT step screenshot snapshot. In visual-markers mode, every click/hover/drag id must be re-read from the current screenshot evidence; never carry over an id from a previous screenshot even if the visible control looks similar.',
+    '- Candidate IDs are volatile and valid only for the CURRENT screenshot. Re-read the visible target first, then use its current number.',
     '- For text entry on a numbered candidate, use clickCandidate(id,text) in one tool call. Use typeText only after a fallback click already focused the field.',
     '- For hover-only menus, call hoverCandidate on the visible trigger, then act on the revealed target in the next step.',
-    '- When the current screenshot/scrollableAreas show a scrollbar and the next needed content or control may be outside the visible area, consider scrollArea(areaId) instead of assuming the content is absent.',
-    '- Green dashed S-labels mark scrollable regions. If a target likely belongs inside a table, list, panel, modal, or page viewport with more content, choose the relevant S area from current scrollableAreas.',
-    '- Previous screenshots are not visible unless they are attached as selected references. Use current screenshot ids for actions; use selected references, Recent scroll continuity, pageScrollState, and scrollableAreas only as background context.',
+    '- If needed content may be outside the visible area, use scrollArea with the green S label shown on the current screenshot.',
+    '- For scrollArea, one tool call scrolls one visible viewport/container height. If more content remains, wait for the next screenshot and scroll again.',
+    '- Green dashed boxes/green S labels mark scrollable regions. Use only a green S id visible in the CURRENT screenshot; never reuse historical S ids.',
+    '- Previous screenshots/references are context only; never use their candidate ids.',
+    '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous screenshot.',
   ];
 
   return [
-    'You are an AI browser testing agent. You MUST call exactly ONE tool on every AI request. Use reportState when no browser action is needed.',
+    'You are an AI browser testing agent. Call exactly ONE tool. Use reportState only when no browser action is needed.',
     `Requirement: ${requirement}`,
     `Target URL: ${testCase.targetUrl}`,
     `Target host: ${targetHost}`,
     `Current URL: ${pageContext.url}`,
     '',
     'Hard rules:',
-    '- Call exactly ONE tool. Extra tool calls are ignored. Never respond with only text or only JSON.',
-    '- All user-facing tool fields must be Chinese.',
-    '- You are both a test executor and a continuous AI browser assistant; every tool call must include reason, observation, findings, and memory.',
-    '- Record visible product errors, requirements, business rules, warnings, state changes, and constraints in findings or memory even when the flow can continue.',
+    '- One tool only; all user-facing fields in Chinese.',
+    '- Treat RunState JSON as authoritative compact memory. Preserve currentState and do not downgrade completed state because the current screen shows a recovery/earlier state.',
+    '- Historical actions in RunState/Working Memory are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
+    '- In semantic fields (reason/currentState/observation/findings/memory/nextGoal/ledger text), do not output candidate ids, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
+    '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
+    '- Keep currentState as the compact state after reading current screenshot; nextGoal is the next target state, not the operation method.',
+    '- Maintain a generic TaskFrame. Dimensions must be task-specific content/coverage axes from THIS user goal, not fixed buckets and not agent progress/status such as login status, reading progress, or test-case generation status.',
+    '- If the user asks for detailed requirement analysis or test cases, ledgerItemsJson must record concrete business rules, test points, operation flows, assertions, edge cases, and risks discovered in the current screenshot. Do not write vague status-only items.',
+    '- Every step should append durable ledgerItemsJson entries against the TaskFrame axes unless the current screenshot truly adds no durable information.',
+    '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.',
     `- Use ${evidence} as the current page state.`,
-    '- Use recent notes/tools as attempt memory. The same visible target and action may be tried at most twice; after two ineffective attempts, do not repeat it again.',
-    '- Failure self-healing: when the previous action did not visibly change the page, do not repeat the same visible target again. Re-observe the page and choose a different selector, a tighter child candidate, keyboard input, scrolling, hover, tab switching, or a different navigation path.',
-    '- Do not mark the run failed just because one action failed. First try a reasonable corrective path unless the page is unreachable, the requirement is impossible, or manual verification is required.',
-    '- If a historical strategy hint conflicts with the current screenshot, trust the current screenshot and explain the updated choice in reason.',
-    '- If a white mouse-pointer marker is visible in the screenshot, it indicates the last browser action location only. Do not treat it as a page control, candidate marker, tooltip, cursor state, or evidence that the target remains selected.',
-    '- If recent progress notes contain "[完成校验未通过]", do not finish again immediately. Re-observe the new screenshot; a previously attempted visual target may be tried only if it has fewer than two attempts and the screenshot shows a plausible overlay-dismissal or state-change reason. Otherwise perform a different corrective action.',
-    '- If page is loading/transitioning, call waitForPage once.',
+    '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
+    '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
     '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
@@ -1312,9 +1441,9 @@ function runtimePrompt(input: {
     '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only recording observations.',
     attachScreenshot
       ? separateMarkerScreenshot
-        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map containing numbered candidate outlines. Understand the page from image 1, then choose a candidate ID from image 2. getInteractiveCandidates/getDomTree are unavailable.'
+        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomTree are unavailable.'
         : markerOverlayInScreenshot
-          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. Marker numbers may appear as white text with a dark shadow and no filled background. Choose a numbered candidate id from the screenshot. getInteractiveCandidates/getDomTree are unavailable.'
+          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. White labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomTree are unavailable.'
         : markerEnabled
           ? '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. getInteractiveCandidates/getDomTree are unavailable.'
           : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomTree are unavailable.'
@@ -1329,17 +1458,16 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     ...buildCompletionPromptLines(attachScreenshot),
     '',
     'Response:',
-    '- Always call exactly ONE tool.',
-    '- To act: call exactly ONE browser tool and include reason/observation/findings/memory grounded in current context.',
-    '- For clickCandidate/hoverCandidate, reason must name the visible control, explain why this is the most specific current candidate, and state the expected observable page change.',
-    '- Tool arguments must carry assistant state: reason, observation, findings, memory. Use "无" for empty findings/memory.',
+    '- Call one tool and keep state fields grounded in RunState plus current screenshot.',
+    '- Include taskFrameJson and ledgerItemsJson in tool params. Use ledgerItemsJson=[] when this step adds no durable item.',
+    '- Candidate action reason must mention the current-screenshot visual feature, not just an id.',
+    '- nextGoal is target state only, e.g. "继续分析未完成的新内容", not "点击按钮".',
     '- To finish/block/fail or only record an observation, call reportState. Do not return standalone JSON.',
-    '- To inspect earlier scroll positions on the NEXT request, call selectReferenceScreenshots with ids from Available previous screenshot references. Its result is text only; selected images are attached on the next AI request.',
     '',
     'Current context:',
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
     `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
-    `Scrollable areas JSON: ${JSON.stringify(pageContext.scrollableAreas)}`,
+    `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
     visualMode ? '' : `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
     visualMarkersWithoutOverlay ? `Visible interactive elements:
 ${candidateContext}` : '',
@@ -1347,20 +1475,14 @@ ${candidateContext}` : '',
 ${candidateContext}`,
     visualMode ? '' : `Simplified DOM tree:
 ${domTree}`,
-    `Recent progress notes (last 3, oldest first):
-${recentNotes.join('\n') || '[none]'}`,
-    recentFailures.length ? `Recent business failed/blocked steps:
-${recentFailures.join('\n')}` : '',
-    `Recent scroll continuity:
-${recentScrollContinuity.join('\n') || '[none]'}`,
-    `Available previous screenshot references (text index only; not images unless selected):
-${formatScreenshotReferences(availableScreenshotReferences)}`,
-    `Selected reference screenshots attached after the current screenshot images:
-${formatScreenshotReferences(selectedScreenshotReferences)}`,
+    compactRunContext,
+    availableScreenshotReferences.length ? `Available previous screenshot references:
+${formatScreenshotReferences(availableScreenshotReferences)}` : '',
+    selectedScreenshotReferences.length ? `Selected reference screenshots:
+${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
     selectedScreenshotReferences.length
       ? 'Reference screenshot rule: selected reference images help connect scroll continuity or compare earlier page state. They may show the same interface at different scroll offsets when sameInterfaceGroup matches, but their candidate ids are historical and must never be used for the current action.'
       : '',
-    runMemoryContext,
     attachScreenshot
       ? mode === 'visual-markers' && separateMarkerScreenshot
         ? `Screenshot images are attached in this order: Image 1 current clean viewport, Image 2 current marker map${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
@@ -1373,7 +1495,7 @@ ${formatScreenshotReferences(selectedScreenshotReferences)}`,
 function summarizeToolInput(input: unknown) {
   if (input && typeof input === 'object') {
     const entries = Object.entries(input as Record<string, unknown>)
-      .filter(([key, value]) => key !== 'reason' && value !== undefined && value !== null && value !== '')
+      .filter(([key, value]) => !['reason', 'taskFrameJson', 'ledgerItemsJson', 'visualAfter'].includes(key) && value !== undefined && value !== null && value !== '')
       .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
     return entries.length ? ` (${entries.join(', ')})` : '';
   }
@@ -1474,27 +1596,190 @@ function parseListLike(text?: string) {
     .slice(0, 8);
 }
 
-function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[]): Pick<RuntimeDecision, 'observation' | 'findings' | 'memoryItems'> {
+function parseJsonPayload(value: unknown) {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== 'string') return value;
+  const text = value.trim();
+  if (!text || /^(null|none|unchanged|无|暂无)$/i.test(text)) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function stringField(value: unknown, max = 240) {
+  return typeof value === 'string' && value.trim() ? concise(value.trim(), max) : undefined;
+}
+
+function arrayOfStrings(value: unknown, maxItems = 12) {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => stringField(item, 220)).filter((item): item is string => Boolean(item)).slice(0, maxItems);
+}
+
+function normalizeDimension(value: unknown): TaskFrame['dimensions'][number] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const name = stringField(raw.name, 80);
+  const id = stringField(raw.id, 80) || name?.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/gi, '_').replace(/^_+|_+$/g, '');
+  if (!id || !name) return undefined;
+  const dimension: TaskFrame['dimensions'][number] = {
+    id,
+    name,
+    description: stringField(raw.description, 500),
+  };
+  const focus = arrayOfStrings(raw.focus, 12);
+  const testIdeas = arrayOfStrings(raw.testIdeas, 12);
+  const risks = arrayOfStrings(raw.risks, 8);
+  if (focus.length) dimension.focus = focus;
+  if (testIdeas.length) dimension.testIdeas = testIdeas;
+  if (risks.length) dimension.risks = risks;
+  return dimension;
+}
+
+function fallbackTaskFrame(goal: string): TaskFrame {
+  return {
+    goal: concise(goal, 300) || 'Complete the user task and preserve structured findings.',
+    version: 1,
+    successCriteria: ['满足用户目标', '结构化记录关键过程和结论', '最终输出可由台账追溯'],
+    dimensions: [],
+  };
+}
+
+function normalizeTaskFrame(value: unknown, previous: TaskFrame | undefined, goal: string): TaskFrame | undefined {
+  const parsed = parseJsonPayload(value);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return previous || fallbackTaskFrame(goal);
+  const raw = parsed as Record<string, unknown>;
+  const dimensions = Array.isArray(raw.dimensions)
+    ? raw.dimensions.map(normalizeDimension).filter((item): item is TaskFrame['dimensions'][number] => Boolean(item)).slice(0, 12)
+    : [];
+  if (!dimensions.length && previous) return previous;
+  if (!dimensions.length) return fallbackTaskFrame(goal);
+  const successCriteria = arrayOfStrings(raw.successCriteria, 12);
+  const next: TaskFrame = {
+    goal: stringField(raw.goal, 320) || previous?.goal || concise(goal, 320),
+    version: typeof raw.version === 'number' ? raw.version : previous?.version || 1,
+    successCriteria: successCriteria.length ? successCriteria : previous?.successCriteria || fallbackTaskFrame(goal).successCriteria,
+    dimensions,
+  };
+  const deliverables = arrayOfStrings(raw.deliverables, 12);
+  const analysisGuidance = arrayOfStrings(raw.analysisGuidance, 12);
+  const finalOutputRequirements = arrayOfStrings(raw.finalOutputRequirements, 12);
+  if (deliverables.length) next.deliverables = deliverables;
+  else if (previous?.deliverables?.length) next.deliverables = previous.deliverables;
+  if (analysisGuidance.length) next.analysisGuidance = analysisGuidance;
+  else if (previous?.analysisGuidance?.length) next.analysisGuidance = previous.analysisGuidance;
+  if (finalOutputRequirements.length) next.finalOutputRequirements = finalOutputRequirements;
+  else if (previous?.finalOutputRequirements?.length) next.finalOutputRequirements = previous.finalOutputRequirements;
+  return next;
+}
+
+function normalizeLedgerItem(value: unknown, sourceStep?: number, evidence: string[] = []): TaskLedgerItem | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const title = stringField(raw.title, 180);
+  if (!title) return undefined;
+  const status = ['finding', 'issue', 'covered', 'risk', 'question', 'evidence', 'decision'].includes(String(raw.status))
+    ? raw.status as TaskLedgerItem['status']
+    : 'finding';
+  const severity = ['info', 'minor', 'major', 'critical'].includes(String(raw.severity))
+    ? raw.severity as TaskLedgerItem['severity']
+    : status === 'issue' || status === 'risk' ? 'minor' : 'info';
+  const attributes = Array.isArray(raw.attributes)
+    ? raw.attributes.map((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return undefined;
+      const pair = item as Record<string, unknown>;
+      const key = stringField(pair.key, 80);
+      const valueText = stringField(pair.value, 180);
+      return key && valueText ? { key, value: valueText } : undefined;
+    }).filter((item): item is { key: string; value: string } => Boolean(item)).slice(0, 8)
+    : undefined;
+  const itemEvidence = arrayOfStrings(raw.evidence, 8);
+  return {
+    id: stringField(raw.id, 120),
+    dimensionId: stringField(raw.dimensionId, 80) || 'general',
+    title,
+    summary: stringField(raw.summary, 500),
+    status,
+    severity,
+    expected: stringField(raw.expected, 500),
+    actual: stringField(raw.actual, 500),
+    evidence: Array.from(new Set([...itemEvidence, ...evidence])).slice(0, 8),
+    confidence: typeof raw.confidence === 'number' && Number.isFinite(raw.confidence) ? Math.max(0, Math.min(1, raw.confidence)) : undefined,
+    sourceStep: typeof raw.sourceStep === 'number' ? raw.sourceStep : sourceStep,
+    attributes,
+  };
+}
+
+function parseLedgerItems(value: unknown, sourceStep?: number, evidence: string[] = []) {
+  const parsed = parseJsonPayload(value);
+  const rawItems = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+  return rawItems
+    .map((item) => normalizeLedgerItem(item, sourceStep, evidence))
+    .filter((item): item is TaskLedgerItem => Boolean(item))
+    .slice(0, 12);
+}
+
+function ledgerMemoryLimit() {
+  const raw = Number(process.env.AI_LEDGER_MEMORY_LIMIT || 1000);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1000;
+}
+
+function ledgerKey(item: TaskLedgerItem) {
+  return item.id || `${item.dimensionId}:${item.status || ''}:${item.title}`.toLowerCase();
+}
+
+function mergeLedgerItems(existing: TaskLedgerItem[] = [], incoming: TaskLedgerItem[] = [], limit = 80) {
+  const map = new Map<string, TaskLedgerItem>();
+  for (const item of [...existing, ...incoming]) map.set(ledgerKey(item), item);
+  return [...map.values()].slice(-limit);
+}
+
+function collectTaskFrameFromSteps(steps: StepExecutionResult[]) {
+  return steps.map((step) => step.taskFrame || step.workingMemory?.taskFrame).filter(Boolean).at(-1);
+}
+
+function collectLedgerItemsFromSteps(steps: StepExecutionResult[]) {
+  return mergeLedgerItems([], [
+    ...steps.flatMap((step) => step.ledgerItems || []),
+    ...steps.flatMap((step) => step.workingMemory?.ledgerItems || []),
+  ], ledgerMemoryLimit());
+}
+
+function formatTaskFrameContext(frame?: TaskFrame) {
+  return JSON.stringify({
+    taskFrame: frame || null,
+  }, null, 2);
+}
+
+function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''): Pick<RuntimeDecision, 'observation' | 'findings' | 'memoryItems' | 'taskFrame' | 'ledgerItems'> {
   const observations: string[] = [];
   const findings: string[] = [];
   const memoryItems: string[] = [];
+  let taskFrame: TaskFrame | undefined;
+  let ledgerItems: TaskLedgerItem[] = [];
   for (const trace of traces) {
     if (!trace.input || typeof trace.input !== 'object' || Array.isArray(trace.input)) continue;
     const input = trace.input as Record<string, unknown>;
     if (typeof input.observation === 'string' && input.observation.trim() && !/^无$|^none$/i.test(input.observation.trim())) {
-      observations.push(input.observation.trim());
+      observations.push(sanitizeHistoricalToolText(input.observation.trim(), 800));
     }
-    if (typeof input.findings === 'string') findings.push(...parseListLike(input.findings));
-    if (typeof input.memory === 'string') memoryItems.push(...parseListLike(input.memory));
+    if (typeof input.findings === 'string') findings.push(...parseListLike(input.findings).map((item) => sanitizeHistoricalToolText(item, 260)));
+    if (typeof input.memory === 'string') memoryItems.push(...parseListLike(input.memory).map((item) => sanitizeHistoricalToolText(item, 260)));
+    const evidence = (trace.screenshots || []).map((shot) => shot.path).filter(Boolean);
+    taskFrame = normalizeTaskFrame(input.taskFrameJson, taskFrame, goal);
+    ledgerItems = mergeLedgerItems(ledgerItems, parseLedgerItems(input.ledgerItemsJson, undefined, evidence), 24);
   }
   return {
     observation: observations.length ? observations.at(-1)?.slice(0, 800) : undefined,
     findings: Array.from(new Set(findings)).slice(0, 8),
     memoryItems: Array.from(new Set(memoryItems)).slice(0, 8),
+    taskFrame,
+    ledgerItems,
   };
 }
 
-function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
+function deriveDecision(text: string, traces: ToolTrace[], goal = ''): RuntimeDecision {
   // When a tool actually executed this step, the step result is derived from the action itself. We
   // never trust JSON done/status in the same response as a tool call, so the model cannot accidentally
   // declare the requirement complete before seeing the next screenshot.
@@ -1502,9 +1787,9 @@ function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
     const executed = traces.filter((trace) => trace.name);
     const last = executed.at(-1);
     const failed = executed.find((trace) => !trace.result.ok);
-    const names = executed.map((trace) => `${trace.name}${summarizeToolInput(trace.input)}`).join('; ');
+    const names = executed.map((trace) => summarizeTraceForMemory(trace)).join('; ');
     const note = extractProgressNote(text);
-    const assistantInfo = extractAssistantStepInfoFromToolInputs(executed);
+    const assistantInfo = extractAssistantStepInfoFromToolInputs(executed, goal);
     const toolReason = executed.map((trace) => splitToolInputAndReason(trace.input).reason).find(Boolean);
 
     if (last?.name === 'reportState' && last.input && typeof last.input === 'object' && !Array.isArray(last.input)) {
@@ -1554,6 +1839,39 @@ function deriveDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
 }
 
 // 执行单个运行时步骤：采集页面上下文，调用 AI 选择一个动作，并记录请求快照。
+function progressFieldsFromToolTraces(
+  traces: ToolTrace[],
+  goal: string,
+  stepIndex: number,
+  progress?: ToolTraceProgress,
+): Partial<StepExecutionResult> {
+  const assistantInfo = extractAssistantStepInfoFromToolInputs(traces, goal);
+  const workingMemory = progress?.workingMemory;
+  const findings = Array.from(new Set([
+    ...(assistantInfo.findings || []),
+    ...(workingMemory?.findings || []),
+  ])).slice(-12);
+  const memoryItems = Array.from(new Set([
+    ...(assistantInfo.memoryItems || []),
+    ...(workingMemory?.completed || []),
+  ])).slice(-12);
+  const ledgerItems = mergeLedgerItems(
+    assistantInfo.ledgerItems || [],
+    workingMemory?.ledgerItems || [],
+    ledgerMemoryLimit(),
+  ).map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex }));
+
+  return {
+    observation: assistantInfo.observation || workingMemory?.pageUnderstanding,
+    findings,
+    memoryItems,
+    taskFrame: assistantInfo.taskFrame || workingMemory?.taskFrame,
+    ledgerItems,
+    workingMemory,
+    visualContext: progress?.visualContext,
+  };
+}
+
 async function executeRuntimeStep(input: {
   session: BrowserSession;
   testCase: TestCaseRecord;
@@ -1570,7 +1888,7 @@ async function executeRuntimeStep(input: {
   }) => void | Promise<void>;
   abortSignal?: AbortSignal;
   onDebug?: ExecutionDebug;
-  onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
+  onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
 }) {
   const {
     session,
@@ -1649,12 +1967,37 @@ async function executeRuntimeStep(input: {
     const traces: ToolTrace[] = [];
     const codexMode = isCodexProvider();
     const allowedToolTypes = runtimeToolNames(mode);
-    const requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
+    let requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
+    async function refreshRequestPromptForTurn() {
+      const currentPageContext = await session.getPageContext({
+        includeDomTree: mode === 'dom',
+        includeText: false,
+        includeManualVerification: false,
+        includeInteractiveCandidates: true,
+        useCachedInteractiveCandidates: true,
+      });
+      const currentMarkerPath = visualContext.current()?.markerPath;
+      const basePrompt = runtimePrompt({
+        testCase,
+        pageContext: currentPageContext,
+        completedSteps,
+        workingMemory,
+        stepIndex,
+        beforeScreenshotPath,
+        hasMarkerScreenshot: Boolean(separateMarkerMap && currentMarkerPath),
+        markerOverlayInScreenshot,
+        availableScreenshotReferences,
+        selectedScreenshotReferences,
+      });
+      requestPrompt = codexMode ? buildCodexObjectPrompt(basePrompt, allowedToolTypes) : basePrompt;
+      return requestPrompt;
+    }
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(testCase), phase: 'Entering Agent Loop; choose one tool from the current visual frame.', completed: [], findings: [], blockers: [],
-      pageUnderstanding: '', scrollSummary: '', userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [], nextStep: 'Choose one tool from the current visual context.',
+      pageUnderstanding: '', currentState: '尚未形成状态摘要；等待当前截图判断。', scrollSummary: '', userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [], nextStep: '根据当前截图完成下一个未完成目标。',
+      taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
     let contextCompressionTurns = 0;
@@ -1666,6 +2009,7 @@ async function executeRuntimeStep(input: {
       let visualPaths = includeImage ? visualContext.imagePaths() : [];
       let traceLimit = 5;
       let compressionDetails: Record<string, unknown> | undefined;
+      await refreshRequestPromptForTurn();
       const buildContextText = () => {
         const compressionNote = compressionDetails
           ? [
@@ -1739,7 +2083,24 @@ async function executeRuntimeStep(input: {
       const aiStartedAt = Date.now();
       const result = await generateObjectWithTimeout({ model: getModel(), messages: await prepareStep(0), schema: codexRuntimeObjectSchema, temperature: 0.1, maxRetries: 0, abortSignal });
       const object = result.object as z.infer<typeof codexRuntimeObjectSchema>;
-      const execution = await executeCodexRuntimeObject({ session, targetUrl: testCase.targetUrl, stepIndex, type: object.type, params: object.params, allowedTypes: allowedToolTypes, traces, onToolTrace, onSelectReferenceScreenshots: async (selection) => { const validIds = selection.ids.filter((id) => availableReferenceIds.has(id)); await onSelectReferenceScreenshots?.({ ...selection, ids: validIds, availableReferences: availableScreenshotReferences }); } });
+      const execution = await executeCodexRuntimeObject({
+        session,
+        targetUrl: testCase.targetUrl,
+        runId: input.runId,
+        stepIndex,
+        type: object.type,
+        params: object.params,
+        allowedTypes: allowedToolTypes,
+        traces,
+        visualContext,
+        onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
+        onToolTrace: async (trace) => {
+          workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
+          await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+          await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + ' -> ' + (trace.result.ok ? 'ok' : 'failed'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
+        },
+        onSelectReferenceScreenshots: async (selection) => { const validIds = selection.ids.filter((id) => availableReferenceIds.has(id)); await onSelectReferenceScreenshots?.({ ...selection, ids: validIds, availableReferences: availableScreenshotReferences }); },
+      });
       await onDebug?.({ phase: 'ai:runtime:object', stepIndex, message: 'Codex object -> ' + object.type + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms', details: jsonSafe({ object, traces, elapsedMs: elapsedSince(aiStartedAt) }) });
       return { text: execution.text, traces, aiRequest, visualContext: visualContext.snapshot(), workingMemory };
     }
@@ -1751,7 +2112,7 @@ async function executeRuntimeStep(input: {
       try {
         const result = await generateTextWithTimeout({
           model: getModel(), messages: await prepareStep(turnIndex),
-          tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, async (trace) => { workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace); await onToolTrace?.(trace); await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + ' -> ' + (trace.result.ok ? 'ok' : 'failed'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } }); }, { availableReferenceIds, runId: input.runId, stepIndex, visualContext, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
+          tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, async (trace) => { workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex); await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() }); await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + ' -> ' + (trace.result.ok ? 'ok' : 'failed'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } }); }, { availableReferenceIds, runId: input.runId, stepIndex, visualContext, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
           stopWhen: stepCountIs(1), temperature: 0.1, maxRetries: 0, abortSignal,
         });
         latestText = result.text || '';
@@ -1773,9 +2134,11 @@ async function executeRuntimeStep(input: {
     return { text: latestText, traces, aiRequest, visualContext: visualContext.snapshot(), workingMemory };
   }
 
-  // Only retry when nothing executed yet (pure request failure). The runAgent catch above guarantees
-  // a retry can never re-run an already-executed browser action.
-  const attempts = screenshot ? [true, true] : [false];
+  // Hidden retries can duplicate browser actions when a provider error happens after a tool
+  // started but before the trace is fully persisted. Keep retry opt-in so one AI request maps
+  // to at most one browser action by default.
+  const retryPureRequestFailure = process.env.AI_RUNTIME_RETRY_ON_PURE_FAILURE === 'true';
+  const attempts = retryPureRequestFailure && screenshot ? [true, true] : [Boolean(screenshot)];
   let lastError: unknown;
 
   for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
@@ -1785,8 +2148,8 @@ async function executeRuntimeStep(input: {
         await onDebug?.({
           phase: 'ai:runtime:retry',
           stepIndex,
-                    message: 'AI request failed before any tool executed; retrying once.',
-          details: lastError instanceof Error ? lastError.message : String(lastError),
+          message: 'AI request failed before any tool executed; retrying once.',
+          details: infrastructureError(lastError),
         });
       }
       return await runAgent(includeImage);
@@ -1806,9 +2169,56 @@ async function executeRuntimeStep(input: {
   throw wrapped;
 }
 
+function errorRecordSources(error: unknown) {
+  if (!error || typeof error !== 'object') return [];
+  const root = error as Record<string, unknown>;
+  const sources: Record<string, unknown>[] = [root];
+  if (root.data && typeof root.data === 'object' && !Array.isArray(root.data)) {
+    sources.push(root.data as Record<string, unknown>);
+  }
+  if (root.cause && typeof root.cause === 'object' && !Array.isArray(root.cause)) {
+    const cause = root.cause as Record<string, unknown>;
+    sources.push(cause);
+    if (cause.data && typeof cause.data === 'object' && !Array.isArray(cause.data)) {
+      sources.push(cause.data as Record<string, unknown>);
+    }
+  }
+  return sources;
+}
+
+function firstErrorString(error: unknown, key: string) {
+  for (const source of errorRecordSources(error)) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function firstErrorNumber(error: unknown, key: string) {
+  for (const source of errorRecordSources(error)) {
+    const value = source[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function errorDetailText(error: unknown) {
+  const exitCode = firstErrorNumber(error, 'exitCode');
+  const code = firstErrorString(error, 'code');
+  const stderr = firstErrorString(error, 'stderr');
+  const promptExcerpt = firstErrorString(error, 'promptExcerpt');
+  return [
+    typeof exitCode === 'number' ? `exitCode=${exitCode}` : '',
+    code ? `code=${code}` : '',
+    stderr ? `stderr=${trimDebugText(stderr, 1200)}` : '',
+    promptExcerpt ? `promptExcerpt=${trimDebugText(promptExcerpt, 600)}` : '',
+  ].filter(Boolean).join('\n');
+}
+
 function infrastructureError(error: unknown) {
-  if (!(error instanceof Error)) return 'Unknown execution error';
-  return error.message;
+  const message = error instanceof Error ? error.message : String(error || 'Unknown execution error');
+  const details = errorDetailText(error);
+  return details ? `${message}\n${details}` : message;
 }
 
 function serializeError(error: unknown) {
@@ -1816,6 +2226,10 @@ function serializeError(error: unknown) {
   return {
     name: error.name,
     message: error.message,
+    exitCode: firstErrorNumber(error, 'exitCode'),
+    code: firstErrorString(error, 'code'),
+    stderr: firstErrorString(error, 'stderr'),
+    promptExcerpt: firstErrorString(error, 'promptExcerpt'),
     stack: error.stack,
   };
 }
@@ -1850,8 +2264,9 @@ async function createRecoverableRuntimeErrorStep(input: {
   error: unknown;
   tools?: StepToolCall[];
   aiRequest?: AiRequestSnapshot;
+  recoveredState?: Partial<StepExecutionResult>;
 }): Promise<StepExecutionResult> {
-  const { session, runId, stepIndex, beforeScreenshotPath, error, tools, aiRequest } = input;
+  const { session, runId, stepIndex, beforeScreenshotPath, error, tools, aiRequest, recoveredState } = input;
   const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after').catch(() => undefined);
 
   return {
@@ -1863,6 +2278,13 @@ async function createRecoverableRuntimeErrorStep(input: {
     beforeScreenshotPath,
     afterScreenshotPath,
     screenshotPath: afterScreenshotPath,
+    observation: recoveredState?.observation,
+    findings: recoveredState?.findings,
+    memoryItems: recoveredState?.memoryItems,
+    taskFrame: recoveredState?.taskFrame,
+    ledgerItems: recoveredState?.ledgerItems,
+    workingMemory: recoveredState?.workingMemory,
+    visualContext: recoveredState?.visualContext,
     tools,
     aiRequest,
   };
@@ -1909,11 +2331,18 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         { domPath },
       );
     case 'scrollArea':
-      return session.scrollArea(
-        String(input.areaId || ''),
-        typeof input.deltaY === 'number' ? input.deltaY : 0,
-        typeof input.deltaX === 'number' ? input.deltaX : 0,
-      );
+      {
+        const areaId = typeof input.areaId === 'string' && input.areaId.trim()
+          ? input.areaId.trim()
+          : typeof input.id === 'string' && /^S\d+$/i.test(input.id.trim())
+            ? input.id.trim()
+            : '';
+        return session.scrollArea(
+          areaId,
+          typeof input.deltaY === 'number' ? input.deltaY : 0,
+          typeof input.deltaX === 'number' ? input.deltaX : 0,
+        );
+      }
     case 'clickCandidate':
       return session.clickCandidate(String(input.id || ''), text);
     case 'focusCandidate':
@@ -1958,19 +2387,22 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
 async function executeCodexRuntimeObject(input: {
   session: BrowserSession;
   targetUrl: string;
+  runId: string;
   stepIndex: number;
   type: string;
   params: Record<string, unknown>;
   allowedTypes: string[];
   traces: ToolTrace[];
-  onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
+  visualContext?: VisualContextManager;
+  onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
+  onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onSelectReferenceScreenshots?: (selection: {
     ids: string[];
     selectionReason: string;
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
 }) {
-  const { session, targetUrl, stepIndex, type, params, allowedTypes, traces, onToolTrace, onSelectReferenceScreenshots } = input;
+  const { session, targetUrl, runId, stepIndex, type, params, allowedTypes, traces, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
   if (!allowedTypes.includes(type)) {
     return {
       text: `Codex returned unsupported action type: ${type}. It must call exactly one allowed tool, usually reportState for no-op reporting.`,
@@ -1986,15 +2418,85 @@ async function executeCodexRuntimeObject(input: {
     });
   }
 
-  const result = await runRecordedTool(session, targetUrl, {
-    index: stepIndex,
-    name: type,
-    input: params,
-    reason: typeof params.reason === 'string' ? params.reason : undefined,
-  });
-  const trace = { name: type, input: params, result };
+  const normalizedParams = { ...params };
+  if (type === 'scrollArea') {
+    const areaId = typeof normalizedParams.areaId === 'string' && normalizedParams.areaId.trim()
+      ? normalizedParams.areaId.trim()
+      : typeof normalizedParams.id === 'string' && /^S\d+$/i.test(normalizedParams.id.trim())
+        ? normalizedParams.id.trim()
+        : '';
+    normalizedParams.areaId = areaId || normalizedParams.areaId;
+  }
+
+  const beforeFrame = visualContext?.current();
+  const screenshots: ToolTrace['screenshots'] = [];
+  if (beforeFrame?.path) {
+    screenshots.push({ title: `${type} before`, path: beforeFrame.path, kind: 'history' });
+    if (beforeFrame.markerPath) screenshots.push({ title: `${type} before marker map`, path: beforeFrame.markerPath, kind: 'marker' });
+  }
+
+  const visualAfter = visualAfterFromInput(type, normalizedParams);
+  const candidateActionNames = new Set(['clickCandidate', 'hoverCandidate', 'doubleClickCandidate', 'rightClickCandidate', 'dragCandidate']);
+  let result: BrowserActionResult;
+  try {
+    result = candidateActionNames.has(type)
+      ? validateCandidateActionBeforeExecution(type, normalizedParams, traces) || await runRecordedTool(session, targetUrl, {
+        index: stepIndex,
+        name: type,
+        input: normalizedParams,
+        reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
+      })
+      : await runRecordedTool(session, targetUrl, {
+        index: stepIndex,
+        name: type,
+        input: normalizedParams,
+        reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
+      });
+  } catch (error) {
+    result = {
+      ok: false,
+      actual: `Tool ${type} threw after execution started: ${infrastructureError(error)}`,
+    };
+  }
+  if (result.ok && shouldCaptureVisualAfter(type, visualAfter) && visualContext) {
+    try {
+      await session.waitForPage().catch(() => undefined);
+      const visualIndex = traces.filter((trace) => trace.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
+      const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
+      const screenshotPath = await session.takeScreenshot(runId, stepIndex, `visual-${visualIndex}`, screenshotOptions);
+      const markerPath = session.getLastCandidateMarkerScreenshotPath();
+      const frame = visualContext.apply({
+        path: screenshotPath,
+        markerPath,
+        stepIndex,
+        toolName: type,
+        capture: screenshotOptions.capture,
+        reason: visualAfter.reason || `${type} after screenshot`,
+      }, visualAfter);
+      screenshots.push({ title: `${type} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
+      if (markerPath) screenshots.push({ title: `${type} marker map`, path: markerPath, kind: 'marker' });
+      await onVisualContextChange?.(visualContext.snapshot());
+    } catch (error) {
+      result = {
+        ...result,
+        actual: `${result.actual} Visual-after screenshot failed, so the action is kept and will not be retried: ${infrastructureError(error)}`,
+      };
+    }
+  } else if (!result.ok && visualContext) {
+    const current = visualContext.current();
+    if (current?.path) {
+      screenshots.push({ title: `${type} failure evidence`, path: current.path, kind: 'other' });
+      if (current.markerPath) screenshots.push({ title: `${type} marker map`, path: current.markerPath, kind: 'marker' });
+    }
+  }
+
+  const trace = { name: type, input: normalizedParams, result, visualAfter, screenshots };
   traces.push(trace);
-  await onToolTrace?.(trace);
+  try {
+    await onToolTrace?.(trace);
+  } catch {
+    // Progress persistence failures must not make a browser action look unexecuted.
+  }
   return { text: '', executed: true };
 }
 
@@ -2280,6 +2782,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       }
 
       const liveToolTraces: ToolTrace[] = [];
+      let latestToolProgress: ToolTraceProgress | undefined;
       let actionResult: Awaited<ReturnType<typeof executeRuntimeStep>>;
       try {
         actionResult = await executeRuntimeStep({
@@ -2310,13 +2813,16 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         },
         abortSignal: abortController.signal,
         onDebug,
-        onToolTrace: async (trace) => {
+        onToolTrace: async (trace, progress) => {
           liveToolTraces.push(trace);
+          latestToolProgress = progress || latestToolProgress;
+          const liveFields = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress);
           await onProgress?.({
             ...runningStep,
             beforeScreenshotPath,
                           actual: 'AI called a browser tool; waiting for page feedback.',
             tools: summarizeToolTraces(liveToolTraces),
+            ...liveFields,
           });
         },
         });
@@ -2342,6 +2848,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           error,
           tools: summarizeToolTraces(liveToolTraces),
           aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
+          recoveredState: progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress),
         });
         steps.push(recoverableStep);
         await onProgress?.(recoverableStep);
@@ -2376,7 +2883,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         continue;
       }
 
-      let decision = normalizeRuntimeDecision(deriveDecision(actionResult.text, actionResult.traces));
+      let decision = normalizeRuntimeDecision(deriveDecision(actionResult.text, actionResult.traces, requirementOf(testCase)));
 
       if (decision.done && completionVerifyEnabled()) {
         const verifyPageContext = await session.getPageContext({
@@ -2492,6 +2999,9 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         observation: decision.observation,
         findings: decision.findings,
         memoryItems: decision.memoryItems,
+        taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
+        ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
+          .map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex })),
         aiRequest: actionResult.aiRequest,
         beforeScreenshotPath,
         afterScreenshotPath,
