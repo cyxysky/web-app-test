@@ -7,6 +7,8 @@ import { Clock3, ExternalLink, FileText, Loader2, Trash2 } from 'lucide-react';
 import { DeleteRunButton } from '@/components/DeleteRunButton';
 import { ReplayRunButton } from '@/components/ReplayRunButton';
 import { RecordedFlowToCaseButton } from '@/components/RecordedFlowToCaseButton';
+import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
+import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 const activeRunStatuses: TestRunRecord['status'][] = ['running', 'queued', 'paused'];
@@ -61,6 +63,7 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
     if (!runIds.length || deleting) return;
     if (!window.confirm(`确定删除选中的 ${runIds.length} 条执行记录吗？`)) return;
     setDeleting(true);
+    startGlobalLoading('正在删除执行记录');
     try {
       const response = await fetch('/api/runs/batch-delete', {
         method: 'POST',
@@ -73,7 +76,9 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
       router.refresh();
     } catch (error) {
       window.alert(error instanceof Error ? error.message : '批量删除失败');
+    } finally {
       setDeleting(false);
+      stopGlobalLoading();
     }
   }
 
@@ -139,6 +144,7 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
                   {reportText}
                 </span>
                 <span className="run-history-actions">
+                  <RunScreenshotChainButton className="run-history-replay" run={run} />
                   <ReplayRunButton disabled={!replayable || active} runId={run.id} />
                   <RecordedFlowToCaseButton disabled={!replayable || active} runId={run.id} />
                   <DeleteRunButton disabled={active || deleting} runId={run.id} />

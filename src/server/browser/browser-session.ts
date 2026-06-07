@@ -1,6 +1,7 @@
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { Browser, BrowserContext, Frame, Page } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Frame, LaunchOptions, Page, Request } from 'playwright';
+import { artifactPath } from '@/server/storage/paths';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
   if (errorText === 'net::ERR_ABORTED' && /analytics|collector|apm|beacon|log|track/i.test(url)) return true;
@@ -15,13 +16,14 @@ function shouldIgnoreConsoleError(text: string) {
 }
 
 function shouldUseSeparateMarkerMap() {
-  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
+  return process.env.VISUAL_MARKER_SEPARATE_MAP !== 'false';
 }
 
 export type BrowserSessionMode = 'dom' | 'visual-markers';
 
 export type BrowserSessionOptions = {
   isMarked?: boolean;
+  runId?: string;
 };
 
 /**
@@ -150,6 +152,19 @@ type ManualVerificationDetails = {
   captchaAppearsFilled?: boolean;
 };
 
+type HttpRequestRecord = {
+  id: string;
+  startedAt: string;
+  method: string;
+  url: string;
+  resourceType: string;
+  status?: number;
+  statusText?: string;
+  ok?: boolean;
+  failed?: boolean;
+  errorText?: string;
+};
+
 const manualVerificationUrlPattern = /captcha|security-check|safecheck|abnormal|robot|challenge/i;
 const manualVerificationTextPatterns = [
   /captcha/i,
@@ -169,17 +184,138 @@ const manualVerificationTextPatterns = [
   /身份验证/,
 ];
 
+type BrowserOwnership = 'launched' | 'connected' | 'persistent' | 'shared';
+type SharedBrowserOwnership = Exclude<BrowserOwnership, 'shared'>;
+
+type SharedBrowserLease = {
+  browser?: Browser;
+  context: BrowserContext;
+  ownership: SharedBrowserOwnership;
+  release: () => Promise<void>;
+};
+
+const preparedContextInitScripts = new WeakSet<BrowserContext>();
+const sharedBrowserState: {
+  key?: string;
+  browser?: Browser;
+  context?: BrowserContext;
+  ownership?: SharedBrowserOwnership;
+  refCount: number;
+  initPromise?: Promise<{ browser?: Browser; context: BrowserContext; ownership: SharedBrowserOwnership }>;
+} = {
+  refCount: 0,
+};
+
+function sharedBrowserTabsEnabled() {
+  return process.env.BROWSER_SHARED_TABS !== 'false';
+}
+
+function sharedBrowserKey(input: {
+  cdpEndpoint: string;
+  userDataDir: string;
+  launchOptions: LaunchOptions;
+  contextOptions: BrowserContextOptions;
+}) {
+  if (input.cdpEndpoint) return `cdp:${input.cdpEndpoint}`;
+  if (input.userDataDir) return `persistent:${path.resolve(input.userDataDir)}`;
+  return `launch:${JSON.stringify({ launch: input.launchOptions, context: input.contextOptions })}`;
+}
+
+async function closeIdleSharedBrowser(force = false) {
+  if (sharedBrowserState.refCount > 0) return;
+  const shouldClose = force || process.env.BROWSER_CLOSE_SHARED_WHEN_IDLE === 'true';
+  if (!shouldClose) return;
+
+  const { browser, context, ownership } = sharedBrowserState;
+  if (ownership === 'persistent') {
+    await context?.close().catch(() => undefined);
+  } else if (ownership === 'launched') {
+    await browser?.close().catch(() => undefined);
+  } else if (ownership === 'connected' && process.env.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true') {
+    await browser?.close({ reason: 'Shared browser launch settings changed.' }).catch(() => undefined);
+  }
+  sharedBrowserState.browser = undefined;
+  sharedBrowserState.context = undefined;
+  sharedBrowserState.ownership = undefined;
+  sharedBrowserState.initPromise = undefined;
+  sharedBrowserState.key = undefined;
+}
+
+async function acquireSharedBrowser(input: {
+  chromium: BrowserType;
+  cdpEndpoint: string;
+  userDataDir: string;
+  launchOptions: LaunchOptions;
+  contextOptions: BrowserContextOptions;
+}): Promise<SharedBrowserLease> {
+  const key = sharedBrowserKey(input);
+  if (sharedBrowserState.key && sharedBrowserState.key !== key && sharedBrowserState.refCount > 0) {
+    throw new Error('A shared browser is already running with different launch settings. Stop active runs or set BROWSER_SHARED_TABS=false.');
+  }
+  if (sharedBrowserState.key && sharedBrowserState.key !== key && sharedBrowserState.refCount === 0) {
+    await closeIdleSharedBrowser(true);
+  }
+
+  const browserStillConnected = !sharedBrowserState.browser || sharedBrowserState.browser.isConnected();
+  if (!sharedBrowserState.initPromise || sharedBrowserState.key !== key || !browserStillConnected || !sharedBrowserState.context) {
+    sharedBrowserState.key = key;
+    sharedBrowserState.initPromise = (async () => {
+      if (input.cdpEndpoint) {
+        const browser = await input.chromium.connectOverCDP(input.cdpEndpoint);
+        const context = browser.contexts()[0] || await browser.newContext(input.contextOptions);
+        return { browser, context, ownership: 'connected' as const };
+      }
+
+      if (input.userDataDir) {
+        const context = await input.chromium.launchPersistentContext(input.userDataDir, {
+          ...input.launchOptions,
+          ...input.contextOptions,
+        });
+        return { browser: context.browser() || undefined, context, ownership: 'persistent' as const };
+      }
+
+      const browser = await input.chromium.launch(input.launchOptions);
+      const context = await browser.newContext(input.contextOptions);
+      return { browser, context, ownership: 'launched' as const };
+    })().then((lease) => {
+      sharedBrowserState.browser = lease.browser;
+      sharedBrowserState.context = lease.context;
+      sharedBrowserState.ownership = lease.ownership;
+      return lease;
+    });
+  }
+
+  const lease = await sharedBrowserState.initPromise;
+  sharedBrowserState.refCount += 1;
+  let released = false;
+  return {
+    ...lease,
+    release: async () => {
+      if (released) return;
+      released = true;
+      sharedBrowserState.refCount = Math.max(0, sharedBrowserState.refCount - 1);
+      await closeIdleSharedBrowser();
+    },
+  };
+}
+
 export class BrowserSession {
   private browser?: Browser;
   private context?: BrowserContext;
   private page?: Page;
   private consoleErrors: string[] = [];
   private networkErrors: string[] = [];
+  private attachedPages = new WeakSet<Page>();
+  private httpRequestsByPage = new WeakMap<Page, HttpRequestRecord[]>();
+  private httpRequestByRequest = new WeakMap<Request, HttpRequestRecord>();
   private lastScreenshotMetrics?: ScreenshotMetrics;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
   private lastScreenshotCandidates: InteractiveCandidate[] = [];
   private lastScrollableAreas: ScrollableArea[] = [];
   private lastCandidateMarkerScreenshotPath?: string;
+  private ownedPages = new Set<Page>();
+  private browserOwnership: BrowserOwnership = 'launched';
+  private releaseSharedBrowser?: () => Promise<void>;
 
   constructor(
     private readonly mode: BrowserSessionMode = browserSessionModeFromEnv(),
@@ -195,9 +331,21 @@ export class BrowserSession {
     const viewportWidth = Number(process.env.BROWSER_VIEWPORT_WIDTH || (fullscreen ? 1920 : 1280));
     const viewportHeight = Number(process.env.BROWSER_VIEWPORT_HEIGHT || (fullscreen ? 1080 : 800));
     const ignoreHTTPSErrors = process.env.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
-    this.browser = await chromium.launch({
+    const forceBundledBrowser = process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true';
+    const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
+    const cdpEndpoint = forceBundledBrowser
+      ? ''
+      : process.env.BROWSER_CDP_ENDPOINT?.trim()
+        || process.env.BROWSER_CONNECT_CDP_ENDPOINT?.trim()
+        || process.env.CHROME_REMOTE_DEBUGGING_URL?.trim()
+        || '';
+    const userDataDir = process.env.BROWSER_USER_DATA_DIR?.trim()
+      || process.env.AI_WEB_TEST_BROWSER_PROFILE_DIR?.trim()
+      || '';
+    const launchOptions: LaunchOptions = {
       headless,
       slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
+      ...(channel ? { channel } : {}),
       args: [
         `--window-size=${viewportWidth},${viewportHeight + 120}`,
         fullscreen ? '--start-maximized' : '',
@@ -205,45 +353,99 @@ export class BrowserSession {
         '--force-device-scale-factor=1',
         '--high-dpi-support=1',
       ].filter(Boolean),
-    });
+    };
     const useNativeFullscreenViewport = fullscreen && !headless && !hasExplicitViewport;
-    const context = await this.browser.newContext({
+    const contextOptions: BrowserContextOptions = {
       viewport: useNativeFullscreenViewport ? null : { width: viewportWidth, height: viewportHeight },
       ignoreHTTPSErrors,
       ...(useNativeFullscreenViewport ? {} : { deviceScaleFactor: 1 }),
-    });
-    this.context = context;
-    await context.addInitScript(() => {
-      const originalAddEventListener = EventTarget.prototype.addEventListener;
-      const listenerTypes = new WeakMap<EventTarget, Set<string>>();
-      const interestingEvents = /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown|mouseenter|mouseover|pointerenter|pointerover)$/i;
-      Object.defineProperty(window, '__aiGetEventListenerTypes', {
-        value(target: EventTarget) {
-          return Array.from(listenerTypes.get(target) || []);
-        },
+    };
+
+    if (sharedBrowserTabsEnabled()) {
+      const lease = await acquireSharedBrowser({ chromium, cdpEndpoint, userDataDir, launchOptions, contextOptions });
+      this.browserOwnership = 'shared';
+      this.browser = lease.browser;
+      this.context = lease.context;
+      this.releaseSharedBrowser = lease.release;
+      await this.prepareContext(lease.context, { claimPages: false });
+      const page = await lease.context.newPage();
+      this.claimPage(page);
+      await page.bringToFront().catch(() => undefined);
+      return;
+    }
+
+    if (cdpEndpoint) {
+      this.browserOwnership = 'connected';
+      this.browser = await chromium.connectOverCDP(cdpEndpoint);
+      const existingContext = this.browser.contexts()[0];
+      const context = existingContext || await this.browser.newContext(contextOptions);
+      this.context = context;
+      await this.prepareContext(context);
+      const page = this.sessionPages()[0] || await context.newPage();
+      this.claimPage(page);
+      await page.bringToFront().catch(() => undefined);
+      return;
+    }
+
+    if (userDataDir) {
+      this.browserOwnership = 'persistent';
+      const context = await chromium.launchPersistentContext(userDataDir, {
+        ...launchOptions,
+        ...contextOptions,
       });
-      EventTarget.prototype.addEventListener = function addEventListener(type, listener, options) {
-        if (this instanceof Element && interestingEvents.test(String(type))) {
-          let types = listenerTypes.get(this);
-          if (!types) {
-            types = new Set<string>();
-            listenerTypes.set(this, types);
+      this.context = context;
+      this.browser = context.browser() || undefined;
+      await this.prepareContext(context);
+      const page = this.sessionPages()[0] || await context.newPage();
+      this.claimPage(page);
+      await page.bringToFront().catch(() => undefined);
+      return;
+    }
+
+    this.browserOwnership = 'launched';
+    this.browser = await chromium.launch(launchOptions);
+    const context = await this.browser.newContext(contextOptions);
+    this.context = context;
+    await this.prepareContext(context);
+    this.claimPage(await context.newPage());
+  }
+
+  private async prepareContext(context: BrowserContext, options: { claimPages?: boolean } = {}) {
+    if (!preparedContextInitScripts.has(context)) {
+      preparedContextInitScripts.add(context);
+      await context.addInitScript(() => {
+        const originalAddEventListener = EventTarget.prototype.addEventListener;
+        const listenerTypes = new WeakMap<EventTarget, Set<string>>();
+        const interestingEvents = /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown|mouseenter|mouseover|pointerenter|pointerover)$/i;
+        Object.defineProperty(window, '__aiGetEventListenerTypes', {
+          value(target: EventTarget) {
+            return Array.from(listenerTypes.get(target) || []);
+          },
+        });
+        EventTarget.prototype.addEventListener = function addEventListener(type, listener, options) {
+          if (this instanceof Element && interestingEvents.test(String(type))) {
+            let types = listenerTypes.get(this);
+            if (!types) {
+              types = new Set<string>();
+              listenerTypes.set(this, types);
+            }
+            types.add(String(type));
           }
-          types.add(String(type));
-        }
-        return originalAddEventListener.call(this, type, listener, options);
-      };
-    });
-    context.on('page', (page) => {
-      this.page = page;
-      this.attachPageListeners(page);
-    });
-    this.page = await context.newPage();
-    this.attachPageListeners(this.page);
+          return originalAddEventListener.call(this, type, listener, options);
+        };
+      }).catch((error) => {
+        preparedContextInitScripts.delete(context);
+        throw error;
+      });
+    }
+    if (options.claimPages === false) return;
+    context.on('page', (page) => this.claimPage(page));
+    for (const page of context.pages()) this.claimPage(page, { makeActive: false });
   }
 
   async startTrace(runId: string) {
     if (!this.context || process.env.PLAYWRIGHT_TRACE === 'false') return;
+    if (this.browserOwnership === 'shared' && process.env.PLAYWRIGHT_TRACE_SHARED !== 'true') return;
     await this.context.tracing.start({
       screenshots: true,
       snapshots: true,
@@ -254,32 +456,95 @@ export class BrowserSession {
 
   async stopTrace(runId: string) {
     if (!this.context || process.env.PLAYWRIGHT_TRACE === 'false') return undefined;
-    const dir = path.join(process.cwd(), 'artifacts', runId);
+    if (this.browserOwnership === 'shared' && process.env.PLAYWRIGHT_TRACE_SHARED !== 'true') return undefined;
+    const dir = artifactPath(runId);
     await mkdir(dir, { recursive: true });
     const tracePath = path.join(dir, 'trace.zip');
     await this.context.tracing.stop({ path: tracePath }).catch(() => undefined);
     return tracePath;
   }
 
+  private claimPage(page: Page, options: { makeActive?: boolean } = {}) {
+    if (page.isClosed()) return;
+    const alreadyOwned = this.ownedPages.has(page);
+    this.ownedPages.add(page);
+    this.attachPageListeners(page);
+    if (!alreadyOwned) {
+      page.once('close', () => {
+        this.ownedPages.delete(page);
+        if (this.page === page) {
+          this.page = this.sessionPages()[0];
+        }
+      });
+    }
+    if (options.makeActive !== false) this.page = page;
+  }
+
+  private sessionPages() {
+    return Array.from(this.ownedPages).filter((page) => !page.isClosed());
+  }
+
+  private async closeOwnedPages() {
+    const pages = this.sessionPages();
+    await Promise.all(pages.map((page) => page.close().catch(() => undefined)));
+    this.ownedPages.clear();
+    this.page = undefined;
+  }
+
   // 绑定 console 和网络失败监听，只记录会影响测试判断的关键异常。
   private attachPageListeners(page: Page) {
+    if (this.attachedPages.has(page)) return;
+    this.attachedPages.add(page);
     page.setDefaultTimeout(8000);
     page.on('console', (message) => {
       const text = message.text();
       if (message.type() === 'error' && !shouldIgnoreConsoleError(text)) this.consoleErrors.push(text);
     });
+    page.on('request', (request) => {
+      this.recordHttpRequest(page, request);
+    });
+    page.on('response', (response) => {
+      const record = this.httpRequestByRequest.get(response.request()) || this.recordHttpRequest(page, response.request());
+      record.status = response.status();
+      record.statusText = response.statusText();
+      record.ok = response.ok();
+    });
     page.on('requestfailed', (request) => {
+      const record = this.httpRequestByRequest.get(request) || this.recordHttpRequest(page, request);
       const errorText = request.failure()?.errorText || '';
+      record.failed = true;
+      record.ok = false;
+      record.errorText = errorText;
       if (shouldIgnoreNetworkFailure(request.url(), errorText)) return;
       this.networkErrors.push(`${request.method()} ${request.url()} ${errorText}`);
     });
+  }
+
+  private recordHttpRequest(page: Page, request: Request) {
+    const existing = this.httpRequestByRequest.get(request);
+    if (existing) return existing;
+    const records = this.httpRequestsByPage.get(page) || [];
+    const record: HttpRequestRecord = {
+      id: `${Date.now().toString(36)}-${records.length + 1}`,
+      startedAt: new Date().toISOString(),
+      method: request.method(),
+      url: request.url(),
+      resourceType: request.resourceType(),
+    };
+    records.push(record);
+    const rawMaxRecords = Number(process.env.BROWSER_HTTP_REQUEST_HISTORY_LIMIT || 400);
+    const maxRecords = Math.max(50, Math.floor(Number.isFinite(rawMaxRecords) ? rawMaxRecords : 400));
+    if (records.length > maxRecords) records.splice(0, records.length - maxRecords);
+    this.httpRequestsByPage.set(page, records);
+    this.httpRequestByRequest.set(request, record);
+    return record;
   }
 
   // 获取当前可用页面；如果活动页关闭，会从浏览器上下文中寻找替代页面。
   private get activePage() {
     if (!this.page) throw new Error('Browser session has not started');
     if (this.page.isClosed()) {
-      const replacement = this.browser?.contexts().flatMap((context) => context.pages()).find((page) => !page.isClosed());
+      const replacement = this.sessionPages()[0];
       if (!replacement) throw new Error('Active browser page has been closed and no replacement page is available.');
       this.page = replacement;
       this.attachPageListeners(replacement);
@@ -337,7 +602,7 @@ export class BrowserSession {
       textLength: text.length,
       viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
       viewportMetrics,
-      tabs: this.activePage.context().pages().map((page, index) => ({
+      tabs: this.sessionPages().map((page, index) => ({
         index,
         url: page.url(),
         active: page === this.activePage,
@@ -406,15 +671,14 @@ export class BrowserSession {
     }).catch(() => [] as Array<{ label: string; valueLength: number; filled: boolean }>);
   }
 
-  // 截取当前 viewport。视觉标识模式默认把候选编号叠加到 before 截图；
-  // 仅在 VISUAL_MARKER_SEPARATE_MAP=true 时额外生成一张像素对齐的纯标识图。
+  // 截取当前 viewport。默认保留干净原图，并把视觉标识保存为单独 marker map。
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
     const stabilizeMs = Number(process.env.SCREENSHOT_STABILIZE_MS || 1000);
     if (Number.isFinite(stabilizeMs) && stabilizeMs > 0) {
       await this.waitForStableViewport(Math.min(Math.max(stabilizeMs, 0), 5000));
     }
     const capture: ScreenshotCaptureMode = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
-    const dir = path.join(process.cwd(), 'artifacts', runId);
+    const dir = artifactPath(runId);
     await mkdir(dir, { recursive: true });
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
@@ -443,7 +707,7 @@ export class BrowserSession {
       }));
     }
     this.lastCandidateMarkerScreenshotPath = undefined;
-    // 默认把标识直接叠到当前截图上；只有兼容旧链路时才额外生成纯 marker 图。
+    // 默认保留干净页面截图；候选编号写入单独 marker 图，点击光标保留在操作后截图里。
     const separateMarkerMap = candidateLabelsEnabled && shouldUseSeparateMarkerMap();
     await this.removeCandidateOverlay();
     if (phase === 'before' || String(phase).startsWith('visual-')) await this.removeClickMarker();
@@ -520,25 +784,20 @@ export class BrowserSession {
     if (!resolved.target) return { ok: false, actual: resolved.error };
 
     const { candidate, target } = resolved;
-    const context = this.activePage.context();
-    const beforePages = context.pages().length;
-    const beforeUrl = this.activePage.url();
+    const page = this.activePage;
+    const beforeUrl = page.url();
     const popupWaitMs = Math.min(Math.max(Number(process.env.BROWSER_POPUP_WAIT_MS || 600), 0), 3000);
     const popup = popupWaitMs > 0
-      ? this.activePage.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
+      ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
       : Promise.resolve(undefined);
-    await this.activePage.mouse.click(target.x, target.y);
+    await page.mouse.click(target.x, target.y);
     if (text !== undefined) {
-      await this.activePage.keyboard.type(text);
+      await page.keyboard.type(text);
     }
     const newPage = await popup;
     if (newPage) {
-      this.page = newPage;
-      this.attachPageListeners(newPage);
+      this.claimPage(newPage);
       await newPage.bringToFront();
-    } else if (context.pages().length > beforePages) {
-      this.page = context.pages().at(-1);
-      await this.page?.bringToFront();
     }
     let note = await this.waitAfterAction();
     let fallbackNote = '';
@@ -710,16 +969,40 @@ export class BrowserSession {
 
   // 列出当前浏览器上下文中的所有标签页，供 AI 判断是否需要切换。
   async listTabs(): Promise<BrowserActionResult> {
-    const pages = this.activePage.context().pages();
+    const pages = this.sessionPages();
     return {
       ok: true,
-      actual: pages.map((page, index) => `${index}: ${page.url()}`).join('\n') || 'No tabs found.',
+      actual: pages.map((page, index) => `${index}${page === this.activePage ? ' [active]' : ''}: ${page.url()}`).join('\n') || 'No tabs found for this run.',
+    };
+  }
+
+  // 返回当前活动标签页最近的 HTTP 请求，供 AI 定位接口错误、状态码异常和静态资源问题。
+  async getCurrentTabHttpRequests(): Promise<BrowserActionResult> {
+    const rawLimit = Number(process.env.AI_HTTP_REQUEST_TOOL_LIMIT || 80);
+    const limit = Math.max(1, Math.floor(Number.isFinite(rawLimit) ? rawLimit : 80));
+    const records = (this.httpRequestsByPage.get(this.activePage) || []).slice(-limit);
+    if (!records.length) {
+      return { ok: true, actual: 'Current tab has no captured HTTP requests yet.' };
+    }
+    return {
+      ok: true,
+      actual: JSON.stringify(records.map((record) => ({
+        time: record.startedAt,
+        method: record.method,
+        url: record.url,
+        resourceType: record.resourceType,
+        status: record.status ?? null,
+        statusText: record.statusText ?? null,
+        ok: record.ok ?? null,
+        failed: record.failed || false,
+        errorText: record.errorText || null,
+      })), null, 2),
     };
   }
 
   // 切换到指定标签页，并把它设为后续操作的活动页。
   async switchTab(index: number): Promise<BrowserActionResult> {
-    const page = this.activePage.context().pages()[index];
+    const page = this.sessionPages()[index];
     if (!page) return { ok: false, actual: `Tab ${index} not found.` };
     this.page = page;
     await page.bringToFront();
@@ -779,7 +1062,23 @@ export class BrowserSession {
 
   // 关闭浏览器；调试场景可选择保留窗口。
   async close(options: { keepOpen?: boolean } = {}) {
+    if (this.browserOwnership === 'shared') {
+      if (!options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
+        await this.closeOwnedPages();
+      }
+      await this.releaseSharedBrowser?.();
+      this.releaseSharedBrowser = undefined;
+      return;
+    }
     if (options.keepOpen || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true') return;
+    if (this.browserOwnership === 'connected') {
+      await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
+      return;
+    }
+    if (this.browserOwnership === 'persistent') {
+      await this.context?.close().catch(() => undefined);
+      return;
+    }
     await this.browser?.close().catch(() => undefined);
   }
 
@@ -798,7 +1097,7 @@ export class BrowserSession {
       await this.activePage.waitForTimeout(ms);
     } catch (error) {
       if (!this.isTargetClosedError(error)) throw error;
-      const replacement = this.browser?.contexts().flatMap((context) => context.pages()).find((page) => !page.isClosed());
+      const replacement = this.sessionPages()[0];
       if (!replacement) throw error;
       this.page = replacement;
       this.attachPageListeners(replacement);

@@ -9,6 +9,7 @@ import {
   runtimeEnvDefinition,
   type SettingsTab,
 } from '@/config/settings';
+import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/test-case.schema';
 
 type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
@@ -17,7 +18,7 @@ type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
 
 type ModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
 
-const tabs: Array<{ id: SettingsTab; label: string }> = [
+export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> = [
   { id: 'model', label: '模型配置' },
   { id: 'browser', label: '浏览器与截图' },
   { id: 'runtime', label: '运行控制' },
@@ -55,14 +56,26 @@ function isSecret(item: EnvRow) {
   return Boolean(item.secret || runtimeEnvDefinition(item.key)?.secret || /KEY|TOKEN|SECRET|PASSWORD|COOKIE|DATABASE_URL/i.test(item.key));
 }
 
-export function EnvironmentSettings() {
-  const [activeTab, setActiveTab] = useState<SettingsTab>('model');
+export function EnvironmentSettings({
+  activeTab: controlledActiveTab,
+  embedded = false,
+  onActiveTabChange,
+  showTabs = true,
+}: {
+  activeTab?: SettingsTab;
+  embedded?: boolean;
+  onActiveTabChange?: (tab: SettingsTab) => void;
+  showTabs?: boolean;
+} = {}) {
+  const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('model');
   const [items, setItems] = useState<EnvRow[]>([]);
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig());
   const [modelDraft, setModelDraft] = useState<ModelConfig>(() => createModelConfig());
   const [loading, setLoading] = useState(true);
   const [savingEnv, setSavingEnv] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
+  const activeTab = controlledActiveTab || internalActiveTab;
+  const selectTab = onActiveTabChange || setInternalActiveTab;
 
   useEffect(() => {
     void load();
@@ -92,6 +105,7 @@ export function EnvironmentSettings() {
 
   async function saveEnv() {
     setSavingEnv(true);
+    startGlobalLoading('正在保存环境配置');
     try {
       const response = await fetch('/api/settings/env', {
         method: 'POST',
@@ -103,6 +117,7 @@ export function EnvironmentSettings() {
       setItems(data.saved || []);
     } finally {
       setSavingEnv(false);
+      stopGlobalLoading();
     }
   }
 
@@ -133,6 +148,7 @@ export function EnvironmentSettings() {
   async function saveModel() {
     const payload = createModelConfig(modelDraft || modelConfig);
     setSavingModel(true);
+    startGlobalLoading('正在保存模型配置');
     try {
       const response = await fetch('/api/settings/model', {
         method: 'POST',
@@ -146,6 +162,7 @@ export function EnvironmentSettings() {
       setModelDraft(nextModel);
     } finally {
       setSavingModel(false);
+      stopGlobalLoading();
     }
   }
 
@@ -191,26 +208,30 @@ export function EnvironmentSettings() {
     .filter(({ definition }) => definition?.tab === activeTab);
 
   return (
-    <main className="settings-workspace">
-      <header className="settings-header">
-        <Link className="ghost-link" href="/dashboard">
-          <ArrowLeft size={15} />
-          返回工作台
-        </Link>
-        <div>
-          <h1>环境配置</h1>
-          <span>模型、浏览器、运行控制和调试参数全部在网页配置中管理。</span>
-        </div>
-      </header>
+    <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
+      {embedded ? null : (
+        <header className="settings-header">
+          <Link className="ghost-link" href="/dashboard">
+            <ArrowLeft size={15} />
+            返回工作台
+          </Link>
+          <div>
+            <h1>环境配置</h1>
+            <span>模型、浏览器、运行控制和调试参数全部在网页配置中管理。</span>
+          </div>
+        </header>
+      )}
 
-      <div className="settings-layout">
-        <nav className="settings-tabs" aria-label="环境配置分类">
-          {tabs.map((tab) => (
-            <button className={activeTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setActiveTab(tab.id)} type="button">
-              {tab.label}
-            </button>
-          ))}
-        </nav>
+      <div className={showTabs ? 'settings-layout' : 'settings-layout no-tabs'}>
+        {showTabs ? (
+          <nav className="settings-tabs" aria-label="环境配置分类">
+            {environmentSettingsTabs.map((tab) => (
+              <button className={activeTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => selectTab(tab.id)} type="button">
+                {tab.label}
+              </button>
+            ))}
+          </nav>
+        ) : null}
 
         <div className="settings-content">
           {loading ? (
@@ -285,7 +306,7 @@ export function EnvironmentSettings() {
             <section>
               <div className="settings-section-head">
                 <div>
-                  <h2>{tabs.find((tab) => tab.id === activeTab)?.label}</h2>
+                  <h2>{environmentSettingsTabs.find((tab) => tab.id === activeTab)?.label}</h2>
                   <span>{visibleEnvItems.length} 项网页配置</span>
                 </div>
                 <button className="settings-save-button" disabled={savingEnv || loading} onClick={saveEnv} type="button">

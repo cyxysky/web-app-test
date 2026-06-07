@@ -15,8 +15,13 @@ const eslintConfig = [
     ignores: [
       '.next/**',
       'artifacts/**',
+      'dist-desktop/**',
+      'dist-electron/**',
+      'electron/**',
       'next-env.d.ts',
       'node_modules/**',
+      'scripts/electron-after-pack.js',
+      'scripts/prepare-electron-server.js',
       'scripts/__pycache__/**',
     ],
   },

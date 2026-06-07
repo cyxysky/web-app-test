@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { FilePlus2, Loader2 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 
 export function RecordedFlowToCaseButton({ runId, disabled }: { runId: string; disabled?: boolean }) {
   const router = useRouter();
@@ -11,6 +12,7 @@ export function RecordedFlowToCaseButton({ runId, disabled }: { runId: string; d
   async function createCase() {
     if (loading || disabled) return;
     setLoading(true);
+    startGlobalLoading('正在转为测试用例');
     try {
       const response = await fetch(`/api/runs/${runId}/recorded-flow/to-test-case`, { method: 'POST' });
       const data = await response.json();
@@ -19,6 +21,7 @@ export function RecordedFlowToCaseButton({ runId, disabled }: { runId: string; d
     } catch (error) {
       window.alert(error instanceof Error ? error.message : '生成用例失败');
       setLoading(false);
+      stopGlobalLoading();
     }
   }
 

@@ -1,6 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { artifactsRoot } from '@/server/storage/paths';
 
 type RouteContext = {
   params: Promise<{ path: string[] }>;
@@ -21,7 +22,7 @@ const contentTypes: Record<string, string> = {
 };
 
 function resolveArtifactPath(segments: string[]) {
-  const root = path.resolve(process.cwd(), 'artifacts');
+  const root = artifactsRoot();
   const filePath = path.resolve(root, ...segments);
   const relative = path.relative(root, filePath);
 

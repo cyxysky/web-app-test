@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { Loader2, Save, Sparkles } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { RichTextEditor } from '@/components/RichTextEditor';
+import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
 
@@ -46,6 +47,7 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
     }
     setSaving(true);
     setError('');
+    startGlobalLoading('正在保存测试需求');
     try {
       const payload = {
         ...draft,
@@ -69,6 +71,7 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
       setError(err instanceof Error ? err.message : '保存失败');
     } finally {
       setSaving(false);
+      stopGlobalLoading();
     }
   }
 
@@ -80,6 +83,7 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
     }
     setGeneratingFrame(true);
     setError('');
+    startGlobalLoading('正在生成内容框架');
     try {
       const response = await fetch(`/api/test-cases/${testCase.id}/task-frame`, {
         method: 'POST',
@@ -98,6 +102,7 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
       setError(err instanceof Error ? err.message : '生成内容框架失败');
     } finally {
       setGeneratingFrame(false);
+      stopGlobalLoading();
     }
   }
 

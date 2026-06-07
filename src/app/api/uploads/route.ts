@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { artifactPath } from '@/server/storage/paths';
 
 export async function POST(request: NextRequest) {
   const form = await request.formData();
@@ -16,7 +17,7 @@ export async function POST(request: NextRequest) {
 
   const ext = path.extname(file.name) || '.png';
   const imageId = `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
-  const dir = path.join(process.cwd(), 'artifacts', 'uploads');
+  const dir = artifactPath('uploads');
   const filePath = path.join(dir, imageId);
 
   await mkdir(dir, { recursive: true });

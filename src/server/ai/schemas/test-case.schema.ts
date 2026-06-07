@@ -14,6 +14,8 @@ export const recordedFlowStepSchema = z.object({
   name: z.string(),
   input: z.unknown().optional(),
   reason: z.string().optional(),
+  delayBeforeMs: z.number().optional(),
+  waitForManual: z.boolean().optional(),
 });
 
 export const taskFrameDimensionSchema = z.object({

@@ -29,7 +29,7 @@ export async function GET(_request: Request, context: RouteContext) {
     return NextResponse.json({ error: 'Invalid TinyMCE asset path' }, { status: 400 });
   }
 
-  const tinymceRoot = path.join(process.cwd(), 'node_modules', 'tinymce');
+  const tinymceRoot = process.env.TINYMCE_ROOT || path.join(process.cwd(), 'node_modules', 'tinymce');
   const filePath = path.join(tinymceRoot, ...fileParts);
 
   try {

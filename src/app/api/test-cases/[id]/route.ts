@@ -41,3 +41,18 @@ export async function PUT(request: Request, context: RouteContext) {
     return NextResponse.json({ error: error instanceof Error ? error.message : 'Invalid test case' }, { status: 400 });
   }
 }
+
+export async function DELETE(_request: Request, context: RouteContext) {
+  const { id } = await context.params;
+  const testCase = store.getTestCase(id);
+  if (!testCase) {
+    return NextResponse.json({ error: 'Test case not found' }, { status: 404 });
+  }
+
+  const deleted = store.deleteTestCase(id);
+  if (!deleted) {
+    return NextResponse.json({ error: 'Test case not found' }, { status: 404 });
+  }
+
+  return NextResponse.json({ ok: true });
+}

@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { generateObject, generateText, stepCountIs, tool } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiRequestSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, TestRunRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
@@ -12,6 +12,7 @@ import { richTextToPlainText } from '@/lib/rich-text';
 type ExecutionProgress = (step: StepExecutionResult) => void | Promise<void>;
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type ManualIntervention = { stepIndex: number; reason: string; screenshotPath?: string };
+type RuntimeStructuredMemoryMode = 'full' | 'light';
 type ExecutionOptions = {
   onProgress?: ExecutionProgress;
   onDebug?: ExecutionDebug;
@@ -170,7 +171,7 @@ function visualMarkersEnabledFor(testCase: TestCaseRecord) {
 
 // 兼容旧双截图链路；默认 false，标识直接叠加在当前截图里。
 function usesSeparateMarkerMap() {
-  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
+  return process.env.VISUAL_MARKER_SEPARATE_MAP !== 'false';
 }
 
 // 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
@@ -753,7 +754,7 @@ function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
 
 function shouldCaptureVisualAfter(name: string, visualAfter: VisualAfterPolicy) {
   if (visualAfter.capture === 'viewport' || visualAfter.capture === 'fullPage') return true;
-  return !['reportState', 'selectReferenceScreenshots', 'manageVisualContext', 'listTabs', 'getInteractiveCandidates', 'getDomTree', 'waitForHumanVerification'].includes(name);
+  return !['reportState', 'selectReferenceScreenshots', 'manageVisualContext', 'listTabs', 'getHttpRequests', 'getInteractiveCandidates', 'getDomTree', 'waitForHumanVerification'].includes(name);
 }
 
 function screenshotOptionsFromVisualAfter(visualAfter: VisualAfterPolicy): { capture: ScreenshotCaptureMode } {
@@ -974,6 +975,7 @@ function makeBrowserTools(
     stepIndex?: number;
     visualContext?: VisualContextManager;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
+    structuredMemory?: RuntimeStructuredMemoryMode;
   },
 ) {
   // Enforce a single executed tool per AI request. makeBrowserTools is created fresh for each
@@ -984,15 +986,24 @@ function makeBrowserTools(
   let toolExecutedThisRequest = false;
   const semanticFieldRule = 'Do not include candidate ids, area ids, coordinates, delta values, screenshot ids/file names, marker numbers as business meaning, old tool params, or tool input JSON in this semantic field.';
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${semanticFieldRule}`);
+  const structuredMemory = referenceOptions?.structuredMemory || 'full';
+  const structuredMemoryFields = structuredMemory === 'light'
+    ? {
+        taskFrameJson: z.string().max(9000).nullable().optional().describe('Optional JSON string in browser chat. Include only when the task frame materially changes.'),
+        ledgerItemsJson: z.string().max(10000).nullable().optional().describe('Optional JSON array string in browser chat. Include durable issue/risk/findings items when useful; omit or use [] when nothing durable was found.'),
+      }
+    : {
+        taskFrameJson: z.string().min(1).max(9000).describe('Required JSON string. If no TaskFrame exists yet, create one with goal, successCriteria, deliverables, analysisGuidance, finalOutputRequirements, and task-specific dynamic dimensions for THIS user task. Dimensions must be content/coverage axes, not execution progress/status buckets such as login status, reading progress, or test-case generation status. If unchanged, repeat the current TaskFrame JSON.'),
+        ledgerItemsJson: z.string().min(1).max(10000).describe('Required JSON array string of NEW structured ledger items from this step. Use [] only when nothing durable was found. Each item has dimensionId,title,status,severity,expected,actual,summary,confidence,attributes. For defects or mismatches, use status="issue"; for potential instability, use status="risk"; include expected vs actual and evidence from the current page/tool result. For requirement-analysis tasks, capture business rules, interface behavior, test flow steps, assertions, risks, and open questions in detail.'),
+      };
   const toolContextShape = {
     reason: toolReasonInput,
     currentState: z.string().min(1).max(500).describe(`Required Chinese compact current state after reading the CURRENT screenshot and RunState: page/dialog/mode/progress/error/recovery status. This is authoritative state for the next request. ${semanticFieldRule}`),
     observation: z.string().min(1).max(2200).describe(`Required Chinese observation of the current page/task state. Be concrete and include visible requirement content, business rules, UI state, errors, or "无明显新增观察". ${semanticFieldRule}`),
-    findings: z.string().min(1).max(3000).describe(`Required Chinese findings from this step. For requirement-analysis tasks, include detailed business rules, key points, precise test targets, operation flows, risks, and questions. Use "无" only when truly nothing durable was learned. Separate multiple items with semicolons. ${semanticFieldRule}`),
+    findings: z.string().min(1).max(3000).describe(`Required Chinese findings from this step. Act as a tester: record requirement mismatches, visible UI defects, loading/latency problems, validation errors, console/network symptoms mentioned by tools, blocked verification, business rules, test targets, operation flows, risks, and questions. Use "无" only when truly nothing durable was learned. Separate multiple items with semicolons. ${semanticFieldRule}`),
     memory: z.string().min(1).max(2500).describe(`Required Chinese memory for later steps. Include durable business facts/progress only; preserve concrete requirement facts and test ideas. Use "无" if none. Separate multiple items with semicolons. ${semanticFieldRule}`),
     nextGoal: z.string().min(1).max(600).describe(`Required Chinese objective for the NEXT AI request. Describe only the next unfinished target/state, not the concrete operation method, tool name, candidate id, area id, button id, coordinates, or scroll delta. Example: "继续处理尚未覆盖的业务规则并保持已记录结论". ${semanticFieldRule}`),
-    taskFrameJson: z.string().min(1).max(9000).describe('Required JSON string. If no TaskFrame exists yet, create one with goal, successCriteria, deliverables, analysisGuidance, finalOutputRequirements, and task-specific dynamic dimensions for THIS user task. Dimensions must be content/coverage axes, not execution progress/status buckets such as login status, reading progress, or test-case generation status. If unchanged, repeat the current TaskFrame JSON.'),
-    ledgerItemsJson: z.string().min(1).max(10000).describe('Required JSON array string of NEW structured ledger items from this step. Use [] only when nothing durable was found. Each item has dimensionId,title,status,severity,expected,actual,summary,confidence,attributes. For requirement-analysis tasks, ledger items should capture business rules, interface behavior, test flow steps, assertions, risks, and open questions in detail.'),
+    ...structuredMemoryFields,
     visualAfter: z.object({
       capture: z.enum(['auto', 'viewport', 'fullPage']).optional().describe('Use auto normally. Use viewport/fullPage only when the next model request truly needs that screenshot size.'),
       retention: z.enum(['auto', 'replace', 'append']).optional().describe('Use replace by default. Use append only when the next decision must compare with, continue from, or analyze together with the previous screenshot.'),
@@ -1134,6 +1145,11 @@ function makeBrowserTools(
       description: 'List all currently open browser tabs with their index and URL.',
       inputSchema: browserToolInput({}),
       execute: (input) => record('listTabs', input, () => session.listTabs()),
+    }),
+    getHttpRequests: tool({
+      description: 'Read-only diagnostic tool: return recent HTTP requests for the current active tab, including method, URL, resource type, status, ok/failed, and error text. Use when a page looks broken, data is missing, an API may have failed, or you need evidence for a network-related issue.',
+      inputSchema: browserToolInput({}),
+      execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
     }),
     switchTab: tool({
       description: 'Switch to a browser tab by index when the workflow opened a new tab.',
@@ -1349,6 +1365,8 @@ function runtimePrompt(input: {
   markerOverlayInScreenshot?: boolean;
   availableScreenshotReferences?: ScreenshotReference[];
   selectedScreenshotReferences?: SelectedScreenshotReference[];
+  repairContext?: string;
+  structuredMemory?: RuntimeStructuredMemoryMode;
 }) {
   const { testCase, pageContext, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
@@ -1359,6 +1377,7 @@ function runtimePrompt(input: {
   const visualMarkersWithoutOverlay = mode === 'visual-markers' && !markerEnabled;
   const markerOverlayInScreenshot = Boolean(markerEnabled && input.markerOverlayInScreenshot);
   const separateMarkerScreenshot = Boolean(markerEnabled && input.hasMarkerScreenshot);
+  const structuredMemory = input.structuredMemory || 'full';
   const caseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
   const compactRunContext = buildCompactRunContext(completedSteps, input.workingMemory);
@@ -1412,6 +1431,19 @@ function runtimePrompt(input: {
     '- Previous screenshots/references are context only; never use their candidate ids.',
     '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous screenshot.',
   ];
+  const structuredMemoryRules = structuredMemory === 'full'
+    ? [
+        '- Maintain a generic TaskFrame. Dimensions must be task-specific content/coverage axes from THIS user goal, not fixed buckets and not agent progress/status such as login status, reading progress, or test-case generation status.',
+        '- If the user asks for detailed requirement analysis or test cases, ledgerItemsJson must record concrete business rules, test points, operation flows, assertions, edge cases, and risks discovered in the current screenshot. Do not write vague status-only items.',
+        '- Every step should append durable ledgerItemsJson entries against the TaskFrame axes unless the current screenshot truly adds no durable information.',
+      ]
+    : [
+        '- Browser chat uses light structured memory. Do not spend effort generating or repeating a full TaskFrame unless the user is explicitly asking for test-case analysis or the structure materially changes.',
+        '- In browser chat, ledgerItemsJson is optional. Use it for clear defects, risks, durable findings, or requirement facts; otherwise omit it or use [].',
+      ];
+  const structuredMemoryResponseRules = structuredMemory === 'full'
+    ? ['- Include taskFrameJson and ledgerItemsJson in tool params. Use ledgerItemsJson=[] when this step adds no durable item.']
+    : ['- taskFrameJson and ledgerItemsJson are optional in browser chat. Keep them short and only include durable defects, risks, or requirement facts.'];
 
   return [
     'You are an AI browser testing agent. Call exactly ONE tool. Use reportState only when no browser action is needed.',
@@ -1427,9 +1459,11 @@ function runtimePrompt(input: {
     '- In semantic fields (reason/currentState/observation/findings/memory/nextGoal/ledger text), do not output candidate ids, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
     '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
     '- Keep currentState as the compact state after reading current screenshot; nextGoal is the next target state, not the operation method.',
-    '- Maintain a generic TaskFrame. Dimensions must be task-specific content/coverage axes from THIS user goal, not fixed buckets and not agent progress/status such as login status, reading progress, or test-case generation status.',
-    '- If the user asks for detailed requirement analysis or test cases, ledgerItemsJson must record concrete business rules, test points, operation flows, assertions, edge cases, and risks discovered in the current screenshot. Do not write vague status-only items.',
-    '- Every step should append durable ledgerItemsJson entries against the TaskFrame axes unless the current screenshot truly adds no durable information.',
+    ...structuredMemoryRules,
+    '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
+    '- When a problem is observed or strongly indicated by tool/page feedback, describe why it is a problem in findings and add a ledgerItemsJson item with status="issue" or status="risk", severity, expected, actual, summary/reason, and evidence. The runtime will attach current screenshots as issue evidence.',
+    '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
+    input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.',
     `- Use ${evidence} as the current page state.`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
@@ -1459,7 +1493,7 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     '',
     'Response:',
     '- Call one tool and keep state fields grounded in RunState plus current screenshot.',
-    '- Include taskFrameJson and ledgerItemsJson in tool params. Use ledgerItemsJson=[] when this step adds no durable item.',
+    ...structuredMemoryResponseRules,
     '- Candidate action reason must mention the current-screenshot visual feature, not just an id.',
     '- nextGoal is target state only, e.g. "继续分析未完成的新内容", not "点击按钮".',
     '- To finish/block/fail or only record an observation, call reportState. Do not return standalone JSON.',
@@ -1509,6 +1543,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'waitForPage',
     'waitForHumanVerification',
     'listTabs',
+    'getHttpRequests',
     'switchTab',
     'typeText',
     'pressKey',
@@ -1889,6 +1924,8 @@ async function executeRuntimeStep(input: {
   abortSignal?: AbortSignal;
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
+  repairContext?: string;
+  structuredMemory?: RuntimeStructuredMemoryMode;
 }) {
   const {
     session,
@@ -1902,6 +1939,7 @@ async function executeRuntimeStep(input: {
     onDebug,
     onToolTrace,
   } = input;
+  const structuredMemory = input.structuredMemory || 'full';
   const mode = browserModeOf(testCase);
   const screenshotInputEnabled = shouldSendScreenshotToAi(mode);
   const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
@@ -1944,6 +1982,8 @@ async function executeRuntimeStep(input: {
     markerOverlayInScreenshot,
     availableScreenshotReferences,
     selectedScreenshotReferences,
+    repairContext: input.repairContext,
+    structuredMemory,
   });
   const promptMs = elapsedSince(promptStartedAt);
   await onDebug?.({
@@ -1990,6 +2030,8 @@ async function executeRuntimeStep(input: {
         markerOverlayInScreenshot,
         availableScreenshotReferences,
         selectedScreenshotReferences,
+        repairContext: input.repairContext,
+        structuredMemory,
       });
       requestPrompt = codexMode ? buildCodexObjectPrompt(basePrompt, allowedToolTypes) : basePrompt;
       return requestPrompt;
@@ -2015,7 +2057,7 @@ async function executeRuntimeStep(input: {
           ? [
               'Context budget manager:',
               `- Estimated context exceeded ${Math.round(Number(compressionDetails.thresholdRatio) * 100)}%; historical visual frames and working memory were compressed.`,
-              '- This request is a fresh dialogue turn built from current visual context, compact memory, and recent tool summaries.',
+              '- This request is a single reconstructed prompt built from current visual context, compact memory, and recent tool summaries.',
             ].join('\n')
           : '';
         return buildPrepareStepPrompt({
@@ -2068,7 +2110,7 @@ async function executeRuntimeStep(input: {
         await onDebug?.({
           phase: 'ai:context-compressed',
           stepIndex,
-          message: `Context estimate ${estimatedTokens}/${windowTokens} tokens after compression; opened fresh prepareStep turn ${contextCompressionTurns}.`,
+          message: `Context estimate ${estimatedTokens}/${windowTokens} tokens after compression; rebuilt one-shot runtime context ${contextCompressionTurns}.`,
           details: { ...compressionDetails, estimatedTokensAfter: estimatedTokens, visualContext: visualContext.snapshot(), workingMemory },
         });
       }
@@ -2081,7 +2123,9 @@ async function executeRuntimeStep(input: {
 
     if (codexMode) {
       const aiStartedAt = Date.now();
-      const result = await generateObjectWithTimeout({ model: getModel(), messages: await prepareStep(0), schema: codexRuntimeObjectSchema, temperature: 0.1, maxRetries: 0, abortSignal });
+      const messages = await prepareStep(0);
+      await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision.', details: { provider: getModelSettings().provider, model: getModelSettings().model, codexObjectMode: true } });
+      const result = await generateObjectWithTimeout({ model: getModel(), messages, schema: codexRuntimeObjectSchema, temperature: 0.1, maxRetries: 0, abortSignal });
       const object = result.object as z.infer<typeof codexRuntimeObjectSchema>;
       const execution = await executeCodexRuntimeObject({
         session,
@@ -2110,9 +2154,11 @@ async function executeRuntimeStep(input: {
       const aiStartedAt = Date.now();
       const traceStart = traces.length;
       try {
+        const messages = await prepareStep(turnIndex);
+        await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision. turn ' + (turnIndex + 1) + '/' + maxTurns + '.', details: { provider: getModelSettings().provider, model: getModelSettings().model, turnIndex: turnIndex + 1, maxTurns } });
         const result = await generateTextWithTimeout({
-          model: getModel(), messages: await prepareStep(turnIndex),
-          tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, async (trace) => { workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex); await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() }); await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + ' -> ' + (trace.result.ok ? 'ok' : 'failed'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } }); }, { availableReferenceIds, runId: input.runId, stepIndex, visualContext, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
+          model: getModel(), messages,
+          tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, async (trace) => { workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex); await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() }); await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + ' -> ' + (trace.result.ok ? 'ok' : 'failed'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } }); }, { availableReferenceIds, runId: input.runId, stepIndex, visualContext, structuredMemory, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
           stopWhen: stepCountIs(1), temperature: 0.1, maxRetries: 0, abortSignal,
         });
         latestText = result.text || '';
@@ -2167,6 +2213,271 @@ async function executeRuntimeStep(input: {
   const wrapped = new Error(String(lastError || 'AI request failed before a response was returned'));
   (wrapped as { aiRequest?: AiRequestSnapshot }).aiRequest = lastAiRequest;
   throw wrapped;
+}
+
+export type InteractiveBrowserTurnMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+};
+
+export type InteractiveBrowserTurnResult = {
+  status: 'passed' | 'failed' | 'blocked';
+  reply: string;
+  steps: StepExecutionResult[];
+  newSteps: StepExecutionResult[];
+  consoleErrors: string[];
+  networkErrors: string[];
+};
+
+function browserChatMaxSteps() {
+  const raw = Number(process.env.AI_BROWSER_CHAT_MAX_STEPS || 6);
+  return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 6));
+}
+
+function browserChatRequirement(input: {
+  targetUrl: string;
+  instruction: string;
+  conversation: InteractiveBrowserTurnMessage[];
+}) {
+  const history = input.conversation
+    .slice(-12)
+    .map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${concise(message.content, 900)}`)
+    .join('\n');
+  return [
+    'Browser chat mode. This is not a fixed test case.',
+    'The user is having a live conversation with you and expects you to operate the browser from the current page state.',
+    `Latest user message: ${input.instruction}`,
+    `Target URL if the user did not specify another page: ${input.targetUrl || 'about:blank'}`,
+    history ? `Conversation history:\n${history}` : '',
+    '',
+    'Work style:',
+    '- Follow the latest user message first, while preserving useful context from the conversation.',
+    '- If browser work is needed, take concrete browser actions instead of only describing what to do.',
+    '- If the user asks a question about the current page, inspect the page and answer from evidence.',
+    '- If the user asks you to continue after manual login/captcha/security work, continue from the current browser state.',
+    '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
+    '- Keep tester discipline: record visible problems, suspicious network failures, broken UI states, and why they matter.',
+  ].filter(Boolean).join('\n');
+}
+
+function createInteractiveBrowserTestCase(input: {
+  id: string;
+  mode?: BrowserSessionMode | 'default';
+  targetUrl: string;
+  instruction: string;
+  conversation: InteractiveBrowserTurnMessage[];
+}): TestCaseRecord {
+  const now = new Date().toISOString();
+  const targetUrl = input.targetUrl || 'about:blank';
+  const requirement = browserChatRequirement({
+    targetUrl,
+    instruction: input.instruction,
+    conversation: input.conversation,
+  });
+  return {
+    id: input.id,
+    title: 'Browser chat operation',
+    description: input.instruction,
+    targetUrl,
+    status: 'running',
+    priority: 'medium',
+    content: {
+      title: 'Browser chat operation',
+      description: input.instruction,
+      targetUrl,
+      priority: 'medium',
+      browserMode: input.mode || 'default',
+      isMarked: true,
+      userRequirement: requirement,
+      systemPrompt: 'This is an interactive browser chat. Do not assume a fixed test-case script; operate from the live page and answer the latest user message in Chinese.',
+      preconditions: [],
+      testData: {},
+      steps: [],
+      expectedResults: ['Satisfy the latest user message or clearly report the blocker.'],
+      risks: ['The user may continue the task with another chat message after this turn.'],
+    },
+    imageNames: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function upsertStep(steps: StepExecutionResult[], step: StepExecutionResult) {
+  const index = steps.findIndex((item) => item.index === step.index);
+  if (index >= 0) steps[index] = { ...steps[index], ...step };
+  else steps.push(step);
+  steps.sort((a, b) => a.index - b.index);
+}
+
+function assistantReplyFromStep(step?: StepExecutionResult) {
+  if (!step) return '这一轮没有产生新的浏览器操作。';
+  const lastTool = step.tools?.at(-1);
+  const input = lastTool?.input && typeof lastTool.input === 'object' && !Array.isArray(lastTool.input)
+    ? lastTool.input as Record<string, unknown>
+    : {};
+  const toolText = typeof input.actual === 'string' && input.actual.trim()
+    ? input.actual.trim()
+    : typeof input.action === 'string' && input.action.trim()
+      ? input.action.trim()
+      : '';
+  const actual = (step.actual || '').replace(/^Reported state without browser action:\s*/i, '').trim();
+  return toolText || actual || step.note || '已完成这一轮浏览器操作。';
+}
+
+export async function executeInteractiveBrowserTurn(input: {
+  session: BrowserSession;
+  runId: string;
+  targetUrl: string;
+  instruction: string;
+  conversation?: InteractiveBrowserTurnMessage[];
+  completedSteps?: StepExecutionResult[];
+  mode?: BrowserSessionMode | 'default';
+  onProgress?: (step: StepExecutionResult) => void | Promise<void>;
+  onDebug?: ExecutionDebug;
+  abortSignal?: AbortSignal;
+}): Promise<InteractiveBrowserTurnResult> {
+  const steps = [...(input.completedSteps || [])];
+  const newSteps: StepExecutionResult[] = [];
+  const testCase = createInteractiveBrowserTestCase({
+    id: `chat_${input.runId}`,
+    mode: input.mode,
+    targetUrl: input.targetUrl,
+    instruction: input.instruction,
+    conversation: input.conversation || [],
+  });
+  let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
+  let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
+  let reply = '';
+
+  for (let turnStep = 0; turnStep < browserChatMaxSteps(); turnStep += 1) {
+    const stepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
+    await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `Preparing browser chat step ${stepIndex}; capturing current page screenshot.` });
+    const beforeScreenshotStartedAt = Date.now();
+    const beforeScreenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, 'before');
+    await input.onDebug?.({ phase: 'browser:screenshot:before', stepIndex, message: `Current page screenshot captured in ${elapsedSince(beforeScreenshotStartedAt)}ms.`, details: { elapsedMs: elapsedSince(beforeScreenshotStartedAt), path: beforeScreenshotPath } });
+    const runningStep: StepExecutionResult = {
+      index: stepIndex,
+      action: 'AI is handling the latest browser chat message',
+      expected: 'AI should inspect the live browser state and perform one useful browser action or report the current state.',
+      actual: 'AI is choosing the next browser action from the current page.',
+      status: 'running',
+      beforeScreenshotPath,
+    };
+    upsertStep(steps, runningStep);
+    await input.onProgress?.(runningStep);
+
+    const liveToolTraces: ToolTrace[] = [];
+    let latestToolProgress: ToolTraceProgress | undefined;
+    let actionResult: Awaited<ReturnType<typeof executeRuntimeStep>>;
+
+    try {
+      actionResult = await executeRuntimeStep({
+        session: input.session,
+        testCase,
+        runId: input.runId,
+        stepIndex,
+        beforeScreenshotPath,
+        completedSteps: steps.filter((step) => step.index !== stepIndex),
+        structuredMemory: 'light',
+        selectedScreenshotReferences,
+        onSelectReferenceScreenshots: async (selection) => {
+          selectedScreenshotReferences = selection.ids
+            .map((id) => selection.availableReferences.find((ref) => ref.id === id))
+            .filter((ref): ref is ScreenshotReference => Boolean(ref))
+            .map((ref) => ({
+              ...ref,
+              selectionReason: selection.selectionReason,
+              sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
+            }));
+        },
+        abortSignal: input.abortSignal,
+        onDebug: input.onDebug,
+        onToolTrace: async (trace, progress) => {
+          liveToolTraces.push(trace);
+          latestToolProgress = progress || latestToolProgress;
+          await input.onProgress?.({
+            ...runningStep,
+            actual: 'AI called a browser tool; waiting for page feedback.',
+            tools: summarizeToolTraces(liveToolTraces),
+            ...progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress),
+          });
+        },
+      });
+    } catch (error) {
+      const recoveredState = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress);
+      const errorStep = await createRecoverableRuntimeErrorStep({
+        session: input.session,
+        runId: input.runId,
+        stepIndex,
+        beforeScreenshotPath,
+        error,
+        tools: summarizeToolTraces(liveToolTraces),
+        aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
+        recoveredState,
+      });
+      upsertStep(steps, errorStep);
+      newSteps.push(errorStep);
+      await input.onProgress?.(errorStep);
+      finalStatus = 'failed';
+      reply = assistantReplyFromStep(errorStep);
+      break;
+    }
+
+    const afterScreenshotStartedAt = Date.now();
+    const afterScreenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, 'after');
+    await input.onDebug?.({ phase: 'browser:screenshot:after', stepIndex, message: `Post-action screenshot captured in ${elapsedSince(afterScreenshotStartedAt)}ms.`, details: { elapsedMs: elapsedSince(afterScreenshotStartedAt), path: afterScreenshotPath } });
+    const decision = normalizeRuntimeDecision(deriveDecision(actionResult.text, actionResult.traces, requirementOf(testCase)));
+    const completedStep: StepExecutionResult = {
+      index: stepIndex,
+      action: decision.action,
+      expected: decision.expected,
+      actual: decision.actual,
+      status: decision.status,
+      note: decision.note,
+      observation: decision.observation,
+      findings: decision.findings,
+      memoryItems: decision.memoryItems,
+      taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
+      ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
+        .map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex })),
+      aiRequest: actionResult.aiRequest,
+      beforeScreenshotPath,
+      afterScreenshotPath,
+      screenshotPath: afterScreenshotPath,
+      tools: summarizeToolTraces(actionResult.traces),
+      visualContext: actionResult.visualContext,
+      workingMemory: actionResult.workingMemory,
+    };
+    upsertStep(steps, completedStep);
+    newSteps.push(completedStep);
+    await input.onProgress?.(completedStep);
+    reply = assistantReplyFromStep(completedStep);
+
+    const lastToolName = actionResult.traces.at(-1)?.name;
+    if (decision.status === 'blocked' || decision.status === 'failed') {
+      finalStatus = decision.status;
+      break;
+    }
+    if (decision.done || lastToolName === 'reportState' || lastToolName === 'waitForHumanVerification') {
+      finalStatus = decision.status;
+      break;
+    }
+  }
+
+  if (!newSteps.length) {
+    reply = reply || '这一轮没有产生新的浏览器操作。';
+  } else if (!reply) {
+    reply = assistantReplyFromStep(newSteps.at(-1));
+  }
+
+  return {
+    status: finalStatus,
+    reply,
+    steps,
+    newSteps,
+    consoleErrors: input.session.getConsoleErrors(),
+    networkErrors: input.session.getNetworkErrors(),
+  };
 }
 
 function errorRecordSources(error: unknown) {
@@ -2302,11 +2613,34 @@ function normalizeBrowserUrl(url: string) {
   return `https://${trimmed}`;
 }
 
+function recordedStepDelayMs(flow: RecordedFlowStep, isFirstStep: boolean) {
+  if (typeof flow.delayBeforeMs === 'number' && Number.isFinite(flow.delayBeforeMs)) {
+    return Math.max(0, Math.floor(flow.delayBeforeMs));
+  }
+  if (isFirstStep) return 0;
+  const configuredDelay = Number(process.env.REPLAY_STEP_DELAY_MS || 1500);
+  return Math.max(0, Math.floor(Number.isFinite(configuredDelay) ? configuredDelay : 1500));
+}
+
+async function waitBeforeRecordedTool(session: BrowserSession, flow: RecordedFlowStep, isFirstStep: boolean) {
+  const delayMs = recordedStepDelayMs(flow, isFirstStep);
+  if (delayMs > 0) await session.wait(delayMs).catch(() => undefined);
+}
+
 async function waitAfterRecordedTool(session: BrowserSession) {
   await session.waitForPage().catch(() => undefined);
-  const configuredDelay = Number(process.env.REPLAY_STEP_DELAY_MS || 0);
+  const configuredDelay = Number(process.env.REPLAY_AFTER_ACTION_SETTLE_MS || 0);
   const delayMs = Number.isFinite(configuredDelay) ? configuredDelay : 0;
   if (delayMs > 0) await session.wait(delayMs).catch(() => undefined);
+}
+
+function replayAiRepairEnabled() {
+  return process.env.REPLAY_AI_REPAIR !== 'false';
+}
+
+function replayAiRepairMaxSteps() {
+  const raw = Number(process.env.REPLAY_AI_REPAIR_MAX_STEPS || 2);
+  return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 2));
 }
 
 async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep): Promise<BrowserActionResult> {
@@ -2369,6 +2703,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
     case 'listTabs':
       return session.listTabs();
+    case 'getHttpRequests':
+      return session.getCurrentTabHttpRequests();
     case 'switchTab':
       return session.switchTab(typeof input.index === 'number' ? input.index : Number(input.index || 0));
     case 'reportState':
@@ -2506,11 +2842,15 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
     onDebug,
     shouldSkipStep,
     shouldPauseRun,
+    shouldResumeStep,
     onPaused,
     onResumed,
+    onManualIntervention,
+    onManualInterventionCleared,
   } = options;
-  const session = new BrowserSession(browserModeOf(testCase), { isMarked: visualMarkersEnabledFor(testCase) });
+  const session = new BrowserSession(browserModeOf(testCase), { isMarked: visualMarkersEnabledFor(testCase), runId });
   const steps: StepExecutionResult[] = [];
+  let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
   let allowBrowserClose = false;
 
   async function waitWhilePaused(stepIndex: number) {
@@ -2531,13 +2871,301 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
     return paused;
   }
 
+  async function waitForRecordedManualIntervention(input: {
+    stepIndex: number;
+    reason: string;
+    screenshotPath?: string;
+    runningStep: StepExecutionResult;
+  }) {
+    const { stepIndex, reason, screenshotPath, runningStep } = input;
+    if (!shouldResumeStep) return false;
+    await onManualIntervention?.({ stepIndex, reason, screenshotPath });
+    await onDebug?.({
+      phase: 'recorded:manual-required',
+      stepIndex,
+      message: 'Recorded flow is waiting for user-side verification before continuing.',
+      details: { reason, screenshotPath },
+    });
+    await onProgress?.({
+      ...runningStep,
+      actual: `${reason} 完成后请回到运行报告点击“执行完毕”，回放会从当前浏览器状态继续。`,
+    });
+
+    while (true) {
+      if (await shouldSkipStep?.(stepIndex)) {
+        await onManualInterventionCleared?.(stepIndex);
+        return true;
+      }
+      if (await shouldResumeStep(stepIndex)) break;
+      await sleep(800);
+    }
+
+    await onManualInterventionCleared?.(stepIndex);
+    await onDebug?.({ phase: 'recorded:manual-resumed', stepIndex, message: 'User confirmed manual verification; recorded flow is continuing.' });
+    return false;
+  }
+
+  async function runAiRepairForRecordedFailure(
+    failedRecordedStep: StepExecutionResult,
+    flow: RecordedFlowStep,
+    repairAttempt = 1,
+  ): Promise<{ status: 'passed' | 'failed' | 'blocked'; done: boolean }> {
+    const repairStepIndex = steps.length + 1;
+    await waitWhilePaused(repairStepIndex);
+
+    if (await shouldSkipStep?.(repairStepIndex)) {
+      const skippedStep = createSkippedStep(repairStepIndex, failedRecordedStep.afterScreenshotPath || failedRecordedStep.screenshotPath);
+      steps.push(skippedStep);
+      await onProgress?.(skippedStep);
+      return { status: 'blocked', done: true };
+    }
+
+    const beforeScreenshotPath = failedRecordedStep.afterScreenshotPath
+      || failedRecordedStep.screenshotPath
+      || await session.takeScreenshot(runId, repairStepIndex, 'before');
+    const runningStep: StepExecutionResult = {
+      index: repairStepIndex,
+      action: 'AI 接管修复回放失败操作',
+      expected: 'AI 应基于当前页面重新选择可靠操作，修复固定回放中失败或失效的录制动作。',
+      actual: `回放步骤 ${failedRecordedStep.index} 的工具 ${flow.name} 执行失败，AI 正在接管修复。`,
+      status: 'running',
+      beforeScreenshotPath,
+    };
+    await onProgress?.(runningStep);
+    await onDebug?.({
+      phase: 'recorded:repair:start',
+      stepIndex: repairStepIndex,
+      message: `AI repair attempt ${repairAttempt} started after recorded tool ${flow.name} failed.`,
+      details: { failedRecordedStep, flow, repairAttempt },
+    });
+
+    const abortController = registerStepAbortController(runId, repairStepIndex);
+    const liveToolTraces: ToolTrace[] = [];
+    let latestToolProgress: ToolTraceProgress | undefined;
+
+    try {
+      const flowIndex = recordedFlow.indexOf(flow);
+      const nextFlow = flowIndex >= 0 ? recordedFlow[flowIndex + 1] : undefined;
+      const repairContext = [
+        '- A recorded replay operation just failed. This AI step must automatically repair the current browser state so the remaining recorded replay can continue.',
+        '- Perform one concrete corrective browser action from the CURRENT screenshot/context. Do not ask the user unless CAPTCHA/login/security verification is actually required.',
+        '- Do not reuse old recorded candidate ids, DOM paths, coordinates, or scroll area ids. Treat them only as historical clues.',
+        '- Do not mark the full test complete unless every user requirement is already proven. Prefer restoring the page to a state where the next recorded operation can work.',
+        '- When the page is repaired and ready for the remaining replay, call reportState with done=false and status="passed" to say replay can continue. If it is not repaired yet, keep taking corrective tool actions within this agent loop.',
+        `- Failed recorded tool: ${flow.name}.`,
+        flow.reason ? `- Recorded reason: ${sanitizeHistoricalToolText(flow.reason, 240)}.` : '',
+        `- Failure result: ${sanitizeHistoricalToolText(failedRecordedStep.actual, 420)}.`,
+        nextFlow ? `- Next recorded tool after repair: ${nextFlow.name}${nextFlow.reason ? ` (${sanitizeHistoricalToolText(nextFlow.reason, 180)})` : ''}.` : '- There is no next recorded tool; repair should finish only if the requirement is proven.',
+      ].filter(Boolean).join('\n');
+      const actionResult = await executeRuntimeStep({
+        session,
+        testCase,
+        runId,
+        stepIndex: repairStepIndex,
+        beforeScreenshotPath,
+        completedSteps: steps,
+        selectedScreenshotReferences,
+        onSelectReferenceScreenshots: async (selection) => {
+          selectedScreenshotReferences = selection.ids
+            .map((id) => selection.availableReferences.find((ref) => ref.id === id))
+            .filter((ref): ref is ScreenshotReference => Boolean(ref))
+            .map((ref) => ({
+              ...ref,
+              selectionReason: selection.selectionReason,
+              sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
+            }));
+          await onDebug?.({
+            phase: 'recorded:repair:reference-screenshots:selected',
+            stepIndex: repairStepIndex,
+            message: selectedScreenshotReferences.length
+              ? `Selected reference screenshots for AI repair: ${selectedScreenshotReferences.map((ref) => ref.id).join(', ')}`
+              : 'Cleared reference screenshots for AI repair.',
+            details: { selection, selectedScreenshotReferences },
+          });
+        },
+        abortSignal: abortController.signal,
+        onDebug,
+        repairContext,
+        onToolTrace: async (trace, progress) => {
+          liveToolTraces.push(trace);
+          latestToolProgress = progress || latestToolProgress;
+          const liveFields = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), repairStepIndex, latestToolProgress);
+          await onProgress?.({
+            ...runningStep,
+            actual: 'AI 已调用浏览器工具修复回放失败操作，正在等待页面反馈。',
+            tools: summarizeToolTraces(liveToolTraces),
+            ...liveFields,
+          });
+        },
+      });
+
+      const afterScreenshotPath = await session.takeScreenshot(runId, repairStepIndex, 'after');
+      let decision = normalizeRuntimeDecision(deriveDecision(actionResult.text, actionResult.traces, requirementOf(testCase)));
+
+      if (decision.done && completionVerifyEnabled()) {
+        const verifyPageContext = await session.getPageContext({
+          includeDomTree: false,
+          includeText: false,
+          includeManualVerification: true,
+        });
+        const verification = await verifyRuntimeCompletion({
+          testCase,
+          screenshotPath: afterScreenshotPath,
+          proposed: decision,
+          completedSteps: steps,
+          pageContext: verifyPageContext,
+          abortSignal: abortController.signal,
+        });
+        await onDebug?.({
+          phase: 'recorded:repair:completion-verify',
+          stepIndex: repairStepIndex,
+          message: verification.verified
+            ? 'AI repair completion verification passed.'
+            : `AI repair completion verification failed: ${verification.remainingWork || verification.summary}`,
+          details: { verification, proposed: decision },
+        });
+
+        if (!verification.verified) {
+          const retryInstruction = `[AI 修复完成校验未通过] ${verification.summary}${
+            verification.remainingWork ? ` 待继续：${verification.remainingWork}` : ''
+          }。`;
+          decision = {
+            ...decision,
+            done: false,
+            status: verification.status === 'blocked' ? 'blocked' : 'passed',
+            actual: `${decision.actual}\n\n${retryInstruction}`,
+            note: retryInstruction,
+          };
+        } else {
+          decision = {
+            ...decision,
+            done: true,
+            status: verification.status,
+            actual: verification.summary,
+          };
+        }
+      }
+
+      if (
+        decision.status === 'blocked' &&
+        !decision.done &&
+        manualIssuePattern.test(`${decision.action}\n${decision.expected}\n${decision.actual}`)
+      ) {
+        const skippedForManual = await waitForRecordedManualIntervention({
+          stepIndex: repairStepIndex,
+          reason: decision.actual || 'AI 修复过程中检测到验证码、登录验证或安全校验，需要用户手动处理。',
+          screenshotPath: afterScreenshotPath,
+          runningStep,
+        });
+        if (skippedForManual) {
+          const skippedStep = createSkippedStep(repairStepIndex, beforeScreenshotPath, afterScreenshotPath);
+          steps.push(skippedStep);
+          await onProgress?.(skippedStep);
+          return { status: 'blocked', done: true };
+        }
+
+        const manualStep: StepExecutionResult = {
+          index: repairStepIndex,
+          action: 'AI 修复等待人工校验',
+          expected: '人工校验完成前，AI 修复不应继续执行后续操作。',
+          actual: '用户已确认人工校验完成，AI 将基于最新页面继续修复回放失败操作。',
+          status: 'passed',
+          note: decision.note,
+          observation: decision.observation,
+          findings: Array.from(new Set([...(decision.findings || []), 'AI 修复过程中触发人工校验等待点，已在用户确认后继续。'])),
+          memoryItems: decision.memoryItems,
+          taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
+          ledgerItems: mergeLedgerItems(decision.ledgerItems || [], [{
+            dimensionId: 'runtime-replay',
+            title: 'AI 修复等待人工校验',
+            status: 'evidence',
+            severity: 'info',
+            expected: '人工校验完成前暂停自动化修复。',
+            actual: '已等待用户点击“执行完毕”后继续。',
+            sourceStep: repairStepIndex,
+          }], ledgerMemoryLimit()).map((item) => ({ ...item, sourceStep: item.sourceStep ?? repairStepIndex })),
+          aiRequest: actionResult.aiRequest,
+          beforeScreenshotPath,
+          afterScreenshotPath,
+          screenshotPath: afterScreenshotPath,
+          tools: summarizeToolTraces(actionResult.traces),
+          visualContext: actionResult.visualContext,
+          workingMemory: actionResult.workingMemory,
+        };
+        steps.push(manualStep);
+        await onProgress?.(manualStep);
+        clearStepAbortController(runId, repairStepIndex);
+        if (repairAttempt < replayAiRepairMaxSteps()) {
+          return runAiRepairForRecordedFailure(failedRecordedStep, flow, repairAttempt + 1);
+        }
+        return { status: 'blocked', done: true };
+      }
+
+      const completedStep: StepExecutionResult = {
+        index: repairStepIndex,
+        action: `AI 接管修复：${decision.action}`,
+        expected: decision.expected,
+        actual: decision.actual,
+        status: decision.status,
+        note: decision.note,
+        observation: decision.observation,
+        findings: Array.from(new Set([
+          ...(decision.findings || []),
+          decision.status === 'passed' ? `AI 已接管并尝试修复回放工具 ${flow.name} 的失败。` : `AI 接管修复回放工具 ${flow.name} 后仍未通过。`,
+        ])),
+        memoryItems: decision.memoryItems,
+        taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
+        ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
+          .map((item) => ({ ...item, sourceStep: item.sourceStep ?? repairStepIndex })),
+        aiRequest: actionResult.aiRequest,
+        beforeScreenshotPath,
+        afterScreenshotPath,
+        screenshotPath: afterScreenshotPath,
+        tools: summarizeToolTraces(actionResult.traces),
+        visualContext: actionResult.visualContext,
+        workingMemory: actionResult.workingMemory,
+      };
+      steps.push(completedStep);
+      await onProgress?.(completedStep);
+      await onDebug?.({
+        phase: 'recorded:repair:done',
+        stepIndex: repairStepIndex,
+        message: `AI repair completed with ${decision.status}${decision.done ? '; requirement marked done' : '; replay can continue'}.`,
+        details: { decision, traces: actionResult.traces },
+      });
+      return { status: decision.status, done: decision.done };
+    } catch (error) {
+      const recoverableStep = await createRecoverableRuntimeErrorStep({
+        session,
+        runId,
+        stepIndex: repairStepIndex,
+        beforeScreenshotPath,
+        error,
+        tools: summarizeToolTraces(liveToolTraces),
+        aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
+        recoveredState: progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), repairStepIndex, latestToolProgress),
+      });
+      steps.push(recoverableStep);
+      await onProgress?.(recoverableStep);
+      await onDebug?.({
+        phase: 'recorded:repair:error',
+        stepIndex: repairStepIndex,
+        message: 'AI repair failed; recorded replay cannot continue automatically.',
+        details: { error: serializeError(error), failedRecordedStep, flow },
+      });
+      return { status: 'failed', done: true };
+    } finally {
+      clearStepAbortController(runId, repairStepIndex);
+    }
+  }
+
   try {
-    await onDebug?.({ phase: 'recorded:start', message: `Using recorded flow with ${recordedFlow.length} tool calls; AI runtime requests are skipped.` });
+    await onDebug?.({ phase: 'recorded:start', message: `Using recorded flow with ${recordedFlow.length} tool calls; AI repair will take over if a recorded operation fails.` });
     await session.start();
 
     for (let index = 0; index < recordedFlow.length; index += 1) {
       const flow = recordedFlow[index];
-      const stepIndex = index + 1;
+      const stepIndex = steps.length + 1;
       await waitWhilePaused(stepIndex);
 
       if (await shouldSkipStep?.(stepIndex)) {
@@ -2547,7 +3175,8 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         continue;
       }
 
-      const beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
+      await waitBeforeRecordedTool(session, flow, index === 0);
+      let beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
       const runningStep: StepExecutionResult = {
         index: stepIndex,
         action: `回放固定流程工具：${flow.name}`,
@@ -2558,6 +3187,72 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         tools: [{ name: flow.name, input: flow.input, reason: flow.reason }],
       };
       await onProgress?.(runningStep);
+
+      const pageContext = await session.getPageContext({
+        includeDomTree: false,
+        includeText: true,
+        includeManualVerification: true,
+        includeInteractiveCandidates: false,
+      });
+      const explicitManualWait = flow.waitForManual || flow.name === 'waitForHumanVerification';
+      if (explicitManualWait || pageContext.isManualVerification) {
+        const reason = explicitManualWait
+          ? '录制流程在此处需要用户完成验证码、登录验证或安全校验。'
+          : '回放检测到当前页面出现验证码、登录验证或安全校验，需要用户在现有浏览器中手动处理。';
+        const skippedForManual = await waitForRecordedManualIntervention({
+          stepIndex,
+          reason,
+          screenshotPath: beforeScreenshotPath,
+          runningStep,
+        });
+        if (skippedForManual) {
+          const skippedStep = createSkippedStep(stepIndex, beforeScreenshotPath);
+          steps.push(skippedStep);
+          await onProgress?.(skippedStep);
+          continue;
+        }
+
+        beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
+        await onProgress?.({
+          ...runningStep,
+          beforeScreenshotPath,
+          actual: '用户已确认人工校验完成；回放正在从最新页面状态继续。',
+        });
+
+        if (explicitManualWait) {
+          const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
+          const completedStep: StepExecutionResult = {
+            index: stepIndex,
+            action: `回放固定流程工具：${flow.name}`,
+            expected: 'Recorded manual verification wait should pause until the user confirms completion.',
+            actual: '用户已确认人工校验完成，回放继续执行后续步骤。',
+            status: 'passed',
+            beforeScreenshotPath,
+            afterScreenshotPath,
+            screenshotPath: afterScreenshotPath,
+            tools: [{ name: flow.name, input: flow.input, reason: flow.reason, ok: true, result: 'Manual verification confirmed by user before replay continued.' }],
+            findings: ['回放流程包含人工校验等待点，已在用户确认后继续。'],
+            ledgerItems: [{
+              dimensionId: 'runtime-replay',
+              title: '回放等待人工校验',
+              status: 'evidence',
+              severity: 'info',
+              expected: '验证码、登录验证或安全校验完成前，回放不应继续执行后续操作。',
+              actual: '回放已暂停并等待用户点击“执行完毕”后继续。',
+              sourceStep: stepIndex,
+            }],
+          };
+          steps.push(completedStep);
+          await onProgress?.(completedStep);
+          await onDebug?.({
+            phase: 'recorded:manual-step',
+            stepIndex,
+            message: 'Recorded manual verification step completed after user confirmation.',
+            details: { flow },
+          });
+          continue;
+        }
+      }
 
       const result = await runRecordedTool(session, testCase.targetUrl, flow).catch((error) => ({
         ok: false,
@@ -2575,6 +3270,17 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         afterScreenshotPath,
         screenshotPath: afterScreenshotPath,
         tools: [{ name: flow.name, input: flow.input, reason: flow.reason, ok: result.ok, result: result.actual }],
+        findings: result.ok ? undefined : [`固定回放工具 ${flow.name} 执行失败，AI 将基于当前页面接管修复。错误：${concise(result.actual, 220)}`],
+        ledgerItems: result.ok ? undefined : [{
+          dimensionId: 'runtime-replay',
+          title: '固定回放操作失败',
+          status: 'issue',
+          severity: 'major',
+          expected: '录制动作应能在当前页面稳定执行。',
+          actual: result.actual,
+          summary: `回放工具 ${flow.name} 失败，可能是页面加载状态、候选编号、DOM 结构或登录/验证状态变化导致。`,
+          sourceStep: stepIndex,
+        }],
       };
       steps.push(completedStep);
       await onProgress?.(completedStep);
@@ -2586,9 +3292,23 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
       });
 
       if (!result.ok) {
-        allowBrowserClose = true;
+        if (!replayAiRepairEnabled()) {
+          allowBrowserClose = true;
+          return {
+            status: 'failed' as const,
+            result: {
+              steps,
+              consoleErrors: session.getConsoleErrors(),
+              networkErrors: session.getNetworkErrors(),
+            },
+          };
+        }
+
+        const repair = await runAiRepairForRecordedFailure(completedStep, flow);
+        if (repair.status === 'passed' && !repair.done) continue;
+        allowBrowserClose = repair.status !== 'blocked';
         return {
-          status: 'failed' as const,
+          status: repair.status,
           result: {
             steps,
             consoleErrors: session.getConsoleErrors(),
@@ -2649,7 +3369,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
     onManualIntervention,
     onManualInterventionCleared,
   } = options;
-  const session = new BrowserSession(runtimeMode, { isMarked: visualMarkersEnabledFor(testCase) });
+  const session = new BrowserSession(runtimeMode, { isMarked: visualMarkersEnabledFor(testCase), runId });
   const steps: StepExecutionResult[] = [...(initialSteps || [])];
   // Each runtime step now performs a single browser action, so allow more steps overall.
   const maxRuntimeSteps = Number(process.env.AI_TEST_RUNTIME_MAX_STEPS || 30);

@@ -2,10 +2,11 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, 
 import path from 'node:path';
 import { defaultModelByProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import { storeFilePath } from '@/server/storage/paths';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
-const storePath = path.join(process.cwd(), '.data', 'store.json');
+const storePath = storeFilePath();
 
 const seedContent: TestCaseContent = {
   title: 'Login smoke test',
@@ -501,6 +502,23 @@ export const store = {
     data.runs = data.runs.filter((run) => !targetIds.has(run.id));
     writeData(data);
     return before - data.runs.length;
+  },
+  // 删除测试用例，并移除关联运行记录与定时任务引用。artifact 文件保留，避免误删仍需追溯的证据。
+  deleteTestCase(testCaseId: string) {
+    const data = readData();
+    const exists = data.testCases.some((record) => record.id === testCaseId);
+    if (!exists) return false;
+    data.testCases = data.testCases.filter((record) => record.id !== testCaseId);
+    data.runs = data.runs.filter((run) => run.testCaseId !== testCaseId);
+    data.schedules = (data.schedules || [])
+      .map((schedule) => ({
+        ...schedule,
+        testCaseIds: schedule.testCaseIds.filter((id) => id !== testCaseId),
+        updatedAt: now(),
+      }))
+      .filter((schedule) => schedule.testCaseIds.length > 0);
+    writeData(data);
+    return true;
   },
   // 更新测试用例的整体执行状态。
   updateTestCaseStatus(testCaseId: string, status: TestCaseRecord['status']) {

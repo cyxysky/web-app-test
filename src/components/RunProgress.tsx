@@ -4,6 +4,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, PauseCircle, PlayCircle, Plus, Radar, SkipForward, Wrench, X } from 'lucide-react';
 import { MarkdownReport } from '@/components/MarkdownReport';
 import { RunMetaDrawer } from '@/components/RunMetaDrawer';
+import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
+import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { RunDebugEvent, StepExecutionResult, TaskFrame, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 type ImageItem = { title: string; url: string };
@@ -634,53 +636,78 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   async function skipSelectedStep() {
     if (!selectedStep) return;
-    const response = await fetch(`/api/runs/${run.id}/skip`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stepIndex: selectedStep.index }),
-    });
-    if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+    startGlobalLoading('正在跳过步骤');
+    try {
+      const response = await fetch(`/api/runs/${run.id}/skip`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stepIndex: selectedStep.index }),
+      });
+      if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+    } finally {
+      stopGlobalLoading();
+    }
   }
 
   async function pauseRun() {
     if (!canPause) return;
-    const response = await fetch(`/api/runs/${run.id}/pause`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stepIndex: runningStep?.index || selectedStep?.index }),
-    });
-    if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+    startGlobalLoading('正在暂停运行');
+    try {
+      const response = await fetch(`/api/runs/${run.id}/pause`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stepIndex: runningStep?.index || selectedStep?.index }),
+      });
+      if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+    } finally {
+      stopGlobalLoading();
+    }
   }
 
   async function resumeRun() {
     if (!canResumeRun) return;
-    const response = await fetch(`/api/runs/${run.id}/resume`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stepIndex: run.control?.pauseStepIndex || runningStep?.index || selectedStep?.index }),
-    });
-    if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+    startGlobalLoading('正在继续运行');
+    try {
+      const response = await fetch(`/api/runs/${run.id}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stepIndex: run.control?.pauseStepIndex || runningStep?.index || selectedStep?.index }),
+      });
+      if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+    } finally {
+      stopGlobalLoading();
+    }
   }
 
   async function continueBlockedRun() {
     if (!canContinueBlockedRun) return;
-    const response = await fetch(`/api/runs/${run.id}/continue`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    });
-    if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+    startGlobalLoading('正在继续运行');
+    try {
+      const response = await fetch(`/api/runs/${run.id}/continue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+    } finally {
+      stopGlobalLoading();
+    }
   }
 
   async function resumeManualIntervention() {
     if (!manualIntervention) return;
     setResumePendingStep(manualIntervention.stepIndex);
-    const response = await fetch(`/api/runs/${run.id}/resume`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stepIndex: manualIntervention.stepIndex }),
-    });
-    if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
-    else setResumePendingStep(undefined);
+    startGlobalLoading('正在恢复人工校验');
+    try {
+      const response = await fetch(`/api/runs/${run.id}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stepIndex: manualIntervention.stepIndex }),
+      });
+      if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
+      else setResumePendingStep(undefined);
+    } finally {
+      stopGlobalLoading();
+    }
   }
 
   return (
@@ -694,6 +721,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
               查看最终报告
             </button>
           ) : null}
+          <RunScreenshotChainButton className="link-button" label="查看截图链" run={run} />
           {isFinished(run.status) ? (
             <a className="link-button" href={`/api/runs/${run.id}/pdf`} target="_blank">
               导出 PDF
@@ -844,19 +872,6 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                     ) : (
                       '暂无发现'
                     )}
-                  </dd>
-                </div>
-                <div>
-                  <dt>本步新增台账</dt>
-                  <dd>
-                    <LedgerSectionCard
-                      description={selectedStepLedgerItems.length ? '本步新增的覆盖、发现、问题、风险与疑问' : '本步没有新增结构化台账'}
-                      frame={taskFrame}
-                      items={selectedStepLedgerItems}
-                      key={`step-ledger-${selectedStep.index}`}
-                      limit={8}
-                      title="本步新增台账"
-                    />
                   </dd>
                 </div>
                 <div>

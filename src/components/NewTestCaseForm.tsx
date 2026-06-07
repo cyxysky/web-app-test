@@ -4,6 +4,7 @@ import { FormEvent, useState } from 'react';
 import { ImageUp, Loader2, Sparkles, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { RichTextEditor } from '@/components/RichTextEditor';
+import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { TestCaseContent } from '@/server/ai/schemas/test-case.schema';
 
@@ -22,6 +23,7 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
   async function uploadImage(file: File) {
     setUploading(true);
     setError('');
+    startGlobalLoading('正在上传图片');
     const form = new FormData();
     form.append('file', file);
     try {
@@ -31,6 +33,7 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
       setImageNames((current) => [...current, data.imageId]);
     } finally {
       setUploading(false);
+      stopGlobalLoading();
     }
   }
 
@@ -42,6 +45,7 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
     }
     setLoading(true);
     setError('');
+    startGlobalLoading('正在生成测试用例');
     try {
       const response = await fetch('/api/test-cases/generate', {
         method: 'POST',
@@ -50,11 +54,11 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '生成失败');
-      window.dispatchEvent(new Event('navigation-loading:start'));
       router.push(`/test-cases/${data.testCaseId}`);
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : '生成失败');
+      stopGlobalLoading();
     } finally {
       setLoading(false);
     }

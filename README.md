@@ -1,6 +1,8 @@
 # Web App Test
 
-AI-driven browser testing MVP built with Next.js, AI SDK, and Playwright.
+AI-driven web testing workspace built with Next.js, AI SDK, and Playwright.
+
+The project is focused on test execution, exploratory coverage, replay, evidence capture, and final test reports. Browser automation is treated as the execution mechanism, not the product goal.
 
 ## Run
 
@@ -29,9 +31,31 @@ Each test case can choose a browser operation mode:
 - `DOM interaction` uses textual interactive candidates and the simplified DOM tree.
 - `Visual markers` sends one viewport screenshot with numbered marker labels overlaid by default.
 
+## Reuse an Existing Browser
+
+To reuse login state from an existing Chrome or Edge profile, start that browser with a remote debugging port, then set `BROWSER_CDP_ENDPOINT` in the settings page:
+
+```powershell
+chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:TEMP\web-app-test-chrome"
+```
+
+Then set:
+
+```bash
+BROWSER_CDP_ENDPOINT=http://127.0.0.1:9222
+```
+
+You can also set `BROWSER_USER_DATA_DIR` to let Playwright launch a persistent browser profile when a CDP endpoint is not configured.
+
+Replay uses `REPLAY_STEP_DELAY_MS` between recorded actions by default, so fixed flows wait for page transitions instead of firing every operation immediately. If a recorded flow reaches CAPTCHA, login verification, or another user-side security check, the run pauses and waits for the user to click “执行完毕” before continuing.
+
+When a recorded operation fails, `REPLAY_AI_REPAIR=true` lets the AI inspect the current page, choose a replacement operation, record the failed replay action as an issue, and continue the remaining replay flow after the repair succeeds.
+
+During AI execution, `getHttpRequests` is available as a read-only diagnostic tool for the current tab. The agent can use it to verify API status codes, failed requests, and missing resource evidence before recording a network-related issue. Issues and risks in the final report include the reason and a screenshot from the source step when available.
+
 ## Package and Run with Docker
 
-Docker is the recommended packaging path because the app depends on Playwright and a headless Chromium runtime.
+Docker is available for packaged runs because the app depends on Playwright and a Chromium runtime.
 
 1. Copy `.env.example` to `.env` and fill the provider key you want to use.
 2. Build and start:
@@ -47,4 +71,4 @@ The compose setup keeps runtime data outside the image:
 - `.data/store.json` stores test cases and runs.
 - `artifacts/` stores screenshots and reports.
 
-For production-like packaged runs, keep `HEADLESS_BROWSER=true`.
+For unattended packaged regression runs, keep `HEADLESS_BROWSER=true`. For account-based exploratory testing or manual verification, prefer a visible or CDP-connected browser.

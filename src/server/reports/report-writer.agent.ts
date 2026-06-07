@@ -2,6 +2,7 @@ import path from 'node:path';
 import { generateText } from 'ai';
 import { getModel } from '@/server/ai/model';
 import type { StepExecutionResult, TaskFrame, TaskLedgerItem, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import { artifactsRoot } from '@/server/storage/paths';
 import { richTextToPlainText } from '@/lib/rich-text';
 
 type ReportRecord = NonNullable<TestRunRecord['report']>;
@@ -16,7 +17,7 @@ function statusText(status: TestRunRecord['status'] | StepExecutionResult['statu
 
 function artifactUrl(filePath?: string) {
   if (!filePath) return undefined;
-  const root = path.resolve(process.cwd(), 'artifacts');
+  const root = artifactsRoot();
   const relative = path.relative(root, filePath).replace(/\\/g, '/');
   if (relative.startsWith('..')) return undefined;
   return `/api/artifacts/${relative}`;
@@ -98,6 +99,46 @@ function ledgerMarkdown(frame: TaskFrame | undefined, items: TaskLedgerItem[], l
   ].filter(Boolean).join('\n')).join('\n');
 }
 
+function issueSummaryMarkdown(frame: TaskFrame | undefined, result: TestRunRecord['result'], limit = 80) {
+  const steps = result?.steps || [];
+  const ledgerItems = collectLedgerItems(result);
+  const screenshotForStep = (stepIndex?: number) => {
+    const step = stepIndex ? steps.find((item) => item.index === stepIndex) : undefined;
+    return artifactUrl(step?.afterScreenshotPath || step?.screenshotPath || step?.beforeScreenshotPath);
+  };
+  const dimensionName = (id: string) => frame?.dimensions.find((dimension) => dimension.id === id)?.name || id || 'general';
+  const issueLedger = ledgerItems.filter((item) => item.status === 'issue' || item.status === 'risk');
+  const failedSteps = steps.filter((step) => step.status === 'failed' || step.status === 'blocked');
+  const lines = [
+    ...issueLedger.map((item) => {
+      const screenshot = screenshotForStep(item.sourceStep);
+      return [
+        `- [${item.status === 'issue' ? '问题' : '风险'} / ${item.severity || 'info'} / ${dimensionName(item.dimensionId)}] ${item.title}`,
+        item.summary ? `  - 理由：${compact(item.summary, 420)}` : '',
+        item.expected ? `  - 期望：${compact(item.expected, 260)}` : '',
+        item.actual ? `  - 实际：${compact(item.actual, 360)}` : '',
+        item.sourceStep ? `  - 证据：步骤 ${item.sourceStep}` : '',
+        screenshot ? `  - 问题截图：![步骤 ${item.sourceStep || ''} 问题截图](${screenshot})` : '',
+        item.evidence?.length ? `  - 其他证据：${item.evidence.map((evidence) => compact(evidence, 160)).join('；')}` : '',
+      ].filter(Boolean).join('\n');
+    }),
+    ...failedSteps.map((step) => {
+      const screenshot = artifactUrl(step.afterScreenshotPath || step.screenshotPath || step.beforeScreenshotPath);
+      return [
+        `- [${statusText(step.status)} / 步骤 ${step.index}] ${compact(step.action, 180)}`,
+        `  - 结果：${compact(step.actual, 420)}`,
+        step.findings?.length ? `  - 发现：${step.findings.map((item) => compact(item, 180)).join('；')}` : '',
+        screenshot ? `  - 问题截图：![步骤 ${step.index} 问题截图](${screenshot})` : '',
+      ].filter(Boolean).join('\n');
+    }),
+    ...(result?.consoleErrors || []).map((item) => `- [Console] ${compact(item, 420)}`),
+    ...(result?.networkErrors || []).map((item) => `- [网络异常] ${compact(item, 420)}`),
+  ];
+
+  if (!lines.length) return '- 本次未从步骤、结构化台账、Console 或网络记录中发现明确问题。';
+  return Array.from(new Set(lines)).slice(0, limit).join('\n');
+}
+
 function stepMarkdown(step: StepExecutionResult) {
   const before = artifactUrl(step.beforeScreenshotPath);
   const after = artifactUrl(step.afterScreenshotPath || step.screenshotPath);
@@ -132,6 +173,8 @@ function reportContext(testCase: TestCaseRecord, run: TestRunRecord) {
     `任务框架：\n${taskFrameMarkdown(frame)}`,
     '',
     `结构化台账：\n${ledgerMarkdown(frame, ledger)}`,
+    '',
+    `问题与风险汇总：\n${issueSummaryMarkdown(frame, result)}`,
     '',
     `执行步骤：\n${steps.map((step) => [
       `步骤 ${step.index} [${statusText(step.status)}] ${step.action}`,
@@ -175,6 +218,10 @@ ${taskFrameMarkdown(taskFrame)}
 
 ${ledgerMarkdown(taskFrame, ledgerItems)}
 
+## 问题与风险汇总
+
+${issueSummaryMarkdown(taskFrame, result)}
+
 ## 执行步骤与证据
 
 ${stepBlocks || '- 暂无执行步骤。'}
@@ -211,6 +258,7 @@ export async function writeAiReport(testCase: TestCaseRecord, run: TestRunRecord
         '- 使用中文 Markdown。',
         '- 报告必须详细，不要空泛总结。',
         '- “AI 总结”是任务交付的重要组成部分，需要概括已读内容、关键业务规则、测试覆盖、未覆盖项和最终判断。',
+        '- 必须单独总结测试过程中发现的问题、风险、影响范围和证据步骤；没有明确问题时也要说明“未发现明确问题”。',
         '- 如果用户要求输出测试用例，必须生成完整测试流程：前置条件、测试数据、操作步骤、断言、异常/边界、风险。',
         '- 只能基于提供的事实和台账，不要编造未实际读取到的页面细节。',
         '- 不要输出“测试用例生成状态”这类无意义状态，要输出具体测试内容。',
@@ -223,7 +271,8 @@ export async function writeAiReport(testCase: TestCaseRecord, run: TestRunRecord
         '## 完整测试流程',
         '## 详细测试用例',
         '## 覆盖矩阵与台账结论',
-        '## 风险、疑问与未覆盖项',
+        '## 问题与风险汇总',
+        '## 疑问与未覆盖项',
         '## 执行步骤与证据',
         '',
         context,

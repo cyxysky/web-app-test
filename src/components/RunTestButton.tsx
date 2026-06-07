@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { Loader2, Play } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 
 export function RunTestButton({ testCaseId }: { testCaseId: string }) {
   const router = useRouter();
@@ -13,15 +14,16 @@ export function RunTestButton({ testCaseId }: { testCaseId: string }) {
     if (starting) return;
     setStarting(true);
     setError('');
+    startGlobalLoading('正在启动测试');
     try {
       const response = await fetch(`/api/test-cases/${testCaseId}/run`, { method: 'POST' });
       const data = await response.json();
       if (!response.ok || !data.runId) throw new Error(data.error || '启动失败');
-      window.dispatchEvent(new Event('navigation-loading:start'));
       router.push(`/runs/${data.runId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : '启动失败');
       setStarting(false);
+      stopGlobalLoading();
     }
   }
 

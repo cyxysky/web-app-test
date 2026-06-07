@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 const currentDir = dirname(fileURLToPath(import.meta.url));
 
 const nextConfig: NextConfig = {
+  output: 'standalone',
   outputFileTracingRoot: currentDir,
   serverExternalPackages: [
     'playwright',

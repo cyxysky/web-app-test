@@ -1,10 +1,12 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useMemo, useState, useTransition } from 'react';
-import { CalendarClock, Folder, FolderPlus, Loader2, PlayCircle, Settings, X } from 'lucide-react';
+import { useEffect, useState, useTransition } from 'react';
+import { CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, PlayCircle, Settings, Trash2, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
 import { NewTestCaseModal } from '@/components/NewTestCaseModal';
+import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { RunScheduleRecord, TestCaseRecord, TestGroupRecord } from '@/server/ai/schemas/test-case.schema';
 
@@ -21,7 +23,7 @@ function statusLabel(status: string) {
   return labels[status] || status;
 }
 
-function groupPath(groups: TestGroupRecord[], groupId?: string): string {
+export function groupPath(groups: TestGroupRecord[], groupId?: string): string {
   if (!groupId) return '未分组';
   const group = groups.find((item) => item.id === groupId);
   if (!group) return '未知分组';
@@ -58,29 +60,75 @@ function GroupNode({
   );
 }
 
+export function DashboardGroupSidebar({
+  className = 'group-sidebar',
+  groups,
+  selectedGroupId,
+  onCreateGroup,
+  onSelect,
+}: {
+  className?: string;
+  groups: TestGroupRecord[];
+  selectedGroupId?: string;
+  onCreateGroup: () => void;
+  onSelect: (groupId?: string) => void;
+}) {
+  const rootGroups = groups.filter((group) => !group.parentId);
+
+  return (
+    <aside className={className}>
+      <button className="icon-text-button group-create-button" onClick={onCreateGroup} type="button">
+        <FolderPlus size={15} />
+        {selectedGroupId ? '在当前组内创建子组' : '创建组'}
+      </button>
+      <button className={!selectedGroupId ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(undefined)} type="button">
+        <Folder size={15} />
+        未分组
+      </button>
+      <ol className="group-tree">
+        {rootGroups.map((group) => (
+          <GroupNode group={group} groups={groups} key={group.id} selectedGroupId={selectedGroupId} onSelect={onSelect} />
+        ))}
+      </ol>
+    </aside>
+  );
+}
+
 export function DashboardWorkspace({
   testCases,
   groups,
   schedules,
+  selectedGroupId: controlledSelectedGroupId,
+  onSelectedGroupIdChange,
+  showGroupSidebar = true,
+  showBrowserChatAction = true,
+  showSettingsAction = true,
 }: {
   testCases: TestCaseRecord[];
   groups: TestGroupRecord[];
   schedules: RunScheduleRecord[];
+  selectedGroupId?: string;
+  onSelectedGroupIdChange?: (groupId?: string) => void;
+  showGroupSidebar?: boolean;
+  showBrowserChatAction?: boolean;
+  showSettingsAction?: boolean;
 }) {
   const router = useRouter();
   const [, startTransition] = useTransition();
-  const [selectedGroupId, setSelectedGroupId] = useState<string | undefined>();
+  const [internalSelectedGroupId, setInternalSelectedGroupId] = useState<string | undefined>();
   const [groupName, setGroupName] = useState('');
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [movingCaseId, setMovingCaseId] = useState<string | null>(null);
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
+  const [batchDeleting, setBatchDeleting] = useState(false);
   const [batchRunning, setBatchRunning] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleName, setScheduleName] = useState('定时回归');
   const [scheduleInterval, setScheduleInterval] = useState(60);
   const [savingSchedule, setSavingSchedule] = useState(false);
-  const rootGroups = useMemo(() => groups.filter((group) => !group.parentId), [groups]);
+  const selectedGroupId = controlledSelectedGroupId ?? internalSelectedGroupId;
+  const selectGroup = onSelectedGroupIdChange ?? setInternalSelectedGroupId;
   const visibleCases = testCases.filter((item) => item.groupId === selectedGroupId);
   const completedCases = visibleCases.filter((item) => ['passed', 'failed', 'blocked'].includes(item.status));
 
@@ -94,6 +142,7 @@ export function DashboardWorkspace({
     const name = groupName.trim();
     if (!name || creatingGroup) return;
     setCreatingGroup(true);
+    startGlobalLoading('正在创建分组');
     try {
       await fetch('/api/groups', {
         method: 'POST',
@@ -105,11 +154,13 @@ export function DashboardWorkspace({
       startTransition(() => router.refresh());
     } finally {
       setCreatingGroup(false);
+      stopGlobalLoading();
     }
   }
 
   async function moveCase(testCaseId: string, groupId?: string) {
     setMovingCaseId(testCaseId);
+    startGlobalLoading('正在移动测试用例');
     try {
       await fetch(`/api/test-cases/${testCaseId}/move`, {
         method: 'POST',
@@ -119,6 +170,7 @@ export function DashboardWorkspace({
       startTransition(() => router.refresh());
     } finally {
       setMovingCaseId(null);
+      stopGlobalLoading();
     }
   }
 
@@ -131,6 +183,7 @@ export function DashboardWorkspace({
   async function startBatchRun() {
     if (!selectedCaseIds.length || batchRunning) return;
     setBatchRunning(true);
+    startGlobalLoading('正在批量启动测试');
     const openedTabs = selectedCaseIds.map(() => window.open('about:blank', '_blank'));
     try {
       const response = await fetch('/api/runs/batch', {
@@ -158,6 +211,30 @@ export function DashboardWorkspace({
       window.alert(error instanceof Error ? error.message : '批量运行启动失败');
     } finally {
       setBatchRunning(false);
+      stopGlobalLoading();
+    }
+  }
+
+  async function deleteSelectedCases() {
+    if (!selectedCaseIds.length || batchDeleting) return;
+    if (!window.confirm(`确定删除选中的 ${selectedCaseIds.length} 条用例吗？关联执行记录会一起移除。`)) return;
+    setBatchDeleting(true);
+    startGlobalLoading('正在批量删除测试用例');
+    try {
+      const response = await fetch('/api/test-cases/batch-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ testCaseIds: selectedCaseIds }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || '批量删除失败');
+      setSelectedCaseIds([]);
+      startTransition(() => router.refresh());
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '批量删除失败');
+    } finally {
+      setBatchDeleting(false);
+      stopGlobalLoading();
     }
   }
 
@@ -165,6 +242,7 @@ export function DashboardWorkspace({
     const ids = selectedCaseIds.length ? selectedCaseIds : visibleCases.map((item) => item.id);
     if (!ids.length || savingSchedule) return;
     setSavingSchedule(true);
+    startGlobalLoading('正在保存定时任务');
     try {
       await fetch('/api/schedules', {
         method: 'POST',
@@ -180,26 +258,20 @@ export function DashboardWorkspace({
       startTransition(() => router.refresh());
     } finally {
       setSavingSchedule(false);
+      stopGlobalLoading();
     }
   }
 
   return (
-    <section className="dashboard-folder-layout">
-      <aside className="group-sidebar">
-        <button className="icon-text-button group-create-button" onClick={() => setGroupDialogOpen(true)} type="button">
-          <FolderPlus size={15} />
-          {selectedGroupId ? '在当前组内创建子组' : '创建组'}
-        </button>
-        <button className={!selectedGroupId ? 'group-tree-button active' : 'group-tree-button'} onClick={() => setSelectedGroupId(undefined)} type="button">
-          <Folder size={15} />
-          未分组
-        </button>
-        <ol className="group-tree">
-          {rootGroups.map((group) => (
-            <GroupNode group={group} groups={groups} key={group.id} selectedGroupId={selectedGroupId} onSelect={setSelectedGroupId} />
-          ))}
-        </ol>
-      </aside>
+    <section className={showGroupSidebar ? 'dashboard-folder-layout' : 'dashboard-folder-layout no-sidebar'}>
+      {showGroupSidebar ? (
+        <DashboardGroupSidebar
+          groups={groups}
+          selectedGroupId={selectedGroupId}
+          onCreateGroup={() => setGroupDialogOpen(true)}
+          onSelect={selectGroup}
+        />
+      ) : null}
 
       <div className="dashboard-v2-list">
         <div className="plain-section-head">
@@ -208,13 +280,25 @@ export function DashboardWorkspace({
             <span>{visibleCases.length} 条，已完成 {completedCases.length} 条</span>
           </div>
           <div className="dashboard-actions">
-            <Link className="icon-text-button" href="/settings">
-              <Settings size={15} />
-              环境配置
-            </Link>
+            {showBrowserChatAction ? (
+              <Link className="icon-text-button" href="/browser-chat">
+                <MessageSquare size={15} />
+                对话操作
+              </Link>
+            ) : null}
+            {showSettingsAction ? (
+              <Link className="icon-text-button" href="/settings">
+                <Settings size={15} />
+                环境配置
+              </Link>
+            ) : null}
             <button className="icon-text-button" disabled={!selectedCaseIds.length || batchRunning} onClick={startBatchRun} type="button">
               {batchRunning ? <Loader2 className="spin" size={15} /> : <PlayCircle size={15} />}
               批量运行{selectedCaseIds.length ? ` ${selectedCaseIds.length}` : ''}
+            </button>
+            <button className="icon-text-button danger" disabled={!selectedCaseIds.length || batchDeleting} onClick={deleteSelectedCases} type="button">
+              {batchDeleting ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
+              批量删除{selectedCaseIds.length ? ` ${selectedCaseIds.length}` : ''}
             </button>
             <button className="icon-text-button" disabled={!visibleCases.length} onClick={() => setScheduleOpen(true)} type="button">
               <CalendarClock size={15} />
@@ -254,7 +338,19 @@ export function DashboardWorkspace({
                     <option key={group.id} value={group.id}>{groupPath(groups, group.id)}</option>
                   ))}
                 </select>
-                {movingCaseId === item.id ? <Loader2 className="spin" size={16} /> : <Link href={`/test-cases/${item.id}`}><PlayCircle size={18} /></Link>}
+                <span className="case-row-actions">
+                  {movingCaseId === item.id ? (
+                    <Loader2 className="spin" size={16} />
+                  ) : (
+                    <Link className="case-row-icon-button" href={`/test-cases/${item.id}`} title="查看详情"><PlayCircle size={18} /></Link>
+                  )}
+                  <DeleteTestCaseButton
+                    className="case-row-icon-button danger"
+                    label=""
+                    testCaseId={item.id}
+                    testCaseTitle={item.title}
+                  />
+                </span>
               </div>
             ))
           ) : (

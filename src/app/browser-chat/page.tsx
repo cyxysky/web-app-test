@@ -4,7 +4,7 @@ import { store } from '@/server/db/mock-store';
 
 export const dynamic = 'force-dynamic';
 
-export default function DashboardPage() {
+export default function BrowserChatPage() {
   store.applyRuntimeEnv();
   startScheduler();
   const testCases = store.listTestCases();

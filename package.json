@@ -2,9 +2,12 @@
   "name": "web-app-test",
   "version": "0.1.0",
   "private": true,
+  "main": "electron/main.js",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "desktop:prepare": "npm run build && node scripts/prepare-electron-server.js",
+    "desktop:pack": "npm run desktop:prepare && electron-builder --win portable",
     "start": "next start",
     "docker:build": "docker build -t web-app-test:latest .",
     "docker:up": "docker compose up -d --build",
@@ -31,6 +34,8 @@
     "playwright": "^1.60.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "sharp": "^0.34.5",
     "tinymce": "^8.5.1",
     "zod": "^4.4.3"
@@ -41,10 +46,46 @@
     "@types/node": "^22.15.24",
     "@types/react": "^19.1.6",
     "@types/react-dom": "^19.1.5",
+    "electron": "^42.3.3",
+    "electron-builder": "^26.15.0",
     "eslint": "^9.27.0",
     "eslint-config-next": "^15.3.3",
     "prisma": "^6.8.2",
     "tailwindcss": "^4.1.8",
     "typescript": "^5.8.3"
+  },
+  "build": {
+    "appId": "com.aiwebtest.desktop",
+    "productName": "AI Web Test",
+    "asar": true,
+    "npmRebuild": false,
+    "afterPack": "scripts/electron-after-pack.js",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "dist-desktop/server",
+        "to": "server"
+      },
+      {
+        "from": "dist-desktop/tinymce",
+        "to": "tinymce"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "AI-Web-Test-${version}-${arch}.${ext}"
+    }
   }
 }

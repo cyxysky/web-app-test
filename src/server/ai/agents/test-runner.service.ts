@@ -1,10 +1,10 @@
 import { existsSync } from 'node:fs';
-import path from 'node:path';
 import sharp from 'sharp';
 import { executeTestCase } from '@/server/ai/agents/test-executor.agent';
 import type { RecordedFlowStep, StepExecutionResult, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
 import { writeAiReport } from '@/server/reports/report-writer.agent';
+import { artifactPath } from '@/server/storage/paths';
 
 type ExecuteRunOptions = {
   continueExisting?: boolean;
@@ -100,15 +100,37 @@ function isCertificateBypassTool(step: StepExecutionResult, tool: NonNullable<St
   return /chrome-error:\/\/chromewebdata|ERR_CERT|certificate warning|certificate error|security warning|continue toward the login page|继续前往|证书错误|证书安全|证书安全警告|不安全站点|unsafe/i.test(text);
 }
 
+function replayStepDelayMs() {
+  const raw = Number(process.env.REPLAY_STEP_DELAY_MS || 1500);
+  return Math.max(0, Math.floor(Number.isFinite(raw) ? raw : 1500));
+}
+
+function isManualVerificationReplayPoint(step: StepExecutionResult, tool: NonNullable<StepExecutionResult['tools']>[number]) {
+  if (tool.name === 'waitForHumanVerification') return true;
+  const text = [
+    step.action,
+    step.expected,
+    step.actual,
+    step.observation,
+    ...(step.findings || []),
+    tool.reason,
+    tool.result,
+  ].filter(Boolean).join('\n');
+  return /验证码|安全校验|安全验证|人机验证|人工|用户介入|captcha|verification\s*code|security\s*check|human\s*verification|two[-\s]?factor|\b2fa\b|\botp\b/i.test(text);
+}
+
 function recordedFlowFromSteps(steps: StepExecutionResult[]): RecordedFlowStep[] {
+  const defaultDelayMs = replayStepDelayMs();
   return steps
     .flatMap((step) => (step.tools || []).map((tool) => ({ step, tool })))
     .filter(({ step, tool }) => tool.name && tool.ok !== false && !isCertificateBypassTool(step, tool))
-    .map(({ tool }, index) => ({
+    .map(({ step, tool }, index) => ({
       index: index + 1,
       name: tool.name,
       input: jsonClone(tool.input),
       reason: tool.reason,
+      delayBeforeMs: index === 0 ? 0 : defaultDelayMs,
+      waitForManual: isManualVerificationReplayPoint(step, tool),
     }));
 }
 
@@ -184,14 +206,20 @@ function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUr
     if (index !== 0) return true;
     return step.name !== 'openPage' && step.name !== 'openUrl';
   });
+  const defaultDelayMs = replayStepDelayMs();
   return [
     {
       index: 1,
       name: 'openPage',
       input: { url: targetUrl },
+      delayBeforeMs: 0,
       reason: 'Replay starts from the test case target URL so recorded candidate actions run on the expected page.',
     },
-    ...replayFlow.map((step, index) => ({ ...step, index: index + 2 })),
+    ...replayFlow.map((step, index) => ({
+      ...step,
+      index: index + 2,
+      delayBeforeMs: index === 0 && !step.delayBeforeMs ? defaultDelayMs : step.delayBeforeMs,
+    })),
   ];
 }
 
@@ -316,7 +344,7 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
   });
 
   const current = store.getRun(runId);
-  const tracePath = path.join(process.cwd(), 'artifacts', runId, 'trace.zip');
+  const tracePath = artifactPath(runId, 'trace.zip');
   const executionTracePath = (execution.result as { tracePath?: string }).tracePath;
   const finalSteps = current?.result?.steps?.length ? current.result.steps : execution.result.steps;
   const finished = store.updateRun(runId, {

@@ -9,3 +9,9 @@
 /.data
 *.tsbuildinfo
 .env
+.env.local
+.env.development
+.env.test
+.env.production
+/dist-desktop
+/dist-electron
