@@ -19,23 +19,14 @@ function copyPlaywrightChromium(context) {
   }
 
   const sourceChromiumDir = findBrowserRevisionDir(executablePath);
-  const sourceRoot = path.dirname(sourceChromiumDir);
-  const revision = path.basename(sourceChromiumDir).match(/-(\d+)$/)?.[1];
-  const browserDirs = [
-    path.basename(sourceChromiumDir),
-    revision ? `chromium_headless_shell-${revision}` : '',
-  ].filter(Boolean);
   const targetRoot = path.join(context.appOutDir, 'resources', 'ms-playwright');
+  const targetChromiumDir = path.join(targetRoot, path.basename(sourceChromiumDir));
 
   fs.rmSync(targetRoot, { recursive: true, force: true });
   fs.mkdirSync(targetRoot, { recursive: true });
-  for (const dirName of browserDirs) {
-    const sourceDir = path.join(sourceRoot, dirName);
-    if (!fs.existsSync(sourceDir)) continue;
-    fs.cpSync(sourceDir, path.join(targetRoot, dirName), { recursive: true });
-  }
+  fs.cpSync(sourceChromiumDir, targetChromiumDir, { recursive: true });
 
-  const packagedExecutable = path.join(targetRoot, path.basename(sourceChromiumDir), path.relative(sourceChromiumDir, executablePath));
+  const packagedExecutable = path.join(targetChromiumDir, path.relative(sourceChromiumDir, executablePath));
   if (!fs.existsSync(packagedExecutable)) {
     throw new Error(`Packaged Playwright Chromium executable is missing: ${packagedExecutable}`);
   }

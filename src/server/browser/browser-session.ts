@@ -333,6 +333,7 @@ export class BrowserSession {
     const ignoreHTTPSErrors = process.env.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
     const forceBundledBrowser = process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true';
     const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
+    const executablePath = process.env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
     const cdpEndpoint = forceBundledBrowser
       ? ''
       : process.env.BROWSER_CDP_ENDPOINT?.trim()
@@ -346,6 +347,7 @@ export class BrowserSession {
       headless,
       slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
       ...(channel ? { channel } : {}),
+      ...(executablePath && !channel ? { executablePath } : {}),
       args: [
         `--window-size=${viewportWidth},${viewportHeight + 120}`,
         fullscreen ? '--start-maximized' : '',

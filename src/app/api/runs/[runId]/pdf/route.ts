@@ -40,7 +40,11 @@ export async function GET(_request: Request, context: RouteContext) {
   const markdown = run.report?.markdown || `测试报告生成中。\n运行 ID：${run.id}\n状态：${run.status}`;
   const title = run.report?.title || `测试报告：${testCase?.title || run.id}`;
   const { chromium } = await import('playwright');
-  const browser = await chromium.launch({ headless: true });
+  const executablePath = process.env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
+  const browser = await chromium.launch({
+    headless: true,
+    ...(executablePath ? { executablePath } : {}),
+  });
   try {
     const page = await browser.newPage();
     await page.setContent(reportHtml(markdown, title), { waitUntil: 'load' });

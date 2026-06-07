@@ -7,7 +7,9 @@
     "dev": "next dev",
     "build": "next build",
     "desktop:prepare": "npm run build && node scripts/prepare-electron-server.js",
-    "desktop:pack": "npm run desktop:prepare && electron-builder --win portable",
+    "desktop:pack": "npm run desktop:installer",
+    "desktop:installer": "npm run desktop:prepare && electron-builder --win nsis",
+    "desktop:portable": "npm run desktop:prepare && electron-builder --win portable",
     "start": "next start",
     "docker:build": "docker build -t web-app-test:latest .",
     "docker:up": "docker compose up -d --build",
@@ -58,13 +60,15 @@
     "appId": "com.aiwebtest.desktop",
     "productName": "AI Web Test",
     "asar": true,
-    "npmRebuild": false,
+    "npmRebuild": true,
+    "beforeBuild": "scripts/electron-before-build.js",
     "afterPack": "scripts/electron-after-pack.js",
     "directories": {
+      "app": "electron",
       "output": "dist-electron"
     },
     "files": [
-      "electron/**/*"
+      "**/*"
     ],
     "extraResources": [
       {
@@ -79,13 +83,22 @@
     "win": {
       "target": [
         {
-          "target": "portable",
+          "target": "nsis",
           "arch": [
             "x64"
           ]
         }
       ],
-      "artifactName": "AI-Web-Test-${version}-${arch}.${ext}"
+      "artifactName": "AI-Web-Test-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AI Web Test",
+      "runAfterFinish": true
     }
   }
 }

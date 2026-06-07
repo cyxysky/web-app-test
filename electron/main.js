@@ -83,6 +83,25 @@ function tinymceRoot() {
   return path.join(process.cwd(), 'node_modules', 'tinymce');
 }
 
+function packagedChromiumExecutable() {
+  if (!app.isPackaged) return '';
+  const browserRoot = path.join(process.resourcesPath, 'ms-playwright');
+  try {
+    const chromiumDir = fs.readdirSync(browserRoot)
+      .find((name) => /^chromium-\d+$/.test(name));
+    if (!chromiumDir) return '';
+    for (const executablePath of [
+      path.join(browserRoot, chromiumDir, 'chrome-win64', 'chrome.exe'),
+      path.join(browserRoot, chromiumDir, 'chrome-win', 'chrome.exe'),
+    ]) {
+      if (fs.existsSync(executablePath)) return executablePath;
+    }
+    return '';
+  } catch {
+    return '';
+  }
+}
+
 async function startServer(appDataDir) {
   const port = await findAvailablePort(Number(process.env.AI_WEB_TEST_PORT || DEFAULT_PORT));
   const serverDir = serverDirectory();
@@ -94,6 +113,7 @@ async function startServer(appDataDir) {
     ...process.env,
     AI_WEB_TEST_BROWSER_PROFILE_DIR: process.env.AI_WEB_TEST_BROWSER_PROFILE_DIR || browserProfileDir,
     AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER: app.isPackaged ? 'true' : process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER,
+    AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH: packagedChromiumExecutable(),
     APP_DATA_DIR: appDataDir,
     ARTIFACTS_DIR: ensureDir(path.join(appDataDir, 'artifacts')),
     BROWSER_SHARED_TABS: process.env.BROWSER_SHARED_TABS || 'true',
@@ -117,6 +137,7 @@ async function startServer(appDataDir) {
   appendLog(`BROWSER_USER_DATA_DIR=${env.BROWSER_USER_DATA_DIR}`);
   appendLog(`AI_WEB_TEST_BROWSER_PROFILE_DIR=${env.AI_WEB_TEST_BROWSER_PROFILE_DIR}`);
   appendLog(`PLAYWRIGHT_BROWSERS_PATH=${env.PLAYWRIGHT_BROWSERS_PATH || ''}`);
+  appendLog(`AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH=${env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH || ''}`);
   appendLog(`NODE_PATH=${env.NODE_PATH || ''}`);
 
   serverProcess = spawn(process.execPath, args, {

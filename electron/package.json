@@ -1,0 +1,6 @@
+{
+  "name": "web-app-test-electron",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.js"
+}
