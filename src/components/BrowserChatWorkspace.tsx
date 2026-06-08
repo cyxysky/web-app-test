@@ -4,7 +4,9 @@ import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from
 import {
   Bot,
   Folder,
+  ImageUp,
   Loader2,
+  Maximize2,
   MessageSquare,
   PanelLeft,
   Power,
@@ -12,9 +14,9 @@ import {
   Send,
   Settings,
   FilePlus2,
+  Square,
   Trash2,
   User,
-  Wrench,
   X,
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
@@ -38,8 +40,18 @@ type BrowserChatMessage = {
   createdAt: string;
   updatedAt?: string;
   clientMessageId?: string;
+  attachments?: BrowserChatAttachment[];
   stepIndexes?: number[];
-  status?: 'running' | 'passed' | 'failed' | 'blocked';
+  status?: 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
+};
+
+type BrowserChatAttachment = {
+  id: string;
+  name: string;
+  type: string;
+  size?: number;
+  path: string;
+  url: string;
 };
 
 type BrowserChatLogRecord = {
@@ -86,6 +98,7 @@ function statusLabel(status: string) {
     error: '异常',
     failed: '失败',
     idle: '空闲',
+    interrupted: '已中断',
     passed: '完成',
     running: '执行中',
   } as Record<string, string>)[status] || status;
@@ -125,7 +138,7 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
     ...session,
     consoleErrors: session.consoleErrors || [],
     logs: session.logs || [],
-    messages: session.messages || [],
+    messages: (session.messages || []).map((message) => ({ ...message, attachments: message.attachments || [] })),
     mode: normalizeMode(session.mode),
     networkErrors: session.networkErrors || [],
     steps: session.steps || [],
@@ -197,6 +210,58 @@ function BrowserChatMarkdown({ markdown }: { markdown: string }) {
   );
 }
 
+function formatAttachmentSize(size?: number) {
+  if (!size || !Number.isFinite(size)) return '';
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${Math.round(size / 102.4) / 10} KB`;
+  return `${Math.round(size / 1024 / 102.4) / 10} MB`;
+}
+
+function BrowserChatImageGrid({
+  attachments,
+  editable = false,
+  onPreview,
+  onRemove,
+}: {
+  attachments?: BrowserChatAttachment[];
+  editable?: boolean;
+  onPreview: (attachment: BrowserChatAttachment) => void;
+  onRemove?: (id: string) => void;
+}) {
+  if (!attachments?.length) return null;
+  return (
+    <div className={editable ? 'browser-chat-image-grid editable' : 'browser-chat-image-grid'}>
+      {attachments.map((attachment) => (
+        <figure className="browser-chat-image-thumb" key={attachment.id}>
+          <button
+            aria-label={`放大查看 ${attachment.name}`}
+            className="browser-chat-image-preview-button"
+            onClick={() => onPreview(attachment)}
+            type="button"
+          >
+            <img alt={attachment.name} src={attachment.url} />
+            <span><Maximize2 size={13} /></span>
+          </button>
+          <figcaption>
+            <span>{compactText(attachment.name, 34)}</span>
+            {formatAttachmentSize(attachment.size) ? <small>{formatAttachmentSize(attachment.size)}</small> : null}
+          </figcaption>
+          {editable && onRemove ? (
+            <button
+              aria-label={`删除 ${attachment.name}`}
+              className="browser-chat-image-remove"
+              onClick={() => onRemove(attachment.id)}
+              type="button"
+            >
+              <X size={13} />
+            </button>
+          ) : null}
+        </figure>
+      ))}
+    </div>
+  );
+}
+
 function BrowserChatStepToolCards({
   onSelectTool,
   running,
@@ -211,7 +276,6 @@ function BrowserChatStepToolCards({
   if (running && !toolCalls.length) {
     return (
       <div className="browser-chat-tool-card is-waiting">
-        <Wrench size={14} />
         <div>
           <strong>等待工具调用</strong>
           <p>AI 正在基于当前页面选择下一步操作。</p>
@@ -224,18 +288,23 @@ function BrowserChatStepToolCards({
   return (
     <>
       {toolCalls.map((tool, toolIndex) => (
-        <button
-          className="browser-chat-tool-card"
-          key={`${step.index}-${toolIndex}`}
-          onClick={() => onSelectTool({ stepIndex: step.index, toolIndex, tool })}
-          type="button"
-        >
-          <div>
-            <strong>{compactText(tool.name, 72)}</strong>
-            {tool.reason ? <p>{compactText(tool.reason, 140)}</p> : null}
-          </div>
-          <span className={tool.ok === false ? 'badge status-failed' : 'badge neutral'}>{toolStatusLabel(tool)}</span>
-        </button>
+        <div className="browser-chat-tool-call" key={`${step.index}-${toolIndex}-${tool.name}`}>
+          {tool.reason ? (
+            <div className="browser-chat-tool-reason">
+              {compactText(tool.reason, 140)}
+            </div>
+          ) : null}
+          <button
+            className="browser-chat-tool-card"
+            onClick={() => onSelectTool({ stepIndex: step.index, toolIndex, tool })}
+            type="button"
+          >
+            <div>
+              <strong>{compactText(tool.name, 72)}</strong>
+            </div>
+            <span className={tool.ok === false ? 'badge status-failed' : 'badge neutral'}>{toolStatusLabel(tool)}</span>
+          </button>
+        </div>
       ))}
     </>
   );
@@ -292,6 +361,7 @@ export function BrowserChatWorkspace({
   const [, startTransition] = useTransition();
   const sendingRef = useRef(false);
   const loadingSessionRef = useRef<string | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
   const [activeView, setActiveView] = useState<BrowserChatView>(initialView);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
@@ -303,12 +373,16 @@ export function BrowserChatWorkspace({
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [message, setMessage] = useState('');
+  const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
   const [busy, setBusy] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [interrupting, setInterrupting] = useState(false);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
   const [toolDialog, setToolDialog] = useState<BrowserChatToolDetail | null>(null);
+  const [imagePreview, setImagePreview] = useState<BrowserChatAttachment | null>(null);
   const [error, setError] = useState('');
   const runningSession = useMemo(() => (session?.busy ? session : sessions.find((item) => item.busy)), [session, sessions]);
   const currentBusy = busy || Boolean(runningSession);
@@ -401,6 +475,15 @@ export function BrowserChatWorkspace({
     };
   }, [refreshSession, session?.id]);
 
+  useEffect(() => {
+    if (!session?.id || !session.busy) return undefined;
+    const sessionId = session.id;
+    const timer = window.setInterval(() => {
+      void refreshSession(sessionId).catch(() => undefined);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [refreshSession, session?.busy, session?.id]);
+
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
     if (!name || creatingGroup) return;
@@ -437,20 +520,53 @@ export function BrowserChatWorkspace({
     return createSession();
   }
 
-  async function postMessageToSession(sessionId: string, content: string, clientMessageId: string) {
+  async function postMessageToSession(sessionId: string, content: string, clientMessageId: string, nextAttachments: BrowserChatAttachment[]) {
     const response = await fetch(`/api/browser-chat/${sessionId}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clientMessageId, content, mode }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '发送消息失败');
     return data.session as BrowserChatSession;
   }
 
+  async function uploadChatImages(files: FileList | File[]) {
+    const selectedFiles = Array.from(files).filter((file) => file.type.startsWith('image/'));
+    const remainingSlots = Math.max(0, 8 - attachments.length);
+    if (!selectedFiles.length || !remainingSlots || uploadingImage || currentBusy) return;
+    setUploadingImage(true);
+    setError('');
+    try {
+      const uploaded: BrowserChatAttachment[] = [];
+      for (const file of selectedFiles.slice(0, remainingSlots)) {
+        const form = new FormData();
+        form.append('file', file);
+        const response = await fetch('/api/uploads', { method: 'POST', body: form });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '图片上传失败');
+        uploaded.push({
+          id: String(data.imageId || temporaryId('image')),
+          name: String(data.name || file.name),
+          type: String(data.type || file.type || 'image/*'),
+          size: typeof data.size === 'number' ? data.size : file.size,
+          path: String(data.path || `uploads/${data.imageId}`),
+          url: String(data.url || `/api/artifacts/uploads/${encodeURIComponent(String(data.imageId))}`),
+        });
+      }
+      if (uploaded.length) setAttachments((current) => [...current, ...uploaded].slice(0, 8));
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : '图片上传失败');
+    } finally {
+      setUploadingImage(false);
+      if (imageInputRef.current) imageInputRef.current.value = '';
+    }
+  }
+
   async function sendMessage() {
     const content = message.trim();
-    if (!content || currentBusy || loadingSessionId || sendingRef.current) return;
+    const nextAttachments = attachments;
+    if ((!content && !nextAttachments.length) || currentBusy || loadingSessionId || sendingRef.current || uploadingImage) return;
     sendingRef.current = true;
     const clientMessageId = temporaryId('client_msg');
     setError('');
@@ -460,26 +576,46 @@ export function BrowserChatWorkspace({
       let active = await ensureSession();
       let posted: BrowserChatSession;
       try {
-        posted = await postMessageToSession(active.id, content, clientMessageId);
+        posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
       } catch (firstError) {
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
         active = await createSession();
-        posted = await postMessageToSession(active.id, content, clientMessageId);
+        posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
       }
       upsertSession(posted);
       window.setTimeout(() => {
         void refreshSession(posted.id).catch(() => undefined);
       }, 600);
       setMessage('');
+      setAttachments([]);
       await loadSessions().catch(() => undefined);
     } catch (sendError) {
       const sendMessageText = sendError instanceof Error ? sendError.message : '发送消息失败';
       setError(sendMessageText);
       setMessage(content);
+      setAttachments(nextAttachments);
     } finally {
       sendingRef.current = false;
       setBusy(false);
+    }
+  }
+
+  async function interruptConversation() {
+    const target = runningSession || session;
+    if (!target?.id || interrupting || !target.busy) return;
+    setInterrupting(true);
+    setError('');
+    try {
+      const response = await fetch(`/api/browser-chat/${target.id}/interrupt`, { method: 'POST' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '中断对话失败');
+      upsertSession(data.session as BrowserChatSession);
+      await loadSessions().catch(() => undefined);
+    } catch (interruptError) {
+      setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
+    } finally {
+      setInterrupting(false);
     }
   }
 
@@ -543,6 +679,7 @@ export function BrowserChatWorkspace({
     if (currentBusy) return;
     setError('');
     setMessage('');
+    setAttachments([]);
     setSession(null);
   }
 
@@ -554,6 +691,7 @@ export function BrowserChatWorkspace({
     setActiveView('chat');
     setError('');
     setMessage('');
+    setAttachments([]);
     try {
       const loadedSession = await refreshSession(sessionId);
       setMode(normalizeMode(loadedSession.mode));
@@ -738,14 +876,15 @@ export function BrowserChatWorkspace({
                         {item.role === 'assistant' ? (
                           <>
                             <div className="browser-chat-agent-meta">
-                              <span>{operationRunning ? '处理中' : '已处理'}</span>
+                              <span>{operationRunning ? '处理中' : statusLabel(item.status || 'passed')}</span>
                               <time dateTime={messageUpdateTime(item)}>最后更新 {formatLogTime(messageUpdateTime(item))}</time>
                             </div>
                             <BrowserChatAssistantTimeline message={item} onSelectTool={setToolDialog} running={operationRunning} steps={itemSteps} />
                           </>
                         ) : (
                           <>
-                            <p>{item.content}</p>
+                            {item.content ? <p>{item.content}</p> : null}
+                            <BrowserChatImageGrid attachments={item.attachments} onPreview={setImagePreview} />
                             <time className="browser-chat-message-time" dateTime={messageUpdateTime(item)}>
                               最后更新 {formatLogTime(messageUpdateTime(item))}
                             </time>
@@ -786,6 +925,12 @@ export function BrowserChatWorkspace({
 
             <div className="browser-chat-composer-shell">
               {error || session?.error ? <div className="error">{error || session?.error}</div> : null}
+              <BrowserChatImageGrid
+                attachments={attachments}
+                editable
+                onPreview={setImagePreview}
+                onRemove={(id) => setAttachments((current) => current.filter((attachment) => attachment.id !== id))}
+              />
               <form
                 className="browser-chat-compose"
                 onSubmit={(event) => {
@@ -793,6 +938,17 @@ export function BrowserChatWorkspace({
                   void sendMessage();
                 }}
               >
+                <input
+                  ref={imageInputRef}
+                  className="browser-chat-image-input"
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={(event) => {
+                    const files = event.target.files;
+                    if (files?.length) void uploadChatImages(files);
+                  }}
+                />
                 <textarea
                   disabled={currentBusy || Boolean(loadingSessionId)}
                   placeholder="有问题，尽管问"
@@ -805,6 +961,16 @@ export function BrowserChatWorkspace({
                     }
                   }}
                 />
+                <button
+                  aria-label="上传图片"
+                  className="browser-chat-attach"
+                  disabled={currentBusy || uploadingImage || attachments.length >= 8}
+                  onClick={() => imageInputRef.current?.click()}
+                  title="上传图片"
+                  type="button"
+                >
+                  {uploadingImage ? <Loader2 className="spin" size={17} /> : <ImageUp size={17} />}
+                </button>
                 <div className="browser-chat-mode-toggle" role="radiogroup" aria-label="操作模式">
                   <button
                     aria-pressed={mode === 'visual-markers'}
@@ -825,9 +991,27 @@ export function BrowserChatWorkspace({
                     DOM
                   </button>
                 </div>
-                <button className="browser-chat-send" disabled={!message.trim() || currentBusy || Boolean(loadingSessionId)} type="submit" aria-label="发送">
-                  {currentBusy ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
-                </button>
+                {runningSession?.busy ? (
+                  <button
+                    className="browser-chat-stop"
+                    disabled={interrupting}
+                    onClick={() => void interruptConversation()}
+                    type="button"
+                    aria-label="中断本轮对话"
+                    title="中断本轮对话"
+                  >
+                    {interrupting ? <Loader2 className="spin" size={18} /> : <Square size={16} />}
+                  </button>
+                ) : (
+                  <button
+                    className="browser-chat-send"
+                    disabled={(!message.trim() && !attachments.length) || currentBusy || Boolean(loadingSessionId) || uploadingImage}
+                    type="submit"
+                    aria-label="发送"
+                  >
+                    {busy ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+                  </button>
+                )}
               </form>
             </div>
           </div>
@@ -925,6 +1109,20 @@ export function BrowserChatWorkspace({
               <p className="browser-chat-log-empty">暂无日志</p>
             )}
           </section>
+        </div>
+      ) : null}
+
+      {imagePreview ? (
+        <div className="fullscreen-image-viewer" onClick={() => setImagePreview(null)} role="presentation">
+          <div className="image-viewer-toolbar" onClick={(event) => event.stopPropagation()}>
+            <strong>{imagePreview.name}</strong>
+            <button className="icon-button" onClick={() => setImagePreview(null)} type="button" aria-label="关闭">
+              <X size={18} />
+            </button>
+          </div>
+          <div className="image-viewer-stage">
+            <img alt={imagePreview.name} src={imagePreview.url} onClick={(event) => event.stopPropagation()} />
+          </div>
         </div>
       ) : null}
 

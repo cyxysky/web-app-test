@@ -23,5 +23,13 @@ export async function POST(request: NextRequest) {
   await mkdir(dir, { recursive: true });
   await writeFile(filePath, Buffer.from(await file.arrayBuffer()));
 
-  return NextResponse.json({ imageId, filePath, type: file.type, size: file.size });
+  return NextResponse.json({
+    imageId,
+    filePath,
+    path: `uploads/${imageId}`,
+    url: `/api/artifacts/uploads/${encodeURIComponent(imageId)}`,
+    name: file.name,
+    type: file.type,
+    size: file.size,
+  });
 }

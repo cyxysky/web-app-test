@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { subscribeBrowserChatSessionEvents } from '@/server/ai/agents/browser-chat.service';
+import { getBrowserChatSession, subscribeBrowserChatSessionEvents } from '@/server/ai/agents/browser-chat.service';
 
 type RouteContext = {
   params: Promise<{ sessionId: string }>;
@@ -13,6 +13,7 @@ export async function GET(request: Request, context: RouteContext) {
   let unsubscribe: (() => void) | undefined;
   let closed = false;
   let keepAlive: ReturnType<typeof setInterval> | undefined;
+  let idlePingTicks = 0;
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -36,7 +37,18 @@ export async function GET(request: Request, context: RouteContext) {
       }
 
       send('refresh', { sessionId, time: new Date().toISOString() });
-      keepAlive = setInterval(() => send('ping', { time: new Date().toISOString() }), 15000);
+      keepAlive = setInterval(() => {
+        const session = getBrowserChatSession(sessionId);
+        if (session?.busy) {
+          send('refresh', { sessionId, time: new Date().toISOString(), reason: 'busy-heartbeat' });
+          return;
+        }
+        idlePingTicks += 1;
+        if (idlePingTicks >= 15) {
+          idlePingTicks = 0;
+          send('ping', { time: new Date().toISOString() });
+        }
+      }, 1000);
       request.signal.addEventListener('abort', () => {
         closed = true;
         unsubscribe?.();

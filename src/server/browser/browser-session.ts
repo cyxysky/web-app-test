@@ -1,7 +1,8 @@
+import { existsSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Frame, LaunchOptions, Page, Request } from 'playwright';
-import { artifactPath } from '@/server/storage/paths';
+import { appDataRoot, artifactPath } from '@/server/storage/paths';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
   if (errorText === 'net::ERR_ABORTED' && /analytics|collector|apm|beacon|log|track/i.test(url)) return true;
@@ -24,6 +25,8 @@ export type BrowserSessionMode = 'dom' | 'visual-markers';
 export type BrowserSessionOptions = {
   isMarked?: boolean;
   runId?: string;
+  tabGroupTitle?: string;
+  preferExistingPage?: boolean;
 };
 
 /**
@@ -187,6 +190,13 @@ const manualVerificationTextPatterns = [
 type BrowserOwnership = 'launched' | 'connected' | 'persistent' | 'shared';
 type SharedBrowserOwnership = Exclude<BrowserOwnership, 'shared'>;
 
+export type BrowserTabSnapshot = {
+  index: number;
+  url: string;
+  active: boolean;
+  groupId: string;
+};
+
 type SharedBrowserLease = {
   browser?: Browser;
   context: BrowserContext;
@@ -195,6 +205,7 @@ type SharedBrowserLease = {
 };
 
 const preparedContextInitScripts = new WeakSet<BrowserContext>();
+const sharedPageOwners = new WeakMap<Page, string>();
 const sharedBrowserState: {
   key?: string;
   browser?: Browser;
@@ -210,6 +221,121 @@ function sharedBrowserTabsEnabled() {
   return process.env.BROWSER_SHARED_TABS !== 'false';
 }
 
+function nativeBrowserTabGroupsEnabled(headless: boolean) {
+  return !headless && process.env.BROWSER_NATIVE_TAB_GROUPS !== 'false';
+}
+
+function browserTabTitlePrefixEnabled() {
+  return process.env.BROWSER_TAB_TITLE_PREFIX === 'true';
+}
+
+function sessionTabGrouperExtensionPath() {
+  return path.join(process.cwd(), 'src', 'server', 'browser', 'session-tab-grouper-extension');
+}
+
+function sessionTabGrouperEnabled(headless: boolean) {
+  const extensionPath = sessionTabGrouperExtensionPath();
+  return nativeBrowserTabGroupsEnabled(headless) && existsSync(path.join(extensionPath, 'manifest.json'));
+}
+
+function withSessionTabGrouperArgs(args: string[], headless: boolean, options: { exclusive?: boolean } = {}) {
+  if (!sessionTabGrouperEnabled(headless)) return args;
+  const extensionPath = sessionTabGrouperExtensionPath();
+  return [
+    ...args,
+    ...(options.exclusive ? [`--disable-extensions-except=${extensionPath}`] : []),
+    `--load-extension=${extensionPath}`,
+  ];
+}
+
+function normalizePageGroupId(value?: string) {
+  const normalized = (value || 'browser-session')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 96);
+  return normalized || 'browser-session';
+}
+
+function sessionTabGrouperProfileDir(profileKey: string) {
+  return path.join(appDataRoot(), '.data', 'browser-profiles', 'tab-groups', normalizePageGroupId(profileKey));
+}
+
+function sessionTabGrouperDebugPort(profileKey: string) {
+  const configured = Number(process.env.BROWSER_TAB_GROUP_CDP_PORT || '');
+  if (Number.isInteger(configured) && configured > 0 && configured < 65536) return configured;
+  const key = normalizePageGroupId(profileKey);
+  let hash = 0;
+  for (const char of key) hash = ((hash * 31) + char.charCodeAt(0)) >>> 0;
+  return 24000 + (hash % 10000);
+}
+
+function cdpEndpointForPort(port?: number) {
+  return port ? `http://127.0.0.1:${port}` : '';
+}
+
+function isBlankPage(page: Page) {
+  const url = page.url();
+  return !url || url === 'about:blank';
+}
+
+function normalizeTabGroupTitle(value?: string) {
+  const normalized = (value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 42);
+  return normalized || '浏览器会话';
+}
+
+function applyPageGroupMarker(input: { id: string; title: string; prefix: string; applyPrefix: boolean }) {
+  Object.defineProperty(window, '__aiWebTestSessionGroupId', {
+    configurable: true,
+    enumerable: false,
+    value: input.id,
+    writable: true,
+  });
+  document.documentElement?.setAttribute('data-ai-web-test-session-group-id', input.id);
+  const windowNameMarker = `AI_WEB_TEST_SESSION_GROUP:${input.id};`;
+  const previousWindowName = String(window.name || '').replace(/^AI_WEB_TEST_SESSION_GROUP:[^;]*;/, '');
+  window.name = `${windowNameMarker}${previousWindowName}`;
+  window.postMessage({
+    source: 'AI_WEB_TEST_SESSION_TAB_GROUP',
+    type: 'group-tab',
+    sessionId: input.id,
+    groupTitle: input.title,
+  }, '*');
+
+  if (!input.applyPrefix) return;
+  const stateKey = '__aiWebTestTabGroupTitleState';
+  const win = window as Window & {
+    [stateKey]?: {
+      applying?: boolean;
+      observer?: MutationObserver;
+      prefix: string;
+    };
+  };
+  const state = win[stateKey] || { prefix: input.prefix };
+  state.prefix = input.prefix;
+  win[stateKey] = state;
+  const apply = () => {
+    if (state.applying) return;
+    const current = document.title || '';
+    const prefixes = /^【(?:AI会话|ai-)[^】]*】\s*/i;
+    const clean = current.replace(prefixes, '').trim();
+    const next = `${state.prefix}${clean ? ` ${clean}` : ''}`;
+    if (current === next) return;
+    state.applying = true;
+    document.title = next;
+    state.applying = false;
+  };
+  apply();
+  if (!state.observer) {
+    state.observer = new MutationObserver(apply);
+    const titleElement = document.querySelector('title');
+    if (titleElement) state.observer.observe(titleElement, { childList: true, characterData: true, subtree: true });
+  }
+}
+
 function sharedBrowserKey(input: {
   cdpEndpoint: string;
   userDataDir: string;
@@ -219,6 +345,23 @@ function sharedBrowserKey(input: {
   if (input.cdpEndpoint) return `cdp:${input.cdpEndpoint}`;
   if (input.userDataDir) return `persistent:${path.resolve(input.userDataDir)}`;
   return `launch:${JSON.stringify({ launch: input.launchOptions, context: input.contextOptions })}`;
+}
+
+async function connectExistingBrowserOverCdp(input: {
+  chromium: BrowserType;
+  endpoint: string;
+  contextOptions: BrowserContextOptions;
+}) {
+  if (!input.endpoint) return undefined;
+  const browser = await input.chromium.connectOverCDP(input.endpoint, { timeout: 800 }).catch(() => undefined);
+  if (!browser) return undefined;
+  const context = browser.contexts()[0] || await browser.newContext(input.contextOptions);
+  return { browser, context, ownership: 'connected' as const };
+}
+
+function isPersistentProfileAlreadyOpenError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Target page, context or browser has been closed|browser session|user data directory|profile.*in use|already.*open/i.test(message);
 }
 
 async function closeIdleSharedBrowser(force = false) {
@@ -244,6 +387,7 @@ async function closeIdleSharedBrowser(force = false) {
 async function acquireSharedBrowser(input: {
   chromium: BrowserType;
   cdpEndpoint: string;
+  reconnectCdpEndpoint?: string;
   userDataDir: string;
   launchOptions: LaunchOptions;
   contextOptions: BrowserContextOptions;
@@ -267,11 +411,36 @@ async function acquireSharedBrowser(input: {
       }
 
       if (input.userDataDir) {
-        const context = await input.chromium.launchPersistentContext(input.userDataDir, {
-          ...input.launchOptions,
-          ...input.contextOptions,
+        const connected = await connectExistingBrowserOverCdp({
+          chromium: input.chromium,
+          endpoint: input.reconnectCdpEndpoint || '',
+          contextOptions: input.contextOptions,
         });
-        return { browser: context.browser() || undefined, context, ownership: 'persistent' as const };
+        if (connected) return connected;
+        try {
+          const context = await input.chromium.launchPersistentContext(input.userDataDir, {
+            ...input.launchOptions,
+            ...input.contextOptions,
+          });
+          return { browser: context.browser() || undefined, context, ownership: 'persistent' as const };
+        } catch (error) {
+          const retryConnected = await connectExistingBrowserOverCdp({
+            chromium: input.chromium,
+            endpoint: input.reconnectCdpEndpoint || '',
+            contextOptions: input.contextOptions,
+          });
+          if (retryConnected) return retryConnected;
+          if (input.reconnectCdpEndpoint && isPersistentProfileAlreadyOpenError(error)) {
+            throw new Error([
+              '无法接管上一次的浏览器 tab 组：该 persistent profile 已经被一个旧浏览器进程占用，但旧进程没有可连接的 CDP 端口。',
+              `profile=${input.userDataDir}`,
+              `expectedCdp=${input.reconnectCdpEndpoint}`,
+              '请关闭这个旧的自动化浏览器窗口一次；之后新启动的窗口会带 CDP 端口，继续时会优先连接并接管旧 tab 组。',
+              error instanceof Error ? error.message : String(error),
+            ].join('\n'));
+          }
+          throw error;
+        }
       }
 
       const browser = await input.chromium.launch(input.launchOptions);
@@ -316,11 +485,18 @@ export class BrowserSession {
   private ownedPages = new Set<Page>();
   private browserOwnership: BrowserOwnership = 'launched';
   private releaseSharedBrowser?: () => Promise<void>;
+  private pageDiscoveryListener?: (page: Page) => void;
+  private pageGroupInitScriptPages = new WeakSet<Page>();
+  private readonly pageGroupId: string;
+  private readonly tabGroupTitle: string;
 
   constructor(
     private readonly mode: BrowserSessionMode = browserSessionModeFromEnv(),
     private readonly options: BrowserSessionOptions = {},
-  ) { }
+  ) {
+    this.pageGroupId = normalizePageGroupId(options.runId);
+    this.tabGroupTitle = normalizeTabGroupTitle(options.tabGroupTitle || options.runId);
+  }
 
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
@@ -340,21 +516,34 @@ export class BrowserSession {
         || process.env.BROWSER_CONNECT_CDP_ENDPOINT?.trim()
         || process.env.CHROME_REMOTE_DEBUGGING_URL?.trim()
         || '';
-    const userDataDir = process.env.BROWSER_USER_DATA_DIR?.trim()
+    const requestedUserDataDir = process.env.BROWSER_USER_DATA_DIR?.trim()
       || process.env.AI_WEB_TEST_BROWSER_PROFILE_DIR?.trim()
       || '';
+    const autoTabGroupProfileKey = sharedBrowserTabsEnabled() ? 'shared' : this.pageGroupId;
+    const autoTabGroupProfileDir = sessionTabGrouperEnabled(headless) && !cdpEndpoint && !requestedUserDataDir
+      ? sessionTabGrouperProfileDir(autoTabGroupProfileKey)
+      : '';
+    const autoTabGroupDebugPort = autoTabGroupProfileDir ? sessionTabGrouperDebugPort(autoTabGroupProfileKey) : undefined;
+    const autoTabGroupCdpEndpoint = cdpEndpointForPort(autoTabGroupDebugPort);
+    const userDataDir = requestedUserDataDir || autoTabGroupProfileDir;
+    if (autoTabGroupProfileDir) await mkdir(autoTabGroupProfileDir, { recursive: true });
+    const tabGrouperEnabled = sessionTabGrouperEnabled(headless);
     const launchOptions: LaunchOptions = {
       headless,
       slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
       ...(channel ? { channel } : {}),
       ...(executablePath && !channel ? { executablePath } : {}),
-      args: [
+      ...(tabGrouperEnabled ? { ignoreDefaultArgs: ['--disable-extensions'] } : {}),
+      args: withSessionTabGrouperArgs([
         `--window-size=${viewportWidth},${viewportHeight + 120}`,
         fullscreen ? '--start-maximized' : '',
         ignoreHTTPSErrors ? '--ignore-certificate-errors' : '',
         '--force-device-scale-factor=1',
         '--high-dpi-support=1',
-      ].filter(Boolean),
+        '--no-first-run',
+        '--no-default-browser-check',
+        autoTabGroupDebugPort ? `--remote-debugging-port=${autoTabGroupDebugPort}` : '',
+      ].filter(Boolean), headless, { exclusive: Boolean(autoTabGroupProfileDir) }),
     };
     const useNativeFullscreenViewport = fullscreen && !headless && !hasExplicitViewport;
     const contextOptions: BrowserContextOptions = {
@@ -364,14 +553,14 @@ export class BrowserSession {
     };
 
     if (sharedBrowserTabsEnabled()) {
-      const lease = await acquireSharedBrowser({ chromium, cdpEndpoint, userDataDir, launchOptions, contextOptions });
+      const lease = await acquireSharedBrowser({ chromium, cdpEndpoint, reconnectCdpEndpoint: autoTabGroupCdpEndpoint, userDataDir, launchOptions, contextOptions });
       this.browserOwnership = 'shared';
       this.browser = lease.browser;
       this.context = lease.context;
       this.releaseSharedBrowser = lease.release;
       await this.prepareContext(lease.context, { claimPages: false });
-      const page = await lease.context.newPage();
-      this.claimPage(page);
+      this.installOwnedPageDiscovery(lease.context);
+      const page = await this.findInitialSharedPage(lease.context);
       await page.bringToFront().catch(() => undefined);
       return;
     }
@@ -390,11 +579,38 @@ export class BrowserSession {
     }
 
     if (userDataDir) {
+      if (autoTabGroupCdpEndpoint) {
+        const connected = await connectExistingBrowserOverCdp({ chromium, endpoint: autoTabGroupCdpEndpoint, contextOptions });
+        if (connected) {
+          this.browserOwnership = 'connected';
+          this.browser = connected.browser;
+          this.context = connected.context;
+          await this.prepareContext(connected.context);
+          const page = this.sessionPages()[0] || await connected.context.newPage();
+          this.claimPage(page);
+          await page.bringToFront().catch(() => undefined);
+          return;
+        }
+      }
       this.browserOwnership = 'persistent';
-      const context = await chromium.launchPersistentContext(userDataDir, {
-        ...launchOptions,
-        ...contextOptions,
-      });
+      let context: BrowserContext;
+      try {
+        context = await chromium.launchPersistentContext(userDataDir, {
+          ...launchOptions,
+          ...contextOptions,
+        });
+      } catch (error) {
+        const connected = await connectExistingBrowserOverCdp({ chromium, endpoint: autoTabGroupCdpEndpoint, contextOptions });
+        if (!connected) throw error;
+        this.browserOwnership = 'connected';
+        this.browser = connected.browser;
+        this.context = connected.context;
+        await this.prepareContext(connected.context);
+        const page = this.sessionPages()[0] || await connected.context.newPage();
+        this.claimPage(page);
+        await page.bringToFront().catch(() => undefined);
+        return;
+      }
       this.context = context;
       this.browser = context.browser() || undefined;
       await this.prepareContext(context);
@@ -410,6 +626,47 @@ export class BrowserSession {
     this.context = context;
     await this.prepareContext(context);
     this.claimPage(await context.newPage());
+  }
+
+  private async findInitialSharedPage(context: BrowserContext) {
+    const reclaimedPages: Page[] = [];
+    for (const page of context.pages()) {
+      if (page.isClosed()) continue;
+      const groupId = await this.readPageGroupId(page);
+      if (groupId === this.pageGroupId && this.claimPage(page, { makeActive: false })) {
+        reclaimedPages.push(page);
+      }
+    }
+    const reclaimed = reclaimedPages.find((page) => !isBlankPage(page)) || reclaimedPages.at(-1);
+    if (reclaimed) {
+      this.page = reclaimed;
+      return reclaimed;
+    }
+
+    if (this.options.preferExistingPage) {
+      const unmarkedPages: Page[] = [];
+      for (const page of context.pages()) {
+        if (page.isClosed() || isBlankPage(page)) continue;
+        if (sharedPageOwners.has(page)) continue;
+        const groupId = await this.readPageGroupId(page);
+        if (groupId) continue;
+        unmarkedPages.push(page);
+      }
+      const existingPage = unmarkedPages.at(-1);
+      if (existingPage && this.claimPage(existingPage)) return existingPage;
+    }
+
+    for (const page of context.pages()) {
+      if (page.isClosed() || !isBlankPage(page)) continue;
+      if (sharedPageOwners.has(page)) continue;
+      const groupId = await this.readPageGroupId(page);
+      if (groupId) continue;
+      if (this.claimPage(page)) return page;
+    }
+
+    const page = await context.newPage();
+    this.claimPage(page);
+    return page;
   }
 
   private async prepareContext(context: BrowserContext, options: { claimPages?: boolean } = {}) {
@@ -445,6 +702,20 @@ export class BrowserSession {
     for (const page of context.pages()) this.claimPage(page, { makeActive: false });
   }
 
+  private installOwnedPageDiscovery(context: BrowserContext) {
+    if (this.pageDiscoveryListener) return;
+    this.pageDiscoveryListener = (page) => {
+      void this.claimPopupIfOwned(page);
+    };
+    context.on('page', this.pageDiscoveryListener);
+  }
+
+  private async claimPopupIfOwned(page: Page) {
+    const opener = await page.opener().catch(() => null);
+    if (!opener || !this.ownedPages.has(opener)) return;
+    if (this.claimPage(page)) await page.bringToFront().catch(() => undefined);
+  }
+
   async startTrace(runId: string) {
     if (!this.context || process.env.PLAYWRIGHT_TRACE === 'false') return;
     if (this.browserOwnership === 'shared' && process.env.PLAYWRIGHT_TRACE_SHARED !== 'true') return;
@@ -467,23 +738,92 @@ export class BrowserSession {
   }
 
   private claimPage(page: Page, options: { makeActive?: boolean } = {}) {
-    if (page.isClosed()) return;
+    if (page.isClosed()) return false;
+    if (this.browserOwnership === 'shared') {
+      const owner = sharedPageOwners.get(page);
+      if (owner && owner !== this.pageGroupId) return false;
+      sharedPageOwners.set(page, this.pageGroupId);
+    }
     const alreadyOwned = this.ownedPages.has(page);
     this.ownedPages.add(page);
     this.attachPageListeners(page);
+    void this.markPageGroup(page);
     if (!alreadyOwned) {
       page.once('close', () => {
         this.ownedPages.delete(page);
+        if (sharedPageOwners.get(page) === this.pageGroupId) sharedPageOwners.delete(page);
         if (this.page === page) {
           this.page = this.sessionPages()[0];
         }
       });
     }
     if (options.makeActive !== false) this.page = page;
+    return true;
   }
 
   private sessionPages() {
     return Array.from(this.ownedPages).filter((page) => !page.isClosed());
+  }
+
+  private tabGroupShortId() {
+    const parts = this.pageGroupId.split('_');
+    return (parts.at(-1) || this.pageGroupId).slice(-6).toLowerCase();
+  }
+
+  private tabGroupLabel() {
+    return `ai-${this.tabGroupShortId()}`;
+  }
+
+  private tabTitlePrefix() {
+    return `【${this.tabGroupLabel()}】`;
+  }
+
+  private stripTabTitlePrefix(title: string) {
+    const prefix = this.tabTitlePrefix();
+    return title.startsWith(prefix) ? title.slice(prefix.length).trim() : title;
+  }
+
+  private pageGroupMarkerInput() {
+    return {
+      id: this.pageGroupId,
+      title: this.tabGroupLabel(),
+      prefix: this.tabTitlePrefix(),
+      applyPrefix: browserTabTitlePrefixEnabled(),
+    };
+  }
+
+  private async markPageGroup(page: Page) {
+    const markerInput = this.pageGroupMarkerInput();
+    if (!this.pageGroupInitScriptPages.has(page)) {
+      this.pageGroupInitScriptPages.add(page);
+      await page.addInitScript(applyPageGroupMarker, markerInput).catch(() => {
+        this.pageGroupInitScriptPages.delete(page);
+      });
+    }
+    await page.evaluate(applyPageGroupMarker, markerInput).catch(() => undefined);
+  }
+
+  private async readPageGroupId(page: Page) {
+    if (page.isClosed()) return undefined;
+    return page.evaluate(() => {
+      const win = window as Window & { __aiWebTestSessionGroupId?: unknown };
+      if (typeof win.__aiWebTestSessionGroupId === 'string') return win.__aiWebTestSessionGroupId;
+      const attributeId = document.documentElement?.getAttribute('data-ai-web-test-session-group-id');
+      if (attributeId) return attributeId;
+      const match = String(window.name || '').match(/^AI_WEB_TEST_SESSION_GROUP:([^;]+);/);
+      return match?.[1];
+    }).catch(() => undefined);
+  }
+
+  getTabsSnapshot(): BrowserTabSnapshot[] {
+    const pages = this.sessionPages();
+    const active = this.page && !this.page.isClosed() ? this.page : pages[0];
+    return pages.map((page, index) => ({
+      index,
+      url: page.url(),
+      active: page === active,
+      groupId: this.pageGroupId,
+    }));
   }
 
   private async closeOwnedPages() {
@@ -576,17 +916,18 @@ export class BrowserSession {
   } = {}) {
     const includeText = options.includeText !== false || options.includeManualVerification !== false;
     const includeInteractiveCandidates = options.includeInteractiveCandidates ?? true;
+    const useCachedInteractiveCandidates = Boolean(options.useCachedInteractiveCandidates && !options.includeDomTree);
     const [title, text, viewportMetrics, focusedElement, domTree, interactiveCandidates, scrollableAreas, pageScrollState] = await Promise.all([
-      this.activePage.title().catch(() => ''),
+      this.activePage.title().catch(() => '').then((value) => this.stripTabTitlePrefix(value)),
       includeText ? this.readPageText() : Promise.resolve(''),
       this.getViewportMetrics(),
       this.getFocusedElement(),
       options.includeDomTree ? this.readSimplifiedDomTree().catch((error) => `Unable to read DOM tree: ${error instanceof Error ? error.message : String(error)}`) : Promise.resolve(undefined),
       !includeInteractiveCandidates
         ? Promise.resolve([] as InteractiveCandidate[])
-        : options.useCachedInteractiveCandidates && this.lastScreenshotCandidates.length
+        : useCachedInteractiveCandidates && this.lastScreenshotCandidates.length
           ? Promise.resolve(this.lastScreenshotCandidates)
-          : options.useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
+          : useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
           ? Promise.resolve(this.lastInteractiveCandidates)
           : this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
       this.refreshScrollableAreas().catch(() => this.lastScrollableAreas),
@@ -604,11 +945,7 @@ export class BrowserSession {
       textLength: text.length,
       viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
       viewportMetrics,
-      tabs: this.sessionPages().map((page, index) => ({
-        index,
-        url: page.url(),
-        active: page === this.activePage,
-      })),
+      tabs: this.getTabsSnapshot(),
       focusedElement,
       domTree,
       interactiveCandidates,
@@ -907,7 +1244,7 @@ export class BrowserSession {
   }
 
   // 通过简化 DOM 路径解析元素并点击，作为候选编号不可用时的兜底操作。
-  async clickDomNode(path: string): Promise<BrowserActionResult> {
+  async clickDomNode(path: string, text?: string): Promise<BrowserActionResult> {
     const target = await this.resolveDomPathToClickablePoint(path);
     if (!target) {
       return {
@@ -917,9 +1254,32 @@ export class BrowserSession {
     }
     const offscreenNote = target.offscreen ? ' Note: the node center was outside the viewport and was clamped; scroll it into view first for a reliable click.' : '';
     await this.activePage.mouse.click(target.x, target.y);
+    if (text !== undefined) {
+      await this.activePage.keyboard.type(text);
+    }
     const note = await this.waitAfterAction();
     await this.showClickMarker(target.x, target.y, 'click');
-    return { ok: true, actual: `Clicked DOM node ${path} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${offscreenNote}${note}` };
+    return { ok: true, actual: `Clicked DOM node ${path} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${offscreenNote}${note}` };
+  }
+
+  async clickByText(targetText: string, text?: string): Promise<BrowserActionResult> {
+    const target = await this.resolveTextToClickablePoint(targetText);
+    if (!target) {
+      return {
+        ok: false,
+        actual: `No visible clickable element matched text "${targetText}". Call getDomTree again or use a more exact visible label/title/href.`,
+      };
+    }
+    await this.activePage.mouse.click(target.x, target.y);
+    if (text !== undefined) {
+      await this.activePage.keyboard.type(text);
+    }
+    const note = await this.waitAfterAction();
+    await this.showClickMarker(target.x, target.y, 'click');
+    return {
+      ok: true,
+      actual: `Clicked visible text match "${target.matchedText}" (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${note}`,
+    };
   }
 
   // 通过简化 DOM 路径解析元素并聚焦，作为文本输入前的兜底聚焦方式。
@@ -971,10 +1331,12 @@ export class BrowserSession {
 
   // 列出当前浏览器上下文中的所有标签页，供 AI 判断是否需要切换。
   async listTabs(): Promise<BrowserActionResult> {
-    const pages = this.sessionPages();
+    const tabs = this.getTabsSnapshot();
     return {
       ok: true,
-      actual: pages.map((page, index) => `${index}${page === this.activePage ? ' [active]' : ''}: ${page.url()}`).join('\n') || 'No tabs found for this run.',
+      actual: tabs.length
+        ? [`Tab group: ${this.pageGroupId}`, ...tabs.map((tab) => `${tab.index}${tab.active ? ' [active]' : ''}: ${tab.url}`)].join('\n')
+        : 'No tabs found for this run.',
     };
   }
 
@@ -1064,6 +1426,10 @@ export class BrowserSession {
 
   // 关闭浏览器；调试场景可选择保留窗口。
   async close(options: { keepOpen?: boolean } = {}) {
+    if (this.context && this.pageDiscoveryListener) {
+      this.context.off('page', this.pageDiscoveryListener);
+      this.pageDiscoveryListener = undefined;
+    }
     if (this.browserOwnership === 'shared') {
       if (!options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
         await this.closeOwnedPages();
@@ -1087,6 +1453,7 @@ export class BrowserSession {
   private async waitAfterAction() {
     const settleMs = Number(process.env.BROWSER_ACTION_SETTLE_MS || 0);
     await this.activePage.waitForLoadState('domcontentloaded').catch(() => undefined);
+    await this.markPageGroup(this.activePage);
     if (Number.isFinite(settleMs) && settleMs > 0) {
       await this.waitForStableViewport(Math.min(Math.max(settleMs, 0), 2000));
     }
@@ -1195,7 +1562,7 @@ export class BrowserSession {
 
   private async detectManualVerification(): Promise<ManualVerificationDetails> {
     const [title, text] = await Promise.all([
-      this.activePage.title().catch(() => ''),
+      this.activePage.title().catch(() => '').then((value) => this.stripTabTitlePrefix(value)),
       this.readPageText(),
     ]);
     return this.detectManualVerificationDetails(title, this.activePage.url(), text);
@@ -3257,6 +3624,158 @@ export class BrowserSession {
         offscreen,
       };
     }, pathValue).catch(() => undefined);
+  }
+
+  private async resolveTextToClickablePoint(targetText: string) {
+    return this.activePage.evaluate((rawTargetText) => {
+      const query = String(rawTargetText || '').replace(/\s+/g, ' ').trim();
+      if (!query) return undefined;
+      const normalizedQuery = query.toLowerCase();
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
+
+      function normalize(value?: string | null) {
+        return String(value || '').replace(/\s+/g, ' ').trim();
+      }
+      function isRenderable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        const tag = element.tagName.toLowerCase();
+        if (skippedTags.has(tag)) return false;
+        if (element.hasAttribute('hidden') || element.getAttribute('aria-hidden') === 'true') return false;
+        const style = window.getComputedStyle(element);
+        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (Number(style.opacity || '1') <= 0.01) return false;
+        return true;
+      }
+      function visibleRect(element: Element) {
+        if (!isRenderable(element)) return undefined;
+        const rect = element.getBoundingClientRect();
+        const left = Math.max(rect.left, 0);
+        const top = Math.max(rect.top, 0);
+        const right = Math.min(rect.right, window.innerWidth);
+        const bottom = Math.min(rect.bottom, window.innerHeight);
+        const width = right - left;
+        const height = bottom - top;
+        if (width <= 2 || height <= 2) return undefined;
+        return { left, top, right, bottom, width, height, raw: rect };
+      }
+      function pointBelongsToElement(element: Element, x: number, y: number) {
+        const top = document.elementsFromPoint(x, y).find((item) => isRenderable(item));
+        return Boolean(top && (top === element || element.contains(top)));
+      }
+      function visiblePointForElement(element: Element) {
+        const rect = visibleRect(element);
+        if (!rect) return undefined;
+        const insetX = Math.min(10, Math.max(1, rect.width / 4));
+        const insetY = Math.min(10, Math.max(1, rect.height / 4));
+        const samples = [
+          [rect.left + rect.width / 2, rect.top + rect.height / 2],
+          [rect.left + insetX, rect.top + rect.height / 2],
+          [rect.right - insetX, rect.top + rect.height / 2],
+          [rect.left + rect.width / 2, rect.top + insetY],
+          [rect.left + rect.width / 2, rect.bottom - insetY],
+          [rect.left + insetX, rect.top + insetY],
+          [rect.right - insetX, rect.top + insetY],
+          [rect.left + insetX, rect.bottom - insetY],
+          [rect.right - insetX, rect.bottom - insetY],
+        ];
+        for (const [x, y] of samples) {
+          const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
+          const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
+          if (pointBelongsToElement(element, px, py)) return { x: px, y: py };
+        }
+        return undefined;
+      }
+      function labelOf(element: Element) {
+        const input = element as HTMLInputElement;
+        const imageAlt = Array.from(element.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ');
+        const labelText = input.labels?.length ? Array.from(input.labels).map((label) => label.textContent || '').join(' ') : '';
+        return normalize([
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+          element.getAttribute('alt'),
+          element.getAttribute('placeholder'),
+          imageAlt,
+          labelText,
+          input.value,
+          (element as HTMLElement).innerText || element.textContent,
+          element.tagName.toLowerCase() === 'a' ? (element as HTMLAnchorElement).href || element.getAttribute('href') : '',
+        ].filter(Boolean).join(' '));
+      }
+      function descriptorOf(element: Element) {
+        const tag = element.tagName.toLowerCase();
+        const id = element.id ? `#${element.id}` : '';
+        const role = element.getAttribute('role') ? `[role="${element.getAttribute('role')}"]` : '';
+        return `${tag}${id}${role}`;
+      }
+      function matchScore(label: string) {
+        const normalized = label.toLowerCase();
+        if (!normalized) return undefined;
+        if (normalized === normalizedQuery) return 0;
+        if (normalized.startsWith(normalizedQuery)) return 1;
+        if (normalized.includes(normalizedQuery)) return 2;
+        const queryParts = normalizedQuery.split(/\s+/).filter((item) => item.length >= 2);
+        if (queryParts.length >= 2 && queryParts.every((part) => normalized.includes(part))) return 3;
+        return undefined;
+      }
+
+      const selector = [
+        'a',
+        'button',
+        'input',
+        'textarea',
+        'select',
+        '[role="button"]',
+        '[role="link"]',
+        '[role="menuitem"]',
+        '[role="tab"]',
+        '[onclick]',
+        '[tabindex]',
+        '[contenteditable=""]',
+        '[contenteditable="true"]',
+      ].join(',');
+      const candidates = Array.from(document.querySelectorAll(selector));
+      let best: undefined | {
+        x: number;
+        y: number;
+        descriptor: string;
+        matchedText: string;
+        score: number;
+      };
+
+      for (const element of candidates) {
+        const label = labelOf(element);
+        const score = matchScore(label);
+        if (score === undefined) continue;
+        let point = visiblePointForElement(element);
+        if (!point) {
+          element.scrollIntoView({ block: 'center', inline: 'center' });
+          point = visiblePointForElement(element);
+        }
+        if (!point) continue;
+        const rect = element.getBoundingClientRect();
+        const areaPenalty = Math.min(8, (Math.max(1, rect.width * rect.height) / Math.max(1, window.innerWidth * window.innerHeight)) * 8);
+        const tag = element.tagName.toLowerCase();
+        const tagBonus = tag === 'a' || tag === 'button' ? -0.4 : ['input', 'textarea', 'select'].includes(tag) ? -0.2 : 0;
+        const finalScore = score + areaPenalty + tagBonus;
+        if (!best || finalScore < best.score) {
+          best = {
+            x: Math.round(point.x),
+            y: Math.round(point.y),
+            descriptor: descriptorOf(element),
+            matchedText: label.slice(0, 180),
+            score: finalScore,
+          };
+        }
+      }
+
+      return best ? {
+        x: best.x,
+        y: best.y,
+        descriptor: best.descriptor,
+        matchedText: best.matchedText,
+      } : undefined;
+    }, targetText).catch(() => undefined);
   }
 
   private async dispatchDomPathClick(pathValue: string) {

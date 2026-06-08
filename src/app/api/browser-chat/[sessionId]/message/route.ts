@@ -12,7 +12,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const content = typeof body.content === 'string' ? body.content : '';
     const mode = body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers';
     const clientMessageId = typeof body.clientMessageId === 'string' ? body.clientMessageId : undefined;
-    const session = await sendBrowserChatMessage(sessionId, content, mode, clientMessageId);
+    const session = await sendBrowserChatMessage(sessionId, content, mode, clientMessageId, body.attachments);
     return NextResponse.json({ session });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to send browser chat message';

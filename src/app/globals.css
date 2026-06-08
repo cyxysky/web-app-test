@@ -1,4 +1,4 @@
-@import "tailwindcss";
+﻿@import "tailwindcss";
 
 :root {
   --background: #f6f5f1;
@@ -384,6 +384,7 @@ select {
   min-height: 24px;
   padding: 5px 9px;
   width: fit-content;
+  white-space: nowrap;
 }
 
 .badge.neutral {
@@ -1379,7 +1380,8 @@ select {
 }
 
 .run-workspace {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 18px;
   margin: 0 auto;
   min-height: 100vh;
@@ -1728,7 +1730,8 @@ select {
 }
 
 .evidence-panel {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 14px;
   padding: 0;
   max-width: 100%;
@@ -3758,6 +3761,15 @@ select {
   text-align: center;
 }
 
+.image-viewer-toolbar strong {
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .image-viewer-toolbar button:disabled {
   cursor: not-allowed;
   opacity: 0.42;
@@ -4101,23 +4113,15 @@ select {
 }
 
 .settings-card {
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid var(--border);
-  border-radius: 12px;
   overflow: hidden;
 }
 
 .settings-row {
   align-items: center;
-  border-bottom: 1px solid var(--border);
   display: grid;
   gap: 24px;
   grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
-  padding: 16px;
-}
-
-.settings-row:last-child {
-  border-bottom: 0;
+  padding: 16px 0px;
 }
 
 .settings-row strong {
@@ -4638,11 +4642,6 @@ select {
   max-width: min(760px, 92%);
 }
 
-.browser-chat-message.user>div:last-child {
-  background: #eef2ff;
-  border-color: #cdd7ff;
-}
-
 .browser-chat-message.assistant {
   justify-self: start;
   width: min(920px, 100%);
@@ -4664,8 +4663,6 @@ select {
 }
 
 .browser-chat-message>div:last-child {
-  background: var(--panel-soft);
-  border: 1px solid var(--border);
   border-radius: 10px;
   display: grid;
   gap: 7px;
@@ -5297,18 +5294,11 @@ select {
 }
 
 .browser-chat-message>div:last-child {
-  background: #ffffff;
-  border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 8px 22px rgba(35, 32, 25, 0.04);
+  box-shadow: 0 8px 22px 20px rgba(35, 32, 25, 0.08);
   display: grid;
   gap: 8px;
   padding: 12px 14px;
-}
-
-.browser-chat-message.user>div:last-child {
-  background: #eef2ff;
-  border-color: #cdd7ff;
 }
 
 .browser-chat-message header {
@@ -5490,6 +5480,19 @@ select {
   padding: 9px;
   text-align: left;
   width: 100%;
+}
+
+.browser-chat-tool-call {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.browser-chat-tool-reason {
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .browser-chat-tool-card:hover {
@@ -5740,6 +5743,105 @@ select {
   width: min(100%, 900px);
 }
 
+.browser-chat-image-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.browser-chat-image-grid.editable {
+  background: rgba(255, 255, 255, 0.86);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.browser-chat-image-thumb {
+  background: #fffdfa;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 5px;
+  position: relative;
+  width: 112px;
+}
+
+.browser-chat-image-preview-button {
+  background: #f4f1ea;
+  border: 0;
+  border-radius: 6px;
+  cursor: zoom-in;
+  display: block;
+  height: 76px;
+  overflow: hidden;
+  padding: 0;
+  position: relative;
+  width: 100%;
+}
+
+.browser-chat-image-preview-button img {
+  height: 100%;
+  object-fit: cover;
+  width: 100%;
+}
+
+.browser-chat-image-preview-button span {
+  align-items: center;
+  background: rgba(23, 23, 23, 0.72);
+  border-radius: 999px;
+  bottom: 5px;
+  color: #ffffff;
+  display: inline-flex;
+  height: 22px;
+  justify-content: center;
+  position: absolute;
+  right: 5px;
+  width: 22px;
+}
+
+.browser-chat-image-thumb figcaption {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.browser-chat-image-thumb figcaption span,
+.browser-chat-image-thumb figcaption small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-chat-image-thumb figcaption span {
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.browser-chat-image-thumb figcaption small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.browser-chat-image-remove {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--danger);
+  cursor: pointer;
+  display: inline-flex;
+  height: 22px;
+  justify-content: center;
+  padding: 0;
+  position: absolute;
+  right: -6px;
+  top: -6px;
+  width: 22px;
+}
+
 .browser-chat-compose {
   align-items: stretch;
   background: #ffffff;
@@ -5748,9 +5850,38 @@ select {
   box-shadow: 0 16px 42px rgba(35, 32, 25, 0.1);
   display: grid;
   gap: 10px;
-  grid-template-columns: minmax(0, 1fr) auto 38px;
+  grid-template-columns: minmax(0, 1fr) 38px auto 38px;
   min-height: 94px;
   padding: 12px;
+}
+
+.browser-chat-image-input {
+  display: none;
+}
+
+.browser-chat-attach,
+.browser-chat-send,
+.browser-chat-stop {
+  align-items: center;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  height: 38px;
+  justify-content: center;
+  padding: 0;
+  width: 38px;
+}
+
+.browser-chat-attach {
+  align-self: end;
+  background: var(--panel-warm);
+  color: var(--muted-strong);
+}
+
+.browser-chat-attach:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .browser-chat-compose textarea {
@@ -5812,18 +5943,6 @@ select {
 }
 
 .browser-chat-send {
-  align-items: center;
-  border: 0;
-  border-radius: 999px;
-  cursor: pointer;
-  display: inline-flex;
-  height: 34px;
-  justify-content: center;
-  padding: 0;
-  width: 34px;
-}
-
-.browser-chat-send {
   align-self: end;
   background: var(--foreground);
   color: #ffffff;
@@ -5831,7 +5950,14 @@ select {
   width: 38px;
 }
 
-.browser-chat-send:disabled {
+.browser-chat-stop {
+  align-self: end;
+  background: var(--danger);
+  color: #ffffff;
+}
+
+.browser-chat-send:disabled,
+.browser-chat-stop:disabled {
   cursor: not-allowed;
   opacity: 0.45;
 }
@@ -5895,7 +6021,23 @@ select {
   }
 
   .browser-chat-compose {
-    grid-template-columns: minmax(0, 1fr) 38px;
+    grid-template-columns: 38px minmax(0, 1fr) 38px;
+  }
+
+  .browser-chat-attach {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .browser-chat-compose textarea {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .browser-chat-send,
+  .browser-chat-stop {
+    grid-column: 3;
+    grid-row: 1;
   }
 
   .browser-chat-mode-toggle {
