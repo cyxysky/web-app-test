@@ -127,6 +127,7 @@ export type StepExecutionResult = {
 export type VisualFrameRecord = {
   id: string;
   path: string;
+  originalPath?: string;
   markerPath?: string;
   role: 'current' | 'history' | 'pinned';
   reason: string;
@@ -187,7 +188,7 @@ export type StepToolCall = {
   screenshots?: Array<{
     title: string;
     path: string;
-    kind?: 'current' | 'history' | 'pinned' | 'after' | 'marker' | 'other';
+    kind?: 'current' | 'history' | 'pinned' | 'after' | 'marker' | 'original' | 'other';
   }>;
 };
 

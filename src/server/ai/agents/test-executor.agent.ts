@@ -46,7 +46,7 @@ type ToolTrace = {
   screenshots?: Array<{
     title: string;
     path: string;
-    kind?: 'current' | 'history' | 'pinned' | 'after' | 'marker' | 'other';
+    kind?: 'current' | 'history' | 'pinned' | 'after' | 'marker' | 'original' | 'other';
   }>;
 };
 
@@ -183,7 +183,7 @@ function visualMarkersEnabledFor(testCase: TestCaseRecord) {
 
 // 兼容旧双截图链路；默认 false，标识直接叠加在当前截图里。
 function usesSeparateMarkerMap() {
-  return process.env.VISUAL_MARKER_SEPARATE_MAP !== 'false';
+  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
 }
 
 // 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
@@ -986,7 +986,7 @@ class VisualContextManager {
     const current = this.current();
     const history = this.frames.filter((frame) => frame.id !== this.currentId);
     const frameSummary = (frame: VisualFrameRecord) => (
-      `${frame.id} ${concise(frame.reason, 80)} image=${basenameOfPath(frame.path)}${frame.markerPath ? ` marker=${basenameOfPath(frame.markerPath)}` : ''}${frame.capture ? ` capture=${frame.capture}` : ''}`
+      `${frame.id} ${concise(frame.reason, 80)} image=${basenameOfPath(frame.path)}${frame.originalPath ? ` original=${basenameOfPath(frame.originalPath)}` : ''}${frame.markerPath ? ` marker=${basenameOfPath(frame.markerPath)}` : ''}${frame.capture ? ` capture=${frame.capture}` : ''}`
     );
     return [
       'Visual Context Manager:',
@@ -1106,6 +1106,7 @@ function makeBrowserTools(
     const visualAfter = visualAfterFromInput(name, input);
     if (beforeFrame?.path) {
       screenshots.push({ title: `${name} before`, path: beforeFrame.path, kind: 'history' });
+      if (beforeFrame.originalPath) screenshots.push({ title: `${name} before original`, path: beforeFrame.originalPath, kind: 'original' });
       if (beforeFrame.markerPath) screenshots.push({ title: `${name} before marker map`, path: beforeFrame.markerPath, kind: 'marker' });
     }
     const traceId = [
@@ -1144,8 +1145,10 @@ function makeBrowserTools(
         const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
         const screenshotPath = await session.takeScreenshot(referenceOptions.runId, referenceOptions.stepIndex, `visual-${visualIndex}`, screenshotOptions);
         const markerPath = session.getLastCandidateMarkerScreenshotPath();
+        const originalPath = session.getLastOriginalScreenshotPath();
         const frame = referenceOptions.visualContext.apply({
           path: screenshotPath,
+          originalPath,
           markerPath,
           stepIndex: referenceOptions.stepIndex,
           toolName: name,
@@ -1153,6 +1156,7 @@ function makeBrowserTools(
           reason: visualAfter.reason || `${name} after screenshot`,
         }, visualAfter);
         screenshots.push({ title: `${name} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
+        if (originalPath) screenshots.push({ title: `${name} ${screenshotOptions.capture} after original`, path: originalPath, kind: 'original' });
         if (markerPath) screenshots.push({ title: `${name} marker map`, path: markerPath, kind: 'marker' });
         await referenceOptions.onVisualContextChange?.(referenceOptions.visualContext.snapshot());
       } catch (error) {
@@ -1165,6 +1169,7 @@ function makeBrowserTools(
       const current = referenceOptions.visualContext.current();
       if (current?.path) {
         screenshots.push({ title: `${name} failure evidence`, path: current.path, kind: 'other' });
+        if (current.originalPath) screenshots.push({ title: `${name} failure original`, path: current.originalPath, kind: 'original' });
         if (current.markerPath) screenshots.push({ title: `${name} marker map`, path: current.markerPath, kind: 'marker' });
       }
     }
@@ -2071,6 +2076,7 @@ async function executeRuntimeStep(input: {
   const markerScreenshotPath = separateMarkerMap && screenshotInputEnabled
     ? session.getLastCandidateMarkerScreenshotPath()
     : undefined;
+  const originalScreenshotPath = session.getLastOriginalScreenshotPath();
   await onDebug?.({
     phase: 'ai:runtime-input:start',
     stepIndex,
@@ -2153,7 +2159,7 @@ async function executeRuntimeStep(input: {
     const codexMode = isCodexProvider();
     const allowedToolTypes = runtimeToolNames(mode);
     const visualContext = new VisualContextManager();
-    visualContext.init({ path: beforeScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
+    visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
     let requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
     async function refreshRequestPromptForTurn() {
       const currentPageContext = await session.getPageContext({
@@ -2954,6 +2960,7 @@ async function executeCodexRuntimeObject(input: {
   const screenshots: ToolTrace['screenshots'] = [];
   if (beforeFrame?.path) {
     screenshots.push({ title: `${type} before`, path: beforeFrame.path, kind: 'history' });
+    if (beforeFrame.originalPath) screenshots.push({ title: `${type} before original`, path: beforeFrame.originalPath, kind: 'original' });
     if (beforeFrame.markerPath) screenshots.push({ title: `${type} before marker map`, path: beforeFrame.markerPath, kind: 'marker' });
   }
 
@@ -3007,8 +3014,10 @@ async function executeCodexRuntimeObject(input: {
       const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
       const screenshotPath = await session.takeScreenshot(runId, stepIndex, `visual-${visualIndex}`, screenshotOptions);
       const markerPath = session.getLastCandidateMarkerScreenshotPath();
+      const originalPath = session.getLastOriginalScreenshotPath();
       const frame = visualContext.apply({
         path: screenshotPath,
+        originalPath,
         markerPath,
         stepIndex,
         toolName: type,
@@ -3016,6 +3025,7 @@ async function executeCodexRuntimeObject(input: {
         reason: visualAfter.reason || `${type} after screenshot`,
       }, visualAfter);
       screenshots.push({ title: `${type} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
+      if (originalPath) screenshots.push({ title: `${type} ${screenshotOptions.capture} after original`, path: originalPath, kind: 'original' });
       if (markerPath) screenshots.push({ title: `${type} marker map`, path: markerPath, kind: 'marker' });
       await onVisualContextChange?.(visualContext.snapshot());
     } catch (error) {
@@ -3028,6 +3038,7 @@ async function executeCodexRuntimeObject(input: {
     const current = visualContext.current();
     if (current?.path) {
       screenshots.push({ title: `${type} failure evidence`, path: current.path, kind: 'other' });
+      if (current.originalPath) screenshots.push({ title: `${type} failure original`, path: current.originalPath, kind: 'original' });
       if (current.markerPath) screenshots.push({ title: `${type} marker map`, path: current.markerPath, kind: 'marker' });
     }
   }

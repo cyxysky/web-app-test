@@ -125,6 +125,23 @@ function toolStatusLabel(tool: BrowserChatToolCall) {
   return '运行中';
 }
 
+function artifactUrl(filePath?: string) {
+  if (!filePath) return undefined;
+  const normalized = filePath.replace(/\\/g, '/');
+  const marker = '/artifacts/';
+  const index = normalized.lastIndexOf(marker);
+  if (index < 0) return filePath.startsWith('/api/artifacts/') ? filePath : undefined;
+  return `/api/artifacts/${normalized.slice(index + marker.length)}`;
+}
+
+function screenshotKindLabel(kind?: string) {
+  if (kind === 'original') return '原始图';
+  if (kind === 'marker') return '标识图';
+  if (kind === 'current' || kind === 'pinned' || kind === 'after') return '操作后';
+  if (kind === 'history') return '操作前';
+  return '截图';
+}
+
 function temporaryId(prefix: string) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -1063,6 +1080,29 @@ export function BrowserChatWorkspace({
             {toolDialog.tool.screenshots?.length ? (
               <section className="browser-chat-tool-detail-section">
                 <h3>截图记录</h3>
+                <div className="browser-chat-tool-shot-grid">
+                  {toolDialog.tool.screenshots.map((shot, index) => {
+                    const url = artifactUrl(shot.path);
+                    return (
+                      <a
+                        className="browser-chat-tool-shot-card"
+                        href={url || '#'}
+                        key={`${shot.path}-${index}-preview`}
+                        onClick={(event) => {
+                          if (!url) event.preventDefault();
+                        }}
+                        rel="noreferrer"
+                        target="_blank"
+                      >
+                        {url ? <img alt={shot.title || screenshotKindLabel(shot.kind)} src={url} /> : null}
+                        <span>
+                          <strong>{screenshotKindLabel(shot.kind)} · {shot.title || `截图 ${index + 1}`}</strong>
+                          <code>{shot.path}</code>
+                        </span>
+                      </a>
+                    );
+                  })}
+                </div>
                 <ol className="browser-chat-tool-shot-list">
                   {toolDialog.tool.screenshots.map((shot, index) => (
                     <li key={`${shot.path}-${index}`}>

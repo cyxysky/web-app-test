@@ -1,6 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { ArrowLeft, ArrowRight, Images, Maximize2, X } from 'lucide-react';
 import type { StepExecutionResult, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
@@ -30,7 +31,7 @@ function isOriginalScreenshot(shot: NonNullable<NonNullable<StepExecutionResult[
 }
 
 function addChainItem(items: ScreenshotChainItem[], seen: Set<string>, item: ScreenshotChainItem) {
-  const identity = `${item.stepIndex}:${item.phase}:${item.toolName || ''}:${item.url}:${item.title}`;
+  const identity = `${item.stepIndex}:${item.url}`;
   if (seen.has(identity)) return;
   seen.add(identity);
   items.push(item);
@@ -112,7 +113,7 @@ function ScreenshotChainModal({ items, onClose, title }: { items: ScreenshotChai
   if (!current) return null;
 
   return (
-    <div className="modal-overlay" onClick={onClose} role="presentation">
+    <div className="modal-overlay screenshot-chain-overlay" onClick={onClose} role="presentation">
       <section className="screenshot-chain-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="操作截图链">
         <header className="screenshot-chain-modal-head">
           <div className="screenshot-chain-title">
@@ -177,16 +178,35 @@ export function RunScreenshotChainButton({
   run: TestRunRecord;
 }) {
   const [open, setOpen] = useState(false);
-  const items = useMemo(() => collectRunScreenshotChain(run), [run]);
-  const disabled = !items.length;
+  const latestItems = useMemo(() => collectRunScreenshotChain(run), [run]);
+  const [frozenItems, setFrozenItems] = useState<ScreenshotChainItem[] | null>(null);
+  const [frozenTitle, setFrozenTitle] = useState('');
+  const items = frozenItems || latestItems;
+  const disabled = !latestItems.length;
+
+  function openChain() {
+    setFrozenItems(latestItems);
+    setFrozenTitle(run.report?.title || `运行 ${run.id}`);
+    setOpen(true);
+  }
+
+  function closeChain() {
+    setOpen(false);
+    setFrozenItems(null);
+    setFrozenTitle('');
+  }
+
+  const modal = open
+    ? <ScreenshotChainModal items={items} onClose={closeChain} title={frozenTitle || run.report?.title || `运行 ${run.id}`} />
+    : null;
 
   return (
     <>
-      <button className={className} disabled={disabled} onClick={() => setOpen(true)} type="button" title={disabled ? '暂无截图链' : '查看截图链'}>
+      <button className={className} disabled={disabled} onClick={openChain} type="button" title={disabled ? '暂无截图链' : '查看截图链'}>
         <Images size={14} />
         {label}
       </button>
-      {open ? <ScreenshotChainModal items={items} onClose={() => setOpen(false)} title={run.report?.title || `运行 ${run.id}`} /> : null}
+      {modal && typeof document !== 'undefined' ? createPortal(modal, document.body) : modal}
     </>
   );
 }

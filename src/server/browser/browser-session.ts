@@ -17,7 +17,7 @@ function shouldIgnoreConsoleError(text: string) {
 }
 
 function shouldUseSeparateMarkerMap() {
-  return process.env.VISUAL_MARKER_SEPARATE_MAP !== 'false';
+  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
 }
 
 export type BrowserSessionMode = 'dom' | 'visual-markers';
@@ -482,6 +482,7 @@ export class BrowserSession {
   private lastScreenshotCandidates: InteractiveCandidate[] = [];
   private lastScrollableAreas: ScrollableArea[] = [];
   private lastCandidateMarkerScreenshotPath?: string;
+  private lastOriginalScreenshotPath?: string;
   private ownedPages = new Set<Page>();
   private browserOwnership: BrowserOwnership = 'launched';
   private releaseSharedBrowser?: () => Promise<void>;
@@ -1046,10 +1047,22 @@ export class BrowserSession {
       }));
     }
     this.lastCandidateMarkerScreenshotPath = undefined;
+    this.lastOriginalScreenshotPath = undefined;
     // 默认保留干净页面截图；候选编号写入单独 marker 图，点击光标保留在操作后截图里。
     const separateMarkerMap = candidateLabelsEnabled && shouldUseSeparateMarkerMap();
     await this.removeCandidateOverlay();
     if (phase === 'before' || String(phase).startsWith('visual-')) await this.removeClickMarker();
+    const screenshotOptions = {
+      path: filePath,
+      fullPage: capture === 'fullPage',
+      scale: 'css' as const,
+      timeout: 15000,
+    };
+    if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
+      const originalFilePath = path.join(dir, `step-${stepIndex}-${phase}-original.png`);
+      await this.activePage.screenshot({ ...screenshotOptions, path: originalFilePath }).catch(() => undefined);
+      this.lastOriginalScreenshotPath = originalFilePath;
+    }
     if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
       await this.drawCandidateOverlay(
         candidateLabelsEnabled ? candidates : [],
@@ -1057,12 +1070,6 @@ export class BrowserSession {
         scrollAreaLabelsEnabled ? scrollAreas : [],
       );
     }
-    const screenshotOptions = {
-      path: filePath,
-      fullPage: capture === 'fullPage',
-      scale: 'css' as const,
-      timeout: 15000,
-    };
     try {
       await this.activePage.screenshot(screenshotOptions);
     } finally {
@@ -1104,6 +1111,10 @@ export class BrowserSession {
   // 返回最近一次操作前截图对应的纯标识图路径；仅双截图兼容模式会使用。
   getLastCandidateMarkerScreenshotPath() {
     return this.lastCandidateMarkerScreenshotPath;
+  }
+
+  getLastOriginalScreenshotPath() {
+    return this.lastOriginalScreenshotPath;
   }
 
   // 返回当前可见交互候选元素，供 DOM 模式在无截图输入时定位控件。
