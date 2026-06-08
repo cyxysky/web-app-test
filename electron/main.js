@@ -52,15 +52,30 @@ function findAvailablePort(startPort) {
   });
 }
 
-function waitForHttp(url, timeoutMs = 45_000) {
+function waitForHttp(url, timeoutMs = 60_000, stableChecks = 2) {
   const startedAt = Date.now();
+  let okCount = 0;
   return new Promise((resolve, reject) => {
     function check() {
       const request = http.get(url, (response) => {
         response.resume();
-        resolve();
+        if (response.statusCode && response.statusCode >= 200 && response.statusCode < 400) {
+          okCount += 1;
+          if (okCount >= stableChecks) {
+            resolve();
+            return;
+          }
+        } else {
+          okCount = 0;
+        }
+        if (Date.now() - startedAt > timeoutMs) {
+          reject(new Error(`Timed out waiting for ${url}; last status=${response.statusCode || 'unknown'}`));
+          return;
+        }
+        setTimeout(check, 350);
       });
       request.on('error', () => {
+        okCount = 0;
         if (Date.now() - startedAt > timeoutMs) {
           reject(new Error(`Timed out waiting for ${url}`));
           return;
@@ -155,7 +170,8 @@ async function startServer(appDataDir) {
   });
 
   const url = `http://127.0.0.1:${port}`;
-  await waitForHttp(`${url}/dashboard`);
+  await waitForHttp(`${url}/dashboard`, 60_000, 3);
+  await waitForHttp(`${url}/api/test-cases`, 30_000, 2);
   return url;
 }
 

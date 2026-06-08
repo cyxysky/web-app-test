@@ -2494,13 +2494,23 @@ function assistantReplyFromStep(step?: StepExecutionResult) {
   const input = lastTool?.input && typeof lastTool.input === 'object' && !Array.isArray(lastTool.input)
     ? lastTool.input as Record<string, unknown>
     : {};
-  const toolText = typeof input.actual === 'string' && input.actual.trim()
-    ? input.actual.trim()
-    : typeof input.action === 'string' && input.action.trim()
-      ? input.action.trim()
-      : '';
-  const actual = (step.actual || '').replace(/^Reported state without browser action:\s*/i, '').trim();
-  return toolText || actual || step.note || '已完成这一轮浏览器操作。';
+  const reportState = lastTool?.name === 'reportState';
+  const toolText = [
+    input.actual,
+    input.action,
+    input.reason,
+    input.observation,
+    input.currentState,
+    input.nextGoal,
+  ]
+    .map((value) => (typeof value === 'string' ? readableActionFromRawText(value, { reportState }) : undefined))
+    .find(Boolean);
+  const actual = readableActionFromRawText(
+    (step.actual || '').replace(/^Reported state without browser action:\s*/i, '').trim(),
+    { reportState },
+  );
+  const note = readableActionFromRawText(step.note);
+  return toolText || actual || note || '已完成这一轮浏览器操作。';
 }
 
 export async function executeInteractiveBrowserTurn(input: {

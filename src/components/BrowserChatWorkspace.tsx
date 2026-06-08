@@ -109,6 +109,30 @@ function compactText(value?: string, max = 160) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
+function parseJsonObjectText(value?: string) {
+  const text = (value || '').trim();
+  if (!text || !text.startsWith('{') || !text.endsWith('}')) return undefined;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readableAgentText(value?: string) {
+  const text = (value || '').trim();
+  const parsed = parseJsonObjectText(text);
+  if (!parsed) return text;
+  for (const key of ['actual', 'reason', 'observation', 'currentState', 'nextGoal', 'action']) {
+    const item = typeof parsed[key] === 'string' ? (parsed[key] as string).trim() : '';
+    if (item && !parseJsonObjectText(item)) return item;
+  }
+  return '';
+}
+
 function formatToolPayload(value: unknown) {
   if (value === undefined || value === null || value === '') return '无';
   if (typeof value === 'string') return value;
@@ -182,7 +206,7 @@ function messageUpdateTime(message: BrowserChatMessage) {
 }
 
 function normalizedAgentText(value?: string) {
-  return (value || '').trim();
+  return readableAgentText(value);
 }
 
 function stepNarrative(step: StepExecutionResult) {

@@ -355,10 +355,23 @@ function conversationForPrompt(messages: BrowserChatMessage[]): InteractiveBrows
     .map((message) => ({ role: message.role, content: messageContentForPrompt(message) }));
 }
 
+function isDeadBrowserSessionError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /Browser session has not started|Active browser page has been closed|Target page, context or browser has been closed|browser has been closed|page has been closed/i.test(message);
+}
+
 async function ensureStarted(session: BrowserChatSessionRecord) {
   if (session.started && session.browser) {
-    appendLog(session, 'browser:reuse', '复用当前会话已有浏览器标签');
-    return session.browser;
+    if (session.browser.isUsable()) {
+      appendLog(session, 'browser:reuse', '复用当前会话已有浏览器标签');
+      return session.browser;
+    }
+    appendLog(session, 'browser:stale', '历史对话的浏览器已关闭或页面已失效，正在重新接管本会话。');
+    await session.browser.close().catch(() => undefined);
+    session.browser = undefined;
+    session.started = false;
+    session.updatedAt = now();
+    persistAndNotify(session.id);
   }
   store.applyRuntimeEnv();
   const startedAt = Date.now();
@@ -370,11 +383,24 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
     tabGroupTitle: session.title,
   });
   session.browser = browser;
-  session.started = true;
   session.status = 'running';
   session.updatedAt = now();
   persistAndNotify(session.id);
-  await browser.start();
+  try {
+    await browser.start();
+  } catch (error) {
+    await browser.close().catch(() => undefined);
+    if (session.browser === browser) {
+      session.browser = undefined;
+      session.started = false;
+      session.updatedAt = now();
+      persistAndNotify(session.id);
+    }
+    throw error;
+  }
+  session.started = true;
+  session.updatedAt = now();
+  persistAndNotify(session.id);
   appendLog(session, 'browser:ready', `浏览器已就绪，用时 ${elapsedMs(startedAt)}ms`, { elapsedMs: elapsedMs(startedAt) });
   const url = normalizeBrowserUrl(session.targetUrl);
   if (url) {
@@ -436,6 +462,7 @@ export async function closeBrowserChatSession(sessionId: string) {
   if (!session) return undefined;
   await session.browser?.close().catch(() => undefined);
   session.browser = undefined;
+  session.started = false;
   session.busy = false;
   session.status = 'closed';
   session.closedAt = now();
@@ -449,6 +476,8 @@ export async function deleteBrowserChatSession(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   await session.browser?.close().catch(() => undefined);
+  session.browser = undefined;
+  session.started = false;
   sessions.delete(sessionId);
   persistAndNotify(sessionId);
   return { id: sessionId };
@@ -584,7 +613,7 @@ export async function sendBrowserChatMessage(
   session.error = undefined;
   session.updatedAt = timestamp;
   persistAndNotify(session.id);
-  appendLog(session, 'chat:queued', '已收到消息，准备浏览器执行');
+  appendLog(session, 'chat:queued', '已收到消息，准备执行浏览器操作');
 
   void runBrowserChatMessage(session, messageText, assistantMessage.id, fromStepIndex, abortController, attachments);
   return snapshot(session);
@@ -796,6 +825,11 @@ async function runBrowserChatMessage(
     const interrupted = abortController.signal.aborted || isAbortLikeError(error);
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController) && interrupted) return;
     const message = error instanceof Error ? error.message : String(error);
+    if (isDeadBrowserSessionError(error)) {
+      await session.browser?.close().catch(() => undefined);
+      session.browser = undefined;
+      session.started = false;
+    }
     appendLog(session, interrupted ? 'chat:run:interrupted' : 'chat:run:error', interrupted ? '本轮对话操作已中断。' : `本轮对话操作中断：${message}`);
     session.error = interrupted ? undefined : message;
     session.status = interrupted ? 'idle' : 'error';

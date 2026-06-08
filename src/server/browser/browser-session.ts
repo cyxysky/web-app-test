@@ -499,6 +499,16 @@ export class BrowserSession {
     this.tabGroupTitle = normalizeTabGroupTitle(options.tabGroupTitle || options.runId);
   }
 
+  isUsable() {
+    try {
+      if (!this.context) return false;
+      if (this.browser && !this.browser.isConnected()) return false;
+      return this.sessionPages().length > 0;
+    } catch {
+      return false;
+    }
+  }
+
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
     const { chromium } = await import('playwright');
@@ -1437,28 +1447,37 @@ export class BrowserSession {
 
   // 关闭浏览器；调试场景可选择保留窗口。
   async close(options: { keepOpen?: boolean } = {}) {
-    if (this.context && this.pageDiscoveryListener) {
-      this.context.off('page', this.pageDiscoveryListener);
-      this.pageDiscoveryListener = undefined;
-    }
-    if (this.browserOwnership === 'shared') {
-      if (!options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
-        await this.closeOwnedPages();
+    try {
+      if (this.context && this.pageDiscoveryListener) {
+        this.context.off('page', this.pageDiscoveryListener);
+        this.pageDiscoveryListener = undefined;
       }
-      await this.releaseSharedBrowser?.();
-      this.releaseSharedBrowser = undefined;
-      return;
+      if (this.browserOwnership === 'shared') {
+        if (!options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
+          await this.closeOwnedPages();
+        }
+        await this.releaseSharedBrowser?.();
+        this.releaseSharedBrowser = undefined;
+        return;
+      }
+      if (options.keepOpen || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true') return;
+      if (this.browserOwnership === 'connected') {
+        await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
+        return;
+      }
+      if (this.browserOwnership === 'persistent') {
+        await this.context?.close().catch(() => undefined);
+        return;
+      }
+      await this.browser?.close().catch(() => undefined);
+    } finally {
+      if (!options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
+        this.page = undefined;
+        this.context = undefined;
+        this.browser = undefined;
+        this.ownedPages.clear();
+      }
     }
-    if (options.keepOpen || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true') return;
-    if (this.browserOwnership === 'connected') {
-      await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
-      return;
-    }
-    if (this.browserOwnership === 'persistent') {
-      await this.context?.close().catch(() => undefined);
-      return;
-    }
-    await this.browser?.close().catch(() => undefined);
   }
 
   private async waitAfterAction() {
