@@ -12,7 +12,6 @@ import { richTextToPlainText } from '@/lib/rich-text';
 type ExecutionProgress = (step: StepExecutionResult) => void | Promise<void>;
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type ManualIntervention = { stepIndex: number; reason: string; screenshotPath?: string };
-type RuntimeStructuredMemoryMode = 'full' | 'light';
 type ExecutionOptions = {
   onProgress?: ExecutionProgress;
   onDebug?: ExecutionDebug;
@@ -89,41 +88,35 @@ type SelectedScreenshotReference = ScreenshotReference & {
 };
 
 const codexRuntimeObjectSchema = z.object({
-  type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op observation.'),
+  type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op status update.'),
+  message: z.string().nullable().optional().describe('Optional short Chinese user-facing progress text that accompanies this tool call.'),
   params: z.object({
-    reason: z.string().nullable(),
-    url: z.string().nullable(),
-    id: z.string().nullable(),
-    areaId: z.string().nullable(),
-    text: z.string().nullable(),
-    key: z.string().nullable(),
-    path: z.string().nullable(),
-    domPath: z.string().nullable(),
-    fromId: z.string().nullable(),
-    toId: z.string().nullable(),
-    index: z.number().nullable(),
-    ms: z.number().nullable(),
-    maxMs: z.number().nullable(),
-    deltaX: z.number().nullable(),
-    deltaY: z.number().nullable(),
-    action: z.string().nullable(),
-    expected: z.string().nullable(),
-    actual: z.string().nullable(),
-    status: z.enum(['passed', 'failed', 'blocked']).nullable(),
-    done: z.boolean().nullable(),
-    currentState: z.string().nullable(),
-    observation: z.string().nullable(),
-    findings: z.string().nullable(),
-    memory: z.string().nullable(),
-    nextGoal: z.string().nullable(),
-    targetVisual: z.string().nullable(),
-    targetText: z.string().nullable(),
-    taskFrameJson: z.string().nullable(),
-    ledgerItemsJson: z.string().nullable(),
-    ids: z.array(z.string()).nullable(),
-    selectionReason: z.string().nullable(),
-    sameInterfaceGroup: z.string().nullable(),
-  }).describe('Parameters for the selected tool. Include every listed key; set unused keys to null. Include reason when choosing a tool.'),
+    reason: z.string().nullable().optional(),
+    url: z.string().nullable().optional(),
+    id: z.string().nullable().optional(),
+    areaId: z.string().nullable().optional(),
+    text: z.string().nullable().optional(),
+    key: z.string().nullable().optional(),
+    path: z.string().nullable().optional(),
+    domPath: z.string().nullable().optional(),
+    fromId: z.string().nullable().optional(),
+    toId: z.string().nullable().optional(),
+    index: z.number().nullable().optional(),
+    ms: z.number().nullable().optional(),
+    maxMs: z.number().nullable().optional(),
+    deltaX: z.number().nullable().optional(),
+    deltaY: z.number().nullable().optional(),
+    action: z.string().nullable().optional(),
+    expected: z.string().nullable().optional(),
+    actual: z.string().nullable().optional(),
+    status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
+    done: z.boolean().nullable().optional(),
+    targetVisual: z.string().nullable().optional(),
+    targetText: z.string().nullable().optional(),
+    ids: z.array(z.string()).nullable().optional(),
+    selectionReason: z.string().nullable().optional(),
+    sameInterfaceGroup: z.string().nullable().optional(),
+  }).describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason.'),
 });
 
 const manualIssuePattern = new RegExp(
@@ -323,8 +316,8 @@ function cleanDisplayText(value?: string) {
 
 function readableTextFromToolRecord(record: Record<string, unknown>, options: { reportState?: boolean } = {}) {
   const preferredKeys = options.reportState
-    ? ['action', 'actual', 'reason', 'observation', 'currentState', 'nextGoal']
-    : ['reason', 'actual', 'observation', 'targetVisual', 'currentState', 'nextGoal', 'action'];
+    ? ['action', 'actual', 'reason']
+    : ['reason', 'targetVisual', 'action', 'actual'];
   for (const key of preferredKeys) {
     const value = typeof record[key] === 'string' ? cleanDisplayText(record[key] as string) : undefined;
     if (!value || toolNameLike(value)) continue;
@@ -862,36 +855,25 @@ function summarizeTraceForMemory(trace: ToolTrace) {
 }
 
 function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolTrace, sourceStep?: number) {
-  const input = trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input)
-    ? trace.input as Record<string, unknown>
-    : {};
+  void sourceStep;
   const next: RuntimeWorkingMemory = { ...memory };
-  const currentState = sanitizeCurrentState(input.currentState);
-  const observation = typeof input.observation === 'string' ? sanitizeHistoricalToolText(input.observation.trim(), 800) : '';
-  const findings = typeof input.findings === 'string' ? parseListLike(input.findings).map((item) => sanitizeHistoricalToolText(item, 260)) : [];
-  const remembered = filterRegressiveMemoryItems(typeof input.memory === 'string' ? parseListLike(input.memory).map((item) => sanitizeHistoricalToolText(item, 260)) : [], memory);
-  const nextGoal = sanitizeNextGoal(input.nextGoal);
-  const evidence = (trace.screenshots || []).map((shot) => shot.path).filter(Boolean);
-  const taskFrame = normalizeTaskFrame(input.taskFrameJson, memory.taskFrame, memory.taskGoal);
-  const ledgerItems = parseLedgerItems(input.ledgerItemsJson, sourceStep, evidence);
+  const resultText = sanitizeHistoricalToolText(trace.result?.actual || '', 400);
   next.lastAction = summarizeTraceForMemory(trace);
   next.lastResult = concise(trace.result?.actual || '工具调用已开始，正在等待页面反馈。', 240);
-  if (currentState) next.currentState = currentState;
-  if (taskFrame) next.taskFrame = taskFrame;
-  next.ledgerItems = mergeLedgerItems(memory.ledgerItems || [], ledgerItems, ledgerMemoryLimit());
-  if (observation && !/^none$|^无$/i.test(observation)) next.pageUnderstanding = concise(observation, 400);
-  next.findings = Array.from(new Set([...next.findings, ...findings])).slice(-12);
-  next.completed = Array.from(new Set([...next.completed, ...remembered])).slice(-12);
+  if (resultText) {
+    next.pageUnderstanding = resultText;
+    next.currentState = concise(`${trace.name}: ${resultText}`, 260);
+  }
   if (trace.result && !trace.result.ok) next.blockers = Array.from(new Set([...next.blockers, concise(trace.result.actual, 220)])).slice(-8);
   if (trace.name === 'scrollArea') {
     next.phase = '正在查看滚动区域或长页面内容';
-    next.scrollSummary = concise([next.scrollSummary, observation || trace.result?.actual].filter(Boolean).join('；'), 600);
+    next.scrollSummary = concise([next.scrollSummary, resultText || trace.result?.actual].filter(Boolean).join('；'), 600);
   } else if (trace.name === 'reportState') {
     next.phase = '正在汇报当前状态或最终结论';
   } else {
     next.phase = '正在执行网页操作并等待页面反馈';
   }
-  next.nextStep = nextGoal || (trace.name === 'reportState' ? '根据报告状态决定是否结束' : '根据当前截图继续完成上一个未完成目标');
+  next.nextStep = trace.name === 'reportState' ? '根据报告状态决定是否结束' : '根据当前截图继续完成任务';
   return next;
 }
 
@@ -1054,7 +1036,6 @@ function makeBrowserTools(
     stepIndex?: number;
     visualContext?: VisualContextManager;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
-    structuredMemory?: RuntimeStructuredMemoryMode;
   },
 ) {
   // Enforce a single executed tool per AI request. makeBrowserTools is created fresh for each
@@ -1063,30 +1044,14 @@ function makeBrowserTools(
   // keeps every browser action paired with a fresh screenshot on the next step and prevents the
   // duplicate-operation problem seen when a request was retried mid-chain.
   let toolExecutedThisRequest = false;
-  const semanticFieldRule = 'Do not include candidate ids, area ids, coordinates, delta values, screenshot ids/file names, marker numbers as business meaning, old tool params, or tool input JSON in this semantic field.';
-  const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${semanticFieldRule}`);
-  const structuredMemory = referenceOptions?.structuredMemory || 'full';
-  const structuredMemoryFields = structuredMemory === 'light'
-    ? {
-        taskFrameJson: z.string().max(9000).nullable().optional().describe('Optional JSON string in browser chat. Include only when the task frame materially changes.'),
-        ledgerItemsJson: z.string().max(10000).nullable().optional().describe('Optional JSON array string in browser chat. Include durable issue/risk/findings items when useful; omit or use [] when nothing durable was found.'),
-      }
-    : {
-        taskFrameJson: z.string().min(1).max(9000).describe('Required JSON string. If no TaskFrame exists yet, create one with goal, successCriteria, deliverables, analysisGuidance, finalOutputRequirements, and task-specific dynamic dimensions for THIS user task. Dimensions must be content/coverage axes, not execution progress/status buckets such as login status, reading progress, or test-case generation status. If unchanged, repeat the current TaskFrame JSON.'),
-        ledgerItemsJson: z.string().min(1).max(10000).describe('Required JSON array string of NEW structured ledger items from this step. Use [] only when nothing durable was found. Each item has dimensionId,title,status,severity,expected,actual,summary,confidence,attributes. For defects or mismatches, use status="issue"; for potential instability, use status="risk"; include expected vs actual and evidence from the current page/tool result. For requirement-analysis tasks, capture business rules, interface behavior, test flow steps, assertions, risks, and open questions in detail.'),
-      };
+  const toolTextRule = 'Do not include old tool params, candidate ids as business meaning, coordinates, screenshot ids/file names, or tool input JSON.';
+  const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
   const toolContextShape = {
     reason: toolReasonInput,
-    currentState: z.string().min(1).max(500).describe(`Required Chinese compact current state after reading the CURRENT screenshot and RunState: page/dialog/mode/progress/error/recovery status. This is authoritative state for the next request. ${semanticFieldRule}`),
-    observation: z.string().min(1).max(2200).describe(`Required Chinese observation of the current page/task state. Be concrete and include visible requirement content, business rules, UI state, errors, or "无明显新增观察". ${semanticFieldRule}`),
-    findings: z.string().min(1).max(3000).describe(`Required Chinese findings from this step. Act as a tester: record requirement mismatches, visible UI defects, loading/latency problems, validation errors, console/network symptoms mentioned by tools, blocked verification, business rules, test targets, operation flows, risks, and questions. Use "无" only when truly nothing durable was learned. Separate multiple items with semicolons. ${semanticFieldRule}`),
-    memory: z.string().min(1).max(2500).describe(`Required Chinese memory for later steps. Include durable business facts/progress only; preserve concrete requirement facts and test ideas. Use "无" if none. Separate multiple items with semicolons. ${semanticFieldRule}`),
-    nextGoal: z.string().min(1).max(600).describe(`Required Chinese objective for the NEXT AI request. Describe only the next unfinished target/state, not the concrete operation method, tool name, candidate id, area id, button id, coordinates, or scroll delta. Example: "继续处理尚未覆盖的业务规则并保持已记录结论". ${semanticFieldRule}`),
-    ...structuredMemoryFields,
     visualAfter: z.object({
       capture: z.enum(['auto', 'viewport', 'fullPage']).optional().describe('Use auto normally. Use viewport/fullPage only when the next model request truly needs that screenshot size.'),
       retention: z.enum(['auto', 'replace', 'append']).optional().describe('Use replace by default. Use append only when the next decision must compare with, continue from, or analyze together with the previous screenshot.'),
-      reason: z.string().optional().describe(`Short Chinese reason for append/capture choice. ${semanticFieldRule}`),
+      reason: z.string().optional().describe(`Short Chinese reason for append/capture choice. ${toolTextRule}`),
     }).optional(),
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
@@ -1241,12 +1206,12 @@ function makeBrowserTools(
       execute: (input) => record('switchTab', input, () => session.switchTab(input.index)),
     }),
     reportState: tool({
-      description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or you only need to record observations/findings/memory. This tool does not change the browser.',
+      description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or a short textual status update is enough. This tool does not change the browser.',
       inputSchema: browserToolInput({
         action: z.string().min(1).describe('Chinese summary of the current assistant state or final conclusion.'),
         expected: z.string().min(1).describe('Chinese expected condition or remaining goal.'),
         actual: z.string().min(1).describe('Chinese evidence-based actual state, including important details.'),
-        status: z.enum(['passed', 'failed', 'blocked']).describe('passed for complete or non-terminal observation, failed for impossible/end-to-end failure, blocked for manual verification/security/user input.'),
+        status: z.enum(['passed', 'failed', 'blocked']).describe('passed for complete or non-terminal status update, failed for impossible/end-to-end failure, blocked for manual verification/security/user input.'),
         done: z.boolean().describe('true only when the full requirement is complete or impossible. false when more useful browser work remains or user/manual intervention is needed.'),
       }),
       execute: (input) => record('reportState', input, async () => ({
@@ -1474,7 +1439,6 @@ function runtimePrompt(input: {
   availableScreenshotReferences?: ScreenshotReference[];
   selectedScreenshotReferences?: SelectedScreenshotReference[];
   repairContext?: string;
-  structuredMemory?: RuntimeStructuredMemoryMode;
 }) {
   const { testCase, pageContext, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
@@ -1486,7 +1450,6 @@ function runtimePrompt(input: {
   const visualTextCandidateFallback = visualMode && !attachScreenshot;
   const markerOverlayInScreenshot = Boolean(markerEnabled && input.markerOverlayInScreenshot);
   const separateMarkerScreenshot = Boolean(markerEnabled && input.hasMarkerScreenshot);
-  const structuredMemory = input.structuredMemory || 'full';
   const caseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
   const compactRunContext = buildCompactRunContext(completedSteps, input.workingMemory);
@@ -1550,20 +1513,6 @@ function runtimePrompt(input: {
         '- If needed content may be outside the visible area, use scrollArea with an S id from the CURRENT page context; never reuse historical S ids.',
         '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
       ];
-  const structuredMemoryRules = structuredMemory === 'full'
-    ? [
-        '- Maintain a generic TaskFrame. Dimensions must be task-specific content/coverage axes from THIS user goal, not fixed buckets and not agent progress/status such as login status, reading progress, or test-case generation status.',
-        '- If the user asks for detailed requirement analysis or test cases, ledgerItemsJson must record concrete business rules, test points, operation flows, assertions, edge cases, and risks discovered in the current screenshot. Do not write vague status-only items.',
-        '- Every step should append durable ledgerItemsJson entries against the TaskFrame axes unless the current screenshot truly adds no durable information.',
-      ]
-    : [
-        '- Browser chat uses light structured memory. Do not spend effort generating or repeating a full TaskFrame unless the user is explicitly asking for test-case analysis or the structure materially changes.',
-        '- In browser chat, ledgerItemsJson is optional. Use it for clear defects, risks, durable findings, or requirement facts; otherwise omit it or use [].',
-      ];
-  const structuredMemoryResponseRules = structuredMemory === 'full'
-    ? ['- Include taskFrameJson and ledgerItemsJson in tool params. Use ledgerItemsJson=[] when this step adds no durable item.']
-    : ['- taskFrameJson and ledgerItemsJson are optional in browser chat. Keep them short and only include durable defects, risks, or requirement facts.'];
-
   return [
     'You are an AI browser testing agent. Call exactly ONE tool. Use reportState only when no browser action is needed.',
     `Requirement: ${requirement}`,
@@ -1572,15 +1521,14 @@ function runtimePrompt(input: {
     `Current URL: ${pageContext.url}`,
     '',
     'Hard rules:',
-    '- One tool only; all user-facing fields in Chinese.',
-    '- Treat RunState JSON as authoritative compact memory. Preserve currentState and do not downgrade completed state because the current screen shows a recovery/earlier state.',
-    '- Historical actions in RunState/Working Memory are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
-    '- In semantic fields (reason/currentState/observation/findings/memory/nextGoal/ledger text), do not output candidate ids, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
+    '- One tool only. You may include a short ordinary Chinese progress sentence alongside the tool call.',
+    '- Keep tool params minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
+    '- Treat RunState JSON and Working Memory as compact context only. Do not copy them into tool params.',
+    '- Historical actions are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
+    '- In reason/message/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
     '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
-    '- Keep currentState as the compact state after reading current screenshot; nextGoal is the next target state, not the operation method.',
-    ...structuredMemoryRules,
     '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
-    '- When a problem is observed or strongly indicated by tool/page feedback, describe why it is a problem in findings and add a ledgerItemsJson item with status="issue" or status="risk", severity, expected, actual, summary/reason, and evidence. The runtime will attach current screenshots as issue evidence.',
+    '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
     '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
@@ -1593,7 +1541,7 @@ function runtimePrompt(input: {
     '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
     '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
-    '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only recording observations.',
+    '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
     attachScreenshot
       ? separateMarkerScreenshot
         ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomTree are unavailable.'
@@ -1615,11 +1563,9 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     ...buildCompletionPromptLines(attachScreenshot),
     '',
     'Response:',
-    '- Call one tool and keep state fields grounded in RunState plus current screenshot.',
-    ...structuredMemoryResponseRules,
+    '- Call one tool. Use ordinary assistant text for progress/explanation, and tool params only for the selected tool.',
     '- Candidate action reason must mention the current-screenshot visual feature, not just an id.',
-    '- nextGoal is target state only, e.g. "继续分析未完成的新内容", not "点击按钮".',
-    '- To finish/block/fail or only record an observation, call reportState. Do not return standalone JSON.',
+    '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
     '',
     'Current context:',
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
@@ -1910,31 +1856,10 @@ function formatTaskFrameContext(frame?: TaskFrame) {
   }, null, 2);
 }
 
-function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''): Pick<RuntimeDecision, 'observation' | 'findings' | 'memoryItems' | 'taskFrame' | 'ledgerItems'> {
-  const observations: string[] = [];
-  const findings: string[] = [];
-  const memoryItems: string[] = [];
-  let taskFrame: TaskFrame | undefined;
-  let ledgerItems: TaskLedgerItem[] = [];
-  for (const trace of traces) {
-    if (!trace.input || typeof trace.input !== 'object' || Array.isArray(trace.input)) continue;
-    const input = trace.input as Record<string, unknown>;
-    if (typeof input.observation === 'string' && input.observation.trim() && !/^无$|^none$/i.test(input.observation.trim())) {
-      observations.push(sanitizeHistoricalToolText(input.observation.trim(), 800));
-    }
-    if (typeof input.findings === 'string') findings.push(...parseListLike(input.findings).map((item) => sanitizeHistoricalToolText(item, 260)));
-    if (typeof input.memory === 'string') memoryItems.push(...parseListLike(input.memory).map((item) => sanitizeHistoricalToolText(item, 260)));
-    const evidence = (trace.screenshots || []).map((shot) => shot.path).filter(Boolean);
-    taskFrame = normalizeTaskFrame(input.taskFrameJson, taskFrame, goal);
-    ledgerItems = mergeLedgerItems(ledgerItems, parseLedgerItems(input.ledgerItemsJson, undefined, evidence), 24);
-  }
-  return {
-    observation: observations.length ? observations.at(-1)?.slice(0, 800) : undefined,
-    findings: Array.from(new Set(findings)).slice(0, 8),
-    memoryItems: Array.from(new Set(memoryItems)).slice(0, 8),
-    taskFrame,
-    ledgerItems,
-  };
+function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''): Pick<RuntimeDecision, 'taskFrame' | 'ledgerItems'> {
+  void traces;
+  void goal;
+  return {};
 }
 
 function deriveDecision(text: string, traces: ToolTrace[], goal = ''): RuntimeDecision {
@@ -2008,14 +1933,6 @@ function progressFieldsFromToolTraces(
 ): Partial<StepExecutionResult> {
   const assistantInfo = extractAssistantStepInfoFromToolInputs(traces, goal);
   const workingMemory = progress?.workingMemory;
-  const findings = Array.from(new Set([
-    ...(assistantInfo.findings || []),
-    ...(workingMemory?.findings || []),
-  ])).slice(-12);
-  const memoryItems = Array.from(new Set([
-    ...(assistantInfo.memoryItems || []),
-    ...(workingMemory?.completed || []),
-  ])).slice(-12);
   const ledgerItems = mergeLedgerItems(
     assistantInfo.ledgerItems || [],
     workingMemory?.ledgerItems || [],
@@ -2023,9 +1940,6 @@ function progressFieldsFromToolTraces(
   ).map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex }));
 
   return {
-    observation: assistantInfo.observation || workingMemory?.pageUnderstanding,
-    findings,
-    memoryItems,
     taskFrame: assistantInfo.taskFrame || workingMemory?.taskFrame,
     ledgerItems,
     workingMemory,
@@ -2052,7 +1966,6 @@ async function executeRuntimeStep(input: {
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   repairContext?: string;
-  structuredMemory?: RuntimeStructuredMemoryMode;
 }) {
   const {
     session,
@@ -2067,7 +1980,6 @@ async function executeRuntimeStep(input: {
     onDebug,
     onToolTrace,
   } = input;
-  const structuredMemory = input.structuredMemory || 'full';
   const mode = browserModeOf(testCase);
   const screenshotInputEnabled = shouldSendScreenshotToAi(mode);
   const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
@@ -2133,7 +2045,6 @@ async function executeRuntimeStep(input: {
     availableScreenshotReferences,
     selectedScreenshotReferences,
     repairContext: input.repairContext,
-    structuredMemory,
   })}${userReferenceImagePrompt}`;
   const promptMs = elapsedSince(promptStartedAt);
   await onDebug?.({
@@ -2182,7 +2093,6 @@ async function executeRuntimeStep(input: {
         availableScreenshotReferences,
         selectedScreenshotReferences,
         repairContext: input.repairContext,
-        structuredMemory,
       })}${userReferenceImagePrompt}`;
       requestPrompt = codexMode ? buildCodexObjectPrompt(basePrompt, allowedToolTypes) : basePrompt;
       return requestPrompt;
@@ -2286,6 +2196,7 @@ async function executeRuntimeStep(input: {
         runId: input.runId,
         stepIndex,
         type: object.type,
+        message: object.message || undefined,
         params: object.params,
         allowedTypes: allowedToolTypes,
         traces,
@@ -2320,7 +2231,7 @@ async function executeRuntimeStep(input: {
               message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'),
               details: { trace, visualContext: visualContext.snapshot(), workingMemory },
             });
-          }, { availableReferenceIds, runId: input.runId, stepIndex, visualContext, structuredMemory, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
+          }, { availableReferenceIds, runId: input.runId, stepIndex, visualContext, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
           stopWhen: stepCountIs(1), temperature: 0.1, maxRetries: 0, abortSignal,
         });
         latestText = result.text || '';
@@ -2499,9 +2410,6 @@ function assistantReplyFromStep(step?: StepExecutionResult) {
     input.actual,
     input.action,
     input.reason,
-    input.observation,
-    input.currentState,
-    input.nextGoal,
   ]
     .map((value) => (typeof value === 'string' ? readableActionFromRawText(value, { reportState }) : undefined))
     .find(Boolean);
@@ -2510,7 +2418,9 @@ function assistantReplyFromStep(step?: StepExecutionResult) {
     { reportState },
   );
   const note = readableActionFromRawText(step.note);
-  return toolText || actual || note || '已完成这一轮浏览器操作。';
+  return reportState
+    ? toolText || note || actual || '已完成这一轮浏览器操作。'
+    : note || actual || toolText || '已完成这一轮浏览器操作。';
 }
 
 export async function executeInteractiveBrowserTurn(input: {
@@ -2576,7 +2486,6 @@ export async function executeInteractiveBrowserTurn(input: {
         stepIndex,
         beforeScreenshotPath,
         completedSteps: steps.filter((step) => step.index !== stepIndex),
-        structuredMemory: 'light',
         selectedScreenshotReferences,
         referenceImagePaths: input.referenceImagePaths,
         onSelectReferenceScreenshots: async (selection) => {
@@ -2634,9 +2543,6 @@ export async function executeInteractiveBrowserTurn(input: {
       actual: decision.actual,
       status: decision.status,
       note: decision.note,
-      observation: decision.observation,
-      findings: decision.findings,
-      memoryItems: decision.memoryItems,
       taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
       ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
         .map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex })),
@@ -2789,9 +2695,6 @@ async function createRecoverableRuntimeErrorStep(input: {
     beforeScreenshotPath,
     afterScreenshotPath,
     screenshotPath: afterScreenshotPath,
-    observation: recoveredState?.observation,
-    findings: recoveredState?.findings,
-    memoryItems: recoveredState?.memoryItems,
     taskFrame: recoveredState?.taskFrame,
     ledgerItems: recoveredState?.ledgerItems,
     workingMemory: recoveredState?.workingMemory,
@@ -2928,6 +2831,7 @@ async function executeCodexRuntimeObject(input: {
   runId: string;
   stepIndex: number;
   type: string;
+  message?: string;
   params: Record<string, unknown>;
   allowedTypes: string[];
   traces: ToolTrace[];
@@ -2940,7 +2844,7 @@ async function executeCodexRuntimeObject(input: {
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, params, allowedTypes, traces, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
   if (!allowedTypes.includes(type)) {
     return {
       text: `Codex returned unsupported action type: ${type}. It must call exactly one allowed tool, usually reportState for no-op reporting.`,
@@ -3056,7 +2960,7 @@ async function executeCodexRuntimeObject(input: {
   trace.result = result;
   trace.screenshots = screenshots;
   await notifyTrace();
-  return { text: '', executed: true };
+  return { text: readableActionFromRawText(message) || '', executed: true };
 }
 
 async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, recordedFlow: RecordedFlowStep[], options: ExecutionOptions): Promise<TestExecutionResult> {
@@ -3298,9 +3202,6 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
           actual: '用户已确认人工校验完成，AI 将基于最新页面继续修复回放失败操作。',
           status: 'passed',
           note: decision.note,
-          observation: decision.observation,
-          findings: Array.from(new Set([...(decision.findings || []), 'AI 修复过程中触发人工校验等待点，已在用户确认后继续。'])),
-          memoryItems: decision.memoryItems,
           taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
           ledgerItems: mergeLedgerItems(decision.ledgerItems || [], [{
             dimensionId: 'runtime-replay',
@@ -3335,12 +3236,6 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         actual: decision.actual,
         status: decision.status,
         note: decision.note,
-        observation: decision.observation,
-        findings: Array.from(new Set([
-          ...(decision.findings || []),
-          decision.status === 'passed' ? `AI 已接管并尝试修复回放工具 ${flow.name} 的失败。` : `AI 接管修复回放工具 ${flow.name} 后仍未通过。`,
-        ])),
-        memoryItems: decision.memoryItems,
         taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
         ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
           .map((item) => ({ ...item, sourceStep: item.sourceStep ?? repairStepIndex })),
@@ -3458,7 +3353,6 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
             afterScreenshotPath,
             screenshotPath: afterScreenshotPath,
             tools: [{ name: flow.name, input: flow.input, reason: flow.reason, ok: true, result: 'Manual verification confirmed by user before replay continued.' }],
-            findings: ['回放流程包含人工校验等待点，已在用户确认后继续。'],
             ledgerItems: [{
               dimensionId: 'runtime-replay',
               title: '回放等待人工校验',
@@ -3497,7 +3391,6 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         afterScreenshotPath,
         screenshotPath: afterScreenshotPath,
         tools: [{ name: flow.name, input: flow.input, reason: flow.reason, ok: result.ok, result: result.actual }],
-        findings: result.ok ? undefined : [`固定回放工具 ${flow.name} 执行失败，AI 将基于当前页面接管修复。错误：${concise(result.actual, 220)}`],
         ledgerItems: result.ok ? undefined : [{
           dimensionId: 'runtime-replay',
           title: '固定回放操作失败',
@@ -3967,9 +3860,6 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         actual: decision.actual,
         status: decision.status,
         note: decision.note,
-        observation: decision.observation,
-        findings: decision.findings,
-        memoryItems: decision.memoryItems,
         taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
         ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
           .map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex })),
