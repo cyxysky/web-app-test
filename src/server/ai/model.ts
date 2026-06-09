@@ -47,7 +47,7 @@ export function getModel(): GenerateTextModel {
   if (provider === 'azure-openai') return createAzure({
     baseURL: process.env.AZURE_OPENAI_BASE_URL || 'http://mirrors.shterm.com:8801/openai',
     apiKey: process.env.AZURE_OPENAI_API_KEY || '-',
-  })(model) as unknown as GenerateTextModel;
+  }).chat(model) as unknown as GenerateTextModel;
   return createOpenRouter({
     apiKey: process.env.OPENROUTER_API_KEY || '',
   }).chat(model) as unknown as GenerateTextModel;

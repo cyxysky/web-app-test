@@ -4881,7 +4881,7 @@ select {
   display: grid;
   gap: 0;
   grid-template-columns: 300px minmax(0, 1fr);
-  min-height: 100vh;
+  height: 100vh;
   width: 100%;
 }
 
@@ -5173,6 +5173,7 @@ select {
     var(--background);
   display: block;
   min-height: 100vh;
+  overflow: auto;
   min-width: 0;
 }
 
@@ -5358,7 +5359,8 @@ select {
 }
 
 .browser-chat-agent-markdown {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
 }
 
@@ -5385,14 +5387,17 @@ select {
 .browser-chat-agent-markdown p,
 .browser-chat-agent-markdown li {
   font-size: 14px;
-  line-height: 1.65;
   white-space: pre-wrap;
+  padding: 4px 0;
 }
 
 .browser-chat-agent-markdown ul,
 .browser-chat-agent-markdown ol {
-  gap: 5px;
+  gap: 4px;
   padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  line-height: 1;
 }
 
 .browser-chat-agent-markdown code {
@@ -5792,6 +5797,8 @@ select {
   margin: 0 auto;
   max-width: 900px;
   width: min(100%, 900px);
+  position: sticky;
+  bottom: 32px;
 }
 
 .browser-chat-image-grid {

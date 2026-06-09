@@ -1,12 +1,34 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import { defaultModelByProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import { createSnapshotChannel, type SnapshotEvent, type SnapshotListener } from '@/server/realtime/snapshot-channel';
+import { sleepSync, writeJsonFileAtomic } from '@/server/storage/atomic-json';
 import { storeFilePath } from '@/server/storage/paths';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
 const storePath = storeFilePath();
+const runSnapshots = createSnapshotChannel<TestRunRecord>('run');
+
+export function subscribeRunUpdates(runId: string, listener: SnapshotListener<TestRunRecord>) {
+  return runSnapshots.subscribe(runId, listener);
+}
+
+export function currentRunSnapshotEvent(runId: string, run: TestRunRecord): SnapshotEvent<TestRunRecord> {
+  return runSnapshots.current(runId, run);
+}
+
+function notifyRunUpdate(runId: string, run: TestRunRecord) {
+  runSnapshots.publish(runId, run);
+}
+
+function notifyRunDeleted(runId: string) {
+  runSnapshots.publishDeleted(runId);
+}
+
+function notifyRunsDeleted(runIds: Iterable<string>) {
+  for (const runId of new Set([...runIds].filter(Boolean))) notifyRunDeleted(runId);
+}
 
 const seedContent: TestCaseContent = {
   title: 'Login smoke test',
@@ -242,37 +264,7 @@ function isUserSkippedStep(step?: StepExecutionResult) {
 }
 
 function writeData(data: StoreData) {
-  mkdirSync(path.dirname(storePath), { recursive: true });
-  const tempPath = `${storePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-  writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf8');
-
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    try {
-      renameSync(tempPath, storePath);
-      return;
-    } catch (error) {
-      lastError = error;
-      const code = (error as NodeJS.ErrnoException).code;
-      if (!['EPERM', 'EACCES', 'EBUSY'].includes(code || '')) {
-        rmSync(tempPath, { force: true });
-        throw error;
-      }
-      sleepSync(25 * (attempt + 1));
-    }
-  }
-
-  try {
-    copyFileSync(tempPath, storePath);
-  } finally {
-    rmSync(tempPath, { force: true });
-  }
-  if (!existsSync(storePath) && lastError) throw lastError;
-}
-
-// 短暂同步等待，用于文件读写重试之间的退避。
-function sleepSync(ms: number) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  writeJsonFileAtomic(storePath, data);
 }
 
 // 读取本地存储数据；文件不存在时初始化默认数据。
@@ -499,8 +491,10 @@ export const store = {
     if (!targetIds.size) return 0;
     const data = readData();
     const before = data.runs.length;
+    const deletedRunIds = data.runs.filter((run) => targetIds.has(run.id)).map((run) => run.id);
     data.runs = data.runs.filter((run) => !targetIds.has(run.id));
     writeData(data);
+    notifyRunsDeleted(deletedRunIds);
     return before - data.runs.length;
   },
   // 删除测试用例，并移除关联运行记录与定时任务引用。artifact 文件保留，避免误删仍需追溯的证据。
@@ -508,6 +502,7 @@ export const store = {
     const data = readData();
     const exists = data.testCases.some((record) => record.id === testCaseId);
     if (!exists) return false;
+    const deletedRunIds = data.runs.filter((run) => run.testCaseId === testCaseId).map((run) => run.id);
     data.testCases = data.testCases.filter((record) => record.id !== testCaseId);
     data.runs = data.runs.filter((run) => run.testCaseId !== testCaseId);
     data.schedules = (data.schedules || [])
@@ -518,6 +513,7 @@ export const store = {
       }))
       .filter((schedule) => schedule.testCaseIds.length > 0);
     writeData(data);
+    notifyRunsDeleted(deletedRunIds);
     return true;
   },
   // 更新测试用例的整体执行状态。
@@ -572,6 +568,7 @@ export const store = {
     };
     data.runs.push(run);
     writeData(data);
+    notifyRunUpdate(run.id, run);
     return run;
   },
   // 更新运行记录的队列元信息。
@@ -582,6 +579,7 @@ export const store = {
     const updated = { ...run, queue };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return updated;
   },
   // 合并历史失败沉淀出的操作策略，后续运行会进入 AI prompt。
@@ -607,6 +605,7 @@ export const store = {
     const updated = { ...run, ...patch };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return updated;
   },
   // 新增或替换运行步骤结果，保证相同步骤号只保留最新记录。
@@ -637,6 +636,7 @@ export const store = {
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return updated;
   },
   // 追加运行调试事件，最多保留最近 200 条。
@@ -654,6 +654,7 @@ export const store = {
     const updated = { ...run, debug: updatedDebug };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return updated;
   },
   // 请求跳过指定步骤或当前步骤，并中断正在进行的 AI 请求。
@@ -671,6 +672,7 @@ export const store = {
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return updated;
   },
   // 请求暂停运行，并中断当前步骤让执行循环进入暂停态。
@@ -691,6 +693,7 @@ export const store = {
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return updated;
   },
   // 请求恢复运行；如果指定步骤则只恢复该步骤。
@@ -713,6 +716,7 @@ export const store = {
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return updated;
   },
   // 判断运行是否处于暂停状态。
@@ -734,6 +738,7 @@ export const store = {
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return updated;
   },
   // 消费一次跳过请求；消费后会从控制状态中移除，避免重复跳过。
@@ -745,6 +750,7 @@ export const store = {
     const updated = { ...run, control: { ...run.control, skipRequestedAt: undefined, skipStepIndex: undefined } };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return true;
   },
   // 消费一次恢复请求；消费后清理恢复标记。
@@ -764,6 +770,7 @@ export const store = {
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
     writeData(data);
+    notifyRunUpdate(runId, updated);
     return true;
   },
   // 根据 ID 获取单条运行记录。

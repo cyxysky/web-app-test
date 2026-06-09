@@ -1,7 +1,8 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Frame, LaunchOptions, Page, Request } from 'playwright';
+import { spawn } from 'node:child_process';
+import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Frame, LaunchOptions, Page, Request, Worker as PlaywrightWorker } from 'playwright';
 import { appDataRoot, artifactPath } from '@/server/storage/paths';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
@@ -139,6 +140,16 @@ type ScrollableArea = {
     width: number;
     clientHeight: number;
     clientWidth: number;
+    maxTop: number;
+    maxLeft: number;
+    remainingUp: number;
+    remainingDown: number;
+    remainingLeft: number;
+    remainingRight: number;
+    atTop: boolean;
+    atBottom: boolean;
+    atLeft: boolean;
+    atRight: boolean;
     canScrollUp: boolean;
     canScrollDown: boolean;
     canScrollLeft: boolean;
@@ -195,6 +206,20 @@ export type BrowserTabSnapshot = {
   url: string;
   active: boolean;
   groupId: string;
+};
+
+type NativeTabGroupPage = {
+  tabId: number;
+  url: string;
+  title: string;
+  active: boolean;
+  groupId: number;
+  windowId: number;
+};
+
+type NativeTabGroupLookup = {
+  found: boolean;
+  tabs: NativeTabGroupPage[];
 };
 
 type SharedBrowserLease = {
@@ -274,9 +299,27 @@ function cdpEndpointForPort(port?: number) {
   return port ? `http://127.0.0.1:${port}` : '';
 }
 
+function cdpPortFromEndpoint(endpoint: string) {
+  try {
+    const url = new URL(endpoint);
+    const port = Number(url.port);
+    return Number.isInteger(port) && port > 0 && port < 65536 ? port : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isBlankPage(page: Page) {
   const url = page.url();
-  return !url || url === 'about:blank';
+  return isBlankBrowserUrlLike(url);
+}
+
+function isBlankBrowserUrlLike(url: string) {
+  return !url || url === 'about:blank' || /^(about:newtab|chrome:\/\/new-tab-page|edge:\/\/newtab)/i.test(url);
 }
 
 function normalizeTabGroupTitle(value?: string) {
@@ -359,6 +402,78 @@ async function connectExistingBrowserOverCdp(input: {
   return { browser, context, ownership: 'connected' as const };
 }
 
+function externalChromiumExecutablePath(chromium: BrowserType, launchOptions: LaunchOptions) {
+  const explicit = typeof launchOptions.executablePath === 'string' ? launchOptions.executablePath.trim() : '';
+  if (explicit) return explicit;
+  if (launchOptions.channel) {
+    throw new Error('BROWSER_CHANNEL cannot be used with automatic tab-group reuse unless AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH points to the browser executable.');
+  }
+  return chromium.executablePath();
+}
+
+async function connectOrLaunchPersistentBrowserOverCdp(input: {
+  chromium: BrowserType;
+  endpoint: string;
+  userDataDir: string;
+  launchOptions: LaunchOptions;
+  contextOptions: BrowserContextOptions;
+}) {
+  const existing = await connectExistingBrowserOverCdp({
+    chromium: input.chromium,
+    endpoint: input.endpoint,
+    contextOptions: input.contextOptions,
+  });
+  if (existing) return existing;
+
+  const port = cdpPortFromEndpoint(input.endpoint);
+  if (!port) throw new Error(`Automatic tab-group browser reuse needs a CDP port endpoint, got: ${input.endpoint || '[empty]'}`);
+
+  const executablePath = externalChromiumExecutablePath(input.chromium, input.launchOptions);
+  const launchArgs = [
+    ...(input.launchOptions.args || []).filter((arg) => !/^--remote-debugging-(?:pipe|port)(?:=|$)/.test(arg)),
+    `--user-data-dir=${input.userDataDir}`,
+    `--remote-debugging-port=${port}`,
+    '--no-startup-window',
+  ];
+  let spawnError: unknown;
+  const child = spawn(executablePath, launchArgs, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: false,
+  });
+  child.once('error', (error) => {
+    spawnError = error;
+  });
+  child.unref();
+
+  const timeoutMs = Math.max(3000, Number(process.env.BROWSER_CDP_LAUNCH_TIMEOUT_MS || 15000));
+  const deadline = Date.now() + timeoutMs;
+  let lastConnectError = '';
+  while (Date.now() < deadline) {
+    if (spawnError) {
+      throw new Error(`Failed to launch test Chrome for tab-group reuse: ${spawnError instanceof Error ? spawnError.message : String(spawnError)}`);
+    }
+    const connected = await connectExistingBrowserOverCdp({
+      chromium: input.chromium,
+      endpoint: input.endpoint,
+      contextOptions: input.contextOptions,
+    }).catch((error) => {
+      lastConnectError = error instanceof Error ? error.message : String(error);
+      return undefined;
+    });
+    if (connected) return connected;
+    await sleep(250);
+  }
+
+  throw new Error([
+    `Failed to connect to test Chrome at ${input.endpoint} after launching it.`,
+    `profile=${input.userDataDir}`,
+    `executable=${executablePath}`,
+    'If an old test Chrome already has this profile open but was launched without the expected CDP port, close that old window once and retry.',
+    lastConnectError ? `lastConnectError=${lastConnectError}` : '',
+  ].filter(Boolean).join('\n'));
+}
+
 function isPersistentProfileAlreadyOpenError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   return /Target page, context or browser has been closed|browser session|user data directory|profile.*in use|already.*open/i.test(message);
@@ -411,12 +526,15 @@ async function acquireSharedBrowser(input: {
       }
 
       if (input.userDataDir) {
-        const connected = await connectExistingBrowserOverCdp({
-          chromium: input.chromium,
-          endpoint: input.reconnectCdpEndpoint || '',
-          contextOptions: input.contextOptions,
-        });
-        if (connected) return connected;
+        if (input.reconnectCdpEndpoint) {
+          return connectOrLaunchPersistentBrowserOverCdp({
+            chromium: input.chromium,
+            endpoint: input.reconnectCdpEndpoint,
+            userDataDir: input.userDataDir,
+            launchOptions: input.launchOptions,
+            contextOptions: input.contextOptions,
+          });
+        }
         try {
           const context = await input.chromium.launchPersistentContext(input.userDataDir, {
             ...input.launchOptions,
@@ -509,6 +627,22 @@ export class BrowserSession {
     }
   }
 
+  currentUrl() {
+    try {
+      return this.activePage.url();
+    } catch {
+      return '';
+    }
+  }
+
+  hasNonBlankActivePage() {
+    try {
+      return !isBlankPage(this.activePage);
+    } catch {
+      return false;
+    }
+  }
+
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
     const { chromium } = await import('playwright');
@@ -583,25 +717,25 @@ export class BrowserSession {
       const context = existingContext || await this.browser.newContext(contextOptions);
       this.context = context;
       await this.prepareContext(context);
-      const page = this.sessionPages()[0] || await context.newPage();
-      this.claimPage(page);
-      await page.bringToFront().catch(() => undefined);
+      await this.selectInitialPage(context);
       return;
     }
 
     if (userDataDir) {
       if (autoTabGroupCdpEndpoint) {
-        const connected = await connectExistingBrowserOverCdp({ chromium, endpoint: autoTabGroupCdpEndpoint, contextOptions });
-        if (connected) {
-          this.browserOwnership = 'connected';
-          this.browser = connected.browser;
-          this.context = connected.context;
-          await this.prepareContext(connected.context);
-          const page = this.sessionPages()[0] || await connected.context.newPage();
-          this.claimPage(page);
-          await page.bringToFront().catch(() => undefined);
-          return;
-        }
+        const connected = await connectOrLaunchPersistentBrowserOverCdp({
+          chromium,
+          endpoint: autoTabGroupCdpEndpoint,
+          userDataDir,
+          launchOptions,
+          contextOptions,
+        });
+        this.browserOwnership = 'connected';
+        this.browser = connected.browser;
+        this.context = connected.context;
+        await this.prepareContext(connected.context);
+        await this.selectInitialPage(connected.context);
+        return;
       }
       this.browserOwnership = 'persistent';
       let context: BrowserContext;
@@ -617,17 +751,13 @@ export class BrowserSession {
         this.browser = connected.browser;
         this.context = connected.context;
         await this.prepareContext(connected.context);
-        const page = this.sessionPages()[0] || await connected.context.newPage();
-        this.claimPage(page);
-        await page.bringToFront().catch(() => undefined);
+        await this.selectInitialPage(connected.context);
         return;
       }
       this.context = context;
       this.browser = context.browser() || undefined;
       await this.prepareContext(context);
-      const page = this.sessionPages()[0] || await context.newPage();
-      this.claimPage(page);
-      await page.bringToFront().catch(() => undefined);
+      await this.selectInitialPage(context);
       return;
     }
 
@@ -640,18 +770,23 @@ export class BrowserSession {
   }
 
   private async findInitialSharedPage(context: BrowserContext) {
-    const reclaimedPages: Page[] = [];
-    for (const page of context.pages()) {
-      if (page.isClosed()) continue;
-      const groupId = await this.readPageGroupId(page);
-      if (groupId === this.pageGroupId && this.claimPage(page, { makeActive: false })) {
-        reclaimedPages.push(page);
-      }
-    }
-    const reclaimed = reclaimedPages.find((page) => !isBlankPage(page)) || reclaimedPages.at(-1);
+    const reclaimedPages = await this.reclaimSessionPagesByMarker(context);
+    const reclaimed = this.chooseInitialPage(reclaimedPages);
     if (reclaimed) {
       this.page = reclaimed;
       return reclaimed;
+    }
+
+    const nativeGroup = await this.reclaimPagesFromNativeTabGroup(context);
+    const nativeGroupPage = this.chooseInitialPage(nativeGroup.pages);
+    if (nativeGroupPage) {
+      this.page = nativeGroupPage;
+      return nativeGroupPage;
+    }
+    if (nativeGroup.found) {
+      const page = await context.newPage();
+      this.claimPage(page);
+      return page;
     }
 
     if (this.options.preferExistingPage) {
@@ -678,6 +813,82 @@ export class BrowserSession {
     const page = await context.newPage();
     this.claimPage(page);
     return page;
+  }
+
+  private chooseInitialPage(pages: Page[]) {
+    return pages.find((page) => !isBlankPage(page)) || pages.at(-1);
+  }
+
+  private async reclaimSessionPagesByMarker(context: BrowserContext) {
+    const reclaimedPages: Page[] = [];
+    for (const page of context.pages()) {
+      if (page.isClosed()) continue;
+      const groupId = await this.readPageGroupId(page);
+      if (groupId === this.pageGroupId && this.claimPage(page, { makeActive: false })) {
+        reclaimedPages.push(page);
+      }
+    }
+    return reclaimedPages;
+  }
+
+  private async reclaimPagesFromNativeTabGroup(context: BrowserContext): Promise<{ found: boolean; pages: Page[] }> {
+    const lookup = await this.findNativeTabGroupTabs(context);
+    if (!lookup?.found) return { found: false, pages: [] };
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const markedPages = await this.reclaimSessionPagesByMarker(context);
+      if (markedPages.length) return { found: true, pages: markedPages };
+      if (attempt < 3) await sleep(150);
+    }
+
+    const urlClaimedPages = await this.claimPagesByNativeTabUrls(context, lookup.tabs);
+    return { found: true, pages: urlClaimedPages };
+  }
+
+  private async sessionTabGrouperWorker(context: BrowserContext) {
+    const isGrouperWorker = (worker: PlaywrightWorker) => {
+      const url = worker.url();
+      return url.startsWith('chrome-extension://') && url.endsWith('/service-worker.js');
+    };
+    const existing = context.serviceWorkers().find(isGrouperWorker);
+    if (existing) return existing;
+    return context.waitForEvent('serviceworker', { predicate: isGrouperWorker, timeout: 800 }).catch(() => undefined);
+  }
+
+  private async findNativeTabGroupTabs(context: BrowserContext): Promise<NativeTabGroupLookup | undefined> {
+    const worker = await this.sessionTabGrouperWorker(context);
+    if (!worker) return undefined;
+    return worker.evaluate(async (input: { sessionId: string; groupTitle: string }) => {
+      const global = globalThis as unknown as {
+        aiWebTestSessionTabGrouper?: {
+          findSessionGroupTabs?: (input: { sessionId: string; groupTitle: string }) => Promise<NativeTabGroupLookup>;
+        };
+      };
+      return global.aiWebTestSessionTabGrouper?.findSessionGroupTabs?.(input);
+    }, {
+      sessionId: this.pageGroupId,
+      groupTitle: this.tabGroupLabel(),
+    }).catch(() => undefined);
+  }
+
+  private async claimPagesByNativeTabUrls(context: BrowserContext, tabs: NativeTabGroupPage[]) {
+    const remainingByUrl = new Map<string, number>();
+    for (const tab of tabs) {
+      if (!tab.url || isBlankBrowserUrlLike(tab.url)) continue;
+      remainingByUrl.set(tab.url, (remainingByUrl.get(tab.url) || 0) + 1);
+    }
+    if (!remainingByUrl.size) return [];
+
+    const claimedPages: Page[] = [];
+    for (const page of context.pages()) {
+      if (page.isClosed()) continue;
+      const url = page.url();
+      const remaining = remainingByUrl.get(url) || 0;
+      if (remaining <= 0) continue;
+      remainingByUrl.set(url, remaining - 1);
+      if (this.claimPage(page, { makeActive: false })) claimedPages.push(page);
+    }
+    return claimedPages;
   }
 
   private async prepareContext(context: BrowserContext, options: { claimPages?: boolean } = {}) {
@@ -774,6 +985,17 @@ export class BrowserSession {
 
   private sessionPages() {
     return Array.from(this.ownedPages).filter((page) => !page.isClosed());
+  }
+
+  private async selectInitialPage(context: BrowserContext) {
+    const pages = this.sessionPages();
+    const preferred = this.options.preferExistingPage
+      ? pages.filter((page) => !isBlankPage(page)).at(-1)
+      : undefined;
+    const page = preferred || pages[0] || await context.newPage();
+    this.claimPage(page);
+    await page.bringToFront().catch(() => undefined);
+    return page;
   }
 
   private tabGroupShortId() {
@@ -1138,6 +1360,57 @@ export class BrowserSession {
     return { ok: true, actual: await this.readSimplifiedDomTree() };
   }
 
+  async getDomNodeText(path: string): Promise<BrowserActionResult> {
+    const result = await this.activePage.evaluate((pathValue) => {
+      // Keep this path predicate aligned with readSimplifiedDomTree/resolveDomPathToClickablePoint
+      // so a path copied from getDomTree resolves to the same element here.
+      const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
+      function aiIsTraversable(element: Element) {
+        if (!element || element.nodeType !== 1) return false;
+        if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
+        return !skippedTags.has(element.tagName.toLowerCase());
+      }
+      function aiChildren(element: Element) {
+        return Array.from(element.children).filter(aiIsTraversable);
+      }
+
+      const rawPath = String(pathValue).trim();
+      if (!rawPath) return undefined;
+      const parts = rawPath.split('.').map((item) => Number(String(item).trim()));
+      if (!parts.length || parts[0] !== 0 || parts.some((item) => !Number.isInteger(item) || item < 0)) return undefined;
+
+      let element: Element | undefined = document.documentElement;
+      for (const index of parts.slice(1)) {
+        element = aiChildren(element)[index];
+        if (!element) return undefined;
+      }
+      if (!element) return undefined;
+
+      const tag = element.tagName.toLowerCase();
+      const id = element.id ? `#${element.id}` : '';
+      const classes = typeof element.className === 'string'
+        ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
+        : '';
+      const text = ((element as HTMLElement).innerText || element.textContent || '').trim();
+      return {
+        descriptor: `${tag}${id}${classes}`,
+        text,
+        textLength: text.length,
+      };
+    }, path);
+
+    if (!result) {
+      return {
+        ok: false,
+        actual: `DOM path ${path} was not found. Call getDomTree again to get fresh paths; the DOM may have changed.`,
+      };
+    }
+    return {
+      ok: true,
+      actual: `DOM node ${path} (${result.descriptor}) full text, ${result.textLength} characters:\n${result.text || '[empty text]'}`,
+    };
+  }
+
   // 点击指定编号的候选元素中心点。
   async clickCandidate(candidateId: string, text?: string): Promise<BrowserActionResult> {
     const resolved = await this.resolveCandidateTarget(candidateId);
@@ -1337,12 +1610,39 @@ export class BrowserSession {
         actual: `Scrollable area ${areaId} was not found. Use the latest scrollableAreas list and choose an id such as S1.`,
       };
     }
+    const scrollStateText = (scroll: ScrollableArea['scroll']) => {
+      const yBoundary = scroll.atBottom
+        ? 'atBottom'
+        : scroll.atTop
+          ? 'atTop'
+          : `remainingDown=${scroll.remainingDown}, remainingUp=${scroll.remainingUp}`;
+      const xBoundary = scroll.atRight
+        ? 'atRight'
+        : scroll.atLeft
+          ? 'atLeft'
+          : `remainingRight=${scroll.remainingRight}, remainingLeft=${scroll.remainingLeft}`;
+      return `top=${scroll.top}/${scroll.maxTop}, left=${scroll.left}/${scroll.maxLeft}, ${yBoundary}, ${xBoundary}`;
+    };
+    if (deltaY === 0 && deltaX === 0) {
+      return {
+        ok: false,
+        actual: `Scrollable area ${area.id} was not scrolled because both deltaY and deltaX are 0. Current state: ${scrollStateText(area.scroll)}.`,
+      };
+    }
+    const canMoveY = (deltaY > 0 && area.scroll.canScrollDown) || (deltaY < 0 && area.scroll.canScrollUp) || deltaY === 0;
+    const canMoveX = (deltaX > 0 && area.scroll.canScrollRight) || (deltaX < 0 && area.scroll.canScrollLeft) || deltaX === 0;
+    if (!canMoveY || !canMoveX) {
+      return {
+        ok: false,
+        actual: `Scrollable area ${area.id} cannot scroll in the requested direction. Current state: ${scrollStateText(area.scroll)}. Choose a different action or a different scroll direction/area instead of repeating this scroll.`,
+      };
+    }
     await this.activePage.mouse.move(area.center.x, area.center.y);
     await this.activePage.mouse.wheel(deltaX, deltaY);
     const note = await this.waitAfterAction();
     const updated = (await this.refreshScrollableAreas().catch(() => [])).find((item) => item.id === areaId);
     const state = updated
-      ? ` New scroll: top=${updated.scroll.top}/${updated.scroll.height - updated.scroll.clientHeight}, left=${updated.scroll.left}/${updated.scroll.width - updated.scroll.clientWidth}.`
+      ? ` Before: ${scrollStateText(area.scroll)}. After: ${scrollStateText(updated.scroll)}. Moved: y=${updated.scroll.top - area.scroll.top}, x=${updated.scroll.left - area.scroll.left}.`
       : '';
     return {
       ok: true,
@@ -1644,17 +1944,39 @@ export class BrowserSession {
   private async getPageScrollState() {
     return this.activePage.evaluate(() => {
       const root = document.scrollingElement || document.documentElement;
+      const top = Math.round(root.scrollTop);
+      const left = Math.round(root.scrollLeft);
+      const height = Math.round(root.scrollHeight);
+      const width = Math.round(root.scrollWidth);
+      const clientHeight = Math.round(root.clientHeight);
+      const clientWidth = Math.round(root.clientWidth);
+      const maxTop = Math.max(0, height - clientHeight);
+      const maxLeft = Math.max(0, width - clientWidth);
+      const remainingUp = Math.max(0, top);
+      const remainingDown = Math.max(0, maxTop - top);
+      const remainingLeft = Math.max(0, left);
+      const remainingRight = Math.max(0, maxLeft - left);
       return {
-        top: Math.round(root.scrollTop),
-        left: Math.round(root.scrollLeft),
-        height: Math.round(root.scrollHeight),
-        width: Math.round(root.scrollWidth),
-        clientHeight: Math.round(root.clientHeight),
-        clientWidth: Math.round(root.clientWidth),
-        canScrollUp: root.scrollTop > 1,
-        canScrollDown: root.scrollTop + root.clientHeight < root.scrollHeight - 1,
-        canScrollLeft: root.scrollLeft > 1,
-        canScrollRight: root.scrollLeft + root.clientWidth < root.scrollWidth - 1,
+        top,
+        left,
+        height,
+        width,
+        clientHeight,
+        clientWidth,
+        maxTop,
+        maxLeft,
+        remainingUp,
+        remainingDown,
+        remainingLeft,
+        remainingRight,
+        atTop: remainingUp <= 1,
+        atBottom: remainingDown <= 1,
+        atLeft: remainingLeft <= 1,
+        atRight: remainingRight <= 1,
+        canScrollUp: remainingUp > 1,
+        canScrollDown: remainingDown > 1,
+        canScrollLeft: remainingLeft > 1,
+        canScrollRight: remainingRight > 1,
       };
     });
   }
@@ -1734,6 +2056,18 @@ export class BrowserSession {
         if (!path) continue;
         const tag = element === root ? 'document' : element.tagName.toLowerCase();
         const role = element === root ? undefined : element.getAttribute('role') || undefined;
+        const top = Math.round(element.scrollTop);
+        const left = Math.round(element.scrollLeft);
+        const height = Math.round(element.scrollHeight);
+        const width = Math.round(element.scrollWidth);
+        const clientHeight = Math.round(element.clientHeight);
+        const clientWidth = Math.round(element.clientWidth);
+        const maxTop = Math.max(0, height - clientHeight);
+        const maxLeft = Math.max(0, width - clientWidth);
+        const remainingUp = Math.max(0, top);
+        const remainingDown = Math.max(0, maxTop - top);
+        const remainingLeft = Math.max(0, left);
+        const remainingRight = Math.max(0, maxLeft - left);
         output.push({
           path,
           tag,
@@ -1743,16 +2077,26 @@ export class BrowserSession {
           rect,
           center: { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) },
           scroll: {
-            top: Math.round(element.scrollTop),
-            left: Math.round(element.scrollLeft),
-            height: Math.round(element.scrollHeight),
-            width: Math.round(element.scrollWidth),
-            clientHeight: Math.round(element.clientHeight),
-            clientWidth: Math.round(element.clientWidth),
-            canScrollUp: element.scrollTop > 1,
-            canScrollDown: element.scrollTop + element.clientHeight < element.scrollHeight - 1,
-            canScrollLeft: element.scrollLeft > 1,
-            canScrollRight: element.scrollLeft + element.clientWidth < element.scrollWidth - 1,
+            top,
+            left,
+            height,
+            width,
+            clientHeight,
+            clientWidth,
+            maxTop,
+            maxLeft,
+            remainingUp,
+            remainingDown,
+            remainingLeft,
+            remainingRight,
+            atTop: remainingUp <= 1,
+            atBottom: remainingDown <= 1,
+            atLeft: remainingLeft <= 1,
+            atRight: remainingRight <= 1,
+            canScrollUp: remainingUp > 1,
+            canScrollDown: remainingDown > 1,
+            canScrollLeft: remainingLeft > 1,
+            canScrollRight: remainingRight > 1,
           },
         });
       }
@@ -1862,7 +2206,6 @@ export class BrowserSession {
         if (element.getAttribute('aria-hidden') === 'true') return false;
         const style = window.getComputedStyle(element);
         if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
-        if (style.pointerEvents === 'none') return false;
         if (Number(style.opacity || '1') <= 0.01) return false;
         return true;
       }
@@ -3384,13 +3727,12 @@ export class BrowserSession {
   }
 
   private async readSimplifiedDomTree() {
-    const maxNodes = Number(process.env.DOM_TREE_MAX_NODES || 320);
+    const maxNodes = Number(process.env.DOM_TREE_MAX_NODES || 800);
     const maxDepth = Number(process.env.DOM_TREE_MAX_DEPTH || 14);
     return this.activePage.evaluate(({ maxNodes: nodeLimit, maxDepth: depthLimit }) => {
-      // NOTE: the child-filtering predicate below (skippedTags + aiIsRendered + aiChildren +
-      // aiElementFromPath) MUST stay byte-identical to the one used in resolveDomPathToClickablePoint
-      // and resolveScrollTarget, otherwise the bracket paths printed here will not resolve to the
-      // same elements when the model clicks/focuses them.
+      // NOTE: the child-filtering predicate below (skippedTags + aiChildren) MUST stay aligned
+      // with the one used in resolveDomPathToClickablePoint/getDomNodeText/resolveScrollTarget,
+      // otherwise the bracket paths printed here will not resolve to the same elements.
       type WindowWithAiListeners = Window & {
         __aiGetEventListenerTypes?: (target: EventTarget) => string[];
       };
@@ -3413,17 +3755,30 @@ export class BrowserSession {
         if (element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return false;
         return !skippedTags.has(element.tagName.toLowerCase());
       }
-      function aiVisibleRect(element: Element) {
+      function aiElementBox(element: Element) {
         if (!aiIsRenderable(element)) return undefined;
         const rect = element.getBoundingClientRect();
+        if (rect.width <= 2 || rect.height <= 2) return undefined;
         const left = Math.max(rect.left, 0);
         const top = Math.max(rect.top, 0);
         const right = Math.min(rect.right, window.innerWidth);
         const bottom = Math.min(rect.bottom, window.innerHeight);
         const width = right - left;
         const height = bottom - top;
-        if (width <= 2 || height <= 2) return undefined;
-        return { left, top, right, bottom, width, height };
+        const visible = width > 2 && height > 2
+          ? { left, top, right, bottom, width, height }
+          : undefined;
+        const vertical = rect.bottom < 0
+          ? 'above'
+          : rect.top > window.innerHeight
+            ? 'below'
+            : 'overlaps-y';
+        const horizontal = rect.right < 0
+          ? 'left'
+          : rect.left > window.innerWidth
+            ? 'right'
+            : 'overlaps-x';
+        return { raw: rect, visible, vertical, horizontal };
       }
       function aiChildren(element: Element) {
         return Array.from(element.children).filter(aiIsTraversable);
@@ -3506,9 +3861,11 @@ export class BrowserSession {
           ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${CSS.escape(item)}`).join('')
           : '';
         const clickable = isClickable(element) ? ' *' : '';
-        const rect = aiVisibleRect(element);
-        const box = rect
-          ? ` @${Math.round(rect.left)},${Math.round(rect.top)},${Math.round(rect.width)}x${Math.round(rect.height)}`
+        const boxInfo = aiElementBox(element);
+        const box = boxInfo?.visible
+          ? ` @visible:${Math.round(boxInfo.visible.left)},${Math.round(boxInfo.visible.top)},${Math.round(boxInfo.visible.width)}x${Math.round(boxInfo.visible.height)}`
+          : boxInfo
+            ? ` @offscreen:${boxInfo.vertical === 'overlaps-y' ? boxInfo.horizontal : boxInfo.vertical},y=${Math.round(boxInfo.raw.top)},${Math.round(boxInfo.raw.width)}x${Math.round(boxInfo.raw.height)}`
           : '';
         const attrs = attrSummary(element);
         const text = ownText(element);
@@ -3519,20 +3876,20 @@ export class BrowserSession {
       const lines: string[] = [];
       function walk(element: Element, path: number[], depth: number) {
         if (depth > depthLimit) return;
-        const rect = aiVisibleRect(element);
-        if (rect && count < nodeLimit) {
+        const box = aiElementBox(element);
+        if (box && count < nodeLimit) {
           lines.push(`${'  '.repeat(depth)}${describe(element, path)}`);
           count += 1;
         }
         const childNodes = aiChildren(element);
         for (let index = 0; index < childNodes.length; index += 1) {
           if (count >= nodeLimit) break;
-          walk(childNodes[index], [...path, index], rect ? depth + 1 : depth);
+          walk(childNodes[index], [...path, index], box ? depth + 1 : depth);
         }
       }
 
       walk(document.documentElement, [0], 0);
-      const legend = 'Legend: [path] tag#id.class * @x,y,w,h {attrs} "text" - "*" marks clickable/interactive elements; @ is the visible viewport box; "text" is the node text; only visible (rendered) elements are listed.';
+      const legend = 'Legend: [path] tag#id.class * @visible:x,y,w,h or @offscreen:above/below/left/right,y=rawY,wxh {attrs} "text" - "*" marks clickable/interactive elements; DOM mode lists rendered document nodes, not only the viewport. Use getDomNodeText(path) for complete text.';
       if (count >= nodeLimit) lines.push(`... truncated at ${nodeLimit} nodes`);
       return `${legend}\n${lines.join('\n')}`;
     }, { maxNodes, maxDepth });
@@ -3540,7 +3897,7 @@ export class BrowserSession {
 
   private async resolveDomPathToClickablePoint(pathValue: string) {
     return this.activePage.evaluate((path) => {
-      // Keep this predicate byte-identical to readSimplifiedDomTree so paths resolve consistently.
+      // Keep aiChildren traversal aligned with readSimplifiedDomTree so printed paths resolve consistently.
       const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
       function aiIsRenderable(element: Element) {
         if (!element || element.nodeType !== 1) return false;

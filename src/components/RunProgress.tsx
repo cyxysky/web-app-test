@@ -577,7 +577,8 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
     if (typeof EventSource !== 'undefined') {
       const events = new EventSource(`/api/runs/${run.id}/events`);
       events.addEventListener('run', (event) => {
-        setRun(JSON.parse((event as MessageEvent).data) as TestRunRecord);
+        const payload = JSON.parse((event as MessageEvent).data) as { snapshot: TestRunRecord };
+        setRun(payload.snapshot);
       });
       events.addEventListener('error', () => {
         events.close();

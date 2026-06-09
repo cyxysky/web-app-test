@@ -12,6 +12,11 @@ async function findExistingGroup(windowId, title) {
   return groups.find((group) => group.title === title);
 }
 
+async function findExistingGroups(title) {
+  const groups = await chrome.tabGroups.query({}).catch(() => []);
+  return groups.filter((group) => group.title === title);
+}
+
 async function readTabSessions() {
   const value = await chrome.storage.local.get(TAB_SESSION_STORAGE_KEY).catch(() => ({}));
   const records = value?.[TAB_SESSION_STORAGE_KEY];
@@ -95,6 +100,47 @@ async function groupTab(tab, sessionId, groupTitle) {
   }).catch(() => undefined);
   await rememberTabSession(tab, sessionId, title, groupId);
 }
+
+function tabSnapshot(tab) {
+  return {
+    tabId: tab.id,
+    url: tab.url || '',
+    title: tab.title || '',
+    active: Boolean(tab.active),
+    groupId: tab.groupId,
+    windowId: tab.windowId,
+  };
+}
+
+async function applySessionMarkerToTab(tab, sessionId) {
+  if (!tab?.id || !sessionId) return;
+  await chrome.tabs.sendMessage(tab.id, {
+    type: 'apply-tab-session-marker',
+    sessionId,
+  }).catch(() => undefined);
+}
+
+async function findSessionGroupTabs(input) {
+  const sessionId = cleanText(input?.sessionId, '');
+  const groupTitle = cleanText(input?.groupTitle, sessionId ? `AI Session ${sessionId}` : 'AI Session');
+  if (!sessionId) return { found: false, tabs: [] };
+
+  const groups = await findExistingGroups(groupTitle);
+  const tabs = [];
+  for (const group of groups) {
+    const groupTabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
+    for (const tab of groupTabs) {
+      await rememberTabSession(tab, sessionId, groupTitle, group.id);
+      await applySessionMarkerToTab(tab, sessionId);
+      tabs.push(tabSnapshot({ ...tab, groupId: group.id }));
+    }
+  }
+  return { found: groups.length > 0, tabs };
+}
+
+globalThis.aiWebTestSessionTabGrouper = {
+  findSessionGroupTabs,
+};
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tab = sender.tab;

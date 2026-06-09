@@ -39,6 +39,13 @@ function requestStoredSessionMarker() {
 
 requestStoredSessionMarker();
 
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== 'apply-tab-session-marker') return false;
+  injectSessionMarker(message.sessionId);
+  sendResponse({ ok: true });
+  return false;
+});
+
 window.addEventListener('message', (event) => {
   if (event.source !== window) return;
   const message = event.data;

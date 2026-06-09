@@ -96,6 +96,7 @@ const codexRuntimeObjectSchema = z.object({
     id: z.string().nullable().optional(),
     areaId: z.string().nullable().optional(),
     text: z.string().nullable().optional(),
+    content: z.string().nullable().optional(),
     key: z.string().nullable().optional(),
     path: z.string().nullable().optional(),
     domPath: z.string().nullable().optional(),
@@ -384,6 +385,10 @@ function requirementOf(testCase: TestCaseRecord) {
 // 读取测试用例上的额外系统提示词，例如级联选择器必须选到叶子节点。
 function systemPromptOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.systemPrompt || '').trim();
+}
+
+function isBrowserChatTestCase(testCase: TestCaseRecord) {
+  return testCase.id.startsWith('chat_') || testCase.title === 'Browser chat operation';
 }
 
 // 将浏览器工具调用轨迹压缩为步骤证据，保存到运行历史中。
@@ -708,11 +713,42 @@ function formatScrollableAreaSummary(areas: unknown, limit = 10) {
       scroll.canScrollRight ? 'right' : '',
     ].filter(Boolean).join('/');
     const top = Number(scroll.top);
+    const left = Number(scroll.left);
     const height = Number(scroll.height);
+    const width = Number(scroll.width);
     const clientHeight = Number(scroll.clientHeight);
-    const maxTop = Number.isFinite(height) && Number.isFinite(clientHeight) ? Math.max(0, height - clientHeight) : undefined;
-    const progress = Number.isFinite(top) && maxTop !== undefined ? ` scroll=${Math.round(top)}/${Math.round(maxTop)}` : '';
-    return `${area.id || '?'}${directions ? ` ${directions}` : ''}${progress}${label ? ` "${String(label).slice(0, 60)}"` : ''}`;
+    const clientWidth = Number(scroll.clientWidth);
+    const configuredMaxTop = Number(scroll.maxTop);
+    const configuredMaxLeft = Number(scroll.maxLeft);
+    const maxTop = Number.isFinite(configuredMaxTop)
+      ? configuredMaxTop
+      : Number.isFinite(height) && Number.isFinite(clientHeight) ? Math.max(0, height - clientHeight) : undefined;
+    const maxLeft = Number.isFinite(configuredMaxLeft)
+      ? configuredMaxLeft
+      : Number.isFinite(width) && Number.isFinite(clientWidth) ? Math.max(0, width - clientWidth) : undefined;
+    const configuredRemainingDown = Number(scroll.remainingDown);
+    const configuredRemainingUp = Number(scroll.remainingUp);
+    const configuredRemainingRight = Number(scroll.remainingRight);
+    const configuredRemainingLeft = Number(scroll.remainingLeft);
+    const remainingDown = Number.isFinite(configuredRemainingDown)
+      ? configuredRemainingDown
+      : Number.isFinite(top) && maxTop !== undefined ? Math.max(0, maxTop - top) : undefined;
+    const remainingUp = Number.isFinite(configuredRemainingUp)
+      ? configuredRemainingUp
+      : Number.isFinite(top) ? Math.max(0, top) : undefined;
+    const remainingRight = Number.isFinite(configuredRemainingRight)
+      ? configuredRemainingRight
+      : Number.isFinite(left) && maxLeft !== undefined ? Math.max(0, maxLeft - left) : undefined;
+    const remainingLeft = Number.isFinite(configuredRemainingLeft)
+      ? configuredRemainingLeft
+      : Number.isFinite(left) ? Math.max(0, left) : undefined;
+    const yState = Number.isFinite(top) && maxTop !== undefined
+      ? ` y=${Math.round(top)}/${Math.round(maxTop)} ${remainingDown && remainingDown > 1 ? `remainingDown=${Math.round(remainingDown)}` : 'atBottom'} ${remainingUp && remainingUp > 1 ? `remainingUp=${Math.round(remainingUp)}` : 'atTop'}`
+      : '';
+    const xState = Number.isFinite(left) && maxLeft !== undefined && maxLeft > 0
+      ? ` x=${Math.round(left)}/${Math.round(maxLeft)} ${remainingRight && remainingRight > 1 ? `remainingRight=${Math.round(remainingRight)}` : 'atRight'} ${remainingLeft && remainingLeft > 1 ? `remainingLeft=${Math.round(remainingLeft)}` : 'atLeft'}`
+      : '';
+    return `${area.id || '?'}${directions ? ` can=${directions}` : ' can=none'}${yState}${xState}${label ? ` "${String(label).slice(0, 60)}"` : ''}`;
   }).join('\n');
 }
 
@@ -824,7 +860,7 @@ function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
 
 function shouldCaptureVisualAfter(name: string, visualAfter: VisualAfterPolicy) {
   if (visualAfter.capture === 'viewport' || visualAfter.capture === 'fullPage') return true;
-  return !['reportState', 'selectReferenceScreenshots', 'manageVisualContext', 'listTabs', 'getHttpRequests', 'getInteractiveCandidates', 'getDomTree', 'waitForHumanVerification'].includes(name);
+  return !['reportState', 'selectReferenceScreenshots', 'manageVisualContext', 'listTabs', 'getHttpRequests', 'getInteractiveCandidates', 'getDomTree', 'getDomNodeText', 'waitForHumanVerification'].includes(name);
 }
 
 function screenshotOptionsFromVisualAfter(visualAfter: VisualAfterPolicy): { capture: ScreenshotCaptureMode } {
@@ -1034,6 +1070,7 @@ function makeBrowserTools(
     }) => void | Promise<void>;
     runId?: string;
     stepIndex?: number;
+    allowedToolTypes?: string[];
     visualContext?: VisualContextManager;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   },
@@ -1152,9 +1189,9 @@ function makeBrowserTools(
       execute: (input) => record('openPage', input, () => session.open(input.url || targetUrl)),
     }),
     scrollArea: tool({
-      description: 'Scroll a visible scrollable area by its current S id. In visual mode the S id comes from the green marker label; in DOM mode it comes from the current page context. One call should scroll about one visible viewport/container height only. S ids are volatile per turn; never reuse historical S ids.',
+      description: 'Scroll a visible scrollable area by its current area id. In DOM mode, do not use this to read normal DOM text; use it only for lazy-loaded/virtualized content or viewport-only UI. Check the latest summary/result first: do not scroll down atBottom/remainingDown=0 or up atTop/remainingUp=0. One call should scroll about one visible viewport/container height only. Area ids are volatile per turn; never reuse historical ids.',
       inputSchema: browserToolInput({
-        areaId: z.string().describe('Scrollable area id from the CURRENT page context, such as S1 or S2. Do not invent or reuse an old S id.'),
+        areaId: z.string().describe('Scrollable area id from the CURRENT page context, such as S1 or S2. Do not invent or reuse an old id.'),
         deltaY: z.number().describe('Vertical scroll delta. Positive scrolls down, negative scrolls up. Use roughly one viewport/container height per call; do not request multiple screens of scrolling in one tool call.'),
         deltaX: z.number().optional().describe('Horizontal scroll delta. Positive scrolls right, negative scrolls left.'),
       }),
@@ -1273,9 +1310,16 @@ function makeBrowserTools(
       execute: (input) => record('getInteractiveCandidates', input, () => session.getInteractiveCandidates()),
     }),
     getDomTree: tool({
-      description: 'Return the current tab simplified DOM tree of currently visible elements. Each line is "[path] tag#id.class * @x,y,w,h {attrs} \\"text\\"": "*" marks clickable elements, @ is the visible viewport box, {attrs} holds key attributes (placeholder/aria-label/role/href/value...), and "text" is the node\'s own text. Hidden nodes are removed, so paths line up with what is on screen.',
+      description: 'Return the current tab simplified rendered DOM tree, including nodes outside the viewport. Each line is "[path] tag#id.class * @visible:x,y,w,h or @offscreen:... {attrs} \\"text\\"": "*" marks clickable elements, @visible means currently in viewport, @offscreen means rendered elsewhere in the document, and "text" is short node text. Use getDomNodeText(path) for complete text.',
       inputSchema: browserToolInput({}),
       execute: (input) => record('getDomTree', input, () => session.getSimplifiedDomTree()),
+    }),
+    getDomNodeText: tool({
+      description: 'DOM mode: return the full rendered text under a node from the CURRENT simplified DOM tree by bracket path, for example "0.1.2". Use this when a DOM tree line is truncated or a section/article/container needs complete text. This is read-only and does not click, navigate, or scroll.',
+      inputSchema: browserToolInput({
+        path: z.string().describe('The bracket path shown in the current simplified DOM tree, such as 0.1.2. Paths are volatile; use only a fresh path.'),
+      }),
+      execute: (input) => record('getDomNodeText', input, () => session.getDomNodeText(input.path)),
     }),
     clickDomNode: tool({
       description: 'DOM mode: click a node from the CURRENT simplified DOM tree by its bracket path, for example "0.1.2". If text is provided, type it immediately after clicking. Paths are volatile; use only a path from the current DOM tree.',
@@ -1340,7 +1384,11 @@ function makeBrowserTools(
     }),
   };
 
-  return mode === 'visual-markers' ? { ...sharedTools, ...visualTools } : { ...sharedTools, ...domTools };
+  const tools = mode === 'visual-markers' ? { ...sharedTools, ...visualTools } : { ...sharedTools, ...domTools };
+  const allowedToolTypes = referenceOptions?.allowedToolTypes;
+  if (!allowedToolTypes?.length) return tools;
+  const allowed = new Set(allowedToolTypes);
+  return Object.fromEntries(Object.entries(tools).filter(([name]) => allowed.has(name))) as typeof tools;
 }
 
 // 构造完成判定规则；视觉模式用截图作证据，DOM 模式用文本化页面上下文作证据。
@@ -1452,6 +1500,7 @@ function runtimePrompt(input: {
   const separateMarkerScreenshot = Boolean(markerEnabled && input.hasMarkerScreenshot);
   const caseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
+  const browserChatMode = isBrowserChatTestCase(testCase);
   const compactRunContext = buildCompactRunContext(completedSteps, input.workingMemory);
   const availableScreenshotReferences = input.availableScreenshotReferences || [];
   const selectedScreenshotReferences = input.selectedScreenshotReferences || [];
@@ -1459,7 +1508,7 @@ function runtimePrompt(input: {
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const domTree = visualMode ? '[disabled because visual mode is enabled]' : trimDebugText(pageContext.domTree || '[empty DOM tree]', 12000);
+  const domTree = visualMode ? '[disabled because visual mode is enabled]' : trimDebugText(pageContext.domTree || '[empty DOM tree]', Number(process.env.DOM_TREE_PROMPT_MAX_CHARS || 24000));
   const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
   const candidateContext = visualMode
     ? visualMarkersWithoutOverlay || visualTextCandidateFallback
@@ -1476,7 +1525,7 @@ function runtimePrompt(input: {
         : 'the attached clean viewport screenshot'
     : visualMode
       ? 'current URL, tabs, scrollable areas, focused element, and the visible interactive elements list generated from the current screenshot'
-      : 'DOM tree, URL, tabs, scrollable areas, and focused element';
+      : 'full rendered DOM tree, URL, tabs, scroll state, focused element, and read-only DOM text tools';
   const markerSourceRule = separateMarkerScreenshot
     ? '- Image 1 is the source of truth for what the page means. Image 2 only maps visible click/scroll positions to candidate IDs.'
     : markerOverlayInScreenshot
@@ -1508,21 +1557,30 @@ function runtimePrompt(input: {
     : [
         '- DOM mode has no clickCandidate/hoverCandidate/dragCandidate tools. Never choose candidate IDs.',
         '- Use clickDomNode(path,text?) with a bracket path copied from the CURRENT DOM tree. Paths are volatile; never reuse a path from a previous turn.',
+        '- The DOM tree is the rendered document, not just the viewport. Nodes marked @offscreen can still be read with getDomNodeText(path) and can usually be clicked with clickDomNode(path) because the tool scrolls the node into view.',
+        '- Use getDomNodeText(path) when a DOM tree line is truncated or you need the complete rendered text under a section/article/container.',
         '- On dynamic pages where paths may shift, especially search results, use clickByText(targetText) with the exact visible link/button/control text from the CURRENT DOM/page context.',
-        '- For text entry, use clickDomNode(path,text) in one tool call when the input path is visible. Use typeText only after a prior action already focused the field.',
-        '- If needed content may be outside the visible area, use scrollArea with an S id from the CURRENT page context; never reuse historical S ids.',
+        '- For text entry, use clickDomNode(path,text) in one tool call when the input path is present. Use typeText only after a prior action already focused the field.',
+        '- Do not scroll just to read ordinary DOM content. Use scrollArea only for lazy-loaded/virtualized content or viewport-only UI that is absent from the DOM tree.',
+        '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
         '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
       ];
   return [
-    'You are an AI browser testing agent. Call exactly ONE tool. Use reportState only when no browser action is needed.',
+    browserChatMode
+      ? 'You are an AI browser chat agent. Call a browser tool only when live browser action or inspection is needed; otherwise answer directly in Chinese Markdown.'
+      : 'You are an AI browser testing agent. Call exactly ONE tool. Use reportState only when no browser action is needed.',
     `Requirement: ${requirement}`,
     `Target URL: ${testCase.targetUrl}`,
     `Target host: ${targetHost}`,
     `Current URL: ${pageContext.url}`,
     '',
     'Hard rules:',
-    '- One tool only. You may include a short ordinary Chinese progress sentence alongside the tool call.',
-    '- Keep tool params minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
+    browserChatMode
+      ? '- Browser chat may either answer with Chinese Markdown and no tool, or call at most one browser tool when action/inspection is needed.'
+      : '- One tool only. You may include a short ordinary Chinese progress sentence alongside the tool call.',
+    browserChatMode
+      ? '- Keep browser action tool params minimal: reason, exact tool arguments, and optional visualAfter. If no browser action is needed, answer directly in Markdown without calling a tool.'
+      : '- Keep tool params minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
     '- Treat RunState JSON and Working Memory as compact context only. Do not copy them into tool params.',
     '- Historical actions are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
     '- In reason/message/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
@@ -1541,15 +1599,17 @@ function runtimePrompt(input: {
     '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
     '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
-    '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
+    browserChatMode
+      ? '- Finish the chat turn by returning normal Chinese Markdown text with no tool call once the latest user message is satisfied, blocked, or needs clarification.'
+      : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
     attachScreenshot
       ? separateMarkerScreenshot
-        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomTree are unavailable.'
+        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
         : markerOverlayInScreenshot
-          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. White labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomTree are unavailable.'
+          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. White labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
         : markerEnabled
-          ? '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. getInteractiveCandidates/getDomTree are unavailable.'
-          : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomTree are unavailable.'
+          ? '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
+          : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
       : visualMode
         ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
         : '- DOM mode: no screenshot image/path is attached. Use the current DOM tree and exact text matching. clickCandidate and visual candidate IDs are unavailable.',
@@ -1563,14 +1623,23 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     ...buildCompletionPromptLines(attachScreenshot),
     '',
     'Response:',
-    '- Call one tool. Use ordinary assistant text for progress/explanation, and tool params only for the selected tool.',
-    '- Candidate action reason must mention the current-screenshot visual feature, not just an id.',
-    '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
+    browserChatMode
+      ? '- Either return normal Chinese Markdown text with no tool, or call one browser tool if action/inspection is needed. Tool params are only for the selected tool.'
+      : '- Call one tool. Use ordinary assistant text for progress/explanation, and tool params only for the selected tool.',
+    browserChatMode ? '- Browser chat: when the user can be answered from current evidence, output normal Chinese Markdown text and call no tool.' : '',
+    visualMode
+      ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
+      : '- DOM action reason must mention the current DOM path/text or exact targetText, not a candidate id.',
+    browserChatMode
+      ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
+      : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
     '',
     'Current context:',
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
     `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
-    `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
+    visualMode
+      ? `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`
+      : `Scrollable areas summary (DOM fallback only; atBottom/atTop and remaining* show whether further scrolling is possible):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
     visualMode && !visualTextCandidateFallback ? '' : `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
     visualMarkersWithoutOverlay || visualTextCandidateFallback ? `Visible interactive elements:
 ${candidateContext}` : '',
@@ -1630,7 +1699,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'dragCandidate',
   ];
   if (mode === 'visual-markers') return candidateTools;
-  return [...sharedTools, 'getInteractiveCandidates', 'getDomTree', 'clickDomNode', 'clickByText'];
+  return [...sharedTools, 'getInteractiveCandidates', 'getDomTree', 'getDomNodeText', 'clickDomNode', 'clickByText'];
 }
 
 function isCodexProvider() {
@@ -1981,6 +2050,7 @@ async function executeRuntimeStep(input: {
     onToolTrace,
   } = input;
   const mode = browserModeOf(testCase);
+  const browserChatMode = isBrowserChatTestCase(testCase);
   const screenshotInputEnabled = shouldSendScreenshotToAi(mode);
   const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
   const separateMarkerMap = markerEnabled && usesSeparateMarkerMap();
@@ -2068,7 +2138,10 @@ async function executeRuntimeStep(input: {
   async function runAgent(includeImage: boolean) {
     const traces: ToolTrace[] = [];
     const codexMode = isCodexProvider();
-    const allowedToolTypes = runtimeToolNames(mode);
+    const baseAllowedToolTypes = runtimeToolNames(mode).filter((name) => !(browserChatMode && name === 'reportState'));
+    const allowedToolTypes = browserChatMode && codexMode
+      ? [...baseAllowedToolTypes, 'answer']
+      : baseAllowedToolTypes;
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
     let requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
@@ -2098,8 +2171,26 @@ async function executeRuntimeStep(input: {
       return requestPrompt;
     }
     let workingMemory: RuntimeWorkingMemory = {
-      taskGoal: requirementOf(testCase), phase: 'Entering Agent Loop; choose one tool from the current visual frame.', completed: [], findings: [], blockers: [],
-      pageUnderstanding: '', currentState: '尚未形成状态摘要；等待当前截图判断。', scrollSummary: '', userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [], nextStep: '根据当前截图完成下一个未完成目标。',
+      taskGoal: requirementOf(testCase),
+      phase: browserChatMode
+        ? 'Browser chat turn; answer directly when current evidence is enough, otherwise use one browser tool.'
+        : mode === 'dom'
+          ? 'Entering DOM Agent Loop; choose one DOM/text tool or report state.'
+          : 'Entering visual Agent Loop; choose one tool from the current visual frame.',
+      completed: [],
+      findings: [],
+      blockers: [],
+      pageUnderstanding: '',
+      currentState: mode === 'dom'
+        ? 'No DOM state summary yet; use the current DOM tree, URL, focus, tabs, and scroll state.'
+        : 'No visual state summary yet; inspect the current screenshot.',
+      scrollSummary: '',
+      userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
+      nextStep: browserChatMode
+        ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
+        : mode === 'dom'
+          ? 'Use current DOM paths and getDomNodeText for the next missing goal; scroll only for lazy-loaded or viewport-only content.'
+          : 'Use the current screenshot to complete the next missing goal.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
@@ -2125,11 +2216,20 @@ async function executeRuntimeStep(input: {
           requestPrompt,
           compressionNote,
           workingMemoryText: formatWorkingMemory(workingMemory),
-          visualContextText: visualContext.renderText(),
+          visualContextText: mode === 'dom'
+            ? [
+                'DOM Context Manager:',
+                '- Current DOM tree, URL, focus, tabs, and scroll state in Runtime Context are authoritative.',
+                '- No screenshot image is attached for DOM decisions.',
+                '- Use getDomNodeText(path) for complete rendered text instead of scrolling ordinary DOM content.',
+              ].join('\n')
+            : visualContext.renderText(),
           currentToolAttemptsText: formatCurrentToolAttemptSummary(traces, traceLimit),
           turnIndex,
           maxTurns,
           traceLimit,
+          allowTextResponse: browserChatMode,
+          browserMode: mode,
         });
       };
       let contextText = buildContextText();
@@ -2210,7 +2310,14 @@ async function executeRuntimeStep(input: {
         onSelectReferenceScreenshots: async (selection) => { const validIds = selection.ids.filter((id) => availableReferenceIds.has(id)); await onSelectReferenceScreenshots?.({ ...selection, ids: validIds, availableReferences: availableScreenshotReferences }); },
       });
       await onDebug?.({ phase: 'ai:runtime:object', stepIndex, message: 'Codex object -> ' + object.type + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms', details: jsonSafe({ object, traces, elapsedMs: elapsedSince(aiStartedAt) }) });
-      return { text: execution.text, traces, aiRequest, visualContext: visualContext.snapshot(), workingMemory };
+      return {
+        text: execution.text,
+        traces,
+        aiRequest,
+        visualContext: visualContext.snapshot(),
+        workingMemory,
+        endedWithText: browserChatMode && !execution.executed && Boolean(execution.text.trim()),
+      };
     }
 
     const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
@@ -2231,7 +2338,7 @@ async function executeRuntimeStep(input: {
               message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'),
               details: { trace, visualContext: visualContext.snapshot(), workingMemory },
             });
-          }, { availableReferenceIds, runId: input.runId, stepIndex, visualContext, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
+          }, { availableReferenceIds, allowedToolTypes, runId: input.runId, stepIndex, visualContext, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
           stopWhen: stepCountIs(1), temperature: 0.1, maxRetries: 0, abortSignal,
         });
         latestText = result.text || '';
@@ -2239,25 +2346,46 @@ async function executeRuntimeStep(input: {
         const lastTrace = newTraces.at(-1);
         await onDebug?.({ phase: 'ai:runtime:response', stepIndex, message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; turn ' + (turnIndex + 1) + '/' + maxTurns + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms', details: jsonSafe({ text: latestText, traces: newTraces, visualContext: visualContext.snapshot(), workingMemory, elapsedMs: elapsedSince(aiStartedAt) }) });
         if (!lastTrace || lastTrace.name === 'reportState' || lastTrace.name === 'waitForHumanVerification') {
-          return { text: latestText, traces, aiRequest, visualContext: visualContext.snapshot(), workingMemory };
+          return {
+            text: latestText,
+            traces,
+            aiRequest,
+            visualContext: visualContext.snapshot(),
+            workingMemory,
+            endedWithText: browserChatMode && !lastTrace && Boolean(latestText.trim()),
+          };
         }
       } catch (error) {
         if (traces.length > traceStart && !abortSignal?.aborted) {
           await onDebug?.({ phase: 'ai:runtime:partial', stepIndex, message: 'AI request stopped after a tool executed; keeping the action and continuing from Visual Context Manager.', details: { error: error instanceof Error ? error.message : String(error), traces: traces.slice(traceStart), visualContext: visualContext.snapshot() } });
-          return { text: latestText, traces, aiRequest, visualContext: visualContext.snapshot(), workingMemory };
+          return {
+            text: latestText,
+            traces,
+            aiRequest,
+            visualContext: visualContext.snapshot(),
+            workingMemory,
+            endedWithText: false,
+          };
         }
         if (error && typeof error === 'object') (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
         throw error;
       }
     }
-    return { text: latestText, traces, aiRequest, visualContext: visualContext.snapshot(), workingMemory };
+    return {
+      text: latestText,
+      traces,
+      aiRequest,
+      visualContext: visualContext.snapshot(),
+      workingMemory,
+      endedWithText: false,
+    };
   }
 
   // Hidden retries can duplicate browser actions when a provider error happens after a tool
   // started but before the trace is fully persisted. Keep retry opt-in so one AI request maps
   // to at most one browser action by default.
-  const retryPureRequestFailure = process.env.AI_RUNTIME_RETRY_ON_PURE_FAILURE === 'true';
-  const attempts = retryPureRequestFailure && screenshot ? [true, true] : [Boolean(screenshot)];
+  const retryPureRequestFailure = browserChatMode || process.env.AI_RUNTIME_RETRY_ON_PURE_FAILURE === 'true';
+  const attempts = retryPureRequestFailure ? [Boolean(screenshot), Boolean(screenshot)] : [Boolean(screenshot)];
   let lastError: unknown;
 
   for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
@@ -2347,6 +2475,12 @@ function browserChatRequirement(input: {
     '- If the user asks you to continue after manual login/captcha/security work, continue from the current browser state.',
     '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
     '- Keep tester discipline: record visible problems, suspicious network failures, broken UI states, and why they matter.',
+    '',
+    'Final answer style:',
+    '- The final user-visible browser-chat answer is your assistant content. It must be Chinese Markdown, not plain inline text.',
+    '- Use short paragraphs and Markdown bullets or numbered lists with line breaks. Do not cram numbered items into one paragraph.',
+    '- If the latest user message can be answered from current evidence, return the Markdown answer directly and call no tool.',
+    '- Never include JSON, fenced JSON, tool parameters, candidate ids, coordinates, screenshot paths, or status objects in assistant text.',
   ].filter(Boolean).join('\n');
 }
 
@@ -2513,6 +2647,20 @@ export async function executeInteractiveBrowserTurn(input: {
       });
     } catch (error) {
       if (input.abortSignal?.aborted) throw error;
+      const errorText = infrastructureError(error);
+      if (!liveToolTraces.length && isInfrastructureNoise(errorText)) {
+        const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
+        if (runningIndex >= 0) steps.splice(runningIndex, 1);
+        await input.onDebug?.({
+          phase: 'chat:runtime:request-aborted',
+          stepIndex,
+          message: 'Browser chat AI request failed before any browser tool executed.',
+          details: serializeError(error),
+        });
+        finalStatus = 'failed';
+        reply = `这轮浏览器聊天请求在执行任何浏览器操作前失败：${trimDebugText(errorText, 500)}`;
+        break;
+      }
       const recoveredState = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress);
       const errorStep = await createRecoverableRuntimeErrorStep({
         session: input.session,
@@ -2529,6 +2677,20 @@ export async function executeInteractiveBrowserTurn(input: {
       await input.onProgress?.(errorStep);
       finalStatus = 'failed';
       reply = assistantReplyFromStep(errorStep);
+      break;
+    }
+
+    const browserChatReply = actionResult.endedWithText ? actionResult.text.trim() : '';
+    if (browserChatReply && !actionResult.traces.length) {
+      const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
+      if (runningIndex >= 0) steps.splice(runningIndex, 1);
+      await input.onDebug?.({
+        phase: 'chat:direct-answer',
+        stepIndex,
+        message: 'Browser chat completed with a direct Markdown answer and no browser tool.',
+      });
+      reply = browserChatReply;
+      finalStatus = 'passed';
       break;
     }
 
@@ -2557,9 +2719,13 @@ export async function executeInteractiveBrowserTurn(input: {
     upsertStep(steps, completedStep);
     newSteps.push(completedStep);
     await input.onProgress?.(completedStep);
-    reply = assistantReplyFromStep(completedStep);
+    reply = browserChatReply || assistantReplyFromStep(completedStep);
 
     const lastToolName = actionResult.traces.at(-1)?.name;
+    if (browserChatReply) {
+      finalStatus = decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed';
+      break;
+    }
     if (decision.status === 'blocked' || decision.status === 'failed') {
       finalStatus = decision.status;
       break;
@@ -2820,6 +2986,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.getInteractiveCandidates();
     case 'getDomTree':
       return session.getSimplifiedDomTree();
+    case 'getDomNodeText':
+      return session.getDomNodeText(String(input.path || ''));
     default:
       return { ok: false, actual: `Unsupported recorded tool: ${flow.name}.${reason}` };
   }
@@ -2847,7 +3015,20 @@ async function executeCodexRuntimeObject(input: {
   const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
   if (!allowedTypes.includes(type)) {
     return {
-      text: `Codex returned unsupported action type: ${type}. It must call exactly one allowed tool, usually reportState for no-op reporting.`,
+      text: `Codex returned unsupported action type: ${type}. Allowed types: ${allowedTypes.join(', ')}.`,
+      executed: false,
+    };
+  }
+
+  if (type === 'answer') {
+    const answerText = [
+      message,
+      typeof params.text === 'string' ? params.text : '',
+      typeof params.content === 'string' ? params.content : '',
+      typeof params.actual === 'string' ? params.actual : '',
+    ].map((item) => (item || '').trim()).find(Boolean) || '';
+    return {
+      text: readableActionFromRawText(answerText) || answerText,
       executed: false,
     };
   }

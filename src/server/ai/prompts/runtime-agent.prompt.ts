@@ -23,6 +23,8 @@ type PrepareStepPromptInput = {
   turnIndex: number;
   maxTurns: number;
   traceLimit: number;
+  allowTextResponse?: boolean;
+  browserMode?: 'dom' | 'visual-markers';
 };
 
 export function buildCompletionPromptLines(usesScreenshot: boolean) {
@@ -81,6 +83,9 @@ export function buildCompletionVerificationPrompt(input: CompletionVerificationP
 }
 
 export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
+  const answerAllowed = allowedTypes.includes('answer');
+  const visualMode = allowedTypes.includes('clickCandidate');
+  const domMode = allowedTypes.includes('clickDomNode') || allowedTypes.includes('getDomNodeText');
   return [
     prompt,
     '',
@@ -93,26 +98,41 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- params should include only keys required by that tool plus a concise reason.',
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
     '- In message/reason/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot ids/file names, or tool input JSON.',
-    '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.',
-    '- For scrollArea, put the S scrollable area id in params.areaId, not params.id; scroll about one visible viewport/container height per call.',
+    visualMode ? '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.' : '',
+    domMode ? '- DOM mode: use getDomNodeText(path) for complete text under a DOM node; use clickDomNode(path,text?) with a fresh DOM bracket path.' : '',
+    '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
+    '- For getDomNodeText/clickDomNode, put the fresh DOM bracket path in params.path.',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
-    '- For completion, manual verification, failure, or pure status update, use type="reportState".',
+    answerAllowed
+      ? '- For browser chat completion, clarification, blocked state, failure, or pure text response, set type="answer" and put the complete Chinese Markdown answer in message. Do not use reportState.'
+      : '- For completion, manual verification, failure, or pure status update, use type="reportState".',
   ].join('\n');
 }
 
 export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
+  const domMode = input.browserMode === 'dom';
   return [
     input.requestPrompt,
     '',
     'Agent Loop / prepareStep context:',
-    '- Current screenshot is the only actionable image; history/reference candidate ids are invalid.',
-    '- Screenshot marker labels are only tool target locations. They are not page content, image/page numbers, ordering, progress, status, priority, or business meaning.',
-    '- Green dashed boxes/green S labels in the current screenshot mark scrollable regions; use that visible S label for scrollArea and scroll about one visible viewport/container height per call.',
+    domMode
+      ? '- DOM mode: the actionable context is the current DOM tree, URL, focus, and tool results. No screenshot image is attached for decision making.'
+      : '- Current screenshot is the only actionable image; history/reference candidate ids are invalid.',
+    domMode
+      ? '- DOM mode: do not scroll just to read ordinary page text. Use getDomNodeText(path) when a DOM line is truncated or a section needs full text.'
+      : '- Screenshot marker labels are only tool target locations. They are not page content, image/page numbers, ordering, progress, status, priority, or business meaning.',
+    domMode
+      ? '- Use scrollArea only as a fallback for lazy-loaded/virtualized content or viewport-only UI. Before scrolling, check the latest area state: do not scroll down atBottom or when remainingDown=0, and do not scroll up atTop or when remainingUp=0.'
+      : '- Green dashed boxes/green S labels in the current screenshot mark scrollable regions; use that visible S label for scrollArea and scroll about one visible viewport/container height per call.',
     '- Historical memory contains semantic summaries only; never infer/reuse old candidate ids, area ids, coordinates, deltas, screenshot ids, or tool input JSON.',
     '- Tool params are minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
     '- If RunState/ledgerDigest already covers a requirement area, do not restart it by habit; continue only with missing or contradicted work.',
-    '- Follow RunState.nextObjective, but choose operation/id from current screenshot only.',
-    '- Call exactly one tool. You may include short ordinary assistant text for progress. Candidate action reason should name the visible target. visualAfter defaults to replace; use append only for explicit comparison/continuity with the previous screenshot.',
+    domMode
+      ? '- Follow RunState.nextObjective, but choose DOM paths/text from the current DOM tree only.'
+      : '- Follow RunState.nextObjective, but choose operation/id from current screenshot only.',
+    input.allowTextResponse
+      ? '- Browser chat mode: call at most one tool only when browser action/inspection is needed. If the user can be answered now, return Chinese Markdown text and call no tool.'
+      : '- Call exactly one tool. You may include short ordinary assistant text for progress. Candidate action reason should name the visible target. visualAfter defaults to replace; use append only for explicit comparison/continuity with the previous screenshot.',
     input.compressionNote,
     '',
     input.workingMemoryText,

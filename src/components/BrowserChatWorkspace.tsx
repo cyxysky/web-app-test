@@ -364,6 +364,7 @@ function BrowserChatAssistantTimeline({
 }) {
   const finalText = normalizedAgentText(message.content);
   const seenTexts = new Set<string>();
+  const shouldShowStepTimeline = running || steps.some((step) => (step.tools || []).length);
   const renderText = (text: string, key: string) => {
     const normalized = normalizedAgentText(text);
     if (!normalized || seenTexts.has(normalized)) return null;
@@ -376,12 +377,12 @@ function BrowserChatAssistantTimeline({
   return (
     <div className="browser-chat-agent-timeline">
       {running ? renderText(finalText || '正在处理...', 'running-text') : null}
-      {steps.map((step) => (
+      {shouldShowStepTimeline ? steps.map((step) => (
         <div className="browser-chat-agent-step" key={step.index}>
           <BrowserChatStepToolCards onSelectTool={onSelectTool} running={running && step.status === 'running'} step={step} />
-          {renderText(stepNarrative(step), `step-${step.index}-text`)}
+          {running ? renderText(stepNarrative(step), `step-${step.index}-text`) : null}
         </div>
-      ))}
+      )) : null}
       {!running || !steps.length ? renderText(finalText, 'final-text') : null}
     </div>
   );
@@ -403,6 +404,8 @@ export function BrowserChatWorkspace({
   const sendingRef = useRef(false);
   const loadingSessionRef = useRef<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
+  const sessionVersionsRef = useRef(new Map<string, number>());
   const [activeView, setActiveView] = useState<BrowserChatView>(initialView);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
@@ -417,6 +420,8 @@ export function BrowserChatWorkspace({
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
   const [busy, setBusy] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
+  const [sessionEventsConnected, setSessionEventsConnected] = useState(false);
+  const [sessionEventsRequestKey, setSessionEventsRequestKey] = useState(0);
   const [interrupting, setInterrupting] = useState(false);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
@@ -459,9 +464,19 @@ export function BrowserChatWorkspace({
       .slice(0, 14);
   }, [session, sessions]);
 
-  const upsertSession = useCallback((nextSession: BrowserChatSession) => {
+  useEffect(() => {
+    activeSessionIdRef.current = session?.id || null;
+  }, [session?.id]);
+
+  const upsertSession = useCallback((nextSession: BrowserChatSession, options: { activate?: boolean; version?: number } = {}) => {
     const normalized = normalizeSession(nextSession);
-    setSession(normalized);
+    const lastVersion = sessionVersionsRef.current.get(normalized.id) || 0;
+    if (typeof options.version === 'number') {
+      if (options.version < lastVersion) return normalized;
+      sessionVersionsRef.current.set(normalized.id, options.version);
+    }
+    const shouldActivate = options.activate ?? activeSessionIdRef.current === normalized.id;
+    if (shouldActivate) setSession(normalized);
     setSessions((current) => {
       const next = [normalized, ...current.filter((item) => item.id !== normalized.id)];
       return next.sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
@@ -481,7 +496,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(`/api/browser-chat/${sessionId}`, { cache: 'no-store' });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '加载对话失败');
-    const loadedSession = upsertSession(data.session as BrowserChatSession);
+    const loadedSession = upsertSession(data.session as BrowserChatSession, { activate: true });
     setMode(normalizeMode(loadedSession.mode));
     return loadedSession;
   }, [upsertSession]);
@@ -495,8 +510,10 @@ export function BrowserChatWorkspace({
   useEffect(() => {
     if (!session?.id) return undefined;
     const sessionId = session.id;
+    setSessionEventsConnected(false);
     const events = new EventSource(`/api/browser-chat/${sessionId}/events`);
     let refreshTimer: number | undefined;
+    let reconnectTimer: number | undefined;
     const scheduleRefresh = (delay = 20) => {
       if (refreshTimer) window.clearTimeout(refreshTimer);
       refreshTimer = window.setTimeout(() => {
@@ -505,25 +522,57 @@ export function BrowserChatWorkspace({
         });
       }, delay);
     };
+    const handleSession = (event: Event) => {
+      try {
+        if (activeSessionIdRef.current !== sessionId) return;
+        const payload = JSON.parse((event as MessageEvent).data) as { snapshot: BrowserChatSession; version: number };
+        const loadedSession = upsertSession(payload.snapshot, { activate: true, version: payload.version });
+        setMode(normalizeMode(loadedSession.mode));
+      } catch {
+        scheduleRefresh();
+      }
+    };
+    const handleDeleted = () => {
+      setSessions((current) => current.filter((item) => item.id !== sessionId));
+      setSession((current) => (current?.id === sessionId ? null : current));
+    };
     const handleRefresh = () => scheduleRefresh();
+    const scheduleReconnect = (delay = 800) => {
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      reconnectTimer = window.setTimeout(() => {
+        if (activeSessionIdRef.current === sessionId) {
+          setSessionEventsRequestKey((current) => current + 1);
+        }
+      }, delay);
+    };
+    events.addEventListener('session', handleSession);
+    events.addEventListener('deleted', handleDeleted);
     events.addEventListener('refresh', handleRefresh);
-    events.onopen = () => scheduleRefresh(0);
-    events.onerror = () => undefined;
+    events.onopen = () => setSessionEventsConnected(true);
+    events.onerror = () => {
+      setSessionEventsConnected(false);
+      events.close();
+      scheduleReconnect();
+    };
     return () => {
       if (refreshTimer) window.clearTimeout(refreshTimer);
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      setSessionEventsConnected(false);
+      events.removeEventListener('session', handleSession);
+      events.removeEventListener('deleted', handleDeleted);
       events.removeEventListener('refresh', handleRefresh);
       events.close();
     };
-  }, [refreshSession, session?.id]);
+  }, [refreshSession, session?.id, sessionEventsRequestKey, upsertSession]);
 
   useEffect(() => {
-    if (!session?.id || !session.busy) return undefined;
+    if (!session?.id || !session.busy || sessionEventsConnected) return undefined;
     const sessionId = session.id;
     const timer = window.setInterval(() => {
       void refreshSession(sessionId).catch(() => undefined);
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [refreshSession, session?.busy, session?.id]);
+  }, [refreshSession, session?.busy, session?.id, sessionEventsConnected]);
 
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
@@ -553,7 +602,7 @@ export function BrowserChatWorkspace({
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '创建对话会话失败');
-    return upsertSession(data.session as BrowserChatSession);
+    return upsertSession(data.session as BrowserChatSession, { activate: true });
   }
 
   async function ensureSession() {
@@ -615,6 +664,7 @@ export function BrowserChatWorkspace({
     setActiveView('chat');
     try {
       let active = await ensureSession();
+      setSessionEventsRequestKey((current) => current + 1);
       let posted: BrowserChatSession;
       try {
         posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
@@ -622,15 +672,12 @@ export function BrowserChatWorkspace({
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
         active = await createSession();
+        setSessionEventsRequestKey((current) => current + 1);
         posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
       }
-      upsertSession(posted);
-      window.setTimeout(() => {
-        void refreshSession(posted.id).catch(() => undefined);
-      }, 600);
+      upsertSession(posted, { activate: true });
       setMessage('');
       setAttachments([]);
-      await loadSessions().catch(() => undefined);
     } catch (sendError) {
       const sendMessageText = sendError instanceof Error ? sendError.message : '发送消息失败';
       setError(sendMessageText);
@@ -651,8 +698,7 @@ export function BrowserChatWorkspace({
       const response = await fetch(`/api/browser-chat/${target.id}/interrupt`, { method: 'POST' });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '中断对话失败');
-      upsertSession(data.session as BrowserChatSession);
-      await loadSessions().catch(() => undefined);
+      upsertSession(data.session as BrowserChatSession, { activate: true });
     } catch (interruptError) {
       setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
     } finally {
@@ -668,7 +714,7 @@ export function BrowserChatWorkspace({
       const response = await fetch(`/api/browser-chat/${session.id}`, { method: 'DELETE' });
       const data = await response.json();
       if (response.ok) {
-        upsertSession(data.session);
+        upsertSession(data.session, { activate: true });
         await loadSessions().catch(() => undefined);
       }
     } finally {
@@ -736,6 +782,7 @@ export function BrowserChatWorkspace({
     try {
       const loadedSession = await refreshSession(sessionId);
       setMode(normalizeMode(loadedSession.mode));
+      setSessionEventsRequestKey((current) => current + 1);
       void loadSessions().catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');

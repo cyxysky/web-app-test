@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { BrowserSession, type BrowserSessionMode } from '@/server/browser/browser-session';
 import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage } from '@/server/ai/agents/test-executor.agent';
 import type { RecordedFlowStep, StepExecutionResult, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
+import { createSnapshotChannel, type SnapshotEvent, type SnapshotListener } from '@/server/realtime/snapshot-channel';
+import { writeTextFileAtomic } from '@/server/storage/atomic-json';
 import { appDataRoot, artifactPath as resolveArtifactPath } from '@/server/storage/paths';
 
 export type BrowserChatAttachment = {
@@ -56,6 +58,8 @@ export type BrowserChatSessionSnapshot = {
   logs: BrowserChatLogRecord[];
 };
 
+export type BrowserChatSessionEvent = SnapshotEvent<BrowserChatSessionSnapshot>;
+
 type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
   activeAssistantMessageId?: string;
   activeAbortController?: AbortController;
@@ -64,10 +68,12 @@ type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
 };
 
 const sessions = new Map<string, BrowserChatSessionRecord>();
-const sessionListeners = new Map<string, Set<(event: { sessionId: string; time: string }) => void>>();
+const sessionSnapshots = createSnapshotChannel<BrowserChatSessionSnapshot>('browserChatSession');
 const sessionsPath = path.join(appDataRoot(), '.data', 'browser-chat-sessions.json');
 let sessionsHydrated = false;
 let lastPersistWarningAt = 0;
+let persistTimer: ReturnType<typeof setTimeout> | undefined;
+const persistDebounceMs = 250;
 
 function now() {
   return new Date().toISOString();
@@ -78,31 +84,25 @@ function id(prefix: string) {
 }
 
 function notifySessionUpdate(sessionId: string) {
-  const listeners = sessionListeners.get(sessionId);
-  if (!listeners?.size) return;
-  const event = { sessionId, time: now() };
-  for (const listener of listeners) {
-    try {
-      listener(event);
-    } catch {
-      // A broken client subscription must not interrupt the browser run.
-    }
-  }
+  const session = sessions.get(sessionId);
+  if (session) sessionSnapshots.publish(sessionId, snapshot(session));
+  else sessionSnapshots.publishDeleted(sessionId);
+}
+
+export function currentBrowserChatSessionEvent(
+  sessionId: string,
+  session: BrowserChatSessionSnapshot,
+): BrowserChatSessionEvent {
+  return sessionSnapshots.current(sessionId, session);
 }
 
 export function subscribeBrowserChatSessionEvents(
   sessionId: string,
-  listener: (event: { sessionId: string; time: string }) => void,
+  listener: SnapshotListener<BrowserChatSessionSnapshot>,
 ) {
   hydrateSessions();
   if (!sessions.has(sessionId)) return undefined;
-  const listeners = sessionListeners.get(sessionId) || new Set();
-  listeners.add(listener);
-  sessionListeners.set(sessionId, listeners);
-  return () => {
-    listeners.delete(listener);
-    if (!listeners.size) sessionListeners.delete(sessionId);
-  };
+  return sessionSnapshots.subscribe(sessionId, listener);
 }
 
 function elapsedMs(startedAt: number) {
@@ -121,6 +121,10 @@ function normalizeBrowserUrl(url: string) {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) || /^(about|data|file|blob):/i.test(trimmed)) return trimmed;
   if (/^(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(trimmed)) return `http://${trimmed}`;
   return `https://${trimmed}`;
+}
+
+function isBlankBrowserUrl(url: string) {
+  return !url || url === 'about:blank' || /^(about:newtab|chrome:\/\/new-tab-page|edge:\/\/newtab)/i.test(url);
 }
 
 function compactText(value = '', max = 180) {
@@ -209,11 +213,8 @@ function statusFromSteps(steps: StepExecutionResult[]): CompletedRunStatus {
 }
 
 function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
-  const clientStep = { ...step };
-  delete clientStep.aiRequest;
-  delete clientStep.visualContext;
-  delete clientStep.workingMemory;
-  return jsonSafeClone(clientStep);
+  const { aiRequest: _aiRequest, visualContext: _visualContext, workingMemory: _workingMemory, ...clientStep } = step;
+  return clientStep;
 }
 
 function previewMessages(session: BrowserChatSessionRecord) {
@@ -313,24 +314,29 @@ function appendLog(
 }
 
 function persistSessions() {
-  const tempPath = `${sessionsPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   try {
-    mkdirSync(path.dirname(sessionsPath), { recursive: true });
     const payload = stringifyJsonSafe([...sessions.values()].map((session) => snapshot(session, { fullSteps: true })), 2);
     if (!payload) throw new Error('Browser chat sessions could not be serialized.');
-    writeFileSync(tempPath, payload, 'utf8');
-    renameSync(tempPath, sessionsPath);
+    writeTextFileAtomic(sessionsPath, payload);
     return true;
   } catch (error) {
-    rmSync(tempPath, { force: true });
     warnPersistFailure(error);
     return false;
   }
 }
 
 function persistAndNotify(sessionId: string) {
-  persistSessions();
   notifySessionUpdate(sessionId);
+  schedulePersistSessions();
+}
+
+function schedulePersistSessions() {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistTimer = undefined;
+    persistSessions();
+  }, persistDebounceMs);
+  persistTimer.unref?.();
 }
 
 function hydrateSessions() {
@@ -376,9 +382,11 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   store.applyRuntimeEnv();
   const startedAt = Date.now();
   appendLog(session, 'browser:start', '正在启动或连接浏览器');
+  const hasPriorConversation = session.steps.length > 0
+    || session.messages.some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
   const browser = new BrowserSession(session.mode === 'default' ? undefined : session.mode, {
     isMarked: true,
-    preferExistingPage: true,
+    preferExistingPage: !hasPriorConversation,
     runId: session.id,
     tabGroupTitle: session.title,
   });
@@ -403,12 +411,19 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   persistAndNotify(session.id);
   appendLog(session, 'browser:ready', `浏览器已就绪，用时 ${elapsedMs(startedAt)}ms`, { elapsedMs: elapsedMs(startedAt) });
   const url = normalizeBrowserUrl(session.targetUrl);
-  if (url) {
+  const currentUrl = browser.currentUrl();
+  const shouldOpenTarget = Boolean(url && !isBlankBrowserUrl(url) && (!browser.hasNonBlankActivePage() || !hasPriorConversation));
+  if (browser.hasNonBlankActivePage() && hasPriorConversation) {
+    session.targetUrl = currentUrl || session.targetUrl;
+    appendLog(session, 'browser:reuse-page', `复用当前非空标签页：${session.targetUrl || '[unknown URL]'}`);
+  } else if (shouldOpenTarget) {
     const openStartedAt = Date.now();
     session.targetUrl = url;
     appendLog(session, 'browser:open', `正在打开目标地址：${url}`);
     await browser.open(url);
     appendLog(session, 'browser:url-ready', `目标地址已打开，用时 ${elapsedMs(openStartedAt)}ms`, { elapsedMs: elapsedMs(openStartedAt) });
+  } else if (url) {
+    session.targetUrl = url;
   }
   session.status = 'idle';
   session.updatedAt = now();
