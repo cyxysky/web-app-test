@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, ArrowRight, Images, Maximize2, X } from 'lucide-react';
+import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import type { StepExecutionResult, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 type ScreenshotChainPhase = 'before' | 'tool' | 'after';
@@ -15,15 +16,6 @@ type ScreenshotChainItem = {
   toolName?: string;
   url: string;
 };
-
-function artifactUrl(filePath?: string) {
-  if (!filePath) return undefined;
-  const normalized = filePath.replace(/\\/g, '/');
-  const marker = '/artifacts/';
-  const index = normalized.lastIndexOf(marker);
-  if (index < 0) return filePath.startsWith('/api/artifacts/') ? filePath : undefined;
-  return `/api/artifacts/${normalized.slice(index + marker.length)}`;
-}
 
 function isOriginalScreenshot(shot: NonNullable<NonNullable<StepExecutionResult['tools']>[number]['screenshots']>[number]) {
   if (shot.kind === 'marker') return false;

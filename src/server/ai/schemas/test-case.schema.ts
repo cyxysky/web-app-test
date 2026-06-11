@@ -155,7 +155,30 @@ export type RuntimeWorkingMemory = {
   ledgerItems?: TaskLedgerItem[];
 };
 
+export type AiDomContextSnapshot = {
+  mode: 'dom';
+  source: 'runtime-page-context';
+  generatedAt: string;
+  url?: string;
+  title?: string;
+  tree: string;
+  treeCharLength: number;
+  promptCharLimit?: number;
+  truncated: boolean;
+  focusedElement?: unknown;
+  pageScrollState?: unknown;
+  scrollableAreas?: unknown;
+  interactiveCandidates?: unknown;
+};
+
+export type AiToolContextSnapshot = {
+  requestId?: string;
+  requestCreatedAt?: string;
+  domContext?: AiDomContextSnapshot;
+};
+
 export type AiRequestSnapshot = {
+  id?: string;
   kind: 'runtime' | 'completion-verification';
   stepIndex: number;
   createdAt: string;
@@ -165,6 +188,7 @@ export type AiRequestSnapshot = {
   imageAttached: boolean;
   tools?: string[];
   options?: Record<string, unknown>;
+  domContext?: AiDomContextSnapshot;
   messages: Array<{
     role: 'user' | 'system' | 'assistant';
     content: Array<
@@ -180,6 +204,8 @@ export type StepToolCall = {
   reason?: string;
   ok?: boolean;
   result?: string;
+  contextBefore?: AiToolContextSnapshot;
+  contextAfter?: AiToolContextSnapshot;
   visualAfter?: {
     capture?: 'auto' | 'viewport' | 'fullPage';
     retention?: 'auto' | 'replace' | 'append';

@@ -5,20 +5,13 @@ import { Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, PauseC
 import { MarkdownReport } from '@/components/MarkdownReport';
 import { RunMetaDrawer } from '@/components/RunMetaDrawer';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
+import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
+import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { RunDebugEvent, StepExecutionResult, TaskFrame, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 type ImageItem = { title: string; url: string };
 type StepToolCallItem = NonNullable<StepExecutionResult['tools']>[number];
-
-function artifactUrl(filePath?: string) {
-  if (!filePath) return undefined;
-  const normalized = filePath.replace(/\\/g, '/');
-  const marker = '/artifacts/';
-  const index = normalized.lastIndexOf(marker);
-  if (index < 0) return filePath.startsWith('/api/artifacts/') ? filePath : undefined;
-  return `/api/artifacts/${normalized.slice(index + marker.length)}`;
-}
 
 function traceUrl(run: TestRunRecord) {
   return artifactUrl(run.result?.tracePath);
@@ -226,6 +219,7 @@ function ToolCallCard({
   const input = formatToolInput(tool.input);
   const screenshots = toolScreenshotItems(step, index);
   const preview = toolPreviewText(tool, input, screenshots.length);
+  const domTree = domTreeFromToolCall(tool, step.aiRequest);
 
   return (
     <li className={expanded ? 'expanded' : undefined}>
@@ -258,6 +252,12 @@ function ToolCallCard({
               <span>结果</span>
               <p>{tool.result}</p>
             </div>
+          ) : null}
+          {domTree ? (
+            <details className="debug-details">
+              <summary>模型看到的 DOM 树</summary>
+              <pre>{domTree}</pre>
+            </details>
           ) : null}
           {screenshots.length ? (
             <div className="tool-shot-grid">
@@ -568,6 +568,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   const debugEnabled = Boolean(run.debug?.enabled);
   const manualIntervention = run.control?.manualIntervention;
   const visibleManualIntervention = manualIntervention?.stepIndex === resumePendingStep ? undefined : manualIntervention;
+  const manualInterventionScreenshotUrl = artifactUrl(visibleManualIntervention?.screenshotPath);
   const canPause = run.status === 'running' || run.status === 'queued';
   const canResumeRun = run.status === 'paused';
   const canContinueBlockedRun = run.status === 'blocked';
@@ -780,8 +781,8 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
             <p>{visibleManualIntervention.reason}</p>
           </div>
           <div className="manual-intervention-actions">
-            {artifactUrl(visibleManualIntervention.screenshotPath) ? (
-              <button className="link-button" onClick={() => openImageByUrl(artifactUrl(visibleManualIntervention.screenshotPath)!)} type="button">
+            {manualInterventionScreenshotUrl ? (
+              <button className="link-button" onClick={() => openImageByUrl(manualInterventionScreenshotUrl)} type="button">
                 <Eye size={14} />
                 查看当前截图
               </button>

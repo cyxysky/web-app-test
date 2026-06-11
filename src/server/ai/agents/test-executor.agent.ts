@@ -1,12 +1,14 @@
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { generateObject, generateText, stepCountIs, tool } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiRequestSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
+import { normalizeDomNodeIdParam, normalizeDomPathParam } from '@/lib/dom-path';
 import { richTextToPlainText } from '@/lib/rich-text';
 
 type ExecutionProgress = (step: StepExecutionResult) => void | Promise<void>;
@@ -41,6 +43,8 @@ type ToolTrace = {
   name: string;
   input: unknown;
   result?: BrowserActionResult;
+  contextBefore?: AiToolContextSnapshot;
+  contextAfter?: AiToolContextSnapshot;
   visualAfter?: VisualAfterPolicy;
   screenshots?: Array<{
     title: string;
@@ -100,6 +104,8 @@ const codexRuntimeObjectSchema = z.object({
     key: z.string().nullable().optional(),
     path: z.string().nullable().optional(),
     domPath: z.string().nullable().optional(),
+    scopeId: z.string().nullable().optional(),
+    locatorId: z.string().nullable().optional(),
     fromId: z.string().nullable().optional(),
     toId: z.string().nullable().optional(),
     index: z.number().nullable().optional(),
@@ -166,6 +172,62 @@ function browserModeOf(testCase: TestCaseRecord): BrowserSessionMode {
 
 function isVisualMode(mode: BrowserSessionMode) {
   return mode !== 'dom';
+}
+
+function runtimePageContextOptions(mode: BrowserSessionMode) {
+  const visualMode = isVisualMode(mode);
+  return {
+    includeDomTree: !visualMode,
+    includeText: false,
+    includeManualVerification: false,
+    includeInteractiveCandidates: visualMode,
+    useCachedInteractiveCandidates: visualMode,
+  };
+}
+
+type RuntimePageContext = Awaited<ReturnType<BrowserSession['getPageContext']>>;
+
+function domTreePromptLimit() {
+  const raw = String(process.env.DOM_TREE_PROMPT_MAX_CHARS || '').trim();
+  if (!raw || /^(0|false|none|off|unlimited)$/i.test(raw)) return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
+function domTreeForPrompt(rawTree: string) {
+  const limit = domTreePromptLimit();
+  return limit ? trimDebugText(rawTree, limit) : rawTree;
+}
+
+function createDomContextSnapshot(mode: BrowserSessionMode, pageContext: RuntimePageContext): AiDomContextSnapshot | undefined {
+  if (mode !== 'dom') return undefined;
+  const rawTree = pageContext.domTree || '[empty DOM tree]';
+  const promptCharLimit = domTreePromptLimit();
+  const tree = domTreeForPrompt(rawTree);
+  return {
+    mode: 'dom',
+    source: 'runtime-page-context',
+    generatedAt: new Date().toISOString(),
+    url: pageContext.url,
+    title: pageContext.title,
+    tree,
+    treeCharLength: rawTree.length,
+    promptCharLimit,
+    truncated: Boolean(promptCharLimit && rawTree.length > promptCharLimit),
+    focusedElement: pageContext.focusedElement,
+    pageScrollState: pageContext.pageScrollState,
+    scrollableAreas: pageContext.scrollableAreas,
+    interactiveCandidates: pageContext.interactiveCandidates,
+  };
+}
+
+function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
+  if (!aiRequest?.id && !aiRequest?.domContext) return undefined;
+  return {
+    requestId: aiRequest.id,
+    requestCreatedAt: aiRequest.createdAt,
+    domContext: aiRequest.domContext,
+  };
 }
 
 // 是否启用视觉候选标识。关闭时仍发送截图，但候选元素只以文本摘要进入 prompt。
@@ -267,6 +329,22 @@ function trimDebugText(value: string, max = 4000) {
   return value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
+function looksLikeDomSnapshot(value?: string) {
+  const text = (value || '').trim();
+  if (!text || !/\bnode_id=\d+\b/.test(text)) return false;
+  return /<\s*(?:a|button|input|select|textarea|option|summary|details|label|form|iframe)\b/i.test(text);
+}
+
+function userFacingToolResult(name: string, result?: BrowserActionResult, max = 360) {
+  if (!result) return undefined;
+  if (!result.ok) return trimDebugText(result.actual, max);
+  if (name === 'getDomTree' || looksLikeDomSnapshot(result.actual)) return '已读取当前可见 DOM 快照。';
+  if (name === 'getInteractiveCandidates') return '已读取当前可见可交互元素。';
+  if (name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
+  if (name === 'listTabs') return '已读取浏览器标签页列表。';
+  return trimDebugText(result.actual, max);
+}
+
 function elapsedSince(startedAt: number) {
   return Date.now() - startedAt;
 }
@@ -311,6 +389,7 @@ function toolNameLike(value?: string) {
 function cleanDisplayText(value?: string) {
   const trimmed = (value || '').replace(/\s+/g, ' ').trim();
   if (!trimmed || /^无$|^none$/i.test(trimmed)) return undefined;
+  if (looksLikeDomSnapshot(trimmed)) return undefined;
   if (parseJsonObjectText(trimmed)) return undefined;
   return trimmed;
 }
@@ -400,7 +479,9 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       input,
       reason,
       ok: trace.result?.ok,
-      result: trace.result ? trimDebugText(trace.result.actual, 360) : undefined,
+      result: userFacingToolResult(trace.name, trace.result, 360),
+      contextBefore: trace.contextBefore,
+      contextAfter: trace.contextAfter,
       visualAfter: trace.visualAfter,
       screenshots: trace.screenshots,
     };
@@ -842,6 +923,26 @@ function validateCandidateActionBeforeExecution(name: string, input: unknown, tr
   return undefined;
 }
 
+const candidateActionToolNames = new Set(['clickCandidate', 'hoverCandidate', 'doubleClickCandidate', 'rightClickCandidate', 'dragCandidate']);
+const domNodeIdToolNames = new Set(['clickDomNode', 'focusDomNode', 'getDomNodeText']);
+const noVisualAfterCaptureToolNames = new Set([
+  'reportState',
+  'selectReferenceScreenshots',
+  'manageVisualContext',
+  'listTabs',
+  'getHttpRequests',
+  'getInteractiveCandidates',
+  'getDomTree',
+  'getDomNodeText',
+  'findByText',
+  'waitForHumanVerification',
+]);
+const noDomAfterContextToolNames = new Set([
+  ...noVisualAfterCaptureToolNames,
+  'listTabs',
+  'waitForPage',
+]);
+
 function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
   const fallback = defaultVisualAfterForTool(name);
   if (!input || typeof input !== 'object' || Array.isArray(input)) return fallback;
@@ -860,7 +961,11 @@ function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
 
 function shouldCaptureVisualAfter(name: string, visualAfter: VisualAfterPolicy) {
   if (visualAfter.capture === 'viewport' || visualAfter.capture === 'fullPage') return true;
-  return !['reportState', 'selectReferenceScreenshots', 'manageVisualContext', 'listTabs', 'getHttpRequests', 'getInteractiveCandidates', 'getDomTree', 'getDomNodeText', 'waitForHumanVerification'].includes(name);
+  return !noVisualAfterCaptureToolNames.has(name);
+}
+
+function shouldCollectDomContextAfter(trace: ToolTrace) {
+  return Boolean(trace.contextBefore?.domContext) && !noDomAfterContextToolNames.has(trace.name);
 }
 
 function screenshotOptionsFromVisualAfter(visualAfter: VisualAfterPolicy): { capture: ScreenshotCaptureMode } {
@@ -879,11 +984,12 @@ function summarizeTraceForMemory(trace: ToolTrace) {
     typeof input.targetVisual === 'string' ? input.targetVisual : '',
     typeof input.expected === 'string' ? input.expected : '',
   ].map((item) => item.trim()).find((item): item is string => Boolean(item));
+  const displayResult = userFacingToolResult(trace.name, trace.result, trace.result?.ok ? 160 : 180);
   const result = !trace.result
     ? 'running'
     : trace.result.ok
-    ? sanitizeHistoricalToolText(trace.result.actual, 160)
-    : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
+    ? sanitizeHistoricalToolText(displayResult, 160) || 'ok'
+    : `failed: ${sanitizeHistoricalToolText(displayResult || trace.result.actual, 180)}`;
   return [
     `上一动作：${trace.name}${semanticAction ? ` - ${sanitizeHistoricalToolText(semanticAction, 180)}` : ''}`,
     `结果：${result}`,
@@ -893,9 +999,10 @@ function summarizeTraceForMemory(trace: ToolTrace) {
 function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolTrace, sourceStep?: number) {
   void sourceStep;
   const next: RuntimeWorkingMemory = { ...memory };
-  const resultText = sanitizeHistoricalToolText(trace.result?.actual || '', 400);
+  const displayResult = userFacingToolResult(trace.name, trace.result, 400);
+  const resultText = sanitizeHistoricalToolText(displayResult || '', 400);
   next.lastAction = summarizeTraceForMemory(trace);
-  next.lastResult = concise(trace.result?.actual || '工具调用已开始，正在等待页面反馈。', 240);
+  next.lastResult = concise(displayResult || trace.result?.actual || '工具调用已开始，正在等待页面反馈。', 240);
   if (resultText) {
     next.pageUnderstanding = resultText;
     next.currentState = concise(`${trace.name}: ${resultText}`, 260);
@@ -1055,11 +1162,170 @@ class VisualContextManager {
   }
 }
 
+function pushBeforeFrameScreenshots(screenshots: ToolTrace['screenshots'], name: string, frame?: VisualFrameRecord) {
+  if (!frame?.path) return;
+  screenshots?.push({ title: `${name} before`, path: frame.path, kind: 'history' });
+  if (frame.originalPath) screenshots?.push({ title: `${name} before original`, path: frame.originalPath, kind: 'original' });
+  if (frame.markerPath) screenshots?.push({ title: `${name} before marker map`, path: frame.markerPath, kind: 'marker' });
+}
+
+function pushFailureFrameScreenshots(screenshots: ToolTrace['screenshots'], name: string, frame?: VisualFrameRecord) {
+  if (!frame?.path) return;
+  screenshots?.push({ title: `${name} failure evidence`, path: frame.path, kind: 'other' });
+  if (frame.originalPath) screenshots?.push({ title: `${name} failure original`, path: frame.originalPath, kind: 'original' });
+  if (frame.markerPath) screenshots?.push({ title: `${name} marker map`, path: frame.markerPath, kind: 'marker' });
+}
+
+function createToolTrace(input: {
+  traces: ToolTrace[];
+  name: string;
+  toolInput: unknown;
+  aiRequest?: AiRequestSnapshot;
+  runId?: string;
+  stepIndex?: number;
+  visualContext?: VisualContextManager;
+}) {
+  const { traces, name, toolInput, aiRequest, runId, stepIndex, visualContext } = input;
+  const screenshots: ToolTrace['screenshots'] = [];
+  pushBeforeFrameScreenshots(screenshots, name, visualContext?.current());
+  const visualAfter = visualAfterFromInput(name, toolInput);
+  const traceId = [
+    runId || 'run',
+    stepIndex || 0,
+    traces.length + 1,
+    Date.now().toString(36),
+  ].join(':');
+  const trace: ToolTrace = { id: traceId, name, input: toolInput, contextBefore: toolContextFromAiRequest(aiRequest), visualAfter, screenshots };
+  traces.push(trace);
+  return trace;
+}
+
+async function notifyToolTrace(onToolTrace: ((trace: ToolTrace) => void | Promise<void>) | undefined, trace: ToolTrace) {
+  try {
+    await onToolTrace?.(trace);
+  } catch (error) {
+    console.warn('[browser-agent] Tool progress trace callback failed; browser action will continue.', error);
+    // Progress persistence failures must not make a browser action look unexecuted.
+  }
+}
+
+async function finalizeToolTraceVisuals(input: {
+  session: BrowserSession;
+  traces: ToolTrace[];
+  trace: ToolTrace;
+  result: BrowserActionResult;
+  runId?: string;
+  stepIndex?: number;
+  visualContext?: VisualContextManager;
+  onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
+}) {
+  const { session, traces, trace, runId, stepIndex, visualContext, onVisualContextChange } = input;
+  let result = input.result;
+  const screenshots = trace.screenshots || [];
+  const visualAfter = trace.visualAfter || defaultVisualAfterForTool(trace.name);
+
+  if (result.ok && shouldCaptureVisualAfter(trace.name, visualAfter) && runId && stepIndex !== undefined && visualContext) {
+    try {
+      await session.waitForPage().catch(() => undefined);
+      const visualIndex = traces.filter((item) => item.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
+      const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
+      const screenshotPath = await session.takeScreenshot(runId, stepIndex, `visual-${visualIndex}`, screenshotOptions);
+      const markerPath = session.getLastCandidateMarkerScreenshotPath();
+      const originalPath = session.getLastOriginalScreenshotPath();
+      const frame = visualContext.apply({
+        path: screenshotPath,
+        originalPath,
+        markerPath,
+        stepIndex,
+        toolName: trace.name,
+        capture: screenshotOptions.capture,
+        reason: visualAfter.reason || `${trace.name} after screenshot`,
+      }, visualAfter);
+      screenshots.push({ title: `${trace.name} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
+      if (originalPath) screenshots.push({ title: `${trace.name} ${screenshotOptions.capture} after original`, path: originalPath, kind: 'original' });
+      if (markerPath) screenshots.push({ title: `${trace.name} marker map`, path: markerPath, kind: 'marker' });
+      await onVisualContextChange?.(visualContext.snapshot());
+    } catch (error) {
+      result = {
+        ...result,
+        actual: `${result.actual} Visual-after screenshot failed, so the action is kept and will not be retried: ${infrastructureError(error)}`,
+      };
+    }
+  } else if (!result.ok && visualContext) {
+    pushFailureFrameScreenshots(screenshots, trace.name, visualContext.current());
+  }
+
+  if (shouldCollectDomContextAfter(trace)) {
+    const afterPageContext = await session.getPageContext({
+      includeDomTree: true,
+      includeText: false,
+      includeManualVerification: false,
+      includeInteractiveCandidates: false,
+    }).catch(() => undefined);
+    const domContext = afterPageContext ? createDomContextSnapshot('dom', afterPageContext) : undefined;
+    if (domContext) {
+      trace.contextAfter = {
+        requestId: trace.contextBefore?.requestId,
+        requestCreatedAt: trace.contextBefore?.requestCreatedAt,
+        domContext,
+      };
+    }
+  }
+
+  trace.result = result;
+  trace.screenshots = screenshots;
+  return result;
+}
+
+async function executeTracedBrowserAction(input: {
+  session: BrowserSession;
+  traces: ToolTrace[];
+  name: string;
+  toolInput: unknown;
+  action: () => Promise<BrowserActionResult>;
+  aiRequest?: AiRequestSnapshot;
+  runId?: string;
+  stepIndex?: number;
+  visualContext?: VisualContextManager;
+  onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
+  onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
+}) {
+  const { session, traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, onToolTrace, onVisualContextChange } = input;
+  const trace = createToolTrace({ traces, name, toolInput, aiRequest, runId, stepIndex, visualContext });
+  await notifyToolTrace(onToolTrace, trace);
+
+  let result: BrowserActionResult;
+  try {
+    result = await action();
+  } catch (error) {
+    result = {
+      ok: false,
+      actual: `Tool ${name} threw after execution started: ${infrastructureError(error)}`,
+    };
+  }
+
+  trace.result = result;
+  await notifyToolTrace(onToolTrace, trace);
+  result = await finalizeToolTraceVisuals({
+    session,
+    traces,
+    trace,
+    result,
+    runId,
+    stepIndex,
+    visualContext,
+    onVisualContextChange,
+  });
+  await notifyToolTrace(onToolTrace, trace);
+  return result;
+}
+
 function makeBrowserTools(
   session: BrowserSession,
   targetUrl: string,
   mode: BrowserSessionMode,
   traces: ToolTrace[],
+  aiRequest?: AiRequestSnapshot,
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>,
   referenceOptions?: {
     availableReferenceIds?: Set<string>;
@@ -1103,81 +1369,19 @@ function makeBrowserTools(
       } satisfies BrowserActionResult;
     }
     toolExecutedThisRequest = true;
-    const beforeFrame = referenceOptions?.visualContext?.current();
-    const screenshots: ToolTrace['screenshots'] = [];
-    const visualAfter = visualAfterFromInput(name, input);
-    if (beforeFrame?.path) {
-      screenshots.push({ title: `${name} before`, path: beforeFrame.path, kind: 'history' });
-      if (beforeFrame.originalPath) screenshots.push({ title: `${name} before original`, path: beforeFrame.originalPath, kind: 'original' });
-      if (beforeFrame.markerPath) screenshots.push({ title: `${name} before marker map`, path: beforeFrame.markerPath, kind: 'marker' });
-    }
-    const traceId = [
-      referenceOptions?.runId || 'run',
-      referenceOptions?.stepIndex || 0,
-      traces.length + 1,
-      Date.now().toString(36),
-    ].join(':');
-    const trace: ToolTrace = { id: traceId, name, input, visualAfter, screenshots };
-    traces.push(trace);
-    const notifyTrace = async () => {
-      try {
-        await onToolTrace?.(trace);
-      } catch (error) {
-        console.warn('[browser-agent] Tool progress trace callback failed; browser action will continue.', error);
-        // Progress persistence failures must not make a browser action look unexecuted.
-      }
-    };
-    await notifyTrace();
-    let result: BrowserActionResult;
-    try {
-      result = await action();
-    } catch (error) {
-      result = {
-        ok: false,
-        actual: `Tool ${name} threw after execution started: ${infrastructureError(error)}`,
-      };
-    }
-    trace.result = result;
-    trace.screenshots = screenshots;
-    await notifyTrace();
-    if (result.ok && shouldCaptureVisualAfter(name, visualAfter) && referenceOptions?.runId && referenceOptions.stepIndex && referenceOptions.visualContext) {
-      try {
-        await session.waitForPage().catch(() => undefined);
-        const visualIndex = traces.filter((trace) => trace.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
-        const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
-        const screenshotPath = await session.takeScreenshot(referenceOptions.runId, referenceOptions.stepIndex, `visual-${visualIndex}`, screenshotOptions);
-        const markerPath = session.getLastCandidateMarkerScreenshotPath();
-        const originalPath = session.getLastOriginalScreenshotPath();
-        const frame = referenceOptions.visualContext.apply({
-          path: screenshotPath,
-          originalPath,
-          markerPath,
-          stepIndex: referenceOptions.stepIndex,
-          toolName: name,
-          capture: screenshotOptions.capture,
-          reason: visualAfter.reason || `${name} after screenshot`,
-        }, visualAfter);
-        screenshots.push({ title: `${name} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
-        if (originalPath) screenshots.push({ title: `${name} ${screenshotOptions.capture} after original`, path: originalPath, kind: 'original' });
-        if (markerPath) screenshots.push({ title: `${name} marker map`, path: markerPath, kind: 'marker' });
-        await referenceOptions.onVisualContextChange?.(referenceOptions.visualContext.snapshot());
-      } catch (error) {
-        result = {
-          ...result,
-          actual: `${result.actual} Visual-after screenshot failed, so the action is kept and will not be retried: ${infrastructureError(error)}`,
-        };
-      }
-    } else if (!result.ok && referenceOptions?.visualContext) {
-      const current = referenceOptions.visualContext.current();
-      if (current?.path) {
-        screenshots.push({ title: `${name} failure evidence`, path: current.path, kind: 'other' });
-        if (current.originalPath) screenshots.push({ title: `${name} failure original`, path: current.originalPath, kind: 'original' });
-        if (current.markerPath) screenshots.push({ title: `${name} marker map`, path: current.markerPath, kind: 'marker' });
-      }
-    }
-    trace.screenshots = screenshots;
-    await notifyTrace();
-    return result;
+    return executeTracedBrowserAction({
+      session,
+      traces,
+      name,
+      toolInput: input,
+      runId: referenceOptions?.runId,
+      stepIndex: referenceOptions?.stepIndex,
+      visualContext: referenceOptions?.visualContext,
+      aiRequest,
+      onToolTrace,
+      onVisualContextChange: referenceOptions?.onVisualContextChange,
+      action,
+    });
   }
 
   const sharedTools = {
@@ -1198,7 +1402,7 @@ function makeBrowserTools(
       execute: (input) => record('scrollArea', input, () => session.scrollArea(input.areaId, input.deltaY, input.deltaX || 0)),
     }),
     typeText: tool({
-      description: 'Type text into the currently focused element. In DOM mode prefer clickDomNode(path,text) when the target input path is known; use this only after a prior click/focus already focused the field.',
+      description: 'Type text into the currently focused element. In DOM mode prefer clickDomNode(id,text) when the target input id is known; use this only after a prior click/focus already focused the field.',
       inputSchema: browserToolInput({
         text: z.string().describe('Text to enter.'),
       }),
@@ -1304,38 +1508,41 @@ function makeBrowserTools(
   };
 
   const domTools = {
-    getInteractiveCandidates: tool({
-      description: 'Fallback only (DOM mode): return visible interactable candidates as JSON when the candidate context needs refresh. Each candidate has id (1...), tag/role/name/text, href/host, visible box/center, and nearbyText.',
-      inputSchema: browserToolInput({}),
-      execute: (input) => record('getInteractiveCandidates', input, () => session.getInteractiveCandidates()),
-    }),
     getDomTree: tool({
-      description: 'Return the current tab simplified rendered DOM tree, including nodes outside the viewport. Each line is "[path] tag#id.class * @visible:x,y,w,h or @offscreen:... {attrs} \\"text\\"": "*" marks clickable elements, @visible means currently in viewport, @offscreen means rendered elsewhere in the document, and "text" is short node text. Use getDomNodeText(path) for complete text.',
+      description: 'Return a Codex-style visible DOM snapshot for the current tab. It is filtered to visible interactable nodes and uses HTML-like lines such as <button node_id=12 aria-label="Save">Save</button>. Numeric node_id values are valid only for this current snapshot. Use getDomNodeText(id) for full text on a returned node.',
       inputSchema: browserToolInput({}),
       execute: (input) => record('getDomTree', input, () => session.getSimplifiedDomTree()),
     }),
     getDomNodeText: tool({
-      description: 'DOM mode: return the full rendered text under a node from the CURRENT simplified DOM tree by bracket path, for example "0.1.2". Use this when a DOM tree line is truncated or a section/article/container needs complete text. This is read-only and does not click, navigate, or scroll.',
+      description: 'DOM mode: return the full rendered text under a node from the CURRENT visible DOM snapshot by numeric node_id, for example "12" or "[12]". This is read-only and does not click, navigate, or scroll.',
       inputSchema: browserToolInput({
-        path: z.string().describe('The bracket path shown in the current simplified DOM tree, such as 0.1.2. Paths are volatile; use only a fresh path.'),
+        id: z.string().describe('The numeric node_id shown in the current visible DOM snapshot, such as 12 or [12]. IDs are volatile; use only a fresh id.'),
       }),
-      execute: (input) => record('getDomNodeText', input, () => session.getDomNodeText(input.path)),
+      execute: (input) => record('getDomNodeText', input, () => session.getDomNodeText(normalizeDomNodeIdParam(input))),
     }),
     clickDomNode: tool({
-      description: 'DOM mode: click a node from the CURRENT simplified DOM tree by its bracket path, for example "0.1.2". If text is provided, type it immediately after clicking. Paths are volatile; use only a path from the current DOM tree.',
+      description: 'DOM mode: click a node from the CURRENT visible DOM snapshot by numeric node_id, for example "12" or "[12]". If text is provided, type it immediately after clicking. IDs are volatile; use only an id from the current DOM snapshot.',
       inputSchema: browserToolInput({
-        path: z.string().describe('The bracket path shown in the simplified DOM tree, such as 0.1.2.'),
+        id: z.string().describe('The numeric node_id shown in the visible DOM snapshot, such as 12 or [12].'),
         text: z.string().optional().describe('Optional text to type immediately after clicking/focusing this DOM node.'),
       }),
-      execute: (input) => record('clickDomNode', input, () => session.clickDomNode(input.path, input.text)),
+      execute: (input) => record('clickDomNode', input, () => session.clickDomNode(normalizeDomNodeIdParam(input), input.text)),
     }),
-    clickByText: tool({
-      description: 'DOM mode resilient click: click the currently visible link/button/control whose accessible text, title, aria-label, placeholder, or href best matches targetText. Use this for dynamic search-result pages where DOM paths can shift between context collection and execution.',
+    findByText: tool({
+      description: 'DOM mode recovery, read-only: find visible interactive locators whose text/accessibility label/title/placeholder/href matches targetText. This does not click. Use only when a fresh DOM id is unavailable or unreliable, then choose one returned locatorId in a later clickLocator call.',
       inputSchema: browserToolInput({
-        targetText: z.string().min(1).max(300).describe('Visible or accessible target text from the CURRENT DOM/page context, for example a search result title or button label.'),
-        text: z.string().optional().describe('Optional text to type immediately after clicking/focusing the matched target.'),
+        targetText: z.string().min(1).max(300).describe('Exact visible or accessible text to search for from the CURRENT DOM/page context. Prefer short unique labels over long surrounding snippets.'),
+        scopeId: z.string().optional().describe('Optional numeric DOM id that scopes the search to a subtree, such as 12 or [12].'),
       }),
-      execute: (input) => record('clickByText', input, () => session.clickByText(input.targetText, input.text)),
+      execute: (input) => record('findByText', input, () => session.findByText(input.targetText, normalizeDomNodeIdParam({ id: input.scopeId }))),
+    }),
+    clickLocator: tool({
+      description: 'DOM mode recovery click: click one locatorId returned by the immediately preceding findByText result. Do not invent locatorIds and do not use visual candidate ids.',
+      inputSchema: browserToolInput({
+        locatorId: z.string().min(1).max(20).describe('A locatorId such as T1 from the latest findByText result.'),
+        text: z.string().optional().describe('Optional text to type immediately after clicking/focusing this locator.'),
+      }),
+      execute: (input) => record('clickLocator', input, () => session.clickLocator(input.locatorId, input.text)),
     }),
   };
 
@@ -1508,13 +1715,13 @@ function runtimePrompt(input: {
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const domTree = visualMode ? '[disabled because visual mode is enabled]' : trimDebugText(pageContext.domTree || '[empty DOM tree]', Number(process.env.DOM_TREE_PROMPT_MAX_CHARS || 24000));
+  const domTree = visualMode ? '[disabled because visual mode is enabled]' : domTreeForPrompt(pageContext.domTree || '[empty DOM tree]');
   const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
   const candidateContext = visualMode
     ? visualMarkersWithoutOverlay || visualTextCandidateFallback
       ? formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)
       : '[disabled because visual mode uses screenshot labels]'
-    : '[disabled because DOM mode uses fresh DOM tree paths and text matching, not candidate IDs]';
+    : '[disabled because DOM mode uses fresh DOM tree ids; findByText returns separate T locators only when explicitly called]';
   const evidence = attachScreenshot
     ? mode === 'visual-markers' && separateMarkerScreenshot
       ? 'the two attached screenshots'
@@ -1525,7 +1732,7 @@ function runtimePrompt(input: {
         : 'the attached clean viewport screenshot'
     : visualMode
       ? 'current URL, tabs, scrollable areas, focused element, and the visible interactive elements list generated from the current screenshot'
-      : 'full rendered DOM tree, URL, tabs, scroll state, focused element, and read-only DOM text tools';
+      : 'Codex-style visible DOM snapshot, URL, tabs, scroll state, focused element, and read-only DOM text tools';
   const markerSourceRule = separateMarkerScreenshot
     ? '- Image 1 is the source of truth for what the page means. Image 2 only maps visible click/scroll positions to candidate IDs.'
     : markerOverlayInScreenshot
@@ -1555,13 +1762,15 @@ function runtimePrompt(input: {
         '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous screenshot.',
       ]
     : [
-        '- DOM mode has no clickCandidate/hoverCandidate/dragCandidate tools. Never choose candidate IDs.',
-        '- Use clickDomNode(path,text?) with a bracket path copied from the CURRENT DOM tree. Paths are volatile; never reuse a path from a previous turn.',
-        '- The DOM tree is the rendered document, not just the viewport. Nodes marked @offscreen can still be read with getDomNodeText(path) and can usually be clicked with clickDomNode(path) because the tool scrolls the node into view.',
-        '- Use getDomNodeText(path) when a DOM tree line is truncated or you need the complete rendered text under a section/article/container.',
-        '- On dynamic pages where paths may shift, especially search results, use clickByText(targetText) with the exact visible link/button/control text from the CURRENT DOM/page context.',
-        '- For text entry, use clickDomNode(path,text) in one tool call when the input path is present. Use typeText only after a prior action already focused the field.',
-        '- Do not scroll just to read ordinary DOM content. Use scrollArea only for lazy-loaded/virtualized content or viewport-only UI that is absent from the DOM tree.',
+        '- DOM mode has no clickCandidate/hoverCandidate/dragCandidate tools. Never choose visual candidate IDs.',
+        '- Use clickDomNode(id,text?) with a numeric node_id copied from the CURRENT visible DOM snapshot. The tool accepts the numeric id with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
+        '- The DOM tree follows the Codex Chrome plugin model: it is a visible, interactable DOM snapshot, not a full offscreen document dump. If the desired target is absent, scroll the relevant area and then call getDomTree again.',
+        '- Use getDomNodeText(id) when a visible DOM snapshot line is truncated or you need the complete rendered text under a returned node.',
+        '- Text matching is a recovery path, not the normal click path: call findByText(targetText,scopeId?) first, inspect the returned locatorIds, then call clickLocator(locatorId,text?) in a later turn.',
+        '- Use findByText only when a fresh DOM id is unavailable or unreliable, such as dynamic search results, iframe/shadow/dialog/popover content, or an id that disappeared after refresh.',
+        '- For findByText targetText, use a short unique visible/accessibility label from the CURRENT DOM/page context. Do not pass a long surrounding snippet.',
+        '- For text entry, use clickDomNode(id,text) in one tool call when the input id is present. Use typeText only after a prior action already focused the field.',
+        '- Use scrollArea when needed content or controls are not present in the current visible DOM snapshot, then refresh the DOM snapshot before acting.',
         '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
         '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
       ];
@@ -1591,7 +1800,7 @@ function runtimePrompt(input: {
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
-      : '- DOM action reason must cite the current DOM text/path or exact targetText used for the action.',
+      : '- DOM action reason must cite the current DOM id/text, or the findByText locatorId plus matched text when using recovery locators.',
     `- Use ${evidence} as the current page state.`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
@@ -1612,7 +1821,7 @@ function runtimePrompt(input: {
           : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
       : visualMode
         ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
-        : '- DOM mode: no screenshot image/path is attached. Use the current DOM tree and exact text matching. clickCandidate and visual candidate IDs are unavailable.',
+        : '- DOM mode: no screenshot image/path is attached. Use the current visible DOM snapshot and DOM node_id tools first; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
     ...markerTargetRules,
     caseSystemPrompt ? `Test-case-specific instructions:
 ${caseSystemPrompt}` : '',
@@ -1629,7 +1838,7 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     browserChatMode ? '- Browser chat: when the user can be answered from current evidence, output normal Chinese Markdown text and call no tool.' : '',
     visualMode
       ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
-      : '- DOM action reason must mention the current DOM path/text or exact targetText, not a candidate id.',
+      : '- DOM action reason must mention the current DOM id/text, or the chosen findByText locatorId plus matched text when using clickLocator.',
     browserChatMode
       ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
       : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
@@ -1645,7 +1854,7 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
 ${candidateContext}` : '',
     visualMode ? '' : `Interactive candidates JSON:
 ${candidateContext}`,
-    visualMode ? '' : `Simplified DOM tree:
+    visualMode ? '' : `Visible DOM snapshot:
 ${domTree}`,
     compactRunContext,
     availableScreenshotReferences.length ? `Available previous screenshot references:
@@ -1699,7 +1908,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'dragCandidate',
   ];
   if (mode === 'visual-markers') return candidateTools;
-  return [...sharedTools, 'getInteractiveCandidates', 'getDomTree', 'getDomNodeText', 'clickDomNode', 'clickByText'];
+  return [...sharedTools, 'getDomTree', 'getDomNodeText', 'clickDomNode', 'findByText', 'clickLocator'];
 }
 
 function isCodexProvider() {
@@ -1716,6 +1925,7 @@ function createAiRequestSnapshot(input: {
   imageAttached: boolean;
   tools?: string[];
   options?: Record<string, unknown>;
+  domContext?: AiDomContextSnapshot;
 }): AiRequestSnapshot {
   const { provider, model } = getModelSettings();
   const attachedImagePaths = input.imageAttached
@@ -1731,6 +1941,7 @@ function createAiRequestSnapshot(input: {
     attached: true,
   }));
   return {
+    id: randomUUID(),
     kind: input.kind,
     stepIndex: input.stepIndex,
     createdAt: new Date().toISOString(),
@@ -1740,6 +1951,7 @@ function createAiRequestSnapshot(input: {
     imageAttached: input.imageAttached,
     tools: input.tools,
     options: input.options,
+    domContext: input.domContext,
     messages: [
       {
         role: 'user',
@@ -1976,7 +2188,7 @@ function deriveDecision(text: string, traces: ToolTrace[], goal = ''): RuntimeDe
     return {
       action: note || readableActionFromTrace(last) || toolReason || `AI executed browser action: ${names || last?.name || 'browser action'}`,
       expected: 'This action should advance the user requirement; the next screenshot will verify the result.',
-      actual: last?.result?.actual || 'Tool call finished; waiting for next screenshot to confirm effect.',
+      actual: last ? userFacingToolResult(last.name, last.result, 500) || 'Tool call finished; waiting for next screenshot to confirm effect.' : 'Tool call finished; waiting for next screenshot to confirm effect.',
       status: failed ? 'failed' : 'passed',
       done: false,
       note,
@@ -2066,13 +2278,8 @@ async function executeRuntimeStep(input: {
     details: { browserMode: mode, screenshotInputEnabled, markerEnabled },
   });
   const contextStartedAt = Date.now();
-  const pageContext = await session.getPageContext({
-    includeDomTree: mode === 'dom',
-    includeText: false,
-    includeManualVerification: false,
-    includeInteractiveCandidates: true,
-    useCachedInteractiveCandidates: mode !== 'dom',
-  });
+  const pageContext = await session.getPageContext(runtimePageContextOptions(mode));
+  let currentDomContext = createDomContextSnapshot(mode, pageContext);
   const contextMs = elapsedSince(contextStartedAt);
   const screenshotReadStartedAt = Date.now();
   const screenshot = screenshotInputEnabled ? await readScreenshotForAi(beforeScreenshotPath) : undefined;
@@ -2146,13 +2353,8 @@ async function executeRuntimeStep(input: {
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
     let requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
     async function refreshRequestPromptForTurn() {
-      const currentPageContext = await session.getPageContext({
-        includeDomTree: mode === 'dom',
-        includeText: false,
-        includeManualVerification: false,
-        includeInteractiveCandidates: true,
-        useCachedInteractiveCandidates: mode !== 'dom',
-      });
+      const currentPageContext = await session.getPageContext(runtimePageContextOptions(mode));
+      currentDomContext = createDomContextSnapshot(mode, currentPageContext);
       const currentMarkerPath = visualContext.current()?.markerPath;
       const basePrompt = `${runtimePrompt({
         testCase,
@@ -2182,20 +2384,20 @@ async function executeRuntimeStep(input: {
       blockers: [],
       pageUnderstanding: '',
       currentState: mode === 'dom'
-        ? 'No DOM state summary yet; use the current DOM tree, URL, focus, tabs, and scroll state.'
+        ? 'No DOM state summary yet; use the current visible DOM snapshot, URL, focus, tabs, and scroll state.'
         : 'No visual state summary yet; inspect the current screenshot.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
         : mode === 'dom'
-          ? 'Use current DOM paths and getDomNodeText for the next missing goal; scroll only for lazy-loaded or viewport-only content.'
+          ? 'Use current visible DOM node_ids and getDomNodeText for the next missing goal; scroll and refresh getDomTree when needed content is absent from the snapshot.'
           : 'Use the current screenshot to complete the next missing goal.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
     let contextCompressionTurns = 0;
-    let aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: requestPrompt, screenshotPath: beforeScreenshotPath, imagePaths: [...(includeImage ? visualContext.imagePaths() : []), ...userReferenceImagePaths], imageAttached: Boolean((includeImage && screenshot) || userReferenceImages.some((item) => item.image)), tools: allowedToolTypes, options: { agentLoop: true, prepareStep: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: (includeImage ? visualContext.imagePaths().length : 0) + userReferenceImages.filter((item) => item.image).length, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length } });
+    let aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: requestPrompt, screenshotPath: beforeScreenshotPath, imagePaths: [...(includeImage ? visualContext.imagePaths() : []), ...userReferenceImagePaths], imageAttached: Boolean((includeImage && screenshot) || userReferenceImages.some((item) => item.image)), tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, prepareStep: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: (includeImage ? visualContext.imagePaths().length : 0) + userReferenceImages.filter((item) => item.image).length, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length } });
     lastAiRequest = aiRequest;
 
     async function prepareStep(turnIndex: number) {
@@ -2219,9 +2421,9 @@ async function executeRuntimeStep(input: {
           visualContextText: mode === 'dom'
             ? [
                 'DOM Context Manager:',
-                '- Current DOM tree, URL, focus, tabs, and scroll state in Runtime Context are authoritative.',
+                '- Current visible DOM snapshot, URL, focus, tabs, and scroll state in Runtime Context are authoritative.',
                 '- No screenshot image is attached for DOM decisions.',
-                '- Use getDomNodeText(path) for complete rendered text instead of scrolling ordinary DOM content.',
+                '- If needed content/control is absent from the visible DOM snapshot, scroll the relevant area and call getDomTree again.',
               ].join('\n')
             : visualContext.renderText(),
           currentToolAttemptsText: formatCurrentToolAttemptSummary(traces, traceLimit),
@@ -2279,7 +2481,7 @@ async function executeRuntimeStep(input: {
       for (const imagePath of visualPaths) { const image = await readScreenshotForAi(imagePath).catch(() => undefined); if (image) content.push({ type: 'image', image }); }
       for (const referenceImage of userReferenceImages) { if (referenceImage.image) content.push({ type: 'image', image: referenceImage.image }); }
       const attachedImagePaths = [...visualPaths, ...userReferenceImages.filter((item) => item.image).map((item) => item.imagePath)];
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
       lastAiRequest = aiRequest;
       return [{ role: 'user' as const, content }];
     }
@@ -2300,6 +2502,7 @@ async function executeRuntimeStep(input: {
         params: object.params,
         allowedTypes: allowedToolTypes,
         traces,
+        aiRequest,
         visualContext,
         onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
         onToolTrace: async (trace) => {
@@ -2329,7 +2532,7 @@ async function executeRuntimeStep(input: {
         await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision. turn ' + (turnIndex + 1) + '/' + maxTurns + '.', details: { provider: getModelSettings().provider, model: getModelSettings().model, turnIndex: turnIndex + 1, maxTurns } });
         const result = await generateTextWithTimeout({
           model: getModel(), messages,
-          tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, async (trace) => {
+          tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
             workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
             await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
             await onDebug?.({
@@ -2915,7 +3118,8 @@ function replayAiRepairMaxSteps() {
 async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep): Promise<BrowserActionResult> {
   const input = flowInput(flow.input);
   const text = typeof input.text === 'string' ? input.text : undefined;
-  const domPath = typeof input.domPath === 'string' ? input.domPath : undefined;
+  const domPath = normalizeDomPathParam(input);
+  const domNodeId = normalizeDomNodeIdParam(input);
   const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
 
   switch (flow.name) {
@@ -2959,11 +3163,13 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
     case 'dragCandidate':
       return session.dragCandidate(String(input.fromId || ''), String(input.toId || ''));
     case 'clickDomNode':
-      return session.clickDomNode(String(input.path || ''), text);
+      return session.clickDomNode(domNodeId, text);
     case 'focusDomNode':
-      return session.clickDomNode(String(input.path || ''), text);
-    case 'clickByText':
-      return session.clickByText(String(input.targetText || input.targetVisual || ''), text);
+      return session.clickDomNode(domNodeId, text);
+    case 'findByText':
+      return session.findByText(String(input.targetText || input.targetVisual || ''), normalizeDomNodeIdParam({ id: input.scopeId }));
+    case 'clickLocator':
+      return session.clickLocator(String(input.locatorId || input.id || ''), text);
     case 'typeText':
       return session.typeText(String(input.text || ''));
     case 'pressKey':
@@ -2987,7 +3193,7 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
     case 'getDomTree':
       return session.getSimplifiedDomTree();
     case 'getDomNodeText':
-      return session.getDomNodeText(String(input.path || ''));
+      return session.getDomNodeText(domNodeId);
     default:
       return { ok: false, actual: `Unsupported recorded tool: ${flow.name}.${reason}` };
   }
@@ -3003,6 +3209,7 @@ async function executeCodexRuntimeObject(input: {
   params: Record<string, unknown>;
   allowedTypes: string[];
   traces: ToolTrace[];
+  aiRequest?: AiRequestSnapshot;
   visualContext?: VisualContextManager;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
@@ -3012,7 +3219,7 @@ async function executeCodexRuntimeObject(input: {
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
   if (!allowedTypes.includes(type)) {
     return {
       text: `Codex returned unsupported action type: ${type}. Allowed types: ${allowedTypes.join(', ')}.`,
@@ -3042,6 +3249,10 @@ async function executeCodexRuntimeObject(input: {
   }
 
   const normalizedParams = { ...params };
+  if (domNodeIdToolNames.has(type)) {
+    const nodeId = normalizeDomNodeIdParam(normalizedParams);
+    if (nodeId) normalizedParams.id = nodeId;
+  }
   if (type === 'scrollArea') {
     const areaId = typeof normalizedParams.areaId === 'string' && normalizedParams.areaId.trim()
       ? normalizedParams.areaId.trim()
@@ -3050,97 +3261,30 @@ async function executeCodexRuntimeObject(input: {
         : '';
     normalizedParams.areaId = areaId || normalizedParams.areaId;
   }
-
-  const beforeFrame = visualContext?.current();
-  const screenshots: ToolTrace['screenshots'] = [];
-  if (beforeFrame?.path) {
-    screenshots.push({ title: `${type} before`, path: beforeFrame.path, kind: 'history' });
-    if (beforeFrame.originalPath) screenshots.push({ title: `${type} before original`, path: beforeFrame.originalPath, kind: 'original' });
-    if (beforeFrame.markerPath) screenshots.push({ title: `${type} before marker map`, path: beforeFrame.markerPath, kind: 'marker' });
-  }
-
-  const visualAfter = visualAfterFromInput(type, normalizedParams);
-  const traceId = [
-    runId || 'run',
-    stepIndex || 0,
-    traces.length + 1,
-    Date.now().toString(36),
-  ].join(':');
-  const trace: ToolTrace = { id: traceId, name: type, input: normalizedParams, visualAfter, screenshots };
-  traces.push(trace);
-  const notifyTrace = async () => {
-    try {
-      await onToolTrace?.(trace);
-    } catch (error) {
-      console.warn('[browser-agent] Tool progress trace callback failed; browser action will continue.', error);
-      // Progress persistence failures must not make a browser action look unexecuted.
-    }
+  const flow: RecordedFlowStep = {
+    index: stepIndex,
+    name: type,
+    input: normalizedParams,
+    reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
   };
-  await notifyTrace();
-  const candidateActionNames = new Set(['clickCandidate', 'hoverCandidate', 'doubleClickCandidate', 'rightClickCandidate', 'dragCandidate']);
-  let result: BrowserActionResult;
-  try {
-    result = candidateActionNames.has(type)
-      ? validateCandidateActionBeforeExecution(type, normalizedParams, traces) || await runRecordedTool(session, targetUrl, {
-        index: stepIndex,
-        name: type,
-        input: normalizedParams,
-        reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
-      })
-      : await runRecordedTool(session, targetUrl, {
-        index: stepIndex,
-        name: type,
-        input: normalizedParams,
-        reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
-      });
-  } catch (error) {
-    result = {
-      ok: false,
-      actual: `Tool ${type} threw after execution started: ${infrastructureError(error)}`,
-    };
-  }
-  trace.result = result;
-  trace.screenshots = screenshots;
-  await notifyTrace();
-  if (result.ok && shouldCaptureVisualAfter(type, visualAfter) && visualContext) {
-    try {
-      await session.waitForPage().catch(() => undefined);
-      const visualIndex = traces.filter((trace) => trace.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
-      const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
-      const screenshotPath = await session.takeScreenshot(runId, stepIndex, `visual-${visualIndex}`, screenshotOptions);
-      const markerPath = session.getLastCandidateMarkerScreenshotPath();
-      const originalPath = session.getLastOriginalScreenshotPath();
-      const frame = visualContext.apply({
-        path: screenshotPath,
-        originalPath,
-        markerPath,
-        stepIndex,
-        toolName: type,
-        capture: screenshotOptions.capture,
-        reason: visualAfter.reason || `${type} after screenshot`,
-      }, visualAfter);
-      screenshots.push({ title: `${type} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
-      if (originalPath) screenshots.push({ title: `${type} ${screenshotOptions.capture} after original`, path: originalPath, kind: 'original' });
-      if (markerPath) screenshots.push({ title: `${type} marker map`, path: markerPath, kind: 'marker' });
-      await onVisualContextChange?.(visualContext.snapshot());
-    } catch (error) {
-      result = {
-        ...result,
-        actual: `${result.actual} Visual-after screenshot failed, so the action is kept and will not be retried: ${infrastructureError(error)}`,
-      };
-    }
-  } else if (!result.ok && visualContext) {
-    const current = visualContext.current();
-    if (current?.path) {
-      screenshots.push({ title: `${type} failure evidence`, path: current.path, kind: 'other' });
-      if (current.originalPath) screenshots.push({ title: `${type} failure original`, path: current.originalPath, kind: 'original' });
-      if (current.markerPath) screenshots.push({ title: `${type} marker map`, path: current.markerPath, kind: 'marker' });
-    }
-  }
 
-  trace.result = result;
-  trace.screenshots = screenshots;
-  await notifyTrace();
+  await executeTracedBrowserAction({
+    session,
+    traces,
+    name: type,
+    toolInput: normalizedParams,
+    aiRequest,
+    runId,
+    stepIndex,
+    visualContext,
+    onToolTrace,
+    onVisualContextChange,
+    action: async () => (
+      candidateActionToolNames.has(type)
+        ? validateCandidateActionBeforeExecution(type, normalizedParams, traces) || await runRecordedTool(session, targetUrl, flow)
+        : await runRecordedTool(session, targetUrl, flow)
+    ),
+  });
   return { text: readableActionFromRawText(message) || '', executed: true };
 }
 
@@ -3261,7 +3405,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
       const repairContext = [
         '- A recorded replay operation just failed. This AI step must automatically repair the current browser state so the remaining recorded replay can continue.',
         '- Perform one concrete corrective browser action from the CURRENT screenshot/context. Do not ask the user unless CAPTCHA/login/security verification is actually required.',
-        '- Do not reuse old recorded candidate ids, DOM paths, coordinates, or scroll area ids. Treat them only as historical clues.',
+        '- Do not reuse old recorded candidate ids, DOM ids, coordinates, or scroll area ids. Treat them only as historical clues.',
         '- Do not mark the full test complete unless every user requirement is already proven. Prefer restoring the page to a state where the next recorded operation can work.',
         '- When the page is repaired and ready for the remaining replay, call reportState with done=false and status="passed" to say replay can continue. If it is not repaired yet, keep taking corrective tool actions within this agent loop.',
         `- Failed recorded tool: ${flow.name}.`,

@@ -4997,6 +4997,65 @@ select {
   padding: 0 6px;
 }
 
+.browser-chat-recent-header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.browser-chat-recent-header > div {
+  align-items: center;
+  display: inline-flex;
+  gap: 4px;
+}
+
+.browser-chat-recent-select-all {
+  align-items: center;
+  color: var(--muted-strong);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 11px;
+  font-weight: 850;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.browser-chat-recent-select-all input,
+.browser-chat-recent-check {
+  accent-color: var(--accent);
+  cursor: pointer;
+  height: 14px;
+  margin: 0;
+  width: 14px;
+}
+
+.browser-chat-recent-select-all:has(input:disabled),
+.browser-chat-recent-check:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.browser-chat-recent-bulk-delete {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  height: 26px;
+  justify-content: center;
+  padding: 0;
+  width: 26px;
+}
+
+.browser-chat-recent-bulk-delete:hover {
+  background: rgba(180, 35, 24, 0.08);
+  color: var(--danger);
+}
+
 .browser-chat-recent-list,
 .browser-chat-step-mini ol {
   display: grid;
@@ -5035,8 +5094,9 @@ select {
   border-radius: 8px;
   display: grid;
   gap: 4px;
-  grid-template-columns: minmax(0, 1fr) 30px;
+  grid-template-columns: 18px minmax(0, 1fr) 30px;
   min-width: 0;
+  padding-left: 6px;
 }
 
 .browser-chat-recent-item:hover,
@@ -5081,7 +5141,8 @@ select {
 }
 
 .browser-chat-recent-open:disabled,
-.browser-chat-recent-delete:disabled {
+.browser-chat-recent-delete:disabled,
+.browser-chat-recent-bulk-delete:disabled {
   cursor: not-allowed;
   opacity: 0.54;
 }
@@ -5570,13 +5631,12 @@ select {
   gap: 14px;
   left: 50%;
   max-height: min(760px, calc(100vh - 56px));
-  max-width: min(820px, calc(100vw - 32px));
   overflow: auto;
   padding: 18px;
   position: fixed;
   top: 50%;
   transform: translate(-50%, -50%);
-  width: 760px;
+  width: 1080px;
 }
 
 .browser-chat-tool-modal header {
@@ -5636,7 +5696,7 @@ select {
   font-size: 12px;
   line-height: 1.55;
   margin: 0;
-  max-height: 260px;
+  max-height: 640px;
   overflow: auto;
   padding: 10px;
   white-space: pre-wrap;

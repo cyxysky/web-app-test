@@ -8,6 +8,7 @@ import { store } from '@/server/db/mock-store';
 import { createSnapshotChannel, type SnapshotEvent, type SnapshotListener } from '@/server/realtime/snapshot-channel';
 import { writeTextFileAtomic } from '@/server/storage/atomic-json';
 import { appDataRoot, artifactPath as resolveArtifactPath } from '@/server/storage/paths';
+import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 
 export type BrowserChatAttachment = {
   id: string;
@@ -139,10 +140,6 @@ function normalizeAttachmentPath(value: unknown) {
   return raw.split('/').filter(Boolean).join('/');
 }
 
-function artifactUrl(relativePath: string) {
-  return `/api/artifacts/${relativePath.split('/').map(encodeURIComponent).join('/')}`;
-}
-
 function normalizeAttachments(value: unknown): BrowserChatAttachment[] {
   if (!Array.isArray(value)) return [];
   const attachments: BrowserChatAttachment[] = [];
@@ -161,7 +158,7 @@ function normalizeAttachments(value: unknown): BrowserChatAttachment[] {
       type,
       size: sizeValue,
       path: pathValue,
-      url: typeof record.url === 'string' && record.url.startsWith('/api/artifacts/') ? record.url : artifactUrl(pathValue),
+      url: typeof record.url === 'string' && record.url.startsWith('/api/artifacts/') ? record.url : artifactApiUrlFromRelative(pathValue),
     });
   }
   return attachments;
@@ -475,9 +472,14 @@ export async function closeBrowserChatSession(sessionId: string) {
   hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) return undefined;
+  if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
+    session.activeAbortController.abort(new Error('Browser chat session closed by user.'));
+  }
   await session.browser?.close().catch(() => undefined);
   session.browser = undefined;
   session.started = false;
+  session.activeAbortController = undefined;
+  session.activeAssistantMessageId = undefined;
   session.busy = false;
   session.status = 'closed';
   session.closedAt = now();
@@ -490,12 +492,28 @@ export async function deleteBrowserChatSession(sessionId: string) {
   hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) return undefined;
+  if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
+    session.activeAbortController.abort(new Error('Browser chat session deleted by user.'));
+  }
   await session.browser?.close().catch(() => undefined);
   session.browser = undefined;
   session.started = false;
+  session.activeAbortController = undefined;
+  session.activeAssistantMessageId = undefined;
   sessions.delete(sessionId);
   persistAndNotify(sessionId);
   return { id: sessionId };
+}
+
+export async function deleteBrowserChatSessions(sessionIds: string[]) {
+  hydrateSessions();
+  const uniqueIds = Array.from(new Set(sessionIds.map((item) => item.trim()).filter(Boolean)));
+  const deleted: Array<{ id: string }> = [];
+  for (const sessionId of uniqueIds) {
+    const result = await deleteBrowserChatSession(sessionId);
+    if (result) deleted.push(result);
+  }
+  return { deleted, requested: uniqueIds.length };
 }
 
 export function exportBrowserChatMessageToTestCase(sessionId: string, messageId: string) {
@@ -684,6 +702,12 @@ function warnPersistFailure(error: unknown) {
   console.warn('[browser-chat] Failed to persist sessions; keeping realtime state in memory.', error);
 }
 
+function looksLikeDomSnapshot(value?: string) {
+  const text = (value || '').trim();
+  if (!text || !/\bnode_id=\d+\b/.test(text)) return false;
+  return /<\s*(?:a|button|input|select|textarea|option|summary|details|label|form|iframe)\b/i.test(text);
+}
+
 function runningAssistantContent(step: StepExecutionResult) {
   const latestTool = step.tools?.at(-1);
   if (latestTool) {
@@ -691,7 +715,8 @@ function runningAssistantContent(step: StepExecutionResult) {
     if (latestTool.ok === true) return `工具调用完成：${latestTool.name}`;
     return `正在调用工具：${latestTool.name}`;
   }
-  return step.actual?.trim() || step.action?.trim() || '正在处理...';
+  const actual = step.actual?.trim();
+  return (actual && !looksLikeDomSnapshot(actual) ? actual : undefined) || step.action?.trim() || '正在处理...';
 }
 
 function runningContentFromLog(phase: string, message: string) {

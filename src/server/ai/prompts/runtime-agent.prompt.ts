@@ -99,9 +99,9 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
     '- In message/reason/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot ids/file names, or tool input JSON.',
     visualMode ? '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.' : '',
-    domMode ? '- DOM mode: use getDomNodeText(path) for complete text under a DOM node; use clickDomNode(path,text?) with a fresh DOM bracket path.' : '',
+    domMode ? '- DOM mode: use the current Codex-style visible DOM snapshot. Use getDomNodeText(id) for complete text under a returned DOM node; use clickDomNode(id,text?) with a fresh numeric node_id. Use findByText(targetText,scopeId?) only as a read-only recovery step, then clickLocator(locatorId,text?) using a returned locatorId in a later turn.' : '',
     '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
-    '- For getDomNodeText/clickDomNode, put the fresh DOM bracket path in params.path.',
+    '- For getDomNodeText/clickDomNode, put the fresh DOM numeric node_id in params.id. The numeric id may be copied with or without square brackets.',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
     answerAllowed
       ? '- For browser chat completion, clarification, blocked state, failure, or pure text response, set type="answer" and put the complete Chinese Markdown answer in message. Do not use reportState.'
@@ -116,10 +116,10 @@ export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
     '',
     'Agent Loop / prepareStep context:',
     domMode
-      ? '- DOM mode: the actionable context is the current DOM tree, URL, focus, and tool results. No screenshot image is attached for decision making.'
+      ? '- DOM mode: the actionable context is the current visible DOM snapshot, URL, focus, and tool results. No screenshot image is attached for decision making.'
       : '- Current screenshot is the only actionable image; history/reference candidate ids are invalid.',
     domMode
-      ? '- DOM mode: do not scroll just to read ordinary page text. Use getDomNodeText(path) when a DOM line is truncated or a section needs full text.'
+      ? '- DOM mode: if needed content/control is absent from the visible DOM snapshot, scroll the relevant area and call getDomTree again. Use getDomNodeText(id) when a returned DOM line is truncated or a returned node needs full text.'
       : '- Screenshot marker labels are only tool target locations. They are not page content, image/page numbers, ordering, progress, status, priority, or business meaning.',
     domMode
       ? '- Use scrollArea only as a fallback for lazy-loaded/virtualized content or viewport-only UI. Before scrolling, check the latest area state: do not scroll down atBottom or when remainingDown=0, and do not scroll up atTop or when remainingUp=0.'
@@ -128,7 +128,7 @@ export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
     '- Tool params are minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
     '- If RunState/ledgerDigest already covers a requirement area, do not restart it by habit; continue only with missing or contradicted work.',
     domMode
-      ? '- Follow RunState.nextObjective, but choose DOM paths/text from the current DOM tree only.'
+      ? '- Follow RunState.nextObjective, but choose DOM node_ids/text from the current visible DOM snapshot only.'
       : '- Follow RunState.nextObjective, but choose operation/id from current screenshot only.',
     input.allowTextResponse
       ? '- Browser chat mode: call at most one tool only when browser action/inspection is needed. If the user can be answered now, return Chinese Markdown text and call no tool.'

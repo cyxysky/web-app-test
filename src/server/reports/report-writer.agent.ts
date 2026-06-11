@@ -1,8 +1,8 @@
-import path from 'node:path';
 import { generateText } from 'ai';
 import { getModel } from '@/server/ai/model';
 import type { StepExecutionResult, TaskFrame, TaskLedgerItem, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { artifactsRoot } from '@/server/storage/paths';
+import { artifactApiUrl } from '@/lib/artifacts';
 import { richTextToPlainText } from '@/lib/rich-text';
 
 type ReportRecord = NonNullable<TestRunRecord['report']>;
@@ -16,11 +16,7 @@ function statusText(status: TestRunRecord['status'] | StepExecutionResult['statu
 }
 
 function artifactUrl(filePath?: string) {
-  if (!filePath) return undefined;
-  const root = artifactsRoot();
-  const relative = path.relative(root, filePath).replace(/\\/g, '/');
-  if (relative.startsWith('..')) return undefined;
-  return `/api/artifacts/${relative}`;
+  return artifactApiUrl(filePath, { artifactsRoot: artifactsRoot() });
 }
 
 function compact(value?: string, max = 900) {
