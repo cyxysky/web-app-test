@@ -46,7 +46,7 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
   const [deleting, setDeleting] = useState(false);
   const latestRun = runs[0];
   const finishedRuns = runs.filter((run) => finishedRunStatuses.includes(run.status)).length;
-  const deletableIds = useMemo(() => runs.filter((run) => !isActiveRun(run)).map((run) => run.id), [runs]);
+  const deletableIds = useMemo(() => runs.map((run) => run.id), [runs]);
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const allSelected = deletableIds.length > 0 && deletableIds.every((runId) => selectedSet.has(runId));
 
@@ -107,7 +107,7 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
         <div className="run-history-list">
           <label className="run-history-select-all">
             <input checked={allSelected} disabled={!deletableIds.length || deleting} onChange={toggleAll} type="checkbox" />
-            <span title={deletableIds.length ? '全选可删除记录' : '暂无可删除记录'}>{deletableIds.length ? '全选可删除记录' : '暂无可删除记录'}</span>
+            <span title={deletableIds.length ? '全选执行记录' : '暂无执行记录'}>{deletableIds.length ? '全选执行记录' : '暂无执行记录'}</span>
           </label>
           {runs.map((run) => {
             const completedStepCount = run.result?.steps.filter((step) => step.status !== 'queued').length || 0;
@@ -120,8 +120,8 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
             const reportText = run.report ? '报告已生成' : '报告生成中';
             return (
               <div className={selected ? 'run-history-row selected' : 'run-history-row'} key={run.id}>
-                <label className="run-history-select" title={active ? '运行中的记录不能删除' : '选择这条执行记录'}>
-                  <input checked={selected} disabled={active || deleting} onChange={() => toggleRun(run.id)} type="checkbox" />
+                <label className="run-history-select" title="选择这条执行记录">
+                  <input checked={selected} disabled={deleting} onChange={() => toggleRun(run.id)} type="checkbox" />
                 </label>
                 <span className={`run-history-status status-${run.status}`} title={runStatusLabel(run.status)}>
                   {runStatusLabel(run.status)}
@@ -147,7 +147,7 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
                   <RunScreenshotChainButton className="run-history-replay" run={run} />
                   <ReplayRunButton disabled={!replayable || active} runId={run.id} />
                   <RecordedFlowToCaseButton disabled={!replayable || active} runId={run.id} />
-                  <DeleteRunButton disabled={active || deleting} runId={run.id} />
+                  <DeleteRunButton disabled={deleting} runId={run.id} />
                   <Link className="run-history-open" href={`/runs/${run.id}`} title="查看详情">
                     <ExternalLink size={16} />
                   </Link>

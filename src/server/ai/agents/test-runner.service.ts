@@ -122,15 +122,19 @@ function isManualVerificationReplayPoint(step: StepExecutionResult, tool: NonNul
 function recordedFlowFromSteps(steps: StepExecutionResult[]): RecordedFlowStep[] {
   const defaultDelayMs = replayStepDelayMs();
   return steps
-    .flatMap((step) => (step.tools || []).map((tool) => ({ step, tool })))
+    .flatMap((step) => (step.tools || []).map((tool, toolIndex) => ({ step, tool, toolIndex })))
     .filter(({ step, tool }) => tool.name && tool.ok !== false && !isCertificateBypassTool(step, tool))
-    .map(({ step, tool }, index) => ({
+    .map(({ step, tool, toolIndex }, index) => ({
       index: index + 1,
       name: tool.name,
       input: jsonClone(tool.input),
       reason: tool.reason,
       delayBeforeMs: index === 0 ? 0 : defaultDelayMs,
       waitForManual: isManualVerificationReplayPoint(step, tool),
+      sourceStepIndex: step.index,
+      sourceStepAction: step.action,
+      sourceStepExpected: step.expected,
+      sourceToolIndex: toolIndex + 1,
     }));
 }
 
@@ -201,11 +205,16 @@ function collectTaskLedgerItems(steps: StepExecutionResult[]) {
   return [...map.values()];
 }
 
+function isInitialReplayNavigation(step?: RecordedFlowStep) {
+  return step?.name === 'openPage' || step?.name === 'openUrl';
+}
+
 function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUrl: string): RecordedFlowStep[] {
   const replayFlow = recordedFlow.filter((step, index) => {
     if (index !== 0) return true;
-    return step.name !== 'openPage' && step.name !== 'openUrl';
+    return !isInitialReplayNavigation(step);
   });
+  const initialNavigation = isInitialReplayNavigation(recordedFlow[0]) ? recordedFlow[0] : undefined;
   const defaultDelayMs = replayStepDelayMs();
   return [
     {
@@ -214,6 +223,10 @@ function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUr
       input: { url: targetUrl },
       delayBeforeMs: 0,
       reason: 'Replay starts from the test case target URL so recorded candidate actions run on the expected page.',
+      sourceStepIndex: initialNavigation?.sourceStepIndex,
+      sourceStepAction: initialNavigation?.sourceStepAction,
+      sourceStepExpected: initialNavigation?.sourceStepExpected,
+      sourceToolIndex: initialNavigation?.sourceToolIndex,
     },
     ...replayFlow.map((step, index) => ({
       ...step,
@@ -532,7 +545,8 @@ export function startScheduler() {
 function persistBackgroundRunFailure(run: TestRunRecord, testCase: ReturnType<typeof store.getTestCase>, error: unknown) {
   if (!testCase) return;
   try {
-    const current = store.getRun(run.id) || run;
+    const current = store.getRun(run.id);
+    if (!current) return;
     const previousSteps = current.result?.steps || [];
     const errorStep: StepExecutionResult = {
       index: Math.max(0, ...previousSteps.map((step) => step.index)) + 1,

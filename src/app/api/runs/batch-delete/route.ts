@@ -1,9 +1,20 @@
 import { NextResponse } from 'next/server';
 import { store } from '@/server/db/mock-store';
+import { abortRunStep } from '@/server/ai/run-control.registry';
 import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
-function isActiveRun(status: TestRunRecord['status']) {
-  return status === 'running' || status === 'queued' || status === 'paused';
+function refreshTestCaseStatusAfterRunDelete(testCaseId: string) {
+  const remaining = store.listRunsForTestCase(testCaseId);
+  const active = remaining.find((run) => run.status === 'running' || run.status === 'queued' || run.status === 'paused');
+  if (active) {
+    store.updateTestCaseStatus(testCaseId, 'running');
+    return;
+  }
+  const latest = remaining[0];
+  const finishedStatus = latest?.status === 'passed' || latest?.status === 'failed' || latest?.status === 'blocked'
+    ? latest.status
+    : 'ready';
+  store.updateTestCaseStatus(testCaseId, finishedStatus);
 }
 
 export async function POST(request: Request) {
@@ -22,14 +33,10 @@ export async function POST(request: Request) {
   }
 
   const existingRuns = runIds.map((runId) => store.getRun(runId)).filter((run): run is TestRunRecord => Boolean(run));
-  const activeRuns = existingRuns.filter((run) => isActiveRun(run.status));
-  if (activeRuns.length) {
-    return NextResponse.json(
-      { error: '运行中、排队中或暂停中的记录不能删除', blockedRunIds: activeRuns.map((run) => run.id) },
-      { status: 400 },
-    );
-  }
+  const affectedTestCaseIds = Array.from(new Set(existingRuns.map((run) => run.testCaseId)));
+  existingRuns.forEach((run) => abortRunStep(run.id));
 
   const deleted = store.deleteRuns(runIds);
+  affectedTestCaseIds.forEach(refreshTestCaseStatusAfterRunDelete);
   return NextResponse.json({ ok: true, deleted });
 }

@@ -531,11 +531,15 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
     .sort((a, b) => a.index - b.index);
   if (!selectedSteps.length) throw new Error('No executed browser steps found for this message');
 
-  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).map((tool) => ({
+  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).map((tool, toolIndex) => ({
     index: 0,
     name: tool.name,
     input: tool.input,
     reason: tool.reason,
+    sourceStepIndex: step.index,
+    sourceStepAction: step.action,
+    sourceStepExpected: step.expected,
+    sourceToolIndex: toolIndex + 1,
   }))).map((flow, index) => ({ ...flow, index: index + 1 }));
 
   const titleSeed = previousUser?.content || message.content || '浏览器对话导出用例';

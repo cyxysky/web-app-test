@@ -3199,6 +3199,42 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
   }
 }
 
+function recordedToolTraceInput(flow: RecordedFlowStep) {
+  const input = jsonSafe(flow.input);
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return flow.reason ? { value: input, reason: flow.reason } : input;
+  }
+  const withReason = { ...(input as Record<string, unknown>) };
+  if (flow.reason && typeof withReason.reason !== 'string') withReason.reason = flow.reason;
+  return withReason;
+}
+
+async function runTracedRecordedTool(input: {
+  session: BrowserSession;
+  targetUrl: string;
+  flow: RecordedFlowStep;
+  traces: ToolTrace[];
+  runId: string;
+  stepIndex: number;
+  visualContext: VisualContextManager;
+  onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
+  onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
+}) {
+  const { session, targetUrl, flow, traces, runId, stepIndex, visualContext, onToolTrace, onVisualContextChange } = input;
+  return executeTracedBrowserAction({
+    session,
+    traces,
+    name: flow.name,
+    toolInput: recordedToolTraceInput(flow),
+    runId,
+    stepIndex,
+    visualContext,
+    onToolTrace,
+    onVisualContextChange,
+    action: () => runRecordedTool(session, targetUrl, flow),
+  });
+}
+
 async function executeCodexRuntimeObject(input: {
   session: BrowserSession;
   targetUrl: string;
@@ -3634,6 +3670,25 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         tools: [{ name: flow.name, input: flow.input, reason: flow.reason }],
       };
       await onProgress?.(runningStep);
+      const visualContext = new VisualContextManager();
+      visualContext.init({
+        path: beforeScreenshotPath,
+        stepIndex,
+        capture: 'viewport',
+        reason: 'Initial screenshot for recorded replay step',
+      });
+      const liveToolTraces: ToolTrace[] = [];
+      const publishRecordedToolProgress = async (actual: string) => {
+        const liveFields = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex);
+        await onProgress?.({
+          ...runningStep,
+          beforeScreenshotPath,
+          actual,
+          tools: liveToolTraces.length ? summarizeToolTraces(liveToolTraces) : runningStep.tools,
+          ...liveFields,
+          visualContext: liveFields.visualContext || visualContext.snapshot(),
+        });
+      };
 
       const pageContext = await session.getPageContext({
         includeDomTree: false,
@@ -3700,7 +3755,24 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         }
       }
 
-      const result = await runRecordedTool(session, testCase.targetUrl, flow).catch((error) => ({
+      const result = await runTracedRecordedTool({
+        session,
+        targetUrl: testCase.targetUrl,
+        flow,
+        traces: liveToolTraces,
+        runId,
+        stepIndex,
+        visualContext,
+        onVisualContextChange: async () => {
+          await publishRecordedToolProgress(`Recorded tool ${flow.name} updated the replay screenshot context.`);
+        },
+        onToolTrace: async (trace) => {
+          upsertToolTrace(liveToolTraces, trace);
+          await publishRecordedToolProgress(trace.result
+            ? `Recorded tool ${trace.name} ${trace.result.ok ? 'completed' : 'failed'}.`
+            : `Recorded tool ${trace.name} started.`);
+        },
+      }).catch((error) => ({
         ok: false,
         actual: infrastructureError(error),
       }));
@@ -3715,7 +3787,8 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         beforeScreenshotPath,
         afterScreenshotPath,
         screenshotPath: afterScreenshotPath,
-        tools: [{ name: flow.name, input: flow.input, reason: flow.reason, ok: result.ok, result: result.actual }],
+        tools: liveToolTraces.length ? summarizeToolTraces(liveToolTraces) : [{ name: flow.name, input: flow.input, reason: flow.reason, ok: result.ok, result: result.actual }],
+        visualContext: visualContext.snapshot(),
         ledgerItems: result.ok ? undefined : [{
           dimensionId: 'runtime-replay',
           title: '固定回放操作失败',

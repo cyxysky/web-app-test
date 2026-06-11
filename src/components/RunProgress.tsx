@@ -574,25 +574,51 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   const canContinueBlockedRun = run.status === 'blocked';
 
   useEffect(() => {
-    if (isFinished(run.status) && run.report?.markdown) return;
+    let active = true;
+    let events: EventSource | undefined;
+    let timer: number | undefined;
+    let refreshInFlight: Promise<void> | undefined;
+
+    const stopRealtime = () => {
+      active = false;
+      if (timer !== undefined) window.clearInterval(timer);
+      events?.close();
+    };
+
+    const refreshRun = async () => {
+      if (refreshInFlight) return refreshInFlight;
+      refreshInFlight = (async () => {
+        const response = await fetch(`/api/runs/${run.id}`, { cache: 'no-store' });
+        if (!response.ok || !active) {
+          if (response.status === 404) stopRealtime();
+          return;
+        }
+        const latest = (await response.json()) as TestRunRecord;
+        setRun(latest);
+        if (isFinished(latest.status) && latest.report?.markdown) stopRealtime();
+      })().finally(() => {
+        refreshInFlight = undefined;
+      });
+      return refreshInFlight;
+    };
+
     if (typeof EventSource !== 'undefined') {
-      const events = new EventSource(`/api/runs/${run.id}/events`);
-      events.addEventListener('run', (event) => {
-        const payload = JSON.parse((event as MessageEvent).data) as { snapshot: TestRunRecord };
-        setRun(payload.snapshot);
+      events = new EventSource(`/api/runs/${run.id}/events`);
+      events.addEventListener('run', () => {
+        void refreshRun();
       });
       events.addEventListener('error', () => {
-        events.close();
+        void refreshRun();
       });
-      return () => events.close();
     }
-    const timer = window.setInterval(async () => {
-      const response = await fetch(`/api/runs/${run.id}`, { cache: 'no-store' });
-      if (!response.ok) return;
-      setRun((await response.json()) as TestRunRecord);
-    }, 1200);
-    return () => window.clearInterval(timer);
-  }, [run.id, run.report?.markdown, run.status]);
+
+    timer = window.setInterval(() => {
+      void refreshRun();
+    }, 1000);
+    void refreshRun();
+
+    return stopRealtime;
+  }, [run.id]);
 
   useEffect(() => {
     const latest = steps.at(-1)?.index;
