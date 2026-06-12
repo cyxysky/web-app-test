@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { generateTaskFrame } from '@/server/ai/agents/task-frame-generator.agent';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 
 type RouteContext = {
   params: Promise<{ id: string }>;

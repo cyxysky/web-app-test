@@ -12,7 +12,6 @@ import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 const activeRunStatuses: TestRunRecord['status'][] = ['running', 'queued', 'paused'];
-const finishedRunStatuses: TestRunRecord['status'][] = ['passed', 'failed', 'blocked'];
 
 function isActiveRun(run: TestRunRecord) {
   return activeRunStatuses.includes(run.status);
@@ -45,7 +44,6 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deleting, setDeleting] = useState(false);
   const latestRun = runs[0];
-  const finishedRuns = runs.filter((run) => finishedRunStatuses.includes(run.status)).length;
   const deletableIds = useMemo(() => runs.map((run) => run.id), [runs]);
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const allSelected = deletableIds.length > 0 && deletableIds.every((runId) => selectedSet.has(runId));
@@ -92,10 +90,6 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
           </p>
         </div>
         <div className="run-history-toolbar">
-          <div className="run-history-summary">
-            <span title={`${runs.length} 次运行`}>{runs.length} 次运行</span>
-            <span title={`${finishedRuns} 次完成`}>{finishedRuns} 次完成</span>
-          </div>
           <button className="run-history-bulk-delete" disabled={!selectedIds.length || deleting} onClick={deleteSelected} type="button">
             {deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
             {selectedIds.length ? `删除选中 ${selectedIds.length}` : '删除选中'}

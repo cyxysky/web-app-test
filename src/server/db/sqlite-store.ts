@@ -1,9 +1,10 @@
 import { defaultModelByProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
 import { enrichRunResult, enrichStepWithTrace } from '@/server/ai/run-trace-store';
-import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, SiteKnowledgeRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import type { StoreData } from '@/server/db/store-data';
 import { readStoreData, writeStoreData } from '@/server/db/sqlite-store-engine';
 import { createSnapshotChannel, type SnapshotEvent, type SnapshotListener } from '@/server/realtime/snapshot-channel';
+import { publishRealtimeEvent } from '@/server/realtime/ws-hub';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -27,6 +28,10 @@ function notifyRunDeleted(runId: string) {
 
 function notifyRunsDeleted(runIds: Iterable<string>) {
   for (const runId of new Set([...runIds].filter(Boolean))) notifyRunDeleted(runId);
+}
+
+function notifyDashboardEntity(entityType: 'testCase' | 'group' | 'schedule', id: string, event: 'snapshot' | 'refresh' | 'deleted' = 'refresh') {
+  publishRealtimeEvent({ entityType, id, event });
 }
 
 const seedContent: TestCaseContent = {
@@ -264,6 +269,53 @@ function isUserSkippedStep(step?: StepExecutionResult) {
   return Boolean(step?.status === 'blocked' && step.actual === 'User skipped this step manually.');
 }
 
+function idFromOrigin(origin: string) {
+  return `site_${origin.toLowerCase().replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeOrigin(input?: string) {
+  const raw = (input || '').trim();
+  if (!raw) return '';
+  try {
+    const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+    return `${url.protocol}//${url.host}`.toLowerCase();
+  } catch {
+    return raw.replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+function normalizeKnowledgeItems(items?: unknown) {
+  if (!Array.isArray(items)) return [];
+  return Array.from(new Set(items
+    .map((item) => String(item || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)))
+    .slice(0, 24);
+}
+
+function knowledgeTitle(origin: string, title?: string) {
+  const clean = (title || '').trim();
+  if (clean) return clean;
+  try {
+    return new URL(origin).host;
+  } catch {
+    return origin || '站点知识';
+  }
+}
+
+function siteKnowledgeHints(item?: SiteKnowledgeRecord) {
+  if (!item) return [];
+  const lines = [
+    item.loginMethods.length ? `登录方式：${item.loginMethods.slice(0, 4).join('；')}` : '',
+    item.pageStructure.length ? `页面结构：${item.pageStructure.slice(0, 6).join('；')}` : '',
+    item.reliableSelectors.length ? `可靠选择器/入口：${item.reliableSelectors.slice(0, 6).join('；')}` : '',
+    item.commonFailures.length ? `常见失败：${item.commonFailures.slice(0, 6).join('；')}` : '',
+    item.businessConcepts.length ? `业务概念：${item.businessConcepts.slice(0, 6).join('；')}` : '',
+    item.repairHints.length ? `修复经验：${item.repairHints.slice(0, 6).join('；')}` : '',
+    item.notes ? `备注：${compactText(item.notes, 260)}` : '',
+  ].filter(Boolean);
+  return lines.length ? [`站点知识库 ${item.origin}：${lines.join(' | ')}`] : [];
+}
+
 async function writeData(data: StoreData) {
   await writeStoreData(data);
 }
@@ -285,6 +337,54 @@ export const store = {
   // 列出保存到网页配置里的运行时环境变量。
   async listRuntimeEnv() {
     return (await readData()).runtimeEnv || [];
+  },
+  async listSiteKnowledge() {
+    return (await readData()).siteKnowledge || [];
+  },
+  async getSiteKnowledgeForUrl(targetUrl: string) {
+    const origin = normalizeOrigin(targetUrl);
+    if (!origin) return undefined;
+    return (await readData()).siteKnowledge?.find((item) => item.origin === origin);
+  },
+  async upsertSiteKnowledge(input: {
+    targetUrl?: string;
+    origin?: string;
+    title?: string;
+    loginMethods?: string[];
+    pageStructure?: string[];
+    reliableSelectors?: string[];
+    commonFailures?: string[];
+    businessConcepts?: string[];
+    repairHints?: string[];
+    notes?: string;
+  }) {
+    const origin = normalizeOrigin(input.origin || input.targetUrl);
+    if (!origin) throw new Error('Site origin is required');
+    const data = await readData();
+    const current = data.siteKnowledge?.find((item) => item.origin === origin);
+    const timestamp = now();
+    const record: SiteKnowledgeRecord = {
+      id: current?.id || idFromOrigin(origin),
+      origin,
+      title: knowledgeTitle(origin, input.title || current?.title),
+      loginMethods: normalizeKnowledgeItems(input.loginMethods ?? current?.loginMethods),
+      pageStructure: normalizeKnowledgeItems(input.pageStructure ?? current?.pageStructure),
+      reliableSelectors: normalizeKnowledgeItems(input.reliableSelectors ?? current?.reliableSelectors),
+      commonFailures: normalizeKnowledgeItems(input.commonFailures ?? current?.commonFailures),
+      businessConcepts: normalizeKnowledgeItems(input.businessConcepts ?? current?.businessConcepts),
+      repairHints: normalizeKnowledgeItems(input.repairHints ?? current?.repairHints),
+      notes: input.notes ?? current?.notes,
+      createdAt: current?.createdAt || timestamp,
+      updatedAt: timestamp,
+    };
+    data.siteKnowledge = current
+      ? (data.siteKnowledge || []).map((item) => (item.id === current.id ? record : item))
+      : [record, ...(data.siteKnowledge || [])];
+    await writeData(data);
+    return record;
+  },
+  async siteKnowledgeHintsForUrl(targetUrl: string) {
+    return siteKnowledgeHints(await this.getSiteKnowledgeForUrl(targetUrl));
   },
   async getModelConfig() {
     return normalizeStoredModelConfig((await readData()).modelConfig as LegacyModelConfigRecord | undefined);
@@ -380,6 +480,7 @@ export const store = {
       ? schedules.map((item) => (item.id === schedule.id ? schedule : item))
       : [...schedules, schedule];
     await writeData(data);
+    notifyDashboardEntity('schedule', schedule.id);
     return schedule;
   },
   // 删除定时回归任务。
@@ -387,6 +488,7 @@ export const store = {
     const data = await readData();
     data.schedules = (data.schedules || []).filter((item) => item.id !== scheduleId);
     await writeData(data);
+    notifyDashboardEntity('schedule', scheduleId, 'deleted');
   },
   // 标记定时任务已经触发，并计算下一次运行时间。
   async markScheduleTriggered(scheduleId: string) {
@@ -404,6 +506,7 @@ export const store = {
       return updated;
     });
     await writeData(data);
+    if (updated) notifyDashboardEntity('schedule', updated.id);
     return updated;
   },
   // 创建测试分组，并可挂到父分组下。
@@ -418,6 +521,7 @@ export const store = {
     };
     data.groups = [...(data.groups || []), group];
     await writeData(data);
+    notifyDashboardEntity('group', group.id);
     return group;
   },
   // 更新分组名称或父级关系。
@@ -430,6 +534,7 @@ export const store = {
       return updated;
     });
     await writeData(data);
+    if (updated) notifyDashboardEntity('group', updated.id);
     return updated;
   },
   // 根据 ID 获取单个测试用例。
@@ -460,6 +565,7 @@ export const store = {
     };
     data.testCases.push(record);
     await writeData(data);
+    notifyDashboardEntity('testCase', record.id);
     return record;
   },
   // 删除一条执行记录。这里只移除历史元数据，artifact 文件保留，避免误删仍被报告引用的证据。
@@ -494,6 +600,7 @@ export const store = {
       .filter((schedule) => schedule.testCaseIds.length > 0);
     await writeData(data);
     notifyRunsDeleted(deletedRunIds);
+    notifyDashboardEntity('testCase', testCaseId, 'deleted');
     return true;
   },
   // 更新测试用例的整体执行状态。
@@ -503,6 +610,7 @@ export const store = {
       record.id === testCaseId ? { ...record, status, updatedAt: now() } : record,
     );
     await writeData(data);
+    notifyDashboardEntity('testCase', testCaseId);
   },
   // 移动测试用例到指定分组，未传分组则移出分组。
   async moveTestCase(testCaseId: string, groupId?: string) {
@@ -514,6 +622,7 @@ export const store = {
       return updated;
     });
     await writeData(data);
+    if (updated) notifyDashboardEntity('testCase', updated.id);
     return updated;
   },
   // 更新测试用例内容和可选图片列表。
@@ -535,6 +644,7 @@ export const store = {
       return updated;
     });
     await writeData(data);
+    if (updated) notifyDashboardEntity('testCase', updated.id);
     return updated;
   },
   // 为测试用例创建一条新的运行记录。

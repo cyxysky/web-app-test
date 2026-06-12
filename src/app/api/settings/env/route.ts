@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { runtimeEnvDefinitions } from '@/config/settings';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 
 const allowedKeys = new Set(runtimeEnvDefinitions.map((item) => item.key));
 

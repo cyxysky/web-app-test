@@ -338,8 +338,9 @@ function looksLikeDomSnapshot(value?: string) {
 function userFacingToolResult(name: string, result?: BrowserActionResult, max = 360) {
   if (!result) return undefined;
   if (!result.ok) return trimDebugText(result.actual, max);
-  if (name === 'getDomTree' || looksLikeDomSnapshot(result.actual)) return '已读取当前可见 DOM 快照。';
+  if (name === 'getDomTree' || looksLikeDomSnapshot(result.actual)) return '已读取当前可操作 DOM 树。';
   if (name === 'getInteractiveCandidates') return '已读取当前可见可交互元素。';
+  if (name === 'getPageOverview') return '已读取当前页面概览。';
   if (name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
   if (name === 'listTabs') return '已读取浏览器标签页列表。';
   return trimDebugText(result.actual, max);
@@ -962,6 +963,7 @@ const noVisualAfterCaptureToolNames = new Set([
   'manageVisualContext',
   'listTabs',
   'getHttpRequests',
+  'getPageOverview',
   'getInteractiveCandidates',
   'getDomTree',
   'getDomNodeText',
@@ -1293,7 +1295,7 @@ function makeBrowserTools(
       execute: (input) => record('openPage', input, () => session.open(input.url || targetUrl)),
     }),
     scrollArea: tool({
-      description: 'Scroll a visible scrollable area by its current area id. In DOM mode, do not use this to read normal DOM text; use it only for lazy-loaded/virtualized content or viewport-only UI. Check the latest summary/result first: do not scroll down atBottom/remainingDown=0 or up atTop/remainingUp=0. One call should scroll about one visible viewport/container height only. Area ids are volatile per turn; never reuse historical ids.',
+      description: 'Scroll a visible scrollable area by its current area id. In DOM mode this is a fallback only for lazy-loaded or virtualized content missing from the interactive DOM tree; never use it to discover normal rendered DOM controls. Check the latest summary/result first: do not scroll down atBottom/remainingDown=0 or up atTop/remainingUp=0. One call should scroll about one visible viewport/container height only. Area ids are volatile per turn; never reuse historical ids.',
       inputSchema: browserToolInput({
         areaId: z.string().describe('Scrollable area id from the CURRENT page context, such as S1 or S2. Do not invent or reuse an old id.'),
         deltaY: z.number().describe('Vertical scroll delta. Positive scrolls down, negative scrolls up. Use roughly one viewport/container height per call; do not request multiple screens of scrolling in one tool call.'),
@@ -1338,6 +1340,13 @@ function makeBrowserTools(
       description: 'Read-only diagnostic tool: return recent HTTP requests for the current active tab, including method, URL, resource type, status, ok/failed, and error text. Use when a page looks broken, data is missing, an API may have failed, or you need evidence for a network-related issue.',
       inputSchema: browserToolInput({}),
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
+    }),
+    getPageOverview: tool({
+      description: 'Read-only page understanding tool: summarize current URL/title, visible text, focus, scroll state, manual verification signals, tabs, scrollable areas, and top visible interactive candidates. Use before clicking or typing when the target is ambiguous, when the screenshot is visually dense, or when you need to understand what content is currently visible.',
+      inputSchema: browserToolInput({
+        limit: z.number().optional().describe('Maximum number of interactive candidates to include. Defaults to 40; use a smaller number when context is tight.'),
+      }),
+      execute: (input) => record('getPageOverview', input, () => session.getPageOverview(input.limit)),
     }),
     switchTab: tool({
       description: 'Switch to a browser tab by index when the workflow opened a new tab.',
@@ -1409,21 +1418,21 @@ function makeBrowserTools(
 
   const domTools = {
     getDomTree: tool({
-      description: 'Return a Codex-style visible DOM snapshot for the current tab. It is filtered to visible interactable nodes and uses HTML-like lines such as <button node_id=12 aria-label="Save">Save</button>. Numeric node_id values are valid only for this current snapshot. Use getDomNodeText(id) for full text on a returned node.',
+      description: 'Return a Codex-style interactive DOM tree for the current rendered tab, including offscreen rendered controls. It filters to interactable nodes and uses HTML-like lines such as <button node_id=12 aria-label="Save">Save</button>. Numeric node_id values are valid only for this current snapshot. Use getDomNodeText(id) for full text on a returned node.',
       inputSchema: browserToolInput({}),
       execute: (input) => record('getDomTree', input, () => session.getSimplifiedDomTree()),
     }),
     getDomNodeText: tool({
-      description: 'DOM mode: return the full rendered text under a node from the CURRENT visible DOM snapshot by numeric node_id, for example "12" or "[12]". This is read-only and does not click, navigate, or scroll.',
+      description: 'DOM mode: return the full rendered text under a node from the CURRENT interactive DOM tree by numeric node_id, for example "12" or "[12]". This is read-only and does not click, navigate, or scroll.',
       inputSchema: browserToolInput({
-        id: z.string().describe('The numeric node_id shown in the current visible DOM snapshot, such as 12 or [12]. IDs are volatile; use only a fresh id.'),
+        id: z.string().describe('The numeric node_id shown in the current interactive DOM tree, such as 12 or [12]. IDs are volatile; use only a fresh id.'),
       }),
       execute: (input) => record('getDomNodeText', input, () => session.getDomNodeText(normalizeDomNodeIdParam(input))),
     }),
     clickDomNode: tool({
-      description: 'DOM mode: click a node from the CURRENT visible DOM snapshot by numeric node_id, for example "12" or "[12]". If text is provided, type it immediately after clicking. IDs are volatile; use only an id from the current DOM snapshot.',
+      description: 'DOM mode: click a node from the CURRENT interactive DOM tree by numeric node_id, for example "12" or "[12]". If text is provided, type it immediately after clicking. The browser may scroll the target into view for the click, but DOM discovery itself should not rely on scrolling. IDs are volatile; use only an id from the current DOM snapshot.',
       inputSchema: browserToolInput({
-        id: z.string().describe('The numeric node_id shown in the visible DOM snapshot, such as 12 or [12].'),
+        id: z.string().describe('The numeric node_id shown in the current interactive DOM tree, such as 12 or [12].'),
         text: z.string().optional().describe('Optional text to type immediately after clicking/focusing this DOM node.'),
       }),
       execute: (input) => record('clickDomNode', input, () => session.clickDomNode(normalizeDomNodeIdParam(input), input.text)),
@@ -1632,7 +1641,7 @@ function runtimePrompt(input: {
         : 'the attached clean viewport screenshot'
     : visualMode
       ? 'current URL, tabs, scrollable areas, focused element, and the visible interactive elements list generated from the current screenshot'
-      : 'Codex-style visible DOM snapshot, URL, tabs, scroll state, focused element, and read-only DOM text tools';
+      : 'Codex-style interactive DOM tree, URL, tabs, focused element, and read-only DOM text tools';
   const markerSourceRule = separateMarkerScreenshot
     ? '- Image 1 is the source of truth for what the page means. Image 2 only maps visible click/scroll positions to candidate IDs.'
     : markerOverlayInScreenshot
@@ -1663,15 +1672,15 @@ function runtimePrompt(input: {
       ]
     : [
         '- DOM mode has no clickCandidate/hoverCandidate/dragCandidate tools. Never choose visual candidate IDs.',
-        '- Use clickDomNode(id,text?) with a numeric node_id copied from the CURRENT visible DOM snapshot. The tool accepts the numeric id with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
-        '- The DOM tree follows the Codex Chrome plugin model: it is a visible, interactable DOM snapshot, not a full offscreen document dump. If the desired target is absent, scroll the relevant area and then call getDomTree again.',
-        '- Use getDomNodeText(id) when a visible DOM snapshot line is truncated or you need the complete rendered text under a returned node.',
+        '- Use clickDomNode(id,text?) with a numeric node_id copied from the CURRENT interactive DOM tree. The tool accepts the numeric id with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
+        '- DOM mode receives the rendered page interactive DOM tree, including offscreen rendered controls. Do not scroll just to discover normal DOM controls; choose from the DOM tree first.',
+        '- Use getDomNodeText(id) when a DOM tree line is truncated or you need the complete rendered text under a returned node.',
         '- Text matching is a recovery path, not the normal click path: call findByText(targetText,scopeId?) first, inspect the returned locatorIds, then call clickLocator(locatorId,text?) in a later turn.',
         '- Use findByText only when a fresh DOM id is unavailable or unreliable, such as dynamic search results, iframe/shadow/dialog/popover content, or an id that disappeared after refresh.',
         '- For findByText targetText, use a short unique visible/accessibility label from the CURRENT DOM/page context. Do not pass a long surrounding snippet.',
         '- For text entry, use clickDomNode(id,text) in one tool call when the input id is present. Use typeText only after a prior action already focused the field.',
-        '- Use scrollArea when needed content or controls are not present in the current visible DOM snapshot, then refresh the DOM snapshot before acting.',
-        '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
+        '- Use scrollArea in DOM mode only as a fallback for lazy-loaded or virtualized content that is not present in the DOM tree. Refresh getDomTree after scrolling.',
+        '- Before any fallback scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
         '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
       ];
   return [
@@ -1694,6 +1703,9 @@ function runtimePrompt(input: {
     '- Historical actions are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
     '- In reason/message/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
     '- If progressDigest or ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing, in-progress, questioned, or contradicted work.',
+    visualMode
+      ? '- If the page content or intended target is unclear, call getPageOverview before clicking or typing. It is read-only and combines visible text, focus, scroll state, and top interactive candidates.'
+      : '- If the page content or intended target is unclear, call getPageOverview for a compact read-only summary, but use the interactive DOM tree node_id as the primary action source.',
     '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
     '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
     '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
@@ -1721,7 +1733,7 @@ function runtimePrompt(input: {
           : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
       : visualMode
         ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
-        : '- DOM mode: no screenshot image/path is attached. Use the current visible DOM snapshot and DOM node_id tools first; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
+        : '- DOM mode: no screenshot image/path is attached. Use the current interactive DOM tree and DOM node_id tools first; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
     ...markerTargetRules,
     caseSystemPrompt ? `Test-case-specific instructions:
 ${caseSystemPrompt}` : '',
@@ -1748,13 +1760,13 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
     visualMode
       ? `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`
-      : `Scrollable areas summary (DOM fallback only; atBottom/atTop and remaining* show whether further scrolling is possible):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
+      : `Scrollable areas summary (DOM lazy/virtualized fallback only; do not scroll for normal DOM discovery):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
     visualMode && !visualTextCandidateFallback ? '' : `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
     visualMarkersWithoutOverlay || visualTextCandidateFallback ? `Visible interactive elements:
 ${candidateContext}` : '',
     visualMode ? '' : `Interactive candidates JSON:
 ${candidateContext}`,
-    visualMode ? '' : `Visible DOM snapshot:
+    visualMode ? '' : `Interactive DOM tree:
 ${domTree}`,
     compactRunContext,
     availableScreenshotReferences.length ? `Available previous screenshot references:
@@ -1791,6 +1803,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'waitForHumanVerification',
     'listTabs',
     'getHttpRequests',
+    'getPageOverview',
     'switchTab',
     'typeText',
     'pressKey',
@@ -2900,9 +2913,18 @@ function errorDetailText(error: unknown) {
   ].filter(Boolean).join('\n');
 }
 
+function cleanInfrastructureText(value: string) {
+  return value
+    .replace(/\x1b\[[0-9;]*m/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\n?Call log:\n[\s\S]*$/i, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
 function infrastructureError(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error || 'Unknown execution error');
-  const details = errorDetailText(error);
+  const message = cleanInfrastructureText(error instanceof Error ? error.message : String(error || 'Unknown execution error'));
+  const details = cleanInfrastructureText(errorDetailText(error));
   return details ? `${message}\n${details}` : message;
 }
 
@@ -3081,6 +3103,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.listTabs();
     case 'getHttpRequests':
       return session.getCurrentTabHttpRequests();
+    case 'getPageOverview':
+      return session.getPageOverview(typeof input.limit === 'number' ? input.limit : undefined);
     case 'switchTab':
       return session.switchTab(typeof input.index === 'number' ? input.index : Number(input.index || 0));
     case 'reportState':

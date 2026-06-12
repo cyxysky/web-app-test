@@ -110,7 +110,7 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_IMAGE_CONTEXT_ESTIMATE_TOKENS', label: '单张图片估算 Token', description: '估算每张截图占用的上下文 token。', tab: 'runtime', defaultValue: '1200', control: 'number' },
   { key: 'AI_VISUAL_HISTORY_LIMIT', label: '视觉历史上限', description: 'Visual Context Manager 保留多少张历史图。', tab: 'runtime', defaultValue: '6', control: 'number' },
   { key: 'AI_VISUAL_COMPRESSED_HISTORY_LIMIT', label: '压缩后历史图上限', description: '上下文压缩后保留多少张历史图。', tab: 'runtime', defaultValue: '2', control: 'number' },
-  { key: 'AI_VISUAL_COMPRESSED_PINNED_LIMIT', label: '压缩后证据图上限', description: '上下文压缩后保留多少张固定证据图。', tab: 'runtime', defaultValue: '2', control: 'number' },
+  { key: 'AI_VISUAL_COMPRESSED_PINNED_LIMIT', label: '压缩后固定截图上限', description: '上下文压缩后保留多少张固定截图作为视觉上下文。', tab: 'runtime', defaultValue: '2', control: 'number' },
   { key: 'AI_PROMPT_SCREENSHOT_REFERENCE_LIMIT', label: '历史截图引用上限', description: '可供 AI 选择引用的历史截图数量。', tab: 'runtime', defaultValue: '8', control: 'number' },
 
   { key: 'AI_PROMPT_INCLUDE_FULL_TIMELINE', label: '包含完整时间线', description: '是否在 prompt 中包含完整步骤时间线。', tab: 'debug', defaultValue: 'false', control: 'boolean', options: boolOptions },
@@ -121,7 +121,7 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'PLAYWRIGHT_TRACE', label: 'Playwright Trace', description: '是否保存 Playwright trace。', tab: 'debug', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'DATABASE_DIR', label: 'SQLite 数据目录', description: 'SQLite 数据库目录。留空时使用应用数据目录下的 .data。', tab: 'debug', defaultValue: '', control: 'text' },
   { key: 'SQLITE_DATABASE_NAME', label: 'SQLite 文件名', description: '本地 SQLite 数据库文件名。', tab: 'debug', defaultValue: 'ai-web-test.db', control: 'text' },
-  { key: 'DATABASE_URL', label: '数据库连接', description: '数据库连接字符串。', tab: 'debug', defaultValue: '', control: 'secret', secret: true },
+  { key: 'SQLITE_DATABASE_URL', label: 'SQLite 连接 URL', description: 'SQLite file: 连接字符串。留空时由数据目录和文件名生成。', tab: 'debug', defaultValue: '', control: 'text' },
   { key: 'CODEX_PATH', label: 'Codex CLI 路径', description: '自定义 Codex CLI 可执行文件路径。', tab: 'debug', defaultValue: '', control: 'text' },
   { key: 'CODEX_CWD', label: 'Codex 工作目录', description: 'Codex CLI 默认工作目录。', tab: 'debug', defaultValue: '', control: 'text' },
   { key: 'CODEX_APPROVAL_MODE', label: 'Codex 审批模式', description: 'Codex CLI 的审批策略。', tab: 'debug', defaultValue: 'on-failure', control: 'select', options: [{ label: '失败时询问', value: 'on-failure' }, { label: '每次询问', value: 'on-request' }, { label: '永不询问', value: 'never' }, { label: '不受信任时询问', value: 'untrusted' }] },

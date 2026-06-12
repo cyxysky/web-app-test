@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as { testCaseIds?: unknown };

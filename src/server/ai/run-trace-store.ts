@@ -1,10 +1,8 @@
 import type {
   CoverageMatrixItem,
   EvidenceArtifact,
-  EvidenceGraphRecord,
   EvidenceIndexItem,
   RunDebugEvent,
-  RunDiagnosticSummary,
   RunTraceEvent,
   StepDiagnosticSummary,
   StepExecutionResult,
@@ -350,86 +348,6 @@ export function buildCoverageMatrix(input: {
   });
 }
 
-export function buildEvidenceGraph(steps: StepExecutionResult[], ledgerItems: TaskLedgerItem[], evidenceIndex: EvidenceIndexItem[]): EvidenceGraphRecord {
-  const nodes = new Map<string, EvidenceGraphRecord['nodes'][number]>();
-  const edges: EvidenceGraphRecord['edges'] = [];
-  const addNode = (node: EvidenceGraphRecord['nodes'][number]) => nodes.set(node.id, node);
-  const addEdge = (from: string, to: string, type: EvidenceGraphRecord['edges'][number]['type']) => {
-    if (from && to) edges.push({ from, to, type });
-  };
-
-  for (const step of steps) {
-    const stepId = `step:${step.index}`;
-    addNode({ id: stepId, type: 'step', label: `Step ${step.index}`, stepIndex: step.index, status: step.status, summary: compact(step.action, 160) });
-    for (const [toolIndex, tool] of (step.tools || []).entries()) {
-      const toolId = `step:${step.index}:tool:${toolIndex + 1}`;
-      addNode({ id: toolId, type: 'tool', label: tool.name, stepIndex: step.index, status: tool.ok === false ? 'failed' : tool.ok === true ? 'passed' : 'running', summary: compact(tool.reason || tool.result, 160) });
-      addEdge(stepId, toolId, 'executes');
-    }
-  }
-
-  for (const [index, ledger] of ledgerItems.entries()) {
-    const ledgerId = `ledger:${ledger.id || index + 1}`;
-    addNode({ id: ledgerId, type: 'ledger', label: ledger.title, stepIndex: ledger.sourceStep, status: ledger.status, summary: compact(ledger.summary || ledger.actual || ledger.expected, 180) });
-    if (ledger.sourceStep) addEdge(`step:${ledger.sourceStep}`, ledgerId, 'produces');
-  }
-
-  for (const item of evidenceIndex) {
-    const evidenceId = `evidence:${item.id}`;
-    addNode({ id: evidenceId, type: 'evidence', label: item.title, stepIndex: item.stepIndex, status: item.status, summary: compact(item.summary, 180) });
-    if (item.source === 'tool' && item.stepIndex) {
-      const step = steps.find((candidate) => candidate.index === item.stepIndex);
-      const toolIndex = step?.tools?.findIndex((tool) => tool.name === item.toolName);
-      if (toolIndex !== undefined && toolIndex >= 0) addEdge(`step:${item.stepIndex}:tool:${toolIndex + 1}`, evidenceId, 'produces');
-      else addEdge(`step:${item.stepIndex}`, evidenceId, 'produces');
-    } else if (item.source === 'ledger') {
-      addEdge(item.ledgerItemId ? `ledger:${item.ledgerItemId}` : item.id, evidenceId, 'supports');
-    } else if (item.stepIndex) {
-      addEdge(`step:${item.stepIndex}`, evidenceId, 'produces');
-    }
-  }
-
-  const uniqueEdges = Array.from(new Map(edges.map((edge) => [`${edge.from}:${edge.type}:${edge.to}`, edge])).values());
-  return {
-    nodes: [...nodes.values()].slice(-500),
-    edges: uniqueEdges.slice(-800),
-  };
-}
-
-export function buildRunDiagnostics(steps: StepExecutionResult[], traceEvents: RunTraceEvent[], debugEvents: RunDebugEvent[] = []): RunDiagnosticSummary {
-  const tools = steps.flatMap((step) => step.tools || []);
-  const screenshots = buildEvidenceIndex(steps).filter((item) => item.kind === 'screenshot' && item.path);
-  const runningStep = steps.find((step) => step.status === 'running');
-  const visualFrameCount = steps.reduce((count, step) => count + (step.visualContext?.current ? 1 : 0) + (step.visualContext?.history?.length || 0), 0);
-  const ledgerItemCount = steps.reduce((count, step) => count + (step.ledgerItems?.length || step.workingMemory?.ledgerItems?.length || 0), 0);
-  const contextCompressionCount = debugEvents.filter((event) => event.phase === 'ai:context-compressed').length
-    + steps.reduce((count, step) => count + (step.diagnostics?.contextCompressionCount || 0), 0);
-  const contextBudgets = steps
-    .map((step) => step.diagnostics)
-    .filter((item): item is StepDiagnosticSummary => Boolean(item));
-  const estimatedContexts = contextBudgets.map((item) => item.estimatedContextTokens).filter((item): item is number => typeof item === 'number');
-  const budgetRatios = contextBudgets.map((item) => item.contextBudgetRatio).filter((item): item is number => typeof item === 'number');
-
-  return {
-    stepCount: steps.length,
-    runningStepIndex: runningStep?.index,
-    lastStepIndex: steps.at(-1)?.index,
-    toolCallCount: tools.length,
-    failedToolCallCount: tools.filter((tool) => tool.ok === false).length,
-    screenshotCount: screenshots.length,
-    visualFrameCount,
-    ledgerItemCount,
-    traceEventCount: traceEvents.length,
-    contextCompressionCount,
-    maxEstimatedContextTokens: estimatedContexts.length ? Math.max(...estimatedContexts) : undefined,
-    maxContextBudgetRatio: budgetRatios.length ? Math.max(...budgetRatios) : undefined,
-    latestContextBudgetRatio: contextBudgets.at(-1)?.contextBudgetRatio,
-    latestContextImageCount: contextBudgets.at(-1)?.contextImageCount,
-    lastPhase: debugEvents.at(-1)?.phase,
-    updatedAt: now(),
-  };
-}
-
 export function enrichRunResult(result: RunResult, debugEvents: RunDebugEvent[] = []): RunResult {
   const steps = (result.steps || []).map(enrichStepWithTrace);
   const ledgerItems = result.ledgerItems || [];
@@ -444,7 +362,6 @@ export function enrichRunResult(result: RunResult, debugEvents: RunDebugEvent[] 
   const traceEvents = buildRunTraceEvents(steps, debugEvents);
   const evidenceIndex = buildEvidenceIndex(steps, ledgerItems, traceEvents);
   const coverageMatrix = buildCoverageMatrix({ steps, taskFrame: result.taskFrame, ledgerItems, evidenceIndex });
-  const evidenceGraph = buildEvidenceGraph(steps, ledgerItems, evidenceIndex);
   return {
     ...result,
     steps,
@@ -453,7 +370,5 @@ export function enrichRunResult(result: RunResult, debugEvents: RunDebugEvent[] 
     traceEvents,
     evidenceIndex,
     coverageMatrix,
-    evidenceGraph,
-    diagnostics: buildRunDiagnostics(steps, traceEvents, debugEvents),
   };
 }

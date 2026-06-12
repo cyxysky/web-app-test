@@ -1,14 +1,15 @@
 'use client';
 
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Activity, Bug, Camera, CheckCircle2, ChevronRight, Database, Eye, FileSearch, GitBranch, Loader2, Maximize2, Minus, PauseCircle, PlayCircle, Plus, Radar, SkipForward, Wrench, X } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, PauseCircle, PlayCircle, Plus, Radar, SkipForward, Wrench, X } from 'lucide-react';
 import { MarkdownReport } from '@/components/MarkdownReport';
 import { RunMetaDrawer } from '@/components/RunMetaDrawer';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
 import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
-import type { EvidenceGraphRecord, EvidenceIndexItem, RunDebugEvent, StepExecutionResult, TaskFrame, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import { subscribeRealtime } from '@/lib/realtime-client';
+import type { RunDebugEvent, StepExecutionResult, TaskFrame, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 type ImageItem = { title: string; url: string };
 type StepToolCallItem = NonNullable<StepExecutionResult['tools']>[number];
@@ -71,17 +72,6 @@ function visibleStepObservation(step: StepExecutionResult) {
 function compactText(value?: string, max = 120) {
   const text = (value || '').replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}...` : text;
-}
-
-function percentLabel(value?: number) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 'n/a';
-  return `${Math.round(value * 100)}%`;
-}
-
-function tokenLabel(value?: number) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 'n/a';
-  if (value >= 1000) return `${Math.round(value / 100) / 10}k`;
-  return String(value);
 }
 
 function stepToolBadges(step: StepExecutionResult) {
@@ -379,27 +369,6 @@ function ImageViewer({ images, initialIndex, onClose }: { images: ImageItem[]; i
   );
 }
 
-function ReportAccordion({ title, items }: { title: string; items: string[] }) {
-  return (
-    <details className="report-accordion">
-      <summary>
-        <ChevronRight size={16} />
-        <span>{title}</span>
-        <b>{items.length}</b>
-      </summary>
-      <div>
-        {items.length ? (
-          <ul>
-            {items.map((item, index) => <li key={index}>{item}</li>)}
-          </ul>
-        ) : (
-          <p>暂无记录。</p>
-        )}
-      </div>
-    </details>
-  );
-}
-
 function LedgerItemCard({ frame, item, index }: { frame?: TaskFrame; item: TaskLedgerItem; index: number }) {
   const tone = ledgerToneClass(item);
   const evidence = item.evidence?.slice(0, 4) || [];
@@ -545,109 +514,6 @@ function LedgerPanel({ frame, items }: { frame?: TaskFrame; items: TaskLedgerIte
   );
 }
 
-function DiagnosticMetric({ icon, label, value }: { icon: ReactNode; label: string; value: number | string }) {
-  return (
-    <div className="diagnostic-metric">
-      <span>{icon}</span>
-      <div>
-        <strong>{value}</strong>
-        <p>{label}</p>
-      </div>
-    </div>
-  );
-}
-
-function EvidenceIndexRow({ item }: { item: EvidenceIndexItem }) {
-  const url = artifactUrl(item.path);
-  return (
-    <li className="evidence-index-row">
-      <div>
-        <strong>{item.title}</strong>
-        <p>
-          {[
-            item.stepIndex ? `Step ${item.stepIndex}` : '',
-            item.toolName,
-            item.kind,
-            item.status,
-            item.severity,
-          ].filter(Boolean).join(' · ')}
-        </p>
-        {item.summary ? <span>{compactText(item.summary, 180)}</span> : null}
-      </div>
-      {url ? (
-        <a href={url} rel="noreferrer" target="_blank">
-          <Eye size={14} />
-          Open
-        </a>
-      ) : null}
-    </li>
-  );
-}
-
-function RunDiagnosticsPanel({ run }: { run: TestRunRecord }) {
-  const diagnostics = run.result?.diagnostics;
-  const traceEvents = run.result?.traceEvents || [];
-  const evidenceIndex = run.result?.evidenceIndex || [];
-  if (!diagnostics && !traceEvents.length && !evidenceIndex.length) return null;
-  const recentEvents = traceEvents.slice(-16).reverse();
-  const evidencePreview = evidenceIndex.slice(-24).reverse();
-
-  return (
-    <section className="run-diagnostics-panel">
-      <div className="section-head compact">
-        <div>
-          <h2>运行诊断</h2>
-          <p>Trace store、证据索引和运行指标会随每次步骤写入同步刷新</p>
-        </div>
-      </div>
-      <div className="diagnostic-metric-grid">
-        <DiagnosticMetric icon={<Activity size={16} />} label="步骤" value={diagnostics?.stepCount ?? run.result?.steps.length ?? 0} />
-        <DiagnosticMetric icon={<Wrench size={16} />} label="工具调用" value={diagnostics?.toolCallCount ?? 0} />
-        <DiagnosticMetric icon={<Bug size={16} />} label="失败工具" value={diagnostics?.failedToolCallCount ?? 0} />
-        <DiagnosticMetric icon={<Camera size={16} />} label="截图证据" value={diagnostics?.screenshotCount ?? evidenceIndex.filter((item) => item.kind === 'screenshot').length} />
-        <DiagnosticMetric icon={<Database size={16} />} label="台账项" value={diagnostics?.ledgerItemCount ?? run.result?.ledgerItems?.length ?? 0} />
-        <DiagnosticMetric icon={<FileSearch size={16} />} label="Trace 事件" value={diagnostics?.traceEventCount ?? traceEvents.length} />
-        <DiagnosticMetric icon={<Activity size={16} />} label="上下文峰值" value={tokenLabel(diagnostics?.maxEstimatedContextTokens)} />
-        <DiagnosticMetric icon={<Radar size={16} />} label="最新占用" value={percentLabel(diagnostics?.latestContextBudgetRatio)} />
-        <DiagnosticMetric icon={<Minus size={16} />} label="压缩次数" value={diagnostics?.contextCompressionCount ?? 0} />
-        <DiagnosticMetric icon={<Plus size={16} />} label="最新图片" value={diagnostics?.latestContextImageCount ?? 0} />
-      </div>
-      <div className="diagnostic-columns">
-        <details className="diagnostic-card" open>
-          <summary>
-            <ChevronRight size={16} />
-            <span>最近 Trace 事件</span>
-          </summary>
-          {recentEvents.length ? (
-            <ol className="trace-event-list">
-              {recentEvents.map((event) => (
-                <li key={event.id}>
-                  <span>{event.type}</span>
-                  <div>
-                    <strong>{event.phase || event.toolName || event.status || 'event'}</strong>
-                    <p>{event.stepIndex ? `Step ${event.stepIndex} · ` : ''}{compactText(event.message, 180)}</p>
-                  </div>
-                </li>
-              ))}
-            </ol>
-          ) : <p className="empty-ledger">暂无 Trace 事件</p>}
-        </details>
-        <details className="diagnostic-card" open>
-          <summary>
-            <ChevronRight size={16} />
-            <span>证据索引</span>
-          </summary>
-          {evidencePreview.length ? (
-            <ul className="evidence-index-list">
-              {evidencePreview.map((item) => <EvidenceIndexRow item={item} key={item.id} />)}
-            </ul>
-          ) : <p className="empty-ledger">暂无证据索引</p>}
-        </details>
-      </div>
-    </section>
-  );
-}
-
 function ContextSummarySection({ title, items }: { title: string; items?: string[] }) {
   return (
     <div className="context-summary-section">
@@ -678,7 +544,7 @@ function RunContextSummaryPanel({ run }: { run: TestRunRecord }) {
         <ContextSummarySection items={summary.nextExecutionPlan} title="后续执行方案" />
         <ContextSummarySection items={summary.previousSummary} title="对此前的总结" />
         <ContextSummarySection items={summary.ledgerDigest} title="结构化台账摘要" />
-        <ContextSummarySection items={summary.evidenceDigest} title="证据索引摘要" />
+        <ContextSummarySection items={summary.evidenceDigest} title="证据摘要" />
         <ContextSummarySection items={summary.antiRegressionRules} title="防回退规则" />
         <ContextSummarySection items={summary.currentPageState} title="当前页面状态" />
       </div>
@@ -694,7 +560,7 @@ function RunCoverageMatrixPanel({ run }: { run: TestRunRecord }) {
       <div className="section-head compact">
         <div>
           <h2>覆盖矩阵</h2>
-          <p>{matrix.length} 个需求维度，按结构化台账和证据索引自动汇总</p>
+          <p>{matrix.length} 个需求维度，按结构化台账和步骤证据自动汇总</p>
         </div>
       </div>
       <div className="coverage-matrix-list">
@@ -717,119 +583,42 @@ function RunCoverageMatrixPanel({ run }: { run: TestRunRecord }) {
   );
 }
 
-function graphNodeTypeLabel(type: EvidenceGraphRecord['nodes'][number]['type']) {
+function qualityGradeLabel(grade?: NonNullable<NonNullable<TestRunRecord['report']>['quality']>['grade']) {
   return ({
-    evidence: '证据',
-    ledger: '台账',
-    step: '步骤',
-    tool: '工具',
-  } as Record<string, string>)[type] || type;
+    excellent: '优秀',
+    good: '良好',
+    fair: '可用',
+    poor: '不足',
+  } as Record<string, string>)[grade || ''] || '未评分';
 }
 
-function graphEdgeTypeLabel(type: EvidenceGraphRecord['edges'][number]['type']) {
-  return ({
-    belongs_to: '归属',
-    executes: '执行',
-    produces: '产生',
-    supports: '支撑',
-  } as Record<string, string>)[type] || type;
-}
-
-function RunEvidenceGraphPanel({ run }: { run: TestRunRecord }) {
-  const graph = run.result?.evidenceGraph;
-  if (!graph?.nodes.length) return null;
-
-  const nodes = graph.nodes.slice(-120);
-  const edges = graph.edges.slice(-160);
-  const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
-  const groupedNodes = new Map<EvidenceGraphRecord['nodes'][number]['type'], EvidenceGraphRecord['nodes']>;
-  const edgeCounts = edges.reduce<Record<string, number>>((counts, edge) => {
-    counts[edge.type] = (counts[edge.type] || 0) + 1;
-    return counts;
-  }, {});
-
-  for (const node of nodes) {
-    groupedNodes.set(node.type, [...(groupedNodes.get(node.type) || []), node]);
-  }
-
-  const visibleEdges = edges.slice(-36).reverse();
-
+function ReportQualityPanel({ run }: { run: TestRunRecord }) {
+  const quality = run.report?.quality;
+  if (!quality) return null;
   return (
-    <section className="evidence-graph-panel">
+    <section className="report-quality-panel">
       <div className="section-head compact">
         <div>
-          <h2>证据关系图</h2>
-          <p>{graph.nodes.length} 个节点 · {graph.edges.length} 条关系，串联步骤、工具、台账和证据</p>
+          <h2>报告质量复核</h2>
+          <p>{new Date(quality.reviewedAt).toLocaleString()}</p>
         </div>
-        <GitBranch size={18} />
-      </div>
-      <div className="evidence-graph-summary">
-        {(['step', 'tool', 'ledger', 'evidence'] as const).map((type) => (
-          <span key={type}>{graphNodeTypeLabel(type)} {groupedNodes.get(type)?.length || 0}</span>
-        ))}
-        {Object.entries(edgeCounts).map(([type, count]) => (
-          <span key={type}>{graphEdgeTypeLabel(type as EvidenceGraphRecord['edges'][number]['type'])} {count}</span>
-        ))}
-      </div>
-      <div className="evidence-graph-layout">
-        <div className="evidence-graph-lanes">
-          {(['step', 'tool', 'ledger', 'evidence'] as const).map((type) => {
-            const laneNodes = (groupedNodes.get(type) || []).slice(-12).reverse();
-            return (
-              <div className={`evidence-graph-lane ${type}`} key={type}>
-                <strong>{graphNodeTypeLabel(type)}</strong>
-                {laneNodes.length ? (
-                  <ul>
-                    {laneNodes.map((node) => (
-                      <li key={node.id}>
-                        <span>{node.status || node.type}</span>
-                        <b>{node.label}</b>
-                        {node.summary ? <p>{compactText(node.summary, 96)}</p> : null}
-                      </li>
-                    ))}
-                  </ul>
-                ) : <p className="empty-ledger">暂无节点</p>}
-              </div>
-            );
-          })}
+        <div className={`report-quality-score grade-${quality.grade}`}>
+          <strong>{quality.score}</strong>
+          <span>{qualityGradeLabel(quality.grade)}</span>
         </div>
-        <details className="evidence-graph-edges" open>
-          <summary>
-            <ChevronRight size={16} />
-            <span>最近关系</span>
-          </summary>
-          {visibleEdges.length ? (
-            <ol>
-              {visibleEdges.map((edge, index) => {
-                const from = nodeById.get(edge.from);
-                const to = nodeById.get(edge.to);
-                return (
-                  <li key={`${edge.from}-${edge.type}-${edge.to}-${index}`}>
-                    <span>{graphEdgeTypeLabel(edge.type)}</span>
-                    <div>
-                      <b>{from?.label || edge.from}</b>
-                      <p>{to?.label || edge.to}</p>
-                    </div>
-                  </li>
-                );
-              })}
-            </ol>
-          ) : <p className="empty-ledger">暂无关系</p>}
-        </details>
+      </div>
+      <div className="report-quality-checks">
+        {quality.checks.map((check) => (
+          <div className={`report-quality-check ${check.status}`} key={check.id}>
+            <CheckCircle2 size={16} />
+            <div>
+              <strong>{check.label}</strong>
+              <span>{check.detail}</span>
+            </div>
+          </div>
+        ))}
       </div>
     </section>
-  );
-}
-
-function ReportEvidence({ run }: { run: TestRunRecord }) {
-  return (
-    <div className="report-evidence">
-      <section>
-        <h3>运行日志</h3>
-        <ReportAccordion title="Console 错误" items={run.result?.consoleErrors || []} />
-        <ReportAccordion title="网络异常" items={run.result?.networkErrors || []} />
-      </section>
-    </div>
   );
 }
 
@@ -862,14 +651,10 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   useEffect(() => {
     let active = true;
-    let events: EventSource | undefined;
-    let timer: number | undefined;
     let refreshInFlight: Promise<void> | undefined;
 
     const stopRealtime = () => {
       active = false;
-      if (timer !== undefined) window.clearInterval(timer);
-      events?.close();
     };
 
     const refreshRun = async () => {
@@ -889,22 +674,15 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
       return refreshInFlight;
     };
 
-    if (typeof EventSource !== 'undefined') {
-      events = new EventSource(`/api/runs/${run.id}/events`);
-      events.addEventListener('run', () => {
-        void refreshRun();
-      });
-      events.addEventListener('error', () => {
-        void refreshRun();
-      });
-    }
-
-    timer = window.setInterval(() => {
-      void refreshRun();
-    }, 1000);
+    const unsubscribe = subscribeRealtime([`run:${run.id}`], (event) => {
+      if (event.entityType === 'run' && event.id === run.id) void refreshRun();
+    });
     void refreshRun();
 
-    return stopRealtime;
+    return () => {
+      unsubscribe();
+      stopRealtime();
+    };
   }, [run.id]);
 
   useEffect(() => {
@@ -1221,9 +999,8 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
       <LedgerPanel frame={taskFrame} items={ledgerItems} />
       <RunCoverageMatrixPanel run={run} />
-      <RunEvidenceGraphPanel run={run} />
       <RunContextSummaryPanel run={run} />
-      <RunDiagnosticsPanel run={run} />
+      <ReportQualityPanel run={run} />
 
       {debugEnabled ? (
         <section className="debug-timeline">
@@ -1243,7 +1020,6 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
               <h2>最终报告</h2>
               <button className="icon-button" onClick={() => setReportOpen(false)} type="button" aria-label="关闭"><X size={18} /></button>
             </header>
-            <ReportEvidence run={run} />
             <MarkdownReport markdown={run.report.markdown} onImageClick={openImageByUrl} />
           </section>
         </div>

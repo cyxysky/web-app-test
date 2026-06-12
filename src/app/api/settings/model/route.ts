@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { defaultModelByProvider, modelProviderDefinitions, modelProviderValues, modelProviderDefinition } from '@/config/settings';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/test-case.schema';
 
 const providers = new Set<ModelProvider>(modelProviderValues);

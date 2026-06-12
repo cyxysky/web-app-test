@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { startScheduler } from '@/server/ai/agents/test-runner.service';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 
 export async function GET() {
   startScheduler();

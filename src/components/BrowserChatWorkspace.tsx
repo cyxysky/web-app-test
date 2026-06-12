@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   Bot,
+  Database,
   Folder,
   ImageUp,
   Loader2,
@@ -15,6 +16,7 @@ import {
   Settings,
   FilePlus2,
   Square,
+  FolderPlus,
   Trash2,
   User,
   X,
@@ -28,6 +30,7 @@ import type { SettingsTab } from '@/config/settings';
 import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import { subscribeRealtime } from '@/lib/realtime-client';
 import type {
   RunScheduleRecord,
   StepExecutionResult,
@@ -180,6 +183,42 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
   };
 }
 
+function makeOptimisticRunningSession(
+  session: BrowserChatSession,
+  content: string,
+  clientMessageId: string,
+  attachments: BrowserChatAttachment[],
+) {
+  const now = new Date().toISOString();
+  const optimisticUserMessage: BrowserChatMessage = {
+    id: `${clientMessageId}_user`,
+    role: 'user',
+    content: content || '请结合我上传的图片继续处理当前任务。',
+    attachments,
+    clientMessageId,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const optimisticAssistantMessage: BrowserChatMessage = {
+    id: `${clientMessageId}_assistant`,
+    role: 'assistant',
+    content: '正在处理...',
+    clientMessageId,
+    createdAt: now,
+    updatedAt: now,
+    status: 'running',
+    stepIndexes: [],
+  };
+  const messages = (session.messages || []).filter((item) => item.clientMessageId !== clientMessageId);
+  return normalizeSession({
+    ...session,
+    busy: true,
+    status: 'running',
+    updatedAt: now,
+    messages: [...messages, optimisticUserMessage, optimisticAssistantMessage],
+  });
+}
+
 function sessionSortTime(session: BrowserChatSession) {
   return session.updatedAt || session.createdAt || '';
 }
@@ -212,7 +251,7 @@ function isRawDomSnapshotText(value?: string) {
 
 function toolTimelineSummary(tool?: BrowserChatToolCall) {
   if (!tool || tool.ok === false) return '';
-  if (tool.name === 'getDomTree') return '已读取当前可见 DOM 快照。';
+  if (tool.name === 'getDomTree') return '已读取当前可操作 DOM 树。';
   if (tool.name === 'getInteractiveCandidates') return '已读取当前可见可交互元素。';
   if (tool.name === 'getDomNodeText') return '已读取目标 DOM 节点文本。';
   if (tool.name === 'findByText') return '已查询页面文本匹配结果。';
@@ -420,14 +459,11 @@ export function BrowserChatWorkspace({
   const loadingSessionRef = useRef<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const activeSessionSnapshotRef = useRef<BrowserChatSession | null>(null);
+  const pendingClientMessageIdsRef = useRef(new Map<string, string>());
   const sessionVersionsRef = useRef(new Map<string, number>());
-  const sessionEventSourcesRef = useRef(new Map<string, {
-    events: EventSource;
-    refreshTimer?: number;
-    reconnectTimer?: number;
-  }>());
-  const subscribedSessionIdsRef = useRef(new Set<string>());
   const [activeView, setActiveView] = useState<BrowserChatView>(initialView);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
@@ -441,13 +477,13 @@ export function BrowserChatWorkspace({
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
   const [busy, setBusy] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
-  const [connectedSessionIds, setConnectedSessionIds] = useState<string[]>([]);
-  const [sessionEventsRequestKey, setSessionEventsRequestKey] = useState(0);
   const [interrupting, setInterrupting] = useState(false);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
   const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
+  const [exportingSession, setExportingSession] = useState(false);
+  const [exportingSuite, setExportingSuite] = useState(false);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
   const [toolDialog, setToolDialog] = useState<BrowserChatToolDetail | null>(null);
@@ -456,11 +492,11 @@ export function BrowserChatWorkspace({
   const selectedRunningSession = session?.busy ? session : undefined;
   const selectedSessionBusy = Boolean(session?.busy);
   const currentBusy = busy || selectedSessionBusy;
-  const selectedSessionEventsConnected = Boolean(session?.id && connectedSessionIds.includes(session.id));
-  const modeLocked = Boolean(session && session.status !== 'closed' && (session.messages.length || session.steps.length || session.busy));
   const messages = useMemo(() => session?.messages || [], [session?.messages]);
   const steps = useMemo(() => session?.steps || [], [session?.steps]);
   const logs = useMemo(() => session?.logs || [], [session?.logs]);
+  const modeLocked = Boolean(session && session.status !== 'closed' && (messages.length || steps.length || session.busy));
+  const canExportSession = Boolean(session && !session.busy && steps.some((step) => step.index > 0));
   const visibleMessages = messages;
   const lastAssistantMessageId = useMemo(
     () => [...visibleMessages].reverse().find((item) => item.role === 'assistant')?.id,
@@ -484,7 +520,7 @@ export function BrowserChatWorkspace({
     for (const item of sessions) merged.set(item.id, item);
     if (session) merged.set(session.id, session);
     return [...merged.values()]
-      .filter((item) => item.messages.length || item.id === session?.id)
+      .filter((item) => (item.messages || []).length || item.id === session?.id)
       .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)))
       .slice(0, 14);
   }, [session, sessions]);
@@ -506,16 +542,30 @@ export function BrowserChatWorkspace({
   );
 
   useEffect(() => {
+    setOnboardingDismissed(window.localStorage.getItem('ai-web-test:onboarding-dismissed') === 'true');
+  }, []);
+
+  useEffect(() => {
     activeSessionIdRef.current = session?.id || null;
-  }, [session?.id]);
+    activeSessionSnapshotRef.current = session;
+  }, [session]);
 
   const upsertSession = useCallback((nextSession: BrowserChatSession, options: { activate?: boolean; version?: number } = {}) => {
     const normalized = normalizeSession(nextSession);
     const lastVersion = sessionVersionsRef.current.get(normalized.id) || 0;
     if (typeof options.version === 'number') {
       if (options.version < lastVersion) return normalized;
-      sessionVersionsRef.current.set(normalized.id, options.version);
     }
+    const pendingClientMessageId = pendingClientMessageIdsRef.current.get(normalized.id);
+    if (pendingClientMessageId) {
+      const hasPendingMessage = normalized.messages.some((messageItem) => messageItem.clientMessageId === pendingClientMessageId);
+      const current = activeSessionSnapshotRef.current;
+      const currentHasPendingMessage = current?.id === normalized.id
+        && current.messages.some((messageItem) => messageItem.clientMessageId === pendingClientMessageId);
+      if (!hasPendingMessage && currentHasPendingMessage) return current;
+      if (hasPendingMessage && !normalized.busy) pendingClientMessageIdsRef.current.delete(normalized.id);
+    }
+    if (typeof options.version === 'number') sessionVersionsRef.current.set(normalized.id, options.version);
     const shouldActivate = options.activate ?? activeSessionIdRef.current === normalized.id;
     if (shouldActivate) setSession(normalized);
     setSessions((current) => {
@@ -559,113 +609,35 @@ export function BrowserChatWorkspace({
   }, [session?.id, sessions]);
   const subscribedSessionIdsKey = subscribedSessionIds.join('|');
 
-  const setSessionEventConnected = useCallback((sessionId: string, connected: boolean) => {
-    setConnectedSessionIds((current) => {
-      const next = new Set(current);
-      if (connected) next.add(sessionId);
-      else next.delete(sessionId);
-      return [...next].sort();
-    });
-  }, []);
-
   useEffect(() => {
-    subscribedSessionIdsRef.current = new Set(subscribedSessionIds);
-  }, [subscribedSessionIds, subscribedSessionIdsKey]);
-
-  useEffect(() => {
-    const sources = sessionEventSourcesRef.current;
-    const wanted = new Set(subscribedSessionIds);
-
-    const cleanupSessionEvents = (sessionId: string) => {
-      const record = sources.get(sessionId);
-      if (!record) return;
-      if (record.refreshTimer) window.clearTimeout(record.refreshTimer);
-      if (record.reconnectTimer) window.clearTimeout(record.reconnectTimer);
-      record.events.close();
-      sources.delete(sessionId);
-      setSessionEventConnected(sessionId, false);
-    };
-
-    for (const sessionId of [...sources.keys()]) {
-      if (!wanted.has(sessionId)) cleanupSessionEvents(sessionId);
-    }
-
-    for (const sessionId of subscribedSessionIds) {
-      if (sources.has(sessionId)) continue;
-      const record: {
-        events: EventSource;
-        refreshTimer?: number;
-        reconnectTimer?: number;
-      } = {
-        events: new EventSource(`/api/browser-chat/${sessionId}/events`),
-      };
-      sources.set(sessionId, record);
-
-      const scheduleRefresh = (delay = 20) => {
-        if (record.refreshTimer) window.clearTimeout(record.refreshTimer);
-        record.refreshTimer = window.setTimeout(() => {
-          void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch((refreshError) => {
-            if (activeSessionIdRef.current === sessionId) {
-              setError(refreshError instanceof Error ? refreshError.message : '加载对话失败');
-            }
-          });
-        }, delay);
-      };
-      const scheduleReconnect = (delay = 800) => {
-        if (record.reconnectTimer) window.clearTimeout(record.reconnectTimer);
-        record.reconnectTimer = window.setTimeout(() => {
-          cleanupSessionEvents(sessionId);
-          if (subscribedSessionIdsRef.current.has(sessionId)) {
-            setSessionEventsRequestKey((current) => current + 1);
-          }
-        }, delay);
-      };
-      const handleSession = (event: Event) => {
-        try {
-          const payload = JSON.parse((event as MessageEvent).data) as { snapshot: BrowserChatSession; version: number };
-          const shouldActivate = activeSessionIdRef.current === sessionId;
-          const loadedSession = upsertSession(payload.snapshot, { activate: shouldActivate, version: payload.version });
-          if (shouldActivate) setMode(normalizeMode(loadedSession.mode));
-        } catch {
-          scheduleRefresh();
+    if (!subscribedSessionIds.length) return undefined;
+    return subscribeRealtime(
+      subscribedSessionIds.map((sessionId) => `browserChatSession:${sessionId}`),
+      (event) => {
+        if (event.entityType !== 'browserChatSession') return;
+        if (event.event === 'deleted') {
+          setSessions((current) => current.filter((item) => item.id !== event.id));
+          setSession((current) => (current?.id === event.id ? null : current));
+          setSelectedSessionIds((current) => current.filter((id) => id !== event.id));
+          return;
         }
-      };
-      const handleDeleted = () => {
-        setSessions((current) => current.filter((item) => item.id !== sessionId));
-        setSession((current) => (current?.id === sessionId ? null : current));
-        setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
-        cleanupSessionEvents(sessionId);
-      };
-      const handleRefresh = () => scheduleRefresh();
-
-      record.events.addEventListener('session', handleSession);
-      record.events.addEventListener('deleted', handleDeleted);
-      record.events.addEventListener('refresh', handleRefresh);
-      record.events.onopen = () => setSessionEventConnected(sessionId, true);
-      record.events.onerror = () => {
-        setSessionEventConnected(sessionId, false);
-        scheduleReconnect();
-      };
-    }
-  }, [refreshSession, sessionEventsRequestKey, setSessionEventConnected, subscribedSessionIds, subscribedSessionIdsKey, upsertSession]);
-
-  useEffect(() => () => {
-    for (const record of sessionEventSourcesRef.current.values()) {
-      if (record.refreshTimer) window.clearTimeout(record.refreshTimer);
-      if (record.reconnectTimer) window.clearTimeout(record.reconnectTimer);
-      record.events.close();
-    }
-    sessionEventSourcesRef.current.clear();
-  }, []);
+        void refreshSession(event.id, { activate: activeSessionIdRef.current === event.id }).catch((refreshError) => {
+          if (activeSessionIdRef.current === event.id) {
+            setError(refreshError instanceof Error ? refreshError.message : '加载对话失败');
+          }
+        });
+      },
+    );
+  }, [refreshSession, subscribedSessionIds, subscribedSessionIdsKey]);
 
   useEffect(() => {
-    if (!session?.id || !session.busy || selectedSessionEventsConnected) return undefined;
+    if (!session?.id || (!session.busy && !busy)) return undefined;
     const sessionId = session.id;
-    const timer = window.setInterval(() => {
+    const watchdog = window.setTimeout(() => {
       void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch(() => undefined);
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [refreshSession, selectedSessionEventsConnected, session?.busy, session?.id]);
+    }, 6000);
+    return () => window.clearTimeout(watchdog);
+  }, [busy, refreshSession, session?.busy, session?.id, session?.updatedAt]);
 
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
@@ -757,15 +729,20 @@ export function BrowserChatWorkspace({
     setActiveView('chat');
     try {
       let active = await ensureSession();
-      setSessionEventsRequestKey((current) => current + 1);
+      activeSessionIdRef.current = active.id;
+      pendingClientMessageIdsRef.current.set(active.id, clientMessageId);
+      upsertSession(makeOptimisticRunningSession(active, content, clientMessageId, nextAttachments), { activate: true });
       let posted: BrowserChatSession;
       try {
         posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
       } catch (firstError) {
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
+        pendingClientMessageIdsRef.current.delete(active.id);
         active = await createSession();
-        setSessionEventsRequestKey((current) => current + 1);
+        activeSessionIdRef.current = active.id;
+        pendingClientMessageIdsRef.current.set(active.id, clientMessageId);
+        upsertSession(makeOptimisticRunningSession(active, content, clientMessageId, nextAttachments), { activate: true });
         posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
       }
       upsertSession(posted, { activate: true });
@@ -773,6 +750,8 @@ export function BrowserChatWorkspace({
       setAttachments([]);
     } catch (sendError) {
       const sendMessageText = sendError instanceof Error ? sendError.message : '发送消息失败';
+      const failedSessionId = activeSessionIdRef.current;
+      if (failedSessionId) pendingClientMessageIdsRef.current.delete(failedSessionId);
       setError(sendMessageText);
       setMessage(content);
       setAttachments(nextAttachments);
@@ -901,6 +880,49 @@ export function BrowserChatWorkspace({
     }
   }
 
+  async function exportSessionToTestCase() {
+    if (!session || exportingSession || !canExportSession) return;
+    setExportingSession(true);
+    setError('');
+    try {
+      const response = await fetch(`/api/browser-chat/${session.id}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: 'session' }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '导出探索记录失败');
+      startTransition(() => router.push(`/test-cases/${data.testCaseId}`));
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : '导出探索记录失败');
+    } finally {
+      setExportingSession(false);
+    }
+  }
+
+  async function exportSessionToTestSuite() {
+    if (!session || exportingSuite || !canExportSession) return;
+    setExportingSuite(true);
+    setError('');
+    try {
+      const response = await fetch(`/api/browser-chat/${session.id}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: 'suite' }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '生成测试套件失败');
+      const count = Array.isArray(data.testCaseIds) ? data.testCaseIds.length : 0;
+      window.alert(`已生成 ${count || 1} 条测试用例。`);
+      if (data.testCaseId) startTransition(() => router.push(`/test-cases/${data.testCaseId}`));
+      else startTransition(() => router.refresh());
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : '生成测试套件失败');
+    } finally {
+      setExportingSuite(false);
+    }
+  }
+
   async function startNewConversation() {
     setActiveView('chat');
     if (busy) return;
@@ -921,7 +943,6 @@ export function BrowserChatWorkspace({
     try {
       const loadedSession = await refreshSession(sessionId, { activate: true });
       setMode(normalizeMode(loadedSession.mode));
-      setSessionEventsRequestKey((current) => current + 1);
       void loadSessions().catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');
@@ -1042,6 +1063,16 @@ export function BrowserChatWorkspace({
     );
   }
 
+  function openSettingsTab(tab: SettingsTab) {
+    setSettingsTab(tab);
+    setActiveView('settings');
+  }
+
+  function dismissOnboarding() {
+    window.localStorage.setItem('ai-web-test:onboarding-dismissed', 'true');
+    setOnboardingDismissed(true);
+  }
+
   return (
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed' : 'browser-chat-layout'}>
       <aside className="browser-chat-sidebar">
@@ -1109,6 +1140,30 @@ export function BrowserChatWorkspace({
               </div>
             ) : null}
             {session ? (
+              <button
+                aria-label="生成测试套件"
+                className="browser-chat-export-suite"
+                disabled={!canExportSession || exportingSuite || busy}
+                onClick={() => void exportSessionToTestSuite()}
+                title="从探索记录生成测试套件"
+                type="button"
+              >
+                {exportingSuite ? <Loader2 className="spin" size={17} /> : <FolderPlus size={17} />}
+              </button>
+            ) : null}
+            {session ? (
+              <button
+                aria-label="导出探索记录"
+                className="browser-chat-export-session"
+                disabled={!canExportSession || exportingSession || busy}
+                onClick={() => void exportSessionToTestCase()}
+                title="导出整段探索记录"
+                type="button"
+              >
+                {exportingSession ? <Loader2 className="spin" size={17} /> : <FilePlus2 size={17} />}
+              </button>
+            ) : null}
+            {session ? (
               <button className="browser-chat-close" disabled={session.status === 'closed' || busy} onClick={closeSession} title="结束会话" type="button">
                 <Power size={17} />
               </button>
@@ -1124,7 +1179,7 @@ export function BrowserChatWorkspace({
                     : [];
                   const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || steps.length > 0);
                   return (
-                    <article className={`browser-chat-message ${item.role}`} key={item.id}>
+                    <article className={`browser-chat-message ${item.role} status-${item.status || 'passed'}`} key={item.id}>
                       <div className="browser-chat-avatar">
                         {item.role === 'user' ? <User size={15} /> : <Bot size={15} />}
                       </div>
@@ -1176,6 +1231,34 @@ export function BrowserChatWorkspace({
             ) : (
               <div className="browser-chat-hero">
                 <h1>今天要测试什么？</h1>
+                {!onboardingDismissed && !testCases.length ? (
+                  <div className="first-run-guide">
+                    <div className="first-run-guide-head">
+                      <strong>首启检查</strong>
+                      <button className="icon-button" onClick={dismissOnboarding} type="button" aria-label="关闭首启检查">
+                        <X size={16} />
+                      </button>
+                    </div>
+                    <div className="first-run-guide-grid">
+                      <button onClick={() => openSettingsTab('model')} type="button">
+                        <Settings size={16} />
+                        <span>模型配置</span>
+                      </button>
+                      <button onClick={() => openSettingsTab('browser')} type="button">
+                        <MessageSquare size={16} />
+                        <span>浏览器配置</span>
+                      </button>
+                      <button onClick={() => openSettingsTab('debug')} type="button">
+                        <Database size={16} />
+                        <span>数据目录</span>
+                      </button>
+                      <button onClick={() => setActiveView('target')} type="button">
+                        <Folder size={16} />
+                        <span>最小评测集</span>
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             )}
 

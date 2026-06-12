@@ -254,6 +254,7 @@ type AiDomRuntime = {
   visibleDomSnapshot: (options: {
     maxChars: number;
     maxElements: number;
+    includeOffscreen?: boolean;
     viewportClip?: BrowserUseViewportClip;
   }) => BrowserUseVisibleDomSnapshot;
   visibleDomPoint: (
@@ -485,7 +486,7 @@ function installAiBrowserPageRuntime() {
     win.__aiBrowserPageRuntimeInstalled = true;
   }
 
-  if (win.__aiDomRuntime?.version === 3) return;
+  if (win.__aiDomRuntime?.version === 4) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const actionableTags = new Set(['a', 'button', 'input', 'select', 'textarea', 'summary', 'option', 'label', 'details']);
@@ -805,6 +806,24 @@ function installAiBrowserPageRuntime() {
     return undefined;
   }
 
+  function renderedDomRect(element: Element) {
+    const style = window.getComputedStyle(element);
+    if (
+      style.visibility !== 'visible'
+      || style.display === 'none'
+      || style.pointerEvents === 'none'
+      || Number(style.opacity) <= 0.01
+    ) {
+      return undefined;
+    }
+    for (const rect of Array.from(element.getClientRects())) {
+      if (rect.width > 0 && rect.height > 0) {
+        return { bottom: rect.bottom, left: rect.left, right: rect.right, top: rect.top };
+      }
+    }
+    return undefined;
+  }
+
   function normalizeVisibleDomText(value: string) {
     return value.replace(/\s+/g, ' ').trim();
   }
@@ -875,12 +894,18 @@ function installAiBrowserPageRuntime() {
       : `<${tag} ${attrs.join(' ')}>${escapeVisibleDomText(text)}</${tag}>`;
   }
 
-  function visibleDomSnapshot(options: { maxChars: number; maxElements: number; viewportClip?: BrowserUseViewportClip }) {
+  function visibleDomSnapshot(options: {
+    maxChars: number;
+    maxElements: number;
+    includeOffscreen?: boolean;
+    viewportClip?: BrowserUseViewportClip;
+  }) {
     const state = visibleDomState();
     state.refToElement.clear();
 
     const rawViewport = visualViewportRect();
     const viewportClip = options.viewportClip ? intersectClip(rawViewport, options.viewportClip) || rawViewport : rawViewport;
+    const includeOffscreen = Boolean(options.includeOffscreen);
     const maxElements = Math.max(1, Math.floor(Number(options.maxElements) || 200));
     const maxChars = Math.max(1, Math.floor(Number(options.maxChars) || 20000));
     const frameElements: BrowserUseVisibleDomSnapshot['frameElements'] = [];
@@ -909,7 +934,7 @@ function installAiBrowserPageRuntime() {
     };
     const pushFrame = (element: Element) => {
       if (frameElements.length >= maxElements) return;
-      const rect = visibleDomRect(element, viewportClip);
+      const rect = includeOffscreen ? renderedDomRect(element) : visibleDomRect(element, viewportClip);
       if (!rect) return;
       const ref = visibleDomRef(element);
       state.refToElement.set(ref, element);
@@ -942,7 +967,7 @@ function installAiBrowserPageRuntime() {
       if (isOverlay(element)) return;
       const tag = visibleDomElementName(element);
       if (tag === 'frame' || tag === 'iframe') pushFrame(element);
-      if (isVisibleDomInteractive(element) && visibleDomRect(element, viewportClip)) pushItem(element);
+      if (isVisibleDomInteractive(element) && (includeOffscreen ? renderedDomRect(element) : visibleDomRect(element, viewportClip))) pushItem(element);
       const root = shadowRootOf(element);
       if (root && !stop()) visit(root);
       for (const child of Array.from(element.children)) {
@@ -990,7 +1015,7 @@ function installAiBrowserPageRuntime() {
   }
 
   win.__aiDomRuntime = {
-    version: 3,
+    version: 4,
     isOverlay,
     isTraversable,
     isRenderable,
@@ -2633,6 +2658,75 @@ export class BrowserSession {
     return { ok: true, actual: JSON.stringify(candidates, null, 2) };
   }
 
+  // 返回面向 AI 决策的页面概览，把可见文本、候选元素和滚动/焦点状态合并为一个只读摘要。
+  async getPageOverview(limit = 40): Promise<BrowserActionResult> {
+    const candidateLimit = Math.min(120, Math.max(1, Math.floor(Number.isFinite(limit) ? limit : 40)));
+    const context = await this.getPageContext({
+      includeDomTree: false,
+      includeText: true,
+      includeManualVerification: true,
+      includeInteractiveCandidates: true,
+      useCachedInteractiveCandidates: true,
+    });
+    const compact = (value?: string, max = 220) => {
+      const text = (value || '').replace(/\s+/g, ' ').trim();
+      return text.length > max ? `${text.slice(0, max)}...` : text;
+    };
+    const candidates = context.interactiveCandidates.slice(0, candidateLimit).map((candidate) => ({
+      id: candidate.id,
+      tag: candidate.tag,
+      role: candidate.role,
+      type: candidate.type,
+      label: compact(candidate.name || candidate.text || candidate.ariaLabel || candidate.placeholder || candidate.title || candidate.nearbyText, 160),
+      href: candidate.href,
+      rect: candidate.rect,
+      center: candidate.center,
+      input: candidate.input,
+      disabled: candidate.disabled,
+      framePath: candidate.framePath,
+      shadow: candidate.shadow,
+    }));
+    const scrollableAreas = context.scrollableAreas.slice(0, 20).map((area) => ({
+      id: area.id,
+      label: compact(area.name || area.text || area.role || area.tag, 120),
+      rect: area.rect,
+      scroll: {
+        top: area.scroll.top,
+        left: area.scroll.left,
+        clientHeight: area.scroll.clientHeight,
+        clientWidth: area.scroll.clientWidth,
+        maxTop: area.scroll.maxTop,
+        maxLeft: area.scroll.maxLeft,
+        remainingUp: area.scroll.remainingUp,
+        remainingDown: area.scroll.remainingDown,
+        remainingLeft: area.scroll.remainingLeft,
+        remainingRight: area.scroll.remainingRight,
+      },
+    }));
+    const overview = {
+      url: context.url,
+      title: context.title,
+      visibleTextSummary: compact(context.text, 1400),
+      visibleTextLength: context.textLength,
+      viewport: context.viewport,
+      pageScrollState: context.pageScrollState,
+      focusedElement: context.focusedElement,
+      manualVerification: context.manualVerification,
+      tabs: context.tabs,
+      scrollableAreas,
+      interactiveCandidates: candidates,
+      decisionHints: [
+        'Use this overview to understand the page before choosing a click/input target.',
+        'Candidate ids are still volatile and valid only for the current screenshot/page context.',
+        'Prefer candidates whose label/role/nearby text directly matches the user requirement.',
+      ],
+    };
+    return {
+      ok: true,
+      actual: `Current page overview for target selection:\n${JSON.stringify(overview, null, 2)}`,
+    };
+  }
+
   // 返回简化后的 DOM 树文本，作为候选列表不足时的兜底定位信息。
   async getSimplifiedDomTree(): Promise<BrowserActionResult> {
     return { ok: true, actual: await this.readSimplifiedDomTree() };
@@ -2822,7 +2916,7 @@ export class BrowserSession {
     if (!target) {
       return {
         ok: false,
-        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Call getDomTree again and use a fresh node_id.`,
+        actual: `DOM node id ${nodeId} is stale, missing, or could not be scrolled to a clickable point. Call getDomTree again and use a fresh node_id.`,
       };
     }
     const page = this.activePage;
@@ -2948,7 +3042,7 @@ export class BrowserSession {
     if (!target) {
       return {
         ok: false,
-        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Call getDomTree again and use a fresh node_id.`,
+        actual: `DOM node id ${nodeId} is stale, missing, or could not be scrolled to a clickable point. Call getDomTree again and use a fresh node_id.`,
       };
     }
     await this.activePage.mouse.click(target.x, target.y);
@@ -3854,10 +3948,10 @@ export class BrowserSession {
   }
 
   private async readSimplifiedDomTree() {
-    const maxElements = numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 200);
-    const maxChars = numericLimitFromEnv('DOM_CUA_MAX_CHARS', 20000);
+    const maxElements = numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 600);
+    const maxChars = numericLimitFromEnv('DOM_CUA_MAX_CHARS', 60000);
     this.lastDomNodeReferences = new Map();
-    const mainSnapshot = await this.readVisibleDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars);
+    const mainSnapshot = await this.readVisibleDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars, undefined, true);
     if (!mainSnapshot) return 'DOM runtime is not available on this page. Retry getDomTree after the page settles.';
     this.resetDomVisibleIdState(mainSnapshot.stateKey);
 
@@ -3893,7 +3987,7 @@ export class BrowserSession {
     }
 
     this.lastDomNodeReferences = new Map(references.map((reference) => [reference.id, reference]));
-    return lines.join('\n') || '[empty visible DOM snapshot]';
+    return lines.join('\n') || '[empty interactive DOM snapshot]';
   }
 
   private resetDomVisibleIdState(mainSnapshotKey: string) {
@@ -3928,12 +4022,13 @@ export class BrowserSession {
     maxElements: number,
     maxChars: number,
     viewportClip?: BrowserUseViewportClip,
+    includeOffscreen = false,
   ) {
     await this.ensureBrowserPageRuntime(target);
     return target.evaluate((input) => {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
       return runtime?.visibleDomSnapshot(input);
-    }, { maxChars, maxElements, viewportClip }).catch(() => undefined);
+    }, { includeOffscreen, maxChars, maxElements, viewportClip }).catch(() => undefined);
   }
 
   private async readVisibleFrameDomSnapshots(
@@ -3974,7 +4069,7 @@ export class BrowserSession {
         right: visibleFrameRect.right - box.x,
         top: visibleFrameRect.top - box.y,
       };
-      const snapshot = await this.readVisibleDomSnapshot(frame, maxElements, maxChars, viewportClip);
+      const snapshot = await this.readVisibleDomSnapshot(frame, maxElements, maxChars, viewportClip, true);
       if (!snapshot) continue;
       output.push({
         framePath,

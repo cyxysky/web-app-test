@@ -3,7 +3,7 @@ import path from 'node:path';
 import { BrowserSession, type BrowserSessionMode } from '@/server/browser/browser-session';
 import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage } from '@/server/ai/agents/test-executor.agent';
 import type { RecordedFlowStep, StepExecutionResult, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 import { readBrowserChatSessionSnapshots, writeBrowserChatSessionSnapshots } from '@/server/db/sqlite-store-engine';
 import { createSnapshotChannel, type SnapshotEvent, type SnapshotListener } from '@/server/realtime/snapshot-channel';
 import { artifactPath as resolveArtifactPath } from '@/server/storage/paths';
@@ -209,14 +209,154 @@ function statusFromSteps(steps: StepExecutionResult[]): CompletedRunStatus {
   return 'passed';
 }
 
+function normalizeSessionSnapshot(session: BrowserChatSessionSnapshot): BrowserChatSessionSnapshot {
+  return {
+    ...session,
+    consoleErrors: Array.isArray(session.consoleErrors) ? session.consoleErrors : [],
+    logs: Array.isArray(session.logs) ? session.logs : [],
+    messages: Array.isArray(session.messages) ? session.messages : [],
+    networkErrors: Array.isArray(session.networkErrors) ? session.networkErrors : [],
+    steps: Array.isArray(session.steps) ? session.steps : [],
+  };
+}
+
+function ensureSessionCollections(session: BrowserChatSessionRecord) {
+  session.consoleErrors = Array.isArray(session.consoleErrors) ? session.consoleErrors : [];
+  session.logs = Array.isArray(session.logs) ? session.logs : [];
+  session.messages = Array.isArray(session.messages) ? session.messages : [];
+  session.networkErrors = Array.isArray(session.networkErrors) ? session.networkErrors : [];
+  session.steps = Array.isArray(session.steps) ? session.steps : [];
+}
+
+function stepsForExport(session: BrowserChatSessionRecord, selectedStepIndexes?: Set<number>) {
+  return (session.steps || [])
+    .filter((step) => selectedStepIndexes?.size ? selectedStepIndexes.has(step.index) : step.index > 0)
+    .map((step) => ({ ...step, status: step.status === 'running' ? ('passed' as const) : step.status }))
+    .sort((a, b) => a.index - b.index);
+}
+
+function recordedFlowFromSteps(steps: StepExecutionResult[]): RecordedFlowStep[] {
+  return steps.flatMap((step) => (step.tools || []).map((tool, toolIndex) => ({
+    index: 0,
+    name: tool.name,
+    input: tool.input,
+    reason: tool.reason,
+    sourceStepIndex: step.index,
+    sourceStepAction: step.action,
+    sourceStepExpected: step.expected,
+    sourceToolIndex: toolIndex + 1,
+  }))).map((flow, index) => ({ ...flow, index: index + 1 }));
+}
+
+function testStepsFromBrowserSteps(steps: StepExecutionResult[]): TestCaseContent['steps'] {
+  return steps.map((step, index) => {
+    const firstTool = step.tools?.[0];
+    return {
+      index: index + 1,
+      operation: testOperationFromToolName(firstTool?.name),
+      action: compactText(step.action || firstTool?.name || `执行步骤 ${step.index}`, 240),
+      input: firstTool?.input ? safeJson(firstTool.input) : undefined,
+      expected: compactText(step.expected || step.actual || '该步骤应按对话中的已执行结果完成。', 320),
+      riskLevel: step.status === 'failed' ? 'warning' : 'safe',
+    };
+  });
+}
+
+function exportedRunDebug(session: BrowserChatSessionRecord) {
+  const events = (session.logs || []).slice(-200).map((log) => ({
+    time: log.time,
+    phase: log.phase,
+    message: log.message,
+    stepIndex: log.stepIndex,
+    details: log.elapsedMs ? { elapsedMs: log.elapsedMs } : undefined,
+  }));
+  return events.length ? { enabled: true, phase: 'browser-chat:export', events } : undefined;
+}
+
+async function persistBrowserChatExport(
+  session: BrowserChatSessionRecord,
+  content: TestCaseContent,
+  selectedSteps: StepExecutionResult[],
+  startedAt?: string,
+  groupId?: string,
+) {
+  const testCase = await store.createTestCase(content, [], groupId);
+  const run = await store.createRun(testCase.id);
+  const finishedAt = now();
+  const status = statusFromSteps(selectedSteps);
+  const completedRun = await store.updateRun(run.id, {
+    status,
+    startedAt: startedAt || session.createdAt,
+    endedAt: finishedAt,
+    result: {
+      steps: selectedSteps,
+      consoleErrors: session.consoleErrors,
+      networkErrors: session.networkErrors,
+      taskFrame: selectedSteps.at(-1)?.taskFrame,
+      ledgerItems: selectedSteps.flatMap((step) => step.ledgerItems || []),
+    },
+    debug: exportedRunDebug(session),
+  }) || run;
+  await store.updateTestCaseStatus(testCase.id, status === 'passed' ? 'passed' : status);
+  return { testCase: await store.getTestCase(testCase.id) || testCase, run: completedRun };
+}
+
+function messageExportContent(input: {
+  session: BrowserChatSessionRecord;
+  message: BrowserChatMessage;
+  previousUser?: BrowserChatMessage;
+  selectedSteps: StepExecutionResult[];
+  exportScope: 'message' | 'suite-message';
+  suiteId?: string;
+  suiteIndex?: number;
+}) {
+  const { exportScope, message, previousUser, selectedSteps, session, suiteId, suiteIndex } = input;
+  const recordedFlow = recordedFlowFromSteps(selectedSteps);
+  const titleSeed = previousUser?.content || message.content || '浏览器对话导出用例';
+  const prefix = exportScope === 'suite-message' && suiteIndex ? `套件步骤 ${suiteIndex}` : '对话导出';
+  const testData: Record<string, string> = {
+    browserChatMessageId: message.id,
+    browserChatSessionId: session.id,
+    exportScope,
+  };
+  if (suiteId) testData.browserChatSuiteId = suiteId;
+  if (suiteIndex) testData.browserChatSuiteIndex = String(suiteIndex);
+
+  return {
+    title: `${prefix} - ${compactText(titleSeed, 36)}`,
+    description: [
+      previousUser ? `用户消息：${previousUser.content}` : '',
+      `AI 输出：${message.content}`,
+    ].filter(Boolean).join('\n\n'),
+    targetUrl: session.targetUrl || 'about:blank',
+    priority: 'medium',
+    browserMode: session.mode,
+    isMarked: true,
+    userRequirement: previousUser?.content || message.content,
+    systemPrompt: exportScope === 'suite-message'
+      ? '该用例由 browser-chat 探索套件生成，对应一次 assistant 操作回合，包含原始步骤和工具调用记录。'
+      : '该用例由浏览器对话导出，已包含对话中 AI 实际执行过的步骤记录。',
+    preconditions: ['已根据浏览器对话完成过一次执行，导出时同步创建一条已完成运行记录。'],
+    testData,
+    steps: testStepsFromBrowserSteps(selectedSteps),
+    expectedResults: [message.content || '复现对话中 AI 已完成的浏览器操作。'],
+    risks: (session.networkErrors || []).length || (session.consoleErrors || []).length
+      ? ['原对话执行过程中存在控制台或网络错误记录，复跑时需要关注稳定性。']
+      : [],
+    recordedFlow: recordedFlow.length ? recordedFlow : undefined,
+    taskFrame: selectedSteps.at(-1)?.taskFrame,
+  } satisfies TestCaseContent;
+}
+
 function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
   const { aiRequest: _aiRequest, visualContext: _visualContext, workingMemory: _workingMemory, ...clientStep } = step;
   return clientStep;
 }
 
 function previewMessages(session: BrowserChatSessionRecord) {
-  const firstUserMessage = session.messages.find((message) => message.role === 'user');
-  const latestMessage = session.messages.at(-1);
+  const messages = session.messages || [];
+  const firstUserMessage = messages.find((message) => message.role === 'user');
+  const latestMessage = messages.at(-1);
   const selected = [firstUserMessage, latestMessage].filter((message): message is BrowserChatMessage => Boolean(message));
   return Array.from(new Map(selected.map((message) => [message.id, {
     ...message,
@@ -225,52 +365,54 @@ function previewMessages(session: BrowserChatSessionRecord) {
 }
 
 function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: boolean } = {}): BrowserChatSessionSnapshot {
+  const normalized = normalizeSessionSnapshot(session);
   return {
-    id: session.id,
-    title: session.title,
-    targetUrl: session.targetUrl,
-    mode: session.mode,
-    status: session.status,
-    busy: session.busy,
-    createdAt: session.createdAt,
-    updatedAt: session.updatedAt,
-    closedAt: session.closedAt,
-    error: session.error,
-    messages: [...session.messages],
-    steps: options.fullSteps ? [...session.steps] : session.steps.map(compactStepForClient),
-    consoleErrors: [...session.consoleErrors],
-    networkErrors: [...session.networkErrors],
-    logs: [...(session.logs || [])],
+    id: normalized.id,
+    title: normalized.title,
+    targetUrl: normalized.targetUrl,
+    mode: normalized.mode,
+    status: normalized.status,
+    busy: normalized.busy,
+    createdAt: normalized.createdAt,
+    updatedAt: normalized.updatedAt,
+    closedAt: normalized.closedAt,
+    error: normalized.error,
+    messages: [...normalized.messages],
+    steps: options.fullSteps ? [...normalized.steps] : normalized.steps.map(compactStepForClient),
+    consoleErrors: [...normalized.consoleErrors],
+    networkErrors: [...normalized.networkErrors],
+    logs: [...normalized.logs],
   };
 }
 
 function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionSnapshot {
+  const normalized = normalizeSessionSnapshot(session);
   return {
-    id: session.id,
-    title: session.title,
-    targetUrl: session.targetUrl,
-    mode: session.mode,
-    status: session.status,
-    busy: session.busy,
-    createdAt: session.createdAt,
-    updatedAt: session.updatedAt,
-    closedAt: session.closedAt,
-    error: session.error,
+    id: normalized.id,
+    title: normalized.title,
+    targetUrl: normalized.targetUrl,
+    mode: normalized.mode,
+    status: normalized.status,
+    busy: normalized.busy,
+    createdAt: normalized.createdAt,
+    updatedAt: normalized.updatedAt,
+    closedAt: normalized.closedAt,
+    error: normalized.error,
     messages: previewMessages(session),
     steps: [],
     consoleErrors: [],
     networkErrors: [],
-    logs: session.busy ? [...(session.logs || []).slice(-8)] : [],
+    logs: normalized.busy ? [...normalized.logs.slice(-8)] : [],
   };
 }
 
 function recordFromSnapshot(session: BrowserChatSessionSnapshot): BrowserChatSessionRecord {
-  const status = session.status === 'running' ? 'idle' : session.status;
+  const normalized = normalizeSessionSnapshot(session);
+  const status = normalized.status === 'running' ? 'idle' : normalized.status;
   return {
-    ...session,
+    ...normalized,
     status,
     busy: false,
-    logs: session.logs || [],
     started: false,
     browser: undefined,
   };
@@ -307,7 +449,7 @@ function appendLog(
     }));
   }
   session.updatedAt = timestamp;
-  persistAndNotify(session.id);
+  persistAndNotify(session.id, phase);
 }
 
 function persistSessions() {
@@ -327,7 +469,8 @@ function persistSessions() {
   }
 }
 
-function persistAndNotify(sessionId: string) {
+function persistAndNotify(sessionId: string, reason = 'session-updated') {
+  void reason;
   notifySessionUpdate(sessionId);
   schedulePersistSessions();
 }
@@ -385,13 +528,13 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
     session.browser = undefined;
     session.started = false;
     session.updatedAt = now();
-    persistAndNotify(session.id);
+    persistAndNotify(session.id, 'browser:stale');
   }
   await store.applyRuntimeEnv();
   const startedAt = Date.now();
   appendLog(session, 'browser:start', '正在启动或连接浏览器');
-  const hasPriorConversation = session.steps.length > 0
-    || session.messages.some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
+  const hasPriorConversation = (session.steps || []).length > 0
+    || (session.messages || []).some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
   const browser = new BrowserSession(session.mode === 'default' ? undefined : session.mode, {
     isMarked: true,
     preferExistingPage: !hasPriorConversation,
@@ -531,79 +674,144 @@ export async function exportBrowserChatMessageToTestCase(sessionId: string, mess
   await hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) throw new Error('Browser chat session not found');
-  const messageIndex = session.messages.findIndex((message) => message.id === messageId && message.role === 'assistant');
+  ensureSessionCollections(session);
+  const messages = session.messages || [];
+  const messageIndex = messages.findIndex((message) => message.id === messageId && message.role === 'assistant');
   if (messageIndex < 0) throw new Error('Browser chat assistant message not found');
-  const message = session.messages[messageIndex];
-  const previousUser = [...session.messages.slice(0, messageIndex)].reverse().find((item) => item.role === 'user');
+  const message = messages[messageIndex];
+  const previousUser = [...messages.slice(0, messageIndex)].reverse().find((item) => item.role === 'user');
   const selectedStepIndexes = new Set(message.stepIndexes || []);
-  const selectedSteps = session.steps
-    .filter((step) => selectedStepIndexes.size ? selectedStepIndexes.has(step.index) : step.index > 0)
-    .map((step) => ({ ...step, status: step.status === 'running' ? 'passed' : step.status }))
-    .sort((a, b) => a.index - b.index);
+  const selectedSteps = stepsForExport(session, selectedStepIndexes);
   if (!selectedSteps.length) throw new Error('No executed browser steps found for this message');
 
-  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).map((tool, toolIndex) => ({
-    index: 0,
-    name: tool.name,
-    input: tool.input,
-    reason: tool.reason,
-    sourceStepIndex: step.index,
-    sourceStepAction: step.action,
-    sourceStepExpected: step.expected,
-    sourceToolIndex: toolIndex + 1,
-  }))).map((flow, index) => ({ ...flow, index: index + 1 }));
+  const content = messageExportContent({
+    exportScope: 'message',
+    message,
+    previousUser,
+    selectedSteps,
+    session,
+  });
+  return persistBrowserChatExport(session, content, selectedSteps, message.createdAt || session.createdAt);
+}
 
-  const titleSeed = previousUser?.content || message.content || '浏览器对话导出用例';
+export async function exportBrowserChatSessionToTestCase(sessionId: string) {
+  await hydrateSessions();
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error('Browser chat session not found');
+  ensureSessionCollections(session);
+  const selectedSteps = stepsForExport(session);
+  if (!selectedSteps.length) throw new Error('No executed browser steps found for this session');
+
+  const messages = session.messages || [];
+  const userMessages = messages.filter((message) => message.role === 'user');
+  const assistantMessages = messages.filter((message) => message.role === 'assistant' && message.status !== 'running');
+  const recordedFlow = recordedFlowFromSteps(selectedSteps);
+  const titleSeed = userMessages[0]?.content || session.title || '浏览器探索记录';
+  const userRequirement = userMessages.map((message, index) => `${index + 1}. ${message.content}`).join('\n');
+  const assistantSummary = assistantMessages
+    .slice(-4)
+    .map((message, index) => `${index + 1}. ${compactText(message.content, 480)}`)
+    .join('\n');
+  const logSummary = (session.logs || [])
+    .slice(-8)
+    .map((log) => `${log.phase}：${compactText(log.message, 140)}`)
+    .join('\n');
+  const risks = [
+    (session.networkErrors || []).length || (session.consoleErrors || []).length
+      ? '原对话执行过程中存在控制台或网络错误记录，复跑时需要关注稳定性。'
+      : '',
+    session.status === 'error' ? '原对话处于异常状态，导出的用例需要人工复核。' : '',
+  ].filter(Boolean);
+
   const content: TestCaseContent = {
-    title: `对话导出 - ${compactText(titleSeed, 36)}`,
+    title: `探索记录导出 - ${compactText(titleSeed, 36)}`,
     description: [
-      previousUser ? `用户消息：${previousUser.content}` : '',
-      `AI 输出：${message.content}`,
+      `来源会话：${session.title}`,
+      userRequirement ? `用户消息：\n${userRequirement}` : '',
+      assistantSummary ? `AI 输出摘要：\n${assistantSummary}` : '',
+      logSummary ? `执行日志摘要：\n${logSummary}` : '',
     ].filter(Boolean).join('\n\n'),
     targetUrl: session.targetUrl || 'about:blank',
     priority: 'medium',
     browserMode: session.mode,
     isMarked: true,
-    userRequirement: previousUser?.content || message.content,
-    systemPrompt: '该用例由浏览器对话导出，已包含对话中 AI 实际执行过的步骤记录。',
-    preconditions: ['已根据浏览器对话完成过一次执行，导出时同步创建一条已完成运行记录。'],
-    testData: {},
-    steps: selectedSteps.map((step, index) => {
-      const firstTool = step.tools?.[0];
-      return {
-        index: index + 1,
-        operation: testOperationFromToolName(firstTool?.name),
-        action: compactText(step.action || firstTool?.name || `执行步骤 ${step.index}`, 240),
-        input: firstTool?.input ? safeJson(firstTool.input) : undefined,
-        expected: compactText(step.expected || step.actual || '该步骤应按对话中的已执行结果完成。', 320),
-        riskLevel: step.status === 'failed' ? 'warning' : 'safe',
-      };
-    }),
-    expectedResults: [message.content || '复现对话中 AI 已完成的浏览器操作。'],
-    risks: session.networkErrors.length || session.consoleErrors.length
-      ? ['原对话执行过程中存在控制台或网络诊断记录，复跑时需要关注稳定性。']
-      : [],
+    userRequirement: userRequirement || session.title,
+    systemPrompt: '该用例由完整 browser-chat 探索记录导出，包含会话中的步骤、工具调用和日志摘要。',
+    preconditions: ['已通过 browser-chat 完成一次探索，导出时同步创建一条已完成运行记录。'],
+    testData: {
+      browserChatSessionId: session.id,
+      exportScope: 'session',
+    },
+    steps: testStepsFromBrowserSteps(selectedSteps),
+    expectedResults: assistantMessages.length
+      ? assistantMessages.slice(-3).map((message) => compactText(message.content, 360))
+      : ['复现 browser-chat 探索过程中已完成的浏览器操作。'],
+    risks,
     recordedFlow: recordedFlow.length ? recordedFlow : undefined,
+    taskFrame: selectedSteps.at(-1)?.taskFrame,
   };
 
-  const testCase = await store.createTestCase(content, []);
-  const run = await store.createRun(testCase.id);
-  const finishedAt = now();
-  const status = statusFromSteps(selectedSteps);
-  const completedRun = await store.updateRun(run.id, {
-    status,
-    startedAt: message.createdAt || session.createdAt,
-    endedAt: finishedAt,
-    result: {
-      steps: selectedSteps,
-      consoleErrors: session.consoleErrors,
-      networkErrors: session.networkErrors,
-      taskFrame: selectedSteps.at(-1)?.taskFrame,
-      ledgerItems: selectedSteps.flatMap((step) => step.ledgerItems || []),
-    },
-  }) || run;
-  await store.updateTestCaseStatus(testCase.id, status === 'passed' ? 'passed' : status);
-  return { testCase: await store.getTestCase(testCase.id) || testCase, run: completedRun };
+  return persistBrowserChatExport(session, content, selectedSteps, session.createdAt);
+}
+
+export async function exportBrowserChatSessionToTestSuite(sessionId: string) {
+  await hydrateSessions();
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error('Browser chat session not found');
+  ensureSessionCollections(session);
+  const messages = session.messages || [];
+  const assistantMessages = messages.filter((message) => message.role === 'assistant' && message.status !== 'running');
+  const scopedMessages = assistantMessages.map((message, messageIndex) => {
+    const previousUser = [...messages.slice(0, messages.indexOf(message))]
+      .reverse()
+      .find((item) => item.role === 'user');
+    const hasScopedSteps = Boolean(message.stepIndexes?.length);
+    const selectedSteps = hasScopedSteps || assistantMessages.length === 1
+      ? stepsForExport(session, new Set(message.stepIndexes || []))
+      : [];
+    return { message, messageIndex, previousUser, selectedSteps };
+  }).filter((item) => item.selectedSteps.length > 0);
+
+  if (!scopedMessages.length) {
+    const selectedSteps = stepsForExport(session);
+    if (!selectedSteps.length) throw new Error('No executed browser steps found for this session');
+    const exported = await exportBrowserChatSessionToTestCase(sessionId);
+    return {
+      group: undefined,
+      testCases: [exported.testCase],
+      runs: [exported.run],
+      fallback: true,
+    };
+  }
+
+  const group = await store.createGroup(`探索套件 - ${compactText(session.title || session.id, 32)}`);
+  const exported = [];
+  for (let index = 0; index < scopedMessages.length; index += 1) {
+    const item = scopedMessages[index];
+    const content = messageExportContent({
+      exportScope: 'suite-message',
+      message: item.message,
+      previousUser: item.previousUser,
+      selectedSteps: item.selectedSteps,
+      session,
+      suiteId: group.id,
+      suiteIndex: index + 1,
+    });
+    exported.push(await persistBrowserChatExport(
+      session,
+      content,
+      item.selectedSteps,
+      item.message.createdAt || session.createdAt,
+      group.id,
+    ));
+  }
+
+  return {
+    group,
+    testCases: exported.map((item) => item.testCase),
+    runs: exported.map((item) => item.run),
+    fallback: false,
+  };
 }
 
 export async function sendBrowserChatMessage(
@@ -616,6 +824,7 @@ export async function sendBrowserChatMessage(
   await hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) throw new Error('Browser chat session not found');
+  ensureSessionCollections(session);
   if (session.status === 'closed') throw new Error('Browser chat session is closed');
   const text = content.trim();
   const attachments = normalizeAttachments(attachmentsInput);
@@ -626,8 +835,8 @@ export async function sendBrowserChatMessage(
     return snapshot(session);
   }
   if (session.busy) throw new Error('Browser chat session is already running');
-  if (mode && !session.started && !session.steps.length && !session.messages.length) session.mode = mode;
-  const firstUserMessage = !session.messages.some((message) => message.role === 'user');
+  if (mode && !session.started && !(session.steps || []).length && !(session.messages || []).length) session.mode = mode;
+  const firstUserMessage = !(session.messages || []).some((message) => message.role === 'user');
   if (firstUserMessage) session.title = compactText(messageText, 42);
 
   const timestamp = now();
@@ -767,6 +976,62 @@ function isAbortLikeError(error: unknown) {
   return name === 'AbortError' || /abort|interrupted|cancel/i.test(message);
 }
 
+function cleanInfrastructureMessage(error: unknown) {
+  return (error instanceof Error ? error.message : String(error || ''))
+    .replace(/\x1b\[[0-9;]*m/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\n?Call log:\n[\s\S]*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function browserChatFailureSummary(error: unknown) {
+  const message = cleanInfrastructureMessage(error);
+  if (/page\.screenshot/i.test(message) && /Timeout \d+ms exceeded/i.test(message)) {
+    return {
+      title: '页面截图超时',
+      detail: '浏览器没有在限定时间内完成截图，通常是页面渲染、字体加载或标签页状态卡住导致的。',
+      suggestion: '可以稍等页面稳定后重试；如果这个页面很重，优先使用 DOM 模式继续操作。',
+    };
+  }
+  if (/Timeout \d+ms exceeded/i.test(message)) {
+    return {
+      title: '浏览器操作超时',
+      detail: '本轮操作等待页面响应太久，已经停止以避免一直卡住。',
+      suggestion: '可以重试这一轮，或先确认页面是否还在加载、是否弹出了验证/权限窗口。',
+    };
+  }
+  if (/Target page, context or browser has been closed|browser has been closed|page has been closed/i.test(message)) {
+    return {
+      title: '浏览器页面已关闭',
+      detail: '执行过程中目标标签页或浏览器连接断开。',
+      suggestion: '重新开始或打开目标页面后再继续对话。',
+    };
+  }
+  return {
+    title: '浏览器执行中断',
+    detail: message || '本轮执行遇到浏览器侧异常，已经停止。',
+    suggestion: '可以重试，或查看日志了解更完整的执行节点。',
+  };
+}
+
+function browserChatFailureMarkdown(error: unknown) {
+  const summary = browserChatFailureSummary(error);
+  return [
+    `**${summary.title}**`,
+    '',
+    summary.detail,
+    '',
+    `建议：${summary.suggestion}`,
+  ].join('\n');
+}
+
+function sanitizeBrowserChatReply(reply: string, status: BrowserChatMessage['status']) {
+  if (status !== 'failed' && status !== 'blocked') return reply;
+  if (!/Call log:|\x1b\[[0-9;]*m|page\.screenshot|Timeout \d+ms exceeded/i.test(reply)) return reply;
+  return browserChatFailureMarkdown(reply);
+}
+
 export async function interruptBrowserChatSession(sessionId: string) {
   await hydrateSessions();
   const session = sessions.get(sessionId);
@@ -813,6 +1078,7 @@ async function runBrowserChatMessage(
   abortController: AbortController,
   attachments: BrowserChatAttachment[],
 ) {
+  ensureSessionCollections(session);
   try {
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
     appendLog(session, 'chat:run:start', '开始处理本轮对话操作');
@@ -865,7 +1131,7 @@ async function runBrowserChatMessage(
     const finishedAt = now();
     updateAssistantMessage(session, assistantMessageId, (message) => ({
       ...message,
-      content: result.reply,
+      content: sanitizeBrowserChatReply(result.reply, result.status),
       updatedAt: finishedAt,
       stepIndexes: result.newSteps.map((step) => step.index),
       status: result.status,
@@ -875,30 +1141,31 @@ async function runBrowserChatMessage(
     session.activeAssistantMessageId = undefined;
     session.activeAbortController = undefined;
     session.updatedAt = finishedAt;
-    persistAndNotify(session.id);
+    persistAndNotify(session.id, `chat:run:${result.status}`);
   } catch (error) {
     const interrupted = abortController.signal.aborted || isAbortLikeError(error);
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController) && interrupted) return;
-    const message = error instanceof Error ? error.message : String(error);
+    const message = cleanInfrastructureMessage(error);
+    const friendlyMessage = browserChatFailureMarkdown(error);
     if (isDeadBrowserSessionError(error)) {
       await session.browser?.close().catch(() => undefined);
       session.browser = undefined;
       session.started = false;
     }
-    appendLog(session, interrupted ? 'chat:run:interrupted' : 'chat:run:error', interrupted ? '本轮对话操作已中断。' : `本轮对话操作中断：${message}`);
+    appendLog(session, interrupted ? 'chat:run:interrupted' : 'chat:run:error', interrupted ? '本轮对话操作已中断。' : `本轮对话操作中断：${message || '未知错误'}`);
     session.error = interrupted ? undefined : message;
     session.status = interrupted ? 'idle' : 'error';
     session.busy = false;
     session.updatedAt = now();
     updateAssistantMessage(session, assistantMessageId, (item) => ({
       ...item,
-      content: interrupted ? '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。' : `执行中断：${message}`,
+      content: interrupted ? '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。' : friendlyMessage,
       updatedAt: session.updatedAt,
       status: interrupted ? 'interrupted' : 'failed',
     }));
     session.activeAssistantMessageId = undefined;
     session.activeAbortController = undefined;
-    persistAndNotify(session.id);
+    persistAndNotify(session.id, interrupted ? 'chat:run:interrupted' : 'chat:run:failed');
   } finally {
     if (session.activeAbortController === abortController) session.activeAbortController = undefined;
   }

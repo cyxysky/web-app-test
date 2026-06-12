@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 import { testCaseContentSchema } from '@/server/ai/schemas/test-case.schema';
 import { richTextToPlainText } from '@/lib/rich-text';
 

@@ -1,6 +1,6 @@
 import { generateText } from 'ai';
 import { getModel } from '@/server/ai/model';
-import type { EvidenceIndexItem, StepExecutionResult, TaskFrame, TaskLedgerItem, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { StepExecutionResult, TaskFrame, TaskLedgerItem, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { artifactsRoot } from '@/server/storage/paths';
 import { artifactApiUrl } from '@/lib/artifacts';
 import { richTextToPlainText } from '@/lib/rich-text';
@@ -135,67 +135,6 @@ function issueSummaryMarkdown(frame: TaskFrame | undefined, result: TestRunRecor
   return Array.from(new Set(lines)).slice(0, limit).join('\n');
 }
 
-function fallbackEvidenceIndex(result: TestRunRecord['result']): EvidenceIndexItem[] {
-  const index: EvidenceIndexItem[] = [];
-  for (const step of result?.steps || []) {
-    if (step.beforeScreenshotPath) {
-      index.push({
-        id: `step:${step.index}:before`,
-        title: `Step ${step.index} before screenshot`,
-        source: 'step',
-        stepIndex: step.index,
-        kind: 'screenshot',
-        path: step.beforeScreenshotPath,
-        status: step.status,
-        summary: compact(step.action, 160),
-      });
-    }
-    if (step.afterScreenshotPath || step.screenshotPath) {
-      index.push({
-        id: `step:${step.index}:after`,
-        title: `Step ${step.index} after screenshot`,
-        source: 'step',
-        stepIndex: step.index,
-        kind: 'screenshot',
-        path: step.afterScreenshotPath || step.screenshotPath,
-        status: step.status,
-        summary: compact(step.actual, 180),
-      });
-    }
-  }
-  return index;
-}
-
-function evidenceIndexMarkdown(result: TestRunRecord['result'], limit = Number(process.env.AI_FINAL_REPORT_EVIDENCE_LIMIT || 120)) {
-  const index = result?.evidenceIndex?.length ? result.evidenceIndex : fallbackEvidenceIndex(result);
-  if (!index.length) return '- No evidence index was captured.';
-  return index.slice(-limit).map((item) => {
-    const link = item.path ? artifactUrl(item.path) : '';
-    const location = item.stepIndex ? `Step ${item.stepIndex}` : item.source;
-    const label = [location, item.toolName, item.kind, item.status, item.severity].filter(Boolean).join(' / ');
-    return [
-      `- [${label}] ${item.title}`,
-      item.summary ? `  - Summary: ${compact(item.summary, 260)}` : '',
-      link ? `  - Evidence: [open artifact](${link})` : '',
-    ].filter(Boolean).join('\n');
-  }).join('\n');
-}
-
-function diagnosticsMarkdown(result: TestRunRecord['result']) {
-  const diagnostics = result?.diagnostics;
-  if (!diagnostics) return '- No run diagnostics were captured.';
-  return [
-    `- Steps: ${diagnostics.stepCount}`,
-    `- Tool calls: ${diagnostics.toolCallCount}; failed tools: ${diagnostics.failedToolCallCount}`,
-    `- Screenshots: ${diagnostics.screenshotCount}; visual frames: ${diagnostics.visualFrameCount}`,
-    `- Ledger items: ${diagnostics.ledgerItemCount}; trace events: ${diagnostics.traceEventCount}`,
-    `- Context compression count: ${diagnostics.contextCompressionCount}`,
-    diagnostics.maxEstimatedContextTokens ? `- Max estimated context tokens: ${diagnostics.maxEstimatedContextTokens}` : '',
-    diagnostics.latestContextBudgetRatio ? `- Latest context budget usage: ${Math.round(diagnostics.latestContextBudgetRatio * 100)}%` : '',
-    diagnostics.lastPhase ? `- Last debug phase: ${diagnostics.lastPhase}` : '',
-  ].filter(Boolean).join('\n');
-}
-
 function contextSummaryMarkdown(result: TestRunRecord['result']) {
   const summary = result?.contextSummary || result?.contextSummaries?.at(-1);
   if (!summary) return '- 本次运行尚未触发结构化上下文压缩。';
@@ -213,7 +152,7 @@ function contextSummaryMarkdown(result: TestRunRecord['result']) {
     section('后续执行方案', summary.nextExecutionPlan),
     section('对此前的总结', summary.previousSummary),
     section('结构化台账摘要', summary.ledgerDigest),
-    section('证据索引摘要', summary.evidenceDigest),
+    section('证据摘要', summary.evidenceDigest),
     section('防回退规则', summary.antiRegressionRules),
     section('阻塞点', summary.blockers),
     section('疑问点', summary.openQuestions),
@@ -231,30 +170,6 @@ function coverageMatrixMarkdown(result: TestRunRecord['result']) {
     `  - 台账项：${item.itemCount}；证据：${item.evidenceItemIds.length}`,
     item.nextAction ? `  - 下一步：${item.nextAction}` : '',
   ].filter(Boolean).join('\n')).join('\n');
-}
-
-function evidenceGraphMarkdown(result: TestRunRecord['result']) {
-  const graph = result?.evidenceGraph;
-  if (!graph?.nodes.length) return '- 暂无证据关系图。';
-  const nodeCounts = graph.nodes.reduce<Record<string, number>>((counts, node) => {
-    counts[node.type] = (counts[node.type] || 0) + 1;
-    return counts;
-  }, {});
-  const edgeCounts = graph.edges.reduce<Record<string, number>>((counts, edge) => {
-    counts[edge.type] = (counts[edge.type] || 0) + 1;
-    return counts;
-  }, {});
-  const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
-  const recentEdges = graph.edges.slice(-24).map((edge) => {
-    const from = nodeById.get(edge.from);
-    const to = nodeById.get(edge.to);
-    return `- ${edge.type}: ${from?.label || edge.from} -> ${to?.label || edge.to}`;
-  });
-  return [
-    `- 节点：step ${nodeCounts.step || 0}；tool ${nodeCounts.tool || 0}；ledger ${nodeCounts.ledger || 0}；evidence ${nodeCounts.evidence || 0}`,
-    `- 关系：executes ${edgeCounts.executes || 0}；produces ${edgeCounts.produces || 0}；supports ${edgeCounts.supports || 0}；belongs_to ${edgeCounts.belongs_to || 0}`,
-    recentEdges.length ? ['- 最近关系：', ...recentEdges.map((item) => `  ${item}`)].join('\n') : '- 最近关系：无',
-  ].join('\n');
 }
 
 function stepMarkdown(step: StepExecutionResult) {
@@ -282,11 +197,8 @@ function reportContext(testCase: TestCaseRecord, run: TestRunRecord) {
   const frame = collectTaskFrame(testCase, result);
   const ledger = collectLedgerItems(result);
   const steps = result?.steps || [];
-  const evidenceIndex = evidenceIndexMarkdown(result);
-  const diagnostics = diagnosticsMarkdown(result);
   const contextSummary = contextSummaryMarkdown(result);
   const coverageMatrix = coverageMatrixMarkdown(result);
-  const evidenceGraph = evidenceGraphMarkdown(result);
   return [
     `运行状态：${statusText(run.status)}`,
     `目标地址：${testCase.targetUrl}`,
@@ -298,8 +210,6 @@ function reportContext(testCase: TestCaseRecord, run: TestRunRecord) {
     `结构化台账：\n${ledgerMarkdown(frame, ledger)}`,
     '',
     `覆盖矩阵：\n${coverageMatrix}`,
-    '',
-    `证据关系图：\n${evidenceGraph}`,
     '',
     `问题与风险汇总：\n${issueSummaryMarkdown(frame, result)}`,
     '',
@@ -314,10 +224,6 @@ function reportContext(testCase: TestCaseRecord, run: TestRunRecord) {
     ].filter(Boolean).join('\n')).join('\n\n')}`,
     result?.consoleErrors.length ? `Console 错误：\n${result.consoleErrors.join('\n')}` : '',
     result?.networkErrors.length ? `网络异常：\n${result.networkErrors.join('\n')}` : '',
-    '',
-    `Run diagnostics:\n${diagnostics}`,
-    '',
-    `Evidence index:\n${evidenceIndex}`,
   ].filter(Boolean).join('\n\n');
 }
 
@@ -327,16 +233,99 @@ function fallbackSummary(status: TestRunRecord['status']) {
   return '任务被阻塞或中断。请查看阻塞步骤、人工介入信息和未覆盖台账项。';
 }
 
+function stripReportSections(markdown: string) {
+  return markdown
+    .replace(/\n##\s*(?:Evidence Index|证据索引|证据关系图|Evidence Graph|Run Diagnostics|运行诊断)\b[\s\S]*?(?=\n##\s+|$)/gi, '');
+}
+
+function normalizeReportMarkdown(markdown: string) {
+  return stripReportSections(markdown)
+    .replace(/\r\n/g, '\n')
+    .replace(/([^\n])\n(#{1,6}\s+)/g, '$1\n\n$2')
+    .replace(/(#{1,6}[^\n]+)\n(?!\n)/g, '$1\n\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function reportQualityGrade(score: number): NonNullable<ReportRecord['quality']>['grade'] {
+  if (score >= 90) return 'excellent';
+  if (score >= 75) return 'good';
+  if (score >= 55) return 'fair';
+  return 'poor';
+}
+
+function qualityStatus(ok: boolean, warning = false): 'passed' | 'warning' | 'failed' {
+  if (ok) return 'passed';
+  return warning ? 'warning' : 'failed';
+}
+
+function assessReportQuality(testCase: TestCaseRecord, run: TestRunRecord, markdown: string): NonNullable<ReportRecord['quality']> {
+  const result = run.result;
+  const frame = collectTaskFrame(testCase, result);
+  const ledgerItems = collectLedgerItems(result);
+  const matrix = result?.coverageMatrix || [];
+  const issueItems = ledgerItems.filter((item) => item.status === 'issue' || item.status === 'risk');
+  const failedSteps = result?.steps.filter((step) => step.status === 'failed' || step.status === 'blocked') || [];
+  const hasSuggestions = /建议|修复|优先级|下一步|风险/i.test(markdown);
+  const checks: NonNullable<ReportRecord['quality']>['checks'] = [
+    {
+      id: 'coverage-matrix',
+      label: '覆盖矩阵',
+      status: qualityStatus(Boolean(matrix.length || frame?.dimensions.length), Boolean(frame?.dimensions.length)),
+      detail: matrix.length ? `覆盖矩阵包含 ${matrix.length} 个维度。` : frame?.dimensions.length ? '有任务维度但未形成覆盖矩阵。' : '本次没有任务框架维度。',
+    },
+    {
+      id: 'ledger-items',
+      label: '结构化台账',
+      status: qualityStatus(ledgerItems.length > 0),
+      detail: ledgerItems.length ? `包含 ${ledgerItems.length} 条台账项。` : '缺少结构化台账，报告复核能力较弱。',
+    },
+    {
+      id: 'issue-review',
+      label: '问题复核',
+      status: qualityStatus(Boolean(issueItems.length || !failedSteps.length), Boolean(failedSteps.length)),
+      detail: issueItems.length
+        ? `包含 ${issueItems.length} 条问题/风险台账。`
+        : failedSteps.length
+          ? '存在失败或阻塞步骤，但缺少问题/风险台账。'
+          : '未发现失败步骤或明确问题。',
+    },
+    {
+      id: 'recommendations',
+      label: '建议与下一步',
+      status: qualityStatus(hasSuggestions, run.status === 'passed'),
+      detail: hasSuggestions ? '报告包含建议、修复或下一步信息。' : '报告缺少建议或下一步信息。',
+    },
+    {
+      id: 'context-summary',
+      label: '上下文摘要',
+      status: qualityStatus(Boolean(result?.contextSummary || result?.contextSummaries?.length), true),
+      detail: result?.contextSummary || result?.contextSummaries?.length ? '包含结构化上下文摘要。' : '未触发或未记录结构化上下文摘要。',
+    },
+  ];
+
+  const perCheck = checks.length ? 100 / checks.length : 100;
+  const score = Math.max(0, Math.min(100, Math.round(checks.reduce((sum, check) => {
+    if (check.status === 'passed') return sum + perCheck;
+    if (check.status === 'warning') return sum + perCheck * 0.5;
+    return sum;
+  }, 0))));
+
+  return {
+    score,
+    grade: reportQualityGrade(score),
+    reviewedAt: new Date().toISOString(),
+    checks,
+  };
+}
+
 export function writeReport(testCase: TestCaseRecord, run: TestRunRecord): ReportRecord {
   const result = run.result;
   const taskFrame = collectTaskFrame(testCase, result);
   const ledgerItems = collectLedgerItems(result);
   const stepBlocks = (result?.steps || []).map(stepMarkdown).join('\n\n');
-  const evidenceIndex = evidenceIndexMarkdown(result);
-  const diagnostics = diagnosticsMarkdown(result);
   const contextSummary = contextSummaryMarkdown(result);
   const coverageMatrix = coverageMatrixMarkdown(result);
-  const evidenceGraph = evidenceGraphMarkdown(result);
   const summary = fallbackSummary(run.status);
   const markdown = `# 测试报告：${testCase.title}
 
@@ -360,10 +349,6 @@ ${ledgerMarkdown(taskFrame, ledgerItems)}
 
 ${coverageMatrix}
 
-## 证据关系图
-
-${evidenceGraph}
-
 ## 问题与风险汇总
 
 ${issueSummaryMarkdown(taskFrame, result)}
@@ -384,11 +369,13 @@ ${result?.consoleErrors.length ? result.consoleErrors.map((item) => `- ${item}`)
 
 ${result?.networkErrors.length ? result.networkErrors.map((item) => `- ${item}`).join('\n') : '- 未采集到关键网络异常。'}
 `;
+  const normalizedMarkdown = normalizeReportMarkdown(markdown);
   return {
     title: `测试报告：${testCase.title}`,
     summary,
-    markdown: `${markdown}\n\n## Run Diagnostics\n\n${diagnostics}\n\n## Evidence Index\n\n${evidenceIndex}`,
+    markdown: normalizedMarkdown,
     suggestions: [],
+    quality: assessReportQuality(testCase, run, normalizedMarkdown),
   };
 }
 
@@ -405,7 +392,7 @@ export async function writeAiReport(testCase: TestCaseRecord, run: TestRunRecord
         '你是资深测试负责人。请基于下面的运行事实，生成最终交付报告。',
         '',
         '要求：',
-        '- 使用中文 Markdown。',
+        '- 使用中文 Markdown 便于存储，但内容要面向结构化报告展示，不要输出调试统计。',
         '- 报告必须详细，不要空泛总结。',
         '- “AI 总结”是任务交付的重要组成部分，需要概括已读内容、关键业务规则、测试覆盖、未覆盖项和最终判断。',
         '- 必须单独总结测试过程中发现的问题、风险、影响范围和证据步骤；没有明确问题时也要说明“未发现明确问题”。',
@@ -413,6 +400,7 @@ export async function writeAiReport(testCase: TestCaseRecord, run: TestRunRecord
         '- 只能基于提供的事实和台账，不要编造未实际读取到的页面细节。',
         '- 不要输出“测试用例生成状态”这类无意义状态，要输出具体测试内容。',
         '- 保留必要的截图链接或步骤编号作为证据引用。',
+        '- 不要输出 Evidence Index、证据索引、运行诊断或证据关系图段落。',
         '',
         '建议结构：',
         '# 测试报告：标题',
@@ -421,35 +409,21 @@ export async function writeAiReport(testCase: TestCaseRecord, run: TestRunRecord
         '## 完整测试流程',
         '## 详细测试用例',
         '## 覆盖矩阵与台账结论',
-        '## 证据关系图',
         '## 问题与风险汇总',
         '## 结构化上下文摘要',
         '## 疑问与未覆盖项',
         '## 执行步骤与证据',
-        '## Run Diagnostics',
-        '## Evidence Index',
         '',
         context,
       ].join('\n'),
     });
     const markdown = result.text.trim();
     if (!markdown) return fallback;
-    const evidenceIndex = evidenceIndexMarkdown(run.result);
-    const diagnostics = diagnosticsMarkdown(run.result);
     const contextSummary = contextSummaryMarkdown(run.result);
-    const evidenceGraph = evidenceGraphMarkdown(run.result);
     const markdownWithContextSummary = /##\s*结构化上下文摘要/.test(markdown)
       ? markdown
       : `${markdown}\n\n## 结构化上下文摘要\n\n${contextSummary}`;
-    const markdownWithGraph = /##\s*证据关系图/.test(markdownWithContextSummary) || /##\s*Evidence Graph/i.test(markdownWithContextSummary)
-      ? markdownWithContextSummary
-      : `${markdownWithContextSummary}\n\n## 证据关系图\n\n${evidenceGraph}`;
-    const markdownWithDiagnostics = /##\s*Run Diagnostics/i.test(markdownWithGraph) || /##\s*运行诊断/.test(markdownWithGraph)
-      ? markdownWithGraph
-      : `${markdownWithGraph}\n\n## Run Diagnostics\n\n${diagnostics}`;
-    const markdownWithEvidence = /##\s*Evidence Index/i.test(markdownWithDiagnostics) || /##\s*证据索引/.test(markdownWithDiagnostics)
-      ? markdownWithDiagnostics
-      : `${markdownWithDiagnostics}\n\n## Evidence Index\n\n${evidenceIndex}`;
+    const normalizedMarkdown = normalizeReportMarkdown(markdownWithContextSummary);
     const summary = markdown
       .replace(/^# .+$/m, '')
       .split(/\n## /)[0]
@@ -460,7 +434,8 @@ export async function writeAiReport(testCase: TestCaseRecord, run: TestRunRecord
     return {
       ...fallback,
       summary,
-      markdown: markdownWithEvidence,
+      markdown: normalizedMarkdown,
+      quality: assessReportQuality(testCase, run, normalizedMarkdown),
     };
   } catch {
     return fallback;

@@ -2,7 +2,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { ArrowLeft } from 'lucide-react';
 import { RunProgress } from '@/components/RunProgress';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 
 export const dynamic = 'force-dynamic';
 

@@ -1,12 +1,13 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState, useTransition } from 'react';
-import { CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, PlayCircle, Settings, Trash2, X } from 'lucide-react';
+import { useCallback, useEffect, useState, useTransition } from 'react';
+import { CalendarClock, FlaskConical, Folder, FolderPlus, Loader2, MessageSquare, PlayCircle, Settings, Trash2, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
 import { NewTestCaseModal } from '@/components/NewTestCaseModal';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import { subscribeRealtime } from '@/lib/realtime-client';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { RunScheduleRecord, TestCaseRecord, TestGroupRecord } from '@/server/ai/schemas/test-case.schema';
 
@@ -21,6 +22,145 @@ function statusLabel(status: string) {
     blocked: '阻塞',
   };
   return labels[status] || status;
+}
+
+type EvaluationSuiteStatus = {
+  totalTemplates: number;
+  seededCases: number;
+  missingCases: number;
+  totalRuns: number;
+  completedRunCount: number;
+  passedRunCount: number;
+  failedRunCount: number;
+  blockedRunCount: number;
+  passRate: number;
+  averageDurationMs?: number;
+  trend: {
+    recentRuns: number;
+    previousRuns: number;
+    recentPassRate: number;
+    previousPassRate?: number;
+    delta?: number;
+    status: 'no-data' | 'baseline' | 'regressed' | 'improved' | 'stable';
+  };
+  alerts: Array<{
+    level: 'info' | 'warning' | 'danger';
+    title: string;
+    detail: string;
+  }>;
+  areas: Array<{
+    area: string;
+    totalCases: number;
+    seededCases: number;
+    completedRunCount: number;
+    passedRunCount: number;
+    failedRunCount: number;
+    blockedRunCount: number;
+    passRate: number;
+  }>;
+  cases: Array<{
+    key: string;
+    area: string;
+    title: string;
+    testCaseId?: string;
+    status: string;
+    runCount: number;
+    completedRunCount: number;
+    passRate: number;
+    trend: EvaluationSuiteStatus['trend'];
+    latestRun?: {
+      id: string;
+      status: string;
+      startedAt?: string;
+      endedAt?: string;
+      qualityScore?: number;
+      contextSummaryScore?: number;
+    };
+  }>;
+};
+
+function areaLabel(area: string) {
+  return ({
+    'browser-chat': 'browser-chat',
+    'context-summary': '长上下文',
+    'dom-mode': 'DOM',
+    'visual-markers': '视觉标记',
+  } as Record<string, string>)[area] || area;
+}
+
+function formatDuration(ms?: number) {
+  if (!ms) return '暂无';
+  if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))} 秒`;
+  return `${Math.round(ms / 60_000)} 分钟`;
+}
+
+function trendLabel(trend: EvaluationSuiteStatus['trend']) {
+  if (trend.status === 'no-data') return '暂无趋势';
+  if (trend.status === 'baseline') return `基线 ${trend.recentPassRate}%`;
+  const delta = trend.delta || 0;
+  const sign = delta > 0 ? '+' : '';
+  return `${trend.recentPassRate}% (${sign}${delta})`;
+}
+
+function EvaluationSuiteSummary({
+  loading,
+  status,
+}: {
+  loading: boolean;
+  status: EvaluationSuiteStatus;
+}) {
+  return (
+    <section className="evaluation-suite-summary">
+      <header>
+        <div>
+          <strong>最小评测集</strong>
+          <span>{status.seededCases}/{status.totalTemplates} 用例，{status.completedRunCount} 次完成运行</span>
+        </div>
+        <span>{loading ? '刷新中' : status.totalRuns ? `最近通过率 ${status.passRate}%` : '暂无运行'}</span>
+      </header>
+      <div className="evaluation-suite-metrics">
+        <div>
+          <strong>{status.passRate}%</strong>
+          <span>通过率</span>
+        </div>
+        <div>
+          <strong>{status.passedRunCount}</strong>
+          <span>通过</span>
+        </div>
+        <div>
+          <strong>{status.failedRunCount + status.blockedRunCount}</strong>
+          <span>失败/阻塞</span>
+        </div>
+        <div>
+          <strong>{formatDuration(status.averageDurationMs)}</strong>
+          <span>平均耗时</span>
+        </div>
+        <div>
+          <strong>{trendLabel(status.trend)}</strong>
+          <span>趋势窗口</span>
+        </div>
+      </div>
+      {status.alerts.length ? (
+        <div className="evaluation-suite-alerts">
+          {status.alerts.slice(0, 4).map((item, index) => (
+            <span className={item.level} key={`${item.title}-${index}`}>
+              <strong>{item.title}</strong>
+              {item.detail}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {status.areas.length ? (
+        <div className="evaluation-suite-areas">
+          {status.areas.map((area) => (
+            <span key={area.area}>
+              {areaLabel(area.area)} · {area.seededCases}/{area.totalCases} · {area.completedRunCount ? `${area.passRate}%` : '未运行'}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
 }
 
 export function groupPath(groups: TestGroupRecord[], groupId?: string): string {
@@ -45,9 +185,9 @@ function GroupNode({
 
   return (
     <li>
-      <button className={selectedGroupId === group.id ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(group.id)} type="button">
+      <button className={selectedGroupId === group.id ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(group.id)} title={group.name} type="button">
         <Folder size={15} />
-        {group.name}
+        <span>{group.name}</span>
       </button>
       {children.length ? (
         <ol>
@@ -83,7 +223,7 @@ export function DashboardGroupSidebar({
       </button>
       <button className={!selectedGroupId ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(undefined)} type="button">
         <Folder size={15} />
-        未分组
+        <span>未分组</span>
       </button>
       <ol className="group-tree">
         {rootGroups.map((group) => (
@@ -123,6 +263,9 @@ export function DashboardWorkspace({
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
   const [batchDeleting, setBatchDeleting] = useState(false);
   const [batchRunning, setBatchRunning] = useState(false);
+  const [seedingEvaluation, setSeedingEvaluation] = useState(false);
+  const [loadingEvaluationStatus, setLoadingEvaluationStatus] = useState(false);
+  const [evaluationStatus, setEvaluationStatus] = useState<EvaluationSuiteStatus>();
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleName, setScheduleName] = useState('定时回归');
   const [scheduleInterval, setScheduleInterval] = useState(60);
@@ -132,11 +275,28 @@ export function DashboardWorkspace({
   const visibleCases = testCases.filter((item) => item.groupId === selectedGroupId);
   const completedCases = visibleCases.filter((item) => ['passed', 'failed', 'blocked'].includes(item.status));
 
+  const loadEvaluationStatus = useCallback(async () => {
+    setLoadingEvaluationStatus(true);
+    try {
+      const response = await fetch('/api/evaluation-suite/status', { cache: 'no-store' });
+      const data = await response.json();
+      if (response.ok) setEvaluationStatus(data.status as EvaluationSuiteStatus);
+    } finally {
+      setLoadingEvaluationStatus(false);
+    }
+  }, []);
+
   useEffect(() => {
-    if (!testCases.some((item) => item.status === 'running')) return;
-    const timer = window.setInterval(() => router.refresh(), 1500);
-    return () => window.clearInterval(timer);
-  }, [router, testCases]);
+    return subscribeRealtime(['dashboard'], (event) => {
+      if (event.entityType === 'run' || event.entityType === 'testCase' || event.entityType === 'group' || event.entityType === 'schedule') {
+        router.refresh();
+      }
+    });
+  }, [router]);
+
+  useEffect(() => {
+    void loadEvaluationStatus();
+  }, [loadEvaluationStatus, testCases.length]);
 
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
@@ -262,6 +422,27 @@ export function DashboardWorkspace({
     }
   }
 
+  async function seedEvaluationSuite() {
+    if (seedingEvaluation) return;
+    setSeedingEvaluation(true);
+    startGlobalLoading('正在创建最小评测集');
+    try {
+      const response = await fetch('/api/evaluation-suite/seed', { method: 'POST' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '创建评测集失败');
+      const created = data.result?.created?.length || 0;
+      const skipped = data.result?.skipped?.length || 0;
+      window.alert(`最小评测集已准备好：新建 ${created} 条，已存在 ${skipped} 条。`);
+      void loadEvaluationStatus();
+      startTransition(() => router.refresh());
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '创建评测集失败');
+    } finally {
+      setSeedingEvaluation(false);
+      stopGlobalLoading();
+    }
+  }
+
   return (
     <section className={showGroupSidebar ? 'dashboard-folder-layout' : 'dashboard-folder-layout no-sidebar'}>
       {showGroupSidebar ? (
@@ -304,6 +485,10 @@ export function DashboardWorkspace({
               <CalendarClock size={15} />
               定时任务
             </button>
+            <button className="icon-text-button" disabled={seedingEvaluation} onClick={seedEvaluationSuite} type="button">
+              {seedingEvaluation ? <Loader2 className="spin" size={15} /> : <FlaskConical size={15} />}
+              最小评测集
+            </button>
             <NewTestCaseModal groupId={selectedGroupId} />
           </div>
         </div>
@@ -315,6 +500,9 @@ export function DashboardWorkspace({
               </span>
             ))}
           </div>
+        ) : null}
+        {evaluationStatus && (evaluationStatus.seededCases > 0 || evaluationStatus.totalRuns > 0) ? (
+          <EvaluationSuiteSummary loading={loadingEvaluationStatus} status={evaluationStatus} />
         ) : null}
         <div className="case-table-list">
           {visibleCases.length ? (

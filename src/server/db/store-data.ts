@@ -2,6 +2,7 @@ import type {
   ModelConfigRecord,
   RunScheduleRecord,
   RuntimeEnvRecord,
+  SiteKnowledgeRecord,
   TestCaseRecord,
   TestGroupRecord,
   TestRunRecord,
@@ -14,6 +15,7 @@ export type StoreData = {
   runtimeEnv?: RuntimeEnvRecord[];
   modelConfig?: ModelConfigRecord;
   schedules?: RunScheduleRecord[];
+  siteKnowledge?: SiteKnowledgeRecord[];
 };
 
 export function normalizeStoreData(data: StoreData): StoreData {
@@ -23,5 +25,6 @@ export function normalizeStoreData(data: StoreData): StoreData {
     runtimeEnv: data.runtimeEnv || [],
     modelConfig: data.modelConfig,
     schedules: data.schedules || [],
+    siteKnowledge: data.siteKnowledge || [],
   };
 }

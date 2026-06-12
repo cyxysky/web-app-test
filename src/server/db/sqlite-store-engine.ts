@@ -1,18 +1,30 @@
+import { copyFile, mkdir, readdir, rm, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { PrismaClient } from '@prisma/client';
 import type {
   ModelConfigRecord,
   RunScheduleRecord,
   RuntimeEnvRecord,
+  SiteKnowledgeRecord,
   TestCaseRecord,
   TestRunRecord,
   TestGroupRecord,
 } from '@/server/ai/schemas/test-case.schema';
 import type { StoreData } from '@/server/db/store-data';
 import { normalizeStoreData } from '@/server/db/store-data';
-import { ensureDatabaseDir, sqliteDatabasePath, sqliteDatabaseUrl } from '@/server/storage/database';
+import {
+  databaseBackupDir,
+  ensureDatabaseBackupDir,
+  ensureDatabaseDir,
+  resolveDatabaseBackupPath,
+  sqliteDatabasePath,
+  sqliteDatabaseUrl,
+} from '@/server/storage/database';
 
 let prisma: PrismaClient | undefined;
 let schemaReady: Promise<void> | undefined;
+const runtimeSchemaVersion = 3;
+const exportFormat = 'ai-web-test-runtime-export';
 
 function now() {
   return new Date().toISOString();
@@ -35,9 +47,26 @@ function bool(value: unknown) {
   return value === true || value === 1 || value === '1';
 }
 
+function sqliteStringLiteral(value: string) {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function timestampFilePart(value = new Date()) {
+  return value.toISOString().replace(/[:.]/g, '-');
+}
+
+async function disconnectPrisma() {
+  if (!prisma) return;
+  const current = prisma;
+  prisma = undefined;
+  schemaReady = undefined;
+  await current.$disconnect().catch(() => undefined);
+}
+
 export function databaseRuntimeInfo() {
   return {
     provider: 'sqlite',
+    schemaVersion: runtimeSchemaVersion,
     databasePath: sqliteDatabasePath(),
     databaseUrl: sqliteDatabaseUrl(),
   };
@@ -165,6 +194,53 @@ async function ensureSchema() {
       )
     `);
     await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS BrowserChatSession_updatedAt_idx ON BrowserChatSession(updatedAt)');
+    await db.$executeRawUnsafe(`
+      CREATE TABLE IF NOT EXISTS SiteKnowledge (
+        id TEXT PRIMARY KEY,
+        origin TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        loginMethodsJson TEXT NOT NULL DEFAULT '[]',
+        pageStructureJson TEXT NOT NULL DEFAULT '[]',
+        reliableSelectorsJson TEXT NOT NULL DEFAULT '[]',
+        commonFailuresJson TEXT NOT NULL DEFAULT '[]',
+        businessConceptsJson TEXT NOT NULL DEFAULT '[]',
+        repairHintsJson TEXT NOT NULL DEFAULT '[]',
+        notes TEXT,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS SiteKnowledge_origin_idx ON SiteKnowledge(origin)');
+    await db.$executeRawUnsafe(`
+      CREATE TABLE IF NOT EXISTS SchemaMigration (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        detailsJson TEXT,
+        appliedAt TEXT NOT NULL
+      )
+    `);
+    const timestamp = now();
+    await db.$executeRawUnsafe(
+      'INSERT OR IGNORE INTO SchemaMigration (version, name, detailsJson, appliedAt) VALUES (?, ?, ?, ?)',
+      1,
+      'initial-sqlite-runtime-schema',
+      json({ tables: ['TestCase', 'TestRun', 'Artifact', 'TestGroup', 'RuntimeEnv', 'ModelConfig', 'RunSchedule', 'StoreSnapshot', 'BrowserChatSession'] }),
+      timestamp,
+    );
+    await db.$executeRawUnsafe(
+      'INSERT OR IGNORE INTO SchemaMigration (version, name, detailsJson, appliedAt) VALUES (?, ?, ?, ?)',
+      2,
+      'sqlite-maintenance-and-logical-export',
+      json({ capabilities: ['schema-version', 'backup', 'restore', 'export', 'import'] }),
+      timestamp,
+    );
+    await db.$executeRawUnsafe(
+      'INSERT OR IGNORE INTO SchemaMigration (version, name, detailsJson, appliedAt) VALUES (?, ?, ?, ?)',
+      3,
+      'site-knowledge-runtime-assets',
+      json({ tables: ['SiteKnowledge'], capabilities: ['site-knowledge', 'evaluation-suite-seeding'] }),
+      timestamp,
+    );
   })();
   return schemaReady;
 }
@@ -204,6 +280,37 @@ type RuntimeEnvRow = Omit<RuntimeEnvRecord, 'enabled' | 'secret'> & { enabled: n
 type ModelConfigRow = { id: string; provider: string; configJson: string; updatedAt: string };
 type RunScheduleRow = { id: string; name: string; enabled: number | boolean; configJson: string; createdAt: string; updatedAt: string };
 type BrowserChatSessionRow = { id: string; valueJson: string; createdAt: string; updatedAt: string };
+type SchemaMigrationRow = { version: number | bigint; name: string; detailsJson: string | null; appliedAt: string };
+type SiteKnowledgeRow = {
+  id: string;
+  origin: string;
+  title: string;
+  loginMethodsJson: string;
+  pageStructureJson: string;
+  reliableSelectorsJson: string;
+  commonFailuresJson: string;
+  businessConceptsJson: string;
+  repairHintsJson: string;
+  notes: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type DatabaseBackupInfo = {
+  name: string;
+  path: string;
+  bytes: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RuntimeDataExport = {
+  format: typeof exportFormat;
+  exportedAt: string;
+  schemaVersion: number;
+  data: StoreData;
+  browserChatSessions: unknown[];
+};
 
 function testCaseFromRow(row: TestCaseRow): TestCaseRecord {
   return {
@@ -261,6 +368,23 @@ function runtimeEnvFromRow(row: RuntimeEnvRow): RuntimeEnvRecord {
   };
 }
 
+function siteKnowledgeFromRow(row: SiteKnowledgeRow): SiteKnowledgeRecord {
+  return {
+    id: row.id,
+    origin: row.origin,
+    title: row.title,
+    loginMethods: parseJson(row.loginMethodsJson, [] as string[]),
+    pageStructure: parseJson(row.pageStructureJson, [] as string[]),
+    reliableSelectors: parseJson(row.reliableSelectorsJson, [] as string[]),
+    commonFailures: parseJson(row.commonFailuresJson, [] as string[]),
+    businessConcepts: parseJson(row.businessConceptsJson, [] as string[]),
+    repairHints: parseJson(row.repairHintsJson, [] as string[]),
+    notes: row.notes || undefined,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
 export async function readStoreData(seedData?: StoreData): Promise<StoreData> {
   await ensureSchema();
   const db = getPrisma();
@@ -272,13 +396,14 @@ export async function readStoreData(seedData?: StoreData): Promise<StoreData> {
     await writeStoreData(seedData, 'seed');
   }
 
-  const [testCases, runs, groups, runtimeEnv, modelConfigRows, schedules] = await Promise.all([
+  const [testCases, runs, groups, runtimeEnv, modelConfigRows, schedules, siteKnowledge] = await Promise.all([
     db.$queryRawUnsafe('SELECT * FROM TestCase ORDER BY updatedAt DESC') as Promise<TestCaseRow[]>,
     db.$queryRawUnsafe('SELECT * FROM TestRun ORDER BY createdAt DESC') as Promise<TestRunRow[]>,
     db.$queryRawUnsafe('SELECT * FROM TestGroup ORDER BY createdAt ASC') as Promise<TestGroupRow[]>,
     db.$queryRawUnsafe('SELECT * FROM RuntimeEnv ORDER BY key ASC') as Promise<RuntimeEnvRow[]>,
     db.$queryRawUnsafe('SELECT * FROM ModelConfig WHERE id = ?', 'default') as Promise<ModelConfigRow[]>,
     db.$queryRawUnsafe('SELECT * FROM RunSchedule ORDER BY createdAt ASC') as Promise<RunScheduleRow[]>,
+    db.$queryRawUnsafe('SELECT * FROM SiteKnowledge ORDER BY updatedAt DESC') as Promise<SiteKnowledgeRow[]>,
   ]);
 
   return normalizeStoreData({
@@ -297,6 +422,7 @@ export async function readStoreData(seedData?: StoreData): Promise<StoreData> {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     } as RunScheduleRecord)),
+    siteKnowledge: siteKnowledge.map(siteKnowledgeFromRow),
   });
 }
 
@@ -332,6 +458,143 @@ export async function writeBrowserChatSessionSnapshots(snapshots: Array<{ id?: s
   return snapshots;
 }
 
+export async function readSchemaMigrations() {
+  await ensureSchema();
+  const db = getPrisma();
+  const rows = await db.$queryRawUnsafe(
+    'SELECT * FROM SchemaMigration ORDER BY version ASC',
+  ) as SchemaMigrationRow[];
+  const migrations = rows.map((row) => ({
+    version: Number(row.version),
+    name: row.name,
+    appliedAt: row.appliedAt,
+    details: parseJson(row.detailsJson, undefined as unknown),
+  }));
+  return {
+    currentVersion: migrations.at(-1)?.version || 0,
+    expectedVersion: runtimeSchemaVersion,
+    migrations,
+  };
+}
+
+async function backupInfo(filePath: string): Promise<DatabaseBackupInfo | undefined> {
+  try {
+    const stats = await stat(filePath);
+    if (!stats.isFile()) return undefined;
+    return {
+      name: path.basename(filePath),
+      path: filePath,
+      bytes: stats.size,
+      createdAt: stats.birthtime.toISOString(),
+      updatedAt: stats.mtime.toISOString(),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export async function listDatabaseBackups(): Promise<DatabaseBackupInfo[]> {
+  const dir = ensureDatabaseBackupDir();
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  const backups = await Promise.all(entries
+    .filter((entry) => entry.isFile() && /\.db$/i.test(entry.name))
+    .map((entry) => backupInfo(path.join(dir, entry.name))));
+  return backups
+    .filter((item): item is DatabaseBackupInfo => Boolean(item))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function backupFileName(input?: string) {
+  if (input?.trim()) {
+    const name = input.trim();
+    if (!/\.db$/i.test(name)) throw new Error('Backup file name must end with .db');
+    return name;
+  }
+  return `ai-web-test-${timestampFilePart()}.db`;
+}
+
+export async function createDatabaseBackup(input: { name?: string } = {}) {
+  await ensureSchema();
+  const backupDir = ensureDatabaseBackupDir();
+  await mkdir(backupDir, { recursive: true });
+  const targetPath = resolveDatabaseBackupPath(backupFileName(input.name));
+  await rm(targetPath, { force: true });
+  await getPrisma().$executeRawUnsafe(`VACUUM INTO ${sqliteStringLiteral(targetPath)}`);
+  const created = await backupInfo(targetPath);
+  if (!created) throw new Error('Failed to create SQLite backup');
+  return created;
+}
+
+export async function restoreDatabaseBackup(input: { name?: string } = {}) {
+  const backups = await listDatabaseBackups();
+  const selected = input.name
+    ? backups.find((backup) => backup.name === input.name)
+    : backups[0];
+  if (!selected) throw new Error('No SQLite backup is available to restore');
+
+  const safetyBackup = await createDatabaseBackup({ name: `pre-restore-${timestampFilePart()}.db` });
+  const databasePath = sqliteDatabasePath();
+  await disconnectPrisma();
+  await rm(`${databasePath}-wal`, { force: true });
+  await rm(`${databasePath}-shm`, { force: true });
+  await copyFile(selected.path, databasePath);
+  await ensureSchema();
+  return {
+    restored: selected,
+    safetyBackup,
+  };
+}
+
+function storeDataFromImportPayload(payload: unknown) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('Import payload must be a JSON object');
+  }
+  const record = payload as Record<string, unknown>;
+  const data = (record.format === exportFormat ? record.data : record.data || payload) as StoreData | undefined;
+  if (!data || typeof data !== 'object' || !Array.isArray(data.testCases) || !Array.isArray(data.runs)) {
+    throw new Error('Import payload must include testCases and runs arrays');
+  }
+  const browserChatSessions = Array.isArray(record.browserChatSessions) ? record.browserChatSessions : undefined;
+  return { data: normalizeStoreData(data), browserChatSessions };
+}
+
+export async function exportRuntimeData(): Promise<RuntimeDataExport> {
+  const [data, browserChatSessions] = await Promise.all([
+    readStoreData(),
+    readBrowserChatSessionSnapshots(),
+  ]);
+  return {
+    format: exportFormat,
+    exportedAt: now(),
+    schemaVersion: (await readSchemaMigrations()).currentVersion,
+    data,
+    browserChatSessions,
+  };
+}
+
+export async function importRuntimeData(payload: unknown) {
+  const parsed = storeDataFromImportPayload(payload);
+  const safetyBackup = await createDatabaseBackup({ name: `pre-import-${timestampFilePart()}.db` });
+  const data = await writeStoreData(parsed.data, 'import');
+  if (parsed.browserChatSessions) {
+    await writeBrowserChatSessionSnapshots(parsed.browserChatSessions as Array<{ id?: string; createdAt?: string; updatedAt?: string }>);
+  }
+  return {
+    importedAt: now(),
+    safetyBackup,
+    recordCounts: {
+      testCases: data.testCases.length,
+      runs: data.runs.length,
+      groups: data.groups?.length || 0,
+      runtimeEnv: data.runtimeEnv?.length || 0,
+      schedules: data.schedules?.length || 0,
+      modelConfig: data.modelConfig ? 1 : 0,
+      siteKnowledge: data.siteKnowledge?.length || 0,
+      browserChatSessions: parsed.browserChatSessions?.length,
+    },
+  };
+}
+
 export async function writeStoreData(data: StoreData, reason = 'store-write') {
   await ensureSchema();
   const db = getPrisma();
@@ -343,6 +606,7 @@ export async function writeStoreData(data: StoreData, reason = 'store-write') {
     db.$executeRawUnsafe('DELETE FROM RuntimeEnv'),
     db.$executeRawUnsafe('DELETE FROM ModelConfig'),
     db.$executeRawUnsafe('DELETE FROM RunSchedule'),
+    db.$executeRawUnsafe('DELETE FROM SiteKnowledge'),
     db.$executeRawUnsafe('DELETE FROM StoreSnapshot WHERE key = ?', 'store'),
   ];
 
@@ -427,6 +691,26 @@ export async function writeStoreData(data: StoreData, reason = 'store-write') {
       json(schedule),
       schedule.createdAt,
       schedule.updatedAt,
+    ));
+  }
+
+  for (const item of normalized.siteKnowledge || []) {
+    statements.push(db.$executeRawUnsafe(
+      `INSERT INTO SiteKnowledge
+        (id, origin, title, loginMethodsJson, pageStructureJson, reliableSelectorsJson, commonFailuresJson, businessConceptsJson, repairHintsJson, notes, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      item.id,
+      item.origin,
+      item.title,
+      json(item.loginMethods || []),
+      json(item.pageStructure || []),
+      json(item.reliableSelectors || []),
+      json(item.commonFailures || []),
+      json(item.businessConcepts || []),
+      json(item.repairHints || []),
+      item.notes || null,
+      item.createdAt,
+      item.updatedAt,
     ));
   }
 

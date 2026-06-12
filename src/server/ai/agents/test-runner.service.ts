@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import sharp from 'sharp';
 import { executeTestCase } from '@/server/ai/agents/test-executor.agent';
 import type { RecordedFlowStep, StepExecutionResult, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 import { writeAiReport } from '@/server/reports/report-writer.agent';
 import { artifactPath } from '@/server/storage/paths';
 
@@ -319,6 +319,13 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
   await store.applyRuntimeEnv();
   const testCase = await store.getTestCase(testCaseId);
   if (!testCase) throw new Error('Test case not found');
+  const siteKnowledgeHints = await store.siteKnowledgeHintsForUrl(testCase.targetUrl);
+  const executableTestCase = siteKnowledgeHints.length
+    ? {
+        ...testCase,
+        strategyMemory: Array.from(new Set([...(testCase.strategyMemory || []), ...siteKnowledgeHints])).slice(-16),
+      }
+    : testCase;
   const existingRun = await store.getRun(runId);
   const initialSteps = options.continueExisting ? existingRun?.result?.steps || [] : [];
 
@@ -339,7 +346,7 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
     },
   });
 
-  const execution = await executeTestCase(testCase, runId, {
+  const execution = await executeTestCase(executableTestCase, runId, {
     initialSteps,
     recordedFlow: options.recordedFlow || (options.continueExisting ? undefined : testCase.content.recordedFlow),
     onProgress: async (step) => {
@@ -382,7 +389,7 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
       consoleErrors: execution.result.consoleErrors,
       networkErrors: execution.result.networkErrors,
       tracePath: existsSync(tracePath) ? tracePath : executionTracePath,
-      taskFrame: collectTaskFrame(finalSteps) || testCase.content.taskFrame,
+      taskFrame: collectTaskFrame(finalSteps) || executableTestCase.content.taskFrame,
       ledgerItems: collectTaskLedgerItems(finalSteps),
       contextSummaries,
       contextSummary: contextSummaries.at(-1),
@@ -391,7 +398,7 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
   });
 
   if (!finished) throw new Error('Run not found after execution');
-  const report = await writeAiReport(testCase, finished);
+  const report = await writeAiReport(executableTestCase, finished);
   const analysis = await analyzeRunOutcome({ ...finished, report });
   const withReport = await store.updateRun(runId, { report, analysis });
   if (execution.status === 'failed' || execution.status === 'blocked') {

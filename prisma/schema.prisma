@@ -108,3 +108,27 @@ model BrowserChatSession {
 
   @@index([updatedAt])
 }
+
+model SiteKnowledge {
+  id                    String   @id
+  origin                String   @unique
+  title                 String
+  loginMethodsJson      String   @default("[]")
+  pageStructureJson     String   @default("[]")
+  reliableSelectorsJson String   @default("[]")
+  commonFailuresJson    String   @default("[]")
+  businessConceptsJson  String   @default("[]")
+  repairHintsJson       String   @default("[]")
+  notes                 String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([origin])
+}
+
+model SchemaMigration {
+  version     Int      @id
+  name        String
+  detailsJson String?
+  appliedAt   DateTime @default(now())
+}

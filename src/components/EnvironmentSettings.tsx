@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Database, Loader2, RefreshCw, Save } from 'lucide-react';
+import { ArrowLeft, Database, Download, Loader2, RefreshCw, RotateCcw, Save, Upload } from 'lucide-react';
 import {
   modelProviderDefinitions,
   modelProviderDefinition,
@@ -30,7 +30,41 @@ type StorageHealth = {
       bytes: number;
       updatedAt: string;
     };
+    sizeBytes?: number;
+    lastWriteAt?: string;
     recordCounts: Record<string, number>;
+  };
+  schema: {
+    currentVersion: number;
+    expectedVersion: number;
+    migrations: Array<{
+      version: number;
+      name: string;
+      appliedAt: string;
+      details?: unknown;
+    }>;
+  };
+  backups: {
+    directory: string;
+    count: number;
+    latest?: {
+      name: string;
+      path: string;
+      bytes: number;
+      createdAt: string;
+      updatedAt: string;
+    };
+    items: Array<{
+      name: string;
+      path: string;
+      bytes: number;
+      createdAt: string;
+      updatedAt: string;
+    }>;
+  };
+  artifacts: {
+    root: string;
+    policy: string;
   };
   prisma: {
     schemaPath: string;
@@ -80,13 +114,51 @@ function providerSettings(config: ModelConfig, provider: ModelProvider) {
 }
 
 function isSecret(item: EnvRow) {
+  if (item.key === 'SQLITE_DATABASE_URL') return false;
   return Boolean(item.secret || runtimeEnvDefinition(item.key)?.secret || /KEY|TOKEN|SECRET|PASSWORD|COOKIE|DATABASE_URL/i.test(item.key));
+}
+
+function formatBytes(bytes = 0) {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function formatDate(value?: string) {
+  if (!value) return '暂无';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function downloadFile(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function fileNameFromDisposition(value: string | null) {
+  const match = value?.match(/filename="?([^";]+)"?/i);
+  return match?.[1] || `ai-web-test-export-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
 }
 
 function StorageHealthPanel() {
   const [health, setHealth] = useState<StorageHealth | undefined>();
-  const [busy, setBusy] = useState<'refresh' | 'initialize' | undefined>();
+  const [busy, setBusy] = useState<'refresh' | 'initialize' | 'backup' | 'restore' | 'export' | 'import' | undefined>();
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const counts = health?.database.recordCounts || {};
 
   async function loadStorageHealth(mode: typeof busy = 'refresh') {
@@ -104,22 +176,95 @@ function StorageHealthPanel() {
     }
   }
 
-  async function runStorageAction(action: 'initialize') {
-    const label = '正在初始化 SQLite';
+  async function postStorageAction(action: 'initialize' | 'backup' | 'restore') {
+    const labels = {
+      initialize: '正在初始化 SQLite',
+      backup: '正在创建数据库备份',
+      restore: '正在恢复最近备份',
+    };
+    const endpoints = {
+      initialize: '/api/storage/sqlite/initialize',
+      backup: '/api/storage/sqlite/backup',
+      restore: '/api/storage/sqlite/restore',
+    };
+    const label = labels[action];
+    if (action === 'restore' && !window.confirm('恢复最近备份会覆盖当前 SQLite 数据库，恢复前会自动创建安全备份。继续？')) {
+      return;
+    }
     setBusy(action);
     setError('');
+    setNotice('');
     startGlobalLoading(label);
     try {
       const response = await fetch(
-        '/api/storage/sqlite/initialize',
+        endpoints[action],
         { method: 'POST' },
       );
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || label);
-      await loadStorageHealth(action);
+      setHealth((data.health || health) as StorageHealth | undefined);
+      if (action === 'backup') setNotice(`已创建备份：${data.backup?.name || '完成'}`);
+      if (action === 'restore') setNotice(`已恢复备份：${data.restored?.name || '最近备份'}`);
+      if (action === 'initialize') setNotice('SQLite schema 已确认可用。');
+      if (!data.health) await loadStorageHealth(action);
     } catch (storageError) {
       setError(storageError instanceof Error ? storageError.message : label);
     } finally {
+      setBusy(undefined);
+      stopGlobalLoading();
+    }
+  }
+
+  async function exportStorageData() {
+    const label = '正在导出运行时数据';
+    setBusy('export');
+    setError('');
+    setNotice('');
+    startGlobalLoading(label);
+    try {
+      const response = await fetch('/api/storage/sqlite/export', { cache: 'no-store' });
+      const blob = await response.blob();
+      if (!response.ok) {
+        const text = await blob.text().catch(() => '');
+        throw new Error(text || '导出运行时数据失败');
+      }
+      downloadFile(blob, fileNameFromDisposition(response.headers.get('Content-Disposition')));
+      setNotice('运行时数据已导出为 JSON。');
+    } catch (storageError) {
+      setError(storageError instanceof Error ? storageError.message : label);
+    } finally {
+      setBusy(undefined);
+      stopGlobalLoading();
+    }
+  }
+
+  async function importStorageData(file?: File) {
+    if (!file) return;
+    if (!window.confirm('导入会覆盖当前测试数据；导入前会自动创建安全备份。继续？')) {
+      if (importInputRef.current) importInputRef.current.value = '';
+      return;
+    }
+    const label = '正在导入运行时数据';
+    setBusy('import');
+    setError('');
+    setNotice('');
+    startGlobalLoading(label);
+    try {
+      const text = await file.text();
+      const response = await fetch('/api/storage/sqlite/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: text,
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '导入运行时数据失败');
+      setHealth((data.health || health) as StorageHealth | undefined);
+      setNotice(`已导入数据，安全备份：${data.safetyBackup?.name || '已创建'}`);
+      if (!data.health) await loadStorageHealth('import');
+    } catch (storageError) {
+      setError(storageError instanceof Error ? storageError.message : label);
+    } finally {
+      if (importInputRef.current) importInputRef.current.value = '';
       setBusy(undefined);
       stopGlobalLoading();
     }
@@ -141,10 +286,33 @@ function StorageHealthPanel() {
             {busy === 'refresh' ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
             刷新
           </button>
-          <button className="settings-save-button secondary" disabled={Boolean(busy)} onClick={() => runStorageAction('initialize')} type="button">
+          <button className="settings-save-button secondary" disabled={Boolean(busy)} onClick={() => postStorageAction('initialize')} type="button">
             {busy === 'initialize' ? <Loader2 className="spin" size={15} /> : <Database size={15} />}
             初始化 SQLite
           </button>
+          <button className="settings-save-button secondary" disabled={Boolean(busy)} onClick={() => postStorageAction('backup')} type="button">
+            {busy === 'backup' ? <Loader2 className="spin" size={15} /> : <Database size={15} />}
+            备份
+          </button>
+          <button className="settings-save-button secondary" disabled={Boolean(busy) || !health?.backups.latest} onClick={() => postStorageAction('restore')} type="button">
+            {busy === 'restore' ? <Loader2 className="spin" size={15} /> : <RotateCcw size={15} />}
+            恢复最近备份
+          </button>
+          <button className="settings-save-button secondary" disabled={Boolean(busy)} onClick={exportStorageData} type="button">
+            {busy === 'export' ? <Loader2 className="spin" size={15} /> : <Download size={15} />}
+            导出
+          </button>
+          <button className="settings-save-button secondary" disabled={Boolean(busy)} onClick={() => importInputRef.current?.click()} type="button">
+            {busy === 'import' ? <Loader2 className="spin" size={15} /> : <Upload size={15} />}
+            导入
+          </button>
+          <input
+            ref={importInputRef}
+            className="storage-import-input"
+            type="file"
+            accept="application/json,.json"
+            onChange={(event) => void importStorageData(event.currentTarget.files?.[0])}
+          />
         </div>
       </div>
       <div className="storage-health-grid">
@@ -154,11 +322,19 @@ function StorageHealthPanel() {
         </div>
         <div>
           <strong>数据库记录</strong>
-          <span>{counts.testCases || 0} 用例 · {counts.runs || 0} 运行 · {counts.browserChatSessions || 0} 对话</span>
+          <span>{counts.testCases || 0} 用例 · {counts.runs || 0} 运行 · {counts.browserChatSessions || 0} 对话 · {counts.siteKnowledge || 0} 站点知识</span>
         </div>
         <div>
           <strong>SQLite 文件</strong>
-          <span>{health?.database.exists ? '已存在' : '未初始化'}</span>
+          <span>{health?.database.exists ? `${formatBytes(health.database.sizeBytes)} · ${formatDate(health.database.lastWriteAt)}` : '未初始化'}</span>
+        </div>
+        <div>
+          <strong>Schema 版本</strong>
+          <span>v{health?.schema.currentVersion ?? 0} / v{health?.schema.expectedVersion ?? 0}</span>
+        </div>
+        <div>
+          <strong>备份状态</strong>
+          <span>{health?.backups.count || 0} 个备份 · 最近 {formatDate(health?.backups.latest?.updatedAt)}</span>
         </div>
         <div>
           <strong>Prisma 资源</strong>
@@ -174,15 +350,33 @@ function StorageHealthPanel() {
               <dd>{health.database.path}</dd>
             </div>
             <div>
+              <dt>备份目录</dt>
+              <dd>{health.backups.directory}</dd>
+            </div>
+            <div>
               <dt>Schema</dt>
               <dd>{health.prisma.schemaPath}</dd>
             </div>
+            <div>
+              <dt>Artifacts</dt>
+              <dd>{health.artifacts.root}</dd>
+            </div>
           </dl>
+          <p>{health.artifacts.policy}</p>
+          {health.backups.latest ? (
+            <div className="storage-mirror-status">
+              <strong>最近备份</strong>
+              <span>{health.backups.latest.name}</span>
+              <span>{formatBytes(health.backups.latest.bytes)}</span>
+              <span>{formatDate(health.backups.latest.updatedAt)}</span>
+            </div>
+          ) : null}
           <ul>
             {health.runtime.nextActions.map((item) => <li key={item}>{item}</li>)}
           </ul>
         </div>
       ) : null}
+      {notice ? <p className="storage-status-note">{notice}</p> : null}
       {error ? <p className="error">{error}</p> : null}
     </section>
   );

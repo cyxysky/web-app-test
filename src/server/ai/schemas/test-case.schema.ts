@@ -136,25 +136,6 @@ export type StepDiagnosticSummary = {
   updatedAt: string;
 };
 
-export type RunDiagnosticSummary = {
-  stepCount: number;
-  runningStepIndex?: number;
-  lastStepIndex?: number;
-  toolCallCount: number;
-  failedToolCallCount: number;
-  screenshotCount: number;
-  visualFrameCount: number;
-  ledgerItemCount: number;
-  traceEventCount: number;
-  contextCompressionCount: number;
-  maxEstimatedContextTokens?: number;
-  maxContextBudgetRatio?: number;
-  latestContextBudgetRatio?: number;
-  latestContextImageCount?: number;
-  lastPhase?: string;
-  updatedAt: string;
-};
-
 export type ContextSummaryRecord = {
   version: number;
   createdAt: string;
@@ -196,22 +177,6 @@ export type CoverageMatrixItem = {
   latestSummary?: string;
   evidenceItemIds: string[];
   nextAction?: string;
-};
-
-export type EvidenceGraphRecord = {
-  nodes: Array<{
-    id: string;
-    type: 'step' | 'tool' | 'ledger' | 'evidence';
-    label: string;
-    stepIndex?: number;
-    status?: string;
-    summary?: string;
-  }>;
-  edges: Array<{
-    from: string;
-    to: string;
-    type: 'executes' | 'produces' | 'supports' | 'belongs_to';
-  }>;
 };
 
 export type StepExecutionResult = {
@@ -351,6 +316,21 @@ export type TestGroupRecord = {
   updatedAt: string;
 };
 
+export type SiteKnowledgeRecord = {
+  id: string;
+  origin: string;
+  title: string;
+  loginMethods: string[];
+  pageStructure: string[];
+  reliableSelectors: string[];
+  commonFailures: string[];
+  businessConcepts: string[];
+  repairHints: string[];
+  notes?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type RunDebugEvent = {
   time: string;
   phase: string;
@@ -383,8 +363,6 @@ export type TestRunRecord = {
     traceEvents?: RunTraceEvent[];
     evidenceIndex?: EvidenceIndexItem[];
     coverageMatrix?: CoverageMatrixItem[];
-    evidenceGraph?: EvidenceGraphRecord;
-    diagnostics?: RunDiagnosticSummary;
     contextSummary?: ContextSummaryRecord;
     contextSummaries?: ContextSummaryRecord[];
     memory?: {
@@ -400,6 +378,17 @@ export type TestRunRecord = {
     summary: string;
     markdown: string;
     suggestions: string[];
+    quality?: {
+      score: number;
+      grade: 'excellent' | 'good' | 'fair' | 'poor';
+      reviewedAt: string;
+      checks: Array<{
+        id: string;
+        label: string;
+        status: 'passed' | 'warning' | 'failed';
+        detail: string;
+      }>;
+    };
   };
   analysis?: {
     pageChanges: Array<{

@@ -4,8 +4,9 @@ import { ArrowLeft } from 'lucide-react';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
 import { RunHistoryList } from '@/components/RunHistoryList';
 import { RunTestButton } from '@/components/RunTestButton';
+import { SiteKnowledgePanel } from '@/components/SiteKnowledgePanel';
 import { TestCaseEditor } from '@/components/TestCaseEditor';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/sqlite-store';
 
 export const dynamic = 'force-dynamic';
 
@@ -17,7 +18,10 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
   const { id } = await params;
   const testCase = await store.getTestCase(id);
   if (!testCase) notFound();
-  const runs = await store.listRunsForTestCase(id);
+  const [runs, siteKnowledge] = await Promise.all([
+    store.listRunsForTestCase(id),
+    store.getSiteKnowledgeForUrl(testCase.targetUrl),
+  ]);
 
   return (
     <main className="case-workspace">
@@ -33,6 +37,7 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
       </header>
 
       <TestCaseEditor testCase={testCase} />
+      <SiteKnowledgePanel initialKnowledge={siteKnowledge} targetUrl={testCase.targetUrl} />
 
       <section className="content-band run-history-panel">
         <RunHistoryList runs={runs} />

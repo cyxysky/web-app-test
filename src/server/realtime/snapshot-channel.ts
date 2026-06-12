@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+import { publishRealtimeEvent } from '@/server/realtime/ws-hub';
 
 export type SnapshotEvent<T> = {
   entityType: string;
@@ -7,6 +7,8 @@ export type SnapshotEvent<T> = {
   version: number;
   snapshot?: T;
   deleted?: boolean;
+  refresh?: boolean;
+  reason?: string;
 };
 
 export type SnapshotListener<T> = (event: SnapshotEvent<T>) => void;
@@ -45,6 +47,12 @@ export function createSnapshotChannel<T>(entityType: string) {
       snapshot,
     };
     notify(id, event);
+    publishRealtimeEvent({
+      entityType,
+      id,
+      event: 'snapshot',
+      version: event.version,
+    });
     return event;
   }
 
@@ -57,6 +65,32 @@ export function createSnapshotChannel<T>(entityType: string) {
       deleted: true,
     };
     notify(id, event);
+    publishRealtimeEvent({
+      entityType,
+      id,
+      event: 'deleted',
+      version: event.version,
+    });
+    return event;
+  }
+
+  function publishRefresh(id: string, reason?: string) {
+    const event: SnapshotEvent<T> = {
+      entityType,
+      id,
+      time: new Date().toISOString(),
+      version: nextVersion(id),
+      refresh: true,
+      reason,
+    };
+    notify(id, event);
+    publishRealtimeEvent({
+      entityType,
+      id,
+      event: 'refresh',
+      reason,
+      version: event.version,
+    });
     return event;
   }
 
@@ -86,119 +120,7 @@ export function createSnapshotChannel<T>(entityType: string) {
     current,
     publish,
     publishDeleted,
+    publishRefresh,
     subscribe,
   };
-}
-
-type SnapshotEventStreamOptions<T> = {
-  request: Request;
-  eventName: string;
-  deletedEventName?: string;
-  getSnapshot: () => T | undefined | Promise<T | undefined>;
-  initialEvent: (snapshot: T) => SnapshotEvent<T>;
-  subscribe: (listener: SnapshotListener<T>) => (() => void) | undefined;
-  notFoundMessage: string;
-  isComplete?: (snapshot: T) => boolean;
-  headers?: Record<string, string>;
-  heartbeatMs?: number;
-};
-
-export function createSnapshotEventStream<T>(options: SnapshotEventStreamOptions<T>) {
-  const {
-    request,
-    eventName,
-    deletedEventName = 'deleted',
-    getSnapshot,
-    initialEvent,
-    subscribe,
-    notFoundMessage,
-    isComplete,
-    headers,
-    heartbeatMs = 15_000,
-  } = options;
-  const encoder = new TextEncoder();
-  const streamState: { closed: boolean; stopTimer?: () => void; unsubscribe?: () => void } = { closed: false };
-
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let previous = '';
-
-      const close = () => {
-        if (streamState.closed) return;
-        streamState.closed = true;
-        streamState.stopTimer?.();
-        streamState.unsubscribe?.();
-        try {
-          controller.close();
-        } catch {
-          // The client may already have closed the stream.
-        }
-      };
-
-      const enqueue = (chunk: string) => {
-        if (streamState.closed) return false;
-        try {
-          controller.enqueue(encoder.encode(chunk));
-          return true;
-        } catch {
-          close();
-          return false;
-        }
-      };
-
-      const send = (eventNameToSend: string, payload: unknown) => {
-        const serialized = JSON.stringify(payload);
-        const chunk = `event: ${eventNameToSend}\ndata: ${serialized}\n\n`;
-        if (chunk === previous) return enqueue(': heartbeat\n\n');
-        previous = chunk;
-        return enqueue(chunk);
-      };
-
-      const sendSnapshotEvent = (event: SnapshotEvent<T>) => {
-        if (event.deleted) {
-          send(deletedEventName, event);
-          close();
-          return;
-        }
-        if (!event.snapshot) return;
-        if (!send(eventName, event)) return;
-        if (isComplete?.(event.snapshot)) close();
-      };
-
-      const snapshot = await getSnapshot();
-      if (!snapshot) {
-        enqueue(`event: error\ndata: ${JSON.stringify({ error: notFoundMessage })}\n\n`);
-        close();
-        return;
-      }
-
-      streamState.unsubscribe = subscribe(sendSnapshotEvent);
-      if (!streamState.unsubscribe) {
-        enqueue(`event: error\ndata: ${JSON.stringify({ error: notFoundMessage })}\n\n`);
-        close();
-        return;
-      }
-
-      sendSnapshotEvent(initialEvent(snapshot));
-      if (!streamState.closed) {
-        const timer = setInterval(() => enqueue(': heartbeat\n\n'), heartbeatMs);
-        streamState.stopTimer = () => clearInterval(timer);
-      }
-      request.signal.addEventListener('abort', close);
-    },
-    cancel() {
-      streamState.closed = true;
-      streamState.stopTimer?.();
-      streamState.unsubscribe?.();
-    },
-  });
-
-  return new NextResponse(stream, {
-    headers: {
-      'Cache-Control': 'no-store',
-      Connection: 'keep-alive',
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      ...headers,
-    },
-  });
 }

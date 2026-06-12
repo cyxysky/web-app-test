@@ -83,7 +83,7 @@ Recommended desktop layout:
 - Packaged resources: Prisma schema/migrations and server assets.
 - Artifact directory: screenshots, Playwright traces, reports, and uploaded images.
 
-If `DATABASE_URL` is empty, the runtime uses a local SQLite URL under the app data directory. You can override the location with `DATABASE_DIR`, `SQLITE_DATABASE_NAME`, or `DATABASE_URL`.
+By default, the runtime uses a local SQLite URL under the app data directory. You can override the location with `DATABASE_DIR`, `SQLITE_DATABASE_NAME`, or a `SQLITE_DATABASE_URL` value that starts with `file:`. Legacy non-SQLite `DATABASE_URL` values, such as old PostgreSQL connection strings, are ignored by the SQLite runtime.
 
 Current storage boundary:
 

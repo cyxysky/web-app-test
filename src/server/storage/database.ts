@@ -10,9 +10,34 @@ export function sqliteDatabasePath() {
   return path.join(databaseDir(), process.env.SQLITE_DATABASE_NAME || 'ai-web-test.db');
 }
 
+export function databaseBackupDir() {
+  return path.join(databaseDir(), 'backups');
+}
+
+export function ensureDatabaseBackupDir() {
+  const dir = databaseBackupDir();
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export function resolveDatabaseBackupPath(fileName: string) {
+  const cleanName = path.basename(fileName.trim());
+  if (!cleanName || cleanName === '.' || cleanName === '..' || cleanName !== fileName.trim()) {
+    throw new Error('Invalid backup file name');
+  }
+  return path.join(databaseBackupDir(), cleanName);
+}
+
 export function sqliteDatabaseUrl() {
-  const configured = process.env.DATABASE_URL?.trim();
-  if (configured) return configured;
+  const explicitSqliteUrl = process.env.SQLITE_DATABASE_URL?.trim();
+  if (explicitSqliteUrl) {
+    if (!explicitSqliteUrl.startsWith('file:')) {
+      throw new Error('SQLITE_DATABASE_URL must start with "file:" for the SQLite runtime database.');
+    }
+    return explicitSqliteUrl;
+  }
+  const legacyDatabaseUrl = process.env.DATABASE_URL?.trim();
+  if (legacyDatabaseUrl?.startsWith('file:')) return legacyDatabaseUrl;
   return `file:${sqliteDatabasePath().replace(/\\/g, '/')}`;
 }
 
