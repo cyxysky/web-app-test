@@ -24,7 +24,7 @@ model TestCase {
 }
 
 model TestRun {
-  id          String    @id
+  id          String   @id
   testCaseId  String
   status      String
   queueJson   String?
@@ -35,8 +35,8 @@ model TestRun {
   analysisJson String?
   debugJson   String?
   controlJson String?
-  createdAt   DateTime  @default(now())
-  testCase    TestCase  @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+  testCase    TestCase @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
   artifacts   Artifact[]
 
   @@index([testCaseId])
@@ -77,19 +77,19 @@ model RuntimeEnv {
 }
 
 model ModelConfig {
-  id         String   @id @default("default")
-  provider   String
+  id        String   @id @default("default")
+  provider  String
   configJson String
-  updatedAt  DateTime @updatedAt
+  updatedAt DateTime @updatedAt
 }
 
 model RunSchedule {
-  id         String   @id
-  name       String
-  enabled    Boolean  @default(true)
+  id        String   @id
+  name      String
+  enabled   Boolean  @default(true)
   configJson String
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model StoreSnapshot {

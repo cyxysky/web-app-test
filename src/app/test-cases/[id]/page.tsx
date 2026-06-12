@@ -15,9 +15,9 @@ type PageProps = {
 
 export default async function TestCaseDetailPage({ params }: PageProps) {
   const { id } = await params;
-  const testCase = store.getTestCase(id);
+  const testCase = await store.getTestCase(id);
   if (!testCase) notFound();
-  const runs = store.listRunsForTestCase(id);
+  const runs = await store.listRunsForTestCase(id);
 
   return (
     <main className="case-workspace">

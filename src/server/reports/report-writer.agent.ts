@@ -1,6 +1,6 @@
 import { generateText } from 'ai';
 import { getModel } from '@/server/ai/model';
-import type { StepExecutionResult, TaskFrame, TaskLedgerItem, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { EvidenceIndexItem, StepExecutionResult, TaskFrame, TaskLedgerItem, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { artifactsRoot } from '@/server/storage/paths';
 import { artifactApiUrl } from '@/lib/artifacts';
 import { richTextToPlainText } from '@/lib/rich-text';
@@ -135,6 +135,128 @@ function issueSummaryMarkdown(frame: TaskFrame | undefined, result: TestRunRecor
   return Array.from(new Set(lines)).slice(0, limit).join('\n');
 }
 
+function fallbackEvidenceIndex(result: TestRunRecord['result']): EvidenceIndexItem[] {
+  const index: EvidenceIndexItem[] = [];
+  for (const step of result?.steps || []) {
+    if (step.beforeScreenshotPath) {
+      index.push({
+        id: `step:${step.index}:before`,
+        title: `Step ${step.index} before screenshot`,
+        source: 'step',
+        stepIndex: step.index,
+        kind: 'screenshot',
+        path: step.beforeScreenshotPath,
+        status: step.status,
+        summary: compact(step.action, 160),
+      });
+    }
+    if (step.afterScreenshotPath || step.screenshotPath) {
+      index.push({
+        id: `step:${step.index}:after`,
+        title: `Step ${step.index} after screenshot`,
+        source: 'step',
+        stepIndex: step.index,
+        kind: 'screenshot',
+        path: step.afterScreenshotPath || step.screenshotPath,
+        status: step.status,
+        summary: compact(step.actual, 180),
+      });
+    }
+  }
+  return index;
+}
+
+function evidenceIndexMarkdown(result: TestRunRecord['result'], limit = Number(process.env.AI_FINAL_REPORT_EVIDENCE_LIMIT || 120)) {
+  const index = result?.evidenceIndex?.length ? result.evidenceIndex : fallbackEvidenceIndex(result);
+  if (!index.length) return '- No evidence index was captured.';
+  return index.slice(-limit).map((item) => {
+    const link = item.path ? artifactUrl(item.path) : '';
+    const location = item.stepIndex ? `Step ${item.stepIndex}` : item.source;
+    const label = [location, item.toolName, item.kind, item.status, item.severity].filter(Boolean).join(' / ');
+    return [
+      `- [${label}] ${item.title}`,
+      item.summary ? `  - Summary: ${compact(item.summary, 260)}` : '',
+      link ? `  - Evidence: [open artifact](${link})` : '',
+    ].filter(Boolean).join('\n');
+  }).join('\n');
+}
+
+function diagnosticsMarkdown(result: TestRunRecord['result']) {
+  const diagnostics = result?.diagnostics;
+  if (!diagnostics) return '- No run diagnostics were captured.';
+  return [
+    `- Steps: ${diagnostics.stepCount}`,
+    `- Tool calls: ${diagnostics.toolCallCount}; failed tools: ${diagnostics.failedToolCallCount}`,
+    `- Screenshots: ${diagnostics.screenshotCount}; visual frames: ${diagnostics.visualFrameCount}`,
+    `- Ledger items: ${diagnostics.ledgerItemCount}; trace events: ${diagnostics.traceEventCount}`,
+    `- Context compression count: ${diagnostics.contextCompressionCount}`,
+    diagnostics.maxEstimatedContextTokens ? `- Max estimated context tokens: ${diagnostics.maxEstimatedContextTokens}` : '',
+    diagnostics.latestContextBudgetRatio ? `- Latest context budget usage: ${Math.round(diagnostics.latestContextBudgetRatio * 100)}%` : '',
+    diagnostics.lastPhase ? `- Last debug phase: ${diagnostics.lastPhase}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function contextSummaryMarkdown(result: TestRunRecord['result']) {
+  const summary = result?.contextSummary || result?.contextSummaries?.at(-1);
+  if (!summary) return '- 本次运行尚未触发结构化上下文压缩。';
+  const section = (title: string, items?: string[]) => [
+    `### ${title}`,
+    items?.length ? items.map((item) => `- ${item}`).join('\n') : '- 无',
+  ].join('\n');
+  return [
+    `- 版本：v${summary.version}`,
+    `- 来源：${summary.source}`,
+    `- 覆盖步骤：${summary.sourceStepRange.join(' - ')}`,
+    '',
+    section('具体实现目标', summary.implementationGoal),
+    section('当前实现状态', summary.currentImplementationStatus),
+    section('后续执行方案', summary.nextExecutionPlan),
+    section('对此前的总结', summary.previousSummary),
+    section('结构化台账摘要', summary.ledgerDigest),
+    section('证据索引摘要', summary.evidenceDigest),
+    section('防回退规则', summary.antiRegressionRules),
+    section('阻塞点', summary.blockers),
+    section('疑问点', summary.openQuestions),
+    section('当前页面状态', summary.currentPageState),
+  ].join('\n');
+}
+
+function coverageMatrixMarkdown(result: TestRunRecord['result']) {
+  const matrix = result?.coverageMatrix || [];
+  if (!matrix.length) return '- 暂无覆盖矩阵。';
+  return matrix.map((item) => [
+    `- [${item.status}] ${item.dimensionName} (${item.dimensionId})`,
+    item.latestStep ? `  - 最新步骤：${item.latestStep}` : '',
+    item.latestSummary ? `  - 摘要：${compact(item.latestSummary, 260)}` : '',
+    `  - 台账项：${item.itemCount}；证据：${item.evidenceItemIds.length}`,
+    item.nextAction ? `  - 下一步：${item.nextAction}` : '',
+  ].filter(Boolean).join('\n')).join('\n');
+}
+
+function evidenceGraphMarkdown(result: TestRunRecord['result']) {
+  const graph = result?.evidenceGraph;
+  if (!graph?.nodes.length) return '- 暂无证据关系图。';
+  const nodeCounts = graph.nodes.reduce<Record<string, number>>((counts, node) => {
+    counts[node.type] = (counts[node.type] || 0) + 1;
+    return counts;
+  }, {});
+  const edgeCounts = graph.edges.reduce<Record<string, number>>((counts, edge) => {
+    counts[edge.type] = (counts[edge.type] || 0) + 1;
+    return counts;
+  }, {});
+  const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
+  const recentEdges = graph.edges.slice(-24).map((edge) => {
+    const from = nodeById.get(edge.from);
+    const to = nodeById.get(edge.to);
+    return `- ${edge.type}: ${from?.label || edge.from} -> ${to?.label || edge.to}`;
+  });
+  return [
+    `- 节点：step ${nodeCounts.step || 0}；tool ${nodeCounts.tool || 0}；ledger ${nodeCounts.ledger || 0}；evidence ${nodeCounts.evidence || 0}`,
+    `- 关系：executes ${edgeCounts.executes || 0}；produces ${edgeCounts.produces || 0}；supports ${edgeCounts.supports || 0}；belongs_to ${edgeCounts.belongs_to || 0}`,
+    recentEdges.length ? ['- 最近关系：', ...recentEdges.map((item) => `  ${item}`)].join('\n') : '- 最近关系：无',
+  ].join('\n');
+}
+
 function stepMarkdown(step: StepExecutionResult) {
   const before = artifactUrl(step.beforeScreenshotPath);
   const after = artifactUrl(step.afterScreenshotPath || step.screenshotPath);
@@ -160,6 +282,11 @@ function reportContext(testCase: TestCaseRecord, run: TestRunRecord) {
   const frame = collectTaskFrame(testCase, result);
   const ledger = collectLedgerItems(result);
   const steps = result?.steps || [];
+  const evidenceIndex = evidenceIndexMarkdown(result);
+  const diagnostics = diagnosticsMarkdown(result);
+  const contextSummary = contextSummaryMarkdown(result);
+  const coverageMatrix = coverageMatrixMarkdown(result);
+  const evidenceGraph = evidenceGraphMarkdown(result);
   return [
     `运行状态：${statusText(run.status)}`,
     `目标地址：${testCase.targetUrl}`,
@@ -170,7 +297,13 @@ function reportContext(testCase: TestCaseRecord, run: TestRunRecord) {
     '',
     `结构化台账：\n${ledgerMarkdown(frame, ledger)}`,
     '',
+    `覆盖矩阵：\n${coverageMatrix}`,
+    '',
+    `证据关系图：\n${evidenceGraph}`,
+    '',
     `问题与风险汇总：\n${issueSummaryMarkdown(frame, result)}`,
+    '',
+    `结构化上下文摘要：\n${contextSummary}`,
     '',
     `执行步骤：\n${steps.map((step) => [
       `步骤 ${step.index} [${statusText(step.status)}] ${step.action}`,
@@ -181,6 +314,10 @@ function reportContext(testCase: TestCaseRecord, run: TestRunRecord) {
     ].filter(Boolean).join('\n')).join('\n\n')}`,
     result?.consoleErrors.length ? `Console 错误：\n${result.consoleErrors.join('\n')}` : '',
     result?.networkErrors.length ? `网络异常：\n${result.networkErrors.join('\n')}` : '',
+    '',
+    `Run diagnostics:\n${diagnostics}`,
+    '',
+    `Evidence index:\n${evidenceIndex}`,
   ].filter(Boolean).join('\n\n');
 }
 
@@ -195,6 +332,11 @@ export function writeReport(testCase: TestCaseRecord, run: TestRunRecord): Repor
   const taskFrame = collectTaskFrame(testCase, result);
   const ledgerItems = collectLedgerItems(result);
   const stepBlocks = (result?.steps || []).map(stepMarkdown).join('\n\n');
+  const evidenceIndex = evidenceIndexMarkdown(result);
+  const diagnostics = diagnosticsMarkdown(result);
+  const contextSummary = contextSummaryMarkdown(result);
+  const coverageMatrix = coverageMatrixMarkdown(result);
+  const evidenceGraph = evidenceGraphMarkdown(result);
   const summary = fallbackSummary(run.status);
   const markdown = `# 测试报告：${testCase.title}
 
@@ -214,9 +356,21 @@ ${taskFrameMarkdown(taskFrame)}
 
 ${ledgerMarkdown(taskFrame, ledgerItems)}
 
+## 覆盖矩阵
+
+${coverageMatrix}
+
+## 证据关系图
+
+${evidenceGraph}
+
 ## 问题与风险汇总
 
 ${issueSummaryMarkdown(taskFrame, result)}
+
+## 结构化上下文摘要
+
+${contextSummary}
 
 ## 执行步骤与证据
 
@@ -233,7 +387,7 @@ ${result?.networkErrors.length ? result.networkErrors.map((item) => `- ${item}`)
   return {
     title: `测试报告：${testCase.title}`,
     summary,
-    markdown,
+    markdown: `${markdown}\n\n## Run Diagnostics\n\n${diagnostics}\n\n## Evidence Index\n\n${evidenceIndex}`,
     suggestions: [],
   };
 }
@@ -267,15 +421,35 @@ export async function writeAiReport(testCase: TestCaseRecord, run: TestRunRecord
         '## 完整测试流程',
         '## 详细测试用例',
         '## 覆盖矩阵与台账结论',
+        '## 证据关系图',
         '## 问题与风险汇总',
+        '## 结构化上下文摘要',
         '## 疑问与未覆盖项',
         '## 执行步骤与证据',
+        '## Run Diagnostics',
+        '## Evidence Index',
         '',
         context,
       ].join('\n'),
     });
     const markdown = result.text.trim();
     if (!markdown) return fallback;
+    const evidenceIndex = evidenceIndexMarkdown(run.result);
+    const diagnostics = diagnosticsMarkdown(run.result);
+    const contextSummary = contextSummaryMarkdown(run.result);
+    const evidenceGraph = evidenceGraphMarkdown(run.result);
+    const markdownWithContextSummary = /##\s*结构化上下文摘要/.test(markdown)
+      ? markdown
+      : `${markdown}\n\n## 结构化上下文摘要\n\n${contextSummary}`;
+    const markdownWithGraph = /##\s*证据关系图/.test(markdownWithContextSummary) || /##\s*Evidence Graph/i.test(markdownWithContextSummary)
+      ? markdownWithContextSummary
+      : `${markdownWithContextSummary}\n\n## 证据关系图\n\n${evidenceGraph}`;
+    const markdownWithDiagnostics = /##\s*Run Diagnostics/i.test(markdownWithGraph) || /##\s*运行诊断/.test(markdownWithGraph)
+      ? markdownWithGraph
+      : `${markdownWithGraph}\n\n## Run Diagnostics\n\n${diagnostics}`;
+    const markdownWithEvidence = /##\s*Evidence Index/i.test(markdownWithDiagnostics) || /##\s*证据索引/.test(markdownWithDiagnostics)
+      ? markdownWithDiagnostics
+      : `${markdownWithDiagnostics}\n\n## Evidence Index\n\n${evidenceIndex}`;
     const summary = markdown
       .replace(/^# .+$/m, '')
       .split(/\n## /)[0]
@@ -286,7 +460,7 @@ export async function writeAiReport(testCase: TestCaseRecord, run: TestRunRecord
     return {
       ...fallback,
       summary,
-      markdown,
+      markdown: markdownWithEvidence,
     };
   } catch {
     return fallback;

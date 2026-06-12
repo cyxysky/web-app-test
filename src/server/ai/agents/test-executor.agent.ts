@@ -3,9 +3,15 @@ import { readFile } from 'node:fs/promises';
 import { generateObject, generateText, stepCountIs, tool } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, ContextSummaryRecord, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines } from '@/server/ai/prompts/runtime-agent.prompt';
+import { buildCompressionNote, estimateAgentLoopContextBudget, type ContextCompressionDetails } from '@/server/ai/agents/agent-loop-context';
+import { buildContextSummaryPrompt, contextSummarySchema, fallbackContextSummary, formatContextSummaryForPrompt, normalizeContextSummary } from '@/server/ai/agents/context-summary';
+import { strategyForBrowserMode, visualContextTextForStrategy } from '@/server/ai/agents/execution-strategy';
+import { VisualContextManager, type VisualAfterPolicy } from '@/server/ai/agents/visual-context-manager';
+import { buildProgressDigest } from '@/server/ai/run-progress-digest';
+import { buildEvidenceIndex } from '@/server/ai/run-trace-store';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { normalizeDomNodeIdParam, normalizeDomPathParam } from '@/lib/dom-path';
@@ -56,12 +62,6 @@ type ToolTrace = {
 type ToolTraceProgress = {
   workingMemory: RuntimeWorkingMemory;
   visualContext: ReturnType<VisualContextManager['snapshot']>;
-};
-
-type VisualAfterPolicy = {
-  capture?: 'auto' | 'viewport' | 'fullPage';
-  retention?: 'auto' | 'replace' | 'append';
-  reason?: string;
 };
 
 type RuntimeDecision = {
@@ -557,10 +557,6 @@ function concise(value?: string, max = 220) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
-function basenameOfPath(value?: string) {
-  return value ? value.split(/[\\/]/).filter(Boolean).at(-1) || value : '';
-}
-
 function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
   const recent = traces.slice(-limit);
   if (!recent.length) return '[none]';
@@ -575,33 +571,6 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
     const why = reason ? `; reason=${sanitizeHistoricalToolText(reason, 140)}` : '';
     return `${index + 1}. ${trace.name}: ${status}${why}${shots}`;
   }).join('\n');
-}
-
-function contextWindowTokens() {
-  const raw = Number(process.env.AI_CONTEXT_WINDOW_TOKENS || process.env.AI_MODEL_CONTEXT_TOKENS || '');
-  if (Number.isFinite(raw) && raw > 1000) return Math.floor(raw);
-  return 32000;
-}
-
-function contextCompressionThresholdRatio() {
-  const raw = Number(process.env.AI_CONTEXT_COMPRESSION_THRESHOLD || process.env.AI_CONTEXT_COMPRESSION_RATIO || 0.7);
-  if (!Number.isFinite(raw) || raw <= 0) return 0.7;
-  return raw > 1 ? Math.min(0.98, raw / 100) : Math.min(0.98, raw);
-}
-
-function estimateTextTokens(text: string) {
-  let ascii = 0;
-  let nonAscii = 0;
-  for (const char of text) {
-    if (char.charCodeAt(0) <= 0x7f) ascii += 1;
-    else nonAscii += 1;
-  }
-  return Math.ceil(ascii / 4 + nonAscii);
-}
-
-function estimateContextTokens(text: string, imageCount: number) {
-  const imageTokens = Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
-  return estimateTextTokens(text) + imageCount * imageTokens;
 }
 
 function compactWorkingMemory(memory: RuntimeWorkingMemory): RuntimeWorkingMemory {
@@ -673,7 +642,6 @@ function buildCompactRunContext(steps: StepExecutionResult[], activeMemory?: Run
   const latestWorkingMemory = activeMemory || persistedWorkingMemory;
   const latestNextGoal = sanitizeNextGoal(activeMemory?.nextStep || persistedWorkingMemory?.nextStep || steps.map((step) => step.workingMemory?.nextStep).filter(Boolean).at(-1));
   const currentState = sanitizeCurrentState(latestWorkingMemory?.currentState || latestWorkingMemory?.pageUnderstanding || latestStep?.observation || latestStep?.note || '');
-  const nextObjective = latestNextGoal || '根据当前截图和ledgerDigest完成下一个未完成目标';
   const lastAction = activeMemory?.lastAction
     ? concise([activeMemory.lastAction, activeMemory.lastResult].filter(Boolean).join(' -> '), 180)
     : latestTool
@@ -684,23 +652,86 @@ function buildCompactRunContext(steps: StepExecutionResult[], activeMemory?: Run
     ...collectLedgerItemsFromSteps(steps),
     ...(activeMemory?.ledgerItems || []),
   ], ledgerMemoryLimit());
+  const progressDigest = buildProgressDigest({ steps, taskFrame, ledgerItems: durableLedgerItems });
+  const nextObjective = latestNextGoal || progressDigest.nextObjectiveHint || '根据当前截图、progressDigest 和 ledgerDigest 完成下一个未完成目标';
   const runState = {
     currentState: currentState || null,
     nextObjective,
     lastActionOrResult: lastAction,
     taskFrame: taskFrame || null,
     ledgerDigest: formatLedgerDigest(durableLedgerItems),
+    progressDigest,
     derivedSignals: {
       completedSteps: steps.length,
+      highestStepIndex: progressDigest.highestStepIndex,
       ledgerItemCount: durableLedgerItems.length,
+      unresolvedDimensionIds: progressDigest.unresolvedDimensionIds,
     },
-    stateRule: 'Preserve currentState and ledgerDigest as authoritative compact memory. Do not discard or overwrite prior ledger conclusions unless current evidence truly contradicts them.',
+    stateRule: 'Preserve currentState, progressDigest, and ledgerDigest as authoritative compact memory. Do not restart covered requirement areas unless current evidence truly contradicts them.',
   };
 
   return [
     'RunState JSON (authoritative compact state):',
     JSON.stringify(runState, null, 2),
   ].join('\n');
+}
+
+async function createCompressedContextSummary(input: {
+  goal: string;
+  completedSteps: StepExecutionResult[];
+  workingMemory: RuntimeWorkingMemory;
+  abortSignal?: AbortSignal;
+}) {
+  const taskFrame = input.workingMemory.taskFrame || collectTaskFrameFromSteps(input.completedSteps);
+  const ledgerItems = mergeLedgerItems([], [
+    ...collectLedgerItemsFromSteps(input.completedSteps),
+    ...(input.workingMemory.ledgerItems || []),
+  ], ledgerMemoryLimit());
+  const progressDigest = buildProgressDigest({ steps: input.completedSteps, taskFrame, ledgerItems });
+  const evidenceIndex = buildEvidenceIndex(input.completedSteps, ledgerItems);
+  const version = (input.workingMemory.contextSummary?.version || 0) + 1;
+  const fallback = () => fallbackContextSummary({
+    goal: input.goal,
+    steps: input.completedSteps,
+    workingMemory: input.workingMemory,
+    ledgerItems,
+    evidenceIndex,
+    progressDigest,
+    version,
+  });
+
+  if (process.env.AI_CONTEXT_SUMMARY_MODE === 'fallback') return fallback();
+
+  try {
+    const result = await generateObjectWithTimeout({
+      model: getModel(),
+      schema: contextSummarySchema,
+      prompt: buildContextSummaryPrompt({
+        goal: input.goal,
+        taskFrame,
+        progressDigest,
+        workingMemory: input.workingMemory,
+        steps: input.completedSteps,
+        ledgerItems,
+        evidenceIndex,
+      }),
+      temperature: 0.1,
+      maxRetries: 0,
+      abortSignal: input.abortSignal,
+    });
+    return normalizeContextSummary({
+      object: result.object as z.infer<typeof contextSummarySchema>,
+      goal: input.goal,
+      steps: input.completedSteps,
+      workingMemory: input.workingMemory,
+      ledgerItems,
+      evidenceIndex,
+      source: 'ai',
+      version,
+    });
+  } catch {
+    return fallback();
+  }
 }
 
 function formatLedgerDigest(items: TaskLedgerItem[], limit = Number(process.env.AI_LEDGER_DIGEST_LIMIT || 1000)) {
@@ -1029,137 +1060,6 @@ function formatWorkingMemory(memory: RuntimeWorkingMemory) {
     blockers.length ? `- Recent blockers: ${blockers.join('; ')}` : '',
     constraints.length ? `- User constraints: ${constraints.join('; ')}` : '',
   ].join('\n');
-}
-
-class VisualContextManager {
-  private frames: VisualFrameRecord[] = [];
-  private currentId?: string;
-  private sequence = 0;
-
-  constructor(private readonly maxHistory = Number(process.env.AI_VISUAL_HISTORY_LIMIT || 6)) {}
-
-  init(frame: Omit<VisualFrameRecord, 'id' | 'role' | 'createdAt'>) {
-    const record = this.createFrame(frame, 'current');
-    this.frames = [record];
-    this.currentId = record.id;
-    return record;
-  }
-
-  apply(frame: Omit<VisualFrameRecord, 'id' | 'role' | 'createdAt'>, policy: VisualAfterPolicy) {
-    const retention = policy.retention === 'append' ? 'append' : 'replace';
-    if (retention === 'append') {
-      this.demoteCurrent();
-      const record = this.createFrame(frame, 'current');
-      this.frames.push(record);
-      this.currentId = record.id;
-      this.trim();
-      return record;
-    }
-    this.demoteCurrent();
-    const record = this.createFrame(frame, 'current');
-    this.frames = [...this.frames.filter((item) => item.role === 'pinned'), record];
-    this.currentId = record.id;
-    this.trim();
-    return record;
-  }
-
-  manage(action: 'clearHistory' | 'keepLatestOnly' | 'pinCurrent' | 'compressScrollSequence', reason: string) {
-    if (action === 'clearHistory') {
-      this.frames = this.frames.filter((frame) => frame.id === this.currentId || frame.role === 'pinned');
-    } else if (action === 'keepLatestOnly') {
-      this.frames = this.frames.filter((frame) => frame.id === this.currentId);
-    } else if (action === 'pinCurrent') {
-      this.frames = this.frames.map((frame) => frame.id === this.currentId ? { ...frame, role: 'pinned', reason } : frame);
-    } else if (action === 'compressScrollSequence') {
-      const scrollFrames = this.frames.filter((frame) => frame.group === 'scroll-sequence' && frame.id !== this.currentId);
-      const keep = new Set(scrollFrames.slice(-2).map((frame) => frame.id));
-      this.frames = this.frames.filter((frame) => frame.group !== 'scroll-sequence' || frame.id === this.currentId || keep.has(frame.id) || frame.role === 'pinned');
-    }
-    this.trim();
-  }
-
-  compressForBudget(reason: string) {
-    const beforeCount = this.frames.length;
-    const current = this.current();
-    const historyLimit = Math.max(0, Number(process.env.AI_VISUAL_COMPRESSED_HISTORY_LIMIT || 2));
-    const pinnedLimit = Math.max(0, Number(process.env.AI_VISUAL_COMPRESSED_PINNED_LIMIT || 2));
-    const keep = new Map<string, VisualFrameRecord>();
-    for (const frame of this.frames.filter((item) => item.role !== 'pinned' && item.id !== this.currentId).slice(-historyLimit)) {
-      keep.set(frame.id, { ...frame, reason: frame.reason || reason });
-    }
-    for (const frame of this.frames.filter((item) => item.role === 'pinned').slice(-pinnedLimit)) {
-      keep.set(frame.id, { ...frame, reason: frame.reason || reason });
-    }
-    if (current) keep.set(current.id, { ...current, reason: current.reason || reason });
-    this.frames = Array.from(keep.values());
-    this.trim();
-    return Math.max(0, beforeCount - this.frames.length);
-  }
-
-  current() {
-    return this.frames.find((frame) => frame.id === this.currentId);
-  }
-
-  snapshot() {
-    return {
-      current: this.current(),
-      history: this.frames.filter((frame) => frame.id !== this.currentId),
-    };
-  }
-
-  renderText() {
-    const current = this.current();
-    const history = this.frames.filter((frame) => frame.id !== this.currentId);
-    const frameSummary = (frame: VisualFrameRecord) => (
-      `${frame.id} ${concise(frame.reason, 80)} image=${basenameOfPath(frame.path)}${frame.originalPath ? ` original=${basenameOfPath(frame.originalPath)}` : ''}${frame.markerPath ? ` marker=${basenameOfPath(frame.markerPath)}` : ''}${frame.capture ? ` capture=${frame.capture}` : ''}`
-    );
-    return [
-      'Visual Context Manager:',
-      `current: ${current ? frameSummary(current) : '[none]'}`,
-      'current 是唯一允许使用编号进行点击、输入、hover、drag 定位的截图。',
-      history.length
-        ? `history 仅供参考，不能使用其中编号操作：\n${history.map((frame) => `- ${frameSummary(frame)} role=${frame.role} group=${frame.group || '-'}`).join('\n')}`
-        : 'history: [none]',
-    ].join('\n');
-  }
-
-  imagePaths(historyLimit = Number(process.env.AI_VISUAL_ATTACHED_HISTORY_LIMIT || 0)) {
-    const paths: string[] = [];
-    const current = this.current();
-    if (current) paths.push(current.path);
-    if (current?.markerPath) paths.push(current.markerPath);
-    const history = this.frames.filter((item) => item.id !== this.currentId).slice(-Math.max(0, historyLimit));
-    for (const frame of history) {
-      paths.push(frame.path);
-      if (frame.markerPath) paths.push(frame.markerPath);
-    }
-    return paths;
-  }
-
-  private createFrame(frame: Omit<VisualFrameRecord, 'id' | 'role' | 'createdAt'>, role: VisualFrameRecord['role']) {
-    this.sequence += 1;
-    return {
-      ...frame,
-      id: `vf-${this.sequence}`,
-      role,
-      createdAt: new Date().toISOString(),
-    };
-  }
-
-  private demoteCurrent() {
-    this.frames = this.frames.map((frame) => frame.id === this.currentId && frame.role === 'current'
-      ? { ...frame, role: 'history' }
-      : frame);
-  }
-
-  private trim() {
-    const pinned = this.frames.filter((frame) => frame.role === 'pinned');
-    const current = this.current();
-    const history = this.frames
-      .filter((frame) => frame.role !== 'pinned' && frame.id !== this.currentId)
-      .slice(-this.maxHistory);
-    this.frames = [...history, ...pinned, ...(current ? [current] : [])];
-  }
 }
 
 function pushBeforeFrameScreenshots(screenshots: ToolTrace['screenshots'], name: string, frame?: VisualFrameRecord) {
@@ -1793,7 +1693,7 @@ function runtimePrompt(input: {
     '- Treat RunState JSON and Working Memory as compact context only. Do not copy them into tool params.',
     '- Historical actions are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
     '- In reason/message/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
-    '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
+    '- If progressDigest or ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing, in-progress, questioned, or contradicted work.',
     '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
     '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
     '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
@@ -2224,6 +2124,7 @@ function progressFieldsFromToolTraces(
     taskFrame: assistantInfo.taskFrame || workingMemory?.taskFrame,
     ledgerItems,
     workingMemory,
+    contextSummary: workingMemory?.contextSummary,
     visualContext: progress?.visualContext,
   };
 }
@@ -2263,6 +2164,7 @@ async function executeRuntimeStep(input: {
   } = input;
   const mode = browserModeOf(testCase);
   const browserChatMode = isBrowserChatTestCase(testCase);
+  const executionStrategy = strategyForBrowserMode(mode, browserChatMode);
   const screenshotInputEnabled = shouldSendScreenshotToAi(mode);
   const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
   const separateMarkerMap = markerEnabled && usesSeparateMarkerMap();
@@ -2374,58 +2276,40 @@ async function executeRuntimeStep(input: {
     }
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(testCase),
-      phase: browserChatMode
-        ? 'Browser chat turn; answer directly when current evidence is enough, otherwise use one browser tool.'
-        : mode === 'dom'
-          ? 'Entering DOM Agent Loop; choose one DOM/text tool or report state.'
-          : 'Entering visual Agent Loop; choose one tool from the current visual frame.',
+      phase: executionStrategy.phase,
       completed: [],
       findings: [],
       blockers: [],
       pageUnderstanding: '',
-      currentState: mode === 'dom'
-        ? 'No DOM state summary yet; use the current visible DOM snapshot, URL, focus, tabs, and scroll state.'
-        : 'No visual state summary yet; inspect the current screenshot.',
+      currentState: executionStrategy.initialState,
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
-      nextStep: browserChatMode
-        ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
-        : mode === 'dom'
-          ? 'Use current visible DOM node_ids and getDomNodeText for the next missing goal; scroll and refresh getDomTree when needed content is absent from the snapshot.'
-          : 'Use the current screenshot to complete the next missing goal.',
+      nextStep: executionStrategy.nextStep,
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
     let contextCompressionTurns = 0;
-    let aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: requestPrompt, screenshotPath: beforeScreenshotPath, imagePaths: [...(includeImage ? visualContext.imagePaths() : []), ...userReferenceImagePaths], imageAttached: Boolean((includeImage && screenshot) || userReferenceImages.some((item) => item.image)), tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, prepareStep: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: (includeImage ? visualContext.imagePaths().length : 0) + userReferenceImages.filter((item) => item.image).length, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length } });
+    const initialImagePaths = [...(includeImage ? visualContext.imagePaths() : []), ...userReferenceImagePaths];
+    const initialAttachedImageCount = (includeImage ? visualContext.imagePaths().length : 0) + userReferenceImages.filter((item) => item.image).length;
+    let aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: requestPrompt, screenshotPath: beforeScreenshotPath, imagePaths: initialImagePaths, imageAttached: Boolean((includeImage && screenshot) || userReferenceImages.some((item) => item.image)), tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, prepareStep: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: initialAttachedImageCount, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, contextBudget: estimateAgentLoopContextBudget(requestPrompt, initialAttachedImageCount) } });
     lastAiRequest = aiRequest;
 
     async function prepareStep(turnIndex: number) {
       const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
       let visualPaths = includeImage ? visualContext.imagePaths() : [];
       let traceLimit = 5;
-      let compressionDetails: Record<string, unknown> | undefined;
+      let compressionDetails: ContextCompressionDetails | undefined;
       await refreshRequestPromptForTurn();
       const buildContextText = () => {
-        const compressionNote = compressionDetails
-          ? [
-              'Context budget manager:',
-              `- Estimated context exceeded ${Math.round(Number(compressionDetails.thresholdRatio) * 100)}%; historical visual frames and working memory were compressed.`,
-              '- This request is a single reconstructed prompt built from current visual context, compact memory, and recent tool summaries.',
-            ].join('\n')
-          : '';
+        const compressionNote = buildCompressionNote(compressionDetails);
         return buildPrepareStepPrompt({
           requestPrompt,
           compressionNote,
-          workingMemoryText: formatWorkingMemory(workingMemory),
-          visualContextText: mode === 'dom'
-            ? [
-                'DOM Context Manager:',
-                '- Current visible DOM snapshot, URL, focus, tabs, and scroll state in Runtime Context are authoritative.',
-                '- No screenshot image is attached for DOM decisions.',
-                '- If needed content/control is absent from the visible DOM snapshot, scroll the relevant area and call getDomTree again.',
-              ].join('\n')
-            : visualContext.renderText(),
+          workingMemoryText: [
+            formatWorkingMemory(workingMemory),
+            formatContextSummaryForPrompt(workingMemory.contextSummary),
+          ].filter(Boolean).join('\n\n'),
+          visualContextText: visualContextTextForStrategy(executionStrategy, visualContext.renderText()),
           currentToolAttemptsText: formatCurrentToolAttemptSummary(traces, traceLimit),
           turnIndex,
           maxTurns,
@@ -2435,11 +2319,10 @@ async function executeRuntimeStep(input: {
         });
       };
       let contextText = buildContextText();
-      const windowTokens = contextWindowTokens();
-      const thresholdRatio = contextCompressionThresholdRatio();
-      const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
-      let estimatedTokens = estimateContextTokens(contextText, visualPaths.length + userReferenceImages.filter((item) => item.image).length);
-      if (estimatedTokens > thresholdTokens) {
+      const referenceImageCount = userReferenceImages.filter((item) => item.image).length;
+      let contextBudget = estimateAgentLoopContextBudget(contextText, visualPaths.length + referenceImageCount);
+      let estimatedTokens = contextBudget.estimatedTokens;
+      if (contextBudget.overThreshold) {
         const beforeImageCount = visualPaths.length;
         const removedFrames = visualContext.compressForBudget('Context budget exceeded; compacting historical visual frames.');
         workingMemory = compactWorkingMemory(workingMemory);
@@ -2449,16 +2332,30 @@ async function executeRuntimeStep(input: {
         compressionDetails = {
           turn: contextCompressionTurns,
           estimatedTokensBefore: estimatedTokens,
-          thresholdTokens,
-          thresholdRatio,
-          windowTokens,
+          thresholdTokens: contextBudget.thresholdTokens,
+          thresholdRatio: contextBudget.thresholdRatio,
+          windowTokens: contextBudget.windowTokens,
           beforeImageCount,
           afterImageCount: visualPaths.length,
           removedFrames,
         };
+        const contextSummary = await createCompressedContextSummary({
+          goal: requirementOf(testCase),
+          completedSteps,
+          workingMemory,
+          abortSignal,
+        });
+        workingMemory = { ...workingMemory, contextSummary };
+        await onDebug?.({
+          phase: 'ai:context-summary',
+          stepIndex,
+          message: `Structured context summary v${contextSummary.version} created from steps ${contextSummary.sourceStepRange.join('-')} (${contextSummary.source}).`,
+          details: { contextSummary },
+        });
         contextText = buildContextText();
-        estimatedTokens = estimateContextTokens(contextText, visualPaths.length + userReferenceImages.filter((item) => item.image).length);
-        if (estimatedTokens > thresholdTokens && visualPaths.length > 1) {
+        contextBudget = estimateAgentLoopContextBudget(contextText, visualPaths.length + referenceImageCount);
+        estimatedTokens = contextBudget.estimatedTokens;
+        if (contextBudget.overThreshold && visualPaths.length > 1) {
           visualContext.manage('keepLatestOnly', 'Context budget still exceeded after history compression; keeping only current visual frame for the next dialogue turn.');
           visualPaths = includeImage ? visualContext.imagePaths() : [];
           compressionDetails = {
@@ -2468,12 +2365,13 @@ async function executeRuntimeStep(input: {
             afterImageCount: visualPaths.length,
           };
           contextText = buildContextText();
-          estimatedTokens = estimateContextTokens(contextText, visualPaths.length + userReferenceImages.filter((item) => item.image).length);
+          contextBudget = estimateAgentLoopContextBudget(contextText, visualPaths.length + referenceImageCount);
+          estimatedTokens = contextBudget.estimatedTokens;
         }
         await onDebug?.({
           phase: 'ai:context-compressed',
           stepIndex,
-          message: `Context estimate ${estimatedTokens}/${windowTokens} tokens after compression; rebuilt one-shot runtime context ${contextCompressionTurns}.`,
+          message: `Context estimate ${estimatedTokens}/${contextBudget.windowTokens} tokens after compression; rebuilt one-shot runtime context ${contextCompressionTurns}.`,
           details: { ...compressionDetails, estimatedTokensAfter: estimatedTokens, visualContext: visualContext.snapshot(), workingMemory },
         });
       }
@@ -2481,7 +2379,7 @@ async function executeRuntimeStep(input: {
       for (const imagePath of visualPaths) { const image = await readScreenshotForAi(imagePath).catch(() => undefined); if (image) content.push({ type: 'image', image }); }
       for (const referenceImage of userReferenceImages) { if (referenceImage.image) content.push({ type: 'image', image: referenceImage.image }); }
       const attachedImagePaths = [...visualPaths, ...userReferenceImages.filter((item) => item.image).map((item) => item.imagePath)];
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: referenceImageCount, prepareStep: true, contextBudget: { ...contextBudget, compressed: Boolean(compressionDetails), compressionTurns: contextCompressionTurns }, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
       lastAiRequest = aiRequest;
       return [{ role: 'user' as const, content }];
     }
@@ -2918,6 +2816,7 @@ export async function executeInteractiveBrowserTurn(input: {
       tools: summarizeToolTraces(actionResult.traces),
       visualContext: actionResult.visualContext,
       workingMemory: actionResult.workingMemory,
+      contextSummary: actionResult.workingMemory.contextSummary,
     };
     upsertStep(steps, completedStep);
     newSteps.push(completedStep);
@@ -3580,6 +3479,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
           tools: summarizeToolTraces(actionResult.traces),
           visualContext: actionResult.visualContext,
           workingMemory: actionResult.workingMemory,
+          contextSummary: actionResult.workingMemory.contextSummary,
         };
         steps.push(manualStep);
         await onProgress?.(manualStep);
@@ -3607,6 +3507,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         tools: summarizeToolTraces(actionResult.traces),
         visualContext: actionResult.visualContext,
         workingMemory: actionResult.workingMemory,
+        contextSummary: actionResult.workingMemory.contextSummary,
       };
       steps.push(completedStep);
       await onProgress?.(completedStep);
@@ -4268,6 +4169,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         tools: summarizeToolTraces(actionResult.traces),
         visualContext: actionResult.visualContext,
         workingMemory: actionResult.workingMemory,
+        contextSummary: actionResult.workingMemory.contextSummary,
       };
       steps.push(completedStep);
       await onProgress?.(completedStep);

@@ -7,7 +7,7 @@ type RouteContext = {
 
 export async function GET(_request: Request, context: RouteContext) {
   const { runId } = await context.params;
-  const run = store.getRun(runId);
+  const run = await store.getRun(runId);
 
   if (!run) {
     return NextResponse.json({ error: 'Run not found' }, { status: 404 });

@@ -8,7 +8,7 @@ export async function POST(request: NextRequest) {
     if (!testCaseIds.length) {
       return NextResponse.json({ error: '请选择至少一个测试用例' }, { status: 400 });
     }
-    const runs = startBatchRun(testCaseIds);
+    const runs = await startBatchRun(testCaseIds);
     return NextResponse.json({ ok: true, runs });
   } catch (error) {
     return NextResponse.json(

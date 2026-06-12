@@ -4,12 +4,14 @@ import { store } from '@/server/db/mock-store';
 
 export const dynamic = 'force-dynamic';
 
-export default function BrowserChatPage() {
-  store.applyRuntimeEnv();
+export default async function BrowserChatPage() {
+  await store.applyRuntimeEnv();
   startScheduler();
-  const testCases = store.listTestCases();
-  const groups = store.listGroups();
-  const schedules = store.listSchedules();
+  const [testCases, groups, schedules] = await Promise.all([
+    store.listTestCases(),
+    store.listGroups(),
+    store.listSchedules(),
+  ]);
 
   return (
     <main className="browser-chat-shell">

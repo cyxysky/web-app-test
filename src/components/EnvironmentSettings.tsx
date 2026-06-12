@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Loader2, Save } from 'lucide-react';
+import { ArrowLeft, Database, Loader2, RefreshCw, Save } from 'lucide-react';
 import {
   modelProviderDefinitions,
   modelProviderDefinition,
@@ -17,6 +17,33 @@ type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
 };
 
 type ModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
+
+type StorageHealth = {
+  activeProvider: string;
+  activeStore: string;
+  database: {
+    path: string;
+    url: string;
+    exists: boolean;
+    file?: {
+      path: string;
+      bytes: number;
+      updatedAt: string;
+    };
+    recordCounts: Record<string, number>;
+  };
+  prisma: {
+    schemaPath: string;
+    schemaExists: boolean;
+    cliPath?: string;
+    cliAvailable: boolean;
+  };
+  runtime: {
+    state: string;
+    message: string;
+    nextActions: string[];
+  };
+};
 
 export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> = [
   { id: 'model', label: '模型配置' },
@@ -54,6 +81,111 @@ function providerSettings(config: ModelConfig, provider: ModelProvider) {
 
 function isSecret(item: EnvRow) {
   return Boolean(item.secret || runtimeEnvDefinition(item.key)?.secret || /KEY|TOKEN|SECRET|PASSWORD|COOKIE|DATABASE_URL/i.test(item.key));
+}
+
+function StorageHealthPanel() {
+  const [health, setHealth] = useState<StorageHealth | undefined>();
+  const [busy, setBusy] = useState<'refresh' | 'initialize' | undefined>();
+  const [error, setError] = useState('');
+  const counts = health?.database.recordCounts || {};
+
+  async function loadStorageHealth(mode: typeof busy = 'refresh') {
+    setBusy(mode);
+    setError('');
+    try {
+      const response = await fetch('/api/storage/status', { cache: 'no-store' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '读取存储状态失败');
+      setHealth(data as StorageHealth);
+    } catch (storageError) {
+      setError(storageError instanceof Error ? storageError.message : '读取存储状态失败');
+    } finally {
+      setBusy(undefined);
+    }
+  }
+
+  async function runStorageAction(action: 'initialize') {
+    const label = '正在初始化 SQLite';
+    setBusy(action);
+    setError('');
+    startGlobalLoading(label);
+    try {
+      const response = await fetch(
+        '/api/storage/sqlite/initialize',
+        { method: 'POST' },
+      );
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || label);
+      await loadStorageHealth(action);
+    } catch (storageError) {
+      setError(storageError instanceof Error ? storageError.message : label);
+    } finally {
+      setBusy(undefined);
+      stopGlobalLoading();
+    }
+  }
+
+  useEffect(() => {
+    void loadStorageHealth();
+  }, []);
+
+  return (
+    <section className="storage-health-panel">
+      <div className="settings-section-head compact">
+        <div>
+          <h2>存储健康</h2>
+          <span>SQLite 是当前运行时唯一数据源，测试数据与浏览器对话会话都写入本地数据库。</span>
+        </div>
+        <div className="storage-action-row">
+          <button className="settings-save-button secondary" disabled={Boolean(busy)} onClick={() => loadStorageHealth()} type="button">
+            {busy === 'refresh' ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
+            刷新
+          </button>
+          <button className="settings-save-button secondary" disabled={Boolean(busy)} onClick={() => runStorageAction('initialize')} type="button">
+            {busy === 'initialize' ? <Loader2 className="spin" size={15} /> : <Database size={15} />}
+            初始化 SQLite
+          </button>
+        </div>
+      </div>
+      <div className="storage-health-grid">
+        <div>
+          <strong>当前后端</strong>
+          <span>{health?.activeProvider || 'sqlite'} / {health?.activeStore || 'sqlite-prisma-raw'}</span>
+        </div>
+        <div>
+          <strong>数据库记录</strong>
+          <span>{counts.testCases || 0} 用例 · {counts.runs || 0} 运行 · {counts.browserChatSessions || 0} 对话</span>
+        </div>
+        <div>
+          <strong>SQLite 文件</strong>
+          <span>{health?.database.exists ? '已存在' : '未初始化'}</span>
+        </div>
+        <div>
+          <strong>Prisma 资源</strong>
+          <span>schema {health?.prisma.schemaExists ? 'ok' : 'missing'} · cli {health?.prisma.cliAvailable ? 'ok' : 'missing'}</span>
+        </div>
+      </div>
+      {health ? (
+        <div className="storage-health-detail">
+          <p>{health.runtime.message}</p>
+          <dl>
+            <div>
+              <dt>SQLite</dt>
+              <dd>{health.database.path}</dd>
+            </div>
+            <div>
+              <dt>Schema</dt>
+              <dd>{health.prisma.schemaPath}</dd>
+            </div>
+          </dl>
+          <ul>
+            {health.runtime.nextActions.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        </div>
+      ) : null}
+      {error ? <p className="error">{error}</p> : null}
+    </section>
+  );
 }
 
 export function EnvironmentSettings({
@@ -314,6 +446,7 @@ export function EnvironmentSettings({
                   保存
                 </button>
               </div>
+              {activeTab === 'debug' ? <StorageHealthPanel /> : null}
               {visibleEnvItems.length ? (
                 <div className="settings-card">
                   {visibleEnvItems.map(({ item, index, definition }) => (

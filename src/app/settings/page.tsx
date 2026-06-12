@@ -3,7 +3,7 @@ import { store } from '@/server/db/mock-store';
 
 export const dynamic = 'force-dynamic';
 
-export default function SettingsPage() {
-  store.applyRuntimeEnv();
+export default async function SettingsPage() {
+  await store.applyRuntimeEnv();
   return <EnvironmentSettings />;
 }

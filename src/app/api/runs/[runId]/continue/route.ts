@@ -9,7 +9,7 @@ export async function POST(_request: Request, context: RouteContext) {
   const { runId } = await context.params;
 
   try {
-    const run = continueTestCaseRun(runId);
+    const run = await continueTestCaseRun(runId);
     return NextResponse.json({ ok: true, run });
   } catch (error) {
     return NextResponse.json(

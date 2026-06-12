@@ -12,17 +12,17 @@ export async function POST(request: Request, context: RouteContext) {
   const body = await request.json().catch(() => ({}));
   const stepIndex = typeof body.stepIndex === 'number' ? body.stepIndex : undefined;
   const aborted = abortRunStep(runId, stepIndex);
-  const run = store.requestRunSkip(runId, stepIndex);
+  const run = await store.requestRunSkip(runId, stepIndex);
 
   if (!run) {
     return NextResponse.json({ error: 'Run not found' }, { status: 404 });
   }
 
-  const skippedRun = writeImmediateSkippedStep(run, stepIndex) || run;
+  const skippedRun = await writeImmediateSkippedStep(run, stepIndex) || run;
   return NextResponse.json({ ok: true, aborted, run: skippedRun });
 }
 
-function writeImmediateSkippedStep(run: TestRunRecord, requestedStepIndex?: number) {
+async function writeImmediateSkippedStep(run: TestRunRecord, requestedStepIndex?: number) {
   const steps = run.result?.steps || [];
   const currentStep = typeof requestedStepIndex === 'number'
     ? steps.find((step) => step.index === requestedStepIndex)

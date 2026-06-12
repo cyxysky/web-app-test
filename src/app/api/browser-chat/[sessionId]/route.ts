@@ -7,7 +7,7 @@ type RouteContext = {
 
 export async function GET(_request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
-  const session = getBrowserChatSession(sessionId);
+  const session = await getBrowserChatSession(sessionId);
   if (!session) return NextResponse.json({ error: 'Browser chat session not found' }, { status: 404 });
   return NextResponse.json({ session });
 }

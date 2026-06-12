@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "desktop:prepare": "npm run build && node scripts/prepare-electron-server.js",
+    "desktop:prepare": "npm run prisma:desktop:generate && npm run build && node scripts/prepare-electron-server.js",
     "desktop:pack": "npm run desktop:installer",
     "desktop:installer": "npm run desktop:prepare && electron-builder --win nsis",
     "desktop:portable": "npm run desktop:prepare && electron-builder --win portable",
@@ -15,7 +15,9 @@
     "docker:up": "docker compose up -d --build",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "prisma:generate": "prisma generate"
+    "prisma:generate": "prisma generate",
+    "prisma:desktop:generate": "prisma generate --schema prisma/desktop/schema.prisma",
+    "prisma:desktop:push": "prisma db push --schema prisma/desktop/schema.prisma --skip-generate"
   },
   "dependencies": {
     "@ai-sdk/azure": "^3.0.68",
@@ -78,6 +80,10 @@
       {
         "from": "dist-desktop/tinymce",
         "to": "tinymce"
+      },
+      {
+        "from": "dist-desktop/prisma",
+        "to": "prisma"
       }
     ],
     "win": {

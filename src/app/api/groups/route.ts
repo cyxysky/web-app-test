@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { store } from '@/server/db/mock-store';
 
 export async function GET() {
-  return NextResponse.json({ items: store.listGroups() });
+  return NextResponse.json({ items: await store.listGroups() });
 }
 
 export async function POST(request: Request) {
@@ -12,6 +12,6 @@ export async function POST(request: Request) {
 
   if (!name) return NextResponse.json({ error: 'Group name is required' }, { status: 400 });
 
-  const group = store.createGroup(name, parentId);
+  const group = await store.createGroup(name, parentId);
   return NextResponse.json({ group });
 }

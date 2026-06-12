@@ -9,7 +9,7 @@ export async function POST(request: Request, context: RouteContext) {
   const { id } = await context.params;
   const body = await request.json();
   const groupId = body.groupId ? String(body.groupId) : undefined;
-  const testCase = store.moveTestCase(id, groupId);
+  const testCase = await store.moveTestCase(id, groupId);
 
   if (!testCase) return NextResponse.json({ error: 'Test case not found' }, { status: 404 });
 

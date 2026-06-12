@@ -18,7 +18,7 @@ export async function POST(request: Request) {
 
   let deleted = 0;
   for (const testCaseId of testCaseIds) {
-    if (store.deleteTestCase(testCaseId)) deleted += 1;
+    if (await store.deleteTestCase(testCaseId)) deleted += 1;
   }
 
   return NextResponse.json({ ok: true, deleted });

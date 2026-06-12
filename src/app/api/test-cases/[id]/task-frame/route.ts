@@ -8,7 +8,7 @@ type RouteContext = {
 
 export async function POST(request: Request, context: RouteContext) {
   const { id } = await context.params;
-  const testCase = store.getTestCase(id);
+  const testCase = await store.getTestCase(id);
   if (!testCase) {
     return NextResponse.json({ error: 'Test case not found' }, { status: 404 });
   }

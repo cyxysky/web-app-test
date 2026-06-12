@@ -2,13 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createBrowserChatSession, listBrowserChatSessions } from '@/server/ai/agents/browser-chat.service';
 
 export async function GET() {
-  return NextResponse.json({ sessions: listBrowserChatSessions() });
+  return NextResponse.json({ sessions: await listBrowserChatSessions() });
 }
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json().catch(() => ({}));
-    const session = createBrowserChatSession({
+    const session = await createBrowserChatSession({
       targetUrl: typeof body.targetUrl === 'string' ? body.targetUrl : '',
       mode: body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers',
       title: typeof body.title === 'string' ? body.title : undefined,

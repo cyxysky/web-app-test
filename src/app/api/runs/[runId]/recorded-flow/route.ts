@@ -8,7 +8,7 @@ type RouteContext = {
 export async function GET(_request: Request, context: RouteContext) {
   const { runId } = await context.params;
   try {
-    const flow = getRecordedFlowForRun(runId);
+    const flow = await getRecordedFlowForRun(runId);
     return NextResponse.json({ flow });
   } catch (error) {
     return NextResponse.json(

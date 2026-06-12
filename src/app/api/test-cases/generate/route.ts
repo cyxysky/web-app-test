@@ -27,7 +27,7 @@ export async function POST(request: NextRequest) {
       : undefined,
     isMarked,
   });
-  const testCase = store.createTestCase(content, imageNames, groupId);
+  const testCase = await store.createTestCase(content, imageNames, groupId);
 
   return NextResponse.json({ testCaseId: testCase.id, status: testCase.status, testCase });
 }

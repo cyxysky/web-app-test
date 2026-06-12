@@ -12,10 +12,10 @@ type PageProps = {
 
 export default async function RunReportPage({ params }: PageProps) {
   const { runId } = await params;
-  const run = store.getRun(runId);
+  const run = await store.getRun(runId);
   if (!run) notFound();
 
-  const testCase = store.getTestCase(run.testCaseId);
+  const testCase = await store.getTestCase(run.testCaseId);
 
   return (
     <main className="run-workspace">

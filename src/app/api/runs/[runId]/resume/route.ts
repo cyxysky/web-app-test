@@ -9,7 +9,7 @@ export async function POST(request: Request, context: RouteContext) {
   const { runId } = await context.params;
   const body = await request.json().catch(() => ({}));
   const stepIndex = typeof body.stepIndex === 'number' ? body.stepIndex : undefined;
-  const run = store.requestRunResume(runId, stepIndex);
+  const run = await store.requestRunResume(runId, stepIndex);
 
   if (!run) {
     return NextResponse.json({ error: 'Run not found' }, { status: 404 });

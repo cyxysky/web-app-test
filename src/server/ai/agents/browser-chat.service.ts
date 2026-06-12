@@ -1,13 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { BrowserSession, type BrowserSessionMode } from '@/server/browser/browser-session';
 import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage } from '@/server/ai/agents/test-executor.agent';
 import type { RecordedFlowStep, StepExecutionResult, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
+import { readBrowserChatSessionSnapshots, writeBrowserChatSessionSnapshots } from '@/server/db/sqlite-store-engine';
 import { createSnapshotChannel, type SnapshotEvent, type SnapshotListener } from '@/server/realtime/snapshot-channel';
-import { writeTextFileAtomic } from '@/server/storage/atomic-json';
-import { appDataRoot, artifactPath as resolveArtifactPath } from '@/server/storage/paths';
+import { artifactPath as resolveArtifactPath } from '@/server/storage/paths';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 
 export type BrowserChatAttachment = {
@@ -70,10 +69,11 @@ type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
 
 const sessions = new Map<string, BrowserChatSessionRecord>();
 const sessionSnapshots = createSnapshotChannel<BrowserChatSessionSnapshot>('browserChatSession');
-const sessionsPath = path.join(appDataRoot(), '.data', 'browser-chat-sessions.json');
 let sessionsHydrated = false;
+let hydratePromise: Promise<void> | undefined;
 let lastPersistWarningAt = 0;
 let persistTimer: ReturnType<typeof setTimeout> | undefined;
+let persistPromise: Promise<unknown> = Promise.resolve();
 const persistDebounceMs = 250;
 
 function now() {
@@ -101,7 +101,7 @@ export function subscribeBrowserChatSessionEvents(
   sessionId: string,
   listener: SnapshotListener<BrowserChatSessionSnapshot>,
 ) {
-  hydrateSessions();
+  if (!sessionsHydrated) return undefined;
   if (!sessions.has(sessionId)) return undefined;
   return sessionSnapshots.subscribe(sessionId, listener);
 }
@@ -312,13 +312,18 @@ function appendLog(
 
 function persistSessions() {
   try {
-    const payload = stringifyJsonSafe([...sessions.values()].map((session) => snapshot(session, { fullSteps: true })), 2);
-    if (!payload) throw new Error('Browser chat sessions could not be serialized.');
-    writeTextFileAtomic(sessionsPath, payload);
-    return true;
+    const payload = jsonSafeClone([...sessions.values()].map((session) => snapshot(session, { fullSteps: true })));
+    persistPromise = persistPromise
+      .catch(() => undefined)
+      .then(() => writeBrowserChatSessionSnapshots(payload))
+      .catch((error) => {
+        warnPersistFailure(error);
+        return false;
+      });
+    return persistPromise;
   } catch (error) {
     warnPersistFailure(error);
-    return false;
+    return Promise.resolve(false);
   }
 }
 
@@ -331,25 +336,31 @@ function schedulePersistSessions() {
   if (persistTimer) clearTimeout(persistTimer);
   persistTimer = setTimeout(() => {
     persistTimer = undefined;
-    persistSessions();
+    void persistSessions();
   }, persistDebounceMs);
   persistTimer.unref?.();
 }
 
-function hydrateSessions() {
+async function hydrateSessions() {
   if (sessionsHydrated) return;
-  sessionsHydrated = true;
-  if (!existsSync(sessionsPath)) return;
-  try {
-    const data = JSON.parse(readFileSync(sessionsPath, 'utf8')) as BrowserChatSessionSnapshot[];
-    if (!Array.isArray(data)) return;
-    for (const item of data) {
-      if (!item?.id) continue;
-      sessions.set(item.id, recordFromSnapshot(item));
-    }
-  } catch {
-    sessions.clear();
+  if (!hydratePromise) {
+    hydratePromise = readBrowserChatSessionSnapshots<BrowserChatSessionSnapshot>()
+      .then((data) => {
+        if (!Array.isArray(data)) return;
+        sessions.clear();
+        for (const item of data) {
+          if (!item?.id) continue;
+          sessions.set(item.id, recordFromSnapshot(item));
+        }
+      })
+      .catch((error) => {
+        warnPersistFailure(error);
+      })
+      .finally(() => {
+        sessionsHydrated = true;
+      });
   }
+  await hydratePromise;
 }
 
 function conversationForPrompt(messages: BrowserChatMessage[]): InteractiveBrowserTurnMessage[] {
@@ -376,7 +387,7 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
     session.updatedAt = now();
     persistAndNotify(session.id);
   }
-  store.applyRuntimeEnv();
+  await store.applyRuntimeEnv();
   const startedAt = Date.now();
   appendLog(session, 'browser:start', '正在启动或连接浏览器');
   const hasPriorConversation = session.steps.length > 0
@@ -428,13 +439,13 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   return browser;
 }
 
-export function createBrowserChatSession(input: {
+export async function createBrowserChatSession(input: {
   targetUrl?: string;
   mode?: BrowserSessionMode | 'default';
   title?: string;
 } = {}) {
-  hydrateSessions();
-  store.applyRuntimeEnv();
+  await hydrateSessions();
+  await store.applyRuntimeEnv();
   const timestamp = now();
   const session: BrowserChatSessionRecord = {
     id: id('chat'),
@@ -457,19 +468,19 @@ export function createBrowserChatSession(input: {
   return snapshot(session);
 }
 
-export function getBrowserChatSession(sessionId: string) {
-  hydrateSessions();
+export async function getBrowserChatSession(sessionId: string) {
+  await hydrateSessions();
   const session = sessions.get(sessionId);
   return session ? snapshot(session) : undefined;
 }
 
-export function listBrowserChatSessions() {
-  hydrateSessions();
+export async function listBrowserChatSessions() {
+  await hydrateSessions();
   return [...sessions.values()].map(summarySnapshot).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 export async function closeBrowserChatSession(sessionId: string) {
-  hydrateSessions();
+  await hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
@@ -489,7 +500,7 @@ export async function closeBrowserChatSession(sessionId: string) {
 }
 
 export async function deleteBrowserChatSession(sessionId: string) {
-  hydrateSessions();
+  await hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
@@ -506,7 +517,7 @@ export async function deleteBrowserChatSession(sessionId: string) {
 }
 
 export async function deleteBrowserChatSessions(sessionIds: string[]) {
-  hydrateSessions();
+  await hydrateSessions();
   const uniqueIds = Array.from(new Set(sessionIds.map((item) => item.trim()).filter(Boolean)));
   const deleted: Array<{ id: string }> = [];
   for (const sessionId of uniqueIds) {
@@ -516,8 +527,8 @@ export async function deleteBrowserChatSessions(sessionIds: string[]) {
   return { deleted, requested: uniqueIds.length };
 }
 
-export function exportBrowserChatMessageToTestCase(sessionId: string, messageId: string) {
-  hydrateSessions();
+export async function exportBrowserChatMessageToTestCase(sessionId: string, messageId: string) {
+  await hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) throw new Error('Browser chat session not found');
   const messageIndex = session.messages.findIndex((message) => message.id === messageId && message.role === 'assistant');
@@ -575,11 +586,11 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
     recordedFlow: recordedFlow.length ? recordedFlow : undefined,
   };
 
-  const testCase = store.createTestCase(content, []);
-  const run = store.createRun(testCase.id);
+  const testCase = await store.createTestCase(content, []);
+  const run = await store.createRun(testCase.id);
   const finishedAt = now();
   const status = statusFromSteps(selectedSteps);
-  const completedRun = store.updateRun(run.id, {
+  const completedRun = await store.updateRun(run.id, {
     status,
     startedAt: message.createdAt || session.createdAt,
     endedAt: finishedAt,
@@ -591,8 +602,8 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
       ledgerItems: selectedSteps.flatMap((step) => step.ledgerItems || []),
     },
   }) || run;
-  store.updateTestCaseStatus(testCase.id, status === 'passed' ? 'passed' : status);
-  return { testCase: store.getTestCase(testCase.id) || testCase, run: completedRun };
+  await store.updateTestCaseStatus(testCase.id, status === 'passed' ? 'passed' : status);
+  return { testCase: await store.getTestCase(testCase.id) || testCase, run: completedRun };
 }
 
 export async function sendBrowserChatMessage(
@@ -602,7 +613,7 @@ export async function sendBrowserChatMessage(
   clientMessageId?: string,
   attachmentsInput?: unknown,
 ) {
-  hydrateSessions();
+  await hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) throw new Error('Browser chat session not found');
   if (session.status === 'closed') throw new Error('Browser chat session is closed');
@@ -756,8 +767,8 @@ function isAbortLikeError(error: unknown) {
   return name === 'AbortError' || /abort|interrupted|cancel/i.test(message);
 }
 
-export function interruptBrowserChatSession(sessionId: string) {
-  hydrateSessions();
+export async function interruptBrowserChatSession(sessionId: string) {
+  await hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   const timestamp = now();

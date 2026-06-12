@@ -94,7 +94,7 @@ type SnapshotEventStreamOptions<T> = {
   request: Request;
   eventName: string;
   deletedEventName?: string;
-  getSnapshot: () => T | undefined;
+  getSnapshot: () => T | undefined | Promise<T | undefined>;
   initialEvent: (snapshot: T) => SnapshotEvent<T>;
   subscribe: (listener: SnapshotListener<T>) => (() => void) | undefined;
   notFoundMessage: string;
@@ -120,7 +120,7 @@ export function createSnapshotEventStream<T>(options: SnapshotEventStreamOptions
   const streamState: { closed: boolean; stopTimer?: () => void; unsubscribe?: () => void } = { closed: false };
 
   const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
+    async start(controller) {
       let previous = '';
 
       const close = () => {
@@ -165,7 +165,7 @@ export function createSnapshotEventStream<T>(options: SnapshotEventStreamOptions
         if (isComplete?.(event.snapshot)) close();
       };
 
-      const snapshot = getSnapshot();
+      const snapshot = await getSnapshot();
       if (!snapshot) {
         enqueue(`event: error\ndata: ${JSON.stringify({ error: notFoundMessage })}\n\n`);
         close();

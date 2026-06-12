@@ -7,7 +7,7 @@ type RouteContext = {
 
 export async function POST(_request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
-  const session = interruptBrowserChatSession(sessionId);
+  const session = await interruptBrowserChatSession(sessionId);
   if (!session) return NextResponse.json({ error: 'Browser chat session not found' }, { status: 404 });
   return NextResponse.json({ session });
 }

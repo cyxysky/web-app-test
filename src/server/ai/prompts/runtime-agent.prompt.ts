@@ -126,7 +126,7 @@ export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
       : '- Green dashed boxes/green S labels in the current screenshot mark scrollable regions; use that visible S label for scrollArea and scroll about one visible viewport/container height per call.',
     '- Historical memory contains semantic summaries only; never infer/reuse old candidate ids, area ids, coordinates, deltas, screenshot ids, or tool input JSON.',
     '- Tool params are minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
-    '- If RunState/ledgerDigest already covers a requirement area, do not restart it by habit; continue only with missing or contradicted work.',
+    '- If RunState/progressDigest/ledgerDigest already covers a requirement area, do not restart it by habit; continue only with missing, in-progress, questioned, or contradicted work.',
     domMode
       ? '- Follow RunState.nextObjective, but choose DOM node_ids/text from the current visible DOM snapshot only.'
       : '- Follow RunState.nextObjective, but choose operation/id from current screenshot only.',

@@ -68,7 +68,26 @@ Then open `http://localhost:3000`.
 
 The compose setup keeps runtime data outside the image:
 
-- `.data/store.json` stores test cases and runs.
+- `.data/ai-web-test.db` stores test cases, runs, runtime settings, schedules, and browser-chat sessions.
 - `artifacts/` stores screenshots and reports.
 
 For unattended packaged regression runs, keep `HEADLESS_BROWSER=true`. For account-based exploratory testing or manual verification, prefer a visible or CDP-connected browser.
+
+## Desktop Data Storage
+
+SQLite is the runtime data source. The packaged desktop schema lives under `prisma/desktop` and is copied into packaged resources as `prisma/`.
+
+Recommended desktop layout:
+
+- User data directory: runtime database and mutable data.
+- Packaged resources: Prisma schema/migrations and server assets.
+- Artifact directory: screenshots, Playwright traces, reports, and uploaded images.
+
+If `DATABASE_URL` is empty, the runtime uses a local SQLite URL under the app data directory. You can override the location with `DATABASE_DIR`, `SQLITE_DATABASE_NAME`, or `DATABASE_URL`.
+
+Current storage boundary:
+
+- Runtime reads and writes go through SQLite.
+- `/api/storage/status` reports database, Prisma schema, Prisma CLI readiness, and record counts.
+- `/api/storage/sqlite/initialize` ensures the SQLite schema exists and seeds the initial demo case only for a brand-new database.
+- Desktop packaging runs `prisma:desktop:generate` before the Next build so the packaged app uses the desktop SQLite Prisma client.

@@ -97,6 +97,123 @@ export type TaskLedgerItem = {
   attributes?: Array<{ key: string; value: string }>;
 };
 
+export type EvidenceArtifact = {
+  title: string;
+  path?: string;
+  kind?: 'screenshot' | 'trace' | 'dom' | 'network' | 'console' | 'ledger' | 'other';
+  summary?: string;
+};
+
+export type RunTraceEvent = {
+  id: string;
+  time: string;
+  type: 'step' | 'tool' | 'visual' | 'memory' | 'ledger' | 'diagnostic' | 'report';
+  phase?: string;
+  stepIndex?: number;
+  toolName?: string;
+  status?: 'queued' | 'running' | 'passed' | 'failed' | 'blocked';
+  message: string;
+  evidence?: EvidenceArtifact[];
+  details?: unknown;
+};
+
+export type StepDiagnosticSummary = {
+  browserMode?: string;
+  toolCallCount: number;
+  failedToolCallCount: number;
+  screenshotCount: number;
+  visualFrameCount: number;
+  ledgerItemCount: number;
+  contextCompressionCount: number;
+  estimatedContextTokens?: number;
+  contextWindowTokens?: number;
+  contextThresholdTokens?: number;
+  contextBudgetRatio?: number;
+  contextImageCount?: number;
+  contextCompressed?: boolean;
+  lastToolName?: string;
+  lastToolStatus?: 'running' | 'passed' | 'failed';
+  updatedAt: string;
+};
+
+export type RunDiagnosticSummary = {
+  stepCount: number;
+  runningStepIndex?: number;
+  lastStepIndex?: number;
+  toolCallCount: number;
+  failedToolCallCount: number;
+  screenshotCount: number;
+  visualFrameCount: number;
+  ledgerItemCount: number;
+  traceEventCount: number;
+  contextCompressionCount: number;
+  maxEstimatedContextTokens?: number;
+  maxContextBudgetRatio?: number;
+  latestContextBudgetRatio?: number;
+  latestContextImageCount?: number;
+  lastPhase?: string;
+  updatedAt: string;
+};
+
+export type ContextSummaryRecord = {
+  version: number;
+  createdAt: string;
+  sourceStepRange: [number, number];
+  source: 'ai' | 'fallback';
+  implementationGoal: string[];
+  currentImplementationStatus: string[];
+  nextExecutionPlan: string[];
+  previousSummary: string[];
+  ledgerDigest: string[];
+  evidenceDigest: string[];
+  antiRegressionRules: string[];
+  blockers?: string[];
+  openQuestions?: string[];
+  currentPageState?: string[];
+  confidence?: number;
+};
+
+export type EvidenceIndexItem = {
+  id: string;
+  title: string;
+  source: 'step' | 'tool' | 'ledger' | 'debug';
+  stepIndex?: number;
+  toolName?: string;
+  kind?: EvidenceArtifact['kind'];
+  path?: string;
+  summary?: string;
+  ledgerItemId?: string;
+  status?: TaskLedgerItem['status'] | StepExecutionResult['status'];
+  severity?: TaskLedgerItem['severity'];
+};
+
+export type CoverageMatrixItem = {
+  dimensionId: string;
+  dimensionName: string;
+  status: 'missing' | 'in_progress' | 'covered' | 'issue' | 'risk' | 'question';
+  itemCount: number;
+  latestStep?: number;
+  latestSummary?: string;
+  evidenceItemIds: string[];
+  nextAction?: string;
+};
+
+export type EvidenceGraphRecord = {
+  nodes: Array<{
+    id: string;
+    type: 'step' | 'tool' | 'ledger' | 'evidence';
+    label: string;
+    stepIndex?: number;
+    status?: string;
+    summary?: string;
+  }>;
+  edges: Array<{
+    from: string;
+    to: string;
+    type: 'executes' | 'produces' | 'supports' | 'belongs_to';
+  }>;
+};
+
 export type StepExecutionResult = {
   index: number;
   action: string;
@@ -126,6 +243,9 @@ export type StepExecutionResult = {
     history: VisualFrameRecord[];
   };
   workingMemory?: RuntimeWorkingMemory;
+  contextSummary?: ContextSummaryRecord;
+  traceEvents?: RunTraceEvent[];
+  diagnostics?: StepDiagnosticSummary;
 };
 
 export type VisualFrameRecord = {
@@ -157,6 +277,7 @@ export type RuntimeWorkingMemory = {
   nextStep?: string;
   taskFrame?: TaskFrame;
   ledgerItems?: TaskLedgerItem[];
+  contextSummary?: ContextSummaryRecord;
 };
 
 export type AiDomContextSnapshot = {
@@ -259,6 +380,13 @@ export type TestRunRecord = {
     tracePath?: string;
     taskFrame?: TaskFrame;
     ledgerItems?: TaskLedgerItem[];
+    traceEvents?: RunTraceEvent[];
+    evidenceIndex?: EvidenceIndexItem[];
+    coverageMatrix?: CoverageMatrixItem[];
+    evidenceGraph?: EvidenceGraphRecord;
+    diagnostics?: RunDiagnosticSummary;
+    contextSummary?: ContextSummaryRecord;
+    contextSummaries?: ContextSummaryRecord[];
     memory?: {
       summary: string;
       timeline: string[];

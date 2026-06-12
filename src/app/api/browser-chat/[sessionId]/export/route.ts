@@ -10,7 +10,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
   try {
     const body = await request.json().catch(() => ({}));
     const messageId = typeof body.messageId === 'string' ? body.messageId : '';
-    const exported = exportBrowserChatMessageToTestCase(sessionId, messageId);
+    const exported = await exportBrowserChatMessageToTestCase(sessionId, messageId);
     return NextResponse.json({
       testCaseId: exported.testCase.id,
       runId: exported.run.id,

@@ -33,10 +33,10 @@ function reportHtml(markdown: string, title: string) {
 
 export async function GET(_request: Request, context: RouteContext) {
   const { runId } = await context.params;
-  const run = store.getRun(runId);
+  const run = await store.getRun(runId);
   if (!run) return NextResponse.json({ error: 'Run not found' }, { status: 404 });
 
-  const testCase = store.getTestCase(run.testCaseId);
+  const testCase = await store.getTestCase(run.testCaseId);
   const markdown = run.report?.markdown || `测试报告生成中。\n运行 ID：${run.id}\n状态：${run.status}`;
   const title = run.report?.title || `测试报告：${testCase?.title || run.id}`;
   const { chromium } = await import('playwright');

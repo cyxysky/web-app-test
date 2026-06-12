@@ -28,29 +28,29 @@ function queueConcurrency() {
   return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 1));
 }
 
-function syncQueuePositions() {
-  runQueue.forEach((job, index) => {
-    const run = store.getRun(job.runId);
+async function syncQueuePositions() {
+  await Promise.all(runQueue.map(async (job, index) => {
+    const run = await store.getRun(job.runId);
     if (!run?.queue) return;
-    store.updateRunQueue(job.runId, {
+    await store.updateRunQueue(job.runId, {
       ...run.queue,
       position: index + 1,
     });
-  });
+  }));
 }
 
-function enqueueRun(job: QueueJob) {
-  store.applyRuntimeEnv();
+async function enqueueRun(job: QueueJob) {
+  await store.applyRuntimeEnv();
   if (!runQueue.some((item) => item.runId === job.runId)) runQueue.push(job);
-  syncQueuePositions();
+  await syncQueuePositions();
   void drainQueue();
 }
 
 async function drainQueue() {
-  store.applyRuntimeEnv();
+  await store.applyRuntimeEnv();
   while (activeWorkers < queueConcurrency() && runQueue.length) {
     const job = runQueue.shift()!;
-    syncQueuePositions();
+    await syncQueuePositions();
     activeWorkers += 1;
     void executeQueuedJob(job).finally(() => {
       activeWorkers -= 1;
@@ -60,11 +60,11 @@ async function drainQueue() {
 }
 
 async function executeQueuedJob(job: QueueJob) {
-  const run = store.getRun(job.runId);
-  const testCase = store.getTestCase(job.testCaseId);
+  const run = await store.getRun(job.runId);
+  const testCase = await store.getTestCase(job.testCaseId);
   if (!run || !testCase) return;
   const attempts = (run.queue?.attempts || 0) + 1;
-  store.updateRunQueue(job.runId, {
+  await store.updateRunQueue(job.runId, {
     ...run.queue,
     attempts,
     position: undefined,
@@ -75,7 +75,7 @@ async function executeQueuedJob(job: QueueJob) {
   try {
     await executeRun(job.testCaseId, job.runId, job.options);
   } catch (error) {
-    persistBackgroundRunFailure(run, testCase, error);
+    await persistBackgroundRunFailure(run, testCase, error);
   }
 }
 
@@ -205,6 +205,18 @@ function collectTaskLedgerItems(steps: StepExecutionResult[]) {
   return [...map.values()];
 }
 
+function collectContextSummaries(steps: StepExecutionResult[]) {
+  const map = new Map<string, NonNullable<StepExecutionResult['contextSummary']>>();
+  const summaries = steps
+    .flatMap((step) => [step.contextSummary, step.workingMemory?.contextSummary])
+    .filter((summary): summary is NonNullable<StepExecutionResult['contextSummary']> => Boolean(summary));
+  for (const summary of summaries) {
+    const key = `${summary.version}:${summary.createdAt}:${summary.sourceStepRange.join('-')}`;
+    map.set(key, summary);
+  }
+  return [...map.values()].slice(-12);
+}
+
 function isInitialReplayNavigation(step?: RecordedFlowStep) {
   return step?.name === 'openPage' || step?.name === 'openUrl';
 }
@@ -304,14 +316,14 @@ async function analyzeRunOutcome(run: TestRunRecord) {
 }
 
 async function executeRun(testCaseId: string, runId: string, options: ExecuteRunOptions = {}) {
-  store.applyRuntimeEnv();
-  const testCase = store.getTestCase(testCaseId);
+  await store.applyRuntimeEnv();
+  const testCase = await store.getTestCase(testCaseId);
   if (!testCase) throw new Error('Test case not found');
-  const existingRun = store.getRun(runId);
+  const existingRun = await store.getRun(runId);
   const initialSteps = options.continueExisting ? existingRun?.result?.steps || [] : [];
 
-  store.updateTestCaseStatus(testCaseId, 'running');
-  store.updateRun(runId, {
+  await store.updateTestCaseStatus(testCaseId, 'running');
+  await store.updateRun(runId, {
     status: 'running',
     startedAt: existingRun?.startedAt || new Date().toISOString(),
     endedAt: undefined,
@@ -330,37 +342,38 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
   const execution = await executeTestCase(testCase, runId, {
     initialSteps,
     recordedFlow: options.recordedFlow || (options.continueExisting ? undefined : testCase.content.recordedFlow),
-    onProgress: (step) => {
-      store.updateRunStep(runId, step);
+    onProgress: async (step) => {
+      await store.updateRunStep(runId, step);
     },
-    onDebug: (event) => {
-      if (process.env.AI_TEST_DEBUG === 'true') store.appendRunDebug(runId, event);
+    onDebug: async (event) => {
+      if (process.env.AI_TEST_DEBUG === 'true') await store.appendRunDebug(runId, event);
     },
     shouldSkipStep: (stepIndex) => store.consumeRunSkip(runId, stepIndex),
     shouldPauseRun: () => store.isRunPaused(runId),
     shouldResumeStep: (stepIndex) => store.consumeRunResume(runId, stepIndex),
-    onPaused: () => {
-      store.updateRun(runId, { status: 'paused' });
+    onPaused: async () => {
+      await store.updateRun(runId, { status: 'paused' });
     },
-    onResumed: () => {
-      store.updateRun(runId, { status: 'running' });
+    onResumed: async () => {
+      await store.updateRun(runId, { status: 'running' });
     },
-    onManualIntervention: (manualIntervention) => {
-      store.setRunManualIntervention(runId, {
+    onManualIntervention: async (manualIntervention) => {
+      await store.setRunManualIntervention(runId, {
         ...manualIntervention,
         requestedAt: new Date().toISOString(),
       });
     },
-    onManualInterventionCleared: () => {
-      store.setRunManualIntervention(runId);
+    onManualInterventionCleared: async () => {
+      await store.setRunManualIntervention(runId);
     },
   });
 
-  const current = store.getRun(runId);
+  const current = await store.getRun(runId);
   const tracePath = artifactPath(runId, 'trace.zip');
   const executionTracePath = (execution.result as { tracePath?: string }).tracePath;
   const finalSteps = current?.result?.steps?.length ? current.result.steps : execution.result.steps;
-  const finished = store.updateRun(runId, {
+  const contextSummaries = collectContextSummaries(finalSteps);
+  const finished = await store.updateRun(runId, {
     status: execution.status,
     endedAt: new Date().toISOString(),
     control: undefined,
@@ -371,6 +384,8 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
       tracePath: existsSync(tracePath) ? tracePath : executionTracePath,
       taskFrame: collectTaskFrame(finalSteps) || testCase.content.taskFrame,
       ledgerItems: collectTaskLedgerItems(finalSteps),
+      contextSummaries,
+      contextSummary: contextSummaries.at(-1),
       memory: buildFinalRunMemory(finalSteps, current?.result?.memory),
     },
   });
@@ -378,23 +393,23 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
   if (!finished) throw new Error('Run not found after execution');
   const report = await writeAiReport(testCase, finished);
   const analysis = await analyzeRunOutcome({ ...finished, report });
-  const withReport = store.updateRun(runId, { report, analysis });
+  const withReport = await store.updateRun(runId, { report, analysis });
   if (execution.status === 'failed' || execution.status === 'blocked') {
-    store.appendTestCaseStrategyMemory(testCaseId, analysis.promptHints);
+    await store.appendTestCaseStrategyMemory(testCaseId, analysis.promptHints);
   }
-  store.updateTestCaseStatus(testCaseId, execution.status);
+  await store.updateTestCaseStatus(testCaseId, execution.status);
 
   return withReport;
 }
 
 // 创建处于 running 状态的运行记录，作为同步或后台执行的初始数据。
-function createQueuedRun(testCaseId: string, source: NonNullable<TestRunRecord['queue']>['source'] = 'single') {
-  const testCase = store.getTestCase(testCaseId);
+async function createQueuedRun(testCaseId: string, source: NonNullable<TestRunRecord['queue']>['source'] = 'single') {
+  const testCase = await store.getTestCase(testCaseId);
   if (!testCase) throw new Error('Test case not found');
 
-  const run = store.createRun(testCaseId);
-  store.updateTestCaseStatus(testCaseId, 'running');
-  store.updateRun(run.id, {
+  const run = await store.createRun(testCaseId);
+  await store.updateTestCaseStatus(testCaseId, 'running');
+  await store.updateRun(run.id, {
     status: 'queued',
     result: { steps: [], consoleErrors: [], networkErrors: [] },
     queue: {
@@ -414,33 +429,32 @@ function createQueuedRun(testCaseId: string, source: NonNullable<TestRunRecord['
 
 // 同步执行测试用例，调用方会等待整次运行结束。
 export async function runTestCase(testCaseId: string) {
-  const { run } = createQueuedRun(testCaseId);
+  const { run } = await createQueuedRun(testCaseId);
   return executeRun(testCaseId, run.id);
 }
 
 // 后台启动测试用例执行，立即返回运行记录供前端轮询。
-export function startTestCaseRun(testCaseId: string, source: NonNullable<TestRunRecord['queue']>['source'] = 'single') {
-  const { run } = createQueuedRun(testCaseId, source);
-  enqueueRun({ runId: run.id, testCaseId, options: { source } });
+export async function startTestCaseRun(testCaseId: string, source: NonNullable<TestRunRecord['queue']>['source'] = 'single') {
+  const { run } = await createQueuedRun(testCaseId, source);
+  await enqueueRun({ runId: run.id, testCaseId, options: { source } });
 
-  return store.getRun(run.id) || run;
+  return await store.getRun(run.id) || run;
 }
 
-export function startBatchRun(testCaseIds: string[], source: NonNullable<TestRunRecord['queue']>['source'] = 'batch') {
-  return Array.from(new Set(testCaseIds))
-    .map((testCaseId) => startTestCaseRun(testCaseId, source))
-    .filter(Boolean);
+export async function startBatchRun(testCaseIds: string[], source: NonNullable<TestRunRecord['queue']>['source'] = 'batch') {
+  const runs = await Promise.all(Array.from(new Set(testCaseIds)).map((testCaseId) => startTestCaseRun(testCaseId, source)));
+  return runs.filter(Boolean);
 }
 
 // 从已结束或阻塞的运行记录继续执行，保留已有步骤作为上下文。
-export function continueTestCaseRun(runId: string) {
-  const run = store.getRun(runId);
+export async function continueTestCaseRun(runId: string) {
+  const run = await store.getRun(runId);
   if (!run) throw new Error('Run not found');
   if (run.status === 'running' || run.status === 'queued' || run.status === 'paused') return run;
-  const testCase = store.getTestCase(run.testCaseId);
+  const testCase = await store.getTestCase(run.testCaseId);
   if (!testCase) throw new Error('Test case not found');
 
-  store.updateRun(runId, {
+  await store.updateRun(runId, {
     status: 'queued',
     endedAt: undefined,
     report: undefined,
@@ -451,21 +465,21 @@ export function continueTestCaseRun(runId: string) {
       source: 'continue',
     },
   });
-  store.updateTestCaseStatus(run.testCaseId, 'running');
+  await store.updateTestCaseStatus(run.testCaseId, 'running');
 
-  enqueueRun({ runId, testCaseId: run.testCaseId, options: { continueExisting: true, source: 'continue' } });
+  await enqueueRun({ runId, testCaseId: run.testCaseId, options: { continueExisting: true, source: 'continue' } });
 
-  return store.getRun(runId) || run;
+  return await store.getRun(runId) || run;
 }
 
 // 后台执行发生异常时，把失败步骤和报告落库，避免前端看到悬空的 running 状态。
-export function replayRun(runId: string) {
-  const sourceRun = store.getRun(runId);
+export async function replayRun(runId: string) {
+  const sourceRun = await store.getRun(runId);
   if (!sourceRun) throw new Error('Run not found');
   if (sourceRun.status === 'running' || sourceRun.status === 'queued' || sourceRun.status === 'paused') {
     throw new Error('Cannot replay a run that is still active');
   }
-  const testCase = store.getTestCase(sourceRun.testCaseId);
+  const testCase = await store.getTestCase(sourceRun.testCaseId);
   if (!testCase) throw new Error('Test case not found');
   const recordedFlow = ensureReplayStartsFromTarget(
     recordedFlowFromSteps(sourceRun.result?.steps || []),
@@ -473,32 +487,32 @@ export function replayRun(runId: string) {
   );
   if (!recordedFlow.length) throw new Error('No successful tool calls found in this run');
 
-  const { run } = createQueuedRun(sourceRun.testCaseId, 'replay');
-  store.appendRunDebug(run.id, {
+  const { run } = await createQueuedRun(sourceRun.testCaseId, 'replay');
+  await store.appendRunDebug(run.id, {
     phase: 'recorded:source',
     message: `Replaying ${recordedFlow.length} successful tool calls from ${sourceRun.id}.`,
     details: { sourceRunId: sourceRun.id, recordedFlow },
   });
 
-  enqueueRun({ runId: run.id, testCaseId: sourceRun.testCaseId, options: { recordedFlow, source: 'replay' } });
+  await enqueueRun({ runId: run.id, testCaseId: sourceRun.testCaseId, options: { recordedFlow, source: 'replay' } });
 
-  return store.getRun(run.id) || run;
+  return await store.getRun(run.id) || run;
 }
 
-export function getRecordedFlowForRun(runId: string) {
-  const run = store.getRun(runId);
+export async function getRecordedFlowForRun(runId: string) {
+  const run = await store.getRun(runId);
   if (!run) throw new Error('Run not found');
-  const testCase = store.getTestCase(run.testCaseId);
+  const testCase = await store.getTestCase(run.testCaseId);
   if (!testCase) throw new Error('Test case not found');
   return ensureReplayStartsFromTarget(recordedFlowFromSteps(run.result?.steps || []), testCase.targetUrl);
 }
 
-export function createTestCaseFromRecordedRun(runId: string) {
-  const run = store.getRun(runId);
+export async function createTestCaseFromRecordedRun(runId: string) {
+  const run = await store.getRun(runId);
   if (!run) throw new Error('Run not found');
-  const source = store.getTestCase(run.testCaseId);
+  const source = await store.getTestCase(run.testCaseId);
   if (!source) throw new Error('Source test case not found');
-  const recordedFlow = getRecordedFlowForRun(runId);
+  const recordedFlow = await getRecordedFlowForRun(runId);
   if (!recordedFlow.length) throw new Error('No successful tool calls found in this run');
   const content = {
     ...source.content,
@@ -523,17 +537,17 @@ export function createTestCaseFromRecordedRun(runId: string) {
 export function startScheduler() {
   if (schedulerStarted) return;
   schedulerStarted = true;
-  const tick = () => {
+  const tick = async () => {
     try {
-      store.applyRuntimeEnv();
-      const due = store.listSchedules().filter((schedule) =>
+      await store.applyRuntimeEnv();
+      const due = (await store.listSchedules()).filter((schedule) =>
         schedule.enabled &&
         schedule.testCaseIds.length &&
         new Date(schedule.nextRunAt).getTime() <= Date.now()
       );
       for (const schedule of due) {
-        startBatchRun(schedule.testCaseIds, 'schedule');
-        store.markScheduleTriggered(schedule.id);
+        await startBatchRun(schedule.testCaseIds, 'schedule');
+        await store.markScheduleTriggered(schedule.id);
       }
     } finally {
       setTimeout(tick, 30_000).unref?.();
@@ -542,10 +556,10 @@ export function startScheduler() {
   setTimeout(tick, 2_000).unref?.();
 }
 
-function persistBackgroundRunFailure(run: TestRunRecord, testCase: ReturnType<typeof store.getTestCase>, error: unknown) {
+async function persistBackgroundRunFailure(run: TestRunRecord, testCase: Awaited<ReturnType<typeof store.getTestCase>>, error: unknown) {
   if (!testCase) return;
   try {
-    const current = store.getRun(run.id);
+    const current = await store.getRun(run.id);
     if (!current) return;
     const previousSteps = current.result?.steps || [];
     const errorStep: StepExecutionResult = {
@@ -555,23 +569,27 @@ function persistBackgroundRunFailure(run: TestRunRecord, testCase: ReturnType<ty
       actual: error instanceof Error ? error.message : 'Unknown execution error',
       status: 'blocked',
     };
-    const failed = store.updateRun(run.id, {
+    const failedSteps = [...previousSteps, errorStep];
+    const contextSummaries = collectContextSummaries(failedSteps);
+    const failed = await store.updateRun(run.id, {
       status: 'blocked',
       endedAt: new Date().toISOString(),
       result: {
-        steps: [...previousSteps, errorStep],
+        steps: failedSteps,
         consoleErrors: current.result?.consoleErrors || [],
         networkErrors: current.result?.networkErrors || [],
+        contextSummaries,
+        contextSummary: contextSummaries.at(-1),
       },
     });
     if (failed && testCase) {
       void writeAiReport(testCase, failed).then(async (report) => {
         const analysis = await analyzeRunOutcome({ ...failed, report });
-        store.updateRun(run.id, { report, analysis });
-        store.appendTestCaseStrategyMemory(run.testCaseId, analysis.promptHints);
+        await store.updateRun(run.id, { report, analysis });
+        await store.appendTestCaseStrategyMemory(run.testCaseId, analysis.promptHints);
       });
     }
-    store.updateTestCaseStatus(run.testCaseId, 'blocked');
+    await store.updateTestCaseStatus(run.testCaseId, 'blocked');
   } catch (persistError) {
     console.error('Failed to persist background run failure', persistError);
   }

@@ -8,7 +8,7 @@ type RouteContext = {
 export async function POST(_request: Request, context: RouteContext) {
   const { runId } = await context.params;
   try {
-    const testCase = createTestCaseFromRecordedRun(runId);
+    const testCase = await createTestCaseFromRecordedRun(runId);
     return NextResponse.json({ ok: true, testCase });
   } catch (error) {
     return NextResponse.json(

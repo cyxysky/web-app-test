@@ -53,8 +53,8 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
 }
 
 export async function GET() {
-  store.applyRuntimeEnv();
-  const saved = store.getModelConfig();
+  await store.applyRuntimeEnv();
+  const saved = await store.getModelConfig();
   const provider = saved?.provider || 'openrouter';
   return NextResponse.json({
     saved: Boolean(saved),
@@ -78,11 +78,11 @@ export async function POST(request: NextRequest) {
         baseURL: typeof body.baseURL === 'string' ? body.baseURL : modelProviderDefinition(provider).defaultBaseURL || '',
       };
     }
-    const config = store.saveModelConfig({
+    const config = await store.saveModelConfig({
       provider,
       providers: providersInput,
     });
-    store.applyRuntimeEnv();
+    await store.applyRuntimeEnv();
     return NextResponse.json({ ok: true, config });
   } catch (error) {
     return NextResponse.json(

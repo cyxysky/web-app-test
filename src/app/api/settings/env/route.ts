@@ -13,8 +13,8 @@ function defaultRuntimeItems() {
   }));
 }
 
-function mergedRuntimeItems() {
-  const savedByKey = new Map(store.listRuntimeEnv().map((item) => [item.key, item]));
+async function mergedRuntimeItems() {
+  const savedByKey = new Map((await store.listRuntimeEnv()).map((item) => [item.key, item]));
   return defaultRuntimeItems().map((item) => {
     const saved = savedByKey.get(item.key);
     return {
@@ -28,8 +28,8 @@ function mergedRuntimeItems() {
 }
 
 export async function GET() {
-  store.applyRuntimeEnv();
-  return NextResponse.json({ saved: mergedRuntimeItems() });
+  await store.applyRuntimeEnv();
+  return NextResponse.json({ saved: await mergedRuntimeItems() });
 }
 
 export async function POST(request: NextRequest) {
@@ -48,8 +48,8 @@ export async function POST(request: NextRequest) {
         secret: Boolean(definition.secret),
       };
     });
-    const saved = store.saveRuntimeEnv(sanitized);
-    store.applyRuntimeEnv();
+    const saved = await store.saveRuntimeEnv(sanitized);
+    await store.applyRuntimeEnv();
     return NextResponse.json({ ok: true, saved });
   } catch (error) {
     return NextResponse.json(

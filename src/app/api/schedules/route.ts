@@ -4,14 +4,14 @@ import { store } from '@/server/db/mock-store';
 
 export async function GET() {
   startScheduler();
-  return NextResponse.json({ schedules: store.listSchedules() });
+  return NextResponse.json({ schedules: await store.listSchedules() });
 }
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const intervalMinutes = Number(body.intervalMinutes || 60);
-    const schedule = store.upsertSchedule({
+    const schedule = await store.upsertSchedule({
       id: typeof body.id === 'string' ? body.id : undefined,
       name: typeof body.name === 'string' ? body.name : '定时回归',
       enabled: body.enabled !== false,
@@ -20,7 +20,7 @@ export async function POST(request: NextRequest) {
       nextRunAt: typeof body.nextRunAt === 'string' && body.nextRunAt ? body.nextRunAt : undefined,
     });
     startScheduler();
-    return NextResponse.json({ ok: true, schedule, schedules: store.listSchedules() });
+    return NextResponse.json({ ok: true, schedule, schedules: await store.listSchedules() });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : '保存定时任务失败' },
@@ -33,6 +33,6 @@ export async function DELETE(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const id = searchParams.get('id');
   if (!id) return NextResponse.json({ error: '缺少任务 ID' }, { status: 400 });
-  store.deleteSchedule(id);
-  return NextResponse.json({ ok: true, schedules: store.listSchedules() });
+  await store.deleteSchedule(id);
+  return NextResponse.json({ ok: true, schedules: await store.listSchedules() });
 }

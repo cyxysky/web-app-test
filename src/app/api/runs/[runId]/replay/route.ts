@@ -9,7 +9,7 @@ export async function POST(_request: Request, context: RouteContext) {
   const { runId } = await context.params;
 
   try {
-    const run = replayRun(runId);
+    const run = await replayRun(runId);
     return NextResponse.json({ ok: true, runId: run?.id, status: run?.status, run });
   } catch (error) {
     return NextResponse.json(
