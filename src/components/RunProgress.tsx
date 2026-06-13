@@ -560,11 +560,6 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   const taskFrame = useMemo(() => collectRunTaskFrame(run), [run]);
   const ledgerItems = useMemo(() => collectRunLedgerItems(run), [run]);
   const selectedStep = selectedOrLatest(steps, selectedIndex);
-  const selectedStepLedgerItems = useMemo(() => {
-    if (!selectedStep) return [];
-    if (selectedStep.ledgerItems?.length) return selectedStep.ledgerItems;
-    return (selectedStep.workingMemory?.ledgerItems || []).filter((item) => item.sourceStep === selectedStep.index);
-  }, [selectedStep]);
   const runningStep = steps.find((step) => step.status === 'running');
   const debugEnabled = Boolean(run.debug?.enabled);
   const manualIntervention = run.control?.manualIntervention;
@@ -576,14 +571,13 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   useEffect(() => {
     let active = true;
-    let timer: number | undefined;
     let refreshTimer: number | undefined;
     let refreshInFlight: Promise<void> | undefined;
     let websocketConnected = false;
 
     const stopRealtime = () => {
       active = false;
-      if (timer !== undefined) window.clearInterval(timer);
+      window.clearInterval(timer);
       if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
     };
 
@@ -629,7 +623,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
       },
     });
 
-    timer = window.setInterval(() => {
+    const timer = window.setInterval(() => {
       if (!websocketConnected) void refreshRun();
     }, 1000);
     void refreshRun();

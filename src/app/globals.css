@@ -5457,14 +5457,13 @@ select {
   display: grid;
   gap: 16px;
   left: 50%;
-  max-height: min(720px, calc(100vh - 56px));
-  max-width: min(760px, calc(100vw - 32px));
+  max-height: 1200px;
   overflow: hidden;
   padding: 18px;
   position: fixed;
   top: 50%;
   transform: translate(-50%, -50%);
-  width: 720px;
+  width: 1200px;
 }
 
 .browser-chat-log-modal header {
@@ -5547,11 +5546,53 @@ select {
   font-size: 12px;
   line-height: 1.45;
   margin: 2px 0 0;
-  max-height: 180px;
+  max-height: 360px;
   overflow: auto;
   padding: 8px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.browser-chat-log-details {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.browser-chat-log-detail-block {
+  background: #fffdfa;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+}
+
+.browser-chat-log-detail-block.is-response {
+  background: #f4f8ff;
+  border-color: #c7d8f7;
+}
+
+.browser-chat-log-detail-block strong {
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.browser-chat-log-detail-block pre,
+.browser-chat-log-raw pre {
+  max-height: 360px;
+}
+
+.browser-chat-log-raw {
+  margin-top: 2px;
+}
+
+.browser-chat-log-raw summary {
+  color: var(--muted-strong);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 850;
 }
 
 .browser-chat-composer-shell {

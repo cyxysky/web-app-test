@@ -78,6 +78,7 @@ const interruptedAssistantMessageIds = new Set<string>();
 let sessionsHydrated = false;
 let lastPersistWarningAt = 0;
 const runningHydrationGraceMs = 2 * 60 * 1000;
+const fullLogDetailsFlag = '__browserChatFullLogDetails';
 
 function now() {
   return new Date().toISOString();
@@ -111,13 +112,27 @@ function trimLogText(value: string, max = 3000) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
-function logDetailsFromUnknown(value: unknown) {
+function unwrapLogDetails(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { value, full: false };
+  }
+  const record = value as Record<string, unknown>;
+  if (record[fullLogDetailsFlag] !== true) {
+    return { value, full: false };
+  }
+  return { value: record.value, full: true };
+}
+
+function logDetailsFromUnknown(input: unknown) {
+  const { value, full } = unwrapLogDetails(input);
   if (value === undefined || value === null || value === '') return undefined;
-  if (typeof value === 'string') return trimLogText(value);
+  if (typeof value === 'string') return full ? value.trim() : trimLogText(value);
   try {
-    return trimLogText(JSON.stringify(value, null, 2));
+    const serialized = stringifyJsonSafe(value, 2) || String(value);
+    return full ? serialized.trim() : trimLogText(serialized);
   } catch {
-    return trimLogText(String(value));
+    const fallback = String(value);
+    return full ? fallback.trim() : trimLogText(fallback);
   }
 }
 
@@ -384,7 +399,6 @@ function appendLog(
   input: { stepIndex?: number; elapsedMs?: number; details?: unknown } = {},
 ) {
   const timestamp = now();
-  const runningContent = runningContentFromLog(phase, message);
   const runningActivity = runningActivityFromLog(phase, message);
   const details = logDetailsFromUnknown(input.details);
   session.logs = [
@@ -403,7 +417,6 @@ function appendLog(
   if (session.activeAssistantMessageId) {
     updateAssistantMessage(session, session.activeAssistantMessageId, (item) => ({
       ...item,
-      content: item.status === 'running' && runningContent ? runningContent : item.content,
       activity: item.status === 'running' && runningActivity
         ? { phase, label: runningActivity, updatedAt: timestamp }
         : item.activity,
@@ -752,7 +765,7 @@ export async function sendBrowserChatMessage(
   const assistantMessage: BrowserChatMessage = {
     id: id('msg'),
     role: 'assistant',
-    content: '正在处理...',
+    content: '',
     createdAt: timestamp,
     updatedAt: timestamp,
     clientMessageId: normalizedClientMessageId,
@@ -833,16 +846,14 @@ function looksLikeDomSnapshot(value?: string) {
 
 function runningAssistantContent(step: StepExecutionResult) {
   const latestTool = step.tools?.at(-1);
+  const note = step.note?.trim();
+  if (note && !looksLikeDomSnapshot(note)) return note;
   const actual = step.actual?.trim();
   if (step.status === 'failed' && latestTool?.ok !== false) {
     return (actual && !looksLikeDomSnapshot(actual) ? actual : undefined) || 'AI 请求异常，已保留当前页面状态。';
   }
-  if (latestTool) {
-    if (latestTool.ok === false) return `工具调用失败：${latestTool.name}`;
-    if (latestTool.ok === true) return `工具调用完成：${latestTool.name}`;
-    return `正在调用工具：${latestTool.name}`;
-  }
-  return (actual && !looksLikeDomSnapshot(actual) ? actual : undefined) || step.action?.trim() || '正在处理...';
+  if (latestTool) return '';
+  return '';
 }
 
 function runningAssistantActivity(step: StepExecutionResult, timestamp: string) {
@@ -899,26 +910,6 @@ function runningActivityFromLog(phase: string, message: string) {
   return undefined;
 }
 
-function runningContentFromLog(phase: string, message: string) {
-  if (phase === 'browser:screenshot:before') return '正在截取当前页面...';
-  if (phase === 'browser:screenshot:after') return '正在保存操作后的页面状态...';
-  if (phase === 'ai:runtime-input:start') return '正在准备当前页面上下文...';
-  if (phase === 'perf:runtime-input') return '正在准备当前页面上下文...';
-  if (phase === 'ai:runtime:request') return '正在请求 AI 判断下一步操作...';
-  if (phase === 'ai:context-compressed') return '正在整理视觉上下文...';
-  if (phase === 'ai:visual-context') return '正在更新视觉上下文...';
-  if (phase === 'chat:step:start') return '正在准备下一步浏览器操作...';
-  if (phase === 'ai:prepare') return '正在收集页面状态并请求 AI 决策...';
-  if (phase === 'ai:tool') {
-    const name = toolNameFromLogMessage(message);
-    if (/started/i.test(message)) return `正在调用工具：${name}`;
-    if (/failed/i.test(message)) return `工具调用失败：${name}`;
-    if (/ok/i.test(message)) return `工具调用完成：${name}`;
-    return `正在处理工具调用：${name}`;
-  }
-  return undefined;
-}
-
 function isActiveBrowserChatTurn(session: BrowserChatSessionRecord, assistantMessageId: string, abortController: AbortController) {
   return !interruptedAssistantMessageIds.has(assistantMessageId)
     && session.activeAssistantMessageId === assistantMessageId
@@ -927,7 +918,7 @@ function isActiveBrowserChatTurn(session: BrowserChatSessionRecord, assistantMes
 }
 
 export function interruptBrowserChatSession(sessionId: string) {
-  hydrateSessions();
+  if (!sessionsHydrated) hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   const timestamp = now();

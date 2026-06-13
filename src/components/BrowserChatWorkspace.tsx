@@ -158,6 +158,90 @@ function formatToolPayload(value: unknown) {
   }
 }
 
+function asRecord(value: unknown) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function aiLogTokenEstimate(details?: Record<string, unknown>) {
+  const estimate = asRecord(details?.requestTokenEstimate);
+  return estimate ? formatToolPayload(estimate) : '';
+}
+
+function aiLogRequestPayload(details?: Record<string, unknown>) {
+  const request = asRecord(details?.request);
+  if (!request) return '';
+  return formatToolPayload({
+    provider: request.provider,
+    model: request.model,
+    tools: request.tools,
+    options: request.options,
+    messages: request.messages,
+  });
+}
+
+function aiLogResponsePayload(details?: Record<string, unknown>) {
+  const response = asRecord(details?.response);
+  const blocks: Array<{ label: string; value: unknown }> = [];
+  const directText = typeof details?.text === 'string' ? details.text.trim() : '';
+  if (directText) blocks.push({ label: 'text', value: directText });
+  if (response) {
+    const responseText = typeof response.text === 'string' ? response.text.trim() : '';
+    if (responseText && responseText !== directText) blocks.push({ label: 'response.text', value: responseText });
+    if (response.object !== undefined) blocks.push({ label: 'response.object', value: response.object });
+    if (response.toolCalls !== undefined) blocks.push({ label: 'response.toolCalls', value: response.toolCalls });
+    const providerResponse = asRecord(response.response);
+    if (providerResponse?.messages !== undefined) {
+      blocks.push({ label: 'response.response.messages', value: providerResponse.messages });
+    }
+  }
+  if (!blocks.length && details?.response !== undefined) {
+    blocks.push({ label: 'response', value: details.response });
+  }
+  if (!blocks.length) return '';
+  return blocks.map((block) => `${block.label}:\n${formatToolPayload(block.value)}`).join('\n\n');
+}
+
+function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
+  if (!log.details) return null;
+  const parsed = parseJsonObjectText(log.details);
+  const isAiRequestLog = log.phase === 'ai:runtime:request';
+  const isAiResponseLog = log.phase === 'ai:runtime:response' || log.phase === 'ai:runtime:object';
+  if (!parsed || (!isAiRequestLog && !isAiResponseLog)) {
+    return <pre>{log.details}</pre>;
+  }
+  const tokenEstimate = aiLogTokenEstimate(parsed);
+  const requestPayload = isAiRequestLog ? aiLogRequestPayload(parsed) : '';
+  const responsePayload = isAiResponseLog ? aiLogResponsePayload(parsed) : '';
+  return (
+    <div className="browser-chat-log-details">
+      {tokenEstimate ? (
+        <section className="browser-chat-log-detail-block">
+          <strong>粗略 token 估算</strong>
+          <pre>{tokenEstimate}</pre>
+        </section>
+      ) : null}
+      {requestPayload ? (
+        <section className="browser-chat-log-detail-block">
+          <strong>发送给 AI 的请求</strong>
+          <pre>{requestPayload}</pre>
+        </section>
+      ) : null}
+      {responsePayload ? (
+        <section className="browser-chat-log-detail-block is-response">
+          <strong>AI 返回内容</strong>
+          <pre>{responsePayload}</pre>
+        </section>
+      ) : null}
+      <details className="browser-chat-log-raw">
+        <summary>完整日志 JSON</summary>
+        <pre>{log.details}</pre>
+      </details>
+    </div>
+  );
+}
+
 function toolStatusLabel(tool: BrowserChatToolCall) {
   if (tool.ok === false) return '失败';
   if (tool.ok === true) return '完成';
@@ -259,6 +343,7 @@ function normalizedAgentText(value?: string) {
   if (isRawInfrastructureErrorText(text)) {
     return 'AI 模型请求失败：当前模型网关不兼容本轮工具调用格式，完整错误已记录在日志中。';
   }
+  if (isToolExecutionResultText(text)) return '';
   return isRawDomSnapshotText(text) ? '' : text;
 }
 
@@ -272,23 +357,18 @@ function isRawInfrastructureErrorText(value?: string) {
   return /litellm\.BadRequestError|AnthropicException|Failed to deserialize the JSON body|unknown variant `?custom`?|invalid_request_error|Recorded as recoverable/i.test(value || '');
 }
 
-function toolTimelineSummary(tool?: BrowserChatToolCall) {
-  if (!tool || tool.ok === false) return '';
-  if (tool.name === 'getDomTree') return '已读取当前可见 DOM 快照。';
-  if (tool.name === 'getInteractiveCandidates') return '已读取当前可见可交互元素。';
-  if (tool.name === 'getDomNodeText') return '已读取目标 DOM 节点文本。';
-  if (tool.name === 'findByText') return '已查询页面文本匹配结果。';
-  if (tool.name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
-  if (tool.name === 'listTabs') return '已读取浏览器标签页列表。';
-  return '';
+function isToolExecutionResultText(value?: string) {
+  const text = (value || '').trim();
+  if (!text) return false;
+  return /^(Clicked|Double-clicked|Right-clicked|Hovered|Dragged|Typed text|Pressed key|Batch (?:DOM|candidate) fill completed|Page wait completed|Switched to tab|Text locator candidates|DOM node \d+ .* full text)/i.test(text)
+    || /\bFocused element after action:/i.test(text)
+    || /\bat browser point \(\d+,\s*\d+\)/i.test(text);
 }
 
 function stepNarrative(step: StepExecutionResult) {
-  const text = normalizedAgentText(step.note)
-    || toolTimelineSummary(step.tools?.at(-1))
-    || normalizedAgentText(step.actual);
+  const text = normalizedAgentText(step.note);
   if (!text) return '';
-  if (isRawDomSnapshotText(text)) return toolTimelineSummary(step.tools?.at(-1));
+  if (isRawDomSnapshotText(text)) return '';
   if (/^AI (is choosing|called a browser tool)/i.test(text)) return '';
   return text.replace(/^Reported state without browser action:\s*/i, '').trim();
 }
@@ -439,11 +519,11 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   running: boolean;
   steps: StepExecutionResult[];
 }) {
-  const finalText = normalizedAgentText(message.content);
+  const finalText = message.content;
   const seenTexts = new Set<string>();
   const shouldShowStepTimeline = running || steps.some((step) => (step.tools || []).length);
   const renderText = (text: string, key: string) => {
-    const normalized = normalizedAgentText(text);
+    const normalized = text;
     if (!normalized || seenTexts.has(normalized)) return null;
     seenTexts.add(normalized);
     return (
@@ -453,7 +533,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
 
   return (
     <div className="browser-chat-agent-timeline">
-      {running ? renderText(finalText || '正在处理...', 'running-text') : null}
+      {running ? renderText(finalText, 'running-text') : null}
       {shouldShowStepTimeline ? steps.map((step) => (
         <div className="browser-chat-agent-step" key={step.index}>
           <BrowserChatStepToolCards onSelectTool={onSelectTool} running={running && step.status === 'running'} step={step} />
@@ -1553,7 +1633,7 @@ export function BrowserChatWorkspace({
                         {log.stepIndex ? ` · 步骤 ${log.stepIndex}` : ''}
                         {typeof log.elapsedMs === 'number' ? ` · ${log.elapsedMs}ms` : ''}
                       </small>
-                      {log.details ? <pre>{log.details}</pre> : null}
+                      <BrowserChatLogDetails log={log} />
                     </div>
                   </li>
                 ))}

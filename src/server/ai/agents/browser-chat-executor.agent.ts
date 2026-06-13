@@ -64,6 +64,8 @@ type VisualAfterPolicy = {
   reason?: string;
 };
 
+const BATCH_FILL_FIELD_LIMIT = 80;
+
 type RuntimeDecision = {
   action: string;
   expected: string;
@@ -121,6 +123,12 @@ const codexRuntimeObjectSchema = z.object({
     targetVisual: z.string().nullable().optional(),
     targetText: z.string().nullable().optional(),
     ids: z.array(z.string()).nullable().optional(),
+    fields: z.array(z.object({
+      id: z.string().min(1),
+      text: z.string().nullable().optional(),
+      clear: z.boolean().nullable().optional(),
+      targetVisual: z.string().nullable().optional(),
+    })).nullable().optional(),
     selectionReason: z.string().nullable().optional(),
     sameInterfaceGroup: z.string().nullable().optional(),
   }).describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason.'),
@@ -264,11 +272,27 @@ function shouldSendScreenshotToAi(mode: BrowserSessionMode) {
 // 将调试数据转成可安全 JSON 序列化的结构，避免 Buffer/BigInt 破坏持久化。
 function jsonSafe(value: unknown) {
   if (value === undefined) return undefined;
-  return JSON.parse(JSON.stringify(value, (_key, item) => {
+  const seen = new WeakSet<object>();
+  const serialized = JSON.stringify(value, (_key, item) => {
     if (typeof item === 'bigint') return item.toString();
+    if (typeof item === 'function' || typeof item === 'symbol') return undefined;
+    if (item instanceof Error) {
+      return {
+        name: item.name,
+        message: item.message,
+        stack: item.stack,
+      };
+    }
     if (Buffer.isBuffer(item)) return `[Buffer ${item.length} bytes]`;
+    if (item instanceof ArrayBuffer) return `[ArrayBuffer ${item.byteLength} bytes]`;
+    if (ArrayBuffer.isView(item)) return `[${item.constructor.name || 'TypedArray'} ${(item as ArrayBufferView).byteLength} bytes]`;
+    if (item && typeof item === 'object') {
+      if (seen.has(item)) return '[Circular]';
+      seen.add(item);
+    }
     return item;
-  }));
+  });
+  return serialized ? JSON.parse(serialized) : serialized;
 }
 
 function aiScreenshotMaxBytes() {
@@ -453,6 +477,12 @@ function browserChatAbortError(signal?: AbortSignal) {
   return new Error('Browser chat operation interrupted by user.');
 }
 
+function isBrowserChatAbortError(error: unknown, signal?: AbortSignal) {
+  if (signal?.aborted) return true;
+  const text = error instanceof Error ? `${error.name}\n${error.message}` : String(error || '');
+  return /Browser chat (?:operation interrupted|session (?:closed|deleted)) by user|operation interrupted by user/i.test(text);
+}
+
 function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw browserChatAbortError(signal);
 }
@@ -468,7 +498,7 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
   try {
     return await generateText({ ...options, abortSignal });
   } catch (error) {
-    if (upstream?.aborted) throw browserChatAbortError(upstream);
+    if (isBrowserChatAbortError(error, upstream)) throw browserChatAbortError(upstream);
     if (timeoutController.signal.aborted && !upstream?.aborted) {
       const timeoutError = new Error(`AI request timed out after ${timeoutMs}ms`);
       (timeoutError as { cause?: unknown }).cause = error;
@@ -490,7 +520,7 @@ async function generateObjectWithTimeout(options: Parameters<typeof generateObje
   try {
     return await generateObject({ ...options, abortSignal });
   } catch (error) {
-    if (upstream?.aborted) throw browserChatAbortError(upstream);
+    if (isBrowserChatAbortError(error, upstream)) throw browserChatAbortError(upstream);
     if (timeoutController.signal.aborted && !upstream?.aborted) {
       const timeoutError = new Error(`AI request timed out after ${timeoutMs}ms`);
       (timeoutError as { cause?: unknown }).cause = error;
@@ -655,9 +685,12 @@ function estimateTextTokens(text: string) {
   return Math.ceil(ascii / 4 + nonAscii);
 }
 
+function imageTokenEstimatePerImage() {
+  return Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
+}
+
 function estimateContextTokens(text: string, imageCount: number) {
-  const imageTokens = Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
-  return estimateTextTokens(text) + imageCount * imageTokens;
+  return estimateTextTokens(text) + imageCount * imageTokenEstimatePerImage();
 }
 
 function compactWorkingMemory(memory: RuntimeWorkingMemory): RuntimeWorkingMemory {
@@ -909,7 +942,7 @@ function sanitizeNextGoal(value: unknown) {
       .replace(/(?:点击|双击|右键|拖拽|悬停|输入|按下|滚动|选择)\s*[“"']?([^，。；;]*)[”"']?/g, '完成$1')
       .replace(/候选(?:ID|id|编号)\s*[:：]?\s*\d+/gi, '当前截图中的对应候选')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的对应目标')
-      .replace(/\b(?:clickCandidate|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '根据当前截图选择合适工具'),
+      .replace(/\b(?:clickCandidate|fillCandidates|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|fillDomNodes|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '根据当前页面选择合适工具'),
     220,
   );
 }
@@ -918,7 +951,7 @@ function sanitizeCurrentState(value: unknown) {
   if (typeof value !== 'string') return '';
   return sanitizeHistoricalToolText(
     value
-      .replace(/\b(?:clickCandidate|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '已执行页面操作')
+      .replace(/\b(?:clickCandidate|fillCandidates|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|fillDomNodes|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '已执行页面操作')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的目标'),
     260,
   );
@@ -1430,6 +1463,12 @@ function makeBrowserTools(
     }).optional(),
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
+  const batchFillFieldsInput = z.array(z.object({
+    id: z.string().min(1).describe('Fresh DOM node_id or visual candidate id from the CURRENT snapshot.'),
+    text: z.string().optional().describe('Optional text to fill after clicking this field. Omit for click-only actions.'),
+    clear: z.boolean().optional().describe('Defaults to true when text is provided. Set false only when appending is intended.'),
+    targetVisual: z.string().optional().describe('Visible label/placeholder/target description for this field.'),
+  })).min(1).max(BATCH_FILL_FIELD_LIMIT);
 
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
     throwIfAborted(referenceOptions?.abortSignal);
@@ -1602,6 +1641,17 @@ function makeBrowserTools(
       }),
       execute: (input) => record('clickDomNode', input, () => session.clickDomNode(normalizeDomNodeIdParam(input), input.text)),
     }),
+    fillDomNodes: tool({
+      description: `DOM mode form helper: click and optionally fill up to ${BATCH_FILL_FIELD_LIMIT} fields from the CURRENT full DOM snapshot in one browser action. Use for stable forms where all node_id values are visible in the same fresh DOM snapshot. Do not use across navigation, popups, or dynamic multi-step widgets.`,
+      inputSchema: browserToolInput({
+        fields: batchFillFieldsInput.describe('Ordered fields to click/fill. Each id is a numeric node_id from the current DOM snapshot; text is optional for click-only actions.'),
+      }),
+      execute: (input) => record('fillDomNodes', input, () => session.fillDomNodes(input.fields.map((field) => ({
+        id: normalizeDomNodeIdParam({ id: field.id }),
+        text: field.text,
+        clear: field.clear,
+      })))),
+    }),
     findByText: tool({
       description: 'DOM mode recovery, read-only: find visible interactive locators whose text/accessibility label/title/placeholder/href matches targetText. This does not click. Use only when a fresh DOM id is unavailable or unreliable, then choose one returned locatorId in a later clickLocator call.',
       inputSchema: browserToolInput({
@@ -1629,6 +1679,17 @@ function makeBrowserTools(
         text: z.string().optional().describe('Optional text to type immediately after clicking, useful when the click focuses an input or editable control.'),
       }),
       execute: (input) => record('clickCandidate', input, async () => validateCandidateActionBeforeExecution('clickCandidate', input, traces) || session.clickCandidate(input.id, input.text)),
+    }),
+    fillCandidates: tool({
+      description: `Visual mode form helper: click and optionally fill up to ${BATCH_FILL_FIELD_LIMIT} visible candidates from the CURRENT screenshot candidate map in one browser action. Use for stable forms where all fields are visible at once. Do not use across navigation, popups, hover menus, or dynamic multi-step widgets.`,
+      inputSchema: browserToolInput({
+        fields: batchFillFieldsInput.describe('Ordered visual candidates to click/fill. Each id must come from the current visual labels; targetVisual should name the visible label/placeholder for each field.'),
+      }),
+      execute: (input) => record('fillCandidates', input, async () => session.fillCandidates(input.fields.map((field) => ({
+        id: field.id,
+        text: field.text,
+        clear: field.clear,
+      })))),
     }),
     hoverCandidate: tool({
       description: 'Visual mode: move the mouse over a visible candidate by its numbered label. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
@@ -1822,13 +1883,14 @@ function runtimePrompt(input: {
         '- Candidate ids in attached reference screenshots are historical only. For the next action, use only ids that are visible in the current screenshot/marker map.',
         '- For overlapping boxes, choose the smallest/tightest box that directly encloses the intended visible text/icon/control.',
         '- Count repeated attempts by visible target + action, not only by id. After two ineffective attempts, choose another evidence-based path.',
-        '- Never issue two clicks from one screenshot. Re-inspect the new screenshot before a second attempt.',
+        '- Never issue two separate click tools from one screenshot. Re-inspect the new screenshot before a second attempt, except fillCandidates may fill multiple stable form fields in one tool call.',
       ]
     : [];
   const modeActionRules = visualMode
     ? [
         '- Candidate IDs are volatile and valid only for the CURRENT screenshot. Re-read the visible target first, then use its current number.',
         '- For text entry on a numbered candidate, use clickCandidate(id,text) in one tool call. Use typeText only after a fallback click already focused the field.',
+        `- For stable forms with multiple visible fields in the same screenshot, use fillCandidates(fields[]) once instead of one clickCandidate per field. You may include up to ${BATCH_FILL_FIELD_LIMIT} fields. Do not batch across navigation, hover menus, or dynamic multi-step UI.`,
         '- For hover-only menus, call hoverCandidate on the visible trigger, then act on the revealed target in the next step.',
         '- If needed content may be outside the visible area, use scrollArea with the green S label shown on the current screenshot.',
         '- Green dashed boxes/green S labels mark scrollable regions. Use only a green S id visible in the CURRENT screenshot; never reuse historical S ids.',
@@ -1844,6 +1906,7 @@ function runtimePrompt(input: {
         '- Use findByText only when a fresh DOM id is unavailable or unreliable, such as dynamic search results, iframe/shadow/dialog/popover content, or an id that disappeared after refresh.',
         '- For findByText targetText, use a short unique visible/accessibility label from the CURRENT DOM/page context. Do not pass a long surrounding snippet.',
         '- For text entry, use clickDomNode(id,text) in one tool call when the input id is present. Use typeText only after a prior action already focused the field.',
+        `- For stable forms with multiple fields in the same fresh DOM snapshot, use fillDomNodes(fields[]) once instead of one clickDomNode per field. You may include up to ${BATCH_FILL_FIELD_LIMIT} fields. Do not batch across navigation, popups, or dynamic multi-step UI.`,
         '- Use scrollArea only when interaction requires changing the visual viewport or lazy-loaded content is absent from the full DOM/text context, then refresh the DOM snapshot before acting.',
         '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
         '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
@@ -1978,13 +2041,14 @@ function runtimeToolNames(mode: BrowserSessionMode) {
   const candidateTools = [
     ...sharedTools,
     'clickCandidate',
+    'fillCandidates',
     'hoverCandidate',
     'doubleClickCandidate',
     'rightClickCandidate',
     'dragCandidate',
   ];
   if (mode === 'visual-markers') return candidateTools;
-  return [...sharedTools, 'getDomTree', 'getDomNodeText', 'clickDomNode', 'findByText', 'clickLocator'];
+  return [...sharedTools, 'getDomTree', 'getDomNodeText', 'clickDomNode', 'fillDomNodes', 'findByText', 'clickLocator'];
 }
 
 function isCodexProvider() {
@@ -2038,6 +2102,65 @@ function createAiRequestSnapshot(input: {
       },
     ],
   };
+}
+
+const fullLogDetailsFlag = '__browserChatFullLogDetails';
+
+function aiRequestTextAndImageStats(aiRequest?: AiRequestSnapshot) {
+  let text = '';
+  let imageCount = 0;
+  for (const message of aiRequest?.messages || []) {
+    for (const item of message.content || []) {
+      if (item.type === 'text') text += `\n${item.text}`;
+      if (item.type === 'image') imageCount += 1;
+    }
+  }
+  const estimatedTextTokens = estimateTextTokens(text);
+  const estimatedImageTokens = imageCount * imageTokenEstimatePerImage();
+  return {
+    textCharacters: text.length,
+    imageCount,
+    estimatedTextTokens,
+    estimatedImageTokens,
+    estimatedTotalTokens: estimatedTextTokens + estimatedImageTokens,
+    method: 'rough estimate: ASCII chars / 4 + non-ASCII chars + imageCount * AI_IMAGE_CONTEXT_ESTIMATE_TOKENS',
+  };
+}
+
+function fullLogDetails(value: unknown) {
+  return {
+    [fullLogDetailsFlag]: true,
+    value: jsonSafe(value),
+  };
+}
+
+function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Record<string, unknown> = {}) {
+  return fullLogDetails({
+    ...extra,
+    requestTokenEstimate: aiRequestTextAndImageStats(aiRequest),
+    request: aiRequest,
+  });
+}
+
+function aiResponseLogDetails(input: {
+  aiRequest?: AiRequestSnapshot;
+  response: unknown;
+  elapsedMs: number;
+  traces?: ToolTrace[];
+  visualContext?: ReturnType<VisualContextManager['snapshot']>;
+  workingMemory?: RuntimeWorkingMemory;
+  extra?: Record<string, unknown>;
+}) {
+  return fullLogDetails({
+    ...(input.extra || {}),
+    elapsedMs: input.elapsedMs,
+    requestTokenEstimate: aiRequestTextAndImageStats(input.aiRequest),
+    request: input.aiRequest,
+    response: input.response,
+    traces: input.traces,
+    visualContext: input.visualContext,
+    workingMemory: input.workingMemory,
+  });
 }
 
 function extractProgressNote(text: string) {
@@ -2599,7 +2722,16 @@ async function executeRuntimeStep(input: {
       const aiStartedAt = Date.now();
       const messages = await prepareStep(0);
       throwIfAborted(abortSignal);
-      await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision.', details: { provider: getModelSettings().provider, model: getModelSettings().model, codexObjectMode: true } });
+      await onDebug?.({
+        phase: 'ai:runtime:request',
+        stepIndex,
+        message: 'AI request started; waiting for browser action decision.',
+        details: aiRequestLogDetails(aiRequest, {
+          provider: getModelSettings().provider,
+          model: getModelSettings().model,
+          codexObjectMode: true,
+        }),
+      });
       const result = await generateObjectWithTimeout({ model: getModel(), messages, schema: codexRuntimeObjectSchema, temperature: 0.1, maxRetries: 0, abortSignal });
       throwIfAborted(abortSignal);
       const object = result.object as z.infer<typeof codexRuntimeObjectSchema>;
@@ -2625,7 +2757,20 @@ async function executeRuntimeStep(input: {
         onSelectReferenceScreenshots: async (selection) => { const validIds = selection.ids.filter((id) => availableReferenceIds.has(id)); await onSelectReferenceScreenshots?.({ ...selection, ids: validIds, availableReferences: availableScreenshotReferences }); },
       });
       throwIfAborted(abortSignal);
-      await onDebug?.({ phase: 'ai:runtime:object', stepIndex, message: 'Codex object -> ' + object.type + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms', details: jsonSafe({ object, traces, elapsedMs: elapsedSince(aiStartedAt) }) });
+      await onDebug?.({
+        phase: 'ai:runtime:object',
+        stepIndex,
+        message: 'Codex object -> ' + object.type + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms',
+        details: aiResponseLogDetails({
+          aiRequest,
+          response: { result, object, execution },
+          elapsedMs: elapsedSince(aiStartedAt),
+          traces,
+          visualContext: visualContext.snapshot(),
+          workingMemory,
+          extra: { responseType: 'object', objectType: object.type },
+        }),
+      });
       return {
         text: execution.text,
         traces,
@@ -2644,7 +2789,17 @@ async function executeRuntimeStep(input: {
       try {
         const messages = await prepareStep(turnIndex);
         throwIfAborted(abortSignal);
-        await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision. turn ' + (turnIndex + 1) + '/' + maxTurns + '.', details: { provider: getModelSettings().provider, model: getModelSettings().model, turnIndex: turnIndex + 1, maxTurns } });
+        await onDebug?.({
+          phase: 'ai:runtime:request',
+          stepIndex,
+          message: 'AI request started; waiting for browser action decision. turn ' + (turnIndex + 1) + '/' + maxTurns + '.',
+          details: aiRequestLogDetails(aiRequest, {
+            provider: getModelSettings().provider,
+            model: getModelSettings().model,
+            turnIndex: turnIndex + 1,
+            maxTurns,
+          }),
+        });
         const result = await generateTextWithTimeout({
           model: getModel(), messages,
           tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
@@ -2663,7 +2818,25 @@ async function executeRuntimeStep(input: {
         latestText = result.text || '';
         const newTraces = traces.slice(traceStart);
         const lastTrace = newTraces.at(-1);
-        await onDebug?.({ phase: 'ai:runtime:response', stepIndex, message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; turn ' + (turnIndex + 1) + '/' + maxTurns + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms', details: jsonSafe({ text: latestText, traces: newTraces, visualContext: visualContext.snapshot(), workingMemory, elapsedMs: elapsedSince(aiStartedAt) }) });
+        await onDebug?.({
+          phase: 'ai:runtime:response',
+          stepIndex,
+          message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; turn ' + (turnIndex + 1) + '/' + maxTurns + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms',
+          details: aiResponseLogDetails({
+            aiRequest,
+            response: result,
+            elapsedMs: elapsedSince(aiStartedAt),
+            traces: newTraces,
+            visualContext: visualContext.snapshot(),
+            workingMemory,
+            extra: {
+              responseType: 'text',
+              text: latestText,
+              turnIndex: turnIndex + 1,
+              maxTurns,
+            },
+          }),
+        });
         if (!lastTrace || lastTrace.name === 'reportState' || lastTrace.name === 'waitForHumanVerification') {
           return {
             text: latestText,
@@ -2675,7 +2848,7 @@ async function executeRuntimeStep(input: {
           };
         }
       } catch (error) {
-        if (abortSignal?.aborted) throw browserChatAbortError(abortSignal);
+        if (isBrowserChatAbortError(error, abortSignal)) throw browserChatAbortError(abortSignal);
         if (traces.length > traceStart && !abortSignal?.aborted) {
           await onDebug?.({ phase: 'ai:runtime:partial', stepIndex, message: 'AI request stopped after a tool executed; keeping the action and continuing from Visual Context Manager.', details: { error: error instanceof Error ? error.message : String(error), traces: traces.slice(traceStart), visualContext: visualContext.snapshot() } });
           return {
@@ -2723,7 +2896,7 @@ async function executeRuntimeStep(input: {
       }
       return await runAgent(includeImage);
     } catch (error) {
-      if (abortSignal?.aborted) throw browserChatAbortError(abortSignal);
+      if (isBrowserChatAbortError(error, abortSignal)) throw browserChatAbortError(abortSignal);
       lastError = error;
     }
   }
@@ -2752,7 +2925,7 @@ export type InteractiveBrowserTurnResult = {
   networkErrors: string[];
 };
 
-function browserChatMaxSteps() {
+function browserChatMaxBrowserSteps() {
   const raw = Number(process.env.AI_BROWSER_CHAT_MAX_STEPS || 6);
   return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 6));
 }
@@ -2792,6 +2965,7 @@ function browserChatRequirement(input: {
     '',
     'Work style:',
     '- Follow the latest user message first, while preserving useful context from the conversation.',
+    '- If the previous assistant message says the browser-chat browser step limit was reached, treat its progress summary plus RunState/Working Memory as authoritative continuation context; do not restart from the first step.',
     '- If browser work is needed, take concrete browser actions instead of only describing what to do.',
     '- If the user asks a question about the current page, inspect the page and answer from evidence.',
     '- If the user asks you to continue after manual login/captcha/security work, continue from the current browser state.',
@@ -2803,6 +2977,38 @@ function browserChatRequirement(input: {
     '- Use short paragraphs and Markdown bullets or numbered lists with line breaks. Do not cram numbered items into one paragraph.',
     '- If the latest user message can be answered from current evidence, return the Markdown answer directly and call no tool.',
     '- Never include JSON, fenced JSON, tool parameters, candidate ids, coordinates, screenshot paths, or status objects in assistant text.',
+  ].filter(Boolean).join('\n');
+}
+
+function browserChatStepLimitSummary(input: {
+  maxSteps: number;
+  newSteps: StepExecutionResult[];
+  steps: StepExecutionResult[];
+}) {
+  const latestMemory = input.steps.map((step) => step.workingMemory).filter(Boolean).at(-1);
+  const recentSteps = input.newSteps.slice(-6).map((step) => {
+    const latestTool = step.tools?.at(-1);
+    const title = latestTool
+      ? `${latestTool.name}${latestTool.ok === false ? ' 失败' : ''}`
+      : step.action || `步骤 ${step.index}`;
+    const result = step.actual || step.note || latestTool?.result || '';
+    return `- 第 ${step.index} 步：${concise(title, 80)}${result ? `；${concise(result, 160)}` : ''}`;
+  });
+  const ledgerLines = collectLedgerItemsFromSteps(input.steps).slice(-6).map((item) => (
+    `- ${concise([item.title, item.summary || item.actual || item.expected].filter(Boolean).join('：'), 180)}`
+  ));
+
+  return [
+    `本轮已达到对话模式浏览器步骤上限（${input.maxSteps} 步），我先暂停继续请求，避免无休止执行。`,
+    '',
+    recentSteps.length ? '已保存的最近进度：' : '',
+    ...recentSteps,
+    latestMemory?.currentState ? `\n当前状态：${concise(latestMemory.currentState, 260)}` : '',
+    latestMemory?.nextStep ? `下一步：${concise(latestMemory.nextStep, 220)}` : '',
+    ledgerLines.length ? '\n关键记录：' : '',
+    ...ledgerLines,
+    '',
+    '你发送“继续”时，我会基于当前页面、已保存步骤和这段摘要继续，不会从头开始。',
   ].filter(Boolean).join('\n');
 }
 
@@ -2876,7 +3082,7 @@ function assistantReplyFromStep(step?: StepExecutionResult) {
   const note = readableActionFromRawText(step.note);
   return reportState
     ? toolText || note || actual || '已完成这一轮浏览器操作。'
-    : note || actual || toolText || '已完成这一轮浏览器操作。';
+    : note || toolText || '';
 }
 
 export async function executeInteractiveBrowserTurn(input: {
@@ -2904,8 +3110,10 @@ export async function executeInteractiveBrowserTurn(input: {
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
+  let endedWithFinalAnswer = false;
+  const maxSteps = browserChatMaxBrowserSteps();
 
-  for (let turnStep = 0; turnStep < browserChatMaxSteps(); turnStep += 1) {
+  for (let turnStep = 0; turnStep < maxSteps; turnStep += 1) {
     throwIfAborted(input.abortSignal);
     const stepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
     await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `正在准备第 ${stepIndex} 步浏览器操作：读取当前页面状态。` });
@@ -2966,7 +3174,7 @@ export async function executeInteractiveBrowserTurn(input: {
       });
       throwIfAborted(input.abortSignal);
     } catch (error) {
-      if (input.abortSignal?.aborted) throw browserChatAbortError(input.abortSignal);
+      if (isBrowserChatAbortError(error, input.abortSignal)) throw browserChatAbortError(input.abortSignal);
       const errorText = infrastructureError(error);
       if (!liveToolTraces.length && isInfrastructureNoise(errorText)) {
         const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
@@ -3028,6 +3236,7 @@ export async function executeInteractiveBrowserTurn(input: {
       if (browserChatReply) {
         reply = browserChatReply;
         finalStatus = 'passed';
+        endedWithFinalAnswer = true;
         break;
       }
       continue;
@@ -3066,11 +3275,14 @@ export async function executeInteractiveBrowserTurn(input: {
     // explicitly returns a final Markdown answer.
     if (browserChatReply) {
       finalStatus = 'passed';
+      endedWithFinalAnswer = true;
       break;
     }
   }
 
-  if (!newSteps.length) {
+  if (!endedWithFinalAnswer && newSteps.length) {
+    reply = browserChatStepLimitSummary({ maxSteps, newSteps, steps });
+  } else if (!newSteps.length) {
     reply = reply || '这一轮没有产生新的浏览器操作。';
   } else if (!reply) {
     reply = assistantReplyFromStep(newSteps.at(-1));
@@ -3213,6 +3425,19 @@ function flowInput(input: unknown) {
   return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
 }
 
+function batchFillFieldsFromInput(input: Record<string, unknown>) {
+  const rawFields = Array.isArray(input.fields) ? input.fields : [];
+  return rawFields
+    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+    .map((item) => ({
+      id: String(item.id || ''),
+      text: typeof item.text === 'string' ? item.text : undefined,
+      clear: typeof item.clear === 'boolean' ? item.clear : undefined,
+    }))
+    .filter((item) => item.id.trim())
+    .slice(0, BATCH_FILL_FIELD_LIMIT);
+}
+
 function normalizeBrowserUrl(url: string) {
   const trimmed = url.trim();
   if (!trimmed) return '';
@@ -3288,6 +3513,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       }
     case 'clickCandidate':
       return session.clickCandidate(String(input.id || ''), text);
+    case 'fillCandidates':
+      return session.fillCandidates(batchFillFieldsFromInput(input));
     case 'focusCandidate':
       return session.clickCandidate(String(input.id || ''), text);
     case 'hoverCandidate':
@@ -3300,6 +3527,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.dragCandidate(String(input.fromId || ''), String(input.toId || ''));
     case 'clickDomNode':
       return session.clickDomNode(domNodeId, text);
+    case 'fillDomNodes':
+      return session.fillDomNodes(batchFillFieldsFromInput(input));
     case 'focusDomNode':
       return session.clickDomNode(domNodeId, text);
     case 'findByText':

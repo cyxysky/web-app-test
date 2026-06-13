@@ -47,6 +47,12 @@ export type BrowserActionResult = {
   actual: string;
 };
 
+type BrowserBatchFillAction = {
+  id: string;
+  text?: string;
+  clear?: boolean;
+};
+
 type FocusedElementSummary = {
   hasFocus: boolean;
   summary: string;
@@ -775,8 +781,36 @@ function installAiBrowserPageRuntime() {
       || (tag === 'input' && element.getAttribute('type') === 'hidden');
   }
 
+  function visibleDomStyle(element: Element) {
+    try {
+      return window.getComputedStyle(element);
+    } catch {
+      return undefined;
+    }
+  }
+
+  function isVisibleDomStyleHidden(element: Element) {
+    const style = visibleDomStyle(element);
+    if (!style) return true;
+    return style.display === 'none'
+      || style.visibility === 'hidden'
+      || style.visibility === 'collapse'
+      || Number(style.opacity || '1') <= 0.01;
+  }
+
+  function hasVisibleDomPointerEvents(element: Element) {
+    return visibleDomStyle(element)?.pointerEvents !== 'none';
+  }
+
+  function isVisibleDomSubtreeHidden(element: Element) {
+    return !isTraversable(element)
+      || isOverlay(element)
+      || isVisibleDomHidden(element)
+      || isVisibleDomStyleHidden(element);
+  }
+
   function isVisibleDomInteractive(element: Element) {
-    if (isVisibleDomHidden(element)) return false;
+    if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
     const tag = visibleDomElementName(element);
     const contentEditable = element.getAttribute('contenteditable');
     const role = element.getAttribute('role');
@@ -839,13 +873,18 @@ function installAiBrowserPageRuntime() {
         }
         return;
       }
-      if (node.nodeType === Node.ELEMENT_NODE && visibleDomSkippedTextTags.has(visibleDomElementName(node as Element))) return;
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const element = node as Element;
+        if (isVisibleDomSubtreeHidden(element) || visibleDomSkippedTextTags.has(visibleDomElementName(element))) return;
+      }
       for (const child of Array.from(node.childNodes || [])) {
         if (chars >= 160) break;
         visit(child);
       }
       if (node.nodeType === Node.ELEMENT_NODE) {
-        const root = shadowRootOf(node as Element);
+        const element = node as Element;
+        if (isVisibleDomSubtreeHidden(element)) return;
+        const root = shadowRootOf(element);
         if (!root) return;
         for (const child of Array.from(root.childNodes)) {
           if (chars >= 160) break;
@@ -916,8 +955,7 @@ function installAiBrowserPageRuntime() {
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const element = node as Element;
-      if (!isTraversable(element) || isVisibleDomHidden(element)) return;
-      if (!isRenderable(element)) return;
+      if (isVisibleDomSubtreeHidden(element)) return;
       const tag = visibleDomElementName(element);
       for (const name of textAttributes) append(element.getAttribute(name));
       if (tag === 'input' || tag === 'textarea' || tag === 'select') {
@@ -1028,7 +1066,7 @@ function installAiBrowserPageRuntime() {
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const element = node as Element;
-      if (isOverlay(element)) return;
+      if (isVisibleDomSubtreeHidden(element)) return;
       const tag = visibleDomElementName(element);
       if (tag === 'frame' || tag === 'iframe') pushFrame(element);
       if (isVisibleDomInteractive(element) && visibleDomRect(element, viewportClip)) pushItem(element);
@@ -1068,7 +1106,7 @@ function installAiBrowserPageRuntime() {
       return value !== null && value !== '';
     });
     const shouldIncludeElement = (element: Element) => {
-      if (!isRenderable(element)) return false;
+      if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
       const tag = visibleDomElementName(element);
       if (isVisibleDomInteractive(element)) return true;
       if (structuralTextTags.has(tag) && visibleDomTextContent(element)) return true;
@@ -1126,7 +1164,7 @@ function installAiBrowserPageRuntime() {
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const element = node as Element;
-      if (!isTraversable(element) || isOverlay(element)) return;
+      if (isVisibleDomSubtreeHidden(element)) return;
       const tag = visibleDomElementName(element);
       if (tag === 'frame' || tag === 'iframe') pushFrame(element);
       if (shouldIncludeElement(element)) pushItem(element);
@@ -2965,6 +3003,36 @@ export class BrowserSession {
     };
   }
 
+  async fillCandidates(actions: BrowserBatchFillAction[]): Promise<BrowserActionResult> {
+    const fields = actions
+      .filter((action) => action.id && action.id.trim())
+      .slice(0, 80);
+    if (!fields.length) return { ok: false, actual: 'fillCandidates requires at least one candidate id.' };
+
+    const results: string[] = [];
+    let ok = true;
+    for (const [index, field] of fields.entries()) {
+      const resolved = await this.resolveCandidateTarget(field.id);
+      if (!resolved.target) {
+        ok = false;
+        results.push(`${index + 1}. Candidate ${field.id}: ${resolved.error}`);
+        continue;
+      }
+      const { candidate, target } = resolved;
+      await this.activePage.mouse.click(target.x, target.y);
+      if (field.text !== undefined) {
+        await this.replaceFocusedText(field.text, field.clear !== false);
+      }
+      await this.showClickMarker(target.x, target.y, 'fill');
+      results.push(`${index + 1}. Candidate ${candidate.id} (${this.describeCandidate(candidate)}) clicked${field.text !== undefined ? ` and filled ${field.text.length} characters` : ''}.`);
+    }
+    const note = await this.waitAfterAction();
+    return {
+      ok,
+      actual: `Batch candidate fill completed: ${results.length}/${fields.length} attempted.\n${results.join('\n')}${note}`,
+    };
+  }
+
   // 双击指定编号的候选元素，用于打开链接、表格行等双击场景。
   async doubleClickCandidate(candidateId: string): Promise<BrowserActionResult> {
     const resolved = await this.resolveCandidateTarget(candidateId);
@@ -3076,6 +3144,41 @@ export class BrowserSession {
     const note = await this.waitAfterAction();
     await this.showClickMarker(target.x, target.y, 'click');
     return { ok: true, actual: `Clicked DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${note}` };
+  }
+
+  async fillDomNodes(actions: BrowserBatchFillAction[]): Promise<BrowserActionResult> {
+    const fields = actions
+      .filter((action) => action.id && action.id.trim())
+      .slice(0, 80);
+    if (!fields.length) return { ok: false, actual: 'fillDomNodes requires at least one DOM node id.' };
+
+    const results: string[] = [];
+    let ok = true;
+    for (const [index, field] of fields.entries()) {
+      const resolved = this.resolveDomNodeReference(field.id);
+      if (!resolved.reference) {
+        ok = false;
+        results.push(`${index + 1}. DOM node ${field.id}: ${resolved.error}`);
+        continue;
+      }
+      const target = await this.resolveDomReferenceToClickablePoint(resolved.reference);
+      if (!target) {
+        ok = false;
+        results.push(`${index + 1}. DOM node ${field.id}: stale, missing, or not visible. Call getDomTree again for fresh ids.`);
+        continue;
+      }
+      await this.activePage.mouse.click(target.x, target.y);
+      if (field.text !== undefined) {
+        await this.replaceFocusedText(field.text, field.clear !== false);
+      }
+      await this.showClickMarker(target.x, target.y, 'fill');
+      results.push(`${index + 1}. DOM node ${resolved.reference.id} (${target.descriptor}) clicked${field.text !== undefined ? ` and filled ${field.text.length} characters` : ''}.`);
+    }
+    const note = await this.waitAfterAction();
+    return {
+      ok,
+      actual: `Batch DOM fill completed: ${results.length}/${fields.length} attempted.\n${results.join('\n')}${note}`,
+    };
   }
 
   async findByText(targetText: string, scopeId?: string): Promise<BrowserActionResult> {
@@ -3388,6 +3491,14 @@ export class BrowserSession {
     }
     const [manualNote, focusNote] = await Promise.all([this.manualVerificationNote(), this.focusNote()]);
     return `${manualNote}${focusNote}`;
+  }
+
+  private async replaceFocusedText(text: string, clearFirst: boolean) {
+    if (clearFirst) {
+      await this.activePage.keyboard.press('Control+A').catch(() => undefined);
+      await this.activePage.keyboard.press('Backspace').catch(() => undefined);
+    }
+    if (text) await this.activePage.keyboard.type(text, { delay: 20 });
   }
 
   private async waitForStableViewport(ms: number) {

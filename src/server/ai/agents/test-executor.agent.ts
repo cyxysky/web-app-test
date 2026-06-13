@@ -2633,7 +2633,7 @@ export type InteractiveBrowserTurnResult = {
   networkErrors: string[];
 };
 
-function browserChatMaxSteps() {
+function browserChatMaxBrowserSteps() {
   const raw = Number(process.env.AI_BROWSER_CHAT_MAX_STEPS || 6);
   return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 6));
 }
@@ -2786,7 +2786,7 @@ export async function executeInteractiveBrowserTurn(input: {
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
 
-  for (let turnStep = 0; turnStep < browserChatMaxSteps(); turnStep += 1) {
+  for (let turnStep = 0; turnStep < browserChatMaxBrowserSteps(); turnStep += 1) {
     if (input.abortSignal?.aborted) throw new Error('Browser chat operation interrupted by user.');
     const stepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
     await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `Preparing browser chat step ${stepIndex}; capturing current page screenshot.` });

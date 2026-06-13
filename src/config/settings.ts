@@ -96,6 +96,7 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'KEEP_BROWSER_OPEN_AFTER_RUN', label: '运行后保留浏览器', description: '运行结束后是否保持浏览器打开。', tab: 'runtime', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'KEEP_BROWSER_OPEN_ON_AI_ERROR', label: 'AI 错误时保留浏览器', description: 'AI 调用异常时是否保留浏览器用于排查。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'AI_TEST_RUNTIME_MAX_STEPS', label: '最大运行步骤数', description: '单次测试最多允许 AI 执行多少个运行步骤。', tab: 'runtime', defaultValue: '30', control: 'number' },
+  { key: 'AI_BROWSER_CHAT_MAX_STEPS', label: '对话模式浏览器步骤上限', description: '对话模式中，单轮用户消息最多允许执行多少个浏览器步骤；达到后会保存进度并暂停，发送“继续”可接着执行。', tab: 'runtime', defaultValue: '6', control: 'number' },
   { key: 'AI_AGENT_LOOP_MAX_TURNS', label: 'Agent Loop 最大轮次', description: '单个步骤内部最多允许多少轮工具调用。', tab: 'runtime', defaultValue: '6', control: 'number' },
   { key: 'RUN_WORKER_CONCURRENCY', label: '运行并发数', description: '同时执行多少个测试运行。', tab: 'runtime', defaultValue: '1', control: 'number' },
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
