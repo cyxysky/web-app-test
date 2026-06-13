@@ -256,6 +256,9 @@ function messageUpdateTime(message: BrowserChatMessage) {
 
 function normalizedAgentText(value?: string) {
   const text = readableAgentText(value);
+  if (isRawInfrastructureErrorText(text)) {
+    return 'AI 模型请求失败：当前模型网关不兼容本轮工具调用格式，完整错误已记录在日志中。';
+  }
   return isRawDomSnapshotText(text) ? '' : text;
 }
 
@@ -263,6 +266,10 @@ function isRawDomSnapshotText(value?: string) {
   const text = (value || '').trim();
   if (!text || !/\bnode_id=\d+\b/.test(text)) return false;
   return /<\s*(?:a|button|input|select|textarea|option|summary|details|label|form|iframe)\b/i.test(text);
+}
+
+function isRawInfrastructureErrorText(value?: string) {
+  return /litellm\.BadRequestError|AnthropicException|Failed to deserialize the JSON body|unknown variant `?custom`?|invalid_request_error|Recorded as recoverable/i.test(value || '');
 }
 
 function toolTimelineSummary(tool?: BrowserChatToolCall) {
@@ -1404,7 +1411,7 @@ export function BrowserChatWorkspace({
               />
             ) : (
               <div className="browser-chat-hero">
-                <h1>今天要测试什么？</h1>
+                <h1>今天要做什么？</h1>
               </div>
             )}
 

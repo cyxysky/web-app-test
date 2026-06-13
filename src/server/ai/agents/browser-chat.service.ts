@@ -74,10 +74,9 @@ type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
 
 const sessions = new Map<string, BrowserChatSessionRecord>();
 const sessionsPath = path.join(appDataRoot(), '.data', 'browser-chat-sessions.json');
+const interruptedAssistantMessageIds = new Set<string>();
 let sessionsHydrated = false;
 let lastPersistWarningAt = 0;
-let persistTimer: ReturnType<typeof setTimeout> | undefined;
-const persistDebounceMs = 250;
 const runningHydrationGraceMs = 2 * 60 * 1000;
 
 function now() {
@@ -303,10 +302,43 @@ function isRecentTimestamp(value?: string, maxAgeMs = runningHydrationGraceMs) {
   return Number.isFinite(timestamp) && Date.now() - timestamp < maxAgeMs;
 }
 
-function recordFromSnapshot(session: BrowserChatSessionSnapshot): BrowserChatSessionRecord {
-  const hasRunningMessage = (session.messages || []).some((message) => message.status === 'running');
+function hasRunningAssistantMessage(session: Pick<BrowserChatSessionSnapshot, 'messages'>, assistantMessageId?: string) {
+  return (session.messages || []).some((message) => (
+    message.role === 'assistant'
+    && message.status === 'running'
+    && (!assistantMessageId || message.id === assistantMessageId)
+  ));
+}
+
+function latestRunningAssistantMessageId(session: Pick<BrowserChatSessionSnapshot, 'messages'>) {
+  for (let index = (session.messages || []).length - 1; index >= 0; index -= 1) {
+    const message = session.messages[index];
+    if (message.role === 'assistant' && message.status === 'running') return message.id;
+  }
+  return undefined;
+}
+
+function markAssistantMessageInterrupted(assistantMessageId?: string) {
+  if (!assistantMessageId) return;
+  interruptedAssistantMessageIds.add(assistantMessageId);
+  if (interruptedAssistantMessageIds.size <= 500) return;
+  const oldest = interruptedAssistantMessageIds.values().next().value;
+  if (oldest) interruptedAssistantMessageIds.delete(oldest);
+}
+
+function shouldPreserveRuntimeTurn(existing: BrowserChatSessionRecord, fromDisk: BrowserChatSessionSnapshot) {
+  const assistantMessageId = existing.activeAssistantMessageId;
+  const abortController = existing.activeAbortController;
+  if (!assistantMessageId || !abortController) return false;
+  if (abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId)) return false;
+  if (!fromDisk.busy && fromDisk.status !== 'running' && !hasRunningAssistantMessage(fromDisk, assistantMessageId)) return false;
+  return hasRunningAssistantMessage(fromDisk, assistantMessageId);
+}
+
+function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { preserveRunningState?: boolean } = {}): BrowserChatSessionRecord {
+  const hasRunningMessage = hasRunningAssistantMessage(session);
   const preserveRecentRunningState = (session.busy || session.status === 'running' || hasRunningMessage)
-    && isRecentTimestamp(session.updatedAt);
+    && (options.preserveRunningState || isRecentTimestamp(session.updatedAt));
   const status = preserveRecentRunningState ? session.status : (session.status === 'running' ? 'idle' : session.status);
   const transientStepIndexes = new Set(
     (session.steps || [])
@@ -397,41 +429,45 @@ function persistSessions() {
   }
 }
 
-function persistAndNotify(sessionId: string, options: { flush?: boolean } = {}) {
+function persistAndNotify(sessionId: string) {
+  const persisted = persistSessions();
+  if (!persisted) return;
   notifySessionUpdate(sessionId);
-  if (options.flush) {
-    if (persistTimer) {
-      clearTimeout(persistTimer);
-      persistTimer = undefined;
-    }
-    persistSessions();
-    return;
-  }
-  schedulePersistSessions();
-}
-
-function schedulePersistSessions() {
-  if (persistTimer) clearTimeout(persistTimer);
-  persistTimer = setTimeout(() => {
-    persistTimer = undefined;
-    persistSessions();
-  }, persistDebounceMs);
-  persistTimer.unref?.();
 }
 
 function hydrateSessions() {
-  if (sessionsHydrated) return;
+  const wasHydrated = sessionsHydrated;
   sessionsHydrated = true;
   if (!existsSync(sessionsPath)) return;
   try {
     const data = JSON.parse(readFileSync(sessionsPath, 'utf8')) as BrowserChatSessionSnapshot[];
     if (!Array.isArray(data)) return;
+    const diskSessionIds = new Set<string>();
     for (const item of data) {
       if (!item?.id) continue;
-      sessions.set(item.id, recordFromSnapshot(item));
+      diskSessionIds.add(item.id);
+      const existing = sessions.get(item.id);
+      if (!existing) {
+        sessions.set(item.id, recordFromSnapshot(item));
+        continue;
+      }
+      const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, item);
+      const fromDisk = recordFromSnapshot(item, { preserveRunningState: preserveRuntimeTurn });
+      const runtimeState = {
+        activeAbortController: preserveRuntimeTurn ? existing.activeAbortController : undefined,
+        activeAssistantMessageId: preserveRuntimeTurn ? existing.activeAssistantMessageId : undefined,
+        browser: existing.browser,
+        started: existing.started,
+      };
+      Object.assign(existing, fromDisk, runtimeState);
+    }
+    for (const [sessionId, session] of sessions) {
+      if (diskSessionIds.has(sessionId)) continue;
+      if (session.busy || session.activeAbortController) continue;
+      sessions.delete(sessionId);
     }
   } catch {
-    sessions.clear();
+    if (!wasHydrated) sessions.clear();
   }
 }
 
@@ -797,17 +833,23 @@ function looksLikeDomSnapshot(value?: string) {
 
 function runningAssistantContent(step: StepExecutionResult) {
   const latestTool = step.tools?.at(-1);
+  const actual = step.actual?.trim();
+  if (step.status === 'failed' && latestTool?.ok !== false) {
+    return (actual && !looksLikeDomSnapshot(actual) ? actual : undefined) || 'AI 请求异常，已保留当前页面状态。';
+  }
   if (latestTool) {
     if (latestTool.ok === false) return `工具调用失败：${latestTool.name}`;
     if (latestTool.ok === true) return `工具调用完成：${latestTool.name}`;
     return `正在调用工具：${latestTool.name}`;
   }
-  const actual = step.actual?.trim();
   return (actual && !looksLikeDomSnapshot(actual) ? actual : undefined) || step.action?.trim() || '正在处理...';
 }
 
 function runningAssistantActivity(step: StepExecutionResult, timestamp: string) {
   const latestTool = step.tools?.at(-1);
+  if (step.status === 'failed' && latestTool?.ok !== false) {
+    return { phase: 'ai:runtime:recoverable-error', label: 'AI 请求异常，已保留现场', updatedAt: timestamp };
+  }
   if (latestTool) {
     if (latestTool.ok === false) {
       return { phase: 'tool:failed', label: `工具执行失败：${latestTool.name}`, updatedAt: timestamp };
@@ -878,7 +920,8 @@ function runningContentFromLog(phase: string, message: string) {
 }
 
 function isActiveBrowserChatTurn(session: BrowserChatSessionRecord, assistantMessageId: string, abortController: AbortController) {
-  return session.activeAssistantMessageId === assistantMessageId
+  return !interruptedAssistantMessageIds.has(assistantMessageId)
+    && session.activeAssistantMessageId === assistantMessageId
     && session.activeAbortController === abortController
     && !abortController.signal.aborted;
 }
@@ -888,8 +931,9 @@ export function interruptBrowserChatSession(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   const timestamp = now();
-  const assistantMessageId = session.activeAssistantMessageId;
+  const assistantMessageId = session.activeAssistantMessageId || latestRunningAssistantMessageId(session);
   const abortController = session.activeAbortController;
+  markAssistantMessageInterrupted(assistantMessageId);
   if (abortController && !abortController.signal.aborted) {
     abortController.abort(new Error('Browser chat operation interrupted by user.'));
   }
@@ -918,7 +962,7 @@ export function interruptBrowserChatSession(sessionId: string) {
       messageId: assistantMessageId,
     },
   ].slice(-300);
-  persistAndNotify(session.id, { flush: true });
+  persistAndNotify(session.id);
   return snapshot(session);
 }
 
@@ -1008,7 +1052,7 @@ async function runBrowserChatMessage(
         messageId: assistantMessageId,
       },
     ].slice(-300);
-    persistAndNotify(session.id, { flush: true });
+    persistAndNotify(session.id);
   } catch (error) {
     const interrupted = abortController.signal.aborted;
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController) && interrupted) return;
@@ -1038,7 +1082,7 @@ async function runBrowserChatMessage(
     }));
     session.activeAssistantMessageId = undefined;
     session.activeAbortController = undefined;
-    persistAndNotify(session.id, { flush: true });
+    persistAndNotify(session.id);
   } finally {
     if (session.activeAbortController === abortController) session.activeAbortController = undefined;
   }

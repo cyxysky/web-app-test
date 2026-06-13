@@ -349,8 +349,22 @@ function looksLikeDomSnapshot(value?: string) {
   return /<\s*(?:a|button|input|select|textarea|option|summary|details|label|form|iframe)\b/i.test(text);
 }
 
+function providerToolSchemaError(value?: string) {
+  return /Failed to deserialize the JSON body|unknown variant `?custom`?|invalid_request_error|AnthropicException|litellm\.BadRequestError/i.test(value || '');
+}
+
+function userFacingInfrastructureError(value?: string) {
+  const text = value || '';
+  if (providerToolSchemaError(text)) return 'AI 模型请求失败：当前模型网关不兼容本轮工具调用格式，已保留页面状态并准备继续。';
+  if (/Request aborted|operation interrupted/i.test(text)) return '本轮 AI 请求被中断，未继续写入技术错误。';
+  if (/timed out|timeout/i.test(text)) return 'AI 请求超时，已保留当前页面状态并准备继续。';
+  if (/No capacity available|rate limit/i.test(text)) return 'AI 服务暂时不可用，已保留当前页面状态并准备继续。';
+  return 'AI 请求或响应处理失败，已保留当前页面状态并准备继续。';
+}
+
 function userFacingToolResult(name: string, result?: BrowserActionResult, max = 360) {
   if (!result) return undefined;
+  if (!result.ok && providerToolSchemaError(result.actual)) return userFacingInfrastructureError(result.actual);
   if (!result.ok) return trimDebugText(result.actual, max);
   if (name === 'getDomTree' || looksLikeDomSnapshot(result.actual)) return '已读取当前可见 DOM 快照。';
   if (name === 'getInteractiveCandidates') return '已读取当前可见可交互元素。';
@@ -433,8 +447,19 @@ function readableActionFromTrace(trace?: ToolTrace, options: { reportState?: boo
   return readableTextFromToolRecord(trace.input as Record<string, unknown>, options);
 }
 
+function browserChatAbortError(signal?: AbortSignal) {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  return new Error('Browser chat operation interrupted by user.');
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) throw browserChatAbortError(signal);
+}
+
 // 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
 async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
+  throwIfAborted(options.abortSignal);
   const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
@@ -443,6 +468,7 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
   try {
     return await generateText({ ...options, abortSignal });
   } catch (error) {
+    if (upstream?.aborted) throw browserChatAbortError(upstream);
     if (timeoutController.signal.aborted && !upstream?.aborted) {
       const timeoutError = new Error(`AI request timed out after ${timeoutMs}ms`);
       (timeoutError as { cause?: unknown }).cause = error;
@@ -455,6 +481,7 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
 }
 
 async function generateObjectWithTimeout(options: Parameters<typeof generateObject>[0]) {
+  throwIfAborted(options.abortSignal);
   const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
@@ -463,6 +490,7 @@ async function generateObjectWithTimeout(options: Parameters<typeof generateObje
   try {
     return await generateObject({ ...options, abortSignal });
   } catch (error) {
+    if (upstream?.aborted) throw browserChatAbortError(upstream);
     if (timeoutController.signal.aborted && !upstream?.aborted) {
       const timeoutError = new Error(`AI request timed out after ${timeoutMs}ms`);
       (timeoutError as { cause?: unknown }).cause = error;
@@ -650,7 +678,8 @@ function compactWorkingMemory(memory: RuntimeWorkingMemory): RuntimeWorkingMemor
 
 function isInfrastructureNoise(value?: string) {
   if (!value) return false;
-  return /No capacity available|Request aborted|Active browser page has been closed|Execution context was destroyed|ECONNRESET|ETIMEDOUT|timeout|rate limit|model .*server|Failed after \d+ attempts/i.test(value);
+  return /No capacity available|Request aborted|Active browser page has been closed|Execution context was destroyed|ECONNRESET|ETIMEDOUT|timeout|rate limit|model .*server|Failed after \d+ attempts/i.test(value)
+    || providerToolSchemaError(value);
 }
 
 function isUsefulHistoryStep(step: StepExecutionResult) {
@@ -1245,19 +1274,24 @@ async function finalizeToolTraceVisuals(input: {
   runId?: string;
   stepIndex?: number;
   visualContext?: VisualContextManager;
+  abortSignal?: AbortSignal;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { session, traces, trace, runId, stepIndex, visualContext, onVisualContextChange } = input;
+  const { session, traces, trace, runId, stepIndex, visualContext, abortSignal, onVisualContextChange } = input;
+  throwIfAborted(abortSignal);
   let result = input.result;
   const screenshots = trace.screenshots || [];
   const visualAfter = trace.visualAfter || defaultVisualAfterForTool(trace.name);
 
   if (result.ok && shouldCaptureVisualAfter(trace.name, visualAfter) && runId && stepIndex !== undefined && visualContext) {
     try {
+      throwIfAborted(abortSignal);
       await session.waitForPage().catch(() => undefined);
+      throwIfAborted(abortSignal);
       const visualIndex = traces.filter((item) => item.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
       const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
       const screenshotPath = await session.takeScreenshot(runId, stepIndex, `visual-${visualIndex}`, screenshotOptions);
+      throwIfAborted(abortSignal);
       const markerPath = session.getLastCandidateMarkerScreenshotPath();
       const originalPath = session.getLastOriginalScreenshotPath();
       const frame = visualContext.apply({
@@ -1274,6 +1308,7 @@ async function finalizeToolTraceVisuals(input: {
       if (markerPath) screenshots.push({ title: `${trace.name} marker map`, path: markerPath, kind: 'marker' });
       await onVisualContextChange?.(visualContext.snapshot());
     } catch (error) {
+      if (abortSignal?.aborted) throw browserChatAbortError(abortSignal);
       result = {
         ...result,
         actual: `${result.actual} Visual-after screenshot failed, so the action is kept and will not be retried: ${infrastructureError(error)}`,
@@ -1284,12 +1319,14 @@ async function finalizeToolTraceVisuals(input: {
   }
 
   if (shouldCollectDomContextAfter(trace)) {
+    throwIfAborted(abortSignal);
     const afterPageContext = await session.getPageContext({
       includeDomTree: true,
       includeText: false,
       includeManualVerification: false,
       includeInteractiveCandidates: false,
     }).catch(() => undefined);
+    throwIfAborted(abortSignal);
     const domContext = afterPageContext ? createDomContextSnapshot('dom', afterPageContext) : undefined;
     if (domContext) {
       trace.contextAfter = {
@@ -1315,17 +1352,22 @@ async function executeTracedBrowserAction(input: {
   runId?: string;
   stepIndex?: number;
   visualContext?: VisualContextManager;
+  abortSignal?: AbortSignal;
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { session, traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, onToolTrace, onVisualContextChange } = input;
+  const { session, traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, abortSignal, onToolTrace, onVisualContextChange } = input;
+  throwIfAborted(abortSignal);
   const trace = createToolTrace({ traces, name, toolInput, aiRequest, runId, stepIndex, visualContext });
   await notifyToolTrace(onToolTrace, trace);
+  throwIfAborted(abortSignal);
 
   let result: BrowserActionResult;
   try {
     result = await action();
+    throwIfAborted(abortSignal);
   } catch (error) {
+    if (abortSignal?.aborted) throw browserChatAbortError(abortSignal);
     result = {
       ok: false,
       actual: `Tool ${name} threw after execution started: ${infrastructureError(error)}`,
@@ -1342,6 +1384,7 @@ async function executeTracedBrowserAction(input: {
     runId,
     stepIndex,
     visualContext,
+    abortSignal,
     onVisualContextChange,
   });
   await notifyToolTrace(onToolTrace, trace);
@@ -1366,6 +1409,7 @@ function makeBrowserTools(
     stepIndex?: number;
     allowedToolTypes?: string[];
     visualContext?: VisualContextManager;
+    abortSignal?: AbortSignal;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   },
 ) {
@@ -1388,6 +1432,7 @@ function makeBrowserTools(
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
 
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
+    throwIfAborted(referenceOptions?.abortSignal);
     if (toolExecutedThisRequest) {
       // Do not execute or trace extra calls; just tell the model to stop. This keeps the recorded
       // step clean (one real action) and avoids any duplicate side effect.
@@ -1405,6 +1450,7 @@ function makeBrowserTools(
       runId: referenceOptions?.runId,
       stepIndex: referenceOptions?.stepIndex,
       visualContext: referenceOptions?.visualContext,
+      abortSignal: referenceOptions?.abortSignal,
       aiRequest,
       onToolTrace,
       onVisualContextChange: referenceOptions?.onVisualContextChange,
@@ -2323,6 +2369,7 @@ async function executeRuntimeStep(input: {
     ? session.getLastCandidateMarkerScreenshotPath()
     : undefined;
   const originalScreenshotPath = session.getLastOriginalScreenshotPath();
+  throwIfAborted(abortSignal);
   await onDebug?.({
     phase: 'ai:runtime-input:start',
     stepIndex,
@@ -2331,13 +2378,16 @@ async function executeRuntimeStep(input: {
   });
   const contextStartedAt = Date.now();
   const pageContext = await session.getPageContext(runtimePageContextOptions(mode));
+  throwIfAborted(abortSignal);
   let currentDomContext = createDomContextSnapshot(mode, pageContext);
   const contextMs = elapsedSince(contextStartedAt);
   const screenshotReadStartedAt = Date.now();
   const screenshot = screenshotInputEnabled ? await readScreenshotForAi(beforeScreenshotPath) : undefined;
+  throwIfAborted(abortSignal);
   const markerScreenshot = screenshot && markerScreenshotPath
     ? await readMarkerScreenshotForAi(markerScreenshotPath, screenshot).catch(() => undefined)
     : undefined;
+  throwIfAborted(abortSignal);
   const userReferenceImagePaths = Array.from(new Set(referenceImagePaths.filter(Boolean))).slice(0, 4);
   const userReferenceImages = modelSupportsScreenshotInput()
     ? await Promise.all(userReferenceImagePaths.map(async (imagePath) => ({
@@ -2345,12 +2395,14 @@ async function executeRuntimeStep(input: {
         image: await readScreenshotForAi(imagePath).catch(() => undefined),
       })))
     : [];
+  throwIfAborted(abortSignal);
   const selectedReferenceScreenshots = screenshotInputEnabled
     ? await Promise.all(selectedScreenshotReferences.map(async (ref) => ({
         ref,
         image: await readScreenshotForAi(ref.path).catch(() => undefined),
       })))
     : [];
+  throwIfAborted(abortSignal);
   const screenshotReadMs = elapsedSince(screenshotReadStartedAt);
   const availableScreenshotReferences = buildAvailableScreenshotReferences(completedSteps);
   const availableReferenceIds = new Set(availableScreenshotReferences.map((ref) => ref.id));
@@ -2405,7 +2457,9 @@ async function executeRuntimeStep(input: {
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
     let requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
     async function refreshRequestPromptForTurn() {
+      throwIfAborted(abortSignal);
       const currentPageContext = await session.getPageContext(runtimePageContextOptions(mode));
+      throwIfAborted(abortSignal);
       currentDomContext = createDomContextSnapshot(mode, currentPageContext);
       const currentMarkerPath = visualContext.current()?.markerPath;
       const basePrompt = `${runtimePrompt({
@@ -2453,6 +2507,7 @@ async function executeRuntimeStep(input: {
     lastAiRequest = aiRequest;
 
     async function prepareStep(turnIndex: number) {
+      throwIfAborted(abortSignal);
       const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
       let visualPaths = includeImage ? visualContext.imagePaths() : [];
       let traceLimit = 5;
@@ -2531,7 +2586,9 @@ async function executeRuntimeStep(input: {
       }
       const content: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: contextText }];
       for (const imagePath of visualPaths) { const image = await readScreenshotForAi(imagePath).catch(() => undefined); if (image) content.push({ type: 'image', image }); }
+      throwIfAborted(abortSignal);
       for (const referenceImage of userReferenceImages) { if (referenceImage.image) content.push({ type: 'image', image: referenceImage.image }); }
+      throwIfAborted(abortSignal);
       const attachedImagePaths = [...visualPaths, ...userReferenceImages.filter((item) => item.image).map((item) => item.imagePath)];
       aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
       lastAiRequest = aiRequest;
@@ -2541,8 +2598,10 @@ async function executeRuntimeStep(input: {
     if (codexMode) {
       const aiStartedAt = Date.now();
       const messages = await prepareStep(0);
+      throwIfAborted(abortSignal);
       await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision.', details: { provider: getModelSettings().provider, model: getModelSettings().model, codexObjectMode: true } });
       const result = await generateObjectWithTimeout({ model: getModel(), messages, schema: codexRuntimeObjectSchema, temperature: 0.1, maxRetries: 0, abortSignal });
+      throwIfAborted(abortSignal);
       const object = result.object as z.infer<typeof codexRuntimeObjectSchema>;
       const execution = await executeCodexRuntimeObject({
         session,
@@ -2556,6 +2615,7 @@ async function executeRuntimeStep(input: {
         traces,
         aiRequest,
         visualContext,
+        abortSignal,
         onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
         onToolTrace: async (trace) => {
           workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
@@ -2564,6 +2624,7 @@ async function executeRuntimeStep(input: {
         },
         onSelectReferenceScreenshots: async (selection) => { const validIds = selection.ids.filter((id) => availableReferenceIds.has(id)); await onSelectReferenceScreenshots?.({ ...selection, ids: validIds, availableReferences: availableScreenshotReferences }); },
       });
+      throwIfAborted(abortSignal);
       await onDebug?.({ phase: 'ai:runtime:object', stepIndex, message: 'Codex object -> ' + object.type + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms', details: jsonSafe({ object, traces, elapsedMs: elapsedSince(aiStartedAt) }) });
       return {
         text: execution.text,
@@ -2577,10 +2638,12 @@ async function executeRuntimeStep(input: {
 
     const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
     for (let turnIndex = 0; turnIndex < maxTurns; turnIndex += 1) {
+      throwIfAborted(abortSignal);
       const aiStartedAt = Date.now();
       const traceStart = traces.length;
       try {
         const messages = await prepareStep(turnIndex);
+        throwIfAborted(abortSignal);
         await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision. turn ' + (turnIndex + 1) + '/' + maxTurns + '.', details: { provider: getModelSettings().provider, model: getModelSettings().model, turnIndex: turnIndex + 1, maxTurns } });
         const result = await generateTextWithTimeout({
           model: getModel(), messages,
@@ -2593,9 +2656,10 @@ async function executeRuntimeStep(input: {
               message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'),
               details: { trace, visualContext: visualContext.snapshot(), workingMemory },
             });
-          }, { availableReferenceIds, allowedToolTypes, runId: input.runId, stepIndex, visualContext, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
+          }, { availableReferenceIds, allowedToolTypes, runId: input.runId, stepIndex, visualContext, abortSignal, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
           stopWhen: stepCountIs(1), temperature: 0.1, maxRetries: 0, abortSignal,
         });
+        throwIfAborted(abortSignal);
         latestText = result.text || '';
         const newTraces = traces.slice(traceStart);
         const lastTrace = newTraces.at(-1);
@@ -2611,6 +2675,7 @@ async function executeRuntimeStep(input: {
           };
         }
       } catch (error) {
+        if (abortSignal?.aborted) throw browserChatAbortError(abortSignal);
         if (traces.length > traceStart && !abortSignal?.aborted) {
           await onDebug?.({ phase: 'ai:runtime:partial', stepIndex, message: 'AI request stopped after a tool executed; keeping the action and continuing from Visual Context Manager.', details: { error: error instanceof Error ? error.message : String(error), traces: traces.slice(traceStart), visualContext: visualContext.snapshot() } });
           return {
@@ -2644,9 +2709,11 @@ async function executeRuntimeStep(input: {
   let lastError: unknown;
 
   for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
+    throwIfAborted(abortSignal);
     const includeImage = attempts[attemptIndex];
     try {
       if (attemptIndex > 0) {
+        throwIfAborted(abortSignal);
         await onDebug?.({
           phase: 'ai:runtime:retry',
           stepIndex,
@@ -2656,7 +2723,7 @@ async function executeRuntimeStep(input: {
       }
       return await runAgent(includeImage);
     } catch (error) {
-      if (abortSignal?.aborted) throw error;
+      if (abortSignal?.aborted) throw browserChatAbortError(abortSignal);
       lastError = error;
     }
   }
@@ -2839,7 +2906,7 @@ export async function executeInteractiveBrowserTurn(input: {
   let reply = '';
 
   for (let turnStep = 0; turnStep < browserChatMaxSteps(); turnStep += 1) {
-    if (input.abortSignal?.aborted) throw new Error('Browser chat operation interrupted by user.');
+    throwIfAborted(input.abortSignal);
     const stepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
     await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `正在准备第 ${stepIndex} 步浏览器操作：读取当前页面状态。` });
     let runningStep: StepExecutionResult = {
@@ -2852,6 +2919,7 @@ export async function executeInteractiveBrowserTurn(input: {
 
     const beforeScreenshotStartedAt = Date.now();
     const beforeScreenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, 'before');
+    throwIfAborted(input.abortSignal);
     await input.onDebug?.({ phase: 'browser:screenshot:before', stepIndex, message: `Current page screenshot captured in ${elapsedSince(beforeScreenshotStartedAt)}ms.`, details: { elapsedMs: elapsedSince(beforeScreenshotStartedAt), path: beforeScreenshotPath } });
     runningStep = {
       ...runningStep,
@@ -2896,8 +2964,9 @@ export async function executeInteractiveBrowserTurn(input: {
           });
         },
       });
+      throwIfAborted(input.abortSignal);
     } catch (error) {
-      if (input.abortSignal?.aborted) throw error;
+      if (input.abortSignal?.aborted) throw browserChatAbortError(input.abortSignal);
       const errorText = infrastructureError(error);
       if (!liveToolTraces.length && isInfrastructureNoise(errorText)) {
         const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
@@ -2913,6 +2982,7 @@ export async function executeInteractiveBrowserTurn(input: {
         reply = '';
         continue;
       }
+      throwIfAborted(input.abortSignal);
       const recoveredState = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress);
       const errorStep = await createRecoverableRuntimeErrorStep({
         session: input.session,
@@ -2924,13 +2994,26 @@ export async function executeInteractiveBrowserTurn(input: {
         aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
         recoveredState,
       });
+      throwIfAborted(input.abortSignal);
       upsertStep(steps, errorStep);
       newSteps.push(errorStep);
       await input.onProgress?.(errorStep);
+      await input.onDebug?.({
+        phase: 'ai:runtime:recoverable-error',
+        stepIndex,
+        message: userFacingRecoverableRuntimeError(error),
+        details: {
+          error: serializeError(error),
+          screenshotPath: errorStep.screenshotPath,
+          aiRequest: errorStep.aiRequest,
+          tools: errorStep.tools,
+        },
+      });
       reply = assistantReplyFromStep(errorStep);
       continue;
     }
 
+    throwIfAborted(input.abortSignal);
     const browserChatReply = actionResult.endedWithText ? actionResult.text.trim() : '';
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
@@ -2952,6 +3035,7 @@ export async function executeInteractiveBrowserTurn(input: {
 
     const afterScreenshotStartedAt = Date.now();
     const afterScreenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, 'after');
+    throwIfAborted(input.abortSignal);
     await input.onDebug?.({ phase: 'browser:screenshot:after', stepIndex, message: `Post-action screenshot captured in ${elapsedSince(afterScreenshotStartedAt)}ms.`, details: { elapsedMs: elapsedSince(afterScreenshotStartedAt), path: afterScreenshotPath } });
     const decision = deriveBrowserChatStepDecision(actionResult.text, actionResult.traces, requirementOf(testCase));
     const completedStep: StepExecutionResult = {
@@ -2974,6 +3058,7 @@ export async function executeInteractiveBrowserTurn(input: {
     };
     upsertStep(steps, completedStep);
     newSteps.push(completedStep);
+    throwIfAborted(input.abortSignal);
     await input.onProgress?.(completedStep);
     reply = browserChatReply || assistantReplyFromStep(completedStep);
 
@@ -2991,6 +3076,7 @@ export async function executeInteractiveBrowserTurn(input: {
     reply = assistantReplyFromStep(newSteps.at(-1));
   }
 
+  throwIfAborted(input.abortSignal);
   return {
     status: finalStatus,
     reply,
@@ -3053,6 +3139,10 @@ function infrastructureError(error: unknown) {
   return details ? `${message}\n${details}` : message;
 }
 
+function userFacingRecoverableRuntimeError(error: unknown) {
+  return userFacingInfrastructureError(infrastructureError(error));
+}
+
 function serializeError(error: unknown) {
   if (!(error instanceof Error)) return { message: String(error) };
   return {
@@ -3103,9 +3193,9 @@ async function createRecoverableRuntimeErrorStep(input: {
 
   return {
     index: stepIndex,
-        action: 'AI request or response handling failed; continuing automatically',
-        expected: 'A single AI request/tool/parse failure should not stop the flow; the next round will continue from the latest screenshot.',
-    actual: `${infrastructureError(error)}. Recorded as recoverable; flow will continue unless real verification, completion, or impossibility is detected.`,
+    action: 'AI request or response handling failed; continuing automatically',
+    expected: 'A single AI request/tool/parse failure should not stop the flow; the next round will continue from the latest screenshot.',
+    actual: userFacingRecoverableRuntimeError(error),
     status: 'failed',
     beforeScreenshotPath,
     afterScreenshotPath,
@@ -3293,6 +3383,7 @@ async function executeCodexRuntimeObject(input: {
   traces: ToolTrace[];
   aiRequest?: AiRequestSnapshot;
   visualContext?: VisualContextManager;
+  abortSignal?: AbortSignal;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onSelectReferenceScreenshots?: (selection: {
@@ -3301,7 +3392,8 @@ async function executeCodexRuntimeObject(input: {
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
+  throwIfAborted(abortSignal);
   if (!allowedTypes.includes(type)) {
     return {
       text: `Codex returned unsupported action type: ${type}. Allowed types: ${allowedTypes.join(', ')}.`,
@@ -3323,6 +3415,7 @@ async function executeCodexRuntimeObject(input: {
   }
 
   if (type === 'selectReferenceScreenshots') {
+    throwIfAborted(abortSignal);
     await onSelectReferenceScreenshots?.({
       ids: Array.isArray(params.ids) ? params.ids.filter((id): id is string => typeof id === 'string') : [],
       selectionReason: typeof params.selectionReason === 'string' ? params.selectionReason : String(params.reason || ''),
@@ -3359,6 +3452,7 @@ async function executeCodexRuntimeObject(input: {
     runId,
     stepIndex,
     visualContext,
+    abortSignal,
     onToolTrace,
     onVisualContextChange,
     action: async () => (

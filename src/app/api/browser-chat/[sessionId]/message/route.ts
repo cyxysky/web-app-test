@@ -1,5 +1,9 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { sendBrowserChatMessage } from '@/server/ai/agents/browser-chat.service';
+import { noStoreJson } from '@/server/http/no-store-response';
+
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
 type RouteContext = {
   params: Promise<{ sessionId: string }>;
@@ -13,10 +17,10 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const mode = body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers';
     const clientMessageId = typeof body.clientMessageId === 'string' ? body.clientMessageId : undefined;
     const session = await sendBrowserChatMessage(sessionId, content, mode, clientMessageId, body.attachments);
-    return NextResponse.json({ session });
+    return noStoreJson({ session });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to send browser chat message';
-    return NextResponse.json(
+    return noStoreJson(
       { error: message },
       { status: /Browser chat session not found/i.test(message) ? 404 : 400 },
     );

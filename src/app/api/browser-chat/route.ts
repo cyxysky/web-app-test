@@ -1,8 +1,12 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { createBrowserChatSession, listBrowserChatSessions } from '@/server/ai/agents/browser-chat.service';
+import { noStoreJson } from '@/server/http/no-store-response';
+
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
 export async function GET() {
-  return NextResponse.json({ sessions: listBrowserChatSessions() });
+  return noStoreJson({ sessions: listBrowserChatSessions() });
 }
 
 export async function POST(request: NextRequest) {
@@ -13,9 +17,9 @@ export async function POST(request: NextRequest) {
       mode: body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers',
       title: typeof body.title === 'string' ? body.title : undefined,
     });
-    return NextResponse.json({ session });
+    return noStoreJson({ session });
   } catch (error) {
-    return NextResponse.json(
+    return noStoreJson(
       { error: error instanceof Error ? error.message : 'Failed to create browser chat session' },
       { status: 400 },
     );
