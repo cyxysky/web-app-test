@@ -4898,7 +4898,6 @@ select {
 
 .browser-chat-message>div:last-child {
   border-radius: 10px;
-  display: grid;
   gap: 7px;
   padding: 11px 12px;
 }
@@ -5669,7 +5668,6 @@ select {
 .browser-chat-message>div:last-child {
   border-radius: 8px;
   box-shadow: 0 8px 22px 20px rgba(35, 32, 25, 0.08);
-  display: grid;
   gap: 8px;
   padding: 12px 14px;
 }
@@ -5762,6 +5760,7 @@ select {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  overflow: hidden;
 }
 
 .browser-chat-agent-markdown :where(h1, h2, h3, p, ul, ol, pre, blockquote) {
@@ -5820,6 +5819,8 @@ select {
   line-height: 1.55;
   overflow: auto;
   padding: 10px;
+  white-space: pre-line;
+  word-break: break-all;
 }
 
 .browser-chat-agent-markdown pre code {
@@ -5859,6 +5860,7 @@ select {
   flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
+  padding-top: 8px;
 }
 
 .browser-chat-log-button {
