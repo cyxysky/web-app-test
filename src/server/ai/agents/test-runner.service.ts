@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import sharp from 'sharp';
-import { executeTestCase } from '@/server/ai/agents/test-executor.agent';
+import { executeTestCase } from '@/server/ai/agents/target-executor.agent';
 import type { RecordedFlowStep, StepExecutionResult, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
 import { writeAiReport } from '@/server/reports/report-writer.agent';

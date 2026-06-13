@@ -5445,10 +5445,15 @@ select {
   font-size: 14px;
 }
 
-.browser-chat-agent-markdown p,
-.browser-chat-agent-markdown li {
+.browser-chat-agent-markdown p {
   font-size: 14px;
   white-space: pre-wrap;
+  padding: 4px 0;
+}
+
+.browser-chat-agent-markdown li {
+  font-size: 14px;
+  line-height: 1;
   padding: 4px 0;
 }
 
@@ -5849,6 +5854,21 @@ select {
   color: var(--muted);
   font-size: 12px;
   font-weight: 760;
+}
+
+.browser-chat-log-modal-list pre {
+  background: #f6f3ed;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 2px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .browser-chat-composer-shell {

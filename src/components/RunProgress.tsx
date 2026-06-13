@@ -8,6 +8,7 @@ import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
 import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import type { RunDebugEvent, StepExecutionResult, TaskFrame, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 type ImageItem = { title: string; url: string };
@@ -575,17 +576,19 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   useEffect(() => {
     let active = true;
-    let events: EventSource | undefined;
     let timer: number | undefined;
+    let refreshTimer: number | undefined;
     let refreshInFlight: Promise<void> | undefined;
+    let websocketConnected = false;
 
     const stopRealtime = () => {
       active = false;
       if (timer !== undefined) window.clearInterval(timer);
-      events?.close();
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
     };
 
     const refreshRun = async () => {
+      if (!active) return undefined;
       if (refreshInFlight) return refreshInFlight;
       refreshInFlight = (async () => {
         const response = await fetch(`/api/runs/${run.id}`, { cache: 'no-store' });
@@ -602,22 +605,39 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
       return refreshInFlight;
     };
 
-    if (typeof EventSource !== 'undefined') {
-      events = new EventSource(`/api/runs/${run.id}/events`);
-      events.addEventListener('run', () => {
+    const scheduleRefresh = (delay = 30) => {
+      if (!active) return;
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = undefined;
         void refreshRun();
-      });
-      events.addEventListener('error', () => {
-        void refreshRun();
-      });
-    }
+      }, delay);
+    };
+
+    const unsubscribe = subscribeRealtimeRefresh((event) => {
+      if (!active) return;
+      if (event.entityType !== 'run' || event.id !== run.id) return;
+      if (event.deleted) {
+        stopRealtime();
+        return;
+      }
+      scheduleRefresh();
+    }, {
+      onStatus: (connected) => {
+        websocketConnected = connected;
+        if (connected) scheduleRefresh();
+      },
+    });
 
     timer = window.setInterval(() => {
-      void refreshRun();
+      if (!websocketConnected) void refreshRun();
     }, 1000);
     void refreshRun();
 
-    return stopRealtime;
+    return () => {
+      unsubscribe();
+      stopRealtime();
+    };
   }, [run.id]);
 
   useEffect(() => {

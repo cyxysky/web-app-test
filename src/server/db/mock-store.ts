@@ -1,29 +1,20 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { defaultModelByProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
-import { createSnapshotChannel, type SnapshotEvent, type SnapshotListener } from '@/server/realtime/snapshot-channel';
+import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { sleepSync, writeJsonFileAtomic } from '@/server/storage/atomic-json';
 import { storeFilePath } from '@/server/storage/paths';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
 const storePath = storeFilePath();
-const runSnapshots = createSnapshotChannel<TestRunRecord>('run');
-
-export function subscribeRunUpdates(runId: string, listener: SnapshotListener<TestRunRecord>) {
-  return runSnapshots.subscribe(runId, listener);
-}
-
-export function currentRunSnapshotEvent(runId: string, run: TestRunRecord): SnapshotEvent<TestRunRecord> {
-  return runSnapshots.current(runId, run);
-}
 
 function notifyRunUpdate(runId: string, run: TestRunRecord) {
-  runSnapshots.publish(runId, run);
+  publishRefreshEvent({ entityType: 'run', id: runId, updatedAt: run.endedAt || run.startedAt || now() });
 }
 
 function notifyRunDeleted(runId: string) {
-  runSnapshots.publishDeleted(runId);
+  publishRefreshEvent({ entityType: 'run', id: runId, deleted: true });
 }
 
 function notifyRunsDeleted(runIds: Iterable<string>) {

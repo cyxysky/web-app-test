@@ -28,6 +28,7 @@ import type { SettingsTab } from '@/config/settings';
 import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import type {
   RunScheduleRecord,
   StepExecutionResult,
@@ -44,6 +45,11 @@ type BrowserChatMessage = {
   clientMessageId?: string;
   attachments?: BrowserChatAttachment[];
   stepIndexes?: number[];
+  activity?: {
+    phase: string;
+    label: string;
+    updatedAt: string;
+  };
   status?: 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
 };
 
@@ -61,6 +67,7 @@ type BrowserChatLogRecord = {
   time: string;
   phase: string;
   message: string;
+  details?: string;
   messageId?: string;
   stepIndex?: number;
   elapsedMs?: number;
@@ -182,6 +189,22 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
 
 function sessionSortTime(session: BrowserChatSession) {
   return session.updatedAt || session.createdAt || '';
+}
+
+function sessionTimeValue(session: BrowserChatSession) {
+  const timestamp = Date.parse(sessionSortTime(session));
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function isOlderSessionSnapshot(incoming: BrowserChatSession, existing?: BrowserChatSession | null) {
+  if (!existing || incoming.id !== existing.id) return false;
+  const incomingTime = sessionTimeValue(incoming);
+  const existingTime = sessionTimeValue(existing);
+  if (incomingTime < existingTime) return true;
+  if (incomingTime > existingTime) return false;
+  return (incoming.messages?.length || 0) < (existing.messages?.length || 0)
+    || (incoming.steps?.length || 0) < (existing.steps?.length || 0)
+    || (incoming.logs?.length || 0) < (existing.logs?.length || 0);
 }
 
 function sessionDisplayTitle(session: BrowserChatSession) {
@@ -421,12 +444,8 @@ export function BrowserChatWorkspace({
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
   const sessionVersionsRef = useRef(new Map<string, number>());
-  const sessionEventSourcesRef = useRef(new Map<string, {
-    events: EventSource;
-    refreshTimer?: number;
-    reconnectTimer?: number;
-  }>());
-  const subscribedSessionIdsRef = useRef(new Set<string>());
+  const sessionRefreshTimersRef = useRef(new Map<string, number>());
+  const sessionListRefreshTimerRef = useRef<number | undefined>(undefined);
   const [activeView, setActiveView] = useState<BrowserChatView>(initialView);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
@@ -441,8 +460,7 @@ export function BrowserChatWorkspace({
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
   const [busy, setBusy] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
-  const [connectedSessionIds, setConnectedSessionIds] = useState<string[]>([]);
-  const [sessionEventsRequestKey, setSessionEventsRequestKey] = useState(0);
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
@@ -456,7 +474,6 @@ export function BrowserChatWorkspace({
   const selectedRunningSession = session?.busy ? session : undefined;
   const selectedSessionBusy = Boolean(session?.busy);
   const currentBusy = busy || selectedSessionBusy;
-  const selectedSessionEventsConnected = Boolean(session?.id && connectedSessionIds.includes(session.id));
   const modeLocked = Boolean(session && session.status !== 'closed' && (session.messages.length || session.steps.length || session.busy));
   const messages = useMemo(() => session?.messages || [], [session?.messages]);
   const steps = useMemo(() => session?.steps || [], [session?.steps]);
@@ -517,9 +534,13 @@ export function BrowserChatWorkspace({
       sessionVersionsRef.current.set(normalized.id, options.version);
     }
     const shouldActivate = options.activate ?? activeSessionIdRef.current === normalized.id;
-    if (shouldActivate) setSession(normalized);
+    if (shouldActivate) {
+      setSession((current) => (isOlderSessionSnapshot(normalized, current) ? current : normalized));
+    }
     setSessions((current) => {
-      const next = [normalized, ...current.filter((item) => item.id !== normalized.id)];
+      const existing = current.find((item) => item.id === normalized.id);
+      const accepted = isOlderSessionSnapshot(normalized, existing) ? existing || normalized : normalized;
+      const next = [accepted, ...current.filter((item) => item.id !== normalized.id)];
       return next.sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
     });
     return normalized;
@@ -543,129 +564,70 @@ export function BrowserChatWorkspace({
     return loadedSession;
   }, [upsertSession]);
 
+  const scheduleLoadSessions = useCallback((delay = 80) => {
+    if (sessionListRefreshTimerRef.current) window.clearTimeout(sessionListRefreshTimerRef.current);
+    sessionListRefreshTimerRef.current = window.setTimeout(() => {
+      sessionListRefreshTimerRef.current = undefined;
+      void loadSessions().catch((loadError) => {
+        setError(loadError instanceof Error ? loadError.message : '鍔犺浇瀵硅瘽鍘嗗彶澶辫触');
+      });
+    }, delay);
+  }, [loadSessions]);
+
+  const scheduleSessionRefresh = useCallback((sessionId: string, delay = 30) => {
+    const timers = sessionRefreshTimersRef.current;
+    const existing = timers.get(sessionId);
+    if (existing) window.clearTimeout(existing);
+    const timer = window.setTimeout(() => {
+      timers.delete(sessionId);
+      void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch((refreshError) => {
+        if (activeSessionIdRef.current === sessionId) {
+          setError(refreshError instanceof Error ? refreshError.message : '鍔犺浇瀵硅瘽澶辫触');
+        }
+      });
+    }, delay);
+    timers.set(sessionId, timer);
+  }, [refreshSession]);
+
   useEffect(() => {
     void loadSessions().catch((loadError) => {
       setError(loadError instanceof Error ? loadError.message : '加载对话历史失败');
     });
   }, [loadSessions]);
 
-  const subscribedSessionIds = useMemo(() => {
-    const ids = new Set<string>();
-    if (session?.id) ids.add(session.id);
-    for (const item of sessions) {
-      if (item.busy) ids.add(item.id);
-    }
-    return [...ids].sort();
-  }, [session?.id, sessions]);
-  const subscribedSessionIdsKey = subscribedSessionIds.join('|');
-
-  const setSessionEventConnected = useCallback((sessionId: string, connected: boolean) => {
-    setConnectedSessionIds((current) => {
-      const next = new Set(current);
-      if (connected) next.add(sessionId);
-      else next.delete(sessionId);
-      return [...next].sort();
-    });
-  }, []);
-
   useEffect(() => {
-    subscribedSessionIdsRef.current = new Set(subscribedSessionIds);
-  }, [subscribedSessionIds, subscribedSessionIdsKey]);
-
-  useEffect(() => {
-    const sources = sessionEventSourcesRef.current;
-    const wanted = new Set(subscribedSessionIds);
-
-    const cleanupSessionEvents = (sessionId: string) => {
-      const record = sources.get(sessionId);
-      if (!record) return;
-      if (record.refreshTimer) window.clearTimeout(record.refreshTimer);
-      if (record.reconnectTimer) window.clearTimeout(record.reconnectTimer);
-      record.events.close();
-      sources.delete(sessionId);
-      setSessionEventConnected(sessionId, false);
-    };
-
-    for (const sessionId of [...sources.keys()]) {
-      if (!wanted.has(sessionId)) cleanupSessionEvents(sessionId);
-    }
-
-    for (const sessionId of subscribedSessionIds) {
-      if (sources.has(sessionId)) continue;
-      const record: {
-        events: EventSource;
-        refreshTimer?: number;
-        reconnectTimer?: number;
-      } = {
-        events: new EventSource(`/api/browser-chat/${sessionId}/events`),
-      };
-      sources.set(sessionId, record);
-
-      const scheduleRefresh = (delay = 20) => {
-        if (record.refreshTimer) window.clearTimeout(record.refreshTimer);
-        record.refreshTimer = window.setTimeout(() => {
-          void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch((refreshError) => {
-            if (activeSessionIdRef.current === sessionId) {
-              setError(refreshError instanceof Error ? refreshError.message : '加载对话失败');
-            }
-          });
-        }, delay);
-      };
-      const scheduleReconnect = (delay = 800) => {
-        if (record.reconnectTimer) window.clearTimeout(record.reconnectTimer);
-        record.reconnectTimer = window.setTimeout(() => {
-          cleanupSessionEvents(sessionId);
-          if (subscribedSessionIdsRef.current.has(sessionId)) {
-            setSessionEventsRequestKey((current) => current + 1);
-          }
-        }, delay);
-      };
-      const handleSession = (event: Event) => {
-        try {
-          const payload = JSON.parse((event as MessageEvent).data) as { snapshot: BrowserChatSession; version: number };
-          const shouldActivate = activeSessionIdRef.current === sessionId;
-          const loadedSession = upsertSession(payload.snapshot, { activate: shouldActivate, version: payload.version });
-          if (shouldActivate) setMode(normalizeMode(loadedSession.mode));
-        } catch {
-          scheduleRefresh();
-        }
-      };
-      const handleDeleted = () => {
-        setSessions((current) => current.filter((item) => item.id !== sessionId));
-        setSession((current) => (current?.id === sessionId ? null : current));
-        setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
-        cleanupSessionEvents(sessionId);
-      };
-      const handleRefresh = () => scheduleRefresh();
-
-      record.events.addEventListener('session', handleSession);
-      record.events.addEventListener('deleted', handleDeleted);
-      record.events.addEventListener('refresh', handleRefresh);
-      record.events.onopen = () => setSessionEventConnected(sessionId, true);
-      record.events.onerror = () => {
-        setSessionEventConnected(sessionId, false);
-        scheduleReconnect();
-      };
-    }
-  }, [refreshSession, sessionEventsRequestKey, setSessionEventConnected, subscribedSessionIds, subscribedSessionIdsKey, upsertSession]);
+    return subscribeRealtimeRefresh((event) => {
+      if (event.entityType !== 'browserChatSession') return;
+      const lastVersion = sessionVersionsRef.current.get(event.id) || 0;
+      if (event.version < lastVersion) return;
+      sessionVersionsRef.current.set(event.id, event.version);
+      if (event.deleted) {
+        setSessions((current) => current.filter((item) => item.id !== event.id));
+        setSession((current) => (current?.id === event.id ? null : current));
+        setSelectedSessionIds((current) => current.filter((id) => id !== event.id));
+        return;
+      }
+      if (activeSessionIdRef.current === event.id) scheduleSessionRefresh(event.id);
+      scheduleLoadSessions();
+    }, { onStatus: setRealtimeConnected });
+  }, [scheduleLoadSessions, scheduleSessionRefresh]);
 
   useEffect(() => () => {
-    for (const record of sessionEventSourcesRef.current.values()) {
-      if (record.refreshTimer) window.clearTimeout(record.refreshTimer);
-      if (record.reconnectTimer) window.clearTimeout(record.reconnectTimer);
-      record.events.close();
+    for (const timer of sessionRefreshTimersRef.current.values()) {
+      window.clearTimeout(timer);
     }
-    sessionEventSourcesRef.current.clear();
+    sessionRefreshTimersRef.current.clear();
+    if (sessionListRefreshTimerRef.current) window.clearTimeout(sessionListRefreshTimerRef.current);
   }, []);
 
   useEffect(() => {
-    if (!session?.id || !session.busy || selectedSessionEventsConnected) return undefined;
+    if (!session?.id || !session.busy || realtimeConnected) return undefined;
     const sessionId = session.id;
     const timer = window.setInterval(() => {
       void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch(() => undefined);
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [refreshSession, selectedSessionEventsConnected, session?.busy, session?.id]);
+  }, [realtimeConnected, refreshSession, session?.busy, session?.id]);
 
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
@@ -757,7 +719,6 @@ export function BrowserChatWorkspace({
     setActiveView('chat');
     try {
       let active = await ensureSession();
-      setSessionEventsRequestKey((current) => current + 1);
       let posted: BrowserChatSession;
       try {
         posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
@@ -765,7 +726,6 @@ export function BrowserChatWorkspace({
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
         active = await createSession();
-        setSessionEventsRequestKey((current) => current + 1);
         posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
       }
       upsertSession(posted, { activate: true });
@@ -921,7 +881,6 @@ export function BrowserChatWorkspace({
     try {
       const loadedSession = await refreshSession(sessionId, { activate: true });
       setMode(normalizeMode(loadedSession.mode));
-      setSessionEventsRequestKey((current) => current + 1);
       void loadSessions().catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');
@@ -1119,6 +1078,7 @@ export function BrowserChatWorkspace({
                 {visibleMessages.map((item) => {
                   const itemSteps = (item.stepIndexes || []).map((stepIndex) => stepsByIndex.get(stepIndex)).filter((step): step is StepExecutionResult => Boolean(step));
                   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(session?.busy && item.id === lastAssistantMessageId));
+                  const operationLabel = operationRunning ? (item.activity?.label || '处理中') : statusLabel(item.status || 'passed');
                   const itemLogs = item.role === 'assistant'
                     ? logs.filter((log) => log.messageId === item.id || (!log.messageId && log.stepIndex && (item.stepIndexes || []).includes(log.stepIndex)))
                     : [];
@@ -1132,7 +1092,7 @@ export function BrowserChatWorkspace({
                         {item.role === 'assistant' ? (
                           <>
                             <div className="browser-chat-agent-meta">
-                              <span>{operationRunning ? '处理中' : statusLabel(item.status || 'passed')}</span>
+                              <span>{operationLabel}</span>
                               <time dateTime={messageUpdateTime(item)}>最后更新 {formatLogTime(messageUpdateTime(item))}</time>
                             </div>
                             <BrowserChatAssistantTimeline message={item} onSelectTool={setToolDialog} running={operationRunning} steps={itemSteps} />
@@ -1386,6 +1346,7 @@ export function BrowserChatWorkspace({
                         {log.stepIndex ? ` · 步骤 ${log.stepIndex}` : ''}
                         {typeof log.elapsedMs === 'number' ? ` · ${log.elapsedMs}ms` : ''}
                       </small>
+                      {log.details ? <pre>{log.details}</pre> : null}
                     </div>
                   </li>
                 ))}

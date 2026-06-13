@@ -45,7 +45,7 @@ export function getModel(): GenerateTextModel {
     baseURL: process.env.OPENAI_BASE_URL || undefined,
   })(model) as unknown as GenerateTextModel;
   if (provider === 'azure-openai') return createAzure({
-    baseURL: process.env.AZURE_OPENAI_BASE_URL || 'http://mirrors.shterm.com:8801/openai',
+    baseURL: process.env.AZURE_OPENAI_BASE_URL || 'http://mirrors.shterm.com:4000',
     apiKey: process.env.AZURE_OPENAI_API_KEY || '-',
   }).chat(model) as unknown as GenerateTextModel;
   return createOpenRouter({
@@ -56,7 +56,7 @@ export function getModel(): GenerateTextModel {
 export function getModelSettings() {
   const provider = normalizeProvider(process.env.AI_PROVIDER);
   const defaults: Record<AiProvider, string> = {
-    'azure-openai': 'gpt-5.5',
+    'azure-openai': 'deepseek-v4-pro',
     codex: 'gpt-5.5',
     deepseek: 'deepseek-v4-flash',
     google: 'gemini-3-flash-preview',

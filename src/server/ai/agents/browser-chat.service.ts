@@ -2,10 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { BrowserSession, type BrowserSessionMode } from '@/server/browser/browser-session';
-import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage } from '@/server/ai/agents/test-executor.agent';
+import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage } from '@/server/ai/agents/browser-chat-executor.agent';
 import type { RecordedFlowStep, StepExecutionResult, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
-import { createSnapshotChannel, type SnapshotEvent, type SnapshotListener } from '@/server/realtime/snapshot-channel';
+import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { writeTextFileAtomic } from '@/server/storage/atomic-json';
 import { appDataRoot, artifactPath as resolveArtifactPath } from '@/server/storage/paths';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
@@ -28,6 +28,11 @@ export type BrowserChatMessage = {
   clientMessageId?: string;
   attachments?: BrowserChatAttachment[];
   stepIndexes?: number[];
+  activity?: {
+    phase: string;
+    label: string;
+    updatedAt: string;
+  };
   status?: 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
 };
 
@@ -36,6 +41,7 @@ export type BrowserChatLogRecord = {
   time: string;
   phase: string;
   message: string;
+  details?: string;
   messageId?: string;
   stepIndex?: number;
   elapsedMs?: number;
@@ -59,8 +65,6 @@ export type BrowserChatSessionSnapshot = {
   logs: BrowserChatLogRecord[];
 };
 
-export type BrowserChatSessionEvent = SnapshotEvent<BrowserChatSessionSnapshot>;
-
 type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
   activeAssistantMessageId?: string;
   activeAbortController?: AbortController;
@@ -69,12 +73,12 @@ type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
 };
 
 const sessions = new Map<string, BrowserChatSessionRecord>();
-const sessionSnapshots = createSnapshotChannel<BrowserChatSessionSnapshot>('browserChatSession');
 const sessionsPath = path.join(appDataRoot(), '.data', 'browser-chat-sessions.json');
 let sessionsHydrated = false;
 let lastPersistWarningAt = 0;
 let persistTimer: ReturnType<typeof setTimeout> | undefined;
 const persistDebounceMs = 250;
+const runningHydrationGraceMs = 2 * 60 * 1000;
 
 function now() {
   return new Date().toISOString();
@@ -86,24 +90,11 @@ function id(prefix: string) {
 
 function notifySessionUpdate(sessionId: string) {
   const session = sessions.get(sessionId);
-  if (session) sessionSnapshots.publish(sessionId, snapshot(session));
-  else sessionSnapshots.publishDeleted(sessionId);
-}
-
-export function currentBrowserChatSessionEvent(
-  sessionId: string,
-  session: BrowserChatSessionSnapshot,
-): BrowserChatSessionEvent {
-  return sessionSnapshots.current(sessionId, session);
-}
-
-export function subscribeBrowserChatSessionEvents(
-  sessionId: string,
-  listener: SnapshotListener<BrowserChatSessionSnapshot>,
-) {
-  hydrateSessions();
-  if (!sessions.has(sessionId)) return undefined;
-  return sessionSnapshots.subscribe(sessionId, listener);
+  if (session) {
+    publishRefreshEvent({ entityType: 'browserChatSession', id: sessionId, updatedAt: session.updatedAt });
+  } else {
+    publishRefreshEvent({ entityType: 'browserChatSession', id: sessionId, deleted: true });
+  }
 }
 
 function elapsedMs(startedAt: number) {
@@ -114,6 +105,43 @@ function elapsedFromDetails(details: unknown) {
   if (!details || typeof details !== 'object') return undefined;
   const value = (details as { elapsedMs?: unknown }).elapsedMs;
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function trimLogText(value: string, max = 3000) {
+  const text = value.trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function logDetailsFromUnknown(value: unknown) {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value === 'string') return trimLogText(value);
+  try {
+    return trimLogText(JSON.stringify(value, null, 2));
+  } catch {
+    return trimLogText(String(value));
+  }
+}
+
+function errorLogDetails(error: unknown) {
+  if (!(error instanceof Error)) return logDetailsFromUnknown(error);
+  return logDetailsFromUnknown({
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+    cause: error.cause instanceof Error
+      ? { name: error.cause.name, message: error.cause.message, stack: error.cause.stack }
+      : error.cause,
+    data: 'data' in error ? (error as { data?: unknown }).data : undefined,
+    code: 'code' in error ? (error as { code?: unknown }).code : undefined,
+  });
+}
+
+function userFacingErrorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || '未知错误');
+  const detail = errorLogDetails(error);
+  if (!detail || detail === message) return message;
+  if (/^\{\s*"/.test(detail)) return message;
+  return `${message}\n${detail}`;
 }
 
 function normalizeBrowserUrl(url: string) {
@@ -264,12 +292,53 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
   };
 }
 
+function isTransientBrowserChatProgress(value?: string) {
+  const text = (value || '').trim();
+  return text === 'AI is preparing the current browser state.'
+    || text === 'AI is choosing the next browser action from the current page.';
+}
+
+function isRecentTimestamp(value?: string, maxAgeMs = runningHydrationGraceMs) {
+  const timestamp = value ? Date.parse(value) : NaN;
+  return Number.isFinite(timestamp) && Date.now() - timestamp < maxAgeMs;
+}
+
 function recordFromSnapshot(session: BrowserChatSessionSnapshot): BrowserChatSessionRecord {
-  const status = session.status === 'running' ? 'idle' : session.status;
+  const hasRunningMessage = (session.messages || []).some((message) => message.status === 'running');
+  const preserveRecentRunningState = (session.busy || session.status === 'running' || hasRunningMessage)
+    && isRecentTimestamp(session.updatedAt);
+  const status = preserveRecentRunningState ? session.status : (session.status === 'running' ? 'idle' : session.status);
+  const transientStepIndexes = new Set(
+    (session.steps || [])
+      .filter((step) => step.status === 'running' && isTransientBrowserChatProgress(step.actual))
+      .map((step) => step.index),
+  );
+  const steps = (session.steps || []).filter((step) => !transientStepIndexes.has(step.index));
+  const messages = (session.messages || []).map((message) => {
+    const contentIsTransient = message.role === 'assistant' && isTransientBrowserChatProgress(message.content);
+    const stepIndexes = transientStepIndexes.size
+      ? (message.stepIndexes || []).filter((stepIndex) => !transientStepIndexes.has(stepIndex))
+      : message.stepIndexes;
+    if (preserveRecentRunningState && message.status === 'running') {
+      return stepIndexes === message.stepIndexes ? message : { ...message, stepIndexes };
+    }
+    if (message.status !== 'running' && !contentIsTransient) {
+      return stepIndexes === message.stepIndexes ? message : { ...message, stepIndexes };
+    }
+    return {
+      ...message,
+      content: contentIsTransient ? '本轮对话在准备页面状态时中断，未执行新的浏览器操作。' : message.content || '上次对话未完成，已恢复为空闲状态。',
+      status: message.status === 'running' || contentIsTransient ? 'interrupted' as const : message.status,
+      activity: undefined,
+      stepIndexes,
+    };
+  });
   return {
     ...session,
+    messages,
+    steps,
     status,
-    busy: false,
+    busy: preserveRecentRunningState ? session.busy : false,
     logs: session.logs || [],
     started: false,
     browser: undefined,
@@ -280,10 +349,12 @@ function appendLog(
   session: BrowserChatSessionRecord,
   phase: string,
   message: string,
-  input: { stepIndex?: number; elapsedMs?: number } = {},
+  input: { stepIndex?: number; elapsedMs?: number; details?: unknown } = {},
 ) {
   const timestamp = now();
   const runningContent = runningContentFromLog(phase, message);
+  const runningActivity = runningActivityFromLog(phase, message);
+  const details = logDetailsFromUnknown(input.details);
   session.logs = [
     ...(session.logs || []),
     {
@@ -291,6 +362,7 @@ function appendLog(
       time: timestamp,
       phase,
       message,
+      details,
       messageId: session.activeAssistantMessageId,
       stepIndex: input.stepIndex,
       elapsedMs: input.elapsedMs,
@@ -300,6 +372,9 @@ function appendLog(
     updateAssistantMessage(session, session.activeAssistantMessageId, (item) => ({
       ...item,
       content: item.status === 'running' && runningContent ? runningContent : item.content,
+      activity: item.status === 'running' && runningActivity
+        ? { phase, label: runningActivity, updatedAt: timestamp }
+        : item.activity,
       stepIndexes: input.stepIndex
         ? Array.from(new Set([...(item.stepIndexes || []), input.stepIndex])).sort((a, b) => a - b)
         : item.stepIndexes,
@@ -322,8 +397,16 @@ function persistSessions() {
   }
 }
 
-function persistAndNotify(sessionId: string) {
+function persistAndNotify(sessionId: string, options: { flush?: boolean } = {}) {
   notifySessionUpdate(sessionId);
+  if (options.flush) {
+    if (persistTimer) {
+      clearTimeout(persistTimer);
+      persistTimer = undefined;
+    }
+    persistSessions();
+    return;
+  }
   schedulePersistSessions();
 }
 
@@ -723,6 +806,57 @@ function runningAssistantContent(step: StepExecutionResult) {
   return (actual && !looksLikeDomSnapshot(actual) ? actual : undefined) || step.action?.trim() || '正在处理...';
 }
 
+function runningAssistantActivity(step: StepExecutionResult, timestamp: string) {
+  const latestTool = step.tools?.at(-1);
+  if (latestTool) {
+    if (latestTool.ok === false) {
+      return { phase: 'tool:failed', label: `工具执行失败：${latestTool.name}`, updatedAt: timestamp };
+    }
+    if (latestTool.ok === true) {
+      return { phase: 'tool:completed', label: `工具执行完成：${latestTool.name}`, updatedAt: timestamp };
+    }
+    return { phase: 'tool:running', label: `正在执行工具：${latestTool.name}`, updatedAt: timestamp };
+  }
+  return { phase: 'step:running', label: '正在处理浏览器操作', updatedAt: timestamp };
+}
+
+function toolNameFromLogMessage(message: string) {
+  return message.split(/\s|->/).filter(Boolean)[0] || 'tool';
+}
+
+function runningActivityFromLog(phase: string, message: string) {
+  if (phase === 'chat:queued') return '已发送，等待后端开始处理';
+  if (phase === 'chat:run:start') return '正在启动本轮对话';
+  if (phase === 'browser:start') return '正在连接浏览器';
+  if (phase === 'browser:reuse') return '正在复用当前浏览器';
+  if (phase === 'browser:stale') return '正在重新接管浏览器';
+  if (phase === 'browser:screenshot:before') return '正在读取当前页面';
+  if (phase === 'browser:screenshot:after') return '正在保存页面状态';
+  if (phase === 'ai:runtime-input:start') return '正在准备页面上下文';
+  if (phase === 'perf:runtime-input') return '正在准备页面上下文';
+  if (phase === 'ai:prepare') return '正在收集页面状态';
+  if (phase === 'ai:runtime:request') return '正在请求 AI 模型';
+  if (phase === 'ai:runtime:response') return 'AI 已返回，正在处理结果';
+  if (phase === 'ai:runtime:object') return 'AI 已返回，正在解析动作';
+  if (phase === 'ai:runtime:retry') return 'AI 请求失败，正在重试';
+  if (phase === 'ai:runtime:partial') return '工具已执行，正在继续判断';
+  if (phase === 'ai:context-compressed') return '正在整理上下文';
+  if (phase === 'ai:visual-context') return '正在更新视觉上下文';
+  if (phase === 'chat:step:start') return '正在准备下一步操作';
+  if (phase === 'chat:run:saving') return '正在写入最终结果';
+  if (phase === 'chat:run:done') return '正在完成本轮对话';
+  if (phase === 'chat:run:error') return '本轮对话异常，正在收尾';
+  if (phase === 'chat:run:interrupted') return '正在中断本轮对话';
+  if (phase === 'ai:tool') {
+    const name = toolNameFromLogMessage(message);
+    if (/started/i.test(message)) return `正在执行工具：${name}`;
+    if (/failed/i.test(message)) return `工具执行失败：${name}`;
+    if (/ok/i.test(message)) return `工具执行完成：${name}`;
+    return `正在处理工具：${name}`;
+  }
+  return undefined;
+}
+
 function runningContentFromLog(phase: string, message: string) {
   if (phase === 'browser:screenshot:before') return '正在截取当前页面...';
   if (phase === 'browser:screenshot:after') return '正在保存操作后的页面状态...';
@@ -734,7 +868,7 @@ function runningContentFromLog(phase: string, message: string) {
   if (phase === 'chat:step:start') return '正在准备下一步浏览器操作...';
   if (phase === 'ai:prepare') return '正在收集页面状态并请求 AI 决策...';
   if (phase === 'ai:tool') {
-    const name = message.split(/\s|->/).filter(Boolean)[0];
+    const name = toolNameFromLogMessage(message);
     if (/started/i.test(message)) return `正在调用工具：${name}`;
     if (/failed/i.test(message)) return `工具调用失败：${name}`;
     if (/ok/i.test(message)) return `工具调用完成：${name}`;
@@ -747,13 +881,6 @@ function isActiveBrowserChatTurn(session: BrowserChatSessionRecord, assistantMes
   return session.activeAssistantMessageId === assistantMessageId
     && session.activeAbortController === abortController
     && !abortController.signal.aborted;
-}
-
-function isAbortLikeError(error: unknown) {
-  if (!error || typeof error !== 'object') return /abort|interrupted/i.test(String(error || ''));
-  const name = 'name' in error ? String((error as { name?: unknown }).name || '') : '';
-  const message = error instanceof Error ? error.message : String(error);
-  return name === 'AbortError' || /abort|interrupted|cancel/i.test(message);
 }
 
 export function interruptBrowserChatSession(sessionId: string) {
@@ -772,6 +899,7 @@ export function interruptBrowserChatSession(sessionId: string) {
       content: '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。',
       updatedAt: timestamp,
       status: 'interrupted',
+      activity: undefined,
     }));
   }
   session.activeAbortController = undefined;
@@ -790,7 +918,7 @@ export function interruptBrowserChatSession(sessionId: string) {
       messageId: assistantMessageId,
     },
   ].slice(-300);
-  persistAndNotify(session.id);
+  persistAndNotify(session.id, { flush: true });
   return snapshot(session);
 }
 
@@ -830,6 +958,7 @@ async function runBrowserChatMessage(
           updateAssistantMessage(session, assistantMessageId, (message) => ({
             ...message,
             content: runningAssistantContent(step),
+            activity: runningAssistantActivity(step, timestamp),
             status: 'running',
             updatedAt: timestamp,
             stepIndexes: Array.from(new Set([...(message.stepIndexes || []), step.index])).sort((a, b) => a - b),
@@ -843,11 +972,12 @@ async function runBrowserChatMessage(
         appendLog(session, event.phase, event.message, {
           stepIndex: event.stepIndex,
           elapsedMs: elapsedFromDetails(event.details),
+          details: event.details,
         });
       },
     });
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-    appendLog(session, 'chat:run:done', '本轮对话操作已完成');
+    appendLog(session, 'chat:run:saving', '正在写入本轮对话最终结果');
     session.steps = result.steps;
     session.consoleErrors = result.consoleErrors;
     session.networkErrors = result.networkErrors;
@@ -856,38 +986,59 @@ async function runBrowserChatMessage(
       ...message,
       content: result.reply,
       updatedAt: finishedAt,
-      stepIndexes: result.newSteps.map((step) => step.index),
+      stepIndexes: Array.from(new Set([
+        ...(message.stepIndexes || []),
+        ...result.newSteps.map((step) => step.index),
+      ])).sort((a, b) => a - b),
       status: result.status,
+      activity: undefined,
     }));
     session.status = 'idle';
     session.busy = false;
     session.activeAssistantMessageId = undefined;
     session.activeAbortController = undefined;
     session.updatedAt = finishedAt;
-    persistAndNotify(session.id);
+    session.logs = [
+      ...(session.logs || []),
+      {
+        id: id('log'),
+        time: finishedAt,
+        phase: 'chat:run:done',
+        message: '本轮对话操作已完成，最终结果已写入。',
+        messageId: assistantMessageId,
+      },
+    ].slice(-300);
+    persistAndNotify(session.id, { flush: true });
   } catch (error) {
-    const interrupted = abortController.signal.aborted || isAbortLikeError(error);
+    const interrupted = abortController.signal.aborted;
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController) && interrupted) return;
-    const message = error instanceof Error ? error.message : String(error);
+    const message = userFacingErrorMessage(error);
+    const details = errorLogDetails(error);
     if (isDeadBrowserSessionError(error)) {
       await session.browser?.close().catch(() => undefined);
       session.browser = undefined;
       session.started = false;
     }
-    appendLog(session, interrupted ? 'chat:run:interrupted' : 'chat:run:error', interrupted ? '本轮对话操作已中断。' : `本轮对话操作中断：${message}`);
+    appendLog(
+      session,
+      interrupted ? 'chat:run:interrupted' : 'chat:run:error',
+      interrupted ? '用户主动中断了本轮对话。' : `本轮对话异常：${message}`,
+      { details },
+    );
     session.error = interrupted ? undefined : message;
     session.status = interrupted ? 'idle' : 'error';
     session.busy = false;
     session.updatedAt = now();
     updateAssistantMessage(session, assistantMessageId, (item) => ({
       ...item,
-      content: interrupted ? '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。' : `执行中断：${message}`,
+      content: interrupted ? '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。' : `执行异常：${message}`,
       updatedAt: session.updatedAt,
       status: interrupted ? 'interrupted' : 'failed',
+      activity: undefined,
     }));
     session.activeAssistantMessageId = undefined;
     session.activeAbortController = undefined;
-    persistAndNotify(session.id);
+    persistAndNotify(session.id, { flush: true });
   } finally {
     if (session.activeAbortController === abortController) session.activeAbortController = undefined;
   }
