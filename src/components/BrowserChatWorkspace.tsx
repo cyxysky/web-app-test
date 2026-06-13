@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { memo, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   Bot,
   Folder,
@@ -99,6 +99,11 @@ type BrowserChatToolDetail = {
   step: StepExecutionResult;
   toolIndex: number;
   tool: BrowserChatToolCall;
+};
+
+type BrowserChatLogIndex = {
+  byMessageId: Map<string, BrowserChatLogRecord[]>;
+  byStepIndex: Map<number, BrowserChatLogRecord[]>;
 };
 
 function statusLabel(status: string) {
@@ -218,6 +223,33 @@ function formatLogTime(value: string) {
   return date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+function buildBrowserChatLogIndex(logs: BrowserChatLogRecord[]): BrowserChatLogIndex {
+  const byMessageId = new Map<string, BrowserChatLogRecord[]>();
+  const byStepIndex = new Map<number, BrowserChatLogRecord[]>();
+
+  for (const log of logs) {
+    if (log.messageId) {
+      const entries = byMessageId.get(log.messageId) || [];
+      entries.push(log);
+      byMessageId.set(log.messageId, entries);
+      continue;
+    }
+    if (typeof log.stepIndex === 'number') {
+      const entries = byStepIndex.get(log.stepIndex) || [];
+      entries.push(log);
+      byStepIndex.set(log.stepIndex, entries);
+    }
+  }
+
+  return { byMessageId, byStepIndex };
+}
+
+function browserChatLogsForMessage(message: BrowserChatMessage, logIndex: BrowserChatLogIndex) {
+  const directLogs = logIndex.byMessageId.get(message.id) || [];
+  const stepLogs = (message.stepIndexes || []).flatMap((stepIndex) => logIndex.byStepIndex.get(stepIndex) || []);
+  return directLogs.length || stepLogs.length ? [...directLogs, ...stepLogs] : [];
+}
+
 function messageUpdateTime(message: BrowserChatMessage) {
   return message.updatedAt || message.createdAt;
 }
@@ -278,8 +310,8 @@ function normalizeChatMarkdown(markdown: string) {
     .trim();
 }
 
-function BrowserChatMarkdown({ markdown }: { markdown: string }) {
-  const normalizedMarkdown = normalizeChatMarkdown(markdown);
+const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { markdown: string }) {
+  const normalizedMarkdown = useMemo(() => normalizeChatMarkdown(markdown), [markdown]);
   return (
     <div className="browser-chat-agent-markdown">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -287,7 +319,7 @@ function BrowserChatMarkdown({ markdown }: { markdown: string }) {
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 function formatAttachmentSize(size?: number) {
   if (!size || !Number.isFinite(size)) return '';
@@ -296,7 +328,7 @@ function formatAttachmentSize(size?: number) {
   return `${Math.round(size / 1024 / 102.4) / 10} MB`;
 }
 
-function BrowserChatImageGrid({
+const BrowserChatImageGrid = memo(function BrowserChatImageGrid({
   attachments,
   editable = false,
   onPreview,
@@ -339,9 +371,9 @@ function BrowserChatImageGrid({
       ))}
     </div>
   );
-}
+});
 
-function BrowserChatStepToolCards({
+const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   onSelectTool,
   running,
   step,
@@ -387,9 +419,9 @@ function BrowserChatStepToolCards({
       ))}
     </>
   );
-}
+});
 
-function BrowserChatAssistantTimeline({
+const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
   message,
   onSelectTool,
   running,
@@ -424,7 +456,282 @@ function BrowserChatAssistantTimeline({
       {!running || !steps.length ? renderText(finalText, 'final-text') : null}
     </div>
   );
-}
+});
+
+const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
+  exportingMessageId,
+  item,
+  itemLogs,
+  itemSteps,
+  lastAssistantMessageId,
+  onExportMessage,
+  onPreviewImage,
+  onSelectTool,
+  onShowLogs,
+  sessionBusy,
+  totalStepCount,
+}: {
+  exportingMessageId: string | null;
+  item: BrowserChatMessage;
+  itemLogs: BrowserChatLogRecord[];
+  itemSteps: StepExecutionResult[];
+  lastAssistantMessageId?: string;
+  onExportMessage: (messageId: string) => void | Promise<void>;
+  onPreviewImage: (attachment: BrowserChatAttachment) => void;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
+  onShowLogs: (messageId: string) => void;
+  sessionBusy: boolean;
+  totalStepCount: number;
+}) {
+  const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
+  const operationLabel = operationRunning ? (item.activity?.label || '处理中') : statusLabel(item.status || 'passed');
+  const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
+
+  return (
+    <article className={`browser-chat-message ${item.role}`}>
+      <div className="browser-chat-avatar">
+        {item.role === 'user' ? <User size={15} /> : <Bot size={15} />}
+      </div>
+      <div>
+        {item.role === 'assistant' ? (
+          <>
+            <div className="browser-chat-agent-meta">
+              <span>{operationLabel}</span>
+              <time dateTime={messageUpdateTime(item)}>最后更新 {formatLogTime(messageUpdateTime(item))}</time>
+            </div>
+            <BrowserChatAssistantTimeline message={item} onSelectTool={onSelectTool} running={operationRunning} steps={itemSteps} />
+          </>
+        ) : (
+          <>
+            {item.content ? <p>{item.content}</p> : null}
+            <BrowserChatImageGrid attachments={item.attachments} onPreview={onPreviewImage} />
+            <time className="browser-chat-message-time" dateTime={messageUpdateTime(item)}>
+              最后更新 {formatLogTime(messageUpdateTime(item))}
+            </time>
+          </>
+        )}
+        {item.role === 'assistant' ? (
+          <div className="browser-chat-message-actions">
+            {itemLogs.length ? (
+              <button className="browser-chat-log-button" onClick={() => onShowLogs(item.id)} type="button">
+                <ScrollText size={14} />
+                查看日志
+              </button>
+            ) : null}
+            {canExportMessage ? (
+              <button
+                className="browser-chat-log-button"
+                disabled={Boolean(exportingMessageId)}
+                onClick={() => void onExportMessage(item.id)}
+                type="button"
+              >
+                {exportingMessageId === item.id ? <Loader2 className="spin" size={14} /> : <FilePlus2 size={14} />}
+                导出用例
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </article>
+  );
+});
+
+const BrowserChatMessageList = memo(function BrowserChatMessageList({
+  exportingMessageId,
+  lastAssistantMessageId,
+  logIndex,
+  messages,
+  onExportMessage,
+  onPreviewImage,
+  onSelectTool,
+  onShowLogs,
+  sessionBusy,
+  stepsByIndex,
+  totalStepCount,
+}: {
+  exportingMessageId: string | null;
+  lastAssistantMessageId?: string;
+  logIndex: BrowserChatLogIndex;
+  messages: BrowserChatMessage[];
+  onExportMessage: (messageId: string) => void | Promise<void>;
+  onPreviewImage: (attachment: BrowserChatAttachment) => void;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
+  onShowLogs: (messageId: string) => void;
+  sessionBusy: boolean;
+  stepsByIndex: Map<number, StepExecutionResult>;
+  totalStepCount: number;
+}) {
+  return (
+    <div className="browser-chat-message-list">
+      {messages.map((item) => {
+        const itemSteps = (item.stepIndexes || [])
+          .map((stepIndex) => stepsByIndex.get(stepIndex))
+          .filter((step): step is StepExecutionResult => Boolean(step));
+        const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
+        return (
+          <BrowserChatMessageItem
+            exportingMessageId={exportingMessageId}
+            item={item}
+            itemLogs={itemLogs}
+            itemSteps={itemSteps}
+            key={item.id}
+            lastAssistantMessageId={lastAssistantMessageId}
+            onExportMessage={onExportMessage}
+            onPreviewImage={onPreviewImage}
+            onSelectTool={onSelectTool}
+            onShowLogs={onShowLogs}
+            sessionBusy={sessionBusy}
+            totalStepCount={totalStepCount}
+          />
+        );
+      })}
+    </div>
+  );
+});
+
+const BrowserChatComposer = memo(function BrowserChatComposer({
+  attachments,
+  busy,
+  currentBusy,
+  imageInputRef,
+  interrupting,
+  loading,
+  mode,
+  modeLocked,
+  onInterrupt,
+  onModeChange,
+  onPreviewAttachment,
+  onRemoveAttachment,
+  onSubmitMessage,
+  onUploadImages,
+  resetToken,
+  showStop,
+  uploadingImage,
+}: {
+  attachments: BrowserChatAttachment[];
+  busy: boolean;
+  currentBusy: boolean;
+  imageInputRef: RefObject<HTMLInputElement | null>;
+  interrupting: boolean;
+  loading: boolean;
+  mode: BrowserChatMode;
+  modeLocked: boolean;
+  onInterrupt: () => void | Promise<void>;
+  onModeChange: (mode: BrowserChatMode) => void;
+  onPreviewAttachment: (attachment: BrowserChatAttachment) => void;
+  onRemoveAttachment: (id: string) => void;
+  onSubmitMessage: (content: string) => Promise<boolean>;
+  onUploadImages: (files: File[]) => void | Promise<void>;
+  resetToken: number;
+  showStop: boolean;
+  uploadingImage: boolean;
+}) {
+  const [draft, setDraft] = useState('');
+
+  useEffect(() => {
+    setDraft('');
+  }, [resetToken]);
+
+  const submitDraft = useCallback(async () => {
+    const content = draft.trim();
+    if ((!content && !attachments.length) || currentBusy || loading || uploadingImage) return;
+    const sent = await onSubmitMessage(content);
+    if (sent) setDraft('');
+  }, [attachments.length, currentBusy, draft, loading, onSubmitMessage, uploadingImage]);
+
+  return (
+    <>
+      <BrowserChatImageGrid
+        attachments={attachments}
+        editable
+        onPreview={onPreviewAttachment}
+        onRemove={onRemoveAttachment}
+      />
+      <form
+        className="browser-chat-compose"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submitDraft();
+        }}
+      >
+        <input
+          ref={imageInputRef}
+          className="browser-chat-image-input"
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={(event) => {
+            const files = event.currentTarget.files;
+            if (files?.length) void onUploadImages(Array.from(files));
+          }}
+        />
+        <textarea
+          disabled={currentBusy || loading}
+          placeholder="有问题，尽管问"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              void submitDraft();
+            }
+          }}
+        />
+        <button
+          aria-label="上传图片"
+          className="browser-chat-attach"
+          disabled={currentBusy || uploadingImage || attachments.length >= 8}
+          onClick={() => imageInputRef.current?.click()}
+          title="上传图片"
+          type="button"
+        >
+          {uploadingImage ? <Loader2 className="spin" size={17} /> : <ImageUp size={17} />}
+        </button>
+        <div className="browser-chat-mode-toggle" role="radiogroup" aria-label="操作模式">
+          <button
+            aria-pressed={mode === 'visual-markers'}
+            className={mode === 'visual-markers' ? 'active' : undefined}
+            disabled={currentBusy || loading || modeLocked}
+            onClick={() => onModeChange('visual-markers')}
+            type="button"
+          >
+            视觉
+          </button>
+          <button
+            aria-pressed={mode === 'dom'}
+            className={mode === 'dom' ? 'active' : undefined}
+            disabled={currentBusy || loading || modeLocked}
+            onClick={() => onModeChange('dom')}
+            type="button"
+          >
+            DOM
+          </button>
+        </div>
+        {showStop ? (
+          <button
+            className="browser-chat-stop"
+            disabled={interrupting}
+            onClick={() => void onInterrupt()}
+            type="button"
+            aria-label="中断本轮对话"
+            title="中断本轮对话"
+          >
+            {interrupting ? <Loader2 className="spin" size={18} /> : <Square size={16} />}
+          </button>
+        ) : (
+          <button
+            className="browser-chat-send"
+            disabled={(!draft.trim() && !attachments.length) || currentBusy || loading || uploadingImage}
+            type="submit"
+            aria-label="发送"
+          >
+            {busy ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+          </button>
+        )}
+      </form>
+    </>
+  );
+});
 
 export function BrowserChatWorkspace({
   testCases,
@@ -456,8 +763,8 @@ export function BrowserChatWorkspace({
   const [groupName, setGroupName] = useState('');
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
-  const [message, setMessage] = useState('');
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
+  const [composerResetToken, setComposerResetToken] = useState(0);
   const [busy, setBusy] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [realtimeConnected, setRealtimeConnected] = useState(false);
@@ -485,17 +792,24 @@ export function BrowserChatWorkspace({
   );
   const hasMessages = visibleMessages.length > 0;
   const stepsByIndex = useMemo(() => new Map(steps.map((step) => [step.index, step])), [steps]);
+  const logIndex = useMemo(() => buildBrowserChatLogIndex(logs), [logs]);
   const logDialogMessage = useMemo(
     () => messages.find((item) => item.id === logDialogMessageId),
     [logDialogMessageId, messages],
   );
   const logDialogEntries = useMemo(() => {
     if (!logDialogMessage) return [];
-    const byMessageId = logs.filter((log) => log.messageId === logDialogMessage.id);
-    if (byMessageId.length) return byMessageId;
-    const stepIndexes = new Set(logDialogMessage.stepIndexes || []);
-    return logs.filter((log) => log.stepIndex && stepIndexes.has(log.stepIndex));
-  }, [logDialogMessage, logs]);
+    return browserChatLogsForMessage(logDialogMessage, logIndex);
+  }, [logDialogMessage, logIndex]);
+  const previewAttachment = useCallback((attachment: BrowserChatAttachment) => {
+    setImagePreview(attachment);
+  }, []);
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments((current) => current.filter((attachment) => attachment.id !== id));
+  }, []);
+  const showMessageLogs = useCallback((messageId: string) => {
+    setLogDialogMessageId(messageId);
+  }, []);
   const recentSessions = useMemo(() => {
     const merged = new Map<string, BrowserChatSession>();
     for (const item of sessions) merged.set(item.id, item);
@@ -708,10 +1022,10 @@ export function BrowserChatWorkspace({
     }
   }
 
-  async function sendMessage() {
-    const content = message.trim();
+  async function sendMessage(content: string) {
+    const trimmedContent = content.trim();
     const nextAttachments = attachments;
-    if ((!content && !nextAttachments.length) || currentBusy || loadingSessionId || sendingRef.current || uploadingImage) return;
+    if ((!trimmedContent && !nextAttachments.length) || currentBusy || loadingSessionId || sendingRef.current || uploadingImage) return false;
     sendingRef.current = true;
     const clientMessageId = temporaryId('client_msg');
     setError('');
@@ -721,21 +1035,21 @@ export function BrowserChatWorkspace({
       let active = await ensureSession();
       let posted: BrowserChatSession;
       try {
-        posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
+        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments);
       } catch (firstError) {
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
         active = await createSession();
-        posted = await postMessageToSession(active.id, content, clientMessageId, nextAttachments);
+        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments);
       }
       upsertSession(posted, { activate: true });
-      setMessage('');
       setAttachments([]);
+      return true;
     } catch (sendError) {
       const sendMessageText = sendError instanceof Error ? sendError.message : '发送消息失败';
       setError(sendMessageText);
-      setMessage(content);
       setAttachments(nextAttachments);
+      return false;
     } finally {
       sendingRef.current = false;
       setBusy(false);
@@ -841,12 +1155,13 @@ export function BrowserChatWorkspace({
     }
   }
 
-  async function exportMessageToTestCase(messageId: string) {
-    if (!session || exportingMessageId) return;
+  const exportMessageToTestCase = useCallback(async (messageId: string) => {
+    const sessionId = session?.id;
+    if (!sessionId || exportingMessageId) return;
     setExportingMessageId(messageId);
     setError('');
     try {
-      const response = await fetch(`/api/browser-chat/${session.id}/export`, {
+      const response = await fetch(`/api/browser-chat/${sessionId}/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageId }),
@@ -859,13 +1174,13 @@ export function BrowserChatWorkspace({
     } finally {
       setExportingMessageId(null);
     }
-  }
+  }, [exportingMessageId, router, session?.id, startTransition]);
 
   async function startNewConversation() {
     setActiveView('chat');
     if (busy) return;
     setError('');
-    setMessage('');
+    setComposerResetToken((current) => current + 1);
     setAttachments([]);
     setSession(null);
   }
@@ -876,7 +1191,7 @@ export function BrowserChatWorkspace({
     setLoadingSessionId(sessionId);
     setActiveView('chat');
     setError('');
-    setMessage('');
+    setComposerResetToken((current) => current + 1);
     setAttachments([]);
     try {
       const loadedSession = await refreshSession(sessionId, { activate: true });
@@ -1074,65 +1389,19 @@ export function BrowserChatWorkspace({
             ) : null}
 
             {hasMessages ? (
-              <div className="browser-chat-message-list">
-                {visibleMessages.map((item) => {
-                  const itemSteps = (item.stepIndexes || []).map((stepIndex) => stepsByIndex.get(stepIndex)).filter((step): step is StepExecutionResult => Boolean(step));
-                  const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(session?.busy && item.id === lastAssistantMessageId));
-                  const operationLabel = operationRunning ? (item.activity?.label || '处理中') : statusLabel(item.status || 'passed');
-                  const itemLogs = item.role === 'assistant'
-                    ? logs.filter((log) => log.messageId === item.id || (!log.messageId && log.stepIndex && (item.stepIndexes || []).includes(log.stepIndex)))
-                    : [];
-                  const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || steps.length > 0);
-                  return (
-                    <article className={`browser-chat-message ${item.role}`} key={item.id}>
-                      <div className="browser-chat-avatar">
-                        {item.role === 'user' ? <User size={15} /> : <Bot size={15} />}
-                      </div>
-                      <div>
-                        {item.role === 'assistant' ? (
-                          <>
-                            <div className="browser-chat-agent-meta">
-                              <span>{operationLabel}</span>
-                              <time dateTime={messageUpdateTime(item)}>最后更新 {formatLogTime(messageUpdateTime(item))}</time>
-                            </div>
-                            <BrowserChatAssistantTimeline message={item} onSelectTool={setToolDialog} running={operationRunning} steps={itemSteps} />
-                          </>
-                        ) : (
-                          <>
-                            {item.content ? <p>{item.content}</p> : null}
-                            <BrowserChatImageGrid attachments={item.attachments} onPreview={setImagePreview} />
-                            <time className="browser-chat-message-time" dateTime={messageUpdateTime(item)}>
-                              最后更新 {formatLogTime(messageUpdateTime(item))}
-                            </time>
-                          </>
-                        )}
-                        {item.role === 'assistant' ? (
-                          <div className="browser-chat-message-actions">
-                            {itemLogs.length ? (
-                              <button className="browser-chat-log-button" onClick={() => setLogDialogMessageId(item.id)} type="button">
-                                <ScrollText size={14} />
-                                查看日志
-                              </button>
-                            ) : null}
-                            {canExportMessage ? (
-                              <button
-                                className="browser-chat-log-button"
-                                disabled={Boolean(exportingMessageId)}
-                                onClick={() => void exportMessageToTestCase(item.id)}
-                                type="button"
-                              >
-                                {exportingMessageId === item.id ? <Loader2 className="spin" size={14} /> : <FilePlus2 size={14} />}
-                                导出用例
-                              </button>
-                            ) : null}
-                          </div>
-                        ) : null}
-                      </div>
-                    </article>
-
-                  );
-                })}
-              </div>
+              <BrowserChatMessageList
+                exportingMessageId={exportingMessageId}
+                lastAssistantMessageId={lastAssistantMessageId}
+                logIndex={logIndex}
+                messages={visibleMessages}
+                onExportMessage={exportMessageToTestCase}
+                onPreviewImage={previewAttachment}
+                onSelectTool={setToolDialog}
+                onShowLogs={showMessageLogs}
+                sessionBusy={Boolean(session?.busy)}
+                stepsByIndex={stepsByIndex}
+                totalStepCount={steps.length}
+              />
             ) : (
               <div className="browser-chat-hero">
                 <h1>今天要测试什么？</h1>
@@ -1141,94 +1410,25 @@ export function BrowserChatWorkspace({
 
             <div className="browser-chat-composer-shell">
               {error || session?.error ? <div className="error">{error || session?.error}</div> : null}
-              <BrowserChatImageGrid
+              <BrowserChatComposer
                 attachments={attachments}
-                editable
-                onPreview={setImagePreview}
-                onRemove={(id) => setAttachments((current) => current.filter((attachment) => attachment.id !== id))}
+                busy={busy}
+                currentBusy={currentBusy}
+                imageInputRef={imageInputRef}
+                interrupting={interrupting}
+                loading={Boolean(loadingSessionId)}
+                mode={mode}
+                modeLocked={modeLocked}
+                onInterrupt={interruptConversation}
+                onModeChange={setMode}
+                onPreviewAttachment={previewAttachment}
+                onRemoveAttachment={removeAttachment}
+                onSubmitMessage={sendMessage}
+                onUploadImages={uploadChatImages}
+                resetToken={composerResetToken}
+                showStop={Boolean(selectedRunningSession)}
+                uploadingImage={uploadingImage}
               />
-              <form
-                className="browser-chat-compose"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void sendMessage();
-                }}
-              >
-                <input
-                  ref={imageInputRef}
-                  className="browser-chat-image-input"
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  onChange={(event) => {
-                    const files = event.target.files;
-                    if (files?.length) void uploadChatImages(files);
-                  }}
-                />
-                <textarea
-                  disabled={currentBusy || Boolean(loadingSessionId)}
-                  placeholder="有问题，尽管问"
-                  value={message}
-                  onChange={(event) => setMessage(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                      event.preventDefault();
-                      void sendMessage();
-                    }
-                  }}
-                />
-                <button
-                  aria-label="上传图片"
-                  className="browser-chat-attach"
-                  disabled={currentBusy || uploadingImage || attachments.length >= 8}
-                  onClick={() => imageInputRef.current?.click()}
-                  title="上传图片"
-                  type="button"
-                >
-                  {uploadingImage ? <Loader2 className="spin" size={17} /> : <ImageUp size={17} />}
-                </button>
-                <div className="browser-chat-mode-toggle" role="radiogroup" aria-label="操作模式">
-                  <button
-                    aria-pressed={mode === 'visual-markers'}
-                    className={mode === 'visual-markers' ? 'active' : undefined}
-                    disabled={currentBusy || Boolean(loadingSessionId) || modeLocked}
-                    onClick={() => setMode('visual-markers')}
-                    type="button"
-                  >
-                    视觉
-                  </button>
-                  <button
-                    aria-pressed={mode === 'dom'}
-                    className={mode === 'dom' ? 'active' : undefined}
-                    disabled={currentBusy || Boolean(loadingSessionId) || modeLocked}
-                    onClick={() => setMode('dom')}
-                    type="button"
-                  >
-                    DOM
-                  </button>
-                </div>
-                {selectedRunningSession ? (
-                  <button
-                    className="browser-chat-stop"
-                    disabled={interrupting}
-                    onClick={() => void interruptConversation()}
-                    type="button"
-                    aria-label="中断本轮对话"
-                    title="中断本轮对话"
-                  >
-                    {interrupting ? <Loader2 className="spin" size={18} /> : <Square size={16} />}
-                  </button>
-                ) : (
-                  <button
-                    className="browser-chat-send"
-                    disabled={(!message.trim() && !attachments.length) || currentBusy || Boolean(loadingSessionId) || uploadingImage}
-                    type="submit"
-                    aria-label="发送"
-                  >
-                    {busy ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
-                  </button>
-                )}
-              </form>
             </div>
           </div>
         )}
