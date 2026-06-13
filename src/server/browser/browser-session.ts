@@ -75,6 +75,19 @@ type FocusedElementSummary = {
   isTextEntryTarget?: boolean;
 };
 
+type CandidateDomState = {
+  descriptor?: string;
+  tagName?: string;
+  type?: string;
+  valueLength?: number;
+  checked?: boolean;
+  selectedIndex?: number;
+  ariaPressed?: string;
+  ariaExpanded?: string;
+  disabled?: boolean;
+  text?: string;
+};
+
 type ViewportMetrics = {
   width: number;
   height: number;
@@ -3011,25 +3024,77 @@ export class BrowserSession {
 
     const results: string[] = [];
     let ok = true;
+    let suspicious = 0;
+    let failed = 0;
     for (const [index, field] of fields.entries()) {
       const resolved = await this.resolveCandidateTarget(field.id);
       if (!resolved.target) {
         ok = false;
-        results.push(`${index + 1}. Candidate ${field.id}: ${resolved.error}`);
+        failed += 1;
+        results.push(`${index + 1}. Candidate ${field.id}: failed before click. ${resolved.error}`);
         continue;
       }
       const { candidate, target } = resolved;
-      await this.activePage.mouse.click(target.x, target.y);
-      if (field.text !== undefined) {
-        await this.replaceFocusedText(field.text, field.clear !== false);
+      const beforeUrl = this.activePage.url();
+      const beforeState = await this.candidateDomState(candidate);
+      const beforeFocus = await this.getFocusedElement();
+      let afterFocus: FocusedElementSummary | undefined;
+      let afterState: CandidateDomState | undefined;
+      let clickError = '';
+      let typed = false;
+      try {
+        await this.activePage.mouse.click(target.x, target.y);
+        await this.activePage.waitForTimeout(80).catch(() => undefined);
+        afterFocus = await this.getFocusedElement();
+        if (field.text !== undefined) {
+          if (afterFocus.isTextEntryTarget && !afterFocus.disabled && !afterFocus.readOnly) {
+            await this.replaceFocusedText(field.text, field.clear !== false);
+            typed = true;
+            await this.activePage.waitForTimeout(40).catch(() => undefined);
+            afterFocus = await this.getFocusedElement();
+          } else {
+            ok = false;
+            suspicious += 1;
+          }
+        }
+        afterState = await this.candidateDomState(candidate);
+        await this.showClickMarker(target.x, target.y, 'fill');
+      } catch (error) {
+        ok = false;
+        failed += 1;
+        clickError = error instanceof Error ? error.message : String(error);
       }
-      await this.showClickMarker(target.x, target.y, 'fill');
-      results.push(`${index + 1}. Candidate ${candidate.id} (${this.describeCandidate(candidate)}) clicked${field.text !== undefined ? ` and filled ${field.text.length} characters` : ''}.`);
+      const afterUrl = this.activePage.url();
+      const stateChanged = this.candidateDomStateChanged(beforeState, afterState);
+      const urlChanged = afterUrl !== beforeUrl;
+      const focusSummary = afterFocus?.summary || 'Focus was not inspected after click.';
+      const status = clickError
+        ? 'failed'
+        : field.text !== undefined && !typed
+          ? 'suspicious'
+          : 'clicked';
+      const signals = [
+        urlChanged ? `url changed from ${beforeUrl} to ${afterUrl}` : `url unchanged (${afterUrl})`,
+        stateChanged ? 'candidate DOM state changed' : 'candidate DOM state did not change',
+        field.text !== undefined ? (typed ? `filled ${field.text.length} characters` : `text was not typed because click did not focus an editable target`) : '',
+        target.offscreen ? 'target was offscreen/clamped' : '',
+      ].filter(Boolean).join('; ');
+      results.push([
+        `${index + 1}. Candidate ${candidate.id}: ${status}.`,
+        `target="${this.describeCandidate(candidate)}"`,
+        `point=(${target.x}, ${target.y})`,
+        `beforeState=[${this.candidateDomStateSummary(beforeState)}]`,
+        `afterState=[${this.candidateDomStateSummary(afterState)}]`,
+        `beforeFocus=[${beforeFocus.summary}]`,
+        `afterFocus=[${focusSummary}]`,
+        `signals=[${signals || 'no observable signal'}]`,
+        clickError ? `error="${clickError}"` : '',
+      ].filter(Boolean).join(' '));
     }
     const note = await this.waitAfterAction();
     return {
       ok,
-      actual: `Batch candidate fill completed: ${results.length}/${fields.length} attempted.\n${results.join('\n')}${note}`,
+      actual: `Batch candidate fill completed without fallback clicks: ${fields.length - failed}/${fields.length} clicked, ${suspicious} suspicious, ${failed} failed.\n${results.join('\n')}${note}`,
     };
   }
 
@@ -3598,6 +3663,56 @@ export class BrowserSession {
       hasFocus: false,
       summary: `Unable to inspect focused element: ${error instanceof Error ? error.message : String(error)}`,
     }));
+  }
+
+  private async candidateDomState(candidate: InteractiveCandidate): Promise<CandidateDomState | undefined> {
+    if (candidate.shadow) return undefined;
+    const target = candidate.framePath ? this.frameFromPath(candidate.framePath) : this.activePage.mainFrame();
+    if (!target) return undefined;
+    await this.ensureBrowserPageRuntime(target);
+    return target.evaluate((pathValue) => {
+      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
+      if (!runtime) return undefined;
+      let element = runtime.elementFromPath(pathValue);
+      if (!element) return undefined;
+      element = runtime.actionableTargetFor(element);
+      const field = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+      const tagName = element.tagName.toLowerCase();
+      const text = (element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160) || undefined;
+      return {
+        descriptor: runtime.descriptor(element),
+        tagName,
+        type: tagName === 'input' ? (field as HTMLInputElement).type : undefined,
+        valueLength: 'value' in field ? (field.value || '').length : undefined,
+        checked: 'checked' in field ? Boolean((field as HTMLInputElement).checked) : undefined,
+        selectedIndex: 'selectedIndex' in field ? Number((field as HTMLSelectElement).selectedIndex) : undefined,
+        ariaPressed: element.getAttribute('aria-pressed') || undefined,
+        ariaExpanded: element.getAttribute('aria-expanded') || undefined,
+        disabled: Boolean((field as HTMLInputElement).disabled || element.getAttribute('aria-disabled') === 'true'),
+        text,
+      };
+    }, candidate.path).catch(() => undefined);
+  }
+
+  private candidateDomStateSummary(state?: CandidateDomState) {
+    if (!state) return 'unavailable';
+    return [
+      state.descriptor,
+      state.tagName ? `tag=${state.tagName}` : '',
+      state.type ? `type=${state.type}` : '',
+      typeof state.valueLength === 'number' ? `valueLength=${state.valueLength}` : '',
+      typeof state.checked === 'boolean' ? `checked=${state.checked}` : '',
+      typeof state.selectedIndex === 'number' ? `selectedIndex=${state.selectedIndex}` : '',
+      state.ariaPressed ? `aria-pressed=${state.ariaPressed}` : '',
+      state.ariaExpanded ? `aria-expanded=${state.ariaExpanded}` : '',
+      state.disabled ? 'disabled=true' : '',
+      state.text ? `text="${state.text}"` : '',
+    ].filter(Boolean).join(', ');
+  }
+
+  private candidateDomStateChanged(before?: CandidateDomState, after?: CandidateDomState) {
+    if (!before || !after) return false;
+    return JSON.stringify(before) !== JSON.stringify(after);
   }
 
   private async detectManualVerification(): Promise<ManualVerificationDetails> {

@@ -1,8 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { generateObject } from 'ai';
+import { z } from 'zod';
 import { BrowserSession, type BrowserSessionMode } from '@/server/browser/browser-session';
-import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage } from '@/server/ai/agents/browser-chat-executor.agent';
+import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage, type InteractiveBrowserTurnResult } from '@/server/ai/agents/browser-chat-executor.agent';
+import { getModel, getModelSettings } from '@/server/ai/model';
 import type { RecordedFlowStep, StepExecutionResult, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
@@ -47,6 +50,46 @@ export type BrowserChatLogRecord = {
   elapsedMs?: number;
 };
 
+export type BrowserChatConversationMemory = {
+  version: 1;
+  updatedAt: string;
+  coveredMessageIds: string[];
+  coveredStepIndexes: number[];
+  latestUserGoal?: string;
+  summary: string;
+  userConstraints: string[];
+  completed: string[];
+  pending: string[];
+  findings: string[];
+  blockers: string[];
+  decisions: string[];
+  lastAssistantReply?: string;
+  continuationHint?: string;
+  evidenceRefs: Array<{
+    type: 'message' | 'step' | 'tool' | 'ledger';
+    id: string;
+    note?: string;
+  }>;
+};
+
+const browserChatConversationMemoryAiSchema = z.object({
+  latestUserGoal: z.string().max(700).optional(),
+  summary: z.string().min(1).max(2400),
+  userConstraints: z.array(z.string().min(1).max(260)).max(24),
+  completed: z.array(z.string().min(1).max(360)).max(36),
+  pending: z.array(z.string().min(1).max(360)).max(24),
+  findings: z.array(z.string().min(1).max(360)).max(36),
+  blockers: z.array(z.string().min(1).max(360)).max(24),
+  decisions: z.array(z.string().min(1).max(360)).max(28),
+  lastAssistantReply: z.string().max(900).optional(),
+  continuationHint: z.string().max(700).optional(),
+  evidenceRefs: z.array(z.object({
+    type: z.enum(['message', 'step', 'tool', 'ledger']),
+    id: z.string().min(1).max(160),
+    note: z.string().max(180).optional(),
+  })).max(100),
+});
+
 export type BrowserChatSessionSnapshot = {
   id: string;
   title: string;
@@ -63,6 +106,7 @@ export type BrowserChatSessionSnapshot = {
   consoleErrors: string[];
   networkErrors: string[];
   logs: BrowserChatLogRecord[];
+  conversationMemory?: BrowserChatConversationMemory;
 };
 
 type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
@@ -72,13 +116,31 @@ type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
   started: boolean;
 };
 
-const sessions = new Map<string, BrowserChatSessionRecord>();
+type BrowserChatRuntimeState = {
+  sessions: Map<string, BrowserChatSessionRecord>;
+  interruptedAssistantMessageIds: Set<string>;
+  sessionsHydrated: boolean;
+  lastPersistWarningAt: number;
+};
+
+const browserChatRuntimeState = ((globalThis as typeof globalThis & {
+  __browserChatRuntimeState?: BrowserChatRuntimeState;
+}).__browserChatRuntimeState ??= {
+  sessions: new Map<string, BrowserChatSessionRecord>(),
+  interruptedAssistantMessageIds: new Set<string>(),
+  sessionsHydrated: false,
+  lastPersistWarningAt: 0,
+});
+
+const sessions = browserChatRuntimeState.sessions;
 const sessionsPath = path.join(appDataRoot(), '.data', 'browser-chat-sessions.json');
-const interruptedAssistantMessageIds = new Set<string>();
-let sessionsHydrated = false;
-let lastPersistWarningAt = 0;
+const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const runningHydrationGraceMs = 2 * 60 * 1000;
 const fullLogDetailsFlag = '__browserChatFullLogDetails';
+
+function fullLogDetails(value: unknown) {
+  return { [fullLogDetailsFlag]: true, value };
+}
 
 function now() {
   return new Date().toISOString();
@@ -175,6 +237,50 @@ function compactText(value = '', max = 180) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
+function normalizeConversationMemory(value: unknown): BrowserChatConversationMemory | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Partial<BrowserChatConversationMemory>;
+  const arrayOfStrings = (items: unknown, limit: number, max = 420) => (
+    Array.isArray(items)
+      ? items.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map((item) => compactText(item, max)).slice(-limit)
+      : []
+  );
+  const evidenceRefs = Array.isArray(record.evidenceRefs)
+    ? record.evidenceRefs
+      .filter((item): item is BrowserChatConversationMemory['evidenceRefs'][number] => (
+        Boolean(item)
+        && typeof item === 'object'
+        && ['message', 'step', 'tool', 'ledger'].includes(String((item as { type?: unknown }).type))
+        && typeof (item as { id?: unknown }).id === 'string'
+      ))
+      .map((item) => ({
+        type: item.type,
+        id: item.id,
+        note: typeof item.note === 'string' ? compactText(item.note, 180) : undefined,
+      }))
+      .slice(-80)
+    : [];
+  return {
+    version: 1,
+    updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : now(),
+    coveredMessageIds: arrayOfStrings(record.coveredMessageIds, 300, 120),
+    coveredStepIndexes: Array.isArray(record.coveredStepIndexes)
+      ? record.coveredStepIndexes.filter((item): item is number => Number.isInteger(item)).slice(-300)
+      : [],
+    latestUserGoal: typeof record.latestUserGoal === 'string' ? compactText(record.latestUserGoal, 600) : undefined,
+    summary: compactText(record.summary || '', 2400),
+    userConstraints: arrayOfStrings(record.userConstraints, 24, 260),
+    completed: arrayOfStrings(record.completed, 36, 360),
+    pending: arrayOfStrings(record.pending, 24, 360),
+    findings: arrayOfStrings(record.findings, 36, 360),
+    blockers: arrayOfStrings(record.blockers, 24, 360),
+    decisions: arrayOfStrings(record.decisions, 28, 360),
+    lastAssistantReply: typeof record.lastAssistantReply === 'string' ? compactText(record.lastAssistantReply, 900) : undefined,
+    continuationHint: typeof record.continuationHint === 'string' ? compactText(record.continuationHint, 700) : undefined,
+    evidenceRefs,
+  };
+}
+
 function normalizeAttachmentPath(value: unknown) {
   const raw = typeof value === 'string' ? value.trim().replace(/\\/g, '/') : '';
   if (!raw || raw.startsWith('/') || raw.includes('..')) return undefined;
@@ -222,6 +328,217 @@ function attachmentSummary(attachments?: BrowserChatAttachment[]) {
 
 function messageContentForPrompt(message: BrowserChatMessage) {
   return [message.content, attachmentSummary(message.attachments)].filter(Boolean).join('\n\n');
+}
+
+function browserChatRawHistoryMessages() {
+  const raw = Number(process.env.AI_BROWSER_CHAT_RAW_HISTORY_MESSAGES || 8);
+  const value = Math.floor(Number.isFinite(raw) ? raw : 8);
+  return Math.min(Math.max(value, 2), 20);
+}
+
+function stableConversationMessages(messages: BrowserChatMessage[]) {
+  return messages.filter((message) => (
+    (message.role === 'user' || message.role === 'assistant')
+    && message.status !== 'running'
+    && !isTransientBrowserChatProgress(message.content)
+  ));
+}
+
+function latestAssistantMessage(messages: BrowserChatMessage[], assistantMessageId?: string) {
+  if (assistantMessageId) {
+    const byId = messages.find((message) => message.id === assistantMessageId && message.role === 'assistant');
+    if (byId) return byId;
+  }
+  return stableConversationMessages(messages).filter((message) => message.role === 'assistant').at(-1);
+}
+
+function browserChatMemoryMessageLimit() {
+  const raw = Number(process.env.AI_BROWSER_CHAT_MEMORY_MESSAGE_LIMIT || 40);
+  const value = Math.floor(Number.isFinite(raw) ? raw : 40);
+  return Math.min(Math.max(value, 8), 120);
+}
+
+function browserChatMemoryStepLimit() {
+  const raw = Number(process.env.AI_BROWSER_CHAT_MEMORY_STEP_LIMIT || 40);
+  const value = Math.floor(Number.isFinite(raw) ? raw : 40);
+  return Math.min(Math.max(value, 8), 120);
+}
+
+function estimateTextTokens(value: string) {
+  let ascii = 0;
+  let nonAscii = 0;
+  for (const char of value) {
+    if (char.charCodeAt(0) <= 0x7f) ascii += 1;
+    else nonAscii += 1;
+  }
+  return Math.ceil(ascii / 4 + nonAscii);
+}
+
+function compactStepForMemoryPrompt(step: StepExecutionResult) {
+  return {
+    index: step.index,
+    status: step.status,
+    action: compactText(step.action, 700),
+    expected: compactText(step.expected, 700),
+    actual: compactText(step.actual, 1400),
+    note: compactText(step.note || '', 700) || undefined,
+    findings: (step.findings || []).map((item) => compactText(item, 500)),
+    memoryItems: (step.memoryItems || []).map((item) => compactText(item, 500)),
+    taskFrame: step.taskFrame,
+    ledgerItems: [
+      ...(step.ledgerItems || []),
+      ...(step.workingMemory?.ledgerItems || []),
+    ],
+    workingMemory: step.workingMemory ? {
+      taskGoal: step.workingMemory.taskGoal,
+      phase: step.workingMemory.phase,
+      completed: step.workingMemory.completed,
+      findings: step.workingMemory.findings,
+      blockers: step.workingMemory.blockers,
+      lastAction: step.workingMemory.lastAction,
+      lastResult: step.workingMemory.lastResult,
+      pageUnderstanding: step.workingMemory.pageUnderstanding,
+      currentState: step.workingMemory.currentState,
+      scrollSummary: step.workingMemory.scrollSummary,
+      userConstraints: step.workingMemory.userConstraints,
+      nextStep: step.workingMemory.nextStep,
+    } : undefined,
+    tools: (step.tools || []).map((tool, index) => ({
+      index: index + 1,
+      name: tool.name,
+      input: tool.input,
+      reason: compactText(tool.reason || '', 700) || undefined,
+      ok: tool.ok,
+      result: compactText(tool.result || '', 2000) || undefined,
+    })),
+  };
+}
+
+function buildBrowserChatConversationMemoryPrompt(
+  session: BrowserChatSessionRecord,
+  result: InteractiveBrowserTurnResult,
+  assistantMessageId: string,
+): { prompt: string; promptInput: unknown; tokenEstimate: number; coveredMessageIds: string[]; coveredStepIndexes: number[] } {
+  const previous = normalizeConversationMemory(session.conversationMemory);
+  const messages = stableConversationMessages(session.messages);
+  const latestAssistant = latestAssistantMessage(messages, assistantMessageId);
+  const selectedMessages = messages.slice(-browserChatMemoryMessageLimit()).map((message) => ({
+    id: message.id,
+    role: message.role,
+    status: message.status,
+    createdAt: message.createdAt,
+    updatedAt: message.updatedAt,
+    content: compactText(messageContentForPrompt(message), 3000),
+    stepIndexes: message.stepIndexes || [],
+  }));
+  const selectedSteps = session.steps.slice(-browserChatMemoryStepLimit()).map(compactStepForMemoryPrompt);
+  const promptInput = {
+    previousMemory: previous || null,
+    session: {
+      id: session.id,
+      title: session.title,
+      targetUrl: session.targetUrl,
+      mode: session.mode,
+    },
+    currentTurn: {
+      assistantMessageId,
+      status: result.status,
+      reply: result.reply,
+      latestAssistantReply: latestAssistant?.content || result.reply,
+      newStepIndexes: result.newSteps.map((step) => step.index),
+      consoleErrors: result.consoleErrors.slice(-20),
+      networkErrors: result.networkErrors.slice(-20),
+    },
+    messages: selectedMessages,
+    steps: selectedSteps,
+  };
+  const prompt = [
+    'You are the memory summarizer for an interactive browser-chat agent.',
+    'Create the next durable Conversation Memory JSON from the previous memory, the raw conversation window, and browser execution evidence.',
+    '',
+    'Rules:',
+    '- You must synthesize semantically; do not copy long raw logs.',
+    '- Preserve the latest user goal, constraints, completed work, pending work, findings, blockers, decisions, and continuation hint.',
+    '- If the new evidence contradicts prior memory, prefer the new evidence and mention the correction.',
+    '- Keep the memory useful for the next browser-chat turn, especially after Agent Loop limits.',
+    '- Use Chinese for user-facing content when the conversation is Chinese; technical ids/tool names may stay as-is.',
+    '- evidenceRefs must point to message ids, step indexes, tool ids like "12.1:fillCandidates", or ledger ids that support the memory.',
+    '- Do not invent facts that are not present in the input.',
+    '',
+    `Input JSON:\n${stringifyJsonSafe(promptInput, 2)}`,
+  ].join('\n');
+  return {
+    prompt,
+    promptInput,
+    tokenEstimate: estimateTextTokens(prompt),
+    coveredMessageIds: messages.map((message) => message.id).slice(-300),
+    coveredStepIndexes: session.steps.map((step) => step.index).slice(-300),
+  };
+}
+
+async function generateBrowserChatConversationMemory(
+  session: BrowserChatSessionRecord,
+  result: InteractiveBrowserTurnResult,
+  assistantMessageId: string,
+  abortSignal?: AbortSignal,
+): Promise<BrowserChatConversationMemory> {
+  if (abortSignal?.aborted) throw abortSignal.reason || new Error('Browser-chat memory summary aborted.');
+  const { provider, model } = getModelSettings();
+  const built = buildBrowserChatConversationMemoryPrompt(session, result, assistantMessageId);
+  appendLog(session, 'conversation:memory:request', 'Requesting AI conversation memory summary.', {
+    details: fullLogDetails({
+      provider,
+      model,
+      promptTokenEstimate: built.tokenEstimate,
+      prompt: built.prompt,
+      input: built.promptInput,
+    }),
+  });
+  const startedAt = Date.now();
+  const timeoutMs = Math.max(1000, Number(process.env.AI_BROWSER_CHAT_MEMORY_TIMEOUT_MS || process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000));
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => timeoutController.abort(new Error(`AI memory summary timed out after ${timeoutMs}ms`)), timeoutMs);
+  const combinedSignal = abortSignal ? AbortSignal.any([abortSignal, timeoutController.signal]) : timeoutController.signal;
+  try {
+    const generated = await generateObject({
+      model: getModel(),
+      schema: browserChatConversationMemoryAiSchema,
+      temperature: 0.1,
+      prompt: built.prompt,
+      maxRetries: 0,
+      abortSignal: combinedSignal,
+    });
+    const memory = normalizeConversationMemory({
+      ...generated.object,
+      version: 1,
+      updatedAt: now(),
+      coveredMessageIds: built.coveredMessageIds,
+      coveredStepIndexes: built.coveredStepIndexes,
+    });
+    if (!memory) throw new Error('AI memory summary did not match the BrowserChatConversationMemory schema.');
+    appendLog(session, 'conversation:memory:response', 'AI conversation memory summary completed.', {
+      elapsedMs: elapsedMs(startedAt),
+      details: fullLogDetails({
+        provider,
+        model,
+        elapsedMs: elapsedMs(startedAt),
+        promptTokenEstimate: built.tokenEstimate,
+        response: generated.object,
+        memory,
+      }),
+    });
+    return memory;
+  } catch (error) {
+    if (abortSignal?.aborted) throw abortSignal.reason || error;
+    if (timeoutController.signal.aborted) {
+      const timeoutError = new Error(`AI memory summary timed out after ${timeoutMs}ms`);
+      (timeoutError as { cause?: unknown }).cause = error;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function safeJson(value: unknown) {
@@ -283,6 +600,7 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     consoleErrors: [...session.consoleErrors],
     networkErrors: [...session.networkErrors],
     logs: [...(session.logs || [])],
+    conversationMemory: normalizeConversationMemory(session.conversationMemory),
   };
 }
 
@@ -303,6 +621,7 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
     consoleErrors: [],
     networkErrors: [],
     logs: session.busy ? [...(session.logs || []).slice(-8)] : [],
+    conversationMemory: normalizeConversationMemory(session.conversationMemory),
   };
 }
 
@@ -384,6 +703,7 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
     ...session,
     messages,
     steps,
+    conversationMemory: normalizeConversationMemory(session.conversationMemory),
     status,
     busy: preserveRecentRunningState ? session.busy : false,
     logs: session.logs || [],
@@ -430,11 +750,170 @@ function appendLog(
   persistAndNotify(session.id);
 }
 
-function persistSessions() {
+function readSessionSnapshotsFromFile(): BrowserChatSessionSnapshot[] {
+  if (!existsSync(sessionsPath)) return [];
+  const data = JSON.parse(readFileSync(sessionsPath, 'utf8')) as unknown;
+  if (!Array.isArray(data)) throw new Error('Browser chat sessions file must contain an array.');
+  return data.filter((item): item is BrowserChatSessionSnapshot => (
+    Boolean(item)
+    && typeof item === 'object'
+    && !Array.isArray(item)
+    && typeof (item as { id?: unknown }).id === 'string'
+  ));
+}
+
+function writeSessionSnapshotsToFile(items: BrowserChatSessionSnapshot[]) {
+  const payload = stringifyJsonSafe(items, 2);
+  if (!payload) throw new Error('Browser chat sessions could not be serialized.');
+  writeTextFileAtomic(sessionsPath, payload);
+}
+
+function timestampValue(value?: string) {
+  const parsed = value ? Date.parse(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function messageTimestamp(message: BrowserChatMessage) {
+  return Math.max(timestampValue(message.updatedAt), timestampValue(message.createdAt));
+}
+
+function mergeSortedNumbers(first?: number[], second?: number[]) {
+  return Array.from(new Set([...(first || []), ...(second || [])])).sort((a, b) => a - b);
+}
+
+function mergeStringLists(first?: string[], second?: string[]) {
+  return Array.from(new Set([...(first || []), ...(second || [])].filter(Boolean)));
+}
+
+function mergeMessagesFromFile(existing: BrowserChatMessage[] = [], incoming: BrowserChatMessage[] = []) {
+  const byId = new Map<string, BrowserChatMessage>();
+  for (const message of existing) byId.set(message.id, message);
+  for (const message of incoming) {
+    const previous = byId.get(message.id);
+    if (!previous) {
+      byId.set(message.id, message);
+      continue;
+    }
+    const incomingNewer = messageTimestamp(message) >= messageTimestamp(previous);
+    const merged = incomingNewer ? { ...previous, ...message } : { ...message, ...previous };
+    byId.set(message.id, {
+      ...merged,
+      stepIndexes: mergeSortedNumbers(previous.stepIndexes, message.stepIndexes),
+      attachments: incomingNewer ? message.attachments || previous.attachments : previous.attachments || message.attachments,
+    });
+  }
+  return [...byId.values()].sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
+}
+
+function stepCompletenessScore(step: StepExecutionResult) {
+  let score = 0;
+  score += (step.tools?.length || 0) * 20;
+  if (step.aiRequest) score += 8;
+  if (step.beforeScreenshotPath) score += 4;
+  if (step.afterScreenshotPath) score += 4;
+  if (step.screenshotPath) score += 2;
+  if (step.visualContext) score += 2;
+  if (step.workingMemory) score += 2;
+  if (step.status && step.status !== 'running') score += 10;
+  return score;
+}
+
+function mergeStepFromFile(existing: StepExecutionResult, incoming: StepExecutionResult) {
+  if (existing.status !== 'running' && incoming.status === 'running') return existing;
+  if (incoming.status !== 'running' && existing.status === 'running') return incoming;
+  return stepCompletenessScore(incoming) >= stepCompletenessScore(existing)
+    ? { ...existing, ...incoming }
+    : { ...incoming, ...existing };
+}
+
+function mergeStepsFromFile(existing: StepExecutionResult[] = [], incoming: StepExecutionResult[] = []) {
+  const byIndex = new Map<number, StepExecutionResult>();
+  for (const step of existing) byIndex.set(step.index, step);
+  for (const step of incoming) {
+    const previous = byIndex.get(step.index);
+    byIndex.set(step.index, previous ? mergeStepFromFile(previous, step) : step);
+  }
+  return [...byIndex.values()].sort((a, b) => a.index - b.index);
+}
+
+function mergeLogsFromFile(existing: BrowserChatLogRecord[] = [], incoming: BrowserChatLogRecord[] = []) {
+  const byKey = new Map<string, BrowserChatLogRecord>();
+  const keyOf = (item: BrowserChatLogRecord) => item.id || [item.time, item.phase, item.message, item.stepIndex || ''].join('|');
+  for (const item of existing) byKey.set(keyOf(item), item);
+  for (const item of incoming) byKey.set(keyOf(item), item);
+  return [...byKey.values()]
+    .sort((a, b) => timestampValue(a.time) - timestampValue(b.time))
+    .slice(-300);
+}
+
+function mergeConversationMemoryFromFile(
+  existing?: BrowserChatConversationMemory,
+  incoming?: BrowserChatConversationMemory,
+) {
+  if (!existing) return normalizeConversationMemory(incoming);
+  if (!incoming) return normalizeConversationMemory(existing);
+  return timestampValue(incoming.updatedAt) >= timestampValue(existing.updatedAt)
+    ? normalizeConversationMemory(incoming)
+    : normalizeConversationMemory(existing);
+}
+
+function mergeSessionSnapshotFromFile(
+  existing: BrowserChatSessionSnapshot | undefined,
+  incoming: BrowserChatSessionSnapshot,
+): BrowserChatSessionSnapshot {
+  if (!existing) return incoming;
+  const incomingNewer = timestampValue(incoming.updatedAt) >= timestampValue(existing.updatedAt);
+  const base = incomingNewer ? { ...existing, ...incoming } : { ...incoming, ...existing };
+  return {
+    ...base,
+    messages: mergeMessagesFromFile(existing.messages, incoming.messages),
+    steps: mergeStepsFromFile(existing.steps, incoming.steps),
+    consoleErrors: mergeStringLists(existing.consoleErrors, incoming.consoleErrors),
+    networkErrors: mergeStringLists(existing.networkErrors, incoming.networkErrors),
+    logs: mergeLogsFromFile(existing.logs, incoming.logs),
+    conversationMemory: mergeConversationMemoryFromFile(existing.conversationMemory, incoming.conversationMemory),
+  };
+}
+
+function applyFileSnapshotToRuntime(snapshotFromFile: BrowserChatSessionSnapshot) {
+  const existing = sessions.get(snapshotFromFile.id);
+  if (!existing) {
+    sessions.set(snapshotFromFile.id, recordFromSnapshot(snapshotFromFile));
+    return;
+  }
+  const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, snapshotFromFile);
+  const fromDisk = recordFromSnapshot(snapshotFromFile, { preserveRunningState: preserveRuntimeTurn });
+  const runtimeState = {
+    activeAbortController: preserveRuntimeTurn ? existing.activeAbortController : undefined,
+    activeAssistantMessageId: preserveRuntimeTurn ? existing.activeAssistantMessageId : undefined,
+    browser: existing.browser,
+    started: existing.started,
+  };
+  Object.assign(existing, fromDisk, runtimeState);
+}
+
+function persistSessionToFile(sessionId: string) {
   try {
-    const payload = stringifyJsonSafe([...sessions.values()].map((session) => snapshot(session, { fullSteps: true })), 2);
-    if (!payload) throw new Error('Browser chat sessions could not be serialized.');
-    writeTextFileAtomic(sessionsPath, payload);
+    const diskSnapshots = readSessionSnapshotsFromFile();
+    const currentSession = sessions.get(sessionId);
+    const incoming = currentSession ? snapshot(currentSession, { fullSteps: true }) : undefined;
+    let writtenSnapshot: BrowserChatSessionSnapshot | undefined;
+    let found = false;
+    const nextSnapshots = diskSnapshots
+      .map((item) => {
+        if (item.id !== sessionId) return item;
+        found = true;
+        if (!incoming) return undefined;
+        writtenSnapshot = mergeSessionSnapshotFromFile(item, incoming);
+        return writtenSnapshot;
+      })
+      .filter((item): item is BrowserChatSessionSnapshot => Boolean(item));
+    if (incoming && !found) {
+      writtenSnapshot = mergeSessionSnapshotFromFile(undefined, incoming);
+      nextSnapshots.push(writtenSnapshot);
+    }
+    writeSessionSnapshotsToFile(nextSnapshots);
+    if (writtenSnapshot) applyFileSnapshotToRuntime(writtenSnapshot);
     return true;
   } catch (error) {
     warnPersistFailure(error);
@@ -443,21 +922,31 @@ function persistSessions() {
 }
 
 function persistAndNotify(sessionId: string) {
-  const persisted = persistSessions();
-  if (!persisted) return;
+  const persisted = persistSessionToFile(sessionId);
+  if (!persisted) return false;
   notifySessionUpdate(sessionId);
+  return true;
+}
+
+function persistDeletedSessionsToFile(sessionIds: string[]) {
+  try {
+    const deletedIds = new Set(sessionIds);
+    const nextSnapshots = readSessionSnapshotsFromFile().filter((item) => !deletedIds.has(item.id));
+    writeSessionSnapshotsToFile(nextSnapshots);
+    return true;
+  } catch (error) {
+    warnPersistFailure(error);
+    return false;
+  }
 }
 
 function hydrateSessions() {
-  const wasHydrated = sessionsHydrated;
-  sessionsHydrated = true;
-  if (!existsSync(sessionsPath)) return;
+  const wasHydrated = browserChatRuntimeState.sessionsHydrated;
+  browserChatRuntimeState.sessionsHydrated = true;
   try {
-    const data = JSON.parse(readFileSync(sessionsPath, 'utf8')) as BrowserChatSessionSnapshot[];
-    if (!Array.isArray(data)) return;
+    const data = readSessionSnapshotsFromFile();
     const diskSessionIds = new Set<string>();
     for (const item of data) {
-      if (!item?.id) continue;
       diskSessionIds.add(item.id);
       const existing = sessions.get(item.id);
       if (!existing) {
@@ -476,17 +965,32 @@ function hydrateSessions() {
     }
     for (const [sessionId, session] of sessions) {
       if (diskSessionIds.has(sessionId)) continue;
-      if (session.busy || session.activeAbortController) continue;
+      if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
+        session.activeAbortController.abort(new Error('Browser chat session no longer exists in the session file.'));
+      }
+      session.activeAbortController = undefined;
+      session.activeAssistantMessageId = undefined;
+      session.busy = false;
       sessions.delete(sessionId);
     }
-  } catch {
+  } catch (error) {
+    warnPersistFailure(error);
     if (!wasHydrated) sessions.clear();
   }
 }
 
-function conversationForPrompt(messages: BrowserChatMessage[]): InteractiveBrowserTurnMessage[] {
-  return messages
-    .filter((message) => (message.role === 'user' || message.role === 'assistant') && message.status !== 'running')
+function conversationForPrompt(
+  messages: BrowserChatMessage[],
+  memory?: BrowserChatConversationMemory,
+): InteractiveBrowserTurnMessage[] {
+  const rawLimit = browserChatRawHistoryMessages();
+  const stableMessages = stableConversationMessages(messages);
+  const coveredIds = new Set(memory?.coveredMessageIds || []);
+  const uncovered = stableMessages.filter((message) => !coveredIds.has(message.id)).slice(-rawLimit);
+  const recent = stableMessages.slice(-rawLimit);
+  const merged = new Map<string, BrowserChatMessage>();
+  for (const message of [...uncovered, ...recent]) merged.set(message.id, message);
+  return [...merged.values()]
     .map((message) => ({ role: message.role, content: messageContentForPrompt(message) }));
 }
 
@@ -622,6 +1126,16 @@ export async function closeBrowserChatSession(sessionId: string) {
 
 export async function deleteBrowserChatSession(sessionId: string) {
   hydrateSessions();
+  const removed = await deleteBrowserChatSessionFromMemory(sessionId);
+  if (!removed) return undefined;
+  if (!persistAndNotify(sessionId)) {
+    sessions.set(sessionId, removed.session);
+    throw new Error('Browser chat session was removed from memory, but the session file could not be updated.');
+  }
+  return removed.deleted;
+}
+
+async function deleteBrowserChatSessionFromMemory(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
@@ -633,17 +1147,28 @@ export async function deleteBrowserChatSession(sessionId: string) {
   session.activeAbortController = undefined;
   session.activeAssistantMessageId = undefined;
   sessions.delete(sessionId);
-  persistAndNotify(sessionId);
-  return { id: sessionId };
+  return { deleted: { id: sessionId }, session };
 }
 
 export async function deleteBrowserChatSessions(sessionIds: string[]) {
   hydrateSessions();
   const uniqueIds = Array.from(new Set(sessionIds.map((item) => item.trim()).filter(Boolean)));
   const deleted: Array<{ id: string }> = [];
+  const removed: Array<{ deleted: { id: string }; session: BrowserChatSessionRecord }> = [];
   for (const sessionId of uniqueIds) {
-    const result = await deleteBrowserChatSession(sessionId);
-    if (result) deleted.push(result);
+    const result = await deleteBrowserChatSessionFromMemory(sessionId);
+    if (result) {
+      removed.push(result);
+      deleted.push(result.deleted);
+    }
+  }
+  if (removed.length) {
+    const persisted = persistDeletedSessionsToFile(removed.map((item) => item.deleted.id));
+    if (!persisted) {
+      for (const item of removed) sessions.set(item.deleted.id, item.session);
+      throw new Error('Browser chat sessions were removed from memory, but the session file could not be updated.');
+    }
+    for (const item of removed) notifySessionUpdate(item.deleted.id);
   }
   return { deleted, requested: uniqueIds.length };
 }
@@ -833,8 +1358,8 @@ function jsonSafeClone<T>(value: T): T {
 
 function warnPersistFailure(error: unknown) {
   const timestamp = Date.now();
-  if (timestamp - lastPersistWarningAt < 1000) return;
-  lastPersistWarningAt = timestamp;
+  if (timestamp - browserChatRuntimeState.lastPersistWarningAt < 1000) return;
+  browserChatRuntimeState.lastPersistWarningAt = timestamp;
   console.warn('[browser-chat] Failed to persist sessions; keeping realtime state in memory.', error);
 }
 
@@ -912,13 +1437,14 @@ function runningActivityFromLog(phase: string, message: string) {
 
 function isActiveBrowserChatTurn(session: BrowserChatSessionRecord, assistantMessageId: string, abortController: AbortController) {
   return !interruptedAssistantMessageIds.has(assistantMessageId)
+    && sessions.get(session.id) === session
     && session.activeAssistantMessageId === assistantMessageId
     && session.activeAbortController === abortController
     && !abortController.signal.aborted;
 }
 
 export function interruptBrowserChatSession(sessionId: string) {
-  if (!sessionsHydrated) hydrateSessions();
+  hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   const timestamp = now();
@@ -927,6 +1453,10 @@ export function interruptBrowserChatSession(sessionId: string) {
   markAssistantMessageInterrupted(assistantMessageId);
   if (abortController && !abortController.signal.aborted) {
     abortController.abort(new Error('Browser chat operation interrupted by user.'));
+  } else if (assistantMessageId) {
+    appendLog(session, 'chat:interrupt:controller-missing', 'Interrupt requested, but the active AbortController was not available; stale runtime writes will be ignored by message id.', {
+      details: { assistantMessageId },
+    });
   }
   if (assistantMessageId) {
     updateAssistantMessage(session, assistantMessageId, (message) => ({
@@ -953,7 +1483,9 @@ export function interruptBrowserChatSession(sessionId: string) {
       messageId: assistantMessageId,
     },
   ].slice(-300);
-  persistAndNotify(session.id);
+  if (!persistAndNotify(session.id)) {
+    throw new Error('Browser chat interrupt state could not be persisted.');
+  }
   return snapshot(session);
 }
 
@@ -977,11 +1509,13 @@ async function runBrowserChatMessage(
       runId: session.id,
       targetUrl: session.targetUrl || 'about:blank',
       instruction: text,
-      conversation: conversationForPrompt(session.messages),
+      conversation: conversationForPrompt(session.messages, session.conversationMemory),
+      conversationMemory: normalizeConversationMemory(session.conversationMemory),
       completedSteps: session.steps,
       mode: session.mode,
       referenceImagePaths,
       abortSignal: abortController.signal,
+      shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
       onProgress: (step) => {
         if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
         const index = session.steps.findIndex((item) => item.index === step.index);
@@ -1028,16 +1562,32 @@ async function runBrowserChatMessage(
       status: result.status,
       activity: undefined,
     }));
+    try {
+      const nextConversationMemory = await generateBrowserChatConversationMemory(session, result, assistantMessageId, abortController.signal);
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      session.conversationMemory = nextConversationMemory;
+      appendLog(session, 'conversation:memory:update', 'Updated browser-chat conversation memory for the next turn.', {
+        details: fullLogDetails(session.conversationMemory),
+      });
+    } catch (memoryError) {
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      if (abortController.signal.aborted) throw memoryError;
+      appendLog(session, 'conversation:memory:error', 'Failed to update browser-chat conversation memory; continuing without blocking the turn.', {
+        details: errorLogDetails(memoryError),
+      });
+    }
+    if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+    const completedAt = now();
     session.status = 'idle';
     session.busy = false;
     session.activeAssistantMessageId = undefined;
     session.activeAbortController = undefined;
-    session.updatedAt = finishedAt;
+    session.updatedAt = completedAt;
     session.logs = [
       ...(session.logs || []),
       {
         id: id('log'),
-        time: finishedAt,
+        time: completedAt,
         phase: 'chat:run:done',
         message: '本轮对话操作已完成，最终结果已写入。',
         messageId: assistantMessageId,
@@ -1045,8 +1595,9 @@ async function runBrowserChatMessage(
     ].slice(-300);
     persistAndNotify(session.id);
   } catch (error) {
-    const interrupted = abortController.signal.aborted;
-    if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController) && interrupted) return;
+    const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);
+    const interrupted = abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId);
+    if (!stillActive) return;
     const message = userFacingErrorMessage(error);
     const details = errorLogDetails(error);
     if (isDeadBrowserSessionError(error)) {
