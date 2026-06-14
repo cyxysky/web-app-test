@@ -584,6 +584,7 @@ function previewMessages(session: BrowserChatSessionRecord) {
 }
 
 function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: boolean } = {}): BrowserChatSessionSnapshot {
+  finalizeIdleRunningAssistantMessages(session);
   return {
     id: session.id,
     title: session.title,
@@ -605,6 +606,7 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
 }
 
 function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionSnapshot {
+  finalizeIdleRunningAssistantMessages(session);
   return {
     id: session.id,
     title: session.title,
@@ -652,6 +654,36 @@ function latestRunningAssistantMessageId(session: Pick<BrowserChatSessionSnapsho
   return undefined;
 }
 
+function recoveredStatusForStaleAssistantMessage(
+  session: Pick<BrowserChatSessionRecord, 'steps'>,
+  message: BrowserChatMessage,
+): BrowserChatMessage['status'] {
+  const linkedIndexes = new Set(message.stepIndexes || []);
+  const linkedSteps = linkedIndexes.size
+    ? session.steps.filter((step) => linkedIndexes.has(step.index))
+    : [];
+  const steps = linkedSteps.length ? linkedSteps : session.steps.slice(-1);
+  if (steps.some((step) => step.status === 'blocked')) return 'blocked';
+  if (steps.some((step) => step.status === 'failed')) return 'failed';
+  if (steps.some((step) => step.status === 'passed')) return 'passed';
+  return 'interrupted';
+}
+
+function finalizeIdleRunningAssistantMessages(session: BrowserChatSessionRecord) {
+  if (session.busy || session.status === 'running') return false;
+  let changed = false;
+  session.messages = session.messages.map((message) => {
+    if (message.role !== 'assistant' || message.status !== 'running') return message;
+    changed = true;
+    return {
+      ...message,
+      status: recoveredStatusForStaleAssistantMessage(session, message),
+      activity: undefined,
+    };
+  });
+  return changed;
+}
+
 function markAssistantMessageInterrupted(assistantMessageId?: string) {
   if (!assistantMessageId) return;
   interruptedAssistantMessageIds.add(assistantMessageId);
@@ -670,8 +702,7 @@ function shouldPreserveRuntimeTurn(existing: BrowserChatSessionRecord, fromDisk:
 }
 
 function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { preserveRunningState?: boolean } = {}): BrowserChatSessionRecord {
-  const hasRunningMessage = hasRunningAssistantMessage(session);
-  const preserveRecentRunningState = (session.busy || session.status === 'running' || hasRunningMessage)
+  const preserveRecentRunningState = (session.busy || session.status === 'running' || options.preserveRunningState)
     && (options.preserveRunningState || isRecentTimestamp(session.updatedAt));
   const status = preserveRecentRunningState ? session.status : (session.status === 'running' ? 'idle' : session.status);
   const transientStepIndexes = new Set(
@@ -694,7 +725,9 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
     return {
       ...message,
       content: contentIsTransient ? '本轮对话在准备页面状态时中断，未执行新的浏览器操作。' : message.content || '上次对话未完成，已恢复为空闲状态。',
-      status: message.status === 'running' || contentIsTransient ? 'interrupted' as const : message.status,
+      status: message.status === 'running' || contentIsTransient
+        ? recoveredStatusForStaleAssistantMessage({ steps } as Pick<BrowserChatSessionRecord, 'steps'>, message)
+        : message.status,
       activity: undefined,
       stepIndexes,
     };
@@ -1363,24 +1396,6 @@ function warnPersistFailure(error: unknown) {
   console.warn('[browser-chat] Failed to persist sessions; keeping realtime state in memory.', error);
 }
 
-function looksLikeDomSnapshot(value?: string) {
-  const text = (value || '').trim();
-  if (!text || !/\bnode_id=\d+\b/.test(text)) return false;
-  return /<\s*(?:a|button|input|select|textarea|option|summary|details|label|form|iframe)\b/i.test(text);
-}
-
-function runningAssistantContent(step: StepExecutionResult) {
-  const latestTool = step.tools?.at(-1);
-  const note = step.note?.trim();
-  if (note && !looksLikeDomSnapshot(note)) return note;
-  const actual = step.actual?.trim();
-  if (step.status === 'failed' && latestTool?.ok !== false) {
-    return (actual && !looksLikeDomSnapshot(actual) ? actual : undefined) || 'AI 请求异常，已保留当前页面状态。';
-  }
-  if (latestTool) return '';
-  return '';
-}
-
 function runningAssistantActivity(step: StepExecutionResult, timestamp: string) {
   const latestTool = step.tools?.at(-1);
   if (step.status === 'failed' && latestTool?.ok !== false) {
@@ -1526,7 +1541,6 @@ async function runBrowserChatMessage(
           const timestamp = now();
           updateAssistantMessage(session, assistantMessageId, (message) => ({
             ...message,
-            content: runningAssistantContent(step),
             activity: runningAssistantActivity(step, timestamp),
             status: 'running',
             updatedAt: timestamp,

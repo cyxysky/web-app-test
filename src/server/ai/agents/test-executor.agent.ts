@@ -338,7 +338,7 @@ function looksLikeDomSnapshot(value?: string) {
 function userFacingToolResult(name: string, result?: BrowserActionResult, max = 360) {
   if (!result) return undefined;
   if (!result.ok) return trimDebugText(result.actual, max);
-  if (name === 'getDomTree' || looksLikeDomSnapshot(result.actual)) return '已读取当前可见 DOM 快照。';
+  if (looksLikeDomSnapshot(result.actual)) return '已读取当前可见 DOM 快照。';
   if (name === 'getInteractiveCandidates') return '已读取当前可见可交互元素。';
   if (name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
   if (name === 'listTabs') return '已读取浏览器标签页列表。';
@@ -932,7 +932,6 @@ const noVisualAfterCaptureToolNames = new Set([
   'listTabs',
   'getHttpRequests',
   'getInteractiveCandidates',
-  'getDomTree',
   'getDomNodeText',
   'findByText',
   'waitForHumanVerification',
@@ -1508,11 +1507,6 @@ function makeBrowserTools(
   };
 
   const domTools = {
-    getDomTree: tool({
-      description: 'Return a Codex-style visible DOM snapshot for the current tab. It is filtered to visible interactable nodes and uses HTML-like lines such as <button node_id=12 aria-label="Save">Save</button>. Numeric node_id values are valid only for this current snapshot. Use getDomNodeText(id) for full text on a returned node.',
-      inputSchema: browserToolInput({}),
-      execute: (input) => record('getDomTree', input, () => session.getSimplifiedDomTree()),
-    }),
     getDomNodeText: tool({
       description: 'DOM mode: return the full rendered text under a node from the CURRENT visible DOM snapshot by numeric node_id, for example "12" or "[12]". This is read-only and does not click, navigate, or scroll.',
       inputSchema: browserToolInput({
@@ -1682,6 +1676,22 @@ async function verifyRuntimeCompletion(input: {
 }
 
 // 根据当前模式生成验证码/安全校验规则；DOM 模式不要要求 AI 读取截图。
+function domRuntimeSystemPrompt(pageContext: RuntimePageContext) {
+  const domTree = domTreeForPrompt(pageContext.domTree || '[empty DOM tree]');
+  return [
+    'Runtime DOM Context (fresh, authoritative for DOM mode):',
+    '- This system message is refreshed immediately before the AI request.',
+    '- Numeric DOM node_id values are volatile and valid only for this request. Never reuse historical DOM ids.',
+    `Current URL: ${pageContext.url}`,
+    `Current title: ${pageContext.title}`,
+    `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
+    `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
+    `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
+    `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
+    `Visible DOM snapshot:\n${domTree}`,
+  ].filter(Boolean).join('\n');
+}
+
 function runtimePrompt(input: {
   testCase: TestCaseRecord;
   pageContext: Awaited<ReturnType<BrowserSession['getPageContext']>>;
@@ -1715,7 +1725,6 @@ function runtimePrompt(input: {
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const domTree = visualMode ? '[disabled because visual mode is enabled]' : domTreeForPrompt(pageContext.domTree || '[empty DOM tree]');
   const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
   const candidateContext = visualMode
     ? visualMarkersWithoutOverlay || visualTextCandidateFallback
@@ -1764,13 +1773,13 @@ function runtimePrompt(input: {
     : [
         '- DOM mode has no clickCandidate/hoverCandidate/dragCandidate tools. Never choose visual candidate IDs.',
         '- Use clickDomNode(id,text?) with a numeric node_id copied from the CURRENT visible DOM snapshot. The tool accepts the numeric id with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
-        '- The DOM tree follows the Codex Chrome plugin model: it is a visible, interactable DOM snapshot, not a full offscreen document dump. If the desired target is absent, scroll the relevant area and then call getDomTree again.',
+        '- The DOM context is refreshed automatically immediately before every AI request. If the desired target is absent, scroll the relevant area; the next turn will include a fresh DOM snapshot.',
         '- Use getDomNodeText(id) when a visible DOM snapshot line is truncated or you need the complete rendered text under a returned node.',
         '- Text matching is a recovery path, not the normal click path: call findByText(targetText,scopeId?) first, inspect the returned locatorIds, then call clickLocator(locatorId,text?) in a later turn.',
         '- Use findByText only when a fresh DOM id is unavailable or unreliable, such as dynamic search results, iframe/shadow/dialog/popover content, or an id that disappeared after refresh.',
         '- For findByText targetText, use a short unique visible/accessibility label from the CURRENT DOM/page context. Do not pass a long surrounding snippet.',
         '- For text entry, use clickDomNode(id,text) in one tool call when the input id is present. Use typeText only after a prior action already focused the field.',
-        '- Use scrollArea when needed content or controls are not present in the current visible DOM snapshot, then refresh the DOM snapshot before acting.',
+        '- Use scrollArea when needed content or controls are not present in the current visible DOM snapshot. The next AI request automatically includes the refreshed DOM snapshot before any further action.',
         '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
         '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
       ];
@@ -1813,12 +1822,12 @@ function runtimePrompt(input: {
       : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
     attachScreenshot
       ? separateMarkerScreenshot
-        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
+        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomNodeText are unavailable.'
         : markerOverlayInScreenshot
-          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. White labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
+          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. White labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomNodeText are unavailable.'
         : markerEnabled
-          ? '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
-          : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomTree/getDomNodeText are unavailable.'
+          ? '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. getInteractiveCandidates/getDomNodeText are unavailable.'
+          : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomNodeText are unavailable.'
       : visualMode
         ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
         : '- DOM mode: no screenshot image/path is attached. Use the current visible DOM snapshot and DOM node_id tools first; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
@@ -1844,18 +1853,12 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
       : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
     '',
     'Current context:',
-    `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
-    `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
-    visualMode
-      ? `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`
-      : `Scrollable areas summary (DOM fallback only; atBottom/atTop and remaining* show whether further scrolling is possible):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
-    visualMode && !visualTextCandidateFallback ? '' : `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
+    visualMode ? `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}` : 'See the Runtime DOM Context system message for current URL, tabs, focus, scroll state, and DOM snapshot.',
+    visualMode ? `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}` : '',
+    visualMode ? `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}` : '',
+    visualMode && visualTextCandidateFallback ? `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}` : '',
     visualMarkersWithoutOverlay || visualTextCandidateFallback ? `Visible interactive elements:
 ${candidateContext}` : '',
-    visualMode ? '' : `Interactive candidates JSON:
-${candidateContext}`,
-    visualMode ? '' : `Visible DOM snapshot:
-${domTree}`,
     compactRunContext,
     availableScreenshotReferences.length ? `Available previous screenshot references:
 ${formatScreenshotReferences(availableScreenshotReferences)}` : '',
@@ -1908,7 +1911,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'dragCandidate',
   ];
   if (mode === 'visual-markers') return candidateTools;
-  return [...sharedTools, 'getDomTree', 'getDomNodeText', 'clickDomNode', 'findByText', 'clickLocator'];
+  return [...sharedTools, 'getDomNodeText', 'clickDomNode', 'findByText', 'clickLocator'];
 }
 
 function isCodexProvider() {
@@ -1926,6 +1929,7 @@ function createAiRequestSnapshot(input: {
   tools?: string[];
   options?: Record<string, unknown>;
   domContext?: AiDomContextSnapshot;
+  systemPrompt?: string;
 }): AiRequestSnapshot {
   const { provider, model } = getModelSettings();
   const attachedImagePaths = input.imageAttached
@@ -1953,6 +1957,10 @@ function createAiRequestSnapshot(input: {
     options: input.options,
     domContext: input.domContext,
     messages: [
+      ...(input.systemPrompt ? [{
+        role: 'system' as const,
+        content: [{ type: 'text' as const, text: input.systemPrompt }],
+      }] : []),
       {
         role: 'user',
         content: [
@@ -2352,9 +2360,11 @@ async function executeRuntimeStep(input: {
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
     let requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
+    let requestSystemPrompt: string | undefined;
     async function refreshRequestPromptForTurn() {
       const currentPageContext = await session.getPageContext(runtimePageContextOptions(mode));
       currentDomContext = createDomContextSnapshot(mode, currentPageContext);
+      requestSystemPrompt = mode === 'dom' ? domRuntimeSystemPrompt(currentPageContext) : undefined;
       const currentMarkerPath = visualContext.current()?.markerPath;
       const basePrompt = `${runtimePrompt({
         testCase,
@@ -2391,7 +2401,7 @@ async function executeRuntimeStep(input: {
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
         : mode === 'dom'
-          ? 'Use current visible DOM node_ids and getDomNodeText for the next missing goal; scroll and refresh getDomTree when needed content is absent from the snapshot.'
+          ? 'Use current visible DOM node_ids and getDomNodeText for the next missing goal; scroll when needed content is absent from the snapshot so the next request receives a fresh DOM context.'
           : 'Use the current screenshot to complete the next missing goal.',
       taskFrame: testCase.content.taskFrame,
     };
@@ -2423,7 +2433,7 @@ async function executeRuntimeStep(input: {
                 'DOM Context Manager:',
                 '- Current visible DOM snapshot, URL, focus, tabs, and scroll state in Runtime Context are authoritative.',
                 '- No screenshot image is attached for DOM decisions.',
-                '- If needed content/control is absent from the visible DOM snapshot, scroll the relevant area and call getDomTree again.',
+                '- If needed content/control is absent from the visible DOM snapshot, scroll the relevant area; the next AI request will include the refreshed DOM context.',
               ].join('\n')
             : visualContext.renderText(),
           currentToolAttemptsText: formatCurrentToolAttemptSummary(traces, traceLimit),
@@ -2438,7 +2448,8 @@ async function executeRuntimeStep(input: {
       const windowTokens = contextWindowTokens();
       const thresholdRatio = contextCompressionThresholdRatio();
       const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
-      let estimatedTokens = estimateContextTokens(contextText, visualPaths.length + userReferenceImages.filter((item) => item.image).length);
+      const estimateText = () => [requestSystemPrompt, contextText].filter(Boolean).join('\n');
+      let estimatedTokens = estimateContextTokens(estimateText(), visualPaths.length + userReferenceImages.filter((item) => item.image).length);
       if (estimatedTokens > thresholdTokens) {
         const beforeImageCount = visualPaths.length;
         const removedFrames = visualContext.compressForBudget('Context budget exceeded; compacting historical visual frames.');
@@ -2457,7 +2468,7 @@ async function executeRuntimeStep(input: {
           removedFrames,
         };
         contextText = buildContextText();
-        estimatedTokens = estimateContextTokens(contextText, visualPaths.length + userReferenceImages.filter((item) => item.image).length);
+        estimatedTokens = estimateContextTokens(estimateText(), visualPaths.length + userReferenceImages.filter((item) => item.image).length);
         if (estimatedTokens > thresholdTokens && visualPaths.length > 1) {
           visualContext.manage('keepLatestOnly', 'Context budget still exceeded after history compression; keeping only current visual frame for the next dialogue turn.');
           visualPaths = includeImage ? visualContext.imagePaths() : [];
@@ -2468,7 +2479,7 @@ async function executeRuntimeStep(input: {
             afterImageCount: visualPaths.length,
           };
           contextText = buildContextText();
-          estimatedTokens = estimateContextTokens(contextText, visualPaths.length + userReferenceImages.filter((item) => item.image).length);
+          estimatedTokens = estimateContextTokens(estimateText(), visualPaths.length + userReferenceImages.filter((item) => item.image).length);
         }
         await onDebug?.({
           phase: 'ai:context-compressed',
@@ -2481,9 +2492,12 @@ async function executeRuntimeStep(input: {
       for (const imagePath of visualPaths) { const image = await readScreenshotForAi(imagePath).catch(() => undefined); if (image) content.push({ type: 'image', image }); }
       for (const referenceImage of userReferenceImages) { if (referenceImage.image) content.push({ type: 'image', image: referenceImage.image }); }
       const attachedImagePaths = [...visualPaths, ...userReferenceImages.filter((item) => item.image).map((item) => item.imagePath)];
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, systemPrompt: requestSystemPrompt, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
       lastAiRequest = aiRequest;
-      return [{ role: 'user' as const, content }];
+      return [
+        ...(requestSystemPrompt ? [{ role: 'system' as const, content: requestSystemPrompt }] : []),
+        { role: 'user' as const, content },
+      ];
     }
 
     if (codexMode) {
@@ -3190,8 +3204,6 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return { ok: true, actual: `Selected screenshot references for context only: ${(Array.isArray(input.ids) ? input.ids : []).join(', ') || '[none]'}.` };
     case 'getInteractiveCandidates':
       return session.getInteractiveCandidates();
-    case 'getDomTree':
-      return session.getSimplifiedDomTree();
     case 'getDomNodeText':
       return session.getDomNodeText(domNodeId);
     default:

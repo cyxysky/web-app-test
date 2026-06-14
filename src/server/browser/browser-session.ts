@@ -745,7 +745,32 @@ function installAiBrowserPageRuntime() {
 
   const visibleDomInteractiveTags = new Set(['a', 'button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
   const visibleDomInteractiveRoles = new Set(['button', 'checkbox', 'combobox', 'link', 'menuitem', 'option', 'radio', 'slider', 'spinbutton', 'switch', 'tab', 'textbox']);
-  const visibleDomRenderedAttributes = ['aria-disabled', 'aria-label', 'contenteditable', 'href', 'name', 'placeholder', 'role', 'title', 'type', 'value'];
+  const visibleDomRenderedAttributes = [
+    'id',
+    'class',
+    'aria-disabled',
+    'aria-label',
+    'aria-labelledby',
+    'aria-describedby',
+    'aria-controls',
+    'aria-expanded',
+    'aria-pressed',
+    'alt',
+    'contenteditable',
+    'data-testid',
+    'data-test',
+    'data-qa',
+    'data-cy',
+    'href',
+    'name',
+    'placeholder',
+    'role',
+    'title',
+    'type',
+    'value',
+  ];
+  const visibleDomMeaningfulAttributes = visibleDomRenderedAttributes
+    .filter((name) => !['id', 'class', 'aria-describedby', 'aria-controls'].includes(name));
   const visibleDomBooleanAttributes = ['checked', 'disabled', 'multiple', 'readonly', 'required', 'selected'];
   const visibleDomSkippedTextTags = new Set(['noscript', 'script', 'style', 'template']);
 
@@ -871,6 +896,46 @@ function installAiBrowserPageRuntime() {
       .replaceAll('<', '&lt;')
       .replaceAll('>', '&gt;')
       .replaceAll('"', '&quot;');
+  }
+
+  function visibleDomAttributeValue(element: Element, name: string) {
+    const value = element.getAttribute(name);
+    if (value === null || value === '') return undefined;
+    const normalized = normalizeVisibleDomText(value);
+    if (!normalized) return undefined;
+    if (name === 'class') {
+      const classes = normalized.split(/\s+/).filter(Boolean).slice(0, 10).join(' ');
+      return classes || undefined;
+    }
+    if (name === 'href') return normalized.slice(0, 240);
+    if (name === 'value') return normalized.slice(0, 180);
+    return normalized.slice(0, 140);
+  }
+
+  function visibleDomIconHint(element: Element) {
+    const hints: string[] = [];
+    const push = (value?: string | null) => {
+      const normalized = normalizeVisibleDomText(value || '')
+        .replace(/\b(?:lucide|icon|svg|size|stroke|fill|currentColor|true|false)\b/gi, ' ')
+        .replace(/[^a-zA-Z0-9_\-\u4e00-\u9fff]+/g, ' ')
+        .trim();
+      if (!normalized) return;
+      for (const token of normalized.split(/\s+/)) {
+        if (token.length < 2 || hints.includes(token)) continue;
+        hints.push(token);
+        if (hints.length >= 5) return;
+      }
+    };
+    for (const child of Array.from(element.querySelectorAll('svg, [data-icon], [class*="icon"], [class*="lucide"]')).slice(0, 8)) {
+      push(child.getAttribute('aria-label'));
+      push(child.getAttribute('title'));
+      push(child.getAttribute('data-icon'));
+      push(child.getAttribute('class'));
+      const title = child.querySelector('title')?.textContent;
+      push(title);
+      if (hints.length >= 5) break;
+    }
+    return hints.join(' ').slice(0, 120) || undefined;
   }
 
   function visibleDomTextContent(element: Element) {
@@ -1002,9 +1067,11 @@ function installAiBrowserPageRuntime() {
   function visibleDomLine(element: Element, ref: string) {
     const attrs = [`node_id=${ref}`];
     for (const name of visibleDomRenderedAttributes) {
-      const value = element.getAttribute(name);
-      if (value !== null && value !== '') attrs.push(`${name}="${escapeVisibleDomText(value)}"`);
+      const value = visibleDomAttributeValue(element, name);
+      if (value) attrs.push(`${name}="${escapeVisibleDomText(value)}"`);
     }
+    const icon = visibleDomIconHint(element);
+    if (icon) attrs.push(`icon="${escapeVisibleDomText(icon)}"`);
     for (const name of visibleDomBooleanAttributes) {
       if (element.hasAttribute(name)) attrs.push(`${name}="true"`);
     }
@@ -1114,10 +1181,7 @@ function installAiBrowserPageRuntime() {
     ]);
     const directTextContainerTags = new Set(['article', 'aside', 'div', 'fieldset', 'footer', 'form', 'header', 'main', 'nav', 'section', 'span']);
     const stop = () => truncated || items.length >= maxElements || chars >= maxChars;
-    const hasMeaningfulAttributes = (element: Element) => visibleDomRenderedAttributes.some((name) => {
-      const value = element.getAttribute(name);
-      return value !== null && value !== '';
-    });
+    const hasMeaningfulAttributes = (element: Element) => visibleDomMeaningfulAttributes.some((name) => Boolean(visibleDomAttributeValue(element, name)));
     const shouldIncludeElement = (element: Element) => {
       if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
       const tag = visibleDomElementName(element);
@@ -2934,7 +2998,7 @@ export class BrowserSession {
       .map((item) => `${item.id}: ${item.descriptor}${item.framePath ? ` frame=${item.framePath}` : ''}`)
       .join('\n');
     return {
-      error: `DOM node id "${nodeId}" was not found in the current DOM snapshot. Call getDomTree again and use one of the returned numeric ids.${available ? ` Available ids:\n${available}` : ''}`,
+      error: `DOM node id "${nodeId}" was not found in the current DOM snapshot. Use a node_id from the next refreshed DOM context.${available ? ` Available ids from the last snapshot:\n${available}` : ''}`,
     };
   }
 
@@ -2963,7 +3027,7 @@ export class BrowserSession {
     if (!result) {
       return {
         ok: false,
-        actual: `DOM node id ${nodeId} was not found. Call getDomTree again to get fresh ids; the DOM may have changed.`,
+        actual: `DOM node id ${nodeId} was not found. Use a node_id from the next refreshed DOM context; the DOM may have changed.`,
       };
     }
     return {
@@ -3189,7 +3253,7 @@ export class BrowserSession {
     if (!target) {
       return {
         ok: false,
-        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Call getDomTree again and use a fresh node_id.`,
+        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
       };
     }
     const page = this.activePage;
@@ -3229,7 +3293,7 @@ export class BrowserSession {
       const target = await this.resolveDomReferenceToClickablePoint(resolved.reference);
       if (!target) {
         ok = false;
-        results.push(`${index + 1}. DOM node ${field.id}: stale, missing, or not visible. Call getDomTree again for fresh ids.`);
+        results.push(`${index + 1}. DOM node ${field.id}: stale, missing, or not visible. Use a fresh node_id from the next refreshed DOM context.`);
         continue;
       }
       await this.activePage.mouse.click(target.x, target.y);
@@ -3257,7 +3321,7 @@ export class BrowserSession {
     if (!this.lastTextLocatorCandidates.length) {
       return {
         ok: false,
-        actual: `No visible interactive locator matched text "${targetText}". Use getDomTree/getDomNodeText for a DOM node id, or retry findByText with a shorter exact label and optional scopeId.`,
+        actual: `No visible interactive locator matched text "${targetText}". Use a DOM node id from the current prompt context with getDomNodeText, or retry findByText with a shorter exact label and optional scopeId.`,
       };
     }
 
@@ -3350,7 +3414,7 @@ export class BrowserSession {
     if (!target) {
       return {
         ok: false,
-        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Call getDomTree again and use a fresh node_id.`,
+        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
       };
     }
     await this.activePage.mouse.click(target.x, target.y);
@@ -4325,7 +4389,7 @@ export class BrowserSession {
     const mainSnapshot = fullScope
       ? await this.readFullDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars)
       : await this.readVisibleDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars);
-    if (!mainSnapshot) return 'DOM runtime is not available on this page. Retry getDomTree after the page settles.';
+    if (!mainSnapshot) return 'DOM runtime is not available on this page. Retry after the page settles.';
     this.resetDomVisibleIdState(mainSnapshot.stateKey);
 
     const lines: string[] = [];

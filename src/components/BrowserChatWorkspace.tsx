@@ -3,6 +3,7 @@
 import { memo, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   Bot,
+  ChevronDown,
   Folder,
   ImageUp,
   Loader2,
@@ -14,6 +15,7 @@ import {
   Send,
   Settings,
   FilePlus2,
+  SquareTerminal,
   Square,
   Trash2,
   User,
@@ -135,17 +137,6 @@ function parseJsonObjectText(value?: string) {
   } catch {
     return undefined;
   }
-}
-
-function readableAgentText(value?: string) {
-  const text = (value || '').trim();
-  const parsed = parseJsonObjectText(text);
-  if (!parsed) return text;
-  for (const key of ['actual', 'reason', 'observation', 'currentState', 'nextGoal', 'action']) {
-    const item = typeof parsed[key] === 'string' ? (parsed[key] as string).trim() : '';
-    if (item && !parseJsonObjectText(item)) return item;
-  }
-  return '';
 }
 
 function formatToolPayload(value: unknown) {
@@ -338,41 +329,6 @@ function messageUpdateTime(message: BrowserChatMessage) {
   return message.updatedAt || message.createdAt;
 }
 
-function normalizedAgentText(value?: string) {
-  const text = readableAgentText(value);
-  if (isRawInfrastructureErrorText(text)) {
-    return 'AI 模型请求失败：当前模型网关不兼容本轮工具调用格式，完整错误已记录在日志中。';
-  }
-  if (isToolExecutionResultText(text)) return '';
-  return isRawDomSnapshotText(text) ? '' : text;
-}
-
-function isRawDomSnapshotText(value?: string) {
-  const text = (value || '').trim();
-  if (!text || !/\bnode_id=\d+\b/.test(text)) return false;
-  return /<\s*(?:a|button|input|select|textarea|option|summary|details|label|form|iframe)\b/i.test(text);
-}
-
-function isRawInfrastructureErrorText(value?: string) {
-  return /litellm\.BadRequestError|AnthropicException|Failed to deserialize the JSON body|unknown variant `?custom`?|invalid_request_error|Recorded as recoverable/i.test(value || '');
-}
-
-function isToolExecutionResultText(value?: string) {
-  const text = (value || '').trim();
-  if (!text) return false;
-  return /^(Clicked|Double-clicked|Right-clicked|Hovered|Dragged|Typed text|Pressed key|Batch (?:DOM|candidate) fill completed|Page wait completed|Switched to tab|Text locator candidates|DOM node \d+ .* full text)/i.test(text)
-    || /\bFocused element after action:/i.test(text)
-    || /\bat browser point \(\d+,\s*\d+\)/i.test(text);
-}
-
-function stepNarrative(step: StepExecutionResult) {
-  const text = normalizedAgentText(step.note);
-  if (!text) return '';
-  if (isRawDomSnapshotText(text)) return '';
-  if (/^AI (is choosing|called a browser tool)/i.test(text)) return '';
-  return text.replace(/^Reported state without browser action:\s*/i, '').trim();
-}
-
 function phaseLabel(phase: string) {
   if (phase.startsWith('browser:')) return '浏览器';
   if (phase.startsWith('ai:')) return 'AI';
@@ -486,12 +442,9 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   return (
     <>
       {toolCalls.map((tool, toolIndex) => (
+        <>
+        <p style={{ fontSize: "12px"}}>{tool.reason}</p>
         <div className="browser-chat-tool-call" key={`${step.index}-${toolIndex}-${tool.name}`}>
-          {tool.reason ? (
-            <div className="browser-chat-tool-reason">
-              {compactText(tool.reason, 140)}
-            </div>
-          ) : null}
           <button
             className="browser-chat-tool-card"
             onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
@@ -503,6 +456,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
             <span className={tool.ok === false ? 'badge status-failed' : 'badge neutral'}>{toolStatusLabel(tool)}</span>
           </button>
         </div>
+        </>
       ))}
     </>
   );
@@ -519,9 +473,20 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   running: boolean;
   steps: StepExecutionResult[];
 }) {
+  const [toolsExpanded, setToolsExpanded] = useState(false);
   const finalText = message.content;
   const seenTexts = new Set<string>();
-  const shouldShowStepTimeline = running || steps.some((step) => (step.tools || []).length);
+  const toolCount = steps.reduce((count, step) => count + (step.tools || []).length, 0);
+  const failedToolCount = steps.reduce((count, step) => (
+    count + (step.tools || []).filter((tool) => tool.ok === false).length
+  ), 0);
+  const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
+  const shouldShowStepTimeline = running || toolCount > 0;
+  const toolSummary = toolCount
+    ? `${running ? '已运行' : '已运行'} ${toolCount} 个工具${failedToolCount ? `，${failedToolCount} 条失败` : ''}`
+    : waitingForTool
+      ? '正在准备工具'
+      : '暂无工具';
   const renderText = (text: string, key: string) => {
     const normalized = text;
     if (!normalized || seenTexts.has(normalized)) return null;
@@ -533,14 +498,26 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
 
   return (
     <div className="browser-chat-agent-timeline">
-      {running ? renderText(finalText, 'running-text') : null}
-      {shouldShowStepTimeline ? steps.map((step) => (
-        <div className="browser-chat-agent-step" key={step.index}>
-          <BrowserChatStepToolCards onSelectTool={onSelectTool} running={running && step.status === 'running'} step={step} />
-          {running ? renderText(stepNarrative(step), `step-${step.index}-text`) : null}
+      {shouldShowStepTimeline ? (
+        <div className="browser-chat-tool-stack">
+          <button
+            aria-expanded={toolsExpanded}
+            className={`browser-chat-tool-summary${toolsExpanded ? ' is-expanded' : ''}${failedToolCount ? ' has-failed' : ''}`}
+            onClick={() => setToolsExpanded((value) => !value)}
+            type="button"
+          >
+            <SquareTerminal size={14} />
+            <span>{toolSummary}</span>
+            <ChevronDown className="browser-chat-tool-summary-chevron" size={14} />
+          </button>
+          {toolsExpanded ? steps.map((step) => (
+            <div className="browser-chat-agent-step" key={step.index}>
+              <BrowserChatStepToolCards onSelectTool={onSelectTool} running={running && step.status === 'running'} step={step} />
+            </div>
+          )) : null}
         </div>
-      )) : null}
-      {!running || !steps.length ? renderText(finalText, 'final-text') : null}
+      ) : null}
+      {renderText(finalText, 'final-text')}
     </div>
   );
 });
