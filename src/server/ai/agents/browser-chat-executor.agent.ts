@@ -669,8 +669,9 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
         ? 'ok'
         : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
     const shots = trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
+    const desktop = trace.desktopEvidence ? `; desktop=${sanitizeHistoricalToolText(trace.desktopEvidence.summary, 180)}` : '';
     const why = reason ? `; reason=${sanitizeHistoricalToolText(reason, 140)}` : '';
-    return `${index + 1}. ${trace.name}: ${status}${why}${shots}`;
+    return `${index + 1}. ${trace.name}: ${status}${why}${desktop}${shots}`;
   }).join('\n');
 }
 

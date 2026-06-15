@@ -116,23 +116,12 @@ export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
     '',
     'Agent Loop / prepareStep context:',
     domMode
-      ? '- DOM mode: the actionable context is the current full DOM snapshot, full page text, accessible iframe/shadow DOM content, URL, focus, and tool results. No screenshot image is attached for decision making.'
-      : '- Current screenshot is the only actionable image; history/reference candidate ids are invalid.',
+      ? '- Current turn delta: use Runtime DOM Context for fresh node_ids/text; RunState.nextObjective guides the goal only.'
+      : '- Current turn delta: use only the current screenshot/marker map for actionable ids; RunState.nextObjective guides the goal only.',
     domMode
-      ? '- DOM mode: use the full DOM snapshot and full page text first. Scroll only when interaction requires changing the viewport or lazy-loaded content is absent; use getDomNodeText(id) when a returned DOM line is truncated or a returned node needs full text.'
-      : '- Screenshot marker labels are only tool target locations. They are not page content, image/page numbers, ordering, progress, status, priority, or business meaning.',
-    domMode
-      ? '- Use scrollArea only as a fallback for lazy-loaded/virtualized content or viewport-only UI. Before scrolling, check the latest area state: do not scroll down atBottom or when remainingDown=0, and do not scroll up atTop or when remainingUp=0.'
-      : '- Green dashed boxes/green S labels in the current screenshot mark scrollable regions; use that visible S label for scrollArea and scroll about one visible viewport/container height per call.',
-    '- Historical memory contains semantic summaries only; never infer/reuse old candidate ids, area ids, coordinates, deltas, screenshot ids, or tool input JSON.',
-    '- Tool params are minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
-    '- If RunState/ledgerDigest already covers a requirement area, do not restart it by habit; continue only with missing or contradicted work.',
-    domMode
-      ? '- Follow RunState.nextObjective, but choose DOM node_ids/text from the current full DOM snapshot and full page text only.'
-      : '- Follow RunState.nextObjective, but choose operation/id from current screenshot only.',
-    input.allowTextResponse
-      ? '- Browser chat mode: call at most one tool only when browser action/inspection is needed. Return Chinese Markdown text with no tool only when you are intentionally closing this chat turn.'
-      : '- Call exactly one tool. You may include short ordinary assistant text for progress. Candidate action reason should name the visible target. visualAfter defaults to replace; use append only for explicit comparison/continuity with the previous screenshot.',
+      ? '- DOM Context Manager below is the current actionable DOM/page state; scroll only if the full DOM/text context lacks lazy-loaded or viewport-dependent content.'
+      : '- Visual Context Manager below is the current actionable visual state; historical screenshot ids remain context only.',
+    '- Current step tool attempts below are authoritative recent tool feedback; desktop=... means a local process/window change was detected outside the browser.',
     input.compressionNote,
     '',
     input.workingMemoryText,
