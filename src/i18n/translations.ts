@@ -6,6 +6,8 @@ export const languageOptions: Array<{ value: Language; label: string }> = [
 ];
 
 const en: Record<string, string> = {
+  'theme.color': 'Theme color',
+  'theme.color.description': 'Adjust the theme color used by buttons, scrollbars, and highlighted states.',
   '通用设置': 'General',
   '界面语言': 'Interface language',
   '选择界面显示语言。': 'Choose the display language for the interface.',
@@ -494,6 +496,11 @@ function translateDynamicText(language: Language, value: string) {
   if (exact) return exact;
 
   const dynamicRules: Array<[RegExp, (...matches: string[]) => string]> = [
+    [/^(.+) 访问密钥（可选）$/, (name) => `${name} access key (optional)`],
+    [/^(.+) 访问密钥$/, (name) => `${name} access key`],
+    [/^(.+) 服务地址$/, (name) => `${name} service URL`],
+    [/^AWS 区域$/, () => 'AWS region'],
+    [/^AWS Bedrock Bearer Token（可选）$/, () => 'AWS Bedrock Bearer Token (optional)'],
     [/^(\d+) 项网页配置$/, (count) => `${count} web settings`],
     [/^步骤 (\d+) · 操作前$/, (index) => `Step ${index} · Before`],
     [/^步骤 (\d+) · 操作后$/, (index) => `Step ${index} · After`],

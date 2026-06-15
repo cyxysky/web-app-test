@@ -91,13 +91,31 @@ function compactText(value?: string, max = 220) {
 
 function normalizeModelProvider(value: string): ModelProvider {
   const provider = value.trim().toLowerCase();
+  if (provider === 'ai-gateway' || provider === 'gateway' || provider === 'vercel-ai-gateway') return 'ai-gateway';
+  if (provider === 'alibaba' || provider === 'aliyun' || provider === 'dashscope') return 'alibaba';
+  if (provider === 'anthropic' || provider === 'claude') return 'anthropic';
   if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
+  if (provider === 'bedrock' || provider === 'amazon-bedrock' || provider === 'aws-bedrock') return 'bedrock';
+  if (provider === 'cerebras') return 'cerebras';
   if (provider === 'codex' || provider === 'codex-cli') return 'codex';
+  if (provider === 'cohere') return 'cohere';
+  if (provider === 'deepinfra') return 'deepinfra';
   if (provider === 'deepseek') return 'deepseek';
+  if (provider === 'fireworks' || provider === 'fireworks-ai') return 'fireworks';
   if (provider === 'gemini' || provider === 'gemini-cli') return 'gemini';
   if (provider === 'google') return 'google';
+  if (provider === 'google-vertex' || provider === 'vertex' || provider === 'vertex-ai') return 'google-vertex';
+  if (provider === 'groq') return 'groq';
+  if (provider === 'huggingface' || provider === 'hugging-face') return 'huggingface';
+  if (provider === 'llama-cpp' || provider === 'llamacpp' || provider === 'llama.cpp') return 'llama-cpp';
   if (provider === 'lmstudio' || provider === 'lm-studio' || provider === 'local') return 'lmstudio';
+  if (provider === 'mistral' || provider === 'mistral-ai') return 'mistral';
+  if (provider === 'ollama') return 'ollama';
   if (provider === 'openai') return 'openai';
+  if (provider === 'perplexity') return 'perplexity';
+  if (provider === 'together' || provider === 'togetherai' || provider === 'together-ai') return 'togetherai';
+  if (provider === 'vercel' || provider === 'v0') return 'vercel';
+  if (provider === 'xai' || provider === 'x-ai') return 'xai';
   return 'openrouter';
 }
 
@@ -109,27 +127,63 @@ type LegacyModelConfigRecord = Partial<ModelConfigRecord> & {
 
 function modelApiKeyEnv(provider: ModelProvider) {
   return ({
+    'ai-gateway': 'AI_GATEWAY_API_KEY',
+    alibaba: 'ALIBABA_API_KEY',
+    anthropic: 'ANTHROPIC_API_KEY',
     'azure-openai': 'AZURE_OPENAI_API_KEY',
+    bedrock: 'AWS_BEARER_TOKEN_BEDROCK',
+    cerebras: 'CEREBRAS_API_KEY',
     codex: '',
+    cohere: 'COHERE_API_KEY',
+    deepinfra: 'DEEPINFRA_API_KEY',
     deepseek: 'DEEPSEEK_API_KEY',
+    fireworks: 'FIREWORKS_API_KEY',
     gemini: '',
     google: 'GOOGLE_GENERATIVE_AI_API_KEY',
+    'google-vertex': 'GOOGLE_VERTEX_API_KEY',
+    groq: 'GROQ_API_KEY',
+    huggingface: 'HUGGINGFACE_API_KEY',
+    'llama-cpp': 'LLAMA_CPP_API_KEY',
     lmstudio: 'LMSTUDIO_API_KEY',
+    mistral: 'MISTRAL_API_KEY',
+    ollama: 'OLLAMA_API_KEY',
     openai: 'OPENAI_API_KEY',
     openrouter: 'OPENROUTER_API_KEY',
+    perplexity: 'PERPLEXITY_API_KEY',
+    togetherai: 'TOGETHERAI_API_KEY',
+    vercel: 'VERCEL_API_KEY',
+    xai: 'XAI_API_KEY',
   } as Record<ModelProvider, string>)[provider];
 }
 
 function modelBaseUrlEnv(provider: ModelProvider) {
   return ({
+    'ai-gateway': 'AI_GATEWAY_BASE_URL',
+    alibaba: 'ALIBABA_BASE_URL',
+    anthropic: 'ANTHROPIC_BASE_URL',
     'azure-openai': 'AZURE_OPENAI_BASE_URL',
+    bedrock: 'AWS_REGION',
+    cerebras: 'CEREBRAS_BASE_URL',
     codex: '',
+    cohere: 'COHERE_BASE_URL',
+    deepinfra: 'DEEPINFRA_BASE_URL',
     deepseek: '',
+    fireworks: 'FIREWORKS_BASE_URL',
     gemini: '',
     google: '',
+    'google-vertex': 'GOOGLE_VERTEX_BASE_URL',
+    groq: 'GROQ_BASE_URL',
+    huggingface: 'HUGGINGFACE_BASE_URL',
+    'llama-cpp': 'LLAMA_CPP_BASE_URL',
     lmstudio: 'LMSTUDIO_BASE_URL',
+    mistral: 'MISTRAL_BASE_URL',
+    ollama: 'OLLAMA_BASE_URL',
     openai: 'OPENAI_BASE_URL',
     openrouter: '',
+    perplexity: 'PERPLEXITY_BASE_URL',
+    togetherai: 'TOGETHERAI_BASE_URL',
+    vercel: 'VERCEL_BASE_URL',
+    xai: 'XAI_BASE_URL',
   } as Record<ModelProvider, string>)[provider];
 }
 

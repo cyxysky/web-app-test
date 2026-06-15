@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { Loader2, Save, Sparkles } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import { CustomSelect } from '@/components/CustomSelect';
 import { RichTextEditor } from '@/components/RichTextEditor';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -137,15 +138,15 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
         </label>
         <label>
           {t('浏览器操作模式')}
-          <select
-            className="input"
-            value={draft.browserMode}
-            onChange={(event) => update({ browserMode: event.target.value as TestCaseContent['browserMode'] })}
-          >
-            <option value="default">{t('默认配置')}</option>
-            <option value="dom">{t('DOM 交互')}</option>
-            <option value="visual-markers">{t('视觉标识')}</option>
-          </select>
+          <CustomSelect
+            value={draft.browserMode || 'default'}
+            onChange={(nextValue) => update({ browserMode: nextValue as TestCaseContent['browserMode'] })}
+            options={[
+              { label: t('默认配置'), value: 'default' },
+              { label: t('DOM 交互'), value: 'dom' },
+              { label: t('视觉标识'), value: 'visual-markers' },
+            ]}
+          />
         </label>
         {draft.browserMode === 'visual-markers' ? (
           <label>

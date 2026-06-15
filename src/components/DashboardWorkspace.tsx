@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useEffect, useState, useTransition } from 'react';
 import { CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, PlayCircle, Settings, Trash2, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import { CustomSelect } from '@/components/CustomSelect';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
 import { NewTestCaseModal } from '@/components/NewTestCaseModal';
 import { useI18n } from '@/i18n/I18nProvider';
@@ -52,9 +53,15 @@ function GroupNode({
 
   return (
     <li>
-      <button className={selectedGroupId === group.id ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(group.id)} type="button">
+      <button
+        aria-label={group.name}
+        className={selectedGroupId === group.id ? 'group-tree-button active' : 'group-tree-button'}
+        onClick={() => onSelect(group.id)}
+        title={group.name}
+        type="button"
+      >
         <Folder size={15} />
-        {group.name}
+        <span>{group.name}</span>
       </button>
       {children.length ? (
         <ol>
@@ -85,13 +92,18 @@ export function DashboardGroupSidebar({
 
   return (
     <aside className={className}>
-      <button className="icon-text-button group-create-button" onClick={onCreateGroup} type="button">
+      <button
+        className="icon-text-button group-create-button"
+        onClick={onCreateGroup}
+        title={selectedGroupId ? t('在当前组内创建子组') : t('创建组')}
+        type="button"
+      >
         <FolderPlus size={15} />
-        {selectedGroupId ? t('在当前组内创建子组') : t('创建组')}
+        <span>{selectedGroupId ? t('在当前组内创建子组') : t('创建组')}</span>
       </button>
-      <button className={!selectedGroupId ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(undefined)} type="button">
+      <button aria-label={t('Ungrouped')} className={!selectedGroupId ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(undefined)} title={t('Ungrouped')} type="button">
         <Folder size={15} />
-        {t('未分组')}
+        <span>{t('Ungrouped')}</span>
       </button>
       <ol className="group-tree">
         {rootGroups.map((group) => (
@@ -347,12 +359,16 @@ export function DashboardWorkspace({
                 </Link>
                 <span className={`badge status-${item.status}`}>{t(statusLabel(item.status))}</span>
                 <span>{t(caseProgressLabel(item.status))}</span>
-                <select className="input compact-select" disabled={movingCaseId === item.id} value={item.groupId || ''} onChange={(event) => moveCase(item.id, event.target.value || undefined)}>
-                  <option value="">{t('未分组')}</option>
-                  {groups.map((group) => (
-                    <option key={group.id} value={group.id}>{groupPath(groups, group.id)}</option>
-                  ))}
-                </select>
+                <CustomSelect
+                  className="compact-select"
+                  disabled={movingCaseId === item.id}
+                  value={item.groupId || ''}
+                  onChange={(nextValue) => moveCase(item.id, nextValue || undefined)}
+                  options={[
+                    { label: t('未分组'), value: '' },
+                    ...groups.map((group) => ({ label: groupPath(groups, group.id), value: group.id })),
+                  ]}
+                />
                 <span className="case-row-actions">
                   {movingCaseId === item.id ? (
                     <Loader2 className="spin" size={16} />

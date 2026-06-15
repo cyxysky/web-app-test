@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ArrowLeft, Loader2, Save } from 'lucide-react';
+import { CustomSelect } from '@/components/CustomSelect';
 import {
   modelProviderDefinitions,
   modelProviderDefinition,
@@ -13,6 +14,7 @@ import { useI18n } from '@/i18n/I18nProvider';
 import { languageOptions } from '@/i18n/translations';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/test-case.schema';
+import { useTheme } from '@/theme/ThemeProvider';
 
 type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
   updatedAt?: string;
@@ -71,6 +73,7 @@ export function EnvironmentSettings({
   showTabs?: boolean;
 } = {}) {
   const { language, setLanguage, t } = useI18n();
+  const { color, currentColor, scrollbarColor, setColor, setScrollbarColor } = useTheme();
   const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('general');
   const [items, setItems] = useState<EnvRow[]>([]);
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig());
@@ -188,11 +191,15 @@ export function EnvironmentSettings({
 
     if (definition?.control === 'select') {
       return (
-        <select className="input settings-control" value={item.value} onChange={(event) => update(index, { value: event.target.value })}>
-          {(definition.options || []).map((option) => (
-            <option key={option.value} value={option.value}>{optionLabel(option)}</option>
-          ))}
-        </select>
+        <CustomSelect
+          className="settings-control"
+          value={item.value}
+          onChange={(nextValue) => update(index, { value: nextValue })}
+          options={(definition.options || []).map((option) => ({
+            label: optionLabel(option),
+            value: option.value,
+          }))}
+        />
       );
     }
 
@@ -267,15 +274,51 @@ export function EnvironmentSettings({
                     <strong>{t('界面语言')}</strong>
                     <span>{t('选择界面显示语言。')}</span>
                   </div>
-                  <select
-                    className="input settings-control"
+                  <CustomSelect
+                    className="settings-control"
                     value={language}
-                    onChange={(event) => setLanguage(event.target.value === 'en' ? 'en' : 'zh')}
-                  >
-                    {languageOptions.map((option) => (
-                      <option key={option.value} value={option.value}>{t(option.label)}</option>
-                    ))}
-                  </select>
+                    onChange={(nextValue) => setLanguage(nextValue === 'en' ? 'en' : 'zh')}
+                    options={languageOptions.map((option) => ({
+                      label: t(option.label),
+                      value: option.value,
+                    }))}
+                  />
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <strong>{language === 'en' ? 'Theme color' : '主题色'}</strong>
+                    <span>{language === 'en' ? 'Adjust the theme color used by buttons, scrollbars, and highlighted states.' : '调整按钮、滚动条和高亮状态使用的主题色。'}</span>
+                  </div>
+                  <div className="theme-color-picker">
+                    <label>
+                      <span style={{ backgroundColor: currentColor.accent }} />
+                      <input
+                        aria-label={language === 'en' ? 'Theme color' : '主题色'}
+                        type="color"
+                        value={color}
+                        onChange={(event) => setColor(event.target.value)}
+                      />
+                    </label>
+                    <code>{color.toUpperCase()}</code>
+                  </div>
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <strong>{language === 'en' ? 'Scrollbar thumb color' : '滚动条滑块颜色'}</strong>
+                    <span>{language === 'en' ? 'Choose a custom color for scrollbar thumbs.' : '自定义全局滚动条滑块颜色。'}</span>
+                  </div>
+                  <div className="theme-color-picker">
+                    <label>
+                      <span style={{ backgroundColor: scrollbarColor }} />
+                      <input
+                        aria-label={language === 'en' ? 'Scrollbar thumb color' : '滚动条滑块颜色'}
+                        type="color"
+                        value={scrollbarColor}
+                        onChange={(event) => setScrollbarColor(event.target.value)}
+                      />
+                    </label>
+                    <code>{scrollbarColor.toUpperCase()}</code>
+                  </div>
                 </div>
               </div>
             </section>
@@ -299,11 +342,15 @@ export function EnvironmentSettings({
                     <strong>{t('服务商')}</strong>
                     <span>{t('选择当前运行使用的 AI 模型服务提供商。')}</span>
                   </div>
-                  <select className="input settings-control" value={activeProvider} onChange={(event) => selectProvider(event.target.value as ModelProvider)}>
-                    {modelProviderDefinitions.map((provider) => (
-                      <option key={provider.value} value={provider.value}>{t(provider.label)}</option>
-                    ))}
-                  </select>
+                  <CustomSelect
+                    className="settings-control"
+                    value={activeProvider}
+                    onChange={(nextValue) => selectProvider(nextValue as ModelProvider)}
+                    options={modelProviderDefinitions.map((provider) => ({
+                      label: t(provider.label),
+                      value: provider.value,
+                    }))}
+                  />
                 </div>
                 <div className="settings-row">
                   <div>

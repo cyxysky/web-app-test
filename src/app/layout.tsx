@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { NavigationLoading } from '@/components/NavigationLoading';
 import { I18nProvider } from '@/i18n/I18nProvider';
+import { ThemeProvider } from '@/theme/ThemeProvider';
 import './globals.css';
 
 export const metadata: Metadata = {
@@ -12,10 +13,12 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
   return (
     <html lang="zh-CN" suppressHydrationWarning>
       <body>
-        <I18nProvider>
-          {children}
-          <NavigationLoading />
-        </I18nProvider>
+        <ThemeProvider>
+          <I18nProvider>
+            {children}
+            <NavigationLoading />
+          </I18nProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

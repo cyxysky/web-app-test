@@ -3,6 +3,7 @@
 import { FormEvent, useState } from 'react';
 import { ImageUp, Loader2, Sparkles, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import { CustomSelect } from '@/components/CustomSelect';
 import { RichTextEditor } from '@/components/RichTextEditor';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -74,16 +75,16 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
       </div>
       <div className="field">
         <label htmlFor="browserMode">{t('浏览器操作模式')}</label>
-        <select
-          className="input"
+        <CustomSelect
           id="browserMode"
           value={browserMode}
-          onChange={(event) => setBrowserMode(event.target.value as TestCaseContent['browserMode'])}
-        >
-          <option value="default">{t('默认配置')}</option>
-          <option value="dom">{t('DOM 交互')}</option>
-          <option value="visual-markers">{t('视觉标识')}</option>
-        </select>
+          onChange={(nextValue) => setBrowserMode(nextValue as TestCaseContent['browserMode'])}
+          options={[
+            { label: t('默认配置'), value: 'default' },
+            { label: t('DOM 交互'), value: 'dom' },
+            { label: t('视觉标识'), value: 'visual-markers' },
+          ]}
+        />
       </div>
       {browserMode === 'visual-markers' ? (
         <label className="field">

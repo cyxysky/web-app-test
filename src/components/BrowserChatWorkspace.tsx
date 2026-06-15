@@ -3,6 +3,7 @@
 import { memo, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   Bot,
+  Bug,
   ChevronDown,
   Folder,
   ImageUp,
@@ -14,6 +15,7 @@ import {
   ScrollText,
   Send,
   Settings,
+  SlidersHorizontal,
   FilePlus2,
   SquareTerminal,
   Square,
@@ -120,6 +122,14 @@ function statusLabel(status: string) {
     passed: '完成',
     running: '执行中',
   } as Record<string, string>)[status] || status;
+}
+
+function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
+  if (tab === 'model') return <Bot size={15} />;
+  if (tab === 'browser') return <PanelLeft size={15} />;
+  if (tab === 'runtime') return <SquareTerminal size={15} />;
+  if (tab === 'debug') return <Bug size={15} />;
+  return <SlidersHorizontal size={15} />;
 }
 
 function compactText(value?: string, max = 160) {
@@ -1293,12 +1303,13 @@ export function BrowserChatWorkspace({
 
     if (activeView === 'settings') {
       return (
-        <section className="browser-chat-sidebar-section">
+        <section className="browser-chat-sidebar-section browser-chat-settings-section">
           <h2>设置</h2>
           <nav className="browser-chat-subnav" aria-label="环境配置分类">
             {environmentSettingsTabs.map((tab) => (
-              <button className={settingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} type="button">
-                {tab.label}
+              <button className={settingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={tab.label} type="button">
+                <SettingsTabIcon tab={tab.id} />
+                <span>{tab.label}</span>
               </button>
             ))}
           </nav>
@@ -1307,7 +1318,7 @@ export function BrowserChatWorkspace({
     }
 
     return (
-      <section className="browser-chat-sidebar-section">
+      <section className="browser-chat-sidebar-section browser-chat-recent-section">
         <div className="browser-chat-recent-header">
           <h2>最近</h2>
           {recentSessions.length ? (
@@ -1354,6 +1365,7 @@ export function BrowserChatWorkspace({
                     onClick={() => void loadSession(item.id)}
                     type="button"
                   >
+                    <MessageSquare className="browser-chat-recent-icon" size={15} />
                     <span>{sessionDisplayTitle(item)}</span>
                     <small>
                       {loadingSessionId === item.id ? <Loader2 className="spin" size={11} /> : null}

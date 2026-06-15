@@ -319,7 +319,33 @@ export type RuntimeEnvRecord = {
   updatedAt: string;
 };
 
-export type ModelProvider = 'azure-openai' | 'codex' | 'deepseek' | 'gemini' | 'google' | 'lmstudio' | 'openai' | 'openrouter';
+export type ModelProvider =
+  | 'ai-gateway'
+  | 'alibaba'
+  | 'anthropic'
+  | 'azure-openai'
+  | 'bedrock'
+  | 'cerebras'
+  | 'codex'
+  | 'cohere'
+  | 'deepinfra'
+  | 'deepseek'
+  | 'fireworks'
+  | 'gemini'
+  | 'google'
+  | 'google-vertex'
+  | 'groq'
+  | 'huggingface'
+  | 'lmstudio'
+  | 'llama-cpp'
+  | 'mistral'
+  | 'ollama'
+  | 'openai'
+  | 'openrouter'
+  | 'perplexity'
+  | 'togetherai'
+  | 'vercel'
+  | 'xai';
 
 export type ModelProviderSettings = {
   model: string;
