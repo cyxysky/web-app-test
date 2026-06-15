@@ -2,52 +2,54 @@
 
 import { useState } from 'react';
 import { Info, X } from 'lucide-react';
+import { useI18n } from '@/i18n/I18nProvider';
 import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 export function RunMetaDrawer({ run, testCaseTitle }: { run: TestRunRecord; testCaseTitle: string }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
 
   return (
     <>
       <button className="icon-text-button" onClick={() => setOpen(true)} type="button">
         <Info size={16} />
-        运行信息
+        {t('运行信息')}
       </button>
       {open ? (
         <div className="drawer-overlay" role="presentation" onClick={() => setOpen(false)}>
-          <aside className="run-drawer" role="dialog" aria-label="运行信息" onClick={(event) => event.stopPropagation()}>
+          <aside className="run-drawer" role="dialog" aria-label={t('运行信息')} onClick={(event) => event.stopPropagation()}>
             <header>
               <div>
-                <h2>运行信息</h2>
+                <h2>{t('运行信息')}</h2>
               </div>
-              <button className="icon-button" onClick={() => setOpen(false)} type="button" aria-label="关闭">
+              <button className="icon-button" onClick={() => setOpen(false)} type="button" aria-label={t('关闭')}>
                 <X size={18} />
               </button>
             </header>
             <dl className="drawer-form-list">
               <div>
-                <dt>运行 ID</dt>
+                <dt>{t('运行 ID')}</dt>
                 <dd>{run.id}</dd>
               </div>
               <div>
-                <dt>当前用例</dt>
+                <dt>{t('当前用例')}</dt>
                 <dd>{testCaseTitle}</dd>
               </div>
               <div>
-                <dt>开始时间</dt>
+                <dt>{t('开始时间')}</dt>
                 <dd>{run.startedAt || '-'}</dd>
               </div>
               <div>
-                <dt>结束时间</dt>
+                <dt>{t('结束时间')}</dt>
                 <dd>{run.endedAt || '-'}</dd>
               </div>
               <div>
-                <dt>步骤记录</dt>
+                <dt>{t('步骤记录')}</dt>
                 <dd>{run.result?.steps.length || 0}</dd>
               </div>
               <div>
-                <dt>报告状态</dt>
-                <dd>{run.report ? '已生成' : '生成中'}</dd>
+                <dt>{t('报告状态')}</dt>
+                <dd>{run.report ? t('已生成') : t('生成中')}</dd>
               </div>
             </dl>
           </aside>

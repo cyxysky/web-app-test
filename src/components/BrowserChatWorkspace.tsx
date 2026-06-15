@@ -27,6 +27,7 @@ import remarkGfm from 'remark-gfm';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
 import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
 import type { SettingsTab } from '@/config/settings';
+import { useI18n } from '@/i18n/I18nProvider';
 import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -690,6 +691,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   showStop: boolean;
   uploadingImage: boolean;
 }) {
+  const { t } = useI18n();
   const [draft, setDraft] = useState('');
 
   useEffect(() => {
@@ -731,7 +733,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
         />
         <textarea
           disabled={currentBusy || loading}
-          placeholder="有问题，尽管问"
+          placeholder={t('有问题，尽管问')}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
@@ -742,16 +744,16 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           }}
         />
         <button
-          aria-label="上传图片"
+          aria-label={t('上传图片')}
           className="browser-chat-attach"
           disabled={currentBusy || uploadingImage || attachments.length >= 8}
           onClick={() => imageInputRef.current?.click()}
-          title="上传图片"
+          title={t('上传图片')}
           type="button"
         >
           {uploadingImage ? <Loader2 className="spin" size={17} /> : <ImageUp size={17} />}
         </button>
-        <div className="browser-chat-mode-toggle" role="radiogroup" aria-label="操作模式">
+        <div className="browser-chat-mode-toggle" role="radiogroup" aria-label={t('操作模式')}>
           <button
             aria-pressed={mode === 'visual-markers'}
             className={mode === 'visual-markers' ? 'active' : undefined}
@@ -759,7 +761,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             onClick={() => onModeChange('visual-markers')}
             type="button"
           >
-            视觉
+            {t('视觉')}
           </button>
           <button
             aria-pressed={mode === 'dom'}
@@ -768,7 +770,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             onClick={() => onModeChange('dom')}
             type="button"
           >
-            DOM
+            {t('DOM')}
           </button>
         </div>
         {showStop ? (
@@ -777,8 +779,8 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             disabled={interrupting}
             onClick={() => void onInterrupt()}
             type="button"
-            aria-label="中断本轮对话"
-            title="中断本轮对话"
+            aria-label={t('中断本轮对话')}
+            title={t('中断本轮对话')}
           >
             {interrupting ? <Loader2 className="spin" size={18} /> : <Square size={16} />}
           </button>
@@ -787,7 +789,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             className="browser-chat-send"
             disabled={(!draft.trim() && !attachments.length) || currentBusy || loading || uploadingImage}
             type="submit"
-            aria-label="发送"
+            aria-label={t('发送')}
           >
             {busy ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
           </button>
@@ -823,7 +825,7 @@ export function BrowserChatWorkspace({
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
   const [mode, setMode] = useState<BrowserChatMode>('visual-markers');
   const [targetGroupId, setTargetGroupId] = useState<string | undefined>();
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>('model');
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [groupName, setGroupName] = useState('');
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
@@ -947,7 +949,7 @@ export function BrowserChatWorkspace({
     sessionListRefreshTimerRef.current = window.setTimeout(() => {
       sessionListRefreshTimerRef.current = undefined;
       void loadSessions().catch((loadError) => {
-        setError(loadError instanceof Error ? loadError.message : '鍔犺浇瀵硅瘽鍘嗗彶澶辫触');
+        setError(loadError instanceof Error ? loadError.message : '加载对话历史失败');
       });
     }, delay);
   }, [loadSessions]);
@@ -960,7 +962,7 @@ export function BrowserChatWorkspace({
       timers.delete(sessionId);
       void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch((refreshError) => {
         if (activeSessionIdRef.current === sessionId) {
-          setError(refreshError instanceof Error ? refreshError.message : '鍔犺浇瀵硅瘽澶辫触');
+          setError(refreshError instanceof Error ? refreshError.message : '加载对话失败');
         }
       });
     }, delay);
@@ -1384,7 +1386,7 @@ export function BrowserChatWorkspace({
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed' : 'browser-chat-layout'}>
       <aside className="browser-chat-sidebar">
         <div className="browser-chat-brand">
-          <strong>AI Web Test</strong>
+          <strong>WebPilot QA</strong>
           <button
             className="icon-button"
             onClick={() => setSidebarCollapsed((current) => !current)}

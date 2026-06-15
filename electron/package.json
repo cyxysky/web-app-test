@@ -1,5 +1,5 @@
 {
-  "name": "web-app-test-electron",
+  "name": "webpilot-qa-electron",
   "version": "0.1.0",
   "private": true,
   "main": "main.js"

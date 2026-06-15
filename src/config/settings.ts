@@ -1,6 +1,6 @@
 import type { ModelProvider } from '@/server/ai/schemas/test-case.schema';
 
-export type SettingsTab = 'model' | 'browser' | 'runtime' | 'debug';
+export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'debug';
 
 export type ModelProviderDefinition = {
   value: ModelProvider;
@@ -16,7 +16,7 @@ export type RuntimeEnvDefinition = {
   key: string;
   label: string;
   description: string;
-  tab: Exclude<SettingsTab, 'model'>;
+  tab: Exclude<SettingsTab, 'general' | 'model'>;
   defaultValue: string;
   control: 'boolean' | 'number' | 'select' | 'text' | 'secret';
   options?: Array<{ label: string; value: string }>;

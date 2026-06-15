@@ -1,5 +1,5 @@
 {
-  "name": "web-app-test",
+  "name": "webpilot-qa",
   "version": "0.1.0",
   "private": true,
   "main": "electron/main.js",
@@ -11,7 +11,7 @@
     "desktop:installer": "npm run desktop:prepare && electron-builder --win nsis",
     "desktop:portable": "npm run desktop:prepare && electron-builder --win portable",
     "start": "next start",
-    "docker:build": "docker build -t web-app-test:latest .",
+    "docker:build": "docker build -t webpilot-qa:latest .",
     "docker:up": "docker compose up -d --build",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
@@ -57,8 +57,8 @@
     "typescript": "^5.8.3"
   },
   "build": {
-    "appId": "com.aiwebtest.desktop",
-    "productName": "AI Web Test",
+    "appId": "com.webpilotqa.desktop",
+    "productName": "WebPilot QA",
     "asar": true,
     "npmRebuild": true,
     "beforeBuild": "scripts/electron-before-build.js",
@@ -78,6 +78,10 @@
       {
         "from": "dist-desktop/tinymce",
         "to": "tinymce"
+      },
+      {
+        "from": "assets/app-icon.png",
+        "to": "app-icon.png"
       }
     ],
     "win": {
@@ -89,7 +93,8 @@
           ]
         }
       ],
-      "artifactName": "AI-Web-Test-Setup-${version}-${arch}.${ext}"
+      "artifactName": "WebPilot-QA-Setup-${version}-${arch}.${ext}",
+      "icon": "assets/app-icon.ico"
     },
     "nsis": {
       "oneClick": false,
@@ -97,7 +102,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "AI Web Test",
+      "shortcutName": "WebPilot QA",
       "runAfterFinish": true
     }
   }

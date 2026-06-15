@@ -1,7 +1,7 @@
 services:
-  web-app-test:
+  webpilot-qa:
     build: .
-    image: web-app-test:latest
+    image: webpilot-qa:latest
     ports:
       - "3000:3000"
     env_file:

@@ -5,6 +5,7 @@ import { Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, PauseC
 import { MarkdownReport } from '@/components/MarkdownReport';
 import { RunMetaDrawer } from '@/components/RunMetaDrawer';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
+import { useI18n } from '@/i18n/I18nProvider';
 import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -548,6 +549,7 @@ function ReportEvidence({ run }: { run: TestRunRecord }) {
 }
 
 export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { initialRun: TestRunRecord; testCaseTitle?: string }) {
+  const { t } = useI18n();
   const [run, setRun] = useState(initialRun);
   const [selectedIndex, setSelectedIndex] = useState<number | undefined>(() => initialRun.result?.steps.at(-1)?.index);
   const [imagePreview, setImagePreview] = useState<{ images: ImageItem[]; index: number } | null>(null);
@@ -649,11 +651,11 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   }, [selectedStep?.index]);
 
   const progressText = useMemo(() => {
-    if (run.status === 'paused') return 'AI 测试已暂停';
-    if (!steps.length) return run.status === 'running' ? 'AI 正在启动浏览器' : '暂无执行步骤';
-    if (runningStep) return `正在记录步骤 ${runningStep.index}`;
-    return `已记录 ${steps.length} 个操作`;
-  }, [run.status, runningStep, steps]);
+    if (run.status === 'paused') return t('AI 测试已暂停');
+    if (!steps.length) return run.status === 'running' ? t('AI 正在启动浏览器') : t('暂无执行步骤');
+    if (runningStep) return t('正在记录步骤 {index}', { index: runningStep.index });
+    return t('已记录 {count} 个操作', { count: steps.length });
+  }, [run.status, runningStep, steps.length, t]);
 
   function openImageByUrl(url: string) {
     const images = allImages.some((image) => image.url === url) ? allImages : [...allImages, { title: '当前截图', url }];
@@ -678,7 +680,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   async function skipSelectedStep() {
     if (!selectedStep) return;
-    startGlobalLoading('正在跳过步骤');
+    startGlobalLoading(t('正在跳过步骤'));
     try {
       const response = await fetch(`/api/runs/${run.id}/skip`, {
         method: 'POST',
@@ -693,7 +695,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   async function pauseRun() {
     if (!canPause) return;
-    startGlobalLoading('正在暂停运行');
+    startGlobalLoading(t('正在暂停运行'));
     try {
       const response = await fetch(`/api/runs/${run.id}/pause`, {
         method: 'POST',
@@ -708,7 +710,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   async function resumeRun() {
     if (!canResumeRun) return;
-    startGlobalLoading('正在继续运行');
+    startGlobalLoading(t('正在继续运行'));
     try {
       const response = await fetch(`/api/runs/${run.id}/resume`, {
         method: 'POST',
@@ -723,7 +725,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
   async function continueBlockedRun() {
     if (!canContinueBlockedRun) return;
-    startGlobalLoading('正在继续运行');
+    startGlobalLoading(t('正在继续运行'));
     try {
       const response = await fetch(`/api/runs/${run.id}/continue`, {
         method: 'POST',
@@ -738,7 +740,7 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
   async function resumeManualIntervention() {
     if (!manualIntervention) return;
     setResumePendingStep(manualIntervention.stepIndex);
-    startGlobalLoading('正在恢复人工校验');
+    startGlobalLoading(t('正在恢复人工校验'));
     try {
       const response = await fetch(`/api/runs/${run.id}/resume`, {
         method: 'POST',
@@ -757,33 +759,33 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
       <div className="cockpit-toolbar">
         <div style={{ display: "flex", gap: "16px", alignItems: "center" }}>
           <span>{progressText}</span>
-          <span>{steps.length} 条操作</span>
+          <span>{t('{count} 条操作', { count: steps.length })}</span>
           {run.report?.markdown ? (
             <button className="link-button" onClick={() => setReportOpen(true)} type="button">
-              查看最终报告
+              {t('查看最终报告')}
             </button>
           ) : null}
-          <RunScreenshotChainButton className="link-button" label="查看截图链" run={run} />
+          <RunScreenshotChainButton className="link-button" label={t('查看截图链')} run={run} />
           {isFinished(run.status) ? (
             <a className="link-button" href={`/api/runs/${run.id}/pdf`} target="_blank">
-              导出 PDF
+              {t('导出 PDF')}
             </a>
           ) : null}
           {traceUrl(run) ? (
             <a className="link-button" href={traceUrl(run)} target="_blank">
-              下载 Trace
+              {t('下载 Trace')}
             </a>
           ) : null}
           {isFinished(run.status) && steps.some((step) => step.tools?.some((tool) => tool.ok !== false)) ? (
             <a className="link-button" href={`/api/runs/${run.id}/recorded-flow`} target="_blank">
-              导出录制流
+              {t('导出录制流')}
             </a>
           ) : null}
           {debugEnabled ? (
             <span className="debug-phase">
               <Bug size={14} />
               {run.debug?.phase || 'debug'}
-              {run.debug?.stepIndex ? ` · 步骤 ${run.debug.stepIndex}` : ''}
+              {run.debug?.stepIndex ? ` · ${t('步骤 {index}', { index: run.debug.stepIndex })}` : ''}
             </span>
           ) : null}
         </div>
@@ -791,25 +793,25 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
           {canPause ? (
             <button className="link-button" onClick={pauseRun} type="button">
               <PauseCircle size={16} />
-              暂停
+              {t('暂停')}
             </button>
           ) : null}
           {canResumeRun ? (
             <button className="link-button" onClick={resumeRun} type="button">
               <PlayCircle size={16} />
-              继续
+              {t('继续')}
             </button>
           ) : null}
           {canContinueBlockedRun ? (
             <button className="link-button" onClick={continueBlockedRun} type="button">
               <PlayCircle size={16} />
-              继续运行
+              {t('继续运行')}
             </button>
           ) : null}
           <RunMetaDrawer run={run} testCaseTitle={testCaseTitle} />
           <span className={`run-status-large status-${run.status}`}>
             <Radar size={18} />
-            {statusLabel(run.status)}
+            {t(statusLabel(run.status))}
           </span>
         </div>
       </div>
@@ -817,26 +819,26 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
       {visibleManualIntervention ? (
         <div className="manual-intervention-banner">
           <div>
-            <strong>需要人工介入</strong>
+            <strong>{t('需要人工介入')}</strong>
             <p>{visibleManualIntervention.reason}</p>
           </div>
           <div className="manual-intervention-actions">
             {manualInterventionScreenshotUrl ? (
               <button className="link-button" onClick={() => openImageByUrl(manualInterventionScreenshotUrl)} type="button">
                 <Eye size={14} />
-                查看当前截图
+                {t('查看当前截图')}
               </button>
             ) : null}
             <button className="link-button" onClick={resumeManualIntervention} type="button">
               <CheckCircle2 size={16} />
-              执行完毕
+              {t('执行完毕')}
             </button>
           </div>
         </div>
       ) : null}
 
       <section className="cockpit-body">
-        <aside className="step-rail" aria-label="执行步骤">
+        <aside className="step-rail" aria-label={t('执行步骤')}>
           {steps.map((step) => {
             const badges = stepToolBadges(step);
             const visibleBadges = badges.slice(0, 4);
@@ -848,9 +850,9 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                 <span className="rail-copy">
                   <strong>{step.action}</strong>
                   <small className="rail-step-meta">
-                    <span>步骤 {step.index}</span>
+                    <span>{t('步骤 {index}', { index: step.index })}</span>
                     {visibleBadges.length ? (
-                      <span className="rail-tool-chips" aria-label={`工具：${badges.map((badge) => badge.name).join('、')}`}>
+                      <span className="rail-tool-chips" aria-label={t('工具：{names}', { names: badges.map((badge) => badge.name).join('、') })}>
                         {visibleBadges.map((badge) => (
                           <span className={badge.ok === false ? 'rail-tool-chip failed' : 'rail-tool-chip'} key={badge.name}>
                             {toolBadgeLabel(badge)}
@@ -875,49 +877,49 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                   <span className="rail-icon"><StepIcon status={selectedStep.status} /></span>
                   <div>
                     <h3>{selectedStep.action}</h3>
-                    <p>步骤 {selectedStep.index}</p>
+                    <p>{t('步骤 {index}', { index: selectedStep.index })}</p>
                   </div>
                 </div>
                 <div className="evidence-actions">
                   {selectedStep.aiRequest ? (
                     <button className="link-button" onClick={() => setRequestOpen(true)} type="button">
                       <Bug size={14} />
-                      查看请求内容
+                      {t('查看请求内容')}
                     </button>
                   ) : null}
                   {selectedStep.status === 'running' ? (
                     <button className="text-danger-button" onClick={skipSelectedStep} type="button">
                       <SkipForward size={15} />
-                      跳过当前步骤
+                      {t('跳过当前步骤')}
                     </button>
                   ) : null}
                 </div>
               </header>
               <dl className="evidence-properties">
                 <div>
-                  <dt>AI 操作</dt>
+                  <dt>{t('AI 操作')}</dt>
                   <dd>{selectedStep.action}</dd>
                 </div>
                 {visibleStepObservation(selectedStep) ? (
                   <div>
-                    <dt>页面观察</dt>
+                    <dt>{t('页面观察')}</dt>
                     <dd>{visibleStepObservation(selectedStep)}</dd>
                   </div>
                 ) : null}
                 <div>
-                  <dt>重要发现</dt>
+                  <dt>{t('重要发现')}</dt>
                   <dd>
                     {selectedStep.findings?.length ? (
                       <ul className="compact-bullet-list">
                         {selectedStep.findings.map((item, index) => <li key={index}>{item}</li>)}
                       </ul>
                     ) : (
-                      '暂无发现'
+                      t('暂无发现')
                     )}
                   </dd>
                 </div>
                 <div>
-                  <dt>工具调用</dt>
+                  <dt>{t('工具调用')}</dt>
                   <dd>
                     {selectedStep.tools?.length ? (
                       <ol className="tool-call-list">
@@ -934,14 +936,14 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
                         ))}
                       </ol>
                     ) : (
-                      '本步未调用浏览器工具'
+                      t('本步未调用浏览器工具')
                     )}
                   </dd>
                 </div>
               </dl>
             </>
           ) : (
-            <div className="empty-state">等待 AI 写入第一条执行记录。</div>
+            <div className="empty-state">{t('等待 AI 写入第一条执行记录。')}</div>
           )}
         </article>
       </section>
@@ -961,10 +963,10 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
       {reportOpen && run.report?.markdown ? (
         <div className="modal-overlay" onClick={() => setReportOpen(false)} role="presentation">
-          <section className="report-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="最终报告">
+          <section className="report-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('最终报告')}>
             <header>
-              <h2>最终报告</h2>
-              <button className="icon-button" onClick={() => setReportOpen(false)} type="button" aria-label="关闭"><X size={18} /></button>
+              <h2>{t('最终报告')}</h2>
+              <button className="icon-button" onClick={() => setReportOpen(false)} type="button" aria-label={t('关闭')}><X size={18} /></button>
             </header>
             <ReportEvidence run={run} />
             <MarkdownReport markdown={run.report.markdown} onImageClick={openImageByUrl} />
@@ -974,10 +976,10 @@ export function RunProgress({ initialRun, testCaseTitle = '未知用例' }: { in
 
       {requestOpen && selectedStep?.aiRequest ? (
         <div className="modal-overlay" onClick={() => setRequestOpen(false)} role="presentation">
-          <section className="report-modal ai-request-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="AI 请求内容">
+          <section className="report-modal ai-request-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('AI 请求内容')}>
             <header>
-              <h2>AI 请求内容 · 步骤 {selectedStep.index}</h2>
-              <button className="icon-button" onClick={() => setRequestOpen(false)} type="button" aria-label="关闭"><X size={18} /></button>
+              <h2>{t('AI 请求内容')} · {t('步骤 {index}', { index: selectedStep.index })}</h2>
+              <button className="icon-button" onClick={() => setRequestOpen(false)} type="button" aria-label={t('关闭')}><X size={18} /></button>
             </header>
             <pre className="ai-request-pre">{JSON.stringify(selectedStep.aiRequest, null, 2)}</pre>
           </section>

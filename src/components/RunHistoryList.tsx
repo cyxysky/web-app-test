@@ -8,6 +8,7 @@ import { DeleteRunButton } from '@/components/DeleteRunButton';
 import { ReplayRunButton } from '@/components/ReplayRunButton';
 import { RecordedFlowToCaseButton } from '@/components/RecordedFlowToCaseButton';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
+import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
@@ -30,9 +31,9 @@ function runStatusLabel(status: TestRunRecord['status']) {
   return labels[status];
 }
 
-function formatRunTime(value?: string) {
-  if (!value) return '未开始';
-  return new Intl.DateTimeFormat('zh-CN', {
+function formatRunTime(value?: string, language: 'zh' | 'en' = 'zh') {
+  if (!value) return language === 'en' ? 'Not started' : '未开始';
+  return new Intl.DateTimeFormat(language === 'en' ? 'en-US' : 'zh-CN', {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
@@ -41,6 +42,7 @@ function formatRunTime(value?: string) {
 }
 
 export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
+  const { language, t } = useI18n();
   const router = useRouter();
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deleting, setDeleting] = useState(false);
@@ -61,9 +63,9 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
   async function deleteSelected() {
     const runIds = selectedIds.filter((runId) => deletableIds.includes(runId));
     if (!runIds.length || deleting) return;
-    if (!window.confirm(`确定删除选中的 ${runIds.length} 条执行记录吗？`)) return;
+    if (!window.confirm(t('确定删除选中的 {count} 条执行记录吗？', { count: runIds.length }))) return;
     setDeleting(true);
-    startGlobalLoading('正在删除执行记录');
+    startGlobalLoading(t('正在删除执行记录'));
     try {
       const response = await fetch('/api/runs/batch-delete', {
         method: 'POST',
@@ -71,11 +73,11 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
         body: JSON.stringify({ runIds }),
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || '批量删除失败');
+      if (!response.ok) throw new Error(data.error || t('批量删除失败'));
       setSelectedIds([]);
       router.refresh();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : '批量删除失败');
+      window.alert(error instanceof Error ? error.message : t('批量删除失败'));
     } finally {
       setDeleting(false);
       stopGlobalLoading();
@@ -87,18 +89,18 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
       <div className="section-head compact run-history-head">
         <div className="run-history-title-copy">
           <h2>执行记录</h2>
-          <p title={latestRun ? `最近一次：${formatRunTime(latestRun.startedAt || latestRun.createdAt)}` : '运行后会在这里保留详情入口。'}>
-            {latestRun ? `最近一次：${formatRunTime(latestRun.startedAt || latestRun.createdAt)}` : '运行后会在这里保留详情入口。'}
+          <p title={latestRun ? t('最近一次：{time}', { time: formatRunTime(latestRun.startedAt || latestRun.createdAt, language) }) : t('运行后会在这里保留详情入口。')}>
+            {latestRun ? t('最近一次：{time}', { time: formatRunTime(latestRun.startedAt || latestRun.createdAt, language) }) : t('运行后会在这里保留详情入口。')}
           </p>
         </div>
         <div className="run-history-toolbar">
           <div className="run-history-summary">
-            <span title={`${runs.length} 次运行`}>{runs.length} 次运行</span>
-            <span title={`${finishedRuns} 次完成`}>{finishedRuns} 次完成</span>
+            <span title={t('{count} 次运行', { count: runs.length })}>{t('{count} 次运行', { count: runs.length })}</span>
+            <span title={t('{count} 次完成', { count: finishedRuns })}>{t('{count} 次完成', { count: finishedRuns })}</span>
           </div>
           <button className="run-history-bulk-delete" disabled={!selectedIds.length || deleting} onClick={deleteSelected} type="button">
             {deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
-            {selectedIds.length ? `删除选中 ${selectedIds.length}` : '删除选中'}
+            {selectedIds.length ? `${t('删除选中')} ${selectedIds.length}` : t('删除选中')}
           </button>
         </div>
       </div>
@@ -107,37 +109,37 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
         <div className="run-history-list">
           <label className="run-history-select-all">
             <input checked={allSelected} disabled={!deletableIds.length || deleting} onChange={toggleAll} type="checkbox" />
-            <span title={deletableIds.length ? '全选执行记录' : '暂无执行记录'}>{deletableIds.length ? '全选执行记录' : '暂无执行记录'}</span>
+            <span title={deletableIds.length ? t('全选执行记录') : t('暂无执行记录')}>{deletableIds.length ? t('全选执行记录') : t('暂无执行记录')}</span>
           </label>
           {runs.map((run) => {
             const completedStepCount = run.result?.steps.filter((step) => step.status !== 'queued').length || 0;
             const totalStepCount = run.result?.steps.length || 0;
             const replayable = Boolean(run.result?.steps.some((step) => step.tools?.some((tool) => tool.name && tool.ok !== false)));
-            const startedAt = formatRunTime(run.startedAt || run.createdAt);
-            const endedAt = run.endedAt ? formatRunTime(run.endedAt) : undefined;
+            const startedAt = formatRunTime(run.startedAt || run.createdAt, language);
+            const endedAt = run.endedAt ? formatRunTime(run.endedAt, language) : undefined;
             const active = isActiveRun(run);
             const selected = selectedSet.has(run.id);
-            const reportText = run.report ? '报告已生成' : '报告生成中';
+            const reportText = run.report ? t('报告已生成') : t('报告生成中');
             return (
               <div className={selected ? 'run-history-row selected' : 'run-history-row'} key={run.id}>
-                <label className="run-history-select" title="选择这条执行记录">
+                <label className="run-history-select" title={t('选择这条执行记录')}>
                   <input checked={selected} disabled={deleting} onChange={() => toggleRun(run.id)} type="checkbox" />
                 </label>
-                <span className={`run-history-status status-${run.status}`} title={runStatusLabel(run.status)}>
-                  {runStatusLabel(run.status)}
+                <span className={`run-history-status status-${run.status}`} title={t(runStatusLabel(run.status))}>
+                  {t(runStatusLabel(run.status))}
                 </span>
                 <span className="run-history-main">
-                  <strong title={run.report?.title || `运行 ${run.id}`}>{run.report?.title || `运行 ${run.id}`}</strong>
+                  <strong title={run.report?.title || t('运行 {id}', { id: run.id })}>{run.report?.title || t('运行 {id}', { id: run.id })}</strong>
                   <small className="run-history-id" title={run.id}>{run.id}</small>
                 </span>
-                <span className="run-history-time" title={endedAt ? `${startedAt} 至 ${endedAt}` : `${startedAt}，未结束`}>
+                <span className="run-history-time" title={endedAt ? `${startedAt} ${t('至')} ${endedAt}` : `${startedAt}${language === 'en' ? ', ' : '，'}${t('未结束')}`}>
                   <Clock3 size={14} />
                   {startedAt}
-                  {endedAt ? <span>至 {endedAt}</span> : <span>未结束</span>}
+                  {endedAt ? <span>{t('至')} {endedAt}</span> : <span>{t('未结束')}</span>}
                 </span>
-                <span className="run-history-meta" title={`${totalStepCount ? `${completedStepCount}/${totalStepCount}` : '-'} 步骤`}>
+                <span className="run-history-meta" title={t('{count} 步骤', { count: totalStepCount ? `${completedStepCount}/${totalStepCount}` : '-' })}>
                   <b>{totalStepCount ? `${completedStepCount}/${totalStepCount}` : '-'}</b>
-                  步骤
+                  {t('步骤')}
                 </span>
                 <span className={run.report ? 'run-history-report ready' : 'run-history-report'} title={reportText}>
                   <FileText size={14} />
@@ -148,7 +150,7 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
                   <ReplayRunButton disabled={!replayable || active} runId={run.id} />
                   <RecordedFlowToCaseButton disabled={!replayable || active} runId={run.id} />
                   <DeleteRunButton disabled={deleting} runId={run.id} />
-                  <Link className="run-history-open" href={`/runs/${run.id}`} title="查看详情">
+                  <Link className="run-history-open" href={`/runs/${run.id}`} title={t('查看详情')}>
                     <ExternalLink size={16} />
                   </Link>
                 </span>

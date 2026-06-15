@@ -6,6 +6,7 @@ import { CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, PlayCircle, 
 import { useRouter } from 'next/navigation';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
 import { NewTestCaseModal } from '@/components/NewTestCaseModal';
+import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { RunScheduleRecord, TestCaseRecord, TestGroupRecord } from '@/server/ai/schemas/test-case.schema';
@@ -21,6 +22,12 @@ function statusLabel(status: string) {
     blocked: '阻塞',
   };
   return labels[status] || status;
+}
+
+function caseProgressLabel(status: string) {
+  if (status === 'running') return '执行中';
+  if (['passed', 'failed', 'blocked'].includes(status)) return '已完成';
+  return '待执行';
 }
 
 export function groupPath(groups: TestGroupRecord[], groupId?: string): string {
@@ -73,17 +80,18 @@ export function DashboardGroupSidebar({
   onCreateGroup: () => void;
   onSelect: (groupId?: string) => void;
 }) {
+  const { t } = useI18n();
   const rootGroups = groups.filter((group) => !group.parentId);
 
   return (
     <aside className={className}>
       <button className="icon-text-button group-create-button" onClick={onCreateGroup} type="button">
         <FolderPlus size={15} />
-        {selectedGroupId ? '在当前组内创建子组' : '创建组'}
+        {selectedGroupId ? t('在当前组内创建子组') : t('创建组')}
       </button>
       <button className={!selectedGroupId ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(undefined)} type="button">
         <Folder size={15} />
-        未分组
+        {t('未分组')}
       </button>
       <ol className="group-tree">
         {rootGroups.map((group) => (
@@ -113,6 +121,7 @@ export function DashboardWorkspace({
   showBrowserChatAction?: boolean;
   showSettingsAction?: boolean;
 }) {
+  const { language, t } = useI18n();
   const router = useRouter();
   const [, startTransition] = useTransition();
   const [internalSelectedGroupId, setInternalSelectedGroupId] = useState<string | undefined>();
@@ -124,7 +133,7 @@ export function DashboardWorkspace({
   const [batchDeleting, setBatchDeleting] = useState(false);
   const [batchRunning, setBatchRunning] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
-  const [scheduleName, setScheduleName] = useState('定时回归');
+  const [scheduleName, setScheduleName] = useState(() => t('定时回归'));
   const [scheduleInterval, setScheduleInterval] = useState(60);
   const [savingSchedule, setSavingSchedule] = useState(false);
   const selectedGroupId = controlledSelectedGroupId ?? internalSelectedGroupId;
@@ -138,11 +147,17 @@ export function DashboardWorkspace({
     return () => window.clearInterval(timer);
   }, [router, testCases]);
 
+  useEffect(() => {
+    setScheduleName((current) => (
+      current === '定时回归' || current === 'Scheduled regression' ? t('定时回归') : current
+    ));
+  }, [language, t]);
+
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
     if (!name || creatingGroup) return;
     setCreatingGroup(true);
-    startGlobalLoading('正在创建分组');
+    startGlobalLoading(t('正在创建分组'));
     try {
       await fetch('/api/groups', {
         method: 'POST',
@@ -160,7 +175,7 @@ export function DashboardWorkspace({
 
   async function moveCase(testCaseId: string, groupId?: string) {
     setMovingCaseId(testCaseId);
-    startGlobalLoading('正在移动测试用例');
+    startGlobalLoading(t('正在移动测试用例'));
     try {
       await fetch(`/api/test-cases/${testCaseId}/move`, {
         method: 'POST',
@@ -183,7 +198,7 @@ export function DashboardWorkspace({
   async function startBatchRun() {
     if (!selectedCaseIds.length || batchRunning) return;
     setBatchRunning(true);
-    startGlobalLoading('正在批量启动测试');
+    startGlobalLoading(t('正在批量启动测试'));
     const openedTabs = selectedCaseIds.map(() => window.open('about:blank', '_blank'));
     try {
       const response = await fetch('/api/runs/batch', {
@@ -192,7 +207,7 @@ export function DashboardWorkspace({
         body: JSON.stringify({ testCaseIds: selectedCaseIds }),
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '批量运行启动失败');
+      if (!response.ok) throw new Error(data.error || t('批量运行启动失败'));
       const runs: Array<{ id?: string }> = Array.isArray(data.runs) ? data.runs : [];
       runs.forEach((run, index) => {
         if (!run?.id) return;
@@ -208,7 +223,7 @@ export function DashboardWorkspace({
       startTransition(() => router.refresh());
     } catch (error) {
       openedTabs.forEach((tab) => tab?.close());
-      window.alert(error instanceof Error ? error.message : '批量运行启动失败');
+      window.alert(error instanceof Error ? error.message : t('批量运行启动失败'));
     } finally {
       setBatchRunning(false);
       stopGlobalLoading();
@@ -217,9 +232,9 @@ export function DashboardWorkspace({
 
   async function deleteSelectedCases() {
     if (!selectedCaseIds.length || batchDeleting) return;
-    if (!window.confirm(`确定删除选中的 ${selectedCaseIds.length} 条用例吗？关联执行记录会一起移除。`)) return;
+    if (!window.confirm(t('确定删除选中的 {count} 条用例吗？关联执行记录会一起移除。', { count: selectedCaseIds.length }))) return;
     setBatchDeleting(true);
-    startGlobalLoading('正在批量删除测试用例');
+    startGlobalLoading(t('正在批量删除测试用例'));
     try {
       const response = await fetch('/api/test-cases/batch-delete', {
         method: 'POST',
@@ -227,11 +242,11 @@ export function DashboardWorkspace({
         body: JSON.stringify({ testCaseIds: selectedCaseIds }),
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || '批量删除失败');
+      if (!response.ok) throw new Error(data.error || t('批量删除失败'));
       setSelectedCaseIds([]);
       startTransition(() => router.refresh());
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : '批量删除失败');
+      window.alert(error instanceof Error ? error.message : t('批量删除失败'));
     } finally {
       setBatchDeleting(false);
       stopGlobalLoading();
@@ -242,7 +257,7 @@ export function DashboardWorkspace({
     const ids = selectedCaseIds.length ? selectedCaseIds : visibleCases.map((item) => item.id);
     if (!ids.length || savingSchedule) return;
     setSavingSchedule(true);
-    startGlobalLoading('正在保存定时任务');
+    startGlobalLoading(t('正在保存定时任务'));
     try {
       await fetch('/api/schedules', {
         method: 'POST',
@@ -276,33 +291,33 @@ export function DashboardWorkspace({
       <div className="dashboard-v2-list">
         <div className="plain-section-head">
           <div>
-            <h2>{selectedGroupId ? groupPath(groups, selectedGroupId) : '未分组'}</h2>
-            <span>{visibleCases.length} 条，已完成 {completedCases.length} 条</span>
+            <h2>{selectedGroupId ? groupPath(groups, selectedGroupId) : t('未分组')}</h2>
+            <span>{t('{total} 条，已完成 {completed} 条', { total: visibleCases.length, completed: completedCases.length })}</span>
           </div>
           <div className="dashboard-actions">
             {showBrowserChatAction ? (
               <Link className="icon-text-button" href="/browser-chat">
                 <MessageSquare size={15} />
-                对话操作
+                {t('对话操作')}
               </Link>
             ) : null}
             {showSettingsAction ? (
               <Link className="icon-text-button" href="/settings">
                 <Settings size={15} />
-                环境配置
+                {t('环境配置')}
               </Link>
             ) : null}
             <button className="icon-text-button" disabled={!selectedCaseIds.length || batchRunning} onClick={startBatchRun} type="button">
               {batchRunning ? <Loader2 className="spin" size={15} /> : <PlayCircle size={15} />}
-              批量运行{selectedCaseIds.length ? ` ${selectedCaseIds.length}` : ''}
+              {t('批量运行')}{selectedCaseIds.length ? ` ${selectedCaseIds.length}` : ''}
             </button>
             <button className="icon-text-button danger" disabled={!selectedCaseIds.length || batchDeleting} onClick={deleteSelectedCases} type="button">
               {batchDeleting ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-              批量删除{selectedCaseIds.length ? ` ${selectedCaseIds.length}` : ''}
+              {t('批量删除')}{selectedCaseIds.length ? ` ${selectedCaseIds.length}` : ''}
             </button>
             <button className="icon-text-button" disabled={!visibleCases.length} onClick={() => setScheduleOpen(true)} type="button">
               <CalendarClock size={15} />
-              定时任务
+              {t('定时任务')}
             </button>
             <NewTestCaseModal groupId={selectedGroupId} />
           </div>
@@ -311,7 +326,7 @@ export function DashboardWorkspace({
           <div className="schedule-strip">
             {schedules.slice(0, 4).map((schedule) => (
               <span key={schedule.id}>
-                {schedule.enabled ? '启用' : '停用'} · {schedule.name} · 下次 {new Date(schedule.nextRunAt).toLocaleString()}
+                {schedule.enabled ? t('启用') : t('停用')} · {schedule.name} · {t('下次')} {new Date(schedule.nextRunAt).toLocaleString(language === 'en' ? 'en-US' : 'zh-CN')}
               </span>
             ))}
           </div>
@@ -321,7 +336,7 @@ export function DashboardWorkspace({
             visibleCases.map((item) => (
               <div className="case-table-row case-table-row-managed" key={item.id}>
                 <input
-                  aria-label={`选择 ${item.title}`}
+                  aria-label={t('选择 {name}', { name: item.title })}
                   checked={selectedCaseIds.includes(item.id)}
                   onChange={() => toggleCase(item.id)}
                   type="checkbox"
@@ -330,10 +345,10 @@ export function DashboardWorkspace({
                   <strong>{item.title}</strong>
                   <p>{richTextToPlainText(item.content.userRequirement || item.description) || item.description}</p>
                 </Link>
-                <span className={`badge status-${item.status}`}>{statusLabel(item.status)}</span>
-                <span>{item.status === 'running' ? '执行中' : ['passed', 'failed', 'blocked'].includes(item.status) ? '已完成' : '待执行'}</span>
+                <span className={`badge status-${item.status}`}>{t(statusLabel(item.status))}</span>
+                <span>{t(caseProgressLabel(item.status))}</span>
                 <select className="input compact-select" disabled={movingCaseId === item.id} value={item.groupId || ''} onChange={(event) => moveCase(item.id, event.target.value || undefined)}>
-                  <option value="">未分组</option>
+                  <option value="">{t('未分组')}</option>
                   {groups.map((group) => (
                     <option key={group.id} value={group.id}>{groupPath(groups, group.id)}</option>
                   ))}
@@ -342,7 +357,7 @@ export function DashboardWorkspace({
                   {movingCaseId === item.id ? (
                     <Loader2 className="spin" size={16} />
                   ) : (
-                    <Link className="case-row-icon-button" href={`/test-cases/${item.id}`} title="查看详情"><PlayCircle size={18} /></Link>
+                    <Link className="case-row-icon-button" href={`/test-cases/${item.id}`} title={t('查看详情')}><PlayCircle size={18} /></Link>
                   )}
                   <DeleteTestCaseButton
                     className="case-row-icon-button danger"
@@ -354,56 +369,56 @@ export function DashboardWorkspace({
               </div>
             ))
           ) : (
-            <div className="empty-state">当前分组暂无测试用例。</div>
+            <div className="empty-state">{t('当前分组暂无测试用例。')}</div>
           )}
         </div>
       </div>
       {groupDialogOpen ? (
         <div className="modal-overlay" onClick={() => setGroupDialogOpen(false)} role="presentation">
-          <section className="group-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="创建分组">
+          <section className="group-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('创建分组')}>
             <header>
               <div>
-                <h2>{selectedGroupId ? '创建子组' : '创建组'}</h2>
-                <p>{selectedGroupId ? `父级：${groupPath(groups, selectedGroupId)}` : '创建根分组'}</p>
+                <h2>{selectedGroupId ? t('创建子组') : t('创建组')}</h2>
+                <p>{selectedGroupId ? t('父级：{name}', { name: groupPath(groups, selectedGroupId) }) : t('创建根分组')}</p>
               </div>
-              <button className="icon-button" onClick={() => setGroupDialogOpen(false)} type="button" aria-label="关闭">
+              <button className="icon-button" onClick={() => setGroupDialogOpen(false)} type="button" aria-label={t('关闭')}>
                 <X size={18} />
               </button>
             </header>
             <label className="modal-field">
-              分组名称
+              {t('分组名称')}
               <input autoFocus className="input" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
             </label>
             <button className="button full-width" disabled={creatingGroup} onClick={() => createGroup(selectedGroupId)} type="button">
               {creatingGroup ? <Loader2 className="spin" size={16} /> : null}
-              {creatingGroup ? '创建中' : '创建'}
+              {creatingGroup ? t('创建中') : t('创建')}
             </button>
           </section>
         </div>
       ) : null}
       {scheduleOpen ? (
         <div className="modal-overlay" onClick={() => setScheduleOpen(false)} role="presentation">
-          <section className="group-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="创建定时任务">
+          <section className="group-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('创建定时任务')}>
             <header>
               <div>
-                <h2>创建定时任务</h2>
-                <p>{selectedCaseIds.length ? `已选择 ${selectedCaseIds.length} 条用例` : `将运行当前分组 ${visibleCases.length} 条用例`}</p>
+                <h2>{t('创建定时任务')}</h2>
+                <p>{selectedCaseIds.length ? t('已选择 {count} 条用例', { count: selectedCaseIds.length }) : t('将运行当前分组 {count} 条用例', { count: visibleCases.length })}</p>
               </div>
-              <button className="icon-button" onClick={() => setScheduleOpen(false)} type="button" aria-label="关闭">
+              <button className="icon-button" onClick={() => setScheduleOpen(false)} type="button" aria-label={t('关闭')}>
                 <X size={18} />
               </button>
             </header>
             <label className="modal-field">
-              任务名称
+              {t('任务名称')}
               <input className="input" value={scheduleName} onChange={(event) => setScheduleName(event.target.value)} />
             </label>
             <label className="modal-field">
-              间隔分钟
+              {t('间隔分钟')}
               <input className="input" min={1} type="number" value={scheduleInterval} onChange={(event) => setScheduleInterval(Number(event.target.value))} />
             </label>
             <button className="button full-width" disabled={savingSchedule} onClick={saveSchedule} type="button">
               {savingSchedule ? <Loader2 className="spin" size={16} /> : null}
-              {savingSchedule ? '保存中' : '保存并启用'}
+              {savingSchedule ? t('保存中') : t('保存并启用')}
             </button>
           </section>
         </div>

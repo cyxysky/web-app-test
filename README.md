@@ -36,7 +36,7 @@ Each test case can choose a browser operation mode:
 To reuse login state from an existing Chrome or Edge profile, start that browser with a remote debugging port, then set `BROWSER_CDP_ENDPOINT` in the settings page:
 
 ```powershell
-chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:TEMP\web-app-test-chrome"
+chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:TEMP\webpilot-qa-chrome"
 ```
 
 Then set:

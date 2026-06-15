@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "AI Web Test Session Tab Grouper",
+  "name": "WebPilot QA Session Tab Grouper",
   "version": "1.0.0",
-  "description": "Groups AI Web Test browser-session tabs in Chrome's native tab strip.",
+  "description": "Groups WebPilot QA browser-session tabs in Chrome's native tab strip.",
   "permissions": ["tabs", "tabGroups", "storage"],
   "background": {
     "service_worker": "service-worker.js"

@@ -5,7 +5,7 @@ const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
 
-const APP_NAME = 'AI Web Test';
+const APP_NAME = 'WebPilot QA';
 const DEFAULT_PORT = 17890;
 
 let serverProcess;
@@ -98,6 +98,11 @@ function tinymceRoot() {
   return path.join(process.cwd(), 'node_modules', 'tinymce');
 }
 
+function appIconPath() {
+  if (app.isPackaged) return path.join(process.resourcesPath, 'app-icon.png');
+  return path.join(process.cwd(), 'assets', 'app-icon.png');
+}
+
 function packagedChromiumExecutable() {
   if (!app.isPackaged) return '';
   const browserRoot = path.join(process.resourcesPath, 'ms-playwright');
@@ -182,13 +187,14 @@ function createWindow() {
     minWidth: 980,
     minHeight: 680,
     title: APP_NAME,
+    icon: appIconPath(),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
   mainWindow.setMenuBarVisibility(false);
-  const loadingHtml = '<body style="font-family:system-ui;margin:0;display:grid;place-items:center;height:100vh;color:#242f3a"><div><h2>AI Web Test</h2><p>Starting local service...</p></div></body>';
+  const loadingHtml = `<body style="font-family:system-ui;margin:0;display:grid;place-items:center;height:100vh;color:#242f3a"><div><h2>${APP_NAME}</h2><p>Starting local service...</p></div></body>`;
   mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(loadingHtml)}`);
   return mainWindow;
 }

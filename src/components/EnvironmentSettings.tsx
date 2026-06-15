@@ -9,6 +9,8 @@ import {
   runtimeEnvDefinition,
   type SettingsTab,
 } from '@/config/settings';
+import { useI18n } from '@/i18n/I18nProvider';
+import { languageOptions } from '@/i18n/translations';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/test-case.schema';
 
@@ -19,6 +21,7 @@ type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
 type ModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
 
 export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> = [
+  { id: 'general', label: '通用设置' },
   { id: 'model', label: '模型配置' },
   { id: 'browser', label: '浏览器与截图' },
   { id: 'runtime', label: '运行控制' },
@@ -67,7 +70,8 @@ export function EnvironmentSettings({
   onActiveTabChange?: (tab: SettingsTab) => void;
   showTabs?: boolean;
 } = {}) {
-  const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('model');
+  const { language, setLanguage, t } = useI18n();
+  const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('general');
   const [items, setItems] = useState<EnvRow[]>([]);
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig());
   const [modelDraft, setModelDraft] = useState<ModelConfig>(() => createModelConfig());
@@ -76,6 +80,11 @@ export function EnvironmentSettings({
   const [savingModel, setSavingModel] = useState(false);
   const activeTab = controlledActiveTab || internalActiveTab;
   const selectTab = onActiveTabChange || setInternalActiveTab;
+
+  function optionLabel(option: { label: string; value: string }) {
+    if (option.label === '关闭' && option.value === 'false') return language === 'en' ? 'Off' : '关闭';
+    return t(option.label);
+  }
 
   useEffect(() => {
     void load();
@@ -105,7 +114,7 @@ export function EnvironmentSettings({
 
   async function saveEnv() {
     setSavingEnv(true);
-    startGlobalLoading('正在保存环境配置');
+    startGlobalLoading(t('正在保存环境配置'));
     try {
       const response = await fetch('/api/settings/env', {
         method: 'POST',
@@ -113,7 +122,7 @@ export function EnvironmentSettings({
         body: JSON.stringify({ items: items.map((item) => ({ ...item, enabled: true, secret: isSecret(item) })) }),
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '保存环境配置失败');
+      if (!response.ok) throw new Error(data.error || t('保存环境配置失败'));
       setItems(data.saved || []);
     } finally {
       setSavingEnv(false);
@@ -148,7 +157,7 @@ export function EnvironmentSettings({
   async function saveModel() {
     const payload = createModelConfig(modelDraft || modelConfig);
     setSavingModel(true);
-    startGlobalLoading('正在保存模型配置');
+    startGlobalLoading(t('正在保存模型配置'));
     try {
       const response = await fetch('/api/settings/model', {
         method: 'POST',
@@ -156,7 +165,7 @@ export function EnvironmentSettings({
         body: JSON.stringify(payload),
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '保存模型配置失败');
+      if (!response.ok) throw new Error(data.error || t('保存模型配置失败'));
       const nextModel = createModelConfig(data.config);
       setModelConfig(nextModel);
       setModelDraft(nextModel);
@@ -181,7 +190,7 @@ export function EnvironmentSettings({
       return (
         <select className="input settings-control" value={item.value} onChange={(event) => update(index, { value: event.target.value })}>
           {(definition.options || []).map((option) => (
-            <option key={option.value} value={option.value}>{option.label}</option>
+            <option key={option.value} value={option.value}>{optionLabel(option)}</option>
           ))}
         </select>
       );
@@ -191,7 +200,7 @@ export function EnvironmentSettings({
       <input
         className="input settings-control"
         inputMode={definition?.control === 'number' ? 'decimal' : undefined}
-        placeholder="未设置"
+        placeholder={t('未设置')}
         type={definition?.control === 'number' ? 'number' : isSecret(item) ? 'password' : 'text'}
         value={item.value}
         onChange={(event) => update(index, { value: event.target.value })}
@@ -205,7 +214,7 @@ export function EnvironmentSettings({
   const activeProviderSettings = providerSettings(editingModelConfig, activeProvider);
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
-    .filter(({ definition }) => definition?.tab === activeTab);
+    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && definition?.tab === activeTab);
 
   return (
     <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
@@ -213,21 +222,21 @@ export function EnvironmentSettings({
         <header className="settings-header">
           <Link className="ghost-link" href="/dashboard">
             <ArrowLeft size={15} />
-            返回工作台
+            {t('返回工作台')}
           </Link>
           <div>
-            <h1>环境配置</h1>
-            <span>模型、浏览器、运行控制和调试参数全部在网页配置中管理。</span>
+            <h1>{t('环境配置')}</h1>
+            <span>{t('模型、浏览器、运行控制和调试参数全部在网页配置中管理。')}</span>
           </div>
         </header>
       )}
 
       <div className={showTabs ? 'settings-layout' : 'settings-layout no-tabs'}>
         {showTabs ? (
-          <nav className="settings-tabs" aria-label="环境配置分类">
+          <nav className="settings-tabs" aria-label={t('环境配置分类')}>
             {environmentSettingsTabs.map((tab) => (
               <button className={activeTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => selectTab(tab.id)} type="button">
-                {tab.label}
+                {t(tab.label)}
               </button>
             ))}
           </nav>
@@ -238,47 +247,75 @@ export function EnvironmentSettings({
             <section className="settings-loading-panel" role="status" aria-live="polite">
               <Loader2 className="spin" size={18} />
               <div>
-                <h2>正在读取环境配置</h2>
-                <span>正在加载模型、浏览器、运行控制和调试参数。</span>
+                <h2>{t('正在读取环境配置')}</h2>
+                <span>{t('正在加载模型、浏览器、运行控制和调试参数。')}</span>
               </div>
             </section>
           ) : (
             <>
+          {activeTab === 'general' ? (
+            <section>
+              <div className="settings-section-head">
+                <div>
+                  <h2>{t('通用设置')}</h2>
+                  <span>{t('选择界面显示语言。')}</span>
+                </div>
+              </div>
+              <div className="settings-card">
+                <div className="settings-row">
+                  <div>
+                    <strong>{t('界面语言')}</strong>
+                    <span>{t('选择界面显示语言。')}</span>
+                  </div>
+                  <select
+                    className="input settings-control"
+                    value={language}
+                    onChange={(event) => setLanguage(event.target.value === 'en' ? 'en' : 'zh')}
+                  >
+                    {languageOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{t(option.label)}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </section>
+          ) : null}
+
           {activeTab === 'model' ? (
             <section>
               <div className="settings-section-head">
                 <div>
-                  <h2>模型配置</h2>
-                  <span>每个服务商独立保存模型、Key 和 Base URL，切换服务商不会串用密钥。</span>
+                  <h2>{t('模型配置')}</h2>
+                  <span>{t('每个服务商独立保存模型、Key 和 Base URL，切换服务商不会串用密钥。')}</span>
                 </div>
                 <button className="settings-save-button" disabled={savingModel || loading} onClick={saveModel} type="button">
                   {savingModel ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
-                  保存
+                  {t('保存')}
                 </button>
               </div>
               <div className="settings-card">
                 <div className="settings-row">
                   <div>
-                    <strong>服务商</strong>
-                    <span>选择当前运行使用的 AI 模型服务提供商。</span>
+                    <strong>{t('服务商')}</strong>
+                    <span>{t('选择当前运行使用的 AI 模型服务提供商。')}</span>
                   </div>
                   <select className="input settings-control" value={activeProvider} onChange={(event) => selectProvider(event.target.value as ModelProvider)}>
                     {modelProviderDefinitions.map((provider) => (
-                      <option key={provider.value} value={provider.value}>{provider.label}</option>
+                      <option key={provider.value} value={provider.value}>{t(provider.label)}</option>
                     ))}
                   </select>
                 </div>
                 <div className="settings-row">
                   <div>
-                    <strong>模型名称</strong>
-                    <span>仅作用于当前选中的服务商。</span>
+                    <strong>{t('模型名称')}</strong>
+                    <span>{t('仅作用于当前选中的服务商。')}</span>
                   </div>
                   <input className="input settings-control" value={activeProviderSettings.model} onChange={(event) => updateActiveProviderSettings({ model: event.target.value })} placeholder={activeProviderOption.defaultModel} />
                 </div>
                 <div className="settings-row">
                   <div>
-                    <strong>访问密钥</strong>
-                    <span>{activeProviderOption.keyLabel}</span>
+                    <strong>{t('访问密钥')}</strong>
+                    <span>{t(activeProviderOption.keyLabel)}</span>
                   </div>
                   <input
                     className="input settings-control"
@@ -286,32 +323,32 @@ export function EnvironmentSettings({
                     type="password"
                     value={activeProviderSettings.apiKey || ''}
                     onChange={(event) => updateActiveProviderSettings({ apiKey: event.target.value })}
-                    placeholder={activeProviderOption.localAuth ? '本地登录，无需 Key' : '填写该服务商的访问密钥'}
+                    placeholder={activeProviderOption.localAuth ? t('本地登录，无需 Key') : t('填写该服务商的访问密钥')}
                   />
                 </div>
                 {activeProviderOption.baseUrlLabel ? (
                   <div className="settings-row">
                     <div>
-                      <strong>{activeProviderOption.baseUrlLabel}</strong>
-                      <span>自定义兼容服务地址，留空使用默认地址。</span>
+                      <strong>{t(activeProviderOption.baseUrlLabel)}</strong>
+                      <span>{t('自定义兼容服务地址，留空使用默认地址。')}</span>
                     </div>
-                    <input className="input settings-control" value={activeProviderSettings.baseURL || ''} onChange={(event) => updateActiveProviderSettings({ baseURL: event.target.value })} placeholder={activeProviderOption.defaultBaseURL || '默认地址'} />
+                    <input className="input settings-control" value={activeProviderSettings.baseURL || ''} onChange={(event) => updateActiveProviderSettings({ baseURL: event.target.value })} placeholder={activeProviderOption.defaultBaseURL || t('默认地址')} />
                   </div>
                 ) : null}
               </div>
             </section>
           ) : null}
 
-          {activeTab !== 'model' ? (
+          {activeTab !== 'general' && activeTab !== 'model' ? (
             <section>
               <div className="settings-section-head">
                 <div>
-                  <h2>{environmentSettingsTabs.find((tab) => tab.id === activeTab)?.label}</h2>
-                  <span>{visibleEnvItems.length} 项网页配置</span>
+                  <h2>{t(environmentSettingsTabs.find((tab) => tab.id === activeTab)?.label || '')}</h2>
+                  <span>{t('{count} 项网页配置', { count: visibleEnvItems.length })}</span>
                 </div>
                 <button className="settings-save-button" disabled={savingEnv || loading} onClick={saveEnv} type="button">
                   {savingEnv ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
-                  保存
+                  {t('保存')}
                 </button>
               </div>
               {visibleEnvItems.length ? (
@@ -319,8 +356,8 @@ export function EnvironmentSettings({
                   {visibleEnvItems.map(({ item, index, definition }) => (
                     <div className="settings-row settings-env-row" key={item.key}>
                       <div className="env-name" title={item.key}>
-                        <strong>{definition?.label || item.key}</strong>
-                        <span>{definition?.description || '网页配置项。'}</span>
+                        <strong>{definition?.label ? t(definition.label) : item.key}</strong>
+                        <span>{definition?.description ? t(definition.description) : t('网页配置项。')}</span>
                       </div>
                       <div className="settings-row-control">
                         {renderRuntimeControl(item, index)}
@@ -329,7 +366,7 @@ export function EnvironmentSettings({
                   ))}
                 </div>
               ) : (
-                <div className="empty-state">这个分类暂无配置。</div>
+                <div className="empty-state">{t('这个分类暂无配置。')}</div>
               )}
             </section>
           ) : null}
