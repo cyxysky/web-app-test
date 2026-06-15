@@ -4043,8 +4043,6 @@ select {
 
 .settings-loading-panel {
   align-items: center;
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid var(--border);
   border-radius: 12px;
   color: var(--muted-strong);
   display: flex;
