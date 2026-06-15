@@ -3,11 +3,12 @@ import { readFile } from 'node:fs/promises';
 import { generateObject, generateText, stepCountIs, tool } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
+import { appendDesktopEvidenceToResult, captureDesktopBeforeTool, collectDesktopEvidenceAfterTool } from '@/server/desktop/desktop-action-evidence';
 import { normalizeDomNodeIdParam, normalizeDomPathParam } from '@/lib/dom-path';
 import { richTextToPlainText } from '@/lib/rich-text';
 
@@ -43,6 +44,7 @@ type ToolTrace = {
   name: string;
   input: unknown;
   result?: BrowserActionResult;
+  desktopEvidence?: DesktopActionEvidence;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
   visualAfter?: VisualAfterPolicy;
@@ -574,6 +576,7 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       reason,
       ok: trace.result?.ok,
       result: userFacingToolResult(trace.name, trace.result, 360),
+      desktopEvidence: trace.desktopEvidence,
       contextBefore: trace.contextBefore,
       contextAfter: trace.contextAfter,
       visualAfter: trace.visualAfter,
@@ -1403,6 +1406,8 @@ async function executeTracedBrowserAction(input: {
   const trace = createToolTrace({ traces, name, toolInput, aiRequest, runId, stepIndex, visualContext });
   await notifyToolTrace(onToolTrace, trace);
   throwIfStopped(abortSignal, shouldContinue);
+  const desktopBefore = await captureDesktopBeforeTool(name);
+  throwIfStopped(abortSignal, shouldContinue);
 
   let result: BrowserActionResult;
   try {
@@ -1416,6 +1421,12 @@ async function executeTracedBrowserAction(input: {
     };
   }
 
+  const desktopEvidence = await collectDesktopEvidenceAfterTool(name, desktopBefore);
+  if (desktopEvidence) {
+    trace.desktopEvidence = desktopEvidence;
+    result = appendDesktopEvidenceToResult(result, desktopEvidence);
+  }
+  throwIfStopped(abortSignal, shouldContinue);
   trace.result = result;
   await notifyToolTrace(onToolTrace, trace);
   throwIfStopped(abortSignal, shouldContinue);
