@@ -51,3 +51,9 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
     return ipcRenderer.invoke('webpilot:embedded-browser:set-visible', input);
   },
 });
+
+contextBridge.exposeInMainWorld('webPilotSystem', {
+  selectDirectory(input) {
+    return ipcRenderer.invoke('webpilot:system:select-directory', input || {});
+  },
+});

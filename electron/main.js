@@ -637,6 +637,25 @@ function registerEmbeddedBrowserIpc() {
   });
 }
 
+function registerSystemIpc() {
+  ipcMain.handle('webpilot:system:select-directory', async (_event, input = {}) => {
+    try {
+      const defaultPath = typeof input.defaultPath === 'string' && input.defaultPath.trim()
+        ? input.defaultPath.trim()
+        : undefined;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        defaultPath,
+        properties: ['openDirectory', 'createDirectory'],
+        title: 'Select file output directory',
+      });
+      if (result.canceled || !result.filePaths?.[0]) return { ok: true, canceled: true };
+      return { ok: true, path: result.filePaths[0] };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+}
+
 async function startServer(appDataDir) {
   const port = await findAvailablePort(Number(process.env.AI_WEB_TEST_PORT || DEFAULT_PORT));
   const serverDir = serverDirectory();
@@ -745,6 +764,7 @@ async function boot() {
 }
 
 registerEmbeddedBrowserIpc();
+registerSystemIpc();
 
 app.whenReady().then(boot);
 

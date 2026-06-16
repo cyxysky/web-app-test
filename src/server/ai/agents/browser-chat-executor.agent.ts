@@ -5,12 +5,13 @@ import sharp from 'sharp';
 import { z } from 'zod';
 import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines } from '@/server/ai/prompts/runtime-agent.prompt';
+import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { appendDesktopEvidenceToResult, captureDesktopBeforeTool, collectDesktopEvidenceAfterTool } from '@/server/desktop/desktop-action-evidence';
 import { normalizeDomNodeIdParam, normalizeDomPathParam } from '@/lib/dom-path';
 import { richTextToPlainText } from '@/lib/rich-text';
+import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 
 type ExecutionProgress = (step: StepExecutionResult) => void | Promise<void>;
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
@@ -101,10 +102,13 @@ const codexRuntimeObjectSchema = z.object({
   params: z.object({
     reason: z.string().nullable().optional(),
     url: z.string().nullable().optional(),
+    urlOrPath: z.string().nullable().optional(),
     id: z.string().nullable().optional(),
     areaId: z.string().nullable().optional(),
     text: z.string().nullable().optional(),
     content: z.string().nullable().optional(),
+    fileName: z.string().nullable().optional(),
+    title: z.string().nullable().optional(),
     key: z.string().nullable().optional(),
     path: z.string().nullable().optional(),
     domPath: z.string().nullable().optional(),
@@ -399,6 +403,7 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, max = 
   if (name === 'getInteractiveCandidates') return '已读取当前可见可交互元素。';
   if (name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
   if (name === 'listTabs') return '已读取浏览器标签页列表。';
+  if (name === 'downloadFile' || name === 'generateMarkdownFile') return formatFileArtifactResult(name, result.actual);
   return trimDebugText(result.actual, resultMax);
 }
 
@@ -663,10 +668,11 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
   if (!recent.length) return '[none]';
   return recent.map((trace, index) => {
     const { reason } = splitToolInputAndReason(trace.input);
+    const fileResult = trace.result?.ok ? formatFileArtifactResult(trace.name, trace.result.actual) : undefined;
     const status = !trace.result
       ? 'running'
       : trace.result.ok
-        ? 'ok'
+        ? fileResult ? `ok: ${sanitizeHistoricalToolText(fileResult, 260)}` : 'ok'
         : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
     const shots = trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
     const desktop = trace.desktopEvidence ? `; desktop=${sanitizeHistoricalToolText(trace.desktopEvidence.summary, 180)}` : '';
@@ -1037,6 +1043,8 @@ const noVisualAfterCaptureToolNames = new Set([
   'getDomNodeText',
   'findByText',
   'waitForHumanVerification',
+  'downloadFile',
+  'generateMarkdownFile',
 ]);
 const noDomAfterContextToolNames = new Set([
   ...noVisualAfterCaptureToolNames,
@@ -1578,6 +1586,25 @@ function makeBrowserTools(
       inputSchema: browserToolInput({}),
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
     }),
+    downloadFile: tool({
+      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, or pass a relative path/urlOrPath that will be resolved against AI_FILE_DOWNLOAD_BASE_URL from settings. Use this when the user asks to download/save a file; return the saved URL or local path in the final answer.',
+      inputSchema: browserToolInput({
+        url: z.string().optional().describe('Absolute download URL. If omitted, path or urlOrPath is used.'),
+        path: z.string().optional().describe('Relative file path resolved against configured AI_FILE_DOWNLOAD_BASE_URL.'),
+        urlOrPath: z.string().optional().describe('Absolute URL or relative path resolved against configured AI_FILE_DOWNLOAD_BASE_URL.'),
+        fileName: z.string().optional().describe('Optional saved file name, including extension when known.'),
+      }),
+      execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId })),
+    }),
+    generateMarkdownFile: tool({
+      description: 'Create a Markdown .md file in the configured local output directory or this run artifacts from complete Markdown content written by the AI. Use this when the user asks to generate/export/save a Markdown file, then include the saved URL or local path in the final answer.',
+      inputSchema: browserToolInput({
+        fileName: z.string().optional().describe('Optional Markdown file name. The .md extension is added when missing.'),
+        title: z.string().optional().describe('Optional title used as fallback file name.'),
+        content: z.string().min(1).describe('Complete Markdown file content to save.'),
+      }),
+      execute: (input) => record('generateMarkdownFile', input, () => generateMarkdownArtifact({ ...input, runId: referenceOptions?.runId })),
+    }),
     switchTab: tool({
       description: 'Switch to a browser tab by index when the workflow opened a new tab.',
       inputSchema: browserToolInput({
@@ -1882,6 +1909,22 @@ function runtimePrompt(input: {
   const requirement = requirementOf(testCase);
   const browserChatMode = isBrowserChatTestCase(testCase);
   const compactRunContext = buildCompactRunContext(completedSteps, input.workingMemory);
+  const customPrompt = customRuntimePromptFromEnv(browserChatMode ? 'browser-chat' : 'target', {
+    requirement,
+    targetUrl: testCase.targetUrl,
+    currentUrl: pageContext.url,
+    currentTitle: pageContext.title,
+    browserMode: mode,
+    stepIndex: input.stepIndex,
+    runState: compactRunContext,
+    workingMemory: input.workingMemory ? formatWorkingMemory(input.workingMemory) : '',
+    openTabs: pageContext.tabs,
+    pageScrollState: pageContext.pageScrollState,
+    testCaseTitle: testCase.title,
+    testCaseDescription: testCase.description,
+    systemPrompt: caseSystemPrompt,
+    currentDate: new Date().toISOString(),
+  });
   const availableScreenshotReferences = input.availableScreenshotReferences || [];
   const selectedScreenshotReferences = input.selectedScreenshotReferences || [];
   const strategyMemory = (testCase.strategyMemory || [])
@@ -1971,6 +2014,8 @@ function runtimePrompt(input: {
     '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
     '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
     '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
+    '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL or a relative path resolved against AI_FILE_DOWNLOAD_BASE_URL from settings.',
+    '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. Include the returned URL or local path in the final answer.',
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
@@ -1999,6 +2044,8 @@ function runtimePrompt(input: {
     ...markerTargetRules,
     caseSystemPrompt ? `Test-case-specific instructions:
 ${caseSystemPrompt}` : '',
+    customPrompt ? `Mode custom instructions:
+${customPrompt}` : '',
     strategyMemory.length ? `Historical failure strategy memory:
 ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : '',
     '',
@@ -2016,6 +2063,7 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     browserChatMode
       ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
       : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
+    '- When a file tool succeeds, mention the saved file name and include its returned URL or local path.',
     '',
     'Current context:',
     visualMode ? `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}` : 'See the Runtime DOM Context system message for current URL, tabs, focus, scroll state, DOM snapshot, and page text.',
@@ -2059,6 +2107,8 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'waitForHumanVerification',
     'listTabs',
     'getHttpRequests',
+    'downloadFile',
+    'generateMarkdownFile',
     'switchTab',
     'typeText',
     'pressKey',
@@ -3569,7 +3619,7 @@ function replayAiRepairMaxSteps() {
   return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 2));
 }
 
-async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep): Promise<BrowserActionResult> {
+async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep, runId?: string): Promise<BrowserActionResult> {
   const input = flowInput(flow.input);
   const text = typeof input.text === 'string' ? input.text : undefined;
   const domPath = normalizeDomPathParam(input);
@@ -3640,6 +3690,21 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.listTabs();
     case 'getHttpRequests':
       return session.getCurrentTabHttpRequests();
+    case 'downloadFile':
+      return downloadFileArtifact({
+        runId,
+        url: typeof input.url === 'string' ? input.url : undefined,
+        path: typeof input.path === 'string' ? input.path : undefined,
+        urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
+        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+      });
+    case 'generateMarkdownFile':
+      return generateMarkdownArtifact({
+        runId,
+        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+        title: typeof input.title === 'string' ? input.title : undefined,
+        content: typeof input.content === 'string' ? input.content : typeof input.text === 'string' ? input.text : undefined,
+      });
     case 'switchTab':
       return session.switchTab(typeof input.index === 'number' ? input.index : Number(input.index || 0));
     case 'reportState':
@@ -3687,7 +3752,7 @@ async function runTracedRecordedTool(input: {
     visualContext,
     onToolTrace,
     onVisualContextChange,
-    action: () => runRecordedTool(session, targetUrl, flow),
+    action: () => runRecordedTool(session, targetUrl, flow, runId),
   });
 }
 
@@ -3779,8 +3844,8 @@ async function executeCodexRuntimeObject(input: {
     onVisualContextChange,
     action: async () => (
       candidateActionToolNames.has(type)
-        ? validateCandidateActionBeforeExecution(type, normalizedParams, traces) || await runRecordedTool(session, targetUrl, flow)
-        : await runRecordedTool(session, targetUrl, flow)
+        ? validateCandidateActionBeforeExecution(type, normalizedParams, traces) || await runRecordedTool(session, targetUrl, flow, runId)
+        : await runRecordedTool(session, targetUrl, flow, runId)
     ),
   });
   return { text: readableActionFromRawText(message) || '', executed: true };

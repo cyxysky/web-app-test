@@ -27,6 +27,8 @@ type PrepareStepPromptInput = {
   browserMode?: 'dom' | 'visual-markers';
 };
 
+type CustomPromptMode = 'browser-chat' | 'target';
+
 export function buildCompletionPromptLines(usesScreenshot: boolean) {
   const evidence = usesScreenshot ? 'screenshot' : 'textual page context / candidates / DOM / URL / focus';
   return [
@@ -102,10 +104,50 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     domMode ? '- DOM mode: use the current Codex-style full DOM snapshot plus full page text, including accessible iframe and shadow DOM content. Use getDomNodeText(id) for complete text under a returned DOM node; use clickDomNode(id,text?) with a fresh numeric node_id. Use findByText(targetText,scopeId?) only as a read-only recovery step, then clickLocator(locatorId,text?) using a returned locatorId in a later turn.' : '',
     '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
     '- For getDomNodeText/clickDomNode, put the fresh DOM numeric node_id in params.id. The numeric id may be copied with or without square brackets.',
+    allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, or a relative source path in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
+    allowedTypes.includes('generateMarkdownFile') ? '- For generateMarkdownFile, put the complete Markdown document in params.content and the desired file name in params.fileName.' : '',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
     answerAllowed
       ? '- For browser chat completion, clarification, blocked state, failure, or pure text response, set type="answer" and put the complete Chinese Markdown answer in message. Do not use reportState.'
       : '- For completion, manual verification, failure, or pure status update, use type="reportState".',
+  ].join('\n');
+}
+
+function stringifyPromptVariable(value: unknown) {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+export function renderCustomPromptTemplate(template: string, variables: Record<string, unknown>) {
+  let rendered = String(template || '');
+  for (const [key, value] of Object.entries(variables)) {
+    const text = stringifyPromptVariable(value);
+    rendered = rendered
+      .split(`{{${key}}}`).join(text)
+      .split(`{${key}}`).join(text);
+  }
+  return rendered.trim();
+}
+
+export function customRuntimePromptFromEnv(mode: CustomPromptMode, variables: Record<string, unknown>) {
+  const enabled = mode === 'browser-chat'
+    ? process.env.AI_BROWSER_CHAT_CUSTOM_PROMPT_ENABLED === 'true'
+    : process.env.AI_TARGET_MODE_CUSTOM_PROMPT_ENABLED === 'true';
+  if (!enabled) return '';
+  const template = String(mode === 'browser-chat'
+    ? process.env.AI_BROWSER_CHAT_CUSTOM_PROMPT || ''
+    : process.env.AI_TARGET_MODE_CUSTOM_PROMPT || '').trim();
+  if (!template) return '';
+  const rendered = renderCustomPromptTemplate(template, variables);
+  if (!rendered) return '';
+  return [
+    `User-configured ${mode === 'browser-chat' ? 'browser chat' : 'target mode'} prompt (variables rendered):`,
+    rendered,
   ].join('\n');
 }
 

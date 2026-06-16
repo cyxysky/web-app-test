@@ -1,8 +1,9 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Loader2, Save } from 'lucide-react';
+import { ArrowLeft, FolderOpen, Loader2, Save } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import {
   modelProviderDefinitions,
@@ -21,6 +22,16 @@ type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
 };
 
 type ModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
+
+type SystemBridge = {
+  selectDirectory: (input?: { defaultPath?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
+};
+
+declare global {
+  interface Window {
+    webPilotSystem?: SystemBridge;
+  }
+}
 
 export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> = [
   { id: 'general', label: '通用设置' },
@@ -61,6 +72,44 @@ function isSecret(item: EnvRow) {
   return Boolean(item.secret || runtimeEnvDefinition(item.key)?.secret || /KEY|TOKEN|SECRET|PASSWORD|COOKIE|DATABASE_URL/i.test(item.key));
 }
 
+function pushPromptPreviewText(parts: ReactNode[], text: string, keyPrefix: string) {
+  const lines = text.split('\n');
+  lines.forEach((line, lineIndex) => {
+    if (line) parts.push(<span className="settings-prompt-preview-text" key={`${keyPrefix}-text-${lineIndex}`}>{line}</span>);
+    if (lineIndex < lines.length - 1) parts.push(<br key={`${keyPrefix}-break-${lineIndex}`} />);
+  });
+}
+
+function renderPromptTemplatePreview(
+  value: string,
+  variables: Array<{ label: string; value: string }>,
+  translate: (value: string) => string,
+) {
+  const parts: ReactNode[] = [];
+  const labelsByToken = new Map(variables.map((variable) => [variable.value, translate(variable.label)]));
+  const pattern = /\{\{[a-zA-Z][a-zA-Z0-9_]*\}\}/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let hasToken = false;
+
+  while ((match = pattern.exec(value)) !== null) {
+    const token = match[0];
+    const index = match.index;
+    if (index > lastIndex) {
+      pushPromptPreviewText(parts, value.slice(lastIndex, index), `text-${lastIndex}`);
+    }
+    parts.push(<span className="settings-prompt-token" key={`token-${index}`} title={token}>{labelsByToken.get(token) || token}</span>);
+    lastIndex = index + token.length;
+    hasToken = true;
+  }
+
+  if (!hasToken) return null;
+  if (lastIndex < value.length) {
+    pushPromptPreviewText(parts, value.slice(lastIndex), `text-${lastIndex}`);
+  }
+  return parts;
+}
+
 export function EnvironmentSettings({
   activeTab: controlledActiveTab,
   embedded = false,
@@ -83,6 +132,8 @@ export function EnvironmentSettings({
   const [loading, setLoading] = useState(true);
   const [savingEnv, setSavingEnv] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
+  const [hasDirectoryPicker, setHasDirectoryPicker] = useState(false);
+  const textareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   const activeTab = controlledActiveTab || internalActiveTab;
   const selectTab = onActiveTabChange || setInternalActiveTab;
 
@@ -92,6 +143,7 @@ export function EnvironmentSettings({
   }
 
   useEffect(() => {
+    setHasDirectoryPicker(typeof window !== 'undefined' && Boolean(window.webPilotSystem?.selectDirectory));
     void load();
   }, []);
 
@@ -115,6 +167,32 @@ export function EnvironmentSettings({
 
   function update(index: number, patch: Partial<EnvRow>) {
     setItems((current) => current.map((item, itemIndex) => (itemIndex === index ? { ...item, enabled: true, ...patch } : item)));
+  }
+
+  function insertRuntimeVariable(index: number, key: string, token: string) {
+    const textarea = textareaRefs.current[key];
+    const current = items[index]?.value || '';
+    const start = textarea?.selectionStart ?? current.length;
+    const end = textarea?.selectionEnd ?? current.length;
+    const nextValue = `${current.slice(0, start)}${token}${current.slice(end)}`;
+    update(index, { value: nextValue });
+    requestAnimationFrame(() => {
+      const nextTextarea = textareaRefs.current[key];
+      const nextPosition = start + token.length;
+      nextTextarea?.focus();
+      nextTextarea?.setSelectionRange(nextPosition, nextPosition);
+    });
+  }
+
+  async function chooseRuntimeDirectory(index: number, item: EnvRow) {
+    const bridge = typeof window !== 'undefined' ? window.webPilotSystem : undefined;
+    if (!bridge?.selectDirectory) return;
+    const result = await bridge.selectDirectory({ defaultPath: item.value || undefined });
+    if (result.ok && result.path) {
+      update(index, { value: result.path });
+    } else if (!result.ok && result.error) {
+      window.alert(result.error);
+    }
   }
 
   async function saveEnv() {
@@ -203,6 +281,65 @@ export function EnvironmentSettings({
             value: option.value,
           }))}
         />
+      );
+    }
+
+    if (definition?.control === 'textarea') {
+      const preview = renderPromptTemplatePreview(item.value, definition.variables || [], t);
+      return (
+        <div className="settings-prompt-control">
+          <textarea
+            ref={(node) => {
+              textareaRefs.current[item.key] = node;
+            }}
+            className="textarea settings-control settings-textarea-control"
+            placeholder={t('未设置')}
+            value={item.value}
+            onChange={(event) => update(index, { value: event.target.value })}
+          />
+          {definition.variables?.length ? (
+            <div className="settings-variable-tags" aria-label={t('可用变量')}>
+              {definition.variables.map((variable) => (
+                <button
+                  className="settings-variable-tag"
+                  key={variable.value}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => insertRuntimeVariable(index, item.key, variable.value)}
+                  title={variable.description ? t(variable.description) : variable.value}
+                  type="button"
+                >
+                  <span>{t(variable.label)}</span>
+                  <code>{variable.value}</code>
+                </button>
+              ))}
+            </div>
+          ) : null}
+          {preview ? <div className="settings-prompt-token-preview">{preview}</div> : null}
+        </div>
+      );
+    }
+
+    if (definition?.picker === 'directory') {
+      return (
+        <div className="settings-directory-control">
+          <input
+            className="input settings-control"
+            placeholder={t('未设置')}
+            type="text"
+            value={item.value}
+            onChange={(event) => update(index, { value: event.target.value })}
+          />
+          <button
+            className="settings-picker-button"
+            disabled={!hasDirectoryPicker}
+            onClick={() => chooseRuntimeDirectory(index, item)}
+            title={hasDirectoryPicker ? t('选择目录') : t('仅 Electron 桌面端支持目录选择')}
+            type="button"
+          >
+            <FolderOpen size={15} />
+            {t('选择')}
+          </button>
+        </div>
       );
     }
 
@@ -404,7 +541,7 @@ export function EnvironmentSettings({
               {visibleEnvItems.length ? (
                 <div className="settings-card">
                   {visibleEnvItems.map(({ item, index, definition }) => (
-                    <div className="settings-row settings-env-row" key={item.key}>
+                    <div className={`settings-row settings-env-row${definition?.control === 'textarea' ? ' prompt-row' : ''}`} key={item.key}>
                       <div className="env-name" title={item.key}>
                         <strong>{definition?.label ? t(definition.label) : item.key}</strong>
                         <span>{definition?.description ? t(definition.description) : t('网页配置项。')}</span>

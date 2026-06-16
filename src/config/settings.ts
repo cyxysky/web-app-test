@@ -18,8 +18,10 @@ export type RuntimeEnvDefinition = {
   description: string;
   tab: Exclude<SettingsTab, 'general' | 'model'>;
   defaultValue: string;
-  control: 'boolean' | 'number' | 'select' | 'text' | 'secret';
+  control: 'boolean' | 'number' | 'select' | 'text' | 'secret' | 'textarea';
   options?: Array<{ label: string; value: string }>;
+  picker?: 'directory';
+  variables?: Array<{ label: string; value: string; description?: string }>;
   secret?: boolean;
 };
 
@@ -82,6 +84,23 @@ const boolOptions = [
   { label: '关闭', value: 'false' },
 ];
 
+export const promptVariableOptions = [
+  { label: '用户需求', value: '{{requirement}}', description: '当前对话或测试目标的完整需求文本' },
+  { label: '目标地址', value: '{{targetUrl}}', description: '测试用例或对话默认目标 URL' },
+  { label: '当前地址', value: '{{currentUrl}}', description: '浏览器当前页面 URL' },
+  { label: '当前标题', value: '{{currentTitle}}', description: '浏览器当前页面标题' },
+  { label: '浏览器模式', value: '{{browserMode}}', description: 'visual-markers 或 dom' },
+  { label: '步骤序号', value: '{{stepIndex}}', description: '当前运行步骤序号' },
+  { label: '运行上下文', value: '{{runState}}', description: '压缩后的历史步骤、进展和待办上下文' },
+  { label: '工作记忆', value: '{{workingMemory}}', description: '当前 agent loop 的短期工作记忆' },
+  { label: '标签页', value: '{{openTabs}}', description: '当前浏览器标签页列表 JSON' },
+  { label: '滚动状态', value: '{{pageScrollState}}', description: '当前页面滚动状态 JSON' },
+  { label: '用例标题', value: '{{testCaseTitle}}', description: '目标模式测试用例标题' },
+  { label: '用例描述', value: '{{testCaseDescription}}', description: '目标模式测试用例描述' },
+  { label: '用例提示词', value: '{{systemPrompt}}', description: '测试用例内置的 AI 操作提示词' },
+  { label: '当前时间', value: '{{currentDate}}', description: '运行时 ISO 时间' },
+];
+
 export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: 'visual-markers 使用截图编号，dom 使用 DOM 定位。', tab: 'browser', defaultValue: 'visual-markers', control: 'select', options: [{ label: '视觉标记', value: 'visual-markers' }, { label: 'DOM 定位', value: 'dom' }] },
@@ -116,6 +135,12 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'KEEP_BROWSER_OPEN_ON_AI_ERROR', label: 'AI 错误时保留浏览器', description: 'AI 调用异常时是否保留浏览器用于排查。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'AI_TEST_RUNTIME_MAX_STEPS', label: '最大运行步骤数', description: '单次测试最多允许 AI 执行多少个运行步骤。', tab: 'runtime', defaultValue: '30', control: 'number' },
   { key: 'AI_BROWSER_CHAT_MAX_STEPS', label: '对话模式浏览器步骤上限', description: '对话模式中，单轮用户消息最多允许执行多少个浏览器步骤；达到后会保存进度并暂停，发送“继续”可接着执行。', tab: 'runtime', defaultValue: '6', control: 'number' },
+  { key: 'AI_FILE_DOWNLOAD_BASE_URL', label: '文件下载源基础地址', description: 'AI 下载文件时用于拼接相对路径的源地址；如果 AI 传入完整 URL，则不需要配置。', tab: 'runtime', defaultValue: '', control: 'text' },
+  { key: 'AI_FILE_OUTPUT_DIR', label: '文件保存目录', description: '下载文件和生成 Markdown 的本地保存目录；留空时保存到默认 artifacts 目录并生成网页下载链接。', tab: 'runtime', defaultValue: '', control: 'text', picker: 'directory' },
+  { key: 'AI_BROWSER_CHAT_CUSTOM_PROMPT_ENABLED', label: '启用对话模式自定义提示词', description: '关闭时对话模式完全使用默认提示词；开启后才会追加下方自定义提示词。', tab: 'runtime', defaultValue: 'false', control: 'boolean', options: boolOptions },
+  { key: 'AI_BROWSER_CHAT_CUSTOM_PROMPT', label: '对话模式自定义提示词', description: '追加到对话模式运行 prompt 的自定义说明；支持点击下方变量标签插入 {{变量名}}。', tab: 'runtime', defaultValue: '', control: 'textarea', variables: promptVariableOptions },
+  { key: 'AI_TARGET_MODE_CUSTOM_PROMPT_ENABLED', label: '启用目标模式自定义提示词', description: '关闭时目标模式完全使用默认提示词；开启后才会追加下方自定义提示词。', tab: 'runtime', defaultValue: 'false', control: 'boolean', options: boolOptions },
+  { key: 'AI_TARGET_MODE_CUSTOM_PROMPT', label: '目标模式自定义提示词', description: '追加到目标模式运行 prompt 的自定义说明；支持点击下方变量标签插入 {{变量名}}。', tab: 'runtime', defaultValue: '', control: 'textarea', variables: promptVariableOptions },
   { key: 'AI_AGENT_LOOP_MAX_TURNS', label: 'Agent Loop 最大轮次', description: '单个步骤内部最多允许多少轮工具调用。', tab: 'runtime', defaultValue: '6', control: 'number' },
   { key: 'RUN_WORKER_CONCURRENCY', label: '运行并发数', description: '同时执行多少个测试运行。', tab: 'runtime', defaultValue: '1', control: 'number' },
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
