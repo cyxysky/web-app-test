@@ -2,24 +2,42 @@
 
 import { memo, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
+  AppWindow,
+  BadgeCheck,
   Bot,
+  Braces,
   Bug,
   ChevronDown,
+  ClipboardCheck,
+  Compass,
+  CornerDownLeft,
+  FileSearch,
   Folder,
+  GalleryHorizontalEnd,
+  Gauge,
   ImageUp,
   Loader2,
   Maximize2,
   MessageSquare,
+  MousePointer2,
+  Network,
   PanelLeft,
+  PencilLine,
   Power,
+  Route,
+  ScanSearch,
   ScrollText,
   Send,
+  SendHorizontal,
   Settings,
   SlidersHorizontal,
   FilePlus2,
+  SquareArrowOutUpRight,
   SquareTerminal,
   Square,
   Trash2,
+  Waypoints,
+  Workflow,
   User,
   X,
 } from 'lucide-react';
@@ -250,6 +268,127 @@ function toolStatusLabel(tool: BrowserChatToolCall) {
   return '运行中';
 }
 
+function toolStringValue(value: unknown) {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return '';
+}
+
+function toolInputValue(record: Record<string, unknown> | undefined, keys: string[]) {
+  if (!record) return '';
+  for (const key of keys) {
+    const value = toolStringValue(record[key]);
+    if (value) return value;
+  }
+  return '';
+}
+
+function summarizeToolFields(fields: unknown) {
+  if (!Array.isArray(fields) || !fields.length) return '';
+  const textValues = fields
+    .map((field) => toolInputValue(asRecord(field), ['text', 'value', 'content']))
+    .filter(Boolean);
+  if (fields.length === 1) return textValues[0] || '1 项';
+  return `${fields.length} 项${textValues[0] ? `，${textValues[0]}` : ''}`;
+}
+
+function browserChatToolLabel(name: string) {
+  const labels: Record<string, string> = {
+    clickCandidate: '点选目标',
+    clickDomNode: '点选节点',
+    clickLocator: '点选定位器',
+    doubleClickCandidate: '双击目标',
+    dragCandidate: '拖拽元素',
+    fillCandidates: '填写表单',
+    fillDomNodes: '填写节点',
+    findByText: '定位文本',
+    getDomNodeText: '读取节点',
+    getHttpRequests: '检查请求',
+    listTabs: '扫描标签页',
+    manageVisualContext: '整理视觉上下文',
+    openPage: '导航页面',
+    pressKey: '发送按键',
+    reportState: '确认状态',
+    rightClickCandidate: '右键目标',
+    scrollArea: '移动视窗',
+    selectReferenceScreenshots: '引用截图',
+    switchTab: '切换标签',
+    typeText: '键入内容',
+    waitForHumanVerification: '等待人工验证',
+    waitForPage: '等待页面稳定',
+  };
+  if (labels[name]) return labels[name];
+
+  const lower = name.toLowerCase();
+  if (lower.includes('screenshot') || lower.includes('capture')) return '截屏取证';
+  if (lower.includes('snapshot') || lower.includes('context')) return '读取页面状态';
+  if (lower.includes('clickat') || lower.includes('coordinate')) return '点选坐标';
+  if (lower.includes('click')) return '点选目标';
+  if (lower.includes('fill') || lower.includes('type')) return '键入内容';
+  if (lower.includes('hover')) return '悬停元素';
+  if (lower.includes('drag')) return '拖拽元素';
+  if (lower.includes('scroll')) return '移动视窗';
+  if (lower.includes('wait')) return '等待页面稳定';
+  if (lower.includes('open') || lower.includes('page')) return '导航页面';
+  if (lower.includes('request')) return '检查请求';
+  if (lower.includes('report') || lower.includes('state')) return '确认状态';
+  return name;
+}
+
+function browserChatToolMeta(name: string, input: unknown) {
+  const record = asRecord(input);
+  if (!record) return toolStringValue(input);
+
+  const lower = name.toLowerCase();
+  if (name === 'typeText') return toolInputValue(record, ['text', 'content', 'value']);
+  if (name === 'pressKey') return toolInputValue(record, ['key']);
+  if (name === 'openPage') return toolInputValue(record, ['url']);
+  if (name === 'switchTab') return toolInputValue(record, ['index']);
+  if (name === 'waitForPage') return toolInputValue(record, ['ms']);
+  if (name === 'waitForHumanVerification') return toolInputValue(record, ['maxMs']);
+  if (name === 'scrollArea') {
+    const area = toolInputValue(record, ['areaId']);
+    const deltaY = toolInputValue(record, ['deltaY']);
+    return [area, deltaY ? `Y ${deltaY}` : ''].filter(Boolean).join(' · ');
+  }
+  if (name === 'selectReferenceScreenshots') {
+    const ids = Array.isArray(record.ids) ? record.ids : [];
+    return ids.length ? `${ids.length} 张` : '';
+  }
+  if (name === 'manageVisualContext') return toolInputValue(record, ['action', 'manageReason']);
+  if (name === 'reportState') return toolInputValue(record, ['action', 'actual', 'status']);
+  if (lower.includes('fill')) return summarizeToolFields(record.fields) || toolInputValue(record, ['text', 'content', 'value']);
+  if (lower.includes('click') || lower.includes('hover') || lower.includes('drag')) {
+    return toolInputValue(record, ['text', 'targetVisual', 'targetText', 'id', 'locatorId', 'fromId']);
+  }
+  if (lower.includes('find')) return toolInputValue(record, ['targetText', 'scopeId']);
+  if (lower.includes('text')) return toolInputValue(record, ['text', 'targetText', 'id']);
+  return toolInputValue(record, ['url', 'text', 'targetVisual', 'targetText', 'id', 'areaId', 'action', 'status']);
+}
+
+function BrowserChatToolIcon({ name }: { name: string }) {
+  const lower = name.toLowerCase();
+  if (lower.includes('screenshot') || lower.includes('capture')) return <GalleryHorizontalEnd size={13} />;
+  if (lower.includes('snapshot') || lower.includes('context')) return <Braces size={13} />;
+  if (lower.includes('type') || lower.includes('fill')) return <PencilLine size={13} />;
+  if (lower.includes('press') || lower.includes('key')) return <CornerDownLeft size={13} />;
+  if (lower.includes('clickat') || lower.includes('coordinate')) return <Compass size={13} />;
+  if (lower.includes('click') || lower.includes('hover') || lower.includes('drag')) return <MousePointer2 size={13} />;
+  if (lower.includes('request')) return <Network size={13} />;
+  if (lower.includes('find') || lower.includes('dom')) return <FileSearch size={13} />;
+  if (lower.includes('list')) return <ScanSearch size={13} />;
+  if (lower.includes('report') || lower.includes('state')) return <BadgeCheck size={13} />;
+  if (lower.includes('reference')) return <ClipboardCheck size={13} />;
+  if (lower.includes('visual') || lower.includes('manage')) return <Waypoints size={13} />;
+  if (lower.includes('scroll')) return <Route size={13} />;
+  if (lower.includes('wait')) return <Gauge size={13} />;
+  if (lower.includes('switch')) return <SendHorizontal size={13} />;
+  if (lower.includes('open')) return <SquareArrowOutUpRight size={13} />;
+  if (lower.includes('page') || lower.includes('tab')) return <AppWindow size={13} />;
+  if (lower.includes('move')) return <Compass size={13} />;
+  return <Workflow size={13} />;
+}
+
 function screenshotKindLabel(kind?: string) {
   if (kind === 'original') return '原始图';
   if (kind === 'marker') return '标识图';
@@ -441,34 +580,52 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   if (running && !toolCalls.length) {
     return (
       <div className="browser-chat-tool-card is-waiting">
-        <div>
-          <strong>等待工具调用</strong>
-          <p>AI 正在基于当前页面选择下一步操作。</p>
-        </div>
-        <span className="badge neutral">运行中</span>
+        <span className="browser-chat-tool-icon" aria-hidden="true">
+          <Loader2 className="spin" size={13} />
+        </span>
+        <span className="browser-chat-tool-content">
+          <span className="browser-chat-tool-label">
+            <span className="browser-chat-tool-name">准备工具</span>
+            <span className="browser-chat-tool-state">运行中</span>
+          </span>
+          <small className="browser-chat-tool-meta">正在选择下一步浏览器动作</small>
+        </span>
       </div>
     );
   }
 
   return (
     <>
-      {toolCalls.map((tool, toolIndex) => (
-        <>
-        <p style={{ fontSize: "12px"}}>{tool.reason}</p>
-        <div className="browser-chat-tool-call" key={`${step.index}-${toolIndex}-${tool.name}`}>
-          <button
-            className="browser-chat-tool-card"
-            onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
-            type="button"
-          >
-            <div>
-              <strong>{compactText(tool.name, 72)}</strong>
-            </div>
-            <span className={tool.ok === false ? 'badge status-failed' : 'badge neutral'}>{toolStatusLabel(tool)}</span>
-          </button>
-        </div>
-        </>
-      ))}
+      {toolCalls.map((tool, toolIndex) => {
+        const label = browserChatToolLabel(tool.name);
+        const meta = compactText(browserChatToolMeta(tool.name, tool.input), 56);
+        const status = toolStatusLabel(tool);
+        const showState = tool.ok !== true;
+        const displayText = `${label}${meta ? `: ${meta}` : ''}`;
+        return (
+          <div className="browser-chat-tool-call" key={`${step.index}-${toolIndex}-${tool.name}`}>
+            {tool.reason ? <p className="browser-chat-tool-reason">{tool.reason}</p> : null}
+            <button
+              aria-label={`${displayText}，${status}`}
+              className={`browser-chat-tool-card${tool.ok === false ? ' is-failed' : ''}${tool.ok === undefined ? ' is-running' : ''}`}
+              onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
+              title={`${displayText} · ${status}`}
+              type="button"
+            >
+              <span className="browser-chat-tool-icon" aria-hidden="true">
+                <BrowserChatToolIcon name={tool.name} />
+              </span>
+              <span className="browser-chat-tool-content">
+                <span className="browser-chat-tool-label">
+                  <span className="browser-chat-tool-name">{label}</span>
+                  {showState ? <span className="browser-chat-tool-state">{status}</span> : null}
+                </span>
+                {meta ? <small className="browser-chat-tool-meta">{meta}</small> : null}
+              </span>
+            </button>
+          </div>
+        );
+      })}
     </>
   );
 });
@@ -564,9 +721,9 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
 
   return (
     <article className={`browser-chat-message ${item.role}`}>
-      <div className="browser-chat-avatar">
+      {/* <div className="browser-chat-avatar">
         {item.role === 'user' ? <User size={15} /> : <Bot size={15} />}
-      </div>
+      </div> */}
       <div>
         {item.role === 'assistant' ? (
           <>
