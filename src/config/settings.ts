@@ -83,6 +83,7 @@ const boolOptions = [
 ];
 
 export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
+  { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: 'visual-markers 使用截图编号，dom 使用 DOM 定位。', tab: 'browser', defaultValue: 'visual-markers', control: 'select', options: [{ label: '视觉标记', value: 'visual-markers' }, { label: 'DOM 定位', value: 'dom' }] },
   { key: 'BROWSER_CDP_ENDPOINT', label: '现有浏览器 CDP 地址', description: '连接已开启远程调试的 Chrome/Edge，例如 http://127.0.0.1:9222；可复用登录态。留空则启动新浏览器。', tab: 'browser', defaultValue: '', control: 'text' },
   { key: 'BROWSER_USER_DATA_DIR', label: '浏览器用户数据目录', description: '未配置 CDP 时使用指定 profile 启动持久浏览器，适合保存登录态。留空使用临时上下文。', tab: 'browser', defaultValue: '', control: 'text' },

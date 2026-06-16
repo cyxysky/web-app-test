@@ -1,6 +1,6 @@
 'use client';
 
-import { memo, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { memo, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   AppWindow,
   BadgeCheck,
@@ -24,6 +24,7 @@ import {
   PanelLeft,
   PencilLine,
   Power,
+  RefreshCw,
   Route,
   ScanSearch,
   ScrollText,
@@ -124,6 +125,54 @@ type BrowserChatToolDetail = {
   tool: BrowserChatToolCall;
 };
 
+type EmbeddedBrowserBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type EmbeddedBrowserBridgeResult = {
+  ok: boolean;
+  error?: string;
+};
+
+type EmbeddedBrowserTab = {
+  id: string;
+  sessionId?: string;
+  title: string;
+  url: string;
+  loading?: boolean;
+};
+
+type EmbeddedBrowserState = EmbeddedBrowserBridgeResult & {
+  activeIndex?: number;
+  tabs?: EmbeddedBrowserTab[];
+  zoomFactor?: number;
+};
+
+type EmbeddedBrowserBridge = {
+  activateTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
+  closeActiveTab: () => Promise<EmbeddedBrowserBridgeResult>;
+  closeTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
+  getState: () => Promise<EmbeddedBrowserState>;
+  navigate: (input: { sessionId?: string; url: string }) => Promise<EmbeddedBrowserBridgeResult>;
+  reset: () => Promise<EmbeddedBrowserBridgeResult>;
+  setBounds: (bounds: EmbeddedBrowserBounds) => Promise<EmbeddedBrowserBridgeResult>;
+  setVisible: (input: {
+    bounds?: EmbeddedBrowserBounds;
+    sessionId?: string;
+    url?: string;
+    visible: boolean;
+  }) => Promise<EmbeddedBrowserBridgeResult>;
+};
+
+declare global {
+  interface Window {
+    webPilotEmbeddedBrowser?: EmbeddedBrowserBridge;
+  }
+}
+
 type BrowserChatLogIndex = {
   byMessageId: Map<string, BrowserChatLogRecord[]>;
   byStepIndex: Map<number, BrowserChatLogRecord[]>;
@@ -153,6 +202,28 @@ function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
 function compactText(value?: string, max = 160) {
   const text = (value || '').replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function embeddedTabUrlLabel(url?: string) {
+  const value = (url || '').trim();
+  if (!value) return 'about:blank';
+  if (value.startsWith('data:')) return 'embedded page';
+  try {
+    const parsed = new URL(value);
+    return parsed.host || parsed.protocol.replace(':', '');
+  } catch {
+    return compactText(value, 72);
+  }
+}
+
+function embeddedSessionGroupLabel(sessionId?: string) {
+  const normalized = (sessionId || 'browser-session')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  const parts = normalized.split('_');
+  const shortId = (parts.at(-1) || normalized || 'session').slice(-6).toLowerCase();
+  return `ai-${shortId}`;
 }
 
 function parseJsonObjectText(value?: string) {
@@ -910,59 +981,273 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             }
           }}
         />
-        <button
-          aria-label={t('上传图片')}
-          className="browser-chat-attach"
-          disabled={currentBusy || uploadingImage || attachments.length >= 8}
-          onClick={() => imageInputRef.current?.click()}
-          title={t('上传图片')}
-          type="button"
-        >
-          {uploadingImage ? <Loader2 className="spin" size={17} /> : <ImageUp size={17} />}
-        </button>
-        <div className="browser-chat-mode-toggle" role="radiogroup" aria-label={t('操作模式')}>
-          <button
-            aria-pressed={mode === 'visual-markers'}
-            className={mode === 'visual-markers' ? 'active' : undefined}
-            disabled={currentBusy || loading || modeLocked}
-            onClick={() => onModeChange('visual-markers')}
-            type="button"
-          >
-            {t('视觉')}
-          </button>
-          <button
-            aria-pressed={mode === 'dom'}
-            className={mode === 'dom' ? 'active' : undefined}
-            disabled={currentBusy || loading || modeLocked}
-            onClick={() => onModeChange('dom')}
-            type="button"
-          >
-            {t('DOM')}
-          </button>
+        <div className="browser-chat-compose-actions">
+          <div className="browser-chat-compose-tools">
+            <button
+              aria-label={t('上传图片')}
+              className="browser-chat-attach"
+              disabled={currentBusy || uploadingImage || attachments.length >= 8}
+              onClick={() => imageInputRef.current?.click()}
+              title={t('上传图片')}
+              type="button"
+            >
+              {uploadingImage ? <Loader2 className="spin" size={17} /> : <ImageUp size={17} />}
+            </button>
+            <div className="browser-chat-mode-toggle" role="radiogroup" aria-label={t('操作模式')}>
+              <button
+                aria-pressed={mode === 'visual-markers'}
+                className={mode === 'visual-markers' ? 'active' : undefined}
+                disabled={currentBusy || loading || modeLocked}
+                onClick={() => onModeChange('visual-markers')}
+                type="button"
+              >
+                {t('视觉')}
+              </button>
+              <button
+                aria-pressed={mode === 'dom'}
+                className={mode === 'dom' ? 'active' : undefined}
+                disabled={currentBusy || loading || modeLocked}
+                onClick={() => onModeChange('dom')}
+                type="button"
+              >
+                {t('DOM')}
+              </button>
+            </div>
+          </div>
+          <div className="browser-chat-compose-submit">
+            {showStop ? (
+              <button
+                className="browser-chat-stop"
+                disabled={interrupting}
+                onClick={() => void onInterrupt()}
+                type="button"
+                aria-label={t('中断本轮对话')}
+                title={t('中断本轮对话')}
+              >
+                {interrupting ? <Loader2 className="spin" size={18} /> : <Square size={16} />}
+              </button>
+            ) : (
+              <button
+                className="browser-chat-send"
+                disabled={(!draft.trim() && !attachments.length) || currentBusy || loading || uploadingImage}
+                type="submit"
+                aria-label={t('发送')}
+              >
+                {busy ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+              </button>
+            )}
+          </div>
         </div>
-        {showStop ? (
-          <button
-            className="browser-chat-stop"
-            disabled={interrupting}
-            onClick={() => void onInterrupt()}
-            type="button"
-            aria-label={t('中断本轮对话')}
-            title={t('中断本轮对话')}
-          >
-            {interrupting ? <Loader2 className="spin" size={18} /> : <Square size={16} />}
-          </button>
-        ) : (
-          <button
-            className="browser-chat-send"
-            disabled={(!draft.trim() && !attachments.length) || currentBusy || loading || uploadingImage}
-            type="submit"
-            aria-label={t('发送')}
-          >
-            {busy ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
-          </button>
-        )}
       </form>
     </>
+  );
+});
+
+function embeddedBoundsFromElement(element: HTMLElement): EmbeddedBrowserBounds {
+  const rect = element.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.round(rect.left)),
+    y: Math.max(0, Math.round(rect.top)),
+    width: Math.max(1, Math.round(rect.width)),
+    height: Math.max(1, Math.round(rect.height)),
+  };
+}
+
+const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
+  active,
+  enabled,
+  onSelectSession,
+  sessionId,
+}: {
+  active: boolean;
+  enabled: boolean;
+  onSelectSession?: (sessionId: string) => void;
+  sessionId?: string;
+}) {
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const [bridgeAvailable, setBridgeAvailable] = useState(false);
+  const [bridgeError, setBridgeError] = useState('');
+  const [browserTabs, setBrowserTabs] = useState<EmbeddedBrowserTab[]>([]);
+  const [activeTabIndex, setActiveTabIndex] = useState(0);
+
+  const applyEmbeddedBrowserState = useCallback((result: EmbeddedBrowserState) => {
+    if (!result.ok) {
+      setBridgeError(result.error || '嵌入浏览器状态不可用');
+      return;
+    }
+    setBridgeError('');
+    setBrowserTabs(Array.isArray(result.tabs) ? result.tabs : []);
+    setActiveTabIndex(typeof result.activeIndex === 'number' && result.activeIndex >= 0 ? result.activeIndex : 0);
+  }, []);
+
+  const loadEmbeddedBrowserState = useCallback(async () => {
+    const bridge = window.webPilotEmbeddedBrowser;
+    setBridgeAvailable(Boolean(bridge));
+    if (!bridge) {
+      setBrowserTabs([]);
+      setActiveTabIndex(0);
+      return;
+    }
+
+    try {
+      const result = await bridge.getState();
+      applyEmbeddedBrowserState(result);
+    } catch (error) {
+      setBridgeError(error instanceof Error ? error.message : '嵌入浏览器状态不可用');
+    }
+  }, [applyEmbeddedBrowserState]);
+
+  const syncEmbeddedBrowser = useCallback(async () => {
+    const bridge = window.webPilotEmbeddedBrowser;
+    const viewport = viewportRef.current;
+    const visible = enabled && active && Boolean(viewport);
+    setBridgeAvailable(Boolean(bridge));
+    if (!bridge) return;
+    try {
+      const result = await bridge.setVisible({
+        bounds: visible && viewport ? embeddedBoundsFromElement(viewport) : undefined,
+        sessionId,
+        visible,
+      });
+      setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
+      if (result.ok) void loadEmbeddedBrowserState();
+    } catch (error) {
+      setBridgeError(error instanceof Error ? error.message : '嵌入浏览器不可用');
+    }
+  }, [active, enabled, loadEmbeddedBrowserState, sessionId]);
+
+  useEffect(() => {
+    void syncEmbeddedBrowser();
+    const viewport = viewportRef.current;
+    if (!enabled || !active || !viewport) {
+      return () => {
+        void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
+      };
+    }
+
+    const update = () => {
+      void syncEmbeddedBrowser();
+    };
+    const resizeObserver = new ResizeObserver(update);
+    resizeObserver.observe(viewport);
+    window.addEventListener('resize', update);
+    window.addEventListener('scroll', update, true);
+    const timer = window.setInterval(update, 700);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', update);
+      window.removeEventListener('scroll', update, true);
+      window.clearInterval(timer);
+      void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
+    };
+  }, [active, enabled, syncEmbeddedBrowser]);
+
+  async function resetEmbeddedBrowser() {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.reset().catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '重置嵌入浏览器失败',
+    }));
+    setBridgeError(result.ok ? '' : result.error || '重置嵌入浏览器失败');
+    void syncEmbeddedBrowser();
+    void loadEmbeddedBrowserState();
+  }
+
+  async function activateEmbeddedBrowserTab(tab: EmbeddedBrowserTab) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.activateTab({ id: tab.id }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '切换嵌入浏览器标签失败',
+    }));
+    applyEmbeddedBrowserState(result);
+    if (result.ok && tab.sessionId && tab.sessionId !== sessionId) onSelectSession?.(tab.sessionId);
+  }
+
+  async function closeEmbeddedBrowserTab(tab: EmbeddedBrowserTab) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.closeTab({ id: tab.id }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '关闭嵌入浏览器标签失败',
+    }));
+    applyEmbeddedBrowserState(result);
+    void syncEmbeddedBrowser();
+  }
+
+  const visibleTabs = browserTabs.length
+    ? browserTabs
+    : [{ id: 'embedded-placeholder', loading: false, title: '测试浏览器', url: '' }];
+
+  return (
+    <section className="browser-chat-embedded-browser" aria-label="嵌入浏览器">
+      <header>
+        <div className="browser-chat-embedded-tab-list" role="tablist" aria-label="嵌入浏览器标签">
+          {visibleTabs.map((tab, index) => (
+            <div
+              aria-selected={index === activeTabIndex}
+              className={[
+                'browser-chat-embedded-tab',
+                index === activeTabIndex ? 'active' : '',
+                tab.loading ? 'loading' : '',
+              ].filter(Boolean).join(' ')}
+              key={tab.id || `${tab.url}-${index}`}
+              onClick={() => void activateEmbeddedBrowserTab(tab)}
+              role="tab"
+              title={tab.url || tab.title}
+            >
+              <span className="browser-chat-embedded-tab-icon">
+                <AppWindow size={14} />
+              </span>
+              <span className="browser-chat-embedded-tab-text">
+                <strong>{compactText(tab.title || tab.url || '新标签页', 56)}</strong>
+                <small>{embeddedTabUrlLabel(tab.url)}</small>
+              </span>
+              <span className="browser-chat-embedded-tab-group">{embeddedSessionGroupLabel(tab.sessionId || sessionId)}</span>
+              {tab.loading ? (
+                <span className="browser-chat-embedded-tab-loading" aria-label="页面加载中">
+                  <Loader2 className="spin" size={12} />
+                </span>
+              ) : null}
+              <button
+                aria-label="关闭当前标签页"
+                className="browser-chat-embedded-tab-close"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void closeEmbeddedBrowserTab(tab);
+                }}
+                title="关闭当前标签页"
+                type="button"
+              >
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="browser-chat-embedded-toolbar">
+          <button className="browser-chat-embedded-tool-button" onClick={() => void resetEmbeddedBrowser()} title="重置浏览器视图" type="button" aria-label="重置浏览器视图">
+            <RefreshCw size={15} />
+          </button>
+        </div>
+      </header>
+      <div className="browser-chat-embedded-viewport" ref={viewportRef}>
+        {!bridgeAvailable ? (
+          <div className="browser-chat-embedded-state">
+            <AppWindow size={24} />
+            <strong>仅桌面端可用</strong>
+            <span>请使用 Electron 开发壳或桌面版打开。</span>
+          </div>
+        ) : bridgeError ? (
+          <div className="browser-chat-embedded-state">
+            <Bug size={24} />
+            <strong>嵌入浏览器未就绪</strong>
+            <span>{bridgeError}</span>
+          </div>
+        ) : null}
+      </div>
+    </section>
   );
 });
 
@@ -982,6 +1267,7 @@ export function BrowserChatWorkspace({
   const sendingRef = useRef(false);
   const loadingSessionRef = useRef<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const embeddedWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
   const sessionVersionsRef = useRef(new Map<string, number>());
   const sessionRefreshTimersRef = useRef(new Map<string, number>());
@@ -1001,6 +1287,10 @@ export function BrowserChatWorkspace({
   const [busy, setBusy] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [realtimeConnected, setRealtimeConnected] = useState(false);
+  const [embeddedBrowserEnabled, setEmbeddedBrowserEnabled] = useState(false);
+  const [embeddedChatWidth, setEmbeddedChatWidth] = useState(420);
+  const [embeddedChatResizing, setEmbeddedChatResizing] = useState(false);
+  const [historyTooltipActive, setHistoryTooltipActive] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
@@ -1068,6 +1358,52 @@ export function BrowserChatWorkspace({
     () => domTreeFromToolCall(toolDialog?.tool, toolDialog?.step.aiRequest),
     [toolDialog],
   );
+  const embeddedBrowserActive = embeddedBrowserEnabled && activeView === 'chat';
+  const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || imagePreview || groupDialogOpen || historyTooltipActive);
+  const embeddedBrowserViewActive = embeddedBrowserActive && !embeddedBrowserCovered;
+
+  const loadBrowserRuntimeSettings = useCallback(async () => {
+    const response = await fetch('/api/settings/env', { cache: 'no-store' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '加载浏览器配置失败');
+    const saved = Array.isArray(data.saved) ? data.saved as Array<{ key?: string; value?: string }> : [];
+    const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
+    setEmbeddedBrowserEnabled(embeddedSetting?.value === 'true');
+  }, []);
+
+  const beginEmbeddedChatResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const workspace = embeddedWorkspaceRef.current;
+    if (!workspace) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    const rect = workspace.getBoundingClientRect();
+    const minChatWidth = 320;
+    const minBrowserWidth = 380;
+    const maxChatWidth = Math.max(minChatWidth, Math.min(760, rect.width - minBrowserWidth - 8));
+    setEmbeddedChatResizing(true);
+
+    function nextWidth(clientX: number) {
+      return Math.round(Math.max(minChatWidth, Math.min(maxChatWidth, rect.right - clientX)));
+    }
+
+    setEmbeddedChatWidth(nextWidth(event.clientX));
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      setEmbeddedChatWidth(nextWidth(moveEvent.clientX));
+    };
+    const onPointerUp = () => {
+      setEmbeddedChatResizing(false);
+      document.body.classList.remove('browser-chat-resizing');
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+    };
+    document.body.classList.add('browser-chat-resizing');
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp, { once: true });
+  }, []);
+
+  useEffect(() => {
+    if (!sidebarCollapsed) setHistoryTooltipActive(false);
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     activeSessionIdRef.current = session?.id || null;
@@ -1141,6 +1477,10 @@ export function BrowserChatWorkspace({
       setError(loadError instanceof Error ? loadError.message : '加载对话历史失败');
     });
   }, [loadSessions]);
+
+  useEffect(() => {
+    void loadBrowserRuntimeSettings().catch(() => undefined);
+  }, [loadBrowserRuntimeSettings]);
 
   useEffect(() => {
     return subscribeRealtimeRefresh((event) => {
@@ -1223,6 +1563,14 @@ export function BrowserChatWorkspace({
     return data.session as BrowserChatSession;
   }
 
+  async function ensureEmbeddedBrowserSessionTab(sessionId: string) {
+    if (!embeddedBrowserEnabled || typeof window === 'undefined') return;
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.setVisible({ sessionId, visible: true });
+    if (!result.ok) throw new Error(result.error || '嵌入浏览器标签创建失败');
+  }
+
   async function uploadChatImages(files: FileList | File[]) {
     const selectedFiles = Array.from(files).filter((file) => file.type.startsWith('image/'));
     const remainingSlots = Math.max(0, 8 - attachments.length);
@@ -1266,6 +1614,7 @@ export function BrowserChatWorkspace({
     setActiveView('chat');
     try {
       let active = await ensureSession();
+      await ensureEmbeddedBrowserSessionTab(active.id);
       let posted: BrowserChatSession;
       try {
         posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments);
@@ -1273,6 +1622,7 @@ export function BrowserChatWorkspace({
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
         active = await createSession();
+        await ensureEmbeddedBrowserSessionTab(active.id);
         posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments);
       }
       upsertSession(posted, { activate: true });
@@ -1415,6 +1765,17 @@ export function BrowserChatWorkspace({
     setError('');
     setComposerResetToken((current) => current + 1);
     setAttachments([]);
+    if (embeddedBrowserEnabled && typeof window !== 'undefined' && window.webPilotEmbeddedBrowser) {
+      try {
+        const created = await createSession();
+        await ensureEmbeddedBrowserSessionTab(created.id);
+        setMode(normalizeMode(created.mode));
+      } catch (createError) {
+        setSession(null);
+        setError(createError instanceof Error ? createError.message : '创建对话会话失败');
+      }
+      return;
+    }
     setSession(null);
   }
 
@@ -1520,7 +1881,21 @@ export function BrowserChatWorkspace({
                     className="browser-chat-recent-open"
                     data-title={sessionDisplayTitle(item)}
                     disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
-                    onClick={() => void loadSession(item.id)}
+                    onBlur={() => setHistoryTooltipActive(false)}
+                    onClick={() => {
+                      if (sidebarCollapsed) setHistoryTooltipActive(true);
+                      void loadSession(item.id);
+                    }}
+                    onFocus={() => {
+                      if (sidebarCollapsed) setHistoryTooltipActive(true);
+                    }}
+                    onMouseEnter={() => {
+                      if (sidebarCollapsed) setHistoryTooltipActive(true);
+                    }}
+                    onMouseLeave={() => setHistoryTooltipActive(false)}
+                    onPointerDown={() => {
+                      if (sidebarCollapsed) setHistoryTooltipActive(true);
+                    }}
                     title={sessionDisplayTitle(item)}
                     type="button"
                   >
@@ -1552,6 +1927,65 @@ export function BrowserChatWorkspace({
       </section>
     );
   }
+
+  const renderChatPane = () => (
+    <div className={`${hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`}>
+      {loadingSessionId ? (
+        <div className="browser-chat-inline-loading">
+          <Loader2 className="spin" size={15} />
+          <span>正在加载对话</span>
+        </div>
+      ) : null}
+      {session ? (
+        <button className="browser-chat-close" disabled={session.status === 'closed' || busy} onClick={closeSession} title="结束会话" type="button">
+          <Power size={17} />
+        </button>
+      ) : null}
+
+      {hasMessages ? (
+        <BrowserChatMessageList
+          exportingMessageId={exportingMessageId}
+          lastAssistantMessageId={lastAssistantMessageId}
+          logIndex={logIndex}
+          messages={visibleMessages}
+          onExportMessage={exportMessageToTestCase}
+          onPreviewImage={previewAttachment}
+          onSelectTool={setToolDialog}
+          onShowLogs={showMessageLogs}
+          sessionBusy={Boolean(session?.busy)}
+          stepsByIndex={stepsByIndex}
+          totalStepCount={steps.length}
+        />
+      ) : (
+        <div className="browser-chat-hero">
+          <h1>今天要做什么？</h1>
+        </div>
+      )}
+
+      <div className="browser-chat-composer-shell">
+        {error || session?.error ? <div className="error">{error || session?.error}</div> : null}
+        <BrowserChatComposer
+          attachments={attachments}
+          busy={busy}
+          currentBusy={currentBusy}
+          imageInputRef={imageInputRef}
+          interrupting={interrupting}
+          loading={Boolean(loadingSessionId)}
+          mode={mode}
+          modeLocked={modeLocked}
+          onInterrupt={interruptConversation}
+          onModeChange={setMode}
+          onPreviewAttachment={previewAttachment}
+          onRemoveAttachment={removeAttachment}
+          onSubmitMessage={sendMessage}
+          onUploadImages={uploadChatImages}
+          resetToken={composerResetToken}
+          showStop={Boolean(selectedRunningSession)}
+          uploadingImage={uploadingImage}
+        />
+      </div>
+    </div>
+  );
 
   return (
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed' : 'browser-chat-layout'}>
@@ -1609,7 +2043,38 @@ export function BrowserChatWorkspace({
           </div>
         ) : activeView === 'settings' ? (
           <div className="browser-chat-settings-pane">
-            <EnvironmentSettings activeTab={settingsTab} embedded showTabs={false} onActiveTabChange={setSettingsTab} />
+            <EnvironmentSettings activeTab={settingsTab} embedded showTabs={false} onActiveTabChange={setSettingsTab} onRuntimeEnvSaved={() => void loadBrowserRuntimeSettings()} />
+          </div>
+        ) : embeddedBrowserActive ? (
+          <div
+            className="browser-chat-embedded-workspace"
+            ref={embeddedWorkspaceRef}
+            style={{ '--embedded-chat-width': `${embeddedChatWidth}px` } as CSSProperties}
+          >
+            <BrowserChatEmbeddedBrowser
+              active={embeddedBrowserViewActive}
+              enabled={embeddedBrowserEnabled}
+              onSelectSession={(nextSessionId) => {
+                if (nextSessionId !== activeSessionIdRef.current) void loadSession(nextSessionId);
+              }}
+              sessionId={session?.id}
+            />
+            <div
+              aria-label="调整对话栏宽度"
+              aria-orientation="vertical"
+              aria-valuemax={760}
+              aria-valuemin={320}
+              aria-valuenow={embeddedChatWidth}
+              className="browser-chat-embedded-resizer"
+              onPointerDown={beginEmbeddedChatResize}
+              role="separator"
+              title="拖拽调整对话栏宽度"
+            >
+              <span />
+            </div>
+            <aside className="browser-chat-embedded-chat-column">
+              {renderChatPane()}
+            </aside>
           </div>
         ) : (
           <div className={hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}>

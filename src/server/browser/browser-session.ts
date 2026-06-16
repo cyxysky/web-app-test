@@ -406,6 +406,16 @@ function browserTabTitlePrefixEnabled() {
   return process.env.BROWSER_TAB_TITLE_PREFIX === 'true';
 }
 
+function electronEmbeddedBrowserEnabled() {
+  return process.env.ELECTRON_EMBEDDED_BROWSER === 'true';
+}
+
+function electronEmbeddedBrowserCdpEndpoint() {
+  if (!electronEmbeddedBrowserEnabled()) return '';
+  const port = Number(process.env.ELECTRON_EMBEDDED_BROWSER_CDP_PORT || process.env.WEBPILOT_ELECTRON_CDP_PORT || 19333);
+  return cdpEndpointForPort(Number.isInteger(port) && port > 0 ? port : 19333);
+}
+
 function sessionTabGrouperExtensionPath() {
   return path.join(process.cwd(), 'src', 'server', 'browser', 'session-tab-grouper-extension');
 }
@@ -2265,7 +2275,7 @@ export class BrowserSession {
     const viewportWidth = Number(process.env.BROWSER_VIEWPORT_WIDTH || (fullscreen ? 1920 : 1280));
     const viewportHeight = Number(process.env.BROWSER_VIEWPORT_HEIGHT || (fullscreen ? 1080 : 800));
     const ignoreHTTPSErrors = process.env.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
-    const forceBundledBrowser = process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true';
+    const forceBundledBrowser = process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !electronEmbeddedBrowserEnabled();
     const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
     const executablePath = process.env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
     const cdpEndpoint = forceBundledBrowser
@@ -2273,11 +2283,13 @@ export class BrowserSession {
       : process.env.BROWSER_CDP_ENDPOINT?.trim()
         || process.env.BROWSER_CONNECT_CDP_ENDPOINT?.trim()
         || process.env.CHROME_REMOTE_DEBUGGING_URL?.trim()
+        || electronEmbeddedBrowserCdpEndpoint()
         || '';
     const requestedUserDataDir = process.env.BROWSER_USER_DATA_DIR?.trim()
       || process.env.AI_WEB_TEST_BROWSER_PROFILE_DIR?.trim()
       || '';
-    const autoTabGroupProfileKey = sharedBrowserTabsEnabled() ? 'shared' : this.pageGroupId;
+    const useSharedBrowserTabs = sharedBrowserTabsEnabled() && !electronEmbeddedBrowserEnabled();
+    const autoTabGroupProfileKey = useSharedBrowserTabs ? 'shared' : this.pageGroupId;
     const autoTabGroupProfileDir = sessionTabGrouperEnabled(headless) && !cdpEndpoint && !requestedUserDataDir
       ? sessionTabGrouperProfileDir(autoTabGroupProfileKey)
       : '';
@@ -2310,7 +2322,7 @@ export class BrowserSession {
       ...(useNativeFullscreenViewport ? {} : { deviceScaleFactor: 1 }),
     };
 
-    if (sharedBrowserTabsEnabled()) {
+    if (useSharedBrowserTabs) {
       const lease = await acquireSharedBrowser({ chromium, cdpEndpoint, reconnectCdpEndpoint: autoTabGroupCdpEndpoint, userDataDir, launchOptions, contextOptions });
       this.browserOwnership = 'shared';
       this.browser = lease.browser;
@@ -2329,6 +2341,15 @@ export class BrowserSession {
       const existingContext = this.browser.contexts()[0];
       const context = existingContext || await this.browser.newContext(contextOptions);
       this.context = context;
+      if (electronEmbeddedBrowserEnabled()) {
+        await this.prepareContext(context, { claimPages: false });
+        const embeddedPage = await this.findInitialElectronEmbeddedBrowserPage(context);
+        if (embeddedPage && this.claimPage(embeddedPage, { allowSteal: true })) {
+          await embeddedPage.bringToFront().catch(() => undefined);
+          return;
+        }
+        throw new Error('Electron embedded browser tab for this session is not ready.');
+      }
       await this.prepareContext(context);
       await this.selectInitialPage(context);
       return;
@@ -2390,6 +2411,12 @@ export class BrowserSession {
       return reclaimed;
     }
 
+    const embeddedPage = await this.findElectronEmbeddedBrowserPage(context);
+    if (embeddedPage && this.claimPage(embeddedPage, { allowSteal: true })) {
+      await embeddedPage.bringToFront().catch(() => undefined);
+      return embeddedPage;
+    }
+
     const nativeGroup = await this.reclaimPagesFromNativeTabGroup(context);
     const nativeGroupPage = this.chooseInitialPage(nativeGroup.pages);
     if (nativeGroupPage) {
@@ -2406,6 +2433,7 @@ export class BrowserSession {
       const unmarkedPages: Page[] = [];
       for (const page of context.pages()) {
         if (page.isClosed() || isBlankPage(page)) continue;
+        if (await this.isElectronAppShellPage(page)) continue;
         if (sharedPageOwners.has(page)) continue;
         const groupId = await this.readPageGroupId(page);
         if (groupId) continue;
@@ -2417,6 +2445,7 @@ export class BrowserSession {
 
     for (const page of context.pages()) {
       if (page.isClosed() || !isBlankPage(page)) continue;
+      if (await this.isElectronAppShellPage(page)) continue;
       if (sharedPageOwners.has(page)) continue;
       const groupId = await this.readPageGroupId(page);
       if (groupId) continue;
@@ -2430,6 +2459,57 @@ export class BrowserSession {
 
   private chooseInitialPage(pages: Page[]) {
     return pages.find((page) => !isBlankPage(page)) || pages.at(-1);
+  }
+
+  private async isElectronEmbeddedBrowserPage(page: Page) {
+    if (!electronEmbeddedBrowserEnabled() || page.isClosed()) return false;
+    return page.evaluate(() => {
+      const win = window as Window & { __webPilotEmbeddedBrowserView?: unknown };
+      return win.__webPilotEmbeddedBrowserView === true
+        || document.documentElement?.getAttribute('data-webpilot-embedded-browser') === 'true';
+    }).catch(() => false);
+  }
+
+  private async isElectronEmbeddedBrowserSessionPage(page: Page) {
+    if (!await this.isElectronEmbeddedBrowserPage(page)) return false;
+    const sessionId = await page.evaluate(() => {
+      const win = window as Window & { __webPilotEmbeddedBrowserSessionId?: unknown };
+      if (typeof win.__webPilotEmbeddedBrowserSessionId === 'string') return win.__webPilotEmbeddedBrowserSessionId;
+      const attributeId = document.documentElement?.getAttribute('data-webpilot-embedded-browser-session-id');
+      if (attributeId) return attributeId;
+      return String(window.name || '').match(/^AI_WEB_TEST_SESSION_GROUP:([^;]+);/)?.[1] || '';
+    }).catch(() => '');
+    return sessionId === this.options.runId || normalizePageGroupId(sessionId) === this.pageGroupId;
+  }
+
+  private async isElectronAppShellPage(page: Page) {
+    if (!electronEmbeddedBrowserEnabled() || page.isClosed()) return false;
+    return page.evaluate(() => {
+      const win = window as Window & { __webPilotAppShell?: unknown };
+      return win.__webPilotAppShell === true
+        || document.documentElement?.getAttribute('data-webpilot-app-shell') === 'true';
+    }).catch(() => false);
+  }
+
+  private async findElectronEmbeddedBrowserPage(context: BrowserContext) {
+    if (!electronEmbeddedBrowserEnabled()) return undefined;
+    for (const page of [...context.pages()].reverse()) {
+      if (page.isClosed()) continue;
+      if (await this.isElectronEmbeddedBrowserPage(page)) return page;
+    }
+    return undefined;
+  }
+
+  private async findInitialElectronEmbeddedBrowserPage(context: BrowserContext) {
+    if (!electronEmbeddedBrowserEnabled()) return undefined;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      for (const page of [...context.pages()].reverse()) {
+        if (page.isClosed()) continue;
+        if (await this.isElectronEmbeddedBrowserSessionPage(page)) return page;
+      }
+      if (attempt < 11) await sleep(160);
+    }
+    return undefined;
   }
 
   private async reclaimSessionPagesByMarker(context: BrowserContext) {
@@ -2552,11 +2632,11 @@ export class BrowserSession {
     return tracePath;
   }
 
-  private claimPage(page: Page, options: { makeActive?: boolean } = {}) {
+  private claimPage(page: Page, options: { allowSteal?: boolean; makeActive?: boolean } = {}) {
     if (page.isClosed()) return false;
     if (this.browserOwnership === 'shared') {
       const owner = sharedPageOwners.get(page);
-      if (owner && owner !== this.pageGroupId) return false;
+      if (owner && owner !== this.pageGroupId && !options.allowSteal) return false;
       sharedPageOwners.set(page, this.pageGroupId);
     }
     const alreadyOwned = this.ownedPages.has(page);
@@ -3584,7 +3664,7 @@ export class BrowserSession {
         this.pageDiscoveryListener = undefined;
       }
       if (this.browserOwnership === 'shared') {
-        if (!options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
+        if (!electronEmbeddedBrowserEnabled() && !options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
           await this.closeOwnedPages();
         }
         await this.releaseSharedBrowser?.();
@@ -3593,6 +3673,7 @@ export class BrowserSession {
       }
       if (options.keepOpen || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true') return;
       if (this.browserOwnership === 'connected') {
+        if (electronEmbeddedBrowserEnabled()) return;
         await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
         return;
       }

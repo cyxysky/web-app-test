@@ -65,11 +65,13 @@ export function EnvironmentSettings({
   activeTab: controlledActiveTab,
   embedded = false,
   onActiveTabChange,
+  onRuntimeEnvSaved,
   showTabs = true,
 }: {
   activeTab?: SettingsTab;
   embedded?: boolean;
   onActiveTabChange?: (tab: SettingsTab) => void;
+  onRuntimeEnvSaved?: () => void;
   showTabs?: boolean;
 } = {}) {
   const { language, setLanguage, t } = useI18n();
@@ -127,6 +129,7 @@ export function EnvironmentSettings({
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || t('保存环境配置失败'));
       setItems(data.saved || []);
+      onRuntimeEnvSaved?.();
     } finally {
       setSavingEnv(false);
       stopGlobalLoading();

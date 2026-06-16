@@ -486,6 +486,7 @@ async function generateBrowserChatConversationMemory(
   const { provider, model } = getModelSettings();
   const built = buildBrowserChatConversationMemoryPrompt(session, result, assistantMessageId);
   appendLog(session, 'conversation:memory:request', 'Requesting AI conversation memory summary.', {
+    messageId: assistantMessageId,
     details: fullLogDetails({
       provider,
       model,
@@ -517,6 +518,7 @@ async function generateBrowserChatConversationMemory(
     });
     if (!memory) throw new Error('AI memory summary did not match the BrowserChatConversationMemory schema.');
     appendLog(session, 'conversation:memory:response', 'AI conversation memory summary completed.', {
+      messageId: assistantMessageId,
       elapsedMs: elapsedMs(startedAt),
       details: fullLogDetails({
         provider,
@@ -749,11 +751,12 @@ function appendLog(
   session: BrowserChatSessionRecord,
   phase: string,
   message: string,
-  input: { stepIndex?: number; elapsedMs?: number; details?: unknown } = {},
+  input: { stepIndex?: number; elapsedMs?: number; details?: unknown; messageId?: string | null } = {},
 ) {
   const timestamp = now();
   const runningActivity = runningActivityFromLog(phase, message);
   const details = logDetailsFromUnknown(input.details);
+  const logMessageId = input.messageId === null ? undefined : input.messageId ?? session.activeAssistantMessageId;
   session.logs = [
     ...(session.logs || []),
     {
@@ -762,13 +765,13 @@ function appendLog(
       phase,
       message,
       details,
-      messageId: session.activeAssistantMessageId,
+      messageId: logMessageId,
       stepIndex: input.stepIndex,
       elapsedMs: input.elapsedMs,
     },
   ].slice(-300);
-  if (session.activeAssistantMessageId) {
-    updateAssistantMessage(session, session.activeAssistantMessageId, (item) => ({
+  if (logMessageId && logMessageId === session.activeAssistantMessageId) {
+    updateAssistantMessage(session, logMessageId, (item) => ({
       ...item,
       activity: item.status === 'running' && runningActivity
         ? { phase, label: runningActivity, updatedAt: timestamp }
@@ -1458,6 +1461,30 @@ function isActiveBrowserChatTurn(session: BrowserChatSessionRecord, assistantMes
     && !abortController.signal.aborted;
 }
 
+async function updateBrowserChatConversationMemoryInBackground(
+  session: BrowserChatSessionRecord,
+  result: InteractiveBrowserTurnResult,
+  assistantMessageId: string,
+  abortController: AbortController,
+) {
+  if (abortController.signal.aborted) return;
+  try {
+    const nextConversationMemory = await generateBrowserChatConversationMemory(session, result, assistantMessageId, abortController.signal);
+    if (abortController.signal.aborted || sessions.get(session.id) !== session) return;
+    session.conversationMemory = nextConversationMemory;
+    appendLog(session, 'conversation:memory:update', 'Updated browser-chat conversation memory for the next turn.', {
+      messageId: assistantMessageId,
+      details: fullLogDetails(session.conversationMemory),
+    });
+  } catch (memoryError) {
+    if (abortController.signal.aborted || sessions.get(session.id) !== session) return;
+    appendLog(session, 'conversation:memory:error', 'Failed to update browser-chat conversation memory; continuing without blocking the turn.', {
+      messageId: assistantMessageId,
+      details: errorLogDetails(memoryError),
+    });
+  }
+}
+
 export function interruptBrowserChatSession(sessionId: string) {
   hydrateSessions();
   const session = sessions.get(sessionId);
@@ -1576,20 +1603,6 @@ async function runBrowserChatMessage(
       status: result.status,
       activity: undefined,
     }));
-    try {
-      const nextConversationMemory = await generateBrowserChatConversationMemory(session, result, assistantMessageId, abortController.signal);
-      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      session.conversationMemory = nextConversationMemory;
-      appendLog(session, 'conversation:memory:update', 'Updated browser-chat conversation memory for the next turn.', {
-        details: fullLogDetails(session.conversationMemory),
-      });
-    } catch (memoryError) {
-      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      if (abortController.signal.aborted) throw memoryError;
-      appendLog(session, 'conversation:memory:error', 'Failed to update browser-chat conversation memory; continuing without blocking the turn.', {
-        details: errorLogDetails(memoryError),
-      });
-    }
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
     const completedAt = now();
     session.status = 'idle';
@@ -1608,6 +1621,7 @@ async function runBrowserChatMessage(
       },
     ].slice(-300);
     persistAndNotify(session.id);
+    void updateBrowserChatConversationMemoryInBackground(session, result, assistantMessageId, abortController);
   } catch (error) {
     const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);
     const interrupted = abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId);

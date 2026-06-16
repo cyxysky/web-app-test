@@ -72,3 +72,7 @@ The compose setup keeps runtime data outside the image:
 - `artifacts/` stores screenshots and reports.
 
 For unattended packaged regression runs, keep `HEADLESS_BROWSER=true`. For account-based exploratory testing or manual verification, prefer a visible or CDP-connected browser.
+
+
+$env:WEBPILOT_ELECTRON_SERVER_URL="http://127.0.0.1:3000"
+npx electron .
