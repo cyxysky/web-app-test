@@ -1518,8 +1518,10 @@ export function BrowserChatWorkspace({
                   />
                   <button
                     className="browser-chat-recent-open"
+                    data-title={sessionDisplayTitle(item)}
                     disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
                     onClick={() => void loadSession(item.id)}
+                    title={sessionDisplayTitle(item)}
                     type="button"
                   >
                     <MessageSquare className="browser-chat-recent-icon" size={15} />
