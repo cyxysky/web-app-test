@@ -35,6 +35,9 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
   closeTab(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:close-tab', input);
   },
+  closeGroup(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:close-group', input);
+  },
   createTab(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:create-tab', input);
   },

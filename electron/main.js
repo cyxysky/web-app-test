@@ -667,6 +667,36 @@ function closeEmbeddedBrowserTab(tabId) {
   return embeddedBrowserState();
 }
 
+function closeEmbeddedBrowserGroup(groupIdInput) {
+  const groupId = String(groupIdInput || embeddedBrowserActiveGroupId || '').trim();
+  if (!groupId) return embeddedBrowserState();
+
+  const group = embeddedBrowserGroups.get(groupId);
+  const groupTabs = embeddedBrowserTabsForGroup(groupId);
+  if (!group && !groupTabs.length) return embeddedBrowserState();
+
+  const wasActiveGroup = embeddedBrowserActiveGroupId === groupId
+    || groupTabs.some((tab) => tab.id === embeddedBrowserActiveTabId);
+
+  for (const tab of groupTabs) destroyEmbeddedBrowserTab(tab);
+  embeddedBrowserGroups.delete(groupId);
+
+  if (wasActiveGroup) {
+    const nextTab = Array.from(embeddedBrowserTabs.values()).find((tab) => !tab.view.webContents.isDestroyed());
+    if (nextTab) {
+      if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id: nextTab.id });
+      else setActiveEmbeddedBrowserTab(nextTab);
+    } else {
+      embeddedBrowserActiveGroupId = '';
+      embeddedBrowserActiveTabId = '';
+      embeddedBrowserView = undefined;
+      embeddedBrowserAttached = false;
+    }
+  }
+
+  return embeddedBrowserState();
+}
+
 function moveEmbeddedBrowserTab(input = {}) {
   const tabId = String(input.id || '').trim();
   const targetId = String(input.targetId || '').trim();
@@ -793,6 +823,14 @@ function registerEmbeddedBrowserIpc() {
   ipcMain.handle('webpilot:embedded-browser:close-tab', async (_event, input = {}) => {
     try {
       return closeEmbeddedBrowserTab(typeof input.id === 'string' ? input.id : embeddedBrowserActiveTabId);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:close-group', async (_event, input = {}) => {
+    try {
+      return closeEmbeddedBrowserGroup(typeof input.id === 'string' ? input.id : embeddedBrowserActiveGroupId);
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }

@@ -167,6 +167,7 @@ type EmbeddedBrowserState = EmbeddedBrowserBridgeResult & {
 type EmbeddedBrowserBridge = {
   activateTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   closeActiveTab: () => Promise<EmbeddedBrowserBridgeResult>;
+  closeGroup: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   closeTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   createTab: (input: { groupId?: string; sessionId?: string }) => Promise<EmbeddedBrowserState>;
   getState: () => Promise<EmbeddedBrowserState>;
@@ -1060,12 +1061,14 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   );
 });
 
-function embeddedBoundsFromElement(element: HTMLElement): EmbeddedBrowserBounds {
+function embeddedBoundsFromElement(element: HTMLElement, options: { leftInset?: number } = {}): EmbeddedBrowserBounds {
   const rect = element.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width));
+  const leftInset = Math.max(0, Math.min(Math.round(options.leftInset || 0), width - 1));
   return {
-    x: Math.max(0, Math.round(rect.left)),
+    x: Math.max(0, Math.round(rect.left) + leftInset),
     y: Math.max(0, Math.round(rect.top)),
-    width: Math.max(1, Math.round(rect.width)),
+    width: Math.max(1, width - leftInset),
     height: Math.max(1, Math.round(rect.height)),
   };
 }
@@ -1077,11 +1080,13 @@ function embeddedBoundsKey(bounds?: EmbeddedBrowserBounds) {
 const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   active,
   enabled,
+  leftOverlayInset = 0,
   onSelectSession,
   sessionId,
 }: {
   active: boolean;
   enabled: boolean;
+  leftOverlayInset?: number;
   onSelectSession?: (sessionId: string) => void;
   sessionId?: string;
 }) {
@@ -1096,6 +1101,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [activeGroupId, setActiveGroupId] = useState('');
   const [activeTabIndex, setActiveTabIndex] = useState(0);
   const [activeTabId, setActiveTabId] = useState('');
+  const [closedGroupIds, setClosedGroupIds] = useState<string[]>([]);
   const [collapsedGroupIds, setCollapsedGroupIds] = useState<string[]>([]);
   const [draggingTabId, setDraggingTabId] = useState('');
   const [dragDropTarget, setDragDropTarget] = useState<{ position: 'before' | 'after'; tabId: string } | null>(null);
@@ -1138,7 +1144,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const viewport = viewportRef.current;
     const visible = enabled && active && Boolean(viewport);
     const groupId = embeddedGroupIdForSession(sessionId);
-    const bounds = visible && viewport ? embeddedBoundsFromElement(viewport) : undefined;
+    const bounds = visible && viewport ? embeddedBoundsFromElement(viewport, { leftInset: leftOverlayInset }) : undefined;
     const boundsKey = embeddedBoundsKey(bounds);
     const previous = embeddedBrowserSyncRef.current;
     setBridgeAvailable(Boolean(bridge));
@@ -1175,7 +1181,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     } catch (error) {
       setBridgeError(error instanceof Error ? error.message : '嵌入浏览器不可用');
     }
-  }, [active, applyEmbeddedBrowserState, enabled, sessionId]);
+  }, [active, applyEmbeddedBrowserState, enabled, leftOverlayInset, sessionId]);
 
   useEffect(() => {
     void syncEmbeddedBrowser();
@@ -1238,6 +1244,24 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     void syncEmbeddedBrowser();
   }
 
+  async function closeEmbeddedBrowserGroup(group: EmbeddedBrowserGroup) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.closeGroup({ id: group.id }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '关闭嵌入浏览器标签组失败',
+    }));
+    applyEmbeddedBrowserState(result);
+    if (result.ok) {
+      setClosedGroupIds((current) => (current.includes(group.id) ? current : [...current, group.id]));
+      setCollapsedGroupIds((current) => current.filter((item) => item !== group.id));
+      const nextActiveGroup = result.groups?.find((item) => item.active) || result.groups?.find((item) => item.tabs.length);
+      const nextSessionId = nextActiveGroup?.sessionId || nextActiveGroup?.tabs.find((tab) => tab.sessionId)?.sessionId;
+      if (nextSessionId && nextSessionId !== sessionId) onSelectSession?.(nextSessionId);
+      void syncEmbeddedBrowser();
+    }
+  }
+
   async function createEmbeddedBrowserTab(group: EmbeddedBrowserGroup) {
     const bridge = window.webPilotEmbeddedBrowser;
     if (!bridge) return;
@@ -1248,6 +1272,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     }));
     applyEmbeddedBrowserState(result);
     if (result.ok) {
+      setClosedGroupIds((current) => current.filter((item) => item !== group.id));
       setCollapsedGroupIds((current) => current.filter((item) => item !== group.id));
       if (groupSessionId && groupSessionId !== sessionId) onSelectSession?.(groupSessionId);
     }
@@ -1325,12 +1350,12 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       if (!hydrated.tabs.some((item) => item.id === tab.id)) hydrated.tabs.push(tab);
     }
 
-    if (!groupsById.size || (sessionId && !groupsById.has(selectedGroupId))) {
+    if ((!groupsById.size || (sessionId && !groupsById.has(selectedGroupId))) && !closedGroupIds.includes(selectedGroupId)) {
       ensureGroup(selectedGroupId, { active: true, sessionId });
     }
 
     return orderedIds.map((id) => groupsById.get(id)!).filter(Boolean);
-  }, [activeGroupId, activeTabId, browserGroups, browserTabs, selectedGroupId, sessionId]);
+  }, [activeGroupId, activeTabId, browserGroups, browserTabs, closedGroupIds, selectedGroupId, sessionId]);
   return (
     <section className="browser-chat-embedded-browser" aria-label="嵌入浏览器">
       <header>
@@ -1351,16 +1376,30 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                 ].filter(Boolean).join(' ')}
                 key={group.id}
               >
-                <button
-                  aria-expanded={!isCollapsedGroup}
-                  className="browser-chat-embedded-tab-group-label"
-                  onClick={() => toggleEmbeddedBrowserGroup(group.id)}
-                  title={embeddedSessionGroupLabel(groupSessionId)}
-                  type="button"
-                >
-                  <Folder size={14} />
-                  <span>{embeddedSessionGroupLabel(groupSessionId)}</span>
-                </button>
+                <div className="browser-chat-embedded-tab-group-tag">
+                  <button
+                    aria-expanded={!isCollapsedGroup}
+                    className="browser-chat-embedded-tab-group-label"
+                    onClick={() => toggleEmbeddedBrowserGroup(group.id)}
+                    title={embeddedSessionGroupLabel(groupSessionId)}
+                    type="button"
+                  >
+                    <Folder size={14} />
+                    <span>{embeddedSessionGroupLabel(groupSessionId)}</span>
+                  </button>
+                  <button
+                    aria-label={`关闭 ${embeddedSessionGroupLabel(groupSessionId)} 标签组`}
+                    className="browser-chat-embedded-tab-group-close"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void closeEmbeddedBrowserGroup(group);
+                    }}
+                    title={`关闭 ${embeddedSessionGroupLabel(groupSessionId)} 标签组`}
+                    type="button"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
                 <div className="browser-chat-embedded-tab-stack" hidden={isCollapsedGroup}>
                   {group.tabs.map((tab) => {
                     const tabIndex = browserTabs.findIndex((item) => item.id === tab.id);
@@ -1581,8 +1620,9 @@ export function BrowserChatWorkspace({
     [toolDialog],
   );
   const embeddedBrowserActive = embeddedBrowserEnabled && activeView === 'chat';
-  const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || imagePreview || groupDialogOpen || historyTooltipActive);
+  const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || imagePreview || groupDialogOpen);
   const embeddedBrowserViewActive = embeddedBrowserActive && !embeddedBrowserCovered;
+  const embeddedBrowserLeftOverlayInset = embeddedBrowserActive && historyTooltipActive && sidebarCollapsed ? 300 : 0;
 
   const loadBrowserRuntimeSettings = useCallback(async () => {
     const response = await fetch('/api/settings/env', { cache: 'no-store' });
@@ -1624,8 +1664,8 @@ export function BrowserChatWorkspace({
   }, []);
 
   useEffect(() => {
-    if (!sidebarCollapsed) setHistoryTooltipActive(false);
-  }, [sidebarCollapsed]);
+    if (!sidebarCollapsed || activeView !== 'chat') setHistoryTooltipActive(false);
+  }, [activeView, sidebarCollapsed]);
 
   useEffect(() => {
     activeSessionIdRef.current = session?.id || null;
@@ -2084,7 +2124,20 @@ export function BrowserChatWorkspace({
           <ol className="browser-chat-recent-list">
             {recentSessions.map((item) => (
               <li key={item.id}>
-                <div className={session?.id === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}>
+                <div
+                  className={session?.id === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}
+                  onBlurCapture={() => setHistoryTooltipActive(false)}
+                  onFocusCapture={() => {
+                    if (sidebarCollapsed) setHistoryTooltipActive(true);
+                  }}
+                  onMouseEnter={() => {
+                    if (sidebarCollapsed) setHistoryTooltipActive(true);
+                  }}
+                  onMouseLeave={() => setHistoryTooltipActive(false)}
+                  onPointerDownCapture={() => {
+                    if (sidebarCollapsed) setHistoryTooltipActive(true);
+                  }}
+                >
                   <input
                     aria-label={`选择 ${sessionDisplayTitle(item)}`}
                     checked={selectedSessionIdSet.has(item.id)}
@@ -2097,20 +2150,8 @@ export function BrowserChatWorkspace({
                     className="browser-chat-recent-open"
                     data-title={sessionDisplayTitle(item)}
                     disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
-                    onBlur={() => setHistoryTooltipActive(false)}
                     onClick={() => {
-                      if (sidebarCollapsed) setHistoryTooltipActive(true);
                       void loadSession(item.id);
-                    }}
-                    onFocus={() => {
-                      if (sidebarCollapsed) setHistoryTooltipActive(true);
-                    }}
-                    onMouseEnter={() => {
-                      if (sidebarCollapsed) setHistoryTooltipActive(true);
-                    }}
-                    onMouseLeave={() => setHistoryTooltipActive(false)}
-                    onPointerDown={() => {
-                      if (sidebarCollapsed) setHistoryTooltipActive(true);
                     }}
                     title={sessionDisplayTitle(item)}
                     type="button"
@@ -2270,6 +2311,7 @@ export function BrowserChatWorkspace({
             <BrowserChatEmbeddedBrowser
               active={embeddedBrowserViewActive}
               enabled={embeddedBrowserEnabled}
+              leftOverlayInset={embeddedBrowserLeftOverlayInset}
               onSelectSession={(nextSessionId) => {
                 if (nextSessionId !== activeSessionIdRef.current) void loadSession(nextSessionId);
               }}
