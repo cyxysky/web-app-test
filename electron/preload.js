@@ -35,11 +35,17 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
   closeTab(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:close-tab', input);
   },
+  createTab(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:create-tab', input);
+  },
   getState() {
     return ipcRenderer.invoke('webpilot:embedded-browser:get-state');
   },
   navigate(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:navigate', input);
+  },
+  moveTab(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:move-tab', input);
   },
   reset() {
     return ipcRenderer.invoke('webpilot:embedded-browser:reset');

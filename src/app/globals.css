@@ -5525,15 +5525,14 @@ select {
 
 .browser-chat-embedded-browser header {
   align-items: center;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(226, 233, 239, 0.96));
-  border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, #94a3b8);
+  background: transparent;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
   display: flex;
-  gap: 10px;
+  gap: 4px;
   justify-content: space-between;
   min-width: 0;
   overflow: hidden;
-  padding: 7px 10px 0 12px;
+  padding: 4px 8px 0 10px;
   position: relative;
   z-index: 1;
 }
@@ -5550,34 +5549,173 @@ select {
 
 .browser-chat-embedded-tab-list {
   align-items: flex-end;
+  background: transparent;
   display: flex;
   flex: 1 1 auto;
-  gap: 3px;
-  height: 39px;
+  gap: 2px;
+  height: 42px;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: hidden;
+  padding-left: 2px;
+  padding-right: 6px;
+}
+
+.browser-chat-embedded-tab-group-shell {
+  align-items: flex-end;
+  display: inline-flex;
+  flex: 1 1 0;
+  gap: 1px;
+  height: 42px;
+  min-width: 0;
+  padding-top: 4px;
+  position: relative;
+}
+
+.browser-chat-embedded-tab-group-shell::before {
+  background: var(--accent);
+  border-radius: 999px;
+  content: "";
+  height: 2px;
+  left: 0;
+  opacity: 0.86;
+  position: absolute;
+  right: 5px;
+  top: 0;
+}
+
+.browser-chat-embedded-tab-group-shell.collapsed {
+  flex: 0 1 134px;
+}
+
+.browser-chat-embedded-tab-group-shell.collapsed::before {
+  right: 0;
+}
+
+.browser-chat-embedded-tab-group-label {
+  align-items: center;
+  align-self: flex-end;
+  background: var(--accent);
+  border: 0;
+  border-radius: 5px;
+  box-shadow: none;
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 1 104px;
+  font-size: 13px;
+  font-weight: 500;
+  gap: 6px;
+  height: 31px;
+  justify-content: center;
+  line-height: 1;
+  max-width: 104px;
+  min-width: 76px;
+  overflow: hidden;
+  padding: 0 8px;
+  text-overflow: ellipsis;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    color 0.16s ease;
+  white-space: nowrap;
+}
+
+.browser-chat-embedded-tab-group-label svg {
+  flex: 0 0 auto;
+}
+
+.browser-chat-embedded-tab-group-label span {
+  display: block;
   min-width: 0;
   overflow: hidden;
-  padding-left: 2px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-label {
+  background: var(--accent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+.browser-chat-embedded-tab-group-label:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-strong);
+}
+
+.browser-chat-embedded-tab-group-label:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+}
+
+.browser-chat-embedded-tab-stack {
+  align-items: flex-end;
+  display: inline-flex;
+  flex: 1 1 auto;
+  gap: 0;
+  min-width: 0;
+}
+
+.browser-chat-embedded-new-tab-button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: #0f2433;
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 30px;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease;
+  width: 30px;
+}
+
+.browser-chat-embedded-group-new-tab-button {
+  align-self: flex-end;
+  margin-bottom: 3px;
+}
+
+.browser-chat-embedded-new-tab-button:hover {
+  background: color-mix(in srgb, var(--panel-warm) 76%, transparent);
+  color: #07131f;
+}
+
+.browser-chat-embedded-new-tab-button:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+}
+
+.browser-chat-embedded-new-tab-button svg {
+  flex: 0 0 auto;
 }
 
 .browser-chat-embedded-tab {
   align-items: center;
   align-self: flex-end;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(241, 245, 249, 0.72));
-  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  background: color-mix(in srgb, var(--panel-warm) 72%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
   border-bottom-color: transparent;
-  border-radius: 9px 9px 0 0;
+  border-radius: 10px 10px 0 0;
   box-shadow: inset 0 -1px 0 rgba(15, 23, 42, 0.04);
-  color: var(--muted);
-  cursor: pointer;
+  color: #101820;
+  cursor: grab;
+  container-type: inline-size;
   display: inline-flex;
-  flex: 0 1 280px;
+  flex: 1 1 170px;
   gap: 8px;
   height: 36px;
   isolation: isolate;
-  min-width: 150px;
+  max-width: 188px;
+  min-width: 28px;
   overflow: hidden;
-  padding: 5px 10px 5px 9px;
+  padding: 0 9px 0 10px;
   position: relative;
   transition:
     background 0.16s ease,
@@ -5585,6 +5723,14 @@ select {
     box-shadow 0.16s ease,
     color 0.16s ease,
     transform 0.16s ease;
+}
+
+.browser-chat-embedded-tab:active {
+  cursor: grabbing;
+}
+
+.browser-chat-embedded-tab.dragging {
+  opacity: 0.54;
 }
 
 .browser-chat-embedded-tab::before {
@@ -5609,55 +5755,72 @@ select {
 }
 
 .browser-chat-embedded-tab:hover {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(247, 250, 252, 0.82));
-  border-color: color-mix(in srgb, var(--border) 88%, #94a3b8);
-  color: var(--foreground);
-  transform: translateY(-1px);
+  background: color-mix(in srgb, var(--panel) 82%, var(--panel-warm));
+  border-color: color-mix(in srgb, var(--border-strong) 80%, transparent);
+  color: #07131f;
+  transform: none;
 }
 
 .browser-chat-embedded-tab.active {
-  background: #fff;
-  border-color: color-mix(in srgb, var(--border) 88%, #64748b);
-  border-bottom-color: #fff;
-  color: var(--foreground);
-  box-shadow:
-    0 -1px 0 rgba(255, 255, 255, 0.82) inset,
-    0 8px 18px rgba(15, 23, 42, 0.08);
+  background: var(--panel);
+  border-color: color-mix(in srgb, var(--border-strong) 82%, transparent);
+  border-bottom-color: var(--panel);
+  color: #07131f;
+  box-shadow: none;
   transform: translateY(0);
 }
 
 .browser-chat-embedded-tab.active::after {
-  background: #fff;
+  background: var(--panel);
+}
+
+.browser-chat-embedded-tab.drop-before {
+  box-shadow:
+    -3px 0 0 var(--accent),
+    inset 0 -1px 0 rgba(15, 23, 42, 0.04);
+}
+
+.browser-chat-embedded-tab.drop-after {
+  box-shadow:
+    3px 0 0 var(--accent),
+    inset 0 -1px 0 rgba(15, 23, 42, 0.04);
 }
 
 .browser-chat-embedded-tab-icon {
   align-items: center;
-  background: rgba(15, 23, 42, 0.06);
-  border-radius: 6px;
-  color: var(--muted-strong);
+  background: transparent;
+  border-radius: 0;
+  color: #17364a;
   display: inline-flex;
   flex: 0 0 auto;
-  height: 22px;
+  height: 20px;
   justify-content: center;
-  width: 22px;
+  opacity: 1;
+  transition:
+    color 0.16s ease,
+    opacity 0.12s ease;
+  width: 20px;
 }
 
 .browser-chat-embedded-tab.active .browser-chat-embedded-tab-icon {
-  background: color-mix(in srgb, var(--accent) 13%, #fff);
-  color: var(--accent-strong);
+  background: transparent;
+  color: #0b263a;
+}
+
+.browser-chat-embedded-tab.active .browser-chat-embedded-tab-icon,
+.browser-chat-embedded-tab:hover .browser-chat-embedded-tab-icon {
+  opacity: 0;
 }
 
 .browser-chat-embedded-tab-text {
-  display: grid;
+  display: block;
   flex: 1 1 auto;
-  gap: 1px;
-  line-height: 1.05;
+  line-height: 1;
   min-width: 0;
 }
 
-.browser-chat-embedded-tab-text strong,
-.browser-chat-embedded-tab-text small {
+.browser-chat-embedded-tab-text strong {
+  display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -5666,35 +5829,8 @@ select {
 
 .browser-chat-embedded-tab-text strong {
   color: inherit;
-  font-size: 12px;
-  font-weight: 900;
-}
-
-.browser-chat-embedded-tab-text small {
-  color: var(--muted);
-  font-size: 10px;
-  font-weight: 800;
-}
-
-.browser-chat-embedded-tab-group {
-  background: rgba(15, 23, 42, 0.06);
-  border-radius: 999px;
-  color: var(--muted-strong);
-  flex: 0 0 auto;
-  font-size: 10px;
-  font-weight: 900;
-  line-height: 1;
-  margin-left: auto;
-  max-width: 72px;
-  overflow: hidden;
-  padding: 4px 6px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.browser-chat-embedded-tab.active .browser-chat-embedded-tab-group {
-  background: color-mix(in srgb, var(--accent) 12%, #fff);
-  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .browser-chat-embedded-tab-loading {
@@ -5721,17 +5857,27 @@ select {
   color: var(--muted);
   cursor: pointer;
   display: inline-flex;
-  flex: 0 0 auto;
   height: 20px;
   justify-content: center;
-  margin-left: -2px;
-  opacity: 0.72;
+  left: 10px;
+  opacity: 0;
   padding: 0;
+  pointer-events: none;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
   transition:
     background 0.16s ease,
     color 0.16s ease,
     opacity 0.16s ease;
   width: 20px;
+  z-index: 2;
+}
+
+.browser-chat-embedded-tab.active .browser-chat-embedded-tab-close,
+.browser-chat-embedded-tab:hover .browser-chat-embedded-tab-close {
+  opacity: 0.88;
+  pointer-events: auto;
 }
 
 .browser-chat-embedded-tab-close:hover {
@@ -5753,20 +5899,16 @@ select {
   align-items: center;
   display: inline-flex;
   flex: 0 0 auto;
-  gap: 8px;
-  height: 39px;
+  gap: 2px;
+  height: 38px;
   justify-content: center;
-  min-width: 38px;
-  padding-left: 6px;
+  min-width: 32px;
+  padding-left: 0;
   position: relative;
 }
 
 .browser-chat-embedded-toolbar::before {
-  background: color-mix(in srgb, var(--border) 72%, transparent);
-  border-radius: 999px;
-  content: "";
-  height: 22px;
-  width: 1px;
+  content: none;
 }
 
 .browser-chat-embedded-tool-button {
@@ -5809,11 +5951,37 @@ select {
 
 @media (max-width: 1120px) {
   .browser-chat-embedded-tab {
-    min-width: 126px;
+    flex-basis: 150px;
+    max-width: 164px;
+    min-width: 26px;
   }
 
-  .browser-chat-embedded-tab-group {
+  .browser-chat-embedded-tab-group-label {
+    flex-basis: 92px;
+    max-width: 92px;
+    min-width: 64px;
+  }
+}
+
+@container (max-width: 76px) {
+  .browser-chat-embedded-tab {
+    gap: 0;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .browser-chat-embedded-tab-text,
+  .browser-chat-embedded-tab-loading {
     display: none;
+  }
+
+  .browser-chat-embedded-tab-icon {
+    width: 100%;
+  }
+
+  .browser-chat-embedded-tab-close {
+    left: 50%;
+    transform: translate(-50%, -50%);
   }
 }
 

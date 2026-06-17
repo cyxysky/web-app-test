@@ -1,6 +1,6 @@
 'use client';
 
-import { memo, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { memo, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   AppWindow,
   BadgeCheck,
@@ -23,6 +23,7 @@ import {
   Network,
   PanelLeft,
   PencilLine,
+  Plus,
   Power,
   RefreshCw,
   Route,
@@ -138,6 +139,7 @@ type EmbeddedBrowserBridgeResult = {
 };
 
 type EmbeddedBrowserTab = {
+  groupId?: string;
   id: string;
   sessionId?: string;
   title: string;
@@ -145,8 +147,19 @@ type EmbeddedBrowserTab = {
   loading?: boolean;
 };
 
+type EmbeddedBrowserGroup = {
+  active?: boolean;
+  activeTabId?: string;
+  id: string;
+  sessionId?: string;
+  tabs: EmbeddedBrowserTab[];
+};
+
 type EmbeddedBrowserState = EmbeddedBrowserBridgeResult & {
+  activeGroupId?: string;
   activeIndex?: number;
+  activeTabId?: string;
+  groups?: EmbeddedBrowserGroup[];
   tabs?: EmbeddedBrowserTab[];
   zoomFactor?: number;
 };
@@ -155,16 +168,21 @@ type EmbeddedBrowserBridge = {
   activateTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   closeActiveTab: () => Promise<EmbeddedBrowserBridgeResult>;
   closeTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
+  createTab: (input: { groupId?: string; sessionId?: string }) => Promise<EmbeddedBrowserState>;
   getState: () => Promise<EmbeddedBrowserState>;
+  moveTab: (input: { id: string; position: 'before' | 'after'; targetId: string }) => Promise<EmbeddedBrowserState>;
   navigate: (input: { sessionId?: string; url: string }) => Promise<EmbeddedBrowserBridgeResult>;
   reset: () => Promise<EmbeddedBrowserBridgeResult>;
   setBounds: (bounds: EmbeddedBrowserBounds) => Promise<EmbeddedBrowserBridgeResult>;
   setVisible: (input: {
     bounds?: EmbeddedBrowserBounds;
+    createIfMissing?: boolean;
+    groupId?: string;
+    id?: string;
     sessionId?: string;
     url?: string;
     visible: boolean;
-  }) => Promise<EmbeddedBrowserBridgeResult>;
+  }) => Promise<EmbeddedBrowserState>;
 };
 
 declare global {
@@ -204,18 +222,6 @@ function compactText(value?: string, max = 160) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
-function embeddedTabUrlLabel(url?: string) {
-  const value = (url || '').trim();
-  if (!value) return 'about:blank';
-  if (value.startsWith('data:')) return 'embedded page';
-  try {
-    const parsed = new URL(value);
-    return parsed.host || parsed.protocol.replace(':', '');
-  } catch {
-    return compactText(value, 72);
-  }
-}
-
 function embeddedSessionGroupLabel(sessionId?: string) {
   const normalized = (sessionId || 'browser-session')
     .trim()
@@ -224,6 +230,17 @@ function embeddedSessionGroupLabel(sessionId?: string) {
   const parts = normalized.split('_');
   const shortId = (parts.at(-1) || normalized || 'session').slice(-6).toLowerCase();
   return `ai-${shortId}`;
+}
+
+function embeddedGroupIdForSession(sessionId?: string) {
+  const normalized = (sessionId || '').trim();
+  return normalized ? `session:${normalized}` : 'default';
+}
+
+function embeddedGroupIdForTab(tab: EmbeddedBrowserTab, fallbackGroupId: string) {
+  if (tab.groupId) return tab.groupId;
+  if (tab.sessionId) return embeddedGroupIdForSession(tab.sessionId);
+  return fallbackGroupId;
 }
 
 function parseJsonObjectText(value?: string) {
@@ -1053,6 +1070,10 @@ function embeddedBoundsFromElement(element: HTMLElement): EmbeddedBrowserBounds 
   };
 }
 
+function embeddedBoundsKey(bounds?: EmbeddedBrowserBounds) {
+  return bounds ? `${bounds.x}:${bounds.y}:${bounds.width}:${bounds.height}` : '';
+}
+
 const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   active,
   enabled,
@@ -1065,10 +1086,19 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   sessionId?: string;
 }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const embeddedBrowserSyncRef = useRef({ boundsKey: '', groupId: '', visible: false });
+  const draggingGroupIdRef = useRef('');
+  const draggingTabIdRef = useRef('');
   const [bridgeAvailable, setBridgeAvailable] = useState(false);
   const [bridgeError, setBridgeError] = useState('');
+  const [browserGroups, setBrowserGroups] = useState<EmbeddedBrowserGroup[]>([]);
   const [browserTabs, setBrowserTabs] = useState<EmbeddedBrowserTab[]>([]);
+  const [activeGroupId, setActiveGroupId] = useState('');
   const [activeTabIndex, setActiveTabIndex] = useState(0);
+  const [activeTabId, setActiveTabId] = useState('');
+  const [collapsedGroupIds, setCollapsedGroupIds] = useState<string[]>([]);
+  const [draggingTabId, setDraggingTabId] = useState('');
+  const [dragDropTarget, setDragDropTarget] = useState<{ position: 'before' | 'after'; tabId: string } | null>(null);
 
   const applyEmbeddedBrowserState = useCallback((result: EmbeddedBrowserState) => {
     if (!result.ok) {
@@ -1076,16 +1106,22 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       return;
     }
     setBridgeError('');
+    setBrowserGroups(Array.isArray(result.groups) ? result.groups : []);
     setBrowserTabs(Array.isArray(result.tabs) ? result.tabs : []);
+    setActiveGroupId(result.activeGroupId || '');
     setActiveTabIndex(typeof result.activeIndex === 'number' && result.activeIndex >= 0 ? result.activeIndex : 0);
+    setActiveTabId(result.activeTabId || '');
   }, []);
 
   const loadEmbeddedBrowserState = useCallback(async () => {
     const bridge = window.webPilotEmbeddedBrowser;
     setBridgeAvailable(Boolean(bridge));
     if (!bridge) {
+      setBrowserGroups([]);
       setBrowserTabs([]);
+      setActiveGroupId('');
       setActiveTabIndex(0);
+      setActiveTabId('');
       return;
     }
 
@@ -1101,26 +1137,52 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const bridge = window.webPilotEmbeddedBrowser;
     const viewport = viewportRef.current;
     const visible = enabled && active && Boolean(viewport);
+    const groupId = embeddedGroupIdForSession(sessionId);
+    const bounds = visible && viewport ? embeddedBoundsFromElement(viewport) : undefined;
+    const boundsKey = embeddedBoundsKey(bounds);
+    const previous = embeddedBrowserSyncRef.current;
     setBridgeAvailable(Boolean(bridge));
     if (!bridge) return;
     try {
-      const result = await bridge.setVisible({
-        bounds: visible && viewport ? embeddedBoundsFromElement(viewport) : undefined,
-        sessionId,
-        visible,
-      });
-      setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
-      if (result.ok) void loadEmbeddedBrowserState();
+      if (!visible) {
+        if (!previous.visible) return;
+        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', visible: false };
+        const result = await bridge.setVisible({ visible: false });
+        setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
+        if (result.ok) applyEmbeddedBrowserState(result);
+        return;
+      }
+
+      if (!previous.visible || previous.groupId !== groupId) {
+        embeddedBrowserSyncRef.current = { boundsKey, groupId, visible: true };
+        const result = await bridge.setVisible({
+          bounds,
+          createIfMissing: false,
+          groupId,
+          sessionId,
+          visible: true,
+        });
+        setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
+        if (result.ok) applyEmbeddedBrowserState(result);
+        return;
+      }
+
+      if (bounds && previous.boundsKey !== boundsKey) {
+        embeddedBrowserSyncRef.current = { boundsKey, groupId, visible: true };
+        const result = await bridge.setBounds(bounds);
+        setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
+      }
     } catch (error) {
       setBridgeError(error instanceof Error ? error.message : '嵌入浏览器不可用');
     }
-  }, [active, enabled, loadEmbeddedBrowserState, sessionId]);
+  }, [active, applyEmbeddedBrowserState, enabled, sessionId]);
 
   useEffect(() => {
     void syncEmbeddedBrowser();
     const viewport = viewportRef.current;
     if (!enabled || !active || !viewport) {
       return () => {
+        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', visible: false };
         void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
       };
     }
@@ -1132,13 +1194,12 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     resizeObserver.observe(viewport);
     window.addEventListener('resize', update);
     window.addEventListener('scroll', update, true);
-    const timer = window.setInterval(update, 700);
 
     return () => {
       resizeObserver.disconnect();
       window.removeEventListener('resize', update);
       window.removeEventListener('scroll', update, true);
-      window.clearInterval(timer);
+      embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', visible: false };
       void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
     };
   }, [active, enabled, syncEmbeddedBrowser]);
@@ -1177,54 +1238,215 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     void syncEmbeddedBrowser();
   }
 
-  const visibleTabs = browserTabs.length
-    ? browserTabs
-    : [{ id: 'embedded-placeholder', loading: false, title: '测试浏览器', url: '' }];
+  async function createEmbeddedBrowserTab(group: EmbeddedBrowserGroup) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const groupSessionId = group.sessionId || (group.id.startsWith('session:') ? group.id.slice('session:'.length) : sessionId);
+    const result = await bridge.createTab({ groupId: group.id, sessionId: groupSessionId }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '创建嵌入浏览器标签失败',
+    }));
+    applyEmbeddedBrowserState(result);
+    if (result.ok) {
+      setCollapsedGroupIds((current) => current.filter((item) => item !== group.id));
+      if (groupSessionId && groupSessionId !== sessionId) onSelectSession?.(groupSessionId);
+    }
+  }
 
+  function embeddedTabDragPosition(event: ReactDragEvent<HTMLElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return event.clientX > rect.left + rect.width / 2 ? 'after' : 'before';
+  }
+
+  async function moveEmbeddedBrowserTab(tabId: string, targetId: string, position: 'before' | 'after') {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge || !tabId || !targetId || tabId === targetId) return;
+    const result = await bridge.moveTab({ id: tabId, position, targetId }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '移动嵌入浏览器标签失败',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  function clearEmbeddedTabDrag() {
+    draggingGroupIdRef.current = '';
+    draggingTabIdRef.current = '';
+    setDraggingTabId('');
+    setDragDropTarget(null);
+  }
+
+  function toggleEmbeddedBrowserGroup(groupId: string) {
+    setCollapsedGroupIds((current) => (
+      current.includes(groupId)
+        ? current.filter((item) => item !== groupId)
+        : [...current, groupId]
+    ));
+  }
+
+  const selectedGroupId = embeddedGroupIdForSession(sessionId);
+  const visibleGroups = useMemo<EmbeddedBrowserGroup[]>(() => {
+    const groupsById = new Map<string, EmbeddedBrowserGroup>();
+    const orderedIds: string[] = [];
+    const resolvedActiveGroupId = activeGroupId || browserGroups.find((group) => group.active)?.id || selectedGroupId;
+
+    function ensureGroup(id: string, input: Partial<EmbeddedBrowserGroup> = {}) {
+      const normalizedId = id || selectedGroupId;
+      let group = groupsById.get(normalizedId);
+      if (!group) {
+        group = {
+          active: normalizedId === resolvedActiveGroupId,
+          activeTabId: input.activeTabId,
+          id: normalizedId,
+          sessionId: input.sessionId,
+          tabs: [],
+        };
+        groupsById.set(normalizedId, group);
+        orderedIds.push(normalizedId);
+      }
+      group.active = Boolean(group.active || input.active || normalizedId === resolvedActiveGroupId);
+      group.activeTabId = group.activeTabId || input.activeTabId;
+      group.sessionId = group.sessionId || input.sessionId;
+      return group;
+    }
+
+    for (const group of browserGroups) {
+      const hydrated = ensureGroup(group.id, group);
+      for (const tab of Array.isArray(group.tabs) ? group.tabs : []) {
+        if (!hydrated.tabs.some((item) => item.id === tab.id)) hydrated.tabs.push(tab);
+      }
+    }
+
+    for (const tab of browserTabs) {
+      const groupId = embeddedGroupIdForTab(tab, resolvedActiveGroupId || selectedGroupId);
+      const hydrated = ensureGroup(groupId, {
+        active: groupId === resolvedActiveGroupId || tab.id === activeTabId,
+        sessionId: tab.sessionId || (groupId.startsWith('session:') ? groupId.slice('session:'.length) : undefined),
+      });
+      if (!hydrated.tabs.some((item) => item.id === tab.id)) hydrated.tabs.push(tab);
+    }
+
+    if (!groupsById.size || (sessionId && !groupsById.has(selectedGroupId))) {
+      ensureGroup(selectedGroupId, { active: true, sessionId });
+    }
+
+    return orderedIds.map((id) => groupsById.get(id)!).filter(Boolean);
+  }, [activeGroupId, activeTabId, browserGroups, browserTabs, selectedGroupId, sessionId]);
   return (
     <section className="browser-chat-embedded-browser" aria-label="嵌入浏览器">
       <header>
         <div className="browser-chat-embedded-tab-list" role="tablist" aria-label="嵌入浏览器标签">
-          {visibleTabs.map((tab, index) => (
-            <div
-              aria-selected={index === activeTabIndex}
-              className={[
-                'browser-chat-embedded-tab',
-                index === activeTabIndex ? 'active' : '',
-                tab.loading ? 'loading' : '',
-              ].filter(Boolean).join(' ')}
-              key={tab.id || `${tab.url}-${index}`}
-              onClick={() => void activateEmbeddedBrowserTab(tab)}
-              role="tab"
-              title={tab.url || tab.title}
-            >
-              <span className="browser-chat-embedded-tab-icon">
-                <AppWindow size={14} />
-              </span>
-              <span className="browser-chat-embedded-tab-text">
-                <strong>{compactText(tab.title || tab.url || '新标签页', 56)}</strong>
-                <small>{embeddedTabUrlLabel(tab.url)}</small>
-              </span>
-              <span className="browser-chat-embedded-tab-group">{embeddedSessionGroupLabel(tab.sessionId || sessionId)}</span>
-              {tab.loading ? (
-                <span className="browser-chat-embedded-tab-loading" aria-label="页面加载中">
-                  <Loader2 className="spin" size={12} />
-                </span>
-              ) : null}
-              <button
-                aria-label="关闭当前标签页"
-                className="browser-chat-embedded-tab-close"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void closeEmbeddedBrowserTab(tab);
-                }}
-                title="关闭当前标签页"
-                type="button"
+          {visibleGroups.map((group) => {
+            const groupSessionId = group.sessionId
+              || group.tabs.find((tab) => tab.sessionId)?.sessionId
+              || (group.id.startsWith('session:') ? group.id.slice('session:'.length) : sessionId);
+            const isActiveGroup = Boolean(group.active || group.id === selectedGroupId);
+            const isCollapsedGroup = collapsedGroupIds.includes(group.id);
+            return (
+              <div
+                className={[
+                  'browser-chat-embedded-tab-group-shell',
+                  isActiveGroup ? 'active' : '',
+                  isCollapsedGroup ? 'collapsed' : '',
+                  group.tabs.length ? '' : 'empty',
+                ].filter(Boolean).join(' ')}
+                key={group.id}
               >
-                <X size={13} />
-              </button>
-            </div>
-          ))}
+                <button
+                  aria-expanded={!isCollapsedGroup}
+                  className="browser-chat-embedded-tab-group-label"
+                  onClick={() => toggleEmbeddedBrowserGroup(group.id)}
+                  title={embeddedSessionGroupLabel(groupSessionId)}
+                  type="button"
+                >
+                  <Folder size={14} />
+                  <span>{embeddedSessionGroupLabel(groupSessionId)}</span>
+                </button>
+                <div className="browser-chat-embedded-tab-stack" hidden={isCollapsedGroup}>
+                  {group.tabs.map((tab) => {
+                    const tabIndex = browserTabs.findIndex((item) => item.id === tab.id);
+                    const isActiveTab = activeTabId ? tab.id === activeTabId : tabIndex === activeTabIndex;
+                    const dragPosition = dragDropTarget?.tabId === tab.id ? dragDropTarget.position : undefined;
+                    return (
+                      <div
+                        aria-selected={isActiveTab}
+                        className={[
+                          'browser-chat-embedded-tab',
+                          isActiveTab ? 'active' : '',
+                          tab.loading ? 'loading' : '',
+                          draggingTabId === tab.id ? 'dragging' : '',
+                          dragPosition ? `drop-${dragPosition}` : '',
+                        ].filter(Boolean).join(' ')}
+                        draggable
+                        key={tab.id || `${tab.url}-${tabIndex}`}
+                        onClick={() => void activateEmbeddedBrowserTab(tab)}
+                        onDragEnd={clearEmbeddedTabDrag}
+                        onDragOver={(event) => {
+                          const sourceTabId = draggingTabIdRef.current || draggingTabId;
+                          if (!sourceTabId || sourceTabId === tab.id) return;
+                          if (draggingGroupIdRef.current && draggingGroupIdRef.current !== group.id) return;
+                          event.preventDefault();
+                          event.dataTransfer.dropEffect = 'move';
+                          setDragDropTarget({ position: embeddedTabDragPosition(event), tabId: tab.id });
+                        }}
+                        onDragStart={(event) => {
+                          draggingGroupIdRef.current = group.id;
+                          draggingTabIdRef.current = tab.id;
+                          setDraggingTabId(tab.id);
+                          event.dataTransfer.effectAllowed = 'move';
+                          event.dataTransfer.setData('application/x-webpilot-tab-id', tab.id);
+                          event.dataTransfer.setData('text/plain', tab.id);
+                        }}
+                        onDrop={(event) => {
+                          const droppedTabId = draggingTabIdRef.current || draggingTabId || event.dataTransfer.getData('application/x-webpilot-tab-id') || event.dataTransfer.getData('text/plain');
+                          if (!droppedTabId || droppedTabId === tab.id) return;
+                          if (draggingGroupIdRef.current && draggingGroupIdRef.current !== group.id) return;
+                          event.preventDefault();
+                          const position = dragDropTarget?.tabId === tab.id ? dragDropTarget.position : embeddedTabDragPosition(event);
+                          clearEmbeddedTabDrag();
+                          void moveEmbeddedBrowserTab(droppedTabId, tab.id, position);
+                        }}
+                        role="tab"
+                        title={tab.url || tab.title}
+                      >
+                        <span className="browser-chat-embedded-tab-icon">
+                          <AppWindow size={14} />
+                        </span>
+                        <span className="browser-chat-embedded-tab-text">
+                          <strong>{compactText(tab.title || tab.url || '新标签页', 56)}</strong>
+                        </span>
+                        {tab.loading ? (
+                          <span className="browser-chat-embedded-tab-loading" aria-label="页面加载中">
+                            <Loader2 className="spin" size={12} />
+                          </span>
+                        ) : null}
+                        <button
+                          aria-label="关闭当前标签页"
+                          className="browser-chat-embedded-tab-close"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void closeEmbeddedBrowserTab(tab);
+                          }}
+                          title="关闭当前标签页"
+                          type="button"
+                        >
+                          <X size={13} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                <button
+                  aria-label={`在 ${embeddedSessionGroupLabel(groupSessionId)} 中新建标签页`}
+                  className="browser-chat-embedded-new-tab-button browser-chat-embedded-group-new-tab-button"
+                  onClick={() => void createEmbeddedBrowserTab(group)}
+                  title={`在 ${embeddedSessionGroupLabel(groupSessionId)} 中新建标签页`}
+                  type="button"
+                >
+                  <Plus size={18} />
+                </button>
+              </div>
+            );
+          })}
         </div>
         <div className="browser-chat-embedded-toolbar">
           <button className="browser-chat-embedded-tool-button" onClick={() => void resetEmbeddedBrowser()} title="重置浏览器视图" type="button" aria-label="重置浏览器视图">
@@ -1567,7 +1789,12 @@ export function BrowserChatWorkspace({
     if (!embeddedBrowserEnabled || typeof window === 'undefined') return;
     const bridge = window.webPilotEmbeddedBrowser;
     if (!bridge) return;
-    const result = await bridge.setVisible({ sessionId, visible: true });
+    const result = await bridge.setVisible({
+      createIfMissing: true,
+      groupId: embeddedGroupIdForSession(sessionId),
+      sessionId,
+      visible: true,
+    });
     if (!result.ok) throw new Error(result.error || '嵌入浏览器标签创建失败');
   }
 
@@ -1765,17 +1992,6 @@ export function BrowserChatWorkspace({
     setError('');
     setComposerResetToken((current) => current + 1);
     setAttachments([]);
-    if (embeddedBrowserEnabled && typeof window !== 'undefined' && window.webPilotEmbeddedBrowser) {
-      try {
-        const created = await createSession();
-        await ensureEmbeddedBrowserSessionTab(created.id);
-        setMode(normalizeMode(created.mode));
-      } catch (createError) {
-        setSession(null);
-        setError(createError instanceof Error ? createError.message : '创建对话会话失败');
-      }
-      return;
-    }
     setSession(null);
   }
 

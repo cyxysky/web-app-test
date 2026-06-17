@@ -2343,8 +2343,11 @@ export class BrowserSession {
       this.context = context;
       if (electronEmbeddedBrowserEnabled()) {
         await this.prepareContext(context, { claimPages: false });
-        const embeddedPage = await this.findInitialElectronEmbeddedBrowserPage(context);
-        if (embeddedPage && this.claimPage(embeddedPage, { allowSteal: true })) {
+        this.installElectronEmbeddedBrowserPageDiscovery(context);
+        const embeddedPages = await this.findInitialElectronEmbeddedBrowserPages(context);
+        const embeddedPage = this.chooseInitialPage(embeddedPages);
+        if (embeddedPage) {
+          this.page = embeddedPage;
           await embeddedPage.bringToFront().catch(() => undefined);
           return;
         }
@@ -2500,16 +2503,20 @@ export class BrowserSession {
     return undefined;
   }
 
-  private async findInitialElectronEmbeddedBrowserPage(context: BrowserContext) {
-    if (!electronEmbeddedBrowserEnabled()) return undefined;
+  private async findInitialElectronEmbeddedBrowserPages(context: BrowserContext) {
+    if (!electronEmbeddedBrowserEnabled()) return [];
     for (let attempt = 0; attempt < 12; attempt += 1) {
+      const pages: Page[] = [];
       for (const page of [...context.pages()].reverse()) {
         if (page.isClosed()) continue;
-        if (await this.isElectronEmbeddedBrowserSessionPage(page)) return page;
+        if (await this.isElectronEmbeddedBrowserSessionPage(page) && this.claimPage(page, { allowSteal: true, makeActive: false })) {
+          pages.push(page);
+        }
       }
+      if (pages.length) return pages.reverse();
       if (attempt < 11) await sleep(160);
     }
-    return undefined;
+    return [];
   }
 
   private async reclaimSessionPagesByMarker(context: BrowserContext) {
@@ -2601,6 +2608,25 @@ export class BrowserSession {
     if (this.pageDiscoveryListener) return;
     this.pageDiscoveryListener = (page) => {
       void this.claimPopupIfOwned(page);
+    };
+    context.on('page', this.pageDiscoveryListener);
+  }
+
+  private installElectronEmbeddedBrowserPageDiscovery(context: BrowserContext) {
+    if (this.pageDiscoveryListener) return;
+    this.pageDiscoveryListener = (page) => {
+      void (async () => {
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          if (page.isClosed()) return;
+          if (await this.isElectronEmbeddedBrowserSessionPage(page)) {
+            if (this.claimPage(page, { allowSteal: true })) {
+              await page.bringToFront().catch(() => undefined);
+            }
+            return;
+          }
+          if (attempt < 7) await sleep(120);
+        }
+      })();
     };
     context.on('page', this.pageDiscoveryListener);
   }
