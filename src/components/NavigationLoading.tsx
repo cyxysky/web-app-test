@@ -17,8 +17,8 @@ function isInternalNavigationLink(anchor: HTMLAnchorElement) {
 function LoadingOverlay({ label }: { label: string }) {
   return (
     <div className="navigation-loading-overlay" role="status" aria-live="polite" aria-label={label}>
-      <div className="navigation-loading-mark">
-        <span />
+      <div className="navigation-loading-mark" aria-hidden="true">
+        <span className="navigation-loading-ring" />
       </div>
       <p>{label}</p>
     </div>

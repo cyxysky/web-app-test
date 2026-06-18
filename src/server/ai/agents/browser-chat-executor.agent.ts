@@ -9,7 +9,7 @@ import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVeri
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { appendDesktopEvidenceToResult, captureDesktopBeforeTool, collectDesktopEvidenceAfterTool } from '@/server/desktop/desktop-action-evidence';
-import { normalizeDomNodeIdParam, normalizeDomPathParam } from '@/lib/dom-path';
+import { normalizeDomNodeIdParam } from '@/lib/dom-path';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 
@@ -610,12 +610,12 @@ function screenshotPhaseLabel(phase: ScreenshotReference['phase']) {
 }
 
 function screenshotReferenceGroupOf(step: StepExecutionResult) {
-  const scrollTool = (step.tools || []).find((toolCall) => toolCall.name === 'scrollArea' || toolCall.name === 'scrollViewport');
+  const scrollTool = (step.tools || []).find((toolCall) => toolCall.name === 'scrollArea');
   if (!scrollTool) return undefined;
   const input = scrollTool.input && typeof scrollTool.input === 'object' && !Array.isArray(scrollTool.input)
     ? scrollTool.input as Record<string, unknown>
     : {};
-  const area = typeof input.areaId === 'string' ? input.areaId : typeof input.domPath === 'string' ? input.domPath : 'page';
+  const area = typeof input.areaId === 'string' ? input.areaId : 'page';
   return `scroll-step-${step.index}-${area}`;
 }
 
@@ -3622,7 +3622,6 @@ function replayAiRepairMaxSteps() {
 async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep, runId?: string): Promise<BrowserActionResult> {
   const input = flowInput(flow.input);
   const text = typeof input.text === 'string' ? input.text : undefined;
-  const domPath = normalizeDomPathParam(input);
   const domNodeId = normalizeDomNodeIdParam(input);
   const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
 
@@ -3635,12 +3634,6 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         if (!url) return { ok: false, actual: 'Recorded openPage/openUrl failed because the target URL is empty.' };
         return session.open(url);
       }
-    case 'scrollViewport':
-      return session.scroll(
-        typeof input.deltaY === 'number' ? input.deltaY : 0,
-        typeof input.deltaX === 'number' ? input.deltaX : 0,
-        { domPath },
-      );
     case 'scrollArea':
       {
         const areaId = typeof input.areaId === 'string' && input.areaId.trim()

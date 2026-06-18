@@ -22,6 +22,14 @@ function shouldUseSeparateMarkerMap() {
   return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
 }
 
+function positiveIntegerEnv(key: string) {
+  const raw = process.env[key]?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  return Math.floor(value);
+}
+
 export type BrowserSessionMode = 'dom' | 'visual-markers';
 
 export type BrowserSessionOptions = {
@@ -2271,9 +2279,22 @@ export class BrowserSession {
     const { chromium } = await import('playwright');
     const headless = process.env.HEADLESS_BROWSER === 'true';
     const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
-    const hasExplicitViewport = Boolean(process.env.BROWSER_VIEWPORT_WIDTH || process.env.BROWSER_VIEWPORT_HEIGHT);
-    const viewportWidth = Number(process.env.BROWSER_VIEWPORT_WIDTH || (fullscreen ? 1920 : 1280));
-    const viewportHeight = Number(process.env.BROWSER_VIEWPORT_HEIGHT || (fullscreen ? 1080 : 800));
+    const configuredViewportWidth = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH');
+    const configuredViewportHeight = positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT');
+    const hasConfiguredViewport = configuredViewportWidth !== undefined && configuredViewportHeight !== undefined;
+    const rawViewportMode = process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase();
+    const viewportMode = rawViewportMode === 'fixed' || (!rawViewportMode && hasConfiguredViewport) ? 'fixed' : 'auto';
+    const fixedViewport = viewportMode === 'fixed' && hasConfiguredViewport
+      ? { width: configuredViewportWidth, height: configuredViewportHeight }
+      : undefined;
+    const headlessFallbackViewport = { width: fullscreen ? 1920 : 1280, height: fullscreen ? 1080 : 800 };
+    const useNativeViewport = !headless && !fixedViewport;
+    const contextViewport = useNativeViewport ? null : fixedViewport || headlessFallbackViewport;
+    const windowSizeArg = fixedViewport
+      ? `--window-size=${fixedViewport.width},${fixedViewport.height + 120}`
+      : headless
+        ? `--window-size=${headlessFallbackViewport.width},${headlessFallbackViewport.height + 120}`
+        : '';
     const ignoreHTTPSErrors = process.env.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
     const forceBundledBrowser = process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !electronEmbeddedBrowserEnabled();
     const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
@@ -2305,7 +2326,7 @@ export class BrowserSession {
       ...(executablePath && !channel ? { executablePath } : {}),
       ...(tabGrouperEnabled ? { ignoreDefaultArgs: ['--disable-extensions'] } : {}),
       args: withSessionTabGrouperArgs([
-        `--window-size=${viewportWidth},${viewportHeight + 120}`,
+        windowSizeArg,
         fullscreen ? '--start-maximized' : '',
         ignoreHTTPSErrors ? '--ignore-certificate-errors' : '',
         '--force-device-scale-factor=1',
@@ -2315,11 +2336,10 @@ export class BrowserSession {
         autoTabGroupDebugPort ? `--remote-debugging-port=${autoTabGroupDebugPort}` : '',
       ].filter(Boolean), headless, { exclusive: Boolean(autoTabGroupProfileDir) }),
     };
-    const useNativeFullscreenViewport = fullscreen && !headless && !hasExplicitViewport;
     const contextOptions: BrowserContextOptions = {
-      viewport: useNativeFullscreenViewport ? null : { width: viewportWidth, height: viewportHeight },
+      viewport: contextViewport,
       ignoreHTTPSErrors,
-      ...(useNativeFullscreenViewport ? {} : { deviceScaleFactor: 1 }),
+      ...(contextViewport ? { deviceScaleFactor: 1 } : {}),
     };
 
     if (useSharedBrowserTabs) {

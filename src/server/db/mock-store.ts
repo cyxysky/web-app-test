@@ -538,6 +538,11 @@ export const store = {
     const before = data.runs.length;
     const deletedRunIds = data.runs.filter((run) => targetIds.has(run.id)).map((run) => run.id);
     data.runs = data.runs.filter((run) => !targetIds.has(run.id));
+    data.testCases = data.testCases.map((record) => (
+      record.content.defaultRecordedRunId && targetIds.has(record.content.defaultRecordedRunId)
+        ? { ...record, content: { ...record.content, defaultRecordedRunId: undefined }, updatedAt: now() }
+        : record
+    ));
     writeData(data);
     notifyRunsDeleted(deletedRunIds);
     return before - data.runs.length;

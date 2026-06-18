@@ -381,7 +381,7 @@ function summarizeToolFields(fields: unknown) {
   return `${fields.length} 项${textValues[0] ? `，${textValues[0]}` : ''}`;
 }
 
-function browserChatToolLabel(name: string) {
+function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
     clickCandidate: '点选目标',
     clickDomNode: '点选节点',
@@ -406,21 +406,21 @@ function browserChatToolLabel(name: string) {
     waitForHumanVerification: '等待人工验证',
     waitForPage: '等待页面稳定',
   };
-  if (labels[name]) return labels[name];
+  if (labels[name]) return t(labels[name]);
 
   const lower = name.toLowerCase();
-  if (lower.includes('screenshot') || lower.includes('capture')) return '截屏取证';
-  if (lower.includes('snapshot') || lower.includes('context')) return '读取页面状态';
-  if (lower.includes('clickat') || lower.includes('coordinate')) return '点选坐标';
-  if (lower.includes('click')) return '点选目标';
-  if (lower.includes('fill') || lower.includes('type')) return '键入内容';
-  if (lower.includes('hover')) return '悬停元素';
-  if (lower.includes('drag')) return '拖拽元素';
-  if (lower.includes('scroll')) return '移动视窗';
-  if (lower.includes('wait')) return '等待页面稳定';
-  if (lower.includes('open') || lower.includes('page')) return '导航页面';
-  if (lower.includes('request')) return '检查请求';
-  if (lower.includes('report') || lower.includes('state')) return '确认状态';
+  if (lower.includes('screenshot') || lower.includes('capture')) return t('截屏取证');
+  if (lower.includes('snapshot') || lower.includes('context')) return t('读取页面状态');
+  if (lower.includes('clickat') || lower.includes('coordinate')) return t('点选坐标');
+  if (lower.includes('click')) return t('点选目标');
+  if (lower.includes('fill') || lower.includes('type')) return t('键入内容');
+  if (lower.includes('hover')) return t('悬停元素');
+  if (lower.includes('drag')) return t('拖拽元素');
+  if (lower.includes('scroll')) return t('移动视窗');
+  if (lower.includes('wait')) return t('等待页面稳定');
+  if (lower.includes('open') || lower.includes('page')) return t('导航页面');
+  if (lower.includes('request')) return t('检查请求');
+  if (lower.includes('report') || lower.includes('state')) return t('确认状态');
   return name;
 }
 
@@ -664,6 +664,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   running: boolean;
   step: StepExecutionResult;
 }) {
+  const { t } = useI18n();
   const toolCalls = step.tools || [];
   if (!running && !toolCalls.length) return null;
   if (running && !toolCalls.length) {
@@ -686,7 +687,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   return (
     <>
       {toolCalls.map((tool, toolIndex) => {
-        const label = browserChatToolLabel(tool.name);
+        const label = browserChatToolLabel(tool.name, t);
         const meta = compactText(browserChatToolMeta(tool.name, tool.input), 56);
         const status = toolStatusLabel(tool);
         const showState = tool.ok !== true;
@@ -781,6 +782,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
 
 const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   exportingMessageId,
+  exportingSelectedMessages,
   item,
   itemLogs,
   itemSteps,
@@ -789,10 +791,13 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   onPreviewImage,
   onSelectTool,
   onShowLogs,
+  onToggleExportSelection,
+  selectedForExport,
   sessionBusy,
   totalStepCount,
 }: {
   exportingMessageId: string | null;
+  exportingSelectedMessages: boolean;
   item: BrowserChatMessage;
   itemLogs: BrowserChatLogRecord[];
   itemSteps: StepExecutionResult[];
@@ -801,12 +806,15 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
+  onToggleExportSelection: (messageId: string, selected: boolean) => void;
+  selectedForExport: boolean;
   sessionBusy: boolean;
   totalStepCount: number;
 }) {
   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
   const operationLabel = operationRunning ? (item.activity?.label || '处理中') : statusLabel(item.status || 'passed');
   const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
+  const exportingDisabled = Boolean(exportingMessageId) || exportingSelectedMessages;
 
   return (
     <article className={`browser-chat-message ${item.role}`}>
@@ -817,7 +825,10 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
         {item.role === 'assistant' ? (
           <>
             <div className="browser-chat-agent-meta">
-              <span>{operationLabel}</span>
+              <span className="browser-chat-agent-status">
+                {operationRunning ? <span aria-hidden="true" className="browser-chat-message-loading" /> : null}
+                <span>{operationLabel}</span>
+              </span>
               <time dateTime={messageUpdateTime(item)}>最后更新 {formatLogTime(messageUpdateTime(item))}</time>
             </div>
             <BrowserChatAssistantTimeline message={item} onSelectTool={onSelectTool} running={operationRunning} steps={itemSteps} />
@@ -833,6 +844,17 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
         )}
         {item.role === 'assistant' ? (
           <div className="browser-chat-message-actions">
+            {canExportMessage ? (
+              <label className="browser-chat-message-select">
+                <input
+                  checked={selectedForExport}
+                  disabled={exportingDisabled}
+                  onChange={(event) => onToggleExportSelection(item.id, event.currentTarget.checked)}
+                  type="checkbox"
+                />
+                <span>选择</span>
+              </label>
+            ) : null}
             {itemLogs.length ? (
               <button className="browser-chat-log-button" onClick={() => onShowLogs(item.id)} type="button">
                 <ScrollText size={14} />
@@ -842,7 +864,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
             {canExportMessage ? (
               <button
                 className="browser-chat-log-button"
-                disabled={Boolean(exportingMessageId)}
+                disabled={exportingDisabled}
                 onClick={() => void onExportMessage(item.id)}
                 type="button"
               >
@@ -859,31 +881,66 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
 
 const BrowserChatMessageList = memo(function BrowserChatMessageList({
   exportingMessageId,
+  exportingSelectedMessages,
   lastAssistantMessageId,
   logIndex,
   messages,
+  onBulkExportMessages,
+  onClearExportSelection,
   onExportMessage,
   onPreviewImage,
   onSelectTool,
   onShowLogs,
+  onToggleExportSelection,
+  selectedExportMessageIdSet,
+  selectedExportMessageIds,
   sessionBusy,
   stepsByIndex,
   totalStepCount,
 }: {
   exportingMessageId: string | null;
+  exportingSelectedMessages: boolean;
   lastAssistantMessageId?: string;
   logIndex: BrowserChatLogIndex;
   messages: BrowserChatMessage[];
+  onBulkExportMessages: () => void | Promise<void>;
+  onClearExportSelection: () => void;
   onExportMessage: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
+  onToggleExportSelection: (messageId: string, selected: boolean) => void;
+  selectedExportMessageIdSet: Set<string>;
+  selectedExportMessageIds: string[];
   sessionBusy: boolean;
   stepsByIndex: Map<number, StepExecutionResult>;
   totalStepCount: number;
 }) {
   return (
     <div className="browser-chat-message-list">
+      {selectedExportMessageIds.length ? (
+        <div className="browser-chat-message-export-bar">
+          <span>已选 {selectedExportMessageIds.length} 轮</span>
+          <button
+            className="browser-chat-log-button"
+            disabled={Boolean(exportingMessageId) || exportingSelectedMessages}
+            onClick={() => void onBulkExportMessages()}
+            type="button"
+          >
+            {exportingSelectedMessages ? <Loader2 className="spin" size={14} /> : <FilePlus2 size={14} />}
+            导出为用例
+          </button>
+          <button
+            className="browser-chat-log-button"
+            disabled={Boolean(exportingMessageId) || exportingSelectedMessages}
+            onClick={onClearExportSelection}
+            type="button"
+          >
+            <X size={14} />
+            清空
+          </button>
+        </div>
+      ) : null}
       {messages.map((item) => {
         const itemSteps = (item.stepIndexes || [])
           .map((stepIndex) => stepsByIndex.get(stepIndex))
@@ -892,6 +949,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         return (
           <BrowserChatMessageItem
             exportingMessageId={exportingMessageId}
+            exportingSelectedMessages={exportingSelectedMessages}
             item={item}
             itemLogs={itemLogs}
             itemSteps={itemSteps}
@@ -901,6 +959,8 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             onPreviewImage={onPreviewImage}
             onSelectTool={onSelectTool}
             onShowLogs={onShowLogs}
+            onToggleExportSelection={onToggleExportSelection}
+            selectedForExport={selectedExportMessageIdSet.has(item.id)}
             sessionBusy={sessionBusy}
             totalStepCount={totalStepCount}
           />
@@ -1247,7 +1307,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   async function closeEmbeddedBrowserGroup(group: EmbeddedBrowserGroup) {
     const bridge = window.webPilotEmbeddedBrowser;
     if (!bridge) return;
-    const result = await bridge.closeGroup({ id: group.id }).catch((error: unknown) => ({
+    const result = await bridge.closeGroup({ id: group.id }).catch((error: unknown): EmbeddedBrowserState => ({
       ok: false,
       error: error instanceof Error ? error.message : '关闭嵌入浏览器标签组失败',
     }));
@@ -1524,6 +1584,7 @@ export function BrowserChatWorkspace({
   initialView?: BrowserChatView;
 }) {
   const router = useRouter();
+  const { t } = useI18n();
   const [, startTransition] = useTransition();
   const sendingRef = useRef(false);
   const loadingSessionRef = useRef<string | null>(null);
@@ -1557,6 +1618,8 @@ export function BrowserChatWorkspace({
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
   const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
+  const [exportingSelectedMessages, setExportingSelectedMessages] = useState(false);
+  const [selectedExportMessageIds, setSelectedExportMessageIds] = useState<string[]>([]);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
   const [toolDialog, setToolDialog] = useState<BrowserChatToolDetail | null>(null);
@@ -1576,6 +1639,7 @@ export function BrowserChatWorkspace({
   );
   const hasMessages = visibleMessages.length > 0;
   const stepsByIndex = useMemo(() => new Map(steps.map((step) => [step.index, step])), [steps]);
+  const selectedExportMessageIdSet = useMemo(() => new Set(selectedExportMessageIds), [selectedExportMessageIds]);
   const logIndex = useMemo(() => buildBrowserChatLogIndex(logs), [logs]);
   const logDialogMessage = useMemo(
     () => messages.find((item) => item.id === logDialogMessageId),
@@ -1593,6 +1657,17 @@ export function BrowserChatWorkspace({
   }, []);
   const showMessageLogs = useCallback((messageId: string) => {
     setLogDialogMessageId(messageId);
+  }, []);
+  const toggleExportMessageSelection = useCallback((messageId: string, selected: boolean) => {
+    setSelectedExportMessageIds((current) => {
+      const next = new Set(current);
+      if (selected) next.add(messageId);
+      else next.delete(messageId);
+      return [...next];
+    });
+  }, []);
+  const clearExportMessageSelection = useCallback(() => {
+    setSelectedExportMessageIds([]);
   }, []);
   const recentSessions = useMemo(() => {
     const merged = new Map<string, BrowserChatSession>();
@@ -1669,6 +1744,10 @@ export function BrowserChatWorkspace({
 
   useEffect(() => {
     activeSessionIdRef.current = session?.id || null;
+  }, [session?.id]);
+
+  useEffect(() => {
+    setSelectedExportMessageIds([]);
   }, [session?.id]);
 
   const upsertSession = useCallback((nextSession: BrowserChatSession, options: { activate?: boolean; version?: number } = {}) => {
@@ -2005,9 +2084,34 @@ export function BrowserChatWorkspace({
     }
   }
 
+  const exportSelectedMessagesToTestCase = useCallback(async () => {
+    const sessionId = session?.id;
+    if (!sessionId || !selectedExportMessageIds.length || exportingMessageId || exportingSelectedMessages) return;
+    const messageIds = selectedExportMessageIds;
+    setExportingSelectedMessages(true);
+    setError('');
+    startGlobalLoading('正在导出选中对话轮次');
+    try {
+      const response = await fetch(`/api/browser-chat/${sessionId}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageIds }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '导出测试用例失败');
+      setSelectedExportMessageIds([]);
+      startTransition(() => router.push(`/test-cases/${data.testCaseId}`));
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : '导出测试用例失败');
+    } finally {
+      setExportingSelectedMessages(false);
+      stopGlobalLoading();
+    }
+  }, [exportingMessageId, exportingSelectedMessages, router, selectedExportMessageIds, session?.id, startTransition]);
+
   const exportMessageToTestCase = useCallback(async (messageId: string) => {
     const sessionId = session?.id;
-    if (!sessionId || exportingMessageId) return;
+    if (!sessionId || exportingMessageId || exportingSelectedMessages) return;
     setExportingMessageId(messageId);
     setError('');
     try {
@@ -2024,7 +2128,7 @@ export function BrowserChatWorkspace({
     } finally {
       setExportingMessageId(null);
     }
-  }, [exportingMessageId, router, session?.id, startTransition]);
+  }, [exportingMessageId, exportingSelectedMessages, router, session?.id, startTransition]);
 
   async function startNewConversation() {
     setActiveView('chat');
@@ -2202,13 +2306,19 @@ export function BrowserChatWorkspace({
       {hasMessages ? (
         <BrowserChatMessageList
           exportingMessageId={exportingMessageId}
+          exportingSelectedMessages={exportingSelectedMessages}
           lastAssistantMessageId={lastAssistantMessageId}
           logIndex={logIndex}
           messages={visibleMessages}
+          onBulkExportMessages={exportSelectedMessagesToTestCase}
+          onClearExportSelection={clearExportMessageSelection}
           onExportMessage={exportMessageToTestCase}
           onPreviewImage={previewAttachment}
           onSelectTool={setToolDialog}
           onShowLogs={showMessageLogs}
+          onToggleExportSelection={toggleExportMessageSelection}
+          selectedExportMessageIdSet={selectedExportMessageIdSet}
+          selectedExportMessageIds={selectedExportMessageIds}
           sessionBusy={Boolean(session?.busy)}
           stepsByIndex={stepsByIndex}
           totalStepCount={steps.length}
@@ -2351,13 +2461,19 @@ export function BrowserChatWorkspace({
             {hasMessages ? (
               <BrowserChatMessageList
                 exportingMessageId={exportingMessageId}
+                exportingSelectedMessages={exportingSelectedMessages}
                 lastAssistantMessageId={lastAssistantMessageId}
                 logIndex={logIndex}
                 messages={visibleMessages}
+                onBulkExportMessages={exportSelectedMessagesToTestCase}
+                onClearExportSelection={clearExportMessageSelection}
                 onExportMessage={exportMessageToTestCase}
                 onPreviewImage={previewAttachment}
                 onSelectTool={setToolDialog}
                 onShowLogs={showMessageLogs}
+                onToggleExportSelection={toggleExportMessageSelection}
+                selectedExportMessageIdSet={selectedExportMessageIdSet}
+                selectedExportMessageIds={selectedExportMessageIds}
                 sessionBusy={Boolean(session?.busy)}
                 stepsByIndex={stepsByIndex}
                 totalStepCount={steps.length}
@@ -2399,7 +2515,7 @@ export function BrowserChatWorkspace({
           <section className="browser-chat-tool-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="工具调用详情">
             <header>
               <div>
-                <h2>{toolDialog.tool.name}</h2>
+                <h2 title={toolDialog.tool.name}>{browserChatToolLabel(toolDialog.tool.name, t)}</h2>
                 <p>步骤 {toolDialog.stepIndex} · 工具调用 {toolDialog.toolIndex + 1}</p>
               </div>
               <button className="icon-button" onClick={() => setToolDialog(null)} type="button" aria-label="关闭">
@@ -2413,7 +2529,7 @@ export function BrowserChatWorkspace({
               </div>
               <div>
                 <span>工具名</span>
-                <strong>{toolDialog.tool.name}</strong>
+                <strong title={toolDialog.tool.name}>{browserChatToolLabel(toolDialog.tool.name, t)}</strong>
               </div>
             </div>
             {toolDialog.tool.reason ? (

@@ -236,6 +236,19 @@ function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUr
   ];
 }
 
+function recordedFlowFromDefaultRun(testCaseId: string, runId: string, targetUrl: string) {
+  const run = store.getRun(runId);
+  if (!run || run.testCaseId !== testCaseId) {
+    throw new Error('默认执行记录不存在或不属于当前测试用例');
+  }
+  if (run.status === 'running' || run.status === 'queued' || run.status === 'paused') {
+    throw new Error('默认执行记录仍在运行中，不能作为固定流程执行');
+  }
+  const recordedFlow = ensureReplayStartsFromTarget(recordedFlowFromSteps(run.result?.steps || []), targetUrl);
+  if (!recordedFlow.length) throw new Error('默认执行记录没有可回放的成功工具调用');
+  return recordedFlow;
+}
+
 async function screenshotChangeScore(beforePath?: string, afterPath?: string) {
   if (!beforePath || !afterPath || !existsSync(beforePath) || !existsSync(afterPath)) return 0;
   const [before, after] = await Promise.all([
@@ -309,7 +322,6 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
   if (!testCase) throw new Error('Test case not found');
   const existingRun = store.getRun(runId);
   const initialSteps = options.continueExisting ? existingRun?.result?.steps || [] : [];
-
   store.updateTestCaseStatus(testCaseId, 'running');
   store.updateRun(runId, {
     status: 'running',
@@ -422,6 +434,23 @@ export async function runTestCase(testCaseId: string) {
 export function startTestCaseRun(testCaseId: string, source: NonNullable<TestRunRecord['queue']>['source'] = 'single') {
   const { run } = createQueuedRun(testCaseId, source);
   enqueueRun({ runId: run.id, testCaseId, options: { source } });
+
+  return store.getRun(run.id) || run;
+}
+
+export function startDefaultRecordedRun(testCaseId: string) {
+  const testCase = store.getTestCase(testCaseId);
+  if (!testCase) throw new Error('Test case not found');
+  if (!testCase.content.defaultRecordedRunId) throw new Error('请先在执行记录中设置默认记录');
+  const recordedFlow = recordedFlowFromDefaultRun(testCaseId, testCase.content.defaultRecordedRunId, testCase.targetUrl);
+
+  const { run } = createQueuedRun(testCaseId, 'replay');
+  store.appendRunDebug(run.id, {
+    phase: 'recorded:default-source',
+    message: `Running default recorded flow from ${testCase.content.defaultRecordedRunId}.`,
+    details: { sourceRunId: testCase.content.defaultRecordedRunId, recordedFlow },
+  });
+  enqueueRun({ runId: run.id, testCaseId, options: { recordedFlow, source: 'replay' } });
 
   return store.getRun(run.id) || run;
 }

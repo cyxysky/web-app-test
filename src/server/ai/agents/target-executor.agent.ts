@@ -9,7 +9,7 @@ import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVeri
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { appendDesktopEvidenceToResult, captureDesktopBeforeTool, collectDesktopEvidenceAfterTool } from '@/server/desktop/desktop-action-evidence';
-import { normalizeDomNodeIdParam, normalizeDomPathParam } from '@/lib/dom-path';
+import { normalizeDomNodeIdParam } from '@/lib/dom-path';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 
@@ -530,12 +530,12 @@ function screenshotPhaseLabel(phase: ScreenshotReference['phase']) {
 }
 
 function screenshotReferenceGroupOf(step: StepExecutionResult) {
-  const scrollTool = (step.tools || []).find((toolCall) => toolCall.name === 'scrollArea' || toolCall.name === 'scrollViewport');
+  const scrollTool = (step.tools || []).find((toolCall) => toolCall.name === 'scrollArea');
   if (!scrollTool) return undefined;
   const input = scrollTool.input && typeof scrollTool.input === 'object' && !Array.isArray(scrollTool.input)
     ? scrollTool.input as Record<string, unknown>
     : {};
-  const area = typeof input.areaId === 'string' ? input.areaId : typeof input.domPath === 'string' ? input.domPath : 'page';
+  const area = typeof input.areaId === 'string' ? input.areaId : 'page';
   return `scroll-step-${step.index}-${area}`;
 }
 
@@ -961,6 +961,7 @@ const noVisualAfterCaptureToolNames = new Set([
   'waitForHumanVerification',
   'downloadFile',
   'generateMarkdownFile',
+  'generateText',
 ]);
 const noDomAfterContextToolNames = new Set([
   ...noVisualAfterCaptureToolNames,
@@ -2586,6 +2587,7 @@ async function executeRuntimeStep(input: {
         targetUrl: testCase.targetUrl,
         runId: input.runId,
         stepIndex,
+        mode,
         type: object.type,
         message: object.message || undefined,
         params: object.params,
@@ -3166,6 +3168,18 @@ function flowInput(input: unknown) {
   return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
 }
 
+function batchFillFieldsFromInput(input: Record<string, unknown>) {
+  const rawFields = Array.isArray(input.fields) ? input.fields : [];
+  return rawFields
+    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+    .map((item) => ({
+      id: String(item.id || ''),
+      text: typeof item.text === 'string' ? item.text : undefined,
+      clear: typeof item.clear === 'boolean' ? item.clear : undefined,
+    }))
+    .filter((item) => item.id);
+}
+
 function normalizeBrowserUrl(url: string) {
   const trimmed = url.trim();
   if (!trimmed) return '';
@@ -3204,10 +3218,128 @@ function replayAiRepairMaxSteps() {
   return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 2));
 }
 
-async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep, runId?: string): Promise<BrowserActionResult> {
+function recordedTextGenerationLimit(input: Record<string, unknown>) {
+  const value = typeof input.maxCharacters === 'number' ? input.maxCharacters : Number(input.maxCharacters || 1200);
+  return Math.max(200, Math.min(8000, Math.floor(Number.isFinite(value) ? value : 1200)));
+}
+
+function recordedTextGenerationPrompt(input: Record<string, unknown>) {
+  return [
+    typeof input.prompt === 'string' ? input.prompt : '',
+    typeof input.instruction === 'string' ? input.instruction : '',
+    typeof input.question === 'string' ? input.question : '',
+  ].map((item) => item.trim()).find(Boolean) || '';
+}
+
+function recordedTextGenerationContextLines(mode: BrowserSessionMode, pageContext: RuntimePageContext, input: Record<string, unknown>) {
+  const includeDomTree = input.includeDomTree !== false;
+  const includePageText = input.includePageText !== false;
+  const lines = [
+    'Current browser context:',
+    `- Mode: ${mode}`,
+    `- URL: ${pageContext.url || '[unknown]'}`,
+    `- Title: ${pageContext.title || '[unknown]'}`,
+    pageContext.focusedElement ? `- Focused element: ${trimDebugText(JSON.stringify(pageContext.focusedElement), 1200)}` : '',
+    pageContext.pageScrollState ? `- Page scroll: ${trimDebugText(JSON.stringify(pageContext.pageScrollState), 1200)}` : '',
+    pageContext.scrollableAreas ? `- Scrollable areas: ${trimDebugText(JSON.stringify(pageContext.scrollableAreas), 1800)}` : '',
+    mode === 'visual-markers' && pageContext.interactiveCandidates
+      ? `- Visible interactive candidates: ${trimDebugText(JSON.stringify(pageContext.interactiveCandidates), 4000)}`
+      : '',
+    includePageText && pageContext.text ? `\nVisible/page text:\n${trimDebugText(pageTextForPrompt(pageContext.text), 6000)}` : '',
+    includeDomTree && mode === 'dom' && pageContext.domTree ? `\nDOM tree:\n${domTreeForPrompt(pageContext.domTree)}` : '',
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
+async function runRecordedTextGeneration(
+  session: BrowserSession,
+  mode: BrowserSessionMode,
+  flow: RecordedFlowStep,
+  options: { currentScreenshotPath?: string },
+): Promise<BrowserActionResult> {
+  const input = flowInput(flow.input);
+  const prompt = recordedTextGenerationPrompt(input);
+  if (!prompt) {
+    return { ok: false, actual: 'generateText failed: prompt is required.' };
+  }
+
+  const includeScreenshot = input.includeScreenshot !== false;
+  const outputFormat = typeof input.outputFormat === 'string' ? input.outputFormat : 'markdown';
+  const maxCharacters = recordedTextGenerationLimit(input);
+  const pageContext = await session.getPageContext({
+    domScope: mode === 'dom' ? 'full' : undefined,
+    includeDomTree: mode === 'dom' && input.includeDomTree !== false,
+    includeText: input.includePageText !== false,
+    includeManualVerification: true,
+    includeInteractiveCandidates: mode === 'visual-markers',
+    textMaxChars: 6000,
+    useCachedInteractiveCandidates: mode === 'visual-markers',
+  });
+  const content: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{
+    type: 'text',
+    text: [
+      'You are generating text for a manually edited web test replay tool.',
+      'Use only the current browser context and the user prompt. Do not invent page content.',
+      `Output format: ${outputFormat}.`,
+      `Keep the answer within ${maxCharacters} Chinese characters unless JSON format requires concise keys.`,
+      '',
+      recordedTextGenerationContextLines(mode, pageContext, input),
+      '',
+      `User prompt:\n${prompt}`,
+    ].join('\n'),
+  }];
+
+  if (includeScreenshot && options.currentScreenshotPath && modelSupportsScreenshotInput()) {
+    const screenshot = await readScreenshotForAi(options.currentScreenshotPath).catch(() => undefined);
+    if (screenshot) content.push({ type: 'image', image: screenshot });
+  }
+
+  const result = await generateTextWithTimeout({
+    model: getModel(),
+    messages: [
+      { role: 'system', content: 'You are a precise browser UI analysis assistant for replayed web test records.' },
+      { role: 'user', content },
+    ],
+    temperature: 0.1,
+    maxRetries: 0,
+  });
+  const text = result.text.trim();
+  return {
+    ok: true,
+    actual: text ? trimDebugText(text, maxCharacters) : 'AI 没有返回内容。',
+  };
+}
+
+async function recordedToolAiRequestSnapshot(input: {
+  flow: RecordedFlowStep;
+  mode: BrowserSessionMode;
+  session: BrowserSession;
+  stepIndex: number;
+  screenshotPath?: string;
+}) {
+  const { flow, mode, session, stepIndex, screenshotPath } = input;
+  const pageContext = await session.getPageContext(runtimePageContextOptions(mode)).catch(() => undefined);
+  const domContext = pageContext ? createDomContextSnapshot(mode, pageContext) : undefined;
+  return createAiRequestSnapshot({
+    kind: 'runtime',
+    stepIndex,
+    prompt: `Recorded replay context for ${flow.name}.`,
+    screenshotPath,
+    imageAttached: false,
+    tools: [flow.name],
+    domContext,
+    options: { recordedReplay: true, browserMode: mode },
+  });
+}
+
+async function runRecordedTool(
+  session: BrowserSession,
+  targetUrl: string,
+  flow: RecordedFlowStep,
+  options: { currentScreenshotPath?: string; mode: BrowserSessionMode; runId?: string; stepIndex?: number },
+): Promise<BrowserActionResult> {
   const input = flowInput(flow.input);
   const text = typeof input.text === 'string' ? input.text : undefined;
-  const domPath = normalizeDomPathParam(input);
   const domNodeId = normalizeDomNodeIdParam(input);
   const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
 
@@ -3220,12 +3352,6 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         if (!url) return { ok: false, actual: 'Recorded openPage/openUrl failed because the target URL is empty.' };
         return session.open(url);
       }
-    case 'scrollViewport':
-      return session.scroll(
-        typeof input.deltaY === 'number' ? input.deltaY : 0,
-        typeof input.deltaX === 'number' ? input.deltaX : 0,
-        { domPath },
-      );
     case 'scrollArea':
       {
         const areaId = typeof input.areaId === 'string' && input.areaId.trim()
@@ -3241,6 +3367,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       }
     case 'clickCandidate':
       return session.clickCandidate(String(input.id || ''), text);
+    case 'fillCandidates':
+      return session.fillCandidates(batchFillFieldsFromInput(input));
     case 'focusCandidate':
       return session.clickCandidate(String(input.id || ''), text);
     case 'hoverCandidate':
@@ -3253,6 +3381,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.dragCandidate(String(input.fromId || ''), String(input.toId || ''));
     case 'clickDomNode':
       return session.clickDomNode(domNodeId, text);
+    case 'fillDomNodes':
+      return session.fillDomNodes(batchFillFieldsFromInput(input));
     case 'focusDomNode':
       return session.clickDomNode(domNodeId, text);
     case 'findByText':
@@ -3273,7 +3403,7 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.getCurrentTabHttpRequests();
     case 'downloadFile':
       return downloadFileArtifact({
-        runId,
+        runId: options.runId,
         url: typeof input.url === 'string' ? input.url : undefined,
         path: typeof input.path === 'string' ? input.path : undefined,
         urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
@@ -3281,11 +3411,13 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       });
     case 'generateMarkdownFile':
       return generateMarkdownArtifact({
-        runId,
+        runId: options.runId,
         fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
         title: typeof input.title === 'string' ? input.title : undefined,
         content: typeof input.content === 'string' ? input.content : typeof input.text === 'string' ? input.text : undefined,
       });
+    case 'generateText':
+      return runRecordedTextGeneration(session, options.mode, flow, { currentScreenshotPath: options.currentScreenshotPath });
     case 'switchTab':
       return session.switchTab(typeof input.index === 'number' ? input.index : Number(input.index || 0));
     case 'reportState':
@@ -3315,6 +3447,7 @@ async function runTracedRecordedTool(input: {
   session: BrowserSession;
   targetUrl: string;
   flow: RecordedFlowStep;
+  mode: BrowserSessionMode;
   traces: ToolTrace[];
   runId: string;
   stepIndex: number;
@@ -3322,18 +3455,32 @@ async function runTracedRecordedTool(input: {
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { session, targetUrl, flow, traces, runId, stepIndex, visualContext, onToolTrace, onVisualContextChange } = input;
+  const { session, targetUrl, flow, mode, traces, runId, stepIndex, visualContext, onToolTrace, onVisualContextChange } = input;
+  const currentScreenshotPath = visualContext.current()?.path;
+  const aiRequest = await recordedToolAiRequestSnapshot({
+    flow,
+    mode,
+    session,
+    stepIndex,
+    screenshotPath: currentScreenshotPath,
+  });
   return executeTracedBrowserAction({
     session,
     traces,
     name: flow.name,
     toolInput: recordedToolTraceInput(flow),
+    aiRequest,
     runId,
     stepIndex,
     visualContext,
     onToolTrace,
     onVisualContextChange,
-    action: () => runRecordedTool(session, targetUrl, flow, runId),
+    action: () => runRecordedTool(session, targetUrl, flow, {
+      currentScreenshotPath,
+      mode,
+      runId,
+      stepIndex,
+    }),
   });
 }
 
@@ -3342,6 +3489,7 @@ async function executeCodexRuntimeObject(input: {
   targetUrl: string;
   runId: string;
   stepIndex: number;
+  mode: BrowserSessionMode;
   type: string;
   message?: string;
   params: Record<string, unknown>;
@@ -3357,7 +3505,7 @@ async function executeCodexRuntimeObject(input: {
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
+  const { session, targetUrl, runId, stepIndex, mode, type, message, params, allowedTypes, traces, aiRequest, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
   if (!allowedTypes.includes(type)) {
     return {
       text: `Codex returned unsupported action type: ${type}. Allowed types: ${allowedTypes.join(', ')}.`,
@@ -3419,8 +3567,18 @@ async function executeCodexRuntimeObject(input: {
     onVisualContextChange,
     action: async () => (
       candidateActionToolNames.has(type)
-        ? validateCandidateActionBeforeExecution(type, normalizedParams, traces) || await runRecordedTool(session, targetUrl, flow, runId)
-        : await runRecordedTool(session, targetUrl, flow, runId)
+        ? validateCandidateActionBeforeExecution(type, normalizedParams, traces) || await runRecordedTool(session, targetUrl, flow, {
+          currentScreenshotPath: visualContext?.current()?.path,
+          mode,
+          runId,
+          stepIndex,
+        })
+        : await runRecordedTool(session, targetUrl, flow, {
+          currentScreenshotPath: visualContext?.current()?.path,
+          mode,
+          runId,
+          stepIndex,
+        })
     ),
   });
   return { text: readableActionFromRawText(message) || '', executed: true };
@@ -3438,7 +3596,8 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
     onManualIntervention,
     onManualInterventionCleared,
   } = options;
-  const session = new BrowserSession(browserModeOf(testCase), {
+  const mode = browserModeOf(testCase);
+  const session = new BrowserSession(mode, {
     isMarked: visualMarkersEnabledFor(testCase),
     runId,
     tabGroupTitle: testCase.title,
@@ -3861,6 +4020,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         session,
         targetUrl: testCase.targetUrl,
         flow,
+        mode,
         traces: liveToolTraces,
         runId,
         stepIndex,

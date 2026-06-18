@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useEffect, useState, useTransition } from 'react';
-import { CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, PlayCircle, Settings, Trash2, X } from 'lucide-react';
+import { CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, Settings, Trash2, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { CustomSelect } from '@/components/CustomSelect';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
@@ -144,6 +144,9 @@ export function DashboardWorkspace({
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
   const [batchDeleting, setBatchDeleting] = useState(false);
   const [batchRunning, setBatchRunning] = useState(false);
+  const [batchDefaultRunning, setBatchDefaultRunning] = useState(false);
+  const [startingCaseId, setStartingCaseId] = useState<string | null>(null);
+  const [startingDefaultCaseId, setStartingDefaultCaseId] = useState<string | null>(null);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleName, setScheduleName] = useState(() => t('定时回归'));
   const [scheduleInterval, setScheduleInterval] = useState(60);
@@ -152,6 +155,10 @@ export function DashboardWorkspace({
   const selectGroup = onSelectedGroupIdChange ?? setInternalSelectedGroupId;
   const visibleCases = testCases.filter((item) => item.groupId === selectedGroupId);
   const completedCases = visibleCases.filter((item) => ['passed', 'failed', 'blocked'].includes(item.status));
+  const selectedCases = selectedCaseIds
+    .map((id) => testCases.find((item) => item.id === id))
+    .filter((item): item is TestCaseRecord => Boolean(item));
+  const selectedCasesCanRunDefault = selectedCases.length > 0 && selectedCases.every((item) => item.content.defaultRecordedRunId);
 
   useEffect(() => {
     if (!testCases.some((item) => item.status === 'running')) return;
@@ -207,8 +214,44 @@ export function DashboardWorkspace({
     );
   }
 
+  async function startCaseRun(testCaseId: string) {
+    if (startingCaseId || startingDefaultCaseId) return;
+    setStartingCaseId(testCaseId);
+    startGlobalLoading(t('正在启动测试'));
+    try {
+      const response = await fetch(`/api/test-cases/${testCaseId}/run`, { method: 'POST' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.runId) throw new Error(data.error || t('启动失败'));
+      router.push(`/runs/${data.runId}`);
+    } catch (error) {
+      setStartingCaseId(null);
+      stopGlobalLoading();
+      window.alert(error instanceof Error ? error.message : t('启动失败'));
+    }
+  }
+
+  async function startDefaultRecordedCaseRun(testCase: TestCaseRecord) {
+    if (startingCaseId || startingDefaultCaseId) return;
+    if (!testCase.content.defaultRecordedRunId) {
+      window.alert(t('请先在执行记录中设置默认记录'));
+      return;
+    }
+    setStartingDefaultCaseId(testCase.id);
+    startGlobalLoading(t('正在按默认记录执行'));
+    try {
+      const response = await fetch(`/api/test-cases/${testCase.id}/run-default-recorded`, { method: 'POST' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.runId) throw new Error(data.error || t('默认记录执行失败'));
+      router.push(`/runs/${data.runId}`);
+    } catch (error) {
+      setStartingDefaultCaseId(null);
+      stopGlobalLoading();
+      window.alert(error instanceof Error ? error.message : t('默认记录执行失败'));
+    }
+  }
+
   async function startBatchRun() {
-    if (!selectedCaseIds.length || batchRunning) return;
+    if (!selectedCaseIds.length || batchRunning || batchDefaultRunning) return;
     setBatchRunning(true);
     startGlobalLoading(t('正在批量启动测试'));
     const openedTabs = selectedCaseIds.map(() => window.open('about:blank', '_blank'));
@@ -238,6 +281,45 @@ export function DashboardWorkspace({
       window.alert(error instanceof Error ? error.message : t('批量运行启动失败'));
     } finally {
       setBatchRunning(false);
+      stopGlobalLoading();
+    }
+  }
+
+  async function startBatchDefaultRecordedRun() {
+    if (!selectedCaseIds.length || batchDefaultRunning || batchRunning) return;
+    const missingDefaultRuns = selectedCases.filter((item) => !item.content.defaultRecordedRunId);
+    if (missingDefaultRuns.length) {
+      window.alert(t('选中的用例中有 {count} 条没有默认记录，请先在执行记录中设置默认记录。', { count: missingDefaultRuns.length }));
+      return;
+    }
+
+    setBatchDefaultRunning(true);
+    startGlobalLoading(t('正在按默认记录批量执行'));
+    const openedTabs = selectedCaseIds.map(() => window.open('about:blank', '_blank'));
+    const navigatedTabs = new Set<number>();
+    try {
+      for (const [index, testCaseId] of selectedCaseIds.entries()) {
+        const response = await fetch(`/api/test-cases/${testCaseId}/run-default-recorded`, { method: 'POST' });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.runId) throw new Error(data.error || t('默认记录执行失败'));
+        const url = `/runs/${data.runId}`;
+        const tab = openedTabs[index];
+        if (tab) {
+          tab.location.href = url;
+          navigatedTabs.add(index);
+        } else {
+          window.open(url, '_blank', 'noopener,noreferrer');
+        }
+      }
+      setSelectedCaseIds([]);
+      startTransition(() => router.refresh());
+    } catch (error) {
+      openedTabs.forEach((tab, index) => {
+        if (!navigatedTabs.has(index)) tab?.close();
+      });
+      window.alert(error instanceof Error ? error.message : t('默认记录执行失败'));
+    } finally {
+      setBatchDefaultRunning(false);
       stopGlobalLoading();
     }
   }
@@ -319,9 +401,19 @@ export function DashboardWorkspace({
                 {t('环境配置')}
               </Link>
             ) : null}
-            <button className="icon-text-button" disabled={!selectedCaseIds.length || batchRunning} onClick={startBatchRun} type="button">
-              {batchRunning ? <Loader2 className="spin" size={15} /> : <PlayCircle size={15} />}
-              {t('批量运行')}{selectedCaseIds.length ? ` ${selectedCaseIds.length}` : ''}
+            <button className="icon-text-button" disabled={!selectedCaseIds.length || batchRunning || batchDefaultRunning} onClick={startBatchRun} type="button">
+              {batchRunning ? <Loader2 className="spin" size={15} /> : null}
+              {t('AI运行')}{selectedCaseIds.length ? ` ${selectedCaseIds.length}` : ''}
+            </button>
+            <button
+              className="icon-text-button"
+              disabled={!selectedCasesCanRunDefault || batchDefaultRunning || batchRunning}
+              onClick={startBatchDefaultRecordedRun}
+              title={selectedCasesCanRunDefault ? t('按当前默认记录执行') : t('请先在执行记录中设置默认记录')}
+              type="button"
+            >
+              {batchDefaultRunning ? <Loader2 className="spin" size={15} /> : null}
+              {t('默认用例执行')}{selectedCaseIds.length ? ` ${selectedCaseIds.length}` : ''}
             </button>
             <button className="icon-text-button danger" disabled={!selectedCaseIds.length || batchDeleting} onClick={deleteSelectedCases} type="button">
               {batchDeleting ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
@@ -370,11 +462,26 @@ export function DashboardWorkspace({
                   ]}
                 />
                 <span className="case-row-actions">
-                  {movingCaseId === item.id ? (
-                    <Loader2 className="spin" size={16} />
-                  ) : (
-                    <Link className="case-row-icon-button" href={`/test-cases/${item.id}`} title={t('查看详情')}><PlayCircle size={18} /></Link>
-                  )}
+                  {movingCaseId === item.id ? <Loader2 className="spin" size={16} /> : null}
+                  <button
+                    className="case-row-text-button"
+                    disabled={Boolean(startingCaseId || startingDefaultCaseId)}
+                    onClick={() => void startCaseRun(item.id)}
+                    type="button"
+                  >
+                    {startingCaseId === item.id ? <Loader2 className="spin" size={13} /> : null}
+                    {t('AI运行')}
+                  </button>
+                  <button
+                    className="case-row-text-button"
+                    disabled={Boolean(startingCaseId || startingDefaultCaseId || !item.content.defaultRecordedRunId)}
+                    onClick={() => void startDefaultRecordedCaseRun(item)}
+                    title={item.content.defaultRecordedRunId ? t('按当前默认记录执行') : t('请先在执行记录中设置默认记录')}
+                    type="button"
+                  >
+                    {startingDefaultCaseId === item.id ? <Loader2 className="spin" size={13} /> : null}
+                    {t('默认用例执行')}
+                  </button>
                   <DeleteTestCaseButton
                     className="case-row-icon-button danger"
                     label=""

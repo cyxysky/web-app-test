@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, FolderOpen, Loader2, Save } from 'lucide-react';
+import { ArrowLeft, FolderOpen, Loader2, Moon, Save, Sun } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import {
   modelProviderDefinitions,
@@ -124,7 +124,7 @@ export function EnvironmentSettings({
   showTabs?: boolean;
 } = {}) {
   const { language, setLanguage, t } = useI18n();
-  const { color, currentColor, scrollbarColor, setColor, setScrollbarColor } = useTheme();
+  const { color, currentColor, mode, scrollbarColor, setColor, setScrollbarColor, toggleMode } = useTheme();
   const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('general');
   const [items, setItems] = useState<EnvRow[]>([]);
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig());
@@ -423,6 +423,27 @@ export function EnvironmentSettings({
                       value: option.value,
                     }))}
                   />
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <strong>{language === 'en' ? 'Appearance mode' : '外观模式'}</strong>
+                    <span>{language === 'en' ? 'Switch the interface between light and dark themes.' : '在浅色和深色主题之间切换界面。'}</span>
+                  </div>
+                  <button
+                    aria-pressed={mode === 'dark'}
+                    className="settings-theme-mode-toggle"
+                    onClick={toggleMode}
+                    type="button"
+                  >
+                    <span className={mode === 'dark' ? undefined : 'active'}>
+                      <Sun size={15} />
+                      {language === 'en' ? 'Light' : '浅色'}
+                    </span>
+                    <span className={mode === 'dark' ? 'active' : undefined}>
+                      <Moon size={15} />
+                      {language === 'en' ? 'Dark' : '深色'}
+                    </span>
+                  </button>
                 </div>
                 <div className="settings-row">
                   <div>

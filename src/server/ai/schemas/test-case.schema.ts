@@ -56,6 +56,7 @@ export const testCaseContentSchema = z.object({
   expectedResults: z.array(z.string()),
   risks: z.array(z.string()),
   recordedFlow: z.array(recordedFlowStepSchema).optional(),
+  defaultRecordedRunId: z.string().optional(),
   taskFrame: taskFrameSchema.optional(),
 });
 

@@ -8,7 +8,7 @@ import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
-import { normalizeDomNodeIdParam, normalizeDomPathParam } from '@/lib/dom-path';
+import { normalizeDomNodeIdParam } from '@/lib/dom-path';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 
@@ -513,12 +513,12 @@ function screenshotPhaseLabel(phase: ScreenshotReference['phase']) {
 }
 
 function screenshotReferenceGroupOf(step: StepExecutionResult) {
-  const scrollTool = (step.tools || []).find((toolCall) => toolCall.name === 'scrollArea' || toolCall.name === 'scrollViewport');
+  const scrollTool = (step.tools || []).find((toolCall) => toolCall.name === 'scrollArea');
   if (!scrollTool) return undefined;
   const input = scrollTool.input && typeof scrollTool.input === 'object' && !Array.isArray(scrollTool.input)
     ? scrollTool.input as Record<string, unknown>
     : {};
-  const area = typeof input.areaId === 'string' ? input.areaId : typeof input.domPath === 'string' ? input.domPath : 'page';
+  const area = typeof input.areaId === 'string' ? input.areaId : 'page';
   return `scroll-step-${step.index}-${area}`;
 }
 
@@ -3141,6 +3141,18 @@ function flowInput(input: unknown) {
   return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
 }
 
+function batchFillFieldsFromInput(input: Record<string, unknown>) {
+  const rawFields = Array.isArray(input.fields) ? input.fields : [];
+  return rawFields
+    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+    .map((item) => ({
+      id: String(item.id || ''),
+      text: typeof item.text === 'string' ? item.text : undefined,
+      clear: typeof item.clear === 'boolean' ? item.clear : undefined,
+    }))
+    .filter((item) => item.id);
+}
+
 function normalizeBrowserUrl(url: string) {
   const trimmed = url.trim();
   if (!trimmed) return '';
@@ -3182,7 +3194,6 @@ function replayAiRepairMaxSteps() {
 async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep, runId?: string): Promise<BrowserActionResult> {
   const input = flowInput(flow.input);
   const text = typeof input.text === 'string' ? input.text : undefined;
-  const domPath = normalizeDomPathParam(input);
   const domNodeId = normalizeDomNodeIdParam(input);
   const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
 
@@ -3195,12 +3206,6 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         if (!url) return { ok: false, actual: 'Recorded openPage/openUrl failed because the target URL is empty.' };
         return session.open(url);
       }
-    case 'scrollViewport':
-      return session.scroll(
-        typeof input.deltaY === 'number' ? input.deltaY : 0,
-        typeof input.deltaX === 'number' ? input.deltaX : 0,
-        { domPath },
-      );
     case 'scrollArea':
       {
         const areaId = typeof input.areaId === 'string' && input.areaId.trim()
@@ -3216,6 +3221,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       }
     case 'clickCandidate':
       return session.clickCandidate(String(input.id || ''), text);
+    case 'fillCandidates':
+      return session.fillCandidates(batchFillFieldsFromInput(input));
     case 'focusCandidate':
       return session.clickCandidate(String(input.id || ''), text);
     case 'hoverCandidate':
@@ -3228,6 +3235,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.dragCandidate(String(input.fromId || ''), String(input.toId || ''));
     case 'clickDomNode':
       return session.clickDomNode(domNodeId, text);
+    case 'fillDomNodes':
+      return session.fillDomNodes(batchFillFieldsFromInput(input));
     case 'focusDomNode':
       return session.clickDomNode(domNodeId, text);
     case 'findByText':

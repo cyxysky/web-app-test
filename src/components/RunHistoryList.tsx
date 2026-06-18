@@ -3,9 +3,8 @@
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useMemo, useState } from 'react';
-import { Clock3, ExternalLink, FileText, Loader2, Trash2 } from 'lucide-react';
+import { BadgeCheck, Clock3, ExternalLink, FileText, Loader2, Trash2 } from 'lucide-react';
 import { DeleteRunButton } from '@/components/DeleteRunButton';
-import { ReplayRunButton } from '@/components/ReplayRunButton';
 import { RecordedFlowToCaseButton } from '@/components/RecordedFlowToCaseButton';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
 import { useI18n } from '@/i18n/I18nProvider';
@@ -41,11 +40,20 @@ function formatRunTime(value?: string, language: 'zh' | 'en' = 'zh') {
   }).format(new Date(value));
 }
 
-export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
+export function RunHistoryList({
+  defaultRecordedRunId,
+  runs,
+  testCaseId,
+}: {
+  defaultRecordedRunId?: string;
+  runs: TestRunRecord[];
+  testCaseId: string;
+}) {
   const { language, t } = useI18n();
   const router = useRouter();
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deleting, setDeleting] = useState(false);
+  const [settingDefaultRunId, setSettingDefaultRunId] = useState<string | null>(null);
   const latestRun = runs[0];
   const finishedRuns = runs.filter((run) => finishedRunStatuses.includes(run.status)).length;
   const deletableIds = useMemo(() => runs.map((run) => run.id), [runs]);
@@ -80,6 +88,27 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
       window.alert(error instanceof Error ? error.message : t('批量删除失败'));
     } finally {
       setDeleting(false);
+      stopGlobalLoading();
+    }
+  }
+
+  async function setDefaultRecordedRun(runId: string) {
+    if (settingDefaultRunId) return;
+    setSettingDefaultRunId(runId);
+    startGlobalLoading(t('正在设置默认记录'));
+    try {
+      const response = await fetch(`/api/test-cases/${testCaseId}/default-recorded-run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ runId }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || t('设置默认记录失败'));
+      router.refresh();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : t('设置默认记录失败'));
+    } finally {
+      setSettingDefaultRunId(null);
       stopGlobalLoading();
     }
   }
@@ -119,6 +148,7 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
             const endedAt = run.endedAt ? formatRunTime(run.endedAt, language) : undefined;
             const active = isActiveRun(run);
             const selected = selectedSet.has(run.id);
+            const isDefaultRecordedRun = run.id === defaultRecordedRunId;
             const reportText = run.report ? t('报告已生成') : t('报告生成中');
             return (
               <div className={selected ? 'run-history-row selected' : 'run-history-row'} key={run.id}>
@@ -146,8 +176,17 @@ export function RunHistoryList({ runs }: { runs: TestRunRecord[] }) {
                   {reportText}
                 </span>
                 <span className="run-history-actions">
+                  <button
+                    className={isDefaultRecordedRun ? 'run-history-replay default-record selected' : 'run-history-replay default-record'}
+                    disabled={!replayable || active || isDefaultRecordedRun || Boolean(settingDefaultRunId)}
+                    onClick={() => setDefaultRecordedRun(run.id)}
+                    title={isDefaultRecordedRun ? t('当前默认记录') : t('设为默认记录')}
+                    type="button"
+                  >
+                    {settingDefaultRunId === run.id ? <Loader2 className="spin" size={14} /> : <BadgeCheck size={14} />}
+                    {isDefaultRecordedRun ? t('默认记录') : t('设为默认记录')}
+                  </button>
                   <RunScreenshotChainButton className="run-history-replay" run={run} />
-                  <ReplayRunButton disabled={!replayable || active} runId={run.id} />
                   <RecordedFlowToCaseButton disabled={!replayable || active} runId={run.id} />
                   <DeleteRunButton disabled={deleting} runId={run.id} />
                   <Link className="run-history-open" href={`/runs/${run.id}`} title={t('查看详情')}>

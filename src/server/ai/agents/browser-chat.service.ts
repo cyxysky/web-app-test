@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+﻿import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { generateObject } from 'ai';
@@ -1242,7 +1242,7 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
       previousUser ? `用户消息：${previousUser.content}` : '',
       `AI 输出：${message.content}`,
     ].filter(Boolean).join('\n\n'),
-    targetUrl: session.targetUrl || 'about:blank',
+    targetUrl: '',
     priority: 'medium',
     browserMode: session.mode,
     isMarked: true,
@@ -1287,6 +1287,112 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
   store.updateTestCaseStatus(testCase.id, status === 'passed' ? 'passed' : status);
   return { testCase: store.getTestCase(testCase.id) || testCase, run: completedRun };
 }
+
+export function exportBrowserChatMessagesToTestCase(sessionId: string, messageIds: string[]) {
+  hydrateSessions();
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error('Browser chat session not found');
+  const uniqueMessageIds = Array.from(new Set(messageIds.map((item) => item.trim()).filter(Boolean)));
+  if (!uniqueMessageIds.length) throw new Error('请选择要导出的对话轮次');
+
+  const selectedIdSet = new Set(uniqueMessageIds);
+  const selectedMessages = session.messages
+    .map((message, index) => ({ message, index }))
+    .filter((item) => selectedIdSet.has(item.message.id) && item.message.role === 'assistant');
+  if (!selectedMessages.length) throw new Error('请选择可导出的 AI 回复消息');
+
+  const selectedStepIndexSet = new Set<number>();
+  for (const { message } of selectedMessages) {
+    for (const stepIndex of message.stepIndexes || []) selectedStepIndexSet.add(stepIndex);
+  }
+
+  const rawSteps = session.steps
+    .filter((step) => selectedStepIndexSet.size ? selectedStepIndexSet.has(step.index) : step.index > 0)
+    .map((step) => ({ ...step, status: step.status === 'running' ? 'passed' : step.status }))
+    .sort((a, b) => a.index - b.index);
+  if (!rawSteps.length) throw new Error('选中的对话轮次没有可导出的执行步骤');
+
+  const selectedSteps = rawSteps.map((step, index): StepExecutionResult => ({
+    ...step,
+    index: index + 1,
+  }));
+  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).map((tool, toolIndex) => ({
+    index: 0,
+    name: tool.name,
+    input: tool.input,
+    reason: tool.reason,
+    sourceStepIndex: step.index,
+    sourceStepAction: step.action,
+    sourceStepExpected: step.expected,
+    sourceToolIndex: toolIndex + 1,
+  }))).map((flow, index) => ({ ...flow, index: index + 1 }));
+
+  const turnDescriptions = selectedMessages.map(({ message, index }, turnIndex) => {
+    const previousUser = [...session.messages.slice(0, index)].reverse().find((item) => item.role === 'user');
+    return [
+      `轮次 ${turnIndex + 1}`,
+      previousUser?.content ? `用户消息：${previousUser.content}` : '',
+      message.content ? `AI 输出：${message.content}` : '',
+    ].filter(Boolean).join('\n');
+  });
+  const firstSelected = selectedMessages[0];
+  const firstPreviousUser = firstSelected
+    ? [...session.messages.slice(0, firstSelected.index)].reverse().find((item) => item.role === 'user')
+    : undefined;
+  const titleSeed = firstPreviousUser?.content || firstSelected?.message.content || session.title || '浏览器对话导出用例';
+  const expectedResults = selectedMessages
+    .map((item) => item.message.content)
+    .filter((item): item is string => Boolean(item?.trim()))
+    .map((item) => compactText(item, 420));
+  const content: TestCaseContent = {
+    title: `对话导出 - ${compactText(titleSeed, 36)}`,
+    description: turnDescriptions.join('\n\n'),
+    targetUrl: '',
+    priority: 'medium',
+    browserMode: session.mode,
+    isMarked: true,
+    userRequirement: turnDescriptions.join('\n\n') || titleSeed,
+    systemPrompt: '该用例由浏览器对话中的多轮消息导出，已包含所选轮次中 AI 实际执行过的步骤记录。',
+    preconditions: ['已根据所选浏览器对话轮次完成过执行，导出时同步创建一条已完成运行记录。'],
+    testData: {},
+    steps: selectedSteps.map((step, index) => {
+      const firstTool = step.tools?.[0];
+      return {
+        index: index + 1,
+        operation: testOperationFromToolName(firstTool?.name),
+        action: compactText(step.action || firstTool?.name || `执行步骤 ${step.index}`, 240),
+        input: firstTool?.input ? safeJson(firstTool.input) : undefined,
+        expected: compactText(step.expected || step.actual || '该步骤应按对话中的已执行结果完成。', 320),
+        riskLevel: step.status === 'failed' ? 'warning' : 'safe',
+      };
+    }),
+    expectedResults: expectedResults.length ? expectedResults : ['复现选中对话轮次中 AI 已完成的浏览器操作。'],
+    risks: session.networkErrors.length || session.consoleErrors.length
+      ? ['原对话执行过程中存在控制台或网络诊断记录，复跑时需要关注稳定性。']
+      : [],
+    recordedFlow: recordedFlow.length ? recordedFlow : undefined,
+  };
+
+  const testCase = store.createTestCase(content, []);
+  const run = store.createRun(testCase.id);
+  const finishedAt = now();
+  const status = statusFromSteps(selectedSteps);
+  const completedRun = store.updateRun(run.id, {
+    status,
+    startedAt: selectedMessages[0]?.message.createdAt || session.createdAt,
+    endedAt: finishedAt,
+    result: {
+      steps: selectedSteps,
+      consoleErrors: session.consoleErrors,
+      networkErrors: session.networkErrors,
+      taskFrame: selectedSteps.at(-1)?.taskFrame,
+      ledgerItems: selectedSteps.flatMap((step) => step.ledgerItems || []),
+    },
+  }) || run;
+  store.updateTestCaseStatus(testCase.id, status === 'passed' ? 'passed' : status);
+  return { testCase: store.getTestCase(testCase.id) || testCase, run: completedRun, exportedMessageIds: uniqueMessageIds };
+}
+
 
 export async function sendBrowserChatMessage(
   sessionId: string,

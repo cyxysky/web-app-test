@@ -27,7 +27,7 @@ export default async function RunReportPage({ params }: PageProps) {
         <div className="run-inline-actions" />
       </header>
 
-      <RunProgress initialRun={run} testCaseTitle={testCase?.title || '未知用例'} />
+      <RunProgress browserMode={testCase?.content.browserMode} initialRun={run} testCaseTitle={testCase?.title || '未知用例'} />
     </main>
   );
 }

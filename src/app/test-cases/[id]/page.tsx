@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { ArrowLeft } from 'lucide-react';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
+import { RunDefaultRecordedRunButton } from '@/components/RunDefaultRecordedRunButton';
 import { RunHistoryList } from '@/components/RunHistoryList';
 import { RunTestButton } from '@/components/RunTestButton';
 import { TestCaseEditor } from '@/components/TestCaseEditor';
@@ -27,6 +28,7 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
           工作台
         </Link>
         <div className="case-inline-actions">
+          <RunDefaultRecordedRunButton defaultRecordedRunId={testCase.content.defaultRecordedRunId} testCaseId={id} />
           <RunTestButton testCaseId={id} />
           <DeleteTestCaseButton redirectTo="/dashboard" testCaseId={id} testCaseTitle={testCase.title} />
         </div>
@@ -35,7 +37,7 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
       <TestCaseEditor testCase={testCase} />
 
       <section className="content-band run-history-panel">
-        <RunHistoryList runs={runs} />
+        <RunHistoryList defaultRecordedRunId={testCase.content.defaultRecordedRunId} runs={runs} testCaseId={id} />
       </section>
     </main>
   );
