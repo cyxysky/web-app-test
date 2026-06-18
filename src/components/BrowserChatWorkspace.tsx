@@ -731,7 +731,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   running: boolean;
   steps: StepExecutionResult[];
 }) {
-  const [toolsExpanded, setToolsExpanded] = useState(false);
+  const autoExpandedToolsRef = useRef(false);
+  const [toolsExpanded, setToolsExpanded] = useState(() => running);
   const finalText = message.content;
   const seenTexts = new Set<string>();
   const toolCount = steps.reduce((count, step) => count + (step.tools || []).length, 0);
@@ -753,6 +754,12 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       <BrowserChatMarkdown key={key} markdown={normalized} />
     );
   };
+
+  useEffect(() => {
+    if (!running || !shouldShowStepTimeline || autoExpandedToolsRef.current) return;
+    autoExpandedToolsRef.current = true;
+    setToolsExpanded(true);
+  }, [running, shouldShowStepTimeline]);
 
   return (
     <div className="browser-chat-agent-timeline">
