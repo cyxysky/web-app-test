@@ -2552,6 +2552,23 @@ function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal =
 }
 
 // 执行单个运行时步骤：采集页面上下文，调用 AI 选择一个动作，并记录请求快照。
+function browserChatReplyFromDecision(decision: RuntimeDecision, lastToolName?: string) {
+  const candidates = [
+    decision.actual,
+    decision.note,
+    decision.observation,
+    decision.action,
+  ].map((item) => String(item || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const text = candidates.find((item) => (
+    item
+    && !/^Tool call finished/i.test(item)
+    && !/^Browser chat returned no browser tool/i.test(item)
+    && !/^AI executed browser-chat action/i.test(item)
+  )) || candidates[0] || '';
+  if (!text) return lastToolName === 'reportState' ? '已完成本轮操作。' : '';
+  return text.length > 900 ? `${text.slice(0, 900)}...` : text;
+}
+
 function progressFieldsFromToolTraces(
   traces: ToolTrace[],
   goal: string,
@@ -3437,11 +3454,13 @@ export async function executeInteractiveBrowserTurn(input: {
     }
     if (lastToolName === 'waitForHumanVerification') {
       finalStatus = 'blocked';
+      if (!reply) reply = browserChatReplyFromDecision(decision, lastToolName);
       endedWithFinalAnswer = true;
       break;
     }
     if (decision.done || lastToolName === 'reportState') {
       finalStatus = decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed';
+      if (!reply) reply = browserChatReplyFromDecision(decision, lastToolName);
       endedWithFinalAnswer = true;
       break;
     }

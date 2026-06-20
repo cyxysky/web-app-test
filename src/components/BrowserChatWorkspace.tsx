@@ -33,6 +33,7 @@ import {
   SendHorizontal,
   Settings,
   SlidersHorizontal,
+  Sparkles,
   FilePlus2,
   SquareArrowOutUpRight,
   SquareTerminal,
@@ -732,6 +733,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const toolCount = steps.reduce((count, step) => count + (step.tools || []).length, 0);
   const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
   const shouldShowStepTimeline = running || toolCount > 0;
+  const hasFinalText = Boolean(finalText.trim());
   const toolSummary = toolCount
     ? `${running ? '正在进行' : '已完成'} ${toolCount} 个工具调用`
     : waitingForTool
@@ -773,19 +775,26 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
           )) : null}
         </div>
       ) : null}
-      {renderText(finalText, 'final-text')}
+      {hasFinalText ? renderText(finalText, 'final-text') : null}
+      {!hasFinalText && !shouldShowStepTimeline ? (
+        <p className="browser-chat-agent-empty">{running ? 'AI 正在处理当前请求。' : 'AI 已完成本轮操作，未返回额外文本。'}</p>
+      ) : null}
     </div>
   );
 });
 
 const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
+  availableSkills,
   exportingMessageId,
   exportingSelectedMessages,
+  generatingSkillMessageId,
+  generatingSkillSelectedMessages,
   item,
   itemLogs,
   itemSteps,
   lastAssistantMessageId,
   onExportMessage,
+  onGenerateSkill,
   onPreviewImage,
   onSelectTool,
   onShowLogs,
@@ -794,13 +803,17 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   sessionBusy,
   totalStepCount,
 }: {
+  availableSkills: SkillRecord[];
   exportingMessageId: string | null;
   exportingSelectedMessages: boolean;
+  generatingSkillMessageId: string | null;
+  generatingSkillSelectedMessages: boolean;
   item: BrowserChatMessage;
   itemLogs: BrowserChatLogRecord[];
   itemSteps: StepExecutionResult[];
   lastAssistantMessageId?: string;
   onExportMessage: (messageId: string) => void | Promise<void>;
+  onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
@@ -812,7 +825,18 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
   const operationLabel = operationRunning ? '进行中' : '已完成';
   const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
-  const exportingDisabled = Boolean(exportingMessageId) || exportingSelectedMessages;
+  const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
+  const messageSkills = useMemo(() => {
+    const byId = new Map(availableSkills.map((skill) => [skill.id, skill]));
+    return Array.from(new Set(item.skillIds || [])).map((skillId) => {
+      const skill = byId.get(skillId);
+      return {
+        id: skillId,
+        title: skill?.title || skillId,
+        description: skill?.description || 'Skill',
+      };
+    });
+  }, [availableSkills, item.skillIds]);
 
   return (
     <article className={`browser-chat-message ${item.role}`}>
@@ -833,7 +857,19 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
           </>
         ) : (
           <>
-            {item.content ? <p>{item.content}</p> : null}
+            {item.content ?
+              <p>
+                {item.content}
+                {messageSkills.length ? (
+                  <span className="browser-chat-message-skills" aria-label="已选择 Skills">
+                    {messageSkills.map((skill) => (
+                      <span className="browser-chat-message-skill" key={skill.id} title={skill.description}>
+                        <span>{skill.title}</span>
+                      </span>
+                    ))}
+                  </span>
+                ) : null}
+              </p> : null}
             <BrowserChatImageGrid attachments={item.attachments} onPreview={onPreviewImage} />
             <time className="browser-chat-message-time" dateTime={messageUpdateTime(item)}>
               最后更新 {formatLogTime(messageUpdateTime(item))}
@@ -846,7 +882,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
               <label className="browser-chat-message-select">
                 <input
                   checked={selectedForExport}
-                  disabled={exportingDisabled}
+                  disabled={actionDisabled}
                   onChange={(event) => onToggleExportSelection(item.id, event.currentTarget.checked)}
                   type="checkbox"
                 />
@@ -862,7 +898,18 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
             {canExportMessage ? (
               <button
                 className="browser-chat-log-button"
-                disabled={exportingDisabled}
+                disabled={actionDisabled}
+                onClick={() => void onGenerateSkill(item.id)}
+                type="button"
+              >
+                {generatingSkillMessageId === item.id ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
+                生成 Skill
+              </button>
+            ) : null}
+            {canExportMessage ? (
+              <button
+                className="browser-chat-log-button"
+                disabled={actionDisabled}
                 onClick={() => void onExportMessage(item.id)}
                 type="button"
               >
@@ -878,14 +925,19 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
 });
 
 const BrowserChatMessageList = memo(function BrowserChatMessageList({
+  availableSkills,
   exportingMessageId,
   exportingSelectedMessages,
+  generatingSkillMessageId,
+  generatingSkillSelectedMessages,
   lastAssistantMessageId,
   logIndex,
   messages,
   onBulkExportMessages,
+  onBulkGenerateSkillMessages,
   onClearExportSelection,
   onExportMessage,
+  onGenerateSkill,
   onPreviewImage,
   onSelectTool,
   onShowLogs,
@@ -896,14 +948,19 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   stepsByIndex,
   totalStepCount,
 }: {
+  availableSkills: SkillRecord[];
   exportingMessageId: string | null;
   exportingSelectedMessages: boolean;
+  generatingSkillMessageId: string | null;
+  generatingSkillSelectedMessages: boolean;
   lastAssistantMessageId?: string;
   logIndex: BrowserChatLogIndex;
   messages: BrowserChatMessage[];
   onBulkExportMessages: () => void | Promise<void>;
+  onBulkGenerateSkillMessages: () => void | Promise<void>;
   onClearExportSelection: () => void;
   onExportMessage: (messageId: string) => void | Promise<void>;
+  onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
@@ -914,6 +971,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   stepsByIndex: Map<number, StepExecutionResult>;
   totalStepCount: number;
 }) {
+  const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
   return (
     <div className="browser-chat-message-list">
       {selectedExportMessageIds.length ? (
@@ -921,7 +979,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
           <span>已选 {selectedExportMessageIds.length} 轮</span>
           <button
             className="browser-chat-log-button"
-            disabled={Boolean(exportingMessageId) || exportingSelectedMessages}
+            disabled={actionDisabled}
             onClick={() => void onBulkExportMessages()}
             type="button"
           >
@@ -930,7 +988,16 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
           </button>
           <button
             className="browser-chat-log-button"
-            disabled={Boolean(exportingMessageId) || exportingSelectedMessages}
+            disabled={actionDisabled}
+            onClick={() => void onBulkGenerateSkillMessages()}
+            type="button"
+          >
+            {generatingSkillSelectedMessages ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
+            生成 Skill
+          </button>
+          <button
+            className="browser-chat-log-button"
+            disabled={actionDisabled}
             onClick={onClearExportSelection}
             type="button"
           >
@@ -946,14 +1013,18 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
         return (
           <BrowserChatMessageItem
+            availableSkills={availableSkills}
             exportingMessageId={exportingMessageId}
             exportingSelectedMessages={exportingSelectedMessages}
+            generatingSkillMessageId={generatingSkillMessageId}
+            generatingSkillSelectedMessages={generatingSkillSelectedMessages}
             item={item}
             itemLogs={itemLogs}
             itemSteps={itemSteps}
             key={item.id}
             lastAssistantMessageId={lastAssistantMessageId}
             onExportMessage={onExportMessage}
+            onGenerateSkill={onGenerateSkill}
             onPreviewImage={onPreviewImage}
             onSelectTool={onSelectTool}
             onShowLogs={onShowLogs}
@@ -2038,6 +2109,8 @@ export function BrowserChatWorkspace({
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
   const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
   const [exportingSelectedMessages, setExportingSelectedMessages] = useState(false);
+  const [generatingSkillMessageId, setGeneratingSkillMessageId] = useState<string | null>(null);
+  const [generatingSkillSelectedMessages, setGeneratingSkillSelectedMessages] = useState(false);
   const [selectedExportMessageIds, setSelectedExportMessageIds] = useState<string[]>([]);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
@@ -2516,7 +2589,7 @@ export function BrowserChatWorkspace({
 
   const exportSelectedMessagesToTestCase = useCallback(async () => {
     const sessionId = session?.id;
-    if (!sessionId || !selectedExportMessageIds.length || exportingMessageId || exportingSelectedMessages) return;
+    if (!sessionId || !selectedExportMessageIds.length || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
     const messageIds = selectedExportMessageIds;
     setExportingSelectedMessages(true);
     setError('');
@@ -2537,11 +2610,11 @@ export function BrowserChatWorkspace({
       setExportingSelectedMessages(false);
       stopGlobalLoading();
     }
-  }, [exportingMessageId, exportingSelectedMessages, router, selectedExportMessageIds, session?.id, startTransition]);
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, router, selectedExportMessageIds, session?.id, startTransition]);
 
   const exportMessageToTestCase = useCallback(async (messageId: string) => {
     const sessionId = session?.id;
-    if (!sessionId || exportingMessageId || exportingSelectedMessages) return;
+    if (!sessionId || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
     setExportingMessageId(messageId);
     setError('');
     try {
@@ -2558,7 +2631,55 @@ export function BrowserChatWorkspace({
     } finally {
       setExportingMessageId(null);
     }
-  }, [exportingMessageId, exportingSelectedMessages, router, session?.id, startTransition]);
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, router, session?.id, startTransition]);
+
+  const generateSelectedMessagesSkill = useCallback(async () => {
+    const sessionId = session?.id;
+    if (!sessionId || !selectedExportMessageIds.length || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
+    const messageIds = selectedExportMessageIds;
+    setGeneratingSkillSelectedMessages(true);
+    setError('');
+    startGlobalLoading('正在生成 Skill');
+    try {
+      const response = await fetch(`/api/browser-chat/${sessionId}/skills`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageIds }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '生成 Skill 失败');
+      setSelectedExportMessageIds([]);
+      await loadSkills();
+    } catch (skillError) {
+      setError(skillError instanceof Error ? skillError.message : '生成 Skill 失败');
+    } finally {
+      setGeneratingSkillSelectedMessages(false);
+      stopGlobalLoading();
+    }
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, selectedExportMessageIds, session?.id]);
+
+  const generateMessageSkill = useCallback(async (messageId: string) => {
+    const sessionId = session?.id;
+    if (!sessionId || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
+    setGeneratingSkillMessageId(messageId);
+    setError('');
+    startGlobalLoading('正在生成 Skill');
+    try {
+      const response = await fetch(`/api/browser-chat/${sessionId}/skills`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageId }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '生成 Skill 失败');
+      await loadSkills();
+    } catch (skillError) {
+      setError(skillError instanceof Error ? skillError.message : '生成 Skill 失败');
+    } finally {
+      setGeneratingSkillMessageId(null);
+      stopGlobalLoading();
+    }
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, session?.id]);
 
   async function startNewConversation() {
     setActiveView('chat');
@@ -2735,14 +2856,19 @@ export function BrowserChatWorkspace({
 
       {hasMessages ? (
         <BrowserChatMessageList
+          availableSkills={skills}
           exportingMessageId={exportingMessageId}
           exportingSelectedMessages={exportingSelectedMessages}
+          generatingSkillMessageId={generatingSkillMessageId}
+          generatingSkillSelectedMessages={generatingSkillSelectedMessages}
           lastAssistantMessageId={lastAssistantMessageId}
           logIndex={logIndex}
           messages={visibleMessages}
           onBulkExportMessages={exportSelectedMessagesToTestCase}
+          onBulkGenerateSkillMessages={generateSelectedMessagesSkill}
           onClearExportSelection={clearExportMessageSelection}
           onExportMessage={exportMessageToTestCase}
+          onGenerateSkill={generateMessageSkill}
           onPreviewImage={previewAttachment}
           onSelectTool={setToolDialog}
           onShowLogs={showMessageLogs}
@@ -2898,14 +3024,19 @@ export function BrowserChatWorkspace({
 
             {hasMessages ? (
               <BrowserChatMessageList
+                availableSkills={skills}
                 exportingMessageId={exportingMessageId}
                 exportingSelectedMessages={exportingSelectedMessages}
+                generatingSkillMessageId={generatingSkillMessageId}
+                generatingSkillSelectedMessages={generatingSkillSelectedMessages}
                 lastAssistantMessageId={lastAssistantMessageId}
                 logIndex={logIndex}
                 messages={visibleMessages}
                 onBulkExportMessages={exportSelectedMessagesToTestCase}
+                onBulkGenerateSkillMessages={generateSelectedMessagesSkill}
                 onClearExportSelection={clearExportMessageSelection}
                 onExportMessage={exportMessageToTestCase}
+                onGenerateSkill={generateMessageSkill}
                 onPreviewImage={previewAttachment}
                 onSelectTool={setToolDialog}
                 onShowLogs={showMessageLogs}

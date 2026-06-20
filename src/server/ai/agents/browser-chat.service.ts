@@ -5,9 +5,10 @@ import { generateObject } from 'ai';
 import { z } from 'zod';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage, type InteractiveBrowserTurnResult } from '@/server/ai/agents/browser-chat-executor.agent';
+import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
 import { formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import type { RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { writeTextFileAtomic } from '@/server/storage/atomic-json';
@@ -749,6 +750,46 @@ function isRecentTimestamp(value?: string, maxAgeMs = runningHydrationGraceMs) {
   return Number.isFinite(timestamp) && Date.now() - timestamp < maxAgeMs;
 }
 
+function parseLogDetails(details?: string) {
+  if (!details) return undefined;
+  try {
+    return JSON.parse(details) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function runtimeResponseTextFromLog(log: BrowserChatLogRecord) {
+  if (log.phase !== 'ai:runtime:response') return '';
+  const details = parseLogDetails(log.details);
+  if (details && typeof details === 'object') {
+    const text = (details as { text?: unknown }).text;
+    if (typeof text === 'string' && text.trim()) return text.trim();
+  }
+  const fallback = log.message
+    .replace(/;\s*turn\s+\d+\/\d+;\s*AI\+tool[\s\S]*$/i, '')
+    .trim();
+  return /^AI returned no text/i.test(fallback) ? '' : fallback;
+}
+
+function recoverAssistantMessageFromLogs(
+  message: BrowserChatMessage,
+  logs: BrowserChatLogRecord[],
+  steps: StepExecutionResult[],
+) {
+  if (message.role !== 'assistant' || message.status === 'running' || hasMessageContent(message)) return message;
+  const responseLogs = logs.filter((log) => log.messageId === message.id && log.phase === 'ai:runtime:response');
+  const recoveredLog = [...responseLogs].reverse().find((log) => runtimeResponseTextFromLog(log));
+  if (!recoveredLog) return message;
+  const hasCompletedRun = logs.some((log) => log.messageId === message.id && log.phase === 'chat:run:done');
+  return {
+    ...message,
+    content: runtimeResponseTextFromLog(recoveredLog),
+    status: hasCompletedRun ? statusFromSteps(steps) : message.status,
+    updatedAt: message.updatedAt || recoveredLog.time,
+  };
+}
+
 function hasRunningAssistantMessage(session: Pick<BrowserChatSessionSnapshot, 'messages'>, assistantMessageId?: string) {
   return (session.messages || []).some((message) => (
     message.role === 'assistant'
@@ -822,7 +863,8 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
       .map((step) => step.index),
   );
   const steps = (session.steps || []).filter((step) => !transientStepIndexes.has(step.index));
-  const messages = (session.messages || []).map((message) => {
+  const messages = (session.messages || []).map((rawMessage) => {
+    const message = recoverAssistantMessageFromLogs(rawMessage, session.logs || [], steps);
     const contentIsTransient = message.role === 'assistant' && isTransientBrowserChatProgress(message.content);
     const stepIndexes = transientStepIndexes.size
       ? (message.stepIndexes || []).filter((stepIndex) => !transientStepIndexes.has(stepIndex))
@@ -924,6 +966,20 @@ function messageTimestamp(message: BrowserChatMessage) {
   return Math.max(timestampValue(message.updatedAt), timestampValue(message.createdAt));
 }
 
+function hasMessageContent(message: BrowserChatMessage) {
+  return Boolean(message.content?.trim());
+}
+
+function shouldPreferIncomingMessage(previous: BrowserChatMessage, incoming: BrowserChatMessage) {
+  const previousHasContent = hasMessageContent(previous);
+  const incomingHasContent = hasMessageContent(incoming);
+  if (incomingHasContent && !previousHasContent) return true;
+  if (!incomingHasContent && previousHasContent) return false;
+  if (incoming.status !== 'running' && previous.status === 'running') return true;
+  if (incoming.status === 'running' && previous.status !== 'running') return false;
+  return messageTimestamp(incoming) >= messageTimestamp(previous);
+}
+
 function mergeSortedNumbers(first?: number[], second?: number[]) {
   return Array.from(new Set([...(first || []), ...(second || [])])).sort((a, b) => a - b);
 }
@@ -941,12 +997,12 @@ function mergeMessagesFromFile(existing: BrowserChatMessage[] = [], incoming: Br
       byId.set(message.id, message);
       continue;
     }
-    const incomingNewer = messageTimestamp(message) >= messageTimestamp(previous);
-    const merged = incomingNewer ? { ...previous, ...message } : { ...message, ...previous };
+    const incomingPreferred = shouldPreferIncomingMessage(previous, message);
+    const merged = incomingPreferred ? { ...previous, ...message } : { ...message, ...previous };
     byId.set(message.id, {
       ...merged,
       stepIndexes: mergeSortedNumbers(previous.stepIndexes, message.stepIndexes),
-      attachments: incomingNewer ? message.attachments || previous.attachments : previous.attachments || message.attachments,
+      attachments: incomingPreferred ? message.attachments || previous.attachments : previous.attachments || message.attachments,
     });
   }
   return [...byId.values()].sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
@@ -1022,6 +1078,25 @@ function mergeSessionSnapshotFromFile(
   };
 }
 
+function mergeRuntimeSessionState(fromDisk: BrowserChatSessionRecord, existing: BrowserChatSessionRecord) {
+  const hasRuntimeTurn = Boolean(
+    existing.activeAssistantMessageId
+    || existing.activeAbortController
+    || existing.busy
+    || existing.status === 'running',
+  );
+  if (!hasRuntimeTurn) return fromDisk;
+  return {
+    ...fromDisk,
+    messages: mergeMessagesFromFile(fromDisk.messages, existing.messages),
+    steps: mergeStepsFromFile(fromDisk.steps, existing.steps),
+    consoleErrors: mergeStringLists(fromDisk.consoleErrors, existing.consoleErrors),
+    networkErrors: mergeStringLists(fromDisk.networkErrors, existing.networkErrors),
+    logs: mergeLogsFromFile(fromDisk.logs, existing.logs),
+    conversationMemory: mergeConversationMemoryFromFile(fromDisk.conversationMemory, existing.conversationMemory),
+  };
+}
+
 function applyFileSnapshotToRuntime(snapshotFromFile: BrowserChatSessionSnapshot) {
   const existing = sessions.get(snapshotFromFile.id);
   if (!existing) {
@@ -1029,7 +1104,10 @@ function applyFileSnapshotToRuntime(snapshotFromFile: BrowserChatSessionSnapshot
     return;
   }
   const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, snapshotFromFile);
-  const fromDisk = recordFromSnapshot(snapshotFromFile, { preserveRunningState: preserveRuntimeTurn });
+  const fromDisk = mergeRuntimeSessionState(
+    recordFromSnapshot(snapshotFromFile, { preserveRunningState: preserveRuntimeTurn }),
+    existing,
+  );
   const runtimeState = {
     activeAbortController: preserveRuntimeTurn ? existing.activeAbortController : undefined,
     activeAssistantMessageId: preserveRuntimeTurn ? existing.activeAssistantMessageId : undefined,
@@ -1101,7 +1179,10 @@ function hydrateSessions() {
         continue;
       }
       const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, item);
-      const fromDisk = recordFromSnapshot(item, { preserveRunningState: preserveRuntimeTurn });
+      const fromDisk = mergeRuntimeSessionState(
+        recordFromSnapshot(item, { preserveRunningState: preserveRuntimeTurn }),
+        existing,
+      );
       const runtimeState = {
         activeAbortController: preserveRuntimeTurn ? existing.activeAbortController : undefined,
         activeAssistantMessageId: preserveRuntimeTurn ? existing.activeAssistantMessageId : undefined,
@@ -1577,6 +1658,131 @@ export function exportBrowserChatMessagesToTestCase(sessionId: string, messageId
   return { testCase: store.getTestCase(testCase.id) || testCase, run: completedRun, exportedMessageIds: uniqueMessageIds };
 }
 
+export async function generateBrowserChatMessagesSkill(sessionId: string, messageIds: string[]) {
+  hydrateSessions();
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error('Browser chat session not found');
+  const uniqueMessageIds = Array.from(new Set(messageIds.map((item) => item.trim()).filter(Boolean)));
+  if (!uniqueMessageIds.length) throw new Error('请选择要生成 Skill 的对话轮次');
+
+  const selectedIdSet = new Set(uniqueMessageIds);
+  const selectedMessages = session.messages
+    .map((message, index) => ({ message, index }))
+    .filter((item) => selectedIdSet.has(item.message.id) && item.message.role === 'assistant');
+  if (!selectedMessages.length) throw new Error('请选择可生成 Skill 的 AI 回复消息');
+  if (selectedMessages.some((item) => item.message.status === 'running')) throw new Error('请等待所选对话轮次执行完成后再生成 Skill');
+
+  const selectedStepIndexSet = new Set<number>();
+  for (const { message } of selectedMessages) {
+    for (const stepIndex of message.stepIndexes || []) selectedStepIndexSet.add(stepIndex);
+  }
+
+  const selectedSteps = session.steps
+    .filter((step) => selectedStepIndexSet.size ? selectedStepIndexSet.has(step.index) : step.index > 0)
+    .sort((a, b) => a.index - b.index)
+    .map((step, index): StepExecutionResult => ({
+      ...step,
+      index: index + 1,
+      status: step.status === 'running' ? 'passed' : step.status,
+    }));
+  if (!selectedSteps.length) throw new Error('选中的对话轮次没有可生成 Skill 的执行步骤');
+
+  const targetUrl = exportedTargetUrl(session, selectedSteps);
+  const turnDescriptions = selectedMessages.map(({ message, index }, turnIndex) => {
+    const previousUser = [...session.messages.slice(0, index)].reverse().find((item) => item.role === 'user');
+    return [
+      `轮次 ${turnIndex + 1}`,
+      previousUser?.content ? `用户消息：${previousUser.content}` : '',
+      message.content ? `AI 输出：${message.content}` : '',
+    ].filter(Boolean).join('\n');
+  });
+  const firstSelected = selectedMessages[0];
+  const firstPreviousUser = firstSelected
+    ? [...session.messages.slice(0, firstSelected.index)].reverse().find((item) => item.role === 'user')
+    : undefined;
+  const titleSeed = firstPreviousUser?.content || firstSelected?.message.content || session.title || '浏览器对话 Skill';
+  const timestamp = now();
+  const content: TestCaseContent = {
+    title: `对话 Skill - ${compactText(titleSeed, 36)}`,
+    description: turnDescriptions.join('\n\n'),
+    targetUrl,
+    priority: 'medium',
+    browserMode: session.mode,
+    isMarked: true,
+    userRequirement: turnDescriptions.join('\n\n') || titleSeed,
+    systemPrompt: '该上下文由浏览器对话生成，用于提炼可复用 Skill，不会创建测试用例。',
+    preconditions: ['已在浏览器对话中完成过相关操作，Skill 只保留可复用的操作经验。'],
+    testData: {},
+    steps: selectedSteps.map((step, index) => {
+      const firstTool = step.tools?.[0];
+      return {
+        index: index + 1,
+        operation: testOperationFromToolName(firstTool?.name),
+        action: compactText(step.action || firstTool?.name || `执行步骤 ${step.index}`, 240),
+        input: firstTool?.input ? safeJson(firstTool.input) : undefined,
+        expected: compactText(step.expected || step.actual || '该步骤应按对话中的已执行结果完成。', 320),
+        riskLevel: step.status === 'failed' ? 'warning' : 'safe',
+      };
+    }),
+    expectedResults: selectedMessages
+      .map((item) => item.message.content)
+      .filter((item): item is string => Boolean(item?.trim()))
+      .map((item) => compactText(item, 420)),
+    risks: session.networkErrors.length || session.consoleErrors.length
+      ? ['原对话执行过程中存在控制台或网络诊断记录，复用时需要关注稳定性。']
+      : [],
+  };
+  const syntheticTestCase: TestCaseRecord = {
+    id: `chat_case_${session.id}`,
+    title: content.title,
+    description: content.description,
+    targetUrl,
+    status: 'generated',
+    priority: content.priority,
+    content,
+    imageNames: [],
+    createdAt: session.createdAt,
+    updatedAt: timestamp,
+  };
+  const syntheticRun: TestRunRecord = {
+    id: `chat_run_${session.id}`,
+    testCaseId: syntheticTestCase.id,
+    status: statusFromSteps(selectedSteps),
+    startedAt: selectedMessages[0]?.message.createdAt || session.createdAt,
+    endedAt: timestamp,
+    createdAt: session.createdAt,
+    result: {
+      steps: selectedSteps,
+      consoleErrors: session.consoleErrors,
+      networkErrors: session.networkErrors,
+      taskFrame: selectedSteps.at(-1)?.taskFrame,
+      ledgerItems: selectedSteps.flatMap((step) => step.ledgerItems || []),
+    },
+    report: {
+      title: content.title,
+      summary: content.description || titleSeed,
+      markdown: turnDescriptions.join('\n\n'),
+      suggestions: [],
+    },
+  };
+
+  const generated = await generateSkillFromRun({ run: syntheticRun, testCase: syntheticTestCase });
+  const skill = store.upsertSkill({
+    title: generated.title,
+    description: generated.description,
+    tags: generated.tags,
+    triggerPhrases: generated.triggerPhrases,
+    content: generated.content,
+    sourceSessionId: session.id,
+    status: 'ready',
+  });
+  return { skill, sourceMessageIds: uniqueMessageIds };
+}
+
+export async function generateBrowserChatMessageSkill(sessionId: string, messageId: string) {
+  return generateBrowserChatMessagesSkill(sessionId, [messageId]);
+}
+
 
 export async function sendBrowserChatMessage(
   sessionId: string,
@@ -1904,6 +2110,12 @@ async function runBrowserChatMessage(
     }));
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
     const completedAt = now();
+    const shouldCloseCompletedBrowser = Boolean(session.browser || session.started);
+    if (shouldCloseCompletedBrowser) {
+      await session.browser?.close().catch(() => undefined);
+      session.browser = undefined;
+      session.started = false;
+    }
     session.status = 'idle';
     session.busy = false;
     session.activeAssistantMessageId = undefined;
@@ -1915,7 +2127,9 @@ async function runBrowserChatMessage(
         id: id('log'),
         time: completedAt,
         phase: 'chat:run:done',
-        message: '本轮对话操作已完成，最终结果已写入。',
+        message: shouldCloseCompletedBrowser
+          ? '本轮对话操作已完成，最终结果已写入，浏览器已自动关闭。'
+          : '本轮对话操作已完成，最终结果已写入。',
         messageId: assistantMessageId,
       },
     ].slice(-300);

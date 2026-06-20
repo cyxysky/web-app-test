@@ -371,7 +371,7 @@ export type BrowserTabSnapshot = {
 
 export type BrowserScreencastFrame = {
   data: string;
-  contentType: 'image/jpeg';
+  contentType: 'image/png';
   capturedAt: string;
   url: string;
   tabs: BrowserTabSnapshot[];
@@ -2822,12 +2822,10 @@ export class BrowserSession {
     everyNthFrame?: number;
     onError?: (error: unknown) => void;
     onFrame: (frame: BrowserScreencastFrame) => void | Promise<void>;
-    quality?: number;
   }): Promise<BrowserScreencastHandle> {
     const page = this.activePage;
     const client = await page.context().newCDPSession(page);
-    const rawQuality = Number(options.quality ?? process.env.BROWSER_PREVIEW_JPEG_QUALITY ?? 62);
-    const quality = Math.min(90, Math.max(35, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 62)));
+    const contentType: BrowserScreencastFrame['contentType'] = 'image/png';
     const rawEveryNthFrame = Number(options.everyNthFrame ?? process.env.BROWSER_SCREENCAST_EVERY_NTH_FRAME ?? 1);
     const everyNthFrame = Math.min(8, Math.max(1, Math.floor(Number.isFinite(rawEveryNthFrame) ? rawEveryNthFrame : 1)));
     let stopped = false;
@@ -2855,7 +2853,7 @@ export class BrowserSession {
       const height = Math.floor(Number(event.metadata?.deviceHeight) || fallback.height);
       void Promise.resolve(options.onFrame({
         capturedAt: new Date().toISOString(),
-        contentType: 'image/jpeg',
+        contentType,
         data: event.data,
         metadata: event.metadata,
         tabs: this.getTabsSnapshot(),
@@ -2867,8 +2865,7 @@ export class BrowserSession {
     try {
       await client.send('Page.startScreencast', {
         everyNthFrame,
-        format: 'jpeg',
-        quality,
+        format: 'png',
       });
     } catch (error) {
       (client as any).off?.('Page.screencastFrame', onFrame);
