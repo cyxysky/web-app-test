@@ -584,6 +584,12 @@ function isBrowserChatTestCase(testCase: TestCaseRecord) {
 }
 
 // 将浏览器工具调用轨迹压缩为步骤证据，保存到运行历史中。
+const browserChatDefaultSystemPrompt = 'This is an interactive browser chat. Do not assume a fixed test-case script; operate from the live page and answer the latest user message in Chinese.';
+
+function browserChatSystemPromptForRuntime(value: string) {
+  return value.replace(browserChatDefaultSystemPrompt, '').trim();
+}
+
 function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   return traces.map((trace) => {
     const { input, reason } = splitToolInputAndReason(trace.input);
@@ -819,6 +825,32 @@ function buildCompactRunContext(steps: StepExecutionResult[], activeMemory?: Run
 
   return [
     'RunState JSON (authoritative compact state):',
+    JSON.stringify(runState, null, 2),
+  ].join('\n');
+}
+
+function buildCompactBrowserChatContext(steps: StepExecutionResult[], activeMemory?: RuntimeWorkingMemory) {
+  const usefulSteps = steps.filter(isUsefulHistoryStep);
+  const latestStep = usefulSteps.at(-1);
+  const latestTool = latestStep?.tools?.at(-1);
+  const persistedWorkingMemory = steps.map((step) => step.workingMemory).filter(Boolean).at(-1);
+  const latestWorkingMemory = activeMemory || persistedWorkingMemory;
+  const latestNextGoal = sanitizeNextGoal(activeMemory?.nextStep || persistedWorkingMemory?.nextStep || steps.map((step) => step.workingMemory?.nextStep).filter(Boolean).at(-1));
+  const currentState = sanitizeCurrentState(latestWorkingMemory?.currentState || latestWorkingMemory?.pageUnderstanding || latestStep?.observation || latestStep?.note || '');
+  const lastAction = activeMemory?.lastAction
+    ? concise([activeMemory.lastAction, activeMemory.lastResult].filter(Boolean).join(' -> '), 180)
+    : latestTool
+    ? summarizeStepToolCallForPrompt(latestTool)
+    : latestStep ? `Step ${latestStep.index}: ${concise(latestStep.observation || latestStep.note || latestStep.action, 140)}` : '[none]';
+  const runState = {
+    currentState: currentState || null,
+    nextObjective: latestNextGoal || 'Satisfy the latest browser-chat user message.',
+    lastActionOrResult: lastAction,
+    completedSteps: steps.length,
+  };
+
+  return [
+    'BrowserChat RunState JSON (compact context):',
     JSON.stringify(runState, null, 2),
   ].join('\n');
 }
@@ -1917,10 +1949,13 @@ function runtimePrompt(input: {
   const visualTextCandidateFallback = visualMode && !attachScreenshot;
   const markerOverlayInScreenshot = Boolean(markerEnabled && input.markerOverlayInScreenshot);
   const separateMarkerScreenshot = Boolean(markerEnabled && input.hasMarkerScreenshot);
-  const caseSystemPrompt = systemPromptOf(testCase);
+  const rawCaseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
   const browserChatMode = isBrowserChatTestCase(testCase);
-  const compactRunContext = buildCompactRunContext(completedSteps, input.workingMemory);
+  const caseSystemPrompt = browserChatMode ? browserChatSystemPromptForRuntime(rawCaseSystemPrompt) : rawCaseSystemPrompt;
+  const compactRunContext = browserChatMode
+    ? buildCompactBrowserChatContext(completedSteps, input.workingMemory)
+    : buildCompactRunContext(completedSteps, input.workingMemory);
   const customPrompt = customRuntimePromptFromEnv(browserChatMode ? 'browser-chat' : 'target', {
     requirement,
     targetUrl: testCase.targetUrl,
@@ -2005,7 +2040,7 @@ function runtimePrompt(input: {
       ];
   return [
     browserChatMode
-      ? 'You are an AI browser chat agent. Call a browser tool only when live browser action or inspection is needed; otherwise answer directly in Chinese Markdown.'
+      ? 'You are an AI browser chat agent.'
       : 'You are an AI browser testing agent. Call exactly ONE tool. Use reportState only when no browser action is needed.',
     `Requirement: ${requirement}`,
     `Target URL: ${testCase.targetUrl}`,
@@ -2022,10 +2057,10 @@ function runtimePrompt(input: {
     '- Treat RunState JSON and Working Memory as compact context only. Do not copy them into tool params.',
     '- Historical actions are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
     '- In reason/message/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
-    '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
-    '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
-    '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
-    '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
+    browserChatMode ? '' : '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
+    browserChatMode ? '' : '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
+    browserChatMode ? '' : '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
+    browserChatMode ? '' : '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
     '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL or a relative path resolved against AI_FILE_DOWNLOAD_BASE_URL from settings.',
     '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. Include the returned URL or local path in the final answer.',
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
@@ -2040,7 +2075,7 @@ function runtimePrompt(input: {
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
     '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
     browserChatMode
-      ? '- Finish the chat turn by returning normal Chinese Markdown text with no tool call once the latest user message is satisfied, blocked, or needs clarification.'
+      ? ''
       : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
     attachScreenshot
       ? separateMarkerScreenshot
@@ -2054,21 +2089,20 @@ function runtimePrompt(input: {
         ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
         : '- DOM mode: no screenshot image/path is attached. Use the current full DOM snapshot, full page text, and DOM node_id tools first; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
     ...markerTargetRules,
-    caseSystemPrompt ? `Test-case-specific instructions:
+    caseSystemPrompt ? `${browserChatMode ? 'Browser-chat loaded instructions and Skills' : 'Test-case-specific instructions'}:
 ${caseSystemPrompt}` : '',
     customPrompt ? `Mode custom instructions:
 ${customPrompt}` : '',
-    strategyMemory.length ? `Historical failure strategy memory:
+    !browserChatMode && strategyMemory.length ? `Historical failure strategy memory:
 ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : '',
     '',
-    ...buildVerificationPromptLines(pageContext, attachScreenshot),
-    ...buildCompletionPromptLines(attachScreenshot),
+    ...(browserChatMode ? [] : buildVerificationPromptLines(pageContext, attachScreenshot)),
+    ...(browserChatMode ? [] : buildCompletionPromptLines(attachScreenshot)),
     '',
     'Response:',
     browserChatMode
       ? '- Either return normal Chinese Markdown text with no tool, or call one browser tool if action/inspection is needed. Tool params are only for the selected tool.'
       : '- Call one tool. Use ordinary assistant text for progress/explanation, and tool params only for the selected tool.',
-    browserChatMode ? '- Browser chat: when the user can be answered from current evidence, output normal Chinese Markdown text and call no tool.' : '',
     visualMode
       ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
       : '- DOM action reason must mention the current full-DOM id/text, or the chosen findByText locatorId plus matched text when using clickLocator.',
@@ -3146,27 +3180,17 @@ function browserChatRequirement(input: {
     .map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${concise(message.content, 900)}`)
     .join('\n');
   return [
-    'Browser chat mode. This is not a fixed test case.',
-    'The user is having a live conversation with you and expects you to operate the browser from the current page state.',
+    'Browser chat mode: live conversation, not a fixed test case.',
     `Latest user message: ${input.instruction}`,
-    `Target URL if the user did not specify another page: ${input.targetUrl || 'about:blank'}`,
+    `Fallback target URL: ${input.targetUrl || 'about:blank'}`,
     memory ? `Conversation Memory JSON (cross-turn compact state; prefer the latest user message and live page evidence if anything conflicts):\n${memory}` : '',
     history ? `Recent raw conversation window:\n${history}` : '',
     '',
-    'Work style:',
-    '- Follow the latest user message first, while preserving useful context from the conversation.',
-    '- If the previous assistant message says the browser-chat browser step limit was reached, treat its progress summary plus RunState/Working Memory as authoritative continuation context; do not restart from the first step.',
-    '- If browser work is needed, take concrete browser actions instead of only describing what to do.',
-    '- If the user asks a question about the current page, inspect the page and answer from evidence.',
-    '- If the user asks you to continue after manual login/captcha/security work, continue from the current browser state.',
+    'Browser-chat behavior:',
+    '- Follow the latest user message first; use earlier conversation only as context.',
+    '- Use browser tools only for live action or page inspection. If current evidence is enough, answer directly.',
     '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
-    '- Keep tester discipline: record visible problems, suspicious network failures, broken UI states, and why they matter.',
-    '',
-    'Final answer style:',
-    '- The final user-visible browser-chat answer is your assistant content. It must be Chinese Markdown, not plain inline text.',
-    '- Use short paragraphs and Markdown bullets or numbered lists with line breaks. Do not cram numbered items into one paragraph.',
-    '- If the latest user message can be answered from current evidence, return the Markdown answer directly and call no tool.',
-    '- Never include JSON, fenced JSON, tool parameters, candidate ids, coordinates, screenshot paths, or status objects in assistant text.',
+    '- Final visible answer must be Chinese Markdown. Do not include JSON, tool parameters, candidate ids, coordinates, or screenshot paths.',
   ].filter(Boolean).join('\n');
 }
 
@@ -3202,10 +3226,7 @@ function createInteractiveBrowserTestCase(input: {
       browserMode: input.mode || 'default',
       isMarked: true,
       userRequirement: requirement,
-      systemPrompt: [
-        'This is an interactive browser chat. Do not assume a fixed test-case script; operate from the live page and answer the latest user message in Chinese.',
-        input.skillContext,
-      ].filter(Boolean).join('\n\n'),
+      systemPrompt: input.skillContext || '',
       preconditions: [],
       testData: {},
       steps: [],
