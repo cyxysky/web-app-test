@@ -1,6 +1,6 @@
 import type { ModelProvider } from '@/server/ai/schemas/test-case.schema';
 
-export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'debug';
+export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'debug';
 
 export type ModelProviderDefinition = {
   value: ModelProvider;
@@ -16,7 +16,7 @@ export type RuntimeEnvDefinition = {
   key: string;
   label: string;
   description: string;
-  tab: Exclude<SettingsTab, 'general' | 'model'>;
+  tab: Exclude<SettingsTab, 'general' | 'model' | 'skills'>;
   defaultValue: string;
   control: 'boolean' | 'number' | 'select' | 'text' | 'secret' | 'textarea';
   options?: Array<{ label: string; value: string }>;
@@ -39,7 +39,6 @@ export const modelProviderDefinitions: ModelProviderDefinition[] = [
     defaultBaseURL: 'http://localhost:1234/v1',
   },
   { value: 'google', label: 'Google Gemini API', defaultModel: 'gemini-3-flash-preview', keyLabel: 'Google 访问密钥' },
-  { value: 'gemini', label: 'Gemini CLI', defaultModel: 'gemini-3-flash-preview', keyLabel: 'Gemini CLI 使用本地登录，无需 Key', localAuth: true },
   { value: 'codex', label: 'Codex CLI', defaultModel: 'gpt-5.5', keyLabel: 'Codex CLI 使用本地登录，无需 Key', localAuth: true },
   { value: 'anthropic', label: 'Anthropic', defaultModel: 'claude-sonnet-4-5', keyLabel: 'Anthropic 访问密钥', baseUrlLabel: 'Anthropic 服务地址' },
   { value: 'deepseek', label: 'DeepSeek', defaultModel: 'deepseek-v4-flash', keyLabel: 'DeepSeek 访问密钥' },

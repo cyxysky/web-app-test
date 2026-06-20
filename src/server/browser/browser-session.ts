@@ -37,6 +37,7 @@ export type BrowserSessionOptions = {
   runId?: string;
   tabGroupTitle?: string;
   preferExistingPage?: boolean;
+  browserProfileKey?: string;
 };
 
 /**
@@ -368,6 +369,20 @@ export type BrowserTabSnapshot = {
   groupId: string;
 };
 
+export type BrowserScreencastFrame = {
+  data: string;
+  contentType: 'image/jpeg';
+  capturedAt: string;
+  url: string;
+  tabs: BrowserTabSnapshot[];
+  viewport: { width: number; height: number };
+  metadata?: unknown;
+};
+
+export type BrowserScreencastHandle = {
+  stop: () => Promise<void>;
+};
+
 type NativeTabGroupPage = {
   tabId: number;
   url: string;
@@ -489,7 +504,13 @@ function isBlankPage(page: Page) {
 }
 
 function isBlankBrowserUrlLike(url: string) {
-  return !url || url === 'about:blank' || /^(about:newtab|chrome:\/\/new-tab-page|edge:\/\/newtab)/i.test(url);
+  return !url
+    || url === 'about:blank'
+    || /^(about:newtab|chrome:\/\/new-tab-page|edge:\/\/newtab)/i.test(url)
+    || (
+      /^data:text\/html/i.test(url)
+      && /data-webpilot-embedded-browser|WebPilot(?:%20|\+)Embedded(?:%20|\+)Browser|WebPilot embedded browser/i.test(url)
+    );
 }
 
 function normalizeTabGroupTitle(value?: string) {
@@ -2299,26 +2320,39 @@ export class BrowserSession {
     const forceBundledBrowser = process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !electronEmbeddedBrowserEnabled();
     const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
     const executablePath = process.env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
-    const cdpEndpoint = forceBundledBrowser
+    const browserProfileKey = this.options.browserProfileKey ? normalizePageGroupId(this.options.browserProfileKey) : '';
+    const rawCdpEndpoint = forceBundledBrowser
       ? ''
       : process.env.BROWSER_CDP_ENDPOINT?.trim()
         || process.env.BROWSER_CONNECT_CDP_ENDPOINT?.trim()
         || process.env.CHROME_REMOTE_DEBUGGING_URL?.trim()
         || electronEmbeddedBrowserCdpEndpoint()
         || '';
-    const requestedUserDataDir = process.env.BROWSER_USER_DATA_DIR?.trim()
+    const cdpEndpoint = browserProfileKey && rawCdpEndpoint
+      ? /\{(?:browserProfileKey|profileKey)\}/.test(rawCdpEndpoint)
+        ? rawCdpEndpoint
+          .replace(/\{browserProfileKey\}/g, encodeURIComponent(browserProfileKey))
+          .replace(/\{profileKey\}/g, encodeURIComponent(browserProfileKey))
+        : ''
+      : rawCdpEndpoint;
+    const configuredUserDataDir = process.env.BROWSER_USER_DATA_DIR?.trim()
       || process.env.AI_WEB_TEST_BROWSER_PROFILE_DIR?.trim()
       || '';
-    const useSharedBrowserTabs = sharedBrowserTabsEnabled() && !electronEmbeddedBrowserEnabled();
-    const autoTabGroupProfileKey = useSharedBrowserTabs ? 'shared' : this.pageGroupId;
-    const autoTabGroupProfileDir = sessionTabGrouperEnabled(headless) && !cdpEndpoint && !requestedUserDataDir
+    const requestedUserDataDir = configuredUserDataDir && browserProfileKey
+      ? path.join(configuredUserDataDir, browserProfileKey)
+      : configuredUserDataDir;
+    const tabGrouperEnabled = sessionTabGrouperEnabled(headless);
+    const useSharedBrowserTabs = sharedBrowserTabsEnabled() && !electronEmbeddedBrowserEnabled() && !browserProfileKey;
+    const autoTabGroupProfileKey = browserProfileKey || (useSharedBrowserTabs ? 'shared' : this.pageGroupId);
+    const autoTabGroupProfileDir = tabGrouperEnabled && !cdpEndpoint && !requestedUserDataDir
       ? sessionTabGrouperProfileDir(autoTabGroupProfileKey)
       : '';
-    const autoTabGroupDebugPort = autoTabGroupProfileDir ? sessionTabGrouperDebugPort(autoTabGroupProfileKey) : undefined;
+    const autoTabGroupDebugPort = (autoTabGroupProfileDir || (tabGrouperEnabled && browserProfileKey && !cdpEndpoint))
+      ? sessionTabGrouperDebugPort(autoTabGroupProfileKey)
+      : undefined;
     const autoTabGroupCdpEndpoint = cdpEndpointForPort(autoTabGroupDebugPort);
     const userDataDir = requestedUserDataDir || autoTabGroupProfileDir;
-    if (autoTabGroupProfileDir) await mkdir(autoTabGroupProfileDir, { recursive: true });
-    const tabGrouperEnabled = sessionTabGrouperEnabled(headless);
+    if (userDataDir) await mkdir(userDataDir, { recursive: true });
     const launchOptions: LaunchOptions = {
       headless,
       slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
@@ -2781,6 +2815,75 @@ export class BrowserSession {
       active: page === active,
       groupId: this.pageGroupId,
     }));
+  }
+
+  async startScreencast(options: {
+    onActivePageChanged?: () => void;
+    everyNthFrame?: number;
+    onError?: (error: unknown) => void;
+    onFrame: (frame: BrowserScreencastFrame) => void | Promise<void>;
+    quality?: number;
+  }): Promise<BrowserScreencastHandle> {
+    const page = this.activePage;
+    const client = await page.context().newCDPSession(page);
+    const rawQuality = Number(options.quality ?? process.env.BROWSER_PREVIEW_JPEG_QUALITY ?? 62);
+    const quality = Math.min(90, Math.max(35, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 62)));
+    const rawEveryNthFrame = Number(options.everyNthFrame ?? process.env.BROWSER_SCREENCAST_EVERY_NTH_FRAME ?? 1);
+    const everyNthFrame = Math.min(8, Math.max(1, Math.floor(Number.isFinite(rawEveryNthFrame) ? rawEveryNthFrame : 1)));
+    let stopped = false;
+    const onFrame = (event: {
+      data?: string;
+      metadata?: { deviceHeight?: number; deviceWidth?: number };
+      sessionId?: number;
+    }) => {
+      if (event.sessionId !== undefined) {
+        void client.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
+      }
+      if (stopped || !event.data) return;
+      const activePage = this.page && !this.page.isClosed() ? this.page : this.sessionPages()[0];
+      if (!activePage || activePage !== page || page.isClosed()) {
+        stopped = true;
+        void Promise.resolve(options.onActivePageChanged?.())
+          .finally(() => {
+            void client.send('Page.stopScreencast').catch(() => undefined);
+            void client.detach().catch(() => undefined);
+          });
+        return;
+      }
+      const fallback = page.viewportSize() || { width: 1280, height: 720 };
+      const width = Math.floor(Number(event.metadata?.deviceWidth) || fallback.width);
+      const height = Math.floor(Number(event.metadata?.deviceHeight) || fallback.height);
+      void Promise.resolve(options.onFrame({
+        capturedAt: new Date().toISOString(),
+        contentType: 'image/jpeg',
+        data: event.data,
+        metadata: event.metadata,
+        tabs: this.getTabsSnapshot(),
+        url: page.url(),
+        viewport: { width, height },
+      })).catch((error) => options.onError?.(error));
+    };
+    client.on('Page.screencastFrame', onFrame);
+    try {
+      await client.send('Page.startScreencast', {
+        everyNthFrame,
+        format: 'jpeg',
+        quality,
+      });
+    } catch (error) {
+      (client as any).off?.('Page.screencastFrame', onFrame);
+      await client.detach().catch(() => undefined);
+      throw error;
+    }
+    return {
+      stop: async () => {
+        if (stopped) return;
+        stopped = true;
+        (client as any).off?.('Page.screencastFrame', onFrame);
+        await client.send('Page.stopScreencast').catch(() => undefined);
+        await client.detach().catch(() => undefined);
+      },
+    };
   }
 
   private async closeOwnedPages() {

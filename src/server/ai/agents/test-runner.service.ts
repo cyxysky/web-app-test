@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import sharp from 'sharp';
+import { withSkillContext } from '@/server/ai/agents/skill-context';
 import { executeTestCase } from '@/server/ai/agents/target-executor.agent';
 import type { RecordedFlowStep, StepExecutionResult, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
@@ -320,6 +321,7 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
   store.applyRuntimeEnv();
   const testCase = store.getTestCase(testCaseId);
   if (!testCase) throw new Error('Test case not found');
+  const runnableTestCase = withSkillContext(testCase, store.getSkills(testCase.content.skillIds || []));
   const existingRun = store.getRun(runId);
   const initialSteps = options.continueExisting ? existingRun?.result?.steps || [] : [];
   store.updateTestCaseStatus(testCaseId, 'running');
@@ -339,7 +341,7 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
     },
   });
 
-  const execution = await executeTestCase(testCase, runId, {
+  const execution = await executeTestCase(runnableTestCase, runId, {
     initialSteps,
     recordedFlow: options.recordedFlow || (options.continueExisting ? undefined : testCase.content.recordedFlow),
     onProgress: (step) => {

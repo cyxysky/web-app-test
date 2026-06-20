@@ -8,16 +8,21 @@ type RouteContext = {
   params: Promise<{ sessionId: string }>;
 };
 
-export async function GET(_request: Request, context: RouteContext) {
+function requestUserId(request: Request) {
+  const url = new URL(request.url);
+  return (url.searchParams.get('userId') || url.searchParams.get('qzUserId') || '').trim();
+}
+
+export async function GET(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
-  const session = getBrowserChatSession(sessionId);
+  const session = getBrowserChatSession(sessionId, requestUserId(request));
   if (!session) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
   return noStoreJson({ session });
 }
 
-export async function DELETE(_request: Request, context: RouteContext) {
+export async function DELETE(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
-  const session = await closeBrowserChatSession(sessionId);
+  const session = await closeBrowserChatSession(sessionId, requestUserId(request));
   if (!session) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
   return noStoreJson({ session });
 }

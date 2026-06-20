@@ -41,6 +41,15 @@ export const taskFrameSchema = z.object({
   version: z.number().optional(),
 });
 
+export const skillContentSchema = z.object({
+  whenToUse: z.array(z.string()).default([]),
+  workflow: z.array(z.string()).default([]),
+  reusablePatterns: z.array(z.string()).default([]),
+  cautions: z.array(z.string()).default([]),
+  verification: z.array(z.string()).default([]),
+  sourceSummary: z.string().optional(),
+});
+
 export const testCaseContentSchema = z.object({
   title: z.string(),
   description: z.string(),
@@ -58,11 +67,13 @@ export const testCaseContentSchema = z.object({
   recordedFlow: z.array(recordedFlowStepSchema).optional(),
   defaultRecordedRunId: z.string().optional(),
   taskFrame: taskFrameSchema.optional(),
+  skillIds: z.array(z.string()).optional(),
 });
 
 export type TestStep = z.infer<typeof testStepSchema>;
 export type RecordedFlowStep = z.infer<typeof recordedFlowStepSchema>;
 export type TestCaseContent = z.infer<typeof testCaseContentSchema>;
+export type SkillContent = z.infer<typeof skillContentSchema>;
 
 export type TestCaseRecord = {
   id: string;
@@ -75,6 +86,22 @@ export type TestCaseRecord = {
   content: TestCaseContent;
   imageNames: string[];
   strategyMemory?: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SkillRecord = {
+  id: string;
+  title: string;
+  description: string;
+  tags: string[];
+  triggerPhrases: string[];
+  content: SkillContent;
+  sourceRunId?: string;
+  sourceTestCaseId?: string;
+  sourceSessionId?: string;
+  status: 'draft' | 'ready' | 'disabled';
+  version: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -367,7 +394,6 @@ export type ModelProvider =
   | 'deepinfra'
   | 'deepseek'
   | 'fireworks'
-  | 'gemini'
   | 'google'
   | 'google-vertex'
   | 'groq'

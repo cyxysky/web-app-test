@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { generateObject, generateText, stepCountIs, tool } from 'ai';
+import { generateText, stepCountIs, tool } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
 import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
@@ -129,6 +129,7 @@ const codexRuntimeObjectSchema = z.object({
     sameInterfaceGroup: z.string().nullable().optional(),
   }).describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason.'),
 });
+type CodexRuntimeObject = z.infer<typeof codexRuntimeObjectSchema>;
 
 const manualIssuePattern = new RegExp(
   [
@@ -438,19 +439,6 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
   }
 }
 
-async function generateObjectWithTimeout(options: Parameters<typeof generateObject>[0]) {
-  const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
-  const timeoutController = new AbortController();
-  const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
-  const upstream = options.abortSignal;
-  const abortSignal = upstream ? AbortSignal.any([upstream, timeoutController.signal]) : timeoutController.signal;
-  try {
-    return await generateObject({ ...options, abortSignal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 // 从模型回复中提取 JSON，兼容模型把 JSON 包在 markdown 代码块里的情况。
 function extractJson(text: string) {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -462,6 +450,38 @@ function extractJson(text: string) {
 }
 
 // 将测试需求富文本转为纯文本，作为执行器理解目标的主输入。
+function recordFromUnknown(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function codexRuntimeObjectFromText(text: string, fallbackType: 'reportState' = 'reportState'): CodexRuntimeObject {
+  let raw: Record<string, unknown> | undefined;
+  try {
+    raw = recordFromUnknown(extractJson(text));
+  } catch {
+    const fallbackText = trimDebugText((text || '').trim() || 'Codex did not return a valid action JSON.', 2000);
+    return {
+      type: fallbackType,
+      message: fallbackText,
+      params: {
+        actual: fallbackText,
+        status: 'blocked',
+        done: true,
+      },
+    };
+  }
+
+  const rawRecord = raw || {};
+  const params = recordFromUnknown(rawRecord.params);
+  const candidate = {
+    type: typeof rawRecord.type === 'string' && rawRecord.type.trim() ? rawRecord.type.trim() : fallbackType,
+    message: typeof rawRecord.message === 'string' && rawRecord.message.trim() ? rawRecord.message.trim() : undefined,
+    params,
+  };
+  const parsed = codexRuntimeObjectSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : candidate as CodexRuntimeObject;
+}
+
 function requirementOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.userRequirement || testCase.description) || testCase.description || testCase.title;
 }
@@ -2544,18 +2564,18 @@ async function executeRuntimeStep(input: {
       const attachedImagePaths = [...visualPaths, ...userReferenceImages.filter((item) => item.image).map((item) => item.imagePath)];
       aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, systemPrompt: requestSystemPrompt, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
       lastAiRequest = aiRequest;
-      return [
-        ...(requestSystemPrompt ? [{ role: 'system' as const, content: requestSystemPrompt }] : []),
-        { role: 'user' as const, content },
-      ];
+      return {
+        system: requestSystemPrompt || undefined,
+        messages: [{ role: 'user' as const, content }],
+      };
     }
 
     if (codexMode) {
       const aiStartedAt = Date.now();
-      const messages = await prepareStep(0);
+      const { system, messages } = await prepareStep(0);
       await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision.', details: { provider: getModelSettings().provider, model: getModelSettings().model, codexObjectMode: true } });
-      const result = await generateObjectWithTimeout({ model: getModel(), messages, schema: codexRuntimeObjectSchema, temperature: 0.1, maxRetries: 0, abortSignal });
-      const object = result.object as z.infer<typeof codexRuntimeObjectSchema>;
+      const result = await generateTextWithTimeout({ model: getModel(), system, messages, temperature: 0.1, maxRetries: 0, abortSignal });
+      const object = codexRuntimeObjectFromText(result.text);
       const execution = await executeCodexRuntimeObject({
         session,
         targetUrl: testCase.targetUrl,
@@ -2592,10 +2612,10 @@ async function executeRuntimeStep(input: {
       const aiStartedAt = Date.now();
       const traceStart = traces.length;
       try {
-        const messages = await prepareStep(turnIndex);
+        const { system, messages } = await prepareStep(turnIndex);
         await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision. turn ' + (turnIndex + 1) + '/' + maxTurns + '.', details: { provider: getModelSettings().provider, model: getModelSettings().model, turnIndex: turnIndex + 1, maxTurns } });
         const result = await generateTextWithTimeout({
-          model: getModel(), messages,
+          model: getModel(), system, messages,
           tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
             workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
             await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });

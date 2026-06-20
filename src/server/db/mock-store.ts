@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { defaultModelByProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
-import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, SkillContent, SkillRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { sleepSync, writeJsonFileAtomic } from '@/server/storage/atomic-json';
 import { storeFilePath } from '@/server/storage/paths';
@@ -66,6 +66,7 @@ type StoreData = {
   testCases: TestCaseRecord[];
   runs: TestRunRecord[];
   groups?: TestGroupRecord[];
+  skills?: SkillRecord[];
   runtimeEnv?: RuntimeEnvRecord[];
   modelConfig?: ModelConfigRecord;
   schedules?: RunScheduleRecord[];
@@ -102,8 +103,7 @@ function normalizeModelProvider(value: string): ModelProvider {
   if (provider === 'deepinfra') return 'deepinfra';
   if (provider === 'deepseek') return 'deepseek';
   if (provider === 'fireworks' || provider === 'fireworks-ai') return 'fireworks';
-  if (provider === 'gemini' || provider === 'gemini-cli') return 'gemini';
-  if (provider === 'google') return 'google';
+  if (provider === 'gemini' || provider === 'gemini-cli' || provider === 'google') return 'google';
   if (provider === 'google-vertex' || provider === 'vertex' || provider === 'vertex-ai') return 'google-vertex';
   if (provider === 'groq') return 'groq';
   if (provider === 'huggingface' || provider === 'hugging-face') return 'huggingface';
@@ -138,7 +138,6 @@ function modelApiKeyEnv(provider: ModelProvider) {
     deepinfra: 'DEEPINFRA_API_KEY',
     deepseek: 'DEEPSEEK_API_KEY',
     fireworks: 'FIREWORKS_API_KEY',
-    gemini: '',
     google: 'GOOGLE_GENERATIVE_AI_API_KEY',
     'google-vertex': 'GOOGLE_VERTEX_API_KEY',
     groq: 'GROQ_API_KEY',
@@ -169,7 +168,6 @@ function modelBaseUrlEnv(provider: ModelProvider) {
     deepinfra: 'DEEPINFRA_BASE_URL',
     deepseek: '',
     fireworks: 'FIREWORKS_BASE_URL',
-    gemini: '',
     google: '',
     'google-vertex': 'GOOGLE_VERTEX_BASE_URL',
     groq: 'GROQ_BASE_URL',
@@ -312,10 +310,32 @@ function writeData(data: StoreData) {
   writeJsonFileAtomic(storePath, data);
 }
 
+function normalizeSkillContent(content?: Partial<SkillContent>): SkillContent {
+  return {
+    whenToUse: (content?.whenToUse || []).map((item) => item.trim()).filter(Boolean).slice(0, 12),
+    workflow: (content?.workflow || []).map((item) => item.trim()).filter(Boolean).slice(0, 18),
+    reusablePatterns: (content?.reusablePatterns || []).map((item) => item.trim()).filter(Boolean).slice(0, 16),
+    cautions: (content?.cautions || []).map((item) => item.trim()).filter(Boolean).slice(0, 12),
+    verification: (content?.verification || []).map((item) => item.trim()).filter(Boolean).slice(0, 12),
+    sourceSummary: content?.sourceSummary?.trim() || undefined,
+  };
+}
+
+function normalizeSkillRecord(record: SkillRecord): SkillRecord {
+  return {
+    ...record,
+    tags: (record.tags || []).map((item) => item.trim()).filter(Boolean).slice(0, 12),
+    triggerPhrases: (record.triggerPhrases || []).map((item) => item.trim()).filter(Boolean).slice(0, 16),
+    content: normalizeSkillContent(record.content),
+    status: record.status || 'ready',
+    version: record.version || 1,
+  };
+}
+
 // 读取本地存储数据；文件不存在时初始化默认数据。
 function readData(): StoreData {
   if (!existsSync(storePath)) {
-    const seed: StoreData = { testCases: [seedRecord], runs: [], groups: [], runtimeEnv: [], schedules: [] };
+    const seed: StoreData = { testCases: [seedRecord], runs: [], groups: [], skills: [], runtimeEnv: [], schedules: [] };
     writeData(seed);
     return seed;
   }
@@ -327,6 +347,7 @@ function readData(): StoreData {
       return {
         ...data,
         groups: data.groups || [],
+        skills: (data.skills || []).map(normalizeSkillRecord),
         runtimeEnv: data.runtimeEnv || [],
         modelConfig: data.modelConfig,
         schedules: data.schedules || [],
@@ -347,6 +368,75 @@ export const store = {
   // 列出全部测试分组。
   listGroups() {
     return readData().groups || [];
+  },
+  listSkills(query?: string) {
+    const normalizedQuery = (query || '').trim().toLowerCase();
+    const skills = (readData().skills || [])
+      .map(normalizeSkillRecord)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    if (!normalizedQuery) return skills;
+    return skills.filter((skill) => [
+      skill.title,
+      skill.description,
+      ...skill.tags,
+      ...skill.triggerPhrases,
+    ].some((value) => value.toLowerCase().includes(normalizedQuery)));
+  },
+  getSkill(skillId: string) {
+    const skill = (readData().skills || []).find((item) => item.id === skillId);
+    return skill ? normalizeSkillRecord(skill) : undefined;
+  },
+  getSkills(skillIds: string[] = []) {
+    const byId = new Map((readData().skills || []).map((skill) => [skill.id, normalizeSkillRecord(skill)]));
+    return skillIds.map((skillId) => byId.get(skillId)).filter((item): item is SkillRecord => Boolean(item));
+  },
+  upsertSkill(input: {
+    id?: string;
+    title: string;
+    description: string;
+    tags?: string[];
+    triggerPhrases?: string[];
+    content: SkillContent;
+    sourceRunId?: string;
+    sourceTestCaseId?: string;
+    sourceSessionId?: string;
+    status?: SkillRecord['status'];
+  }) {
+    const data = readData();
+    const timestamp = now();
+    const existing = input.id ? (data.skills || []).find((item) => item.id === input.id) : undefined;
+    const skill = normalizeSkillRecord({
+      id: existing?.id || id('skl'),
+      title: input.title.trim() || existing?.title || 'Runtime Skill',
+      description: input.description.trim() || existing?.description || '',
+      tags: input.tags || existing?.tags || [],
+      triggerPhrases: input.triggerPhrases || existing?.triggerPhrases || [],
+      content: normalizeSkillContent(input.content),
+      sourceRunId: input.sourceRunId || existing?.sourceRunId,
+      sourceTestCaseId: input.sourceTestCaseId || existing?.sourceTestCaseId,
+      sourceSessionId: input.sourceSessionId || existing?.sourceSessionId,
+      status: input.status || existing?.status || 'ready',
+      version: existing ? existing.version + 1 : 1,
+      createdAt: existing?.createdAt || timestamp,
+      updatedAt: timestamp,
+    });
+    data.skills = existing
+      ? (data.skills || []).map((item) => (item.id === skill.id ? skill : item))
+      : [skill, ...(data.skills || [])];
+    writeData(data);
+    return skill;
+  },
+  deleteSkill(skillId: string) {
+    const data = readData();
+    const before = (data.skills || []).length;
+    data.skills = (data.skills || []).filter((skill) => skill.id !== skillId);
+    data.testCases = data.testCases.map((record) => (
+      record.content.skillIds?.includes(skillId)
+        ? { ...record, content: { ...record.content, skillIds: record.content.skillIds.filter((id) => id !== skillId) }, updatedAt: now() }
+        : record
+    ));
+    writeData(data);
+    return before !== data.skills.length;
   },
   // 列出保存到网页配置里的运行时环境变量。
   listRuntimeEnv() {

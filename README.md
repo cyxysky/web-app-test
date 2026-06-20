@@ -76,3 +76,5 @@ For unattended packaged regression runs, keep `HEADLESS_BROWSER=true`. For accou
 
 $env:WEBPILOT_ELECTRON_SERVER_URL="http://127.0.0.1:3000"
 npx electron .
+
+gpt-5.3-codex-spark

@@ -5,8 +5,13 @@ import { noStoreJson } from '@/server/http/no-store-response';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-export async function GET() {
-  return noStoreJson({ sessions: listBrowserChatSessions() });
+function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
+  const value = body?.userId ?? body?.qzUserId ?? request.nextUrl.searchParams.get('userId') ?? request.nextUrl.searchParams.get('qzUserId');
+  return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+}
+
+export async function GET(request: NextRequest) {
+  return noStoreJson({ sessions: listBrowserChatSessions({ userId: requestUserId(request) }) });
 }
 
 export async function POST(request: NextRequest) {
@@ -16,6 +21,7 @@ export async function POST(request: NextRequest) {
       targetUrl: typeof body.targetUrl === 'string' ? body.targetUrl : '',
       mode: body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers',
       title: typeof body.title === 'string' ? body.title : undefined,
+      userId: requestUserId(request, body),
     });
     return noStoreJson({ session });
   } catch (error) {

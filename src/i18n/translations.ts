@@ -36,7 +36,6 @@ const en: Record<string, string> = {
   '仅作用于当前选中的服务商。': 'Only applies to the selected provider.',
   '访问密钥': 'Access key',
   '本地登录，无需 Key': 'Local login, no key required',
-  'Gemini CLI 使用本地登录，无需 Key': 'Gemini CLI uses local login, no key required',
   'Codex CLI 使用本地登录，无需 Key': 'Codex CLI uses local login, no key required',
   'LM Studio API Key（可选）': 'LM Studio API Key (optional)',
   'LM Studio 服务地址': 'LM Studio service URL',

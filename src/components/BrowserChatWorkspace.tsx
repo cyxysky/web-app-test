@@ -56,6 +56,7 @@ import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import type {
   RunScheduleRecord,
+  SkillRecord,
   StepExecutionResult,
   TestCaseRecord,
   TestGroupRecord,
@@ -69,6 +70,7 @@ type BrowserChatMessage = {
   updatedAt?: string;
   clientMessageId?: string;
   attachments?: BrowserChatAttachment[];
+  skillIds?: string[];
   stepIndexes?: number[];
   activity?: {
     phase: string;
@@ -198,22 +200,14 @@ type BrowserChatLogIndex = {
 };
 
 function statusLabel(status: string) {
-  return ({
-    blocked: '阻塞',
-    closed: '已结束',
-    error: '异常',
-    failed: '失败',
-    idle: '空闲',
-    interrupted: '已中断',
-    passed: '完成',
-    running: '执行中',
-  } as Record<string, string>)[status] || status;
+  return status === 'running' ? '进行中' : '已完成';
 }
 
 function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'model') return <Bot size={15} />;
   if (tab === 'browser') return <PanelLeft size={15} />;
   if (tab === 'runtime') return <SquareTerminal size={15} />;
+  if (tab === 'skills') return <Braces size={15} />;
   if (tab === 'debug') return <Bug size={15} />;
   return <SlidersHorizontal size={15} />;
 }
@@ -352,8 +346,8 @@ function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
 }
 
 function toolStatusLabel(tool: BrowserChatToolCall) {
-  if (tool.ok === false) return '失败';
   if (tool.ok === true) return '完成';
+  if (tool.ok === false) return '完成';
   return '运行中';
 }
 
@@ -697,7 +691,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
             {tool.reason ? <p className="browser-chat-tool-reason">{tool.reason}</p> : null}
             <button
               aria-label={`${displayText}，${status}`}
-              className={`browser-chat-tool-card${tool.ok === false ? ' is-failed' : ''}${tool.ok === undefined ? ' is-running' : ''}`}
+              className={`browser-chat-tool-card${tool.ok === undefined ? ' is-running' : ''}`}
               onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
               title={`${displayText} · ${status}`}
               type="button"
@@ -736,13 +730,10 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const finalText = message.content;
   const seenTexts = new Set<string>();
   const toolCount = steps.reduce((count, step) => count + (step.tools || []).length, 0);
-  const failedToolCount = steps.reduce((count, step) => (
-    count + (step.tools || []).filter((tool) => tool.ok === false).length
-  ), 0);
   const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
   const shouldShowStepTimeline = running || toolCount > 0;
   const toolSummary = toolCount
-    ? `${running ? '已运行' : '已运行'} ${toolCount} 个工具${failedToolCount ? `，${failedToolCount} 条失败` : ''}`
+    ? `${running ? '正在进行' : '已完成'} ${toolCount} 个工具调用`
     : waitingForTool
       ? '正在准备工具'
       : '暂无工具';
@@ -767,7 +758,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
         <div className="browser-chat-tool-stack">
           <button
             aria-expanded={toolsExpanded}
-            className={`browser-chat-tool-summary${toolsExpanded ? ' is-expanded' : ''}${failedToolCount ? ' has-failed' : ''}`}
+            className={`browser-chat-tool-summary${toolsExpanded ? ' is-expanded' : ''}`}
             onClick={() => setToolsExpanded((value) => !value)}
             type="button"
           >
@@ -819,7 +810,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   totalStepCount: number;
 }) {
   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
-  const operationLabel = operationRunning ? (item.activity?.label || '处理中') : statusLabel(item.status || 'passed');
+  const operationLabel = operationRunning ? '进行中' : '已完成';
   const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
   const exportingDisabled = Boolean(exportingMessageId) || exportingSelectedMessages;
 
@@ -979,6 +970,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
 
 const BrowserChatComposer = memo(function BrowserChatComposer({
   attachments,
+  availableSkills,
   busy,
   currentBusy,
   imageInputRef,
@@ -997,6 +989,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   uploadingImage,
 }: {
   attachments: BrowserChatAttachment[];
+  availableSkills: SkillRecord[];
   busy: boolean;
   currentBusy: boolean;
   imageInputRef: RefObject<HTMLInputElement | null>;
@@ -1008,25 +1001,310 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   onModeChange: (mode: BrowserChatMode) => void;
   onPreviewAttachment: (attachment: BrowserChatAttachment) => void;
   onRemoveAttachment: (id: string) => void;
-  onSubmitMessage: (content: string) => Promise<boolean>;
+  onSubmitMessage: (content: string, skillIds: string[]) => Promise<boolean>;
   onUploadImages: (files: File[]) => void | Promise<void>;
   resetToken: number;
   showStop: boolean;
   uploadingImage: boolean;
 }) {
   const { t } = useI18n();
+  const editorRef = useRef<HTMLDivElement | null>(null);
   const [draft, setDraft] = useState('');
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [dismissedSlashDraft, setDismissedSlashDraft] = useState('');
+  const [activeSkillIndex, setActiveSkillIndex] = useState(0);
 
   useEffect(() => {
     setDraft('');
+    setSelectedSkillIds([]);
+    setDismissedSlashDraft('');
+    setActiveSkillIndex(0);
+    if (editorRef.current) editorRef.current.innerHTML = '';
   }, [resetToken]);
 
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || typeof MutationObserver === 'undefined') return undefined;
+    let frame = 0;
+    const observer = new MutationObserver(() => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        syncEditorState();
+      });
+    });
+    observer.observe(editor, { childList: true, characterData: true, subtree: true });
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    const readySkillIds = new Set(availableSkills.filter((skill) => skill.status === 'ready').map((skill) => skill.id));
+    let removed = false;
+    editorRef.current?.querySelectorAll<HTMLElement>('[data-skill-id]').forEach((node) => {
+      if (!readySkillIds.has(node.dataset.skillId || '')) {
+        node.remove();
+        removed = true;
+      }
+    });
+    if (removed) syncEditorState();
+    setSelectedSkillIds((current) => current.filter((skillId) => readySkillIds.has(skillId)));
+  }, [availableSkills]);
+
+  const selectedSkills = useMemo(() => (
+    selectedSkillIds
+      .map((skillId) => availableSkills.find((skill) => skill.id === skillId))
+      .filter((skill): skill is SkillRecord => Boolean(skill))
+  ), [availableSkills, selectedSkillIds]);
+  const composerText = useMemo(() => draft.replace(/\s+/g, ' ').trim(), [draft]);
+  const slashMatch = draft.match(/(?:^|\s)\/([^\s/]*)$/);
+  const skillQuery = slashMatch?.[1]?.toLowerCase() || '';
+  const skillMenuOpen = Boolean(slashMatch && dismissedSlashDraft !== draft);
+  const skillSuggestions = useMemo(() => {
+    if (!skillMenuOpen) return [];
+    const selected = new Set(selectedSkillIds);
+    return availableSkills
+      .filter((skill) => skill.status === 'ready' && !selected.has(skill.id))
+      .filter((skill) => {
+        if (!skillQuery) return true;
+        return [
+          skill.title,
+          skill.description,
+          ...skill.tags,
+          ...skill.triggerPhrases,
+        ].some((value) => value.toLowerCase().includes(skillQuery));
+      })
+      .slice(0, 8);
+  }, [availableSkills, selectedSkillIds, skillMenuOpen, skillQuery]);
+
+  useEffect(() => {
+    setActiveSkillIndex(0);
+  }, [skillMenuOpen, skillQuery, selectedSkillIds.length]);
+
+  useEffect(() => {
+    if (activeSkillIndex >= skillSuggestions.length) setActiveSkillIndex(Math.max(0, skillSuggestions.length - 1));
+  }, [activeSkillIndex, skillSuggestions.length]);
+
   const submitDraft = useCallback(async () => {
-    const content = draft.trim();
-    if ((!content && !attachments.length) || currentBusy || loading || uploadingImage) return;
-    const sent = await onSubmitMessage(content);
-    if (sent) setDraft('');
-  }, [attachments.length, currentBusy, draft, loading, onSubmitMessage, uploadingImage]);
+    const content = composerText;
+    if ((!content && !attachments.length && !selectedSkillIds.length) || currentBusy || loading || uploadingImage) return;
+    const sent = await onSubmitMessage(content, selectedSkillIds);
+    if (sent) {
+      setDraft('');
+      setSelectedSkillIds([]);
+      if (editorRef.current) editorRef.current.innerHTML = '';
+    }
+  }, [attachments.length, composerText, currentBusy, loading, onSubmitMessage, selectedSkillIds, uploadingImage]);
+
+  function chooseSkill(skill: SkillRecord) {
+    insertSkillToken(skill);
+    setSelectedSkillIds((current) => current.includes(skill.id) ? current : [...current, skill.id]);
+    setDismissedSlashDraft('');
+    requestAnimationFrame(() => editorRef.current?.focus());
+  }
+
+  function removeSkill(skillId: string) {
+    editorRef.current?.querySelectorAll<HTMLElement>(`[data-skill-id="${CSS.escape(skillId)}"]`).forEach((node) => node.remove());
+    setSelectedSkillIds((current) => current.filter((id) => id !== skillId));
+    syncEditorState();
+  }
+
+  function editorPlainText(root: HTMLElement | null) {
+    if (!root) return '';
+    const walk = (node: Node): string => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
+      if (!(node instanceof HTMLElement)) return '';
+      if (node.dataset.skillId) return ' ';
+      if (node.tagName === 'BR') return '\n';
+      return Array.from(node.childNodes).map(walk).join('');
+    };
+    return Array.from(root.childNodes).map(walk).join('').replace(/\u00A0/g, ' ');
+  }
+
+  function syncEditorState() {
+    const editor = editorRef.current;
+    const skillIds = editor
+      ? Array.from(editor.querySelectorAll<HTMLElement>('[data-skill-id]')).map((node) => node.dataset.skillId || '').filter(Boolean)
+      : [];
+    setDraft(editorPlainText(editor));
+    setSelectedSkillIds(Array.from(new Set(skillIds)));
+  }
+
+  function isSkillToken(node: Node | null): node is HTMLElement {
+    return node instanceof HTMLElement && Boolean(node.dataset.skillId);
+  }
+
+  function isBlankText(value: string) {
+    return value.replace(/\u00A0/g, ' ').trim() === '';
+  }
+
+  function setEditorSelection(container: Node, offset: number) {
+    const selection = window.getSelection();
+    if (!selection) return;
+    const maxOffset = container.nodeType === Node.TEXT_NODE
+      ? (container as Text).data.length
+      : container.childNodes.length;
+    const range = document.createRange();
+    range.setStart(container, Math.max(0, Math.min(offset, maxOffset)));
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  function clearEditorIfBlank() {
+    const editor = editorRef.current;
+    if (!editor || editor.querySelector('[data-skill-id]') || !isBlankText(editorPlainText(editor))) return false;
+    editor.innerHTML = '';
+    setEditorSelection(editor, 0);
+    return true;
+  }
+
+  function removeSkillTokenNode(token: HTMLElement, selectionTarget?: { container: Node; offset: number }) {
+    const editor = editorRef.current;
+    token.remove();
+    if (!clearEditorIfBlank()) {
+      if (selectionTarget?.container.isConnected && editor?.contains(selectionTarget.container)) {
+        setEditorSelection(selectionTarget.container, selectionTarget.offset);
+      } else if (editor) {
+        setEditorSelection(editor, editor.childNodes.length);
+      }
+    }
+    setDismissedSlashDraft('');
+    syncEditorState();
+  }
+
+  function removeAdjacentSkillByKeyboard(key: string) {
+    const editor = editorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection?.rangeCount) return false;
+    const range = selection.getRangeAt(0);
+    if (!editor.contains(range.commonAncestorContainer)) return false;
+
+    if (!range.collapsed) {
+      const fragment = range.cloneContents();
+      if (!fragment.querySelector('[data-skill-id]')) return false;
+      range.deleteContents();
+      setEditorSelection(range.startContainer, range.startOffset);
+      clearEditorIfBlank();
+      setDismissedSlashDraft('');
+      syncEditorState();
+      return true;
+    }
+
+    const container = range.startContainer;
+    const offset = range.startOffset;
+
+    if (key === 'Backspace') {
+      if (container.nodeType === Node.TEXT_NODE) {
+        const textNode = container as Text;
+        const beforeCaret = textNode.data.slice(0, offset);
+        const previous = textNode.previousSibling;
+        if (isSkillToken(previous) && isBlankText(beforeCaret)) {
+          textNode.data = textNode.data.slice(offset);
+          removeSkillTokenNode(previous, { container: textNode, offset: 0 });
+          return true;
+        }
+      } else {
+        const before = container.childNodes[offset - 1];
+        if (isSkillToken(before)) {
+          removeSkillTokenNode(before, { container, offset: offset - 1 });
+          return true;
+        }
+        if (before?.nodeType === Node.TEXT_NODE && isBlankText(before.textContent || '') && isSkillToken(before.previousSibling)) {
+          const token = before.previousSibling;
+          before.remove();
+          removeSkillTokenNode(token, { container, offset: offset - 2 });
+          return true;
+        }
+      }
+    }
+
+    if (key === 'Delete') {
+      if (container.nodeType === Node.TEXT_NODE) {
+        const textNode = container as Text;
+        const afterCaret = textNode.data.slice(offset);
+        const next = textNode.nextSibling;
+        if (isSkillToken(next) && isBlankText(afterCaret)) {
+          textNode.data = textNode.data.slice(0, offset);
+          removeSkillTokenNode(next, { container: textNode, offset });
+          return true;
+        }
+      } else {
+        const after = container.childNodes[offset];
+        if (isSkillToken(after)) {
+          removeSkillTokenNode(after, { container, offset });
+          return true;
+        }
+        if (after?.nodeType === Node.TEXT_NODE && isBlankText(after.textContent || '') && isSkillToken(after.nextSibling)) {
+          const token = after.nextSibling;
+          after.remove();
+          removeSkillTokenNode(token, { container, offset });
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  function editorRange() {
+    const editor = editorRef.current;
+    if (!editor) return undefined;
+    editor.focus();
+    const selection = window.getSelection();
+    if (selection?.rangeCount) {
+      const range = selection.getRangeAt(0);
+      if (editor.contains(range.commonAncestorContainer)) return range;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    return range;
+  }
+
+  function removeSlashTrigger(range: Range) {
+    if (!range.collapsed || range.startContainer.nodeType !== Node.TEXT_NODE) return range;
+    const node = range.startContainer as Text;
+    const before = node.data.slice(0, range.startOffset);
+    const match = before.match(/(^|\s)\/[^\s/]*$/);
+    if (!match) return range;
+    const deleteFrom = before.length - match[0].length + match[1].length;
+    node.data = `${node.data.slice(0, deleteFrom)}${node.data.slice(range.startOffset)}`;
+    const nextRange = document.createRange();
+    nextRange.setStart(node, deleteFrom);
+    nextRange.collapse(true);
+    return nextRange;
+  }
+
+  function insertSkillToken(skill: SkillRecord) {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const range = removeSlashTrigger(editorRange() || document.createRange());
+    range.deleteContents();
+
+    const token = document.createElement('span');
+    token.className = 'browser-chat-inline-skill';
+    token.contentEditable = 'false';
+    token.dataset.skillId = skill.id;
+    token.title = skill.description;
+    token.innerHTML = `<span class="browser-chat-inline-skill-title"></span>`;
+    token.querySelector('.browser-chat-inline-skill-title')!.textContent = skill.title;
+
+    range.insertNode(token);
+    const trailingText = document.createTextNode('\u00A0');
+    token.after(trailingText);
+    const nextRange = document.createRange();
+    nextRange.setStart(trailingText, trailingText.data.length);
+    nextRange.collapse(true);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(nextRange);
+    syncEditorState();
+  }
 
   return (
     <>
@@ -1036,6 +1314,42 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
         onPreview={onPreviewAttachment}
         onRemove={onRemoveAttachment}
       />
+      {selectedSkills.length ? (
+        <div className="browser-chat-skill-chips">
+          {selectedSkills.map((skill) => (
+            <button key={skill.id} onClick={() => removeSkill(skill.id)} title={skill.description} type="button">
+              <span>{skill.title}</span>
+              <X size={13} />
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {skillMenuOpen ? (
+        <div className="browser-chat-skill-menu" role="listbox" aria-label="Skills">
+          <div className="browser-chat-skill-menu-head">
+            <b>Skills</b>
+            {skillQuery ? <span>/{skillQuery}</span> : null}
+          </div>
+          {skillSuggestions.length ? skillSuggestions.map((skill, index) => (
+            <button
+              aria-selected={activeSkillIndex === index}
+              className={activeSkillIndex === index ? 'active' : undefined}
+              key={skill.id}
+              onClick={() => chooseSkill(skill)}
+              onMouseDown={(event) => event.preventDefault()}
+              role="option"
+              type="button"
+            >
+              <b>{skill.title}</b>
+              <span>{skill.description}</span>
+            </button>
+          )) : (
+            <div className="browser-chat-skill-empty">
+              {availableSkills.some((skill) => skill.status === 'ready') ? '没有匹配的 Skills' : '暂无可用 Skills'}
+            </div>
+          )}
+        </div>
+      ) : null}
       <form
         className="browser-chat-compose"
         onSubmit={(event) => {
@@ -1054,17 +1368,114 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             if (files?.length) void onUploadImages(Array.from(files));
           }}
         />
-        <textarea
-          disabled={currentBusy || loading}
-          placeholder={t('有问题，尽管问')}
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
+        {(selectedSkills.length || skillMenuOpen) ? (
+          <div className="browser-chat-compose-context">
+            {selectedSkills.length ? (
+              <div className="browser-chat-skill-chips">
+                {selectedSkills.map((skill) => (
+                  <button key={skill.id} onClick={() => removeSkill(skill.id)} title={skill.description} type="button">
+                    <Braces size={14} />
+                    <span>{skill.title}</span>
+                    <X size={13} />
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {skillMenuOpen ? (
+              <div className="browser-chat-skill-menu" role="listbox" aria-label="Skills">
+                <div className="browser-chat-skill-menu-head">
+                  <b>Skills</b>
+                  {skillQuery ? <span>/{skillQuery}</span> : <span>/</span>}
+                </div>
+                {skillSuggestions.length ? skillSuggestions.map((skill, index) => (
+                  <button
+                    aria-selected={activeSkillIndex === index}
+                    className={activeSkillIndex === index ? 'active' : undefined}
+                    key={skill.id}
+                    onClick={() => chooseSkill(skill)}
+                    onMouseDown={(event) => event.preventDefault()}
+                    role="option"
+                    type="button"
+                  >
+                    <Braces size={15} />
+                    <span>
+                      <b>{skill.title}</b>
+                      <small>{skill.description}</small>
+                    </span>
+                  </button>
+                )) : (
+                  <div className="browser-chat-skill-empty">
+                    {availableSkills.some((skill) => skill.status === 'ready') ? '没有匹配的 Skills' : '暂无可用 Skills'}
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        <div
+          ref={editorRef}
+          className="browser-chat-inline-editor"
+          contentEditable={!currentBusy && !loading}
+          data-placeholder={t('有问题，尽管问')}
+          onClick={(event) => {
+            const remove = (event.target as HTMLElement).closest<HTMLElement>('[data-skill-remove]');
+            const token = remove?.closest<HTMLElement>('[data-skill-id]');
+            if (token?.dataset.skillId) {
+              event.preventDefault();
+              removeSkill(token.dataset.skillId);
+            }
+          }}
+          onInput={syncEditorState}
           onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === 'Backspace' || event.key === 'Delete') {
+              if (removeAdjacentSkillByKeyboard(event.key)) {
+                event.preventDefault();
+                return;
+              }
+              requestAnimationFrame(syncEditorState);
+            }
+            if (skillMenuOpen && event.key === 'ArrowDown') {
+              event.preventDefault();
+              setActiveSkillIndex((current) => skillSuggestions.length ? (current + 1) % skillSuggestions.length : 0);
+              return;
+            }
+            if (skillMenuOpen && event.key === 'ArrowUp') {
+              event.preventDefault();
+              setActiveSkillIndex((current) => skillSuggestions.length ? (current - 1 + skillSuggestions.length) % skillSuggestions.length : 0);
+              return;
+            }
+            if (skillMenuOpen && event.key === 'Escape') {
+              event.preventDefault();
+              setDismissedSlashDraft(draft);
+              return;
+            }
+            if (skillMenuOpen && (event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
+              event.preventDefault();
+              const skill = skillSuggestions[activeSkillIndex];
+              if (skill) chooseSkill(skill);
+              return;
+            }
+            if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault();
               void submitDraft();
             }
           }}
+          onKeyUp={(event) => {
+            if (event.key === 'Backspace' || event.key === 'Delete') syncEditorState();
+          }}
+          onPaste={(event) => {
+            event.preventDefault();
+            const text = event.clipboardData.getData('text/plain');
+            if (!text) return;
+            const range = editorRange();
+            range?.deleteContents();
+            range?.insertNode(document.createTextNode(text));
+            range?.collapse(false);
+            syncEditorState();
+          }}
+          role="textbox"
+          suppressContentEditableWarning
         />
         <div className="browser-chat-compose-actions">
           <div className="browser-chat-compose-tools">
@@ -1114,7 +1525,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             ) : (
               <button
                 className="browser-chat-send"
-                disabled={(!draft.trim() && !attachments.length) || currentBusy || loading || uploadingImage}
+                disabled={(!composerText && !attachments.length && !selectedSkillIds.length) || currentBusy || loading || uploadingImage}
                 type="submit"
                 aria-label={t('发送')}
               >
@@ -1605,6 +2016,7 @@ export function BrowserChatWorkspace({
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
+  const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [mode, setMode] = useState<BrowserChatMode>('visual-markers');
   const [targetGroupId, setTargetGroupId] = useState<string | undefined>();
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
@@ -1713,6 +2125,13 @@ export function BrowserChatWorkspace({
     const saved = Array.isArray(data.saved) ? data.saved as Array<{ key?: string; value?: string }> : [];
     const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
     setEmbeddedBrowserEnabled(embeddedSetting?.value === 'true');
+  }, []);
+
+  const loadSkills = useCallback(async () => {
+    const response = await fetch('/api/skills', { cache: 'no-store' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '加载 Skills 失败');
+    setSkills(Array.isArray(data.skills) ? data.skills : []);
   }, []);
 
   const beginEmbeddedChatResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1827,6 +2246,10 @@ export function BrowserChatWorkspace({
   }, [loadSessions]);
 
   useEffect(() => {
+    void loadSkills().catch(() => undefined);
+  }, [loadSkills]);
+
+  useEffect(() => {
     void loadBrowserRuntimeSettings().catch(() => undefined);
   }, [loadBrowserRuntimeSettings]);
 
@@ -1900,11 +2323,11 @@ export function BrowserChatWorkspace({
     return createSession();
   }
 
-  async function postMessageToSession(sessionId: string, content: string, clientMessageId: string, nextAttachments: BrowserChatAttachment[]) {
+  async function postMessageToSession(sessionId: string, content: string, clientMessageId: string, nextAttachments: BrowserChatAttachment[], skillIds: string[]) {
     const response = await fetch(`/api/browser-chat/${sessionId}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, skillIds }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '发送消息失败');
@@ -1956,10 +2379,10 @@ export function BrowserChatWorkspace({
     }
   }
 
-  async function sendMessage(content: string) {
+  async function sendMessage(content: string, skillIds: string[] = []) {
     const trimmedContent = content.trim();
     const nextAttachments = attachments;
-    if ((!trimmedContent && !nextAttachments.length) || currentBusy || loadingSessionId || sendingRef.current || uploadingImage) return false;
+    if ((!trimmedContent && !nextAttachments.length && !skillIds.length) || currentBusy || loadingSessionId || sendingRef.current || uploadingImage) return false;
     sendingRef.current = true;
     const clientMessageId = temporaryId('client_msg');
     setError('');
@@ -1970,13 +2393,13 @@ export function BrowserChatWorkspace({
       await ensureEmbeddedBrowserSessionTab(active.id);
       let posted: BrowserChatSession;
       try {
-        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments);
+        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments, skillIds);
       } catch (firstError) {
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
         active = await createSession();
         await ensureEmbeddedBrowserSessionTab(active.id);
-        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments);
+        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments, skillIds);
       }
       upsertSession(posted, { activate: true });
       setAttachments([]);
@@ -2340,6 +2763,7 @@ export function BrowserChatWorkspace({
         {error || session?.error ? <div className="error">{error || session?.error}</div> : null}
         <BrowserChatComposer
           attachments={attachments}
+          availableSkills={skills}
           busy={busy}
           currentBusy={currentBusy}
           imageInputRef={imageInputRef}
@@ -2417,7 +2841,14 @@ export function BrowserChatWorkspace({
           </div>
         ) : activeView === 'settings' ? (
           <div className="browser-chat-settings-pane">
-            <EnvironmentSettings activeTab={settingsTab} embedded showTabs={false} onActiveTabChange={setSettingsTab} onRuntimeEnvSaved={() => void loadBrowserRuntimeSettings()} />
+            <EnvironmentSettings
+              activeTab={settingsTab}
+              embedded
+              showTabs={false}
+              onActiveTabChange={setSettingsTab}
+              onRuntimeEnvSaved={() => void loadBrowserRuntimeSettings()}
+              onSkillsChanged={() => void loadSkills()}
+            />
           </div>
         ) : embeddedBrowserActive ? (
           <div
@@ -2495,6 +2926,7 @@ export function BrowserChatWorkspace({
               {error || session?.error ? <div className="error">{error || session?.error}</div> : null}
               <BrowserChatComposer
                 attachments={attachments}
+                availableSkills={skills}
                 busy={busy}
                 currentBusy={currentBusy}
                 imageInputRef={imageInputRef}

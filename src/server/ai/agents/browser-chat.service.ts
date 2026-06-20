@@ -3,10 +3,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { generateObject } from 'ai';
 import { z } from 'zod';
-import { BrowserSession, type BrowserSessionMode } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage, type InteractiveBrowserTurnResult } from '@/server/ai/agents/browser-chat-executor.agent';
+import { formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import type { RecordedFlowStep, StepExecutionResult, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { writeTextFileAtomic } from '@/server/storage/atomic-json';
@@ -30,6 +31,7 @@ export type BrowserChatMessage = {
   updatedAt?: string;
   clientMessageId?: string;
   attachments?: BrowserChatAttachment[];
+  skillIds?: string[];
   stepIndexes?: number[];
   activity?: {
     phase: string;
@@ -93,10 +95,13 @@ const browserChatConversationMemoryAiSchema = z.object({
 export type BrowserChatSessionSnapshot = {
   id: string;
   title: string;
+  userId?: string;
   targetUrl: string;
+  noVncUrl?: string;
   mode: BrowserSessionMode | 'default';
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
+  tabs: BrowserTabSnapshot[];
   createdAt: string;
   updatedAt: string;
   closedAt?: string;
@@ -137,6 +142,23 @@ const sessionsPath = path.join(appDataRoot(), '.data', 'browser-chat-sessions.js
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const runningHydrationGraceMs = 2 * 60 * 1000;
 const fullLogDetailsFlag = '__browserChatFullLogDetails';
+
+function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'userId'>) {
+  const template = String(process.env.BROWSER_CHAT_NOVNC_URL || process.env.NEXT_PUBLIC_BROWSER_CHAT_NOVNC_URL || '').trim();
+  if (!template) return undefined;
+  const encodedSessionId = encodeURIComponent(session.id);
+  const encodedUserId = encodeURIComponent(session.userId || '');
+  return template
+    .replace(/\{sessionId\}/g, encodedSessionId)
+    .replace(/\{id\}/g, encodedSessionId)
+    .replace(/\{userId\}/g, encodedUserId)
+    .replace(/\{qzUserId\}/g, encodedUserId);
+}
+
+function browserChatBrowserProfileKey(session: Pick<BrowserChatSessionSnapshot, 'id' | 'userId'>) {
+  const userId = normalizeUserId(session.userId);
+  return userId ? `user_${userId}` : session.id;
+}
 
 function fullLogDetails(value: unknown) {
   return { [fullLogDetailsFlag]: true, value };
@@ -228,13 +250,78 @@ function normalizeBrowserUrl(url: string) {
   return `https://${trimmed}`;
 }
 
+function isEmbeddedBrowserPlaceholderUrl(url: string) {
+  return /^data:text\/html/i.test(url)
+    && /data-webpilot-embedded-browser|WebPilot(?:%20|\+)Embedded(?:%20|\+)Browser|WebPilot embedded browser/i.test(url);
+}
+
 function isBlankBrowserUrl(url: string) {
-  return !url || url === 'about:blank' || /^(about:newtab|chrome:\/\/new-tab-page|edge:\/\/newtab)/i.test(url);
+  return !url
+    || url === 'about:blank'
+    || /^(about:newtab|chrome:\/\/new-tab-page|edge:\/\/newtab)/i.test(url)
+    || isEmbeddedBrowserPlaceholderUrl(url);
+}
+
+function exportableTargetUrl(value?: string) {
+  const url = normalizeBrowserUrl(value || '');
+  if (!url || isBlankBrowserUrl(url) || /^(blob|javascript):/i.test(url)) return '';
+  return url;
+}
+
+function inputUrl(input: unknown) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return '';
+  const value = (input as { url?: unknown }).url;
+  return typeof value === 'string' ? value : '';
+}
+
+function firstExportableTargetUrl(candidates: Array<string | undefined>) {
+  for (const candidate of candidates) {
+    const url = exportableTargetUrl(candidate);
+    if (url) return url;
+  }
+  return '';
+}
+
+function exportedTargetUrl(session: BrowserChatSessionRecord, steps: StepExecutionResult[]) {
+  const browserCurrentUrl = session.browser?.currentUrl();
+  const urlsFromToolContexts = steps.flatMap((step) => (step.tools || []).flatMap((tool) => [
+    tool.contextBefore?.domContext?.url,
+    tool.contextAfter?.domContext?.url,
+  ]));
+  const urlsFromOpenTools = steps.flatMap((step) => (step.tools || []).flatMap((tool) => (
+    /^(openPage|openUrl)$/i.test(tool.name) ? [inputUrl(tool.input)] : []
+  )));
+  return firstExportableTargetUrl([
+    session.targetUrl,
+    browserCurrentUrl,
+    ...urlsFromOpenTools,
+    ...urlsFromToolContexts,
+  ]);
+}
+
+function exportedRecordedToolInput(toolName: string, input: unknown, targetUrl: string) {
+  if (!/^(openPage|openUrl)$/i.test(toolName)) return input;
+  const url = exportableTargetUrl(inputUrl(input));
+  if (url) return input;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return targetUrl ? { url: targetUrl } : input;
+  const { url: _url, ...rest } = input as Record<string, unknown>;
+  return targetUrl ? { ...rest, url: targetUrl } : rest;
 }
 
 function compactText(value = '', max = 180) {
   const text = value.replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function normalizeUserId(value: unknown) {
+  if (typeof value === 'string' || typeof value === 'number') return String(value).trim();
+  return '';
+}
+
+function sessionBelongsToUser(session: Pick<BrowserChatSessionSnapshot, 'userId'>, userId?: unknown) {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!normalizedUserId) return true;
+  return normalizeUserId(session.userId) === normalizedUserId;
 }
 
 function normalizeConversationMemory(value: unknown): BrowserChatConversationMemory | undefined {
@@ -310,6 +397,14 @@ function normalizeAttachments(value: unknown): BrowserChatAttachment[] {
     });
   }
   return attachments;
+}
+
+function normalizeSkillIds(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value
+    .map((item) => typeof item === 'string' ? item.trim() : '')
+    .filter(Boolean)))
+    .slice(0, 8);
 }
 
 function attachmentAbsolutePath(attachment: BrowserChatAttachment) {
@@ -585,15 +680,26 @@ function previewMessages(session: BrowserChatSessionRecord) {
   }])).values());
 }
 
+function browserChatTabs(session: BrowserChatSessionRecord): BrowserTabSnapshot[] {
+  try {
+    return session.browser?.getTabsSnapshot() || [];
+  } catch {
+    return [];
+  }
+}
+
 function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: boolean } = {}): BrowserChatSessionSnapshot {
   finalizeIdleRunningAssistantMessages(session);
   return {
     id: session.id,
     title: session.title,
+    userId: session.userId,
     targetUrl: session.targetUrl,
+    noVncUrl: browserChatNoVncUrl(session),
     mode: session.mode,
     status: session.status,
     busy: session.busy,
+    tabs: browserChatTabs(session),
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
     closedAt: session.closedAt,
@@ -612,10 +718,13 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
   return {
     id: session.id,
     title: session.title,
+    userId: session.userId,
     targetUrl: session.targetUrl,
+    noVncUrl: browserChatNoVncUrl(session),
     mode: session.mode,
     status: session.status,
     busy: session.busy,
+    tabs: browserChatTabs(session),
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
     closedAt: session.closedAt,
@@ -736,6 +845,8 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
   });
   return {
     ...session,
+    tabs: session.tabs || [],
+    targetUrl: exportableTargetUrl(session.targetUrl),
     messages,
     steps,
     conversationMemory: normalizeConversationMemory(session.conversationMemory),
@@ -1054,6 +1165,7 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   const hasPriorConversation = session.steps.length > 0
     || session.messages.some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
   const browser = new BrowserSession(session.mode === 'default' ? undefined : session.mode, {
+    browserProfileKey: browserChatBrowserProfileKey(session),
     isMarked: true,
     preferExistingPage: !hasPriorConversation,
     runId: session.id,
@@ -1079,11 +1191,12 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   session.updatedAt = now();
   persistAndNotify(session.id);
   appendLog(session, 'browser:ready', `浏览器已就绪，用时 ${elapsedMs(startedAt)}ms`, { elapsedMs: elapsedMs(startedAt) });
-  const url = normalizeBrowserUrl(session.targetUrl);
+  const url = exportableTargetUrl(session.targetUrl);
+  if (session.targetUrl && !url) session.targetUrl = '';
   const currentUrl = browser.currentUrl();
-  const shouldOpenTarget = Boolean(url && !isBlankBrowserUrl(url) && (!browser.hasNonBlankActivePage() || !hasPriorConversation));
+  const shouldOpenTarget = Boolean(url && (!browser.hasNonBlankActivePage() || !hasPriorConversation));
   if (browser.hasNonBlankActivePage() && hasPriorConversation) {
-    session.targetUrl = currentUrl || session.targetUrl;
+    session.targetUrl = exportableTargetUrl(currentUrl) || url || session.targetUrl;
     appendLog(session, 'browser:reuse-page', `复用当前非空标签页：${session.targetUrl || '[unknown URL]'}`);
   } else if (shouldOpenTarget) {
     const openStartedAt = Date.now();
@@ -1104,6 +1217,7 @@ export function createBrowserChatSession(input: {
   targetUrl?: string;
   mode?: BrowserSessionMode | 'default';
   title?: string;
+  userId?: string | number;
 } = {}) {
   hydrateSessions();
   store.applyRuntimeEnv();
@@ -1111,10 +1225,12 @@ export function createBrowserChatSession(input: {
   const session: BrowserChatSessionRecord = {
     id: id('chat'),
     title: input.title?.trim() || '浏览器对话操作',
-    targetUrl: normalizeBrowserUrl(input.targetUrl || ''),
+    userId: normalizeUserId(input.userId) || undefined,
+    targetUrl: exportableTargetUrl(input.targetUrl || ''),
     mode: input.mode || 'visual-markers',
     status: 'idle',
     busy: false,
+    tabs: [],
     started: false,
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -1129,21 +1245,26 @@ export function createBrowserChatSession(input: {
   return snapshot(session);
 }
 
-export function getBrowserChatSession(sessionId: string) {
+export function getBrowserChatSession(sessionId: string, userId?: string | number) {
   hydrateSessions();
   const session = sessions.get(sessionId);
+  if (session && !sessionBelongsToUser(session, userId)) return undefined;
   return session ? snapshot(session) : undefined;
 }
 
-export function listBrowserChatSessions() {
+export function listBrowserChatSessions(input: { userId?: string | number } = {}) {
   hydrateSessions();
-  return [...sessions.values()].map(summarySnapshot).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return [...sessions.values()]
+    .filter((session) => sessionBelongsToUser(session, input.userId))
+    .map(summarySnapshot)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-export async function closeBrowserChatSession(sessionId: string) {
+export async function closeBrowserChatSession(sessionId: string, userId?: string | number) {
   hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) return undefined;
+  if (!sessionBelongsToUser(session, userId)) return undefined;
   if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
     session.activeAbortController.abort(new Error('Browser chat session closed by user.'));
   }
@@ -1160,8 +1281,10 @@ export async function closeBrowserChatSession(sessionId: string) {
   return snapshot(session);
 }
 
-export async function deleteBrowserChatSession(sessionId: string) {
+export async function deleteBrowserChatSession(sessionId: string, userId?: string | number) {
   hydrateSessions();
+  const session = sessions.get(sessionId);
+  if (session && !sessionBelongsToUser(session, userId)) return undefined;
   const removed = await deleteBrowserChatSessionFromMemory(sessionId);
   if (!removed) return undefined;
   if (!persistAndNotify(sessionId)) {
@@ -1169,6 +1292,63 @@ export async function deleteBrowserChatSession(sessionId: string) {
     throw new Error('Browser chat session was removed from memory, but the session file could not be updated.');
   }
   return removed.deleted;
+}
+
+export async function switchBrowserChatTab(sessionId: string, index: number, userId?: string | number) {
+  hydrateSessions();
+  const session = sessions.get(sessionId);
+  if (!session || session.status === 'closed') return undefined;
+  if (!sessionBelongsToUser(session, userId)) return undefined;
+  const normalizedIndex = Math.floor(Number(index));
+  if (!Number.isInteger(normalizedIndex) || normalizedIndex < 0) {
+    throw new Error('Invalid tab index');
+  }
+
+  if (!session.started || !session.browser || !session.browser.isUsable()) {
+    throw new Error('当前会话还没有运行中的浏览器，无法切换标签页。');
+  }
+  const browser = session.browser;
+  const result = await browser.switchTab(normalizedIndex);
+  if (!result?.ok) {
+    throw new Error(`Switch tab failed: ${result?.actual || 'Unknown error'}`);
+  }
+
+  session.updatedAt = now();
+  session.error = undefined;
+  if (!session.busy) {
+    session.status = 'idle';
+  }
+  persistAndNotify(session.id);
+  return snapshot(session);
+}
+
+export async function startBrowserChatScreencast(
+  sessionId: string,
+  userId: string | number | undefined,
+  handlers: {
+    onActivePageChanged?: () => void;
+    onError?: (error: unknown) => void;
+    onFrame: (frame: BrowserScreencastFrame) => void | Promise<void>;
+  },
+) {
+  hydrateSessions();
+  const session = sessions.get(sessionId);
+  if (!session || session.status === 'closed') return undefined;
+  if (!sessionBelongsToUser(session, userId)) return undefined;
+
+  if (!session.started || !session.browser || !session.browser.isUsable()) {
+    throw new Error('当前会话还没有运行中的浏览器；请先发送AI访问请求，浏览器启动后会自动显示画面。');
+  }
+  const browser = session.browser;
+  return browser.startScreencast({
+    onActivePageChanged: handlers.onActivePageChanged,
+    onError: handlers.onError,
+    onFrame: (frame) => {
+      session.tabs = frame.tabs;
+      session.targetUrl = exportableTargetUrl(frame.url) || session.targetUrl;
+      return handlers.onFrame(frame);
+    },
+  });
 }
 
 async function deleteBrowserChatSessionFromMemory(sessionId: string) {
@@ -1186,12 +1366,14 @@ async function deleteBrowserChatSessionFromMemory(sessionId: string) {
   return { deleted: { id: sessionId }, session };
 }
 
-export async function deleteBrowserChatSessions(sessionIds: string[]) {
+export async function deleteBrowserChatSessions(sessionIds: string[], userId?: string | number) {
   hydrateSessions();
   const uniqueIds = Array.from(new Set(sessionIds.map((item) => item.trim()).filter(Boolean)));
   const deleted: Array<{ id: string }> = [];
   const removed: Array<{ deleted: { id: string }; session: BrowserChatSessionRecord }> = [];
   for (const sessionId of uniqueIds) {
+    const session = sessions.get(sessionId);
+    if (session && !sessionBelongsToUser(session, userId)) continue;
     const result = await deleteBrowserChatSessionFromMemory(sessionId);
     if (result) {
       removed.push(result);
@@ -1223,11 +1405,12 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
     .map((step) => ({ ...step, status: step.status === 'running' ? 'passed' : step.status }))
     .sort((a, b) => a.index - b.index);
   if (!selectedSteps.length) throw new Error('No executed browser steps found for this message');
+  const targetUrl = exportedTargetUrl(session, selectedSteps);
 
   const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).map((tool, toolIndex) => ({
     index: 0,
     name: tool.name,
-    input: tool.input,
+    input: exportedRecordedToolInput(tool.name, tool.input, targetUrl),
     reason: tool.reason,
     sourceStepIndex: step.index,
     sourceStepAction: step.action,
@@ -1242,7 +1425,7 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
       previousUser ? `用户消息：${previousUser.content}` : '',
       `AI 输出：${message.content}`,
     ].filter(Boolean).join('\n\n'),
-    targetUrl: '',
+    targetUrl,
     priority: 'medium',
     browserMode: session.mode,
     isMarked: true,
@@ -1316,10 +1499,11 @@ export function exportBrowserChatMessagesToTestCase(sessionId: string, messageId
     ...step,
     index: index + 1,
   }));
+  const targetUrl = exportedTargetUrl(session, selectedSteps);
   const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).map((tool, toolIndex) => ({
     index: 0,
     name: tool.name,
-    input: tool.input,
+    input: exportedRecordedToolInput(tool.name, tool.input, targetUrl),
     reason: tool.reason,
     sourceStepIndex: step.index,
     sourceStepAction: step.action,
@@ -1347,7 +1531,7 @@ export function exportBrowserChatMessagesToTestCase(sessionId: string, messageId
   const content: TestCaseContent = {
     title: `对话导出 - ${compactText(titleSeed, 36)}`,
     description: turnDescriptions.join('\n\n'),
-    targetUrl: '',
+    targetUrl,
     priority: 'medium',
     browserMode: session.mode,
     isMarked: true,
@@ -1400,15 +1584,20 @@ export async function sendBrowserChatMessage(
   mode?: BrowserSessionMode | 'default',
   clientMessageId?: string,
   attachmentsInput?: unknown,
+  skillIdsInput?: unknown,
+  userId?: string | number,
 ) {
   hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) throw new Error('Browser chat session not found');
+  if (!sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   if (session.status === 'closed') throw new Error('Browser chat session is closed');
   const text = content.trim();
   const attachments = normalizeAttachments(attachmentsInput);
-  if (!text && !attachments.length) throw new Error('Message is empty');
-  const messageText = text || '请结合我上传的图片继续处理当前任务。';
+  const skillIds = normalizeSkillIds(skillIdsInput);
+  const selectedSkills = store.getSkills(skillIds).filter((skill) => skill.status === 'ready');
+  if (!text && !attachments.length && !selectedSkills.length) throw new Error('Message is empty');
+  const messageText = text || (selectedSkills.length ? '请结合已选择的 Skills 继续处理当前任务。' : '请结合我上传的图片继续处理当前任务。');
   const normalizedClientMessageId = clientMessageId?.trim().slice(0, 120) || undefined;
   if (normalizedClientMessageId && session.messages.some((message) => message.clientMessageId === normalizedClientMessageId)) {
     return snapshot(session);
@@ -1428,6 +1617,7 @@ export async function sendBrowserChatMessage(
     updatedAt: timestamp,
     clientMessageId: normalizedClientMessageId,
     attachments,
+    skillIds: selectedSkills.map((skill) => skill.id),
   };
   const assistantMessage: BrowserChatMessage = {
     id: id('msg'),
@@ -1451,7 +1641,7 @@ export async function sendBrowserChatMessage(
   persistAndNotify(session.id);
   appendLog(session, 'chat:queued', '已收到消息，准备执行浏览器操作');
 
-  void runBrowserChatMessage(session, messageText, assistantMessage.id, fromStepIndex, abortController, attachments);
+  void runBrowserChatMessage(session, messageText, assistantMessage.id, fromStepIndex, abortController, attachments, selectedSkills);
   return snapshot(session);
 }
 
@@ -1591,10 +1781,11 @@ async function updateBrowserChatConversationMemoryInBackground(
   }
 }
 
-export function interruptBrowserChatSession(sessionId: string) {
+export function interruptBrowserChatSession(sessionId: string, userId?: string | number) {
   hydrateSessions();
   const session = sessions.get(sessionId);
   if (!session) return undefined;
+  if (!sessionBelongsToUser(session, userId)) return undefined;
   const timestamp = now();
   const assistantMessageId = session.activeAssistantMessageId || latestRunningAssistantMessageId(session);
   const abortController = session.activeAbortController;
@@ -1644,6 +1835,7 @@ async function runBrowserChatMessage(
   fromStepIndex: number,
   abortController: AbortController,
   attachments: BrowserChatAttachment[],
+  skills: SkillRecord[] = [],
 ) {
   try {
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
@@ -1662,6 +1854,7 @@ async function runBrowserChatMessage(
       completedSteps: session.steps,
       mode: session.mode,
       referenceImagePaths,
+      skillContext: formatSkillsForPrompt(skills),
       abortSignal: abortController.signal,
       shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
       onProgress: (step) => {

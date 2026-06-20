@@ -8,9 +8,9 @@ import { RichTextEditor } from '@/components/RichTextEditor';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
-import type { TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import type { SkillRecord, TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
 
-export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
+export function TestCaseEditor({ skills, testCase }: { skills: SkillRecord[]; testCase: TestCaseRecord }) {
   const { t } = useI18n();
   const router = useRouter();
   const [draft, setDraft] = useState<TestCaseContent>({
@@ -19,6 +19,7 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
     isMarked: testCase.content.isMarked ?? true,
     userRequirement: testCase.content.userRequirement || testCase.description,
     systemPrompt: testCase.content.systemPrompt || '',
+    skillIds: testCase.content.skillIds || [],
     steps: [],
   });
   const [saving, setSaving] = useState(false);
@@ -30,6 +31,15 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
 
   function update(patch: Partial<TestCaseContent>) {
     setDraft((current) => ({ ...current, ...patch }));
+  }
+
+  function toggleSkill(skillId: string) {
+    setDraft((current) => {
+      const selected = new Set(current.skillIds || []);
+      if (selected.has(skillId)) selected.delete(skillId);
+      else selected.add(skillId);
+      return { ...current, skillIds: [...selected] };
+    });
   }
 
   async function save() {
@@ -162,6 +172,24 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
             <span className="hint">{t('关闭后只发送原始截图，并在提示词中加入可交互元素摘要。')}</span>
           </label>
         ) : null}
+        <label className="wide">
+          Skills
+          <div className="skill-picker">
+            {skills.length ? skills.map((skill) => (
+              <label className="skill-picker-item" key={skill.id} title={skill.description}>
+                <input
+                  type="checkbox"
+                  checked={(draft.skillIds || []).includes(skill.id)}
+                  onChange={() => toggleSkill(skill.id)}
+                />
+                <span>
+                  <b>{skill.title}</b>
+                  <small>{skill.description}</small>
+                </span>
+              </label>
+            )) : <span className="hint">No skills yet. Generate one from a run record first.</span>}
+          </div>
+        </label>
         <label className="wide">
           {t('用户需求')}
           <RichTextEditor

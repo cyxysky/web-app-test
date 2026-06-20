@@ -21,8 +21,7 @@ import { createVercel } from '@ai-sdk/vercel';
 import { createXai } from '@ai-sdk/xai';
 import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import type { generateText } from 'ai';
-import { createCodexCli, type ReasoningEffort } from 'ai-sdk-provider-codex-cli';
-import { createGeminiProvider } from 'ai-sdk-provider-gemini-cli';
+import { createCodexAppServer, createCodexCli, type ReasoningEffort } from 'ai-sdk-provider-codex-cli';
 
 
 type GenerateTextModel = Parameters<typeof generateText>[0]['model'];
@@ -38,7 +37,6 @@ type AiProvider =
   | 'deepinfra'
   | 'deepseek'
   | 'fireworks'
-  | 'gemini'
   | 'google'
   | 'google-vertex'
   | 'groq'
@@ -82,19 +80,7 @@ export function getModel(): GenerateTextModel {
     apiKey: process.env.COHERE_API_KEY || '',
     baseURL: process.env.COHERE_BASE_URL || undefined,
   })(model) as unknown as GenerateTextModel;
-  if (provider === 'gemini') return createGeminiProvider({ authType: 'oauth-personal' })(model) as unknown as GenerateTextModel;
-  if (provider === 'codex') return createCodexCli({
-    defaultSettings: {
-      codexPath: process.env.CODEX_PATH || undefined,
-      cwd: process.env.CODEX_CWD || process.cwd(),
-      approvalMode: parseApprovalMode(process.env.CODEX_APPROVAL_MODE) || 'on-failure',
-      sandboxMode: parseSandboxMode(process.env.CODEX_SANDBOX_MODE) || 'workspace-write',
-      reasoningEffort: parseReasoningEffort(process.env.CODEX_REASONING_EFFORT) || 'medium',
-      verbose: process.env.CODEX_VERBOSE === 'true',
-      skipGitRepoCheck: process.env.CODEX_SKIP_GIT_REPO_CHECK !== 'false',
-      allowNpx: process.env.CODEX_ALLOW_NPX === 'true',
-    },
-  })(model) as unknown as GenerateTextModel;
+  if (provider === 'codex') return getCodexModel(model);
   if (provider === 'deepseek') return createDeepSeek({
     apiKey: process.env.DEEPSEEK_API_KEY || '',
   })(model) as unknown as GenerateTextModel;
@@ -197,13 +183,48 @@ export function getModelSettings() {
     togetherai: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
     vercel: 'v0-1.5-md',
     xai: 'grok-4',
-    gemini: 'gemini-3-flash-preview',
   };
-  // gemini-3.1-pro-preview
   return {
     provider,
     model: process.env.AI_MODEL || defaults[provider],
   };
+}
+
+function getCodexModel(model: string): GenerateTextModel {
+  const codexPath = process.env.CODEX_PATH || undefined;
+  const cwd = process.env.CODEX_CWD || process.cwd();
+  const approvalMode = parseApprovalMode(process.env.CODEX_APPROVAL_MODE) || 'on-failure';
+  const sandboxMode = parseSandboxMode(process.env.CODEX_SANDBOX_MODE) || 'workspace-write';
+  const effort = parseReasoningEffort(process.env.CODEX_REASONING_EFFORT) || 'medium';
+  const verbose = process.env.CODEX_VERBOSE === 'true';
+
+  if (process.env.CODEX_TRANSPORT === 'exec' || process.env.CODEX_PROVIDER_MODE === 'exec') {
+    return createCodexCli({
+      defaultSettings: {
+        codexPath,
+        cwd,
+        approvalMode,
+        sandboxMode,
+        reasoningEffort: effort,
+        verbose,
+        skipGitRepoCheck: process.env.CODEX_SKIP_GIT_REPO_CHECK !== 'false',
+        allowNpx: process.env.CODEX_ALLOW_NPX === 'true',
+      },
+    })(model) as unknown as GenerateTextModel;
+  }
+
+  return createCodexAppServer({
+    defaultSettings: {
+      codexPath,
+      cwd,
+      approvalPolicy: approvalMode,
+      sandboxPolicy: sandboxMode,
+      effort,
+      verbose,
+      minCodexVersion: '0.130.0',
+      threadMode: 'stateless',
+    },
+  })(model) as unknown as GenerateTextModel;
 }
 
 function normalizeProvider(value: string | undefined): AiProvider {
@@ -219,8 +240,7 @@ function normalizeProvider(value: string | undefined): AiProvider {
   if (provider === 'deepinfra') return 'deepinfra';
   if (provider === 'deepseek') return 'deepseek';
   if (provider === 'fireworks' || provider === 'fireworks-ai') return 'fireworks';
-  if (provider === 'gemini' || provider === 'gemini-cli') return 'gemini';
-  if (provider === 'google') return 'google';
+  if (provider === 'gemini' || provider === 'gemini-cli' || provider === 'google') return 'google';
   if (provider === 'google-vertex' || provider === 'vertex' || provider === 'vertex-ai') return 'google-vertex';
   if (provider === 'groq') return 'groq';
   if (provider === 'huggingface' || provider === 'hugging-face') return 'huggingface';

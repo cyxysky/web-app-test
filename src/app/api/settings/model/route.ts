@@ -9,7 +9,7 @@ function normalizeProvider(value: unknown): ModelProvider {
   const provider = String(value || 'openrouter').trim().toLowerCase();
   if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
   if (provider === 'codex' || provider === 'codex-cli') return 'codex';
-  if (provider === 'gemini' || provider === 'gemini-cli') return 'gemini';
+  if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
   if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
   return providers.has(provider as ModelProvider) ? provider as ModelProvider : 'openrouter';
 }

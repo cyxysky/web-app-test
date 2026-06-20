@@ -5,6 +5,7 @@ import type { ReactNode } from 'react';
 import Link from 'next/link';
 import { ArrowLeft, FolderOpen, Loader2, Moon, Save, Sun } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
+import { SkillsManager } from '@/components/SkillsManager';
 import {
   modelProviderDefinitions,
   modelProviderDefinition,
@@ -34,6 +35,7 @@ declare global {
 }
 
 export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> = [
+  { id: 'skills', label: 'Skills 管理' },
   { id: 'general', label: '通用设置' },
   { id: 'model', label: '模型配置' },
   { id: 'browser', label: '浏览器与截图' },
@@ -115,12 +117,14 @@ export function EnvironmentSettings({
   embedded = false,
   onActiveTabChange,
   onRuntimeEnvSaved,
+  onSkillsChanged,
   showTabs = true,
 }: {
   activeTab?: SettingsTab;
   embedded?: boolean;
   onActiveTabChange?: (tab: SettingsTab) => void;
   onRuntimeEnvSaved?: () => void;
+  onSkillsChanged?: () => void;
   showTabs?: boolean;
 } = {}) {
   const { language, setLanguage, t } = useI18n();
@@ -361,7 +365,7 @@ export function EnvironmentSettings({
   const activeProviderSettings = providerSettings(editingModelConfig, activeProvider);
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
-    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && definition?.tab === activeTab);
+    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && definition?.tab === activeTab);
 
   return (
     <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
@@ -547,7 +551,9 @@ export function EnvironmentSettings({
             </section>
           ) : null}
 
-          {activeTab !== 'general' && activeTab !== 'model' ? (
+          {activeTab === 'skills' ? <SkillsManager onChanged={onSkillsChanged} /> : null}
+
+          {activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' ? (
             <section>
               <div className="settings-section-head">
                 <div>

@@ -19,6 +19,7 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
   const testCase = store.getTestCase(id);
   if (!testCase) notFound();
   const runs = store.listRunsForTestCase(id);
+  const skills = store.listSkills().filter((skill) => skill.status === 'ready');
 
   return (
     <main className="case-workspace">
@@ -34,7 +35,7 @@ export default async function TestCaseDetailPage({ params }: PageProps) {
         </div>
       </header>
 
-      <TestCaseEditor testCase={testCase} />
+      <TestCaseEditor skills={skills} testCase={testCase} />
 
       <section className="content-band run-history-panel">
         <RunHistoryList defaultRecordedRunId={testCase.content.defaultRecordedRunId} runs={runs} testCaseId={id} />

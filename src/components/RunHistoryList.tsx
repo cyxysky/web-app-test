@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useMemo, useState } from 'react';
-import { BadgeCheck, Clock3, ExternalLink, FileText, Loader2, Trash2 } from 'lucide-react';
+import { BadgeCheck, Clock3, ExternalLink, FileText, Loader2, Sparkles, Trash2 } from 'lucide-react';
 import { DeleteRunButton } from '@/components/DeleteRunButton';
 import { RecordedFlowToCaseButton } from '@/components/RecordedFlowToCaseButton';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
@@ -54,6 +54,7 @@ export function RunHistoryList({
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deleting, setDeleting] = useState(false);
   const [settingDefaultRunId, setSettingDefaultRunId] = useState<string | null>(null);
+  const [generatingSkillRunId, setGeneratingSkillRunId] = useState<string | null>(null);
   const latestRun = runs[0];
   const finishedRuns = runs.filter((run) => finishedRunStatuses.includes(run.status)).length;
   const deletableIds = useMemo(() => runs.map((run) => run.id), [runs]);
@@ -113,6 +114,23 @@ export function RunHistoryList({
     }
   }
 
+  async function generateSkill(runId: string) {
+    if (generatingSkillRunId) return;
+    setGeneratingSkillRunId(runId);
+    startGlobalLoading(t('正在生成 Skill'));
+    try {
+      const response = await fetch(`/api/runs/${runId}/skills`, { method: 'POST' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || t('生成 Skill 失败'));
+      router.refresh();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : t('生成 Skill 失败'));
+    } finally {
+      setGeneratingSkillRunId(null);
+      stopGlobalLoading();
+    }
+  }
+
   return (
     <>
       <div className="section-head compact run-history-head">
@@ -149,6 +167,7 @@ export function RunHistoryList({
             const active = isActiveRun(run);
             const selected = selectedSet.has(run.id);
             const isDefaultRecordedRun = run.id === defaultRecordedRunId;
+            const skillable = !active && Boolean(run.result?.steps?.length);
             const reportText = run.report ? t('报告已生成') : t('报告生成中');
             return (
               <div className={selected ? 'run-history-row selected' : 'run-history-row'} key={run.id}>
@@ -188,6 +207,16 @@ export function RunHistoryList({
                   </button>
                   <RunScreenshotChainButton className="run-history-replay" run={run} />
                   <RecordedFlowToCaseButton disabled={!replayable || active} runId={run.id} />
+                  <button
+                    className="run-history-replay"
+                    disabled={!skillable || Boolean(generatingSkillRunId)}
+                    onClick={() => void generateSkill(run.id)}
+                    title={t('从这条执行记录生成 Skill')}
+                    type="button"
+                  >
+                    {generatingSkillRunId === run.id ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
+                    {t('生成 Skill')}
+                  </button>
                   <DeleteRunButton disabled={deleting} runId={run.id} />
                   <Link className="run-history-open" href={`/runs/${run.id}`} title={t('查看详情')}>
                     <ExternalLink size={16} />
