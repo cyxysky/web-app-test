@@ -216,6 +216,7 @@ export type AiRequestSnapshot = {
   createdAt: string;
   provider: string;
   model: string;
+  systemPrompt?: string;
   screenshotPath?: string;
   imageAttached: boolean;
   tools?: string[];

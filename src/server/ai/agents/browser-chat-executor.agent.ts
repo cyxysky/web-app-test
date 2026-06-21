@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { generateText, stepCountIs, tool } from 'ai';
+import { generateText, hasToolCall, tool, type ModelMessage } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
 import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
+import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { appendDesktopEvidenceToResult, captureDesktopBeforeTool, collectDesktopEvidenceAfterTool } from '@/server/desktop/desktop-action-evidence';
@@ -179,10 +179,12 @@ function browserModeFromEnv(): BrowserSessionMode {
 
 function browserModeOf(testCase: TestCaseRecord): BrowserSessionMode {
   const configured = testCase.content.browserMode;
-  if (configured === 'dom' || configured === 'visual-markers') {
-    return configured;
-  }
-  return browserModeFromEnv();
+  const requestedMode = configured === 'dom' || configured === 'visual-markers'
+    ? configured
+    : browserModeFromEnv();
+  return requestedMode === 'visual-markers' && !modelSupportsScreenshotInput()
+    ? 'dom'
+    : requestedMode;
 }
 
 function isVisualMode(mode: BrowserSessionMode) {
@@ -385,6 +387,115 @@ function providerToolSchemaError(value?: string) {
 }
 
 const untrimmedToolResultNames = new Set(['fillCandidates', 'fillDomNodes']);
+const runtimeObservationToolNames = new Set(['readObservation', 'searchObservation']);
+
+type RuntimeObservationRecord = {
+  id: string;
+  toolName: string;
+  createdAt: string;
+  text: string;
+  totalChars: number;
+};
+
+type RuntimeObservationStore = Map<string, RuntimeObservationRecord>;
+
+function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
+  const numberValue = typeof value === 'number' ? value : Number(value);
+  const normalized = Number.isFinite(numberValue) ? Math.floor(numberValue) : fallback;
+  return Math.min(Math.max(normalized, min), max);
+}
+
+function createObservationId(store: RuntimeObservationStore) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const id = `obs_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    if (!store.has(id)) return id;
+  }
+  return `obs_${Date.now().toString(36)}`;
+}
+
+function storeRuntimeObservation(store: RuntimeObservationStore, toolName: string, text: string) {
+  const maxRecords = boundedInteger(process.env.AI_OBSERVATION_STORE_LIMIT, 30, 5, 100);
+  while (store.size >= maxRecords) {
+    const firstKey = store.keys().next().value;
+    if (!firstKey) break;
+    store.delete(firstKey);
+  }
+  const record: RuntimeObservationRecord = {
+    id: createObservationId(store),
+    toolName,
+    createdAt: new Date().toISOString(),
+    text,
+    totalChars: text.length,
+  };
+  store.set(record.id, record);
+  return record;
+}
+
+function observationPreviewLimit(name: string) {
+  const raw = Number(process.env.AI_TOOL_RESULT_PREVIEW_MAX_CHARS || (name === 'getDomNodeText' ? 3200 : 2400));
+  const value = Math.floor(Number.isFinite(raw) ? raw : 2400);
+  return Math.min(Math.max(value, 800), 8000);
+}
+
+function readRuntimeObservation(
+  store: RuntimeObservationStore | undefined,
+  id: string,
+  offset?: number,
+  maxChars?: number,
+): BrowserActionResult {
+  const record = store?.get(id);
+  if (!record) {
+    return { ok: false, actual: `Observation not found: ${id}. It may belong to another agent turn or have been evicted.` };
+  }
+  const start = boundedInteger(offset, 0, 0, record.totalChars);
+  const length = boundedInteger(maxChars, 6000, 600, 12000);
+  const end = Math.min(record.totalChars, start + length);
+  return {
+    ok: true,
+    actual: [
+      `Observation ${record.id} from ${record.toolName}. Range ${start}-${end}/${record.totalChars}.`,
+      record.text.slice(start, end),
+      end < record.totalChars ? `More available: call readObservation with id="${record.id}", offset=${end}.` : 'End of observation.',
+    ].join('\n'),
+  };
+}
+
+function searchRuntimeObservation(
+  store: RuntimeObservationStore | undefined,
+  id: string,
+  query: string,
+  maxMatches?: number,
+  aroundChars?: number,
+): BrowserActionResult {
+  const record = store?.get(id);
+  if (!record) {
+    return { ok: false, actual: `Observation not found: ${id}. It may belong to another agent turn or have been evicted.` };
+  }
+  const needle = query.trim().toLowerCase();
+  if (!needle) return { ok: false, actual: 'searchObservation failed: query is required.' };
+  const haystack = record.text.toLowerCase();
+  const limit = boundedInteger(maxMatches, 6, 1, 20);
+  const around = boundedInteger(aroundChars, 700, 120, 2400);
+  const matches: string[] = [];
+  let cursor = 0;
+  while (matches.length < limit) {
+    const index = haystack.indexOf(needle, cursor);
+    if (index < 0) break;
+    const start = Math.max(0, index - around);
+    const end = Math.min(record.totalChars, index + query.length + around);
+    matches.push([
+      `Match ${matches.length + 1}: range ${start}-${end}/${record.totalChars}, hitOffset=${index}`,
+      record.text.slice(start, end),
+    ].join('\n'));
+    cursor = index + Math.max(needle.length, 1);
+  }
+  return {
+    ok: true,
+    actual: matches.length
+      ? `Observation ${record.id} search "${query}" found ${matches.length} match(es).\n\n${matches.join('\n\n')}`
+      : `Observation ${record.id} search "${query}" found 0 matches. Try a shorter or different query, or call readObservation by offset.`,
+  };
+}
 
 function userFacingInfrastructureError(value?: string) {
   const text = value || '';
@@ -406,6 +517,42 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, max = 
   if (name === 'listTabs') return '已读取浏览器标签页列表。';
   if (name === 'downloadFile' || name === 'generateMarkdownFile') return formatFileArtifactResult(name, result.actual);
   return trimDebugText(result.actual, resultMax);
+}
+
+function modelToolResultLimit(name: string) {
+  const raw = Number(
+    name === 'getDomNodeText'
+      ? process.env.AI_DOM_NODE_TEXT_TOOL_RESULT_MAX_CHARS || process.env.AI_TOOL_RESULT_MAX_CHARS || 8000
+      : process.env.AI_TOOL_RESULT_MAX_CHARS || 6000,
+  );
+  const value = Math.floor(Number.isFinite(raw) ? raw : 6000);
+  return Math.min(Math.max(value, 1200), 30000);
+}
+
+function compactToolResultForModel(
+  name: string,
+  result: BrowserActionResult,
+  observationStore?: RuntimeObservationStore,
+): BrowserActionResult {
+  if (!result.actual) return result;
+  if (runtimeObservationToolNames.has(name)) return result;
+  const limit = modelToolResultLimit(name);
+  if (result.actual.length <= limit) return result;
+  const previewLimit = observationStore ? Math.min(limit, observationPreviewLimit(name)) : limit;
+  const omitted = result.actual.length - previewLimit;
+  const observation = observationStore
+    ? storeRuntimeObservation(observationStore, name, result.actual)
+    : undefined;
+  return {
+    ...result,
+    actual: [
+      result.actual.slice(0, previewLimit),
+      '',
+      observation
+        ? `[Large tool result saved for this agent turn: observationId=${observation.id}, tool=${name}, totalChars=${observation.totalChars}, previewChars=${previewLimit}, omittedChars=${omitted}. Use readObservation(id="${observation.id}", offset, maxChars) or searchObservation(id="${observation.id}", query) to inspect omitted content instead of repeating ${name}.]`
+        : `[Tool result truncated for model context: ${omitted} characters omitted from ${name}. Use a narrower DOM node, text query, HTTP filter, or another observation tool call if more detail is required.]`,
+    ].join('\n'),
+  };
 }
 
 function elapsedSince(startedAt: number) {
@@ -504,9 +651,19 @@ function throwIfStopped(signal?: AbortSignal, shouldContinue?: () => boolean) {
 }
 
 // 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
+function generateTextTimeoutMs(options: Parameters<typeof generateText>[0]) {
+  const nativeToolLoop = typeof (options as { prepareStep?: unknown }).prepareStep === 'function';
+  const raw = Number(
+    nativeToolLoop
+      ? process.env.AI_AGENT_LOOP_TIMEOUT_MS || process.env.AI_TEST_REQUEST_TIMEOUT_MS || 120000
+      : process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000,
+  );
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : nativeToolLoop ? 120000 : 30000;
+}
+
 async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
   throwIfAborted(options.abortSignal);
-  const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
+  const timeoutMs = generateTextTimeoutMs(options);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
   const upstream = options.abortSignal;
@@ -709,6 +866,75 @@ function contextCompressionThresholdRatio() {
   const raw = Number(process.env.AI_CONTEXT_COMPRESSION_THRESHOLD || process.env.AI_CONTEXT_COMPRESSION_RATIO || 0.7);
   if (!Number.isFinite(raw) || raw <= 0) return 0.7;
   return raw > 1 ? Math.min(0.98, raw / 100) : Math.min(0.98, raw);
+}
+
+function agentStepLabel(stepIndex: number) {
+  return String(stepIndex + 1);
+}
+
+function agentLoopSummaryInputCharLimit() {
+  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS || 60000);
+  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 60000;
+}
+
+function buildContinuationSummaryPrompt(input: {
+  goal: string;
+  browserMode: BrowserSessionMode;
+  stepIndex: number;
+  agentStep: number;
+  estimatedTokens: number;
+  thresholdTokens: number;
+  modelMessages: unknown;
+}) {
+  const serializedMessages = trimDebugText(
+    JSON.stringify(input.modelMessages, null, 2),
+    agentLoopSummaryInputCharLimit(),
+  );
+  return [
+    'You are compressing a WebPilot browser-agent loop so the SAME user request can continue in a fresh model context.',
+    'Return concise JSON only. Do not use markdown.',
+    '',
+    'Required JSON shape:',
+    '{ "goal": string, "completed": string[], "currentPage": string, "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
+    '',
+    'Rules:',
+    '- Preserve observationId values exactly, because later steps can call readObservation/searchObservation.',
+    '- Preserve tool results that materially affect the next action.',
+    '- Preserve current URL/page state, blockers, manual verification state, and user constraints.',
+    '- Do not include raw screenshots, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON unless essential.',
+    '- Write Chinese for user-facing summaries when possible.',
+    '',
+    `Goal: ${input.goal}`,
+    `Executor step: ${input.stepIndex}`,
+    `Agent step before compression: ${input.agentStep}`,
+    `Browser mode: ${input.browserMode}`,
+    `Estimated model-context tokens: ${input.estimatedTokens}/${input.thresholdTokens}`,
+    '',
+    `Sanitized model messages JSON:\n${serializedMessages}`,
+  ].join('\n');
+}
+
+function fallbackContinuationSummary(input: {
+  goal: string;
+  browserMode: BrowserSessionMode;
+  stepIndex: number;
+  agentStep: number;
+  traces: ToolTrace[];
+  workingMemory: RuntimeWorkingMemory;
+}) {
+  return JSON.stringify({
+    goal: input.goal,
+    browserMode: input.browserMode,
+    executorStep: input.stepIndex,
+    agentStepBeforeCompression: input.agentStep,
+    completed: input.workingMemory.completed,
+    currentPage: input.workingMemory.currentState || input.workingMemory.pageUnderstanding || '',
+    importantEvidence: input.workingMemory.findings,
+    openObservations: [],
+    remaining: input.workingMemory.nextStep ? [input.workingMemory.nextStep] : [],
+    nextStep: input.workingMemory.nextStep || 'Continue from the latest live browser state.',
+    recentToolAttempts: formatCurrentToolAttemptSummary(input.traces, 5),
+  }, null, 2);
 }
 
 function estimateTextTokens(text: string) {
@@ -1078,9 +1304,12 @@ function validateCandidateActionBeforeExecution(name: string, input: unknown, tr
 const candidateActionToolNames = new Set(['clickCandidate', 'hoverCandidate', 'doubleClickCandidate', 'rightClickCandidate', 'dragCandidate']);
 const domNodeIdToolNames = new Set(['clickDomNode', 'focusDomNode', 'getDomNodeText']);
 const noVisualAfterCaptureToolNames = new Set([
+  'getPageState',
   'reportState',
   'selectReferenceScreenshots',
   'manageVisualContext',
+  'readObservation',
+  'searchObservation',
   'listTabs',
   'getHttpRequests',
   'getInteractiveCandidates',
@@ -1518,17 +1747,21 @@ function makeBrowserTools(
     stepIndex?: number;
     allowedToolTypes?: string[];
     visualContext?: VisualContextManager;
+    observationStore?: RuntimeObservationStore;
+    toolExecutionGate?: { stepNumber: number; executed: boolean };
+    getAiRequest?: () => AiRequestSnapshot | undefined;
     abortSignal?: AbortSignal;
     shouldContinue?: () => boolean;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
+    observePageState?: () => Promise<BrowserActionResult>;
   },
 ) {
-  // Enforce a single executed tool per AI request. makeBrowserTools is created fresh for each
-  // request, so this flag guarantees that even if the model emits several tool calls in one
-  // response (parallel/chained), only the first one actually runs. The rest are ignored, which
-  // keeps every browser action paired with a fresh screenshot on the next step and prevents the
-  // duplicate-operation problem seen when a request was retried mid-chain.
-  let toolExecutedThisRequest = false;
+  // Enforce one executed browser tool per model step. The native AI SDK loop may call the model
+  // multiple times inside one user turn, so prepareStep resets this gate before each LLM call.
+  // If a single model response emits several tool calls, only the first one can produce side
+  // effects; the following calls receive an ignored result and the model can continue from the
+  // fresh tool result in the next step.
+  const toolExecutionGate = referenceOptions?.toolExecutionGate || { stepNumber: 0, executed: false };
   const toolTextRule = 'Do not include old tool params, candidate ids as business meaning, coordinates, screenshot ids/file names, or tool input JSON.';
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
   const toolContextShape = {
@@ -1549,15 +1782,15 @@ function makeBrowserTools(
 
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
     throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
-    if (toolExecutedThisRequest) {
+    if (toolExecutionGate.executed) {
       // Do not execute or trace extra calls; just tell the model to stop. This keeps the recorded
       // step clean (one real action) and avoids any duplicate side effect.
       return {
         ok: false,
-        actual: 'Ignored: only one tool call is allowed per step. Stop now; you will get a fresh screenshot at the start of the next step and can act again then.',
+        actual: `Ignored: only one browser tool can execute in model step ${toolExecutionGate.stepNumber + 1}. Continue from the executed tool result in the next model step.`,
       } satisfies BrowserActionResult;
     }
-    toolExecutedThisRequest = true;
+    toolExecutionGate.executed = true;
     return executeTracedBrowserAction({
       session,
       traces,
@@ -1568,14 +1801,23 @@ function makeBrowserTools(
       visualContext: referenceOptions?.visualContext,
       abortSignal: referenceOptions?.abortSignal,
       shouldContinue: referenceOptions?.shouldContinue,
-      aiRequest,
+      aiRequest: referenceOptions?.getAiRequest?.() || aiRequest,
       onToolTrace,
       onVisualContextChange: referenceOptions?.onVisualContextChange,
       action,
-    });
+    }).then((result) => compactToolResultForModel(name, result, referenceOptions?.observationStore));
   }
 
   const sharedTools = {
+    getPageState: tool({
+      description: 'Read-only observation tool: inspect the current active page state. DOM mode returns fresh full DOM, page text, URL, tabs, focus, and scroll state. Visual mode captures/attaches a fresh screenshot observation for the next model request and returns current visual metadata. Call this after any browser-changing action before choosing another action.',
+      inputSchema: browserToolInput({}),
+      execute: (input) => record('getPageState', input, async () => (
+        referenceOptions?.observePageState
+          ? referenceOptions.observePageState()
+          : { ok: false, actual: 'getPageState is unavailable in this runtime.' }
+      )),
+    }),
     openPage: tool({
       description: 'Open or navigate to a URL in the browser.',
       inputSchema: browserToolInput({
@@ -1629,6 +1871,25 @@ function makeBrowserTools(
       description: 'Read-only diagnostic tool: return recent HTTP requests for the current active tab, including method, URL, resource type, status, ok/failed, and error text. Use when a page looks broken, data is missing, an API may have failed, or you need evidence for a network-related issue.',
       inputSchema: browserToolInput({}),
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
+    }),
+    readObservation: tool({
+      description: 'Read-only context tool: read a range from a large tool result saved as observationId in this same agent turn. Use this instead of repeating a heavy text/DOM/network tool when the previous result was truncated.',
+      inputSchema: browserToolInput({
+        id: z.string().min(1).describe('The observationId returned by a previous large tool result, for example obs_ab12cd34ef56.'),
+        offset: z.number().int().nonnegative().optional().describe('Character offset to start reading from. Defaults to 0.'),
+        maxChars: z.number().int().positive().max(12000).optional().describe('Maximum characters to return. Defaults to 6000, capped at 12000.'),
+      }),
+      execute: (input) => record('readObservation', input, async () => readRuntimeObservation(referenceOptions?.observationStore, input.id, input.offset, input.maxChars)),
+    }),
+    searchObservation: tool({
+      description: 'Read-only context tool: search inside a large tool result saved as observationId in this same agent turn. Use this to locate omitted text without loading the whole observation.',
+      inputSchema: browserToolInput({
+        id: z.string().min(1).describe('The observationId returned by a previous large tool result.'),
+        query: z.string().min(1).max(300).describe('Short exact text to search for inside the saved observation.'),
+        maxMatches: z.number().int().positive().max(20).optional().describe('Maximum matches to return. Defaults to 6.'),
+        aroundChars: z.number().int().positive().max(2400).optional().describe('Characters of context around each match. Defaults to 700.'),
+      }),
+      execute: (input) => record('searchObservation', input, async () => searchRuntimeObservation(referenceOptions?.observationStore, input.id, input.query, input.maxMatches, input.aroundChars)),
     }),
     downloadFile: tool({
       description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, or pass a relative path/urlOrPath that will be resolved against AI_FILE_DOWNLOAD_BASE_URL from settings. Use this when the user asks to download/save a file; return the saved URL or local path in the final answer.',
@@ -1909,12 +2170,11 @@ async function verifyRuntimeCompletion(input: {
 }
 
 // 根据当前模式生成验证码/安全校验规则；DOM 模式不要要求 AI 读取截图。
-function domRuntimeSystemPrompt(pageContext: RuntimePageContext) {
+function formatDomPageStateObservation(pageContext: RuntimePageContext) {
   const domTree = domTreeForPrompt(pageContext.domTree || '[empty DOM tree]');
   return [
-    'Runtime DOM Context (fresh, authoritative for DOM mode):',
-    '- This system message is refreshed immediately before the AI request.',
-    '- Numeric DOM node_id values are volatile and valid only for this request. Never reuse historical DOM ids.',
+    'Current DOM page state observation:',
+    '- Numeric DOM node_id values are volatile. Use these ids only until the page changes.',
     `Current URL: ${pageContext.url}`,
     `Current title: ${pageContext.title}`,
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
@@ -1923,6 +2183,47 @@ function domRuntimeSystemPrompt(pageContext: RuntimePageContext) {
     `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
     `Full DOM snapshot:\n${domTree}`,
     `Full page text (${pageContext.textLength || 0} chars):\n${pageTextForPrompt(pageContext.text || '')}`,
+  ].filter(Boolean).join('\n');
+}
+
+function formatVisualPageStateObservation(input: {
+  pageContext: RuntimePageContext;
+  visualContext: ReturnType<VisualContextManager['snapshot']>;
+  screenshotInputEnabled: boolean;
+  markerEnabled: boolean;
+  markerOverlayInScreenshot: boolean;
+  separateMarkerMap: boolean;
+}) {
+  const { pageContext, visualContext, screenshotInputEnabled, markerEnabled, markerOverlayInScreenshot, separateMarkerMap } = input;
+  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
+  const shouldIncludeCandidates = !screenshotInputEnabled || !markerEnabled;
+  const imageRule = screenshotInputEnabled
+    ? separateMarkerMap
+      ? 'Screenshot images are attached: clean viewport first, pixel-aligned marker map second.'
+      : markerOverlayInScreenshot
+        ? 'A current viewport screenshot with marker labels overlaid is attached.'
+        : 'A current clean viewport screenshot is attached.'
+    : 'No screenshot image is attached; use the visible interactive elements list as the screenshot-derived candidate map.';
+  const frameSummary = (frame: VisualFrameRecord) => (
+    `${frame.id} ${concise(frame.reason, 80)} image=${basenameOfPath(frame.path)}${frame.originalPath ? ` original=${basenameOfPath(frame.originalPath)}` : ''}${frame.markerPath ? ` marker=${basenameOfPath(frame.markerPath)}` : ''}${frame.capture ? ` capture=${frame.capture}` : ''}`
+  );
+  return [
+    'Current visual page state observation:',
+    imageRule,
+    '- Candidate ids and scroll area ids are volatile. Use them only until the next browser-changing action.',
+    `Current URL: ${pageContext.url}`,
+    `Current title: ${pageContext.title}`,
+    `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
+    `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
+    `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
+    shouldIncludeCandidates
+      ? `Visible interactive elements:\n${formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)}`
+      : '',
+    'Visual Context Manager:',
+    `current: ${visualContext.current ? frameSummary(visualContext.current) : '[none]'}`,
+    visualContext.history.length
+      ? `history is context only, never use its ids for current actions:\n${visualContext.history.map((frame) => `- ${frameSummary(frame)} role=${frame.role} group=${frame.group || '-'}`).join('\n')}`
+      : 'history: [none]',
   ].filter(Boolean).join('\n');
 }
 
@@ -1994,7 +2295,7 @@ function runtimePrompt(input: {
         : 'the attached clean viewport screenshot'
     : visualMode
       ? 'current URL, tabs, scrollable areas, focused element, and the visible interactive elements list generated from the current screenshot'
-      : 'Codex-style full DOM snapshot, full page text, URL, tabs, scroll state, focused element, and read-only DOM text tools';
+      : 'the latest explicit getPageState DOM snapshot/page text observation, URL, tabs, scroll state, focused element, and read-only DOM text tools';
   const markerSourceRule = separateMarkerScreenshot
     ? '- Image 1 is the source of truth for what the page means. Image 2 only maps visible click/scroll positions to candidate IDs.'
     : markerOverlayInScreenshot
@@ -2027,14 +2328,14 @@ function runtimePrompt(input: {
     : [
         '- DOM mode has no clickCandidate/hoverCandidate/dragCandidate tools. Never choose visual candidate IDs.',
         '- Use clickDomNode(id,text?) with a numeric node_id copied from the CURRENT full DOM snapshot. The tool accepts the numeric id with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
-        '- The DOM tree is a full-page DOM snapshot with actionable node_ids beyond the current viewport, including accessible iframe and shadow DOM content, paired with full page text. Prefer this context before deciding to scroll.',
+        '- The DOM tree returned by getPageState is a full-page DOM snapshot with actionable node_ids beyond the current viewport, including accessible iframe and shadow DOM content, paired with full page text. Prefer this context before deciding to scroll.',
         '- Use getDomNodeText(id) when a full DOM snapshot line is truncated or you need the complete rendered text under a returned node.',
         '- Text matching is a recovery path, not the normal click path: call findByText(targetText,scopeId?) first, inspect the returned locatorIds, then call clickLocator(locatorId,text?) in a later turn.',
         '- Use findByText only when a fresh DOM id is unavailable or unreliable, such as dynamic search results, iframe/shadow/dialog/popover content, or an id that disappeared after refresh.',
         '- For findByText targetText, use a short unique visible/accessibility label from the CURRENT DOM/page context. Do not pass a long surrounding snippet.',
         '- For text entry, use clickDomNode(id,text) in one tool call when the input id is present. Use typeText only after a prior action already focused the field.',
         `- For stable forms with multiple fields in the same fresh DOM snapshot, use fillDomNodes(fields[]) once instead of one clickDomNode per field. You may include up to ${BATCH_FILL_FIELD_LIMIT} fields. Do not batch across navigation, popups, or dynamic multi-step UI.`,
-        '- Use scrollArea only when interaction requires changing the visual viewport or lazy-loaded content is absent from the full DOM/text context. The next AI request automatically includes the refreshed DOM snapshot before any further action.',
+        '- Use scrollArea only when interaction requires changing the visual viewport or lazy-loaded content is absent from the full DOM/text context. After scrolling or any browser-changing action, call getPageState before using new ids.',
         '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
         '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
       ];
@@ -2063,11 +2364,13 @@ function runtimePrompt(input: {
     browserChatMode ? '' : '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
     '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL or a relative path resolved against AI_FILE_DOWNLOAD_BASE_URL from settings.',
     '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. Include the returned URL or local path in the final answer.',
+    '- If the page may have changed or you need fresh DOM/text/screenshot evidence, call getPageState explicitly. The backend will not silently refresh page state between model calls.',
+    '- If a tool result includes observationId=..., inspect omitted content with readObservation(id,offset,maxChars) or searchObservation(id,query). Do not repeat the heavy tool unless the page changed.',
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
       : '- DOM action reason must cite the current full-DOM id/text, or the findByText locatorId plus matched text when using recovery locators.',
-    `- Use ${evidence} as the current page state.`,
+    `- Use ${evidence} as the current page state. When this state is stale, call getPageState.`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
@@ -2079,15 +2382,15 @@ function runtimePrompt(input: {
       : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
     attachScreenshot
       ? separateMarkerScreenshot
-        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomNodeText are unavailable.'
+        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. After any browser-changing action, call getPageState for the next screenshot observation. getInteractiveCandidates/getDomNodeText are unavailable.'
         : markerOverlayInScreenshot
-          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. White labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomNodeText are unavailable.'
+          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. White labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. After any browser-changing action, call getPageState for the next screenshot observation. getInteractiveCandidates/getDomNodeText are unavailable.'
         : markerEnabled
           ? '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. getInteractiveCandidates/getDomNodeText are unavailable.'
           : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomNodeText are unavailable.'
       : visualMode
         ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
-        : '- DOM mode: no screenshot image/path is attached. Use the current full DOM snapshot, full page text, and DOM node_id tools first; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
+        : '- DOM mode: no screenshot image/path is attached. Use getPageState for fresh full DOM/page text when needed, then use DOM node_id tools; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
     ...markerTargetRules,
     caseSystemPrompt ? `${browserChatMode ? 'Browser-chat loaded instructions and Skills' : 'Test-case-specific instructions'}:
 ${caseSystemPrompt}` : '',
@@ -2112,13 +2415,15 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     '- When a file tool succeeds, mention the saved file name and include its returned URL or local path.',
     '',
     'Current context:',
-    visualMode ? `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}` : 'See the Runtime DOM Context system message for current URL, tabs, focus, scroll state, DOM snapshot, and page text.',
+    browserChatMode
+      ? 'No DOM/page observation or tool result is preloaded in the initial messages. Call getPageState when fresh URL, tabs, focus, scroll state, DOM snapshot, page text, or screenshot evidence is needed.'
+      : visualMode ? `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}` : 'Initial DOM page observation is included in the user message. Call getPageState for fresh URL, tabs, focus, scroll state, DOM snapshot, and page text.',
     visualMode ? `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}` : '',
     visualMode ? `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}` : '',
     visualMode && visualTextCandidateFallback ? `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}` : '',
     visualMarkersWithoutOverlay || visualTextCandidateFallback ? `Visible interactive elements:
 ${candidateContext}` : '',
-    compactRunContext,
+    browserChatMode ? '' : compactRunContext,
     availableScreenshotReferences.length ? `Available previous screenshot references:
 ${formatScreenshotReferences(availableScreenshotReferences)}` : '',
     selectedScreenshotReferences.length ? `Selected reference screenshots:
@@ -2147,12 +2452,15 @@ function summarizeToolInput(input: unknown) {
 
 function runtimeToolNames(mode: BrowserSessionMode) {
   const sharedTools = [
+    'getPageState',
     'openPage',
     'openUrl',
     'waitForPage',
     'waitForHumanVerification',
     'listTabs',
     'getHttpRequests',
+    'readObservation',
+    'searchObservation',
     'downloadFile',
     'generateMarkdownFile',
     'switchTab',
@@ -2213,16 +2521,13 @@ function createAiRequestSnapshot(input: {
     createdAt: new Date().toISOString(),
     provider,
     model,
+    systemPrompt: input.systemPrompt,
     screenshotPath: input.screenshotPath,
     imageAttached: input.imageAttached,
     tools: input.tools,
     options: input.options,
     domContext: input.domContext,
     messages: [
-      ...(input.systemPrompt ? [{
-        role: 'system' as const,
-        content: [{ type: 'text' as const, text: input.systemPrompt }],
-      }] : []),
       {
         role: 'user',
         content: [
@@ -2257,6 +2562,98 @@ function aiRequestTextAndImageStats(aiRequest?: AiRequestSnapshot) {
   };
 }
 
+function binaryLogDescriptor(value: unknown, imagePath?: string) {
+  const bytes = Buffer.isBuffer(value)
+    ? value.length
+    : ArrayBuffer.isView(value)
+      ? value.byteLength
+      : value instanceof ArrayBuffer
+        ? value.byteLength
+        : typeof value === 'string'
+          ? value.length
+          : undefined;
+  return {
+    type: 'binary',
+    bytes,
+    imagePath,
+    attached: Boolean(imagePath),
+  };
+}
+
+function sanitizeModelLogValue(
+  value: unknown,
+  imagePaths: string[],
+  state: { imageIndex: number },
+  seen = new WeakSet<object>(),
+): unknown {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== 'object') return value;
+  if (Buffer.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    const imagePath = imagePaths[state.imageIndex++];
+    return binaryLogDescriptor(value, imagePath);
+  }
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeModelLogValue(item, imagePaths, state, seen));
+  }
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (key === 'image') {
+      const imagePath = imagePaths[state.imageIndex++];
+      output[key] = binaryLogDescriptor(item, imagePath);
+    } else {
+      output[key] = sanitizeModelLogValue(item, imagePaths, state, seen);
+    }
+  }
+  return output;
+}
+
+function sanitizeModelMessagesForLog(system: string | undefined, messages: unknown, imagePaths: string[]) {
+  void system;
+  return sanitizeModelLogValue(Array.isArray(messages) ? messages : [], imagePaths, { imageIndex: 0 });
+}
+
+function sanitizeModelInputForStats(system: string | undefined, messages: unknown, imagePaths: string[]) {
+  return sanitizeModelLogValue({
+    system: system || '',
+    messages: Array.isArray(messages) ? messages : [],
+  }, imagePaths, { imageIndex: 0 });
+}
+
+function modelMessagesTextAndImageStats(messages: unknown) {
+  let text = '';
+  let imageCount = 0;
+  const walk = (value: unknown) => {
+    if (typeof value === 'string') {
+      text += `\n${value}`;
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    if (record.type === 'image' || (record.image && typeof record.image === 'object')) {
+      imageCount += 1;
+      return;
+    }
+    Object.values(record).forEach(walk);
+  };
+  walk(messages);
+  const estimatedTextTokens = estimateTextTokens(text);
+  const estimatedImageTokens = imageCount * imageTokenEstimatePerImage();
+  return {
+    textCharacters: text.length,
+    imageCount,
+    estimatedTextTokens,
+    estimatedImageTokens,
+    estimatedTotalTokens: estimatedTextTokens + estimatedImageTokens,
+    method: 'rough estimate from sanitized modelMessages: ASCII chars / 4 + non-ASCII chars + imageCount * AI_IMAGE_CONTEXT_ESTIMATE_TOKENS',
+  };
+}
+
 function fullLogDetails(value: unknown) {
   return {
     [fullLogDetailsFlag]: true,
@@ -2264,16 +2661,25 @@ function fullLogDetails(value: unknown) {
   };
 }
 
-function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Record<string, unknown> = {}) {
+function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Record<string, unknown> = {}, modelMessages?: unknown) {
   return fullLogDetails({
-    ...extra,
-    requestTokenEstimate: aiRequestTextAndImageStats(aiRequest),
-    request: aiRequest,
+    aiInput: {
+      provider: aiRequest?.provider || extra.provider,
+      model: aiRequest?.model || extra.model,
+      tools: aiRequest?.tools,
+      options: {
+        ...(aiRequest?.options || {}),
+        ...extra,
+      },
+      system: aiRequest?.systemPrompt,
+      messages: modelMessages || aiRequest?.messages || [],
+    },
   });
 }
 
 function aiResponseLogDetails(input: {
   aiRequest?: AiRequestSnapshot;
+  modelMessages?: unknown;
   response: unknown;
   elapsedMs: number;
   traces?: ToolTrace[];
@@ -2282,14 +2688,11 @@ function aiResponseLogDetails(input: {
   extra?: Record<string, unknown>;
 }) {
   return fullLogDetails({
-    ...(input.extra || {}),
-    elapsedMs: input.elapsedMs,
-    requestTokenEstimate: aiRequestTextAndImageStats(input.aiRequest),
-    request: input.aiRequest,
-    response: input.response,
-    traces: input.traces,
-    visualContext: input.visualContext,
-    workingMemory: input.workingMemory,
+    aiOutput: sanitizeModelLogValue({
+      ...(input.extra || {}),
+      elapsedMs: input.elapsedMs,
+      response: input.response,
+    }, [], { imageIndex: 0 }),
   });
 }
 
@@ -2308,6 +2711,28 @@ function parseListLike(text?: string) {
     .map((item) => item.replace(/^[\d.\s、*-]+/, '').trim())
     .filter((item) => item && !/^(无|none)$/i.test(item))
     .slice(0, 8);
+}
+
+function textFromUnknown(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
+        const record = item as Record<string, unknown>;
+        return textFromUnknown(record.text ?? record.content);
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return textFromUnknown(record.text ?? record.content);
+  }
+  return '';
 }
 
 function parseJsonPayload(value: unknown) {
@@ -2631,6 +3056,8 @@ async function executeRuntimeStep(input: {
   runId: string;
   stepIndex: number;
   beforeScreenshotPath: string;
+  instruction?: string;
+  conversation?: InteractiveBrowserTurnMessage[];
   completedSteps: StepExecutionResult[];
   selectedScreenshotReferences?: SelectedScreenshotReference[];
   referenceImagePaths?: string[];
@@ -2697,16 +3124,40 @@ async function executeRuntimeStep(input: {
       })))
     : [];
   ensureActive();
-  const selectedReferenceScreenshots = screenshotInputEnabled
-    ? await Promise.all(selectedScreenshotReferences.map(async (ref) => ({
+  let runtimeSelectedScreenshotReferences = [...selectedScreenshotReferences];
+  const loadSelectedReferenceScreenshots = async () => screenshotInputEnabled
+    ? Promise.all(runtimeSelectedScreenshotReferences.map(async (ref) => ({
         ref,
         image: await readScreenshotForAi(ref.path).catch(() => undefined),
       })))
     : [];
+  let runtimeSelectedReferenceScreenshots = await loadSelectedReferenceScreenshots();
   ensureActive();
   const screenshotReadMs = elapsedSince(screenshotReadStartedAt);
   const availableScreenshotReferences = buildAvailableScreenshotReferences(completedSteps);
   const availableReferenceIds = new Set(availableScreenshotReferences.map((ref) => ref.id));
+  const applySelectedReferenceScreenshots = async (selection: {
+    ids: string[];
+    selectionReason: string;
+    sameInterfaceGroup?: string;
+  }) => {
+    const validIds = selection.ids.filter((id) => availableReferenceIds.has(id));
+    runtimeSelectedScreenshotReferences = validIds
+      .map((id) => availableScreenshotReferences.find((ref) => ref.id === id))
+      .filter((ref): ref is ScreenshotReference => Boolean(ref))
+      .map((ref) => ({
+        ...ref,
+        selectionReason: selection.selectionReason,
+        sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
+      }));
+    runtimeSelectedReferenceScreenshots = await loadSelectedReferenceScreenshots();
+    await onSelectReferenceScreenshots?.({
+      ...selection,
+      ids: validIds,
+      availableReferences: availableScreenshotReferences,
+    });
+    return validIds;
+  };
   const promptStartedAt = Date.now();
   const userReferenceImagePrompt = userReferenceImagePaths.length
     ? [
@@ -2725,7 +3176,7 @@ async function executeRuntimeStep(input: {
     hasMarkerScreenshot: Boolean(markerScreenshot),
     markerOverlayInScreenshot,
     availableScreenshotReferences,
-    selectedScreenshotReferences,
+    selectedScreenshotReferences: runtimeSelectedScreenshotReferences,
     repairContext: input.repairContext,
   })}${userReferenceImagePrompt}`;
   const promptMs = elapsedSince(promptStartedAt);
@@ -2740,7 +3191,7 @@ async function executeRuntimeStep(input: {
       screenshotInputEnabled,
       screenshotBytes: screenshot?.length,
       markerScreenshotBytes: markerScreenshot?.length,
-      selectedReferenceScreenshotCount: selectedReferenceScreenshots.filter((item) => item.image).length,
+      selectedReferenceScreenshotCount: runtimeSelectedReferenceScreenshots.filter((item) => item.image).length,
       userReferenceImageCount: userReferenceImages.filter((item) => item.image).length,
       browserMode: mode,
     },
@@ -2750,37 +3201,33 @@ async function executeRuntimeStep(input: {
   async function runAgent(includeImage: boolean) {
     const traces: ToolTrace[] = [];
     const codexMode = isCodexProvider();
-    const baseAllowedToolTypes = runtimeToolNames(mode).filter((name) => !(browserChatMode && name === 'reportState'));
+    const observationStore: RuntimeObservationStore = new Map();
+    const nativeAllowedToolTypes = runtimeToolNames(mode).filter((name) => !(browserChatMode && name === 'reportState'));
+    const baseAllowedToolTypes = codexMode
+      ? nativeAllowedToolTypes.filter((name) => !runtimeObservationToolNames.has(name) && name !== 'getPageState')
+      : nativeAllowedToolTypes;
     const allowedToolTypes = browserChatMode && codexMode
       ? [...baseAllowedToolTypes, 'answer']
       : baseAllowedToolTypes;
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
-    let requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
-    let requestSystemPrompt: string | undefined;
-    async function refreshRequestPromptForTurn() {
-      ensureActive();
-      const currentPageContext = await session.getPageContext(runtimePageContextOptions(mode));
-      ensureActive();
-      currentDomContext = createDomContextSnapshot(mode, currentPageContext);
-      requestSystemPrompt = mode === 'dom' ? domRuntimeSystemPrompt(currentPageContext) : undefined;
-      const currentMarkerPath = visualContext.current()?.markerPath;
-      const basePrompt = `${runtimePrompt({
-        testCase,
-        pageContext: currentPageContext,
-        completedSteps,
-        workingMemory,
-        stepIndex,
-        beforeScreenshotPath,
-        hasMarkerScreenshot: Boolean(separateMarkerMap && currentMarkerPath),
-        markerOverlayInScreenshot,
-        availableScreenshotReferences,
-        selectedScreenshotReferences,
-        repairContext: input.repairContext,
-      })}${userReferenceImagePrompt}`;
-      requestPrompt = codexMode ? buildCodexObjectPrompt(basePrompt, allowedToolTypes) : basePrompt;
-      return requestPrompt;
-    }
+    const initialPageObservation = browserChatMode
+      ? ''
+      : mode === 'dom'
+      ? formatDomPageStateObservation(pageContext)
+      : formatVisualPageStateObservation({
+          pageContext,
+          visualContext: visualContext.snapshot(),
+          screenshotInputEnabled,
+          markerEnabled,
+          markerOverlayInScreenshot,
+          separateMarkerMap,
+        });
+    const initialRequestPrompt = initialPageObservation
+      ? `${prompt}\n\nInitial page observation:\n${initialPageObservation}`
+      : prompt;
+    const requestPrompt = codexMode ? buildCodexObjectPrompt(initialRequestPrompt, allowedToolTypes) : initialRequestPrompt;
+    let requestSystemPrompt: string | undefined = browserChatMode ? requestPrompt : undefined;
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(testCase),
       phase: browserChatMode
@@ -2792,119 +3239,283 @@ async function executeRuntimeStep(input: {
       findings: [],
       blockers: [],
       pageUnderstanding: '',
-      currentState: mode === 'dom'
-        ? 'No DOM state summary yet; use the current full DOM snapshot, full page text, URL, focus, tabs, and scroll state.'
-        : 'No visual state summary yet; inspect the current screenshot.',
+      currentState: browserChatMode
+        ? 'No page observation is preloaded; call getPageState when browser evidence is needed.'
+        : mode === 'dom'
+        ? 'Initial DOM observation is available; call getPageState again whenever the page may have changed.'
+        : 'Initial visual observation is available; call getPageState again after browser-changing actions.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
         : mode === 'dom'
-          ? 'Use current full DOM node_ids, full page text, and getDomNodeText for the next missing goal; scroll only when the content is lazy-loaded or viewport-dependent.'
-          : 'Use the current screenshot to complete the next missing goal.',
+          ? 'Use the latest getPageState DOM node_ids/page text for the next missing goal; scroll only when content is lazy-loaded or viewport-dependent.'
+          : 'Use the latest getPageState screenshot observation to complete the next missing goal.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
-    let contextCompressionTurns = 0;
-    let aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: requestPrompt, screenshotPath: beforeScreenshotPath, imagePaths: [...(includeImage ? visualContext.imagePaths() : []), ...userReferenceImagePaths], imageAttached: Boolean((includeImage && screenshot) || userReferenceImages.some((item) => item.image)), tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, prepareStep: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: (includeImage ? visualContext.imagePaths().length : 0) + userReferenceImages.filter((item) => item.image).length, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length } });
+    const initialVisualPaths = browserChatMode ? [] : includeImage ? visualContext.imagePaths() : [];
+    const initialSelectedReferenceImagePaths = browserChatMode ? [] : runtimeSelectedReferenceScreenshots.filter((item) => item.image).map((item) => item.ref.path);
+    const initialUserReferenceImagePaths = userReferenceImages.filter((item) => item.image).map((item) => item.imagePath);
+    type RuntimeModelMessage = ModelMessage;
+    type PendingObservationMessage = {
+      text: string;
+      imagePaths: string[];
+      domContext?: AiDomContextSnapshot;
+    };
+    const pendingObservationMessages: PendingObservationMessage[] = [];
+    const historyMessages = (input.conversation || [])
+      .map((message) => {
+        const content = textFromUnknown(message?.content);
+        if (!content.trim()) return undefined;
+        return {
+          role: message?.role === 'assistant' ? 'assistant' as const : 'user' as const,
+          content,
+        };
+      })
+      .filter((message): message is { role: 'user' | 'assistant'; content: string } => Boolean(message)) as RuntimeModelMessage[];
+    const initialImagePaths = [...initialVisualPaths, ...initialSelectedReferenceImagePaths, ...initialUserReferenceImagePaths];
+    const initialImages: Buffer[] = [];
+    for (const imagePath of initialImagePaths) {
+      const image = await readScreenshotForAi(imagePath).catch(() => undefined);
+      if (image) initialImages.push(image);
+    }
+    let initialMessages = [...historyMessages] as RuntimeModelMessage[];
+    if (browserChatMode) {
+      const latestInstruction = (
+        textFromUnknown(input.instruction)
+        || textFromUnknown(testCase.description)
+        || textFromUnknown(testCase.content?.description)
+      ).trim();
+      const hasLatestUserMessage = Boolean(latestInstruction && initialMessages.some((message) => {
+        if (message.role !== 'user' || typeof message.content !== 'string') return false;
+        const content = textFromUnknown(message.content);
+        return content.trim() === latestInstruction || content.includes(latestInstruction);
+      }));
+      if (latestInstruction && !hasLatestUserMessage) {
+        initialMessages.push({ role: 'user' as const, content: latestInstruction });
+      }
+      if (initialImages.length) {
+        const latestUserIndex = initialMessages.map((message) => message.role).lastIndexOf('user');
+        const fallbackText = latestInstruction || 'User uploaded reference image(s).';
+        if (latestUserIndex >= 0) {
+          const latestUser = initialMessages[latestUserIndex];
+          const text = typeof latestUser.content === 'string' && latestUser.content.trim()
+            ? latestUser.content
+            : fallbackText;
+          initialMessages[latestUserIndex] = {
+            role: 'user' as const,
+            content: [
+              { type: 'text' as const, text },
+              ...initialImages.map((image) => ({ type: 'image' as const, image })),
+            ],
+          };
+        } else {
+          initialMessages.push({
+            role: 'user' as const,
+            content: [
+              { type: 'text' as const, text: fallbackText },
+              ...initialImages.map((image) => ({ type: 'image' as const, image })),
+            ],
+          });
+        }
+      }
+    } else {
+      const initialContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: requestPrompt }];
+      for (const image of initialImages) initialContent.push({ type: 'image', image });
+      initialMessages = [...historyMessages, { role: 'user' as const, content: initialContent }] as RuntimeModelMessage[];
+    }
+    let messageImagePaths = [...initialImagePaths];
+    let aiRequest = createAiRequestSnapshot({
+      kind: 'runtime',
+      stepIndex,
+      prompt: browserChatMode ? '[system prompt]' : requestPrompt,
+      systemPrompt: requestSystemPrompt,
+      screenshotPath: beforeScreenshotPath,
+      imagePaths: initialImagePaths,
+      imageAttached: Boolean(initialImagePaths.length),
+      tools: allowedToolTypes,
+      domContext: currentDomContext,
+      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: initialVisualPaths.length + initialSelectedReferenceImagePaths.length + initialUserReferenceImagePaths.length, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, selectedReferenceScreenshotCount: initialSelectedReferenceImagePaths.length, userReferenceImageCount: initialUserReferenceImagePaths.length, observationCount: observationStore.size },
+    });
     lastAiRequest = aiRequest;
+    const toolExecutionGate = { stepNumber: 0, executed: false };
+    const stepTraceStarts = new Map<number, number>();
+    const stepStartedAt = new Map<number, number>();
+    const stepModelMessagesForLog = new Map<number, unknown>();
+    let contextSegmentationTurns = 0;
+    let pageStateObservationIndex = 0;
+    const continuationSummaryMarker = '[WebPilot continuation summary]';
 
-    async function prepareStep(turnIndex: number) {
+    async function observePageState(): Promise<BrowserActionResult> {
       ensureActive();
-      const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
-      let visualPaths = includeImage ? visualContext.imagePaths() : [];
-      let traceLimit = 5;
-      let compressionDetails: Record<string, unknown> | undefined;
-      await refreshRequestPromptForTurn();
-      const buildContextText = () => {
-        const compressionNote = compressionDetails
-          ? [
-              'Context budget manager:',
-              `- Estimated context exceeded ${Math.round(Number(compressionDetails.thresholdRatio) * 100)}%; historical visual frames and working memory were compressed.`,
-              '- This request is a single reconstructed prompt built from current visual context, compact memory, and recent tool summaries.',
-            ].join('\n')
-          : '';
-        return buildPrepareStepPrompt({
-          requestPrompt,
-          compressionNote,
-          workingMemoryText: formatWorkingMemory(workingMemory),
-          visualContextText: mode === 'dom'
-            ? [
-                'DOM Context Manager:',
-                '- Current full DOM snapshot, full page text, URL, focus, tabs, and scroll state in Runtime Context are authoritative.',
-                '- No screenshot image is attached for DOM decisions.',
-                '- If needed content/control is absent from the full DOM/text context, scroll the relevant area only for lazy-loaded or viewport-dependent UI; the next AI request will include the refreshed DOM/text context.',
-              ].join('\n')
-            : visualContext.renderText(),
-          currentToolAttemptsText: formatCurrentToolAttemptSummary(traces, traceLimit),
-          turnIndex,
-          maxTurns,
-          traceLimit,
-          allowTextResponse: browserChatMode,
-          browserMode: mode,
+      const currentPageContext = await session.getPageContext(runtimePageContextOptions(mode));
+      ensureActive();
+      currentDomContext = createDomContextSnapshot(mode, currentPageContext);
+
+      if (mode === 'dom') {
+        return { ok: true, actual: formatDomPageStateObservation(currentPageContext) };
+      }
+
+      let observationImagePaths: string[] = [];
+      if (includeImage && screenshotInputEnabled) {
+        pageStateObservationIndex += 1;
+        const visualIndex = traces.length + pageStateObservationIndex + 1;
+        const screenshotPath = await session.takeScreenshot(input.runId, stepIndex, `visual-${visualIndex}`, { capture: 'viewport' });
+        ensureActive();
+        const markerPath = session.getLastCandidateMarkerScreenshotPath();
+        const originalPath = session.getLastOriginalScreenshotPath();
+        const frame = visualContext.apply({
+          path: screenshotPath,
+          originalPath,
+          markerPath,
+          stepIndex,
+          toolName: 'getPageState',
+          capture: 'viewport',
+          reason: 'Explicit getPageState screenshot observation',
+        }, { capture: 'viewport', retention: 'replace', reason: 'Explicit getPageState screenshot observation' });
+        observationImagePaths = [frame.path, ...(frame.markerPath ? [frame.markerPath] : [])];
+        await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated by getPageState.', details: visualContext.snapshot() });
+      }
+
+      const observationText = formatVisualPageStateObservation({
+        pageContext: currentPageContext,
+        visualContext: visualContext.snapshot(),
+        screenshotInputEnabled: Boolean(observationImagePaths.length),
+        markerEnabled,
+        markerOverlayInScreenshot,
+        separateMarkerMap,
+      });
+      if (observationImagePaths.length) {
+        pendingObservationMessages.push({
+          text: `[WebPilot explicit page observation]\n${observationText}`,
+          imagePaths: observationImagePaths,
+          domContext: currentDomContext,
         });
+      }
+      return {
+        ok: true,
+        actual: observationImagePaths.length
+          ? `${observationText}\n\n[Current screenshot image will be attached to the next model request as an explicit getPageState observation message.]`
+          : observationText,
       };
-      let contextText = buildContextText();
+    }
+
+    const summarizeContinuation = async (modelMessagesForLog: unknown, turnIndex: number, messageStats: ReturnType<typeof modelMessagesTextAndImageStats>, thresholdTokens: number) => {
+      ensureActive();
+      try {
+        const result = await generateTextWithTimeout({
+          model: getModel(),
+          messages: [{
+            role: 'user' as const,
+            content: buildContinuationSummaryPrompt({
+              goal: requirementOf(testCase),
+              browserMode: mode,
+              stepIndex,
+              agentStep: turnIndex + 1,
+              estimatedTokens: messageStats.estimatedTotalTokens,
+              thresholdTokens,
+              modelMessages: modelMessagesForLog,
+            }),
+          }],
+          temperature: 0.1,
+          maxRetries: 0,
+          abortSignal,
+        });
+        ensureActive();
+        return trimDebugText(result.text || '', 12000) || fallbackContinuationSummary({
+          goal: requirementOf(testCase),
+          browserMode: mode,
+          stepIndex,
+          agentStep: turnIndex + 1,
+          traces,
+          workingMemory,
+        });
+      } catch (error) {
+        if (isBrowserChatAbortError(error, abortSignal)) throw browserChatAbortError(abortSignal);
+        return fallbackContinuationSummary({
+          goal: requirementOf(testCase),
+          browserMode: mode,
+          stepIndex,
+          agentStep: turnIndex + 1,
+          traces,
+          workingMemory,
+        });
+      }
+    };
+
+    async function prepareStep(turnIndex: number, previousMessages?: RuntimeModelMessage[]) {
+      ensureActive();
       const windowTokens = contextWindowTokens();
       const thresholdRatio = contextCompressionThresholdRatio();
       const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
-      const estimateText = () => [requestSystemPrompt, contextText].filter(Boolean).join('\n');
-      let estimatedTokens = estimateContextTokens(estimateText(), visualPaths.length + userReferenceImages.filter((item) => item.image).length);
-      if (estimatedTokens > thresholdTokens) {
-        const beforeImageCount = visualPaths.length;
-        const removedFrames = visualContext.compressForBudget('Context budget exceeded; compacting historical visual frames.');
-        workingMemory = compactWorkingMemory(workingMemory);
-        contextCompressionTurns += 1;
-        traceLimit = 3;
-        visualPaths = includeImage ? visualContext.imagePaths() : [];
-        compressionDetails = {
-          turn: contextCompressionTurns,
-          estimatedTokensBefore: estimatedTokens,
-          thresholdTokens,
-          thresholdRatio,
-          windowTokens,
-          beforeImageCount,
-          afterImageCount: visualPaths.length,
-          removedFrames,
-        };
-        contextText = buildContextText();
-        estimatedTokens = estimateContextTokens(estimateText(), visualPaths.length + userReferenceImages.filter((item) => item.image).length);
-        if (estimatedTokens > thresholdTokens && visualPaths.length > 1) {
-          visualContext.manage('keepLatestOnly', 'Context budget still exceeded after history compression; keeping only current visual frame for the next dialogue turn.');
-          visualPaths = includeImage ? visualContext.imagePaths() : [];
-          compressionDetails = {
-            ...compressionDetails,
-            secondPass: 'keepLatestOnly',
-            estimatedTokensAfterFirstPass: estimatedTokens,
-            afterImageCount: visualPaths.length,
-          };
-          contextText = buildContextText();
-          estimatedTokens = estimateContextTokens(estimateText(), visualPaths.length + userReferenceImages.filter((item) => item.image).length);
+      const appendedMessages: RuntimeModelMessage[] = [];
+      const appendedImagePaths: string[] = [];
+      while (pendingObservationMessages.length) {
+        const observation = pendingObservationMessages.shift();
+        if (!observation) break;
+        if (observation.domContext) currentDomContext = observation.domContext;
+        const content: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: observation.text }];
+        for (const imagePath of observation.imagePaths) {
+          const image = await readScreenshotForAi(imagePath).catch(() => undefined);
+          if (image) {
+            content.push({ type: 'image', image });
+            appendedImagePaths.push(imagePath);
+          }
         }
+        appendedMessages.push({ role: 'user' as const, content });
+      }
+
+      let messagesToSend = previousMessages?.length ? [...previousMessages] : [...initialMessages];
+      if (appendedMessages.length) {
+        messagesToSend = [...messagesToSend, ...appendedMessages];
+        messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
+      }
+
+      let attachedImagePaths = [...messageImagePaths];
+      let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
+      let modelContextSegmentation: Record<string, unknown> | undefined;
+      const modelInputForStats = sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths);
+      const messageStats = modelMessagesTextAndImageStats(modelInputForStats);
+      if ((previousMessages?.length || messagesToSend.length > 1) && messageStats.estimatedTotalTokens > thresholdTokens) {
+        const summary = await summarizeContinuation(modelInputForStats, turnIndex, messageStats, thresholdTokens);
+        contextSegmentationTurns += 1;
+        messagesToSend = [
+          { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
+          ...(appendedMessages.length
+            ? appendedMessages
+            : [{ role: 'user' as const, content: 'Continue from the continuation summary. If fresh page state is needed before acting, call getPageState.' }]),
+        ];
+        attachedImagePaths = appendedImagePaths;
+        messageImagePaths = [...attachedImagePaths];
+        modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
+        const afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths));
+        modelContextSegmentation = {
+          segment: contextSegmentationTurns,
+          reason: 'modelMessages exceeded context threshold',
+          estimatedTokensBefore: messageStats.estimatedTotalTokens,
+          estimatedTokensAfter: afterStats.estimatedTotalTokens,
+          thresholdTokens,
+        };
         await onDebug?.({
-          phase: 'ai:context-compressed',
+          phase: 'ai:context-segmented',
           stepIndex,
-          message: `Context estimate ${estimatedTokens}/${windowTokens} tokens after compression; rebuilt one-shot runtime context ${contextCompressionTurns}.`,
-          details: { ...compressionDetails, estimatedTokensAfter: estimatedTokens, visualContext: visualContext.snapshot(), workingMemory },
+          message: `Model message context exceeded threshold; inserted continuation summary segment ${contextSegmentationTurns}.`,
+          details: modelContextSegmentation,
         });
       }
-      const content: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: contextText }];
-      for (const imagePath of visualPaths) { const image = await readScreenshotForAi(imagePath).catch(() => undefined); if (image) content.push({ type: 'image', image }); }
-      ensureActive();
-      for (const referenceImage of userReferenceImages) { if (referenceImage.image) content.push({ type: 'image', image: referenceImage.image }); }
-      ensureActive();
-      const attachedImagePaths = [...visualPaths, ...userReferenceImages.filter((item) => item.image).map((item) => item.imagePath)];
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, systemPrompt: requestSystemPrompt, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, agentStepIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: observationStore.size, explicitPageState: true, modelContextSegmentation } });
       lastAiRequest = aiRequest;
       return {
         system: requestSystemPrompt || undefined,
-        messages: [{ role: 'user' as const, content }],
+        messages: messagesToSend,
+        modelMessagesForLog,
       };
     }
 
     if (codexMode) {
       const aiStartedAt = Date.now();
-      const { system, messages } = await prepareStep(0);
+      const { system, messages, modelMessagesForLog } = await prepareStep(0);
       ensureActive();
       await onDebug?.({
         phase: 'ai:runtime:request',
@@ -2914,7 +3525,7 @@ async function executeRuntimeStep(input: {
           provider: getModelSettings().provider,
           model: getModelSettings().model,
           codexObjectMode: true,
-        }),
+        }, modelMessagesForLog),
       });
       const result = await generateTextWithTimeout({ model: getModel(), system, messages, temperature: 0.1, maxRetries: 0, abortSignal });
       ensureActive();
@@ -2941,7 +3552,7 @@ async function executeRuntimeStep(input: {
           ensureActive();
           await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
         },
-        onSelectReferenceScreenshots: async (selection) => { ensureActive(); const validIds = selection.ids.filter((id) => availableReferenceIds.has(id)); await onSelectReferenceScreenshots?.({ ...selection, ids: validIds, availableReferences: availableScreenshotReferences }); },
+        onSelectReferenceScreenshots: async (selection) => { ensureActive(); await applySelectedReferenceScreenshots(selection); },
       });
       ensureActive();
       await onDebug?.({
@@ -2950,6 +3561,7 @@ async function executeRuntimeStep(input: {
         message: 'Codex object -> ' + object.type + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms',
         details: aiResponseLogDetails({
           aiRequest,
+          modelMessages: modelMessagesForLog,
           response: { result, object, execution },
           elapsedMs: elapsedSince(aiStartedAt),
           traces,
@@ -2964,103 +3576,133 @@ async function executeRuntimeStep(input: {
         aiRequest,
         visualContext: visualContext.snapshot(),
         workingMemory,
-        endedWithText: browserChatMode && !execution.executed && Boolean(execution.text.trim()),
+        endedWithText: browserChatMode && !execution.executed && Boolean(textFromUnknown(execution.text).trim()),
       };
     }
 
-    const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
-    for (let turnIndex = 0; turnIndex < maxTurns; turnIndex += 1) {
+    const stopWhen = [hasToolCall('reportState'), hasToolCall('waitForHumanVerification')];
+    try {
+      const result = await generateTextWithTimeout({
+        model: getModel(),
+        messages: initialMessages,
+        tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
+          ensureActive();
+          workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
+          await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+          ensureActive();
+          await onDebug?.({
+            phase: 'ai:tool',
+            stepIndex,
+            message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'),
+            details: { trace, visualContext: visualContext.snapshot(), workingMemory },
+          });
+        }, {
+          availableReferenceIds,
+          allowedToolTypes,
+          runId: input.runId,
+          stepIndex,
+          visualContext,
+          observationStore,
+          toolExecutionGate,
+          getAiRequest: () => aiRequest,
+          abortSignal,
+          shouldContinue: input.shouldContinue,
+          observePageState,
+          onVisualContextChange: async (snapshot) => {
+            ensureActive();
+            await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
+          },
+          onSelectReferenceScreenshots: async (selection) => {
+            ensureActive();
+            await applySelectedReferenceScreenshots(selection);
+          },
+        }),
+        stopWhen,
+        prepareStep: async ({ stepNumber, messages }) => {
+          ensureActive();
+          const prepared = await prepareStep(stepNumber, messages as RuntimeModelMessage[]);
+          ensureActive();
+          stepModelMessagesForLog.set(stepNumber, prepared.modelMessagesForLog);
+          toolExecutionGate.stepNumber = stepNumber;
+          toolExecutionGate.executed = false;
+          stepTraceStarts.set(stepNumber, traces.length);
+          stepStartedAt.set(stepNumber, Date.now());
+          await onDebug?.({
+            phase: 'ai:runtime:request',
+            stepIndex,
+            message: 'AI request started; waiting for browser action decision. agent step ' + agentStepLabel(stepNumber) + '.',
+            details: aiRequestLogDetails(aiRequest, {
+              provider: getModelSettings().provider,
+              model: getModelSettings().model,
+              agentStepIndex: stepNumber + 1,
+              nativeToolLoop: true,
+            }, prepared.modelMessagesForLog),
+          });
+          return { system: prepared.system, messages: prepared.messages };
+        },
+        onStepFinish: async (event) => {
+          ensureActive();
+          latestText = event.text || '';
+          const turnIndex = event.stepNumber;
+          const traceStart = stepTraceStarts.get(turnIndex) ?? 0;
+          const newTraces = traces.slice(traceStart);
+          const startedAt = stepStartedAt.get(turnIndex) || Date.now();
+          await onDebug?.({
+            phase: 'ai:runtime:response',
+            stepIndex,
+            message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; agent step ' + agentStepLabel(turnIndex) + '; AI+tool ' + elapsedSince(startedAt) + 'ms',
+            details: aiResponseLogDetails({
+              aiRequest,
+              modelMessages: stepModelMessagesForLog.get(turnIndex),
+              response: event,
+              elapsedMs: elapsedSince(startedAt),
+              traces: newTraces,
+              visualContext: visualContext.snapshot(),
+              workingMemory,
+              extra: {
+                responseType: 'text',
+                text: latestText,
+                agentStepIndex: turnIndex + 1,
+                nativeToolLoop: true,
+              },
+            }),
+          });
+        },
+        temperature: 0.1,
+        maxRetries: 0,
+        abortSignal,
+      });
       ensureActive();
-      const aiStartedAt = Date.now();
-      const traceStart = traces.length;
-      try {
-        const { system, messages } = await prepareStep(turnIndex);
-        ensureActive();
+      latestText = result.text || latestText;
+      return {
+        text: latestText,
+        traces,
+        aiRequest,
+        visualContext: visualContext.snapshot(),
+        workingMemory,
+        endedWithText: browserChatMode && Boolean(textFromUnknown(latestText).trim()) && traces.at(-1)?.name !== 'waitForHumanVerification',
+      };
+    } catch (error) {
+      if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
+      if (traces.length && !abortSignal?.aborted) {
         await onDebug?.({
-          phase: 'ai:runtime:request',
+          phase: 'ai:runtime:partial',
           stepIndex,
-          message: 'AI request started; waiting for browser action decision. turn ' + (turnIndex + 1) + '/' + maxTurns + '.',
-          details: aiRequestLogDetails(aiRequest, {
-            provider: getModelSettings().provider,
-            model: getModelSettings().model,
-            turnIndex: turnIndex + 1,
-            maxTurns,
-          }),
+          message: 'AI request stopped after a tool executed; keeping the action and returning the partial native tool-loop state.',
+          details: { error: error instanceof Error ? error.message : String(error), traces, visualContext: visualContext.snapshot() },
         });
-        const result = await generateTextWithTimeout({
-          model: getModel(), system, messages,
-          tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
-            ensureActive();
-            workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
-            await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
-            ensureActive();
-            await onDebug?.({
-              phase: 'ai:tool',
-              stepIndex,
-              message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'),
-              details: { trace, visualContext: visualContext.snapshot(), workingMemory },
-            });
-          }, { availableReferenceIds, allowedToolTypes, runId: input.runId, stepIndex, visualContext, abortSignal, shouldContinue: input.shouldContinue, onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { ensureActive(); await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
-          stopWhen: stepCountIs(1), temperature: 0.1, maxRetries: 0, abortSignal,
-        });
-        ensureActive();
-        latestText = result.text || '';
-        const newTraces = traces.slice(traceStart);
-        const lastTrace = newTraces.at(-1);
-        await onDebug?.({
-          phase: 'ai:runtime:response',
-          stepIndex,
-          message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; turn ' + (turnIndex + 1) + '/' + maxTurns + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms',
-          details: aiResponseLogDetails({
-            aiRequest,
-            response: result,
-            elapsedMs: elapsedSince(aiStartedAt),
-            traces: newTraces,
-            visualContext: visualContext.snapshot(),
-            workingMemory,
-            extra: {
-              responseType: 'text',
-              text: latestText,
-              turnIndex: turnIndex + 1,
-              maxTurns,
-            },
-          }),
-        });
-        if (!lastTrace || lastTrace.name === 'reportState' || lastTrace.name === 'waitForHumanVerification') {
-          return {
-            text: latestText,
-            traces,
-            aiRequest,
-            visualContext: visualContext.snapshot(),
-            workingMemory,
-            endedWithText: browserChatMode && !lastTrace && Boolean(latestText.trim()),
-          };
-        }
-      } catch (error) {
-        if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
-        if (traces.length > traceStart && !abortSignal?.aborted) {
-          await onDebug?.({ phase: 'ai:runtime:partial', stepIndex, message: 'AI request stopped after a tool executed; keeping the action and continuing from Visual Context Manager.', details: { error: error instanceof Error ? error.message : String(error), traces: traces.slice(traceStart), visualContext: visualContext.snapshot() } });
-          return {
-            text: latestText,
-            traces,
-            aiRequest,
-            visualContext: visualContext.snapshot(),
-            workingMemory,
-            endedWithText: false,
-          };
-        }
-        if (error && typeof error === 'object') (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
-        throw error;
+        return {
+          text: latestText,
+          traces,
+          aiRequest,
+          visualContext: visualContext.snapshot(),
+          workingMemory,
+          endedWithText: false,
+        };
       }
+      if (error && typeof error === 'object') (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
+      throw error;
     }
-    return {
-      text: latestText,
-      traces,
-      aiRequest,
-      visualContext: visualContext.snapshot(),
-      workingMemory,
-      endedWithText: false,
-    };
   }
 
   // Hidden retries can duplicate browser actions when a provider error happens after a tool
@@ -3105,24 +3747,6 @@ export type InteractiveBrowserTurnMessage = {
   content: string;
 };
 
-export type InteractiveBrowserConversationMemory = {
-  version?: number;
-  updatedAt?: string;
-  coveredMessageIds?: string[];
-  coveredStepIndexes?: number[];
-  latestUserGoal?: string;
-  summary?: string;
-  userConstraints?: string[];
-  completed?: string[];
-  pending?: string[];
-  findings?: string[];
-  blockers?: string[];
-  decisions?: string[];
-  lastAssistantReply?: string;
-  continuationHint?: string;
-  evidenceRefs?: Array<{ type?: string; id?: string; note?: string }>;
-};
-
 export type InteractiveBrowserTurnResult = {
   status: 'passed' | 'failed' | 'blocked';
   reply: string;
@@ -3131,11 +3755,6 @@ export type InteractiveBrowserTurnResult = {
   consoleErrors: string[];
   networkErrors: string[];
 };
-
-function browserChatMaxBrowserSteps() {
-  const raw = Number(process.env.AI_BROWSER_CHAT_MAX_STEPS || 6);
-  return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 6));
-}
 
 function browserChatMaxConsecutiveAiRequestFailures() {
   const raw = Number(process.env.AI_BROWSER_CHAT_MAX_CONSECUTIVE_REQUEST_FAILURES || 3);
@@ -3159,35 +3778,17 @@ function canPromptManualVerification(counts: Map<number, number>, stepIndex: num
   return manualResumeCount(counts, stepIndex) < maxPrompts;
 }
 
-function formatBrowserChatConversationMemory(memory?: InteractiveBrowserConversationMemory) {
-  if (!memory) return '';
-  try {
-    return JSON.stringify(jsonSafe(memory), null, 2);
-  } catch {
-    return String(memory);
-  }
-}
-
 function browserChatRequirement(input: {
   targetUrl: string;
   instruction: string;
-  conversation: InteractiveBrowserTurnMessage[];
-  conversationMemory?: InteractiveBrowserConversationMemory;
 }) {
-  const memory = formatBrowserChatConversationMemory(input.conversationMemory);
-  const history = input.conversation
-    .slice(-12)
-    .map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${concise(message.content, 900)}`)
-    .join('\n');
   return [
     'Browser chat mode: live conversation, not a fixed test case.',
     `Latest user message: ${input.instruction}`,
     `Fallback target URL: ${input.targetUrl || 'about:blank'}`,
-    memory ? `Conversation Memory JSON (cross-turn compact state; prefer the latest user message and live page evidence if anything conflicts):\n${memory}` : '',
-    history ? `Recent raw conversation window:\n${history}` : '',
     '',
     'Browser-chat behavior:',
-    '- Follow the latest user message first; use earlier conversation only as context.',
+    '- Follow the latest user message first; use earlier model messages only as conversation context.',
     '- Use browser tools only for live action or page inspection. If current evidence is enough, answer directly.',
     '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
     '- Final visible answer must be Chinese Markdown. Do not include JSON, tool parameters, candidate ids, coordinates, or screenshot paths.',
@@ -3199,8 +3800,6 @@ function createInteractiveBrowserTestCase(input: {
   mode?: BrowserSessionMode | 'default';
   targetUrl: string;
   instruction: string;
-  conversation: InteractiveBrowserTurnMessage[];
-  conversationMemory?: InteractiveBrowserConversationMemory;
   skillContext?: string;
 }): TestCaseRecord {
   const now = new Date().toISOString();
@@ -3208,8 +3807,6 @@ function createInteractiveBrowserTestCase(input: {
   const requirement = browserChatRequirement({
     targetUrl,
     instruction: input.instruction,
-    conversation: input.conversation,
-    conversationMemory: input.conversationMemory,
   });
   return {
     id: input.id,
@@ -3251,8 +3848,8 @@ export async function executeInteractiveBrowserTurn(input: {
   runId: string;
   targetUrl: string;
   instruction: string;
+  modelInstruction?: string;
   conversation?: InteractiveBrowserTurnMessage[];
-  conversationMemory?: InteractiveBrowserConversationMemory;
   completedSteps?: StepExecutionResult[];
   mode?: BrowserSessionMode | 'default';
   referenceImagePaths?: string[];
@@ -3270,22 +3867,19 @@ export async function executeInteractiveBrowserTurn(input: {
     mode: input.mode,
     targetUrl: input.targetUrl,
     instruction: input.instruction,
-    conversation: input.conversation || [],
-    conversationMemory: input.conversationMemory,
     skillContext: input.skillContext,
   });
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
-  const maxSteps = browserChatMaxBrowserSteps();
   const maxConsecutiveAiRequestFailures = browserChatMaxConsecutiveAiRequestFailures();
   let consecutiveAiRequestFailures = 0;
 
-  for (let turnStep = 0; turnStep < maxSteps; turnStep += 1) {
+  while (true) {
     ensureActive();
     const stepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
-    await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `正在准备第 ${stepIndex} 步浏览器操作：读取当前页面状态。` });
+    await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `正在准备第 ${stepIndex} 步浏览器操作。` });
     let runningStep: StepExecutionResult = {
       index: stepIndex,
       action: 'AI is handling the latest browser chat message',
@@ -3315,6 +3909,8 @@ export async function executeInteractiveBrowserTurn(input: {
         runId: input.runId,
         stepIndex,
         beforeScreenshotPath,
+        instruction: input.modelInstruction || input.instruction,
+        conversation: input.conversation || [],
         completedSteps: steps.filter((step) => step.index !== stepIndex),
         selectedScreenshotReferences,
         referenceImagePaths: input.referenceImagePaths,
@@ -3417,7 +4013,7 @@ export async function executeInteractiveBrowserTurn(input: {
 
     ensureActive();
     consecutiveAiRequestFailures = 0;
-    const browserChatReply = actionResult.endedWithText ? actionResult.text.trim() : '';
+    const browserChatReply = actionResult.endedWithText ? textFromUnknown(actionResult.text).trim() : '';
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
       if (runningIndex >= 0) steps.splice(runningIndex, 1);
@@ -3426,7 +4022,7 @@ export async function executeInteractiveBrowserTurn(input: {
         stepIndex,
         message: browserChatReply
           ? 'Browser chat completed with an explicit Markdown answer and no browser tool.'
-          : 'Browser chat returned no browser tool and no explicit final answer; continuing until the AI explicitly answers or the safety step limit is reached.',
+          : 'Browser chat returned no browser tool and no explicit final answer; continuing until the AI explicitly answers, blocks, or is stopped.',
       });
       if (browserChatReply) {
         reply = browserChatReply;
@@ -4471,10 +5067,7 @@ async function executeTestCase(testCase: TestCaseRecord, runId: string, options:
     tabGroupTitle: testCase.title,
   });
   const steps: StepExecutionResult[] = [...(initialSteps || [])];
-  // Each runtime step now performs a single browser action, so allow more steps overall.
-  const maxRuntimeSteps = Number(process.env.AI_TEST_RUNTIME_MAX_STEPS || 30);
   const startStepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
-  const finalStepIndex = startStepIndex + maxRuntimeSteps - 1;
   const manualResumeCounts = new Map<number, number>();
   const maxManualPromptsPerStep = manualVerificationMaxPromptsPerStep();
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
@@ -4506,7 +5099,7 @@ async function executeTestCase(testCase: TestCaseRecord, runId: string, options:
     await session.startTrace(runId);
     await onDebug?.({ phase: 'browser:ready', message: 'Browser is ready; AI will decide each next action from the current page.' });
 
-    for (let stepIndex = startStepIndex; stepIndex <= finalStepIndex; stepIndex += 1) {
+    for (let stepIndex = startStepIndex; ; stepIndex += 1) {
       await waitWhilePaused(stepIndex);
       const abortController = registerStepAbortController(runId, stepIndex);
       await onDebug?.({ phase: 'step:start', stepIndex, message: `开始执行运行时步骤 ${stepIndex}` });
@@ -4884,26 +5477,6 @@ async function executeTestCase(testCase: TestCaseRecord, runId: string, options:
       }
     }
 
-    const timeoutStep: StepExecutionResult = {
-      index: steps.length + 1,
-            action: 'Reached maximum AI runtime steps',
-      expected: `AI should complete or clearly block within ${maxRuntimeSteps} runtime steps.`,
-      actual: `Executed ${maxRuntimeSteps} runtime steps, but AI has not marked the requirement complete.`,
-      status: 'failed',
-    };
-    steps.push(timeoutStep);
-    await onProgress?.(timeoutStep);
-    allowBrowserClose = true;
-
-    return {
-      status: 'failed' as const,
-      result: {
-        steps,
-        consoleErrors: session.getConsoleErrors(),
-        networkErrors: session.getNetworkErrors(),
-        tracePath,
-      },
-    };
   } catch (error) {
     keepBrowserOpen = shouldKeepBrowserOpenAfterError();
     const blockedStep: StepExecutionResult = {

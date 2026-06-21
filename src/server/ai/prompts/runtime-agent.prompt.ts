@@ -20,8 +20,7 @@ type PrepareStepPromptInput = {
   workingMemoryText: string;
   visualContextText: string;
   currentToolAttemptsText: string;
-  turnIndex: number;
-  maxTurns: number;
+  agentStepIndex: number;
   traceLimit: number;
   allowTextResponse?: boolean;
   browserMode?: 'dom' | 'visual-markers';
@@ -101,7 +100,7 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
     '- In message/reason/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot ids/file names, or tool input JSON.',
     visualMode ? '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.' : '',
-    domMode ? '- DOM mode: use the current Codex-style full DOM snapshot plus full page text, including accessible iframe and shadow DOM content. Use getDomNodeText(id) for complete text under a returned DOM node; use clickDomNode(id,text?) with a fresh numeric node_id. Use findByText(targetText,scopeId?) only as a read-only recovery step, then clickLocator(locatorId,text?) using a returned locatorId in a later turn.' : '',
+    domMode ? '- DOM mode: use getPageState for a fresh full DOM snapshot plus full page text, including accessible iframe and shadow DOM content. Use getDomNodeText(id) for complete text under a returned DOM node; use clickDomNode(id,text?) with a fresh numeric node_id. Use findByText(targetText,scopeId?) only as a read-only recovery step, then clickLocator(locatorId,text?) using a returned locatorId in a later turn.' : '',
     '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
     '- For getDomNodeText/clickDomNode, put the fresh DOM numeric node_id in params.id. The numeric id may be copied with or without square brackets.',
     allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, or a relative source path in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
@@ -158,11 +157,15 @@ export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
     '',
     'Agent Loop / prepareStep context:',
     domMode
-      ? '- Current turn delta: use Runtime DOM Context for fresh node_ids/text; RunState.nextObjective guides the goal only.'
-      : '- Current turn delta: use only the current screenshot/marker map for actionable ids; RunState.nextObjective guides the goal only.',
+      ? '- Current turn delta: use the latest getPageState observation for fresh node_ids/text; RunState.nextObjective guides the goal only.'
+      : '- Current turn delta: use the latest getPageState screenshot observation/marker map for actionable ids; RunState.nextObjective guides the goal only.',
     domMode
-      ? '- DOM Context Manager below is the current actionable DOM/page state; scroll only if the full DOM/text context lacks lazy-loaded or viewport-dependent content.'
-      : '- Visual Context Manager below is the current actionable visual state; historical screenshot ids remain context only.',
+      ? '- DOM observations are explicit tool results. Call getPageState when the current DOM/page state may be stale.'
+      : '- Visual observations are explicit getPageState messages. Historical screenshot ids remain context only.',
+    '- If a recent tool result saved a large output as observationId=..., call readObservation/searchObservation for omitted details instead of repeating the heavy tool.',
+    domMode
+      ? ''
+      : '- Visual image budget: current screenshot/marker map is the actionable image; selected reference images are comparison context only and must be requested deliberately.',
     '- Current step tool attempts below are authoritative recent tool feedback; desktop=... means a local process/window change was detected outside the browser.',
     input.compressionNote,
     '',
@@ -171,6 +174,6 @@ export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
     input.visualContextText,
     '',
     `Current step tool attempts (last ${input.traceLimit}):\n${input.currentToolAttemptsText}`,
-    `Loop turn: ${input.turnIndex + 1}/${input.maxTurns}`,
+    `Agent step: ${input.agentStepIndex + 1}`,
   ].filter(Boolean).join('\n');
 }

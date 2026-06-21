@@ -1,12 +1,11 @@
 ﻿import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { generateObject } from 'ai';
-import { z } from 'zod';
+import { generateText } from 'ai';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
-import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage, type InteractiveBrowserTurnResult } from '@/server/ai/agents/browser-chat-executor.agent';
+import { executeInteractiveBrowserTurn, type InteractiveBrowserTurnMessage } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
-import { formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
+import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import type { RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
@@ -53,45 +52,12 @@ export type BrowserChatLogRecord = {
   elapsedMs?: number;
 };
 
-export type BrowserChatConversationMemory = {
+export type BrowserChatConversationContext = {
   version: 1;
   updatedAt: string;
   coveredMessageIds: string[];
-  coveredStepIndexes: number[];
-  latestUserGoal?: string;
   summary: string;
-  userConstraints: string[];
-  completed: string[];
-  pending: string[];
-  findings: string[];
-  blockers: string[];
-  decisions: string[];
-  lastAssistantReply?: string;
-  continuationHint?: string;
-  evidenceRefs: Array<{
-    type: 'message' | 'step' | 'tool' | 'ledger';
-    id: string;
-    note?: string;
-  }>;
 };
-
-const browserChatConversationMemoryAiSchema = z.object({
-  latestUserGoal: z.string().max(700).optional(),
-  summary: z.string().min(1).max(2400),
-  userConstraints: z.array(z.string().min(1).max(260)).max(24),
-  completed: z.array(z.string().min(1).max(360)).max(36),
-  pending: z.array(z.string().min(1).max(360)).max(24),
-  findings: z.array(z.string().min(1).max(360)).max(36),
-  blockers: z.array(z.string().min(1).max(360)).max(24),
-  decisions: z.array(z.string().min(1).max(360)).max(28),
-  lastAssistantReply: z.string().max(900).optional(),
-  continuationHint: z.string().max(700).optional(),
-  evidenceRefs: z.array(z.object({
-    type: z.enum(['message', 'step', 'tool', 'ledger']),
-    id: z.string().min(1).max(160),
-    note: z.string().max(180).optional(),
-  })).max(100),
-});
 
 export type BrowserChatSessionSnapshot = {
   id: string;
@@ -112,7 +78,7 @@ export type BrowserChatSessionSnapshot = {
   consoleErrors: string[];
   networkErrors: string[];
   logs: BrowserChatLogRecord[];
-  conversationMemory?: BrowserChatConversationMemory;
+  conversationContext?: BrowserChatConversationContext;
 };
 
 type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
@@ -309,8 +275,30 @@ function exportedRecordedToolInput(toolName: string, input: unknown, targetUrl: 
   return targetUrl ? { ...rest, url: targetUrl } : rest;
 }
 
-function compactText(value = '', max = 180) {
-  const text = value.replace(/\s+/g, ' ').trim();
+function textFromUnknown(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
+        const record = item as Record<string, unknown>;
+        return textFromUnknown(record.text ?? record.content);
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return textFromUnknown(record.text ?? record.content);
+  }
+  return '';
+}
+
+function compactText(value: unknown = '', max = 180) {
+  const text = textFromUnknown(value).replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
@@ -325,47 +313,21 @@ function sessionBelongsToUser(session: Pick<BrowserChatSessionSnapshot, 'userId'
   return normalizeUserId(session.userId) === normalizedUserId;
 }
 
-function normalizeConversationMemory(value: unknown): BrowserChatConversationMemory | undefined {
+function normalizeConversationContext(value: unknown): BrowserChatConversationContext | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const record = value as Partial<BrowserChatConversationMemory>;
+  const record = value as Partial<BrowserChatConversationContext>;
   const arrayOfStrings = (items: unknown, limit: number, max = 420) => (
     Array.isArray(items)
       ? items.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map((item) => compactText(item, max)).slice(-limit)
       : []
   );
-  const evidenceRefs = Array.isArray(record.evidenceRefs)
-    ? record.evidenceRefs
-      .filter((item): item is BrowserChatConversationMemory['evidenceRefs'][number] => (
-        Boolean(item)
-        && typeof item === 'object'
-        && ['message', 'step', 'tool', 'ledger'].includes(String((item as { type?: unknown }).type))
-        && typeof (item as { id?: unknown }).id === 'string'
-      ))
-      .map((item) => ({
-        type: item.type,
-        id: item.id,
-        note: typeof item.note === 'string' ? compactText(item.note, 180) : undefined,
-      }))
-      .slice(-80)
-    : [];
+  const summary = typeof record.summary === 'string' ? record.summary.trim() : '';
+  if (!summary) return undefined;
   return {
     version: 1,
     updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : now(),
     coveredMessageIds: arrayOfStrings(record.coveredMessageIds, 300, 120),
-    coveredStepIndexes: Array.isArray(record.coveredStepIndexes)
-      ? record.coveredStepIndexes.filter((item): item is number => Number.isInteger(item)).slice(-300)
-      : [],
-    latestUserGoal: typeof record.latestUserGoal === 'string' ? compactText(record.latestUserGoal, 600) : undefined,
-    summary: compactText(record.summary || '', 2400),
-    userConstraints: arrayOfStrings(record.userConstraints, 24, 260),
-    completed: arrayOfStrings(record.completed, 36, 360),
-    pending: arrayOfStrings(record.pending, 24, 360),
-    findings: arrayOfStrings(record.findings, 36, 360),
-    blockers: arrayOfStrings(record.blockers, 24, 360),
-    decisions: arrayOfStrings(record.decisions, 28, 360),
-    lastAssistantReply: typeof record.lastAssistantReply === 'string' ? compactText(record.lastAssistantReply, 900) : undefined,
-    continuationHint: typeof record.continuationHint === 'string' ? compactText(record.continuationHint, 700) : undefined,
-    evidenceRefs,
+    summary: compactText(summary, 12000),
   };
 }
 
@@ -423,41 +385,18 @@ function attachmentSummary(attachments?: BrowserChatAttachment[]) {
 }
 
 function messageContentForPrompt(message: BrowserChatMessage) {
-  return [message.content, attachmentSummary(message.attachments)].filter(Boolean).join('\n\n');
-}
-
-function browserChatRawHistoryMessages() {
-  const raw = Number(process.env.AI_BROWSER_CHAT_RAW_HISTORY_MESSAGES || 8);
-  const value = Math.floor(Number.isFinite(raw) ? raw : 8);
-  return Math.min(Math.max(value, 2), 20);
+  const skillReferences = message.skillIds?.length
+    ? formatSkillReferencesForUser(store.getSkills(message.skillIds).filter((skill) => skill.status === 'ready'))
+    : '';
+  return [textFromUnknown(message.content), skillReferences, attachmentSummary(message.attachments)].filter(Boolean).join('\n\n');
 }
 
 function stableConversationMessages(messages: BrowserChatMessage[]) {
   return messages.filter((message) => (
     (message.role === 'user' || message.role === 'assistant')
     && message.status !== 'running'
-    && !isTransientBrowserChatProgress(message.content)
+    && !isTransientBrowserChatProgress(textFromUnknown(message.content))
   ));
-}
-
-function latestAssistantMessage(messages: BrowserChatMessage[], assistantMessageId?: string) {
-  if (assistantMessageId) {
-    const byId = messages.find((message) => message.id === assistantMessageId && message.role === 'assistant');
-    if (byId) return byId;
-  }
-  return stableConversationMessages(messages).filter((message) => message.role === 'assistant').at(-1);
-}
-
-function browserChatMemoryMessageLimit() {
-  const raw = Number(process.env.AI_BROWSER_CHAT_MEMORY_MESSAGE_LIMIT || 40);
-  const value = Math.floor(Number.isFinite(raw) ? raw : 40);
-  return Math.min(Math.max(value, 8), 120);
-}
-
-function browserChatMemoryStepLimit() {
-  const raw = Number(process.env.AI_BROWSER_CHAT_MEMORY_STEP_LIMIT || 40);
-  const value = Math.floor(Number.isFinite(raw) ? raw : 40);
-  return Math.min(Math.max(value, 8), 120);
 }
 
 function estimateTextTokens(value: string) {
@@ -470,173 +409,67 @@ function estimateTextTokens(value: string) {
   return Math.ceil(ascii / 4 + nonAscii);
 }
 
-function compactStepForMemoryPrompt(step: StepExecutionResult) {
-  return {
-    index: step.index,
-    status: step.status,
-    action: compactText(step.action, 700),
-    expected: compactText(step.expected, 700),
-    actual: compactText(step.actual, 1400),
-    note: compactText(step.note || '', 700) || undefined,
-    findings: (step.findings || []).map((item) => compactText(item, 500)),
-    memoryItems: (step.memoryItems || []).map((item) => compactText(item, 500)),
-    taskFrame: step.taskFrame,
-    ledgerItems: [
-      ...(step.ledgerItems || []),
-      ...(step.workingMemory?.ledgerItems || []),
-    ],
-    workingMemory: step.workingMemory ? {
-      taskGoal: step.workingMemory.taskGoal,
-      phase: step.workingMemory.phase,
-      completed: step.workingMemory.completed,
-      findings: step.workingMemory.findings,
-      blockers: step.workingMemory.blockers,
-      lastAction: step.workingMemory.lastAction,
-      lastResult: step.workingMemory.lastResult,
-      pageUnderstanding: step.workingMemory.pageUnderstanding,
-      currentState: step.workingMemory.currentState,
-      scrollSummary: step.workingMemory.scrollSummary,
-      userConstraints: step.workingMemory.userConstraints,
-      nextStep: step.workingMemory.nextStep,
-    } : undefined,
-    tools: (step.tools || []).map((tool, index) => ({
-      index: index + 1,
-      name: tool.name,
-      input: tool.input,
-      reason: compactText(tool.reason || '', 700) || undefined,
-      ok: tool.ok,
-      result: compactText(tool.result || '', 2000) || undefined,
+function contextWindowTokens() {
+  const raw = Number(process.env.AI_CONTEXT_WINDOW_TOKENS || process.env.AI_MODEL_CONTEXT_TOKENS || '');
+  if (Number.isFinite(raw) && raw > 1000) return Math.floor(raw);
+  return 32000;
+}
+
+function contextCompressionThresholdRatio() {
+  const raw = Number(process.env.AI_CONTEXT_COMPRESSION_THRESHOLD || process.env.AI_CONTEXT_COMPRESSION_RATIO || 0.7);
+  if (!Number.isFinite(raw) || raw <= 0) return 0.7;
+  return raw > 1 ? Math.min(0.98, raw / 100) : Math.min(0.98, raw);
+}
+
+function browserChatConversationTokenEstimate(messages: InteractiveBrowserTurnMessage[]) {
+  return estimateTextTokens(messages.map((message) => `${message.role}: ${message.content}`).join('\n\n'));
+}
+
+function browserChatConversationSummaryInputCharLimit() {
+  const raw = Number(process.env.AI_BROWSER_CHAT_SUMMARY_INPUT_MAX_CHARS || 60000);
+  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 60000;
+}
+
+function buildConversationSummaryPrompt(input: {
+  previousContext?: BrowserChatConversationContext;
+  messages: BrowserChatMessage[];
+  estimatedTokens: number;
+  thresholdTokens: number;
+}) {
+  const source = {
+    previousSummary: input.previousContext?.summary || '',
+    messages: input.messages.map((message) => ({
+      id: message.id,
+      role: message.role,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+      content: messageContentForPrompt(message),
+      stepIndexes: message.stepIndexes || [],
+      status: message.status,
     })),
   };
-}
-
-function buildBrowserChatConversationMemoryPrompt(
-  session: BrowserChatSessionRecord,
-  result: InteractiveBrowserTurnResult,
-  assistantMessageId: string,
-): { prompt: string; promptInput: unknown; tokenEstimate: number; coveredMessageIds: string[]; coveredStepIndexes: number[] } {
-  const previous = normalizeConversationMemory(session.conversationMemory);
-  const messages = stableConversationMessages(session.messages);
-  const latestAssistant = latestAssistantMessage(messages, assistantMessageId);
-  const selectedMessages = messages.slice(-browserChatMemoryMessageLimit()).map((message) => ({
-    id: message.id,
-    role: message.role,
-    status: message.status,
-    createdAt: message.createdAt,
-    updatedAt: message.updatedAt,
-    content: compactText(messageContentForPrompt(message), 3000),
-    stepIndexes: message.stepIndexes || [],
-  }));
-  const selectedSteps = session.steps.slice(-browserChatMemoryStepLimit()).map(compactStepForMemoryPrompt);
-  const promptInput = {
-    previousMemory: previous || null,
-    session: {
-      id: session.id,
-      title: session.title,
-      targetUrl: session.targetUrl,
-      mode: session.mode,
-    },
-    currentTurn: {
-      assistantMessageId,
-      status: result.status,
-      reply: result.reply,
-      latestAssistantReply: latestAssistant?.content || result.reply,
-      newStepIndexes: result.newSteps.map((step) => step.index),
-      consoleErrors: result.consoleErrors.slice(-20),
-      networkErrors: result.networkErrors.slice(-20),
-    },
-    messages: selectedMessages,
-    steps: selectedSteps,
-  };
-  const prompt = [
-    'You are the memory summarizer for an interactive browser-chat agent.',
-    'Create the next durable Conversation Memory JSON from the previous memory, the raw conversation window, and browser execution evidence.',
+  return [
+    'You are compressing the historical messages of a WebPilot browser chat session.',
+    'Return a concise Chinese summary that will become the first message of future model contexts.',
     '',
     'Rules:',
-    '- You must synthesize semantically; do not copy long raw logs.',
-    '- Preserve the latest user goal, constraints, completed work, pending work, findings, blockers, decisions, and continuation hint.',
-    '- If the new evidence contradicts prior memory, prefer the new evidence and mention the correction.',
-    '- Keep the memory useful for the next browser-chat turn, especially after Agent Loop limits.',
-    '- Use Chinese for user-facing content when the conversation is Chinese; technical ids/tool names may stay as-is.',
-    '- evidenceRefs must point to message ids, step indexes, tool ids like "12.1:fillCandidates", or ledger ids that support the memory.',
-    '- Do not invent facts that are not present in the input.',
+    '- Preserve user goals, constraints, decisions, completed work, pending work, blockers, useful findings, URLs/pages, and any facts needed to continue.',
+    '- Preserve the order of important events, but do not copy long raw logs or repeated text.',
+    '- Do not summarize the latest user request if it is not included in the input.',
+    '- Do not invent facts.',
+    '- Plain text only. No markdown table.',
     '',
-    `Input JSON:\n${stringifyJsonSafe(promptInput, 2)}`,
+    `Estimated historical context tokens before compression: ${input.estimatedTokens}/${input.thresholdTokens}`,
+    '',
+    `Input JSON:\n${trimLogText(stringifyJsonSafe(source, 2) || '', browserChatConversationSummaryInputCharLimit())}`,
   ].join('\n');
-  return {
-    prompt,
-    promptInput,
-    tokenEstimate: estimateTextTokens(prompt),
-    coveredMessageIds: messages.map((message) => message.id).slice(-300),
-    coveredStepIndexes: session.steps.map((step) => step.index).slice(-300),
-  };
 }
 
-async function generateBrowserChatConversationMemory(
-  session: BrowserChatSessionRecord,
-  result: InteractiveBrowserTurnResult,
-  assistantMessageId: string,
-  abortSignal?: AbortSignal,
-): Promise<BrowserChatConversationMemory> {
-  if (abortSignal?.aborted) throw abortSignal.reason || new Error('Browser-chat memory summary aborted.');
-  const { provider, model } = getModelSettings();
-  const built = buildBrowserChatConversationMemoryPrompt(session, result, assistantMessageId);
-  appendLog(session, 'conversation:memory:request', 'Requesting AI conversation memory summary.', {
-    messageId: assistantMessageId,
-    details: fullLogDetails({
-      provider,
-      model,
-      promptTokenEstimate: built.tokenEstimate,
-      prompt: built.prompt,
-      input: built.promptInput,
-    }),
-  });
-  const startedAt = Date.now();
-  const timeoutMs = Math.max(1000, Number(process.env.AI_BROWSER_CHAT_MEMORY_TIMEOUT_MS || process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000));
-  const timeoutController = new AbortController();
-  const timer = setTimeout(() => timeoutController.abort(new Error(`AI memory summary timed out after ${timeoutMs}ms`)), timeoutMs);
-  const combinedSignal = abortSignal ? AbortSignal.any([abortSignal, timeoutController.signal]) : timeoutController.signal;
-  try {
-    const generated = await generateObject({
-      model: getModel(),
-      schema: browserChatConversationMemoryAiSchema,
-      temperature: 0.1,
-      prompt: built.prompt,
-      maxRetries: 0,
-      abortSignal: combinedSignal,
-    });
-    const memory = normalizeConversationMemory({
-      ...generated.object,
-      version: 1,
-      updatedAt: now(),
-      coveredMessageIds: built.coveredMessageIds,
-      coveredStepIndexes: built.coveredStepIndexes,
-    });
-    if (!memory) throw new Error('AI memory summary did not match the BrowserChatConversationMemory schema.');
-    appendLog(session, 'conversation:memory:response', 'AI conversation memory summary completed.', {
-      messageId: assistantMessageId,
-      elapsedMs: elapsedMs(startedAt),
-      details: fullLogDetails({
-        provider,
-        model,
-        elapsedMs: elapsedMs(startedAt),
-        promptTokenEstimate: built.tokenEstimate,
-        response: generated.object,
-        memory,
-      }),
-    });
-    return memory;
-  } catch (error) {
-    if (abortSignal?.aborted) throw abortSignal.reason || error;
-    if (timeoutController.signal.aborted) {
-      const timeoutError = new Error(`AI memory summary timed out after ${timeoutMs}ms`);
-      (timeoutError as { cause?: unknown }).cause = error;
-      throw timeoutError;
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+function fallbackConversationSummary(input: { previousContext?: BrowserChatConversationContext; messages: BrowserChatMessage[] }) {
+  return [
+    input.previousContext?.summary ? `此前摘要：${input.previousContext.summary}` : '',
+    ...input.messages.slice(-12).map((message) => `${message.role === 'user' ? '用户' : 'AI'}：${compactText(messageContentForPrompt(message), 700)}`),
+  ].filter(Boolean).join('\n');
 }
 
 function safeJson(value: unknown) {
@@ -710,7 +543,7 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     consoleErrors: [...session.consoleErrors],
     networkErrors: [...session.networkErrors],
     logs: [...(session.logs || [])],
-    conversationMemory: normalizeConversationMemory(session.conversationMemory),
+    conversationContext: normalizeConversationContext(session.conversationContext),
   };
 }
 
@@ -735,7 +568,7 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
     consoleErrors: [],
     networkErrors: [],
     logs: session.busy ? [...(session.logs || []).slice(-8)] : [],
-    conversationMemory: normalizeConversationMemory(session.conversationMemory),
+    conversationContext: normalizeConversationContext(session.conversationContext),
   };
 }
 
@@ -864,7 +697,14 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
   );
   const steps = (session.steps || []).filter((step) => !transientStepIndexes.has(step.index));
   const messages = (session.messages || []).map((rawMessage) => {
-    const message = recoverAssistantMessageFromLogs(rawMessage, session.logs || [], steps);
+    const safeMessage: BrowserChatMessage = {
+      ...rawMessage,
+      role: rawMessage.role === 'assistant' ? 'assistant' : 'user',
+      content: textFromUnknown(rawMessage.content),
+      attachments: Array.isArray(rawMessage.attachments) ? rawMessage.attachments : [],
+      stepIndexes: Array.isArray(rawMessage.stepIndexes) ? rawMessage.stepIndexes : [],
+    };
+    const message = recoverAssistantMessageFromLogs(safeMessage, session.logs || [], steps);
     const contentIsTransient = message.role === 'assistant' && isTransientBrowserChatProgress(message.content);
     const stepIndexes = transientStepIndexes.size
       ? (message.stepIndexes || []).filter((stepIndex) => !transientStepIndexes.has(stepIndex))
@@ -891,7 +731,7 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
     targetUrl: exportableTargetUrl(session.targetUrl),
     messages,
     steps,
-    conversationMemory: normalizeConversationMemory(session.conversationMemory),
+    conversationContext: normalizeConversationContext(session.conversationContext),
     status,
     busy: preserveRecentRunningState ? session.busy : false,
     logs: session.logs || [],
@@ -967,7 +807,7 @@ function messageTimestamp(message: BrowserChatMessage) {
 }
 
 function hasMessageContent(message: BrowserChatMessage) {
-  return Boolean(message.content?.trim());
+  return Boolean(textFromUnknown(message.content).trim());
 }
 
 function shouldPreferIncomingMessage(previous: BrowserChatMessage, incoming: BrowserChatMessage) {
@@ -1049,15 +889,15 @@ function mergeLogsFromFile(existing: BrowserChatLogRecord[] = [], incoming: Brow
     .slice(-300);
 }
 
-function mergeConversationMemoryFromFile(
-  existing?: BrowserChatConversationMemory,
-  incoming?: BrowserChatConversationMemory,
+function mergeConversationContextFromFile(
+  existing?: BrowserChatConversationContext,
+  incoming?: BrowserChatConversationContext,
 ) {
-  if (!existing) return normalizeConversationMemory(incoming);
-  if (!incoming) return normalizeConversationMemory(existing);
+  if (!existing) return normalizeConversationContext(incoming);
+  if (!incoming) return normalizeConversationContext(existing);
   return timestampValue(incoming.updatedAt) >= timestampValue(existing.updatedAt)
-    ? normalizeConversationMemory(incoming)
-    : normalizeConversationMemory(existing);
+    ? normalizeConversationContext(incoming)
+    : normalizeConversationContext(existing);
 }
 
 function mergeSessionSnapshotFromFile(
@@ -1074,7 +914,7 @@ function mergeSessionSnapshotFromFile(
     consoleErrors: mergeStringLists(existing.consoleErrors, incoming.consoleErrors),
     networkErrors: mergeStringLists(existing.networkErrors, incoming.networkErrors),
     logs: mergeLogsFromFile(existing.logs, incoming.logs),
-    conversationMemory: mergeConversationMemoryFromFile(existing.conversationMemory, incoming.conversationMemory),
+    conversationContext: mergeConversationContextFromFile(existing.conversationContext, incoming.conversationContext),
   };
 }
 
@@ -1093,7 +933,7 @@ function mergeRuntimeSessionState(fromDisk: BrowserChatSessionRecord, existing: 
     consoleErrors: mergeStringLists(fromDisk.consoleErrors, existing.consoleErrors),
     networkErrors: mergeStringLists(fromDisk.networkErrors, existing.networkErrors),
     logs: mergeLogsFromFile(fromDisk.logs, existing.logs),
-    conversationMemory: mergeConversationMemoryFromFile(fromDisk.conversationMemory, existing.conversationMemory),
+    conversationContext: mergeConversationContextFromFile(fromDisk.conversationContext, existing.conversationContext),
   };
 }
 
@@ -1207,19 +1047,108 @@ function hydrateSessions() {
   }
 }
 
+function orderedMessagesAfterCoveredContext(messages: BrowserChatMessage[], context?: BrowserChatConversationContext) {
+  if (!context?.coveredMessageIds.length) return messages;
+  const coveredIds = new Set(context.coveredMessageIds);
+  const lastCoveredIndex = messages.reduce((latest, message, index) => (
+    coveredIds.has(message.id) ? index : latest
+  ), -1);
+  return messages.slice(lastCoveredIndex + 1);
+}
+
 function conversationForPrompt(
   messages: BrowserChatMessage[],
-  memory?: BrowserChatConversationMemory,
+  context?: BrowserChatConversationContext,
+  currentUserMessageId?: string,
 ): InteractiveBrowserTurnMessage[] {
-  const rawLimit = browserChatRawHistoryMessages();
-  const stableMessages = stableConversationMessages(messages);
-  const coveredIds = new Set(memory?.coveredMessageIds || []);
-  const uncovered = stableMessages.filter((message) => !coveredIds.has(message.id)).slice(-rawLimit);
-  const recent = stableMessages.slice(-rawLimit);
-  const merged = new Map<string, BrowserChatMessage>();
-  for (const message of [...uncovered, ...recent]) merged.set(message.id, message);
-  return [...merged.values()]
-    .map((message) => ({ role: message.role, content: messageContentForPrompt(message) }));
+  const stableMessages = stableConversationMessages(messages)
+    .filter((message) => message.id !== currentUserMessageId);
+  const uncovered = orderedMessagesAfterCoveredContext(stableMessages, context);
+  return [
+    ...(context?.summary ? [{
+      role: 'user' as const,
+      content: `[历史会话总结]\n${context.summary}`,
+    }] : []),
+    ...uncovered.map((message) => ({ role: message.role, content: messageContentForPrompt(message) })),
+  ];
+}
+
+async function ensureConversationContextWithinThreshold(
+  session: BrowserChatSessionRecord,
+  currentUserMessageId: string,
+  abortSignal?: AbortSignal,
+) {
+  const stableMessages = stableConversationMessages(session.messages);
+  const currentUserIndex = stableMessages.findIndex((message) => message.id === currentUserMessageId);
+  const historicalMessages = (currentUserIndex >= 0 ? stableMessages.slice(0, currentUserIndex) : stableMessages)
+    .filter((message) => message.id !== session.activeAssistantMessageId);
+  const currentConversation = conversationForPrompt(historicalMessages, session.conversationContext);
+  const thresholdTokens = Math.floor(contextWindowTokens() * contextCompressionThresholdRatio());
+  const estimatedTokens = browserChatConversationTokenEstimate(currentConversation);
+  if (estimatedTokens <= thresholdTokens) return;
+
+  const previousContext = normalizeConversationContext(session.conversationContext);
+  const sourceMessages = orderedMessagesAfterCoveredContext(historicalMessages, previousContext);
+  if (!previousContext?.summary && !sourceMessages.length) return;
+
+  const prompt = buildConversationSummaryPrompt({
+    previousContext,
+    messages: sourceMessages,
+    estimatedTokens,
+    thresholdTokens,
+  });
+  const { provider, model } = getModelSettings();
+  appendLog(session, 'conversation:context:request', '历史对话超过上下文阈值，正在压缩为后续模型上下文开头。', {
+    details: fullLogDetails({
+      provider,
+      model,
+      estimatedTokens,
+      thresholdTokens,
+      prompt,
+    }),
+  });
+  const startedAt = Date.now();
+  try {
+    const timeoutMs = Math.max(1000, Number(process.env.AI_BROWSER_CHAT_CONTEXT_TIMEOUT_MS || process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000));
+    const timeoutController = new AbortController();
+    const timer = setTimeout(() => timeoutController.abort(new Error(`AI conversation context summary timed out after ${timeoutMs}ms`)), timeoutMs);
+    const combinedSignal = abortSignal ? AbortSignal.any([abortSignal, timeoutController.signal]) : timeoutController.signal;
+    try {
+      const result = await generateText({
+        model: getModel(),
+        temperature: 0.1,
+        maxRetries: 0,
+        prompt,
+        abortSignal: combinedSignal,
+      });
+      const summary = compactText(result.text || '', 12000) || fallbackConversationSummary({ previousContext, messages: sourceMessages });
+      session.conversationContext = {
+        version: 1,
+        updatedAt: now(),
+        coveredMessageIds: historicalMessages.map((message) => message.id).slice(-300),
+        summary,
+      };
+      appendLog(session, 'conversation:context:response', '历史对话已压缩，后续轮次会以该摘要作为 messages 开头。', {
+        elapsedMs: elapsedMs(startedAt),
+        details: fullLogDetails({
+          provider,
+          model,
+          estimatedTokensBefore: estimatedTokens,
+          estimatedTokensAfter: browserChatConversationTokenEstimate(conversationForPrompt(historicalMessages, session.conversationContext)),
+          thresholdTokens,
+          context: session.conversationContext,
+        }),
+      });
+      persistAndNotify(session.id);
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (error) {
+    if (abortSignal?.aborted) throw abortSignal.reason || error;
+    appendLog(session, 'conversation:context:error', '历史对话压缩失败，本轮继续使用未压缩历史。', {
+      details: errorLogDetails(error),
+    });
+  }
 }
 
 function isDeadBrowserSessionError(error: unknown) {
@@ -1798,12 +1727,14 @@ export async function sendBrowserChatMessage(
   if (!session) throw new Error('Browser chat session not found');
   if (!sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   if (session.status === 'closed') throw new Error('Browser chat session is closed');
-  const text = content.trim();
+  const text = textFromUnknown(content).trim();
   const attachments = normalizeAttachments(attachmentsInput);
   const skillIds = normalizeSkillIds(skillIdsInput);
   const selectedSkills = store.getSkills(skillIds).filter((skill) => skill.status === 'ready');
   if (!text && !attachments.length && !selectedSkills.length) throw new Error('Message is empty');
   const messageText = text || (selectedSkills.length ? '请结合已选择的 Skills 继续处理当前任务。' : '请结合我上传的图片继续处理当前任务。');
+  const skillReferences = formatSkillReferencesForUser(selectedSkills);
+  const modelMessageText = [messageText, skillReferences].filter(Boolean).join('\n\n');
   const normalizedClientMessageId = clientMessageId?.trim().slice(0, 120) || undefined;
   if (normalizedClientMessageId && session.messages.some((message) => message.clientMessageId === normalizedClientMessageId)) {
     return snapshot(session);
@@ -1847,7 +1778,7 @@ export async function sendBrowserChatMessage(
   persistAndNotify(session.id);
   appendLog(session, 'chat:queued', '已收到消息，准备执行浏览器操作');
 
-  void runBrowserChatMessage(session, messageText, assistantMessage.id, fromStepIndex, abortController, attachments, selectedSkills);
+  void runBrowserChatMessage(session, messageText, modelMessageText, userMessage.id, assistantMessage.id, fromStepIndex, abortController, attachments, selectedSkills);
   return snapshot(session);
 }
 
@@ -1930,9 +1861,9 @@ function runningActivityFromLog(phase: string, message: string) {
   if (phase === 'browser:stale') return '正在重新接管浏览器';
   if (phase === 'browser:screenshot:before') return '正在读取当前页面';
   if (phase === 'browser:screenshot:after') return '正在保存页面状态';
-  if (phase === 'ai:runtime-input:start') return '正在准备页面上下文';
+  if (phase === 'ai:runtime-input:start') return '正在准备运行上下文';
   if (phase === 'perf:runtime-input') return '正在准备页面上下文';
-  if (phase === 'ai:prepare') return '正在收集页面状态';
+  if (phase === 'ai:prepare') return '正在请求 AI 决策';
   if (phase === 'ai:runtime:request') return '正在请求 AI 模型';
   if (phase === 'ai:runtime:response') return 'AI 已返回，正在处理结果';
   if (phase === 'ai:runtime:object') return 'AI 已返回，正在解析动作';
@@ -1961,30 +1892,6 @@ function isActiveBrowserChatTurn(session: BrowserChatSessionRecord, assistantMes
     && session.activeAssistantMessageId === assistantMessageId
     && session.activeAbortController === abortController
     && !abortController.signal.aborted;
-}
-
-async function updateBrowserChatConversationMemoryInBackground(
-  session: BrowserChatSessionRecord,
-  result: InteractiveBrowserTurnResult,
-  assistantMessageId: string,
-  abortController: AbortController,
-) {
-  if (abortController.signal.aborted) return;
-  try {
-    const nextConversationMemory = await generateBrowserChatConversationMemory(session, result, assistantMessageId, abortController.signal);
-    if (abortController.signal.aborted || sessions.get(session.id) !== session) return;
-    session.conversationMemory = nextConversationMemory;
-    appendLog(session, 'conversation:memory:update', 'Updated browser-chat conversation memory for the next turn.', {
-      messageId: assistantMessageId,
-      details: fullLogDetails(session.conversationMemory),
-    });
-  } catch (memoryError) {
-    if (abortController.signal.aborted || sessions.get(session.id) !== session) return;
-    appendLog(session, 'conversation:memory:error', 'Failed to update browser-chat conversation memory; continuing without blocking the turn.', {
-      messageId: assistantMessageId,
-      details: errorLogDetails(memoryError),
-    });
-  }
 }
 
 export function interruptBrowserChatSession(sessionId: string, userId?: string | number) {
@@ -2037,6 +1944,8 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
 async function runBrowserChatMessage(
   session: BrowserChatSessionRecord,
   text: string,
+  modelText: string,
+  userMessageId: string,
   assistantMessageId: string,
   fromStepIndex: number,
   abortController: AbortController,
@@ -2048,15 +1957,17 @@ async function runBrowserChatMessage(
     appendLog(session, 'chat:run:start', '开始处理本轮对话操作');
     const browser = await ensureStarted(session);
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-    appendLog(session, 'ai:prepare', '浏览器已准备好，正在收集页面状态并请求 AI 决策');
+    await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
+    if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+    appendLog(session, 'ai:prepare', '浏览器已准备好，正在请求 AI 决策');
     const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
     const result = await executeInteractiveBrowserTurn({
       session: browser,
       runId: session.id,
       targetUrl: session.targetUrl || 'about:blank',
       instruction: text,
-      conversation: conversationForPrompt(session.messages, session.conversationMemory),
-      conversationMemory: normalizeConversationMemory(session.conversationMemory),
+      modelInstruction: modelText,
+      conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId),
       completedSteps: session.steps,
       mode: session.mode,
       referenceImagePaths,
@@ -2134,7 +2045,6 @@ async function runBrowserChatMessage(
       },
     ].slice(-300);
     persistAndNotify(session.id);
-    void updateBrowserChatConversationMemoryInBackground(session, result, assistantMessageId, abortController);
   } catch (error) {
     const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);
     const interrupted = abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId);

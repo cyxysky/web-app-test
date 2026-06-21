@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { generateText, stepCountIs, tool } from 'ai';
+import { generateText, hasToolCall, tool } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
 import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
@@ -2481,7 +2481,6 @@ async function executeRuntimeStep(input: {
     lastAiRequest = aiRequest;
 
     async function prepareStep(turnIndex: number) {
-      const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
       let visualPaths = includeImage ? visualContext.imagePaths() : [];
       let traceLimit = 5;
       let compressionDetails: Record<string, unknown> | undefined;
@@ -2507,8 +2506,7 @@ async function executeRuntimeStep(input: {
               ].join('\n')
             : visualContext.renderText(),
           currentToolAttemptsText: formatCurrentToolAttemptSummary(traces, traceLimit),
-          turnIndex,
-          maxTurns,
+          agentStepIndex: turnIndex,
           traceLimit,
           allowTextResponse: browserChatMode,
           browserMode: mode,
@@ -2562,7 +2560,7 @@ async function executeRuntimeStep(input: {
       for (const imagePath of visualPaths) { const image = await readScreenshotForAi(imagePath).catch(() => undefined); if (image) content.push({ type: 'image', image }); }
       for (const referenceImage of userReferenceImages) { if (referenceImage.image) content.push({ type: 'image', image: referenceImage.image }); }
       const attachedImagePaths = [...visualPaths, ...userReferenceImages.filter((item) => item.image).map((item) => item.imagePath)];
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, systemPrompt: requestSystemPrompt, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, systemPrompt: requestSystemPrompt, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, agentStepIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
       lastAiRequest = aiRequest;
       return {
         system: requestSystemPrompt || undefined,
@@ -2607,13 +2605,12 @@ async function executeRuntimeStep(input: {
       };
     }
 
-    const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
-    for (let turnIndex = 0; turnIndex < maxTurns; turnIndex += 1) {
+    for (let turnIndex = 0; ; turnIndex += 1) {
       const aiStartedAt = Date.now();
       const traceStart = traces.length;
       try {
         const { system, messages } = await prepareStep(turnIndex);
-        await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision. turn ' + (turnIndex + 1) + '/' + maxTurns + '.', details: { provider: getModelSettings().provider, model: getModelSettings().model, turnIndex: turnIndex + 1, maxTurns } });
+        await onDebug?.({ phase: 'ai:runtime:request', stepIndex, message: 'AI request started; waiting for browser action decision. agent step ' + (turnIndex + 1) + '.', details: { provider: getModelSettings().provider, model: getModelSettings().model, agentStepIndex: turnIndex + 1 } });
         const result = await generateTextWithTimeout({
           model: getModel(), system, messages,
           tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
@@ -2626,12 +2623,12 @@ async function executeRuntimeStep(input: {
               details: { trace, visualContext: visualContext.snapshot(), workingMemory },
             });
           }, { availableReferenceIds, allowedToolTypes, runId: input.runId, stepIndex, visualContext, onVisualContextChange: async (snapshot) => { await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
-          stopWhen: stepCountIs(1), temperature: 0.1, maxRetries: 0, abortSignal,
+          stopWhen: [hasToolCall('reportState'), hasToolCall('waitForHumanVerification')], temperature: 0.1, maxRetries: 0, abortSignal,
         });
         latestText = result.text || '';
         const newTraces = traces.slice(traceStart);
         const lastTrace = newTraces.at(-1);
-        await onDebug?.({ phase: 'ai:runtime:response', stepIndex, message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; turn ' + (turnIndex + 1) + '/' + maxTurns + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms', details: jsonSafe({ text: latestText, traces: newTraces, visualContext: visualContext.snapshot(), workingMemory, elapsedMs: elapsedSince(aiStartedAt) }) });
+        await onDebug?.({ phase: 'ai:runtime:response', stepIndex, message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; agent step ' + (turnIndex + 1) + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms', details: jsonSafe({ text: latestText, traces: newTraces, visualContext: visualContext.snapshot(), workingMemory, elapsedMs: elapsedSince(aiStartedAt), agentStepIndex: turnIndex + 1 }) });
         if (!lastTrace || lastTrace.name === 'reportState' || lastTrace.name === 'waitForHumanVerification') {
           return {
             text: latestText,
@@ -2716,11 +2713,6 @@ export type InteractiveBrowserTurnResult = {
   consoleErrors: string[];
   networkErrors: string[];
 };
-
-function browserChatMaxBrowserSteps() {
-  const raw = Number(process.env.AI_BROWSER_CHAT_MAX_STEPS || 6);
-  return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 6));
-}
 
 function manualVerificationMaxPromptsPerStep() {
   const raw = Number(process.env.AI_MANUAL_VERIFICATION_MAX_PROMPTS_PER_STEP || 3);
@@ -2870,7 +2862,7 @@ export async function executeInteractiveBrowserTurn(input: {
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
 
-  for (let turnStep = 0; turnStep < browserChatMaxBrowserSteps(); turnStep += 1) {
+  while (true) {
     if (input.abortSignal?.aborted) throw new Error('Browser chat operation interrupted by user.');
     const stepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
     await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `Preparing browser chat step ${stepIndex}; capturing current page screenshot.` });
@@ -4000,9 +3992,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
   });
   const steps: StepExecutionResult[] = [...(initialSteps || [])];
   // Each runtime step now performs a single browser action, so allow more steps overall.
-  const maxRuntimeSteps = Number(process.env.AI_TEST_RUNTIME_MAX_STEPS || 30);
   const startStepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
-  const finalStepIndex = startStepIndex + maxRuntimeSteps - 1;
   const manualResumeCounts = new Map<number, number>();
   const maxManualPromptsPerStep = manualVerificationMaxPromptsPerStep();
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
@@ -4034,7 +4024,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
     await session.startTrace(runId);
     await onDebug?.({ phase: 'browser:ready', message: 'Browser is ready; AI will decide each next action from the current page.' });
 
-    for (let stepIndex = startStepIndex; stepIndex <= finalStepIndex; stepIndex += 1) {
+    for (let stepIndex = startStepIndex; ; stepIndex += 1) {
       await waitWhilePaused(stepIndex);
       const abortController = registerStepAbortController(runId, stepIndex);
       await onDebug?.({ phase: 'step:start', stepIndex, message: `开始执行运行时步骤 ${stepIndex}` });
@@ -4412,26 +4402,6 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       }
     }
 
-    const timeoutStep: StepExecutionResult = {
-      index: steps.length + 1,
-            action: 'Reached maximum AI runtime steps',
-      expected: `AI should complete or clearly block within ${maxRuntimeSteps} runtime steps.`,
-      actual: `Executed ${maxRuntimeSteps} runtime steps, but AI has not marked the requirement complete.`,
-      status: 'failed',
-    };
-    steps.push(timeoutStep);
-    await onProgress?.(timeoutStep);
-    allowBrowserClose = true;
-
-    return {
-      status: 'failed' as const,
-      result: {
-        steps,
-        consoleErrors: session.getConsoleErrors(),
-        networkErrors: session.getNetworkErrors(),
-        tracePath,
-      },
-    };
   } catch (error) {
     keepBrowserOpen = shouldKeepBrowserOpenAfterError();
     const blockedStep: StepExecutionResult = {
