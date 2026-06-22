@@ -5975,11 +5975,49 @@ select {
 
 .browser-chat-recent-select-all input,
 .browser-chat-recent-check {
-  accent-color: var(--accent);
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
   cursor: pointer;
+  display: inline-grid;
   height: 14px;
   margin: 0;
+  place-content: center;
   width: 14px;
+}
+
+.browser-chat-recent-select-all input::before,
+.browser-chat-recent-check::before,
+.browser-chat-message-select input::before {
+  background: #ffffff;
+  clip-path: polygon(14% 48%, 38% 72%, 86% 22%, 96% 32%, 39% 91%, 4% 58%);
+  content: "";
+  height: 9px;
+  transform: scale(0);
+  transition: transform 0.12s ease;
+  width: 9px;
+}
+
+.browser-chat-recent-select-all input:checked,
+.browser-chat-recent-check:checked,
+.browser-chat-message-select input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.browser-chat-recent-select-all input:checked::before,
+.browser-chat-recent-check:checked::before,
+.browser-chat-message-select input:checked::before {
+  transform: scale(1);
+}
+
+.browser-chat-recent-select-all input:focus-visible,
+.browser-chat-recent-check:focus-visible,
+.browser-chat-message-select input:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+  outline: none;
 }
 
 .browser-chat-recent-select-all:has(input:disabled),
@@ -7023,6 +7061,10 @@ select {
   width: min(100%, 920px);
 }
 
+.browser-chat-message-list-end {
+  height: 1px;
+}
+
 .browser-chat-message {
   max-width: 790px;
 }
@@ -7603,10 +7645,16 @@ select {
 }
 
 .browser-chat-message-select input {
-  accent-color: var(--accent);
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
   cursor: pointer;
+  display: inline-grid;
   height: 14px;
   margin: 0;
+  place-content: center;
   width: 14px;
 }
 
@@ -7682,6 +7730,72 @@ select {
   max-width: 690px;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+.browser-chat-tool-confirmation {
+  align-items: center;
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--foreground);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: min(100%, 620px);
+  padding: 8px;
+}
+
+.browser-chat-tool-confirmation>span {
+  flex: 1 1 220px;
+  font-size: 13px;
+  font-weight: 760;
+  line-height: 1.4;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.browser-chat-tool-confirmation-actions {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.browser-chat-tool-confirm,
+.browser-chat-tool-cancel {
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 900;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.browser-chat-tool-confirm {
+  background: var(--foreground);
+  border-color: var(--foreground);
+  color: #ffffff;
+}
+
+.browser-chat-tool-cancel {
+  background: transparent;
+  color: var(--muted-strong);
+}
+
+.browser-chat-tool-confirm:disabled,
+.browser-chat-tool-cancel:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.browser-chat-tool-cancel:hover:not(:disabled) {
+  background: var(--panel-warm);
+  color: var(--foreground);
 }
 
 .browser-chat-tool-card:hover {
@@ -7785,6 +7899,32 @@ select {
   padding: 2px 6px;
   place-items: center;
   white-space: nowrap;
+}
+
+.browser-chat-tool-user-action-tag {
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1.1;
+  min-height: 16px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+
+.browser-chat-tool-user-action-tag.is-confirmed {
+  background: color-mix(in srgb, var(--accent) 16%, #ffffff);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+  color: var(--accent-strong);
+}
+
+.browser-chat-tool-user-action-tag.is-cancelled {
+  background: color-mix(in srgb, var(--danger) 10%, #ffffff);
+  border-color: color-mix(in srgb, var(--danger) 22%, transparent);
+  color: var(--danger);
 }
 
 .browser-chat-tool-card.is-failed .browser-chat-tool-state {
@@ -8507,7 +8647,8 @@ select {
   justify-content: flex-end;
 }
 
-.browser-chat-mode-toggle {
+.browser-chat-mode-toggle,
+.browser-chat-safety-toggle {
   align-items: center;
   background: var(--accent-soft);
   border: 1px solid var(--accent-border);
@@ -8520,11 +8661,19 @@ select {
   white-space: nowrap;
 }
 
-.browser-chat-mode-toggle svg {
+.browser-chat-safety-toggle {
+  background: var(--panel-soft);
+  border-color: var(--border);
+  color: var(--foreground);
+}
+
+.browser-chat-mode-toggle svg,
+.browser-chat-safety-toggle svg {
   margin-left: 6px;
 }
 
-.browser-chat-mode-toggle button {
+.browser-chat-mode-toggle button,
+.browser-chat-safety-toggle button {
   background: transparent;
   border: 0;
   border-radius: 999px;
@@ -8538,12 +8687,14 @@ select {
   padding: 0 9px;
 }
 
-.browser-chat-mode-toggle button.active {
+.browser-chat-mode-toggle button.active,
+.browser-chat-safety-toggle button.active {
   background: var(--accent-strong);
   color: #ffffff;
 }
 
-.browser-chat-mode-toggle button:disabled {
+.browser-chat-mode-toggle button:disabled,
+.browser-chat-safety-toggle button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
@@ -8720,6 +8871,7 @@ select {
   .browser-chat-stop,
   .browser-chat-close,
   .browser-chat-mode-toggle button,
+  .browser-chat-safety-toggle button,
   .browser-chat-nav-item,
   .browser-chat-subnav button,
   .browser-chat-recent-open,
@@ -8750,6 +8902,7 @@ select {
   .browser-chat-stop,
   .browser-chat-close,
   .browser-chat-mode-toggle button,
+  .browser-chat-safety-toggle button,
   .browser-chat-nav-item,
   .browser-chat-subnav button,
   .browser-chat-recent-open,
@@ -8771,6 +8924,7 @@ select {
   .browser-chat-stop,
   .browser-chat-close,
   .browser-chat-mode-toggle button,
+  .browser-chat-safety-toggle button,
   .browser-chat-nav-item,
   .browser-chat-subnav button,
   .browser-chat-recent-open,
@@ -9399,7 +9553,74 @@ select {
   border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
 }
 
-:root[data-theme="dark"] .browser-chat-mode-toggle button.active {
+:root[data-theme="dark"] .browser-chat-safety-toggle {
+  background: color-mix(in srgb, var(--panel) 86%, var(--foreground));
+  border-color: var(--border);
+}
+
+:root[data-theme="dark"] .browser-chat-tool-confirmation {
+  background: color-mix(in srgb, var(--panel) 90%, #000000);
+  border-color: var(--border-strong);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
+  color: var(--foreground);
+}
+
+:root[data-theme="dark"] .browser-chat-tool-confirmation>span {
+  color: var(--foreground);
+}
+
+:root[data-theme="dark"] .browser-chat-tool-confirm {
+  background: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 82%, #ffffff);
+  color: #ffffff;
+}
+
+:root[data-theme="dark"] .browser-chat-tool-confirm:disabled,
+:root[data-theme="dark"] .browser-chat-tool-cancel:disabled {
+  background: color-mix(in srgb, var(--panel-warm) 82%, #000000);
+  border-color: var(--border);
+  color: var(--muted);
+  opacity: 1;
+}
+
+:root[data-theme="dark"] .browser-chat-tool-cancel {
+  border-color: var(--border);
+  color: var(--muted-strong);
+}
+
+:root[data-theme="dark"] .browser-chat-tool-cancel:hover:not(:disabled) {
+  background: var(--panel-warm);
+  color: var(--foreground);
+}
+
+:root[data-theme="dark"] .browser-chat-recent-select-all input,
+:root[data-theme="dark"] .browser-chat-recent-check,
+:root[data-theme="dark"] .browser-chat-message-select input {
+  background: color-mix(in srgb, var(--panel) 84%, #000000);
+  border-color: var(--border);
+}
+
+:root[data-theme="dark"] .browser-chat-recent-select-all input:checked,
+:root[data-theme="dark"] .browser-chat-recent-check:checked,
+:root[data-theme="dark"] .browser-chat-message-select input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+:root[data-theme="dark"] .browser-chat-tool-user-action-tag.is-confirmed {
+  background: color-mix(in srgb, var(--accent) 22%, var(--panel));
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  color: var(--foreground);
+}
+
+:root[data-theme="dark"] .browser-chat-tool-user-action-tag.is-cancelled {
+  background: color-mix(in srgb, var(--danger) 18%, var(--panel));
+  border-color: color-mix(in srgb, var(--danger) 34%, var(--border));
+  color: color-mix(in srgb, var(--danger) 78%, #ffffff);
+}
+
+:root[data-theme="dark"] .browser-chat-mode-toggle button.active,
+:root[data-theme="dark"] .browser-chat-safety-toggle button.active {
   background: var(--accent);
   color: #ffffff;
 }

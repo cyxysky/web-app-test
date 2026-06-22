@@ -330,6 +330,30 @@ const toolDefinitions: ToolDefinition[] = [
     fields: [{ key: 'id', label: 'DOM 节点 ID', kind: 'text' }],
   },
   {
+    name: 'hoverDomNode',
+    label: '悬停 DOM 节点',
+    mode: 'dom',
+    template: { id: '' },
+    fields: [{ key: 'id', label: 'DOM 节点 ID', kind: 'text' }],
+  },
+  {
+    name: 'doubleClickDomNode',
+    label: '双击 DOM 节点',
+    mode: 'dom',
+    template: { id: '' },
+    fields: [{ key: 'id', label: 'DOM 节点 ID', kind: 'text' }],
+  },
+  {
+    name: 'dragDomNode',
+    label: '拖拽 DOM 节点',
+    mode: 'dom',
+    template: { fromId: '', toId: '' },
+    fields: [
+      { key: 'fromId', label: '起点 DOM 节点 ID', kind: 'text' },
+      { key: 'toId', label: '终点 DOM 节点 ID', kind: 'text' },
+    ],
+  },
+  {
     name: 'findByText',
     label: '查找文本',
     mode: 'dom',

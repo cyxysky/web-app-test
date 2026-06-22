@@ -75,6 +75,18 @@ type VisualAfterPolicy = {
 
 const BATCH_FILL_FIELD_LIMIT = 80;
 
+type BrowserChatSafetyMode = 'strict' | 'full';
+
+export type BrowserToolConfirmationDecision = 'confirmed' | 'cancelled';
+
+export type BrowserToolConfirmationRequest = {
+  toolName: string;
+  input: unknown;
+  reason?: string;
+  prompt: string;
+  stepIndex?: number;
+};
+
 type RuntimeDecision = {
   action: string;
   expected: string;
@@ -143,6 +155,8 @@ const codexRuntimeObjectSchema = z.object({
     })).nullable().optional(),
     selectionReason: z.string().nullable().optional(),
     sameInterfaceGroup: z.string().nullable().optional(),
+    requiresConfirmation: z.boolean().nullable().optional(),
+    confirmationMessage: z.string().nullable().optional(),
   }).describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason.'),
 });
 type CodexRuntimeObject = z.infer<typeof codexRuntimeObjectSchema>;
@@ -672,12 +686,27 @@ function splitToolInputAndReason(input: unknown) {
   if (!safeInput || typeof safeInput !== 'object' || Array.isArray(safeInput)) {
     return { input: safeInput, reason: undefined };
   }
-  const { reason, ...rest } = safeInput as Record<string, unknown>;
+  const { reason, requiresConfirmation, confirmationMessage, ...rest } = safeInput as Record<string, unknown>;
+  void requiresConfirmation;
+  void confirmationMessage;
   const compactInput = Object.keys(rest).length ? rest : undefined;
   return {
     input: compactInput,
     reason: typeof reason === 'string' && reason.trim() ? trimDebugText(reason.trim(), 300) : undefined,
   };
+}
+
+function toolConfirmationFromInput(toolName: string, input: unknown) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const record = input as Record<string, unknown>;
+  if (record.requiresConfirmation !== true) return undefined;
+  const reason = typeof record.reason === 'string' ? trimDebugText(record.reason.trim(), 300) : undefined;
+  const explicit = typeof record.confirmationMessage === 'string' ? record.confirmationMessage.trim() : '';
+  const prompt = trimDebugText(
+    explicit || `请确认是否执行工具 ${toolName}${reason ? `：${reason}` : ''}`,
+    300,
+  );
+  return { prompt, reason };
 }
 
 function parseJsonObjectText(text?: string) {
@@ -1284,7 +1313,7 @@ function sanitizeNextGoal(value: unknown) {
       .replace(/(?:点击|双击|右键|拖拽|悬停|输入|按下|滚动|选择)\s*[“"']?([^，。；;]*)[”"']?/g, '完成$1')
       .replace(/候选(?:ID|id|编号)\s*[:：]?\s*\d+/gi, '当前截图中的对应候选')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的对应目标')
-      .replace(/\b(?:clickCandidate|fillCandidates|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|fillDomNodes|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '根据当前页面选择合适工具'),
+      .replace(/\b(?:clickCandidate|fillCandidates|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|hoverDomNode|doubleClickDomNode|dragDomNode|fillDomNodes|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '根据当前页面选择合适工具'),
     220,
   );
 }
@@ -1293,7 +1322,7 @@ function sanitizeCurrentState(value: unknown) {
   if (typeof value !== 'string') return '';
   return sanitizeHistoricalToolText(
     value
-      .replace(/\b(?:clickCandidate|fillCandidates|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|fillDomNodes|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '已执行页面操作')
+      .replace(/\b(?:clickCandidate|fillCandidates|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|hoverDomNode|doubleClickDomNode|dragDomNode|fillDomNodes|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '已执行页面操作')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的目标'),
     260,
   );
@@ -1313,7 +1342,7 @@ function validateCandidateActionBeforeExecution(name: string, input: unknown, tr
 }
 
 const candidateActionToolNames = new Set(['clickCandidate', 'hoverCandidate', 'doubleClickCandidate', 'rightClickCandidate', 'dragCandidate']);
-const domNodeIdToolNames = new Set(['clickDomNode', 'focusDomNode', 'getDomNodeText']);
+const domNodeIdToolNames = new Set(['clickDomNode', 'hoverDomNode', 'doubleClickDomNode', 'focusDomNode', 'getDomNodeText']);
 const noVisualAfterCaptureToolNames = new Set([
   'getPageState',
   'reportState',
@@ -1765,6 +1794,7 @@ function makeBrowserTools(
     shouldContinue?: () => boolean;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
     observePageState?: () => Promise<BrowserActionResult>;
+    requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   },
 ) {
   // Enforce one executed browser tool per model step. The native AI SDK loop may call the model
@@ -1777,6 +1807,8 @@ function makeBrowserTools(
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
   const toolContextShape = {
     reason: toolReasonInput,
+    requiresConfirmation: z.boolean().optional().describe('Browser chat strict safety mode only: set true when this important tool call must pause for user confirm/cancel before execution. Do not use this in full safety mode.'),
+    confirmationMessage: z.string().min(1).max(300).optional().describe('Browser chat strict safety mode only: concise Chinese text shown next to the tool confirm/cancel buttons.'),
     visualAfter: z.object({
       capture: z.enum(['auto', 'viewport', 'fullPage']).optional().describe('Use auto normally. Use viewport/fullPage only when the next model request truly needs that screenshot size.'),
       retention: z.enum(['auto', 'replace', 'append']).optional().describe('Use replace by default. Use append only when the next decision must compare with, continue from, or analyze together with the previous screenshot.'),
@@ -1802,6 +1834,26 @@ function makeBrowserTools(
       } satisfies BrowserActionResult;
     }
     toolExecutionGate.executed = true;
+    const pendingConfirmation = referenceOptions?.requestToolConfirmation ? toolConfirmationFromInput(name, input) : undefined;
+    const actionWithConfirmation = async () => {
+      if (pendingConfirmation && referenceOptions?.requestToolConfirmation) {
+        const decision = await referenceOptions.requestToolConfirmation({
+          toolName: name,
+          input,
+          reason: pendingConfirmation.reason,
+          prompt: pendingConfirmation.prompt,
+          stepIndex: referenceOptions.stepIndex,
+        });
+        throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
+        if (decision !== 'confirmed') {
+          return {
+            ok: true,
+            actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
+          } satisfies BrowserActionResult;
+        }
+      }
+      return action();
+    };
     return executeTracedBrowserAction({
       session,
       traces,
@@ -1815,7 +1867,7 @@ function makeBrowserTools(
       aiRequest: referenceOptions?.getAiRequest?.() || aiRequest,
       onToolTrace,
       onVisualContextChange: referenceOptions?.onVisualContextChange,
-      action,
+      action: actionWithConfirmation,
     }).then((result) => compactToolResultForModel(name, result, referenceOptions?.observationStore));
   }
 
@@ -1903,14 +1955,14 @@ function makeBrowserTools(
       execute: (input) => record('searchObservation', input, async () => searchRuntimeObservation(referenceOptions?.observationStore, input.id, input.query, input.maxMatches, input.aroundChars)),
     }),
     downloadFile: tool({
-      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, or pass a relative path/urlOrPath that will be resolved against AI_FILE_DOWNLOAD_BASE_URL from settings. Use this when the user asks to download/save a file; return the saved URL or local path in the final answer.',
+      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, an origin-relative path starting with / resolved against the current page origin, or a page-relative path resolved against the current page directory. Use this when the user asks to download/save a file; return the saved URL or local path in the final answer.',
       inputSchema: browserToolInput({
         url: z.string().optional().describe('Absolute download URL. If omitted, path or urlOrPath is used.'),
-        path: z.string().optional().describe('Relative file path resolved against configured AI_FILE_DOWNLOAD_BASE_URL.'),
-        urlOrPath: z.string().optional().describe('Absolute URL or relative path resolved against configured AI_FILE_DOWNLOAD_BASE_URL.'),
+        path: z.string().optional().describe('Download path. /files/a.pdf resolves against current page origin; report/a.pdf resolves against current page directory.'),
+        urlOrPath: z.string().optional().describe('Absolute URL, origin-relative path, or page-relative path to download.'),
         fileName: z.string().optional().describe('Optional saved file name, including extension when known.'),
       }),
-      execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId })),
+      execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
     }),
     generateMarkdownFile: tool({
       description: 'Create a Markdown .md file in the configured local output directory or this run artifacts from complete Markdown content written by the AI. Use this when the user asks to generate/export/save a Markdown file, then include the saved URL or local path in the final answer.',
@@ -2004,6 +2056,28 @@ function makeBrowserTools(
         text: z.string().optional().describe('Optional text to type immediately after clicking/focusing this DOM node.'),
       }),
       execute: (input) => record('clickDomNode', input, () => session.clickDomNode(normalizeDomNodeIdParam(input), input.text)),
+    }),
+    hoverDomNode: tool({
+      description: 'DOM mode: hover a node from the CURRENT full DOM snapshot by numeric node_id. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
+      inputSchema: browserToolInput({
+        id: z.string().describe('The numeric node_id shown in the full DOM snapshot, such as 12 or [12].'),
+      }),
+      execute: (input) => record('hoverDomNode', input, () => session.hoverDomNode(normalizeDomNodeIdParam(input))),
+    }),
+    doubleClickDomNode: tool({
+      description: 'DOM mode: double-click a node from the CURRENT full DOM snapshot by numeric node_id. Use this for rows, tree items, editors, or controls that require double-click.',
+      inputSchema: browserToolInput({
+        id: z.string().describe('The numeric node_id shown in the full DOM snapshot, such as 12 or [12].'),
+      }),
+      execute: (input) => record('doubleClickDomNode', input, () => session.doubleClickDomNode(normalizeDomNodeIdParam(input))),
+    }),
+    dragDomNode: tool({
+      description: 'DOM mode: drag from one DOM node center to another DOM node center using numeric node_id values from the CURRENT full DOM snapshot.',
+      inputSchema: browserToolInput({
+        fromId: z.string().describe('Start numeric node_id shown in the full DOM snapshot, such as 12 or [12].'),
+        toId: z.string().describe('End numeric node_id shown in the full DOM snapshot, such as 18 or [18].'),
+      }),
+      execute: (input) => record('dragDomNode', input, () => session.dragDomNode(normalizeDomNodeIdParam({ id: input.fromId }), normalizeDomNodeIdParam({ id: input.toId }))),
     }),
     fillDomNodes: tool({
       description: `DOM mode form helper: click and optionally fill up to ${BATCH_FILL_FIELD_LIMIT} fields from the CURRENT full DOM snapshot in one browser action. Use for stable forms where all node_id values are visible in the same fresh DOM snapshot. Do not use across navigation, popups, or dynamic multi-step widgets.`,
@@ -2321,7 +2395,7 @@ function runtimePrompt(input: {
     ? visualMarkersWithoutOverlay || visualTextCandidateFallback
       ? formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)
       : '[disabled because visual mode uses screenshot labels]'
-    : '[disabled because DOM mode uses fresh DOM tree ids; findByText returns separate T locators only when explicitly called]';
+    : '[disabled because DOM mode uses fresh DOM tree ids]';
   const evidence = attachScreenshot
     ? mode === 'visual-markers' && separateMarkerScreenshot
       ? 'the two attached screenshots'
@@ -2364,12 +2438,11 @@ function runtimePrompt(input: {
       ]
     : [
         '- DOM mode has no clickCandidate/hoverCandidate/dragCandidate tools. Never choose visual candidate IDs.',
-        '- Use clickDomNode(id,text?) with a numeric node_id copied from the CURRENT full DOM snapshot. The tool accepts the numeric id with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
+        '- Use clickDomNode/hoverDomNode/doubleClickDomNode/dragDomNode with numeric node_id values copied from the CURRENT full DOM snapshot. The tools accept numeric ids with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
         '- The DOM tree returned by getPageState is a full-page DOM snapshot with actionable node_ids beyond the current viewport, including accessible iframe and shadow DOM content, paired with full page text. Prefer this context before deciding to scroll.',
         '- Use getDomNodeText(id) when a full DOM snapshot line is truncated or you need the complete rendered text under a returned node.',
-        '- Text matching is a recovery path, not the normal click path: call findByText(targetText,scopeId?) first, inspect the returned locatorIds, then call clickLocator(locatorId,text?) in a later turn.',
-        '- Use findByText only when a fresh DOM id is unavailable or unreliable, such as dynamic search results, iframe/shadow/dialog/popover content, or an id that disappeared after refresh.',
-        '- For findByText targetText, use a short unique visible/accessibility label from the CURRENT DOM/page context. Do not pass a long surrounding snippet.',
+        '- For hover-only menus in DOM mode, call hoverDomNode on the current DOM node_id trigger, then call getPageState before choosing a revealed target.',
+        '- For drag-and-drop in DOM mode, call dragDomNode(fromId,toId) only when both endpoints are present in the same fresh DOM snapshot.',
         '- For text entry, use clickDomNode(id,text) in one tool call when the input id is present. Use typeText only after a prior action already focused the field.',
         `- For stable forms with multiple fields in the same fresh DOM snapshot, use fillDomNodes(fields[]) once instead of one clickDomNode per field. You may include up to ${BATCH_FILL_FIELD_LIMIT} fields. Do not batch across navigation, popups, or dynamic multi-step UI.`,
         '- Use scrollArea only when interaction requires changing the visual viewport or lazy-loaded content is absent from the full DOM/text context. After scrolling or any browser-changing action, call getPageState before using new ids.',
@@ -2390,7 +2463,7 @@ function runtimePrompt(input: {
       ? '- Browser chat may either answer with Chinese Markdown and no tool, or call at most one browser tool when action/inspection is needed.'
       : '- One tool only. You may include a short ordinary Chinese progress sentence alongside the tool call.',
     browserChatMode
-      ? '- Keep browser action tool params minimal: reason, exact tool arguments, and optional visualAfter. If no browser action is needed, answer directly in Markdown without calling a tool.'
+      ? '- Keep browser action tool params minimal: reason, exact tool arguments, optional visualAfter, and optional requiresConfirmation/confirmationMessage only when strict safety requires a button confirmation. If no browser action is needed, answer directly in Markdown without calling a tool.'
       : '- Keep tool params minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
     '- Treat RunState JSON and Working Memory as compact context only. Do not copy them into tool params.',
     '- Historical actions are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
@@ -2399,14 +2472,15 @@ function runtimePrompt(input: {
     browserChatMode ? '' : '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
     browserChatMode ? '' : '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
     browserChatMode ? '' : '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
-    '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL or a relative path resolved against AI_FILE_DOWNLOAD_BASE_URL from settings.',
+    '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL.',
+    browserChatMode ? '- Strict safety confirmations must use tool params requiresConfirmation=true and confirmationMessage; never ask the user to type a confirmation message for that purpose.' : '',
     '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. Include the returned URL or local path in the final answer.',
     '- If the page may have changed or you need fresh DOM/text/screenshot evidence, call getPageState explicitly. The backend will not silently refresh page state between model calls.',
     '- If a tool result includes observationId=..., inspect omitted content with readObservation(id,offset,maxChars) or searchObservation(id,query). Do not repeat the heavy tool unless the page changed.',
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
-      : '- DOM action reason must cite the current full-DOM id/text, or the findByText locatorId plus matched text when using recovery locators.',
+      : '- DOM action reason must cite the current full-DOM node_id/text used for the action.',
     `- Use ${evidence} as the current page state. When this state is stale, call getPageState.`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
@@ -2427,11 +2501,11 @@ function runtimePrompt(input: {
           : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomNodeText are unavailable.'
       : visualMode
         ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
-        : '- DOM mode: no screenshot image/path is attached. Use getPageState for fresh full DOM/page text when needed, then use DOM node_id tools; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
+        : '- DOM mode: no screenshot image/path is attached. Use getPageState for fresh full DOM/page text when needed, then use DOM node_id tools. clickCandidate and visual candidate IDs are unavailable.',
     ...markerTargetRules,
     caseSystemPrompt ? `${browserChatMode ? 'Browser-chat loaded instructions and Skills' : 'Test-case-specific instructions'}:
 ${caseSystemPrompt}` : '',
-    customPrompt ? `Mode custom instructions:
+    customPrompt ? `Custom system instructions:
 ${customPrompt}` : '',
     !browserChatMode && strategyMemory.length ? `Historical failure strategy memory:
 ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : '',
@@ -2445,7 +2519,7 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
       : '- Call one tool. Use ordinary assistant text for progress/explanation, and tool params only for the selected tool.',
     visualMode
       ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
-      : '- DOM action reason must mention the current full-DOM id/text, or the chosen findByText locatorId plus matched text when using clickLocator.',
+      : '- DOM action reason must mention the current full-DOM node_id/text used for the action.',
     browserChatMode
       ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
       : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
@@ -2496,11 +2570,14 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'pressKey',
     'reportState',
     'scrollArea',
+  ];
+  const visualContextTools = [
     'selectReferenceScreenshots',
     'manageVisualContext',
   ];
   const candidateTools = [
     ...sharedTools,
+    ...visualContextTools,
     'clickCandidate',
     'fillCandidates',
     'hoverCandidate',
@@ -2509,7 +2586,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'dragCandidate',
   ];
   if (mode === 'visual-markers') return candidateTools;
-  return [...sharedTools, 'getDomNodeText', 'clickDomNode', 'fillDomNodes', 'findByText', 'clickLocator'];
+  return [...sharedTools, 'getDomNodeText', 'clickDomNode', 'hoverDomNode', 'doubleClickDomNode', 'dragDomNode', 'fillDomNodes'];
 }
 
 function isCodexProvider() {
@@ -2950,6 +3027,7 @@ async function executeRuntimeStep(input: {
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   repairContext?: string;
+  requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
 }) {
   const {
     session,
@@ -3451,6 +3529,7 @@ async function executeRuntimeStep(input: {
         visualContext,
         abortSignal,
         shouldContinue: input.shouldContinue,
+        requestToolConfirmation: input.requestToolConfirmation,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
         onToolTrace: async (trace) => {
           ensureActive();
@@ -3510,6 +3589,7 @@ async function executeRuntimeStep(input: {
       getAiRequest: () => aiRequest,
       abortSignal,
       shouldContinue: input.shouldContinue,
+      requestToolConfirmation: input.requestToolConfirmation,
       observePageState,
       onVisualContextChange: async (snapshot) => {
         ensureActive();
@@ -3723,9 +3803,28 @@ function browserChatRequirement(input: {
   ].filter(Boolean).join('\n');
 }
 
+function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
+  if (mode === 'full') {
+    return [
+      'Safety mode: full.',
+      '- When the user request is clear, do not ask for extra confirmation only because an operation is important.',
+      '- Do not set requiresConfirmation or confirmationMessage for browser tools in full mode.',
+      '- Still stop or ask for help when the page requires captcha/OTP/security verification, missing credentials, or information only the user can provide.',
+    ].join('\n');
+  }
+  return [
+    'Safety mode: strict.',
+    '- Before executing an operation you judge important, irreversible, externally visible, data-changing, privacy-sensitive, or costly, call the intended browser tool with requiresConfirmation=true and a concise Chinese confirmationMessage.',
+    '- Important operations can include submit/publish/send/delete/modify records, payment/order/authorization, login/security actions, file upload/download/export, or similar actions based on page context.',
+    '- The backend will pause this same browser-chat turn and show Confirm/Cancel buttons on that tool before executing it.',
+    '- Do not ask for this confirmation in plain text and do not end the turn just to ask the user to type confirm.',
+  ].join('\n');
+}
+
 function createInteractiveBrowserTestCase(input: {
   id: string;
   mode?: BrowserSessionMode | 'default';
+  safetyMode?: BrowserChatSafetyMode;
   targetUrl: string;
   instruction: string;
   skillContext?: string;
@@ -3736,6 +3835,10 @@ function createInteractiveBrowserTestCase(input: {
     targetUrl,
     instruction: input.instruction,
   });
+  const systemPrompt = [
+    browserChatSafetyInstructions(input.safetyMode),
+    input.skillContext,
+  ].filter(Boolean).join('\n\n');
   return {
     id: input.id,
     title: 'Browser chat operation',
@@ -3751,7 +3854,7 @@ function createInteractiveBrowserTestCase(input: {
       browserMode: input.mode || 'default',
       isMarked: true,
       userRequirement: requirement,
-      systemPrompt: input.skillContext || '',
+      systemPrompt,
       preconditions: [],
       testData: {},
       steps: [],
@@ -3780,12 +3883,14 @@ export async function executeInteractiveBrowserTurn(input: {
   conversation?: InteractiveBrowserTurnMessage[];
   completedSteps?: StepExecutionResult[];
   mode?: BrowserSessionMode | 'default';
+  safetyMode?: BrowserChatSafetyMode;
   referenceImagePaths?: string[];
   skillContext?: string;
   onProgress?: (step: StepExecutionResult) => void | Promise<void>;
   onDebug?: ExecutionDebug;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
+  requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
 }): Promise<InteractiveBrowserTurnResult> {
   const ensureActive = () => throwIfStopped(input.abortSignal, input.shouldContinue);
   const steps = [...(input.completedSteps || [])];
@@ -3793,6 +3898,7 @@ export async function executeInteractiveBrowserTurn(input: {
   const testCase = createInteractiveBrowserTestCase({
     id: `chat_${input.runId}`,
     mode: input.mode,
+    safetyMode: input.safetyMode,
     targetUrl: input.targetUrl,
     instruction: input.instruction,
     skillContext: input.skillContext,
@@ -3888,6 +3994,7 @@ export async function executeInteractiveBrowserTurn(input: {
         },
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
+        requestToolConfirmation: input.requestToolConfirmation,
         onDebug: input.onDebug,
         onToolTrace: async (trace, progress) => {
           ensureActive();
@@ -4330,6 +4437,12 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.dragCandidate(String(input.fromId || ''), String(input.toId || ''));
     case 'clickDomNode':
       return session.clickDomNode(domNodeId, text);
+    case 'hoverDomNode':
+      return session.hoverDomNode(domNodeId);
+    case 'doubleClickDomNode':
+      return session.doubleClickDomNode(domNodeId);
+    case 'dragDomNode':
+      return session.dragDomNode(normalizeDomNodeIdParam({ id: input.fromId }), normalizeDomNodeIdParam({ id: input.toId }));
     case 'fillDomNodes':
       return session.fillDomNodes(batchFillFieldsFromInput(input));
     case 'focusDomNode':
@@ -4356,6 +4469,7 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         url: typeof input.url === 'string' ? input.url : undefined,
         path: typeof input.path === 'string' ? input.path : undefined,
         urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
+        sourcePageUrl: session.currentUrl(),
         fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
       });
     case 'generateMarkdownFile':
@@ -4430,6 +4544,7 @@ async function executeCodexRuntimeObject(input: {
   visualContext?: VisualContextManager;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
+  requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onSelectReferenceScreenshots?: (selection: {
@@ -4438,7 +4553,7 @@ async function executeCodexRuntimeObject(input: {
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -4482,12 +4597,17 @@ async function executeCodexRuntimeObject(input: {
         : '';
     normalizedParams.areaId = areaId || normalizedParams.areaId;
   }
+  if (type === 'dragDomNode') {
+    normalizedParams.fromId = normalizeDomNodeIdParam({ id: normalizedParams.fromId });
+    normalizedParams.toId = normalizeDomNodeIdParam({ id: normalizedParams.toId });
+  }
   const flow: RecordedFlowStep = {
     index: stepIndex,
     name: type,
     input: normalizedParams,
     reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
   };
+  const pendingConfirmation = requestToolConfirmation ? toolConfirmationFromInput(type, normalizedParams) : undefined;
 
   await executeTracedBrowserAction({
     session,
@@ -4502,11 +4622,27 @@ async function executeCodexRuntimeObject(input: {
     shouldContinue,
     onToolTrace,
     onVisualContextChange,
-    action: async () => (
-      candidateActionToolNames.has(type)
+    action: async () => {
+      if (pendingConfirmation && requestToolConfirmation) {
+        const decision = await requestToolConfirmation({
+          toolName: type,
+          input: normalizedParams,
+          reason: pendingConfirmation.reason,
+          prompt: pendingConfirmation.prompt,
+          stepIndex,
+        });
+        throwIfStopped(abortSignal, shouldContinue);
+        if (decision !== 'confirmed') {
+          return {
+            ok: true,
+            actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
+          } satisfies BrowserActionResult;
+        }
+      }
+      return candidateActionToolNames.has(type)
         ? validateCandidateActionBeforeExecution(type, normalizedParams, traces) || await runRecordedTool(session, targetUrl, flow, runId)
-        : await runRecordedTool(session, targetUrl, flow, runId)
-    ),
+        : await runRecordedTool(session, targetUrl, flow, runId);
+    },
   });
   return { text: readableActionFromRawText(message) || '', executed: true };
 }

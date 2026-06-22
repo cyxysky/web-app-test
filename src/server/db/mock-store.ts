@@ -495,11 +495,20 @@ export const store = {
   applyRuntimeEnv() {
     const allowedKeys = new Set(runtimeEnvKeys);
     const items = readData().runtimeEnv || [];
+    const itemByKey = new Map(items.map((item) => [item.key, item]));
     const savedByKey = new Map(items.filter((item) => allowedKeys.has(item.key)).map((item) => [item.key, item]));
+    const legacyTargetPrompt = itemByKey.get('AI_TARGET_MODE_CUSTOM_PROMPT')?.value?.trim();
+    const legacyBrowserPrompt = itemByKey.get('AI_BROWSER_CHAT_CUSTOM_PROMPT')?.value?.trim();
+    const legacyCustomSystemPrompt =
+      itemByKey.get('AI_TARGET_MODE_CUSTOM_PROMPT_ENABLED')?.value === 'true' && legacyTargetPrompt
+        ? legacyTargetPrompt
+        : itemByKey.get('AI_BROWSER_CHAT_CUSTOM_PROMPT_ENABLED')?.value === 'true' && legacyBrowserPrompt
+          ? legacyBrowserPrompt
+          : '';
     for (const definition of runtimeEnvDefinitions) {
       const item = savedByKey.get(definition.key);
       if (item?.enabled === false) continue;
-      process.env[definition.key] = item?.value ?? definition.defaultValue;
+      process.env[definition.key] = item?.value ?? (definition.key === 'AI_CUSTOM_SYSTEM_PROMPT' ? legacyCustomSystemPrompt : definition.defaultValue);
     }
     applyModelConfig(readData().modelConfig as LegacyModelConfigRecord | undefined);
     return items;

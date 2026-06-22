@@ -101,11 +101,22 @@ type BrowserChatLogRecord = {
   elapsedMs?: number;
 };
 
+type BrowserChatToolConfirmation = {
+  id: string;
+  messageId: string;
+  stepIndex?: number;
+  toolName: string;
+  reason?: string;
+  prompt: string;
+  requestedAt: string;
+};
+
 type BrowserChatSession = {
   id: string;
   title: string;
   targetUrl: string;
   mode: BrowserChatMode;
+  safetyMode: BrowserChatSafetyMode;
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
   createdAt: string;
@@ -116,11 +127,13 @@ type BrowserChatSession = {
   consoleErrors: string[];
   networkErrors: string[];
   logs: BrowserChatLogRecord[];
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
   error?: string;
 };
 
 type BrowserChatView = 'chat' | 'target' | 'settings';
 type BrowserChatMode = 'dom' | 'visual-markers';
+type BrowserChatSafetyMode = 'strict' | 'full';
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
 type BrowserChatToolDetail = {
   stepIndex: number;
@@ -702,12 +715,15 @@ function browserChatToolLabel(name: string, t: (value: string) => string) {
     clickDomNode: '点选节点',
     clickLocator: '点选定位器',
     doubleClickCandidate: '双击目标',
+    doubleClickDomNode: '双击节点',
     dragCandidate: '拖拽元素',
+    dragDomNode: '拖拽节点',
     fillCandidates: '填写表单',
     fillDomNodes: '填写节点',
     findByText: '定位文本',
     getDomNodeText: '读取节点',
     getHttpRequests: '检查请求',
+    hoverDomNode: '悬停节点',
     listTabs: '扫描标签页',
     manageVisualContext: '整理视觉上下文',
     openPage: '导航页面',
@@ -809,6 +825,28 @@ function normalizeMode(value?: string): BrowserChatMode {
   return value === 'dom' ? 'dom' : 'visual-markers';
 }
 
+function normalizeSafetyMode(value?: string): BrowserChatSafetyMode {
+  return value === 'full' ? 'full' : 'strict';
+}
+
+function normalizeToolConfirmation(value?: BrowserChatToolConfirmation): BrowserChatToolConfirmation | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const id = typeof value.id === 'string' ? value.id.trim() : '';
+  const messageId = typeof value.messageId === 'string' ? value.messageId.trim() : '';
+  const toolName = typeof value.toolName === 'string' ? value.toolName.trim() : '';
+  const prompt = typeof value.prompt === 'string' ? value.prompt.trim() : '';
+  if (!id || !messageId || !toolName || !prompt) return undefined;
+  return {
+    id,
+    messageId,
+    stepIndex: typeof value.stepIndex === 'number' && Number.isFinite(value.stepIndex) ? Math.floor(value.stepIndex) : undefined,
+    toolName,
+    reason: typeof value.reason === 'string' && value.reason.trim() ? compactText(value.reason, 300) : undefined,
+    prompt: compactText(prompt, 500),
+    requestedAt: typeof value.requestedAt === 'string' ? value.requestedAt : '',
+  };
+}
+
 function normalizeSession(session: BrowserChatSession): BrowserChatSession {
   return {
     ...session,
@@ -822,7 +860,9 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
       stepIndexes: Array.isArray(message.stepIndexes) ? message.stepIndexes : [],
     })),
     mode: normalizeMode(session.mode),
+    safetyMode: normalizeSafetyMode(session.safetyMode),
     networkErrors: session.networkErrors || [],
+    pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
     steps: session.steps || [],
   };
 }
@@ -976,19 +1016,107 @@ const BrowserChatImageGrid = memo(function BrowserChatImageGrid({
   );
 });
 
+function pendingConfirmationForTool(input: {
+  pending?: BrowserChatToolConfirmation;
+  stepIndex?: number;
+  toolName: string;
+  toolOk?: boolean;
+}) {
+  const { pending, stepIndex, toolName, toolOk } = input;
+  if (!pending || toolOk !== undefined) return undefined;
+  if (pending.toolName !== toolName) return undefined;
+  if (pending.stepIndex !== undefined && stepIndex !== pending.stepIndex) return undefined;
+  return pending;
+}
+
+function toolUserActionForTool(logs: BrowserChatLogRecord[], stepIndex: number | undefined, toolName: string) {
+  if (stepIndex === undefined) return undefined;
+  for (const log of [...logs].reverse()) {
+    if (log.stepIndex !== stepIndex) continue;
+    if (log.phase !== 'tool:confirmation:confirmed' && log.phase !== 'tool:confirmation:cancelled') continue;
+    const details = parseJsonObjectText(log.details);
+    const loggedToolName = typeof details?.toolName === 'string' ? details.toolName : '';
+    if (loggedToolName && loggedToolName !== toolName) continue;
+    return log.phase === 'tool:confirmation:confirmed'
+      ? { className: 'is-confirmed', label: '用户已确认' }
+      : { className: 'is-cancelled', label: '用户已取消' };
+  }
+  return undefined;
+}
+
+function BrowserChatToolUserActionTag({ action }: { action?: ReturnType<typeof toolUserActionForTool> }) {
+  if (!action) return null;
+  return <span className={`browser-chat-tool-user-action-tag ${action.className}`}>{action.label}</span>;
+}
+
+const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirmationActions({
+  pending,
+  resolvingConfirmationId,
+  onResolveToolConfirmation,
+}: {
+  pending?: BrowserChatToolConfirmation;
+  resolvingConfirmationId?: string | null;
+  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
+}) {
+  if (!pending || !onResolveToolConfirmation) return null;
+  const resolving = resolvingConfirmationId === pending.id;
+  return (
+    <div className="browser-chat-tool-confirmation" role="group" aria-label="工具调用确认">
+      <span>{pending.prompt}</span>
+      <div className="browser-chat-tool-confirmation-actions">
+        <button
+          className="browser-chat-tool-confirm"
+          disabled={resolving}
+          onClick={() => void onResolveToolConfirmation(pending.id, 'confirm')}
+          type="button"
+        >
+          {resolving ? <Loader2 className="spin" size={13} /> : <BadgeCheck size={13} />}
+          确认
+        </button>
+        <button
+          className="browser-chat-tool-cancel"
+          disabled={resolving}
+          onClick={() => void onResolveToolConfirmation(pending.id, 'cancel')}
+          type="button"
+        >
+          <X size={13} />
+          取消
+        </button>
+      </div>
+    </div>
+  );
+});
+
 const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
+  logs,
   onSelectTool,
+  onResolveToolConfirmation,
+  onlyPendingConfirmation = false,
+  pendingToolConfirmation,
+  resolvingConfirmationId,
   running,
   step,
 }: {
+  logs: BrowserChatLogRecord[];
   onSelectTool: (detail: BrowserChatToolDetail) => void;
+  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
+  onlyPendingConfirmation?: boolean;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationId?: string | null;
   running: boolean;
   step: StepExecutionResult;
 }) {
   const { t } = useI18n();
   const toolCalls = step.tools || [];
   if (!running && !toolCalls.length) return null;
+  if (onlyPendingConfirmation && !toolCalls.some((tool) => pendingConfirmationForTool({
+    pending: pendingToolConfirmation,
+    stepIndex: step.index,
+    toolName: tool.name,
+    toolOk: tool.ok,
+  }))) return null;
   if (running && !toolCalls.length) {
+    if (onlyPendingConfirmation) return null;
     return (
       <div className="browser-chat-tool-card is-waiting">
         <span className="browser-chat-tool-icon" aria-hidden="true">
@@ -1013,6 +1141,14 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
         const status = toolStatusLabel(tool);
         const displayText = `${label}${meta ? `: ${meta}` : ''}`;
         const stateClass = tool.ok === false ? ' is-failed' : tool.ok === undefined ? ' is-running' : '';
+        const pendingConfirmation = pendingConfirmationForTool({
+          pending: pendingToolConfirmation,
+          stepIndex: step.index,
+          toolName: tool.name,
+          toolOk: tool.ok,
+        });
+        if (onlyPendingConfirmation && !pendingConfirmation) return null;
+        const userAction = toolUserActionForTool(logs, step.index, tool.name);
         return (
           <div className="browser-chat-tool-call" key={`${step.index}-${toolIndex}-${tool.name}`}>
             {tool.reason ? <p className="browser-chat-tool-reason">{tool.reason}</p> : null}
@@ -1029,10 +1165,16 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
               <span className="browser-chat-tool-content">
                 <span className="browser-chat-tool-label">
                   <span className="browser-chat-tool-name">{label}</span>
+                  <BrowserChatToolUserActionTag action={userAction} />
                 </span>
                 {meta ? <small className="browser-chat-tool-meta">{meta}</small> : null}
               </span>
             </button>
+            <BrowserChatToolConfirmationActions
+              pending={pendingConfirmation}
+              resolvingConfirmationId={resolvingConfirmationId}
+              onResolveToolConfirmation={onResolveToolConfirmation}
+            />
           </div>
         );
       })}
@@ -1042,11 +1184,19 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
 
 const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   cycle,
+  logs,
+  onResolveToolConfirmation,
   onSelectTool,
+  pendingToolConfirmation,
+  resolvingConfirmationId,
   toolDetails,
 }: {
   cycle: BrowserChatAiOutputCycle;
+  logs: BrowserChatLogRecord[];
+  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationId?: string | null;
   toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
   const { output } = cycle;
@@ -1056,6 +1206,15 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   const firstToolMeta = firstTool ? browserChatToolMeta(firstTool.name, firstTool.input) || firstTool.reason : '';
   const toolTitle = compactText([firstToolLabel, firstToolMeta].filter(Boolean).join(': '), 160);
   const toolSummary = output.tools.length === 1 ? '执行一个工具' : `执行 ${output.tools.length} 个工具`;
+  const hasPendingConfirmation = output.tools.some((tool, index) => {
+    const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+    return Boolean(pendingConfirmationForTool({
+      pending: pendingToolConfirmation,
+      stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+      toolName: tool.name,
+      toolOk: toolDetail?.tool.ok,
+    }));
+  });
   return (
     <div className="browser-chat-ai-cycle">
       {output.reasoning.length ? (
@@ -1073,7 +1232,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
         </details>
       ) : null}
       {output.tools.length ? (
-        <details className="browser-chat-ai-line-collapse">
+        <details className="browser-chat-ai-line-collapse" open={hasPendingConfirmation || undefined}>
           <summary className="browser-chat-ai-collapse-summary" title={toolTitle}>
             <SquareTerminal size={14} />
             <span>{toolSummary}</span>
@@ -1085,6 +1244,13 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
               const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
               const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
               const stateClass = toolDetail?.tool.ok === false ? ' is-failed' : toolDetail?.tool.ok === undefined ? ' is-running' : '';
+              const pendingConfirmation = pendingConfirmationForTool({
+                pending: pendingToolConfirmation,
+                stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+                toolName: tool.name,
+                toolOk: toolDetail?.tool.ok,
+              });
+              const userAction = toolUserActionForTool(logs, toolDetail?.stepIndex ?? cycle.stepIndex, tool.name);
               const card = (
                 <>
                   <span className="browser-chat-tool-icon" aria-hidden="true">
@@ -1093,6 +1259,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                   <span className="browser-chat-tool-content">
                     <span className="browser-chat-tool-label">
                       <span className="browser-chat-tool-name">{label}</span>
+                      <BrowserChatToolUserActionTag action={userAction} />
                     </span>
                     {meta ? <small className="browser-chat-tool-meta">{compactText(meta, 150)}</small> : null}
                   </span>
@@ -1114,6 +1281,11 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                       {card}
                     </div>
                   )}
+                  <BrowserChatToolConfirmationActions
+                    pending={pendingConfirmation}
+                    resolvingConfirmationId={resolvingConfirmationId}
+                    onResolveToolConfirmation={onResolveToolConfirmation}
+                  />
                 </div>
               );
             })}
@@ -1134,13 +1306,19 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
 const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
   logs,
   message,
+  onResolveToolConfirmation,
   onSelectTool,
+  pendingToolConfirmation,
+  resolvingConfirmationId,
   running,
   steps,
 }: {
   logs: BrowserChatLogRecord[];
   message: BrowserChatMessage;
+  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationId?: string | null;
   running: boolean;
   steps: StepExecutionResult[];
 }) {
@@ -1155,19 +1333,44 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const failedToolCount = steps.reduce((count, step) => count + (step.tools || []).filter((tool) => tool.ok === false).length, 0);
   const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
   const timelineSteps = steps.filter((step) => (step.tools || []).length || (running && step.status === 'running'));
-  const shouldShowStepTimeline = !aiOutputCycles.length && (toolCount > 0 || waitingForTool);
+  const hasPendingConfirmation = Boolean(pendingToolConfirmation);
+  const aiCyclesContainPendingConfirmation = hasPendingConfirmation && aiOutputCycles.some((cycle) => (
+    cycle.output.tools.some((tool, index) => {
+      const toolDetail = aiCycleToolDetails.get(aiCycleToolKey(cycle.id, index));
+      return Boolean(pendingConfirmationForTool({
+        pending: pendingToolConfirmation,
+        stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+        toolName: tool.name,
+        toolOk: toolDetail?.tool.ok,
+      }));
+    })
+  ));
+  const pendingTimelineSteps = hasPendingConfirmation
+    ? steps.filter((step) => (step.tools || []).some((tool) => pendingConfirmationForTool({
+      pending: pendingToolConfirmation,
+      stepIndex: step.index,
+      toolName: tool.name,
+      toolOk: tool.ok,
+    })))
+    : [];
+  const showPendingTimelineFallback = hasPendingConfirmation && !aiCyclesContainPendingConfirmation;
+  const timelineStepsToRender = showPendingTimelineFallback ? pendingTimelineSteps : timelineSteps;
+  const shouldShowStepTimeline = (!aiOutputCycles.length && (toolCount > 0 || waitingForTool))
+    || (showPendingTimelineFallback && pendingTimelineSteps.length > 0);
   const hasFinalText = Boolean(finalText.trim());
   const toolSummary = failedToolCount
     ? failedToolCount === 1
       ? '工具调用失败'
       : `${failedToolCount} 个工具调用失败`
-    : toolCount
-    ? toolCount === 1
-      ? `${running ? '正在执行' : '执行'}一个工具`
-      : `${running ? '正在执行' : '执行'} ${toolCount} 个工具`
-    : waitingForTool
-      ? '准备工具'
-      : '暂无工具';
+    : showPendingTimelineFallback
+      ? '等待用户确认工具调用'
+      : toolCount
+        ? toolCount === 1
+          ? `${running ? '正在执行' : '执行'}一个工具`
+          : `${running ? '正在执行' : '执行'} ${toolCount} 个工具`
+        : waitingForTool
+          ? '准备工具'
+          : '暂无工具';
   const renderText = (text: string, key: string) => {
     const normalized = text;
     if (!normalized || seenTexts.has(normalized)) return null;
@@ -1178,10 +1381,14 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   };
 
   useEffect(() => {
+    if (showPendingTimelineFallback) {
+      setToolsExpanded(true);
+      return;
+    }
     if (!running || !shouldShowStepTimeline || autoExpandedToolsRef.current) return;
     autoExpandedToolsRef.current = true;
     setToolsExpanded(true);
-  }, [running, shouldShowStepTimeline]);
+  }, [running, shouldShowStepTimeline, showPendingTimelineFallback]);
 
   return (
     <div className="browser-chat-agent-timeline">
@@ -1189,7 +1396,11 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
         <BrowserChatAiCycleLine
           cycle={cycle}
           key={cycle.id}
+          logs={logs}
+          onResolveToolConfirmation={onResolveToolConfirmation}
           onSelectTool={onSelectTool}
+          pendingToolConfirmation={pendingToolConfirmation}
+          resolvingConfirmationId={resolvingConfirmationId}
           toolDetails={aiCycleToolDetails}
         />
       ))}
@@ -1205,9 +1416,18 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
             <span>{toolSummary}</span>
             <ChevronDown className="browser-chat-tool-summary-chevron" size={14} />
           </button>
-          {toolsExpanded ? timelineSteps.map((step) => (
+          {toolsExpanded ? timelineStepsToRender.map((step) => (
             <div className="browser-chat-agent-step" key={step.index}>
-              <BrowserChatStepToolCards onSelectTool={onSelectTool} running={running && step.status === 'running'} step={step} />
+              <BrowserChatStepToolCards
+                logs={logs}
+                onResolveToolConfirmation={onResolveToolConfirmation}
+                onSelectTool={onSelectTool}
+                onlyPendingConfirmation={showPendingTimelineFallback}
+                pendingToolConfirmation={pendingToolConfirmation}
+                resolvingConfirmationId={resolvingConfirmationId}
+                running={running && step.status === 'running'}
+                step={step}
+              />
             </div>
           )) : null}
         </div>
@@ -1233,9 +1453,12 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   onExportMessage,
   onGenerateSkill,
   onPreviewImage,
+  onResolveToolConfirmation,
   onSelectTool,
   onShowLogs,
   onToggleExportSelection,
+  pendingToolConfirmation,
+  resolvingConfirmationId,
   selectedForExport,
   sessionBusy,
   totalStepCount,
@@ -1252,9 +1475,12 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   onExportMessage: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
+  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
   onToggleExportSelection: (messageId: string, selected: boolean) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationId?: string | null;
   selectedForExport: boolean;
   sessionBusy: boolean;
   totalStepCount: number;
@@ -1287,7 +1513,16 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
               </span>
               <time dateTime={messageUpdateTime(item)}>最后更新 {formatLogTime(messageUpdateTime(item))}</time>
             </div>
-            <BrowserChatAssistantTimeline logs={itemLogs} message={item} onSelectTool={onSelectTool} running={operationRunning} steps={itemSteps} />
+            <BrowserChatAssistantTimeline
+              logs={itemLogs}
+              message={item}
+              onResolveToolConfirmation={onResolveToolConfirmation}
+              onSelectTool={onSelectTool}
+              pendingToolConfirmation={pendingToolConfirmation?.messageId === item.id ? pendingToolConfirmation : undefined}
+              resolvingConfirmationId={resolvingConfirmationId}
+              running={operationRunning}
+              steps={itemSteps}
+            />
           </>
         ) : (
           <>
@@ -1373,11 +1608,15 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   onExportMessage,
   onGenerateSkill,
   onPreviewImage,
+  onResolveToolConfirmation,
   onSelectTool,
   onShowLogs,
   onToggleExportSelection,
+  pendingToolConfirmation,
+  resolvingConfirmationId,
   selectedExportMessageIdSet,
   selectedExportMessageIds,
+  sessionId,
   sessionBusy,
   stepsByIndex,
   totalStepCount,
@@ -1396,18 +1635,51 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   onExportMessage: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
+  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
   onToggleExportSelection: (messageId: string, selected: boolean) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationId?: string | null;
   selectedExportMessageIdSet: Set<string>;
   selectedExportMessageIds: string[];
+  sessionId?: string;
   sessionBusy: boolean;
   stepsByIndex: Map<number, StepExecutionResult>;
   totalStepCount: number;
 }) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
+  const lastMessage = messages[messages.length - 1];
+  const scrollKey = [
+    sessionId || '',
+    messages.length,
+    lastMessage?.id || '',
+    lastMessage?.updatedAt || '',
+    pendingToolConfirmation?.id || '',
+    sessionBusy ? 'busy' : 'idle',
+  ].join(':');
+
+  useEffect(() => {
+    let frame = 0;
+    let nextFrame = 0;
+    const scrollToBottom = () => {
+      const container = scrollRef.current;
+      if (!container) return;
+      container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    };
+    frame = requestAnimationFrame(() => {
+      scrollToBottom();
+      nextFrame = requestAnimationFrame(scrollToBottom);
+    });
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      if (nextFrame) cancelAnimationFrame(nextFrame);
+    };
+  }, [scrollKey]);
+
   return (
-    <div className="browser-chat-message-list">
+    <div className="browser-chat-message-list" ref={scrollRef}>
       {selectedExportMessageIds.length ? (
         <div className="browser-chat-message-export-bar">
           <span>已选 {selectedExportMessageIds.length} 轮</span>
@@ -1460,15 +1732,19 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             onExportMessage={onExportMessage}
             onGenerateSkill={onGenerateSkill}
             onPreviewImage={onPreviewImage}
+            onResolveToolConfirmation={onResolveToolConfirmation}
             onSelectTool={onSelectTool}
             onShowLogs={onShowLogs}
             onToggleExportSelection={onToggleExportSelection}
+            pendingToolConfirmation={pendingToolConfirmation}
+            resolvingConfirmationId={resolvingConfirmationId}
             selectedForExport={selectedExportMessageIdSet.has(item.id)}
             sessionBusy={sessionBusy}
             totalStepCount={totalStepCount}
           />
         );
       })}
+      <div aria-hidden="true" className="browser-chat-message-list-end" />
     </div>
   );
 });
@@ -1483,11 +1759,13 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading,
   mode,
   modeLocked,
+  safetyMode,
   onInterrupt,
   onModeChange,
   onPreviewAttachment,
   onRemoveAttachment,
   onSubmitMessage,
+  onSafetyModeChange,
   onUploadImages,
   resetToken,
   showStop,
@@ -1502,11 +1780,13 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading: boolean;
   mode: BrowserChatMode;
   modeLocked: boolean;
+  safetyMode: BrowserChatSafetyMode;
   onInterrupt: () => void | Promise<void>;
   onModeChange: (mode: BrowserChatMode) => void;
   onPreviewAttachment: (attachment: BrowserChatAttachment) => void;
   onRemoveAttachment: (id: string) => void;
   onSubmitMessage: (content: string, skillIds: string[]) => Promise<boolean>;
+  onSafetyModeChange: (mode: BrowserChatSafetyMode) => void;
   onUploadImages: (files: File[]) => void | Promise<void>;
   resetToken: number;
   showStop: boolean;
@@ -1539,13 +1819,18 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     return Array.from(root.childNodes).map(walk).join('').replace(/\u00A0/g, ' ');
   }, []);
 
-  const syncEditorState = useCallback(() => {
+  const syncEditorState = useCallback((options: { scrollToBottom?: boolean } = {}) => {
     const editor = editorRef.current;
     const skillIds = editor
       ? Array.from(editor.querySelectorAll<HTMLElement>('[data-skill-id]')).map((node) => node.dataset.skillId || '').filter(Boolean)
       : [];
     setDraft(editorPlainText(editor));
     setSelectedSkillIds(Array.from(new Set(skillIds)));
+    if (options.scrollToBottom && editor) {
+      requestAnimationFrame(() => {
+        editor.scrollTop = editor.scrollHeight;
+      });
+    }
   }, [editorPlainText]);
 
   useEffect(() => {
@@ -1930,7 +2215,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
               removeSkill(token.dataset.skillId);
             }
           }}
-          onInput={syncEditorState}
+          onInput={() => syncEditorState({ scrollToBottom: true })}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
             if (event.key === 'Backspace' || event.key === 'Delete') {
@@ -1938,7 +2223,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                 event.preventDefault();
                 return;
               }
-              requestAnimationFrame(syncEditorState);
+              requestAnimationFrame(() => syncEditorState({ scrollToBottom: true }));
             }
             if (skillMenuOpen && event.key === 'ArrowDown') {
               event.preventDefault();
@@ -1967,7 +2252,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             }
           }}
           onKeyUp={(event) => {
-            if (event.key === 'Backspace' || event.key === 'Delete') syncEditorState();
+            if (event.key === 'Backspace' || event.key === 'Delete') syncEditorState({ scrollToBottom: true });
           }}
           onPaste={(event) => {
             event.preventDefault();
@@ -1977,7 +2262,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             range?.deleteContents();
             range?.insertNode(document.createTextNode(text));
             range?.collapse(false);
-            syncEditorState();
+            syncEditorState({ scrollToBottom: true });
           }}
           role="textbox"
           suppressContentEditableWarning
@@ -2012,6 +2297,28 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                 type="button"
               >
                 {t('DOM')}
+              </button>
+            </div>
+            <div className="browser-chat-safety-toggle" role="radiogroup" aria-label={t('安全性')}>
+              <button
+                aria-pressed={safetyMode === 'strict'}
+                className={safetyMode === 'strict' ? 'active' : undefined}
+                disabled={currentBusy || loading}
+                onClick={() => onSafetyModeChange('strict')}
+                title={t('严格模式下，一些模型认为重要的操作需要用户手动确认执行')}
+                type="button"
+              >
+                {t('严格')}
+              </button>
+              <button
+                aria-pressed={safetyMode === 'full'}
+                className={safetyMode === 'full' ? 'active' : undefined}
+                disabled={currentBusy || loading}
+                onClick={() => onSafetyModeChange('full')}
+                title={t('完全模式下，模型不需要征求用户手动确认执行')}
+                type="button"
+              >
+                {t('完全')}
               </button>
             </div>
           </div>
@@ -2523,6 +2830,7 @@ export function BrowserChatWorkspace({
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [mode, setMode] = useState<BrowserChatMode>('visual-markers');
+  const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
   const [targetGroupId, setTargetGroupId] = useState<string | undefined>();
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [groupName, setGroupName] = useState('');
@@ -2549,6 +2857,7 @@ export function BrowserChatWorkspace({
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
   const [toolDialog, setToolDialog] = useState<BrowserChatToolDetail | null>(null);
+  const [resolvingConfirmationId, setResolvingConfirmationId] = useState<string | null>(null);
   const [imagePreview, setImagePreview] = useState<BrowserChatAttachment | null>(null);
   const [error, setError] = useState('');
   const selectedRunningSession = session?.busy ? session : undefined;
@@ -2717,7 +3026,10 @@ export function BrowserChatWorkspace({
     if (!response.ok) throw new Error(data.error || '加载对话失败');
     const shouldActivate = options.activate ?? activeSessionIdRef.current === sessionId;
     const loadedSession = upsertSession(data.session as BrowserChatSession, { activate: shouldActivate });
-    if (shouldActivate) setMode(normalizeMode(loadedSession.mode));
+    if (shouldActivate) {
+      setMode(normalizeMode(loadedSession.mode));
+      setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
+    }
     return loadedSession;
   }, [upsertSession]);
 
@@ -2818,7 +3130,7 @@ export function BrowserChatWorkspace({
     const response = await fetch('/api/browser-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ mode, safetyMode }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '创建对话会话失败');
@@ -2834,7 +3146,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(`/api/browser-chat/${sessionId}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, skillIds }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, safetyMode, skillIds }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '发送消息失败');
@@ -2944,6 +3256,28 @@ export function BrowserChatWorkspace({
       setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
     } finally {
       setInterrupting(false);
+    }
+  }
+
+  async function resolveToolConfirmation(confirmationId: string, action: 'confirm' | 'cancel') {
+    const sessionId = session?.id;
+    if (!sessionId || resolvingConfirmationId) return;
+    setResolvingConfirmationId(confirmationId);
+    setError('');
+    try {
+      const response = await fetch(`/api/browser-chat/${sessionId}/tool-confirmation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, confirmationId }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '工具确认失败');
+      upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === sessionId });
+      scheduleSessionRefresh(sessionId, 120);
+    } catch (resolveError) {
+      setError(resolveError instanceof Error ? resolveError.message : '工具确认失败');
+    } finally {
+      setResolvingConfirmationId(null);
     }
   }
 
@@ -3153,6 +3487,7 @@ export function BrowserChatWorkspace({
     try {
       const loadedSession = await refreshSession(sessionId, { activate: true });
       setMode(normalizeMode(loadedSession.mode));
+      setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
       void loadSessions().catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');
@@ -3322,11 +3657,15 @@ export function BrowserChatWorkspace({
           onExportMessage={exportMessageToTestCase}
           onGenerateSkill={generateMessageSkill}
           onPreviewImage={previewAttachment}
+          onResolveToolConfirmation={resolveToolConfirmation}
           onSelectTool={setToolDialog}
           onShowLogs={showMessageLogs}
           onToggleExportSelection={toggleExportMessageSelection}
+          pendingToolConfirmation={session?.pendingToolConfirmation}
+          resolvingConfirmationId={resolvingConfirmationId}
           selectedExportMessageIdSet={selectedExportMessageIdSet}
           selectedExportMessageIds={selectedExportMessageIds}
+          sessionId={session?.id}
           sessionBusy={Boolean(session?.busy)}
           stepsByIndex={stepsByIndex}
           totalStepCount={steps.length}
@@ -3349,11 +3688,13 @@ export function BrowserChatWorkspace({
           loading={Boolean(loadingSessionId)}
           mode={mode}
           modeLocked={modeLocked}
+          safetyMode={safetyMode}
           onInterrupt={interruptConversation}
           onModeChange={setMode}
           onPreviewAttachment={previewAttachment}
           onRemoveAttachment={removeAttachment}
           onSubmitMessage={sendMessage}
+          onSafetyModeChange={setSafetyMode}
           onUploadImages={uploadChatImages}
           resetToken={composerResetToken}
           showStop={Boolean(selectedRunningSession)}
@@ -3490,11 +3831,15 @@ export function BrowserChatWorkspace({
                 onExportMessage={exportMessageToTestCase}
                 onGenerateSkill={generateMessageSkill}
                 onPreviewImage={previewAttachment}
+                onResolveToolConfirmation={resolveToolConfirmation}
                 onSelectTool={setToolDialog}
                 onShowLogs={showMessageLogs}
                 onToggleExportSelection={toggleExportMessageSelection}
+                pendingToolConfirmation={session?.pendingToolConfirmation}
+                resolvingConfirmationId={resolvingConfirmationId}
                 selectedExportMessageIdSet={selectedExportMessageIdSet}
                 selectedExportMessageIds={selectedExportMessageIds}
+                sessionId={session?.id}
                 sessionBusy={Boolean(session?.busy)}
                 stepsByIndex={stepsByIndex}
                 totalStepCount={steps.length}
@@ -3517,11 +3862,13 @@ export function BrowserChatWorkspace({
                 loading={Boolean(loadingSessionId)}
                 mode={mode}
                 modeLocked={modeLocked}
+                safetyMode={safetyMode}
                 onInterrupt={interruptConversation}
                 onModeChange={setMode}
                 onPreviewAttachment={previewAttachment}
                 onRemoveAttachment={removeAttachment}
                 onSubmitMessage={sendMessage}
+                onSafetyModeChange={setSafetyMode}
                 onUploadImages={uploadChatImages}
                 resetToken={composerResetToken}
                 showStop={Boolean(selectedRunningSession)}

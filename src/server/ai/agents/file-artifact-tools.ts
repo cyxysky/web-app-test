@@ -10,6 +10,7 @@ type DownloadArtifactInput = {
   url?: string;
   path?: string;
   urlOrPath?: string;
+  sourcePageUrl?: string;
   fileName?: string | null;
 };
 
@@ -145,11 +146,15 @@ function resolveDownloadUrl(input: DownloadArtifactInput) {
   if (!raw) throw new Error('downloadFile requires url, path, or urlOrPath.');
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
 
-  const base = String(process.env.AI_FILE_DOWNLOAD_BASE_URL || '').trim();
-  if (!base) {
-    throw new Error('AI_FILE_DOWNLOAD_BASE_URL is not configured; provide an absolute URL or set the file download base URL in settings.');
+  const sourcePageUrl = String(input.sourcePageUrl || '').trim();
+  if (!sourcePageUrl) {
+    throw new Error('downloadFile needs the current page URL to resolve relative paths; provide an absolute URL instead.');
   }
-  return new URL(raw.replace(/^\/+/, ''), base.endsWith('/') ? base : `${base}/`).toString();
+  try {
+    return new URL(raw, sourcePageUrl).toString();
+  } catch {
+    throw new Error(`downloadFile cannot resolve "${raw}" against current page URL "${sourcePageUrl}".`);
+  }
 }
 
 async function readLimitedResponse(response: Response, maxBytes: number) {

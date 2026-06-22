@@ -3633,6 +3633,80 @@ export class BrowserSession {
     return { ok: true, actual: `Clicked DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${note}` };
   }
 
+  async hoverDomNode(nodeId: string): Promise<BrowserActionResult> {
+    const resolved = this.resolveDomNodeReference(nodeId);
+    if (!resolved.reference) return { ok: false, actual: resolved.error };
+    const reference = resolved.reference;
+    const target = await this.resolveDomReferenceToClickablePoint(reference);
+    if (!target) {
+      return {
+        ok: false,
+        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
+      };
+    }
+    await this.activePage.mouse.move(target.x, target.y);
+    const note = await this.waitAfterAction();
+    return { ok: true, actual: `Hovered DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${note}` };
+  }
+
+  async doubleClickDomNode(nodeId: string): Promise<BrowserActionResult> {
+    const resolved = this.resolveDomNodeReference(nodeId);
+    if (!resolved.reference) return { ok: false, actual: resolved.error };
+    const reference = resolved.reference;
+    const target = await this.resolveDomReferenceToClickablePoint(reference);
+    if (!target) {
+      return {
+        ok: false,
+        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
+      };
+    }
+    const page = this.activePage;
+    const popupWaitMs = Math.min(Math.max(Number(process.env.BROWSER_POPUP_WAIT_MS || 600), 0), 3000);
+    const popup = popupWaitMs > 0
+      ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
+      : Promise.resolve(undefined);
+    await page.mouse.dblclick(target.x, target.y);
+    const newPage = await popup;
+    if (newPage) {
+      this.claimPage(newPage);
+      await newPage.bringToFront();
+    }
+    const note = await this.waitAfterAction();
+    await this.showClickMarker(target.x, target.y, 'double');
+    return { ok: true, actual: `Double-clicked DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${note}` };
+  }
+
+  async dragDomNode(fromNodeId: string, toNodeId: string): Promise<BrowserActionResult> {
+    const fromResolved = this.resolveDomNodeReference(fromNodeId);
+    if (!fromResolved.reference) return { ok: false, actual: fromResolved.error };
+    const toResolved = this.resolveDomNodeReference(toNodeId);
+    if (!toResolved.reference) return { ok: false, actual: toResolved.error };
+    const fromTarget = await this.resolveDomReferenceToClickablePoint(fromResolved.reference);
+    if (!fromTarget) {
+      return {
+        ok: false,
+        actual: `DOM node id ${fromNodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
+      };
+    }
+    const toTarget = await this.resolveDomReferenceToClickablePoint(toResolved.reference);
+    if (!toTarget) {
+      return {
+        ok: false,
+        actual: `DOM node id ${toNodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
+      };
+    }
+    await this.activePage.mouse.move(fromTarget.x, fromTarget.y);
+    await this.activePage.mouse.down();
+    await this.activePage.mouse.move(toTarget.x, toTarget.y, { steps: 12 });
+    await this.activePage.mouse.up();
+    const note = await this.waitAfterAction();
+    await this.showClickMarker(toTarget.x, toTarget.y, 'drag');
+    return {
+      ok: true,
+      actual: `Dragged DOM node ${fromResolved.reference.id} (${fromTarget.descriptor}) to DOM node ${toResolved.reference.id} (${toTarget.descriptor}).${note}`,
+    };
+  }
+
   async fillDomNodes(actions: BrowserBatchFillAction[]): Promise<BrowserActionResult> {
     const fields = actions
       .filter((action) => action.id && action.id.trim())

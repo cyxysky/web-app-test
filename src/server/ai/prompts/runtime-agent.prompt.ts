@@ -97,13 +97,14 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- All user-facing strings such as message/reason/action/expected/actual must be Chinese.',
     `- type must be one of: ${allowedTypes.join(', ')}.`,
     '- params should include only keys required by that tool plus a concise reason.',
+    answerAllowed ? '- In browser chat strict safety mode, important actions must still return the intended tool object; add params.requiresConfirmation=true and a concise Chinese params.confirmationMessage so the UI can pause with Confirm/Cancel buttons before execution. Do not ask the user to type confirmation text.' : '',
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
     '- In message/reason/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot ids/file names, or tool input JSON.',
     visualMode ? '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.' : '',
-    domMode ? '- DOM mode: use getPageState for a fresh full DOM snapshot plus full page text, including accessible iframe and shadow DOM content. Use getDomNodeText(id) for complete text under a returned DOM node; use clickDomNode(id,text?) with a fresh numeric node_id. Use findByText(targetText,scopeId?) only as a read-only recovery step, then clickLocator(locatorId,text?) using a returned locatorId in a later turn.' : '',
+    domMode ? '- DOM mode: use getPageState for a fresh full DOM snapshot plus full page text, including accessible iframe and shadow DOM content. Use getDomNodeText(id) for complete text under a returned DOM node; use clickDomNode(id,text?), hoverDomNode(id), doubleClickDomNode(id), or dragDomNode(fromId,toId) with fresh numeric node_id values.' : '',
     '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
-    '- For getDomNodeText/clickDomNode, put the fresh DOM numeric node_id in params.id. The numeric id may be copied with or without square brackets.',
-    allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, or a relative source path in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
+    '- For getDomNodeText/clickDomNode/hoverDomNode/doubleClickDomNode, put the fresh DOM numeric node_id in params.id. For dragDomNode, put fresh DOM numeric node_ids in params.fromId and params.toId. Numeric ids may be copied with or without square brackets.',
+    allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
     allowedTypes.includes('generateMarkdownFile') ? '- For generateMarkdownFile, put the complete Markdown document in params.content and the desired file name in params.fileName.' : '',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
     answerAllowed
@@ -133,19 +134,13 @@ export function renderCustomPromptTemplate(template: string, variables: Record<s
   return rendered.trim();
 }
 
-export function customRuntimePromptFromEnv(mode: CustomPromptMode, variables: Record<string, unknown>) {
-  const enabled = mode === 'browser-chat'
-    ? process.env.AI_BROWSER_CHAT_CUSTOM_PROMPT_ENABLED === 'true'
-    : process.env.AI_TARGET_MODE_CUSTOM_PROMPT_ENABLED === 'true';
-  if (!enabled) return '';
-  const template = String(mode === 'browser-chat'
-    ? process.env.AI_BROWSER_CHAT_CUSTOM_PROMPT || ''
-    : process.env.AI_TARGET_MODE_CUSTOM_PROMPT || '').trim();
+export function customRuntimePromptFromEnv(_mode: CustomPromptMode, variables: Record<string, unknown>) {
+  const template = String(process.env.AI_CUSTOM_SYSTEM_PROMPT || '').trim();
   if (!template) return '';
   const rendered = renderCustomPromptTemplate(template, variables);
   if (!rendered) return '';
   return [
-    `User-configured ${mode === 'browser-chat' ? 'browser chat' : 'target mode'} prompt (variables rendered):`,
+    'User-configured custom system prompt (variables rendered):',
     rendered,
   ].join('\n');
 }

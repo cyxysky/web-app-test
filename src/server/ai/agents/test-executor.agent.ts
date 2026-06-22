@@ -845,7 +845,7 @@ function sanitizeNextGoal(value: unknown) {
       .replace(/(?:点击|双击|右键|拖拽|悬停|输入|按下|滚动|选择)\s*[“"']?([^，。；;]*)[”"']?/g, '完成$1')
       .replace(/候选(?:ID|id|编号)\s*[:：]?\s*\d+/gi, '当前截图中的对应候选')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的对应目标')
-      .replace(/\b(?:clickCandidate|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '根据当前截图选择合适工具'),
+      .replace(/\b(?:clickCandidate|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|hoverDomNode|doubleClickDomNode|dragDomNode|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '根据当前页面选择合适工具'),
     220,
   );
 }
@@ -854,7 +854,7 @@ function sanitizeCurrentState(value: unknown) {
   if (typeof value !== 'string') return '';
   return sanitizeHistoricalToolText(
     value
-      .replace(/\b(?:clickCandidate|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '已执行页面操作')
+      .replace(/\b(?:clickCandidate|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|hoverDomNode|doubleClickDomNode|dragDomNode|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '已执行页面操作')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的目标'),
     260,
   );
@@ -874,7 +874,7 @@ function validateCandidateActionBeforeExecution(name: string, input: unknown, tr
 }
 
 const candidateActionToolNames = new Set(['clickCandidate', 'hoverCandidate', 'doubleClickCandidate', 'rightClickCandidate', 'dragCandidate']);
-const domNodeIdToolNames = new Set(['clickDomNode', 'focusDomNode', 'getDomNodeText']);
+const domNodeIdToolNames = new Set(['clickDomNode', 'hoverDomNode', 'doubleClickDomNode', 'focusDomNode', 'getDomNodeText']);
 const noVisualAfterCaptureToolNames = new Set([
   'reportState',
   'selectReferenceScreenshots',
@@ -1391,14 +1391,14 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
     }),
     downloadFile: tool({
-      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, or pass a relative path/urlOrPath that will be resolved against AI_FILE_DOWNLOAD_BASE_URL from settings. Use this when the user asks to download/save a file; return the saved URL or local path in the final answer.',
+      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, an origin-relative path starting with / resolved against the current page origin, or a page-relative path resolved against the current page directory. Use this when the user asks to download/save a file; return the saved URL or local path in the final answer.',
       inputSchema: browserToolInput({
         url: z.string().optional().describe('Absolute download URL. If omitted, path or urlOrPath is used.'),
-        path: z.string().optional().describe('Relative file path resolved against configured AI_FILE_DOWNLOAD_BASE_URL.'),
-        urlOrPath: z.string().optional().describe('Absolute URL or relative path resolved against configured AI_FILE_DOWNLOAD_BASE_URL.'),
+        path: z.string().optional().describe('Download path. /files/a.pdf resolves against current page origin; report/a.pdf resolves against current page directory.'),
+        urlOrPath: z.string().optional().describe('Absolute URL, origin-relative path, or page-relative path to download.'),
         fileName: z.string().optional().describe('Optional saved file name, including extension when known.'),
       }),
-      execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId })),
+      execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
     }),
     generateMarkdownFile: tool({
       description: 'Create a Markdown .md file in the configured local output directory or this run artifacts from complete Markdown content written by the AI. Use this when the user asks to generate/export/save a Markdown file, then include the saved URL or local path in the final answer.',
@@ -1492,6 +1492,28 @@ function makeBrowserTools(
         text: z.string().optional().describe('Optional text to type immediately after clicking/focusing this DOM node.'),
       }),
       execute: (input) => record('clickDomNode', input, () => session.clickDomNode(normalizeDomNodeIdParam(input), input.text)),
+    }),
+    hoverDomNode: tool({
+      description: 'DOM mode: hover a node from the CURRENT visible DOM snapshot by numeric node_id. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
+      inputSchema: browserToolInput({
+        id: z.string().describe('The numeric node_id shown in the visible DOM snapshot, such as 12 or [12].'),
+      }),
+      execute: (input) => record('hoverDomNode', input, () => session.hoverDomNode(normalizeDomNodeIdParam(input))),
+    }),
+    doubleClickDomNode: tool({
+      description: 'DOM mode: double-click a node from the CURRENT visible DOM snapshot by numeric node_id. Use this for rows, tree items, editors, or controls that require double-click.',
+      inputSchema: browserToolInput({
+        id: z.string().describe('The numeric node_id shown in the visible DOM snapshot, such as 12 or [12].'),
+      }),
+      execute: (input) => record('doubleClickDomNode', input, () => session.doubleClickDomNode(normalizeDomNodeIdParam(input))),
+    }),
+    dragDomNode: tool({
+      description: 'DOM mode: drag from one DOM node center to another DOM node center using numeric node_id values from the CURRENT visible DOM snapshot.',
+      inputSchema: browserToolInput({
+        fromId: z.string().describe('Start numeric node_id shown in the visible DOM snapshot, such as 12 or [12].'),
+        toId: z.string().describe('End numeric node_id shown in the visible DOM snapshot, such as 18 or [18].'),
+      }),
+      execute: (input) => record('dragDomNode', input, () => session.dragDomNode(normalizeDomNodeIdParam({ id: input.fromId }), normalizeDomNodeIdParam({ id: input.toId }))),
     }),
     findByText: tool({
       description: 'DOM mode recovery, read-only: find visible interactive locators whose text/accessibility label/title/placeholder/href matches targetText. This does not click. Use only when a fresh DOM id is unavailable or unreliable, then choose one returned locatorId in a later clickLocator call.',
@@ -1717,7 +1739,7 @@ function runtimePrompt(input: {
     ? visualMarkersWithoutOverlay || visualTextCandidateFallback
       ? formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)
       : '[disabled because visual mode uses screenshot labels]'
-    : '[disabled because DOM mode uses fresh DOM tree ids; findByText returns separate T locators only when explicitly called]';
+    : '[disabled because DOM mode uses fresh DOM tree ids]';
   const evidence = attachScreenshot
     ? mode === 'visual-markers' && separateMarkerScreenshot
       ? 'the two attached screenshots'
@@ -1759,12 +1781,11 @@ function runtimePrompt(input: {
       ]
     : [
         '- DOM mode has no clickCandidate/hoverCandidate/dragCandidate tools. Never choose visual candidate IDs.',
-        '- Use clickDomNode(id,text?) with a numeric node_id copied from the CURRENT visible DOM snapshot. The tool accepts the numeric id with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
+        '- Use clickDomNode/hoverDomNode/doubleClickDomNode/dragDomNode with numeric node_id values copied from the CURRENT visible DOM snapshot. The tools accept numeric ids with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
         '- The DOM context is refreshed automatically immediately before every AI request. If the desired target is absent, scroll the relevant area; the next turn will include a fresh DOM snapshot.',
         '- Use getDomNodeText(id) when a visible DOM snapshot line is truncated or you need the complete rendered text under a returned node.',
-        '- Text matching is a recovery path, not the normal click path: call findByText(targetText,scopeId?) first, inspect the returned locatorIds, then call clickLocator(locatorId,text?) in a later turn.',
-        '- Use findByText only when a fresh DOM id is unavailable or unreliable, such as dynamic search results, iframe/shadow/dialog/popover content, or an id that disappeared after refresh.',
-        '- For findByText targetText, use a short unique visible/accessibility label from the CURRENT DOM/page context. Do not pass a long surrounding snippet.',
+        '- For hover-only menus in DOM mode, call hoverDomNode on the current DOM node_id trigger, then call getPageState before choosing a revealed target.',
+        '- For drag-and-drop in DOM mode, call dragDomNode(fromId,toId) only when both endpoints are present in the same fresh DOM snapshot.',
         '- For text entry, use clickDomNode(id,text) in one tool call when the input id is present. Use typeText only after a prior action already focused the field.',
         '- Use scrollArea when needed content or controls are not present in the current visible DOM snapshot. The next AI request automatically includes the refreshed DOM snapshot before any further action.',
         '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
@@ -1793,12 +1814,12 @@ function runtimePrompt(input: {
     '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
     '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
     '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
-    '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL or a relative path resolved against AI_FILE_DOWNLOAD_BASE_URL from settings.',
+    '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL.',
     '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. Include the returned URL or local path in the final answer.',
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
-      : '- DOM action reason must cite the current DOM id/text, or the findByText locatorId plus matched text when using recovery locators.',
+      : '- DOM action reason must cite the current DOM node_id/text used for the action.',
     `- Use ${evidence} as the current page state.`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
@@ -1819,11 +1840,11 @@ function runtimePrompt(input: {
           : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomNodeText are unavailable.'
       : visualMode
         ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
-        : '- DOM mode: no screenshot image/path is attached. Use the current visible DOM snapshot and DOM node_id tools first; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
+        : '- DOM mode: no screenshot image/path is attached. Use the current visible DOM snapshot and DOM node_id tools. clickCandidate and visual candidate IDs are unavailable.',
     ...markerTargetRules,
     caseSystemPrompt ? `Test-case-specific instructions:
 ${caseSystemPrompt}` : '',
-    customPrompt ? `Mode custom instructions:
+    customPrompt ? `Custom system instructions:
 ${customPrompt}` : '',
     strategyMemory.length ? `Historical failure strategy memory:
 ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : '',
@@ -1838,7 +1859,7 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     browserChatMode ? '- Browser chat: when the user can be answered from current evidence, output normal Chinese Markdown text and call no tool.' : '',
     visualMode
       ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
-      : '- DOM action reason must mention the current DOM id/text, or the chosen findByText locatorId plus matched text when using clickLocator.',
+      : '- DOM action reason must mention the current DOM node_id/text used for the action.',
     browserChatMode
       ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
       : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
@@ -1884,11 +1905,14 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'pressKey',
     'reportState',
     'scrollArea',
+  ];
+  const visualContextTools = [
     'selectReferenceScreenshots',
     'manageVisualContext',
   ];
   const candidateTools = [
     ...sharedTools,
+    ...visualContextTools,
     'clickCandidate',
     'hoverCandidate',
     'doubleClickCandidate',
@@ -1896,7 +1920,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'dragCandidate',
   ];
   if (mode === 'visual-markers') return candidateTools;
-  return [...sharedTools, 'getDomNodeText', 'clickDomNode', 'findByText', 'clickLocator'];
+  return [...sharedTools, 'getDomNodeText', 'clickDomNode', 'hoverDomNode', 'doubleClickDomNode', 'dragDomNode'];
 }
 
 function isCodexProvider() {
@@ -3023,6 +3047,12 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.dragCandidate(String(input.fromId || ''), String(input.toId || ''));
     case 'clickDomNode':
       return session.clickDomNode(domNodeId, text);
+    case 'hoverDomNode':
+      return session.hoverDomNode(domNodeId);
+    case 'doubleClickDomNode':
+      return session.doubleClickDomNode(domNodeId);
+    case 'dragDomNode':
+      return session.dragDomNode(normalizeDomNodeIdParam({ id: input.fromId }), normalizeDomNodeIdParam({ id: input.toId }));
     case 'fillDomNodes':
       return session.fillDomNodes(batchFillFieldsFromInput(input));
     case 'focusDomNode':
@@ -3049,6 +3079,7 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         url: typeof input.url === 'string' ? input.url : undefined,
         path: typeof input.path === 'string' ? input.path : undefined,
         urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
+        sourcePageUrl: session.currentUrl(),
         fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
       });
     case 'generateMarkdownFile':
@@ -3170,6 +3201,10 @@ async function executeCodexRuntimeObject(input: {
         ? normalizedParams.id.trim()
         : '';
     normalizedParams.areaId = areaId || normalizedParams.areaId;
+  }
+  if (type === 'dragDomNode') {
+    normalizedParams.fromId = normalizeDomNodeIdParam({ id: normalizedParams.fromId });
+    normalizedParams.toId = normalizeDomNodeIdParam({ id: normalizedParams.toId });
   }
   const flow: RecordedFlowStep = {
     index: stepIndex,

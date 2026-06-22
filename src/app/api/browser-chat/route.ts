@@ -10,6 +10,10 @@ function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
+function safetyMode(value: unknown) {
+  return value === 'full' ? 'full' : 'strict';
+}
+
 export async function GET(request: NextRequest) {
   return noStoreJson({ sessions: listBrowserChatSessions({ userId: requestUserId(request) }) });
 }
@@ -20,6 +24,7 @@ export async function POST(request: NextRequest) {
     const session = createBrowserChatSession({
       targetUrl: typeof body.targetUrl === 'string' ? body.targetUrl : '',
       mode: body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers',
+      safetyMode: safetyMode(body.safetyMode),
       title: typeof body.title === 'string' ? body.title : undefined,
       userId: requestUserId(request, body),
     });
