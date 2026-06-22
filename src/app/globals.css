@@ -7951,14 +7951,21 @@ select {
 }
 
 .browser-chat-log-modal-list {
-  display: grid;
   border-top: 1px solid var(--border);
-  gap: 0;
   list-style: none;
   margin: 0;
   max-height: min(560px, calc(100vh - 190px));
   overflow: auto;
   padding: 0;
+}
+
+.browser-chat-log-virtual-inner {
+  list-style: none;
+  margin: 0;
+  min-height: 100%;
+  padding: 0;
+  position: relative;
+  width: 100%;
 }
 
 .browser-chat-log-modal-list li {
@@ -7975,6 +7982,39 @@ select {
 
 .browser-chat-log-modal-list li:last-child {
   border-bottom: 0;
+}
+
+.browser-chat-log-modal-list li.has-context-compression {
+  grid-template-columns: 82px minmax(0, 1fr);
+  padding-top: 14px;
+}
+
+.browser-chat-context-compression-marker {
+  align-items: center;
+  color: var(--muted-strong);
+  display: flex !important;
+  font-size: 12px;
+  font-weight: 900;
+  gap: 8px !important;
+  grid-column: 1 / -1;
+  justify-content: center;
+  letter-spacing: 0;
+  min-width: 0;
+  text-align: center;
+}
+
+.browser-chat-context-compression-marker span {
+  color: color-mix(in srgb, var(--muted) 76%, transparent);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+
+.browser-chat-context-compression-marker strong {
+  color: var(--muted-strong);
+  flex: 0 0 auto;
+  font-size: 12px;
 }
 
 .browser-chat-log-modal-list li>span {
@@ -8651,7 +8691,6 @@ select {
   .browser-chat-image-thumb,
   .tool-shot-button,
   .browser-chat-tool-shot-card,
-  .browser-chat-log-modal-list li
 ) {
   animation: ui-rise-in 0.38s cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }

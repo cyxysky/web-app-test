@@ -16,6 +16,12 @@ import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifac
 type ExecutionProgress = (step: StepExecutionResult) => void | Promise<void>;
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type ManualIntervention = { stepIndex: number; reason: string; screenshotPath?: string };
+type RuntimeModelMessage = ModelMessage;
+type RuntimeRetryState = {
+  messages: RuntimeModelMessage[];
+  imagePaths: string[];
+  agentStepOffset: number;
+};
 type ExecutionOptions = {
   onProgress?: ExecutionProgress;
   onDebug?: ExecutionDebug;
@@ -55,6 +61,34 @@ type ToolTrace = {
     kind?: 'current' | 'history' | 'pinned' | 'after' | 'marker' | 'original' | 'other';
   }>;
 };
+
+function cloneRuntimeMessageState(state?: RuntimeRetryState): RuntimeRetryState | undefined {
+  if (!state?.messages.length) return undefined;
+  return {
+    messages: [...state.messages],
+    imagePaths: [...state.imagePaths],
+    agentStepOffset: state.agentStepOffset,
+  };
+}
+
+function responseMessagesFromGenerateTextResult(result: unknown): RuntimeModelMessage[] {
+  const response = recordFromUnknown(recordFromUnknown(result).response);
+  const messages = response.messages;
+  return Array.isArray(messages) ? messages as RuntimeModelMessage[] : [];
+}
+
+function appendRuntimeResponseMessages(
+  state: RuntimeRetryState | undefined,
+  responseMessages: RuntimeModelMessage[],
+) {
+  const base = cloneRuntimeMessageState(state);
+  if (!base) return undefined;
+  return {
+    ...base,
+    agentStepOffset: base.agentStepOffset + 1,
+    messages: responseMessages.length ? [...base.messages, ...responseMessages] : base.messages,
+  };
+}
 
 type ToolTraceProgress = {
   workingMemory: RuntimeWorkingMemory;
@@ -376,6 +410,12 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
   return Math.min(Math.max(normalized, min), max);
 }
 
+function runtimeRequestConsecutiveFailureLimit(browserChatMode: boolean) {
+  const retryEnabled = browserChatMode || process.env.AI_RUNTIME_RETRY_ON_PURE_FAILURE === 'true';
+  if (!retryEnabled) return 1;
+  return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, browserChatMode ? 3 : 2, 1, 10);
+}
+
 function createObservationId(store: RuntimeObservationStore) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const id = `obs_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
@@ -608,6 +648,13 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
   const abortSignal = upstream ? AbortSignal.any([upstream, timeoutController.signal]) : timeoutController.signal;
   try {
     return await generateText({ ...options, abortSignal });
+  } catch (error) {
+    if (timeoutController.signal.aborted && !upstream?.aborted) {
+      const timeoutError = new Error(`AI request timed out after ${timeoutMs}ms`);
+      (timeoutError as { cause?: unknown }).cause = error;
+      throw timeoutError;
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -870,30 +917,13 @@ function estimateTextTokens(text: string) {
   return Math.ceil(ascii / 4 + nonAscii);
 }
 
-function estimateContextTokens(text: string, imageCount: number) {
-  const imageTokens = Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
-  return estimateTextTokens(text) + imageCount * imageTokens;
-}
-
-function compactWorkingMemory(memory: RuntimeWorkingMemory): RuntimeWorkingMemory {
-  return {
-    ...memory,
-    completed: memory.completed.slice(-6),
-    findings: memory.findings.slice(-8),
-    blockers: memory.blockers.slice(-4),
-    lastAction: concise(memory.lastAction, 180),
-    lastResult: concise(memory.lastResult, 180),
-    pageUnderstanding: concise(memory.pageUnderstanding, 260),
-    currentState: concise(memory.currentState, 260),
-    scrollSummary: concise(memory.scrollSummary, 360),
-    userConstraints: memory.userConstraints.slice(-4).map((item) => concise(item, 180)),
-    nextStep: concise(memory.nextStep, 180),
-  };
+function imageTokenEstimatePerImage() {
+  return Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
 }
 
 function isInfrastructureNoise(value?: string) {
   if (!value) return false;
-  return /No capacity available|Request aborted|Active browser page has been closed|Execution context was destroyed|ECONNRESET|ETIMEDOUT|timeout|rate limit|model .*server|Failed after \d+ attempts/i.test(value);
+  return /No capacity available|Request aborted|Active browser page has been closed|Execution context was destroyed|ECONNRESET|ETIMEDOUT|UND_ERR_SOCKET|other side closed|Cannot connect to API|timeout|rate limit|model .*server|Failed after \d+ attempts/i.test(value);
 }
 
 function isUsefulHistoryStep(step: StepExecutionResult) {
@@ -923,11 +953,6 @@ function sanitizeHistoricalToolText(value: unknown, max = 180) {
       .trim(),
     max,
   );
-}
-
-function filterRegressiveMemoryItems(items: string[], memory: RuntimeWorkingMemory) {
-  void memory;
-  return items;
 }
 
 function summarizeStepToolCallForPrompt(toolCall: StepToolCall) {
@@ -992,34 +1017,6 @@ function hostOf(url: string) {
   } catch {
     return '';
   }
-}
-
-function formatInteractiveCandidates(candidates: unknown, limit = 50) {
-  if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive candidates]';
-  return JSON.stringify(
-    candidates.slice(0, limit).map((item) => {
-      const candidate = item as Record<string, unknown>;
-      return {
-        id: candidate.id,
-        tag: candidate.tag,
-        role: candidate.role,
-        type: candidate.type,
-        name: candidate.name,
-        text: candidate.text,
-        href: candidate.href,
-        host: candidate.host,
-        rect: candidate.rect,
-        center: candidate.center,
-        input: candidate.input,
-        disabled: candidate.disabled,
-        framePath: candidate.framePath,
-        frameUrl: candidate.frameUrl,
-        nearbyText: candidate.nearbyText,
-      };
-    }),
-    null,
-    2,
-  );
 }
 
 function formatVisualInteractiveElements(candidates: unknown, limit = 80) {
@@ -1136,49 +1133,6 @@ function sanitizeCurrentState(value: unknown) {
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的目标'),
     260,
   );
-}
-
-function hasConcreteTargetVisual(input: unknown) {
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
-  const reason = typeof raw.reason === 'string' ? raw.reason.trim() : '';
-  const combined = `${targetVisual} ${reason}`.trim();
-  if (targetVisual.length < 4) return false;
-  if (!/[A-Za-z\u4e00-\u9fff]/.test(targetVisual)) return false;
-  if (/^(?:候选|编号|id|ID|candidate|#|\d|\s|[:：-])+$/i.test(targetVisual)) return false;
-  if (/^(?:下一张|上一张|确定|确认|关闭|按钮|图标|图片|目标|控件)$/i.test(targetVisual)) return false;
-  if (!reason || /^(?:点击|选择|使用)?\s*(?:候选|编号|id|ID|candidate)?\s*\d+$/i.test(reason)) return false;
-  return /[A-Za-z\u4e00-\u9fff]/.test(combined);
-}
-
-function rejectWeakTargetVisual(name: string, input: unknown): BrowserActionResult | undefined {
-  if (hasConcreteTargetVisual(input)) return undefined;
-  return {
-    ok: false,
-    actual: `${name} rejected before execution: targetVisual/reason must describe the visible target in the CURRENT screenshot, such as text/icon/position/role. Do not provide only a candidate id or a generic label.`,
-  };
-}
-
-function candidateActionId(name: string, input: unknown) {
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  if (name === 'dragCandidate') return `${raw.fromId || ''}->${raw.toId || ''}`;
-  return typeof raw.id === 'string' ? raw.id : '';
-}
-
-function rejectStaleRepeatedCandidateAction(name: string, input: unknown, traces: ToolTrace[]): BrowserActionResult | undefined {
-  const id = candidateActionId(name, input);
-  if (!id) return undefined;
-  const repeated = traces.some((trace) => trace.name === name && candidateActionId(name, trace.input) === id);
-  if (!repeated) return undefined;
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  const reason = typeof raw.reason === 'string' ? raw.reason.trim() : '';
-  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
-  const hasReasonedRepeat = targetVisual.length >= 4 && reason.length >= 10;
-  if (hasReasonedRepeat) return undefined;
-  return {
-    ok: false,
-    actual: `${name} rejected before execution: candidate ${id} was already used in this agent loop. Repeating the same id is allowed, but targetVisual and reason must explain why the current screenshot still supports this same visible target.`,
-  };
 }
 
 function validateCandidateActionBeforeExecution(name: string, input: unknown, traces: ToolTrace[]) {
@@ -1927,6 +1881,32 @@ function makeBrowserTools(
 }
 
 // 构造完成判定规则；视觉模式用截图作证据，DOM 模式用文本化页面上下文作证据。
+type RuntimeToolDefinitions = ReturnType<typeof makeBrowserTools>;
+
+function toolInputJsonSchema(inputSchema: unknown) {
+  if (!inputSchema) return undefined;
+  try {
+    return z.toJSONSchema(inputSchema as z.ZodType);
+  } catch (error) {
+    return { unavailable: true, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
+  if (!tools) return [];
+  return Object.entries(tools).map(([name, toolDefinition]) => {
+    const record = toolDefinition as Record<string, unknown>;
+    return {
+      type: 'function',
+      function: {
+        name,
+        description: typeof record.description === 'string' ? record.description : '',
+        parameters: toolInputJsonSchema(record.inputSchema),
+      },
+    };
+  });
+}
+
 function completionVerifyEnabled() {
   const raw = process.env.AI_COMPLETION_VERIFY ?? 'true';
   return raw.toLowerCase() !== 'false';
@@ -2253,15 +2233,6 @@ ${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
       : 'Screenshot image/path is not attached.',
   ].filter(Boolean).join('\n');
 }
-function summarizeToolInput(input: unknown) {
-  if (input && typeof input === 'object') {
-    const entries = Object.entries(input as Record<string, unknown>)
-      .filter(([key, value]) => !['reason', 'taskFrameJson', 'ledgerItemsJson', 'visualAfter'].includes(key) && value !== undefined && value !== null && value !== '')
-      .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
-    return entries.length ? ` (${entries.join(', ')})` : '';
-  }
-  return '';
-}
 
 function runtimeToolNames(mode: BrowserSessionMode) {
   const sharedTools = [
@@ -2410,7 +2381,7 @@ function sanitizeModelInputForStats(system: string | undefined, messages: unknow
   }, imagePaths, { imageIndex: 0 });
 }
 
-function modelMessagesTextAndImageStats(messages: unknown) {
+function modelMessagesTextAndImageStats(messages: unknown, tools?: RuntimeToolDefinitions) {
   let text = '';
   let imageCount = 0;
   const walk = (value: unknown) => {
@@ -2431,15 +2402,27 @@ function modelMessagesTextAndImageStats(messages: unknown) {
     Object.values(record).forEach(walk);
   };
   walk(messages);
-  const estimatedTextTokens = estimateTextTokens(text);
-  const estimatedImageTokens = imageCount * Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
+  const serialized = JSON.stringify(messages) || '';
+  const estimatedValueTextTokens = estimateTextTokens(text);
+  const estimatedSerializedTextTokens = estimateTextTokens(serialized);
+  const estimatedTextTokens = Math.max(estimatedValueTextTokens, estimatedSerializedTextTokens);
+  const estimatedImageTokens = imageCount * imageTokenEstimatePerImage();
+  const toolSchema = toolSchemaEstimateInput(tools);
+  const serializedToolSchema = JSON.stringify(toolSchema) || '';
+  const estimatedToolSchemaTokens = estimateTextTokens(serializedToolSchema);
   return {
     textCharacters: text.length,
+    serializedCharacters: serialized.length,
     imageCount,
+    toolCount: toolSchema.length,
+    toolSchemaCharacters: serializedToolSchema.length,
+    estimatedValueTextTokens,
+    estimatedSerializedTextTokens,
     estimatedTextTokens,
     estimatedImageTokens,
-    estimatedTotalTokens: estimatedTextTokens + estimatedImageTokens,
-    method: 'rough estimate from sanitized modelMessages: ASCII chars / 4 + non-ASCII chars + imageCount * AI_IMAGE_CONTEXT_ESTIMATE_TOKENS',
+    estimatedToolSchemaTokens,
+    estimatedTotalTokens: estimatedTextTokens + estimatedImageTokens + estimatedToolSchemaTokens,
+    method: 'rough estimate from sanitized modelMessages plus current browser tool schemas: max(value-text tokens, serialized JSON tokens) + imageCount * AI_IMAGE_CONTEXT_ESTIMATE_TOKENS + serialized current tool definitions',
   };
 }
 
@@ -2486,139 +2469,6 @@ function extractProgressNote(text: string) {
   return readableActionFromRawText(note)?.slice(0, 400);
 }
 
-function parseListLike(text?: string) {
-  if (!text || /^(无|none)$/i.test(text.trim())) return [];
-  return text
-    .split(/(?:[；;]\s*|\n+|\s(?:\d+\.|[-*])\s)/)
-    .map((item) => item.replace(/^[\d.\s、*-]+/, '').trim())
-    .filter((item) => item && !/^(无|none)$/i.test(item))
-    .slice(0, 8);
-}
-
-function parseJsonPayload(value: unknown) {
-  if (value === null || value === undefined) return undefined;
-  if (typeof value !== 'string') return value;
-  const text = value.trim();
-  if (!text || /^(null|none|unchanged|无|暂无)$/i.test(text)) return undefined;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-}
-
-function stringField(value: unknown, max = 240) {
-  return typeof value === 'string' && value.trim() ? concise(value.trim(), max) : undefined;
-}
-
-function arrayOfStrings(value: unknown, maxItems = 12) {
-  if (!Array.isArray(value)) return [];
-  return value.map((item) => stringField(item, 220)).filter((item): item is string => Boolean(item)).slice(0, maxItems);
-}
-
-function normalizeDimension(value: unknown): TaskFrame['dimensions'][number] | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const name = stringField(raw.name, 80);
-  const id = stringField(raw.id, 80) || name?.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/gi, '_').replace(/^_+|_+$/g, '');
-  if (!id || !name) return undefined;
-  const dimension: TaskFrame['dimensions'][number] = {
-    id,
-    name,
-    description: stringField(raw.description, 500),
-  };
-  const focus = arrayOfStrings(raw.focus, 12);
-  const testIdeas = arrayOfStrings(raw.testIdeas, 12);
-  const risks = arrayOfStrings(raw.risks, 8);
-  if (focus.length) dimension.focus = focus;
-  if (testIdeas.length) dimension.testIdeas = testIdeas;
-  if (risks.length) dimension.risks = risks;
-  return dimension;
-}
-
-function fallbackTaskFrame(goal: string): TaskFrame {
-  return {
-    goal: concise(goal, 300) || 'Complete the user task and preserve structured findings.',
-    version: 1,
-    successCriteria: ['满足用户目标', '结构化记录关键过程和结论', '最终输出可由台账追溯'],
-    dimensions: [],
-  };
-}
-
-function normalizeTaskFrame(value: unknown, previous: TaskFrame | undefined, goal: string): TaskFrame | undefined {
-  const parsed = parseJsonPayload(value);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return previous || fallbackTaskFrame(goal);
-  const raw = parsed as Record<string, unknown>;
-  const dimensions = Array.isArray(raw.dimensions)
-    ? raw.dimensions.map(normalizeDimension).filter((item): item is TaskFrame['dimensions'][number] => Boolean(item)).slice(0, 12)
-    : [];
-  if (!dimensions.length && previous) return previous;
-  if (!dimensions.length) return fallbackTaskFrame(goal);
-  const successCriteria = arrayOfStrings(raw.successCriteria, 12);
-  const next: TaskFrame = {
-    goal: stringField(raw.goal, 320) || previous?.goal || concise(goal, 320),
-    version: typeof raw.version === 'number' ? raw.version : previous?.version || 1,
-    successCriteria: successCriteria.length ? successCriteria : previous?.successCriteria || fallbackTaskFrame(goal).successCriteria,
-    dimensions,
-  };
-  const deliverables = arrayOfStrings(raw.deliverables, 12);
-  const analysisGuidance = arrayOfStrings(raw.analysisGuidance, 12);
-  const finalOutputRequirements = arrayOfStrings(raw.finalOutputRequirements, 12);
-  if (deliverables.length) next.deliverables = deliverables;
-  else if (previous?.deliverables?.length) next.deliverables = previous.deliverables;
-  if (analysisGuidance.length) next.analysisGuidance = analysisGuidance;
-  else if (previous?.analysisGuidance?.length) next.analysisGuidance = previous.analysisGuidance;
-  if (finalOutputRequirements.length) next.finalOutputRequirements = finalOutputRequirements;
-  else if (previous?.finalOutputRequirements?.length) next.finalOutputRequirements = previous.finalOutputRequirements;
-  return next;
-}
-
-function normalizeLedgerItem(value: unknown, sourceStep?: number, evidence: string[] = []): TaskLedgerItem | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const title = stringField(raw.title, 180);
-  if (!title) return undefined;
-  const status = ['finding', 'issue', 'covered', 'risk', 'question', 'evidence', 'decision'].includes(String(raw.status))
-    ? raw.status as TaskLedgerItem['status']
-    : 'finding';
-  const severity = ['info', 'minor', 'major', 'critical'].includes(String(raw.severity))
-    ? raw.severity as TaskLedgerItem['severity']
-    : status === 'issue' || status === 'risk' ? 'minor' : 'info';
-  const attributes = Array.isArray(raw.attributes)
-    ? raw.attributes.map((item) => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return undefined;
-      const pair = item as Record<string, unknown>;
-      const key = stringField(pair.key, 80);
-      const valueText = stringField(pair.value, 180);
-      return key && valueText ? { key, value: valueText } : undefined;
-    }).filter((item): item is { key: string; value: string } => Boolean(item)).slice(0, 8)
-    : undefined;
-  const itemEvidence = arrayOfStrings(raw.evidence, 8);
-  return {
-    id: stringField(raw.id, 120),
-    dimensionId: stringField(raw.dimensionId, 80) || 'general',
-    title,
-    summary: stringField(raw.summary, 500),
-    status,
-    severity,
-    expected: stringField(raw.expected, 500),
-    actual: stringField(raw.actual, 500),
-    evidence: Array.from(new Set([...itemEvidence, ...evidence])).slice(0, 8),
-    confidence: typeof raw.confidence === 'number' && Number.isFinite(raw.confidence) ? Math.max(0, Math.min(1, raw.confidence)) : undefined,
-    sourceStep: typeof raw.sourceStep === 'number' ? raw.sourceStep : sourceStep,
-    attributes,
-  };
-}
-
-function parseLedgerItems(value: unknown, sourceStep?: number, evidence: string[] = []) {
-  const parsed = parseJsonPayload(value);
-  const rawItems = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-  return rawItems
-    .map((item) => normalizeLedgerItem(item, sourceStep, evidence))
-    .filter((item): item is TaskLedgerItem => Boolean(item))
-    .slice(0, 12);
-}
-
 function ledgerMemoryLimit() {
   const raw = Number(process.env.AI_LEDGER_MEMORY_LIMIT || 1000);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1000;
@@ -2643,12 +2493,6 @@ function collectLedgerItemsFromSteps(steps: StepExecutionResult[]) {
     ...steps.flatMap((step) => step.ledgerItems || []),
     ...steps.flatMap((step) => step.workingMemory?.ledgerItems || []),
   ], ledgerMemoryLimit());
-}
-
-function formatTaskFrameContext(frame?: TaskFrame) {
-  return JSON.stringify({
-    taskFrame: frame || null,
-  }, null, 2);
 }
 
 function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''): Pick<RuntimeDecision, 'taskFrame' | 'ledgerItems'> {
@@ -2749,6 +2593,7 @@ async function executeRuntimeStep(input: {
   stepIndex: number;
   beforeScreenshotPath: string;
   completedSteps: StepExecutionResult[];
+  runtimeMessageState?: RuntimeRetryState;
   selectedScreenshotReferences?: SelectedScreenshotReference[];
   referenceImagePaths?: string[];
   onSelectReferenceScreenshots?: (selection: {
@@ -2768,6 +2613,7 @@ async function executeRuntimeStep(input: {
     stepIndex,
     beforeScreenshotPath,
     completedSteps,
+    runtimeMessageState,
     selectedScreenshotReferences = [],
     referenceImagePaths = [],
     onSelectReferenceScreenshots,
@@ -2879,10 +2725,21 @@ async function executeRuntimeStep(input: {
     },
   });
   let lastAiRequest: AiRequestSnapshot | undefined;
+  let lastRetryState: RuntimeRetryState | undefined;
+  let consecutiveRequestFailures = 0;
 
-  async function runAgent(includeImage: boolean) {
+  function rememberRetryState(state: RuntimeRetryState) {
+    lastRetryState = {
+      messages: [...state.messages],
+      imagePaths: [...state.imagePaths],
+      agentStepOffset: state.agentStepOffset,
+    };
+  }
+
+  async function runAgent(includeImage: boolean, retryState?: RuntimeRetryState) {
     const traces: ToolTrace[] = [];
     const codexMode = isCodexProvider();
+    const retryAgentStepOffset = retryState?.agentStepOffset ?? runtimeMessageState?.agentStepOffset ?? 0;
     const observationStore: RuntimeObservationStore = new Map();
     const nativeAllowedToolTypes = runtimeToolNames(mode).filter((name) => !(browserChatMode && name === 'reportState'));
     const baseAllowedToolTypes = codexMode
@@ -2891,10 +2748,26 @@ async function executeRuntimeStep(input: {
     const allowedToolTypes = browserChatMode && codexMode
       ? [...baseAllowedToolTypes, 'answer']
       : baseAllowedToolTypes;
+    const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
-    const requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
-    let requestSystemPrompt: string | undefined = requestPrompt;
+    const initialPageObservation = browserChatMode
+      ? ''
+      : mode === 'dom'
+      ? formatDomPageStateObservation(pageContext)
+      : formatVisualPageStateObservation({
+          pageContext,
+          visualContext: visualContext.snapshot(),
+          screenshotInputEnabled,
+          markerEnabled,
+          markerOverlayInScreenshot,
+          separateMarkerMap,
+        });
+    const initialRequestPrompt = initialPageObservation
+      ? `${prompt}\n\nInitial page observation:\n${initialPageObservation}`
+      : prompt;
+    const requestPrompt = codexMode ? buildCodexObjectPrompt(initialRequestPrompt, allowedToolTypes) : initialRequestPrompt;
+    const requestSystemPrompt: string | undefined = browserChatMode ? requestPrompt : undefined;
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(testCase),
       phase: browserChatMode
@@ -2906,9 +2779,11 @@ async function executeRuntimeStep(input: {
       findings: [],
       blockers: [],
       pageUnderstanding: '',
-      currentState: mode === 'dom'
-        ? 'No DOM observation is preloaded; call getPageState whenever page evidence is needed.'
-        : 'No visual observation is preloaded; call getPageState whenever screenshot evidence is needed.',
+      currentState: browserChatMode
+        ? 'No page observation is preloaded; call getPageState when browser evidence is needed.'
+        : mode === 'dom'
+        ? 'Initial DOM observation is available; call getPageState again whenever the page may have changed.'
+        : 'Initial visual observation is available; call getPageState again after browser-changing actions.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
@@ -2919,8 +2794,8 @@ async function executeRuntimeStep(input: {
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
-    const initialVisualPaths: string[] = [];
-    const initialSelectedReferenceImagePaths: string[] = [];
+    const initialVisualPaths = browserChatMode ? [] : includeImage ? visualContext.imagePaths() : [];
+    const initialSelectedReferenceImagePaths = browserChatMode ? [] : runtimeSelectedReferenceScreenshots.filter((item) => item.image).map((item) => item.ref.path);
     const initialUserReferenceImagePaths = userReferenceImages.filter((item) => item.image).map((item) => item.imagePath);
     type RuntimeModelMessage = ModelMessage;
     type PendingObservationMessage = {
@@ -2930,24 +2805,36 @@ async function executeRuntimeStep(input: {
     };
     const pendingObservationMessages: PendingObservationMessage[] = [];
     const initialImagePaths = [...initialVisualPaths, ...initialSelectedReferenceImagePaths, ...initialUserReferenceImagePaths];
-    const initialContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: requirementOf(testCase) }];
+    const initialContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: browserChatMode ? requirementOf(testCase) : requestPrompt }];
     for (const imagePath of initialImagePaths) {
       const image = await readScreenshotForAi(imagePath).catch(() => undefined);
       if (image) initialContent.push({ type: 'image', image });
     }
-    const initialMessages = [{ role: 'user' as const, content: initialContent }] as RuntimeModelMessage[];
-    let messageImagePaths = [...initialImagePaths];
+    let initialMessages = runtimeMessageState?.messages.length
+      ? [...runtimeMessageState.messages]
+      : [{ role: 'user' as const, content: initialContent }] as RuntimeModelMessage[];
+    if (retryState?.messages.length) {
+      initialMessages = [...retryState.messages];
+    }
+    let messageImagePaths = retryState?.messages.length
+      ? [...retryState.imagePaths]
+      : [...(runtimeMessageState?.imagePaths || []), ...initialImagePaths];
+    rememberRetryState({
+      messages: initialMessages,
+      imagePaths: messageImagePaths,
+      agentStepOffset: retryAgentStepOffset,
+    });
     let aiRequest = createAiRequestSnapshot({
       kind: 'runtime',
       stepIndex,
-      prompt: requirementOf(testCase),
+      prompt: browserChatMode ? '[system prompt]' : requestPrompt,
       systemPrompt: requestSystemPrompt,
       screenshotPath: beforeScreenshotPath,
-      imagePaths: initialImagePaths,
-      imageAttached: Boolean(initialImagePaths.length),
+      imagePaths: messageImagePaths,
+      imageAttached: Boolean(messageImagePaths.length),
       tools: allowedToolTypes,
       domContext: currentDomContext,
-      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: initialVisualPaths.length + initialSelectedReferenceImagePaths.length + initialUserReferenceImagePaths.length, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, selectedReferenceScreenshotCount: initialSelectedReferenceImagePaths.length, userReferenceImageCount: initialUserReferenceImagePaths.length, observationCount: observationStore.size },
+      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, selectedReferenceScreenshotCount: initialSelectedReferenceImagePaths.length, userReferenceImageCount: initialUserReferenceImagePaths.length, observationCount: observationStore.size },
     });
     lastAiRequest = aiRequest;
     const toolExecutionGate = { stepNumber: 0, executed: false };
@@ -3019,7 +2906,7 @@ async function executeRuntimeStep(input: {
               goal: requirementOf(testCase),
               browserMode: mode,
               stepIndex,
-              agentStep: turnIndex + 1,
+              agentStep: retryAgentStepOffset + turnIndex + 1,
               estimatedTokens: messageStats.estimatedTotalTokens,
               thresholdTokens,
               modelMessages: modelMessagesForLog,
@@ -3033,7 +2920,7 @@ async function executeRuntimeStep(input: {
           goal: requirementOf(testCase),
           browserMode: mode,
           stepIndex,
-          agentStep: turnIndex + 1,
+          agentStep: retryAgentStepOffset + turnIndex + 1,
           traces,
           workingMemory,
         });
@@ -3043,7 +2930,7 @@ async function executeRuntimeStep(input: {
           goal: requirementOf(testCase),
           browserMode: mode,
           stepIndex,
-          agentStep: turnIndex + 1,
+          agentStep: retryAgentStepOffset + turnIndex + 1,
           traces,
           workingMemory,
         });
@@ -3051,6 +2938,7 @@ async function executeRuntimeStep(input: {
     };
 
     async function prepareStep(turnIndex: number, previousMessages?: RuntimeModelMessage[]) {
+      const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = contextWindowTokens();
       const thresholdRatio = contextCompressionThresholdRatio();
       const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
@@ -3081,8 +2969,8 @@ async function executeRuntimeStep(input: {
       let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
       let modelContextSegmentation: Record<string, unknown> | undefined;
       const modelInputForStats = sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths);
-      const messageStats = modelMessagesTextAndImageStats(modelInputForStats);
-      if (previousMessages?.length && messageStats.estimatedTotalTokens > thresholdTokens) {
+      const messageStats = modelMessagesTextAndImageStats(modelInputForStats, codexMode ? undefined : nativeToolsRef.current);
+      if ((previousMessages?.length || messagesToSend.length > 1) && messageStats.estimatedTotalTokens > thresholdTokens) {
         const summary = await summarizeContinuation(modelInputForStats, turnIndex, messageStats, thresholdTokens);
         contextSegmentationTurns += 1;
         messagesToSend = [
@@ -3094,7 +2982,7 @@ async function executeRuntimeStep(input: {
         attachedImagePaths = appendedImagePaths;
         messageImagePaths = [...attachedImagePaths];
         modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
-        const afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths));
+        const afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current);
         modelContextSegmentation = {
           segment: contextSegmentationTurns,
           reason: 'modelMessages exceeded context threshold',
@@ -3109,7 +2997,15 @@ async function executeRuntimeStep(input: {
           details: modelContextSegmentation,
         });
       }
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, agentStepIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: observationStore.size, explicitPageState: true, modelContextSegmentation } });
+      const finalStats = modelContextSegmentation
+        ? modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current)
+        : messageStats;
+      rememberRetryState({
+        messages: [...messagesToSend],
+        imagePaths: [...attachedImagePaths],
+        agentStepOffset: agentStepIndex - 1,
+      });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: observationStore.size, explicitPageState: true, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
       return {
         system: requestSystemPrompt || undefined,
@@ -3171,41 +3067,44 @@ async function executeRuntimeStep(input: {
         aiRequest,
         visualContext: visualContext.snapshot(),
         workingMemory,
+        runtimeMessageState: appendRuntimeResponseMessages(lastRetryState, responseMessagesFromGenerateTextResult(result)),
         endedWithText: browserChatMode && !execution.executed && Boolean(execution.text.trim()),
       };
     }
 
     const stopWhen = [hasToolCall('reportState'), hasToolCall('waitForHumanVerification')];
+    nativeToolsRef.current = makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
+      workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
+      await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+      await onDebug?.({
+        phase: 'ai:tool',
+        stepIndex,
+        message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'),
+        details: { trace, visualContext: visualContext.snapshot(), workingMemory },
+      });
+    }, {
+      availableReferenceIds,
+      allowedToolTypes,
+      runId: input.runId,
+      stepIndex,
+      visualContext,
+      observationStore,
+      toolExecutionGate,
+      getAiRequest: () => aiRequest,
+      observePageState,
+      onVisualContextChange: async (snapshot) => {
+        await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
+      },
+      onSelectReferenceScreenshots: async (selection) => {
+        await applySelectedReferenceScreenshots(selection);
+      },
+    });
+    const toolsForRequest = nativeToolsRef.current;
     try {
       const result = await generateTextWithTimeout({
         model: getModel(),
         messages: initialMessages,
-        tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
-          workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
-          await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
-          await onDebug?.({
-            phase: 'ai:tool',
-            stepIndex,
-            message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'),
-            details: { trace, visualContext: visualContext.snapshot(), workingMemory },
-          });
-        }, {
-          availableReferenceIds,
-          allowedToolTypes,
-          runId: input.runId,
-          stepIndex,
-          visualContext,
-          observationStore,
-          toolExecutionGate,
-          getAiRequest: () => aiRequest,
-          observePageState,
-          onVisualContextChange: async (snapshot) => {
-            await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
-          },
-          onSelectReferenceScreenshots: async (selection) => {
-            await applySelectedReferenceScreenshots(selection);
-          },
-        }),
+        tools: toolsForRequest,
         stopWhen,
         prepareStep: async ({ stepNumber, messages }) => {
           const prepared = await prepareStep(stepNumber, messages as RuntimeModelMessage[]);
@@ -3217,21 +3116,23 @@ async function executeRuntimeStep(input: {
           await onDebug?.({
             phase: 'ai:runtime:request',
             stepIndex,
-            message: 'AI request started; waiting for browser action decision. agent step ' + agentStepLabel(stepNumber) + '.',
-            details: aiRequestLogDetails(aiRequest, { provider: getModelSettings().provider, model: getModelSettings().model, agentStepIndex: stepNumber + 1, nativeToolLoop: true }, prepared.modelMessagesForLog),
+            message: 'AI request started; waiting for browser action decision. agent step ' + agentStepLabel(retryAgentStepOffset + stepNumber) + '.',
+            details: aiRequestLogDetails(aiRequest, { provider: getModelSettings().provider, model: getModelSettings().model, agentStepIndex: retryAgentStepOffset + stepNumber + 1, nativeToolLoop: true }, prepared.modelMessagesForLog),
           });
           return { system: prepared.system, messages: prepared.messages };
         },
         onStepFinish: async (event) => {
+          consecutiveRequestFailures = 0;
           latestText = event.text || '';
-          const turnIndex = event.stepNumber;
+          const eventStep = event as { stepNumber?: unknown };
+          const turnIndex = typeof eventStep.stepNumber === 'number' ? eventStep.stepNumber : toolExecutionGate.stepNumber;
           const traceStart = stepTraceStarts.get(turnIndex) ?? 0;
           const newTraces = traces.slice(traceStart);
           const startedAt = stepStartedAt.get(turnIndex) || Date.now();
           await onDebug?.({
             phase: 'ai:runtime:response',
             stepIndex,
-            message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; agent step ' + agentStepLabel(turnIndex) + '; AI+tool ' + elapsedSince(startedAt) + 'ms',
+            message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; agent step ' + agentStepLabel(retryAgentStepOffset + turnIndex) + '; AI+tool ' + elapsedSince(startedAt) + 'ms',
             details: aiResponseLogDetails({
               aiRequest,
               modelMessages: stepModelMessagesForLog.get(turnIndex),
@@ -3243,7 +3144,7 @@ async function executeRuntimeStep(input: {
               extra: {
                 responseType: 'text',
                 text: latestText,
-                agentStepIndex: turnIndex + 1,
+                agentStepIndex: retryAgentStepOffset + turnIndex + 1,
                 nativeToolLoop: true,
               },
             }),
@@ -3260,6 +3161,7 @@ async function executeRuntimeStep(input: {
         aiRequest,
         visualContext: visualContext.snapshot(),
         workingMemory,
+        runtimeMessageState: appendRuntimeResponseMessages(lastRetryState, responseMessagesFromGenerateTextResult(result)),
         endedWithText: browserChatMode && Boolean(latestText.trim()) && traces.at(-1)?.name !== 'waitForHumanVerification',
       };
     } catch (error) {
@@ -3276,6 +3178,7 @@ async function executeRuntimeStep(input: {
           aiRequest,
           visualContext: visualContext.snapshot(),
           workingMemory,
+          runtimeMessageState: cloneRuntimeMessageState(lastRetryState),
           endedWithText: false,
         };
       }
@@ -3284,38 +3187,71 @@ async function executeRuntimeStep(input: {
     }
   }
 
-  // Hidden retries can duplicate browser actions when a provider error happens after a tool
-  // started but before the trace is fully persisted. Keep retry opt-in so one AI request maps
-  // to at most one browser action by default.
-  const retryPureRequestFailure = browserChatMode || process.env.AI_RUNTIME_RETRY_ON_PURE_FAILURE === 'true';
-  const attempts = retryPureRequestFailure ? [Boolean(screenshot), Boolean(screenshot)] : [Boolean(screenshot)];
+  // Keep SDK retries disabled, but allow the runtime loop to retry transient upstream
+  // disconnects with the exact model messages prepared for the failed request. The
+  // limit is consecutive failures; any successful model step resets the counter.
+  const consecutiveFailureLimit = runtimeRequestConsecutiveFailureLimit(browserChatMode);
   let lastError: unknown;
+  let retryingAfterFailure = false;
 
-  for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
-    const includeImage = attempts[attemptIndex];
+  while (true) {
+    const includeImage = Boolean(screenshot);
+    const retryState = retryingAfterFailure && lastRetryState?.messages.length ? lastRetryState : undefined;
     try {
-      if (attemptIndex > 0) {
+      if (retryingAfterFailure) {
+        if (!retryState) {
+          await onDebug?.({
+            phase: 'ai:runtime:retry-skipped',
+            stepIndex,
+            message: 'AI request failed, but no preserved model messages exist; not rebuilding messages for retry.',
+            details: {
+              error: infrastructureError(lastError),
+              consecutiveFailures: consecutiveRequestFailures,
+              consecutiveFailureLimit,
+            },
+          });
+          break;
+        }
         await onDebug?.({
           phase: 'ai:runtime:retry',
           stepIndex,
-          message: 'AI request failed before any tool executed; retrying once.',
-          details: infrastructureError(lastError),
+          message: `AI request failed; retrying after consecutive failure ${consecutiveRequestFailures}/${consecutiveFailureLimit} with the previously prepared model messages.`,
+          details: {
+            error: infrastructureError(lastError),
+            consecutiveFailures: consecutiveRequestFailures,
+            consecutiveFailureLimit,
+            reusePreparedMessages: Boolean(retryState),
+            messageCount: retryState?.messages.length,
+            imageCount: retryState?.imagePaths.length,
+            agentStepIndex: retryState ? retryState.agentStepOffset + 1 : undefined,
+          },
         });
       }
-      return await runAgent(includeImage);
+      return await runAgent(includeImage, retryState);
     } catch (error) {
       if (abortSignal?.aborted) throw error;
       lastError = error;
+      consecutiveRequestFailures += 1;
+      if (consecutiveRequestFailures >= consecutiveFailureLimit) break;
+      retryingAfterFailure = true;
     }
   }
 
   if (lastError && typeof lastError === 'object') {
     (lastError as { aiRequest?: AiRequestSnapshot }).aiRequest ??= lastAiRequest;
+    (lastError as { runtimeRetry?: { consecutiveFailures: number; consecutiveFailureLimit: number } }).runtimeRetry ??= {
+      consecutiveFailures: consecutiveRequestFailures,
+      consecutiveFailureLimit,
+    };
     throw lastError;
   }
 
   const wrapped = new Error(String(lastError || 'AI request failed before a response was returned'));
   (wrapped as { aiRequest?: AiRequestSnapshot }).aiRequest = lastAiRequest;
+  (wrapped as { runtimeRetry?: { consecutiveFailures: number; consecutiveFailureLimit: number } }).runtimeRetry = {
+    consecutiveFailures: consecutiveRequestFailures,
+    consecutiveFailureLimit,
+  };
   throw wrapped;
 }
 
@@ -3455,7 +3391,7 @@ function assistantReplyFromStep(step?: StepExecutionResult) {
     : note || actual || toolText || '已完成这一轮浏览器操作。';
 }
 
-async function executeInteractiveBrowserTurn(input: {
+export async function executeInteractiveBrowserTurn(input: {
   session: BrowserSession;
   runId: string;
   targetUrl: string;
@@ -3516,7 +3452,7 @@ async function executeInteractiveBrowserTurn(input: {
         testCase,
         runId: input.runId,
         stepIndex,
-        beforeScreenshotPath,
+        beforeScreenshotPath: beforeScreenshotPath || '',
         completedSteps: steps.filter((step) => step.index !== stepIndex),
         selectedScreenshotReferences,
         referenceImagePaths: input.referenceImagePaths,
@@ -4365,7 +4301,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         });
         const verification = await verifyRuntimeCompletion({
           testCase,
-          screenshotPath: afterScreenshotPath,
+          screenshotPath: afterScreenshotPath || '',
           proposed: decision,
           completedSteps: steps,
           pageContext: verifyPageContext,
@@ -4648,7 +4584,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         expected: 'Recorded tool should execute with recorded parameters.',
         actual: result.actual,
         status: result.ok ? 'passed' : 'failed',
-        beforeScreenshotPath,
+        beforeScreenshotPath: beforeScreenshotPath || '',
         afterScreenshotPath,
         screenshotPath: afterScreenshotPath,
         tools: liveToolTraces.length ? summarizeToolTraces(liveToolTraces) : [{ name: flow.name, input: flow.input, reason: flow.reason, ok: result.ok, result: result.actual }],
@@ -4761,6 +4697,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
   const manualResumeCounts = new Map<number, number>();
   const maxManualPromptsPerStep = manualVerificationMaxPromptsPerStep();
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
+  let runtimeMessageState: RuntimeRetryState | undefined;
   let keepBrowserOpen = false;
   let allowBrowserClose = false;
   let tracePath: string | undefined;
@@ -4783,6 +4720,32 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
     return paused;
   }
 
+  async function takeStepScreenshot(phase: 'before' | 'after', stepIndex: number) {
+    if (runtimeMode === 'dom' && process.env.TARGET_DOM_SCREENSHOTS !== 'true' && process.env.BROWSER_CHAT_DOM_SCREENSHOTS !== 'true') {
+      await onDebug?.({
+        phase: `browser:screenshot:${phase}:skipped`,
+        stepIndex,
+        message: `DOM target mode skipped ${phase} screenshot; using DOM page context instead.`,
+        details: { browserMode: runtimeMode, enabledBy: 'TARGET_DOM_SCREENSHOTS=true' },
+      });
+      return undefined;
+    }
+    const startedAt = Date.now();
+    try {
+      const screenshotPath = await session.takeScreenshot(runId, stepIndex, phase);
+      return screenshotPath;
+    } catch (error) {
+      if (runtimeMode !== 'dom') throw error;
+      await onDebug?.({
+        phase: `browser:screenshot:${phase}:error`,
+        stepIndex,
+        message: `DOM target mode screenshot ${phase} failed after ${elapsedSince(startedAt)}ms; continuing with DOM page context.`,
+        details: serializeError(error),
+      });
+      return undefined;
+    }
+  }
+
   try {
     await onDebug?.({ phase: 'browser:start', message: 'Starting visible browser.' });
     await session.start();
@@ -4803,7 +4766,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       }
 
       const beforeScreenshotStartedAt = Date.now();
-      let beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
+      let beforeScreenshotPath = await takeStepScreenshot('before', stepIndex);
       const runningStep: StepExecutionResult = {
         index: stepIndex,
                 action: 'AI is choosing the next browser action from the current screenshot',
@@ -4877,7 +4840,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         await onDebug?.({ phase: 'manual:resumed', stepIndex, message: 'User confirmed verification complete; collecting a fresh screenshot for AI.' });
         markManualResumed(manualResumeCounts, stepIndex);
         const manualScreenshotStartedAt = Date.now();
-        beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
+        beforeScreenshotPath = await takeStepScreenshot('before', stepIndex);
         await onDebug?.({
           phase: 'perf:manual-resume-screenshot',
           stepIndex,
@@ -4900,8 +4863,9 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         testCase,
         runId,
         stepIndex,
-        beforeScreenshotPath,
+        beforeScreenshotPath: beforeScreenshotPath || '',
         completedSteps: steps,
+        runtimeMessageState,
         selectedScreenshotReferences,
         onSelectReferenceScreenshots: async (selection) => {
           selectedScreenshotReferences = selection.ids
@@ -4950,6 +4914,40 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           clearStepAbortController(runId, stepIndex);
           continue;
         }
+        const errorText = infrastructureError(error);
+        if (!liveToolTraces.length && isInfrastructureNoise(errorText)) {
+          const blockedStep: StepExecutionResult = {
+            index: stepIndex,
+            action: 'AI request failed before any browser tool executed',
+            expected: 'The upstream AI provider should return a tool decision or a clear error within the configured timeout.',
+            actual: `${errorText}\n本轮操作已停止，当前页面状态已保留。`,
+            status: 'blocked',
+            beforeScreenshotPath,
+            aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
+          };
+          steps.push(blockedStep);
+          await onProgress?.(blockedStep);
+          await onDebug?.({
+            phase: 'ai:runtime:upstream-error',
+            stepIndex,
+            message: 'AI provider request failed before any browser tool executed; stopping this run instead of starting another message array.',
+            details: {
+              error: serializeError(error),
+              aiRequest: blockedStep.aiRequest,
+            },
+          });
+          keepBrowserOpen = shouldKeepBrowserOpenAfterError();
+          clearStepAbortController(runId, stepIndex);
+          return {
+            status: 'blocked',
+            result: {
+              steps,
+              consoleErrors: session.getConsoleErrors(),
+              networkErrors: session.getNetworkErrors(),
+              tracePath,
+            },
+          };
+        }
         const recoverableStep = await createRecoverableRuntimeErrorStep({
           session,
           runId,
@@ -4976,14 +4974,28 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         continue;
       }
 
+      runtimeMessageState = cloneRuntimeMessageState(actionResult.runtimeMessageState);
+
+      if (await waitWhilePaused(stepIndex)) {
+        clearStepAbortController(runId, stepIndex);
+        stepIndex -= 1;
+        continue;
+      }
+
       const afterScreenshotStartedAt = Date.now();
-      const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
+      const afterScreenshotPath = await takeStepScreenshot('after', stepIndex);
       await onDebug?.({
         phase: 'perf:after-screenshot',
         stepIndex,
         message: `操作后截图耗时 ${elapsedSince(afterScreenshotStartedAt)}ms`,
         details: { elapsedMs: elapsedSince(afterScreenshotStartedAt), screenshotPath: afterScreenshotPath },
       });
+
+      if (await waitWhilePaused(stepIndex)) {
+        clearStepAbortController(runId, stepIndex);
+        stepIndex -= 1;
+        continue;
+      }
 
       if (await shouldSkipStep?.(stepIndex)) {
         const skippedStep = createSkippedStep(stepIndex, beforeScreenshotPath, afterScreenshotPath);
@@ -5003,14 +5015,25 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
           includeManualVerification: true,
         });
         const verificationStartedAt = Date.now();
-        const verification = await verifyRuntimeCompletion({
-          testCase,
-          screenshotPath: afterScreenshotPath,
-          proposed: decision,
-          completedSteps: steps,
-          pageContext: verifyPageContext,
-          abortSignal: abortController.signal,
-        });
+        let verification: CompletionVerification;
+        try {
+          verification = await verifyRuntimeCompletion({
+            testCase,
+            screenshotPath: afterScreenshotPath || '',
+            proposed: decision,
+            completedSteps: steps,
+            pageContext: verifyPageContext,
+            abortSignal: abortController.signal,
+          });
+        } catch (error) {
+          if (await shouldPauseRun?.(stepIndex)) {
+            clearStepAbortController(runId, stepIndex);
+            await waitWhilePaused(stepIndex);
+            stepIndex -= 1;
+            continue;
+          }
+          throw error;
+        }
         await onDebug?.({
           phase: 'completion:verify',
           stepIndex,

@@ -41,6 +41,7 @@
     "@ai-sdk/xai": "^3.0.95",
     "@openrouter/ai-sdk-provider": "^2.9.0",
     "@prisma/client": "^6.8.2",
+    "@tanstack/react-virtual": "^3.14.3",
     "@tinymce/tinymce-react": "^6.3.0",
     "ai": "^6.0.193",
     "ai-sdk-provider-codex-app-server": "^1.1.7",

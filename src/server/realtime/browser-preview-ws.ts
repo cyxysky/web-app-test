@@ -23,7 +23,6 @@ type BrowserPreviewWebSocketState = {
 };
 
 declare global {
-  // eslint-disable-next-line no-var
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
 }
 
@@ -170,10 +169,12 @@ async function attachScreencast(client: BrowserPreviewClient, url: URL) {
         type: 'error',
         error: error instanceof Error ? error.message : 'Browser screencast failed',
       }),
-      onFrame: (frame) => sendToClient(client, {
-        ...frame,
-        type: 'frame',
-      }),
+      onFrame: (frame) => {
+        sendToClient(client, {
+          ...frame,
+          type: 'frame',
+        });
+      },
     });
     if (!handle) {
       sendToClient(client, { type: 'error', error: 'Browser chat session not found' });

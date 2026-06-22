@@ -680,11 +680,6 @@ function sanitizeHistoricalToolText(value: unknown, max = 180) {
   );
 }
 
-function filterRegressiveMemoryItems(items: string[], memory: RuntimeWorkingMemory) {
-  void memory;
-  return items;
-}
-
 function summarizeStepToolCallForPrompt(toolCall: StepToolCall) {
   const reason = sanitizeHistoricalToolText(toolCall.reason, 140);
   const result = sanitizeHistoricalToolText(toolCall.result, 140);
@@ -747,34 +742,6 @@ function hostOf(url: string) {
   } catch {
     return '';
   }
-}
-
-function formatInteractiveCandidates(candidates: unknown, limit = 50) {
-  if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive candidates]';
-  return JSON.stringify(
-    candidates.slice(0, limit).map((item) => {
-      const candidate = item as Record<string, unknown>;
-      return {
-        id: candidate.id,
-        tag: candidate.tag,
-        role: candidate.role,
-        type: candidate.type,
-        name: candidate.name,
-        text: candidate.text,
-        href: candidate.href,
-        host: candidate.host,
-        rect: candidate.rect,
-        center: candidate.center,
-        input: candidate.input,
-        disabled: candidate.disabled,
-        framePath: candidate.framePath,
-        frameUrl: candidate.frameUrl,
-        nearbyText: candidate.nearbyText,
-      };
-    }),
-    null,
-    2,
-  );
 }
 
 function formatVisualInteractiveElements(candidates: unknown, limit = 80) {
@@ -891,49 +858,6 @@ function sanitizeCurrentState(value: unknown) {
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的目标'),
     260,
   );
-}
-
-function hasConcreteTargetVisual(input: unknown) {
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
-  const reason = typeof raw.reason === 'string' ? raw.reason.trim() : '';
-  const combined = `${targetVisual} ${reason}`.trim();
-  if (targetVisual.length < 4) return false;
-  if (!/[A-Za-z\u4e00-\u9fff]/.test(targetVisual)) return false;
-  if (/^(?:候选|编号|id|ID|candidate|#|\d|\s|[:：-])+$/i.test(targetVisual)) return false;
-  if (/^(?:下一张|上一张|确定|确认|关闭|按钮|图标|图片|目标|控件)$/i.test(targetVisual)) return false;
-  if (!reason || /^(?:点击|选择|使用)?\s*(?:候选|编号|id|ID|candidate)?\s*\d+$/i.test(reason)) return false;
-  return /[A-Za-z\u4e00-\u9fff]/.test(combined);
-}
-
-function rejectWeakTargetVisual(name: string, input: unknown): BrowserActionResult | undefined {
-  if (hasConcreteTargetVisual(input)) return undefined;
-  return {
-    ok: false,
-    actual: `${name} rejected before execution: targetVisual/reason must describe the visible target in the CURRENT screenshot, such as text/icon/position/role. Do not provide only a candidate id or a generic label.`,
-  };
-}
-
-function candidateActionId(name: string, input: unknown) {
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  if (name === 'dragCandidate') return `${raw.fromId || ''}->${raw.toId || ''}`;
-  return typeof raw.id === 'string' ? raw.id : '';
-}
-
-function rejectStaleRepeatedCandidateAction(name: string, input: unknown, traces: ToolTrace[]): BrowserActionResult | undefined {
-  const id = candidateActionId(name, input);
-  if (!id) return undefined;
-  const repeated = traces.some((trace) => trace.name === name && candidateActionId(name, trace.input) === id);
-  if (!repeated) return undefined;
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  const reason = typeof raw.reason === 'string' ? raw.reason.trim() : '';
-  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
-  const hasReasonedRepeat = targetVisual.length >= 4 && reason.length >= 10;
-  if (hasReasonedRepeat) return undefined;
-  return {
-    ok: false,
-    actual: `${name} rejected before execution: candidate ${id} was already used in this agent loop. Repeating the same id is allowed, but targetVisual and reason must explain why the current screenshot still supports this same visible target.`,
-  };
 }
 
 function validateCandidateActionBeforeExecution(name: string, input: unknown, traces: ToolTrace[]) {
@@ -1944,15 +1868,6 @@ ${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
       : 'Screenshot image/path is not attached.',
   ].filter(Boolean).join('\n');
 }
-function summarizeToolInput(input: unknown) {
-  if (input && typeof input === 'object') {
-    const entries = Object.entries(input as Record<string, unknown>)
-      .filter(([key, value]) => !['reason', 'taskFrameJson', 'ledgerItemsJson', 'visualAfter'].includes(key) && value !== undefined && value !== null && value !== '')
-      .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
-    return entries.length ? ` (${entries.join(', ')})` : '';
-  }
-  return '';
-}
 
 function runtimeToolNames(mode: BrowserSessionMode) {
   const sharedTools = [
@@ -2050,139 +1965,6 @@ function extractProgressNote(text: string) {
   return readableActionFromRawText(note)?.slice(0, 400);
 }
 
-function parseListLike(text?: string) {
-  if (!text || /^(无|none)$/i.test(text.trim())) return [];
-  return text
-    .split(/(?:[；;]\s*|\n+|\s(?:\d+\.|[-*])\s)/)
-    .map((item) => item.replace(/^[\d.\s、*-]+/, '').trim())
-    .filter((item) => item && !/^(无|none)$/i.test(item))
-    .slice(0, 8);
-}
-
-function parseJsonPayload(value: unknown) {
-  if (value === null || value === undefined) return undefined;
-  if (typeof value !== 'string') return value;
-  const text = value.trim();
-  if (!text || /^(null|none|unchanged|无|暂无)$/i.test(text)) return undefined;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-}
-
-function stringField(value: unknown, max = 240) {
-  return typeof value === 'string' && value.trim() ? concise(value.trim(), max) : undefined;
-}
-
-function arrayOfStrings(value: unknown, maxItems = 12) {
-  if (!Array.isArray(value)) return [];
-  return value.map((item) => stringField(item, 220)).filter((item): item is string => Boolean(item)).slice(0, maxItems);
-}
-
-function normalizeDimension(value: unknown): TaskFrame['dimensions'][number] | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const name = stringField(raw.name, 80);
-  const id = stringField(raw.id, 80) || name?.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/gi, '_').replace(/^_+|_+$/g, '');
-  if (!id || !name) return undefined;
-  const dimension: TaskFrame['dimensions'][number] = {
-    id,
-    name,
-    description: stringField(raw.description, 500),
-  };
-  const focus = arrayOfStrings(raw.focus, 12);
-  const testIdeas = arrayOfStrings(raw.testIdeas, 12);
-  const risks = arrayOfStrings(raw.risks, 8);
-  if (focus.length) dimension.focus = focus;
-  if (testIdeas.length) dimension.testIdeas = testIdeas;
-  if (risks.length) dimension.risks = risks;
-  return dimension;
-}
-
-function fallbackTaskFrame(goal: string): TaskFrame {
-  return {
-    goal: concise(goal, 300) || 'Complete the user task and preserve structured findings.',
-    version: 1,
-    successCriteria: ['满足用户目标', '结构化记录关键过程和结论', '最终输出可由台账追溯'],
-    dimensions: [],
-  };
-}
-
-function normalizeTaskFrame(value: unknown, previous: TaskFrame | undefined, goal: string): TaskFrame | undefined {
-  const parsed = parseJsonPayload(value);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return previous || fallbackTaskFrame(goal);
-  const raw = parsed as Record<string, unknown>;
-  const dimensions = Array.isArray(raw.dimensions)
-    ? raw.dimensions.map(normalizeDimension).filter((item): item is TaskFrame['dimensions'][number] => Boolean(item)).slice(0, 12)
-    : [];
-  if (!dimensions.length && previous) return previous;
-  if (!dimensions.length) return fallbackTaskFrame(goal);
-  const successCriteria = arrayOfStrings(raw.successCriteria, 12);
-  const next: TaskFrame = {
-    goal: stringField(raw.goal, 320) || previous?.goal || concise(goal, 320),
-    version: typeof raw.version === 'number' ? raw.version : previous?.version || 1,
-    successCriteria: successCriteria.length ? successCriteria : previous?.successCriteria || fallbackTaskFrame(goal).successCriteria,
-    dimensions,
-  };
-  const deliverables = arrayOfStrings(raw.deliverables, 12);
-  const analysisGuidance = arrayOfStrings(raw.analysisGuidance, 12);
-  const finalOutputRequirements = arrayOfStrings(raw.finalOutputRequirements, 12);
-  if (deliverables.length) next.deliverables = deliverables;
-  else if (previous?.deliverables?.length) next.deliverables = previous.deliverables;
-  if (analysisGuidance.length) next.analysisGuidance = analysisGuidance;
-  else if (previous?.analysisGuidance?.length) next.analysisGuidance = previous.analysisGuidance;
-  if (finalOutputRequirements.length) next.finalOutputRequirements = finalOutputRequirements;
-  else if (previous?.finalOutputRequirements?.length) next.finalOutputRequirements = previous.finalOutputRequirements;
-  return next;
-}
-
-function normalizeLedgerItem(value: unknown, sourceStep?: number, evidence: string[] = []): TaskLedgerItem | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const title = stringField(raw.title, 180);
-  if (!title) return undefined;
-  const status = ['finding', 'issue', 'covered', 'risk', 'question', 'evidence', 'decision'].includes(String(raw.status))
-    ? raw.status as TaskLedgerItem['status']
-    : 'finding';
-  const severity = ['info', 'minor', 'major', 'critical'].includes(String(raw.severity))
-    ? raw.severity as TaskLedgerItem['severity']
-    : status === 'issue' || status === 'risk' ? 'minor' : 'info';
-  const attributes = Array.isArray(raw.attributes)
-    ? raw.attributes.map((item) => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return undefined;
-      const pair = item as Record<string, unknown>;
-      const key = stringField(pair.key, 80);
-      const valueText = stringField(pair.value, 180);
-      return key && valueText ? { key, value: valueText } : undefined;
-    }).filter((item): item is { key: string; value: string } => Boolean(item)).slice(0, 8)
-    : undefined;
-  const itemEvidence = arrayOfStrings(raw.evidence, 8);
-  return {
-    id: stringField(raw.id, 120),
-    dimensionId: stringField(raw.dimensionId, 80) || 'general',
-    title,
-    summary: stringField(raw.summary, 500),
-    status,
-    severity,
-    expected: stringField(raw.expected, 500),
-    actual: stringField(raw.actual, 500),
-    evidence: Array.from(new Set([...itemEvidence, ...evidence])).slice(0, 8),
-    confidence: typeof raw.confidence === 'number' && Number.isFinite(raw.confidence) ? Math.max(0, Math.min(1, raw.confidence)) : undefined,
-    sourceStep: typeof raw.sourceStep === 'number' ? raw.sourceStep : sourceStep,
-    attributes,
-  };
-}
-
-function parseLedgerItems(value: unknown, sourceStep?: number, evidence: string[] = []) {
-  const parsed = parseJsonPayload(value);
-  const rawItems = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-  return rawItems
-    .map((item) => normalizeLedgerItem(item, sourceStep, evidence))
-    .filter((item): item is TaskLedgerItem => Boolean(item))
-    .slice(0, 12);
-}
-
 function ledgerMemoryLimit() {
   const raw = Number(process.env.AI_LEDGER_MEMORY_LIMIT || 1000);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1000;
@@ -2207,12 +1989,6 @@ function collectLedgerItemsFromSteps(steps: StepExecutionResult[]) {
     ...steps.flatMap((step) => step.ledgerItems || []),
     ...steps.flatMap((step) => step.workingMemory?.ledgerItems || []),
   ], ledgerMemoryLimit());
-}
-
-function formatTaskFrameContext(frame?: TaskFrame) {
-  return JSON.stringify({
-    taskFrame: frame || null,
-  }, null, 2);
 }
 
 function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''): Pick<RuntimeDecision, 'taskFrame' | 'ledgerItems'> {

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Edit3, Loader2, Plus, Save, Trash2 } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { useI18n } from '@/i18n/I18nProvider';
@@ -110,15 +110,7 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
     ].some((value) => value.toLowerCase().includes(keyword)));
   }, [query, skills]);
 
-  useEffect(() => {
-    void loadSkills();
-  }, []);
-
-  function update(patch: Partial<SkillDraft>) {
-    setDraft((current) => ({ ...current, ...patch }));
-  }
-
-  async function loadSkills() {
+  const loadSkills = useCallback(async () => {
     setLoading(true);
     try {
       const response = await fetch('/api/skills', { cache: 'no-store' });
@@ -130,6 +122,14 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
     } finally {
       setLoading(false);
     }
+  }, [t]);
+
+  useEffect(() => {
+    void loadSkills();
+  }, [loadSkills]);
+
+  function update(patch: Partial<SkillDraft>) {
+    setDraft((current) => ({ ...current, ...patch }));
   }
 
   function selectSkill(skill: SkillRecord) {

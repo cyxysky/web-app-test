@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowDown, ArrowUp, Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, PauseCircle, PlayCircle, Plus, Radar, RotateCcw, Save, SkipForward, Trash2, Wrench, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, PlayCircle, Plus, Radar, RotateCcw, Save, SkipForward, Trash2, Wrench, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -1343,8 +1343,6 @@ export function RunProgress({
   const manualIntervention = run.control?.manualIntervention;
   const visibleManualIntervention = manualIntervention?.stepIndex === resumePendingStep ? undefined : manualIntervention;
   const manualInterventionScreenshotUrl = artifactUrl(visibleManualIntervention?.screenshotPath);
-  const canPause = run.status === 'running' || run.status === 'queued';
-  const canResumeRun = run.status === 'paused';
   const canContinueBlockedRun = run.status === 'blocked';
   const canEditToolRecord = selectedStep && run.status !== 'running' && run.status !== 'queued' && run.status !== 'paused';
   const canRunByRecord = isFinished(run.status) && steps.some((step) => step.tools?.some((tool) => tool.ok !== false));
@@ -1613,36 +1611,6 @@ export function RunProgress({
     }
   }
 
-  async function pauseRun() {
-    if (!canPause) return;
-    startGlobalLoading(t('正在暂停运行'));
-    try {
-      const response = await fetch(`/api/runs/${run.id}/pause`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stepIndex: runningStep?.index || selectedStep?.index }),
-      });
-      if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
-    } finally {
-      stopGlobalLoading();
-    }
-  }
-
-  async function resumeRun() {
-    if (!canResumeRun) return;
-    startGlobalLoading(t('正在继续运行'));
-    try {
-      const response = await fetch(`/api/runs/${run.id}/resume`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stepIndex: run.control?.pauseStepIndex || runningStep?.index || selectedStep?.index }),
-      });
-      if (response.ok) setRun(((await response.json()) as { run: TestRunRecord }).run);
-    } finally {
-      stopGlobalLoading();
-    }
-  }
-
   async function continueBlockedRun() {
     if (!canContinueBlockedRun) return;
     startGlobalLoading(t('正在继续运行'));
@@ -1716,18 +1684,6 @@ export function RunProgress({
           ) : null}
         </div>
         <div style={{ display: "flex", gap: "16px" }}>
-          {canPause ? (
-            <button className="link-button" onClick={pauseRun} type="button">
-              <PauseCircle size={16} />
-              {t('暂停')}
-            </button>
-          ) : null}
-          {canResumeRun ? (
-            <button className="link-button" onClick={resumeRun} type="button">
-              <PlayCircle size={16} />
-              {t('继续')}
-            </button>
-          ) : null}
           {canContinueBlockedRun ? (
             <button className="link-button" onClick={continueBlockedRun} type="button">
               <PlayCircle size={16} />

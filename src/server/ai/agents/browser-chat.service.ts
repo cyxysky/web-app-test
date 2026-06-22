@@ -124,11 +124,25 @@ function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'u
 
 function browserChatBrowserProfileKey(session: Pick<BrowserChatSessionSnapshot, 'id' | 'userId'>) {
   const userId = normalizeUserId(session.userId);
-  return userId ? `user_${userId}` : session.id;
+  return `user_${userId || 'default'}`;
 }
 
 function fullLogDetails(value: unknown) {
   return { [fullLogDetailsFlag]: true, value };
+}
+
+function browserChatLogLimit() {
+  const raw = Number(process.env.BROWSER_CHAT_LOG_LIMIT || 2000);
+  const normalized = Number.isFinite(raw) ? Math.floor(raw) : 2000;
+  return Math.min(Math.max(normalized, 300), 10000);
+}
+
+function trimBrowserChatLogs(logs: BrowserChatLogRecord[]) {
+  return logs.slice(-browserChatLogLimit());
+}
+
+function browserChatKeepBrowserOpenAfterTurn() {
+  return process.env.BROWSER_CHAT_KEEP_BROWSER_OPEN_AFTER_TURN !== 'false';
 }
 
 function now() {
@@ -271,7 +285,8 @@ function exportedRecordedToolInput(toolName: string, input: unknown, targetUrl: 
   const url = exportableTargetUrl(inputUrl(input));
   if (url) return input;
   if (!input || typeof input !== 'object' || Array.isArray(input)) return targetUrl ? { url: targetUrl } : input;
-  const { url: _url, ...rest } = input as Record<string, unknown>;
+  const rest = { ...(input as Record<string, unknown>) };
+  delete rest.url;
   return targetUrl ? { ...rest, url: targetUrl } : rest;
 }
 
@@ -500,7 +515,10 @@ function statusFromSteps(steps: StepExecutionResult[]): CompletedRunStatus {
 }
 
 function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
-  const { aiRequest: _aiRequest, visualContext: _visualContext, workingMemory: _workingMemory, ...clientStep } = step;
+  const clientStep = { ...step };
+  delete clientStep.aiRequest;
+  delete clientStep.visualContext;
+  delete clientStep.workingMemory;
   return clientStep;
 }
 
@@ -750,7 +768,7 @@ function appendLog(
   const runningActivity = runningActivityFromLog(phase, message);
   const details = logDetailsFromUnknown(input.details);
   const logMessageId = input.messageId === null ? undefined : input.messageId ?? session.activeAssistantMessageId;
-  session.logs = [
+  session.logs = trimBrowserChatLogs([
     ...(session.logs || []),
     {
       id: id('log'),
@@ -762,7 +780,7 @@ function appendLog(
       stepIndex: input.stepIndex,
       elapsedMs: input.elapsedMs,
     },
-  ].slice(-300);
+  ]);
   if (logMessageId && logMessageId === session.activeAssistantMessageId) {
     updateAssistantMessage(session, logMessageId, (item) => ({
       ...item,
@@ -886,7 +904,7 @@ function mergeLogsFromFile(existing: BrowserChatLogRecord[] = [], incoming: Brow
   for (const item of incoming) byKey.set(keyOf(item), item);
   return [...byKey.values()]
     .sort((a, b) => timestampValue(a.time) - timestampValue(b.time))
-    .slice(-300);
+    .slice(-browserChatLogLimit());
 }
 
 function mergeConversationContextFromFile(
@@ -1177,7 +1195,7 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   const browser = new BrowserSession(session.mode === 'default' ? undefined : session.mode, {
     browserProfileKey: browserChatBrowserProfileKey(session),
     isMarked: true,
-    preferExistingPage: !hasPriorConversation,
+    preferExistingPage: false,
     runId: session.id,
     tabGroupTitle: session.title,
   });
@@ -1820,11 +1838,6 @@ function stringifyJsonSafe(value: unknown, space?: number) {
   }, space);
 }
 
-function jsonSafeClone<T>(value: T): T {
-  const serialized = stringifyJsonSafe(value);
-  return serialized ? JSON.parse(serialized) as T : value;
-}
-
 function warnPersistFailure(error: unknown) {
   const timestamp = Date.now();
   if (timestamp - browserChatRuntimeState.lastPersistWarningAt < 1000) return;
@@ -1925,7 +1938,7 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
   if (session.status !== 'closed') session.status = 'idle';
   session.error = undefined;
   session.updatedAt = timestamp;
-  session.logs = [
+  session.logs = trimBrowserChatLogs([
     ...(session.logs || []),
     {
       id: id('log'),
@@ -1934,7 +1947,7 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
       message: '用户中断了本轮对话操作，浏览器保持当前状态。',
       messageId: assistantMessageId,
     },
-  ].slice(-300);
+  ]);
   if (!persistAndNotify(session.id)) {
     throw new Error('Browser chat interrupt state could not be persisted.');
   }
@@ -2021,7 +2034,8 @@ async function runBrowserChatMessage(
     }));
     if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
     const completedAt = now();
-    const shouldCloseCompletedBrowser = Boolean(session.browser || session.started);
+    const keepCompletedBrowser = browserChatKeepBrowserOpenAfterTurn() && Boolean(session.browser?.isUsable());
+    const shouldCloseCompletedBrowser = Boolean(session.browser || session.started) && !keepCompletedBrowser;
     if (shouldCloseCompletedBrowser) {
       await session.browser?.close().catch(() => undefined);
       session.browser = undefined;
@@ -2032,7 +2046,7 @@ async function runBrowserChatMessage(
     session.activeAssistantMessageId = undefined;
     session.activeAbortController = undefined;
     session.updatedAt = completedAt;
-    session.logs = [
+    session.logs = trimBrowserChatLogs([
       ...(session.logs || []),
       {
         id: id('log'),
@@ -2040,10 +2054,12 @@ async function runBrowserChatMessage(
         phase: 'chat:run:done',
         message: shouldCloseCompletedBrowser
           ? '本轮对话操作已完成，最终结果已写入，浏览器已自动关闭。'
-          : '本轮对话操作已完成，最终结果已写入。',
+          : keepCompletedBrowser
+            ? '本轮对话操作已完成，最终结果已写入，浏览器已保留供后续对话复用。'
+            : '本轮对话操作已完成，最终结果已写入。',
         messageId: assistantMessageId,
       },
-    ].slice(-300);
+    ]);
     persistAndNotify(session.id);
   } catch (error) {
     const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);

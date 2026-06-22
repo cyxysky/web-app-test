@@ -177,6 +177,16 @@ function embeddedBrowserGroupIdForSession(sessionId) {
   return normalized ? `session:${normalized}` : 'default';
 }
 
+function embeddedBrowserSessionIdFromGroupId(groupId) {
+  const normalized = String(groupId || '').trim();
+  return normalized.startsWith('session:') ? normalized.slice('session:'.length) : '';
+}
+
+function embeddedBrowserSessionIdForGroup(input = {}, groupIdInput) {
+  const groupId = String(groupIdInput || embeddedBrowserGroupId(input) || '').trim();
+  return embeddedBrowserSessionIdFromGroupId(groupId) || normalizeEmbeddedBrowserSessionId(input.sessionId);
+}
+
 function embeddedBrowserGroupId(input = {}) {
   const explicitGroupId = String(input.groupId || '').trim();
   if (explicitGroupId) return explicitGroupId;
@@ -295,7 +305,7 @@ function embeddedBrowserTabsForGroup(groupId) {
 
 function ensureEmbeddedBrowserGroup(input = {}) {
   const groupId = embeddedBrowserGroupId(input);
-  const sessionId = normalizeEmbeddedBrowserSessionId(input.sessionId);
+  const sessionId = embeddedBrowserSessionIdForGroup(input, groupId);
   let group = embeddedBrowserGroups.get(groupId);
   if (!group) {
     group = {
@@ -305,7 +315,7 @@ function ensureEmbeddedBrowserGroup(input = {}) {
       sessionId,
     };
     embeddedBrowserGroups.set(group.id, group);
-  } else if (sessionId && !group.sessionId) {
+  } else if (sessionId && group.sessionId !== sessionId) {
     group.sessionId = sessionId;
   }
   return group;
@@ -369,7 +379,7 @@ function createEmbeddedBrowserTab(input = {}) {
   if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Main window is not ready.');
   if (!WebContentsView) throw new Error('Electron WebContentsView is not available.');
   const group = ensureEmbeddedBrowserGroup(input);
-  const sessionId = group.sessionId || normalizeEmbeddedBrowserSessionId(input.sessionId);
+  const sessionId = embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || normalizeEmbeddedBrowserSessionId(input.sessionId);
   const tabId = input.id || `tab:${embeddedBrowserNextTabId++}`;
   const view = new WebContentsView({
     webPreferences: {
@@ -413,7 +423,8 @@ function ensureEmbeddedBrowserTab(input = {}) {
   }
 
   if (!tab && input.createIfMissing !== false) {
-    tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId: group.sessionId });
+    const sessionId = embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || normalizeEmbeddedBrowserSessionId(input.sessionId);
+    tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId });
   }
   return tab;
 }
@@ -605,6 +616,12 @@ function embeddedBrowserState() {
     const groupTabs = [];
     for (const tab of embeddedBrowserTabs.values()) {
       if (tab.groupId !== group.id || tab.view.webContents.isDestroyed()) continue;
+      const canonicalSessionId = embeddedBrowserSessionIdFromGroupId(tab.groupId) || tab.sessionId || group.sessionId || '';
+      if (canonicalSessionId && tab.sessionId !== canonicalSessionId) {
+        tab.sessionId = canonicalSessionId;
+        void markEmbeddedBrowserSession(tab);
+      }
+      if (canonicalSessionId && group.sessionId !== canonicalSessionId) group.sessionId = canonicalSessionId;
       const webContents = tab.view.webContents;
       const url = webContents.getURL() || '';
       const title = webContents.getTitle() || url || 'New tab';
@@ -724,7 +741,8 @@ function moveEmbeddedBrowserTab(input = {}) {
 
 async function createManualEmbeddedBrowserTab(input = {}) {
   const group = ensureEmbeddedBrowserGroup(input);
-  const tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId: group.sessionId || input.sessionId });
+  const sessionId = embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || normalizeEmbeddedBrowserSessionId(input.sessionId);
+  const tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId });
   if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id: tab.id });
   else setActiveEmbeddedBrowserTab(tab);
   await ensureEmbeddedBrowserTabReady(tab);

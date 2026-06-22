@@ -41,12 +41,12 @@ import {
   Trash2,
   Waypoints,
   Workflow,
-  User,
   X,
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
 import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
 import type { SettingsTab } from '@/config/settings';
@@ -233,6 +233,11 @@ function embeddedGroupIdForSession(sessionId?: string) {
   return normalized ? `session:${normalized}` : 'default';
 }
 
+function embeddedSessionIdFromGroupId(groupId?: string) {
+  const normalized = (groupId || '').trim();
+  return normalized.startsWith('session:') ? normalized.slice('session:'.length) : '';
+}
+
 function embeddedGroupIdForTab(tab: EmbeddedBrowserTab, fallbackGroupId: string) {
   if (tab.groupId) return tab.groupId;
   if (tab.sessionId) return embeddedGroupIdForSession(tab.sessionId);
@@ -252,14 +257,92 @@ function parseJsonObjectText(value?: string) {
   }
 }
 
+function stripAnsiControlCodes(value: string) {
+  return value.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+}
+
 function formatToolPayload(value: unknown) {
   if (value === undefined || value === null || value === '') return '无';
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return stripAnsiControlCodes(value);
   try {
-    return JSON.stringify(value, null, 2);
+    return stripAnsiControlCodes(JSON.stringify(value, null, 2));
   } catch {
-    return String(value);
+    return stripAnsiControlCodes(String(value));
   }
+}
+
+const logVirtualRowEstimate = 104;
+
+function BrowserChatLogEntry({ log, style, measureRef, virtualIndex }: {
+  log: BrowserChatLogRecord;
+  measureRef?: (node: HTMLLIElement | null) => void;
+  style?: CSSProperties;
+  virtualIndex?: number;
+}) {
+  return (
+    <li
+      className={contextCompressionLabel(log) ? 'has-context-compression' : ''}
+      data-index={virtualIndex}
+      ref={measureRef}
+      style={style}
+    >
+      {contextCompressionLabel(log) ? (
+        <div className="browser-chat-context-compression-marker">
+          <span>--------------------------</span>
+          <strong>{contextCompressionLabel(log)}</strong>
+          <span>--------------------------</span>
+        </div>
+      ) : null}
+      <span>{phaseLabel(log.phase)}</span>
+      <div>
+        <strong>{log.message}</strong>
+        <small>
+          {formatLogTime(log.time)}
+          {log.stepIndex ? ` · 步骤 ${log.stepIndex}` : ''}
+          {typeof log.elapsedMs === 'number' ? ` · ${log.elapsedMs}ms` : ''}
+        </small>
+        <BrowserChatLogDetails log={log} />
+      </div>
+    </li>
+  );
+}
+
+function BrowserChatVirtualLogList({ entries }: { entries: BrowserChatLogRecord[] }) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: entries.length,
+    estimateSize: () => logVirtualRowEstimate,
+    getScrollElement: () => scrollRef.current,
+    overscan: 8,
+  });
+  const virtualItems = rowVirtualizer.getVirtualItems();
+
+  return (
+    <div className="browser-chat-log-modal-list" ref={scrollRef}>
+      <ol
+        className="browser-chat-log-virtual-inner"
+        style={{ height: rowVirtualizer.getTotalSize() }}
+      >
+        {virtualItems.map((virtualRow) => {
+          const log = entries[virtualRow.index];
+          if (!log) return null;
+          return (
+            <BrowserChatLogEntry
+              key={log.id}
+              log={log}
+              measureRef={rowVirtualizer.measureElement}
+              style={{
+                position: 'absolute',
+                transform: `translateY(${virtualRow.start}px)`,
+                width: '100%',
+              }}
+              virtualIndex={virtualRow.index}
+            />
+          );
+        })}
+      </ol>
+    </div>
+  );
 }
 
 function asRecord(value: unknown) {
@@ -295,8 +378,8 @@ type BrowserChatAiOutputCycle = {
   stepIndex?: number;
 };
 
-function stringFromUnknown(value: unknown) {
-  if (typeof value === 'string') return value.trim();
+function stringFromUnknown(value: unknown): string {
+  if (typeof value === 'string') return stripAnsiControlCodes(value).trim();
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) {
     return value
@@ -457,12 +540,80 @@ function aiOutputTextSetFromCycles(cycles: BrowserChatAiOutputCycle[]) {
   return new Set(cycles.flatMap((cycle) => cycle.output.texts).map((text) => text.replace(/\s+/g, ' ').trim()));
 }
 
-function aiOutputViewFromLogs(logs: BrowserChatLogRecord[]): BrowserChatAiOutputView {
-  const output: BrowserChatAiOutputView = { reasoning: [], texts: [], tools: [] };
-  for (const cycle of aiOutputCyclesFromLogs(logs)) {
-    mergeAiOutputView(output, cycle.output);
-  }
-  return compactAiOutputView(output);
+function aiCycleToolKey(cycleId: string, toolIndex: number) {
+  return `${cycleId}:${toolIndex}`;
+}
+
+function toolInputSignature(value: unknown) {
+  return formatToolPayload(value).replace(/\s+/g, ' ').trim();
+}
+
+function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[]) {
+  const details = new Map<string, BrowserChatToolDetail>();
+  const usedStepTools = new Set<string>();
+
+  cycles.forEach((cycle) => {
+    const candidateSteps = cycle.stepIndex
+      ? steps.filter((step) => step.index === cycle.stepIndex)
+      : steps;
+
+    cycle.output.tools.forEach((aiTool, aiToolIndex) => {
+      const exactInput = toolInputSignature(aiTool.input);
+      let fallback: BrowserChatToolDetail | undefined;
+
+      for (const step of candidateSteps) {
+        const toolCalls = step.tools || [];
+        for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex += 1) {
+          const tool = toolCalls[toolIndex];
+          if (!tool) continue;
+          const usedKey = `${step.index}:${toolIndex}`;
+          if (usedStepTools.has(usedKey) || tool.name !== aiTool.name) continue;
+
+          const detail = { stepIndex: step.index, step, toolIndex, tool };
+          if (!fallback) fallback = detail;
+          if (!exactInput || toolInputSignature(tool.input) === exactInput) {
+            details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
+            usedStepTools.add(usedKey);
+            return;
+          }
+        }
+      }
+
+      if (fallback) {
+        details.set(aiCycleToolKey(cycle.id, aiToolIndex), fallback);
+        usedStepTools.add(`${fallback.step.index}:${fallback.toolIndex}`);
+      }
+    });
+  });
+
+  return details;
+}
+
+function isAiInputOutputLog(log: BrowserChatLogRecord) {
+  return log.phase === 'ai:runtime:request'
+    || log.phase === 'ai:runtime:response'
+    || log.phase === 'ai:runtime:object'
+    || log.phase === 'conversation:context:request'
+    || log.phase === 'conversation:context:response';
+}
+
+function isContextCompressionLog(log: BrowserChatLogRecord) {
+  return log.phase === 'ai:context-segmented'
+    || log.phase === 'conversation:context:request'
+    || log.phase === 'conversation:context:response'
+    || log.phase === 'conversation:context:error';
+}
+
+function visibleExecutionLog(log: BrowserChatLogRecord) {
+  return isAiInputOutputLog(log) || isContextCompressionLog(log);
+}
+
+function contextCompressionLabel(log: BrowserChatLogRecord) {
+  if (log.phase === 'ai:context-segmented') return 'Agent Loop 上下文在这里压缩';
+  if (log.phase === 'conversation:context:request') return '历史对话上下文开始压缩';
+  if (log.phase === 'conversation:context:response') return '历史对话上下文压缩完成';
+  if (log.phase === 'conversation:context:error') return '历史对话上下文压缩失败';
+  return '';
 }
 
 function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
@@ -470,11 +621,33 @@ function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
   const parsed = parseJsonObjectText(log.details);
   const isAiRequestLog = log.phase === 'ai:runtime:request';
   const isAiResponseLog = log.phase === 'ai:runtime:response' || log.phase === 'ai:runtime:object';
-  if (!parsed || (!isAiRequestLog && !isAiResponseLog)) {
-    return <pre>{log.details}</pre>;
-  }
-  const requestPayload = isAiRequestLog ? aiLogRequestPayload(parsed) : '';
-  const responsePayload = isAiResponseLog ? aiLogResponsePayload(parsed) : '';
+  const isConversationSummaryRequest = log.phase === 'conversation:context:request';
+  const isConversationSummaryResponse = log.phase === 'conversation:context:response';
+  if (!parsed) return null;
+  const requestPayload = isAiRequestLog
+    ? aiLogRequestPayload(parsed)
+    : isConversationSummaryRequest
+      ? formatToolPayload({
+          provider: parsed.provider,
+          model: parsed.model,
+          estimatedTokens: parsed.estimatedTokens,
+          thresholdTokens: parsed.thresholdTokens,
+          prompt: parsed.prompt,
+        })
+      : '';
+  const responsePayload = isAiResponseLog
+    ? aiLogResponsePayload(parsed)
+    : isConversationSummaryResponse
+      ? formatToolPayload({
+          provider: parsed.provider,
+          model: parsed.model,
+          estimatedTokensBefore: parsed.estimatedTokensBefore,
+          estimatedTokensAfter: parsed.estimatedTokensAfter,
+          thresholdTokens: parsed.thresholdTokens,
+          context: parsed.context,
+        })
+      : '';
+  if (!requestPayload && !responsePayload) return null;
   return (
     <div className="browser-chat-log-details">
       {requestPayload ? (
@@ -489,10 +662,6 @@ function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
           <pre>{responsePayload}</pre>
         </section>
       ) : null}
-      <details className="browser-chat-log-raw">
-        <summary>完整日志 JSON</summary>
-        <pre>{log.details}</pre>
-      </details>
     </div>
   );
 }
@@ -871,212 +1040,14 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   );
 });
 
-const BrowserChatAiOutputOverview = memo(function BrowserChatAiOutputOverview({
-  output,
-}: {
-  output: BrowserChatAiOutputView;
-}) {
-  if (!output.reasoning.length && !output.tools.length && !output.texts.length) return null;
-  return (
-    <div className="browser-chat-ai-output-overview">
-      {output.reasoning.length ? (
-        <details className="browser-chat-ai-output-card reasoning">
-          <summary>
-            <Sparkles size={13} />
-            <span>思维链</span>
-            <small>{compactText(output.reasoning[0], 96)}</small>
-          </summary>
-          <div>
-            {output.reasoning.map((item, index) => (
-              <p key={`${index}-${item.slice(0, 16)}`}>{item}</p>
-            ))}
-          </div>
-        </details>
-      ) : null}
-      {output.tools.length ? (
-        <details className="browser-chat-ai-output-card tools">
-          <summary>
-            <SquareTerminal size={13} />
-            <span>工具调用</span>
-            <small>{output.tools.length} 个调用</small>
-          </summary>
-          <div className="browser-chat-ai-output-tool-list">
-            {output.tools.map((tool, index) => {
-              const label = browserChatToolLabel(tool.name, (value) => value);
-              const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
-              return (
-                <span className="browser-chat-ai-output-tool" key={`${tool.id}-${index}`}>
-                  <span className="browser-chat-tool-icon" aria-hidden="true">
-                    <BrowserChatToolIcon name={tool.name} />
-                  </span>
-                  <span>
-                    <b>{label}</b>
-                    {meta ? <small>{compactText(meta, 120)}</small> : null}
-                  </span>
-                </span>
-              );
-            })}
-          </div>
-        </details>
-      ) : null}
-      {output.texts.length ? (
-        <div className="browser-chat-ai-output-text">
-          {output.texts.map((text, index) => (
-            <BrowserChatMarkdown key={`${index}-${text.slice(0, 16)}`} markdown={text} />
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-});
-
-const BrowserChatAiCycle = memo(function BrowserChatAiCycle({
-  cycle,
-}: {
-  cycle: BrowserChatAiOutputCycle;
-}) {
-  const { output } = cycle;
-  if (!hasAiOutputView(output)) return null;
-  const firstTool = output.tools[0];
-  const firstToolLabel = firstTool ? browserChatToolLabel(firstTool.name, (value) => value) : '';
-  const firstToolMeta = firstTool ? browserChatToolMeta(firstTool.name, firstTool.input) || firstTool.reason : '';
-  return (
-    <div className="browser-chat-ai-cycle">
-      {output.reasoning.length ? (
-        <details className="browser-chat-ai-cycle-detail">
-          <summary className="browser-chat-tool-card browser-chat-ai-reasoning-card">
-            <span className="browser-chat-tool-icon" aria-hidden="true">
-              <Sparkles size={13} />
-            </span>
-            <span className="browser-chat-tool-content">
-              <span className="browser-chat-tool-label">
-                <span className="browser-chat-tool-name">思维链</span>
-              </span>
-              <small className="browser-chat-tool-meta">{compactText(output.reasoning[0], 130)}</small>
-            </span>
-          </summary>
-          <div className="browser-chat-ai-reasoning-body">
-            {output.reasoning.map((item, index) => (
-              <p key={`${index}-${item.slice(0, 16)}`}>{item}</p>
-            ))}
-          </div>
-        </details>
-      ) : null}
-      {output.tools.length ? (
-        <div className="browser-chat-ai-cycle-tools">
-          {output.tools.map((tool, index) => {
-            const label = browserChatToolLabel(tool.name, (value) => value);
-            const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
-            return (
-              <div className="browser-chat-tool-call" key={`${tool.id}-${index}`}>
-                <div className="browser-chat-tool-card browser-chat-ai-call-card" title={`${label}${meta ? ` - ${meta}` : ''}`}>
-                  <span className="browser-chat-tool-icon" aria-hidden="true">
-                    <BrowserChatToolIcon name={tool.name} />
-                  </span>
-                  <span className="browser-chat-tool-content">
-                    <span className="browser-chat-tool-label">
-                      <span className="browser-chat-tool-name">{label}</span>
-                    </span>
-                    {meta ? <small className="browser-chat-tool-meta">{compactText(meta, 150)}</small> : null}
-                  </span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      ) : null}
-      {output.texts.length ? (
-        <div className="browser-chat-ai-cycle-text">
-          {output.texts.map((text, index) => (
-            <BrowserChatMarkdown key={`${index}-${text.slice(0, 16)}`} markdown={text} />
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-});
-
-const BrowserChatAiCycleCompact = memo(function BrowserChatAiCycleCompact({
-  cycle,
-}: {
-  cycle: BrowserChatAiOutputCycle;
-}) {
-  const { output } = cycle;
-  if (!hasAiOutputView(output)) return null;
-  const firstTool = output.tools[0];
-  const firstToolLabel = firstTool ? browserChatToolLabel(firstTool.name, (value) => value) : '';
-  const firstToolMeta = firstTool ? browserChatToolMeta(firstTool.name, firstTool.input) || firstTool.reason : '';
-  return (
-    <div className="browser-chat-ai-cycle">
-      {output.reasoning.length ? (
-        <details className="browser-chat-ai-tool-collapse">
-          <summary className="browser-chat-ai-collapse-summary">
-            <Sparkles size={14} />
-            <span>思维链</span>
-            <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
-          </summary>
-          <div className="browser-chat-ai-reasoning-text">
-            {output.reasoning.map((item, index) => (
-              <p key={`${index}-${item.slice(0, 16)}`}>{item}</p>
-            ))}
-          </div>
-        </details>
-      ) : null}
-      {output.tools.length ? (
-        <details className="browser-chat-ai-tool-collapse">
-          <summary className="browser-chat-tool-card browser-chat-ai-tool-summary-card">
-            <span className="browser-chat-tool-icon" aria-hidden="true">
-              <SquareTerminal size={13} />
-            </span>
-            <span className="browser-chat-tool-content">
-              <span className="browser-chat-tool-label">
-                <span className="browser-chat-tool-name">工具调用</span>
-                <span className="browser-chat-tool-state">{output.tools.length} 个</span>
-              </span>
-              <small className="browser-chat-tool-meta">
-                {compactText([firstToolLabel, firstToolMeta].filter(Boolean).join(': '), 150)}
-              </small>
-            </span>
-            <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
-          </summary>
-          <div className="browser-chat-ai-cycle-tools">
-            {output.tools.map((tool, index) => {
-              const label = browserChatToolLabel(tool.name, (value) => value);
-              const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
-              return (
-                <div className="browser-chat-tool-call" key={`${tool.id}-${index}`}>
-                  <div className="browser-chat-tool-card browser-chat-ai-call-card" title={`${label}${meta ? ` - ${meta}` : ''}`}>
-                    <span className="browser-chat-tool-icon" aria-hidden="true">
-                      <BrowserChatToolIcon name={tool.name} />
-                    </span>
-                    <span className="browser-chat-tool-content">
-                      <span className="browser-chat-tool-label">
-                        <span className="browser-chat-tool-name">{label}</span>
-                      </span>
-                      {meta ? <small className="browser-chat-tool-meta">{compactText(meta, 150)}</small> : null}
-                    </span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </details>
-      ) : null}
-      {output.texts.length ? (
-        <div className="browser-chat-ai-cycle-text">
-          {output.texts.map((text, index) => (
-            <BrowserChatMarkdown key={`${index}-${text.slice(0, 16)}`} markdown={text} />
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-});
-
 const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   cycle,
+  onSelectTool,
+  toolDetails,
 }: {
   cycle: BrowserChatAiOutputCycle;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
+  toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
   const { output } = cycle;
   if (!hasAiOutputView(output)) return null;
@@ -1112,19 +1083,37 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
             {output.tools.map((tool, index) => {
               const label = browserChatToolLabel(tool.name, (value) => value);
               const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
+              const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+              const stateClass = toolDetail?.tool.ok === false ? ' is-failed' : toolDetail?.tool.ok === undefined ? ' is-running' : '';
+              const card = (
+                <>
+                  <span className="browser-chat-tool-icon" aria-hidden="true">
+                    <BrowserChatToolIcon name={tool.name} />
+                  </span>
+                  <span className="browser-chat-tool-content">
+                    <span className="browser-chat-tool-label">
+                      <span className="browser-chat-tool-name">{label}</span>
+                    </span>
+                    {meta ? <small className="browser-chat-tool-meta">{compactText(meta, 150)}</small> : null}
+                  </span>
+                </>
+              );
               return (
                 <div className="browser-chat-tool-call" key={`${tool.id}-${index}`}>
-                  <div className="browser-chat-tool-card browser-chat-ai-call-card" title={`${label}${meta ? ` - ${meta}` : ''}`}>
-                    <span className="browser-chat-tool-icon" aria-hidden="true">
-                      <BrowserChatToolIcon name={tool.name} />
-                    </span>
-                    <span className="browser-chat-tool-content">
-                      <span className="browser-chat-tool-label">
-                        <span className="browser-chat-tool-name">{label}</span>
-                      </span>
-                      {meta ? <small className="browser-chat-tool-meta">{compactText(meta, 150)}</small> : null}
-                    </span>
-                  </div>
+                  {toolDetail ? (
+                    <button
+                      className={`browser-chat-tool-card browser-chat-ai-call-card${stateClass}`}
+                      onClick={() => onSelectTool(toolDetail)}
+                      title={`${label}${meta ? ` - ${meta}` : ''}`}
+                      type="button"
+                    >
+                      {card}
+                    </button>
+                  ) : (
+                    <div className="browser-chat-tool-card browser-chat-ai-call-card" title={`${label}${meta ? ` - ${meta}` : ''}`}>
+                      {card}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -1160,6 +1149,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const finalText = stringFromUnknown(message.content);
   const aiOutputCycles = useMemo(() => aiOutputCyclesFromLogs(logs), [logs]);
   const aiOutputTextSet = useMemo(() => aiOutputTextSetFromCycles(aiOutputCycles), [aiOutputCycles]);
+  const aiCycleToolDetails = useMemo(() => buildAiCycleToolDetailMap(aiOutputCycles, steps), [aiOutputCycles, steps]);
   const seenTexts = new Set<string>();
   const toolCount = steps.reduce((count, step) => count + (step.tools || []).length, 0);
   const failedToolCount = steps.reduce((count, step) => count + (step.tools || []).filter((tool) => tool.ok === false).length, 0);
@@ -1196,7 +1186,12 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   return (
     <div className="browser-chat-agent-timeline">
       {aiOutputCycles.map((cycle) => (
-        <BrowserChatAiCycleLine cycle={cycle} key={cycle.id} />
+        <BrowserChatAiCycleLine
+          cycle={cycle}
+          key={cycle.id}
+          onSelectTool={onSelectTool}
+          toolDetails={aiCycleToolDetails}
+        />
       ))}
       {shouldShowStepTimeline ? (
         <div className="browser-chat-tool-stack">
@@ -1282,9 +1277,6 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
 
   return (
     <article className={`browser-chat-message ${item.role}`}>
-      {/* <div className="browser-chat-avatar">
-        {item.role === 'user' ? <User size={15} /> : <Bot size={15} />}
-      </div> */}
       <div>
         {item.role === 'assistant' ? (
           <>
@@ -1535,6 +1527,27 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     if (editorRef.current) editorRef.current.innerHTML = '';
   }, [resetToken]);
 
+  const editorPlainText = useCallback((root: HTMLElement | null) => {
+    if (!root) return '';
+    const walk = (node: Node): string => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
+      if (!(node instanceof HTMLElement)) return '';
+      if (node.dataset.skillId) return ' ';
+      if (node.tagName === 'BR') return '\n';
+      return Array.from(node.childNodes).map(walk).join('');
+    };
+    return Array.from(root.childNodes).map(walk).join('').replace(/\u00A0/g, ' ');
+  }, []);
+
+  const syncEditorState = useCallback(() => {
+    const editor = editorRef.current;
+    const skillIds = editor
+      ? Array.from(editor.querySelectorAll<HTMLElement>('[data-skill-id]')).map((node) => node.dataset.skillId || '').filter(Boolean)
+      : [];
+    setDraft(editorPlainText(editor));
+    setSelectedSkillIds(Array.from(new Set(skillIds)));
+  }, [editorPlainText]);
+
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor || typeof MutationObserver === 'undefined') return undefined;
@@ -1551,7 +1564,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
       if (frame) cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, []);
+  }, [syncEditorState]);
 
   useEffect(() => {
     const readySkillIds = new Set(availableSkills.filter((skill) => skill.status === 'ready').map((skill) => skill.id));
@@ -1564,7 +1577,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     });
     if (removed) syncEditorState();
     setSelectedSkillIds((current) => current.filter((skillId) => readySkillIds.has(skillId)));
-  }, [availableSkills]);
+  }, [availableSkills, syncEditorState]);
 
   const selectedSkills = useMemo(() => (
     selectedSkillIds
@@ -1622,27 +1635,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     editorRef.current?.querySelectorAll<HTMLElement>(`[data-skill-id="${CSS.escape(skillId)}"]`).forEach((node) => node.remove());
     setSelectedSkillIds((current) => current.filter((id) => id !== skillId));
     syncEditorState();
-  }
-
-  function editorPlainText(root: HTMLElement | null) {
-    if (!root) return '';
-    const walk = (node: Node): string => {
-      if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
-      if (!(node instanceof HTMLElement)) return '';
-      if (node.dataset.skillId) return ' ';
-      if (node.tagName === 'BR') return '\n';
-      return Array.from(node.childNodes).map(walk).join('');
-    };
-    return Array.from(root.childNodes).map(walk).join('').replace(/\u00A0/g, ' ');
-  }
-
-  function syncEditorState() {
-    const editor = editorRef.current;
-    const skillIds = editor
-      ? Array.from(editor.querySelectorAll<HTMLElement>('[data-skill-id]')).map((node) => node.dataset.skillId || '').filter(Boolean)
-      : [];
-    setDraft(editorPlainText(editor));
-    setSelectedSkillIds(Array.from(new Set(skillIds)));
   }
 
   function isSkillToken(node: Node | null): node is HTMLElement {
@@ -2082,7 +2074,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   sessionId?: string;
 }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
-  const embeddedBrowserSyncRef = useRef({ boundsKey: '', groupId: '', visible: false });
+  const embeddedBrowserSyncRef = useRef({ boundsKey: '', groupId: '', sessionId: '', visible: false });
   const draggingGroupIdRef = useRef('');
   const draggingTabIdRef = useRef('');
   const [bridgeAvailable, setBridgeAvailable] = useState(false);
@@ -2143,15 +2135,15 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     try {
       if (!visible) {
         if (!previous.visible) return;
-        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', visible: false };
+        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
         const result = await bridge.setVisible({ visible: false });
         setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
         if (result.ok) applyEmbeddedBrowserState(result);
         return;
       }
 
-      if (!previous.visible || previous.groupId !== groupId) {
-        embeddedBrowserSyncRef.current = { boundsKey, groupId, visible: true };
+      if (!previous.visible || previous.groupId !== groupId || previous.sessionId !== (sessionId || '')) {
+        embeddedBrowserSyncRef.current = { boundsKey, groupId, sessionId: sessionId || '', visible: true };
         const result = await bridge.setVisible({
           bounds,
           createIfMissing: false,
@@ -2165,7 +2157,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       }
 
       if (bounds && previous.boundsKey !== boundsKey) {
-        embeddedBrowserSyncRef.current = { boundsKey, groupId, visible: true };
+        embeddedBrowserSyncRef.current = { boundsKey, groupId, sessionId: sessionId || '', visible: true };
         const result = await bridge.setBounds(bounds);
         setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
       }
@@ -2179,7 +2171,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const viewport = viewportRef.current;
     if (!enabled || !active || !viewport) {
       return () => {
-        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', visible: false };
+        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
         void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
       };
     }
@@ -2196,7 +2188,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       resizeObserver.disconnect();
       window.removeEventListener('resize', update);
       window.removeEventListener('scroll', update, true);
-      embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', visible: false };
+      embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
       void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
     };
   }, [active, enabled, syncEmbeddedBrowser]);
@@ -2256,7 +2248,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   async function createEmbeddedBrowserTab(group: EmbeddedBrowserGroup) {
     const bridge = window.webPilotEmbeddedBrowser;
     if (!bridge) return;
-    const groupSessionId = group.sessionId || (group.id.startsWith('session:') ? group.id.slice('session:'.length) : sessionId);
+    const groupSessionId = embeddedSessionIdFromGroupId(group.id) || group.sessionId || sessionId;
     const result = await bridge.createTab({ groupId: group.id, sessionId: groupSessionId }).catch((error: unknown) => ({
       ok: false,
       error: error instanceof Error ? error.message : '创建嵌入浏览器标签失败',
@@ -2543,7 +2535,7 @@ export function BrowserChatWorkspace({
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [embeddedBrowserEnabled, setEmbeddedBrowserEnabled] = useState(false);
   const [embeddedChatWidth, setEmbeddedChatWidth] = useState(420);
-  const [embeddedChatResizing, setEmbeddedChatResizing] = useState(false);
+  const [, setEmbeddedChatResizing] = useState(false);
   const [historyTooltipActive, setHistoryTooltipActive] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
@@ -2581,7 +2573,7 @@ export function BrowserChatWorkspace({
   );
   const logDialogEntries = useMemo(() => {
     if (!logDialogMessage) return [];
-    return browserChatLogsForMessage(logDialogMessage, logIndex);
+    return browserChatLogsForMessage(logDialogMessage, logIndex).filter(visibleExecutionLog);
   }, [logDialogMessage, logIndex]);
   const previewAttachment = useCallback((attachment: BrowserChatAttachment) => {
     setImagePreview(attachment);
@@ -2853,13 +2845,21 @@ export function BrowserChatWorkspace({
     if (!embeddedBrowserEnabled || typeof window === 'undefined') return;
     const bridge = window.webPilotEmbeddedBrowser;
     if (!bridge) return;
+    const groupId = embeddedGroupIdForSession(sessionId);
     const result = await bridge.setVisible({
       createIfMissing: true,
-      groupId: embeddedGroupIdForSession(sessionId),
+      groupId,
       sessionId,
       visible: true,
     });
     if (!result.ok) throw new Error(result.error || '嵌入浏览器标签创建失败');
+    const groupTabs = [
+      ...(result.groups?.find((group) => group.id === groupId)?.tabs || []),
+      ...(result.tabs || []).filter((tab) => tab.groupId === groupId),
+    ];
+    if (groupTabs.length) return;
+    const created = await bridge.createTab({ groupId, sessionId });
+    if (!created.ok) throw new Error(created.error || '嵌入浏览器标签创建失败');
   }
 
   async function uploadChatImages(files: FileList | File[]) {
@@ -3125,11 +3125,21 @@ export function BrowserChatWorkspace({
 
   async function startNewConversation() {
     setActiveView('chat');
-    if (busy) return;
+    if (busy || loadingSessionId) return;
     setError('');
     setComposerResetToken((current) => current + 1);
     setAttachments([]);
     setSession(null);
+    if (!embeddedBrowserEnabled) return;
+    setBusy(true);
+    try {
+      const active = await createSession();
+      await ensureEmbeddedBrowserSessionTab(active.id);
+    } catch (newConversationError) {
+      setError(newConversationError instanceof Error ? newConversationError.message : '创建新对话失败');
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function loadSession(sessionId: string) {
@@ -3328,7 +3338,7 @@ export function BrowserChatWorkspace({
       )}
 
       <div className="browser-chat-composer-shell">
-        {error || session?.error ? <div className="error">{error || session?.error}</div> : null}
+        {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
         <BrowserChatComposer
           attachments={attachments}
           availableSkills={skills}
@@ -3496,7 +3506,7 @@ export function BrowserChatWorkspace({
             )}
 
             <div className="browser-chat-composer-shell">
-              {error || session?.error ? <div className="error">{error || session?.error}</div> : null}
+              {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
               <BrowserChatComposer
                 attachments={attachments}
                 availableSkills={skills}
@@ -3623,22 +3633,7 @@ export function BrowserChatWorkspace({
               </button>
             </header>
             {logDialogEntries.length ? (
-              <ol className="browser-chat-log-modal-list">
-                {logDialogEntries.map((log) => (
-                  <li key={log.id}>
-                    <span>{phaseLabel(log.phase)}</span>
-                    <div>
-                      <strong>{log.message}</strong>
-                      <small>
-                        {formatLogTime(log.time)}
-                        {log.stepIndex ? ` · 步骤 ${log.stepIndex}` : ''}
-                        {typeof log.elapsedMs === 'number' ? ` · ${log.elapsedMs}ms` : ''}
-                      </small>
-                      <BrowserChatLogDetails log={log} />
-                    </div>
-                  </li>
-                ))}
-              </ol>
+              <BrowserChatVirtualLogList entries={logDialogEntries} />
             ) : (
               <p className="browser-chat-log-empty">暂无日志</p>
             )}

@@ -34,7 +34,6 @@ type RefreshWebSocketState = {
 };
 
 declare global {
-  // eslint-disable-next-line no-var
   var __aiWebTestRefreshWebSocketState: RefreshWebSocketState | undefined;
 }
 

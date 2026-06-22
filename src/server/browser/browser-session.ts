@@ -30,6 +30,35 @@ function positiveIntegerEnv(key: string) {
   return Math.floor(value);
 }
 
+const DEFAULT_SCREENSHOT_TIMEOUT_MS = 15000;
+const MIN_SCREENSHOT_TIMEOUT_MS = 1000;
+const MAX_SCREENSHOT_TIMEOUT_MS = 120000;
+const SCREENSHOT_FAILURE_CONTEXT_TIMEOUT_MS = 2000;
+
+function boundedPositiveIntegerEnv(key: string, fallback: number, min: number, max: number) {
+  const value = positiveIntegerEnv(key) ?? fallback;
+  return Math.min(Math.max(value, min), max);
+}
+
+function compactDiagnosticText(value: string, maxLength: number) {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}...`;
+}
+
+function unknownErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function stringifyDiagnosticValue(value: unknown) {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 export type BrowserSessionMode = 'dom' | 'visual-markers';
 
 export type BrowserSessionOptions = {
@@ -2343,6 +2372,7 @@ export class BrowserSession {
       : configuredUserDataDir;
     const tabGrouperEnabled = sessionTabGrouperEnabled(headless);
     const useSharedBrowserTabs = sharedBrowserTabsEnabled() && !electronEmbeddedBrowserEnabled() && !browserProfileKey;
+    const useSessionGroupPageSelection = tabGrouperEnabled || Boolean(browserProfileKey);
     const autoTabGroupProfileKey = browserProfileKey || (useSharedBrowserTabs ? 'shared' : this.pageGroupId);
     const autoTabGroupProfileDir = tabGrouperEnabled && !cdpEndpoint && !requestedUserDataDir
       ? sessionTabGrouperProfileDir(autoTabGroupProfileKey)
@@ -2382,10 +2412,7 @@ export class BrowserSession {
       this.browser = lease.browser;
       this.context = lease.context;
       this.releaseSharedBrowser = lease.release;
-      await this.prepareContext(lease.context, { claimPages: false });
-      this.installOwnedPageDiscovery(lease.context);
-      const page = await this.findInitialSharedPage(lease.context);
-      await page.bringToFront().catch(() => undefined);
+      await this.selectInitialSessionGroupPage(lease.context);
       return;
     }
 
@@ -2407,8 +2434,12 @@ export class BrowserSession {
         }
         throw new Error('Electron embedded browser tab for this session is not ready.');
       }
-      await this.prepareContext(context);
-      await this.selectInitialPage(context);
+      if (useSessionGroupPageSelection) {
+        await this.selectInitialSessionGroupPage(context);
+      } else {
+        await this.prepareContext(context);
+        await this.selectInitialPage(context);
+      }
       return;
     }
 
@@ -2424,8 +2455,12 @@ export class BrowserSession {
         this.browserOwnership = 'connected';
         this.browser = connected.browser;
         this.context = connected.context;
-        await this.prepareContext(connected.context);
-        await this.selectInitialPage(connected.context);
+        if (useSessionGroupPageSelection) {
+          await this.selectInitialSessionGroupPage(connected.context);
+        } else {
+          await this.prepareContext(connected.context);
+          await this.selectInitialPage(connected.context);
+        }
         return;
       }
       this.browserOwnership = 'persistent';
@@ -2441,14 +2476,22 @@ export class BrowserSession {
         this.browserOwnership = 'connected';
         this.browser = connected.browser;
         this.context = connected.context;
-        await this.prepareContext(connected.context);
-        await this.selectInitialPage(connected.context);
+        if (useSessionGroupPageSelection) {
+          await this.selectInitialSessionGroupPage(connected.context);
+        } else {
+          await this.prepareContext(connected.context);
+          await this.selectInitialPage(connected.context);
+        }
         return;
       }
       this.context = context;
       this.browser = context.browser() || undefined;
-      await this.prepareContext(context);
-      await this.selectInitialPage(context);
+      if (useSessionGroupPageSelection) {
+        await this.selectInitialSessionGroupPage(context);
+      } else {
+        await this.prepareContext(context);
+        await this.selectInitialPage(context);
+      }
       return;
     }
 
@@ -2458,6 +2501,14 @@ export class BrowserSession {
     this.context = context;
     await this.prepareContext(context);
     this.claimPage(await context.newPage());
+  }
+
+  private async selectInitialSessionGroupPage(context: BrowserContext) {
+    await this.prepareContext(context, { claimPages: false });
+    this.installOwnedPageDiscovery(context);
+    const page = await this.findInitialSharedPage(context);
+    await page.bringToFront().catch(() => undefined);
+    return page;
   }
 
   private async findInitialSharedPage(context: BrowserContext) {
@@ -2868,7 +2919,7 @@ export class BrowserSession {
         format: 'png',
       });
     } catch (error) {
-      (client as any).off?.('Page.screencastFrame', onFrame);
+      client.off('Page.screencastFrame', onFrame);
       await client.detach().catch(() => undefined);
       throw error;
     }
@@ -2876,7 +2927,7 @@ export class BrowserSession {
       stop: async () => {
         if (stopped) return;
         stopped = true;
-        (client as any).off?.('Page.screencastFrame', onFrame);
+        client.off('Page.screencastFrame', onFrame);
         await client.send('Page.stopScreencast').catch(() => undefined);
         await client.detach().catch(() => undefined);
       },
@@ -3098,6 +3149,65 @@ export class BrowserSession {
     }).catch(() => [] as Array<{ label: string; valueLength: number; filled: boolean }>);
   }
 
+  private async buildScreenshotFailureError(error: unknown, details: {
+    phase: string;
+    capture: ScreenshotCaptureMode;
+    timeoutMs: number;
+    filePath: string;
+  }) {
+    const diagnosticLines = await this.collectScreenshotFailureDiagnostics(details);
+    const message = `${unknownErrorMessage(error)}\n\nScreenshot diagnostics:\n${diagnosticLines.join('\n')}`;
+    const enriched = new Error(message);
+    if (error instanceof Error) {
+      enriched.name = error.name;
+    }
+    return enriched;
+  }
+
+  private async collectScreenshotFailureDiagnostics(details: {
+    phase: string;
+    capture: ScreenshotCaptureMode;
+    timeoutMs: number;
+    filePath: string;
+  }) {
+    const title = await this.activePage.title().catch((error) => `<unavailable: ${unknownErrorMessage(error)}>`);
+    const viewport = this.activePage.viewportSize();
+    const pageContext = await Promise.race([
+      this.getPageContext({
+        includeDomTree: false,
+        includeInteractiveCandidates: false,
+        includeManualVerification: false,
+        includeText: true,
+        textMaxChars: 1000,
+      }).then((context) => ({
+        url: context.url,
+        title: context.title,
+        textLength: context.textLength,
+        textSample: compactDiagnosticText(context.text, 700),
+        viewport: context.viewport,
+        pageScrollState: context.pageScrollState,
+        tabs: context.tabs.slice(0, 8),
+      })),
+      new Promise<{ error: string }>((resolve) => {
+        setTimeout(() => {
+          resolve({ error: `Timed out collecting pageContext after ${SCREENSHOT_FAILURE_CONTEXT_TIMEOUT_MS}ms` });
+        }, SCREENSHOT_FAILURE_CONTEXT_TIMEOUT_MS);
+      }),
+    ]).catch((contextError) => ({ error: unknownErrorMessage(contextError) }));
+
+    return [
+      `phase=${details.phase}`,
+      `mode=${this.mode}`,
+      `capture=${details.capture}`,
+      `timeoutMs=${details.timeoutMs}`,
+      `filePath=${details.filePath}`,
+      `url=${this.activePage.url()}`,
+      `title=${title}`,
+      `viewport=${viewport ? `${viewport.width}x${viewport.height}` : 'unknown'}`,
+      `pageContext=${stringifyDiagnosticValue(pageContext)}`,
+    ];
+  }
+
   // 截取当前 viewport。默认保留干净原图，并把视觉标识保存为单独 marker map。
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
     const stabilizeMs = Number(process.env.SCREENSHOT_STABILIZE_MS || 1000);
@@ -3139,11 +3249,19 @@ export class BrowserSession {
     const separateMarkerMap = candidateLabelsEnabled && shouldUseSeparateMarkerMap();
     await this.removeCandidateOverlay();
     if (phase === 'before' || String(phase).startsWith('visual-')) await this.removeClickMarker();
+    const screenshotTimeoutMs = boundedPositiveIntegerEnv(
+      'SCREENSHOT_TIMEOUT_MS',
+      DEFAULT_SCREENSHOT_TIMEOUT_MS,
+      MIN_SCREENSHOT_TIMEOUT_MS,
+      MAX_SCREENSHOT_TIMEOUT_MS,
+    );
     const screenshotOptions = {
+      animations: 'disabled' as const,
+      caret: 'hide' as const,
       path: filePath,
       fullPage: capture === 'fullPage',
       scale: 'css' as const,
-      timeout: 15000,
+      timeout: screenshotTimeoutMs,
     };
     if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
       const originalFilePath = path.join(dir, `step-${stepIndex}-${phase}-original.png`);
@@ -3159,6 +3277,13 @@ export class BrowserSession {
     }
     try {
       await this.activePage.screenshot(screenshotOptions);
+    } catch (error) {
+      throw await this.buildScreenshotFailureError(error, {
+        phase: String(phase),
+        capture,
+        timeoutMs: screenshotTimeoutMs,
+        filePath,
+      });
     } finally {
       if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
         await this.removeCandidateOverlay();
@@ -3170,6 +3295,13 @@ export class BrowserSession {
       try {
         await this.activePage.screenshot({ ...screenshotOptions, path: markerFilePath });
         this.lastCandidateMarkerScreenshotPath = markerFilePath;
+      } catch (error) {
+        throw await this.buildScreenshotFailureError(error, {
+          phase: `${String(phase)}-markers`,
+          capture,
+          timeoutMs: screenshotTimeoutMs,
+          filePath: markerFilePath,
+        });
       } finally {
         await this.removeCandidateOverlay();
       }
