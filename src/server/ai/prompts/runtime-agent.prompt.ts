@@ -101,9 +101,9 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
     '- In message/reason/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot ids/file names, or tool input JSON.',
     visualMode ? '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.' : '',
-    domMode ? '- DOM mode: use getPageState for a fresh full DOM snapshot plus full page text, including accessible iframe and shadow DOM content. Use getDomNodeText(id) for complete text under a returned DOM node; use clickDomNode(id,text?), hoverDomNode(id), doubleClickDomNode(id), or dragDomNode(fromId,toId) with fresh numeric node_id values.' : '',
+    domMode ? '- DOM mode: use getPageState for hierarchical page text and hierarchical visible interactive elements without coordinates. Use findByText then clickLocator for normal text-accessible targets. Use getDomNodeText/clickDomNode/hoverDomNode/doubleClickDomNode/dragDomNode only when a current tool result actually exposes fresh numeric node_id values.' : '',
     '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
-    '- For getDomNodeText/clickDomNode/hoverDomNode/doubleClickDomNode, put the fresh DOM numeric node_id in params.id. For dragDomNode, put fresh DOM numeric node_ids in params.fromId and params.toId. Numeric ids may be copied with or without square brackets.',
+    '- For readObservation, put params.type as text or interactive when choosing which processed saved observation view to read. Raw HTML is not available through readObservation. For getDomNodeText/clickDomNode/hoverDomNode/doubleClickDomNode, put a fresh numeric node_id in params.id only when one is available. For dragDomNode, put fresh numeric node_ids in params.fromId and params.toId.',
     allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
     allowedTypes.includes('generateMarkdownFile') ? '- For generateMarkdownFile, put the complete Markdown document in params.content and the desired file name in params.fileName.' : '',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
@@ -152,12 +152,12 @@ export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
     '',
     'Agent Loop / prepareStep context:',
     domMode
-      ? '- Current turn delta: use the latest getPageState observation for fresh node_ids/text; RunState.nextObjective guides the goal only.'
+      ? '- Current turn delta: use the latest getPageState hierarchical text/interactive observation; RunState.nextObjective guides the goal only.'
       : '- Current turn delta: use the latest getPageState screenshot observation/marker map for actionable ids; RunState.nextObjective guides the goal only.',
     domMode
       ? '- DOM observations are explicit tool results. Call getPageState when the current DOM/page state may be stale.'
       : '- Visual observations are explicit getPageState messages. Historical screenshot ids remain context only.',
-    '- If a recent tool result saved a large output as observationId=..., call readObservation/searchObservation for omitted details instead of repeating the heavy tool.',
+    '- If a recent tool result saved a large output as observationId=..., call readObservation with type="text" or "interactive" for omitted processed details instead of repeating the heavy tool.',
     domMode
       ? ''
       : '- Visual image budget: current screenshot/marker map is the actionable image; selected reference images are comparison context only and must be requested deliberately.',

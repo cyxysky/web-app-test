@@ -51,7 +51,7 @@ import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/componen
 import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
 import type { SettingsTab } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
-import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
+import { domTreeFromToolCall, fullDomSnapshotFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
@@ -110,6 +110,8 @@ type BrowserChatToolConfirmation = {
   prompt: string;
   requestedAt: string;
 };
+
+type BrowserChatToolConfirmationAction = 'confirm' | 'cancel';
 
 type BrowserChatSession = {
   id: string;
@@ -1051,15 +1053,19 @@ function BrowserChatToolUserActionTag({ action }: { action?: ReturnType<typeof t
 
 const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirmationActions({
   pending,
+  resolvingConfirmationAction,
   resolvingConfirmationId,
   onResolveToolConfirmation,
 }: {
   pending?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
-  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
 }) {
   if (!pending || !onResolveToolConfirmation) return null;
   const resolving = resolvingConfirmationId === pending.id;
+  const resolvingConfirm = resolving && resolvingConfirmationAction === 'confirm';
+  const resolvingCancel = resolving && resolvingConfirmationAction === 'cancel';
   return (
     <div className="browser-chat-tool-confirmation" role="group" aria-label="工具调用确认">
       <span>{pending.prompt}</span>
@@ -1070,8 +1076,8 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
           onClick={() => void onResolveToolConfirmation(pending.id, 'confirm')}
           type="button"
         >
-          {resolving ? <Loader2 className="spin" size={13} /> : <BadgeCheck size={13} />}
-          确认
+          {resolvingConfirm ? <Loader2 className="spin" size={13} /> : <BadgeCheck size={13} />}
+          {resolvingConfirm ? '确认中' : '确认'}
         </button>
         <button
           className="browser-chat-tool-cancel"
@@ -1079,8 +1085,8 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
           onClick={() => void onResolveToolConfirmation(pending.id, 'cancel')}
           type="button"
         >
-          <X size={13} />
-          取消
+          {resolvingCancel ? <Loader2 className="spin" size={13} /> : <X size={13} />}
+          {resolvingCancel ? '取消中' : '取消'}
         </button>
       </div>
     </div>
@@ -1093,15 +1099,17 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   onResolveToolConfirmation,
   onlyPendingConfirmation = false,
   pendingToolConfirmation,
+  resolvingConfirmationAction,
   resolvingConfirmationId,
   running,
   step,
 }: {
   logs: BrowserChatLogRecord[];
   onSelectTool: (detail: BrowserChatToolDetail) => void;
-  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onlyPendingConfirmation?: boolean;
   pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   running: boolean;
   step: StepExecutionResult;
@@ -1172,6 +1180,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
             </button>
             <BrowserChatToolConfirmationActions
               pending={pendingConfirmation}
+              resolvingConfirmationAction={resolvingConfirmationAction}
               resolvingConfirmationId={resolvingConfirmationId}
               onResolveToolConfirmation={onResolveToolConfirmation}
             />
@@ -1188,14 +1197,16 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   onResolveToolConfirmation,
   onSelectTool,
   pendingToolConfirmation,
+  resolvingConfirmationAction,
   resolvingConfirmationId,
   toolDetails,
 }: {
   cycle: BrowserChatAiOutputCycle;
   logs: BrowserChatLogRecord[];
-  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
@@ -1283,6 +1294,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                   )}
                   <BrowserChatToolConfirmationActions
                     pending={pendingConfirmation}
+                    resolvingConfirmationAction={resolvingConfirmationAction}
                     resolvingConfirmationId={resolvingConfirmationId}
                     onResolveToolConfirmation={onResolveToolConfirmation}
                   />
@@ -1309,15 +1321,17 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   onResolveToolConfirmation,
   onSelectTool,
   pendingToolConfirmation,
+  resolvingConfirmationAction,
   resolvingConfirmationId,
   running,
   steps,
 }: {
   logs: BrowserChatLogRecord[];
   message: BrowserChatMessage;
-  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   running: boolean;
   steps: StepExecutionResult[];
@@ -1400,6 +1414,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
           onResolveToolConfirmation={onResolveToolConfirmation}
           onSelectTool={onSelectTool}
           pendingToolConfirmation={pendingToolConfirmation}
+          resolvingConfirmationAction={resolvingConfirmationAction}
           resolvingConfirmationId={resolvingConfirmationId}
           toolDetails={aiCycleToolDetails}
         />
@@ -1424,6 +1439,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                 onSelectTool={onSelectTool}
                 onlyPendingConfirmation={showPendingTimelineFallback}
                 pendingToolConfirmation={pendingToolConfirmation}
+                resolvingConfirmationAction={resolvingConfirmationAction}
                 resolvingConfirmationId={resolvingConfirmationId}
                 running={running && step.status === 'running'}
                 step={step}
@@ -1458,6 +1474,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   onShowLogs,
   onToggleExportSelection,
   pendingToolConfirmation,
+  resolvingConfirmationAction,
   resolvingConfirmationId,
   selectedForExport,
   sessionBusy,
@@ -1475,11 +1492,12 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   onExportMessage: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
-  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
   onToggleExportSelection: (messageId: string, selected: boolean) => void;
   pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   selectedForExport: boolean;
   sessionBusy: boolean;
@@ -1519,6 +1537,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
               onResolveToolConfirmation={onResolveToolConfirmation}
               onSelectTool={onSelectTool}
               pendingToolConfirmation={pendingToolConfirmation?.messageId === item.id ? pendingToolConfirmation : undefined}
+              resolvingConfirmationAction={resolvingConfirmationAction}
               resolvingConfirmationId={resolvingConfirmationId}
               running={operationRunning}
               steps={itemSteps}
@@ -1613,6 +1632,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   onShowLogs,
   onToggleExportSelection,
   pendingToolConfirmation,
+  resolvingConfirmationAction,
   resolvingConfirmationId,
   selectedExportMessageIdSet,
   selectedExportMessageIds,
@@ -1635,11 +1655,12 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   onExportMessage: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
-  onResolveToolConfirmation?: (confirmationId: string, action: 'confirm' | 'cancel') => void | Promise<void>;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
   onToggleExportSelection: (messageId: string, selected: boolean) => void;
   pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   selectedExportMessageIdSet: Set<string>;
   selectedExportMessageIds: string[];
@@ -1737,6 +1758,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             onShowLogs={onShowLogs}
             onToggleExportSelection={onToggleExportSelection}
             pendingToolConfirmation={pendingToolConfirmation}
+            resolvingConfirmationAction={resolvingConfirmationAction}
             resolvingConfirmationId={resolvingConfirmationId}
             selectedForExport={selectedExportMessageIdSet.has(item.id)}
             sessionBusy={sessionBusy}
@@ -2858,6 +2880,7 @@ export function BrowserChatWorkspace({
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
   const [toolDialog, setToolDialog] = useState<BrowserChatToolDetail | null>(null);
   const [resolvingConfirmationId, setResolvingConfirmationId] = useState<string | null>(null);
+  const [resolvingConfirmationAction, setResolvingConfirmationAction] = useState<BrowserChatToolConfirmationAction | null>(null);
   const [imagePreview, setImagePreview] = useState<BrowserChatAttachment | null>(null);
   const [error, setError] = useState('');
   const selectedRunningSession = session?.busy ? session : undefined;
@@ -2927,6 +2950,10 @@ export function BrowserChatWorkspace({
     && selectableRecentSessionIds.every((id) => selectedSessionIdSet.has(id));
   const toolDialogDomTree = useMemo(
     () => domTreeFromToolCall(toolDialog?.tool, toolDialog?.step.aiRequest),
+    [toolDialog],
+  );
+  const toolDialogFullDomSnapshot = useMemo(
+    () => fullDomSnapshotFromToolCall(toolDialog?.tool),
     [toolDialog],
   );
   const embeddedBrowserActive = embeddedBrowserEnabled && activeView === 'chat';
@@ -3259,10 +3286,11 @@ export function BrowserChatWorkspace({
     }
   }
 
-  async function resolveToolConfirmation(confirmationId: string, action: 'confirm' | 'cancel') {
+  async function resolveToolConfirmation(confirmationId: string, action: BrowserChatToolConfirmationAction) {
     const sessionId = session?.id;
     if (!sessionId || resolvingConfirmationId) return;
     setResolvingConfirmationId(confirmationId);
+    setResolvingConfirmationAction(action);
     setError('');
     try {
       const response = await fetch(`/api/browser-chat/${sessionId}/tool-confirmation`, {
@@ -3278,6 +3306,7 @@ export function BrowserChatWorkspace({
       setError(resolveError instanceof Error ? resolveError.message : '工具确认失败');
     } finally {
       setResolvingConfirmationId(null);
+      setResolvingConfirmationAction(null);
     }
   }
 
@@ -3662,6 +3691,7 @@ export function BrowserChatWorkspace({
           onShowLogs={showMessageLogs}
           onToggleExportSelection={toggleExportMessageSelection}
           pendingToolConfirmation={session?.pendingToolConfirmation}
+          resolvingConfirmationAction={resolvingConfirmationAction}
           resolvingConfirmationId={resolvingConfirmationId}
           selectedExportMessageIdSet={selectedExportMessageIdSet}
           selectedExportMessageIds={selectedExportMessageIds}
@@ -3836,6 +3866,7 @@ export function BrowserChatWorkspace({
                 onShowLogs={showMessageLogs}
                 onToggleExportSelection={toggleExportMessageSelection}
                 pendingToolConfirmation={session?.pendingToolConfirmation}
+                resolvingConfirmationAction={resolvingConfirmationAction}
                 resolvingConfirmationId={resolvingConfirmationId}
                 selectedExportMessageIdSet={selectedExportMessageIdSet}
                 selectedExportMessageIds={selectedExportMessageIds}
@@ -3915,9 +3946,23 @@ export function BrowserChatWorkspace({
               <h3>输出结果</h3>
               <pre>{formatToolPayload(toolDialog.tool.result)}</pre>
             </section>
+            {toolDialogFullDomSnapshot ? (
+              <section className="browser-chat-tool-detail-section is-full-dom">
+                <h3>
+                  完整 DOM 快照
+                  {typeof toolDialog.tool.debug?.fullDomSnapshotCharLength === 'number'
+                    ? `（${toolDialog.tool.debug.fullDomSnapshotCharLength} 字符）`
+                    : ''}
+                </h3>
+                <pre>{toolDialogFullDomSnapshot}</pre>
+              </section>
+            ) : null}
             {toolDialogDomTree ? (
               <section className="browser-chat-tool-detail-section">
-                <h3>模型看到的 DOM 树</h3>
+                <h3>
+                  模型上下文 DOM 树
+                  {toolDialog.tool.debug?.domSnapshotTruncatedForModel ? '（已按上下文限制截断）' : ''}
+                </h3>
                 <pre>{toolDialogDomTree}</pre>
               </section>
             ) : null}

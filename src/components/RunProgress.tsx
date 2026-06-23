@@ -9,7 +9,7 @@ import { MarkdownReport } from '@/components/MarkdownReport';
 import { RunMetaDrawer } from '@/components/RunMetaDrawer';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
 import { useI18n } from '@/i18n/I18nProvider';
-import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
+import { domTreeFromToolCall, fullDomSnapshotFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
@@ -1006,6 +1006,7 @@ function ToolCallCard({
   const screenshots = toolScreenshotItems(step, index, t);
   const preview = toolPreviewText(tool, input, screenshots.length);
   const domTree = domTreeFromToolCall(tool, step.aiRequest);
+  const fullDomSnapshot = fullDomSnapshotFromToolCall(tool);
 
   return (
     <li className={expanded ? 'expanded' : undefined}>
@@ -1039,9 +1040,18 @@ function ToolCallCard({
               <p>{tool.result}</p>
             </div>
           ) : null}
+          {fullDomSnapshot ? (
+            <details className="debug-details">
+              <summary>
+                完整 DOM 快照
+                {typeof tool.debug?.fullDomSnapshotCharLength === 'number' ? `（${tool.debug.fullDomSnapshotCharLength} 字符）` : ''}
+              </summary>
+              <pre>{fullDomSnapshot}</pre>
+            </details>
+          ) : null}
           {domTree ? (
             <details className="debug-details">
-              <summary>模型看到的 DOM 树</summary>
+              <summary>模型上下文 DOM 树{tool.debug?.domSnapshotTruncatedForModel ? '（已按上下文限制截断）' : ''}</summary>
               <pre>{domTree}</pre>
             </details>
           ) : null}
@@ -1567,6 +1577,7 @@ export function RunProgress({
         contextBefore: tool.contextBefore,
         contextAfter: tool.contextAfter,
         visualAfter: tool.visualAfter,
+        debug: tool.debug,
         desktopEvidence: tool.desktopEvidence,
         screenshots: tool.screenshots,
       };

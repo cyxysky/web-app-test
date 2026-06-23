@@ -7734,14 +7734,11 @@ select {
 
 .browser-chat-tool-confirmation {
   align-items: center;
-  background: var(--panel-soft);
-  border: 1px solid var(--border);
-  border-radius: 8px;
   color: var(--foreground);
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  max-width: min(100%, 620px);
+  max-width: 100%;
   padding: 8px;
 }
 
@@ -8015,6 +8012,11 @@ select {
   overflow: auto;
   padding: 10px;
   white-space: pre-wrap;
+}
+
+.browser-chat-tool-detail-section.is-full-dom pre {
+  max-height: min(900px, 70vh);
+  white-space: pre;
 }
 
 .browser-chat-tool-shot-list {

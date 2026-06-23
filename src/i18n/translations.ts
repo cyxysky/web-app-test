@@ -330,8 +330,6 @@ const en: Record<string, string> = {
   '操作后': 'After action',
   '操作前': 'Before action',
   '截图': 'Screenshot',
-  '视觉': 'Visual',
-  '操作模式': 'Operation mode',
   'DOM': 'DOM',
   '工作模式': 'Work mode',
   'DOM 模式工具': 'DOM mode tools',

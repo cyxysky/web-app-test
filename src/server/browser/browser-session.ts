@@ -80,9 +80,22 @@ function browserSessionModeFromEnv(): BrowserSessionMode {
   return 'visual-markers';
 }
 
+export type BrowserObservationType = 'text' | 'interactive';
+
+export type BrowserObservationViews = Partial<Record<BrowserObservationType, string>> & {
+  defaultType?: BrowserObservationType;
+};
+
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  observationViews?: BrowserObservationViews;
+  debug?: {
+    fullDomSnapshot?: string;
+    fullDomSnapshotCharLength?: number;
+    domSnapshotPromptCharLimit?: number;
+    domSnapshotTruncatedForModel?: boolean;
+  };
 };
 
 type BrowserBatchFillAction = {
@@ -149,6 +162,44 @@ type ScreenshotMetrics = {
   capture: ScreenshotCaptureMode;
 };
 
+type ScreenshotTimingStep = {
+  name: string;
+  elapsedMs: number;
+  skipped?: boolean;
+  count?: number;
+  path?: string;
+  error?: string;
+};
+
+type ScreenshotTiming = {
+  phase: string;
+  capture: ScreenshotCaptureMode;
+  totalMs: number;
+  path: string;
+  markerPath?: string;
+  originalPath?: string;
+  candidateCount: number;
+  scrollAreaCount: number;
+  candidateLabelsEnabled: boolean;
+  scrollAreaLabelsEnabled: boolean;
+  separateMarkerMap: boolean;
+  steps: ScreenshotTimingStep[];
+};
+
+function formatScreenshotTimingStep(step: ScreenshotTimingStep) {
+  const parts = [`${step.name}=${step.elapsedMs}ms`];
+  if (step.count !== undefined) parts.push(`count=${step.count}`);
+  if (step.skipped) parts.push('skip');
+  if (step.error) parts.push(`error=${step.error}`);
+  return parts.join(' ');
+}
+
+function formatScreenshotTimingSummary(timing?: ScreenshotTiming) {
+  if (!timing) return '';
+  const steps = timing.steps.map(formatScreenshotTimingStep).join(' | ');
+  return `screenshot timing: total=${timing.totalMs}ms, candidates=${timing.candidateCount}, scrollAreas=${timing.scrollAreaCount}; ${steps}`;
+}
+
 export type ScreenshotCaptureMode = 'viewport' | 'fullPage';
 
 type ScreenshotCaptureOptions = {
@@ -163,6 +214,8 @@ type InteractiveCandidate = {
   type?: string;
   name?: string;
   text?: string;
+  className?: string;
+  signals?: string[];
   nearbyText?: string;
   href?: string;
   host?: string;
@@ -426,6 +479,12 @@ type NativeTabGroupLookup = {
   tabs: NativeTabGroupPage[];
 };
 
+type NativeTabGroupActivation = {
+  ok: boolean;
+  tab?: NativeTabGroupPage;
+  lookup?: NativeTabGroupLookup;
+};
+
 type SharedBrowserLease = {
   browser?: Browser;
   context: BrowserContext;
@@ -684,6 +743,16 @@ function installAiBrowserPageRuntime() {
     return false;
   }
 
+  function hasPointerCursor(element: Element) {
+    const style = window.getComputedStyle(element);
+    if (!/\bpointer\b/i.test(style.cursor || '')) return false;
+    const parent = flatParentElement(element);
+    if (!parent) return true;
+    const parentStyle = window.getComputedStyle(parent);
+    if (!/\bpointer\b/i.test(parentStyle.cursor || '')) return true;
+    return /(?:^|;)\s*cursor\s*:\s*pointer\b/i.test(element.getAttribute('style') || '');
+  }
+
   function isContentEditableOwner(element: Element) {
     const value = element.getAttribute('contenteditable');
     return value !== null && value.toLowerCase() !== 'false';
@@ -697,6 +766,7 @@ function installAiBrowserPageRuntime() {
     if (element.hasAttribute('aria-haspopup')) return true;
     if (element.hasAttribute('onclick') || hasActionAttribute(element)) return true;
     if (recordedEventTypes(element).some((type) => /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown|mouseenter|mouseover|pointerenter|pointerover)$/.test(type))) return true;
+    if (hasPointerCursor(element)) return true;
     const tabindex = element.getAttribute('tabindex');
     if (tabindex !== null && tabindex !== '-1') return true;
     return isContentEditableOwner(element);
@@ -980,32 +1050,6 @@ function installAiBrowserPageRuntime() {
     return normalized.slice(0, 140);
   }
 
-  function visibleDomIconHint(element: Element) {
-    const hints: string[] = [];
-    const push = (value?: string | null) => {
-      const normalized = normalizeVisibleDomText(value || '')
-        .replace(/\b(?:lucide|icon|svg|size|stroke|fill|currentColor|true|false)\b/gi, ' ')
-        .replace(/[^a-zA-Z0-9_\-\u4e00-\u9fff]+/g, ' ')
-        .trim();
-      if (!normalized) return;
-      for (const token of normalized.split(/\s+/)) {
-        if (token.length < 2 || hints.includes(token)) continue;
-        hints.push(token);
-        if (hints.length >= 5) return;
-      }
-    };
-    for (const child of Array.from(element.querySelectorAll('svg, [data-icon], [class*="icon"], [class*="lucide"]')).slice(0, 8)) {
-      push(child.getAttribute('aria-label'));
-      push(child.getAttribute('title'));
-      push(child.getAttribute('data-icon'));
-      push(child.getAttribute('class'));
-      const title = child.querySelector('title')?.textContent;
-      push(title);
-      if (hints.length >= 5) break;
-    }
-    return hints.join(' ').slice(0, 120) || undefined;
-  }
-
   function visibleDomTextContent(element: Element) {
     const parts: string[] = [];
     let chars = 0;
@@ -1138,8 +1182,6 @@ function installAiBrowserPageRuntime() {
       const value = visibleDomAttributeValue(element, name);
       if (value) attrs.push(`${name}="${escapeVisibleDomText(value)}"`);
     }
-    const icon = visibleDomIconHint(element);
-    if (icon) attrs.push(`icon="${escapeVisibleDomText(icon)}"`);
     for (const name of visibleDomBooleanAttributes) {
       if (element.hasAttribute(name)) attrs.push(`${name}="true"`);
     }
@@ -1429,8 +1471,24 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
 
   const normalizeText = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
 
+  function classNameOf(element: Element) {
+    return typeof element.className === 'string'
+      ? normalizeText(element.className).split(/\s+/).filter(Boolean).slice(0, 8).join(' ')
+      : '';
+  }
+
   function flatParentElement(node: Node) {
     return runtime.flatParentElement(node);
+  }
+
+  function hasPointerCursor(element: Element) {
+    const style = window.getComputedStyle(element);
+    if (!/\bpointer\b/i.test(style.cursor || '')) return false;
+    const parent = flatParentElement(element);
+    if (!parent) return true;
+    const parentStyle = window.getComputedStyle(parent);
+    if (!/\bpointer\b/i.test(parentStyle.cursor || '')) return true;
+    return /(?:^|;)\s*cursor\s*:\s*pointer\b/i.test(element.getAttribute('style') || '');
   }
 
   function composedContains(ancestor: Element, node: Element) {
@@ -1542,17 +1600,24 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
     return value !== null && value.toLowerCase() !== 'false';
   }
 
-  function clickableReason(element: Element) {
-    const tag = element.tagName.toLowerCase();
-    if (['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag)) return true;
+  function interactionSignals(element: Element, tag = element.tagName.toLowerCase()) {
+    const signals: string[] = [];
     const role = element.getAttribute('role');
-    if (role && interactiveRoles.has(role)) return true;
-    if (element.hasAttribute('onclick')) return true;
-    if (hasRecordedClickListener(element)) return true;
-    if (hasActionAttribute(element)) return true;
+    if (['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag)) signals.push('native');
+    if (role && interactiveRoles.has(role)) signals.push(`role=${role}`);
+    if (element.hasAttribute('aria-haspopup')) signals.push('popup');
+    if (element.hasAttribute('onclick')) signals.push('onclick');
+    if (hasRecordedClickListener(element)) signals.push('listener');
+    if (hasActionAttribute(element)) signals.push('action-attr');
+    if (hasPointerCursor(element)) signals.push('cursor=pointer');
     const tabindex = element.getAttribute('tabindex');
-    if (tabindex !== null && tabindex !== '-1') return true;
-    return isContentEditableOwner(element);
+    if (tabindex !== null && tabindex !== '-1') signals.push('tabindex');
+    if (isContentEditableOwner(element)) signals.push('contenteditable');
+    return signals;
+  }
+
+  function clickableReason(element: Element) {
+    return interactionSignals(element).length > 0;
   }
 
   function isInteractiveDescendant(element: Element) {
@@ -1794,7 +1859,8 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
     const role = element.getAttribute('role') || undefined;
     const inputElement = element as HTMLInputElement;
     const isInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(element);
-    const clickable = clickableReason(element);
+    const signals = interactionSignals(element, tag);
+    const clickable = signals.length > 0;
     const hoverable = hasOwnHoverSignal(element) || hasCssHoverEffect(element);
     if (!clickable && !isInput && !hoverable) return undefined;
 
@@ -1830,6 +1896,7 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
 
     const text = ownText(element);
     const name = nameOf(element);
+    const className = classNameOf(element);
     const placeholder = inputElement.placeholder || undefined;
     const ariaLabel = element.getAttribute('aria-label') || undefined;
     const title = element.getAttribute('title') || undefined;
@@ -1843,6 +1910,8 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
       type,
       name: name || undefined,
       text: text || undefined,
+      className: className || undefined,
+      signals: signals.length ? signals : undefined,
       nearbyText: contextText(element) || undefined,
       href,
       host,
@@ -1915,10 +1984,13 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
 
   walk(document.documentElement, [0], 0);
 
-  for (const element of Array.from(document.querySelectorAll('*'))) {
-    if (!isTraversable(element) || !isVisibleInViewport(element)) continue;
-    const pathParts = domPathOf(element);
-    if (pathParts) pushCandidate(element, pathParts);
+  if (raw.length < candidateLimit) {
+    for (const element of Array.from(document.querySelectorAll('*'))) {
+      if (!isTraversable(element) || !isVisibleInViewport(element)) continue;
+      const pathParts = domPathOf(element);
+      if (pathParts) pushCandidate(element, pathParts);
+      if (raw.length >= candidateLimit) break;
+    }
   }
 
   function pathParts(value: string) {
@@ -2282,6 +2354,7 @@ export class BrowserSession {
   private lastScrollableAreas: ScrollableArea[] = [];
   private lastCandidateMarkerScreenshotPath?: string;
   private lastOriginalScreenshotPath?: string;
+  private lastScreenshotTiming?: ScreenshotTiming;
   private ownedPages = new Set<Page>();
   private browserOwnership: BrowserOwnership = 'launched';
   private releaseSharedBrowser?: () => Promise<void>;
@@ -2373,6 +2446,7 @@ export class BrowserSession {
     const tabGrouperEnabled = sessionTabGrouperEnabled(headless);
     const useSharedBrowserTabs = sharedBrowserTabsEnabled() && !electronEmbeddedBrowserEnabled() && !browserProfileKey;
     const useSessionGroupPageSelection = tabGrouperEnabled || Boolean(browserProfileKey);
+    const restoreLastSession = tabGrouperEnabled && process.env.BROWSER_RESTORE_LAST_SESSION !== 'false';
     const autoTabGroupProfileKey = browserProfileKey || (useSharedBrowserTabs ? 'shared' : this.pageGroupId);
     const autoTabGroupProfileDir = tabGrouperEnabled && !cdpEndpoint && !requestedUserDataDir
       ? sessionTabGrouperProfileDir(autoTabGroupProfileKey)
@@ -2397,6 +2471,7 @@ export class BrowserSession {
         '--high-dpi-support=1',
         '--no-first-run',
         '--no-default-browser-check',
+        restoreLastSession ? '--restore-last-session' : '',
         autoTabGroupDebugPort ? `--remote-debugging-port=${autoTabGroupDebugPort}` : '',
       ].filter(Boolean), headless, { exclusive: Boolean(autoTabGroupProfileDir) }),
     };
@@ -2640,14 +2715,12 @@ export class BrowserSession {
     const lookup = await this.findNativeTabGroupTabs(context);
     if (!lookup?.found) return { found: false, pages: [] };
 
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const markedPages = await this.reclaimSessionPagesByMarker(context);
-      if (markedPages.length) return { found: true, pages: markedPages };
-      if (attempt < 3) await sleep(150);
-    }
+    const existingPages = await this.waitForNativeGroupPages(context, lookup.tabs, 4);
+    if (existingPages.length) return { found: true, pages: existingPages };
 
-    const urlClaimedPages = await this.claimPagesByNativeTabUrls(context, lookup.tabs);
-    return { found: true, pages: urlClaimedPages };
+    await this.activateNativeTabGroupTab(context, lookup.tabs);
+    const activatedPages = await this.waitForNativeGroupPages(context, lookup.tabs, 8);
+    return { found: true, pages: activatedPages };
   }
 
   private async sessionTabGrouperWorker(context: BrowserContext) {
@@ -2674,6 +2747,45 @@ export class BrowserSession {
       sessionId: this.pageGroupId,
       groupTitle: this.tabGroupLabel(),
     }).catch(() => undefined);
+  }
+
+  private chooseNativeTabGroupTab(tabs: NativeTabGroupPage[]) {
+    return tabs.find((tab) => tab.active && tab.url && !isBlankBrowserUrlLike(tab.url))
+      || tabs.find((tab) => tab.url && !isBlankBrowserUrlLike(tab.url))
+      || tabs.find((tab) => tab.active)
+      || tabs.at(-1);
+  }
+
+  private async activateNativeTabGroupTab(context: BrowserContext, tabs: NativeTabGroupPage[]) {
+    const tab = this.chooseNativeTabGroupTab(tabs);
+    if (!tab?.tabId) return undefined;
+    const worker = await this.sessionTabGrouperWorker(context);
+    if (!worker) return undefined;
+    return worker.evaluate(async (input: { sessionId: string; groupTitle: string; tabId: number }) => {
+      const global = globalThis as unknown as {
+        aiWebTestSessionTabGrouper?: {
+          activateSessionGroupTab?: (input: { sessionId: string; groupTitle: string; tabId: number }) => Promise<NativeTabGroupActivation>;
+        };
+      };
+      return global.aiWebTestSessionTabGrouper?.activateSessionGroupTab?.(input);
+    }, {
+      sessionId: this.pageGroupId,
+      groupTitle: this.tabGroupLabel(),
+      tabId: tab.tabId,
+    }).catch(() => undefined);
+  }
+
+  private async waitForNativeGroupPages(context: BrowserContext, tabs: NativeTabGroupPage[], attempts: number) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const markedPages = await this.reclaimSessionPagesByMarker(context);
+      if (markedPages.length) return markedPages;
+
+      const urlClaimedPages = await this.claimPagesByNativeTabUrls(context, tabs);
+      if (urlClaimedPages.length) return urlClaimedPages;
+
+      if (attempt < attempts - 1) await sleep(150);
+    }
+    return [] as Page[];
   }
 
   private async claimPagesByNativeTabUrls(context: BrowserContext, tabs: NativeTabGroupPage[]) {
@@ -3041,6 +3153,37 @@ export class BrowserSession {
     return parts.join('\n\n');
   }
 
+  async readStructuredPageText() {
+    const maxChars = numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000));
+    const frameLimit = numericLimitFromEnv('DOM_STRUCTURED_TEXT_FRAME_LIMIT', numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER));
+    const mainFrame = this.activePage.mainFrame();
+    const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
+    const parts: string[] = [];
+    let chars = 0;
+
+    const append = (label: string, text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || chars >= maxChars) return;
+      const block = label ? `${label}\n${trimmed}` : trimmed;
+      const remaining = maxChars - chars;
+      const chunk = block.length > remaining ? block.slice(0, remaining) : block;
+      if (!chunk) return;
+      parts.push(chunk);
+      chars += chunk.length + 2;
+    };
+
+    for (const frame of frames) {
+      if (chars >= maxChars) break;
+      const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
+      if (frame !== mainFrame && framePath === undefined) continue;
+      const text = await this.readFrameStructuredPageText(frame, maxChars - chars).catch(() => '');
+      const label = framePath ? `[iframe ${framePath}${frame.url() ? ` ${frame.url()}` : ''}]` : '';
+      append(label, text);
+    }
+
+    return parts.join('\n\n');
+  }
+
   // 汇总当前页面上下文，包括 URL、标题、焦点、候选元素、DOM 树和人工验证状态。
   async getPageContext(options: {
     domScope?: 'visible' | 'full';
@@ -3054,12 +3197,13 @@ export class BrowserSession {
     const includeText = options.includeText !== false || options.includeManualVerification !== false;
     const includeInteractiveCandidates = options.includeInteractiveCandidates ?? true;
     const useCachedInteractiveCandidates = Boolean(options.useCachedInteractiveCandidates && !options.includeDomTree);
-    const [title, text, viewportMetrics, focusedElement, domTree, interactiveCandidates, scrollableAreas, pageScrollState] = await Promise.all([
+    const [title, text, structuredText, viewportMetrics, focusedElement, domTree, interactiveCandidates, scrollableAreas, pageScrollState] = await Promise.all([
       this.activePage.title().catch(() => '').then((value) => this.stripTabTitlePrefix(value)),
       includeText ? this.readPageText() : Promise.resolve(''),
+      includeText ? this.readStructuredPageText() : Promise.resolve(''),
       this.getViewportMetrics(),
       this.getFocusedElement(),
-      options.includeDomTree ? this.readSimplifiedDomTree({ scope: options.domScope }).catch((error) => `Unable to read DOM tree: ${error instanceof Error ? error.message : String(error)}`) : Promise.resolve(undefined),
+      options.includeDomTree ? this.readRawDomTree().catch((error) => `Unable to read raw DOM: ${error instanceof Error ? error.message : String(error)}`) : Promise.resolve(undefined),
       !includeInteractiveCandidates
         ? Promise.resolve([] as InteractiveCandidate[])
         : useCachedInteractiveCandidates && this.lastScreenshotCandidates.length
@@ -3082,6 +3226,8 @@ export class BrowserSession {
         ? options.textMaxChars > 0 ? text.slice(0, options.textMaxChars) : text
         : text.slice(0, 2400),
       textLength: text.length,
+      structuredText,
+      structuredTextLength: structuredText.length,
       viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
       viewportMetrics,
       tabs: this.getTabsSnapshot(),
@@ -3210,13 +3356,35 @@ export class BrowserSession {
 
   // 截取当前 viewport。默认保留干净原图，并把视觉标识保存为单独 marker map。
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
-    const stabilizeMs = Number(process.env.SCREENSHOT_STABILIZE_MS || 1000);
+    const totalStartedAt = Date.now();
+    const timingSteps: ScreenshotTimingStep[] = [];
+    const timed = async <T>(
+      name: string,
+      action: () => Promise<T>,
+      details?: (result: T) => Partial<ScreenshotTimingStep>,
+    ) => {
+      const startedAt = Date.now();
+      try {
+        const result = await action();
+        timingSteps.push({ name, elapsedMs: Date.now() - startedAt, ...details?.(result) });
+        return result;
+      } catch (error) {
+        timingSteps.push({
+          name,
+          elapsedMs: Date.now() - startedAt,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+    };
+    const skipped = (name: string) => timingSteps.push({ name, elapsedMs: 0, skipped: true });
+    const stabilizeMs = Number(process.env.SCREENSHOT_STABILIZE_MS || 0);
     if (Number.isFinite(stabilizeMs) && stabilizeMs > 0) {
-      await this.waitForStableViewport(Math.min(Math.max(stabilizeMs, 0), 5000));
-    }
+      await timed('stabilizeViewport', () => this.waitForStableViewport(Math.min(Math.max(stabilizeMs, 0), 5000)));
+    } else skipped('stabilizeViewport');
     const capture: ScreenshotCaptureMode = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
     const dir = artifactPath(runId);
-    await mkdir(dir, { recursive: true });
+    await timed('prepareArtifactDir', () => mkdir(dir, { recursive: true }));
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
     const shouldCaptureCandidates = phase === 'before' || String(phase).startsWith('visual-');
@@ -3228,11 +3396,15 @@ export class BrowserSession {
       && this.mode === 'visual-markers'
       && process.env.SCREENSHOT_SCROLL_AREA_LABELS !== 'false';
     const candidates = shouldCaptureCandidates
-      ? await this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[])
+      ? await timed('refreshInteractiveCandidates', () => this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[]), (items) => ({ count: items.length }))
       : [];
     const scrollAreas = shouldCaptureCandidates
-      ? await this.refreshScrollableAreas().catch(() => this.lastScrollableAreas)
+      ? await timed('refreshScrollableAreas', () => this.refreshScrollableAreas().catch(() => this.lastScrollableAreas), (items) => ({ count: items.length }))
       : [];
+    if (!shouldCaptureCandidates) {
+      skipped('refreshInteractiveCandidates');
+      skipped('refreshScrollableAreas');
+    }
     if (shouldCaptureCandidates) {
       // This immutable-by-convention snapshot is the only source of candidate IDs
       // for the following AI request and click. Later context scans must not make a
@@ -3247,8 +3419,10 @@ export class BrowserSession {
     this.lastOriginalScreenshotPath = undefined;
     // 默认保留干净页面截图；候选编号写入单独 marker 图，点击光标保留在操作后截图里。
     const separateMarkerMap = candidateLabelsEnabled && shouldUseSeparateMarkerMap();
-    await this.removeCandidateOverlay();
-    if (phase === 'before' || String(phase).startsWith('visual-')) await this.removeClickMarker();
+    await timed('removeCandidateOverlayBefore', () => this.removeCandidateOverlay());
+    if (phase === 'before' || String(phase).startsWith('visual-')) {
+      await timed('removeClickMarker', () => this.removeClickMarker());
+    } else skipped('removeClickMarker');
     const screenshotTimeoutMs = boundedPositiveIntegerEnv(
       'SCREENSHOT_TIMEOUT_MS',
       DEFAULT_SCREENSHOT_TIMEOUT_MS,
@@ -3265,18 +3439,18 @@ export class BrowserSession {
     };
     if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
       const originalFilePath = path.join(dir, `step-${stepIndex}-${phase}-original.png`);
-      await this.activePage.screenshot({ ...screenshotOptions, path: originalFilePath }).catch(() => undefined);
+      await timed('captureOriginalScreenshot', () => this.activePage.screenshot({ ...screenshotOptions, path: originalFilePath }).catch(() => undefined), () => ({ path: originalFilePath }));
       this.lastOriginalScreenshotPath = originalFilePath;
-    }
+    } else skipped('captureOriginalScreenshot');
     if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
-      await this.drawCandidateOverlay(
+      await timed('drawInlineOverlay', () => this.drawCandidateOverlay(
         candidateLabelsEnabled ? candidates : [],
         false,
         scrollAreaLabelsEnabled ? scrollAreas : [],
-      );
-    }
+      ));
+    } else skipped('drawInlineOverlay');
     try {
-      await this.activePage.screenshot(screenshotOptions);
+      await timed('capturePrimaryScreenshot', () => this.activePage.screenshot(screenshotOptions), () => ({ path: filePath }));
     } catch (error) {
       throw await this.buildScreenshotFailureError(error, {
         phase: String(phase),
@@ -3286,14 +3460,14 @@ export class BrowserSession {
       });
     } finally {
       if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
-        await this.removeCandidateOverlay();
-      }
+        await timed('removeInlineOverlay', () => this.removeCandidateOverlay());
+      } else skipped('removeInlineOverlay');
     }
     if (separateMarkerMap) {
       const markerFilePath = path.join(dir, `step-${stepIndex}-${phase}-markers.png`);
-      await this.drawCandidateOverlay(candidates, true, scrollAreaLabelsEnabled ? scrollAreas : []);
+      await timed('drawMarkerOverlay', () => this.drawCandidateOverlay(candidates, true, scrollAreaLabelsEnabled ? scrollAreas : []));
       try {
-        await this.activePage.screenshot({ ...screenshotOptions, path: markerFilePath });
+        await timed('captureMarkerScreenshot', () => this.activePage.screenshot({ ...screenshotOptions, path: markerFilePath }), () => ({ path: markerFilePath }));
         this.lastCandidateMarkerScreenshotPath = markerFilePath;
       } catch (error) {
         throw await this.buildScreenshotFailureError(error, {
@@ -3303,13 +3477,17 @@ export class BrowserSession {
           filePath: markerFilePath,
         });
       } finally {
-        await this.removeCandidateOverlay();
+        await timed('removeMarkerOverlay', () => this.removeCandidateOverlay());
       }
+    } else {
+      skipped('drawMarkerOverlay');
+      skipped('captureMarkerScreenshot');
+      skipped('removeMarkerOverlay');
     }
-    const [image, viewportMetrics] = await Promise.all([
+    const [image, viewportMetrics] = await timed('readScreenshotMetadata', () => Promise.all([
       this.readPngSize(filePath),
       this.getViewportMetrics(),
-    ]);
+    ]));
     this.lastScreenshotMetrics = {
       path: filePath,
       image,
@@ -3319,12 +3497,34 @@ export class BrowserSession {
       scale: 'css',
       capture,
     };
+    this.lastScreenshotTiming = {
+      phase: String(phase),
+      capture,
+      totalMs: Date.now() - totalStartedAt,
+      path: filePath,
+      markerPath: this.lastCandidateMarkerScreenshotPath,
+      originalPath: this.lastOriginalScreenshotPath,
+      candidateCount: candidates.length,
+      scrollAreaCount: scrollAreas.length,
+      candidateLabelsEnabled,
+      scrollAreaLabelsEnabled,
+      separateMarkerMap,
+      steps: timingSteps,
+    };
     return filePath;
   }
 
   // 返回最近一次截图的尺寸和 viewport 信息，供 AI 请求上下文引用。
   getLastScreenshotMetrics() {
     return this.lastScreenshotMetrics;
+  }
+
+  getLastScreenshotTiming() {
+    return this.lastScreenshotTiming;
+  }
+
+  formatLastScreenshotTiming() {
+    return formatScreenshotTimingSummary(this.lastScreenshotTiming);
   }
 
   // 返回最近一次操作前截图对应的纯标识图路径；仅双截图兼容模式会使用。
@@ -3339,7 +3539,35 @@ export class BrowserSession {
   // 返回当前可见交互候选元素，供 DOM 模式在无截图输入时定位控件。
   async getInteractiveCandidates(): Promise<BrowserActionResult> {
     const candidates = await this.refreshInteractiveCandidates();
-    return { ok: true, actual: JSON.stringify(candidates, null, 2) };
+    return {
+      ok: true,
+      actual: candidates.map((candidate) => {
+        const depth = Math.max(0, candidate.path.split('.').filter(Boolean).length - 1);
+        const indent = '  '.repeat(Math.min(depth, 10));
+        const className = candidate.className
+          ? `.${candidate.className.split(/\s+/).filter(Boolean).slice(0, 3).join('.')}`
+          : '';
+        const role = [candidate.role, candidate.type].filter(Boolean).join('/');
+        const label = [
+          candidate.name,
+          candidate.text,
+          candidate.ariaLabel,
+          candidate.placeholder,
+          candidate.title,
+          candidate.nearbyText,
+        ].map((value) => value?.replace(/\s+/g, ' ').trim()).find(Boolean) || '[unlabeled]';
+        const state = [
+          candidate.clickable ? 'clickable' : '',
+          candidate.input ? 'input' : '',
+          candidate.disabled ? 'disabled' : '',
+          candidate.signals?.length ? `signals=${candidate.signals.join('|')}` : '',
+          candidate.href ? `href=${candidate.href}` : '',
+          candidate.framePath ? `frame=${candidate.framePath}` : '',
+          candidate.shadow ? 'shadow' : '',
+        ].filter(Boolean).join(', ');
+        return `${indent}- #${candidate.id} ${candidate.tag}${className}${role ? `[${role}]` : ''}: "${label.slice(0, 160)}"${state ? ` (${state})` : ''}`;
+      }).join('\n') || '[no visible interactive elements detected]',
+    };
   }
 
   // 返回简化后的 DOM 树文本，作为候选列表不足时的兜底定位信息。
@@ -3763,13 +3991,14 @@ export class BrowserSession {
       score: Number(score.toFixed(3)),
       tag: candidate.tag,
       role: candidate.role,
+      className: candidate.className,
+      signals: candidate.signals,
       name: candidate.name,
       text: candidate.text,
       href: candidate.href,
       placeholder: candidate.placeholder,
       ariaLabel: candidate.ariaLabel,
       title: candidate.title,
-      rect: candidate.rect,
       disabled: candidate.disabled,
       shadow: candidate.shadow,
     }));
@@ -4509,9 +4738,10 @@ export class BrowserSession {
       candidate.tag,
       candidate.role ? `role=${candidate.role}` : '',
       candidate.name ? `name="${candidate.name.slice(0, 80)}"` : '',
+      candidate.signals?.length ? `signals=${candidate.signals.join('|')}` : '',
       candidate.href ? `href=${candidate.href.slice(0, 140)}` : '',
       candidate.framePath ? `frame=${candidate.framePath}` : '',
-      `box=${candidate.rect.x},${candidate.rect.y},${candidate.rect.width}x${candidate.rect.height}`,
+      this.mode === 'visual-markers' ? `box=${candidate.rect.x},${candidate.rect.y},${candidate.rect.width}x${candidate.rect.height}` : '',
     ].filter(Boolean);
     return parts.join(' ');
   }
@@ -4610,7 +4840,9 @@ export class BrowserSession {
 
   private async resolveCandidateTarget(candidateId: string) {
     const normalized = candidateId.trim().toUpperCase().replace(/^E(?=\d+$)/, '');
-    const candidates = this.lastScreenshotCandidates;
+    const candidates = this.mode === 'visual-markers'
+      ? this.lastScreenshotCandidates
+      : (this.lastInteractiveCandidates.length ? this.lastInteractiveCandidates : this.lastScreenshotCandidates);
     const candidate = candidates.find((item) => item.id.toUpperCase() === normalized);
 
     if (!candidate) {
@@ -4619,7 +4851,7 @@ export class BrowserSession {
         .map((item) => `${item.id}: ${this.describeCandidate(item)}`)
         .join('\n');
       return {
-        error: `Candidate ${candidateId} was not found in the current screenshot snapshot. Candidate clicks are only allowed after a fresh step screenshot. Available candidates:\n${available || '[none]'}`,
+        error: `Candidate ${candidateId} was not found in the current ${this.mode === 'visual-markers' ? 'screenshot' : 'DOM interactive'} snapshot. Refresh getPageState/getInteractiveCandidates and choose one of the returned candidate ids. Available candidates:\n${available || '[none]'}`,
       };
     }
 
@@ -4638,53 +4870,14 @@ export class BrowserSession {
       return { candidate, target: point };
     }
 
-    if (candidate.framePath) {
-      const identity = await this.validateFrameCandidateIdentity(candidate);
-      if (!identity.ok) {
-        return {
-          candidate,
-          error: `Candidate ${candidate.id} no longer matches the element shown in the screenshot: ${identity.reason}`,
-        };
-      }
-      const point = this.resolveCapturedCandidatePoint(candidate, `iframe ${candidate.framePath} screenshot`);
-      if (!point) {
-        return {
-          candidate,
-          error: `Candidate ${candidate.id} (iframe ${candidate.framePath}) has no valid point in the current screenshot snapshot.`,
-        };
-      }
-      return { candidate, target: point };
-    }
-
-    // Shadow-DOM candidates have no resolvable light-tree index path, so click them
-    // by their captured viewport coordinates (which share the host document's space).
-    if (candidate.shadow) {
-      const point = await this.resolveShadowCandidatePoint(candidate);
-      if (!point) {
-        return {
-          candidate,
-          error: `Candidate ${candidate.id} (shadow DOM) is no longer at its captured position. Call getInteractiveCandidates again; the DOM likely changed.`,
-        };
-      }
-      return { candidate, target: point };
-    }
-
-    const identity = await this.validateMainCandidateIdentity(candidate);
-    if (!identity.ok) {
+    const live = await this.resolveLiveLocatorPoint(candidate);
+    if (!live.target) {
       return {
         candidate,
-        error: `Candidate ${candidate.id} no longer matches the element shown in the screenshot: ${identity.reason}`,
+        error: `Candidate ${candidate.id} is no longer actionable in the current DOM snapshot: ${live.error}. Refresh getPageState/getInteractiveCandidates and choose a fresh candidate id.`,
       };
     }
-    const target = this.resolveCapturedCandidatePoint(candidate, 'screenshot');
-    if (!target) {
-      return {
-        candidate,
-        error: `Candidate ${candidate.id} has no valid point in the current screenshot snapshot.`,
-      };
-    }
-
-    return { candidate, target };
+    return { candidate, target: live.target };
   }
 
   private async resolveLiveLocatorPoint(candidate: InteractiveCandidate) {
@@ -4897,6 +5090,94 @@ export class BrowserSession {
     return clip.right > clip.left && clip.bottom > clip.top ? clip : undefined;
   }
 
+  private async readRawDomTree() {
+    const frameLimit = numericLimitFromEnv('DOM_RAW_FRAME_LIMIT', numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER));
+    const mainFrame = this.activePage.mainFrame();
+    const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
+    const parts: string[] = [];
+
+    for (const frame of frames) {
+      const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
+      if (frame !== mainFrame && framePath === undefined) continue;
+      const raw = await this.readFrameRawDom(frame).catch(() => undefined);
+      if (!raw) continue;
+      if (framePath) {
+        parts.push(`<!-- iframe ${framePath}${frame.url() ? ` url="${frame.url().replace(/--/g, '-')}"` : ''} -->\n${raw}`);
+      } else {
+        parts.push(raw);
+      }
+    }
+
+    return parts.join('\n\n') || '[empty raw DOM]';
+  }
+
+  private async readFrameRawDom(target: Page | Frame) {
+    return target.evaluate(() => {
+      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__';
+      const voidTags = new Set([
+        'area',
+        'base',
+        'br',
+        'col',
+        'embed',
+        'hr',
+        'img',
+        'input',
+        'link',
+        'meta',
+        'param',
+        'source',
+        'track',
+        'wbr',
+      ]);
+      const rawTextTags = new Set(['script', 'style']);
+      const escapeText = (value: string) => value
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+      const escapeAttribute = (value: string) => escapeText(value).replaceAll('"', '&quot;');
+
+      const serializeNode = (node: Node, parentTag = ''): string => {
+        if (node.nodeType === Node.DOCUMENT_TYPE_NODE) {
+          const docType = node as DocumentType;
+          const publicId = docType.publicId ? ` PUBLIC "${escapeAttribute(docType.publicId)}"` : '';
+          const systemId = docType.systemId ? `${publicId ? '' : ' SYSTEM'} "${escapeAttribute(docType.systemId)}"` : '';
+          return `<!DOCTYPE ${docType.name}${publicId}${systemId}>`;
+        }
+        if (node.nodeType === Node.TEXT_NODE) {
+          const value = node.nodeValue || '';
+          return rawTextTags.has(parentTag) ? value : escapeText(value);
+        }
+        if (node.nodeType === Node.COMMENT_NODE) {
+          return `<!--${(node.nodeValue || '').replace(/--/g, '-')}-->`;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+        const element = node as Element;
+        if (element.closest(agentOverlaySelector)) return '';
+
+        const tag = element.tagName.toLowerCase();
+        const attributes = Array.from(element.attributes)
+          .map((attribute) => `${attribute.name}="${escapeAttribute(attribute.value)}"`)
+          .join(' ');
+        const openTag = attributes ? `<${tag} ${attributes}>` : `<${tag}>`;
+        if (voidTags.has(tag)) return openTag;
+
+        const shadowRoot = element.shadowRoot;
+        const shadowDom = shadowRoot
+          ? `<template shadowrootmode="${shadowRoot.mode}">${Array.from(shadowRoot.childNodes).map((child) => serializeNode(child, tag)).join('')}</template>`
+          : '';
+        const children = Array.from(element.childNodes).map((child) => serializeNode(child, tag)).join('');
+        return `${openTag}${shadowDom}${children}</${tag}>`;
+      };
+
+      return [
+        document.doctype ? serializeNode(document.doctype) : '',
+        document.documentElement ? serializeNode(document.documentElement) : '',
+      ].filter(Boolean).join('\n');
+    });
+  }
+
   private async readVisibleDomSnapshot(
     target: Page | Frame,
     maxElements: number,
@@ -4931,6 +5212,102 @@ export class BrowserSession {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
       return runtime?.pageText(input);
     }, { maxChars }).catch(() => undefined);
+  }
+
+  private async readFrameStructuredPageText(
+    target: Page | Frame,
+    maxChars: number,
+  ) {
+    await this.ensureBrowserPageRuntime(target);
+    return target.evaluate((input) => {
+      const maxOutputChars = Math.max(1, Math.floor(Number(input.maxChars) || 200000));
+      const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__';
+      const skippedTags = new Set(['script', 'style', 'template', 'noscript']);
+      const structuralTags = new Set([
+        'article',
+        'aside',
+        'body',
+        'details',
+        'dialog',
+        'fieldset',
+        'footer',
+        'form',
+        'header',
+        'li',
+        'main',
+        'menu',
+        'nav',
+        'ol',
+        'section',
+        'summary',
+        'table',
+        'tbody',
+        'td',
+        'th',
+        'thead',
+        'tr',
+        'ul',
+      ]);
+      const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
+      const classText = (element: Element) => {
+        const raw = typeof element.className === 'string' ? element.className : '';
+        return raw.split(/\s+/).filter(Boolean).slice(0, 3).join('.');
+      };
+      const isHidden = (element: Element) => {
+        if (element.closest(overlaySelector)) return true;
+        if (element.getAttribute('aria-hidden') === 'true') return true;
+        const style = window.getComputedStyle(element);
+        return style.display === 'none'
+          || style.visibility === 'hidden'
+          || style.visibility === 'collapse'
+          || Number(style.opacity || '1') <= 0.01;
+      };
+      const ownText = (element: Element) => normalize(Array.from(element.childNodes)
+        .filter((node) => node.nodeType === Node.TEXT_NODE)
+        .map((node) => node.textContent || '')
+        .join(' '));
+      const labelText = (element: Element) => {
+        const inputElement = element as HTMLInputElement;
+        return [
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+          element.getAttribute('alt'),
+          inputElement.placeholder,
+          inputElement.value,
+          ownText(element),
+        ].map(normalize).find(Boolean) || '';
+      };
+      const lines: string[] = [];
+      let chars = 0;
+      const append = (depth: number, text: string) => {
+        if (!text || chars >= maxOutputChars) return;
+        const line = `${'  '.repeat(Math.min(depth, 12))}${text}`;
+        const remaining = maxOutputChars - chars;
+        const chunk = line.length > remaining ? line.slice(0, remaining) : line;
+        if (!chunk) return;
+        lines.push(chunk);
+        chars += chunk.length + 1;
+      };
+      const visit = (element: Element, depth: number) => {
+        if (chars >= maxOutputChars) return;
+        const tag = element.tagName.toLowerCase();
+        if (skippedTags.has(tag) || isHidden(element)) return;
+        const role = element.getAttribute('role');
+        const classes = classText(element);
+        const descriptor = `${tag}${classes ? `.${classes}` : ''}${role ? `[role=${role}]` : ''}`;
+        const label = labelText(element);
+        const shouldShow = Boolean(label)
+          || structuralTags.has(tag)
+          || ['button', 'a', 'input', 'select', 'textarea', 'option'].includes(tag);
+        if (shouldShow) append(depth, label ? `${descriptor}: ${label}` : descriptor);
+        for (const child of Array.from(element.children)) {
+          visit(child, shouldShow ? depth + 1 : depth);
+          if (chars >= maxOutputChars) break;
+        }
+      };
+      if (document.body) visit(document.body, 0);
+      return lines.join('\n');
+    }, { maxChars }).catch(() => '');
   }
 
   private async readFullFrameDomSnapshots(
@@ -5264,6 +5641,7 @@ export class BrowserSession {
       type LabelBox = { left: number; top: number; right: number; bottom: number };
       type TargetBox = LabelBox & { index: number };
       type Leader = { start: Point; end: Point };
+      type LeaderBox = LabelBox & { segment: Leader };
       type LabelLayout = LabelBox & {
         external: boolean;
         compact: boolean;
@@ -5271,6 +5649,48 @@ export class BrowserSession {
       };
       const placedLabels: LabelBox[] = [];
       const placedLeaders: Leader[] = [];
+      const fragment = document.createDocumentFragment();
+      const spatialCellSize = Math.max(48, Math.min(128, Math.round(Math.max(window.innerWidth, window.innerHeight) / 14)));
+      function cellsFor(box: LabelBox) {
+        const keys: string[] = [];
+        const left = Math.floor(box.left / spatialCellSize);
+        const right = Math.floor(Math.max(box.left, box.right) / spatialCellSize);
+        const top = Math.floor(box.top / spatialCellSize);
+        const bottom = Math.floor(Math.max(box.top, box.bottom) / spatialCellSize);
+        for (let y = top; y <= bottom; y += 1) {
+          for (let x = left; x <= right; x += 1) {
+            keys.push(`${x}:${y}`);
+          }
+        }
+        return keys;
+      }
+      function createSpatialIndex<T extends LabelBox>() {
+        const map = new Map<string, T[]>();
+        return {
+          add(item: T) {
+            for (const key of cellsFor(item)) {
+              const bucket = map.get(key);
+              if (bucket) bucket.push(item);
+              else map.set(key, [item]);
+            }
+          },
+          nearby(box: LabelBox) {
+            const seen = new Set<T>();
+            const results: T[] = [];
+            for (const key of cellsFor(box)) {
+              for (const item of map.get(key) || []) {
+                if (seen.has(item)) continue;
+                seen.add(item);
+                results.push(item);
+              }
+            }
+            return results;
+          },
+        };
+      }
+      const placedLabelIndex = createSpatialIndex<LabelBox>();
+      const placedLeaderIndex = createSpatialIndex<LeaderBox>();
+      const targetBoxIndex = createSpatialIndex<TargetBox>();
       const targetBoxes: TargetBox[] = items
         .map((item, index) => ({ rect: item.rect, index }))
         .filter(({ rect }) => rect && rect.width > 0 && rect.height > 0)
@@ -5281,6 +5701,7 @@ export class BrowserSession {
           right: Math.min(window.innerWidth, rect.x + rect.width),
           bottom: Math.min(window.innerHeight, rect.y + rect.height),
         }));
+      for (const target of targetBoxes) targetBoxIndex.add(target);
       function overlaps(a: LabelBox, b: LabelBox) {
         return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
       }
@@ -5291,6 +5712,23 @@ export class BrowserSession {
           right: box.right + padding,
           bottom: box.bottom + padding,
         };
+      }
+      function leaderBounds(leader: Leader, padding = 0): LeaderBox {
+        return {
+          left: Math.min(leader.start.x, leader.end.x) - padding,
+          top: Math.min(leader.start.y, leader.end.y) - padding,
+          right: Math.max(leader.start.x, leader.end.x) + padding,
+          bottom: Math.max(leader.start.y, leader.end.y) + padding,
+          segment: leader,
+        };
+      }
+      function placeLabel(box: LabelBox) {
+        placedLabels.push(box);
+        placedLabelIndex.add(box);
+      }
+      function placeLeader(leader: Leader) {
+        placedLeaders.push(leader);
+        placedLeaderIndex.add(leaderBounds(leader, 2));
       }
       function clamp(value: number, min: number, max: number) {
         return Math.max(min, Math.min(max, value));
@@ -5347,8 +5785,8 @@ export class BrowserSession {
           boxShadow: '0 2px 6px rgba(0,0,0,0.28)',
           pointerEvents: 'none',
         });
-        overlay.appendChild(box);
-        overlay.appendChild(label);
+        fragment.appendChild(box);
+        fragment.appendChild(label);
       }
       function segmentIntersectsBox(segment: Leader, box: LabelBox, padding = 0) {
         const target = expanded(box, padding);
@@ -5387,11 +5825,11 @@ export class BrowserSession {
       }
       function canPlaceLabel(box: LabelBox, avoidTargets: boolean, currentTargetIndex: number) {
         const padded = expanded(box, 1);
-        if (placedLabels.some((placed) => overlaps(padded, expanded(placed, 1)))) return false;
-        if (placedLeaders.some((leader) => segmentIntersectsBox(leader, padded))) return false;
+        if (placedLabelIndex.nearby(padded).some((placed) => overlaps(padded, expanded(placed, 1)))) return false;
+        if (placedLeaderIndex.nearby(padded).some((leader) => segmentIntersectsBox(leader.segment, padded))) return false;
         if (
           avoidTargets &&
-          targetBoxes.some(
+          targetBoxIndex.nearby(padded).some(
             (target) => target.index !== currentTargetIndex && overlaps(padded, expanded(target, 1)),
           )
         ) return false;
@@ -5399,13 +5837,14 @@ export class BrowserSession {
       }
       function canPlaceExternal(box: LabelBox, leader: Leader, currentTargetIndex: number) {
         if (!canPlaceLabel(box, true, currentTargetIndex)) return false;
+        const leaderBox = leaderBounds(leader, 2);
         if (
-          targetBoxes.some(
+          targetBoxIndex.nearby(leaderBox).some(
             (target) => target.index !== currentTargetIndex && segmentIntersectsBox(leader, target, 1),
           )
         ) return false;
-        if (placedLabels.some((placed) => segmentIntersectsBox(leader, placed, 1))) return false;
-        if (placedLeaders.some((placed) => segmentsIntersect(leader, placed))) return false;
+        if (placedLabelIndex.nearby(leaderBox).some((placed) => segmentIntersectsBox(leader, placed, 1))) return false;
+        if (placedLeaderIndex.nearby(leaderBox).some((placed) => segmentsIntersect(leader, placed.segment))) return false;
         return true;
       }
       function isDenseSmallTarget(rect: { x: number; y: number; width: number; height: number }) {
@@ -5417,7 +5856,7 @@ export class BrowserSession {
           bottom: rect.y + rect.height,
         };
         let nearby = 0;
-        for (const target of targetBoxes) {
+        for (const target of targetBoxIndex.nearby(expanded(current, 6))) {
           const same =
             Math.abs(target.left - current.left) < 0.5 &&
             Math.abs(target.top - current.top) < 0.5 &&
@@ -5552,8 +5991,8 @@ export class BrowserSession {
             };
             const leader = leaderFor(rect, box);
             if (canPlaceExternal(box, leader, currentTargetIndex)) {
-              placedLabels.push(box);
-              placedLeaders.push(leader);
+              placeLabel(box);
+              placeLeader(leader);
               return { ...box, external: true, compact: false, leader };
             }
           }
@@ -5574,12 +6013,12 @@ export class BrowserSession {
             if (!labelOverlapsCurrentTarget) {
               const leader = leaderFor(rect, box);
               if (!canPlaceExternal(box, leader, currentTargetIndex)) continue;
-              placedLabels.push(box);
-              placedLeaders.push(leader);
+              placeLabel(box);
+              placeLeader(leader);
               return { ...box, external: true, compact: false, leader };
             }
             if (!canPlaceLabel(box, false, currentTargetIndex)) continue;
-            placedLabels.push(box);
+            placeLabel(box);
             return { ...box, external: false, compact: false };
           }
         }
@@ -5604,7 +6043,7 @@ export class BrowserSession {
             bottom: top + compactLabelHeight,
           };
           if (canPlaceLabel(box, false, currentTargetIndex)) {
-            placedLabels.push(box);
+            placeLabel(box);
             return { ...box, external: false, compact: true };
           }
         }
@@ -5617,7 +6056,7 @@ export class BrowserSession {
           right: left + compactLabelWidth,
           bottom: top + compactLabelHeight,
         };
-        placedLabels.push(finalBox);
+        placeLabel(finalBox);
         return { ...finalBox, external: false, compact: true };
       }
       function drawLeader(leader: Leader, color: string, width = 1) {
@@ -5644,7 +6083,7 @@ export class BrowserSession {
       });
       svg.setAttribute('width', String(window.innerWidth));
       svg.setAttribute('height', String(window.innerHeight));
-      overlay.appendChild(svg);
+      fragment.appendChild(svg);
 
       for (const area of areas) {
         drawScrollArea(area);
@@ -5727,10 +6166,11 @@ export class BrowserSession {
           ].join(', '),
         });
 
-        overlay.appendChild(box);
-        overlay.appendChild(label);
+        fragment.appendChild(box);
+        fragment.appendChild(label);
       }
 
+      overlay.appendChild(fragment);
       document.documentElement.appendChild(overlay);
     }, { items: visible, scrollAreas: visibleScrollAreas, markersOnly }).catch(() => undefined);
   }

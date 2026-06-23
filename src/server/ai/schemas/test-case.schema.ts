@@ -271,6 +271,12 @@ export type StepToolCall = {
   reason?: string;
   ok?: boolean;
   result?: string;
+  debug?: {
+    fullDomSnapshot?: string;
+    fullDomSnapshotCharLength?: number;
+    domSnapshotPromptCharLimit?: number;
+    domSnapshotTruncatedForModel?: boolean;
+  };
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
   visualAfter?: {

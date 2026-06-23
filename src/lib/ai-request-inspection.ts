@@ -43,3 +43,8 @@ export function domTreeFromToolCall(tool?: StepToolCall, request?: AiRequestSnap
     extractDomTreeFromAiRequest(request)
   );
 }
+
+export function fullDomSnapshotFromToolCall(tool?: StepToolCall) {
+  const snapshot = tool?.debug?.fullDomSnapshot;
+  return typeof snapshot === 'string' && snapshot.trim() ? snapshot : '';
+}
