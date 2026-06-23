@@ -31,6 +31,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
       content,
       normalizeMode(body.mode),
       normalizeSafetyMode(body.safetyMode),
+      typeof body.modelProvider === 'string' ? body.modelProvider : undefined,
       typeof body.clientMessageId === 'string' ? body.clientMessageId : undefined,
       body.attachments,
       body.skillIds,

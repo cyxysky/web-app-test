@@ -295,9 +295,9 @@ function visualMarkersEnabledFor(testCase: TestCaseRecord) {
   return true;
 }
 
-// 兼容旧双截图链路；默认 false，标识直接叠加在当前截图里。
+// Default to a separate marker map to avoid the extra original screenshot from inline labels.
 function usesSeparateMarkerMap() {
-  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
+  return !/^(false|0|no|off)$/i.test(String(process.env.VISUAL_MARKER_SEPARATE_MAP || 'true'));
 }
 
 // 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
@@ -316,7 +316,7 @@ function jsonSafe(value: unknown) {
 }
 
 function aiScreenshotMaxBytes() {
-  const raw = process.env.AI_SCREENSHOT_MAX_KB || process.env.SCREENSHOT_MAX_KB || '';
+  const raw = process.env.AI_SCREENSHOT_MAX_KB || '';
   const kb = Number(raw);
   if (!Number.isFinite(kb) || kb <= 0) return undefined;
   return Math.max(1, Math.floor(kb * 1024));
@@ -2078,7 +2078,7 @@ function formatDomPageStateObservation(pageContext: RuntimePageContext) {
   const structuredText = pageContext.structuredText || pageContext.text || '[empty page text]';
   const interactive = formatDomInteractiveElements(
     pageContext.interactiveCandidates,
-    Math.max(10, Number(process.env.INTERACTIVE_CANDIDATE_LIMIT || 160)),
+    Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160)),
   );
   return [
     'Current DOM page state observation:',
@@ -2102,7 +2102,7 @@ function domPageStateObservationViews(pageContext: RuntimePageContext): BrowserA
     text: structuredText,
     interactive: formatDomInteractiveElements(
       pageContext.interactiveCandidates,
-      Math.max(10, Number(process.env.INTERACTIVE_CANDIDATE_LIMIT || 160)),
+      Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160)),
     ),
   };
 }
@@ -2116,7 +2116,7 @@ function formatVisualPageStateObservation(input: {
   separateMarkerMap: boolean;
 }) {
   const { pageContext, visualContext, screenshotInputEnabled, markerEnabled, markerOverlayInScreenshot, separateMarkerMap } = input;
-  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
+  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160));
   const shouldIncludeCandidates = !screenshotInputEnabled || !markerEnabled;
   const imageRule = screenshotInputEnabled
     ? separateMarkerMap

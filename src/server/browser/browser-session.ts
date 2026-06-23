@@ -19,7 +19,7 @@ function shouldIgnoreConsoleError(text: string) {
 }
 
 function shouldUseSeparateMarkerMap() {
-  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
+  return !/^(false|0|no|off)$/i.test(String(process.env.VISUAL_MARKER_SEPARATE_MAP || 'true'));
 }
 
 function positiveIntegerEnv(key: string) {
@@ -3437,11 +3437,9 @@ export class BrowserSession {
       scale: 'css' as const,
       timeout: screenshotTimeoutMs,
     };
-    if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
-      const originalFilePath = path.join(dir, `step-${stepIndex}-${phase}-original.png`);
-      await timed('captureOriginalScreenshot', () => this.activePage.screenshot({ ...screenshotOptions, path: originalFilePath }).catch(() => undefined), () => ({ path: originalFilePath }));
-      this.lastOriginalScreenshotPath = originalFilePath;
-    } else skipped('captureOriginalScreenshot');
+    // Original clean screenshots are disabled globally; keep only the primary screenshot
+    // and, when configured, the separate marker map.
+    skipped('captureOriginalScreenshot');
     if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
       await timed('drawInlineOverlay', () => this.drawCandidateOverlay(
         candidateLabelsEnabled ? candidates : [],
@@ -4653,7 +4651,7 @@ export class BrowserSession {
   }
 
   private async refreshInteractiveCandidates() {
-    const limit = Math.max(10, Number(process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
+    const limit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160));
     const scanLimit = Math.max(limit * 2, limit + 50);
     await this.ensureBrowserPageRuntime();
     const mainCandidates = await this.activePage
@@ -5620,7 +5618,7 @@ export class BrowserSession {
   }
 
   private async drawCandidateOverlay(candidates: InteractiveCandidate[], markersOnly = false, scrollAreas: ScrollableArea[] = []) {
-    const labelLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
+    const labelLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160));
     const visible = candidates.slice(0, labelLimit);
     const visibleScrollAreas = scrollAreas.slice(0, Math.max(1, Number(process.env.SCREENSHOT_SCROLL_AREA_LABEL_LIMIT || 12)));
     await this.activePage.evaluate(({ items, scrollAreas: areas, markersOnly: hidePageContent }) => {

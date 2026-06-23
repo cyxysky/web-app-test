@@ -289,9 +289,9 @@ function visualMarkersEnabledFor(testCase: TestCaseRecord) {
   return true;
 }
 
-// 兼容旧双截图链路；默认 false，标识直接叠加在当前截图里。
+// Default to a separate marker map to avoid the extra original screenshot from inline labels.
 function usesSeparateMarkerMap() {
-  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
+  return !/^(false|0|no|off)$/i.test(String(process.env.VISUAL_MARKER_SEPARATE_MAP || 'true'));
 }
 
 // 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
@@ -326,7 +326,7 @@ function jsonSafe(value: unknown) {
 }
 
 function aiScreenshotMaxBytes() {
-  const raw = process.env.AI_SCREENSHOT_MAX_KB || process.env.SCREENSHOT_MAX_KB || '';
+  const raw = process.env.AI_SCREENSHOT_MAX_KB || '';
   const kb = Number(raw);
   if (!Number.isFinite(kb) || kb <= 0) return undefined;
   return Math.max(1, Math.floor(kb * 1024));
@@ -1709,9 +1709,10 @@ async function finalizeToolTraceVisuals(input: {
   visualContext?: VisualContextManager;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
+  onDebug?: ExecutionDebug;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { session, traces, trace, runId, stepIndex, visualContext, abortSignal, shouldContinue, onVisualContextChange } = input;
+  const { session, traces, trace, runId, stepIndex, visualContext, abortSignal, shouldContinue, onDebug, onVisualContextChange } = input;
   throwIfStopped(abortSignal, shouldContinue);
   let result = input.result;
   const screenshots = trace.screenshots || [];
@@ -1724,8 +1725,22 @@ async function finalizeToolTraceVisuals(input: {
       throwIfStopped(abortSignal, shouldContinue);
       const visualIndex = traces.filter((item) => item.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
       const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
+      const screenshotStartedAt = Date.now();
       const screenshotPath = await session.takeScreenshot(runId, stepIndex, `visual-${visualIndex}`, screenshotOptions);
       throwIfStopped(abortSignal, shouldContinue);
+      const timingSummary = session.formatLastScreenshotTiming();
+      await onDebug?.({
+        phase: 'browser:screenshot:visual-after',
+        stepIndex,
+        message: `${trace.name} visual-after screenshot captured in ${elapsedSince(screenshotStartedAt)}ms${timingSummary ? ` ${timingSummary}` : ''}`,
+        details: {
+          elapsedMs: elapsedSince(screenshotStartedAt),
+          path: screenshotPath,
+          capture: screenshotOptions.capture,
+          toolName: trace.name,
+          timings: session.getLastScreenshotTiming(),
+        },
+      });
       const markerPath = session.getLastCandidateMarkerScreenshotPath();
       const originalPath = session.getLastOriginalScreenshotPath();
       const frame = visualContext.apply({
@@ -1788,10 +1803,11 @@ async function executeTracedBrowserAction(input: {
   visualContext?: VisualContextManager;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
+  onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { session, traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onToolTrace, onVisualContextChange } = input;
+  const { session, traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onDebug, onToolTrace, onVisualContextChange } = input;
   throwIfStopped(abortSignal, shouldContinue);
   const trace = createToolTrace({ traces, name, toolInput, aiRequest, runId, stepIndex, visualContext });
   await notifyToolTrace(onToolTrace, trace);
@@ -1830,6 +1846,7 @@ async function executeTracedBrowserAction(input: {
     visualContext,
     abortSignal,
     shouldContinue,
+    onDebug,
     onVisualContextChange,
   });
   throwIfStopped(abortSignal, shouldContinue);
@@ -1860,6 +1877,7 @@ function makeBrowserTools(
     getAiRequest?: () => AiRequestSnapshot | undefined;
     abortSignal?: AbortSignal;
     shouldContinue?: () => boolean;
+    onDebug?: ExecutionDebug;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
     observePageState?: () => Promise<BrowserActionResult>;
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
@@ -1933,6 +1951,7 @@ function makeBrowserTools(
       abortSignal: referenceOptions?.abortSignal,
       shouldContinue: referenceOptions?.shouldContinue,
       aiRequest: referenceOptions?.getAiRequest?.() || aiRequest,
+      onDebug: referenceOptions?.onDebug,
       onToolTrace,
       onVisualContextChange: referenceOptions?.onVisualContextChange,
       action: actionWithConfirmation,
@@ -2347,7 +2366,7 @@ function formatDomPageStateObservation(pageContext: RuntimePageContext) {
   const structuredText = pageContext.structuredText || pageContext.text || '[empty page text]';
   const interactive = formatDomInteractiveElements(
     pageContext.interactiveCandidates,
-    Math.max(10, Number(process.env.INTERACTIVE_CANDIDATE_LIMIT || 160)),
+    Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160)),
   );
   return [
     'Current DOM page state observation:',
@@ -2371,7 +2390,7 @@ function domPageStateObservationViews(pageContext: RuntimePageContext): BrowserA
     text: structuredText,
     interactive: formatDomInteractiveElements(
       pageContext.interactiveCandidates,
-      Math.max(10, Number(process.env.INTERACTIVE_CANDIDATE_LIMIT || 160)),
+      Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160)),
     ),
   };
 }
@@ -2385,7 +2404,7 @@ function formatVisualPageStateObservation(input: {
   separateMarkerMap: boolean;
 }) {
   const { pageContext, visualContext, screenshotInputEnabled, markerEnabled, markerOverlayInScreenshot, separateMarkerMap } = input;
-  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
+  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160));
   const shouldIncludeCandidates = !screenshotInputEnabled || !markerEnabled;
   const imageRule = screenshotInputEnabled
     ? separateMarkerMap
@@ -2469,7 +2488,7 @@ function runtimePrompt(input: {
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
+  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160));
   const candidateContext = visualMode
     ? visualMarkersWithoutOverlay || visualTextCandidateFallback
       ? formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)
@@ -3416,8 +3435,22 @@ async function executeRuntimeStep(input: {
       if (includeImage && screenshotInputEnabled) {
         pageStateObservationIndex += 1;
         const visualIndex = traces.length + pageStateObservationIndex + 1;
+        const screenshotStartedAt = Date.now();
         const screenshotPath = await session.takeScreenshot(input.runId, stepIndex, `visual-${visualIndex}`, { capture: 'viewport' });
         ensureActive();
+        const timingSummary = session.formatLastScreenshotTiming();
+        await onDebug?.({
+          phase: 'browser:screenshot:page-state',
+          stepIndex,
+          message: `getPageState screenshot captured in ${elapsedSince(screenshotStartedAt)}ms${timingSummary ? ` ${timingSummary}` : ''}`,
+          details: {
+            elapsedMs: elapsedSince(screenshotStartedAt),
+            path: screenshotPath,
+            capture: 'viewport',
+            toolName: 'getPageState',
+            timings: session.getLastScreenshotTiming(),
+          },
+        });
         const markerPath = session.getLastCandidateMarkerScreenshotPath();
         const originalPath = session.getLastOriginalScreenshotPath();
         const frame = visualContext.apply({
@@ -3610,6 +3643,7 @@ async function executeRuntimeStep(input: {
         abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
+        onDebug,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
         onToolTrace: async (trace) => {
           ensureActive();
@@ -3670,6 +3704,7 @@ async function executeRuntimeStep(input: {
       abortSignal,
       shouldContinue: input.shouldContinue,
       requestToolConfirmation: input.requestToolConfirmation,
+      onDebug,
       observePageState,
       onVisualContextChange: async (snapshot) => {
         ensureActive();
@@ -4629,13 +4664,14 @@ async function executeCodexRuntimeObject(input: {
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
+  onDebug?: ExecutionDebug;
   onSelectReferenceScreenshots?: (selection: {
     ids: string[];
     selectionReason: string;
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -4702,6 +4738,7 @@ async function executeCodexRuntimeObject(input: {
     visualContext,
     abortSignal,
     shouldContinue,
+    onDebug,
     onToolTrace,
     onVisualContextChange,
     action: async () => {

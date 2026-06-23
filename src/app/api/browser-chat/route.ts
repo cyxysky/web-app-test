@@ -25,6 +25,7 @@ export async function POST(request: NextRequest) {
       targetUrl: typeof body.targetUrl === 'string' ? body.targetUrl : '',
       mode: body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers',
       safetyMode: safetyMode(body.safetyMode),
+      modelProvider: typeof body.modelProvider === 'string' ? body.modelProvider : undefined,
       title: typeof body.title === 'string' ? body.title : undefined,
       userId: requestUserId(request, body),
     });

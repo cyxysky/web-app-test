@@ -4,6 +4,10 @@ import path from 'node:path';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import {
+  defaultModelByProvider,
+  modelProviderValues,
+} from '@/config/settings';
+import {
   executeInteractiveBrowserTurn,
   type BrowserToolConfirmationDecision,
   type BrowserToolConfirmationRequest,
@@ -11,8 +15,8 @@ import {
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
 import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
-import { getModel, getModelSettings } from '@/server/ai/model';
-import type { RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
+import type { ModelProvider, RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { writeTextFileAtomic } from '@/server/storage/atomic-json';
@@ -84,6 +88,7 @@ export type BrowserChatSessionSnapshot = {
   noVncUrl?: string;
   mode: BrowserSessionMode | 'default';
   safetyMode: BrowserChatSafetyMode;
+  modelProvider: ModelProvider;
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
   tabs: BrowserTabSnapshot[];
@@ -178,6 +183,28 @@ function browserChatKeepBrowserOpenAfterTurn() {
 
 function normalizeSafetyMode(value: unknown): BrowserChatSafetyMode {
   return value === 'full' ? 'full' : 'strict';
+}
+
+const modelProviderSet = new Set<ModelProvider>(modelProviderValues);
+
+function normalizeModelProvider(value: unknown, fallback: ModelProvider = 'openrouter'): ModelProvider {
+  const provider = String(value || '').trim().toLowerCase();
+  if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
+  if (provider === 'codex' || provider === 'codex-cli') return 'codex';
+  if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
+  if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
+  return modelProviderSet.has(provider as ModelProvider) ? provider as ModelProvider : fallback;
+}
+
+function browserChatModelSettings(providerInput?: unknown) {
+  store.applyRuntimeEnv();
+  const config = store.getModelConfig();
+  const provider = normalizeModelProvider(providerInput, config?.provider || 'openrouter');
+  const settings = config?.providers?.[provider];
+  return {
+    provider,
+    model: settings?.model?.trim() || defaultModelByProvider[provider],
+  };
 }
 
 function normalizeToolConfirmation(value: unknown): BrowserChatToolConfirmation | undefined {
@@ -604,6 +631,7 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     noVncUrl: browserChatNoVncUrl(session),
     mode: session.mode,
     safetyMode: normalizeSafetyMode(session.safetyMode),
+    modelProvider: normalizeModelProvider(session.modelProvider),
     status: session.status,
     busy: session.busy,
     tabs: browserChatTabs(session),
@@ -631,6 +659,7 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
     noVncUrl: browserChatNoVncUrl(session),
     mode: session.mode,
     safetyMode: normalizeSafetyMode(session.safetyMode),
+    modelProvider: normalizeModelProvider(session.modelProvider),
     status: session.status,
     busy: session.busy,
     tabs: browserChatTabs(session),
@@ -806,6 +835,7 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
     tabs: session.tabs || [],
     targetUrl: exportableTargetUrl(session.targetUrl),
     safetyMode: normalizeSafetyMode(session.safetyMode),
+    modelProvider: normalizeModelProvider(session.modelProvider),
     messages,
     steps,
     conversationContext: normalizeConversationContext(session.conversationContext),
@@ -1308,11 +1338,13 @@ export function createBrowserChatSession(input: {
   targetUrl?: string;
   mode?: BrowserSessionMode | 'default';
   safetyMode?: BrowserChatSafetyMode;
+  modelProvider?: unknown;
   title?: string;
   userId?: string | number;
 } = {}) {
   hydrateSessions();
   store.applyRuntimeEnv();
+  const modelSettings = browserChatModelSettings(input.modelProvider);
   const timestamp = now();
   const session: BrowserChatSessionRecord = {
     id: id('chat'),
@@ -1321,6 +1353,7 @@ export function createBrowserChatSession(input: {
     targetUrl: exportableTargetUrl(input.targetUrl || ''),
     mode: input.mode || 'visual-markers',
     safetyMode: normalizeSafetyMode(input.safetyMode),
+    modelProvider: modelSettings.provider,
     status: 'idle',
     busy: false,
     tabs: [],
@@ -1805,6 +1838,7 @@ export async function sendBrowserChatMessage(
   content: string,
   mode?: BrowserSessionMode | 'default',
   safetyMode?: BrowserChatSafetyMode,
+  modelProvider?: unknown,
   clientMessageId?: string,
   attachmentsInput?: unknown,
   skillIdsInput?: unknown,
@@ -1833,6 +1867,7 @@ export async function sendBrowserChatMessage(
   session.pendingToolConfirmation = undefined;
   if (mode && !session.started && !session.steps.length && !session.messages.length) session.mode = mode;
   session.safetyMode = normalizeSafetyMode(safetyMode ?? session.safetyMode);
+  session.modelProvider = browserChatModelSettings(modelProvider ?? session.modelProvider).provider;
   const firstUserMessage = !session.messages.some((message) => message.role === 'user');
   if (firstUserMessage) session.title = compactText(messageText, 42);
 
@@ -2159,144 +2194,147 @@ async function runBrowserChatMessage(
   attachments: BrowserChatAttachment[],
   skills: SkillRecord[] = [],
 ) {
-  try {
-    if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-    appendLog(session, 'chat:run:start', '开始处理本轮对话操作');
-    const browser = await ensureStarted(session);
-    if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-    await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
-    if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-    appendLog(session, 'ai:prepare', '浏览器已准备好，正在请求 AI 决策');
-    const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
-    const result = await executeInteractiveBrowserTurn({
-      session: browser,
-      runId: session.id,
-      targetUrl: session.targetUrl || 'about:blank',
-      instruction: text,
-      modelInstruction: modelText,
-      conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId),
-      completedSteps: session.steps,
-      mode: session.mode,
-      safetyMode: session.safetyMode,
-      referenceImagePaths,
-      skillContext: formatSkillsForPrompt(skills),
-      abortSignal: abortController.signal,
-      shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
-      requestToolConfirmation: session.safetyMode === 'strict'
-        ? (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal)
-        : undefined,
-      onProgress: (step) => {
-        if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-        const index = session.steps.findIndex((item) => item.index === step.index);
-        if (index >= 0) session.steps[index] = { ...session.steps[index], ...step };
-        else session.steps.push(step);
-        session.steps.sort((a, b) => a.index - b.index);
-        if (step.index >= fromStepIndex) {
-          const timestamp = now();
-          updateAssistantMessage(session, assistantMessageId, (message) => ({
-            ...message,
-            activity: runningAssistantActivity(step, timestamp),
-            status: 'running',
-            updatedAt: timestamp,
-            stepIndexes: Array.from(new Set([...(message.stepIndexes || []), step.index])).sort((a, b) => a - b),
-          }));
-        }
-        session.updatedAt = now();
-        persistAndNotify(session.id);
-      },
-      onDebug: (event) => {
-        if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-        appendLog(session, event.phase, event.message, {
-          stepIndex: event.stepIndex,
-          elapsedMs: elapsedFromDetails(event.details),
-          details: event.details,
-        });
-      },
-    });
-    if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-    appendLog(session, 'chat:run:saving', '正在写入本轮对话最终结果');
-    session.steps = result.steps;
-    session.consoleErrors = result.consoleErrors;
-    session.networkErrors = result.networkErrors;
-    const finishedAt = now();
-    updateAssistantMessage(session, assistantMessageId, (message) => ({
-      ...message,
-      content: result.reply,
-      updatedAt: finishedAt,
-      stepIndexes: Array.from(new Set([
-        ...(message.stepIndexes || []),
-        ...result.newSteps.map((step) => step.index),
-      ])).sort((a, b) => a - b),
-      status: result.status,
-      activity: undefined,
-    }));
-    if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-    const completedAt = now();
-    const keepCompletedBrowser = browserChatKeepBrowserOpenAfterTurn() && Boolean(session.browser?.isUsable());
-    const shouldCloseCompletedBrowser = Boolean(session.browser || session.started) && !keepCompletedBrowser;
-    if (shouldCloseCompletedBrowser) {
-      await session.browser?.close().catch(() => undefined);
-      session.browser = undefined;
-      session.started = false;
-    }
-    session.status = 'idle';
-    session.busy = false;
-    session.pendingToolConfirmation = undefined;
-    session.activeAssistantMessageId = undefined;
-    session.activeAbortController = undefined;
-    session.updatedAt = completedAt;
-    session.logs = trimBrowserChatLogs([
-      ...(session.logs || []),
-      {
-        id: id('log'),
-        time: completedAt,
-        phase: 'chat:run:done',
-        message: shouldCloseCompletedBrowser
-          ? '本轮对话操作已完成，最终结果已写入，浏览器已自动关闭。'
-          : keepCompletedBrowser
-            ? '本轮对话操作已完成，最终结果已写入，浏览器已保留供后续对话复用。'
-            : '本轮对话操作已完成，最终结果已写入。',
-        messageId: assistantMessageId,
-      },
-    ]);
-    persistAndNotify(session.id);
-  } catch (error) {
-    const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);
-    const interrupted = abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId);
-    if (!stillActive) return;
-    const message = userFacingErrorMessage(error);
-    const details = errorLogDetails(error);
-    if (isDeadBrowserSessionError(error)) {
-      await session.browser?.close().catch(() => undefined);
-      session.browser = undefined;
-      session.started = false;
-    }
-    appendLog(
-      session,
-      interrupted ? 'chat:run:interrupted' : 'chat:run:error',
-      interrupted ? '用户主动中断了本轮对话。' : `本轮对话异常：${message}`,
-      { details },
-    );
-    session.error = interrupted ? undefined : message;
-    session.status = interrupted ? 'idle' : 'error';
-    session.busy = false;
-    session.pendingToolConfirmation = undefined;
-    session.updatedAt = now();
-    updateAssistantMessage(session, assistantMessageId, (item) => ({
-      ...item,
-      content: interrupted ? '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。' : `执行异常：${message}`,
-      updatedAt: session.updatedAt,
-      status: interrupted ? 'interrupted' : 'failed',
-      activity: undefined,
-    }));
-    session.activeAssistantMessageId = undefined;
-    session.activeAbortController = undefined;
-    persistAndNotify(session.id);
-  } finally {
-    if (session.pendingToolConfirmation?.messageId === assistantMessageId) {
-      cancelPendingToolConfirmation(session);
+  const modelSettings = browserChatModelSettings(session.modelProvider);
+  return withModelSettings(modelSettings, async () => {
+    try {
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      appendLog(session, 'chat:run:start', '开始处理本轮对话操作');
+      const browser = await ensureStarted(session);
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      appendLog(session, 'ai:prepare', '浏览器已准备好，正在请求 AI 决策');
+      const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
+      const result = await executeInteractiveBrowserTurn({
+        session: browser,
+        runId: session.id,
+        targetUrl: session.targetUrl || 'about:blank',
+        instruction: text,
+        modelInstruction: modelText,
+        conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId),
+        completedSteps: session.steps,
+        mode: session.mode,
+        safetyMode: session.safetyMode,
+        referenceImagePaths,
+        skillContext: formatSkillsForPrompt(skills),
+        abortSignal: abortController.signal,
+        shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
+        requestToolConfirmation: session.safetyMode === 'strict'
+          ? (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal)
+          : undefined,
+        onProgress: (step) => {
+          if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+          const index = session.steps.findIndex((item) => item.index === step.index);
+          if (index >= 0) session.steps[index] = { ...session.steps[index], ...step };
+          else session.steps.push(step);
+          session.steps.sort((a, b) => a.index - b.index);
+          if (step.index >= fromStepIndex) {
+            const timestamp = now();
+            updateAssistantMessage(session, assistantMessageId, (message) => ({
+              ...message,
+              activity: runningAssistantActivity(step, timestamp),
+              status: 'running',
+              updatedAt: timestamp,
+              stepIndexes: Array.from(new Set([...(message.stepIndexes || []), step.index])).sort((a, b) => a - b),
+            }));
+          }
+          session.updatedAt = now();
+          persistAndNotify(session.id);
+        },
+        onDebug: (event) => {
+          if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+          appendLog(session, event.phase, event.message, {
+            stepIndex: event.stepIndex,
+            elapsedMs: elapsedFromDetails(event.details),
+            details: event.details,
+          });
+        },
+      });
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      appendLog(session, 'chat:run:saving', '正在写入本轮对话最终结果');
+      session.steps = result.steps;
+      session.consoleErrors = result.consoleErrors;
+      session.networkErrors = result.networkErrors;
+      const finishedAt = now();
+      updateAssistantMessage(session, assistantMessageId, (message) => ({
+        ...message,
+        content: result.reply,
+        updatedAt: finishedAt,
+        stepIndexes: Array.from(new Set([
+          ...(message.stepIndexes || []),
+          ...result.newSteps.map((step) => step.index),
+        ])).sort((a, b) => a - b),
+        status: result.status,
+        activity: undefined,
+      }));
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      const completedAt = now();
+      const keepCompletedBrowser = browserChatKeepBrowserOpenAfterTurn() && Boolean(session.browser?.isUsable());
+      const shouldCloseCompletedBrowser = Boolean(session.browser || session.started) && !keepCompletedBrowser;
+      if (shouldCloseCompletedBrowser) {
+        await session.browser?.close().catch(() => undefined);
+        session.browser = undefined;
+        session.started = false;
+      }
+      session.status = 'idle';
+      session.busy = false;
       session.pendingToolConfirmation = undefined;
+      session.activeAssistantMessageId = undefined;
+      session.activeAbortController = undefined;
+      session.updatedAt = completedAt;
+      session.logs = trimBrowserChatLogs([
+        ...(session.logs || []),
+        {
+          id: id('log'),
+          time: completedAt,
+          phase: 'chat:run:done',
+          message: shouldCloseCompletedBrowser
+            ? '本轮对话操作已完成，最终结果已写入，浏览器已自动关闭。'
+            : keepCompletedBrowser
+              ? '本轮对话操作已完成，最终结果已写入，浏览器已保留供后续对话复用。'
+              : '本轮对话操作已完成，最终结果已写入。',
+          messageId: assistantMessageId,
+        },
+      ]);
+      persistAndNotify(session.id);
+    } catch (error) {
+      const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);
+      const interrupted = abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId);
+      if (!stillActive) return;
+      const message = userFacingErrorMessage(error);
+      const details = errorLogDetails(error);
+      if (isDeadBrowserSessionError(error)) {
+        await session.browser?.close().catch(() => undefined);
+        session.browser = undefined;
+        session.started = false;
+      }
+      appendLog(
+        session,
+        interrupted ? 'chat:run:interrupted' : 'chat:run:error',
+        interrupted ? '用户主动中断了本轮对话。' : `本轮对话异常：${message}`,
+        { details },
+      );
+      session.error = interrupted ? undefined : message;
+      session.status = interrupted ? 'idle' : 'error';
+      session.busy = false;
+      session.pendingToolConfirmation = undefined;
+      session.updatedAt = now();
+      updateAssistantMessage(session, assistantMessageId, (item) => ({
+        ...item,
+        content: interrupted ? '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。' : `执行异常：${message}`,
+        updatedAt: session.updatedAt,
+        status: interrupted ? 'interrupted' : 'failed',
+        activity: undefined,
+      }));
+      session.activeAssistantMessageId = undefined;
+      session.activeAbortController = undefined;
+      persistAndNotify(session.id);
+    } finally {
+      if (session.pendingToolConfirmation?.messageId === assistantMessageId) {
+        cancelPendingToolConfirmation(session);
+        session.pendingToolConfirmation = undefined;
+      }
+      if (session.activeAbortController === abortController) session.activeAbortController = undefined;
     }
-    if (session.activeAbortController === abortController) session.activeAbortController = undefined;
-  }
+  });
 }

@@ -47,15 +47,18 @@ import { useRouter } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { CustomSelect } from '@/components/CustomSelect';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
 import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
-import type { SettingsTab } from '@/config/settings';
+import { defaultModelByProvider, modelProviderDefinitions, type SettingsTab } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
 import { domTreeFromToolCall, fullDomSnapshotFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import type {
+  ModelConfigRecord,
+  ModelProvider,
   RunScheduleRecord,
   SkillRecord,
   StepExecutionResult,
@@ -119,6 +122,7 @@ type BrowserChatSession = {
   targetUrl: string;
   mode: BrowserChatMode;
   safetyMode: BrowserChatSafetyMode;
+  modelProvider: ModelProvider;
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
   createdAt: string;
@@ -136,6 +140,7 @@ type BrowserChatSession = {
 type BrowserChatView = 'chat' | 'target' | 'settings';
 type BrowserChatMode = 'dom' | 'visual-markers';
 type BrowserChatSafetyMode = 'strict' | 'full';
+type BrowserChatModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
 type BrowserChatToolDetail = {
   stepIndex: number;
@@ -619,8 +624,14 @@ function isContextCompressionLog(log: BrowserChatLogRecord) {
     || log.phase === 'conversation:context:error';
 }
 
+function isScreenshotPerformanceLog(log: BrowserChatLogRecord) {
+  const phase = log.phase.toLowerCase();
+  return phase.startsWith('browser:screenshot:')
+    || (phase.startsWith('perf:') && phase.includes('screenshot'));
+}
+
 function visibleExecutionLog(log: BrowserChatLogRecord) {
-  return isAiInputOutputLog(log) || isContextCompressionLog(log);
+  return isAiInputOutputLog(log) || isContextCompressionLog(log) || isScreenshotPerformanceLog(log);
 }
 
 function contextCompressionLabel(log: BrowserChatLogRecord) {
@@ -629,6 +640,66 @@ function contextCompressionLabel(log: BrowserChatLogRecord) {
   if (log.phase === 'conversation:context:response') return '历史对话上下文压缩完成';
   if (log.phase === 'conversation:context:error') return '历史对话上下文压缩失败';
   return '';
+}
+
+function finiteNumber(value: unknown) {
+  const numberValue = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numberValue) ? numberValue : undefined;
+}
+
+function stringValue(value: unknown) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function booleanValue(value: unknown) {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function formatScreenshotTimingStep(step: unknown, index: number) {
+  const record = asRecord(step);
+  if (!record) return '';
+  const name = stringValue(record.name) || `step ${index + 1}`;
+  const elapsedMs = finiteNumber(record.elapsedMs);
+  const parts = [`${index + 1}. ${name}`];
+  if (elapsedMs !== undefined) parts.push(`${elapsedMs}ms`);
+  const count = finiteNumber(record.count);
+  if (count !== undefined) parts.push(`count=${count}`);
+  if (booleanValue(record.skipped)) parts.push('skipped');
+  const path = stringValue(record.path);
+  if (path) parts.push(`path=${path}`);
+  const error = stringValue(record.error);
+  if (error) parts.push(`error=${error}`);
+  return parts.join(' | ');
+}
+
+function screenshotPerformancePayload(details: Record<string, unknown>) {
+  const timings = asRecord(details.timings);
+  const lines: string[] = [];
+  const totalMs = finiteNumber(timings?.totalMs) ?? finiteNumber(details.elapsedMs);
+  if (totalMs !== undefined) lines.push(`totalMs: ${totalMs}`);
+  const capture = stringValue(timings?.capture);
+  if (capture) lines.push(`capture: ${capture}`);
+  const path = stringValue(timings?.path) || stringValue(details.path) || stringValue(details.screenshotPath);
+  if (path) lines.push(`path: ${path}`);
+  const markerPath = stringValue(timings?.markerPath);
+  if (markerPath) lines.push(`markerPath: ${markerPath}`);
+  const originalPath = stringValue(timings?.originalPath);
+  if (originalPath) lines.push(`originalPath: ${originalPath}`);
+  const candidateCount = finiteNumber(timings?.candidateCount);
+  if (candidateCount !== undefined) lines.push(`candidateCount: ${candidateCount}`);
+  const scrollAreaCount = finiteNumber(timings?.scrollAreaCount);
+  if (scrollAreaCount !== undefined) lines.push(`scrollAreaCount: ${scrollAreaCount}`);
+  const separateMarkerMap = booleanValue(timings?.separateMarkerMap);
+  if (separateMarkerMap !== undefined) lines.push(`separateMarkerMap: ${separateMarkerMap}`);
+  const rawSteps = timings?.steps;
+  const steps = Array.isArray(rawSteps)
+    ? rawSteps.map(formatScreenshotTimingStep).filter(Boolean)
+    : [];
+  if (steps.length) {
+    lines.push('steps:');
+    lines.push(...steps.map((step) => `  ${step}`));
+  }
+  return lines.join('\n');
 }
 
 function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
@@ -662,7 +733,8 @@ function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
           context: parsed.context,
         })
       : '';
-  if (!requestPayload && !responsePayload) return null;
+  const performancePayload = isScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
+  if (!requestPayload && !responsePayload && !performancePayload) return null;
   return (
     <div className="browser-chat-log-details">
       {requestPayload ? (
@@ -675,6 +747,12 @@ function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
         <section className="browser-chat-log-detail-block is-response">
           <strong>AI output JSON</strong>
           <pre>{responsePayload}</pre>
+        </section>
+      ) : null}
+      {performancePayload ? (
+        <section className="browser-chat-log-detail-block is-performance">
+          <strong>Screenshot performance</strong>
+          <pre>{performancePayload}</pre>
         </section>
       ) : null}
     </div>
@@ -831,6 +909,15 @@ function normalizeSafetyMode(value?: string): BrowserChatSafetyMode {
   return value === 'full' ? 'full' : 'strict';
 }
 
+function normalizeModelProvider(value?: string): ModelProvider {
+  const provider = String(value || '').trim().toLowerCase();
+  if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
+  if (provider === 'codex' || provider === 'codex-cli') return 'codex';
+  if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
+  if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
+  return modelProviderDefinitions.some((item) => item.value === provider) ? provider as ModelProvider : 'openrouter';
+}
+
 function normalizeToolConfirmation(value?: BrowserChatToolConfirmation): BrowserChatToolConfirmation | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const id = typeof value.id === 'string' ? value.id.trim() : '';
@@ -863,6 +950,7 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
     })),
     mode: normalizeMode(session.mode),
     safetyMode: normalizeSafetyMode(session.safetyMode),
+    modelProvider: normalizeModelProvider(session.modelProvider),
     networkErrors: session.networkErrors || [],
     pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
     steps: session.steps || [],
@@ -1781,8 +1869,11 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading,
   mode,
   modeLocked,
+  modelProvider,
+  modelProviderOptions,
   safetyMode,
   onInterrupt,
+  onModelProviderChange,
   onModeChange,
   onPreviewAttachment,
   onRemoveAttachment,
@@ -1802,8 +1893,11 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading: boolean;
   mode: BrowserChatMode;
   modeLocked: boolean;
+  modelProvider: ModelProvider;
+  modelProviderOptions: Array<{ label: string; value: string }>;
   safetyMode: BrowserChatSafetyMode;
   onInterrupt: () => void | Promise<void>;
+  onModelProviderChange: (provider: ModelProvider) => void;
   onModeChange: (mode: BrowserChatMode) => void;
   onPreviewAttachment: (attachment: BrowserChatAttachment) => void;
   onRemoveAttachment: (id: string) => void;
@@ -2343,6 +2437,13 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                 {t('完全')}
               </button>
             </div>
+            <CustomSelect
+              className="browser-chat-provider-select"
+              disabled={currentBusy || loading}
+              onChange={(value) => onModelProviderChange(normalizeModelProvider(value))}
+              options={modelProviderOptions}
+              value={modelProvider}
+            />
           </div>
           <div className="browser-chat-compose-submit">
             {showStop ? (
@@ -2853,6 +2954,8 @@ export function BrowserChatWorkspace({
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [mode, setMode] = useState<BrowserChatMode>('visual-markers');
   const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
+  const [modelProvider, setModelProvider] = useState<ModelProvider>('openrouter');
+  const [modelConfig, setModelConfig] = useState<BrowserChatModelConfig | null>(null);
   const [targetGroupId, setTargetGroupId] = useState<string | undefined>();
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [groupName, setGroupName] = useState('');
@@ -2960,6 +3063,13 @@ export function BrowserChatWorkspace({
   const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || imagePreview || groupDialogOpen);
   const embeddedBrowserViewActive = embeddedBrowserActive && !embeddedBrowserCovered;
   const embeddedBrowserLeftOverlayInset = embeddedBrowserActive && historyTooltipActive && sidebarCollapsed ? 300 : 0;
+  const modelProviderOptions = useMemo(() => modelProviderDefinitions.map((provider) => {
+    const configuredModel = modelConfig?.providers?.[provider.value]?.model?.trim() || defaultModelByProvider[provider.value];
+    return {
+      label: configuredModel ? `${provider.label} - ${configuredModel}` : provider.label,
+      value: provider.value,
+    };
+  }), [modelConfig]);
 
   const loadBrowserRuntimeSettings = useCallback(async () => {
     const response = await fetch('/api/settings/env', { cache: 'no-store' });
@@ -2975,6 +3085,19 @@ export function BrowserChatWorkspace({
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '加载 Skills 失败');
     setSkills(Array.isArray(data.skills) ? data.skills : []);
+  }, []);
+
+  const loadModelConfig = useCallback(async () => {
+    const response = await fetch('/api/settings/model', { cache: 'no-store' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '加载模型配置失败');
+    const config = data.config as Partial<BrowserChatModelConfig> | undefined;
+    if (!config) return;
+    setModelConfig({
+      provider: normalizeModelProvider(config.provider),
+      providers: config.providers || {},
+      updatedAt: typeof config.updatedAt === 'string' ? config.updatedAt : '',
+    });
   }, []);
 
   const beginEmbeddedChatResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -3056,6 +3179,7 @@ export function BrowserChatWorkspace({
     if (shouldActivate) {
       setMode(normalizeMode(loadedSession.mode));
       setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
+      setModelProvider(normalizeModelProvider(loadedSession.modelProvider));
     }
     return loadedSession;
   }, [upsertSession]);
@@ -3094,6 +3218,15 @@ export function BrowserChatWorkspace({
   useEffect(() => {
     void loadSkills().catch(() => undefined);
   }, [loadSkills]);
+
+  useEffect(() => {
+    void loadModelConfig().catch(() => undefined);
+  }, [loadModelConfig]);
+
+  useEffect(() => {
+    if (session?.id || !modelConfig?.provider) return;
+    setModelProvider(normalizeModelProvider(modelConfig.provider));
+  }, [modelConfig?.provider, session?.id]);
 
   useEffect(() => {
     void loadBrowserRuntimeSettings().catch(() => undefined);
@@ -3157,7 +3290,7 @@ export function BrowserChatWorkspace({
     const response = await fetch('/api/browser-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode, safetyMode }),
+      body: JSON.stringify({ mode, safetyMode, modelProvider }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '创建对话会话失败');
@@ -3173,7 +3306,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(`/api/browser-chat/${sessionId}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, safetyMode, skillIds }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, safetyMode, modelProvider, skillIds }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '发送消息失败');
@@ -3517,6 +3650,7 @@ export function BrowserChatWorkspace({
       const loadedSession = await refreshSession(sessionId, { activate: true });
       setMode(normalizeMode(loadedSession.mode));
       setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
+      setModelProvider(normalizeModelProvider(loadedSession.modelProvider));
       void loadSessions().catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');
@@ -3718,8 +3852,11 @@ export function BrowserChatWorkspace({
           loading={Boolean(loadingSessionId)}
           mode={mode}
           modeLocked={modeLocked}
+          modelProvider={modelProvider}
+          modelProviderOptions={modelProviderOptions}
           safetyMode={safetyMode}
           onInterrupt={interruptConversation}
+          onModelProviderChange={setModelProvider}
           onModeChange={setMode}
           onPreviewAttachment={previewAttachment}
           onRemoveAttachment={removeAttachment}
@@ -3893,8 +4030,11 @@ export function BrowserChatWorkspace({
                 loading={Boolean(loadingSessionId)}
                 mode={mode}
                 modeLocked={modeLocked}
+                modelProvider={modelProvider}
+                modelProviderOptions={modelProviderOptions}
                 safetyMode={safetyMode}
                 onInterrupt={interruptConversation}
+                onModelProviderChange={setModelProvider}
                 onModeChange={setMode}
                 onPreviewAttachment={previewAttachment}
                 onRemoveAttachment={removeAttachment}

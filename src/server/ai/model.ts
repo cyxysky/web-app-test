@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createAlibaba } from '@ai-sdk/alibaba';
 import { createAmazonBedrock } from '@ai-sdk/amazon-bedrock';
 import { createAnthropic } from '@ai-sdk/anthropic';
@@ -53,6 +54,16 @@ type AiProvider =
   | 'xai';
 type ApprovalMode = 'never' | 'on-failure' | 'on-request' | 'untrusted';
 type SandboxMode = 'danger-full-access' | 'read-only' | 'workspace-write';
+type ModelSettingsOverride = {
+  provider?: string;
+  model?: string;
+};
+
+const modelSettingsStorage = new AsyncLocalStorage<ModelSettingsOverride>();
+
+export function withModelSettings<T>(settings: ModelSettingsOverride, callback: () => T): T {
+  return modelSettingsStorage.run(settings, callback);
+}
 
 export function getModel(): GenerateTextModel {
   const { provider, model } = getModelSettings();
@@ -156,7 +167,8 @@ export function getModel(): GenerateTextModel {
 }
 
 export function getModelSettings() {
-  const provider = normalizeProvider(process.env.AI_PROVIDER);
+  const override = modelSettingsStorage.getStore();
+  const provider = normalizeProvider(override?.provider || process.env.AI_PROVIDER);
   const defaults: Record<AiProvider, string> = {
     'ai-gateway': 'openai/gpt-5.5',
     alibaba: 'qwen-plus',
@@ -186,7 +198,7 @@ export function getModelSettings() {
   };
   return {
     provider,
-    model: process.env.AI_MODEL || defaults[provider],
+    model: override?.model || process.env.AI_MODEL || defaults[provider],
   };
 }
 

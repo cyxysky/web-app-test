@@ -229,12 +229,15 @@ function applyModelConfig(config?: LegacyModelConfigRecord) {
   if (!normalized) return;
   const provider = normalized.provider;
   const active = normalized.providers[provider] || defaultProviderSettings(provider);
+  for (const definition of modelProviderDefinitions) {
+    const item = normalized.providers[definition.value] || defaultProviderSettings(definition.value);
+    const keyEnv = modelApiKeyEnv(definition.value);
+    if (keyEnv) process.env[keyEnv] = item.apiKey || '';
+    const baseUrlEnv = modelBaseUrlEnv(definition.value);
+    if (baseUrlEnv) process.env[baseUrlEnv] = item.baseURL || definition.defaultBaseURL || '';
+  }
   process.env.AI_PROVIDER = provider;
   process.env.AI_MODEL = active.model || defaultModelByProvider[provider];
-  const keyEnv = modelApiKeyEnv(provider);
-  if (keyEnv) process.env[keyEnv] = active.apiKey || '';
-  const baseUrlEnv = modelBaseUrlEnv(provider);
-  if (baseUrlEnv) process.env[baseUrlEnv] = active.baseURL || modelProviderDefinition(provider).defaultBaseURL || '';
 }
 
 function stepMemoryLine(step: StepExecutionResult) {

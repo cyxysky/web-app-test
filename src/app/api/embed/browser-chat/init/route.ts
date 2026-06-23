@@ -33,6 +33,7 @@ export async function POST(request: NextRequest) {
       targetUrl: normalizeString(body.targetUrl),
       mode: normalizeMode(body.mode),
       safetyMode: normalizeSafetyMode(body.safetyMode),
+      modelProvider: typeof body.modelProvider === 'string' ? body.modelProvider : undefined,
       title: normalizeString(body.title) || undefined,
       userId,
     });
