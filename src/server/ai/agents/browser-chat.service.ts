@@ -1290,7 +1290,6 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
     isMarked: true,
     preferExistingPage: false,
     runId: session.id,
-    tabGroupTitle: session.title,
   });
   session.browser = browser;
   session.status = 'running';

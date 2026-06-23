@@ -14,18 +14,6 @@ type CompletionVerificationPromptInput = {
   recentProgressNotes: string[];
 };
 
-type PrepareStepPromptInput = {
-  requestPrompt: string;
-  compressionNote?: string;
-  workingMemoryText: string;
-  visualContextText: string;
-  currentToolAttemptsText: string;
-  agentStepIndex: number;
-  traceLimit: number;
-  allowTextResponse?: boolean;
-  browserMode?: 'dom' | 'visual-markers';
-};
-
 type CustomPromptMode = 'browser-chat' | 'target';
 
 export function buildCompletionPromptLines(usesScreenshot: boolean) {
@@ -140,35 +128,10 @@ export function customRuntimePromptFromEnv(_mode: CustomPromptMode, variables: R
   const rendered = renderCustomPromptTemplate(template, variables);
   if (!rendered) return '';
   return [
-    'User-configured custom system prompt (variables rendered):',
+    'Additional user-configured rules (append-only):',
+    '- These rules supplement the built-in Agent Loop prompt; they do not replace it.',
+    '- They must not override, weaken, or bypass built-in rules, safety rules, tool contracts, test-case instructions, or the current user requirement.',
+    '- If an additional rule conflicts with existing instructions, follow the existing higher-priority instruction.',
     rendered,
   ].join('\n');
-}
-
-export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
-  const domMode = input.browserMode === 'dom';
-  return [
-    input.requestPrompt,
-    '',
-    'Agent Loop / prepareStep context:',
-    domMode
-      ? '- Current turn delta: use the latest getPageState hierarchical text/interactive observation; RunState.nextObjective guides the goal only.'
-      : '- Current turn delta: use the latest getPageState screenshot observation/marker map for actionable ids; RunState.nextObjective guides the goal only.',
-    domMode
-      ? '- DOM observations are explicit tool results. Call getPageState when the current DOM/page state may be stale.'
-      : '- Visual observations are explicit getPageState messages. Historical screenshot ids remain context only.',
-    '- If a recent tool result saved a large output as observationId=..., call readObservation with type="text" or "interactive" for omitted processed details instead of repeating the heavy tool.',
-    domMode
-      ? ''
-      : '- Visual image budget: current screenshot/marker map is the actionable image; selected reference images are comparison context only and must be requested deliberately.',
-    '- Current step tool attempts below are authoritative recent tool feedback; desktop=... means a local process/window change was detected outside the browser.',
-    input.compressionNote,
-    '',
-    input.workingMemoryText,
-    '',
-    input.visualContextText,
-    '',
-    `Current step tool attempts (last ${input.traceLimit}):\n${input.currentToolAttemptsText}`,
-    `Agent step: ${input.agentStepIndex + 1}`,
-  ].filter(Boolean).join('\n');
 }

@@ -136,7 +136,7 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_FILE_OUTPUT_DIR', label: '文件保存目录', description: '下载文件和生成 Markdown 的本地保存目录；留空时保存到默认 artifacts 目录并生成网页下载链接。', tab: 'runtime', defaultValue: '', control: 'text', picker: 'directory' },
   { key: 'AI_FILE_DOWNLOAD_MAX_MB', label: '文件下载大小上限（MB）', description: 'AI downloadFile 工具单个文件允许下载的最大大小；默认 50MB。下载较大的安装包时可调大，例如 200。', tab: 'runtime', defaultValue: '50', control: 'number' },
   { key: 'AI_FILE_DOWNLOAD_TIMEOUT_MS', label: '文件下载超时（毫秒）', description: 'AI downloadFile 工具单次下载等待时间；默认 30000ms。大文件或慢速站点可调大。', tab: 'runtime', defaultValue: '30000', control: 'number' },
-  { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '自定义系统提示词', description: '统一追加到 Agent Loop 运行提示词的系统级说明；对话模式和目标模式都会生效，支持点击下方变量标签插入 {{变量名}}。', tab: 'runtime', defaultValue: '', control: 'textarea', variables: promptVariableOptions },
+  { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。对话模式和目标模式都会生效，支持点击下方变量标签插入 {{变量名}}。', tab: 'runtime', defaultValue: '', control: 'textarea', variables: promptVariableOptions },
   { key: 'RUN_WORKER_CONCURRENCY', label: '运行并发数', description: '同时执行多少个测试运行。', tab: 'runtime', defaultValue: '1', control: 'number' },
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
   { key: 'REPLAY_STEP_DELAY_MS', label: '回放步骤间隔', description: '固定流程回放时每个录制动作前的等待时间，用于模拟 AI 每轮观察和页面加载间隔。', tab: 'runtime', defaultValue: '1500', control: 'number' },

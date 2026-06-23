@@ -2291,8 +2291,7 @@ function runtimePrompt(input: {
     ...markerTargetRules,
     caseSystemPrompt ? `Test-case-specific instructions:
 ${caseSystemPrompt}` : '',
-    customPrompt ? `Custom system instructions:
-${customPrompt}` : '',
+    customPrompt,
     strategyMemory.length ? `Historical failure strategy memory:
 ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : '',
     '',
@@ -3360,20 +3359,6 @@ async function executeRuntimeStep(input: {
   throw wrapped;
 }
 
-export type InteractiveBrowserTurnMessage = {
-  role: 'user' | 'assistant';
-  content: string;
-};
-
-export type InteractiveBrowserTurnResult = {
-  status: 'passed' | 'failed' | 'blocked';
-  reply: string;
-  steps: StepExecutionResult[];
-  newSteps: StepExecutionResult[];
-  consoleErrors: string[];
-  networkErrors: string[];
-};
-
 function manualVerificationMaxPromptsPerStep() {
   const raw = Number(process.env.AI_MANUAL_VERIFICATION_MAX_PROMPTS_PER_STEP || 3);
   return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 3));
@@ -3389,308 +3374,6 @@ function markManualResumed(counts: Map<number, number>, stepIndex: number) {
 
 function canPromptManualVerification(counts: Map<number, number>, stepIndex: number, maxPrompts: number) {
   return manualResumeCount(counts, stepIndex) < maxPrompts;
-}
-
-function browserChatRequirement(input: {
-  targetUrl: string;
-  instruction: string;
-  conversation: InteractiveBrowserTurnMessage[];
-}) {
-  const history = input.conversation
-    .slice(-12)
-    .map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${concise(message.content, 900)}`)
-    .join('\n');
-  return [
-    'Browser chat mode. This is not a fixed test case.',
-    'The user is having a live conversation with you and expects you to operate the browser from the current page state.',
-    `Latest user message: ${input.instruction}`,
-    `Target URL if the user did not specify another page: ${input.targetUrl || 'about:blank'}`,
-    history ? `Conversation history:\n${history}` : '',
-    '',
-    'Work style:',
-    '- Follow the latest user message first, while preserving useful context from the conversation.',
-    '- If browser work is needed, take concrete browser actions instead of only describing what to do.',
-    '- If the user asks a question about the current page, inspect the page and answer from evidence.',
-    '- If the user asks you to continue after manual login/captcha/security work, continue from the current browser state.',
-    '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
-    '- Keep tester discipline: record visible problems, suspicious network failures, broken UI states, and why they matter.',
-    '',
-    'Final answer style:',
-    '- The final user-visible browser-chat answer is your assistant content. It must be Chinese Markdown, not plain inline text.',
-    '- Use short paragraphs and Markdown bullets or numbered lists with line breaks. Do not cram numbered items into one paragraph.',
-    '- If the latest user message can be answered from current evidence, return the Markdown answer directly and call no tool.',
-    '- Never include JSON, fenced JSON, tool parameters, candidate ids, coordinates, screenshot paths, or status objects in assistant text.',
-  ].filter(Boolean).join('\n');
-}
-
-function createInteractiveBrowserTestCase(input: {
-  id: string;
-  mode?: BrowserSessionMode | 'default';
-  targetUrl: string;
-  instruction: string;
-  conversation: InteractiveBrowserTurnMessage[];
-}): TestCaseRecord {
-  const now = new Date().toISOString();
-  const targetUrl = input.targetUrl || 'about:blank';
-  const requirement = browserChatRequirement({
-    targetUrl,
-    instruction: input.instruction,
-    conversation: input.conversation,
-  });
-  return {
-    id: input.id,
-    title: 'Browser chat operation',
-    description: input.instruction,
-    targetUrl,
-    status: 'running',
-    priority: 'medium',
-    content: {
-      title: 'Browser chat operation',
-      description: input.instruction,
-      targetUrl,
-      priority: 'medium',
-      browserMode: input.mode || 'default',
-      isMarked: true,
-      userRequirement: requirement,
-      systemPrompt: 'This is an interactive browser chat. Do not assume a fixed test-case script; operate from the live page and answer the latest user message in Chinese.',
-      preconditions: [],
-      testData: {},
-      steps: [],
-      expectedResults: ['Satisfy the latest user message or clearly report the blocker.'],
-      risks: ['The user may continue the task with another chat message after this turn.'],
-    },
-    imageNames: [],
-    createdAt: now,
-    updatedAt: now,
-  };
-}
-
-function upsertStep(steps: StepExecutionResult[], step: StepExecutionResult) {
-  const index = steps.findIndex((item) => item.index === step.index);
-  if (index >= 0) steps[index] = { ...steps[index], ...step };
-  else steps.push(step);
-  steps.sort((a, b) => a.index - b.index);
-}
-
-function assistantReplyFromStep(step?: StepExecutionResult) {
-  if (!step) return '这一轮没有产生新的浏览器操作。';
-  const lastTool = step.tools?.at(-1);
-  const input = lastTool?.input && typeof lastTool.input === 'object' && !Array.isArray(lastTool.input)
-    ? lastTool.input as Record<string, unknown>
-    : {};
-  const reportState = lastTool?.name === 'reportState';
-  const toolText = [
-    input.actual,
-    input.action,
-    input.reason,
-  ]
-    .map((value) => (typeof value === 'string' ? readableActionFromRawText(value, { reportState }) : undefined))
-    .find(Boolean);
-  const actual = readableActionFromRawText(
-    (step.actual || '').replace(/^Reported state without browser action:\s*/i, '').trim(),
-    { reportState },
-  );
-  const note = readableActionFromRawText(step.note);
-  return reportState
-    ? toolText || note || actual || '已完成这一轮浏览器操作。'
-    : note || actual || toolText || '已完成这一轮浏览器操作。';
-}
-
-export async function executeInteractiveBrowserTurn(input: {
-  session: BrowserSession;
-  runId: string;
-  targetUrl: string;
-  instruction: string;
-  conversation?: InteractiveBrowserTurnMessage[];
-  completedSteps?: StepExecutionResult[];
-  mode?: BrowserSessionMode | 'default';
-  referenceImagePaths?: string[];
-  onProgress?: (step: StepExecutionResult) => void | Promise<void>;
-  onDebug?: ExecutionDebug;
-  abortSignal?: AbortSignal;
-}): Promise<InteractiveBrowserTurnResult> {
-  const steps = [...(input.completedSteps || [])];
-  const newSteps: StepExecutionResult[] = [];
-  const testCase = createInteractiveBrowserTestCase({
-    id: `chat_${input.runId}`,
-    mode: input.mode,
-    targetUrl: input.targetUrl,
-    instruction: input.instruction,
-    conversation: input.conversation || [],
-  });
-  let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
-  let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
-  let reply = '';
-
-  while (true) {
-    if (input.abortSignal?.aborted) throw new Error('Browser chat operation interrupted by user.');
-    const stepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
-    await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `Preparing browser chat step ${stepIndex}; capturing current page screenshot.` });
-    let runningStep: StepExecutionResult = {
-      index: stepIndex,
-      action: 'AI is handling the latest browser chat message',
-      expected: 'AI should inspect the live browser state and perform one useful browser action or report the current state.',
-      actual: 'AI is preparing the current browser state.',
-      status: 'running',
-    };
-    upsertStep(steps, runningStep);
-    await input.onProgress?.(runningStep);
-
-    const beforeScreenshotStartedAt = Date.now();
-    const beforeScreenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, 'before');
-    const beforeTimingSummary = input.session.formatLastScreenshotTiming();
-    await input.onDebug?.({ phase: 'browser:screenshot:before', stepIndex, message: `Current page screenshot captured in ${elapsedSince(beforeScreenshotStartedAt)}ms.${beforeTimingSummary ? ` ${beforeTimingSummary}` : ''}`, details: { elapsedMs: elapsedSince(beforeScreenshotStartedAt), path: beforeScreenshotPath, timings: input.session.getLastScreenshotTiming() } });
-    runningStep = {
-      ...runningStep,
-      actual: 'AI is choosing the next browser action from the current page.',
-      beforeScreenshotPath,
-    };
-    upsertStep(steps, runningStep);
-    await input.onProgress?.(runningStep);
-
-    const liveToolTraces: ToolTrace[] = [];
-    let latestToolProgress: ToolTraceProgress | undefined;
-    let actionResult: Awaited<ReturnType<typeof executeRuntimeStep>>;
-
-    try {
-      actionResult = await executeRuntimeStep({
-        session: input.session,
-        testCase,
-        runId: input.runId,
-        stepIndex,
-        beforeScreenshotPath: beforeScreenshotPath || '',
-        completedSteps: steps.filter((step) => step.index !== stepIndex),
-        selectedScreenshotReferences,
-        referenceImagePaths: input.referenceImagePaths,
-        onSelectReferenceScreenshots: async (selection) => {
-          selectedScreenshotReferences = selection.ids
-            .map((id) => selection.availableReferences.find((ref) => ref.id === id))
-            .filter((ref): ref is ScreenshotReference => Boolean(ref))
-            .map((ref) => ({
-              ...ref,
-              selectionReason: selection.selectionReason,
-              sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
-            }));
-        },
-        abortSignal: input.abortSignal,
-        onDebug: input.onDebug,
-        onToolTrace: async (trace, progress) => {
-          upsertToolTrace(liveToolTraces, trace);
-          latestToolProgress = progress || latestToolProgress;
-          await input.onProgress?.({
-            ...runningStep,
-            actual: 'AI called a browser tool; waiting for page feedback.',
-            tools: summarizeToolTraces(liveToolTraces),
-            ...progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress),
-          });
-        },
-      });
-    } catch (error) {
-      if (input.abortSignal?.aborted) throw error;
-      const errorText = infrastructureError(error);
-      if (!liveToolTraces.length && isInfrastructureNoise(errorText)) {
-        const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
-        if (runningIndex >= 0) steps.splice(runningIndex, 1);
-        await input.onDebug?.({
-          phase: 'chat:runtime:request-aborted',
-          stepIndex,
-          message: 'Browser chat AI request failed before any browser tool executed.',
-          details: serializeError(error),
-        });
-        finalStatus = 'failed';
-        reply = `这轮浏览器聊天请求在执行任何浏览器操作前失败：${trimDebugText(errorText, 500)}`;
-        break;
-      }
-      const recoveredState = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress);
-      const errorStep = await createRecoverableRuntimeErrorStep({
-        session: input.session,
-        runId: input.runId,
-        stepIndex,
-        beforeScreenshotPath,
-        error,
-        tools: summarizeToolTraces(liveToolTraces),
-        aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
-        recoveredState,
-      });
-      upsertStep(steps, errorStep);
-      newSteps.push(errorStep);
-      await input.onProgress?.(errorStep);
-      finalStatus = 'failed';
-      reply = assistantReplyFromStep(errorStep);
-      break;
-    }
-
-    const browserChatReply = actionResult.endedWithText ? actionResult.text.trim() : '';
-    if (browserChatReply && !actionResult.traces.length) {
-      const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
-      if (runningIndex >= 0) steps.splice(runningIndex, 1);
-      await input.onDebug?.({
-        phase: 'chat:direct-answer',
-        stepIndex,
-        message: 'Browser chat completed with a direct Markdown answer and no browser tool.',
-      });
-      reply = browserChatReply;
-      finalStatus = 'passed';
-      break;
-    }
-
-    const afterScreenshotStartedAt = Date.now();
-    const afterScreenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, 'after');
-    const afterTimingSummary = input.session.formatLastScreenshotTiming();
-    await input.onDebug?.({ phase: 'browser:screenshot:after', stepIndex, message: `Post-action screenshot captured in ${elapsedSince(afterScreenshotStartedAt)}ms.${afterTimingSummary ? ` ${afterTimingSummary}` : ''}`, details: { elapsedMs: elapsedSince(afterScreenshotStartedAt), path: afterScreenshotPath, timings: input.session.getLastScreenshotTiming() } });
-    const decision = normalizeRuntimeDecision(deriveDecision(actionResult.text, actionResult.traces, requirementOf(testCase)));
-    const completedStep: StepExecutionResult = {
-      index: stepIndex,
-      action: decision.action,
-      expected: decision.expected,
-      actual: decision.actual,
-      status: decision.status,
-      note: decision.note,
-      taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
-      ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
-        .map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex })),
-      aiRequest: actionResult.aiRequest,
-      beforeScreenshotPath,
-      afterScreenshotPath,
-      screenshotPath: afterScreenshotPath,
-      tools: summarizeToolTraces(actionResult.traces),
-      visualContext: actionResult.visualContext,
-      workingMemory: actionResult.workingMemory,
-    };
-    upsertStep(steps, completedStep);
-    newSteps.push(completedStep);
-    await input.onProgress?.(completedStep);
-    reply = browserChatReply || assistantReplyFromStep(completedStep);
-
-    const lastToolName = actionResult.traces.at(-1)?.name;
-    if (browserChatReply) {
-      finalStatus = decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed';
-      break;
-    }
-    if (decision.status === 'blocked' || decision.status === 'failed') {
-      finalStatus = decision.status;
-      break;
-    }
-    if (decision.done || lastToolName === 'reportState' || lastToolName === 'waitForHumanVerification') {
-      finalStatus = decision.status;
-      break;
-    }
-  }
-
-  if (!newSteps.length) {
-    reply = reply || '这一轮没有产生新的浏览器操作。';
-  } else if (!reply) {
-    reply = assistantReplyFromStep(newSteps.at(-1));
-  }
-
-  return {
-    status: finalStatus,
-    reply,
-    steps,
-    newSteps,
-    consoleErrors: input.session.getConsoleErrors(),
-    networkErrors: input.session.getNetworkErrors(),
-  };
 }
 
 function errorRecordSources(error: unknown) {
@@ -4256,7 +3939,6 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
   const session = new BrowserSession(mode, {
     isMarked: visualMarkersEnabledFor(testCase),
     runId,
-    tabGroupTitle: testCase.title,
   });
   const steps: StepExecutionResult[] = [];
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
@@ -4808,7 +4490,6 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
   const session = new BrowserSession(runtimeMode, {
     isMarked: visualMarkersEnabledFor(testCase),
     runId,
-    tabGroupTitle: testCase.title,
   });
   const steps: StepExecutionResult[] = [...(initialSteps || [])];
   const startStepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;

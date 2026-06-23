@@ -64,7 +64,6 @@ export type BrowserSessionMode = 'dom' | 'visual-markers';
 export type BrowserSessionOptions = {
   isMarked?: boolean;
   runId?: string;
-  tabGroupTitle?: string;
   preferExistingPage?: boolean;
   browserProfileKey?: string;
 };
@@ -599,14 +598,6 @@ function isBlankBrowserUrlLike(url: string) {
       /^data:text\/html/i.test(url)
       && /data-webpilot-embedded-browser|WebPilot(?:%20|\+)Embedded(?:%20|\+)Browser|WebPilot embedded browser/i.test(url)
     );
-}
-
-function normalizeTabGroupTitle(value?: string) {
-  const normalized = (value || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 42);
-  return normalized || '浏览器会话';
 }
 
 function installAiBrowserPageRuntime() {
@@ -2361,14 +2352,12 @@ export class BrowserSession {
   private pageDiscoveryListener?: (page: Page) => void;
   private pageGroupInitScriptPages = new WeakSet<Page>();
   private readonly pageGroupId: string;
-  private readonly tabGroupTitle: string;
 
   constructor(
     private readonly mode: BrowserSessionMode = browserSessionModeFromEnv(),
     private readonly options: BrowserSessionOptions = {},
   ) {
     this.pageGroupId = normalizePageGroupId(options.runId);
-    this.tabGroupTitle = normalizeTabGroupTitle(options.tabGroupTitle || options.runId);
   }
 
   isUsable() {

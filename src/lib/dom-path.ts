@@ -7,10 +7,6 @@ export function normalizeDomPathString(value: unknown) {
   return bracketed?.[1] || raw;
 }
 
-export function normalizeDomPathParam(input: Record<string, unknown>) {
-  return normalizeDomPathString(input.path) || normalizeDomPathString(input.domPath);
-}
-
 export function normalizeDomNodeIdString(value: unknown) {
   const raw = typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
   if (!raw) return '';

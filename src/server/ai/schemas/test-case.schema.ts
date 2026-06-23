@@ -106,8 +106,6 @@ export type SkillRecord = {
   updatedAt: string;
 };
 
-export type TaskFrameDimension = z.infer<typeof taskFrameDimensionSchema>;
-
 export type TaskFrame = z.infer<typeof taskFrameSchema>;
 
 export type TaskLedgerItem = {

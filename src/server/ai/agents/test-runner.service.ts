@@ -426,12 +426,6 @@ function createQueuedRun(testCaseId: string, source: NonNullable<TestRunRecord['
   return { run, testCase };
 }
 
-// 同步执行测试用例，调用方会等待整次运行结束。
-export async function runTestCase(testCaseId: string) {
-  const { run } = createQueuedRun(testCaseId);
-  return executeRun(testCaseId, run.id);
-}
-
 // 后台启动测试用例执行，立即返回运行记录供前端轮询。
 export function startTestCaseRun(testCaseId: string, source: NonNullable<TestRunRecord['queue']>['source'] = 'single') {
   const { run } = createQueuedRun(testCaseId, source);
