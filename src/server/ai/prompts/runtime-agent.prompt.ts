@@ -74,7 +74,7 @@ export function buildCompletionVerificationPrompt(input: CompletionVerificationP
 export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
   const answerAllowed = allowedTypes.includes('answer');
   const visualMode = allowedTypes.includes('clickCandidate');
-  const domMode = allowedTypes.includes('clickDomNode') || allowedTypes.includes('getDomNodeText');
+  const domMode = allowedTypes.includes('readObservation') || allowedTypes.includes('findByText') || allowedTypes.includes('clickLocator');
   return [
     prompt,
     '',
@@ -89,9 +89,9 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
     '- In message/reason/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot ids/file names, or tool input JSON.',
     visualMode ? '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.' : '',
-    domMode ? '- DOM mode: use getPageState for hierarchical page text and hierarchical visible interactive elements without coordinates. Use findByText then clickLocator for normal text-accessible targets. Use getDomNodeText/clickDomNode/hoverDomNode/doubleClickDomNode/dragDomNode only when a current tool result actually exposes fresh numeric node_id values.' : '',
+    domMode ? '- DOM mode: use getPageState to refresh the current observation. Then use readObservation(type="text"|"interactive", offset, maxChars) to inspect hierarchical page text or visible interactive elements. Use clickCandidate for current interactive #ids, or findByText then clickLocator for normal text-accessible targets.' : '',
     '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
-    '- For readObservation, put params.type as text or interactive when choosing which processed saved observation view to read. Raw HTML is not available through readObservation. For getDomNodeText/clickDomNode/hoverDomNode/doubleClickDomNode, put a fresh numeric node_id in params.id only when one is available. For dragDomNode, put fresh numeric node_ids in params.fromId and params.toId.',
+    '- For readObservation, put params.type as text or interactive when choosing which current getPageState observation view to read. Do not pass an observation id. Raw HTML is not available through readObservation.',
     allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
     allowedTypes.includes('generateMarkdownFile') ? '- For generateMarkdownFile, put the complete Markdown document in params.content and the desired file name in params.fileName.' : '',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',

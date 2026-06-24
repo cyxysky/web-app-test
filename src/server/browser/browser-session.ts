@@ -3968,7 +3968,7 @@ export class BrowserSession {
     if (!this.lastTextLocatorCandidates.length) {
       return {
         ok: false,
-        actual: `No visible interactive locator matched text "${targetText}". Use a DOM node id from the current prompt context with getDomNodeText, or retry findByText with a shorter exact label and optional scopeId.`,
+        actual: `No visible interactive locator matched text "${targetText}". Retry findByText with a shorter exact label and optional scopeId, or call getPageState and readObservation(type="interactive") to choose a fresh candidate.`,
       };
     }
 
