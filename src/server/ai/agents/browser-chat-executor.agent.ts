@@ -2606,7 +2606,6 @@ function runtimeToolNames(mode: BrowserSessionMode) {
   const sharedTools = [
     'getPageState',
     'openPage',
-    'openUrl',
     'waitForPage',
     'waitForHumanVerification',
     'listTabs',
@@ -3533,6 +3532,7 @@ async function executeRuntimeStep(input: {
         targetUrl: testCase.targetUrl,
         runId: input.runId,
         stepIndex,
+        mode,
         type: object.type,
         message: object.message || undefined,
         params: object.params,
@@ -3935,15 +3935,7 @@ export async function executeInteractiveBrowserTurn(input: {
       });
       return screenshotPath;
     } catch (error) {
-      if (runtimeMode !== 'dom') throw error;
-      ensureActive();
-      await input.onDebug?.({
-        phase: `browser:screenshot:${phase}:error`,
-        stepIndex,
-        message: `DOM mode screenshot ${phase} failed after ${elapsedSince(startedAt)}ms; continuing with DOM page context.`,
-        details: serializeError(error),
-      });
-      return undefined;
+      throw error;
     }
   }
 
@@ -4355,11 +4347,10 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
 
   switch (flow.name) {
     case 'openPage':
-    case 'openUrl':
       {
         const rawUrl = typeof input.url === 'string' && input.url.trim() ? input.url : targetUrl;
         const url = normalizeBrowserUrl(rawUrl);
-        if (!url) return { ok: false, actual: 'Recorded openPage/openUrl failed because the target URL is empty.' };
+        if (!url) return { ok: false, actual: 'Recorded openPage failed because the target URL is empty.' };
         return session.open(url);
       }
     case 'scrollArea':
@@ -4439,6 +4430,7 @@ async function executeCodexRuntimeObject(input: {
   targetUrl: string;
   runId: string;
   stepIndex: number;
+  mode: BrowserSessionMode;
   type: string;
   message?: string;
   params: Record<string, unknown>;
@@ -4458,7 +4450,7 @@ async function executeCodexRuntimeObject(input: {
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots } = input;
+  const { session, targetUrl, runId, stepIndex, mode, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {

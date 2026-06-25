@@ -351,7 +351,7 @@ function exportedTargetUrl(session: BrowserChatSessionRecord, steps: StepExecuti
     tool.contextAfter?.domContext?.url,
   ]));
   const urlsFromOpenTools = steps.flatMap((step) => (step.tools || []).flatMap((tool) => (
-    /^(openPage|openUrl)$/i.test(tool.name) ? [inputUrl(tool.input)] : []
+    /^openPage$/i.test(tool.name) ? [inputUrl(tool.input)] : []
   )));
   return firstExportableTargetUrl([
     session.targetUrl,
@@ -362,7 +362,7 @@ function exportedTargetUrl(session: BrowserChatSessionRecord, steps: StepExecuti
 }
 
 function exportedRecordedToolInput(toolName: string, input: unknown, targetUrl: string) {
-  if (!/^(openPage|openUrl)$/i.test(toolName)) return input;
+  if (!/^openPage$/i.test(toolName)) return input;
   const url = exportableTargetUrl(inputUrl(input));
   if (url) return input;
   if (!input || typeof input !== 'object' || Array.isArray(input)) return targetUrl ? { url: targetUrl } : input;

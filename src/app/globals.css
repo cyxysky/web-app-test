@@ -7864,6 +7864,8 @@ select {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px;
+  width: 100%;
+  overflow: hidden;
 }
 
 .browser-chat-tool-detail-grid span,

@@ -105,13 +105,6 @@ const toolDefinitions: ToolDefinition[] = [
     fields: [{ key: 'url', label: '目标地址', kind: 'text', placeholder: 'https://example.com' }],
   },
   {
-    name: 'openUrl',
-    label: '打开地址',
-    mode: 'shared',
-    template: { url: '' },
-    fields: [{ key: 'url', label: '目标地址', kind: 'text', placeholder: 'https://example.com' }],
-  },
-  {
     name: 'scrollArea',
     label: '滚动区域',
     mode: 'shared',

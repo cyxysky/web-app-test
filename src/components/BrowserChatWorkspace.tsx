@@ -4086,7 +4086,7 @@ export function BrowserChatWorkspace({
               <h3>输出结果</h3>
               <pre>{formatToolPayload(toolDialog.tool.result)}</pre>
             </section>
-            {toolDialogFullDomSnapshot ? (
+            {/* {toolDialogFullDomSnapshot ? (
               <section className="browser-chat-tool-detail-section is-full-dom">
                 <h3>
                   完整 DOM 快照
@@ -4096,7 +4096,7 @@ export function BrowserChatWorkspace({
                 </h3>
                 <pre>{toolDialogFullDomSnapshot}</pre>
               </section>
-            ) : null}
+            ) : null} */}
             {toolDialogDomTree ? (
               <section className="browser-chat-tool-detail-section">
                 <h3>

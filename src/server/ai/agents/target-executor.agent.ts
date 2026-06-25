@@ -2438,7 +2438,6 @@ function runtimeToolNames(mode: BrowserSessionMode) {
   const sharedTools = [
     'getPageState',
     'openPage',
-    'openUrl',
     'waitForPage',
     'waitForHumanVerification',
     'listTabs',
@@ -3782,11 +3781,10 @@ async function runRecordedTool(
 
   switch (flow.name) {
     case 'openPage':
-    case 'openUrl':
       {
         const rawUrl = typeof input.url === 'string' && input.url.trim() ? input.url : targetUrl;
         const url = normalizeBrowserUrl(rawUrl);
-        if (!url) return { ok: false, actual: 'Recorded openPage/openUrl failed because the target URL is empty.' };
+        if (!url) return { ok: false, actual: 'Recorded openPage failed because the target URL is empty.' };
         return session.open(url);
       }
     case 'scrollArea':

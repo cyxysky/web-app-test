@@ -207,7 +207,7 @@ function collectTaskLedgerItems(steps: StepExecutionResult[]) {
 }
 
 function isInitialReplayNavigation(step?: RecordedFlowStep) {
-  return step?.name === 'openPage' || step?.name === 'openUrl';
+  return step?.name === 'openPage';
 }
 
 function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUrl: string): RecordedFlowStep[] {
