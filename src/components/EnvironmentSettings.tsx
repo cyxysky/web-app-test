@@ -3,10 +3,12 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, FolderOpen, Loader2, Moon, Save, Sun } from 'lucide-react';
+import { ArrowLeft, FolderOpen, Loader2, Plus, Save, Trash2 } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { SkillsManager } from '@/components/SkillsManager';
 import {
+  defaultModelForProvider,
+  modelListForProvider,
   modelProviderDefinitions,
   modelProviderDefinition,
   runtimeEnvDefinition,
@@ -47,8 +49,12 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
   const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
   for (const definition of modelProviderDefinitions) {
     const current = input?.providers?.[definition.value];
+    const models = modelListForProvider(definition, current);
+    const model = defaultModelForProvider(definition, { ...current, models });
     providers[definition.value] = {
-      model: current?.model || definition.defaultModel,
+      defaultModel: model,
+      model,
+      models,
       apiKey: current?.apiKey || '',
       baseURL: current?.baseURL ?? definition.defaultBaseURL ?? '',
       updatedAt: current?.updatedAt,
@@ -64,10 +70,19 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
 function providerSettings(config: ModelConfig, provider: ModelProvider) {
   const definition = modelProviderDefinition(provider);
   return config.providers[provider] || {
+    defaultModel: definition.defaultModel,
     model: definition.defaultModel,
+    models: modelListForProvider(definition),
     apiKey: '',
     baseURL: definition.defaultBaseURL || '',
   };
+}
+
+function draftModelRows(definition: ReturnType<typeof modelProviderDefinition>, settings: ModelProviderSettings) {
+  const rows = Array.isArray(settings.models) && settings.models.length
+    ? settings.models
+    : [settings.defaultModel || settings.model || definition.defaultModel];
+  return rows.length ? rows : [definition.defaultModel];
 }
 
 function isSecret(item: EnvRow) {
@@ -116,6 +131,7 @@ export function EnvironmentSettings({
   activeTab: controlledActiveTab,
   embedded = false,
   onActiveTabChange,
+  onModelSaved,
   onRuntimeEnvSaved,
   onSkillsChanged,
   showTabs = true,
@@ -123,12 +139,13 @@ export function EnvironmentSettings({
   activeTab?: SettingsTab;
   embedded?: boolean;
   onActiveTabChange?: (tab: SettingsTab) => void;
+  onModelSaved?: () => void;
   onRuntimeEnvSaved?: () => void;
   onSkillsChanged?: () => void;
   showTabs?: boolean;
 } = {}) {
   const { language, setLanguage, t } = useI18n();
-  const { color, currentColor, mode, scrollbarColor, setColor, setScrollbarColor, toggleMode } = useTheme();
+  const { color, currentColor, scrollbarColor, setColor, setScrollbarColor } = useTheme();
   const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('general');
   const [items, setItems] = useState<EnvRow[]>([]);
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig());
@@ -227,7 +244,10 @@ export function EnvironmentSettings({
 
   function updateActiveProviderSettings(patch: Partial<ModelProviderSettings>) {
     setModelDraft((current) => {
-      const next = createModelConfig(current);
+      const next = {
+        ...current,
+        providers: { ...current.providers },
+      };
       const provider = next.provider;
       return {
         ...next,
@@ -240,6 +260,60 @@ export function EnvironmentSettings({
         },
       };
     });
+  }
+
+  function setActiveProviderModels(models: string[], defaultModel?: string) {
+    setModelDraft((current) => {
+      const next = {
+        ...current,
+        providers: { ...current.providers },
+      };
+      const provider = next.provider;
+      const definition = modelProviderDefinition(provider);
+      const currentSettings = providerSettings(next, provider);
+      const fallbackModel = defaultModel || currentSettings.defaultModel || currentSettings.model || definition.defaultModel;
+      return {
+        ...next,
+        providers: {
+          ...next.providers,
+          [provider]: {
+            ...currentSettings,
+            defaultModel: fallbackModel,
+            model: fallbackModel,
+            models,
+          },
+        },
+      };
+    });
+  }
+
+  function updateActiveProviderModel(index: number, value: string) {
+    const rows = [...draftModelRows(activeProviderOption, activeProviderSettings)];
+    const previous = rows[index];
+    rows[index] = value;
+    const trimmedRows = rows.map((item) => item.trim()).filter(Boolean);
+    const currentDefault = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
+    const nextDefault = previous === currentDefault || !trimmedRows.includes(currentDefault)
+      ? value.trim() || trimmedRows[0] || activeProviderOption.defaultModel
+      : currentDefault;
+    setActiveProviderModels(rows, nextDefault);
+  }
+
+  function addActiveProviderModel() {
+    setActiveProviderModels([...draftModelRows(activeProviderOption, activeProviderSettings), ''], activeProviderSettings.defaultModel || activeProviderSettings.model);
+  }
+
+  function removeActiveProviderModel(index: number) {
+    const rows = draftModelRows(activeProviderOption, activeProviderSettings);
+    if (rows.length <= 1) return;
+    const removed = rows[index];
+    const nextRows = rows.filter((_, itemIndex) => itemIndex !== index);
+    const remaining = nextRows.map((item) => item.trim()).filter(Boolean);
+    const currentDefault = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
+    const nextDefault = removed === currentDefault || !remaining.includes(currentDefault)
+      ? remaining[0] || activeProviderOption.defaultModel
+      : currentDefault;
+    setActiveProviderModels(nextRows, nextDefault);
   }
 
   async function saveModel() {
@@ -257,6 +331,7 @@ export function EnvironmentSettings({
       const nextModel = createModelConfig(data.config);
       setModelConfig(nextModel);
       setModelDraft(nextModel);
+      onModelSaved?.();
     } finally {
       setSavingModel(false);
       stopGlobalLoading();
@@ -359,10 +434,12 @@ export function EnvironmentSettings({
     );
   }
 
-  const editingModelConfig = createModelConfig(modelDraft || modelConfig);
+  const editingModelConfig = modelDraft || modelConfig;
   const activeProvider = editingModelConfig.provider;
   const activeProviderOption = modelProviderDefinition(activeProvider);
   const activeProviderSettings = providerSettings(editingModelConfig, activeProvider);
+  const activeProviderModels = draftModelRows(activeProviderOption, activeProviderSettings);
+  const activeProviderDefaultModel = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
     .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && definition?.tab === activeTab);
@@ -430,27 +507,6 @@ export function EnvironmentSettings({
                 </div>
                 <div className="settings-row">
                   <div>
-                    <strong>{language === 'en' ? 'Appearance mode' : '外观模式'}</strong>
-                    <span>{language === 'en' ? 'Switch the interface between light and dark themes.' : '在浅色和深色主题之间切换界面。'}</span>
-                  </div>
-                  <button
-                    aria-pressed={mode === 'dark'}
-                    className="settings-theme-mode-toggle"
-                    onClick={toggleMode}
-                    type="button"
-                  >
-                    <span className={mode === 'dark' ? undefined : 'active'}>
-                      <Sun size={15} />
-                      {language === 'en' ? 'Light' : '浅色'}
-                    </span>
-                    <span className={mode === 'dark' ? 'active' : undefined}>
-                      <Moon size={15} />
-                      {language === 'en' ? 'Dark' : '深色'}
-                    </span>
-                  </button>
-                </div>
-                <div className="settings-row">
-                  <div>
                     <strong>{language === 'en' ? 'Theme color' : '主题色'}</strong>
                     <span>{language === 'en' ? 'Adjust the theme color used by buttons, scrollbars, and highlighted states.' : '调整按钮、滚动条和高亮状态使用的主题色。'}</span>
                   </div>
@@ -504,8 +560,8 @@ export function EnvironmentSettings({
               <div className="settings-card">
                 <div className="settings-row">
                   <div>
-                    <strong>{t('服务商')}</strong>
-                    <span>{t('选择当前运行使用的 AI 模型服务提供商。')}</span>
+                    <strong>{t('默认服务商')}</strong>
+                    <span>{t('选择默认使用的 AI 模型服务提供商。')}</span>
                   </div>
                   <CustomSelect
                     className="settings-control"
@@ -519,10 +575,50 @@ export function EnvironmentSettings({
                 </div>
                 <div className="settings-row">
                   <div>
-                    <strong>{t('模型名称')}</strong>
-                    <span>{t('仅作用于当前选中的服务商。')}</span>
+                    <strong>{t('默认模型')}</strong>
+                    <span>{t('从当前服务商配置的模型列表中选择默认模型。')}</span>
                   </div>
-                  <input className="input settings-control" value={activeProviderSettings.model} onChange={(event) => updateActiveProviderSettings({ model: event.target.value })} placeholder={activeProviderOption.defaultModel} />
+                  <CustomSelect
+                    className="settings-control"
+                    value={activeProviderDefaultModel}
+                    onChange={(nextModel) => updateActiveProviderSettings({ defaultModel: nextModel, model: nextModel })}
+                    options={modelListForProvider(activeProviderOption, activeProviderSettings).map((model) => ({
+                      label: model,
+                      value: model,
+                    }))}
+                  />
+                </div>
+                <div className="settings-row settings-model-list-row">
+                  <div>
+                    <strong>{t('可用模型')}</strong>
+                    <span>{t('一个服务商可以维护多个模型，运行时可在下拉框里按服务商分组选择。')}</span>
+                  </div>
+                  <div className="settings-model-list-control">
+                    {activeProviderModels.map((model, index) => (
+                      <div className="settings-model-input-row" key={`${activeProvider}-${index}`}>
+                        <input
+                          className="input settings-control"
+                          value={model}
+                          onChange={(event) => updateActiveProviderModel(index, event.target.value)}
+                          placeholder={activeProviderOption.defaultModel}
+                        />
+                        <button
+                          aria-label={t('删除模型')}
+                          className="settings-model-row-button danger"
+                          disabled={activeProviderModels.length <= 1}
+                          onClick={() => removeActiveProviderModel(index)}
+                          title={activeProviderModels.length <= 1 ? t('至少保留一个模型') : t('删除模型')}
+                          type="button"
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    ))}
+                    <button className="settings-model-add-button" onClick={addActiveProviderModel} type="button">
+                      <Plus size={15} />
+                      {t('添加模型')}
+                    </button>
+                  </div>
                 </div>
                 <div className="settings-row">
                   <div>

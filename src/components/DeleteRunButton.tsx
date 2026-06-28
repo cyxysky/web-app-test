@@ -30,9 +30,8 @@ export function DeleteRunButton({ runId, disabled }: { runId: string; disabled?:
   }
 
   return (
-    <button className="run-history-replay danger" disabled={disabled || loading} onClick={remove} type="button">
+    <button aria-label={t('删除执行记录')} className="run-history-replay danger" disabled={disabled || loading} onClick={remove} title={t('删除执行记录')} type="button">
       {loading ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
-      删除
     </button>
   );
 }

@@ -13,7 +13,7 @@ export default function DashboardPage() {
 
   return (
     <main className="browser-chat-shell">
-      <BrowserChatWorkspace groups={groups} schedules={schedules} testCases={testCases} />
+      <BrowserChatWorkspace groups={groups} initialView="target" schedules={schedules} testCases={testCases} />
     </main>
   );
 }

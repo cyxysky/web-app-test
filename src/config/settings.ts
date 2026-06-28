@@ -6,10 +6,17 @@ export type ModelProviderDefinition = {
   value: ModelProvider;
   label: string;
   defaultModel: string;
+  defaultModels?: string[];
   keyLabel: string;
   baseUrlLabel?: string;
   defaultBaseURL?: string;
   localAuth?: boolean;
+};
+
+export type ModelSettingsLike = {
+  defaultModel?: string;
+  model?: string;
+  models?: string[];
 };
 
 export type RuntimeEnvDefinition = {
@@ -76,6 +83,35 @@ export const defaultModelByProvider = modelProviderDefinitions.reduce((acc, item
 
 export function modelProviderDefinition(provider: ModelProvider) {
   return modelProviderDefinitions.find((item) => item.value === provider) || modelProviderDefinitions[0];
+}
+
+export function uniqueModelIds(values: Array<string | undefined | null>) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const model = String(value || '').trim();
+    if (!model || seen.has(model)) continue;
+    seen.add(model);
+    result.push(model);
+  }
+  return result;
+}
+
+export function modelListForProvider(definition: ModelProviderDefinition, settings?: ModelSettingsLike) {
+  const models = uniqueModelIds([
+    ...(settings?.models || []),
+    settings?.defaultModel,
+    settings?.model,
+    ...(definition.defaultModels || []),
+    definition.defaultModel,
+  ]);
+  return models.length ? models : [definition.defaultModel];
+}
+
+export function defaultModelForProvider(definition: ModelProviderDefinition, settings?: ModelSettingsLike) {
+  const models = modelListForProvider(definition, settings);
+  const requested = String(settings?.defaultModel || settings?.model || definition.defaultModel).trim();
+  return requested && models.includes(requested) ? requested : models[0];
 }
 
 const boolOptions = [

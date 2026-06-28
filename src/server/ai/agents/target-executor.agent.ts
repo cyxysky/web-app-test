@@ -21,6 +21,7 @@ type RuntimeRetryState = {
   messages: RuntimeModelMessage[];
   imagePaths: string[];
   agentStepOffset: number;
+  observationStore?: RuntimeObservationStore;
 };
 type ExecutionOptions = {
   onProgress?: ExecutionProgress;
@@ -64,10 +65,12 @@ type ToolTrace = {
 
 function cloneRuntimeMessageState(state?: RuntimeRetryState): RuntimeRetryState | undefined {
   if (!state?.messages.length) return undefined;
+  const observationStore = cloneRuntimeObservationStore(state.observationStore);
   return {
     messages: [...state.messages],
     imagePaths: [...state.imagePaths],
     agentStepOffset: state.agentStepOffset,
+    ...(observationStore ? { observationStore } : {}),
   };
 }
 
@@ -527,6 +530,26 @@ type RuntimeObservationRecord = {
 type RuntimeObservationStore = Map<string, RuntimeObservationRecord>;
 const runtimeObservationTypes: BrowserObservationType[] = ['text', 'interactive'];
 const fallbackObservationRunId = '__current__';
+
+function cloneRuntimeObservationStore(store?: RuntimeObservationStore): RuntimeObservationStore | undefined {
+  if (!store?.size) return undefined;
+  const cloned: RuntimeObservationStore = new Map();
+  for (const [key, record] of store) {
+    cloned.set(key, {
+      ...record,
+      views: { ...record.views },
+      viewCharLengths: { ...record.viewCharLengths },
+    });
+  }
+  return cloned;
+}
+
+function restoreRuntimeObservationStore(target: RuntimeObservationStore, source?: RuntimeObservationStore) {
+  target.clear();
+  const cloned = cloneRuntimeObservationStore(source);
+  if (!cloned) return;
+  for (const [key, record] of cloned) target.set(key, record);
+}
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const numberValue = typeof value === 'number' ? value : Number(value);
@@ -2795,6 +2818,7 @@ async function executeRuntimeStep(input: {
   beforeScreenshotPath: string;
   completedSteps: StepExecutionResult[];
   runtimeMessageState?: RuntimeRetryState;
+  runtimeObservationStore?: RuntimeObservationStore;
   selectedScreenshotReferences?: SelectedScreenshotReference[];
   referenceImagePaths?: string[];
   onSelectReferenceScreenshots?: (selection: {
@@ -2930,10 +2954,12 @@ async function executeRuntimeStep(input: {
   let consecutiveRequestFailures = 0;
 
   function rememberRetryState(state: RuntimeRetryState) {
+    const observationStore = cloneRuntimeObservationStore(state.observationStore);
     lastRetryState = {
       messages: [...state.messages],
       imagePaths: [...state.imagePaths],
       agentStepOffset: state.agentStepOffset,
+      ...(observationStore ? { observationStore } : {}),
     };
   }
 
@@ -2941,7 +2967,8 @@ async function executeRuntimeStep(input: {
     const traces: ToolTrace[] = [];
     const codexMode = isCodexProvider();
     const retryAgentStepOffset = retryState?.agentStepOffset ?? runtimeMessageState?.agentStepOffset ?? 0;
-    const observationStore: RuntimeObservationStore = new Map();
+    const observationStore: RuntimeObservationStore = input.runtimeObservationStore || new Map();
+    if (retryState?.observationStore) restoreRuntimeObservationStore(observationStore, retryState.observationStore);
     const nativeAllowedToolTypes = runtimeToolNames(mode).filter((name) => !(browserChatMode && name === 'reportState'));
     const baseAllowedToolTypes = codexMode
       ? nativeAllowedToolTypes.filter((name) => !runtimeObservationToolNames.has(name) && name !== 'getPageState')
@@ -3022,6 +3049,7 @@ async function executeRuntimeStep(input: {
       messages: initialMessages,
       imagePaths: messageImagePaths,
       agentStepOffset: retryAgentStepOffset,
+      observationStore,
     });
     let aiRequest = createAiRequestSnapshot({
       kind: 'runtime',
@@ -3217,6 +3245,7 @@ async function executeRuntimeStep(input: {
         messages: [...messagesToSend],
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
+        observationStore,
       });
       aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: mode === 'dom' ? undefined : (visualContext.current()?.path || beforeScreenshotPath), imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId), explicitPageState: true, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
@@ -4031,6 +4060,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
   });
   const steps: StepExecutionResult[] = [];
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
+  const runtimeObservationStore: RuntimeObservationStore = new Map();
   let allowBrowserClose = false;
 
   async function waitWhilePaused(stepIndex: number) {
@@ -4144,6 +4174,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         stepIndex: repairStepIndex,
         beforeScreenshotPath,
         completedSteps: steps,
+        runtimeObservationStore,
         selectedScreenshotReferences,
         onSelectReferenceScreenshots: async (selection) => {
           selectedScreenshotReferences = selection.ids
@@ -4586,6 +4617,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
   const maxManualPromptsPerStep = manualVerificationMaxPromptsPerStep();
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
   let runtimeMessageState: RuntimeRetryState | undefined;
+  const runtimeObservationStore: RuntimeObservationStore = new Map();
   let keepBrowserOpen = false;
   let allowBrowserClose = false;
   let tracePath: string | undefined;
@@ -4766,6 +4798,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
         beforeScreenshotPath: beforeScreenshotPath || '',
         completedSteps: steps,
         runtimeMessageState,
+        runtimeObservationStore,
         selectedScreenshotReferences,
         onSelectReferenceScreenshots: async (selection) => {
           selectedScreenshotReferences = selection.ids

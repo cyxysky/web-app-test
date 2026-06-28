@@ -34,6 +34,7 @@ export async function POST(request: NextRequest) {
       mode: normalizeMode(body.mode),
       safetyMode: normalizeSafetyMode(body.safetyMode),
       modelProvider: typeof body.modelProvider === 'string' ? body.modelProvider : undefined,
+      model: typeof body.model === 'string' ? body.model : undefined,
       title: normalizeString(body.title) || undefined,
       userId,
     });

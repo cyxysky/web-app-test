@@ -19,6 +19,7 @@ import {
   Loader2,
   Maximize2,
   MessageSquare,
+  Moon,
   MousePointer2,
   Network,
   PanelLeft,
@@ -38,6 +39,7 @@ import {
   SquareArrowOutUpRight,
   SquareTerminal,
   Square,
+  Sun,
   Trash2,
   Waypoints,
   Workflow,
@@ -50,14 +52,23 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { CustomSelect } from '@/components/CustomSelect';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
 import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
-import { defaultModelByProvider, modelProviderDefinitions, type SettingsTab } from '@/config/settings';
+import { defaultModelByProvider, type SettingsTab } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
 import { domTreeFromToolCall, fullDomSnapshotFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import {
+  defaultModelForConfig,
+  modelSelectionOptionsForConfig,
+  modelSelectionValue,
+  normalizeModelId,
+  normalizeModelProvider,
+  parseModelSelectionValue,
+  type RuntimeModelConfig,
+} from '@/lib/model-selection';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
+import { useTheme } from '@/theme/ThemeProvider';
 import type {
-  ModelConfigRecord,
   ModelProvider,
   RunScheduleRecord,
   SkillRecord,
@@ -123,6 +134,7 @@ type BrowserChatSession = {
   mode: BrowserChatMode;
   safetyMode: BrowserChatSafetyMode;
   modelProvider: ModelProvider;
+  model: string;
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
   createdAt: string;
@@ -140,7 +152,7 @@ type BrowserChatSession = {
 type BrowserChatView = 'chat' | 'target' | 'settings';
 type BrowserChatMode = 'dom' | 'visual-markers';
 type BrowserChatSafetyMode = 'strict' | 'full';
-type BrowserChatModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
+type BrowserChatModelConfig = RuntimeModelConfig;
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
 type BrowserChatToolDetail = {
   stepIndex: number;
@@ -909,15 +921,6 @@ function normalizeSafetyMode(value?: string): BrowserChatSafetyMode {
   return value === 'full' ? 'full' : 'strict';
 }
 
-function normalizeModelProvider(value?: string): ModelProvider {
-  const provider = String(value || '').trim().toLowerCase();
-  if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
-  if (provider === 'codex' || provider === 'codex-cli') return 'codex';
-  if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
-  if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
-  return modelProviderDefinitions.some((item) => item.value === provider) ? provider as ModelProvider : 'openrouter';
-}
-
 function normalizeToolConfirmation(value?: BrowserChatToolConfirmation): BrowserChatToolConfirmation | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const id = typeof value.id === 'string' ? value.id.trim() : '';
@@ -951,6 +954,7 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
     mode: normalizeMode(session.mode),
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: normalizeModelProvider(session.modelProvider),
+    model: normalizeModelId(session.model, normalizeModelProvider(session.modelProvider)),
     networkErrors: session.networkErrors || [],
     pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
     steps: session.steps || [],
@@ -1403,6 +1407,103 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   );
 });
 
+type BrowserChatAiCycleRenderEntry =
+  | { cycle: BrowserChatAiOutputCycle; kind: 'cycle' }
+  | { cycles: BrowserChatAiOutputCycle[]; id: string; kind: 'executed' };
+
+function aiCycleRenderEntries(cycles: BrowserChatAiOutputCycle[]): BrowserChatAiCycleRenderEntry[] {
+  const entries: BrowserChatAiCycleRenderEntry[] = [];
+  let pendingExecuted: BrowserChatAiOutputCycle[] = [];
+
+  const flushExecuted = () => {
+    if (!pendingExecuted.length) return;
+    const first = pendingExecuted[0];
+    const last = pendingExecuted[pendingExecuted.length - 1];
+    entries.push({
+      cycles: pendingExecuted,
+      id: `executed-cycles-${first.id}-${last.id}-${pendingExecuted.length}`,
+      kind: 'executed',
+    });
+    pendingExecuted = [];
+  };
+
+  for (const cycle of cycles) {
+    if (!cycle.output.texts.length) {
+      pendingExecuted.push(cycle);
+      continue;
+    }
+    flushExecuted();
+    entries.push({ cycle, kind: 'cycle' });
+  }
+  flushExecuted();
+  return entries;
+}
+
+const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGroup({
+  cycles,
+  logs,
+  onResolveToolConfirmation,
+  onSelectTool,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+  toolDetails,
+}: {
+  cycles: BrowserChatAiOutputCycle[];
+  logs: BrowserChatLogRecord[];
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+  toolDetails: Map<string, BrowserChatToolDetail>;
+}) {
+  const toolCount = cycles.reduce((count, cycle) => count + cycle.output.tools.length, 0);
+  const reasoningCount = cycles.reduce((count, cycle) => count + cycle.output.reasoning.length, 0);
+  const hasPendingConfirmation = cycles.some((cycle) => (
+    cycle.output.tools.some((tool, index) => {
+      const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+      return Boolean(pendingConfirmationForTool({
+        pending: pendingToolConfirmation,
+        stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+        toolName: tool.name,
+        toolOk: toolDetail?.tool.ok,
+      }));
+    })
+  ));
+  const meta = [
+    toolCount ? `${toolCount} 个工具` : '',
+    reasoningCount ? `${reasoningCount} 条思维链` : '',
+  ].filter(Boolean).join(' · ');
+
+  return (
+    <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={hasPendingConfirmation || undefined}>
+      <summary className="browser-chat-ai-collapse-summary" title={meta || undefined}>
+        <SquareTerminal size={14} />
+        <span>已执行</span>
+        {meta ? <small>{meta}</small> : null}
+        <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
+      </summary>
+      <div className="browser-chat-executed-body">
+        {cycles.map((cycle) => (
+          <div className="browser-chat-executed-entry" key={cycle.id}>
+            <BrowserChatAiCycleLine
+              cycle={cycle}
+              logs={logs}
+              onResolveToolConfirmation={onResolveToolConfirmation}
+              onSelectTool={onSelectTool}
+              pendingToolConfirmation={pendingToolConfirmation}
+              resolvingConfirmationAction={resolvingConfirmationAction}
+              resolvingConfirmationId={resolvingConfirmationId}
+              toolDetails={toolDetails}
+            />
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+});
+
 const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
   logs,
   message,
@@ -1428,6 +1529,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const [toolsExpanded, setToolsExpanded] = useState(() => running);
   const finalText = stringFromUnknown(message.content);
   const aiOutputCycles = useMemo(() => aiOutputCyclesFromLogs(logs), [logs]);
+  const aiOutputCycleEntries = useMemo(() => aiCycleRenderEntries(aiOutputCycles), [aiOutputCycles]);
   const aiOutputTextSet = useMemo(() => aiOutputTextSetFromCycles(aiOutputCycles), [aiOutputCycles]);
   const aiCycleToolDetails = useMemo(() => buildAiCycleToolDetailMap(aiOutputCycles, steps), [aiOutputCycles, steps]);
   const seenTexts = new Set<string>();
@@ -1494,18 +1596,32 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
 
   return (
     <div className="browser-chat-agent-timeline">
-      {aiOutputCycles.map((cycle) => (
-        <BrowserChatAiCycleLine
-          cycle={cycle}
-          key={cycle.id}
-          logs={logs}
-          onResolveToolConfirmation={onResolveToolConfirmation}
-          onSelectTool={onSelectTool}
-          pendingToolConfirmation={pendingToolConfirmation}
-          resolvingConfirmationAction={resolvingConfirmationAction}
-          resolvingConfirmationId={resolvingConfirmationId}
-          toolDetails={aiCycleToolDetails}
-        />
+      {aiOutputCycleEntries.map((entry) => (
+        entry.kind === 'executed' ? (
+          <BrowserChatExecutedCycleGroup
+            cycles={entry.cycles}
+            key={entry.id}
+            logs={logs}
+            onResolveToolConfirmation={onResolveToolConfirmation}
+            onSelectTool={onSelectTool}
+            pendingToolConfirmation={pendingToolConfirmation}
+            resolvingConfirmationAction={resolvingConfirmationAction}
+            resolvingConfirmationId={resolvingConfirmationId}
+            toolDetails={aiCycleToolDetails}
+          />
+        ) : (
+          <BrowserChatAiCycleLine
+            cycle={entry.cycle}
+            key={entry.cycle.id}
+            logs={logs}
+            onResolveToolConfirmation={onResolveToolConfirmation}
+            onSelectTool={onSelectTool}
+            pendingToolConfirmation={pendingToolConfirmation}
+            resolvingConfirmationAction={resolvingConfirmationAction}
+            resolvingConfirmationId={resolvingConfirmationId}
+            toolDetails={aiCycleToolDetails}
+          />
+        )
       ))}
       {shouldShowStepTimeline ? (
         <div className="browser-chat-tool-stack">
@@ -1592,7 +1708,6 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   totalStepCount: number;
 }) {
   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
-  const operationLabel = operationRunning ? '进行中' : '已完成';
   const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
   const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
   const messageSkills = useMemo(() => {
@@ -1611,26 +1726,17 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
     <article className={`browser-chat-message ${item.role}`}>
       <div>
         {item.role === 'assistant' ? (
-          <>
-            <div className="browser-chat-agent-meta">
-              <span className="browser-chat-agent-status">
-                {operationRunning ? <span aria-hidden="true" className="browser-chat-message-loading" /> : null}
-                <span>{operationLabel}</span>
-              </span>
-              <time dateTime={messageUpdateTime(item)}>最后更新 {formatLogTime(messageUpdateTime(item))}</time>
-            </div>
-            <BrowserChatAssistantTimeline
-              logs={itemLogs}
-              message={item}
-              onResolveToolConfirmation={onResolveToolConfirmation}
-              onSelectTool={onSelectTool}
-              pendingToolConfirmation={pendingToolConfirmation?.messageId === item.id ? pendingToolConfirmation : undefined}
-              resolvingConfirmationAction={resolvingConfirmationAction}
-              resolvingConfirmationId={resolvingConfirmationId}
-              running={operationRunning}
-              steps={itemSteps}
-            />
-          </>
+          <BrowserChatAssistantTimeline
+            logs={itemLogs}
+            message={item}
+            onResolveToolConfirmation={onResolveToolConfirmation}
+            onSelectTool={onSelectTool}
+            pendingToolConfirmation={pendingToolConfirmation?.messageId === item.id ? pendingToolConfirmation : undefined}
+            resolvingConfirmationAction={resolvingConfirmationAction}
+            resolvingConfirmationId={resolvingConfirmationId}
+            running={operationRunning}
+            steps={itemSteps}
+          />
         ) : (
           <>
             {item.content ?
@@ -1700,6 +1806,124 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   );
 });
 
+type BrowserChatMessageRenderEntry =
+  | { kind: 'message'; item: BrowserChatMessage }
+  | { id: string; items: BrowserChatMessage[]; kind: 'executed-group' };
+
+function browserChatAssistantMessageHasVisibleText(message: BrowserChatMessage, logs: BrowserChatLogRecord[]) {
+  if (stringFromUnknown(message.content)) return true;
+  return aiOutputCyclesFromLogs(logs).some((cycle) => cycle.output.texts.some((text) => Boolean(text.trim())));
+}
+
+function browserChatMessageRenderEntries(messages: BrowserChatMessage[], logIndex: BrowserChatLogIndex): BrowserChatMessageRenderEntry[] {
+  const entries: BrowserChatMessageRenderEntry[] = [];
+  let pendingExecutedGroup: BrowserChatMessage[] = [];
+
+  const flushExecutedGroup = () => {
+    if (!pendingExecutedGroup.length) return;
+    if (pendingExecutedGroup.length > 1) {
+      const first = pendingExecutedGroup[0];
+      const last = pendingExecutedGroup[pendingExecutedGroup.length - 1];
+      entries.push({
+        id: `executed-${first.id}-${last.id}-${pendingExecutedGroup.length}`,
+        items: pendingExecutedGroup,
+        kind: 'executed-group',
+      });
+    } else {
+      entries.push({ item: pendingExecutedGroup[0], kind: 'message' });
+    }
+    pendingExecutedGroup = [];
+  };
+
+  for (const item of messages) {
+    const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
+    const emptyAssistantMessage = item.role === 'assistant' && !browserChatAssistantMessageHasVisibleText(item, itemLogs);
+    if (emptyAssistantMessage) {
+      pendingExecutedGroup.push(item);
+      continue;
+    }
+    flushExecutedGroup();
+    entries.push({ item, kind: 'message' });
+  }
+  flushExecutedGroup();
+
+  return entries;
+}
+
+const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
+  items,
+  lastAssistantMessageId,
+  logIndex,
+  onResolveToolConfirmation,
+  onSelectTool,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+  sessionBusy,
+  stepsByIndex,
+}: {
+  items: BrowserChatMessage[];
+  lastAssistantMessageId?: string;
+  logIndex: BrowserChatLogIndex;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+  sessionBusy: boolean;
+  stepsByIndex: Map<number, StepExecutionResult>;
+}) {
+  const itemViews = items.map((item) => {
+    const steps = (item.stepIndexes || [])
+      .map((stepIndex) => stepsByIndex.get(stepIndex))
+      .filter((step): step is StepExecutionResult => Boolean(step));
+    return {
+      item,
+      logs: browserChatLogsForMessage(item, logIndex),
+      running: item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId),
+      steps,
+    };
+  });
+  const groupRunning = itemViews.some((item) => item.running);
+  const groupHasPendingConfirmation = Boolean(pendingToolConfirmation && items.some((item) => item.id === pendingToolConfirmation.messageId));
+  const toolCount = itemViews.reduce((count, item) => (
+    count + item.steps.reduce((stepCount, step) => stepCount + (step.tools || []).length, 0)
+  ), 0);
+  const summaryMeta = toolCount ? `${toolCount} 个工具` : `${items.length} 轮`;
+
+  return (
+    <article className="browser-chat-message assistant browser-chat-executed-message">
+      <div>
+        <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={groupRunning || groupHasPendingConfirmation || undefined}>
+          <summary className="browser-chat-ai-collapse-summary">
+            <SquareTerminal size={14} />
+            <span>已执行</span>
+            <small>{summaryMeta}</small>
+            <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
+          </summary>
+          <div className="browser-chat-executed-body">
+            {itemViews.map(({ item, logs, running, steps }) => (
+              <div className="browser-chat-executed-entry" key={item.id}>
+                <BrowserChatAssistantTimeline
+                  logs={logs}
+                  message={item}
+                  onResolveToolConfirmation={onResolveToolConfirmation}
+                  onSelectTool={onSelectTool}
+                  pendingToolConfirmation={pendingToolConfirmation?.messageId === item.id ? pendingToolConfirmation : undefined}
+                  resolvingConfirmationAction={resolvingConfirmationAction}
+                  resolvingConfirmationId={resolvingConfirmationId}
+                  running={running}
+                  steps={steps}
+                />
+              </div>
+            ))}
+          </div>
+        </details>
+      </div>
+    </article>
+  );
+});
+
 const BrowserChatMessageList = memo(function BrowserChatMessageList({
   availableSkills,
   exportingMessageId,
@@ -1760,6 +1984,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
   const lastMessage = messages[messages.length - 1];
+  const renderEntries = useMemo(() => browserChatMessageRenderEntries(messages, logIndex), [logIndex, messages]);
   const scrollKey = [
     sessionId || '',
     messages.length,
@@ -1821,7 +2046,25 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
           </button>
         </div>
       ) : null}
-      {messages.map((item) => {
+      {renderEntries.map((entry) => {
+        if (entry.kind === 'executed-group') {
+          return (
+            <BrowserChatExecutedGroup
+              items={entry.items}
+              key={entry.id}
+              lastAssistantMessageId={lastAssistantMessageId}
+              logIndex={logIndex}
+              onResolveToolConfirmation={onResolveToolConfirmation}
+              onSelectTool={onSelectTool}
+              pendingToolConfirmation={pendingToolConfirmation}
+              resolvingConfirmationAction={resolvingConfirmationAction}
+              resolvingConfirmationId={resolvingConfirmationId}
+              sessionBusy={sessionBusy}
+              stepsByIndex={stepsByIndex}
+            />
+          );
+        }
+        const item = entry.item;
         const itemSteps = (item.stepIndexes || [])
           .map((stepIndex) => stepsByIndex.get(stepIndex))
           .filter((step): step is StepExecutionResult => Boolean(step));
@@ -1869,11 +2112,11 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading,
   mode,
   modeLocked,
-  modelProvider,
-  modelProviderOptions,
+  modelSelection,
+  modelSelectionOptions,
   safetyMode,
   onInterrupt,
-  onModelProviderChange,
+  onModelSelectionChange,
   onModeChange,
   onPreviewAttachment,
   onRemoveAttachment,
@@ -1893,11 +2136,11 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading: boolean;
   mode: BrowserChatMode;
   modeLocked: boolean;
-  modelProvider: ModelProvider;
-  modelProviderOptions: Array<{ label: string; value: string }>;
+  modelSelection: string;
+  modelSelectionOptions: Array<{ description?: string; group?: string; label: string; selectedLabel?: string; value: string }>;
   safetyMode: BrowserChatSafetyMode;
   onInterrupt: () => void | Promise<void>;
-  onModelProviderChange: (provider: ModelProvider) => void;
+  onModelSelectionChange: (selection: { provider: ModelProvider; model: string }) => void;
   onModeChange: (mode: BrowserChatMode) => void;
   onPreviewAttachment: (attachment: BrowserChatAttachment) => void;
   onRemoveAttachment: (id: string) => void;
@@ -2440,9 +2683,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             <CustomSelect
               className="browser-chat-provider-select"
               disabled={currentBusy || loading}
-              onChange={(value) => onModelProviderChange(normalizeModelProvider(value))}
-              options={modelProviderOptions}
-              value={modelProvider}
+              onChange={(value) => onModelSelectionChange(parseModelSelectionValue(value))}
+              options={modelSelectionOptions}
+              value={modelSelection}
             />
           </div>
           <div className="browser-chat-compose-submit">
@@ -2930,14 +3173,19 @@ export function BrowserChatWorkspace({
   groups,
   schedules,
   initialView = 'chat',
+  initialTargetDetailCaseId,
+  initialTargetRunId,
 }: {
   testCases: TestCaseRecord[];
   groups: TestGroupRecord[];
   schedules: RunScheduleRecord[];
   initialView?: BrowserChatView;
+  initialTargetDetailCaseId?: string;
+  initialTargetRunId?: string;
 }) {
   const router = useRouter();
   const { t } = useI18n();
+  const { mode: themeMode, toggleMode } = useTheme();
   const [, startTransition] = useTransition();
   const sendingRef = useRef(false);
   const loadingSessionRef = useRef<string | null>(null);
@@ -2955,12 +3203,15 @@ export function BrowserChatWorkspace({
   const [mode, setMode] = useState<BrowserChatMode>('visual-markers');
   const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
   const [modelProvider, setModelProvider] = useState<ModelProvider>('openrouter');
+  const [modelId, setModelId] = useState(defaultModelByProvider.openrouter);
   const [modelConfig, setModelConfig] = useState<BrowserChatModelConfig | null>(null);
   const [targetGroupId, setTargetGroupId] = useState<string | undefined>();
+  const [targetDetailCaseId, setTargetDetailCaseId] = useState<string | null>(initialTargetDetailCaseId || null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [groupName, setGroupName] = useState('');
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
+  const [deletingTargetGroupId, setDeletingTargetGroupId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
   const [composerResetToken, setComposerResetToken] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -3063,13 +3314,14 @@ export function BrowserChatWorkspace({
   const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || imagePreview || groupDialogOpen);
   const embeddedBrowserViewActive = embeddedBrowserActive && !embeddedBrowserCovered;
   const embeddedBrowserLeftOverlayInset = embeddedBrowserActive && historyTooltipActive && sidebarCollapsed ? 300 : 0;
-  const modelProviderOptions = useMemo(() => modelProviderDefinitions.map((provider) => {
-    const configuredModel = modelConfig?.providers?.[provider.value]?.model?.trim() || defaultModelByProvider[provider.value];
-    return {
-      label: configuredModel ? `${provider.label} - ${configuredModel}` : provider.label,
-      value: provider.value,
-    };
-  }), [modelConfig]);
+  const modelSelection = modelSelectionValue(modelProvider, modelId || defaultModelForConfig(modelConfig, modelProvider));
+  const modelSelectionOptions = useMemo(() => modelSelectionOptionsForConfig(modelConfig), [modelConfig]);
+
+  const changeModelSelection = useCallback((selection: { provider: ModelProvider; model: string }) => {
+    const model = normalizeModelId(selection.model, selection.provider, modelConfig);
+    setModelProvider(selection.provider);
+    setModelId(model);
+  }, [modelConfig]);
 
   const loadBrowserRuntimeSettings = useCallback(async () => {
     const response = await fetch('/api/settings/env', { cache: 'no-store' });
@@ -3117,17 +3369,20 @@ export function BrowserChatWorkspace({
 
     setEmbeddedChatWidth(nextWidth(event.clientX));
     const onPointerMove = (moveEvent: PointerEvent) => {
+      moveEvent.preventDefault();
       setEmbeddedChatWidth(nextWidth(moveEvent.clientX));
     };
     const onPointerUp = () => {
       setEmbeddedChatResizing(false);
       document.body.classList.remove('browser-chat-resizing');
-      window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('pointerup', onPointerUp);
+      document.removeEventListener('pointermove', onPointerMove, true);
+      document.removeEventListener('pointerup', onPointerUp, true);
+      document.removeEventListener('pointercancel', onPointerUp, true);
     };
     document.body.classList.add('browser-chat-resizing');
-    window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('pointerup', onPointerUp, { once: true });
+    document.addEventListener('pointermove', onPointerMove, true);
+    document.addEventListener('pointerup', onPointerUp, true);
+    document.addEventListener('pointercancel', onPointerUp, true);
   }, []);
 
   useEffect(() => {
@@ -3179,10 +3434,12 @@ export function BrowserChatWorkspace({
     if (shouldActivate) {
       setMode(normalizeMode(loadedSession.mode));
       setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
-      setModelProvider(normalizeModelProvider(loadedSession.modelProvider));
+      const provider = normalizeModelProvider(loadedSession.modelProvider);
+      setModelProvider(provider);
+      setModelId(normalizeModelId(loadedSession.model, provider, modelConfig));
     }
     return loadedSession;
-  }, [upsertSession]);
+  }, [modelConfig, upsertSession]);
 
   const scheduleLoadSessions = useCallback((delay = 80) => {
     if (sessionListRefreshTimerRef.current) window.clearTimeout(sessionListRefreshTimerRef.current);
@@ -3225,8 +3482,14 @@ export function BrowserChatWorkspace({
 
   useEffect(() => {
     if (session?.id || !modelConfig?.provider) return;
-    setModelProvider(normalizeModelProvider(modelConfig.provider));
-  }, [modelConfig?.provider, session?.id]);
+    const provider = normalizeModelProvider(modelConfig.provider);
+    setModelProvider(provider);
+    setModelId(defaultModelForConfig(modelConfig, provider));
+  }, [modelConfig, session?.id]);
+
+  useEffect(() => {
+    setModelId((current) => normalizeModelId(current, modelProvider, modelConfig));
+  }, [modelConfig, modelProvider]);
 
   useEffect(() => {
     void loadBrowserRuntimeSettings().catch(() => undefined);
@@ -3286,11 +3549,43 @@ export function BrowserChatWorkspace({
     }
   }
 
+  async function deleteTargetGroup(group: TestGroupRecord) {
+    if (deletingTargetGroupId) return;
+    const descendantIds = new Set<string>([group.id]);
+    const collect = (groupId: string) => {
+      groups.filter((item) => item.parentId === groupId).forEach((child) => {
+        if (descendantIds.has(child.id)) return;
+        descendantIds.add(child.id);
+        collect(child.id);
+      });
+    };
+    collect(group.id);
+    const childCount = descendantIds.size - 1;
+    const message = childCount
+      ? `确定删除分组“${group.name}”及其 ${childCount} 个子分组吗？这些分组下的测试用例会移回未分组。`
+      : `确定删除分组“${group.name}”吗？这个分组下的测试用例会移回未分组。`;
+    if (!window.confirm(message)) return;
+    setDeletingTargetGroupId(group.id);
+    startGlobalLoading('正在删除分组');
+    try {
+      const response = await fetch(`/api/groups/${group.id}`, { method: 'DELETE' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || '删除分组失败');
+      if (targetGroupId && descendantIds.has(targetGroupId)) setTargetGroupId(undefined);
+      startTransition(() => router.refresh());
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '删除分组失败');
+    } finally {
+      setDeletingTargetGroupId(null);
+      stopGlobalLoading();
+    }
+  }
+
   async function createSession() {
     const response = await fetch('/api/browser-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode, safetyMode, modelProvider }),
+      body: JSON.stringify({ mode, safetyMode, modelProvider, model: modelId }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '创建对话会话失败');
@@ -3306,7 +3601,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(`/api/browser-chat/${sessionId}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, safetyMode, modelProvider, skillIds }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, safetyMode, modelProvider, model: modelId, skillIds }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '发送消息失败');
@@ -3525,6 +3820,12 @@ export function BrowserChatWorkspace({
     }
   }
 
+  const openTargetCaseDetail = useCallback((testCaseId: string) => {
+    setActiveView('target');
+    setTargetDetailCaseId(testCaseId);
+    startTransition(() => router.refresh());
+  }, [router, startTransition]);
+
   const exportSelectedMessagesToTestCase = useCallback(async () => {
     const sessionId = session?.id;
     if (!sessionId || !selectedExportMessageIds.length || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
@@ -3541,14 +3842,14 @@ export function BrowserChatWorkspace({
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '导出测试用例失败');
       setSelectedExportMessageIds([]);
-      startTransition(() => router.push(`/test-cases/${data.testCaseId}`));
+      if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
     } catch (exportError) {
       setError(exportError instanceof Error ? exportError.message : '导出测试用例失败');
     } finally {
       setExportingSelectedMessages(false);
       stopGlobalLoading();
     }
-  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, router, selectedExportMessageIds, session?.id, startTransition]);
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, selectedExportMessageIds, session?.id]);
 
   const exportMessageToTestCase = useCallback(async (messageId: string) => {
     const sessionId = session?.id;
@@ -3563,13 +3864,13 @@ export function BrowserChatWorkspace({
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '导出测试用例失败');
-      startTransition(() => router.push(`/test-cases/${data.testCaseId}`));
+      if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
     } catch (exportError) {
       setError(exportError instanceof Error ? exportError.message : '导出测试用例失败');
     } finally {
       setExportingMessageId(null);
     }
-  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, router, session?.id, startTransition]);
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, session?.id]);
 
   const generateSelectedMessagesSkill = useCallback(async () => {
     const sessionId = session?.id;
@@ -3650,7 +3951,9 @@ export function BrowserChatWorkspace({
       const loadedSession = await refreshSession(sessionId, { activate: true });
       setMode(normalizeMode(loadedSession.mode));
       setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
-      setModelProvider(normalizeModelProvider(loadedSession.modelProvider));
+      const provider = normalizeModelProvider(loadedSession.modelProvider);
+      setModelProvider(provider);
+      setModelId(normalizeModelId(loadedSession.model, provider, modelConfig));
       void loadSessions().catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');
@@ -3672,8 +3975,10 @@ export function BrowserChatWorkspace({
       return (
         <DashboardGroupSidebar
           className="browser-chat-sub-sidebar"
+          deletingGroupId={deletingTargetGroupId}
           groups={groups}
           selectedGroupId={targetGroupId}
+          onDeleteGroup={deleteTargetGroup}
           onCreateGroup={() => setGroupDialogOpen(true)}
           onSelect={setTargetGroupId}
         />
@@ -3761,11 +4066,9 @@ export function BrowserChatWorkspace({
                     title={sessionDisplayTitle(item)}
                     type="button"
                   >
-                    <MessageSquare className="browser-chat-recent-icon" size={15} />
+                    {sidebarCollapsed ? <MessageSquare className="browser-chat-recent-icon" size={17} /> : null}
                     <span>{sessionDisplayTitle(item)}</span>
                     <small>
-                      {loadingSessionId === item.id ? <Loader2 className="spin" size={11} /> : null}
-                      <span>{loadingSessionId === item.id ? '加载中' : statusLabel(item.status)}</span>
                       {sessionSortTime(item) ? <time dateTime={sessionSortTime(item)}>{formatLogTime(sessionSortTime(item))}</time> : null}
                     </small>
                   </button>
@@ -3852,11 +4155,11 @@ export function BrowserChatWorkspace({
           loading={Boolean(loadingSessionId)}
           mode={mode}
           modeLocked={modeLocked}
-          modelProvider={modelProvider}
-          modelProviderOptions={modelProviderOptions}
+          modelSelection={modelSelection}
+          modelSelectionOptions={modelSelectionOptions}
           safetyMode={safetyMode}
           onInterrupt={interruptConversation}
-          onModelProviderChange={setModelProvider}
+          onModelSelectionChange={changeModelSelection}
           onModeChange={setMode}
           onPreviewAttachment={previewAttachment}
           onRemoveAttachment={removeAttachment}
@@ -3909,13 +4212,47 @@ export function BrowserChatWorkspace({
 
         {renderSidebarDetail()}
 
+        <div className="browser-chat-sidebar-footer">
+          <button
+            aria-label={themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式'}
+            className="browser-chat-theme-toggle"
+            onClick={toggleMode}
+            title={themeMode === 'dark' ? '浅色模式' : '深色模式'}
+            type="button"
+          >
+            {themeMode === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
+          </button>
+        </div>
       </aside>
 
       <main className="browser-chat-main">
         {activeView === 'target' ? (
           <div className="browser-chat-cases-pane">
+            <div className="browser-chat-target-model-bar">
+              <div className="browser-chat-target-copy">
+                <strong>{t('目标模式模型')}</strong>
+                <span>{t('当前目标模式运行将使用这个模型。')}</span>
+              </div>
+              <div className="browser-chat-target-model-controls">
+                <CustomSelect
+                  className="browser-chat-target-model-select"
+                  disabled={currentBusy}
+                  onChange={(value) => changeModelSelection(parseModelSelectionValue(value))}
+                  options={modelSelectionOptions}
+                  value={modelSelection}
+                />
+                <div className="browser-chat-target-actions" id="browser-chat-target-actions" />
+              </div>
+            </div>
             <DashboardWorkspace
+              actionsPortalId="browser-chat-target-actions"
+              activeDetailCaseId={targetDetailCaseId}
               groups={groups}
+              hideListHeader
+              initialActiveRunId={initialTargetRunId}
+              model={modelId}
+              modelProvider={modelProvider}
+              onActiveDetailCaseIdChange={setTargetDetailCaseId}
               schedules={schedules}
               selectedGroupId={targetGroupId}
               showBrowserChatAction={false}
@@ -3932,6 +4269,7 @@ export function BrowserChatWorkspace({
               embedded
               showTabs={false}
               onActiveTabChange={setSettingsTab}
+              onModelSaved={() => void loadModelConfig()}
               onRuntimeEnvSaved={() => void loadBrowserRuntimeSettings()}
               onSkillsChanged={() => void loadSkills()}
             />
@@ -4030,11 +4368,11 @@ export function BrowserChatWorkspace({
                 loading={Boolean(loadingSessionId)}
                 mode={mode}
                 modeLocked={modeLocked}
-                modelProvider={modelProvider}
-                modelProviderOptions={modelProviderOptions}
+                modelSelection={modelSelection}
+                modelSelectionOptions={modelSelectionOptions}
                 safetyMode={safetyMode}
                 onInterrupt={interruptConversation}
-                onModelProviderChange={setModelProvider}
+                onModelSelectionChange={changeModelSelection}
                 onModeChange={setMode}
                 onPreviewAttachment={previewAttachment}
                 onRemoveAttachment={removeAttachment}

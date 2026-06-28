@@ -415,7 +415,9 @@ export type ModelProvider =
   | 'xai';
 
 export type ModelProviderSettings = {
+  defaultModel?: string;
   model: string;
+  models?: string[];
   apiKey?: string;
   baseURL?: string;
   updatedAt?: string;

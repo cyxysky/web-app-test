@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { defaultModelByProvider, modelProviderDefinitions, modelProviderValues, modelProviderDefinition } from '@/config/settings';
+import { defaultModelByProvider, defaultModelForProvider, modelListForProvider, modelProviderDefinitions, modelProviderValues, modelProviderDefinition } from '@/config/settings';
 import { store } from '@/server/db/mock-store';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/test-case.schema';
 
@@ -15,10 +15,15 @@ function normalizeProvider(value: unknown): ModelProvider {
 }
 
 function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
+  const definition = modelProviderDefinition(provider);
+  const models = modelListForProvider(definition);
+  const model = defaultModelForProvider(definition);
   return {
-    model: defaultModelByProvider[provider],
+    defaultModel: model,
+    model,
+    models,
     apiKey: '',
-    baseURL: modelProviderDefinition(provider).defaultBaseURL || '',
+    baseURL: definition.defaultBaseURL || '',
   };
 }
 
@@ -26,10 +31,14 @@ function completeProviders(input?: Partial<Record<ModelProvider, ModelProviderSe
   const result: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
   for (const definition of modelProviderDefinitions) {
     const current = input?.[definition.value];
+    const models = modelListForProvider(definition, current);
+    const model = defaultModelForProvider(definition, current);
     result[definition.value] = {
       ...defaultProviderSettings(definition.value),
       ...current,
-      model: current?.model?.trim() || definition.defaultModel,
+      defaultModel: model,
+      model,
+      models,
     };
   }
   return result;
@@ -43,8 +52,23 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
     const raw = input[definition.value];
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
     const item = raw as Record<string, unknown>;
+    const rawModels = Array.isArray(item.models)
+      ? item.models.map((model) => typeof model === 'string' ? model : '').filter(Boolean)
+      : [];
+    const models = modelListForProvider(definition, {
+      models: rawModels,
+      defaultModel: typeof item.defaultModel === 'string' ? item.defaultModel : undefined,
+      model: typeof item.model === 'string' ? item.model : undefined,
+    });
+    const model = defaultModelForProvider(definition, {
+      models,
+      defaultModel: typeof item.defaultModel === 'string' ? item.defaultModel : undefined,
+      model: typeof item.model === 'string' ? item.model : undefined,
+    });
     result[definition.value] = {
-      model: typeof item.model === 'string' && item.model.trim() ? item.model.trim() : definition.defaultModel,
+      defaultModel: model,
+      model,
+      models,
       apiKey: typeof item.apiKey === 'string' ? item.apiKey : '',
       baseURL: typeof item.baseURL === 'string' ? item.baseURL : definition.defaultBaseURL || '',
     };
@@ -72,8 +96,14 @@ export async function POST(request: NextRequest) {
     const provider = normalizeProvider(body.provider);
     const providersInput = readProviderSettings(body.providers);
     if (!Object.keys(providersInput).length) {
+      const definition = modelProviderDefinition(provider);
+      const bodyModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultModelByProvider[provider];
+      const models = modelListForProvider(definition, { model: bodyModel });
+      const model = defaultModelForProvider(definition, { models, model: bodyModel });
       providersInput[provider] = {
-        model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultModelByProvider[provider],
+        defaultModel: model,
+        model,
+        models,
         apiKey: typeof body.apiKey === 'string' ? body.apiKey : '',
         baseURL: typeof body.baseURL === 'string' ? body.baseURL : modelProviderDefinition(provider).defaultBaseURL || '',
       };

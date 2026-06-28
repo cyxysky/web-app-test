@@ -5,6 +5,9 @@ import { generateText } from 'ai';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import {
   defaultModelByProvider,
+  defaultModelForProvider,
+  modelListForProvider,
+  modelProviderDefinition,
   modelProviderValues,
 } from '@/config/settings';
 import {
@@ -89,6 +92,7 @@ export type BrowserChatSessionSnapshot = {
   mode: BrowserSessionMode | 'default';
   safetyMode: BrowserChatSafetyMode;
   modelProvider: ModelProvider;
+  model: string;
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
   tabs: BrowserTabSnapshot[];
@@ -196,14 +200,18 @@ function normalizeModelProvider(value: unknown, fallback: ModelProvider = 'openr
   return modelProviderSet.has(provider as ModelProvider) ? provider as ModelProvider : fallback;
 }
 
-function browserChatModelSettings(providerInput?: unknown) {
+function browserChatModelSettings(providerInput?: unknown, modelInput?: unknown) {
   store.applyRuntimeEnv();
   const config = store.getModelConfig();
   const provider = normalizeModelProvider(providerInput, config?.provider || 'openrouter');
+  const definition = modelProviderDefinition(provider);
   const settings = config?.providers?.[provider];
+  const models = modelListForProvider(definition, settings);
+  const requestedModel = typeof modelInput === 'string' ? modelInput.trim() : '';
+  const configuredDefault = defaultModelForProvider(definition, settings);
   return {
     provider,
-    model: settings?.model?.trim() || defaultModelByProvider[provider],
+    model: requestedModel && models.includes(requestedModel) ? requestedModel : configuredDefault || defaultModelByProvider[provider],
   };
 }
 
@@ -632,6 +640,7 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     mode: session.mode,
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: normalizeModelProvider(session.modelProvider),
+    model: browserChatModelSettings(session.modelProvider, session.model).model,
     status: session.status,
     busy: session.busy,
     tabs: browserChatTabs(session),
@@ -660,6 +669,7 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
     mode: session.mode,
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: normalizeModelProvider(session.modelProvider),
+    model: browserChatModelSettings(session.modelProvider, session.model).model,
     status: session.status,
     busy: session.busy,
     tabs: browserChatTabs(session),
@@ -792,6 +802,7 @@ function shouldPreserveRuntimeTurn(existing: BrowserChatSessionRecord, fromDisk:
 }
 
 function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { preserveRunningState?: boolean } = {}): BrowserChatSessionRecord {
+  const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
   const preserveRecentRunningState = (session.busy || session.status === 'running' || options.preserveRunningState)
     && (options.preserveRunningState || isRecentTimestamp(session.updatedAt));
   const status = preserveRecentRunningState ? session.status : (session.status === 'running' ? 'idle' : session.status);
@@ -835,7 +846,8 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
     tabs: session.tabs || [],
     targetUrl: exportableTargetUrl(session.targetUrl),
     safetyMode: normalizeSafetyMode(session.safetyMode),
-    modelProvider: normalizeModelProvider(session.modelProvider),
+    modelProvider: modelSettings.provider,
+    model: modelSettings.model,
     messages,
     steps,
     conversationContext: normalizeConversationContext(session.conversationContext),
@@ -1338,12 +1350,13 @@ export function createBrowserChatSession(input: {
   mode?: BrowserSessionMode | 'default';
   safetyMode?: BrowserChatSafetyMode;
   modelProvider?: unknown;
+  model?: unknown;
   title?: string;
   userId?: string | number;
 } = {}) {
   hydrateSessions();
   store.applyRuntimeEnv();
-  const modelSettings = browserChatModelSettings(input.modelProvider);
+  const modelSettings = browserChatModelSettings(input.modelProvider, input.model);
   const timestamp = now();
   const session: BrowserChatSessionRecord = {
     id: id('chat'),
@@ -1353,6 +1366,7 @@ export function createBrowserChatSession(input: {
     mode: input.mode || 'visual-markers',
     safetyMode: normalizeSafetyMode(input.safetyMode),
     modelProvider: modelSettings.provider,
+    model: modelSettings.model,
     status: 'idle',
     busy: false,
     tabs: [],
@@ -1838,6 +1852,7 @@ export async function sendBrowserChatMessage(
   mode?: BrowserSessionMode | 'default',
   safetyMode?: BrowserChatSafetyMode,
   modelProvider?: unknown,
+  model?: unknown,
   clientMessageId?: string,
   attachmentsInput?: unknown,
   skillIdsInput?: unknown,
@@ -1866,7 +1881,9 @@ export async function sendBrowserChatMessage(
   session.pendingToolConfirmation = undefined;
   if (mode && !session.started && !session.steps.length && !session.messages.length) session.mode = mode;
   session.safetyMode = normalizeSafetyMode(safetyMode ?? session.safetyMode);
-  session.modelProvider = browserChatModelSettings(modelProvider ?? session.modelProvider).provider;
+  const modelSettings = browserChatModelSettings(modelProvider ?? session.modelProvider, model ?? session.model);
+  session.modelProvider = modelSettings.provider;
+  session.model = modelSettings.model;
   const firstUserMessage = !session.messages.some((message) => message.role === 'user');
   if (firstUserMessage) session.title = compactText(messageText, 42);
 
@@ -2193,7 +2210,7 @@ async function runBrowserChatMessage(
   attachments: BrowserChatAttachment[],
   skills: SkillRecord[] = [],
 ) {
-  const modelSettings = browserChatModelSettings(session.modelProvider);
+  const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
   return withModelSettings(modelSettings, async () => {
     try {
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;

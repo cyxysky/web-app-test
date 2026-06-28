@@ -10,7 +10,13 @@ import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { TestCaseContent } from '@/server/ai/schemas/test-case.schema';
 
-export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
+export function NewTestCaseForm({
+  groupId,
+  onCreated,
+}: {
+  groupId?: string;
+  onCreated?: (testCaseId: string) => void;
+} = {}) {
   const { t } = useI18n();
   const router = useRouter();
   const [prompt, setPrompt] = useState('');
@@ -57,13 +63,14 @@ export function NewTestCaseForm({ groupId }: { groupId?: string } = {}) {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || t('生成失败'));
-      router.push(`/test-cases/${data.testCaseId}`);
+      if (typeof data.testCaseId === 'string') onCreated?.(data.testCaseId);
+      if (!onCreated) router.push('/dashboard');
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : t('生成失败'));
-      stopGlobalLoading();
     } finally {
       setLoading(false);
+      stopGlobalLoading();
     }
   }
 

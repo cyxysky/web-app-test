@@ -26,6 +26,7 @@ export async function POST(request: NextRequest) {
       mode: body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers',
       safetyMode: safetyMode(body.safetyMode),
       modelProvider: typeof body.modelProvider === 'string' ? body.modelProvider : undefined,
+      model: typeof body.model === 'string' ? body.model : undefined,
       title: typeof body.title === 'string' ? body.title : undefined,
       userId: requestUserId(request, body),
     });

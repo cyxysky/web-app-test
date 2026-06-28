@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useState } from 'react';
 import { Loader2, Save, Sparkles } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -8,9 +8,35 @@ import { RichTextEditor } from '@/components/RichTextEditor';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
-import type { SkillRecord, TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import type { ModelProvider, SkillRecord, TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
 
-export function TestCaseEditor({ skills, testCase }: { skills: SkillRecord[]; testCase: TestCaseRecord }) {
+export type TestCaseEditorActionState = {
+  generatingFrame: boolean;
+  saving: boolean;
+};
+
+export type TestCaseEditorHandle = {
+  generateFrame: () => Promise<void>;
+  save: () => Promise<void>;
+};
+
+export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
+  model?: string;
+  modelProvider?: ModelProvider;
+  onActionStateChange?: (state: TestCaseEditorActionState) => void;
+  onSaved?: (testCase: TestCaseRecord) => void;
+  showSectionActions?: boolean;
+  skills: SkillRecord[];
+  testCase: TestCaseRecord;
+}>(function TestCaseEditor({
+  model,
+  modelProvider,
+  onActionStateChange,
+  onSaved,
+  showSectionActions = true,
+  skills,
+  testCase,
+}, ref) {
   const { t } = useI18n();
   const router = useRouter();
   const [draft, setDraft] = useState<TestCaseContent>({
@@ -28,6 +54,10 @@ export function TestCaseEditor({ skills, testCase }: { skills: SkillRecord[]; te
     testCase.content.taskFrame ? JSON.stringify(testCase.content.taskFrame, null, 2) : ''
   ));
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    onActionStateChange?.({ generatingFrame, saving });
+  }, [generatingFrame, onActionStateChange, saving]);
 
   function update(patch: Partial<TestCaseContent>) {
     setDraft((current) => ({ ...current, ...patch }));
@@ -79,6 +109,7 @@ export function TestCaseEditor({ skills, testCase }: { skills: SkillRecord[]; te
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || t('保存失败'));
+      onSaved?.(data as TestCaseRecord);
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : t('保存失败'));
@@ -102,6 +133,8 @@ export function TestCaseEditor({ skills, testCase }: { skills: SkillRecord[]; te
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          model,
+          modelProvider,
           userRequirement: draft.userRequirement || draft.description,
           systemPrompt: draft.systemPrompt || '',
           targetUrl: draft.targetUrl,
@@ -119,24 +152,13 @@ export function TestCaseEditor({ skills, testCase }: { skills: SkillRecord[]; te
     }
   }
 
+  useImperativeHandle(ref, () => ({
+    generateFrame,
+    save,
+  }));
+
   return (
     <section className="content-band test-goal-list">
-      <div className="section-head">
-        <div>
-          <h2>{t('测试需求')}</h2>
-        </div>
-        <div className="case-editor-actions">
-          <button className="icon-text-button" disabled={generatingFrame || saving} onClick={generateFrame} type="button">
-            {generatingFrame ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-            {generatingFrame ? t('生成中') : t('生成内容框架')}
-          </button>
-          <button className="icon-text-button" disabled={saving} onClick={save} type="button">
-            {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-            {saving ? t('保存中') : t('保存需求')}
-          </button>
-        </div>
-      </div>
-
       <div className="runtime-case-form">
         <label>
           {t('用例标题')}
@@ -224,4 +246,4 @@ export function TestCaseEditor({ skills, testCase }: { skills: SkillRecord[]; te
       {error ? <div className="error">{error}</div> : null}
     </section>
   );
-}
+});

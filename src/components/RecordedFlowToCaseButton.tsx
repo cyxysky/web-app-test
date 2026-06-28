@@ -19,7 +19,9 @@ export function RecordedFlowToCaseButton({ runId, disabled }: { runId: string; d
       const response = await fetch(`/api/runs/${runId}/recorded-flow/to-test-case`, { method: 'POST' });
       const data = await response.json();
       if (!response.ok || !data.testCase?.id) throw new Error(data.error || t('生成用例失败'));
-      router.push(`/test-cases/${data.testCase.id}`);
+      stopGlobalLoading();
+      setLoading(false);
+      router.push('/dashboard');
     } catch (error) {
       window.alert(error instanceof Error ? error.message : t('生成用例失败'));
       setLoading(false);
@@ -28,9 +30,8 @@ export function RecordedFlowToCaseButton({ runId, disabled }: { runId: string; d
   }
 
   return (
-    <button className="run-history-replay" disabled={disabled || loading} onClick={createCase} type="button">
+    <button aria-label={t('转为测试用例')} className="run-history-replay" disabled={disabled || loading} onClick={createCase} title={t('转为测试用例')} type="button">
       {loading ? <Loader2 className="spin" size={14} /> : <FilePlus2 size={14} />}
-      {t('转用例')}
     </button>
   );
 }

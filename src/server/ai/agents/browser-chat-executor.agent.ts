@@ -18,6 +18,7 @@ type RuntimeRetryState = {
   messages: RuntimeModelMessage[];
   imagePaths: string[];
   agentStepOffset: number;
+  observationStore?: RuntimeObservationStore;
 };
 
 const staleReadObservationText = '已失效：这是一条旧 readObservation 结果，已被后续 getPageState 刷新的当前 observation 取代。需要当前内容时，请调用 readObservation(type, offset, maxChars)。';
@@ -497,6 +498,26 @@ type RuntimeObservationRecord = {
 type RuntimeObservationStore = Map<string, RuntimeObservationRecord>;
 const runtimeObservationTypes: BrowserObservationType[] = ['text', 'interactive'];
 const fallbackObservationRunId = '__current__';
+
+function cloneRuntimeObservationStore(store?: RuntimeObservationStore): RuntimeObservationStore | undefined {
+  if (!store?.size) return undefined;
+  const cloned: RuntimeObservationStore = new Map();
+  for (const [key, record] of store) {
+    cloned.set(key, {
+      ...record,
+      views: { ...record.views },
+      viewCharLengths: { ...record.viewCharLengths },
+    });
+  }
+  return cloned;
+}
+
+function restoreRuntimeObservationStore(target: RuntimeObservationStore, source?: RuntimeObservationStore) {
+  target.clear();
+  const cloned = cloneRuntimeObservationStore(source);
+  if (!cloned) return;
+  for (const [key, record] of cloned) target.set(key, record);
+}
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const numberValue = typeof value === 'number' ? value : Number(value);
@@ -3000,6 +3021,7 @@ async function executeRuntimeStep(input: {
   instruction?: string;
   conversation?: InteractiveBrowserTurnMessage[];
   completedSteps: StepExecutionResult[];
+  runtimeObservationStore?: RuntimeObservationStore;
   selectedScreenshotReferences?: SelectedScreenshotReference[];
   referenceImagePaths?: string[];
   onSelectReferenceScreenshots?: (selection: {
@@ -3143,10 +3165,12 @@ async function executeRuntimeStep(input: {
   let consecutiveRequestFailures = 0;
 
   function rememberRetryState(state: RuntimeRetryState) {
+    const observationStore = cloneRuntimeObservationStore(state.observationStore);
     lastRetryState = {
       messages: [...state.messages],
       imagePaths: [...state.imagePaths],
       agentStepOffset: state.agentStepOffset,
+      ...(observationStore ? { observationStore } : {}),
     };
   }
 
@@ -3154,7 +3178,8 @@ async function executeRuntimeStep(input: {
     const traces: ToolTrace[] = [];
     const codexMode = isCodexProvider();
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
-    const observationStore: RuntimeObservationStore = new Map();
+    const observationStore: RuntimeObservationStore = input.runtimeObservationStore || new Map();
+    if (retryState?.observationStore) restoreRuntimeObservationStore(observationStore, retryState.observationStore);
     const nativeAllowedToolTypes = runtimeToolNames(mode).filter((name) => !(browserChatMode && name === 'reportState'));
     const baseAllowedToolTypes = codexMode
       ? nativeAllowedToolTypes.filter((name) => !runtimeObservationToolNames.has(name) && name !== 'getPageState')
@@ -3284,6 +3309,7 @@ async function executeRuntimeStep(input: {
       messages: initialMessages,
       imagePaths: messageImagePaths,
       agentStepOffset: retryAgentStepOffset,
+      observationStore,
     });
     let aiRequest = createAiRequestSnapshot({
       kind: 'runtime',
@@ -3500,6 +3526,7 @@ async function executeRuntimeStep(input: {
         messages: [...messagesToSend],
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
+        observationStore,
       });
       aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: mode === 'dom' ? undefined : (visualContext.current()?.path || beforeScreenshotPath), imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId), explicitPageState: true, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
@@ -3903,6 +3930,7 @@ export async function executeInteractiveBrowserTurn(input: {
   });
   const runtimeMode = browserModeOf(testCase);
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
+  const runtimeObservationStore: RuntimeObservationStore = new Map();
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
@@ -3972,6 +4000,7 @@ export async function executeInteractiveBrowserTurn(input: {
         instruction: input.modelInstruction || input.instruction,
         conversation: input.conversation || [],
         completedSteps: steps.filter((step) => step.index !== stepIndex),
+        runtimeObservationStore,
         selectedScreenshotReferences,
         referenceImagePaths: input.referenceImagePaths,
         onSelectReferenceScreenshots: async (selection) => {

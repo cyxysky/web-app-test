@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { defaultModelByProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
+import { defaultModelByProvider, defaultModelForProvider, modelListForProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, SkillContent, SkillRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { sleepSync, writeJsonFileAtomic } from '@/server/storage/atomic-json';
@@ -186,10 +186,15 @@ function modelBaseUrlEnv(provider: ModelProvider) {
 }
 
 function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
+  const definition = modelProviderDefinition(provider);
+  const models = modelListForProvider(definition);
+  const model = defaultModelForProvider(definition);
   return {
-    model: defaultModelByProvider[provider],
+    defaultModel: model,
+    model,
+    models,
     apiKey: '',
-    baseURL: modelProviderDefinition(provider).defaultBaseURL || '',
+    baseURL: definition.defaultBaseURL || '',
   };
 }
 
@@ -201,19 +206,39 @@ function normalizeStoredModelConfig(input?: LegacyModelConfigRecord): ModelConfi
 
   for (const definition of modelProviderDefinitions) {
     const current = rawProviders[definition.value];
+    const models = modelListForProvider(definition, current);
+    const model = defaultModelForProvider(definition, current);
     providers[definition.value] = {
       ...defaultProviderSettings(definition.value),
       ...current,
-      model: current?.model?.trim() || defaultModelByProvider[definition.value],
+      defaultModel: model,
+      model,
+      models,
     };
   }
 
   if (input.model || input.apiKey || input.baseURL) {
+    const current = providers[provider];
+    const legacyModel = input.model?.trim();
+    const models = modelListForProvider(modelProviderDefinition(provider), {
+      ...current,
+      models: legacyModel ? [legacyModel, ...(current?.models || [])] : current?.models,
+      defaultModel: legacyModel || current?.defaultModel,
+      model: legacyModel || current?.model,
+    });
+    const model = defaultModelForProvider(modelProviderDefinition(provider), {
+      ...current,
+      models,
+      defaultModel: legacyModel || current?.defaultModel,
+      model: legacyModel || current?.model,
+    });
     providers[provider] = {
-      ...providers[provider],
-      model: input.model?.trim() || providers[provider]?.model || defaultModelByProvider[provider],
-      apiKey: input.apiKey ?? providers[provider]?.apiKey,
-      baseURL: input.baseURL ?? providers[provider]?.baseURL,
+      ...current,
+      defaultModel: model,
+      model,
+      models,
+      apiKey: input.apiKey ?? current?.apiKey,
+      baseURL: input.baseURL ?? current?.baseURL,
     };
   }
 
@@ -237,7 +262,7 @@ function applyModelConfig(config?: LegacyModelConfigRecord) {
     if (baseUrlEnv) process.env[baseUrlEnv] = item.baseURL || definition.defaultBaseURL || '';
   }
   process.env.AI_PROVIDER = provider;
-  process.env.AI_MODEL = active.model || defaultModelByProvider[provider];
+  process.env.AI_MODEL = active.defaultModel || active.model || defaultModelByProvider[provider];
 }
 
 function stepMemoryLine(step: StepExecutionResult) {
@@ -458,11 +483,22 @@ export const store = {
       const provider = definition.value;
       const current = input.providers[provider];
       const previous = existing?.providers[provider];
+      const merged = {
+        ...previous,
+        ...current,
+      };
+      const models = modelListForProvider(definition, merged);
+      const model = defaultModelForProvider(definition, {
+        ...merged,
+        models,
+      });
       providers[provider] = {
         ...defaultProviderSettings(provider),
         ...previous,
         ...current,
-        model: current?.model?.trim() || previous?.model || defaultModelByProvider[provider],
+        defaultModel: model,
+        model,
+        models,
         apiKey: current?.apiKey ?? previous?.apiKey ?? '',
         baseURL: current?.baseURL ?? previous?.baseURL ?? definition.defaultBaseURL ?? '',
         updatedAt: current ? timestamp : previous?.updatedAt,
@@ -598,6 +634,28 @@ export const store = {
     });
     writeData(data);
     return updated;
+  },
+  // 删除分组及其子分组，并将关联测试用例移回未分组。
+  deleteGroup(groupId: string) {
+    const data = readData();
+    const groups = data.groups || [];
+    const deletingIds = new Set<string>();
+    const collect = (idToDelete: string) => {
+      if (deletingIds.has(idToDelete)) return;
+      deletingIds.add(idToDelete);
+      groups.filter((group) => group.parentId === idToDelete).forEach((group) => collect(group.id));
+    };
+    collect(groupId);
+    if (!groups.some((group) => group.id === groupId)) return undefined;
+    const deleted = groups.filter((group) => deletingIds.has(group.id));
+    data.groups = groups.filter((group) => !deletingIds.has(group.id));
+    data.testCases = data.testCases.map((record) => (
+      record.groupId && deletingIds.has(record.groupId)
+        ? { ...record, groupId: undefined, updatedAt: now() }
+        : record
+    ));
+    writeData(data);
+    return { deleted, deletedIds: [...deletingIds] };
   },
   // 根据 ID 获取单个测试用例。
   getTestCase(testCaseId: string) {

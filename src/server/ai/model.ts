@@ -54,7 +54,7 @@ type AiProvider =
   | 'xai';
 type ApprovalMode = 'never' | 'on-failure' | 'on-request' | 'untrusted';
 type SandboxMode = 'danger-full-access' | 'read-only' | 'workspace-write';
-type ModelSettingsOverride = {
+export type ModelSettingsOverride = {
   provider?: string;
   model?: string;
 };

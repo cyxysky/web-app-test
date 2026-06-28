@@ -1,11 +1,14 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { Check, ChevronDown } from 'lucide-react';
 
 export type CustomSelectOption = {
+  description?: string;
   disabled?: boolean;
+  group?: string;
   label: string;
+  selectedLabel?: string;
   value: string;
 };
 
@@ -127,7 +130,7 @@ export function CustomSelect({
         ref={buttonRef}
         type="button"
       >
-        <span>{selectedOption?.label || value}</span>
+        <div>{selectedOption?.selectedLabel || selectedOption?.label || value}</div>
         <ChevronDown className={open ? 'open' : undefined} size={16} />
       </button>
       {menuVisible ? (
@@ -139,21 +142,30 @@ export function CustomSelect({
           role="listbox"
           tabIndex={-1}
         >
-          {options.map((option, index) => (
-            <button
-              aria-selected={option.value === value}
-              className={index === activeIndex ? 'active' : undefined}
-              disabled={option.disabled}
-              key={option.value}
-              onClick={() => selectOption(option)}
-              onMouseEnter={() => setActiveIndex(index)}
-              role="option"
-              type="button"
-            >
-              <span>{option.label}</span>
-              {option.value === value ? <Check size={15} /> : null}
-            </button>
-          ))}
+          {options.map((option, index) => {
+            const previous = options[index - 1];
+            const showGroup = Boolean(option.group && option.group !== previous?.group);
+            return (
+              <Fragment key={option.value}>
+                {showGroup ? <div className="custom-select-group">{option.group}</div> : null}
+                <button
+                  aria-selected={option.value === value}
+                  className={`${index === activeIndex ? 'active' : ''}${option.group ? ' grouped' : ''}`.trim() || undefined}
+                  disabled={option.disabled}
+                  onClick={() => selectOption(option)}
+                  onMouseEnter={() => setActiveIndex(index)}
+                  role="option"
+                  type="button"
+                >
+                  <span>
+                    <b>{option.label}</b>
+                    {option.description ? <small>{option.description}</small> : null}
+                  </span>
+                  {option.value === value ? <Check size={15} /> : null}
+                </button>
+              </Fragment>
+            );
+          })}
         </div>
       ) : null}
     </div>

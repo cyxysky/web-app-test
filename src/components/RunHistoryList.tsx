@@ -1,9 +1,8 @@
 'use client';
 
-import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useMemo, useState } from 'react';
-import { BadgeCheck, Clock3, ExternalLink, FileText, Loader2, Sparkles, Trash2 } from 'lucide-react';
+import { BadgeCheck, Clock3, ExternalLink, FileText, Loader2, Sparkles, Star, Trash2 } from 'lucide-react';
 import { DeleteRunButton } from '@/components/DeleteRunButton';
 import { RecordedFlowToCaseButton } from '@/components/RecordedFlowToCaseButton';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
@@ -42,10 +41,12 @@ function formatRunTime(value?: string, language: 'zh' | 'en' = 'zh') {
 
 export function RunHistoryList({
   defaultRecordedRunId,
+  onOpenRun,
   runs,
   testCaseId,
 }: {
   defaultRecordedRunId?: string;
+  onOpenRun?: (runId: string) => void;
   runs: TestRunRecord[];
   testCaseId: string;
 }) {
@@ -186,28 +187,21 @@ export function RunHistoryList({
                   {startedAt}
                   {endedAt ? <span>{t('至')} {endedAt}</span> : <span>{t('未结束')}</span>}
                 </span>
-                <span className="run-history-meta" title={t('{count} 步骤', { count: totalStepCount ? `${completedStepCount}/${totalStepCount}` : '-' })}>
-                  <b>{totalStepCount ? `${completedStepCount}/${totalStepCount}` : '-'}</b>
-                  {t('步骤')}
-                </span>
-                <span className={run.report ? 'run-history-report ready' : 'run-history-report'} title={reportText}>
-                  <FileText size={14} />
-                  {reportText}
-                </span>
                 <span className="run-history-actions">
                   <button
+                    aria-label={isDefaultRecordedRun ? t('当前默认记录') : t('设为默认记录')}
                     className={isDefaultRecordedRun ? 'run-history-replay default-record selected' : 'run-history-replay default-record'}
                     disabled={!replayable || active || isDefaultRecordedRun || Boolean(settingDefaultRunId)}
                     onClick={() => setDefaultRecordedRun(run.id)}
                     title={isDefaultRecordedRun ? t('当前默认记录') : t('设为默认记录')}
                     type="button"
                   >
-                    {settingDefaultRunId === run.id ? <Loader2 className="spin" size={14} /> : <BadgeCheck size={14} />}
-                    {isDefaultRecordedRun ? t('默认记录') : t('设为默认记录')}
+                    {settingDefaultRunId === run.id ? <Loader2 className="spin" size={14} /> : isDefaultRecordedRun ? <BadgeCheck size={14} /> : <Star size={14} />}
                   </button>
                   <RunScreenshotChainButton className="run-history-replay" run={run} />
                   <RecordedFlowToCaseButton disabled={!replayable || active} runId={run.id} />
                   <button
+                    aria-label={t('从这条执行记录生成 Skill')}
                     className="run-history-replay"
                     disabled={!skillable || Boolean(generatingSkillRunId)}
                     onClick={() => void generateSkill(run.id)}
@@ -215,12 +209,11 @@ export function RunHistoryList({
                     type="button"
                   >
                     {generatingSkillRunId === run.id ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
-                    {t('生成 Skill')}
                   </button>
                   <DeleteRunButton disabled={deleting} runId={run.id} />
-                  <Link className="run-history-open" href={`/runs/${run.id}`} title={t('查看详情')}>
+                  <button aria-label={t('查看详情')} className="run-history-open" onClick={() => (onOpenRun ? onOpenRun(run.id) : router.push(`/runs/${run.id}`))} title={t('查看详情')} type="button">
                     <ExternalLink size={16} />
-                  </Link>
+                  </button>
                 </span>
               </div>
             );

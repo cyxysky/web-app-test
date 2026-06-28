@@ -194,9 +194,8 @@ export function RunScreenshotChainButton({
 
   return (
     <>
-      <button className={className} disabled={disabled} onClick={openChain} type="button" title={disabled ? '暂无截图链' : '查看截图链'}>
+      <button aria-label={disabled ? '暂无截图链' : '查看截图链'} className={className} disabled={disabled} onClick={openChain} title={disabled ? '暂无截图链' : '查看截图链'} type="button">
         <Images size={14} />
-        {label}
       </button>
       {modal && typeof document !== 'undefined' ? createPortal(modal, document.body) : modal}
     </>

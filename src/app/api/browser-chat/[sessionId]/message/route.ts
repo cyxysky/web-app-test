@@ -26,8 +26,9 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const mode = body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers';
     const nextSafetyMode = safetyMode(body.safetyMode);
     const modelProvider = typeof body.modelProvider === 'string' ? body.modelProvider : undefined;
+    const model = typeof body.model === 'string' ? body.model : undefined;
     const clientMessageId = typeof body.clientMessageId === 'string' ? body.clientMessageId : undefined;
-    const session = await sendBrowserChatMessage(sessionId, content, mode, nextSafetyMode, modelProvider, clientMessageId, body.attachments, body.skillIds, requestUserId(request, body));
+    const session = await sendBrowserChatMessage(sessionId, content, mode, nextSafetyMode, modelProvider, model, clientMessageId, body.attachments, body.skillIds, requestUserId(request, body));
     return noStoreJson({ session });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to send browser chat message';

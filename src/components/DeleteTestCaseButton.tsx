@@ -10,6 +10,7 @@ export function DeleteTestCaseButton({
   className = 'icon-text-button danger',
   disabled,
   label = '删除用例',
+  onDeleted,
   redirectTo,
   testCaseId,
   testCaseTitle,
@@ -17,6 +18,7 @@ export function DeleteTestCaseButton({
   className?: string;
   disabled?: boolean;
   label?: string;
+  onDeleted?: () => void;
   redirectTo?: string;
   testCaseId: string;
   testCaseTitle?: string;
@@ -35,6 +37,12 @@ export function DeleteTestCaseButton({
       const response = await fetch(`/api/test-cases/${testCaseId}`, { method: 'DELETE' });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || t('删除用例失败'));
+      if (onDeleted) {
+        setLoading(false);
+        stopGlobalLoading();
+        onDeleted();
+        return;
+      }
       if (redirectTo) {
         router.push(redirectTo);
         return;
