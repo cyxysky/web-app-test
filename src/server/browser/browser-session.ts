@@ -34,10 +34,24 @@ const DEFAULT_SCREENSHOT_TIMEOUT_MS = 15000;
 const MIN_SCREENSHOT_TIMEOUT_MS = 1000;
 const MAX_SCREENSHOT_TIMEOUT_MS = 120000;
 const SCREENSHOT_FAILURE_CONTEXT_TIMEOUT_MS = 2000;
+const DEFAULT_BROWSER_OPEN_TIMEOUT_MS = 6000;
+const DEFAULT_BROWSER_ACTION_LOAD_STATE_TIMEOUT_MS = 3000;
+const DEFAULT_BROWSER_POPUP_WAIT_MS = 0;
+const DEFAULT_BROWSER_DIRECT_HREF_TIMEOUT_MS = 0;
+const DEFAULT_BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS = 1500;
+const DEFAULT_BROWSER_WAIT_FOR_PAGE_STABLE_MS = 250;
 
 function boundedPositiveIntegerEnv(key: string, fallback: number, min: number, max: number) {
   const value = positiveIntegerEnv(key) ?? fallback;
   return Math.min(Math.max(value, min), max);
+}
+
+function boundedNonNegativeIntegerEnv(key: string, fallback: number, max: number) {
+  const raw = process.env[key]?.trim();
+  if (!raw) return Math.min(Math.max(Math.floor(fallback), 0), max);
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return Math.min(Math.max(Math.floor(fallback), 0), max);
+  return Math.min(Math.floor(value), max);
 }
 
 function compactDiagnosticText(value: string, maxLength: number) {
@@ -255,6 +269,11 @@ type DomNodeReference = {
 
 type PageInteractiveCandidate = Omit<InteractiveCandidate, 'framePath' | 'frameUrl'>;
 
+type PageDomObservationPayload = {
+  structuredText: string;
+  interactiveCandidates: PageInteractiveCandidate[];
+};
+
 type CandidateIdentityPayload = Pick<
   InteractiveCandidate,
   'tag' | 'role' | 'type' | 'href' | 'ariaLabel' | 'placeholder' | 'title' | 'text' | 'name'
@@ -263,6 +282,22 @@ type CandidateIdentityPayload = Pick<
 type CandidateIdentityValidation = {
   ok: boolean;
   reason: string;
+};
+
+type CandidateClickTarget = {
+  x: number;
+  y: number;
+  descriptor: string;
+  offscreen: boolean;
+  source?: string;
+};
+
+type CandidateActionTargetResolution = {
+  ok: true;
+  target: CandidateClickTarget;
+} | {
+  ok: false;
+  error: string;
 };
 
 type ScrollableArea = {
@@ -296,6 +331,16 @@ type ScrollableArea = {
     canScrollLeft: boolean;
     canScrollRight: boolean;
   };
+};
+
+type ScrollAreaDirectResult = {
+  ok: true;
+  descriptor: string;
+  before: ScrollableArea['scroll'];
+  after: ScrollableArea['scroll'];
+} | {
+  ok: false;
+  error: string;
 };
 
 type AiDomVisibleRect = {
@@ -369,9 +414,6 @@ type AiDomRuntime = {
     maxChars: number;
     maxElements: number;
   }) => BrowserUseVisibleDomSnapshot;
-  pageText: (options: {
-    maxChars: number;
-  }) => { text: string; textLength: number };
   elementText: (pathValue: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
   visibleDomPoint: (
     ref: string,
@@ -583,6 +625,25 @@ function cdpPortFromEndpoint(endpoint: string) {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function timedBrowserStep<T>(
+  timings: Record<string, number> | undefined,
+  name: string,
+  action: () => Promise<T>,
+) {
+  const startedAt = Date.now();
+  try {
+    return await action();
+  } finally {
+    if (timings) timings[name] = (timings[name] || 0) + Date.now() - startedAt;
+  }
+}
+
+function formatTimingRecord(timings: Record<string, number>) {
+  return Object.entries(timings)
+    .map(([name, elapsedMs]) => `${name}=${elapsedMs}ms`)
+    .join(', ');
 }
 
 function isBlankPage(page: Page) {
@@ -1381,10 +1442,6 @@ function installAiBrowserPageRuntime() {
     return point ? { ...point, descriptor: descriptor(element) } : undefined;
   }
 
-  function pageText(options: { maxChars: number }) {
-    return renderedTextFromNode(document, options.maxChars);
-  }
-
   function elementText(pathValue: string, options: { maxChars?: number } = {}) {
     const element = elementFromPath(pathValue);
     if (!element) return undefined;
@@ -1430,19 +1487,25 @@ function installAiBrowserPageRuntime() {
     visiblePointForElement,
     visibleDomSnapshot,
     fullDomSnapshot,
-    pageText,
     elementText,
     visibleDomPoint,
     visibleDomText,
   };
 }
 
-function collectAiInteractiveCandidates(input: { limit: number; requirePointerEvents?: boolean }): PageInteractiveCandidate[] {
-  const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-  if (!runtime) return [];
+function collectAiInteractiveCandidates(input: { requirePointerEvents?: boolean }): PageInteractiveCandidate[] {
+  return collectAiDomObservation(input).interactiveCandidates;
+}
 
-  const candidateLimit = Math.max(1, Number(input.limit || 160));
+function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean; requirePointerEvents?: boolean; structuredTextMaxChars?: number }): PageDomObservationPayload {
+  const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
+  if (!runtime) return { structuredText: '', interactiveCandidates: [] };
+
+  const includeInteractiveCandidates = input.includeInteractiveCandidates !== false;
   const requirePointerEvents = input.requirePointerEvents === true;
+  const maxStructuredTextChars = Math.max(0, Math.floor(Number(input.structuredTextMaxChars) || 0));
+  const structuredLines: string[] = [];
+  let structuredChars = 0;
   const interactiveRoles = new Set([
     'button',
     'link',
@@ -1461,11 +1524,85 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
   ]);
 
   const normalizeText = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
+  const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__';
+  const skippedTextTags = new Set(['script', 'style', 'template', 'noscript']);
+  const structuralTextTags = new Set([
+    'article',
+    'aside',
+    'body',
+    'details',
+    'dialog',
+    'fieldset',
+    'footer',
+    'form',
+    'header',
+    'li',
+    'main',
+    'menu',
+    'nav',
+    'ol',
+    'section',
+    'summary',
+    'table',
+    'tbody',
+    'td',
+    'th',
+    'thead',
+    'tr',
+    'ul',
+  ]);
 
   function classNameOf(element: Element) {
     return typeof element.className === 'string'
       ? normalizeText(element.className).split(/\s+/).filter(Boolean).slice(0, 8).join(' ')
       : '';
+  }
+
+  function compactClassNameOf(element: Element) {
+    return typeof element.className === 'string'
+      ? element.className.split(/\s+/).filter(Boolean).slice(0, 3).join('.')
+      : '';
+  }
+
+  function isHiddenForStructuredText(element: Element) {
+    if (element.closest(overlaySelector)) return true;
+    if (element.getAttribute('aria-hidden') === 'true') return true;
+    const style = window.getComputedStyle(element);
+    return style.display === 'none'
+      || style.visibility === 'hidden'
+      || style.visibility === 'collapse'
+      || Number(style.opacity || '1') <= 0.01;
+  }
+
+  function appendStructuredText(depth: number, text: string) {
+    if (!maxStructuredTextChars || !text || structuredChars >= maxStructuredTextChars) return;
+    const line = `${'  '.repeat(Math.min(depth, 12))}${text}`;
+    const remaining = maxStructuredTextChars - structuredChars;
+    const chunk = line.length > remaining ? line.slice(0, remaining) : line;
+    if (!chunk) return;
+    structuredLines.push(chunk);
+    structuredChars += chunk.length + 1;
+  }
+
+  function structuredTextLine(element: Element) {
+    const tag = element.tagName.toLowerCase();
+    if (skippedTextTags.has(tag) || isHiddenForStructuredText(element)) return undefined;
+    const role = element.getAttribute('role');
+    const classes = compactClassNameOf(element);
+    const descriptor = `${tag}${classes ? `.${classes}` : ''}${role ? `[role=${role}]` : ''}`;
+    const inputElement = element as HTMLInputElement;
+    const label = [
+      element.getAttribute('aria-label'),
+      element.getAttribute('title'),
+      element.getAttribute('alt'),
+      inputElement.placeholder,
+      inputElement.value,
+      ownText(element),
+    ].map(normalizeText).find(Boolean) || '';
+    const shouldShow = Boolean(label)
+      || structuralTextTags.has(tag)
+      || ['button', 'a', 'input', 'select', 'textarea', 'option'].includes(tag);
+    return shouldShow ? { shown: true, text: label ? `${descriptor}: ${label}` : descriptor } : { shown: false, text: '' };
   }
 
   function flatParentElement(node: Node) {
@@ -1497,14 +1634,6 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
 
   function visibleRectOf(element: Element) {
     return runtime.visibleRect(element, { requirePointerEvents });
-  }
-
-  function isVisibleInViewport(element: Element) {
-    return Boolean(visibleRectOf(element));
-  }
-
-  function isTraversable(element: Element) {
-    return runtime.isTraversable(element);
   }
 
   function children(element: Element) {
@@ -1931,59 +2060,6 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
     return descendantPath.startsWith(`${ancestorPath}.`);
   }
 
-  function dropParentWhenChildExists(items: PageInteractiveCandidate[], sourceElements: Map<string, Element>) {
-    return items.filter((candidate) => {
-      const hasChildCandidate = items.some(
-        (other) => other !== candidate && isDomPathAncestor(candidate.path, other.path),
-      );
-      if (!hasChildCandidate) return true;
-      if (!candidate.hasIndependentClickArea) return false;
-      const element = sourceElements.get(candidate.path);
-      return Boolean(
-        element &&
-        (hasStrongOwnInteractionSemantics(element) || hasMeaningfulContentOutsideInteractiveDescendants(element)),
-      );
-    });
-  }
-
-  function domPathOf(element: Element) {
-    return runtime.pathOf(element)?.split('.').map((item) => Number(item));
-  }
-
-  const raw: PageInteractiveCandidate[] = [];
-  const sourceElements = new Map<string, Element>();
-  const seenPaths = new Set<string>();
-
-  function pushCandidate(element: Element, path: number[]) {
-    const pathKey = path.join('.');
-    if (seenPaths.has(pathKey)) return;
-    const candidate = candidateFrom(element, path);
-    if (!candidate) return;
-    raw.push(candidate);
-    sourceElements.set(candidate.path, element);
-    seenPaths.add(pathKey);
-  }
-
-  function walk(element: Element, path: number[], depth: number) {
-    if (depth > 24) return;
-    pushCandidate(element, path);
-    const childNodes = children(element);
-    for (let index = 0; index < childNodes.length; index += 1) {
-      walk(childNodes[index], [...path, index], depth + 1);
-    }
-  }
-
-  walk(document.documentElement, [0], 0);
-
-  if (raw.length < candidateLimit) {
-    for (const element of Array.from(document.querySelectorAll('*'))) {
-      if (!isTraversable(element) || !isVisibleInViewport(element)) continue;
-      const pathParts = domPathOf(element);
-      if (pathParts) pushCandidate(element, pathParts);
-      if (raw.length >= candidateLimit) break;
-    }
-  }
-
   function pathParts(value: string) {
     return value.split('.').map((item) => Number(item));
   }
@@ -1998,10 +2074,56 @@ function collectAiInteractiveCandidates(input: { limit: number; requirePointerEv
     return ap.length - bp.length;
   }
 
-  return dropParentWhenChildExists(raw, sourceElements)
-    .sort((a, b) => comparePath(a.path, b.path) || a.rect.y - b.rect.y || a.rect.x - b.rect.x)
-    .slice(0, candidateLimit)
-    .map((candidate, index) => ({ ...candidate, id: `${index + 1}` }));
+  function dropParentWhenChildExists(items: PageInteractiveCandidate[], sourceElements: Map<string, Element>) {
+    const sorted = [...items].sort((a, b) => comparePath(a.path, b.path));
+    return sorted.filter((candidate, index) => {
+      const next = sorted[index + 1];
+      const hasChildCandidate = Boolean(next && isDomPathAncestor(candidate.path, next.path));
+      if (!hasChildCandidate) return true;
+      if (!candidate.hasIndependentClickArea) return false;
+      const element = sourceElements.get(candidate.path);
+      return Boolean(
+        element &&
+        (hasStrongOwnInteractionSemantics(element) || hasMeaningfulContentOutsideInteractiveDescendants(element)),
+      );
+    });
+  }
+
+  const raw: PageInteractiveCandidate[] = [];
+  const sourceElements = new Map<string, Element>();
+  const seenPaths = new Set<string>();
+
+  function pushCandidate(element: Element, path: number[]) {
+    const pathKey = path.join('.');
+    if (seenPaths.has(pathKey)) return;
+    if (!includeInteractiveCandidates) return;
+    const candidate = candidateFrom(element, path);
+    if (!candidate) return;
+    raw.push(candidate);
+    sourceElements.set(candidate.path, element);
+    seenPaths.add(pathKey);
+  }
+
+  function walk(element: Element, path: number[], depth: number, textDepth: number) {
+    if (depth > 24) return;
+    const structured = maxStructuredTextChars ? structuredTextLine(element) : undefined;
+    const nextTextDepth = structured?.shown ? textDepth + 1 : textDepth;
+    if (structured?.text) appendStructuredText(textDepth, structured.text);
+    pushCandidate(element, path);
+    const childNodes = children(element);
+    for (let index = 0; index < childNodes.length; index += 1) {
+      walk(childNodes[index], [...path, index], depth + 1, nextTextDepth);
+    }
+  }
+
+  walk(document.documentElement, [0], 0, 0);
+
+  const candidates = dropParentWhenChildExists(raw, sourceElements)
+    .sort((a, b) => comparePath(a.path, b.path) || a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+  return {
+    structuredText: structuredLines.join('\n'),
+    interactiveCandidates: candidates.map((candidate, index) => ({ ...candidate, id: `${index + 1}` })),
+  };
 }
 
 function validateAiCandidateIdentity(input: { path: string; expected: CandidateIdentityPayload }): CandidateIdentityValidation {
@@ -2067,6 +2189,145 @@ function validateAiCandidateIdentity(input: { path: string; expected: CandidateI
     return { ok: false, reason: `text/name changed from "${expectedText}" to "${actualText}"` };
   }
   return { ok: true, reason: '' };
+}
+
+function resolveAiCandidateActionTarget(input: {
+  path: string;
+  expected: CandidateIdentityPayload;
+  center?: { x: number; y: number };
+}): CandidateActionTargetResolution {
+  const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+  if (!runtime) return { ok: false, error: 'DOM runtime is not available' };
+
+  const { path: pathValue, expected } = input;
+  const originalElement = runtime.elementFromPath(pathValue);
+  if (!originalElement) return { ok: false, error: `DOM path ${pathValue} no longer exists` };
+
+  const normalized = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+  const actualTag = originalElement.tagName.toLowerCase();
+  if (actualTag !== expected.tag) return { ok: false, error: `tag changed from ${expected.tag} to ${actualTag}` };
+
+  function ownText(target: Element) {
+    let text = '';
+    for (const node of Array.from(target.childNodes)) {
+      if (node.nodeType === Node.TEXT_NODE) text += node.textContent || '';
+    }
+    const inner = normalized((target as HTMLElement).innerText || target.textContent || '');
+    return normalized(text || inner).slice(0, 140);
+  }
+
+  function currentName(target: Element) {
+    const inputElement = target as HTMLInputElement;
+    const labelText = inputElement.labels?.length ? Array.from(inputElement.labels).map((label) => label.textContent || '').join(' ') : '';
+    const imageAlt = Array.from(target.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ');
+    return normalized([
+      target.getAttribute('aria-label'),
+      target.getAttribute('title'),
+      target.getAttribute('alt'),
+      imageAlt,
+      inputElement.placeholder,
+      labelText,
+      ownText(target),
+      inputElement.value,
+    ].filter(Boolean).join(' '));
+  }
+
+  function compare(label: string, expectedValue?: string, actualValue?: string | null) {
+    const left = normalized(expectedValue);
+    const right = normalized(actualValue);
+    if (!left) return undefined;
+    return left === right ? undefined : `${label} changed from "${left}" to "${right || '[empty]'}"`;
+  }
+
+  const inputElement = originalElement as HTMLInputElement;
+  const mismatches = [
+    compare('role', expected.role, originalElement.getAttribute('role')),
+    compare('type', expected.type, originalElement.getAttribute('type')),
+    compare('href', expected.href, actualTag === 'a' ? (originalElement as HTMLAnchorElement).href || originalElement.getAttribute('href') : undefined),
+    compare('aria-label', expected.ariaLabel, originalElement.getAttribute('aria-label')),
+    compare('placeholder', expected.placeholder, inputElement.placeholder),
+    compare('title', expected.title, originalElement.getAttribute('title')),
+  ].filter(Boolean);
+  if (mismatches.length) return { ok: false, error: mismatches.join('; ') };
+
+  const expectedText = normalized(expected.text);
+  const expectedName = normalized(expected.name);
+  const actualText = ownText(originalElement);
+  const actualName = currentName(originalElement);
+  if (expectedText && actualText && expectedText !== actualText && expectedName && actualName && expectedName !== actualName) {
+    return { ok: false, error: `text/name changed from "${expectedText}" to "${actualText}"` };
+  }
+
+  let element = runtime.actionableTargetFor(originalElement);
+
+  const cachedCenter = input.center;
+  if (
+    cachedCenter &&
+    Number.isFinite(cachedCenter.x) &&
+    Number.isFinite(cachedCenter.y) &&
+    cachedCenter.x >= 0 &&
+    cachedCenter.y >= 0 &&
+    cachedCenter.x < window.innerWidth &&
+    cachedCenter.y < window.innerHeight
+  ) {
+    const top = runtime.topmostRenderableAt(cachedCenter.x, cachedCenter.y, { requirePointerEvents: true });
+    if (
+      top &&
+      (top === element || runtime.composedContains(element, top) || top === originalElement || runtime.composedContains(originalElement, top))
+    ) {
+      return {
+        ok: true,
+        target: {
+          x: Math.round(cachedCenter.x),
+          y: Math.round(cachedCenter.y),
+          descriptor: runtime.descriptor(element),
+          offscreen: false,
+          source: 'cached-center',
+        },
+      };
+    }
+  }
+
+  let rect = element.getBoundingClientRect();
+  let point = runtime.visiblePointForElement(element, { requirePointerEvents: true });
+  if (!point) {
+    element.scrollIntoView({ block: 'center', inline: 'center' });
+    rect = element.getBoundingClientRect();
+    point = runtime.visiblePointForElement(element, { requirePointerEvents: true });
+  }
+
+  if (!point || rect.width <= 0 || rect.height <= 0) {
+    const queue = runtime.children(element);
+    let guard = 0;
+    while (queue.length && guard < 4000) {
+      const candidate = queue.shift() as Element;
+      const candidateRect = candidate.getBoundingClientRect();
+      const candidatePoint = runtime.visiblePointForElement(candidate, { requirePointerEvents: true });
+      if (candidateRect.width > 0 && candidateRect.height > 0 && candidatePoint) {
+        element = candidate;
+        rect = candidateRect;
+        point = candidatePoint;
+        break;
+      }
+      queue.push(...runtime.children(candidate));
+      guard += 1;
+    }
+  }
+
+  if (!point || rect.width <= 0 || rect.height <= 0) {
+    return { ok: false, error: `DOM path ${pathValue} is not visible` };
+  }
+
+  return {
+    ok: true,
+    target: {
+      x: Math.round(Math.min(Math.max(point.x, 0), window.innerWidth - 1)),
+      y: Math.round(Math.min(Math.max(point.y, 0), window.innerHeight - 1)),
+      descriptor: runtime.descriptor(element),
+      offscreen: rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth,
+      source: 'resolved-point',
+    },
+  };
 }
 
 function applyPageGroupMarker(input: { id: string; title: string; prefix: string; applyPrefix: boolean }) {
@@ -3103,52 +3364,58 @@ export class BrowserSession {
     return this.page;
   }
 
-  // 打开目标页面并等待基础加载完成。
+  // 打开目标页面，只等待导航提交，页面稳定由模型显式调用 waitForPage/getPageState 决定。
   async open(url: string): Promise<BrowserActionResult> {
-    await this.activePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    const note = await this.waitAfterAction();
-    return { ok: true, actual: `Opened page: ${url}${note}` };
-  }
-
-  // 读取当前页面正文文本，主要用于验证码/人工介入等文本判断。
-  async readPageText() {
-    const maxChars = numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000);
-    const frameLimit = numericLimitFromEnv('DOM_PAGE_TEXT_FRAME_LIMIT', numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER));
-    const mainFrame = this.activePage.mainFrame();
-    const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
-    const parts: string[] = [];
-    let chars = 0;
-    const append = (label: string, text: string) => {
-      const normalized = text.replace(/\s+/g, ' ').trim();
-      if (!normalized || chars >= maxChars) return;
-      const block = label ? `${label}\n${normalized}` : normalized;
-      const remaining = maxChars - chars;
-      const chunk = block.length > remaining ? block.slice(0, remaining) : block;
-      if (!chunk) return;
-      parts.push(chunk);
-      chars += chunk.length + 2;
-    };
-
-    for (const frame of frames) {
-      if (chars >= maxChars) break;
-      const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
-      if (frame !== mainFrame && framePath === undefined) continue;
-      const frameText = await this.readFramePageText(frame, maxChars - chars).catch(() => undefined);
-      const text = frameText?.text || await frame.locator('body').innerText({ timeout: 1000 }).catch(() => '');
-      const label = framePath ? `[iframe ${framePath}${frame.url() ? ` ${frame.url()}` : ''}]` : '';
-      append(label, text);
+    const beforeUrl = this.activePage.url();
+    const timeoutMs = boundedPositiveIntegerEnv('BROWSER_OPEN_TIMEOUT_MS', DEFAULT_BROWSER_OPEN_TIMEOUT_MS, 1000, 30000);
+    let navigationNote = '';
+    const navigation = this.activePage
+      .goto(url, { waitUntil: 'commit', timeout: timeoutMs })
+      .then(() => ({ status: 'committed' as const }))
+      .catch((error) => ({ status: 'failed' as const, error }));
+    const navigationResult = await Promise.race([
+      navigation,
+      sleep(timeoutMs).then(() => ({ status: 'hard-timeout' as const })),
+    ]);
+    if (navigationResult.status !== 'committed') {
+      const currentUrl = this.activePage.url();
+      const unchanged = currentUrl === beforeUrl && currentUrl !== url;
+      if (!currentUrl || isBlankBrowserUrlLike(currentUrl) || unchanged) {
+        const errorMessage = navigationResult.status === 'failed'
+          ? `: ${navigationResult.error instanceof Error ? navigationResult.error.message : String(navigationResult.error)}`
+          : '';
+        return {
+          ok: false,
+          actual: `Open page timed out after ${timeoutMs}ms before navigation committed${errorMessage}`,
+        };
+      }
+      navigationNote = ` Navigation did not commit within hard timeout ${timeoutMs}ms; continuing from current URL: ${currentUrl}.`;
     }
-
-    return parts.join('\n\n');
+    void this.markPageGroup(this.activePage);
+    return { ok: true, actual: `Opened page: ${url}${navigationNote}` };
   }
 
   async readStructuredPageText() {
-    const maxChars = numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000));
+    return (await this.readDomObservation({ includeInteractiveCandidates: false })).structuredText;
+  }
+
+  private async readDomObservation(options: {
+    includeInteractiveCandidates: boolean;
+    maxChars?: number;
+    timings?: Record<string, number>;
+  }) {
+    const fallbackMaxChars = numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000));
+    const maxChars = options.maxChars ?? fallbackMaxChars;
     const frameLimit = numericLimitFromEnv('DOM_STRUCTURED_TEXT_FRAME_LIMIT', numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER));
     const mainFrame = this.activePage.mainFrame();
     const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
     const parts: string[] = [];
     let chars = 0;
+    const mainCandidates: PageInteractiveCandidate[] = [];
+    const frameCandidates: InteractiveCandidate[] = [];
+    const viewport = options.includeInteractiveCandidates
+      ? await timedBrowserStep(options.timings, 'getViewportForFrameCandidatesMs', () => this.getViewportMetrics().catch(() => ({ width: 0, height: 0, devicePixelRatio: 1 })))
+      : undefined;
 
     const append = (label: string, text: string) => {
       const trimmed = text.trim();
@@ -3162,15 +3429,62 @@ export class BrowserSession {
     };
 
     for (const frame of frames) {
-      if (chars >= maxChars) break;
+      if (chars >= maxChars && !options.includeInteractiveCandidates) break;
       const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
       if (frame !== mainFrame && framePath === undefined) continue;
-      const text = await this.readFrameStructuredPageText(frame, maxChars - chars).catch(() => '');
+      const frameBox = framePath && options.includeInteractiveCandidates
+        ? await timedBrowserStep(options.timings, 'getFrameBoxMs', () => frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined))
+        : undefined;
+      if (framePath && options.includeInteractiveCandidates && (!frameBox || frameBox.width <= 2 || frameBox.height <= 2)) continue;
+      const observation = await timedBrowserStep(
+        options.timings,
+        framePath ? 'readFrameDomObservationMs' : 'readMainDomObservationMs',
+        async () => {
+          await this.ensureBrowserPageRuntime(frame);
+          return frame.evaluate(collectAiDomObservation, {
+            includeInteractiveCandidates: options.includeInteractiveCandidates,
+            requirePointerEvents: Boolean(framePath),
+            structuredTextMaxChars: Math.max(0, maxChars - chars),
+          }).catch(() => ({ structuredText: '', interactiveCandidates: [] as PageInteractiveCandidate[] }));
+        },
+      );
       const label = framePath ? `[iframe ${framePath}${frame.url() ? ` ${frame.url()}` : ''}]` : '';
-      append(label, text);
+      append(label, observation.structuredText);
+      if (!options.includeInteractiveCandidates || !observation.interactiveCandidates.length) continue;
+      if (!framePath) {
+        mainCandidates.push(...observation.interactiveCandidates);
+        continue;
+      }
+      if (!frameBox || !viewport) continue;
+      for (const candidate of observation.interactiveCandidates) {
+        const rect = {
+          x: Math.round(frameBox.x + candidate.rect.x),
+          y: Math.round(frameBox.y + candidate.rect.y),
+          width: candidate.rect.width,
+          height: candidate.rect.height,
+        };
+        const center = {
+          x: Math.round(frameBox.x + candidate.center.x),
+          y: Math.round(frameBox.y + candidate.center.y),
+        };
+        if (center.x < 0 || center.y < 0 || center.x >= viewport.width || center.y >= viewport.height) continue;
+        frameCandidates.push({
+          ...candidate,
+          id: '',
+          rect,
+          center,
+          framePath,
+          frameUrl: frame.url() || undefined,
+        });
+      }
     }
 
-    return parts.join('\n\n');
+    return {
+      structuredText: parts.join('\n\n'),
+      interactiveCandidates: options.includeInteractiveCandidates
+        ? this.finalizeInteractiveCandidates(mainCandidates, frameCandidates)
+        : [] as InteractiveCandidate[],
+    };
   }
 
   // 汇总当前页面上下文，包括 URL、标题、焦点、候选元素、DOM 树和人工验证状态。
@@ -3186,23 +3500,42 @@ export class BrowserSession {
     const includeText = options.includeText !== false || options.includeManualVerification !== false;
     const includeInteractiveCandidates = options.includeInteractiveCandidates ?? true;
     const useCachedInteractiveCandidates = Boolean(options.useCachedInteractiveCandidates && !options.includeDomTree);
-    const [title, text, structuredText, viewportMetrics, focusedElement, domTree, interactiveCandidates, scrollableAreas, pageScrollState] = await Promise.all([
-      this.activePage.title().catch(() => '').then((value) => this.stripTabTitlePrefix(value)),
-      includeText ? this.readPageText() : Promise.resolve(''),
-      includeText ? this.readStructuredPageText() : Promise.resolve(''),
-      this.getViewportMetrics(),
-      this.getFocusedElement(),
-      options.includeDomTree ? this.readRawDomTree().catch((error) => `Unable to read raw DOM: ${error instanceof Error ? error.message : String(error)}`) : Promise.resolve(undefined),
-      !includeInteractiveCandidates
+    const timings: Record<string, number> = {};
+    const canUseCombinedDomObservation = includeText
+      && includeInteractiveCandidates
+      && !useCachedInteractiveCandidates
+      && !options.includeDomTree;
+    const domObservationPromise = canUseCombinedDomObservation
+      ? timedBrowserStep(timings, 'readDomObservationMs', () => this.readDomObservation({
+          includeInteractiveCandidates: true,
+          maxChars: numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000)),
+          timings,
+        }))
+      : undefined;
+    const [title, domObservation, structuredTextFallback, viewportMetrics, focusedElement, domTree, interactiveCandidatesFallback, scrollableAreas, pageScrollState] = await Promise.all([
+      timedBrowserStep(timings, 'readTitleMs', () => this.activePage.title().catch(() => '').then((value) => this.stripTabTitlePrefix(value))),
+      domObservationPromise || Promise.resolve(undefined),
+      !domObservationPromise && includeText
+        ? timedBrowserStep(timings, 'readStructuredPageTextMs', () => this.readStructuredPageText())
+        : Promise.resolve(''),
+      timedBrowserStep(timings, 'getViewportMetricsMs', () => this.getViewportMetrics()),
+      timedBrowserStep(timings, 'getFocusedElementMs', () => this.getFocusedElement()),
+      options.includeDomTree
+        ? timedBrowserStep(timings, 'readRawDomTreeMs', () => this.readRawDomTree().catch((error) => `Unable to read raw DOM: ${error instanceof Error ? error.message : String(error)}`))
+        : Promise.resolve(undefined),
+      domObservationPromise || !includeInteractiveCandidates
         ? Promise.resolve([] as InteractiveCandidate[])
         : useCachedInteractiveCandidates && this.lastScreenshotCandidates.length
           ? Promise.resolve(this.lastScreenshotCandidates)
           : useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
-          ? Promise.resolve(this.lastInteractiveCandidates)
-          : this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates),
-      this.refreshScrollableAreas().catch(() => this.lastScrollableAreas),
-      this.getPageScrollState().catch(() => undefined),
+            ? Promise.resolve(this.lastInteractiveCandidates)
+            : timedBrowserStep(timings, 'refreshInteractiveCandidatesMs', () => this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates)),
+      timedBrowserStep(timings, 'refreshScrollableAreasMs', () => this.refreshScrollableAreas().catch(() => this.lastScrollableAreas)),
+      timedBrowserStep(timings, 'getPageScrollStateMs', () => this.getPageScrollState().catch(() => undefined)),
     ]);
+    const structuredText = domObservation?.structuredText ?? structuredTextFallback;
+    const interactiveCandidates = domObservation?.interactiveCandidates ?? interactiveCandidatesFallback;
+    const text = structuredText;
 
     const manualVerification = options.includeManualVerification === false
       ? { detected: false }
@@ -3227,6 +3560,7 @@ export class BrowserSession {
       pageScrollState,
       manualVerification,
       isManualVerification: manualVerification.detected && !manualVerification.captchaAppearsFilled,
+      timings,
     };
   }
 
@@ -3611,45 +3945,51 @@ export class BrowserSession {
 
   // 点击指定编号的候选元素中心点。
   async clickCandidate(candidateId: string, text?: string): Promise<BrowserActionResult> {
-    const resolved = await this.resolveCandidateTarget(candidateId);
+    const timings: Record<string, number> = {};
+    const resolved = await timedBrowserStep(timings, 'resolveCandidateMs', () => this.resolveCandidateTarget(candidateId, timings));
     if (!resolved.target) return { ok: false, actual: resolved.error };
 
     const { candidate, target } = resolved;
     const page = this.activePage;
     const beforeUrl = page.url();
-    const popupWaitMs = Math.min(Math.max(Number(process.env.BROWSER_POPUP_WAIT_MS || 600), 0), 3000);
+    const popupWaitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
     const popup = popupWaitMs > 0
       ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
       : Promise.resolve(undefined);
-    await page.mouse.click(target.x, target.y);
+    await timedBrowserStep(timings, 'mouseClickMs', () => page.mouse.click(target.x, target.y));
     if (text !== undefined) {
-      await page.keyboard.type(text);
+      await timedBrowserStep(timings, 'typeTextMs', () => this.insertFocusedTextFast(text, timings));
     }
-    const newPage = await popup;
+    const newPage = await timedBrowserStep(timings, 'popupWaitMs', () => popup);
     if (newPage) {
       this.claimPage(newPage);
-      await newPage.bringToFront();
+      await timedBrowserStep(timings, 'bringPopupToFrontMs', () => newPage.bringToFront());
     }
-    let note = await this.waitAfterAction();
+    let note = '';
     let fallbackNote = '';
     if (text === undefined && candidate.href && this.activePage.url() === beforeUrl && !newPage) {
-      const fallback = candidate.framePath
-        ? await this.dispatchFrameDomPathClick(candidate.framePath, candidate.path)
-        : await this.dispatchDomPathClick(candidate.path);
+      const fallback = await timedBrowserStep(timings, 'fallbackClickMs', () => (
+        candidate.framePath
+          ? this.dispatchFrameDomPathClick(candidate.framePath, candidate.path)
+          : this.dispatchDomPathClick(candidate.path)
+      ));
       if (fallback) {
         fallbackNote += ` Primary mouse click did not navigate; retried ${fallback} with DOM click.`;
-        note += await this.waitAfterAction();
       }
-      if (this.activePage.url() === beforeUrl && /^https?:\/\//i.test(candidate.href)) {
-        await this.activePage.goto(candidate.href, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
+      const directHrefTimeoutMs = boundedNonNegativeIntegerEnv('BROWSER_DIRECT_HREF_TIMEOUT_MS', DEFAULT_BROWSER_DIRECT_HREF_TIMEOUT_MS, 30000);
+      if (directHrefTimeoutMs > 0 && this.activePage.url() === beforeUrl && /^https?:\/\//i.test(candidate.href)) {
+        const href = candidate.href;
+        await timedBrowserStep(timings, 'directHrefMs', () => this.activePage.goto(href, { waitUntil: 'commit', timeout: directHrefTimeoutMs }).catch(() => undefined));
         fallbackNote += ' Link href was opened directly as a final fallback.';
-        note += await this.waitAfterAction();
       }
     }
-    await this.showClickMarker(target.x, target.y, 'click');
+    void this.markPageGroup(this.activePage);
+    timings.showMarkerMs = 0;
+    void this.showClickMarker(target.x, target.y, 'click');
+    const timingNote = formatTimingRecord(timings);
     return {
       ok: true,
-      actual: `Clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${note}`,
+      actual: `Clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${note}${timingNote ? ` Click timings: ${timingNote}.` : ''}`,
     };
   }
 
@@ -3830,7 +4170,7 @@ export class BrowserSession {
       };
     }
     const page = this.activePage;
-    const popupWaitMs = Math.min(Math.max(Number(process.env.BROWSER_POPUP_WAIT_MS || 600), 0), 3000);
+    const popupWaitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
     const popup = popupWaitMs > 0
       ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
       : Promise.resolve(undefined);
@@ -3843,7 +4183,7 @@ export class BrowserSession {
       this.claimPage(newPage);
       await newPage.bringToFront();
     }
-    const note = await this.waitAfterAction();
+    const note = '';
     await this.showClickMarker(target.x, target.y, 'click');
     return { ok: true, actual: `Clicked DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${note}` };
   }
@@ -3876,7 +4216,7 @@ export class BrowserSession {
       };
     }
     const page = this.activePage;
-    const popupWaitMs = Math.min(Math.max(Number(process.env.BROWSER_POPUP_WAIT_MS || 600), 0), 3000);
+    const popupWaitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
     const popup = popupWaitMs > 0
       ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
       : Promise.resolve(undefined);
@@ -4019,7 +4359,7 @@ export class BrowserSession {
 
     const page = this.activePage;
     const beforeUrl = page.url();
-    const popupWaitMs = Math.min(Math.max(Number(process.env.BROWSER_POPUP_WAIT_MS || 600), 0), 3000);
+    const popupWaitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
     const popup = popupWaitMs > 0
       ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
       : Promise.resolve(undefined);
@@ -4033,7 +4373,7 @@ export class BrowserSession {
       this.claimPage(newPage);
       await newPage.bringToFront();
     }
-    let note = await this.waitAfterAction();
+    let note = '';
     let fallbackNote = '';
     if (text === undefined && candidate.href && this.activePage.url() === beforeUrl && !newPage) {
       const fallback = candidate.framePath
@@ -4043,7 +4383,6 @@ export class BrowserSession {
           : await this.dispatchDomPathClick(candidate.path);
       if (fallback) {
         fallbackNote = ` Primary mouse click did not change the URL; retried ${fallback} with DOM click.`;
-        note += await this.waitAfterAction();
       }
     }
     await this.showClickMarker(target.x, target.y, 'click');
@@ -4081,12 +4420,16 @@ export class BrowserSession {
 
   // 按可滚动区域编号滚动任意滚动容器。编号来自 getPageContext().scrollableAreas。
   async scrollArea(areaId: string, deltaY: number, deltaX = 0): Promise<BrowserActionResult> {
-    const area = this.lastScrollableAreas.find((item) => item.id === areaId)
-      || (await this.refreshScrollableAreas()).find((item) => item.id === areaId);
+    const timings: Record<string, number> = {};
+    const area = await timedBrowserStep(timings, 'lookupAreaMs', async () => (
+      this.lastScrollableAreas.find((item) => item.id === areaId)
+      || (await this.refreshScrollableAreas()).find((item) => item.id === areaId)
+    ));
     if (!area) {
+      const timingNote = formatTimingRecord(timings);
       return {
         ok: false,
-        actual: `Scrollable area ${areaId} was not found. Use the latest scrollableAreas list and choose an id such as S1.`,
+        actual: `Scrollable area ${areaId} was not found. Use the latest scrollableAreas list and choose an id such as S1.${timingNote ? ` Scroll timings: ${timingNote}.` : ''}`,
       };
     }
     const scrollStateText = (scroll: ScrollableArea['scroll']) => {
@@ -4116,20 +4459,110 @@ export class BrowserSession {
         actual: `Scrollable area ${area.id} cannot scroll in the requested direction. Current state: ${scrollStateText(area.scroll)}. Choose a different action or a different scroll direction/area instead of repeating this scroll.`,
       };
     }
-    await this.activePage.mouse.move(area.center.x, area.center.y);
-    await this.activePage.mouse.wheel(deltaX, deltaY);
-    const note = await this.waitAfterAction();
-    const updated = (await this.refreshScrollableAreas().catch(() => [])).find((item) => item.id === areaId);
-    const state = updated
-      ? ` Before: ${scrollStateText(area.scroll)}. After: ${scrollStateText(updated.scroll)}. Moved: y=${updated.scroll.top - area.scroll.top}, x=${updated.scroll.left - area.scroll.left}.`
-      : '';
+    const result = await timedBrowserStep(timings, 'directScrollMs', () => this.scrollAreaByPath(area, deltaY, deltaX));
+    if (!result.ok) {
+      const timingNote = formatTimingRecord(timings);
+      return {
+        ok: false,
+        actual: `Scrollable area ${area.id} could not be scrolled: ${result.error}. Refresh getPageState and choose a fresh scrollable area id.${timingNote ? ` Scroll timings: ${timingNote}.` : ''}`,
+      };
+    }
+    await timedBrowserStep(timings, 'updateScrollCacheMs', async () => {
+      const updatedArea = { ...area, scroll: result.after };
+      this.lastScrollableAreas = this.lastScrollableAreas.map((item) => (item.id === area.id ? updatedArea : item));
+    });
+    void this.markPageGroup(this.activePage);
+    const state = ` Before: ${scrollStateText(result.before)}. After: ${scrollStateText(result.after)}. Moved: y=${result.after.top - result.before.top}, x=${result.after.left - result.before.left}.`;
+    const timingNote = formatTimingRecord(timings);
     return {
       ok: true,
-      actual: `Scrolled area ${area.id} (${area.tag}${area.name ? ` "${area.name}"` : ''}) at (${area.center.x}, ${area.center.y}) by x=${deltaX}, y=${deltaY}.${state}${note}`,
+      actual: `Scrolled area ${area.id} (${area.tag}${area.name ? ` "${area.name}"` : ''}) by x=${deltaX}, y=${deltaY}.${state}${timingNote ? ` Scroll timings: ${timingNote}.` : ''}`,
     };
   }
 
   // 列出当前浏览器上下文中的所有标签页，供 AI 判断是否需要切换。
+  // Scroll an already-known scrollable area without mouse wheel or a full area refresh.
+  private async scrollAreaByPath(area: ScrollableArea, deltaY: number, deltaX: number): Promise<ScrollAreaDirectResult> {
+    await this.ensureBrowserPageRuntime();
+    return this.activePage.evaluate(({ path, deltaY: y, deltaX: x }): ScrollAreaDirectResult => {
+      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+      const isDocumentArea = path === 'document';
+      const root = document.scrollingElement || document.documentElement;
+      const element = isDocumentArea ? root : runtime?.elementFromPath(path);
+      if (!element) return { ok: false, error: `scrollable area path ${path} no longer exists` };
+
+      const scrollElement = element as HTMLElement;
+      const readState = () => {
+        const top = Math.round(scrollElement.scrollTop);
+        const left = Math.round(scrollElement.scrollLeft);
+        const height = Math.round(scrollElement.scrollHeight);
+        const width = Math.round(scrollElement.scrollWidth);
+        const clientHeight = Math.round(scrollElement.clientHeight);
+        const clientWidth = Math.round(scrollElement.clientWidth);
+        const maxTop = Math.max(0, height - clientHeight);
+        const maxLeft = Math.max(0, width - clientWidth);
+        const remainingUp = Math.max(0, top);
+        const remainingDown = Math.max(0, maxTop - top);
+        const remainingLeft = Math.max(0, left);
+        const remainingRight = Math.max(0, maxLeft - left);
+        return {
+          top,
+          left,
+          height,
+          width,
+          clientHeight,
+          clientWidth,
+          maxTop,
+          maxLeft,
+          remainingUp,
+          remainingDown,
+          remainingLeft,
+          remainingRight,
+          atTop: remainingUp <= 1,
+          atBottom: remainingDown <= 1,
+          atLeft: remainingLeft <= 1,
+          atRight: remainingRight <= 1,
+          canScrollUp: remainingUp > 1,
+          canScrollDown: remainingDown > 1,
+          canScrollLeft: remainingLeft > 1,
+          canScrollRight: remainingRight > 1,
+        };
+      };
+
+      const before = readState();
+      const targetTop = Math.min(Math.max(before.top + Math.trunc(Number(y) || 0), 0), before.maxTop);
+      const targetLeft = Math.min(Math.max(before.left + Math.trunc(Number(x) || 0), 0), before.maxLeft);
+      try {
+        scrollElement.scrollTo({ top: targetTop, left: targetLeft, behavior: 'auto' });
+      } catch {
+        scrollElement.scrollTop = targetTop;
+        scrollElement.scrollLeft = targetLeft;
+      }
+      scrollElement.scrollTop = targetTop;
+      scrollElement.scrollLeft = targetLeft;
+      if (isDocumentArea) {
+        try {
+          window.scrollTo({ top: targetTop, left: targetLeft, behavior: 'auto' });
+        } catch {
+          window.scrollTo(targetLeft, targetTop);
+        }
+        window.dispatchEvent(new Event('scroll'));
+      }
+      scrollElement.dispatchEvent(new Event('scroll', { bubbles: true }));
+      const after = readState();
+      return {
+        ok: true,
+        descriptor: isDocumentArea ? 'document' : runtime?.descriptor(element) || element.tagName.toLowerCase(),
+        before,
+        after,
+      };
+    }, { path: area.path, deltaY, deltaX }).catch((error) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+
+  // List current browser tabs so the agent can decide whether to switch.
   async listTabs(): Promise<BrowserActionResult> {
     const tabs = this.getTabsSnapshot();
     return {
@@ -4189,10 +4622,21 @@ export class BrowserSession {
 
   // 等待页面进入较稳定状态，用于加载、跳转或动画后的观察。
   async waitForPage(): Promise<BrowserActionResult> {
-    await this.activePage.waitForLoadState('domcontentloaded').catch((error) => {
+    const loadStateTimeoutMs = boundedPositiveIntegerEnv(
+      'BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS',
+      DEFAULT_BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS,
+      100,
+      30000,
+    );
+    await this.activePage.waitForLoadState('domcontentloaded', { timeout: loadStateTimeoutMs }).catch((error) => {
       if (!this.isTargetClosedError(error)) throw error;
     });
-    await this.waitForStableViewport(500);
+    const stableMs = boundedNonNegativeIntegerEnv(
+      'BROWSER_WAIT_FOR_PAGE_STABLE_MS',
+      DEFAULT_BROWSER_WAIT_FOR_PAGE_STABLE_MS,
+      5000,
+    );
+    if (stableMs > 0) await this.waitForStableViewport(stableMs);
     const note = await this.manualVerificationNote();
     return { ok: true, actual: `Page wait completed.${note}` };
   }
@@ -4262,7 +4706,13 @@ export class BrowserSession {
 
   private async waitAfterAction() {
     const settleMs = Number(process.env.BROWSER_ACTION_SETTLE_MS || 0);
-    await this.activePage.waitForLoadState('domcontentloaded').catch(() => undefined);
+    const loadStateTimeoutMs = boundedPositiveIntegerEnv(
+      'BROWSER_ACTION_LOAD_STATE_TIMEOUT_MS',
+      DEFAULT_BROWSER_ACTION_LOAD_STATE_TIMEOUT_MS,
+      100,
+      30000,
+    );
+    await this.activePage.waitForLoadState('domcontentloaded', { timeout: loadStateTimeoutMs }).catch(() => undefined);
     await this.markPageGroup(this.activePage);
     if (Number.isFinite(settleMs) && settleMs > 0) {
       await this.waitForStableViewport(Math.min(Math.max(settleMs, 0), 2000));
@@ -4277,6 +4727,65 @@ export class BrowserSession {
       await this.activePage.keyboard.press('Backspace').catch(() => undefined);
     }
     if (text) await this.activePage.keyboard.type(text, { delay: 20 });
+  }
+
+  private async insertFocusedTextFast(text: string, timings?: Record<string, number>) {
+    if (!text) return;
+    const domInserted = await timedBrowserStep(timings, 'domTextMs', () => this.insertTextIntoFocusedElement(text));
+    if (domInserted) return;
+    const timeoutMs = boundedPositiveIntegerEnv('BROWSER_FAST_TEXT_TIMEOUT_MS', 1500, 100, 10000);
+    await timedBrowserStep(timings, 'insertTextMs', () => Promise.race([
+      this.activePage.keyboard.insertText(text).then(() => undefined),
+      sleep(timeoutMs).then(() => false),
+    ]));
+  }
+
+  private async insertTextIntoFocusedElement(text: string) {
+    return Boolean(await this.activePage.evaluate((value) => {
+      const active = document.activeElement;
+      if (!active) return false;
+      const input = active as HTMLInputElement;
+      const isTextControl = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement;
+      if (isTextControl) {
+        const currentValue = String(input.value || '');
+        const start = typeof input.selectionStart === 'number' ? input.selectionStart : currentValue.length;
+        const end = typeof input.selectionEnd === 'number' ? input.selectionEnd : start;
+        const nextValue = `${currentValue.slice(0, start)}${value}${currentValue.slice(end)}`;
+        const prototype = active instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+        if (setter) setter.call(input, nextValue);
+        else input.value = nextValue;
+        const cursor = start + value.length;
+        try {
+          input.setSelectionRange?.(cursor, cursor);
+        } catch {
+          // Some input types do not support selection ranges; the value update still succeeded.
+        }
+        active.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          cancelable: true,
+          data: value,
+          inputType: 'insertText',
+        }));
+        active.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+      const editable = active.closest('[contenteditable=""], [contenteditable="true"]') as HTMLElement | null;
+      if (editable) {
+        editable.focus();
+        document.execCommand('insertText', false, value);
+        editable.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          cancelable: true,
+          data: value,
+          inputType: 'insertText',
+        }));
+        return true;
+      }
+      return false;
+    }, text).catch(() => false));
   }
 
   private async waitForStableViewport(ms: number) {
@@ -4431,7 +4940,7 @@ export class BrowserSession {
   private async detectManualVerification(): Promise<ManualVerificationDetails> {
     const [title, text] = await Promise.all([
       this.activePage.title().catch(() => '').then((value) => this.stripTabTitlePrefix(value)),
-      this.readPageText(),
+      this.readStructuredPageText(),
     ]);
     return this.detectManualVerificationDetails(title, this.activePage.url(), text);
   }
@@ -4639,15 +5148,10 @@ export class BrowserSession {
     return areas;
   }
 
-  private async refreshInteractiveCandidates() {
-    const limit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160));
-    const scanLimit = Math.max(limit * 2, limit + 50);
-    await this.ensureBrowserPageRuntime();
-    const mainCandidates = await this.activePage
-      .evaluate(collectAiInteractiveCandidates, { limit: scanLimit, requirePointerEvents: false })
-      .catch(() => [] as PageInteractiveCandidate[]);
-
-    const frameCandidates = await this.refreshFrameInteractiveCandidates(scanLimit);
+  private finalizeInteractiveCandidates(
+    mainCandidates: PageInteractiveCandidate[],
+    frameCandidates: InteractiveCandidate[],
+  ) {
     const combinedCandidates: InteractiveCandidate[] = [...mainCandidates, ...frameCandidates];
     const candidates = combinedCandidates
       .filter((candidate) => {
@@ -4655,13 +5159,22 @@ export class BrowserSession {
         return !frameCandidates.some((frameCandidate) => this.rectContains(candidate.rect, frameCandidate.rect));
       })
       .sort((a, b) => this.compareCandidateOrder(a, b))
-      .slice(0, limit)
       .map((candidate, index) => ({
         ...candidate,
         id: `${index + 1}`,
       }));
     this.lastInteractiveCandidates = candidates;
     return candidates;
+  }
+
+  private async refreshInteractiveCandidates() {
+    await this.ensureBrowserPageRuntime();
+    const mainCandidates = await this.activePage
+      .evaluate(collectAiInteractiveCandidates, { requirePointerEvents: false })
+      .catch(() => [] as PageInteractiveCandidate[]);
+
+    const frameCandidates = await this.refreshFrameInteractiveCandidates();
+    return this.finalizeInteractiveCandidates(mainCandidates, frameCandidates);
   }
 
   private rectContains(
@@ -4677,7 +5190,7 @@ export class BrowserSession {
     );
   }
 
-  private async refreshFrameInteractiveCandidates(limit: number): Promise<InteractiveCandidate[]> {
+  private async refreshFrameInteractiveCandidates(): Promise<InteractiveCandidate[]> {
     const frames = this.activePage.frames().filter((frame) => frame !== this.activePage.mainFrame());
     const viewport = await this.getViewportMetrics().catch(() => ({ width: 0, height: 0, devicePixelRatio: 1 }));
     const all: InteractiveCandidate[] = [];
@@ -4691,7 +5204,7 @@ export class BrowserSession {
 
       await this.ensureBrowserPageRuntime(frame);
       const localCandidates = await frame
-        .evaluate(collectAiInteractiveCandidates, { limit, requirePointerEvents: true })
+        .evaluate(collectAiInteractiveCandidates, { requirePointerEvents: true })
         .catch(() => [] as PageInteractiveCandidate[]);
 
       for (const candidate of localCandidates) {
@@ -4801,6 +5314,69 @@ export class BrowserSession {
     };
   }
 
+  private currentCandidatePool() {
+    return this.mode === 'visual-markers'
+      ? this.lastScreenshotCandidates
+      : (this.lastInteractiveCandidates.length ? this.lastInteractiveCandidates : this.lastScreenshotCandidates);
+  }
+
+  private findCandidateById(candidateId: string) {
+    const normalized = candidateId.trim().toUpperCase().replace(/^E(?=\d+$)/, '');
+    const candidates = this.currentCandidatePool();
+    const candidate = candidates.find((item) => item.id.toUpperCase() === normalized);
+    if (candidate) return { candidate };
+
+    const available = candidates
+      .slice(0, 30)
+      .map((item) => `${item.id}: ${this.describeCandidate(item)}`)
+      .join('\n');
+    return {
+      error: `Candidate ${candidateId} was not found in the current ${this.mode === 'visual-markers' ? 'screenshot' : 'DOM interactive'} snapshot. Refresh getPageState/getInteractiveCandidates and choose one of the returned candidate ids. Available candidates:\n${available || '[none]'}`,
+    };
+  }
+
+  private async resolveMainCandidateActionTarget(candidate: InteractiveCandidate): Promise<CandidateActionTargetResolution> {
+    await this.ensureBrowserPageRuntime();
+    return this.activePage.evaluate(resolveAiCandidateActionTarget, {
+      path: candidate.path,
+      expected: this.candidateIdentityPayload(candidate),
+      center: candidate.center,
+    }).catch((error) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+
+  private async resolveFrameCandidateActionTarget(candidate: InteractiveCandidate): Promise<CandidateActionTargetResolution> {
+    const frame = this.frameFromPath(candidate.framePath);
+    if (!frame) return { ok: false, error: `iframe ${candidate.framePath} no longer exists` };
+    const frameBox = await frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined);
+    if (!frameBox) return { ok: false, error: `iframe ${candidate.framePath} is not visible` };
+    await this.ensureBrowserPageRuntime(frame);
+    const localCenter = {
+      x: candidate.center.x - frameBox.x,
+      y: candidate.center.y - frameBox.y,
+    };
+    const local = await frame.evaluate(resolveAiCandidateActionTarget, {
+      path: candidate.path,
+      expected: this.candidateIdentityPayload(candidate),
+      center: localCenter,
+    }).catch((error) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    } as CandidateActionTargetResolution));
+    if (!local.ok) return local;
+    return {
+      ok: true,
+      target: {
+        ...local.target,
+        x: Math.round(frameBox.x + local.target.x),
+        y: Math.round(frameBox.y + local.target.y),
+        descriptor: `iframe ${candidate.framePath} ${local.target.descriptor}`,
+      },
+    };
+  }
+
   private async validateMainCandidateIdentity(candidate: InteractiveCandidate) {
     await this.ensureBrowserPageRuntime();
     return this.activePage.evaluate(validateAiCandidateIdentity, {
@@ -4825,21 +5401,11 @@ export class BrowserSession {
     }));
   }
 
-  private async resolveCandidateTarget(candidateId: string) {
-    const normalized = candidateId.trim().toUpperCase().replace(/^E(?=\d+$)/, '');
-    const candidates = this.mode === 'visual-markers'
-      ? this.lastScreenshotCandidates
-      : (this.lastInteractiveCandidates.length ? this.lastInteractiveCandidates : this.lastScreenshotCandidates);
-    const candidate = candidates.find((item) => item.id.toUpperCase() === normalized);
-
+  private async resolveCandidateTarget(candidateId: string, timings?: Record<string, number>) {
+    const lookup = this.findCandidateById(candidateId);
+    const candidate = lookup.candidate;
     if (!candidate) {
-      const available = candidates
-        .slice(0, 30)
-        .map((item) => `${item.id}: ${this.describeCandidate(item)}`)
-        .join('\n');
-      return {
-        error: `Candidate ${candidateId} was not found in the current ${this.mode === 'visual-markers' ? 'screenshot' : 'DOM interactive'} snapshot. Refresh getPageState/getInteractiveCandidates and choose one of the returned candidate ids. Available candidates:\n${available || '[none]'}`,
-      };
+      return { error: lookup.error };
     }
 
     if (candidate.disabled) {
@@ -4857,7 +5423,7 @@ export class BrowserSession {
       return { candidate, target: point };
     }
 
-    const live = await this.resolveLiveLocatorPoint(candidate);
+    const live = await this.resolveLiveLocatorPoint(candidate, timings);
     if (!live.target) {
       return {
         candidate,
@@ -4867,23 +5433,19 @@ export class BrowserSession {
     return { candidate, target: live.target };
   }
 
-  private async resolveLiveLocatorPoint(candidate: InteractiveCandidate) {
+  private async resolveLiveLocatorPoint(candidate: InteractiveCandidate, timings?: Record<string, number>) {
     if (candidate.framePath) {
-      const identity = await this.validateFrameCandidateIdentity(candidate);
-      if (!identity.ok) return { error: identity.reason };
-      const target = await this.resolveFrameDomPathToClickablePoint(candidate.framePath, candidate.path);
-      return target ? { target } : { error: `iframe DOM path ${candidate.path} is not visible` };
+      const resolved = await timedBrowserStep(timings, 'validateAndResolvePointMs', () => this.resolveFrameCandidateActionTarget(candidate));
+      return resolved.ok ? { target: resolved.target } : { error: resolved.error };
     }
 
     if (candidate.shadow) {
-      const target = await this.resolveShadowCandidatePoint(candidate);
+      const target = await timedBrowserStep(timings, 'resolvePointMs', () => this.resolveShadowCandidatePoint(candidate));
       return target ? { target } : { error: 'shadow DOM target is no longer at its matched viewport point' };
     }
 
-    const identity = await this.validateMainCandidateIdentity(candidate);
-    if (!identity.ok) return { error: identity.reason };
-    const target = await this.resolveDomPathToClickablePoint(candidate.path);
-    return target ? { target } : { error: `DOM path ${candidate.path} is not visible` };
+    const resolved = await timedBrowserStep(timings, 'validateAndResolvePointMs', () => this.resolveMainCandidateActionTarget(candidate));
+    return resolved.ok ? { target: resolved.target } : { error: resolved.error };
   }
 
   private compareCandidateOrder(a: InteractiveCandidate, b: InteractiveCandidate) {
@@ -5188,113 +5750,6 @@ export class BrowserSession {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
       return runtime?.fullDomSnapshot(input);
     }, { maxChars, maxElements }).catch(() => undefined);
-  }
-
-  private async readFramePageText(
-    target: Page | Frame,
-    maxChars: number,
-  ) {
-    await this.ensureBrowserPageRuntime(target);
-    return target.evaluate((input) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      return runtime?.pageText(input);
-    }, { maxChars }).catch(() => undefined);
-  }
-
-  private async readFrameStructuredPageText(
-    target: Page | Frame,
-    maxChars: number,
-  ) {
-    await this.ensureBrowserPageRuntime(target);
-    return target.evaluate((input) => {
-      const maxOutputChars = Math.max(1, Math.floor(Number(input.maxChars) || 200000));
-      const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__';
-      const skippedTags = new Set(['script', 'style', 'template', 'noscript']);
-      const structuralTags = new Set([
-        'article',
-        'aside',
-        'body',
-        'details',
-        'dialog',
-        'fieldset',
-        'footer',
-        'form',
-        'header',
-        'li',
-        'main',
-        'menu',
-        'nav',
-        'ol',
-        'section',
-        'summary',
-        'table',
-        'tbody',
-        'td',
-        'th',
-        'thead',
-        'tr',
-        'ul',
-      ]);
-      const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
-      const classText = (element: Element) => {
-        const raw = typeof element.className === 'string' ? element.className : '';
-        return raw.split(/\s+/).filter(Boolean).slice(0, 3).join('.');
-      };
-      const isHidden = (element: Element) => {
-        if (element.closest(overlaySelector)) return true;
-        if (element.getAttribute('aria-hidden') === 'true') return true;
-        const style = window.getComputedStyle(element);
-        return style.display === 'none'
-          || style.visibility === 'hidden'
-          || style.visibility === 'collapse'
-          || Number(style.opacity || '1') <= 0.01;
-      };
-      const ownText = (element: Element) => normalize(Array.from(element.childNodes)
-        .filter((node) => node.nodeType === Node.TEXT_NODE)
-        .map((node) => node.textContent || '')
-        .join(' '));
-      const labelText = (element: Element) => {
-        const inputElement = element as HTMLInputElement;
-        return [
-          element.getAttribute('aria-label'),
-          element.getAttribute('title'),
-          element.getAttribute('alt'),
-          inputElement.placeholder,
-          inputElement.value,
-          ownText(element),
-        ].map(normalize).find(Boolean) || '';
-      };
-      const lines: string[] = [];
-      let chars = 0;
-      const append = (depth: number, text: string) => {
-        if (!text || chars >= maxOutputChars) return;
-        const line = `${'  '.repeat(Math.min(depth, 12))}${text}`;
-        const remaining = maxOutputChars - chars;
-        const chunk = line.length > remaining ? line.slice(0, remaining) : line;
-        if (!chunk) return;
-        lines.push(chunk);
-        chars += chunk.length + 1;
-      };
-      const visit = (element: Element, depth: number) => {
-        if (chars >= maxOutputChars) return;
-        const tag = element.tagName.toLowerCase();
-        if (skippedTags.has(tag) || isHidden(element)) return;
-        const role = element.getAttribute('role');
-        const classes = classText(element);
-        const descriptor = `${tag}${classes ? `.${classes}` : ''}${role ? `[role=${role}]` : ''}`;
-        const label = labelText(element);
-        const shouldShow = Boolean(label)
-          || structuralTags.has(tag)
-          || ['button', 'a', 'input', 'select', 'textarea', 'option'].includes(tag);
-        if (shouldShow) append(depth, label ? `${descriptor}: ${label}` : descriptor);
-        for (const child of Array.from(element.children)) {
-          visit(child, shouldShow ? depth + 1 : depth);
-          if (chars >= maxOutputChars) break;
-        }
-      };
-      if (document.body) visit(document.body, 0);
-      return lines.join('\n');
-    }, { maxChars }).catch(() => '');
   }
 
   private async readFullFrameDomSnapshots(
@@ -5607,8 +6062,7 @@ export class BrowserSession {
   }
 
   private async drawCandidateOverlay(candidates: InteractiveCandidate[], markersOnly = false, scrollAreas: ScrollableArea[] = []) {
-    const labelLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160));
-    const visible = candidates.slice(0, labelLimit);
+    const visible = candidates;
     const visibleScrollAreas = scrollAreas.slice(0, Math.max(1, Number(process.env.SCREENSHOT_SCROLL_AREA_LABEL_LIMIT || 12)));
     await this.activePage.evaluate(({ items, scrollAreas: areas, markersOnly: hidePageContent }) => {
       document.getElementById('__ai_candidate_overlay__')?.remove();

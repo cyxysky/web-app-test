@@ -14,6 +14,7 @@ import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import type { RunDebugEvent, StepExecutionResult, TaskFrame, TaskLedgerItem, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import { readApiJson } from '@/lib/api-client';
 
 type ImageItem = { title: string; url: string };
 type StepToolCallItem = NonNullable<StepExecutionResult['tools']>[number];
@@ -1596,8 +1597,8 @@ export function RunProgress({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tools }),
       });
-      const data = await response.json();
-      if (!response.ok || !data.run) throw new Error(data.error || t('保存工具记录失败'));
+      const data = await readApiJson<any>(response, t('保存工具记录失败'));
+      if (!data.run) throw new Error(t('保存工具记录失败'));
       setRun(data.run as TestRunRecord);
       cancelToolRecordEdit();
     } catch (error) {
@@ -1614,8 +1615,8 @@ export function RunProgress({
     startGlobalLoading(t('正在按记录执行'));
     try {
       const response = await fetch(`/api/runs/${run.id}/replay`, { method: 'POST' });
-      const data = await response.json();
-      if (!response.ok || !data.runId) throw new Error(data.error || t('按记录执行失败'));
+      const data = await readApiJson<any>(response, t('按记录执行失败'));
+      if (!data.runId) throw new Error(t('按记录执行失败'));
       window.location.href = `/runs/${data.runId}`;
     } catch (error) {
       window.alert(error instanceof Error ? error.message : t('按记录执行失败'));

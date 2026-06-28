@@ -4,13 +4,6 @@ import path from 'node:path';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import {
-  defaultModelByProvider,
-  defaultModelForProvider,
-  modelListForProvider,
-  modelProviderDefinition,
-  modelProviderValues,
-} from '@/config/settings';
-import {
   executeInteractiveBrowserTurn,
   type BrowserToolConfirmationDecision,
   type BrowserToolConfirmationRequest,
@@ -25,6 +18,7 @@ import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { writeTextFileAtomic } from '@/server/storage/atomic-json';
 import { appDataRoot, artifactPath as resolveArtifactPath } from '@/server/storage/paths';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
+import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 
 export type BrowserChatAttachment = {
   id: string;
@@ -189,30 +183,14 @@ function normalizeSafetyMode(value: unknown): BrowserChatSafetyMode {
   return value === 'full' ? 'full' : 'strict';
 }
 
-const modelProviderSet = new Set<ModelProvider>(modelProviderValues);
-
-function normalizeModelProvider(value: unknown, fallback: ModelProvider = 'openrouter'): ModelProvider {
-  const provider = String(value || '').trim().toLowerCase();
-  if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
-  if (provider === 'codex' || provider === 'codex-cli') return 'codex';
-  if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
-  if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
-  return modelProviderSet.has(provider as ModelProvider) ? provider as ModelProvider : fallback;
-}
-
 function browserChatModelSettings(providerInput?: unknown, modelInput?: unknown) {
   store.applyRuntimeEnv();
   const config = store.getModelConfig();
-  const provider = normalizeModelProvider(providerInput, config?.provider || 'openrouter');
-  const definition = modelProviderDefinition(provider);
-  const settings = config?.providers?.[provider];
-  const models = modelListForProvider(definition, settings);
-  const requestedModel = typeof modelInput === 'string' ? modelInput.trim() : '';
-  const configuredDefault = defaultModelForProvider(definition, settings);
-  return {
-    provider,
-    model: requestedModel && models.includes(requestedModel) ? requestedModel : configuredDefault || defaultModelByProvider[provider],
-  };
+  return resolveRuntimeModelSelection(config, {
+    fallbackProvider: config?.provider,
+    model: modelInput,
+    provider: providerInput,
+  });
 }
 
 function normalizeToolConfirmation(value: unknown): BrowserChatToolConfirmation | undefined {

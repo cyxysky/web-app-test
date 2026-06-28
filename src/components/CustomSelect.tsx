@@ -18,6 +18,7 @@ export function CustomSelect({
   id,
   onChange,
   options,
+  title,
   value,
 }: {
   className?: string;
@@ -25,6 +26,7 @@ export function CustomSelect({
   id?: string;
   onChange: (value: string) => void;
   options: CustomSelectOption[];
+  title?: string;
   value: string;
 }) {
   const [open, setOpen] = useState(false);
@@ -128,6 +130,7 @@ export function CustomSelect({
         onClick={toggleMenu}
         onKeyDown={handleKeyDown}
         ref={buttonRef}
+        title={title}
         type="button"
       >
         <div>{selectedOption?.selectedLabel || selectedOption?.label || value}</div>

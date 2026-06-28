@@ -9,6 +9,7 @@ import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import { readApiJson } from '@/lib/api-client';
 
 const activeRunStatuses: TestRunRecord['status'][] = ['running', 'queued', 'paused'];
 const finishedRunStatuses: TestRunRecord['status'][] = ['passed', 'failed', 'blocked'];
@@ -82,8 +83,7 @@ export function RunHistoryList({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ runIds }),
       });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || t('批量删除失败'));
+      const data = await readApiJson<any>(response, t('批量删除失败'));
       setSelectedIds([]);
       router.refresh();
     } catch (error) {
@@ -104,8 +104,7 @@ export function RunHistoryList({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ runId }),
       });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || t('设置默认记录失败'));
+      const data = await readApiJson<any>(response, t('设置默认记录失败'));
       router.refresh();
     } catch (error) {
       window.alert(error instanceof Error ? error.message : t('设置默认记录失败'));
@@ -121,8 +120,7 @@ export function RunHistoryList({
     startGlobalLoading(t('正在生成 Skill'));
     try {
       const response = await fetch(`/api/runs/${runId}/skills`, { method: 'POST' });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || t('生成 Skill 失败'));
+      const data = await readApiJson<any>(response, t('生成 Skill 失败'));
       router.refresh();
     } catch (error) {
       window.alert(error instanceof Error ? error.message : t('生成 Skill 失败'));

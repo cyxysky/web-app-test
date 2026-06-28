@@ -6,6 +6,7 @@ import { CustomSelect } from '@/components/CustomSelect';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { SkillRecord } from '@/server/ai/schemas/test-case.schema';
+import { readApiJson } from '@/lib/api-client';
 
 type SkillDraft = {
   title: string;
@@ -114,8 +115,7 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
     setLoading(true);
     try {
       const response = await fetch('/api/skills', { cache: 'no-store' });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('加载 Skills 失败'));
+      const data = await readApiJson<any>(response, t('加载 Skills 失败'));
       setSkills(Array.isArray(data.skills) ? data.skills : []);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : t('加载 Skills 失败'));
@@ -161,8 +161,8 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await response.json();
-      if (!response.ok || !data.skill) throw new Error(data.error || t('保存 Skill 失败'));
+      const data = await readApiJson<any>(response, t('保存 Skill 失败'));
+      if (!data.skill) throw new Error(t('保存 Skill 失败'));
       const saved = data.skill as SkillRecord;
       setSkills((current) => [saved, ...current.filter((skill) => skill.id !== saved.id)]
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
@@ -183,8 +183,7 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
     startGlobalLoading(t('正在删除 Skill'));
     try {
       const response = await fetch(`/api/skills/${skill.id}`, { method: 'DELETE' });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || t('删除 Skill 失败'));
+      const data = await readApiJson<any>(response, t('删除 Skill 失败'));
       setSkills((current) => current.filter((item) => item.id !== skill.id));
       if (selectedSkillId === skill.id) createSkill();
       onChanged?.();

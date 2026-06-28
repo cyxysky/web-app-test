@@ -1,0 +1,91 @@
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: var(--panel);
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 13px 13px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  cursor: pointer;
+  flex: 0 0 auto;
+  height: 18px;
+  margin: 0;
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease;
+  vertical-align: middle;
+  width: 18px;
+}
+
+input[type="checkbox"]:checked {
+  background-color: var(--accent);
+  background-image: url("data:image/svg+xml,%3Csvg width='13' height='13' viewBox='0 0 13 13' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M3 6.7L5.2 8.9L10 4.1' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  border-color: var(--accent);
+}
+
+input[type="checkbox"]:indeterminate {
+  background-color: var(--accent);
+  background-image: url("data:image/svg+xml,%3Csvg width='13' height='13' viewBox='0 0 13 13' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M3.2 6.5H9.8' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+  border-color: var(--accent);
+}
+
+input[type="checkbox"]:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+  outline: none;
+}
+
+input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.text-danger-button,
+.icon-text-button,
+.icon-button {
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--control-radius);
+  color: var(--muted-strong);
+  cursor: pointer;
+  display: inline-flex;
+  font-weight: 850;
+  gap: 7px;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease,
+    opacity 0.16s ease;
+}
+
+.text-danger-button,
+.icon-text-button.danger,
+.icon-button.danger {
+  color: var(--danger);
+}
+
+.icon-button {
+  height: var(--control-icon-size);
+  width: var(--control-icon-size);
+}
+
+:where(.icon-button, .icon-text-button):not(:disabled):hover {
+  background: var(--control-hover-bg);
+  color: var(--foreground);
+}
+
+:where(.icon-button.danger, .icon-text-button.danger):not(:disabled):hover {
+  background: var(--control-danger-hover-bg);
+  color: var(--danger);
+}
+
+.icon-text-button:disabled,
+.icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}

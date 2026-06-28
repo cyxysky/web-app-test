@@ -6,145 +6,43 @@ import { z } from 'zod';
 import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
-import { BrowserSession, type BrowserActionResult, type BrowserObservationType, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { appendDesktopEvidenceToResult, captureDesktopBeforeTool, collectDesktopEvidenceAfterTool } from '@/server/desktop/desktop-action-evidence';
 import { normalizeDomNodeIdParam } from '@/lib/dom-path';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
+import {
+  compactStaleReadObservationMessages,
+  observationPreviewLimit,
+  readRuntimeObservation,
+  restoreRuntimeObservationStore,
+  runtimeObservationAvailableTypes,
+  runtimeObservationCount,
+  runtimeObservationToolNames,
+  storeRuntimeObservation,
+  type RuntimeObservationRecord,
+  type RuntimeObservationStore,
+} from './runtime-observation';
+import { domCurrentContextLine, domModeActionRules, domNoScreenshotRule, domObservationHardRules } from './runtime-prompt-rules';
+import { summarizeRuntimeLogTimings } from './runtime-log-timings';
+import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
+import { runtimeAllowedToolTypes } from './runtime-tool-selection';
+import { notifyRuntimeToolTrace, runtimeToolTraceId } from './runtime-tool-trace';
 
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type RuntimeModelMessage = ModelMessage;
-type RuntimeRetryState = {
-  messages: RuntimeModelMessage[];
-  imagePaths: string[];
-  agentStepOffset: number;
-  observationStore?: RuntimeObservationStore;
-};
-
-const staleReadObservationText = '已失效：这是一条旧 readObservation 结果，已被后续 getPageState 刷新的当前 observation 取代。需要当前内容时，请调用 readObservation(type, offset, maxChars)。';
-
-function modelMessageContentParts(message: RuntimeModelMessage) {
-  const content = (message as { content?: unknown }).content;
-  return Array.isArray(content) ? content : undefined;
-}
-
-function modelToolPartName(part: unknown) {
-  if (!part || typeof part !== 'object' || Array.isArray(part)) return undefined;
-  const record = part as Record<string, unknown>;
-  if (
-    (record.type === 'tool-call' || record.type === 'tool-result' || record.type === 'tool-error')
-    && typeof record.toolName === 'string'
-  ) return record.toolName;
-  const toolCall = record.toolCall;
-  if (toolCall && typeof toolCall === 'object' && !Array.isArray(toolCall)) {
-    const toolName = (toolCall as Record<string, unknown>).toolName;
-    if (typeof toolName === 'string') return toolName;
-  }
-  return undefined;
-}
-
-function modelToolPartType(part: unknown) {
-  if (!part || typeof part !== 'object' || Array.isArray(part)) return undefined;
-  const type = (part as Record<string, unknown>).type;
-  return typeof type === 'string' ? type : undefined;
-}
-
-function compactStaleReadObservationOutput(output: unknown): unknown {
-  if (typeof output === 'string') return staleReadObservationText;
-  if (!output || typeof output !== 'object' || Array.isArray(output)) return output;
-  const record = output as Record<string, unknown>;
-  const next: Record<string, unknown> = { ...record };
-  let changed = false;
-  if ('value' in record) {
-    next.value = compactStaleReadObservationOutput(record.value);
-    changed = true;
-  }
-  if (typeof record.actual === 'string') {
-    next.actual = staleReadObservationText;
-    changed = true;
-  }
-  if (typeof record.text === 'string') {
-    next.text = staleReadObservationText;
-    changed = true;
-  }
-  if (typeof record.content === 'string') {
-    next.content = staleReadObservationText;
-    changed = true;
-  }
-  if (changed) return next;
-  return { ...record, actual: staleReadObservationText };
-}
-
-function compactStaleReadObservationPart(part: unknown): unknown {
-  if (!part || typeof part !== 'object' || Array.isArray(part)) return part;
-  const record = part as Record<string, unknown>;
-  const next: Record<string, unknown> = { ...record };
-  let changed = false;
-  if ('output' in record) {
-    next.output = compactStaleReadObservationOutput(record.output);
-    changed = true;
-  }
-  if ('value' in record) {
-    next.value = compactStaleReadObservationOutput(record.value);
-    changed = true;
-  }
-  if ('result' in record) {
-    next.result = compactStaleReadObservationOutput(record.result);
-    changed = true;
-  }
-  if (changed) return next;
-  return { ...record, output: { type: 'json', value: { ok: true, actual: staleReadObservationText } } };
-}
-
-function compactStaleReadObservationMessages(messages: RuntimeModelMessage[]) {
-  let position = 0;
-  let lastGetPageStatePosition = -1;
-  for (const message of messages) {
-    const parts = modelMessageContentParts(message);
-    if (!parts) {
-      position += 1;
-      continue;
-    }
-    for (const part of parts) {
-      if (modelToolPartName(part) === 'getPageState') lastGetPageStatePosition = position;
-      position += 1;
-    }
-  }
-  if (lastGetPageStatePosition < 0) return messages;
-
-  position = 0;
-  let changed = false;
-  const nextMessages = messages.map((message) => {
-    const parts = modelMessageContentParts(message);
-    if (!parts) {
-      position += 1;
-      return message;
-    }
-    let messageChanged = false;
-    const nextParts = parts.map((part) => {
-      const currentPosition = position;
-      position += 1;
-      if (
-        currentPosition < lastGetPageStatePosition
-        && modelToolPartType(part) === 'tool-result'
-        && modelToolPartName(part) === 'readObservation'
-      ) {
-        messageChanged = true;
-        changed = true;
-        return compactStaleReadObservationPart(part);
-      }
-      return part;
-    });
-    return messageChanged ? { ...(message as Record<string, unknown>), content: nextParts } as RuntimeModelMessage : message;
-  });
-  return changed ? nextMessages : messages;
-}
+type RuntimeRetryState = RuntimeRetryStateBase<RuntimeModelMessage>;
 
 type ToolTrace = {
   id?: string;
   name: string;
   input: unknown;
   result?: BrowserActionResult;
+  startedAt?: number;
+  completedAt?: number;
+  elapsedMs?: number;
+  actionElapsedMs?: number;
+  postprocessTimings?: Record<string, number>;
   desktopEvidence?: DesktopActionEvidence;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
@@ -291,7 +189,7 @@ function runtimePageContextOptions(mode: BrowserSessionMode) {
   const visualMode = isVisualMode(mode);
   return {
     domScope: visualMode ? undefined : 'full' as const,
-    includeDomTree: !visualMode,
+    includeDomTree: false,
     includeText: !visualMode,
     includeManualVerification: false,
     includeInteractiveCandidates: true,
@@ -483,52 +381,11 @@ function providerToolSchemaError(value?: string) {
 }
 
 const untrimmedToolResultNames = new Set(['fillCandidates']);
-const runtimeObservationToolNames = new Set(['readObservation']);
-
-type RuntimeObservationRecord = {
-  runId: string;
-  toolName: string;
-  createdAt: string;
-  defaultType: BrowserObservationType;
-  views: Partial<Record<BrowserObservationType, string>>;
-  totalChars: number;
-  viewCharLengths: Partial<Record<BrowserObservationType, number>>;
-};
-
-type RuntimeObservationStore = Map<string, RuntimeObservationRecord>;
-const runtimeObservationTypes: BrowserObservationType[] = ['text', 'interactive'];
-const fallbackObservationRunId = '__current__';
-
-function cloneRuntimeObservationStore(store?: RuntimeObservationStore): RuntimeObservationStore | undefined {
-  if (!store?.size) return undefined;
-  const cloned: RuntimeObservationStore = new Map();
-  for (const [key, record] of store) {
-    cloned.set(key, {
-      ...record,
-      views: { ...record.views },
-      viewCharLengths: { ...record.viewCharLengths },
-    });
-  }
-  return cloned;
-}
-
-function restoreRuntimeObservationStore(target: RuntimeObservationStore, source?: RuntimeObservationStore) {
-  target.clear();
-  const cloned = cloneRuntimeObservationStore(source);
-  if (!cloned) return;
-  for (const [key, record] of cloned) target.set(key, record);
-}
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const numberValue = typeof value === 'number' ? value : Number(value);
   const normalized = Number.isFinite(numberValue) ? Math.floor(numberValue) : fallback;
   return Math.min(Math.max(normalized, min), max);
-}
-
-function lowerBoundedInteger(value: unknown, fallback: number, min: number) {
-  const numberValue = typeof value === 'number' ? value : Number(value);
-  const normalized = Number.isFinite(numberValue) ? Math.floor(numberValue) : fallback;
-  return Math.max(normalized, min);
 }
 
 function runtimeRequestConsecutiveFailureLimit(browserChatMode: boolean) {
@@ -537,99 +394,8 @@ function runtimeRequestConsecutiveFailureLimit(browserChatMode: boolean) {
   return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, browserChatMode ? 3 : 2, 1, 10);
 }
 
-function observationStoreKey(runId?: string) {
-  return runId || fallbackObservationRunId;
-}
-
-function normalizeObservationViews(
-  text: string,
-  views?: BrowserActionResult['observationViews'],
-) {
-  const normalized: Partial<Record<BrowserObservationType, string>> = {};
-  for (const type of runtimeObservationTypes) {
-    const value = views?.[type];
-    if (typeof value === 'string') normalized[type] = value;
-  }
-  if (!normalized.text) normalized.text = text;
-  const defaultType = views?.defaultType && normalized[views.defaultType] !== undefined ? views.defaultType : 'text';
-  return { defaultType, views: normalized };
-}
-
-function storeRuntimeObservation(
-  store: RuntimeObservationStore,
-  runId: string | undefined,
-  toolName: string,
-  text: string,
-  views?: BrowserActionResult['observationViews'],
-) {
-  const key = observationStoreKey(runId);
-  const normalized = normalizeObservationViews(text, views);
-  const viewCharLengths = Object.fromEntries(
-    runtimeObservationTypes
-      .filter((type) => normalized.views[type] !== undefined)
-      .map((type) => [type, normalized.views[type]?.length || 0]),
-  ) as Partial<Record<BrowserObservationType, number>>;
-  const record: RuntimeObservationRecord = {
-    runId: key,
-    toolName,
-    createdAt: new Date().toISOString(),
-    defaultType: normalized.defaultType,
-    views: normalized.views,
-    totalChars: normalized.views[normalized.defaultType]?.length || 0,
-    viewCharLengths,
-  };
-  store.set(key, record);
-  return record;
-}
-
-function runtimeObservationCount(store: RuntimeObservationStore | undefined, runId?: string) {
-  return store?.has(observationStoreKey(runId)) ? 1 : 0;
-}
-
-function runtimeObservationAvailableTypes(record: RuntimeObservationRecord) {
-  return runtimeObservationTypes
-    .filter((item) => record.views[item] !== undefined)
-    .map((item) => `${item}(${record.viewCharLengths[item] || 0})`)
-    .join(', ');
-}
-
-function observationPreviewLimit(name: string) {
-  const raw = Number(process.env.AI_TOOL_RESULT_PREVIEW_MAX_CHARS || (name === 'getPageState' ? 10000 : 2400));
-  const value = Math.floor(Number.isFinite(raw) ? raw : 10000);
-  return Math.min(Math.max(value, 10000), 60000);
-}
-
-function readRuntimeObservation(
-  store: RuntimeObservationStore | undefined,
-  runId: string | undefined,
-  type?: BrowserObservationType,
-  offset?: number,
-  maxChars?: number,
-): BrowserActionResult {
-  const record = store?.get(observationStoreKey(runId));
-  if (!record) {
-    return { ok: false, actual: 'No current DOM observation is available for this run. Call getPageState first, then call readObservation(type, offset, maxChars).' };
-  }
-  const selectedType = type || record.defaultType;
-  const text = record.views[selectedType];
-  const availableTypes = runtimeObservationAvailableTypes(record);
-  if (text === undefined) {
-    return { ok: false, actual: `Current observation from ${record.toolName} has no "${selectedType}" content. Available types: ${availableTypes || '[none]'}.` };
-  }
-  const start = boundedInteger(offset, 0, 0, text.length);
-  const length = lowerBoundedInteger(maxChars, 10000, 10000);
-  const end = Math.min(text.length, start + length);
-  return {
-    ok: true,
-    actual: [
-      `Current observation from ${record.toolName} at ${record.createdAt}. Type ${selectedType}. Range ${start}-${end}/${text.length}. Available types: ${availableTypes || selectedType}.`,
-      text.slice(start, end),
-      end < text.length ? `More available: call readObservation(type="${selectedType}", offset=${end}, maxChars=10000).` : 'End of observation.',
-    ].join('\n'),
-  };
-}
-
 function domSnapshotDebug(pageContext: RuntimePageContext, domContext?: AiDomContextSnapshot) {
+  if (!pageContext.domTree) return undefined;
   const rawTree = pageContext.domTree || '[empty DOM tree]';
   return {
     fullDomSnapshot: rawTree,
@@ -1331,9 +1097,9 @@ function hostOf(url: string) {
   }
 }
 
-function formatVisualInteractiveElements(candidates: unknown, limit = 80) {
+function formatVisualInteractiveElements(candidates: unknown) {
   if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive elements detected]';
-  return candidates.slice(0, limit).map((item, index) => {
+  return candidates.map((item, index) => {
     const candidate = item as Record<string, unknown>;
     const label = [
       candidate.name,
@@ -1357,9 +1123,9 @@ function formatVisualInteractiveElements(candidates: unknown, limit = 80) {
   }).join('\n');
 }
 
-function formatDomInteractiveElements(candidates: unknown, limit = 160) {
+function formatDomInteractiveElements(candidates: unknown) {
   if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive elements detected]';
-  return candidates.slice(0, limit).map((item) => {
+  return candidates.map((item) => {
     const candidate = item as Record<string, unknown>;
     const label = [
       candidate.name,
@@ -1502,20 +1268,7 @@ function validateCandidateActionBeforeExecution(name: string, input: unknown, tr
 
 const candidateActionToolNames = new Set(['clickCandidate', 'hoverCandidate', 'doubleClickCandidate', 'rightClickCandidate', 'dragCandidate']);
 const domNodeIdToolNames = new Set<string>();
-const noVisualAfterCaptureToolNames = new Set([
-  'getPageState',
-  'reportState',
-  'selectReferenceScreenshots',
-  'manageVisualContext',
-  'readObservation',
-  'listTabs',
-  'getHttpRequests',
-  'getInteractiveCandidates',
-  'findByText',
-  'waitForHumanVerification',
-  'downloadFile',
-  'generateMarkdownFile',
-]);
+const noVisualAfterCaptureToolNames = new Set<string>();
 const noDomAfterContextToolNames = new Set([
   ...noVisualAfterCaptureToolNames,
   'listTabs',
@@ -1769,24 +1522,18 @@ function createToolTrace(input: {
   const screenshots: ToolTrace['screenshots'] = [];
   pushBeforeFrameScreenshots(screenshots, name, visualContext?.current());
   const visualAfter = visualAfterFromInput(name, toolInput);
-  const traceId = [
-    runId || 'run',
-    stepIndex || 0,
-    traces.length + 1,
-    Date.now().toString(36),
-  ].join(':');
-  const trace: ToolTrace = { id: traceId, name, input: toolInput, contextBefore: toolContextFromAiRequest(aiRequest), visualAfter, screenshots };
+  const traceId = runtimeToolTraceId({ runId, stepIndex, traceIndex: traces.length + 1 });
+  const trace: ToolTrace = {
+    id: traceId,
+    name,
+    input: toolInput,
+    startedAt: Date.now(),
+    contextBefore: toolContextFromAiRequest(aiRequest),
+    visualAfter,
+    screenshots,
+  };
   traces.push(trace);
   return trace;
-}
-
-async function notifyToolTrace(onToolTrace: ((trace: ToolTrace) => void | Promise<void>) | undefined, trace: ToolTrace) {
-  try {
-    await onToolTrace?.(trace);
-  } catch (error) {
-    console.warn('[browser-agent] Tool progress trace callback failed; browser action will continue.', error);
-    // Progress persistence failures must not make a browser action look unexecuted.
-  }
 }
 
 async function finalizeToolTraceVisuals(input: {
@@ -1810,8 +1557,6 @@ async function finalizeToolTraceVisuals(input: {
 
   if (result.ok && shouldCaptureVisualAfter(trace.name, visualAfter) && runId && stepIndex !== undefined && visualContext) {
     try {
-      throwIfStopped(abortSignal, shouldContinue);
-      await session.waitForPage().catch(() => undefined);
       throwIfStopped(abortSignal, shouldContinue);
       const visualIndex = traces.filter((item) => item.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
       const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
@@ -1900,12 +1645,19 @@ async function executeTracedBrowserAction(input: {
   const { session, traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onDebug, onToolTrace, onVisualContextChange } = input;
   throwIfStopped(abortSignal, shouldContinue);
   const trace = createToolTrace({ traces, name, toolInput, aiRequest, runId, stepIndex, visualContext });
-  await notifyToolTrace(onToolTrace, trace);
+  const postprocessTimings: Record<string, number> = {};
+  trace.postprocessTimings = postprocessTimings;
+  let postprocessStartedAt = Date.now();
+  await notifyRuntimeToolTrace(onToolTrace, trace);
+  postprocessTimings.notifyStartMs = elapsedSince(postprocessStartedAt);
   throwIfStopped(abortSignal, shouldContinue);
+  postprocessStartedAt = Date.now();
   const desktopBefore = await captureDesktopBeforeTool(name);
+  postprocessTimings.desktopBeforeMs = elapsedSince(postprocessStartedAt);
   throwIfStopped(abortSignal, shouldContinue);
 
   let result: BrowserActionResult;
+  const actionStartedAt = Date.now();
   try {
     result = await action();
     throwIfStopped(abortSignal, shouldContinue);
@@ -1916,16 +1668,22 @@ async function executeTracedBrowserAction(input: {
       actual: `Tool ${name} threw after execution started: ${infrastructureError(error)}`,
     };
   }
+  trace.actionElapsedMs = elapsedSince(actionStartedAt);
 
+  postprocessStartedAt = Date.now();
   const desktopEvidence = await collectDesktopEvidenceAfterTool(name, desktopBefore);
+  postprocessTimings.desktopAfterMs = elapsedSince(postprocessStartedAt);
   if (desktopEvidence) {
     trace.desktopEvidence = desktopEvidence;
     result = appendDesktopEvidenceToResult(result, desktopEvidence);
   }
   throwIfStopped(abortSignal, shouldContinue);
   trace.result = result;
-  await notifyToolTrace(onToolTrace, trace);
+  postprocessStartedAt = Date.now();
+  await notifyRuntimeToolTrace(onToolTrace, trace);
+  postprocessTimings.notifyResultMs = elapsedSince(postprocessStartedAt);
   throwIfStopped(abortSignal, shouldContinue);
+  postprocessStartedAt = Date.now();
   result = await finalizeToolTraceVisuals({
     session,
     traces,
@@ -1939,8 +1697,15 @@ async function executeTracedBrowserAction(input: {
     onDebug,
     onVisualContextChange,
   });
+  postprocessTimings.visualAfterMs = elapsedSince(postprocessStartedAt);
   throwIfStopped(abortSignal, shouldContinue);
-  await notifyToolTrace(onToolTrace, trace);
+  trace.completedAt = Date.now();
+  trace.elapsedMs = trace.startedAt ? trace.completedAt - trace.startedAt : undefined;
+  postprocessStartedAt = Date.now();
+  await notifyRuntimeToolTrace(onToolTrace, trace);
+  postprocessTimings.notifyCompleteMs = elapsedSince(postprocessStartedAt);
+  trace.completedAt = Date.now();
+  trace.elapsedMs = trace.startedAt ? trace.completedAt - trace.startedAt : undefined;
   return result;
 }
 
@@ -2320,12 +2085,9 @@ function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
 }
 
 // 根据当前模式生成验证码/安全校验规则；DOM 模式不要要求 AI 读取截图。
-function formatDomPageStateObservation(pageContext: RuntimePageContext) {
+function formatDomPageStateObservation(pageContext: RuntimePageContext, observationViews?: BrowserActionResult['observationViews']) {
   const structuredText = pageContext.structuredText || pageContext.text || '[empty page text]';
-  const interactive = formatDomInteractiveElements(
-    pageContext.interactiveCandidates,
-    Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160)),
-  );
+  const interactive = observationViews?.interactive || formatDomInteractiveElements(pageContext.interactiveCandidates);
   return [
     'Current DOM page state observation:',
     '- Text and interactive elements are processed into hierarchy with indentation. Raw HTML is not exposed through readObservation.',
@@ -2346,10 +2108,7 @@ function domPageStateObservationViews(pageContext: RuntimePageContext): BrowserA
   return {
     defaultType: 'text',
     text: structuredText,
-    interactive: formatDomInteractiveElements(
-      pageContext.interactiveCandidates,
-      Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160)),
-    ),
+    interactive: formatDomInteractiveElements(pageContext.interactiveCandidates),
   };
 }
 
@@ -2367,7 +2126,8 @@ function formatDomPageStateSummary(pageContext: RuntimePageContext, observation:
     `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
     `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
     `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
-    `Observation views: text(${textChars}), interactive(${interactiveChars}); visible interactive candidates=${(pageContext.interactiveCandidates || []).length}.`,
+    `Page context timings JSON: ${JSON.stringify(pageContext.timings || {})}`,
+    `Observation generation: ${observation.generation}. Views: text(${textChars}), interactive(${interactiveChars}); visible interactive candidates=${(pageContext.interactiveCandidates || []).length}.`,
   ].filter(Boolean).join('\n');
 }
 
@@ -2380,7 +2140,6 @@ function formatVisualPageStateObservation(input: {
   separateMarkerMap: boolean;
 }) {
   const { pageContext, visualContext, screenshotInputEnabled, markerEnabled, markerOverlayInScreenshot, separateMarkerMap } = input;
-  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160));
   const shouldIncludeCandidates = !screenshotInputEnabled || !markerEnabled;
   const imageRule = screenshotInputEnabled
     ? separateMarkerMap
@@ -2402,7 +2161,7 @@ function formatVisualPageStateObservation(input: {
     `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
     `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
     shouldIncludeCandidates
-      ? `Visible interactive elements:\n${formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)}`
+      ? `Visible interactive elements:\n${formatVisualInteractiveElements(pageContext.interactiveCandidates)}`
       : '',
     'Visual Context Manager:',
     `current: ${visualContext.current ? frameSummary(visualContext.current) : '[none]'}`,
@@ -2464,10 +2223,9 @@ function runtimePrompt(input: {
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || 160));
   const candidateContext = visualMode
     ? visualMarkersWithoutOverlay || visualTextCandidateFallback
-      ? formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)
+      ? formatVisualInteractiveElements(pageContext.interactiveCandidates)
       : '[disabled because visual mode uses screenshot labels]'
     : '[disabled because DOM mode uses fresh DOM tree ids]';
   const evidence = attachScreenshot
@@ -2510,17 +2268,7 @@ function runtimePrompt(input: {
         '- Previous screenshots/references are context only; never use their candidate ids.',
         '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous screenshot.',
       ]
-    : [
-        '- DOM mode getPageState has two readObservation views: text for hierarchical page text, and interactive for hierarchical visible interactive elements without coordinates.',
-        '- getPageState returns only a summary and refreshes the current observation; call readObservation(type="text"|"interactive", offset, maxChars) to inspect full content.',
-        '- getPageState text/interactive content does not invent numeric node_id attributes. Use visible interactive elements and plain text to identify targets.',
-        '- For normal DOM-mode clicking/filling, prefer clickCandidate(id,targetVisual,text?) using a fresh #id from the latest hierarchical interactive elements list, especially for unlabeled icon-only controls.',
-        '- Use findByText(targetText) then clickLocator(locatorId,text?) only for text-accessible targets when a candidate #id is unavailable.',
-        '- For hover-only menus in DOM mode, use hierarchical text/interactive evidence to choose a supported hover/candidate path, then call getPageState before choosing a revealed target.',
-        '- Use scrollArea only when interaction requires changing the visual viewport or lazy-loaded content is absent from the text/interactive context. After scrolling or any browser-changing action, call getPageState before using new ids or locators.',
-        '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
-        '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
-      ];
+    : domModeActionRules();
   return [
     browserChatMode
       ? 'You are an AI browser chat agent.'
@@ -2547,8 +2295,7 @@ function runtimePrompt(input: {
     '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL.',
     browserChatMode ? '- Strict safety confirmations must use tool params requiresConfirmation=true and confirmationMessage; never ask the user to type a confirmation message for that purpose.' : '',
     '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. Include the returned URL or local path in the final answer.',
-    '- If the page may have changed or you need fresh DOM/text/screenshot evidence, call getPageState explicitly. The backend will not silently refresh page state between model calls.',
-    '- After getPageState in DOM mode, inspect full content with readObservation(type,offset,maxChars). Use type="text" for hierarchical page text or type="interactive" for hierarchical visible actionable elements without coordinates. maxChars values below 10000 are raised to 10000.',
+    ...domObservationHardRules(),
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
@@ -2573,7 +2320,7 @@ function runtimePrompt(input: {
           : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. DOM text/node tools are unavailable.'
       : visualMode
         ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
-        : '- DOM mode: no screenshot image/path is attached. Use getPageState to refresh the current observation, then readObservation for hierarchical text/interactive elements. Use clickCandidate with a current #id from the interactive list for visible controls, or findByText/clickLocator for text-accessible recovery.',
+        : domNoScreenshotRule,
     ...markerTargetRules,
     caseSystemPrompt ? `${browserChatMode ? 'Browser-chat loaded instructions and Skills' : 'Test-case-specific instructions'}:
 ${caseSystemPrompt}` : '',
@@ -2598,8 +2345,8 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     '',
     'Current context:',
     browserChatMode
-      ? 'No DOM/page observation or tool result is preloaded in the initial messages. In DOM mode, call getPageState when fresh URL, tabs, focus, scroll state, DOM snapshot, or page text is needed.'
-      : visualMode ? `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}` : 'No initial DOM page observation is included. Call getPageState for fresh URL, tabs, focus, scroll state, DOM snapshot, and page text.',
+      ? domCurrentContextLine(true)
+      : visualMode ? `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}` : domCurrentContextLine(false),
     visualMode ? `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}` : '',
     visualMode ? `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}` : '',
     visualMode && visualTextCandidateFallback ? `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}` : '',
@@ -2845,6 +2592,8 @@ function aiResponseLogDetails(input: {
   modelMessages?: unknown;
   response: unknown;
   elapsedMs: number;
+  aiElapsedMs?: number;
+  stepStartedAt?: number;
   traces?: ToolTrace[];
   visualContext?: ReturnType<VisualContextManager['snapshot']>;
   workingMemory?: RuntimeWorkingMemory;
@@ -2854,6 +2603,12 @@ function aiResponseLogDetails(input: {
     aiOutput: sanitizeModelLogValue({
       ...(input.extra || {}),
       elapsedMs: input.elapsedMs,
+      timings: summarizeRuntimeLogTimings({
+        aiElapsedMs: input.aiElapsedMs,
+        stepStartedAt: input.stepStartedAt,
+        totalElapsedMs: input.elapsedMs,
+        traces: input.traces,
+      }),
       response: input.response,
     }, [], { imageIndex: 0 }),
   });
@@ -3165,13 +2920,7 @@ async function executeRuntimeStep(input: {
   let consecutiveRequestFailures = 0;
 
   function rememberRetryState(state: RuntimeRetryState) {
-    const observationStore = cloneRuntimeObservationStore(state.observationStore);
-    lastRetryState = {
-      messages: [...state.messages],
-      imagePaths: [...state.imagePaths],
-      agentStepOffset: state.agentStepOffset,
-      ...(observationStore ? { observationStore } : {}),
-    };
+    lastRetryState = cloneRuntimeRetryState(state);
   }
 
   async function runAgent(includeImage: boolean, retryState?: RuntimeRetryState) {
@@ -3180,13 +2929,12 @@ async function executeRuntimeStep(input: {
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
     const observationStore: RuntimeObservationStore = input.runtimeObservationStore || new Map();
     if (retryState?.observationStore) restoreRuntimeObservationStore(observationStore, retryState.observationStore);
-    const nativeAllowedToolTypes = runtimeToolNames(mode).filter((name) => !(browserChatMode && name === 'reportState'));
-    const baseAllowedToolTypes = codexMode
-      ? nativeAllowedToolTypes.filter((name) => !runtimeObservationToolNames.has(name) && name !== 'getPageState')
-      : nativeAllowedToolTypes;
-    const allowedToolTypes = browserChatMode && codexMode
-      ? [...baseAllowedToolTypes, 'answer']
-      : baseAllowedToolTypes;
+    const allowedToolTypes = runtimeAllowedToolTypes({
+      browserChatMode,
+      codexMode,
+      nativeToolNames: runtimeToolNames(mode),
+      observationToolNames: runtimeObservationToolNames,
+    });
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
@@ -3344,7 +3092,7 @@ async function executeRuntimeStep(input: {
           observationStore,
           input.runId,
           'getPageState',
-          formatDomPageStateObservation(currentPageContext),
+          formatDomPageStateObservation(currentPageContext, observationViews),
           observationViews,
         );
         return {
@@ -3552,6 +3300,7 @@ async function executeRuntimeStep(input: {
         }, modelMessagesForLog),
       });
       const result = await generateTextWithTimeout({ model: getModel(), system, messages, temperature: 0.1, maxRetries: 0, abortSignal });
+      const aiElapsedMs = elapsedSince(aiStartedAt);
       ensureActive();
       const object = codexRuntimeObjectFromText(result.text, allowedToolTypes.includes('answer') ? 'answer' : 'reportState');
       const execution = await executeCodexRuntimeObject({
@@ -3591,6 +3340,7 @@ async function executeRuntimeStep(input: {
           modelMessages: modelMessagesForLog,
           response: { result, object, execution },
           elapsedMs: elapsedSince(aiStartedAt),
+          aiElapsedMs,
           traces,
           visualContext: visualContext.snapshot(),
           workingMemory,
@@ -3689,6 +3439,7 @@ async function executeRuntimeStep(input: {
               modelMessages: stepModelMessagesForLog.get(turnIndex),
               response: event,
               elapsedMs: elapsedSince(startedAt),
+              stepStartedAt: startedAt,
               traces: newTraces,
               visualContext: visualContext.snapshot(),
               workingMemory,

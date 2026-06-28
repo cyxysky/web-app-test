@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useEffect, useRef, useState, useTransition, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState, useTransition, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, Play, RotateCcw, Settings, Trash2, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
@@ -11,6 +11,7 @@ import { NewTestCaseModal } from '@/components/NewTestCaseModal';
 import { RunProgress } from '@/components/RunProgress';
 import { TestCaseDetailWorkspace } from '@/components/TestCaseDetailWorkspace';
 import { useI18n } from '@/i18n/I18nProvider';
+import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { ModelProvider, RunScheduleRecord, SkillRecord, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
@@ -139,6 +140,88 @@ export function DashboardGroupSidebar({
   );
 }
 
+type CaseDetailPanelState = {
+  activeDetailCaseId: string | null;
+  activeRunId: string | null;
+};
+
+type CaseDetailPanelAction =
+  | { caseId: string; type: 'open-case' }
+  | { type: 'close' }
+  | { caseId?: string; runId: string; type: 'open-run' }
+  | { runId: string | null; type: 'set-run' }
+  | { type: 'back-to-case' };
+
+function caseDetailPanelReducer(state: CaseDetailPanelState, action: CaseDetailPanelAction): CaseDetailPanelState {
+  if (action.type === 'open-case') {
+    return { activeDetailCaseId: action.caseId, activeRunId: null };
+  }
+  if (action.type === 'close') {
+    return { activeDetailCaseId: null, activeRunId: null };
+  }
+  if (action.type === 'open-run') {
+    return {
+      activeDetailCaseId: action.caseId ?? state.activeDetailCaseId,
+      activeRunId: action.runId,
+    };
+  }
+  if (action.type === 'set-run') {
+    return { ...state, activeRunId: action.runId };
+  }
+  return { ...state, activeRunId: null };
+}
+
+function useCaseDetailPanelState({
+  controlledActiveDetailCaseId,
+  initialActiveRunId,
+  onActiveDetailCaseIdChange,
+}: {
+  controlledActiveDetailCaseId?: string | null;
+  initialActiveRunId?: string | null;
+  onActiveDetailCaseIdChange?: (caseId: string | null) => void;
+}) {
+  const [state, dispatch] = useReducer(caseDetailPanelReducer, {
+    activeDetailCaseId: null,
+    activeRunId: initialActiveRunId || null,
+  });
+  const activeDetailCaseId = controlledActiveDetailCaseId !== undefined ? controlledActiveDetailCaseId : state.activeDetailCaseId;
+  const syncActiveDetailCaseId = useCallback((caseId: string | null) => {
+    onActiveDetailCaseIdChange?.(caseId);
+  }, [onActiveDetailCaseIdChange]);
+  useEffect(() => {
+    if (activeDetailCaseId || !state.activeRunId) return;
+    dispatch({ type: 'set-run', runId: null });
+  }, [activeDetailCaseId, state.activeRunId]);
+  const openCaseDetail = useCallback((caseId: string) => {
+    syncActiveDetailCaseId(caseId);
+    dispatch({ type: 'open-case', caseId });
+  }, [syncActiveDetailCaseId]);
+  const closeCaseDetail = useCallback(() => {
+    syncActiveDetailCaseId(null);
+    dispatch({ type: 'close' });
+  }, [syncActiveDetailCaseId]);
+  const openRunDetail = useCallback((runId: string, caseId?: string) => {
+    if (caseId && caseId !== activeDetailCaseId) syncActiveDetailCaseId(caseId);
+    dispatch({ type: 'open-run', runId, caseId });
+  }, [activeDetailCaseId, syncActiveDetailCaseId]);
+  const backToCaseDetail = useCallback(() => {
+    dispatch({ type: 'back-to-case' });
+  }, []);
+  const setActiveRunId = useCallback((runId: string | null) => {
+    dispatch({ type: 'set-run', runId });
+  }, []);
+
+  return {
+    activeDetailCaseId,
+    activeRunId: state.activeRunId,
+    backToCaseDetail,
+    closeCaseDetail,
+    openCaseDetail,
+    openRunDetail,
+    setActiveRunId,
+  };
+}
+
 export function DashboardWorkspace({
   activeDetailCaseId: controlledActiveDetailCaseId,
   initialActiveRunId,
@@ -176,7 +259,6 @@ export function DashboardWorkspace({
   const router = useRouter();
   const [, startTransition] = useTransition();
   const [internalSelectedGroupId, setInternalSelectedGroupId] = useState<string | undefined>();
-  const [internalActiveDetailCaseId, setInternalActiveDetailCaseId] = useState<string | null>(null);
   const [groupName, setGroupName] = useState('');
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
@@ -195,7 +277,6 @@ export function DashboardWorkspace({
   const [detailData, setDetailData] = useState<CaseDetailPayload | null>(null);
   const [detailError, setDetailError] = useState('');
   const [detailLoading, setDetailLoading] = useState(false);
-  const [activeRunId, setActiveRunId] = useState<string | null>(initialActiveRunId || null);
   const [runData, setRunData] = useState<TestRunRecord | null>(null);
   const [runError, setRunError] = useState('');
   const [runLoading, setRunLoading] = useState(false);
@@ -205,11 +286,19 @@ export function DashboardWorkspace({
   const runRequestIdRef = useRef(0);
   const selectedGroupId = controlledSelectedGroupId ?? internalSelectedGroupId;
   const selectGroup = onSelectedGroupIdChange ?? setInternalSelectedGroupId;
-  const activeDetailCaseId = controlledActiveDetailCaseId !== undefined ? controlledActiveDetailCaseId : internalActiveDetailCaseId;
-  const setActiveDetailCaseId = useCallback((caseId: string | null) => {
-    if (onActiveDetailCaseIdChange) onActiveDetailCaseIdChange(caseId);
-    else setInternalActiveDetailCaseId(caseId);
-  }, [onActiveDetailCaseIdChange]);
+  const {
+    activeDetailCaseId,
+    activeRunId,
+    backToCaseDetail: setPanelBackToCaseDetail,
+    closeCaseDetail: setPanelClosed,
+    openCaseDetail: setPanelCaseDetail,
+    openRunDetail: setPanelRunDetail,
+    setActiveRunId,
+  } = useCaseDetailPanelState({
+    controlledActiveDetailCaseId,
+    initialActiveRunId,
+    onActiveDetailCaseIdChange,
+  });
   const visibleCases = testCases.filter((item) => item.groupId === selectedGroupId);
   const completedCases = visibleCases.filter((item) => ['passed', 'failed', 'blocked'].includes(item.status));
   const selectedCases = selectedCaseIds
@@ -226,31 +315,28 @@ export function DashboardWorkspace({
   }, []);
 
   const openCaseDetail = useCallback((caseId: string) => {
-    setActiveRunId(null);
     setRunData(null);
     setRunError('');
-    setActiveDetailCaseId(caseId);
-  }, [setActiveDetailCaseId]);
+    setPanelCaseDetail(caseId);
+  }, [setPanelCaseDetail]);
 
   const closeCaseDetail = useCallback(() => {
-    setActiveDetailCaseId(null);
-    setActiveRunId(null);
+    setPanelClosed();
     setDetailData(null);
     setDetailError('');
     setRunData(null);
     setRunError('');
-  }, [setActiveDetailCaseId]);
+  }, [setPanelClosed]);
 
   const openRunDetail = useCallback((runId: string, caseId?: string) => {
-    if (caseId && caseId !== activeDetailCaseId) setActiveDetailCaseId(caseId);
-    setActiveRunId(runId);
-  }, [activeDetailCaseId, setActiveDetailCaseId]);
+    setPanelRunDetail(runId, caseId);
+  }, [setPanelRunDetail]);
 
   const backToCaseDetail = useCallback(() => {
-    setActiveRunId(null);
+    setPanelBackToCaseDetail();
     setRunData(null);
     setRunError('');
-  }, []);
+  }, [setPanelBackToCaseDetail]);
 
   const beginDetailPanelResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -323,8 +409,7 @@ export function DashboardWorkspace({
     setDetailError('');
     fetch(`/api/test-cases/${activeDetailCaseId}/detail`, { cache: 'no-store' })
       .then(async (response) => {
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || t('加载测试用例失败'));
+        const data = await readApiJson<any>(response, t('加载测试用例失败'));
         return data as CaseDetailPayload;
       })
       .then((data) => {
@@ -355,8 +440,7 @@ export function DashboardWorkspace({
     setRunError('');
     fetch(`/api/runs/${activeRunId}`, { cache: 'no-store' })
       .then(async (response) => {
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || t('加载执行记录失败'));
+        const data = await readApiJson<any>(response, t('加载执行记录失败'));
         return data as TestRunRecord;
       })
       .then((data) => {
@@ -413,8 +497,7 @@ export function DashboardWorkspace({
     startGlobalLoading(t('正在删除分组'));
     try {
       const response = await fetch(`/api/groups/${group.id}`, { method: 'DELETE' });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || t('删除分组失败'));
+      const data = await readApiJson<any>(response, t('删除分组失败'));
       if (selectedGroupId && descendantIds.has(selectedGroupId)) selectGroup(undefined);
       startTransition(() => router.refresh());
     } catch (error) {
@@ -457,8 +540,8 @@ export function DashboardWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(modelPayload),
       });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok || !data.runId) throw new Error(data.error || t('启动失败'));
+      const data = await readApiJson<any>(response, t('启动失败'));
+      if (!data.runId) throw new Error(t('启动失败'));
       setStartingCaseId(null);
       stopGlobalLoading();
       openRunDetail(data.runId, testCaseId);
@@ -484,8 +567,8 @@ export function DashboardWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(modelPayload),
       });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok || !data.runId) throw new Error(data.error || t('默认记录执行失败'));
+      const data = await readApiJson<any>(response, t('默认记录执行失败'));
+      if (!data.runId) throw new Error(t('默认记录执行失败'));
       setStartingDefaultCaseId(null);
       stopGlobalLoading();
       openRunDetail(data.runId, testCase.id);
@@ -508,8 +591,7 @@ export function DashboardWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ testCaseIds: selectedCaseIds, ...modelPayload }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('批量运行启动失败'));
+      const data = await readApiJson<any>(response, t('批量运行启动失败'));
       const runs: Array<{ id?: string }> = Array.isArray(data.runs) ? data.runs : [];
       runs.forEach((run, index) => {
         if (!run?.id) return;
@@ -551,8 +633,8 @@ export function DashboardWorkspace({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(modelPayload),
         });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data.runId) throw new Error(data.error || t('默认记录执行失败'));
+        const data = await readApiJson<any>(response, t('默认记录执行失败'));
+      if (!data.runId) throw new Error(t('默认记录执行失败'));
         const url = `/runs/${data.runId}`;
         const tab = openedTabs[index];
         if (tab) {
@@ -586,8 +668,7 @@ export function DashboardWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ testCaseIds: selectedCaseIds }),
       });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || t('批量删除失败'));
+      const data = await readApiJson<any>(response, t('批量删除失败'));
       setSelectedCaseIds([]);
       startTransition(() => router.refresh());
     } catch (error) {

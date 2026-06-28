@@ -13,15 +13,15 @@ import {
   type TestCaseEditorActionState,
   type TestCaseEditorHandle,
 } from '@/components/TestCaseEditor';
-import { defaultModelByProvider } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
+import { readApiJson } from '@/lib/api-client';
 import {
-  defaultModelForConfig,
+  modelSelectionDiagnosticLabel,
   modelSelectionOptionsForConfig,
-  modelSelectionValue,
-  normalizeModelId,
-  normalizeModelProvider,
+  modelSelectionValueForConfig,
+  normalizeRuntimeModelConfig,
   parseModelSelectionValue,
+  resolveRuntimeModelSelection,
   type RuntimeModelConfig,
 } from '@/lib/model-selection';
 import type { ModelProvider, SkillRecord, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
@@ -51,13 +51,15 @@ export function TestCaseDetailWorkspace({
 }) {
   const { t } = useI18n();
   const editorRef = useRef<TestCaseEditorHandle | null>(null);
+  const initialSelection = resolveRuntimeModelSelection(null, { model: initialModel, provider: initialModelProvider });
   const [currentTestCase, setCurrentTestCase] = useState(testCase);
   const [editorActions, setEditorActions] = useState<TestCaseEditorActionState>({ generatingFrame: false, saving: false });
-  const [modelProvider, setModelProvider] = useState<ModelProvider>(() => initialModelProvider || 'openrouter');
-  const [modelId, setModelId] = useState(() => initialModel || defaultModelByProvider[initialModelProvider || 'openrouter']);
+  const [modelProvider, setModelProvider] = useState<ModelProvider>(() => initialSelection.provider);
+  const [modelId, setModelId] = useState(() => initialSelection.model);
   const [modelConfig, setModelConfig] = useState<RuntimeModelConfig | null>(null);
 
-  const modelSelection = modelSelectionValue(modelProvider, modelId || defaultModelForConfig(modelConfig, modelProvider));
+  const modelSelection = modelSelectionValueForConfig(modelConfig, { model: modelId, provider: modelProvider });
+  const modelSelectionDiagnostic = modelSelectionDiagnosticLabel(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionOptions = useMemo(() => modelSelectionOptionsForConfig(modelConfig), [modelConfig]);
 
   useEffect(() => {
@@ -72,9 +74,9 @@ export function TestCaseDetailWorkspace({
 
   const changeModelSelection = useCallback((value: string) => {
     const selection = parseModelSelectionValue(value);
-    const model = normalizeModelId(selection.model, selection.provider, modelConfig);
-    setModelProvider(selection.provider);
-    setModelId(model);
+    const nextModel = resolveRuntimeModelSelection(modelConfig, selection);
+    setModelProvider(nextModel.provider);
+    setModelId(nextModel.model);
   }, [modelConfig]);
 
   useEffect(() => {
@@ -82,24 +84,22 @@ export function TestCaseDetailWorkspace({
     async function loadModelConfig() {
       try {
         const response = await fetch('/api/settings/model', { cache: 'no-store' });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || '加载模型配置失败');
+        const data = await readApiJson<any>(response, '加载模型配置失败');
         if (!alive) return;
-        const config = data.config as Partial<RuntimeModelConfig> | undefined;
-        if (!config?.provider || !config.providers) return;
-        const provider = normalizeModelProvider(config.provider);
-        const nextConfig: RuntimeModelConfig = {
-          provider,
-          providers: config.providers,
-          updatedAt: config.updatedAt || '',
-        };
+        const nextConfig = normalizeRuntimeModelConfig(data.config as Partial<RuntimeModelConfig> | undefined);
+        if (!nextConfig) return;
+        const nextModel = resolveRuntimeModelSelection(nextConfig, {
+          model: initialModel,
+          provider: initialModelProvider,
+        });
         setModelConfig(nextConfig);
-        setModelProvider(provider);
-        setModelId(defaultModelForConfig(nextConfig, provider));
+        setModelProvider(nextModel.provider);
+        setModelId(nextModel.model);
       } catch {
         if (!alive) return;
-        setModelProvider('openrouter');
-        setModelId(defaultModelByProvider.openrouter);
+        const fallback = resolveRuntimeModelSelection(null);
+        setModelProvider(fallback.provider);
+        setModelId(fallback.model);
       }
     }
     void loadModelConfig();
@@ -109,14 +109,14 @@ export function TestCaseDetailWorkspace({
   }, []);
 
   useEffect(() => {
-    setModelId((current) => normalizeModelId(current, modelProvider, modelConfig));
+    setModelId((current) => resolveRuntimeModelSelection(modelConfig, { model: current, provider: modelProvider }).model);
   }, [modelConfig, modelProvider]);
 
   useEffect(() => {
     if (!initialModelProvider || !initialModel) return;
-    const provider = normalizeModelProvider(initialModelProvider);
-    setModelProvider(provider);
-    setModelId(normalizeModelId(initialModel, provider, modelConfig));
+    const nextModel = resolveRuntimeModelSelection(modelConfig, { model: initialModel, provider: initialModelProvider });
+    setModelProvider(nextModel.provider);
+    setModelId(nextModel.model);
   }, [initialModel, initialModelProvider, modelConfig]);
 
   const handleSaved = useCallback((nextTestCase: TestCaseRecord) => {
@@ -144,6 +144,7 @@ export function TestCaseDetailWorkspace({
             className="case-model-select"
             onChange={changeModelSelection}
             options={modelSelectionOptions}
+            title={modelSelectionDiagnostic}
             value={modelSelection}
           />
           <button

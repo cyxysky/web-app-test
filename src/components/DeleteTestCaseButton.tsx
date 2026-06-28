@@ -1,10 +1,10 @@
 'use client';
 
-import { useState } from 'react';
 import { Loader2, Trash2 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useI18n } from '@/i18n/I18nProvider';
-import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import { readApiJson } from '@/lib/api-client';
+import { useApiAction } from '@/lib/use-api-action';
 
 export function DeleteTestCaseButton({
   className = 'icon-text-button danger',
@@ -25,21 +25,16 @@ export function DeleteTestCaseButton({
 }) {
   const { t } = useI18n();
   const router = useRouter();
-  const [loading, setLoading] = useState(false);
+  const { run, running: loading } = useApiAction();
 
   async function remove() {
     if (loading || disabled) return;
     const name = testCaseTitle ? `“${testCaseTitle}”` : t('这个测试用例');
     if (!window.confirm(t('确定删除{name}吗？关联执行记录会一起移除。', { name }))) return;
-    setLoading(true);
-    startGlobalLoading(t('正在删除测试用例'));
-    try {
+    await run(async () => {
       const response = await fetch(`/api/test-cases/${testCaseId}`, { method: 'DELETE' });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || t('删除用例失败'));
+      await readApiJson<any>(response, t('删除用例失败'));
       if (onDeleted) {
-        setLoading(false);
-        stopGlobalLoading();
         onDeleted();
         return;
       }
@@ -48,13 +43,9 @@ export function DeleteTestCaseButton({
         return;
       }
       router.refresh();
-      setLoading(false);
-      stopGlobalLoading();
-    } catch (error) {
+    }, { loadingLabel: t('正在删除测试用例') }).catch((error) => {
       window.alert(error instanceof Error ? error.message : t('删除用例失败'));
-      setLoading(false);
-      stopGlobalLoading();
-    }
+    });
   }
 
   return (

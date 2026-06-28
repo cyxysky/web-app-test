@@ -9,6 +9,7 @@ import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { TestCaseContent } from '@/server/ai/schemas/test-case.schema';
+import { readApiJson } from '@/lib/api-client';
 
 export function NewTestCaseForm({
   groupId,
@@ -37,8 +38,7 @@ export function NewTestCaseForm({
     form.append('file', file);
     try {
       const response = await fetch('/api/uploads', { method: 'POST', body: form });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('图片上传失败'));
+      const data = await readApiJson<any>(response, t('图片上传失败'));
       setImageNames((current) => [...current, data.imageId]);
     } finally {
       setUploading(false);
@@ -61,8 +61,7 @@ export function NewTestCaseForm({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, systemPrompt, targetUrl, browserMode, isMarked, imageNames, groupId }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('生成失败'));
+      const data = await readApiJson<any>(response, t('生成失败'));
       if (typeof data.testCaseId === 'string') onCreated?.(data.testCaseId);
       if (!onCreated) router.push('/dashboard');
       router.refresh();

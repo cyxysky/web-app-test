@@ -19,6 +19,7 @@ import { languageOptions } from '@/i18n/translations';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/test-case.schema';
 import { useTheme } from '@/theme/ThemeProvider';
+import { readApiJson } from '@/lib/api-client';
 
 type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
   updatedAt?: string;
@@ -225,8 +226,7 @@ export function EnvironmentSettings({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ items: items.map((item) => ({ ...item, enabled: true, secret: isSecret(item) })) }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('保存环境配置失败'));
+      const data = await readApiJson<any>(response, t('保存环境配置失败'));
       setItems(data.saved || []);
       onRuntimeEnvSaved?.();
     } finally {
@@ -326,8 +326,7 @@ export function EnvironmentSettings({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('保存模型配置失败'));
+      const data = await readApiJson<any>(response, t('保存模型配置失败'));
       const nextModel = createModelConfig(data.config);
       setModelConfig(nextModel);
       setModelDraft(nextModel);

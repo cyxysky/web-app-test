@@ -12,7 +12,6 @@ import {
 } from '@/server/desktop/desktop-observer';
 
 const OBSERVED_TOOL_NAMES = new Set([
-  'openPage',
   'clickCandidate',
   'clickDomNode',
   'clickLocator',
@@ -29,9 +28,9 @@ const OBSERVED_TOOL_NAMES = new Set([
 ]);
 
 const MAX_EVIDENCE_ITEMS = 5;
-const DEFAULT_WAIT_MS = 1_200;
-const DEFAULT_INTERVAL_MS = 300;
-const DEFAULT_COMMAND_TIMEOUT_MS = 6_000;
+const DEFAULT_WAIT_MS = 0;
+const DEFAULT_INTERVAL_MS = 100;
+const DEFAULT_COMMAND_TIMEOUT_MS = 1_500;
 const NOISE_PROCESS_NAMES = new Set([
   'powershell.exe',
   'pwsh.exe',
@@ -142,12 +141,19 @@ export async function collectDesktopEvidenceAfterTool(
   if (!before || !shouldObserveDesktopForTool(name)) return undefined;
 
   try {
-    const { snapshot, diff } = await desktopObserver.waitForChange(before, {
+    const options = {
       includeCommandLine: false,
       timeoutMs: numericEnv('DESKTOP_OBSERVER_WAIT_MS', DEFAULT_WAIT_MS),
       intervalMs: numericEnv('DESKTOP_OBSERVER_INTERVAL_MS', DEFAULT_INTERVAL_MS),
       commandTimeoutMs: numericEnv('DESKTOP_OBSERVER_COMMAND_TIMEOUT_MS', DEFAULT_COMMAND_TIMEOUT_MS),
-    });
+    };
+    const { snapshot, diff } = await (options.timeoutMs > 0
+      ? desktopObserver.waitForChange(before, options)
+      : desktopObserver.snapshot(options).then((snapshot) => ({
+          snapshot,
+          diff: desktopObserver.diffSnapshots(before, snapshot),
+          changed: false,
+        })));
     const added = diff.added.filter((process) => !isNoiseProcess(process));
     const removed = diff.removed.filter((process) => !isNoiseProcess(process));
     const changedWindows = diff.changedWindows.filter((process) => !isNoiseProcess(process));

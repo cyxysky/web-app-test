@@ -48,22 +48,33 @@ import {
 import { useRouter } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useVirtualizer } from '@tanstack/react-virtual';
 import { CustomSelect } from '@/components/CustomSelect';
+import { BrowserChatLogDialog } from '@/components/BrowserChatLogDialog';
+import { BrowserChatToolDialog } from '@/components/BrowserChatToolDialog';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
 import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
-import { defaultModelByProvider, type SettingsTab } from '@/config/settings';
+import {
+  buildBrowserChatAiCycleRenderEntries,
+  buildBrowserChatLogIndex,
+  buildBrowserChatMessageRenderEntries,
+  browserChatAssistantMessageHasVisibleText as modelBrowserChatAssistantMessageHasVisibleText,
+  browserChatLogsForMessage,
+  type BrowserChatLogIndex as BrowserChatLogIndexModel,
+} from '@/components/browser-chat-message-model';
+import {
+  visibleBrowserChatExecutionLogs,
+} from '@/components/browser-chat-log-model';
+import { type SettingsTab } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
-import { domTreeFromToolCall, fullDomSnapshotFromToolCall } from '@/lib/ai-request-inspection';
-import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
+import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import {
-  defaultModelForConfig,
+  modelSelectionDiagnosticLabel,
   modelSelectionOptionsForConfig,
-  modelSelectionValue,
-  normalizeModelId,
-  normalizeModelProvider,
+  modelSelectionValueForConfig,
+  normalizeRuntimeModelConfig,
   parseModelSelectionValue,
+  resolveRuntimeModelSelection,
   type RuntimeModelConfig,
 } from '@/lib/model-selection';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
@@ -114,6 +125,8 @@ type BrowserChatLogRecord = {
   stepIndex?: number;
   elapsedMs?: number;
 };
+
+type BrowserChatLogIndex = BrowserChatLogIndexModel<BrowserChatLogRecord>;
 
 type BrowserChatToolConfirmation = {
   id: string;
@@ -227,11 +240,6 @@ declare global {
   }
 }
 
-type BrowserChatLogIndex = {
-  byMessageId: Map<string, BrowserChatLogRecord[]>;
-  byStepIndex: Map<number, BrowserChatLogRecord[]>;
-};
-
 function statusLabel(status: string) {
   return status === 'running' ? '进行中' : '已完成';
 }
@@ -303,92 +311,10 @@ function formatToolPayload(value: unknown) {
   }
 }
 
-const logVirtualRowEstimate = 104;
-
-function BrowserChatLogEntry({ log, style, measureRef, virtualIndex }: {
-  log: BrowserChatLogRecord;
-  measureRef?: (node: HTMLLIElement | null) => void;
-  style?: CSSProperties;
-  virtualIndex?: number;
-}) {
-  return (
-    <li
-      className={contextCompressionLabel(log) ? 'has-context-compression' : ''}
-      data-index={virtualIndex}
-      ref={measureRef}
-      style={style}
-    >
-      {contextCompressionLabel(log) ? (
-        <div className="browser-chat-context-compression-marker">
-          <span>--------------------------</span>
-          <strong>{contextCompressionLabel(log)}</strong>
-          <span>--------------------------</span>
-        </div>
-      ) : null}
-      <span>{phaseLabel(log.phase)}</span>
-      <div>
-        <strong>{log.message}</strong>
-        <small>
-          {formatLogTime(log.time)}
-          {log.stepIndex ? ` · 步骤 ${log.stepIndex}` : ''}
-          {typeof log.elapsedMs === 'number' ? ` · ${log.elapsedMs}ms` : ''}
-        </small>
-        <BrowserChatLogDetails log={log} />
-      </div>
-    </li>
-  );
-}
-
-function BrowserChatVirtualLogList({ entries }: { entries: BrowserChatLogRecord[] }) {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  const rowVirtualizer = useVirtualizer({
-    count: entries.length,
-    estimateSize: () => logVirtualRowEstimate,
-    getScrollElement: () => scrollRef.current,
-    overscan: 8,
-  });
-  const virtualItems = rowVirtualizer.getVirtualItems();
-
-  return (
-    <div className="browser-chat-log-modal-list" ref={scrollRef}>
-      <ol
-        className="browser-chat-log-virtual-inner"
-        style={{ height: rowVirtualizer.getTotalSize() }}
-      >
-        {virtualItems.map((virtualRow) => {
-          const log = entries[virtualRow.index];
-          if (!log) return null;
-          return (
-            <BrowserChatLogEntry
-              key={log.id}
-              log={log}
-              measureRef={rowVirtualizer.measureElement}
-              style={{
-                position: 'absolute',
-                transform: `translateY(${virtualRow.start}px)`,
-                width: '100%',
-              }}
-              virtualIndex={virtualRow.index}
-            />
-          );
-        })}
-      </ol>
-    </div>
-  );
-}
-
 function asRecord(value: unknown) {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
-}
-
-function aiLogRequestPayload(details?: Record<string, unknown>) {
-  return details?.aiInput !== undefined ? formatToolPayload(details.aiInput) : '';
-}
-
-function aiLogResponsePayload(details?: Record<string, unknown>) {
-  return details?.aiOutput !== undefined ? formatToolPayload(details.aiOutput) : '';
 }
 
 type BrowserChatAiOutputTool = {
@@ -621,156 +547,6 @@ function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: St
   return details;
 }
 
-function isAiInputOutputLog(log: BrowserChatLogRecord) {
-  return log.phase === 'ai:runtime:request'
-    || log.phase === 'ai:runtime:response'
-    || log.phase === 'ai:runtime:object'
-    || log.phase === 'conversation:context:request'
-    || log.phase === 'conversation:context:response';
-}
-
-function isContextCompressionLog(log: BrowserChatLogRecord) {
-  return log.phase === 'ai:context-segmented'
-    || log.phase === 'conversation:context:request'
-    || log.phase === 'conversation:context:response'
-    || log.phase === 'conversation:context:error';
-}
-
-function isScreenshotPerformanceLog(log: BrowserChatLogRecord) {
-  const phase = log.phase.toLowerCase();
-  return phase.startsWith('browser:screenshot:')
-    || (phase.startsWith('perf:') && phase.includes('screenshot'));
-}
-
-function visibleExecutionLog(log: BrowserChatLogRecord) {
-  return isAiInputOutputLog(log) || isContextCompressionLog(log) || isScreenshotPerformanceLog(log);
-}
-
-function contextCompressionLabel(log: BrowserChatLogRecord) {
-  if (log.phase === 'ai:context-segmented') return 'Agent Loop 上下文在这里压缩';
-  if (log.phase === 'conversation:context:request') return '历史对话上下文开始压缩';
-  if (log.phase === 'conversation:context:response') return '历史对话上下文压缩完成';
-  if (log.phase === 'conversation:context:error') return '历史对话上下文压缩失败';
-  return '';
-}
-
-function finiteNumber(value: unknown) {
-  const numberValue = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(numberValue) ? numberValue : undefined;
-}
-
-function stringValue(value: unknown) {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function booleanValue(value: unknown) {
-  return typeof value === 'boolean' ? value : undefined;
-}
-
-function formatScreenshotTimingStep(step: unknown, index: number) {
-  const record = asRecord(step);
-  if (!record) return '';
-  const name = stringValue(record.name) || `step ${index + 1}`;
-  const elapsedMs = finiteNumber(record.elapsedMs);
-  const parts = [`${index + 1}. ${name}`];
-  if (elapsedMs !== undefined) parts.push(`${elapsedMs}ms`);
-  const count = finiteNumber(record.count);
-  if (count !== undefined) parts.push(`count=${count}`);
-  if (booleanValue(record.skipped)) parts.push('skipped');
-  const path = stringValue(record.path);
-  if (path) parts.push(`path=${path}`);
-  const error = stringValue(record.error);
-  if (error) parts.push(`error=${error}`);
-  return parts.join(' | ');
-}
-
-function screenshotPerformancePayload(details: Record<string, unknown>) {
-  const timings = asRecord(details.timings);
-  const lines: string[] = [];
-  const totalMs = finiteNumber(timings?.totalMs) ?? finiteNumber(details.elapsedMs);
-  if (totalMs !== undefined) lines.push(`totalMs: ${totalMs}`);
-  const capture = stringValue(timings?.capture);
-  if (capture) lines.push(`capture: ${capture}`);
-  const path = stringValue(timings?.path) || stringValue(details.path) || stringValue(details.screenshotPath);
-  if (path) lines.push(`path: ${path}`);
-  const markerPath = stringValue(timings?.markerPath);
-  if (markerPath) lines.push(`markerPath: ${markerPath}`);
-  const originalPath = stringValue(timings?.originalPath);
-  if (originalPath) lines.push(`originalPath: ${originalPath}`);
-  const candidateCount = finiteNumber(timings?.candidateCount);
-  if (candidateCount !== undefined) lines.push(`candidateCount: ${candidateCount}`);
-  const scrollAreaCount = finiteNumber(timings?.scrollAreaCount);
-  if (scrollAreaCount !== undefined) lines.push(`scrollAreaCount: ${scrollAreaCount}`);
-  const separateMarkerMap = booleanValue(timings?.separateMarkerMap);
-  if (separateMarkerMap !== undefined) lines.push(`separateMarkerMap: ${separateMarkerMap}`);
-  const rawSteps = timings?.steps;
-  const steps = Array.isArray(rawSteps)
-    ? rawSteps.map(formatScreenshotTimingStep).filter(Boolean)
-    : [];
-  if (steps.length) {
-    lines.push('steps:');
-    lines.push(...steps.map((step) => `  ${step}`));
-  }
-  return lines.join('\n');
-}
-
-function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
-  if (!log.details) return null;
-  const parsed = parseJsonObjectText(log.details);
-  const isAiRequestLog = log.phase === 'ai:runtime:request';
-  const isAiResponseLog = log.phase === 'ai:runtime:response' || log.phase === 'ai:runtime:object';
-  const isConversationSummaryRequest = log.phase === 'conversation:context:request';
-  const isConversationSummaryResponse = log.phase === 'conversation:context:response';
-  if (!parsed) return null;
-  const requestPayload = isAiRequestLog
-    ? aiLogRequestPayload(parsed)
-    : isConversationSummaryRequest
-      ? formatToolPayload({
-          provider: parsed.provider,
-          model: parsed.model,
-          estimatedTokens: parsed.estimatedTokens,
-          thresholdTokens: parsed.thresholdTokens,
-          prompt: parsed.prompt,
-        })
-      : '';
-  const responsePayload = isAiResponseLog
-    ? aiLogResponsePayload(parsed)
-    : isConversationSummaryResponse
-      ? formatToolPayload({
-          provider: parsed.provider,
-          model: parsed.model,
-          estimatedTokensBefore: parsed.estimatedTokensBefore,
-          estimatedTokensAfter: parsed.estimatedTokensAfter,
-          thresholdTokens: parsed.thresholdTokens,
-          context: parsed.context,
-        })
-      : '';
-  const performancePayload = isScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
-  if (!requestPayload && !responsePayload && !performancePayload) return null;
-  return (
-    <div className="browser-chat-log-details">
-      {requestPayload ? (
-        <section className="browser-chat-log-detail-block">
-          <strong>AI input JSON</strong>
-          <pre>{requestPayload}</pre>
-        </section>
-      ) : null}
-      {responsePayload ? (
-        <section className="browser-chat-log-detail-block is-response">
-          <strong>AI output JSON</strong>
-          <pre>{responsePayload}</pre>
-        </section>
-      ) : null}
-      {performancePayload ? (
-        <section className="browser-chat-log-detail-block is-performance">
-          <strong>Screenshot performance</strong>
-          <pre>{performancePayload}</pre>
-        </section>
-      ) : null}
-    </div>
-  );
-}
-
 function toolStatusLabel(tool: BrowserChatToolCall) {
   if (tool.ok === true) return '完成';
   if (tool.ok === false) return '失败';
@@ -940,6 +716,7 @@ function normalizeToolConfirmation(value?: BrowserChatToolConfirmation): Browser
 }
 
 function normalizeSession(session: BrowserChatSession): BrowserChatSession {
+  const modelSelection = resolveRuntimeModelSelection(null, { model: session.model, provider: session.modelProvider });
   return {
     ...session,
     consoleErrors: session.consoleErrors || [],
@@ -953,8 +730,8 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
     })),
     mode: normalizeMode(session.mode),
     safetyMode: normalizeSafetyMode(session.safetyMode),
-    modelProvider: normalizeModelProvider(session.modelProvider),
-    model: normalizeModelId(session.model, normalizeModelProvider(session.modelProvider)),
+    modelProvider: modelSelection.provider,
+    model: modelSelection.model,
     networkErrors: session.networkErrors || [],
     pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
     steps: session.steps || [],
@@ -990,33 +767,6 @@ function formatLogTime(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '';
   return date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-
-function buildBrowserChatLogIndex(logs: BrowserChatLogRecord[]): BrowserChatLogIndex {
-  const byMessageId = new Map<string, BrowserChatLogRecord[]>();
-  const byStepIndex = new Map<number, BrowserChatLogRecord[]>();
-
-  for (const log of logs) {
-    if (log.messageId) {
-      const entries = byMessageId.get(log.messageId) || [];
-      entries.push(log);
-      byMessageId.set(log.messageId, entries);
-      continue;
-    }
-    if (typeof log.stepIndex === 'number') {
-      const entries = byStepIndex.get(log.stepIndex) || [];
-      entries.push(log);
-      byStepIndex.set(log.stepIndex, entries);
-    }
-  }
-
-  return { byMessageId, byStepIndex };
-}
-
-function browserChatLogsForMessage(message: BrowserChatMessage, logIndex: BrowserChatLogIndex) {
-  const directLogs = logIndex.byMessageId.get(message.id) || [];
-  const stepLogs = (message.stepIndexes || []).flatMap((stepIndex) => logIndex.byStepIndex.get(stepIndex) || []);
-  return directLogs.length || stepLogs.length ? [...directLogs, ...stepLogs] : [];
 }
 
 function messageUpdateTime(message: BrowserChatMessage) {
@@ -1407,38 +1157,6 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   );
 });
 
-type BrowserChatAiCycleRenderEntry =
-  | { cycle: BrowserChatAiOutputCycle; kind: 'cycle' }
-  | { cycles: BrowserChatAiOutputCycle[]; id: string; kind: 'executed' };
-
-function aiCycleRenderEntries(cycles: BrowserChatAiOutputCycle[]): BrowserChatAiCycleRenderEntry[] {
-  const entries: BrowserChatAiCycleRenderEntry[] = [];
-  let pendingExecuted: BrowserChatAiOutputCycle[] = [];
-
-  const flushExecuted = () => {
-    if (!pendingExecuted.length) return;
-    const first = pendingExecuted[0];
-    const last = pendingExecuted[pendingExecuted.length - 1];
-    entries.push({
-      cycles: pendingExecuted,
-      id: `executed-cycles-${first.id}-${last.id}-${pendingExecuted.length}`,
-      kind: 'executed',
-    });
-    pendingExecuted = [];
-  };
-
-  for (const cycle of cycles) {
-    if (!cycle.output.texts.length) {
-      pendingExecuted.push(cycle);
-      continue;
-    }
-    flushExecuted();
-    entries.push({ cycle, kind: 'cycle' });
-  }
-  flushExecuted();
-  return entries;
-}
-
 const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGroup({
   cycles,
   logs,
@@ -1529,7 +1247,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const [toolsExpanded, setToolsExpanded] = useState(() => running);
   const finalText = stringFromUnknown(message.content);
   const aiOutputCycles = useMemo(() => aiOutputCyclesFromLogs(logs), [logs]);
-  const aiOutputCycleEntries = useMemo(() => aiCycleRenderEntries(aiOutputCycles), [aiOutputCycles]);
+  const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(aiOutputCycles), [aiOutputCycles]);
   const aiOutputTextSet = useMemo(() => aiOutputTextSetFromCycles(aiOutputCycles), [aiOutputCycles]);
   const aiCycleToolDetails = useMemo(() => buildAiCycleToolDetailMap(aiOutputCycles, steps), [aiOutputCycles, steps]);
   const seenTexts = new Set<string>();
@@ -1806,48 +1524,12 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   );
 });
 
-type BrowserChatMessageRenderEntry =
-  | { kind: 'message'; item: BrowserChatMessage }
-  | { id: string; items: BrowserChatMessage[]; kind: 'executed-group' };
-
 function browserChatAssistantMessageHasVisibleText(message: BrowserChatMessage, logs: BrowserChatLogRecord[]) {
-  if (stringFromUnknown(message.content)) return true;
-  return aiOutputCyclesFromLogs(logs).some((cycle) => cycle.output.texts.some((text) => Boolean(text.trim())));
-}
-
-function browserChatMessageRenderEntries(messages: BrowserChatMessage[], logIndex: BrowserChatLogIndex): BrowserChatMessageRenderEntry[] {
-  const entries: BrowserChatMessageRenderEntry[] = [];
-  let pendingExecutedGroup: BrowserChatMessage[] = [];
-
-  const flushExecutedGroup = () => {
-    if (!pendingExecutedGroup.length) return;
-    if (pendingExecutedGroup.length > 1) {
-      const first = pendingExecutedGroup[0];
-      const last = pendingExecutedGroup[pendingExecutedGroup.length - 1];
-      entries.push({
-        id: `executed-${first.id}-${last.id}-${pendingExecutedGroup.length}`,
-        items: pendingExecutedGroup,
-        kind: 'executed-group',
-      });
-    } else {
-      entries.push({ item: pendingExecutedGroup[0], kind: 'message' });
-    }
-    pendingExecutedGroup = [];
-  };
-
-  for (const item of messages) {
-    const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
-    const emptyAssistantMessage = item.role === 'assistant' && !browserChatAssistantMessageHasVisibleText(item, itemLogs);
-    if (emptyAssistantMessage) {
-      pendingExecutedGroup.push(item);
-      continue;
-    }
-    flushExecutedGroup();
-    entries.push({ item, kind: 'message' });
-  }
-  flushExecutedGroup();
-
-  return entries;
+  return modelBrowserChatAssistantMessageHasVisibleText(
+    message,
+    logs,
+    (sourceLogs) => aiOutputCyclesFromLogs(sourceLogs).flatMap((cycle) => cycle.output.texts),
+  );
 }
 
 const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
@@ -1984,7 +1666,10 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
   const lastMessage = messages[messages.length - 1];
-  const renderEntries = useMemo(() => browserChatMessageRenderEntries(messages, logIndex), [logIndex, messages]);
+  const renderEntries = useMemo(
+    () => buildBrowserChatMessageRenderEntries(messages, logIndex, browserChatAssistantMessageHasVisibleText),
+    [logIndex, messages],
+  );
   const scrollKey = [
     sessionId || '',
     messages.length,
@@ -2113,6 +1798,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   mode,
   modeLocked,
   modelSelection,
+  modelSelectionTitle,
   modelSelectionOptions,
   safetyMode,
   onInterrupt,
@@ -2137,6 +1823,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   mode: BrowserChatMode;
   modeLocked: boolean;
   modelSelection: string;
+  modelSelectionTitle: string;
   modelSelectionOptions: Array<{ description?: string; group?: string; label: string; selectedLabel?: string; value: string }>;
   safetyMode: BrowserChatSafetyMode;
   onInterrupt: () => void | Promise<void>;
@@ -2685,6 +2372,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
               disabled={currentBusy || loading}
               onChange={(value) => onModelSelectionChange(parseModelSelectionValue(value))}
               options={modelSelectionOptions}
+              title={modelSelectionTitle}
               value={modelSelection}
             />
           </div>
@@ -3187,6 +2875,7 @@ export function BrowserChatWorkspace({
   const { t } = useI18n();
   const { mode: themeMode, toggleMode } = useTheme();
   const [, startTransition] = useTransition();
+  const initialModelSelection = resolveRuntimeModelSelection(null);
   const sendingRef = useRef(false);
   const loadingSessionRef = useRef<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -3202,8 +2891,8 @@ export function BrowserChatWorkspace({
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [mode, setMode] = useState<BrowserChatMode>('visual-markers');
   const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
-  const [modelProvider, setModelProvider] = useState<ModelProvider>('openrouter');
-  const [modelId, setModelId] = useState(defaultModelByProvider.openrouter);
+  const [modelProvider, setModelProvider] = useState<ModelProvider>(() => initialModelSelection.provider);
+  const [modelId, setModelId] = useState(() => initialModelSelection.model);
   const [modelConfig, setModelConfig] = useState<BrowserChatModelConfig | null>(null);
   const [targetGroupId, setTargetGroupId] = useState<string | undefined>();
   const [targetDetailCaseId, setTargetDetailCaseId] = useState<string | null>(initialTargetDetailCaseId || null);
@@ -3259,7 +2948,7 @@ export function BrowserChatWorkspace({
   );
   const logDialogEntries = useMemo(() => {
     if (!logDialogMessage) return [];
-    return browserChatLogsForMessage(logDialogMessage, logIndex).filter(visibleExecutionLog);
+    return visibleBrowserChatExecutionLogs(browserChatLogsForMessage(logDialogMessage, logIndex));
   }, [logDialogMessage, logIndex]);
   const previewAttachment = useCallback((attachment: BrowserChatAttachment) => {
     setImagePreview(attachment);
@@ -3302,31 +2991,23 @@ export function BrowserChatWorkspace({
   );
   const allSelectableRecentSessionsSelected = selectableRecentSessionIds.length > 0
     && selectableRecentSessionIds.every((id) => selectedSessionIdSet.has(id));
-  const toolDialogDomTree = useMemo(
-    () => domTreeFromToolCall(toolDialog?.tool, toolDialog?.step.aiRequest),
-    [toolDialog],
-  );
-  const toolDialogFullDomSnapshot = useMemo(
-    () => fullDomSnapshotFromToolCall(toolDialog?.tool),
-    [toolDialog],
-  );
   const embeddedBrowserActive = embeddedBrowserEnabled && activeView === 'chat';
   const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || imagePreview || groupDialogOpen);
   const embeddedBrowserViewActive = embeddedBrowserActive && !embeddedBrowserCovered;
   const embeddedBrowserLeftOverlayInset = embeddedBrowserActive && historyTooltipActive && sidebarCollapsed ? 300 : 0;
-  const modelSelection = modelSelectionValue(modelProvider, modelId || defaultModelForConfig(modelConfig, modelProvider));
+  const modelSelection = modelSelectionValueForConfig(modelConfig, { model: modelId, provider: modelProvider });
+  const modelSelectionDiagnostic = modelSelectionDiagnosticLabel(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionOptions = useMemo(() => modelSelectionOptionsForConfig(modelConfig), [modelConfig]);
 
   const changeModelSelection = useCallback((selection: { provider: ModelProvider; model: string }) => {
-    const model = normalizeModelId(selection.model, selection.provider, modelConfig);
-    setModelProvider(selection.provider);
-    setModelId(model);
+    const next = resolveRuntimeModelSelection(modelConfig, selection);
+    setModelProvider(next.provider);
+    setModelId(next.model);
   }, [modelConfig]);
 
   const loadBrowserRuntimeSettings = useCallback(async () => {
     const response = await fetch('/api/settings/env', { cache: 'no-store' });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '加载浏览器配置失败');
+    const data = await readApiJson<any>(response, '加载浏览器配置失败');
     const saved = Array.isArray(data.saved) ? data.saved as Array<{ key?: string; value?: string }> : [];
     const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
     setEmbeddedBrowserEnabled(embeddedSetting?.value === 'true');
@@ -3334,22 +3015,15 @@ export function BrowserChatWorkspace({
 
   const loadSkills = useCallback(async () => {
     const response = await fetch('/api/skills', { cache: 'no-store' });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '加载 Skills 失败');
+    const data = await readApiJson<any>(response, '加载 Skills 失败');
     setSkills(Array.isArray(data.skills) ? data.skills : []);
   }, []);
 
   const loadModelConfig = useCallback(async () => {
     const response = await fetch('/api/settings/model', { cache: 'no-store' });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '加载模型配置失败');
-    const config = data.config as Partial<BrowserChatModelConfig> | undefined;
-    if (!config) return;
-    setModelConfig({
-      provider: normalizeModelProvider(config.provider),
-      providers: config.providers || {},
-      updatedAt: typeof config.updatedAt === 'string' ? config.updatedAt : '',
-    });
+    const data = await readApiJson<any>(response, '加载模型配置失败');
+    const config = normalizeRuntimeModelConfig(data.config as Partial<BrowserChatModelConfig> | undefined);
+    if (config) setModelConfig(config);
   }, []);
 
   const beginEmbeddedChatResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -3419,24 +3093,25 @@ export function BrowserChatWorkspace({
 
   const loadSessions = useCallback(async () => {
     const response = await fetch('/api/browser-chat', { cache: 'no-store' });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '加载对话历史失败');
+    const data = await readApiJson<any>(response, '加载对话历史失败');
     const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => normalizeSession(item)) : [];
     setSessions(nextSessions);
   }, []);
 
   const refreshSession = useCallback(async (sessionId: string, options: { activate?: boolean } = {}) => {
     const response = await fetch(`/api/browser-chat/${sessionId}`, { cache: 'no-store' });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '加载对话失败');
+    const data = await readApiJson<any>(response, '加载对话失败');
     const shouldActivate = options.activate ?? activeSessionIdRef.current === sessionId;
     const loadedSession = upsertSession(data.session as BrowserChatSession, { activate: shouldActivate });
     if (shouldActivate) {
       setMode(normalizeMode(loadedSession.mode));
       setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
-      const provider = normalizeModelProvider(loadedSession.modelProvider);
-      setModelProvider(provider);
-      setModelId(normalizeModelId(loadedSession.model, provider, modelConfig));
+      const nextModel = resolveRuntimeModelSelection(modelConfig, {
+        model: loadedSession.model,
+        provider: loadedSession.modelProvider,
+      });
+      setModelProvider(nextModel.provider);
+      setModelId(nextModel.model);
     }
     return loadedSession;
   }, [modelConfig, upsertSession]);
@@ -3482,13 +3157,13 @@ export function BrowserChatWorkspace({
 
   useEffect(() => {
     if (session?.id || !modelConfig?.provider) return;
-    const provider = normalizeModelProvider(modelConfig.provider);
-    setModelProvider(provider);
-    setModelId(defaultModelForConfig(modelConfig, provider));
+    const nextModel = resolveRuntimeModelSelection(modelConfig);
+    setModelProvider(nextModel.provider);
+    setModelId(nextModel.model);
   }, [modelConfig, session?.id]);
 
   useEffect(() => {
-    setModelId((current) => normalizeModelId(current, modelProvider, modelConfig));
+    setModelId((current) => resolveRuntimeModelSelection(modelConfig, { model: current, provider: modelProvider }).model);
   }, [modelConfig, modelProvider]);
 
   useEffect(() => {
@@ -3569,8 +3244,7 @@ export function BrowserChatWorkspace({
     startGlobalLoading('正在删除分组');
     try {
       const response = await fetch(`/api/groups/${group.id}`, { method: 'DELETE' });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || '删除分组失败');
+      const data = await readApiJson<any>(response, '删除分组失败');
       if (targetGroupId && descendantIds.has(targetGroupId)) setTargetGroupId(undefined);
       startTransition(() => router.refresh());
     } catch (error) {
@@ -3587,8 +3261,7 @@ export function BrowserChatWorkspace({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode, safetyMode, modelProvider, model: modelId }),
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '创建对话会话失败');
+    const data = await readApiJson<any>(response, '创建对话会话失败');
     return upsertSession(data.session as BrowserChatSession, { activate: true });
   }
 
@@ -3603,8 +3276,7 @@ export function BrowserChatWorkspace({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, safetyMode, modelProvider, model: modelId, skillIds }),
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '发送消息失败');
+    const data = await readApiJson<any>(response, '发送消息失败');
     return data.session as BrowserChatSession;
   }
 
@@ -3641,8 +3313,7 @@ export function BrowserChatWorkspace({
         const form = new FormData();
         form.append('file', file);
         const response = await fetch('/api/uploads', { method: 'POST', body: form });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || '图片上传失败');
+        const data = await readApiJson<any>(response, '图片上传失败');
         uploaded.push({
           id: String(data.imageId || temporaryId('image')),
           name: String(data.name || file.name),
@@ -3704,8 +3375,7 @@ export function BrowserChatWorkspace({
     setError('');
     try {
       const response = await fetch(`/api/browser-chat/${target.id}/interrupt`, { method: 'POST' });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '中断对话失败');
+      const data = await readApiJson<any>(response, '中断对话失败');
       upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === target.id });
     } catch (interruptError) {
       setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
@@ -3726,8 +3396,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, confirmationId }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '工具确认失败');
+      const data = await readApiJson<any>(response, '工具确认失败');
       upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === sessionId });
       scheduleSessionRefresh(sessionId, 120);
     } catch (resolveError) {
@@ -3744,8 +3413,8 @@ export function BrowserChatWorkspace({
     startGlobalLoading('正在结束浏览器对话');
     try {
       const response = await fetch(`/api/browser-chat/${session.id}`, { method: 'DELETE' });
-      const data = await response.json();
       if (response.ok) {
+        const data = await readApiJson<any>(response, '??????');
         upsertSession(data.session, { activate: true });
         await loadSessions().catch(() => undefined);
       }
@@ -3761,8 +3430,7 @@ export function BrowserChatWorkspace({
     setError('');
     try {
       const response = await fetch(`/api/browser-chat/${sessionId}/delete`, { method: 'POST' });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '删除历史对话失败');
+      const data = await readApiJson<any>(response, '删除历史对话失败');
       setSessions((current) => current.filter((item) => item.id !== sessionId));
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
       if (session?.id === sessionId) setSession(null);
@@ -3807,8 +3475,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: deletingIds }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '批量删除历史对话失败');
+      const data = await readApiJson<any>(response, '批量删除历史对话失败');
       setSessions((current) => current.filter((item) => !deletingIdSet.has(item.id)));
       setSelectedSessionIds((current) => current.filter((id) => !deletingIdSet.has(id)));
       if (session?.id && deletingIdSet.has(session.id)) setSession(null);
@@ -3839,8 +3506,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageIds }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '导出测试用例失败');
+      const data = await readApiJson<any>(response, '导出测试用例失败');
       setSelectedExportMessageIds([]);
       if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
     } catch (exportError) {
@@ -3862,8 +3528,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageId }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '导出测试用例失败');
+      const data = await readApiJson<any>(response, '导出测试用例失败');
       if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
     } catch (exportError) {
       setError(exportError instanceof Error ? exportError.message : '导出测试用例失败');
@@ -3885,8 +3550,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageIds }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '生成 Skill 失败');
+      const data = await readApiJson<any>(response, '生成 Skill 失败');
       setSelectedExportMessageIds([]);
       await loadSkills();
     } catch (skillError) {
@@ -3909,8 +3573,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageId }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '生成 Skill 失败');
+      const data = await readApiJson<any>(response, '生成 Skill 失败');
       await loadSkills();
     } catch (skillError) {
       setError(skillError instanceof Error ? skillError.message : '生成 Skill 失败');
@@ -3951,9 +3614,12 @@ export function BrowserChatWorkspace({
       const loadedSession = await refreshSession(sessionId, { activate: true });
       setMode(normalizeMode(loadedSession.mode));
       setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
-      const provider = normalizeModelProvider(loadedSession.modelProvider);
-      setModelProvider(provider);
-      setModelId(normalizeModelId(loadedSession.model, provider, modelConfig));
+      const nextModel = resolveRuntimeModelSelection(modelConfig, {
+        model: loadedSession.model,
+        provider: loadedSession.modelProvider,
+      });
+      setModelProvider(nextModel.provider);
+      setModelId(nextModel.model);
       void loadSessions().catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');
@@ -4156,6 +3822,7 @@ export function BrowserChatWorkspace({
           mode={mode}
           modeLocked={modeLocked}
           modelSelection={modelSelection}
+          modelSelectionTitle={modelSelectionDiagnostic}
           modelSelectionOptions={modelSelectionOptions}
           safetyMode={safetyMode}
           onInterrupt={interruptConversation}
@@ -4239,6 +3906,7 @@ export function BrowserChatWorkspace({
                   disabled={currentBusy}
                   onChange={(value) => changeModelSelection(parseModelSelectionValue(value))}
                   options={modelSelectionOptions}
+                  title={modelSelectionDiagnostic}
                   value={modelSelection}
                 />
                 <div className="browser-chat-target-actions" id="browser-chat-target-actions" />
@@ -4369,6 +4037,7 @@ export function BrowserChatWorkspace({
                 mode={mode}
                 modeLocked={modeLocked}
                 modelSelection={modelSelection}
+                modelSelectionTitle={modelSelectionDiagnostic}
                 modelSelectionOptions={modelSelectionOptions}
                 safetyMode={safetyMode}
                 onInterrupt={interruptConversation}
@@ -4389,126 +4058,19 @@ export function BrowserChatWorkspace({
       </main>
 
       {toolDialog ? (
-        <div className="modal-overlay" onClick={() => setToolDialog(null)} role="presentation">
-          <section className="browser-chat-tool-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="工具调用详情">
-            <header>
-              <div>
-                <h2 title={toolDialog.tool.name}>{browserChatToolLabel(toolDialog.tool.name, t)}</h2>
-                <p>步骤 {toolDialog.stepIndex} · 工具调用 {toolDialog.toolIndex + 1}</p>
-              </div>
-              <button className="icon-button" onClick={() => setToolDialog(null)} type="button" aria-label="关闭">
-                <X size={18} />
-              </button>
-            </header>
-            <div className="browser-chat-tool-detail-grid">
-              <div>
-                <span>状态</span>
-                <strong>{toolStatusLabel(toolDialog.tool)}</strong>
-              </div>
-              <div>
-                <span>工具名</span>
-                <strong title={toolDialog.tool.name}>{browserChatToolLabel(toolDialog.tool.name, t)}</strong>
-              </div>
-            </div>
-            {toolDialog.tool.reason ? (
-              <section className="browser-chat-tool-detail-section">
-                <h3>调用理由</h3>
-                <p>{toolDialog.tool.reason}</p>
-              </section>
-            ) : null}
-            <section className="browser-chat-tool-detail-section">
-              <h3>输入参数</h3>
-              <pre>{formatToolPayload(toolDialog.tool.input)}</pre>
-            </section>
-            <section className="browser-chat-tool-detail-section">
-              <h3>输出结果</h3>
-              <pre>{formatToolPayload(toolDialog.tool.result)}</pre>
-            </section>
-            {/* {toolDialogFullDomSnapshot ? (
-              <section className="browser-chat-tool-detail-section is-full-dom">
-                <h3>
-                  完整 DOM 快照
-                  {typeof toolDialog.tool.debug?.fullDomSnapshotCharLength === 'number'
-                    ? `（${toolDialog.tool.debug.fullDomSnapshotCharLength} 字符）`
-                    : ''}
-                </h3>
-                <pre>{toolDialogFullDomSnapshot}</pre>
-              </section>
-            ) : null} */}
-            {toolDialogDomTree ? (
-              <section className="browser-chat-tool-detail-section">
-                <h3>
-                  模型上下文 DOM 树
-                  {toolDialog.tool.debug?.domSnapshotTruncatedForModel ? '（已按上下文限制截断）' : ''}
-                </h3>
-                <pre>{toolDialogDomTree}</pre>
-              </section>
-            ) : null}
-            {toolDialog.tool.visualAfter ? (
-              <section className="browser-chat-tool-detail-section">
-                <h3>视觉截图参数</h3>
-                <pre>{formatToolPayload(toolDialog.tool.visualAfter)}</pre>
-              </section>
-            ) : null}
-            {toolDialog.tool.screenshots?.length ? (
-              <section className="browser-chat-tool-detail-section">
-                <h3>截图记录</h3>
-                <div className="browser-chat-tool-shot-grid">
-                  {toolDialog.tool.screenshots.map((shot, index) => {
-                    const url = artifactUrl(shot.path);
-                    return (
-                      <a
-                        className="browser-chat-tool-shot-card"
-                        href={url || '#'}
-                        key={`${shot.path}-${index}-preview`}
-                        onClick={(event) => {
-                          if (!url) event.preventDefault();
-                        }}
-                        rel="noreferrer"
-                        target="_blank"
-                      >
-                        {url ? <img alt={shot.title || screenshotKindLabel(shot.kind)} src={url} /> : null}
-                        <span>
-                          <strong>{screenshotKindLabel(shot.kind)} · {shot.title || `截图 ${index + 1}`}</strong>
-                          <code>{shot.path}</code>
-                        </span>
-                      </a>
-                    );
-                  })}
-                </div>
-                <ol className="browser-chat-tool-shot-list">
-                  {toolDialog.tool.screenshots.map((shot, index) => (
-                    <li key={`${shot.path}-${index}`}>
-                      <strong>{shot.title || shot.kind || `截图 ${index + 1}`}</strong>
-                      <code>{shot.path}</code>
-                    </li>
-                  ))}
-                </ol>
-              </section>
-            ) : null}
-          </section>
-        </div>
+        <BrowserChatToolDialog
+          detail={toolDialog}
+          onClose={() => setToolDialog(null)}
+          toolLabel={(name) => browserChatToolLabel(name, t)}
+        />
       ) : null}
 
       {logDialogMessageId ? (
-        <div className="modal-overlay" onClick={() => setLogDialogMessageId(null)} role="presentation">
-          <section className="browser-chat-log-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="执行日志">
-            <header>
-              <div>
-                <h2>执行日志</h2>
-                <p>{logDialogMessage ? compactText(logDialogMessage.content, 80) : '当前 AI 消息'}</p>
-              </div>
-              <button className="icon-button" onClick={() => setLogDialogMessageId(null)} type="button" aria-label="关闭">
-                <X size={18} />
-              </button>
-            </header>
-            {logDialogEntries.length ? (
-              <BrowserChatVirtualLogList entries={logDialogEntries} />
-            ) : (
-              <p className="browser-chat-log-empty">暂无日志</p>
-            )}
-          </section>
-        </div>
+        <BrowserChatLogDialog
+          entries={logDialogEntries}
+          messageContent={logDialogMessage ? compactText(logDialogMessage.content, 80) : undefined}
+          onClose={() => setLogDialogMessageId(null)}
+        />
       ) : null}
 
       {imagePreview ? (

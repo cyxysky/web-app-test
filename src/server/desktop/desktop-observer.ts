@@ -1,8 +1,6 @@
-import { execFile } from 'node:child_process';
 import { Buffer } from 'node:buffer';
-import { promisify } from 'node:util';
-
-const execFileAsync = promisify(execFile);
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { createInterface, type Interface } from 'node:readline';
 
 export type DesktopProcessSnapshot = {
   pid: number;
@@ -54,13 +52,19 @@ export type DesktopWaitForChangeOptions = DesktopSnapshotOptions & {
 };
 
 type WindowsSnapshotPayload = {
-  processes?: unknown;
+  requestId?: unknown;
   foregroundWindow?: unknown;
   errors?: unknown;
 };
 
-const DEFAULT_COMMAND_TIMEOUT_MS = 8_000;
-const DEFAULT_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+type PendingWorkerRequest = {
+  reject: (error: Error) => void;
+  resolve: (payload: WindowsSnapshotPayload) => void;
+  timeout: NodeJS.Timeout;
+};
+
+const DEFAULT_COMMAND_TIMEOUT_MS = 1_500;
+const WORKER_EXIT_COMMAND = '__exit__';
 
 function encodePowerShellCommand(script: string) {
   return Buffer.from(script, 'utf16le').toString('base64');
@@ -95,32 +99,6 @@ function asNumber(value: unknown) {
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
-}
-
-function asBoolean(value: unknown) {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') return /^(true|1|yes)$/i.test(value.trim());
-  return false;
-}
-
-function normalizeProcess(value: unknown): DesktopProcessSnapshot | undefined {
-  const record = asRecord(value);
-  if (!record) return undefined;
-
-  const pid = asNumber(record.pid);
-  const name = asString(record.name);
-  if (pid === undefined || !name) return undefined;
-
-  return {
-    pid,
-    parentPid: asNumber(record.parentPid),
-    name,
-    executablePath: asString(record.executablePath),
-    commandLine: asString(record.commandLine),
-    startedAt: asString(record.startedAt),
-    mainWindowTitle: asString(record.mainWindowTitle),
-    hasMainWindow: asBoolean(record.hasMainWindow),
-  };
 }
 
 function normalizeForegroundWindow(value: unknown): DesktopForegroundWindowSnapshot | undefined {
@@ -165,56 +143,13 @@ function hasDiff(diff: DesktopSnapshotDiff) {
     || Boolean(diff.foregroundChanged);
 }
 
-function buildWindowsSnapshotScript(includeCommandLine: boolean) {
+function buildForegroundWindowWorkerScript() {
   return `
 $ErrorActionPreference = "SilentlyContinue"
 $ProgressPreference = "SilentlyContinue"
 $InformationPreference = "SilentlyContinue"
-$observerErrors = @()
-$includeCommandLine = ${includeCommandLine ? '$true' : '$false'}
+$script:desktopObserverInitErrors = @()
 
-$processById = @{}
-Get-Process | ForEach-Object {
-  $processById[[int]$_.Id] = $_
-}
-
-$processes = Get-CimInstance Win32_Process | ForEach-Object {
-  $pidValue = [int]$_.ProcessId
-  $process = $processById[$pidValue]
-  $parentPid = $null
-  if ($_.ParentProcessId -ne $null) {
-    $parentPid = [int]$_.ParentProcessId
-  }
-  $executablePath = ""
-  try { $executablePath = [string]$_.ExecutablePath } catch { $executablePath = "" }
-  $commandLine = $null
-  if ($includeCommandLine) {
-    try { $commandLine = [string]$_.CommandLine } catch { $commandLine = $null }
-  }
-  $startedAt = $null
-  if ($_.CreationDate) {
-    try { $startedAt = ([datetime]$_.CreationDate).ToUniversalTime().ToString("o") } catch { $startedAt = $null }
-  }
-  $mainWindowTitle = ""
-  $hasMainWindow = $false
-  if ($process) {
-    $mainWindowTitle = [string]$process.MainWindowTitle
-    $hasMainWindow = [bool]($process.MainWindowHandle -ne 0)
-  }
-
-  [pscustomobject]@{
-    pid = $pidValue
-    parentPid = $parentPid
-    name = [string]$_.Name
-    executablePath = $executablePath
-    commandLine = $commandLine
-    startedAt = $startedAt
-    mainWindowTitle = $mainWindowTitle
-    hasMainWindow = $hasMainWindow
-  }
-}
-
-$foregroundWindow = $null
 try {
   Add-Type @"
 using System;
@@ -232,30 +167,157 @@ public static class DesktopObserverNativeWindow {
   public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 }
 "@
-  $handle = [DesktopObserverNativeWindow]::GetForegroundWindow()
-  if ($handle -ne [IntPtr]::Zero) {
-    $titleBuilder = New-Object System.Text.StringBuilder 512
-    [void][DesktopObserverNativeWindow]::GetWindowText($handle, $titleBuilder, $titleBuilder.Capacity)
-    [uint32]$foregroundPid = 0
-    [void][DesktopObserverNativeWindow]::GetWindowThreadProcessId($handle, [ref]$foregroundPid)
-    $foregroundProcess = if ($foregroundPid -gt 0) { Get-Process -Id $foregroundPid -ErrorAction SilentlyContinue } else { $null }
-    $foregroundWindow = [pscustomobject]@{
-      pid = if ($foregroundPid -gt 0) { [int]$foregroundPid } else { $null }
-      processName = if ($foregroundProcess) { [string]$foregroundProcess.ProcessName } else { $null }
-      title = [string]$titleBuilder.ToString()
-    }
-  }
 } catch {
-  $observerErrors += $_.Exception.Message
+  $script:desktopObserverInitErrors += $_.Exception.Message
 }
 
-[pscustomobject]@{
-  processes = @($processes)
-  foregroundWindow = $foregroundWindow
-  errors = @($observerErrors)
-} | ConvertTo-Json -Depth 5 -Compress
+function Write-DesktopObserverResponse($response) {
+  try {
+    $json = $response | ConvertTo-Json -Depth 5 -Compress
+    [Console]::Out.WriteLine($json)
+    [Console]::Out.Flush()
+  } catch {
+    [Console]::Out.WriteLine('{"errors":["desktop observer response serialization failed"]}')
+    [Console]::Out.Flush()
+  }
+}
+
+while ($true) {
+  $requestId = [Console]::In.ReadLine()
+  if ($null -eq $requestId) { break }
+  if ($requestId -eq "${WORKER_EXIT_COMMAND}") { break }
+
+  $observerErrors = @($script:desktopObserverInitErrors)
+  $foregroundWindow = $null
+
+  try {
+    $handle = [DesktopObserverNativeWindow]::GetForegroundWindow()
+    if ($handle -ne [IntPtr]::Zero) {
+      $titleBuilder = New-Object System.Text.StringBuilder 512
+      [void][DesktopObserverNativeWindow]::GetWindowText($handle, $titleBuilder, $titleBuilder.Capacity)
+      [uint32]$foregroundPid = 0
+      [void][DesktopObserverNativeWindow]::GetWindowThreadProcessId($handle, [ref]$foregroundPid)
+      $foregroundProcess = if ($foregroundPid -gt 0) { Get-Process -Id $foregroundPid -ErrorAction SilentlyContinue } else { $null }
+      $foregroundWindow = [pscustomobject]@{
+        pid = if ($foregroundPid -gt 0) { [int]$foregroundPid } else { $null }
+        processName = if ($foregroundProcess) { [string]$foregroundProcess.ProcessName } else { $null }
+        title = [string]$titleBuilder.ToString()
+      }
+    }
+  } catch {
+    $observerErrors += $_.Exception.Message
+  }
+
+  Write-DesktopObserverResponse([pscustomobject]@{
+    requestId = $requestId
+    foregroundWindow = $foregroundWindow
+    errors = @($observerErrors)
+  })
+}
 `;
 }
+
+class ForegroundWindowPowerShellWorker {
+  private nextRequestId = 1;
+  private pending = new Map<string, PendingWorkerRequest>();
+  private process?: ChildProcessWithoutNullStreams;
+  private stdoutLines?: Interface;
+  private stderrTail = '';
+
+  async snapshot(timeoutMs: number): Promise<WindowsSnapshotPayload> {
+    const child = this.ensureStarted();
+    const requestId = String(this.nextRequestId++);
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(requestId);
+        this.restart();
+        reject(new Error(`Desktop foreground window observer timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pending.set(requestId, { resolve, reject, timeout });
+      child.stdin.write(`${requestId}\n`, (error) => {
+        if (!error) return;
+        clearTimeout(timeout);
+        this.pending.delete(requestId);
+        reject(error);
+      });
+    });
+  }
+
+  private ensureStarted() {
+    if (this.process && !this.process.killed && this.process.exitCode === null) return this.process;
+
+    this.stderrTail = '';
+    const child = spawn(
+      powershellPath(),
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-EncodedCommand',
+        encodePowerShellCommand(buildForegroundWindowWorkerScript()),
+      ],
+      {
+        windowsHide: true,
+        stdio: 'pipe',
+      },
+    );
+    this.process = child;
+    this.stdoutLines = createInterface({ input: child.stdout });
+    this.stdoutLines.on('line', (line) => this.handleLine(line));
+    child.stderr.on('data', (chunk: Buffer) => {
+      this.stderrTail = `${this.stderrTail}${chunk.toString('utf8')}`.slice(-4000);
+    });
+    child.once('error', (error) => this.failAll(error instanceof Error ? error : new Error(String(error))));
+    child.once('exit', (code, signal) => {
+      const suffix = this.stderrTail.trim() ? `: ${this.stderrTail.trim()}` : '';
+      this.failAll(new Error(`Desktop foreground window observer exited (${signal || (code ?? 'unknown')})${suffix}`));
+      this.process = undefined;
+      this.stdoutLines?.close();
+      this.stdoutLines = undefined;
+    });
+    return child;
+  }
+
+  private handleLine(line: string) {
+    let payload: WindowsSnapshotPayload;
+    try {
+      payload = JSON.parse(line) as WindowsSnapshotPayload;
+    } catch {
+      return;
+    }
+    const requestId = asString(payload.requestId);
+    if (!requestId) return;
+    const pending = this.pending.get(requestId);
+    if (!pending) return;
+    this.pending.delete(requestId);
+    clearTimeout(pending.timeout);
+    pending.resolve(payload);
+  }
+
+  private failAll(error: Error) {
+    for (const [requestId, pending] of this.pending) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+      this.pending.delete(requestId);
+    }
+  }
+
+  private restart() {
+    const child = this.process;
+    this.process = undefined;
+    this.stdoutLines?.close();
+    this.stdoutLines = undefined;
+    try {
+      child?.stdin.write(`${WORKER_EXIT_COMMAND}\n`);
+      child?.kill();
+    } catch {
+      // Ignore worker cleanup failures; the next request will start a fresh worker.
+    }
+  }
+}
+
+const foregroundWindowWorker = new ForegroundWindowPowerShellWorker();
 
 export class DesktopObserver {
   async snapshot(options: DesktopSnapshotOptions = {}): Promise<DesktopSnapshot> {
@@ -269,64 +331,25 @@ export class DesktopObserver {
       };
     }
 
-    const script = buildWindowsSnapshotScript(Boolean(options.includeCommandLine));
-    const { stdout, stderr } = await execFileAsync(
-      powershellPath(),
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-EncodedCommand',
-        encodePowerShellCommand(script),
-      ],
-      {
-        timeout: options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
-        maxBuffer: options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES,
-        windowsHide: true,
-      },
-    );
-
-    const payload = JSON.parse(stdout) as WindowsSnapshotPayload;
-    const processes = asArray(payload.processes)
-      .map((item) => normalizeProcess(item))
-      .filter((item): item is DesktopProcessSnapshot => Boolean(item));
-    const errors = [
-      ...(normalizeErrors(payload.errors) || []),
-      ...(stderr.trim() ? [stderr.trim()] : []),
-    ];
-
+    const payload = await foregroundWindowWorker.snapshot(options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
+    const errors = normalizeErrors(payload.errors);
     return {
       capturedAt: new Date().toISOString(),
       platform: process.platform,
       supported: true,
-      processes,
+      processes: [],
       foregroundWindow: normalizeForegroundWindow(payload.foregroundWindow),
-      errors: errors.length ? errors : undefined,
+      errors: errors?.length ? errors : undefined,
     };
   }
 
   diffSnapshots(before: DesktopSnapshot, after: DesktopSnapshot): DesktopSnapshotDiff {
-    const beforeByPid = new Map(before.processes.map((item) => [item.pid, item]));
-    const afterByPid = new Map(after.processes.map((item) => [item.pid, item]));
-
-    const added = after.processes.filter((item) => !beforeByPid.has(item.pid));
-    const removed = before.processes.filter((item) => !afterByPid.has(item.pid));
-    const changedWindows = after.processes.filter((item) => {
-      const previous = beforeByPid.get(item.pid);
-      return previous
-        && (
-          previous.hasMainWindow !== item.hasMainWindow
-          || previous.mainWindowTitle !== item.mainWindowTitle
-        );
-    });
-
     return {
       beforeCapturedAt: before.capturedAt,
       afterCapturedAt: after.capturedAt,
-      added,
-      removed,
-      changedWindows,
+      added: [],
+      removed: [],
+      changedWindows: [],
       foregroundChanged: sameForegroundWindow(before.foregroundWindow, after.foregroundWindow)
         ? undefined
         : {
@@ -342,6 +365,12 @@ export class DesktopObserver {
   ): Promise<{ snapshot: DesktopSnapshot; diff: DesktopSnapshotDiff; changed: boolean }> {
     const timeoutMs = Math.max(0, options.timeoutMs ?? 5_000);
     const intervalMs = Math.max(100, options.intervalMs ?? 400);
+    if (timeoutMs <= 0) {
+      const snapshot = await this.snapshot(options);
+      const diff = this.diffSnapshots(before, snapshot);
+      return { snapshot, diff, changed: hasDiff(diff) };
+    }
+
     const startedAt = Date.now();
 
     while (Date.now() - startedAt <= timeoutMs) {

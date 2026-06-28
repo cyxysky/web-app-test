@@ -9,6 +9,7 @@ import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { ModelProvider, SkillRecord, TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import { readApiJson } from '@/lib/api-client';
 
 export type TestCaseEditorActionState = {
   generatingFrame: boolean;
@@ -107,8 +108,7 @@ export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('保存失败'));
+      const data = await readApiJson<any>(response, t('保存失败'));
       onSaved?.(data as TestCaseRecord);
       router.refresh();
     } catch (err) {
@@ -140,8 +140,7 @@ export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
           targetUrl: draft.targetUrl,
         }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('生成内容框架失败'));
+      const data = await readApiJson<any>(response, t('生成内容框架失败'));
       setFrameText(JSON.stringify(data.taskFrame, null, 2));
       update({ taskFrame: data.taskFrame });
     } catch (err) {

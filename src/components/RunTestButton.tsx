@@ -5,6 +5,7 @@ import { Loader2, Play } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { ModelProvider } from '@/server/ai/schemas/test-case.schema';
+import { readApiJson } from '@/lib/api-client';
 
 export function RunTestButton({
   iconOnly = false,
@@ -35,8 +36,8 @@ export function RunTestButton({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(modelPayload),
       });
-      const data = await response.json();
-      if (!response.ok || !data.runId) throw new Error(data.error || '启动失败');
+      const data = await readApiJson<any>(response, '启动失败');
+      if (!data.runId) throw new Error('启动失败');
       if (onStarted) {
         stopGlobalLoading();
         setStarting(false);
