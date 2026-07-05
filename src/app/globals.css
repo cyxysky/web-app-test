@@ -6158,6 +6158,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   justify-content: space-between;
 }
 
+.browser-chat-brand .ui-icon-button{
+  width: 40px;
+}
+
 .browser-chat-layout.sidebar-collapsed .browser-chat-brand {
   justify-content: center;
 }
@@ -6201,7 +6205,6 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     color 0.16s ease,
     justify-content 0.22s ease,
     padding 0.22s ease;
-  width: 40px;
 }
 
 .browser-chat-nav-item span,

@@ -3445,7 +3445,7 @@ export class BrowserSession {
       timedBrowserStep(timings, 'getViewportMetricsMs', () => this.getViewportMetrics()),
       timedBrowserStep(timings, 'getFocusedElementMs', () => this.getFocusedElement()),
       options.includeDomTree
-        ? timedBrowserStep(timings, 'readRawDomTreeMs', () => this.readRawDomTree().catch((error) => `Unable to read raw DOM: ${error instanceof Error ? error.message : String(error)}`))
+        ? timedBrowserStep(timings, 'readSimplifiedDomTreeMs', () => this.readSimplifiedDomTree({ scope: options.domScope || 'visible', timings }).catch((error) => `Unable to read DOM tree: ${error instanceof Error ? error.message : String(error)}`))
         : Promise.resolve(undefined),
       domObservationPromise || !includeInteractiveCandidates
         ? Promise.resolve([] as InteractiveCandidate[])
@@ -5443,7 +5443,7 @@ export class BrowserSession {
       .catch(() => undefined);
   }
 
-  private async readSimplifiedDomTree(options: { scope?: 'visible' | 'full' } = {}) {
+  private async readSimplifiedDomTree(options: { scope?: 'visible' | 'full'; timings?: Record<string, number> } = {}) {
     const fullScope = options.scope === 'full';
     const maxElements = fullScope
       ? numericLimitFromEnv('DOM_CUA_FULL_MAX_ELEMENTS', numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 600))
@@ -5451,10 +5451,13 @@ export class BrowserSession {
     const maxChars = fullScope
       ? numericLimitFromEnv('DOM_CUA_FULL_MAX_CHARS', numericLimitFromEnv('DOM_CUA_MAX_CHARS', 60000))
       : numericLimitFromEnv('DOM_CUA_MAX_CHARS', 20000);
+    const addTiming = (name: string, startedAt: number) => {
+      if (options.timings) options.timings[name] = (options.timings[name] || 0) + Date.now() - startedAt;
+    };
     this.lastDomNodeReferences = new Map();
     const mainSnapshot = fullScope
-      ? await this.readFullDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars)
-      : await this.readVisibleDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars);
+      ? await timedBrowserStep(options.timings, 'readMainFullDomSnapshotMs', () => this.readFullDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars))
+      : await timedBrowserStep(options.timings, 'readMainVisibleDomSnapshotMs', () => this.readVisibleDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars));
     if (!mainSnapshot) return 'DOM runtime is not available on this page. Retry after the page settles.';
     this.resetDomVisibleIdState(mainSnapshot.stateKey);
 
@@ -5490,16 +5493,22 @@ export class BrowserSession {
       }
     };
 
+    const appendMainStartedAt = Date.now();
     appendSnapshot(mainSnapshot);
+    addTiming('appendMainDomSnapshotMs', appendMainStartedAt);
     const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER);
     const frameSnapshots = fullScope
-      ? await this.readFullFrameDomSnapshots(maxElements, maxChars, frameLimit)
-      : await this.readVisibleFrameDomSnapshots(mainSnapshot.viewport, maxElements, maxChars, frameLimit);
+      ? await timedBrowserStep(options.timings, 'readFullFrameDomSnapshotsMs', () => this.readFullFrameDomSnapshots(maxElements, maxChars, frameLimit, options.timings))
+      : await timedBrowserStep(options.timings, 'readVisibleFrameDomSnapshotsMs', () => this.readVisibleFrameDomSnapshots(mainSnapshot.viewport, maxElements, maxChars, frameLimit, options.timings));
+    const appendFramesStartedAt = Date.now();
     for (const frameSnapshot of frameSnapshots) {
       appendSnapshot(frameSnapshot.snapshot, frameSnapshot.framePath, frameSnapshot.frameUrl, frameSnapshot.viewportClip);
     }
+    addTiming('appendFrameDomSnapshotsMs', appendFramesStartedAt);
 
+    const referenceMapStartedAt = Date.now();
     this.lastDomNodeReferences = new Map(references.map((reference) => [reference.id, reference]));
+    addTiming('buildDomNodeReferenceMapMs', referenceMapStartedAt);
     return lines.join('\n') || (fullScope ? '[empty full DOM snapshot]' : '[empty visible DOM snapshot]');
   }
 
@@ -5647,6 +5656,7 @@ export class BrowserSession {
     maxElements: number,
     maxChars: number,
     frameLimit: number,
+    timings?: Record<string, number>,
   ): Promise<Array<{
     framePath: string;
     frameUrl?: string;
@@ -5664,7 +5674,7 @@ export class BrowserSession {
     for (const frame of frames.slice(0, frameLimit)) {
       const framePath = this.getFramePath(frame);
       if (framePath === undefined) continue;
-      const snapshot = await this.readFullDomSnapshot(frame, maxElements, maxChars);
+      const snapshot = await timedBrowserStep(timings, 'readFrameFullDomSnapshotMs', () => this.readFullDomSnapshot(frame, maxElements, maxChars));
       if (!snapshot) continue;
       output.push({
         framePath,
@@ -5680,6 +5690,7 @@ export class BrowserSession {
     maxElements: number,
     maxChars: number,
     frameLimit: number,
+    timings?: Record<string, number>,
   ): Promise<Array<{
     framePath: string;
     frameUrl?: string;
@@ -5697,7 +5708,7 @@ export class BrowserSession {
     for (const frame of frames.slice(0, frameLimit)) {
       const framePath = this.getFramePath(frame);
       if (framePath === undefined) continue;
-      const box = await frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined);
+      const box = await timedBrowserStep(timings, 'getVisibleFrameBoxMs', () => frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined));
       if (!box || box.width <= 0 || box.height <= 0) continue;
       const frameRect = {
         bottom: box.y + box.height,
@@ -5713,7 +5724,7 @@ export class BrowserSession {
         right: visibleFrameRect.right - box.x,
         top: visibleFrameRect.top - box.y,
       };
-      const snapshot = await this.readVisibleDomSnapshot(frame, maxElements, maxChars, viewportClip);
+      const snapshot = await timedBrowserStep(timings, 'readFrameVisibleDomSnapshotMs', () => this.readVisibleDomSnapshot(frame, maxElements, maxChars, viewportClip));
       if (!snapshot) continue;
       output.push({
         framePath,
