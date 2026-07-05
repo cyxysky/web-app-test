@@ -5455,6 +5455,10 @@ export class BrowserSession {
       if (options.timings) options.timings[name] = (options.timings[name] || 0) + Date.now() - startedAt;
     };
     this.lastDomNodeReferences = new Map();
+    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER);
+    const fullFrameSnapshotsPromise = fullScope
+      ? timedBrowserStep(options.timings, 'readFullFrameDomSnapshotsMs', () => this.readFullFrameDomSnapshots(maxElements, maxChars, frameLimit, options.timings))
+      : undefined;
     const mainSnapshot = fullScope
       ? await timedBrowserStep(options.timings, 'readMainFullDomSnapshotMs', () => this.readFullDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars))
       : await timedBrowserStep(options.timings, 'readMainVisibleDomSnapshotMs', () => this.readVisibleDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars));
@@ -5496,9 +5500,8 @@ export class BrowserSession {
     const appendMainStartedAt = Date.now();
     appendSnapshot(mainSnapshot);
     addTiming('appendMainDomSnapshotMs', appendMainStartedAt);
-    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER);
     const frameSnapshots = fullScope
-      ? await timedBrowserStep(options.timings, 'readFullFrameDomSnapshotsMs', () => this.readFullFrameDomSnapshots(maxElements, maxChars, frameLimit, options.timings))
+      ? await fullFrameSnapshotsPromise || []
       : await timedBrowserStep(options.timings, 'readVisibleFrameDomSnapshotsMs', () => this.readVisibleFrameDomSnapshots(mainSnapshot.viewport, maxElements, maxChars, frameLimit, options.timings));
     const appendFramesStartedAt = Date.now();
     for (const frameSnapshot of frameSnapshots) {
@@ -5664,25 +5667,25 @@ export class BrowserSession {
     viewportClip?: BrowserUseViewportClip;
   }>> {
     const frames = this.activePage.frames().filter((frame) => frame !== this.activePage.mainFrame());
-    const output: Array<{
+    type FullFrameSnapshot = {
       framePath: string;
       frameUrl?: string;
       snapshot: BrowserUseVisibleDomSnapshot;
       viewportClip?: BrowserUseViewportClip;
-    }> = [];
+    };
 
-    for (const frame of frames.slice(0, frameLimit)) {
+    const snapshots = await Promise.all(frames.slice(0, frameLimit).map(async (frame): Promise<FullFrameSnapshot | undefined> => {
       const framePath = this.getFramePath(frame);
-      if (framePath === undefined) continue;
+      if (framePath === undefined) return undefined;
       const snapshot = await timedBrowserStep(timings, 'readFrameFullDomSnapshotMs', () => this.readFullDomSnapshot(frame, maxElements, maxChars));
-      if (!snapshot) continue;
-      output.push({
+      if (!snapshot) return undefined;
+      return {
         framePath,
         frameUrl: frame.url() || undefined,
         snapshot,
-      });
-    }
-    return output;
+      };
+    }));
+    return snapshots.filter((snapshot): snapshot is FullFrameSnapshot => Boolean(snapshot));
   }
 
   private async readVisibleFrameDomSnapshots(
@@ -5698,18 +5701,18 @@ export class BrowserSession {
     viewportClip: BrowserUseViewportClip;
   }>> {
     const frames = this.activePage.frames().filter((frame) => frame !== this.activePage.mainFrame());
-    const output: Array<{
+    type VisibleFrameSnapshot = {
       framePath: string;
       frameUrl?: string;
       snapshot: BrowserUseVisibleDomSnapshot;
       viewportClip: BrowserUseViewportClip;
-    }> = [];
+    };
 
-    for (const frame of frames.slice(0, frameLimit)) {
+    const snapshots = await Promise.all(frames.slice(0, frameLimit).map(async (frame): Promise<VisibleFrameSnapshot | undefined> => {
       const framePath = this.getFramePath(frame);
-      if (framePath === undefined) continue;
+      if (framePath === undefined) return undefined;
       const box = await timedBrowserStep(timings, 'getVisibleFrameBoxMs', () => frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined));
-      if (!box || box.width <= 0 || box.height <= 0) continue;
+      if (!box || box.width <= 0 || box.height <= 0) return undefined;
       const frameRect = {
         bottom: box.y + box.height,
         left: box.x,
@@ -5717,7 +5720,7 @@ export class BrowserSession {
         top: box.y,
       };
       const visibleFrameRect = this.intersectViewportClip(topViewport, frameRect);
-      if (!visibleFrameRect) continue;
+      if (!visibleFrameRect) return undefined;
       const viewportClip = {
         bottom: visibleFrameRect.bottom - box.y,
         left: visibleFrameRect.left - box.x,
@@ -5725,15 +5728,15 @@ export class BrowserSession {
         top: visibleFrameRect.top - box.y,
       };
       const snapshot = await timedBrowserStep(timings, 'readFrameVisibleDomSnapshotMs', () => this.readVisibleDomSnapshot(frame, maxElements, maxChars, viewportClip));
-      if (!snapshot) continue;
-      output.push({
+      if (!snapshot) return undefined;
+      return {
         framePath,
         frameUrl: frame.url() || undefined,
         snapshot,
         viewportClip,
-      });
-    }
-    return output;
+      };
+    }));
+    return snapshots.filter((snapshot): snapshot is VisibleFrameSnapshot => Boolean(snapshot));
   }
 
   private async resolveDomReferenceToClickablePoint(reference: DomNodeReference) {
