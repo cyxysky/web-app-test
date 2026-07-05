@@ -29,10 +29,21 @@
   --shadow-soft: 0 16px 48px rgba(13, 13, 13, 0.08);
   --shadow-tight: 0 8px 22px rgba(13, 13, 13, 0.08);
   --control-radius: 8px;
+  --control-height: 40px;
+  --control-compact-height: 36px;
   --control-icon-size: 36px;
   --control-icon-compact-size: 34px;
   --control-hover-bg: color-mix(in srgb, var(--foreground) 7%, transparent);
   --control-danger-hover-bg: color-mix(in srgb, var(--danger) 10%, transparent);
+  --modal-radius: 8px;
+  --modal-overlay-bg: rgba(13, 13, 13, 0.42);
+  --modal-shadow: 0 28px 90px rgba(13, 13, 13, 0.26);
+  --button-neutral-bg: var(--panel);
+  --button-neutral-hover-bg: var(--panel-warm);
+  --button-neutral-border: var(--border);
+  --button-primary-bg: var(--accent);
+  --button-primary-hover-bg: var(--accent-hover);
+  --button-danger-bg: var(--danger);
 }
 
 :root[data-theme="dark"] {
@@ -56,5 +67,10 @@
   --inverse-foreground: #0f1115;
   --shadow-soft: 0 18px 56px rgba(0, 0, 0, 0.38);
   --shadow-tight: 0 10px 28px rgba(0, 0, 0, 0.34);
+  --modal-overlay-bg: rgba(0, 0, 0, 0.62);
+  --modal-shadow: 0 28px 90px rgba(0, 0, 0, 0.5);
+  --button-neutral-bg: var(--panel-soft);
+  --button-neutral-hover-bg: var(--panel-warm);
+  --button-neutral-border: var(--border);
   color-scheme: dark;
 }

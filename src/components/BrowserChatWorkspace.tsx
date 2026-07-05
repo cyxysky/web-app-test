@@ -167,6 +167,27 @@ type BrowserChatMode = 'dom' | 'visual-markers';
 type BrowserChatSafetyMode = 'strict' | 'full';
 type BrowserChatModelConfig = RuntimeModelConfig;
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
+
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'webpilotqa.sidebarCollapsed';
+
+function readStoredSidebarCollapsed() {
+  if (typeof window === 'undefined') return false;
+  return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true';
+}
+
+function writeStoredSidebarCollapsed(collapsed: boolean) {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, collapsed ? 'true' : 'false');
+}
+
+function hasRunningAssistantMessage(session?: Pick<BrowserChatSession, 'messages'> | null) {
+  return Boolean(session?.messages?.some((message) => message.role === 'assistant' && message.status === 'running'));
+}
+
+function isBrowserChatSessionRunning(session?: BrowserChatSession | null) {
+  return Boolean(session && (session.busy || session.status === 'running' || hasRunningAssistantMessage(session)));
+}
+
 type BrowserChatToolDetail = {
   stepIndex: number;
   step: StepExecutionResult;
@@ -2904,6 +2925,7 @@ export function BrowserChatWorkspace({
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
   const [composerResetToken, setComposerResetToken] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [pendingMessageSessionId, setPendingMessageSessionId] = useState<string | null>(null);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [embeddedBrowserEnabled, setEmbeddedBrowserEnabled] = useState(false);
@@ -2926,10 +2948,12 @@ export function BrowserChatWorkspace({
   const [resolvingConfirmationAction, setResolvingConfirmationAction] = useState<BrowserChatToolConfirmationAction | null>(null);
   const [imagePreview, setImagePreview] = useState<BrowserChatAttachment | null>(null);
   const [error, setError] = useState('');
-  const selectedRunningSession = session?.busy ? session : undefined;
-  const selectedSessionBusy = Boolean(session?.busy);
-  const currentBusy = busy || selectedSessionBusy;
-  const modeLocked = Boolean(session && session.status !== 'closed' && (session.messages.length || session.steps.length || session.busy));
+  const selectedSessionRunning = isBrowserChatSessionRunning(session);
+  const selectedRunningSession = selectedSessionRunning ? session : undefined;
+  const currentBusy = busy || selectedSessionRunning;
+  const interruptSessionId = selectedRunningSession?.id || (busy ? pendingMessageSessionId || session?.id : undefined);
+  const canInterruptConversation = Boolean(interruptSessionId && (busy || selectedSessionRunning));
+  const modeLocked = Boolean(session && session.status !== 'closed' && (session.messages.length || session.steps.length || selectedSessionRunning));
   const messages = useMemo(() => session?.messages || [], [session?.messages]);
   const steps = useMemo(() => session?.steps || [], [session?.steps]);
   const logs = useMemo(() => session?.logs || [], [session?.logs]);
@@ -2939,6 +2963,18 @@ export function BrowserChatWorkspace({
     [visibleMessages],
   );
   const hasMessages = visibleMessages.length > 0;
+  const toggleSidebarCollapsed = useCallback(() => {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      writeStoredSidebarCollapsed(next);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    setSidebarCollapsed(readStoredSidebarCollapsed());
+  }, []);
+
   const stepsByIndex = useMemo(() => new Map(steps.map((step) => [step.index, step])), [steps]);
   const selectedExportMessageIdSet = useMemo(() => new Set(selectedExportMessageIds), [selectedExportMessageIds]);
   const logIndex = useMemo(() => buildBrowserChatLogIndex(logs), [logs]);
@@ -3196,13 +3232,13 @@ export function BrowserChatWorkspace({
   }, []);
 
   useEffect(() => {
-    if (!session?.id || !session.busy || realtimeConnected) return undefined;
+    if (!session?.id || !selectedSessionRunning || realtimeConnected) return undefined;
     const sessionId = session.id;
     const timer = window.setInterval(() => {
       void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch(() => undefined);
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [realtimeConnected, refreshSession, session?.busy, session?.id]);
+  }, [realtimeConnected, refreshSession, selectedSessionRunning, session?.id]);
 
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
@@ -3343,6 +3379,7 @@ export function BrowserChatWorkspace({
     setActiveView('chat');
     try {
       let active = await ensureSession();
+      setPendingMessageSessionId(active.id);
       await ensureEmbeddedBrowserSessionTab(active.id);
       let posted: BrowserChatSession;
       try {
@@ -3351,6 +3388,7 @@ export function BrowserChatWorkspace({
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
         active = await createSession();
+        setPendingMessageSessionId(active.id);
         await ensureEmbeddedBrowserSessionTab(active.id);
         posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments, skillIds);
       }
@@ -3364,19 +3402,20 @@ export function BrowserChatWorkspace({
       return false;
     } finally {
       sendingRef.current = false;
+      setPendingMessageSessionId(null);
       setBusy(false);
     }
   }
 
   async function interruptConversation() {
-    const target = selectedRunningSession;
-    if (!target?.id || interrupting || !target.busy) return;
+    const targetId = interruptSessionId;
+    if (!targetId || interrupting) return;
     setInterrupting(true);
     setError('');
     try {
-      const response = await fetch(`/api/browser-chat/${target.id}/interrupt`, { method: 'POST' });
+      const response = await fetch(`/api/browser-chat/${targetId}/interrupt`, { method: 'POST' });
       const data = await readApiJson<any>(response, '中断对话失败');
-      upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === target.id });
+      upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === targetId });
     } catch (interruptError) {
       setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
     } finally {
@@ -3768,7 +3807,7 @@ export function BrowserChatWorkspace({
         </div>
       ) : null}
       {session ? (
-        <button className="browser-chat-close" disabled={session.status === 'closed' || busy} onClick={closeSession} title="结束会话" type="button">
+        <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title="结束会话" type="button">
           <Power size={17} />
         </button>
       ) : null}
@@ -3799,7 +3838,7 @@ export function BrowserChatWorkspace({
           selectedExportMessageIdSet={selectedExportMessageIdSet}
           selectedExportMessageIds={selectedExportMessageIds}
           sessionId={session?.id}
-          sessionBusy={Boolean(session?.busy)}
+          sessionBusy={selectedSessionRunning}
           stepsByIndex={stepsByIndex}
           totalStepCount={steps.length}
         />
@@ -3834,7 +3873,7 @@ export function BrowserChatWorkspace({
           onSafetyModeChange={setSafetyMode}
           onUploadImages={uploadChatImages}
           resetToken={composerResetToken}
-          showStop={Boolean(selectedRunningSession)}
+          showStop={canInterruptConversation}
           uploadingImage={uploadingImage}
         />
       </div>
@@ -3847,8 +3886,8 @@ export function BrowserChatWorkspace({
         <div className="browser-chat-brand">
           <strong>WebPilot QA</strong>
           <button
-            className="icon-button"
-            onClick={() => setSidebarCollapsed((current) => !current)}
+            className="ui-icon-button"
+            onClick={toggleSidebarCollapsed}
             type="button"
             aria-label={sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'}
           >
@@ -3983,7 +4022,7 @@ export function BrowserChatWorkspace({
               </div>
             ) : null}
             {session ? (
-              <button className="browser-chat-close" disabled={session.status === 'closed' || busy} onClick={closeSession} title="结束会话" type="button">
+              <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title="结束会话" type="button">
                 <Power size={17} />
               </button>
             ) : null}
@@ -4014,7 +4053,7 @@ export function BrowserChatWorkspace({
                 selectedExportMessageIdSet={selectedExportMessageIdSet}
                 selectedExportMessageIds={selectedExportMessageIds}
                 sessionId={session?.id}
-                sessionBusy={Boolean(session?.busy)}
+                sessionBusy={selectedSessionRunning}
                 stepsByIndex={stepsByIndex}
                 totalStepCount={steps.length}
               />
@@ -4049,7 +4088,7 @@ export function BrowserChatWorkspace({
                 onSafetyModeChange={setSafetyMode}
                 onUploadImages={uploadChatImages}
                 resetToken={composerResetToken}
-                showStop={Boolean(selectedRunningSession)}
+                showStop={canInterruptConversation}
                 uploadingImage={uploadingImage}
               />
             </div>
@@ -4077,7 +4116,7 @@ export function BrowserChatWorkspace({
         <div className="fullscreen-image-viewer" onClick={() => setImagePreview(null)} role="presentation">
           <div className="image-viewer-toolbar" onClick={(event) => event.stopPropagation()}>
             <strong>{imagePreview.name}</strong>
-            <button className="icon-button" onClick={() => setImagePreview(null)} type="button" aria-label="关闭">
+            <button className="ui-icon-button" onClick={() => setImagePreview(null)} type="button" aria-label="关闭">
               <X size={18} />
             </button>
           </div>
@@ -4088,25 +4127,29 @@ export function BrowserChatWorkspace({
       ) : null}
 
       {groupDialogOpen ? (
-        <div className="modal-overlay" onClick={() => setGroupDialogOpen(false)} role="presentation">
-          <section className="group-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="创建分组">
-            <header>
-              <div>
-                <h2>{targetGroupId ? '创建子组' : '创建组'}</h2>
-                <p>{targetGroupId ? `父级：${groupPath(groups, targetGroupId)}` : '创建根分组'}</p>
+        <div className="ui-modal-overlay" onClick={() => setGroupDialogOpen(false)} role="presentation">
+          <section className="ui-modal ui-modal--compact" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="创建分组">
+            <header className="ui-modal-header">
+              <div className="ui-modal-heading">
+                <h2 className="ui-modal-title">{targetGroupId ? '创建子组' : '创建组'}</h2>
+                <p className="ui-modal-subtitle">{targetGroupId ? `父级：${groupPath(groups, targetGroupId)}` : '创建根分组'}</p>
               </div>
-              <button className="icon-button" onClick={() => setGroupDialogOpen(false)} type="button" aria-label="关闭">
+              <button className="ui-icon-button ui-modal-close" onClick={() => setGroupDialogOpen(false)} type="button" aria-label="关闭">
                 <X size={18} />
               </button>
             </header>
-            <label className="modal-field">
-              分组名称
-              <input autoFocus className="input" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
-            </label>
-            <button className="button full-width" disabled={creatingGroup} onClick={() => createGroup(targetGroupId)} type="button">
-              {creatingGroup ? <Loader2 className="spin" size={16} /> : null}
-              {creatingGroup ? '创建中' : '创建'}
-            </button>
+            <div className="ui-modal-body">
+              <label className="modal-field">
+                分组名称
+                <input autoFocus className="input" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
+              </label>
+            </div>
+            <footer className="ui-modal-footer">
+              <button className="ui-button ui-button--primary" disabled={creatingGroup} onClick={() => createGroup(targetGroupId)} type="button">
+                {creatingGroup ? <Loader2 className="spin" size={16} /> : null}
+                {creatingGroup ? '创建中' : '创建'}
+              </button>
+            </footer>
           </section>
         </div>
       ) : null}

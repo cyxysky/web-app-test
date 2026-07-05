@@ -7,7 +7,6 @@ import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, De
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
-import { appendDesktopEvidenceToResult, captureDesktopBeforeTool, collectDesktopEvidenceAfterTool } from '@/server/desktop/desktop-action-evidence';
 import { normalizeDomNodeIdParam } from '@/lib/dom-path';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
@@ -1097,6 +1096,14 @@ function hostOf(url: string) {
   }
 }
 
+function candidateExternalAppState(candidate: Record<string, unknown>) {
+  if (candidate.opensExternalApp !== true) return '';
+  const protocol = typeof candidate.externalAppProtocol === 'string' && candidate.externalAppProtocol.trim()
+    ? candidate.externalAppProtocol.trim()
+    : 'custom-protocol';
+  return `external-app=${protocol}`;
+}
+
 function formatVisualInteractiveElements(candidates: unknown) {
   if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive elements detected]';
   return candidates.map((item, index) => {
@@ -1116,11 +1123,34 @@ function formatVisualInteractiveElements(candidates: unknown) {
     const state = [
       candidate.input ? 'input' : '',
       candidate.disabled ? 'disabled' : '',
+      candidateExternalAppState(candidate),
       candidate.href ? `href=${candidate.href}` : '',
       candidate.framePath ? `frame=${candidate.framePath}` : '',
     ].filter(Boolean).join(', ');
     return `${index + 1}. id=${candidate.id} ${role || 'element'} "${String(label).slice(0, 120)}"${state ? ` (${state})` : ''}${rect}`;
   }).join('\n');
+}
+
+function formatExternalAppInteractiveElements(candidates: unknown) {
+  if (!Array.isArray(candidates) || !candidates.length) return '';
+  const lines = candidates
+    .map((item) => item as Record<string, unknown>)
+    .filter((candidate) => candidate.opensExternalApp === true)
+    .map((candidate) => {
+      const label = [
+        candidate.name,
+        candidate.text,
+        candidate.ariaLabel,
+        candidate.placeholder,
+        candidate.title,
+        candidate.nearbyText,
+      ]
+        .map((value) => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : ''))
+        .find(Boolean) || '[unlabeled]';
+      const href = typeof candidate.href === 'string' && candidate.href ? ` href=${candidate.href}` : '';
+      return `- id=${candidate.id} ${candidateExternalAppState(candidate)} "${String(label).slice(0, 120)}"${href}`;
+    });
+  return lines.join('\n');
 }
 
 function formatDomInteractiveElements(candidates: unknown) {
@@ -1154,6 +1184,7 @@ function formatDomInteractiveElements(candidates: unknown) {
       candidate.input ? 'input' : '',
       candidate.disabled ? 'disabled' : '',
       signals ? `signals=${signals}` : '',
+      candidateExternalAppState(candidate),
       candidate.href ? `href=${candidate.href}` : '',
       candidate.framePath ? `frame=${candidate.framePath}` : '',
       candidate.shadow ? 'shadow' : '',
@@ -1651,10 +1682,6 @@ async function executeTracedBrowserAction(input: {
   await notifyRuntimeToolTrace(onToolTrace, trace);
   postprocessTimings.notifyStartMs = elapsedSince(postprocessStartedAt);
   throwIfStopped(abortSignal, shouldContinue);
-  postprocessStartedAt = Date.now();
-  const desktopBefore = await captureDesktopBeforeTool(name);
-  postprocessTimings.desktopBeforeMs = elapsedSince(postprocessStartedAt);
-  throwIfStopped(abortSignal, shouldContinue);
 
   let result: BrowserActionResult;
   const actionStartedAt = Date.now();
@@ -1670,13 +1697,6 @@ async function executeTracedBrowserAction(input: {
   }
   trace.actionElapsedMs = elapsedSince(actionStartedAt);
 
-  postprocessStartedAt = Date.now();
-  const desktopEvidence = await collectDesktopEvidenceAfterTool(name, desktopBefore);
-  postprocessTimings.desktopAfterMs = elapsedSince(postprocessStartedAt);
-  if (desktopEvidence) {
-    trace.desktopEvidence = desktopEvidence;
-    result = appendDesktopEvidenceToResult(result, desktopEvidence);
-  }
   throwIfStopped(abortSignal, shouldContinue);
   trace.result = result;
   postprocessStartedAt = Date.now();
@@ -1983,7 +2003,7 @@ function makeBrowserTools(
       execute: (input) => record('findByText', input, () => session.findByText(input.targetText, normalizeDomNodeIdParam({ id: input.scopeId }))),
     }),
     clickLocator: tool({
-      description: 'DOM mode recovery click: click one locatorId returned by the immediately preceding findByText result. Do not invent locatorIds and do not use visual candidate ids.',
+      description: 'DOM mode recovery click: click one locatorId returned by the immediately preceding findByText result. Do not invent locatorIds and do not use visual candidate ids. If the locator/candidate is marked external-app=<protocol>, the click may open a native/system application and leave the browser page unchanged; ok=true means the click was delivered, not that the native launch is server-verifiable.',
       inputSchema: browserToolInput({
         locatorId: z.string().min(1).max(20).describe('A locatorId such as T1 from the latest findByText result.'),
         text: z.string().optional().describe('Optional text to type immediately after clicking/focusing this locator.'),
@@ -1997,7 +2017,7 @@ function makeBrowserTools(
     : 'latest DOM interactive elements list from getPageState/getInteractiveCandidates';
   const visualTools = {
     clickCandidate: tool({
-      description: `Click a visible candidate by its numbered id from the ${candidateSource}. Choose the smallest/tightest candidate that directly represents the intended visible text, icon, or control; avoid larger containing wrapper boxes. A successful tool result only confirms the click was delivered, not that the UI changed. The same visible target may be attempted at most twice because the first click can dismiss an overlay while the second activates the target. If text is provided, type it immediately after the click.`,
+      description: `Click a visible candidate by its numbered id from the ${candidateSource}. Choose the smallest/tightest candidate that directly represents the intended visible text, icon, or control; avoid larger containing wrapper boxes. A successful tool result only confirms the click was delivered, not that the UI changed. If the current candidate is marked external-app=<protocol>, it may open a native/system application and leave the browser page unchanged; treat ok=true as a delivered external-app launch attempt, not server-verifiable native-app success. The same visible target may be attempted at most twice because the first click can dismiss an overlay while the second activates the target. If text is provided, type it immediately after the click.`,
       inputSchema: browserToolInput({
         id: z.string().describe('Candidate id such as 1 or 12. Must come from the current candidate list. Never choose a larger overlapping wrapper when a tighter candidate represents the same visible target.'),
         targetVisual: z.string().min(1).max(300).describe('Visible target description from the current screenshot or DOM interactive list.'),
@@ -2141,6 +2161,7 @@ function formatVisualPageStateObservation(input: {
 }) {
   const { pageContext, visualContext, screenshotInputEnabled, markerEnabled, markerOverlayInScreenshot, separateMarkerMap } = input;
   const shouldIncludeCandidates = !screenshotInputEnabled || !markerEnabled;
+  const externalAppCandidates = formatExternalAppInteractiveElements(pageContext.interactiveCandidates);
   const imageRule = screenshotInputEnabled
     ? separateMarkerMap
       ? 'Screenshot images are attached: clean viewport first, pixel-aligned marker map second.'
@@ -2162,6 +2183,9 @@ function formatVisualPageStateObservation(input: {
     `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
     shouldIncludeCandidates
       ? `Visible interactive elements:\n${formatVisualInteractiveElements(pageContext.interactiveCandidates)}`
+      : '',
+    !shouldIncludeCandidates && externalAppCandidates
+      ? `External application candidates in the current marker map:\n${externalAppCandidates}`
       : '',
     'Visual Context Manager:',
     `current: ${visualContext.current ? frameSummary(visualContext.current) : '[none]'}`,
@@ -2228,6 +2252,7 @@ function runtimePrompt(input: {
       ? formatVisualInteractiveElements(pageContext.interactiveCandidates)
       : '[disabled because visual mode uses screenshot labels]'
     : '[disabled because DOM mode uses fresh DOM tree ids]';
+  const externalAppCandidateContext = formatExternalAppInteractiveElements(pageContext.interactiveCandidates);
   const evidence = attachScreenshot
     ? mode === 'visual-markers' && separateMarkerScreenshot
       ? 'the two attached screenshots'
@@ -2288,6 +2313,7 @@ function runtimePrompt(input: {
     '- Treat RunState JSON and Working Memory as compact context only. Do not copy them into tool params.',
     '- Historical actions are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
     '- In reason/message/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
+    '- When a candidate or locator is marked external-app=<protocol>, clicking it is an external application launch attempt. The browser page may remain unchanged, and native app launch success is not server-verifiable.',
     browserChatMode ? '' : '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
     browserChatMode ? '' : '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
     browserChatMode ? '' : '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
@@ -2350,6 +2376,8 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     visualMode ? `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}` : '',
     visualMode ? `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}` : '',
     visualMode && visualTextCandidateFallback ? `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}` : '',
+    visualMode && externalAppCandidateContext ? `External application candidates in the current candidate map:
+${externalAppCandidateContext}` : '',
     visualMarkersWithoutOverlay || visualTextCandidateFallback ? `Visible interactive elements:
 ${candidateContext}` : '',
     browserChatMode ? '' : compactRunContext,

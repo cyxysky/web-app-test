@@ -323,17 +323,18 @@ export function BrowserChatLogDialog({
 }) {
   const summary = summarizeBrowserChatLogs(entries);
   return (
-    <div className="modal-overlay" onClick={onClose} role="presentation">
-      <section className="browser-chat-log-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="执行日志">
-        <header>
-          <div>
-            <h2>执行日志</h2>
-            <p>{messageContent || '当前 AI 消息'}</p>
+    <div className="ui-modal-overlay" onClick={onClose} role="presentation">
+      <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="执行日志">
+        <header className="ui-modal-header">
+          <div className="ui-modal-heading">
+            <h2 className="ui-modal-title">执行日志</h2>
+            <p className="ui-modal-subtitle">{messageContent || '当前 AI 消息'}</p>
           </div>
-          <button className="icon-button" onClick={onClose} type="button" aria-label="关闭">
+          <button className="ui-icon-button ui-modal-close" onClick={onClose} type="button" aria-label="关闭">
             <X size={18} />
           </button>
         </header>
+        <div className="ui-modal-body browser-chat-log-modal-body">
         {entries.length ? (
           <div className="browser-chat-log-summary" aria-label="log summary">
             <span>AI {summary.ai}</span>
@@ -347,6 +348,7 @@ export function BrowserChatLogDialog({
         ) : (
           <p className="browser-chat-log-empty">暂无日志</p>
         )}
+        </div>
       </section>
     </div>
   );

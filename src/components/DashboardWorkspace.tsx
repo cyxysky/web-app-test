@@ -119,7 +119,7 @@ export function DashboardGroupSidebar({
   return (
     <aside className={className}>
       <button
-        className="icon-text-button group-create-button"
+        className="ui-button ui-button--neutral group-create-button"
         onClick={onCreateGroup}
         title={selectedGroupId ? t('在当前组内创建子组') : t('创建组')}
         type="button"
@@ -706,18 +706,18 @@ export function DashboardWorkspace({
   const dashboardActions = (
     <div className="dashboard-actions">
       {showBrowserChatAction ? (
-        <Link aria-label={t('对话操作')} className="icon-button dashboard-action-icon" href="/browser-chat" title={t('对话操作')}>
+        <Link aria-label={t('对话操作')} className="ui-icon-button dashboard-action-icon" href="/browser-chat" title={t('对话操作')}>
           <MessageSquare size={15} />
         </Link>
       ) : null}
       {showSettingsAction ? (
-        <Link aria-label={t('环境配置')} className="icon-button dashboard-action-icon" href="/settings" title={t('环境配置')}>
+        <Link aria-label={t('环境配置')} className="ui-icon-button dashboard-action-icon" href="/settings" title={t('环境配置')}>
           <Settings size={15} />
         </Link>
       ) : null}
       <button
         aria-label={selectedCaseIds.length ? t('AI运行 {count} 条', { count: selectedCaseIds.length }) : t('AI运行')}
-        className="icon-button dashboard-action-icon"
+        className="ui-icon-button dashboard-action-icon"
         disabled={!selectedCaseIds.length || batchRunning || batchDefaultRunning}
         onClick={startBatchRun}
         title={selectedCaseIds.length ? t('AI运行 {count} 条', { count: selectedCaseIds.length }) : t('AI运行')}
@@ -727,7 +727,7 @@ export function DashboardWorkspace({
       </button>
       <button
         aria-label={selectedCaseIds.length ? t('默认用例执行 {count} 条', { count: selectedCaseIds.length }) : t('默认用例执行')}
-        className="icon-button dashboard-action-icon"
+        className="ui-icon-button dashboard-action-icon"
         disabled={!selectedCasesCanRunDefault || batchDefaultRunning || batchRunning}
         onClick={startBatchDefaultRecordedRun}
         title={selectedCasesCanRunDefault ? (selectedCaseIds.length ? t('默认用例执行 {count} 条', { count: selectedCaseIds.length }) : t('按当前默认记录执行')) : t('请先在执行记录中设置默认记录')}
@@ -737,7 +737,7 @@ export function DashboardWorkspace({
       </button>
       <button
         aria-label={selectedCaseIds.length ? t('批量删除 {count} 条', { count: selectedCaseIds.length }) : t('批量删除')}
-        className="icon-button dashboard-action-icon danger"
+        className="ui-icon-button ui-icon-button--danger dashboard-action-icon"
         disabled={!selectedCaseIds.length || batchDeleting}
         onClick={deleteSelectedCases}
         title={selectedCaseIds.length ? t('批量删除 {count} 条', { count: selectedCaseIds.length }) : t('批量删除')}
@@ -745,7 +745,7 @@ export function DashboardWorkspace({
       >
         {batchDeleting ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
       </button>
-      <button aria-label={t('定时任务')} className="icon-button dashboard-action-icon" disabled={!visibleCases.length} onClick={() => setScheduleOpen(true)} title={t('定时任务')} type="button">
+      <button aria-label={t('定时任务')} className="ui-icon-button dashboard-action-icon" disabled={!visibleCases.length} onClick={() => setScheduleOpen(true)} title={t('定时任务')} type="button">
         <CalendarClock size={15} />
       </button>
       <NewTestCaseModal
@@ -829,7 +829,7 @@ export function DashboardWorkspace({
                   {movingCaseId === item.id ? <Loader2 className="spin" size={16} /> : null}
                   <button
                     aria-label={t('AI运行')}
-                    className="case-row-icon-button"
+                    className="ui-icon-button case-row-icon-button"
                     disabled={Boolean(startingCaseId || startingDefaultCaseId)}
                     onClick={() => void startCaseRun(item.id)}
                     title={t('AI运行')}
@@ -839,7 +839,7 @@ export function DashboardWorkspace({
                   </button>
                   <button
                     aria-label={t('默认用例执行')}
-                    className="case-row-icon-button"
+                    className="ui-icon-button case-row-icon-button"
                     disabled={Boolean(startingCaseId || startingDefaultCaseId || !item.content.defaultRecordedRunId)}
                     onClick={() => void startDefaultRecordedCaseRun(item)}
                     title={item.content.defaultRecordedRunId ? t('按当前默认记录执行') : t('请先在执行记录中设置默认记录')}
@@ -848,7 +848,7 @@ export function DashboardWorkspace({
                     {startingDefaultCaseId === item.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />}
                   </button>
                   <DeleteTestCaseButton
-                    className="case-row-icon-button danger"
+                    className="ui-icon-button ui-icon-button--danger case-row-icon-button"
                     label=""
                     testCaseId={item.id}
                     testCaseTitle={item.title}
@@ -862,52 +862,60 @@ export function DashboardWorkspace({
         </div>
       </div>
       {groupDialogOpen ? (
-        <div className="modal-overlay" onClick={() => setGroupDialogOpen(false)} role="presentation">
-          <section className="group-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('创建分组')}>
-            <header>
-              <div>
-                <h2>{selectedGroupId ? t('创建子组') : t('创建组')}</h2>
-                <p>{selectedGroupId ? t('父级：{name}', { name: groupPath(groups, selectedGroupId) }) : t('创建根分组')}</p>
+        <div className="ui-modal-overlay" onClick={() => setGroupDialogOpen(false)} role="presentation">
+          <section className="ui-modal ui-modal--compact" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('创建分组')}>
+            <header className="ui-modal-header">
+              <div className="ui-modal-heading">
+                <h2 className="ui-modal-title">{selectedGroupId ? t('创建子组') : t('创建组')}</h2>
+                <p className="ui-modal-subtitle">{selectedGroupId ? t('父级：{name}', { name: groupPath(groups, selectedGroupId) }) : t('创建根分组')}</p>
               </div>
-              <button className="icon-button" onClick={() => setGroupDialogOpen(false)} type="button" aria-label={t('关闭')}>
+              <button className="ui-icon-button ui-modal-close" onClick={() => setGroupDialogOpen(false)} type="button" aria-label={t('关闭')}>
                 <X size={18} />
               </button>
             </header>
-            <label className="modal-field">
-              {t('分组名称')}
-              <input autoFocus className="input" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
-            </label>
-            <button className="button full-width" disabled={creatingGroup} onClick={() => createGroup(selectedGroupId)} type="button">
-              {creatingGroup ? <Loader2 className="spin" size={16} /> : null}
-              {creatingGroup ? t('创建中') : t('创建')}
-            </button>
+            <div className="ui-modal-body">
+              <label className="modal-field">
+                {t('分组名称')}
+                <input autoFocus className="input" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
+              </label>
+            </div>
+            <footer className="ui-modal-footer">
+              <button className="ui-button ui-button--primary" disabled={creatingGroup} onClick={() => createGroup(selectedGroupId)} type="button">
+                {creatingGroup ? <Loader2 className="spin" size={16} /> : null}
+                {creatingGroup ? t('创建中') : t('创建')}
+              </button>
+            </footer>
           </section>
         </div>
       ) : null}
       {scheduleOpen ? (
-        <div className="modal-overlay" onClick={() => setScheduleOpen(false)} role="presentation">
-          <section className="group-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('创建定时任务')}>
-            <header>
-              <div>
-                <h2>{t('创建定时任务')}</h2>
-                <p>{selectedCaseIds.length ? t('已选择 {count} 条用例', { count: selectedCaseIds.length }) : t('将运行当前分组 {count} 条用例', { count: visibleCases.length })}</p>
+        <div className="ui-modal-overlay" onClick={() => setScheduleOpen(false)} role="presentation">
+          <section className="ui-modal ui-modal--compact" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('创建定时任务')}>
+            <header className="ui-modal-header">
+              <div className="ui-modal-heading">
+                <h2 className="ui-modal-title">{t('创建定时任务')}</h2>
+                <p className="ui-modal-subtitle">{selectedCaseIds.length ? t('已选择 {count} 条用例', { count: selectedCaseIds.length }) : t('将运行当前分组 {count} 条用例', { count: visibleCases.length })}</p>
               </div>
-              <button className="icon-button" onClick={() => setScheduleOpen(false)} type="button" aria-label={t('关闭')}>
+              <button className="ui-icon-button ui-modal-close" onClick={() => setScheduleOpen(false)} type="button" aria-label={t('关闭')}>
                 <X size={18} />
               </button>
             </header>
-            <label className="modal-field">
-              {t('任务名称')}
-              <input className="input" value={scheduleName} onChange={(event) => setScheduleName(event.target.value)} />
-            </label>
-            <label className="modal-field">
-              {t('间隔分钟')}
-              <input className="input" min={1} type="number" value={scheduleInterval} onChange={(event) => setScheduleInterval(Number(event.target.value))} />
-            </label>
-            <button className="button full-width" disabled={savingSchedule} onClick={saveSchedule} type="button">
-              {savingSchedule ? <Loader2 className="spin" size={16} /> : null}
-              {savingSchedule ? t('保存中') : t('保存并启用')}
-            </button>
+            <div className="ui-modal-body">
+              <label className="modal-field">
+                {t('任务名称')}
+                <input className="input" value={scheduleName} onChange={(event) => setScheduleName(event.target.value)} />
+              </label>
+              <label className="modal-field">
+                {t('间隔分钟')}
+                <input className="input" min={1} type="number" value={scheduleInterval} onChange={(event) => setScheduleInterval(Number(event.target.value))} />
+              </label>
+            </div>
+            <footer className="ui-modal-footer">
+              <button className="ui-button ui-button--primary" disabled={savingSchedule} onClick={saveSchedule} type="button">
+                {savingSchedule ? <Loader2 className="spin" size={16} /> : null}
+                {savingSchedule ? t('保存中') : t('保存并启用')}
+              </button>
+            </footer>
           </section>
         </div>
       ) : null}
@@ -935,7 +943,7 @@ export function DashboardWorkspace({
             ) : runError ? (
               <div className="dashboard-detail-state">
                 <strong>{runError}</strong>
-                <button className="icon-text-button" onClick={backToCaseDetail} type="button">
+                <button className="ui-button ui-button--neutral" onClick={backToCaseDetail} type="button">
                   <ArrowLeft size={15} />
                   {t('返回测试用例')}
                 </button>
@@ -947,7 +955,7 @@ export function DashboardWorkspace({
                     <ArrowLeft size={15} />
                     {t('返回测试用例')}
                   </button>
-                  <button aria-label={t('关闭')} className="icon-button case-detail-close-button" onClick={closeCaseDetail} title={t('关闭')} type="button">
+                  <button aria-label={t('关闭')} className="ui-icon-button case-detail-close-button" onClick={closeCaseDetail} title={t('关闭')} type="button">
                     <X size={17} />
                   </button>
                 </header>
@@ -966,7 +974,7 @@ export function DashboardWorkspace({
           ) : detailError ? (
             <div className="dashboard-detail-state">
               <strong>{detailError}</strong>
-              <button className="icon-text-button" onClick={closeCaseDetail} type="button">
+              <button className="ui-button ui-button--neutral" onClick={closeCaseDetail} type="button">
                 <X size={15} />
                 {t('关闭')}
               </button>

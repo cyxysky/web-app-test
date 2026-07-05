@@ -57,7 +57,7 @@ export function RunTestButton({
       {error ? <span className="error">{error}</span> : null}
       <button
         aria-label="启动 AI 浏览器测试"
-        className={iconOnly ? 'icon-button case-detail-icon-button' : 'icon-text-button'}
+        className={iconOnly ? 'ui-icon-button case-detail-icon-button' : 'ui-button ui-button--neutral'}
         disabled={starting}
         onClick={start}
         title="启动 AI 浏览器测试"

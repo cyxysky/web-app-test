@@ -960,7 +960,7 @@ function ToolDraftEvidenceButtons({
   return (
     <div className="run-tool-editor-evidence">
       {screenshots.length ? (
-        <button className="icon-text-button tool-evidence-button" onClick={() => openScreenshots(screenshots)} type="button">
+        <button className="ui-button ui-button--neutral tool-evidence-button" onClick={() => openScreenshots(screenshots)} type="button">
           <Eye size={14} />
           {t('操作截图')}
           <span>{screenshots.length}</span>
@@ -968,7 +968,7 @@ function ToolDraftEvidenceButtons({
       ) : null}
       {domTree ? (
         <button
-          className="icon-text-button tool-evidence-button"
+          className="ui-button ui-button--neutral tool-evidence-button"
           onClick={() => openDomTree({ domTree, stepIndex: step.index, toolIndex: index, toolName: toolDisplayName(tool.name, t) })}
           type="button"
         >
@@ -1126,14 +1126,14 @@ function ImageViewer({ images, initialIndex, onClose }: { images: ImageItem[]; i
       <div className="image-viewer-toolbar" onClick={(event) => event.stopPropagation()}>
         <strong>{current.title}</strong>
         <div>
-          <button className="icon-button" disabled={index <= 0} onClick={() => show(index - 1)} type="button">上一张</button>
+          <button className="ui-button ui-button--neutral" disabled={index <= 0} onClick={() => show(index - 1)} type="button">上一张</button>
           <span>{index + 1}/{images.length}</span>
-          <button className="icon-button" disabled={index >= images.length - 1} onClick={() => show(index + 1)} type="button">下一张</button>
-          <button className="icon-button" onClick={() => zoom(scale - 0.25)} type="button" aria-label="缩小"><Minus size={18} /></button>
+          <button className="ui-button ui-button--neutral" disabled={index >= images.length - 1} onClick={() => show(index + 1)} type="button">下一张</button>
+          <button className="ui-icon-button" onClick={() => zoom(scale - 0.25)} type="button" aria-label="缩小"><Minus size={18} /></button>
           <span>{Math.round(scale * 100)}%</span>
-          <button className="icon-button" onClick={() => zoom(scale + 0.25)} type="button" aria-label="放大"><Plus size={18} /></button>
-          <button className="icon-button" onClick={() => { setScale(1); setOffset({ x: 0, y: 0 }); }} type="button" aria-label="重置"><Maximize2 size={18} /></button>
-          <button className="icon-button" onClick={onClose} type="button" aria-label="关闭"><X size={18} /></button>
+          <button className="ui-icon-button" onClick={() => zoom(scale + 0.25)} type="button" aria-label="放大"><Plus size={18} /></button>
+          <button className="ui-icon-button" onClick={() => { setScale(1); setOffset({ x: 0, y: 0 }); }} type="button" aria-label="重置"><Maximize2 size={18} /></button>
+          <button className="ui-icon-button" onClick={onClose} type="button" aria-label="关闭"><X size={18} /></button>
         </div>
       </div>
       <div className="image-viewer-stage">
@@ -1799,7 +1799,7 @@ export function RunProgress({
                     </button>
                   ) : null}
                   {selectedStep.status === 'running' ? (
-                    <button className="text-danger-button" onClick={skipSelectedStep} type="button">
+                    <button className="ui-button ui-button--danger" onClick={skipSelectedStep} type="button">
                       <SkipForward size={15} />
                       {t('跳过当前步骤')}
                     </button>
@@ -1836,17 +1836,17 @@ export function RunProgress({
                       <div className="tool-record-toolbar">
                         {editingToolsStepIndex === selectedStep.index ? (
                           <>
-                            <button className="icon-text-button tool-record-action primary" disabled={savingTools} onClick={saveToolRecordEdit} type="button">
+                            <button className="ui-button ui-button--primary tool-record-action" disabled={savingTools} onClick={saveToolRecordEdit} type="button">
                               {savingTools ? <Loader2 className="spin" size={14} /> : <Save size={14} />}
                               {t('保存工具记录')}
                             </button>
-                            <button className="icon-text-button tool-record-action" disabled={savingTools} onClick={cancelToolRecordEdit} type="button">
+                            <button className="ui-button ui-button--neutral tool-record-action" disabled={savingTools} onClick={cancelToolRecordEdit} type="button">
                               <X size={14} />
                               {t('取消')}
                             </button>
                           </>
                         ) : (
-                          <button className="icon-text-button tool-record-action" onClick={() => beginToolRecordEdit(selectedStep)} type="button">
+                          <button className="ui-button ui-button--neutral tool-record-action" onClick={() => beginToolRecordEdit(selectedStep)} type="button">
                             <Wrench size={14} />
                             {t('编辑工具记录')}
                           </button>
@@ -1888,7 +1888,7 @@ export function RunProgress({
                                 <div className="run-tool-editor-actions">
                                   <button
                                     aria-label={t('上移')}
-                                    className="icon-button"
+                                    className="ui-icon-button"
                                     disabled={index === 0 || savingTools}
                                     onClick={() => moveToolDraft(index, -1)}
                                     title={t('上移')}
@@ -1898,7 +1898,7 @@ export function RunProgress({
                                   </button>
                                   <button
                                     aria-label={t('下移')}
-                                    className="icon-button"
+                                    className="ui-icon-button"
                                     disabled={index === toolDrafts.length - 1 || savingTools}
                                     onClick={() => moveToolDraft(index, 1)}
                                     title={t('下移')}
@@ -1908,7 +1908,7 @@ export function RunProgress({
                                   </button>
                                   <button
                                     aria-label={t('删除工具')}
-                                    className="icon-button danger"
+                                    className="ui-icon-button ui-icon-button--danger"
                                     disabled={savingTools}
                                     onClick={() => removeToolDraft(index)}
                                     title={t('删除工具')}
@@ -1945,7 +1945,7 @@ export function RunProgress({
                             </li>
                           ))}
                         </ol>
-                        <button className="icon-text-button add-step-button" disabled={savingTools} onClick={addToolDraft} type="button">
+                        <button className="ui-button ui-button--neutral add-step-button" disabled={savingTools} onClick={addToolDraft} type="button">
                           <Plus size={15} />
                           {t('新增工具调用')}
                         </button>
@@ -1991,41 +1991,47 @@ export function RunProgress({
       ) : null}
 
       {reportOpen && run.report?.markdown ? (
-        <div className="modal-overlay" onClick={() => setReportOpen(false)} role="presentation">
-          <section className="report-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('最终报告')}>
-            <header>
+        <div className="ui-modal-overlay" onClick={() => setReportOpen(false)} role="presentation">
+          <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('最终报告')}>
+            <header className="ui-modal-header">
               <h2>{t('最终报告')}</h2>
-              <button className="icon-button" onClick={() => setReportOpen(false)} type="button" aria-label={t('关闭')}><X size={18} /></button>
+              <button className="ui-icon-button ui-modal-close" onClick={() => setReportOpen(false)} type="button" aria-label={t('关闭')}><X size={18} /></button>
             </header>
-            <ReportEvidence run={run} />
-            <MarkdownReport markdown={run.report.markdown} onImageClick={openImageByUrl} />
+            <div className="ui-modal-body">
+              <ReportEvidence run={run} />
+              <MarkdownReport markdown={run.report.markdown} onImageClick={openImageByUrl} />
+            </div>
           </section>
         </div>
       ) : null}
 
       {requestOpen && selectedStep?.aiRequest ? (
-        <div className="modal-overlay" onClick={() => setRequestOpen(false)} role="presentation">
-          <section className="report-modal ai-request-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('AI 请求内容')}>
-            <header>
+        <div className="ui-modal-overlay" onClick={() => setRequestOpen(false)} role="presentation">
+          <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('AI 请求内容')}>
+            <header className="ui-modal-header">
               <h2>{t('AI 请求内容')} · {t('步骤 {index}', { index: selectedStep.index })}</h2>
-              <button className="icon-button" onClick={() => setRequestOpen(false)} type="button" aria-label={t('关闭')}><X size={18} /></button>
+              <button className="ui-icon-button ui-modal-close" onClick={() => setRequestOpen(false)} type="button" aria-label={t('关闭')}><X size={18} /></button>
             </header>
-            <pre className="ai-request-pre">{JSON.stringify(selectedStep.aiRequest, null, 2)}</pre>
+            <div className="ui-modal-body">
+              <pre className="ai-request-pre">{JSON.stringify(selectedStep.aiRequest, null, 2)}</pre>
+            </div>
           </section>
         </div>
       ) : null}
 
       {domTreeDialog ? (
-        <div className="modal-overlay" onClick={() => setDomTreeDialog(null)} role="presentation">
-          <section className="report-modal dom-tree-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('DOM 树')}>
-            <header>
+        <div className="ui-modal-overlay" onClick={() => setDomTreeDialog(null)} role="presentation">
+          <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('DOM 树')}>
+            <header className="ui-modal-header">
               <div>
                 <h2>{t('DOM 树')}</h2>
                 <p>{t('步骤 {index}', { index: domTreeDialog.stepIndex })} · {domTreeDialog.toolName} · #{domTreeDialog.toolIndex + 1}</p>
               </div>
-              <button className="icon-button" onClick={() => setDomTreeDialog(null)} type="button" aria-label={t('关闭')}><X size={18} /></button>
+              <button className="ui-icon-button ui-modal-close" onClick={() => setDomTreeDialog(null)} type="button" aria-label={t('关闭')}><X size={18} /></button>
             </header>
-            <pre className="dom-tree-pre">{domTreeDialog.domTree}</pre>
+            <div className="ui-modal-body">
+              <pre className="dom-tree-pre">{domTreeDialog.domTree}</pre>
+            </div>
           </section>
         </div>
       ) : null}

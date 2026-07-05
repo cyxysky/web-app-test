@@ -60,7 +60,7 @@ export function RunDefaultRecordedRunButton({
       {error ? <span className="error">{error}</span> : null}
       <button
         aria-label="按默认记录执行"
-        className={iconOnly ? 'icon-button case-detail-icon-button' : 'icon-text-button'}
+        className={iconOnly ? 'ui-icon-button case-detail-icon-button' : 'ui-button ui-button--neutral'}
         disabled={disabled}
         onClick={start}
         title={defaultRecordedRunId ? '按当前默认记录执行' : '请先在执行记录中设为默认记录'}

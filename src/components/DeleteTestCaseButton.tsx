@@ -7,7 +7,7 @@ import { readApiJson } from '@/lib/api-client';
 import { useApiAction } from '@/lib/use-api-action';
 
 export function DeleteTestCaseButton({
-  className = 'icon-text-button danger',
+  className = 'ui-button ui-button--danger',
   disabled,
   label = '删除用例',
   onDeleted,

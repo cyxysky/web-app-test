@@ -149,7 +149,7 @@ export function TestCaseDetailWorkspace({
           />
           <button
             aria-label={t('生成内容框架')}
-            className="icon-button case-detail-icon-button"
+            className="ui-icon-button case-detail-icon-button"
             disabled={editorActions.generatingFrame || editorActions.saving}
             onClick={() => void editorRef.current?.generateFrame()}
             title={t('生成内容框架')}
@@ -159,7 +159,7 @@ export function TestCaseDetailWorkspace({
           </button>
           <button
             aria-label={t('保存需求')}
-            className="icon-button case-detail-icon-button"
+            className="ui-icon-button case-detail-icon-button"
             disabled={editorActions.saving}
             onClick={() => void editorRef.current?.save()}
             title={t('保存需求')}
@@ -177,7 +177,7 @@ export function TestCaseDetailWorkspace({
           />
           <RunTestButton iconOnly model={modelId} modelProvider={modelProvider} onStarted={onOpenRun ? handleOpenRun : undefined} testCaseId={currentTestCase.id} />
           <DeleteTestCaseButton
-            className="icon-button case-detail-icon-button danger"
+            className="ui-icon-button ui-icon-button--danger case-detail-icon-button"
             label=""
             onDeleted={variant === 'panel' ? onDeleted : undefined}
             redirectTo={variant === 'page' ? '/dashboard' : undefined}
@@ -186,7 +186,7 @@ export function TestCaseDetailWorkspace({
           />
         </div>
         {variant === 'panel' ? (
-          <button aria-label={t('关闭')} className="icon-button case-detail-close-button" onClick={onClose} title={t('关闭')} type="button">
+          <button aria-label={t('关闭')} className="ui-icon-button case-detail-close-button" onClick={onClose} title={t('关闭')} type="button">
             <X size={17} />
           </button>
         ) : null}

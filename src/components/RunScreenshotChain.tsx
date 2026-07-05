@@ -105,9 +105,9 @@ function ScreenshotChainModal({ items, onClose, title }: { items: ScreenshotChai
   if (!current) return null;
 
   return (
-    <div className="modal-overlay screenshot-chain-overlay" onClick={onClose} role="presentation">
-      <section className="screenshot-chain-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="操作截图链">
-        <header className="screenshot-chain-modal-head">
+    <div className="ui-modal-overlay screenshot-chain-overlay" onClick={onClose} role="presentation">
+      <section className="ui-modal ui-modal--wide screenshot-chain-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="操作截图链">
+        <header className="ui-modal-header screenshot-chain-modal-head">
           <div className="screenshot-chain-title">
             <Images size={18} />
             <div>
@@ -115,20 +115,20 @@ function ScreenshotChainModal({ items, onClose, title }: { items: ScreenshotChai
               <span>{index + 1}/{items.length}</span>
             </div>
           </div>
-          <button className="icon-button" onClick={onClose} type="button" aria-label="关闭">
+          <button className="ui-icon-button ui-modal-close" onClick={onClose} type="button" aria-label="关闭">
             <X size={18} />
           </button>
         </header>
         <div className="screenshot-chain-modal-toolbar">
-          <button className="icon-text-button" disabled={index <= 0} onClick={() => show(index - 1)} type="button" title="上一张">
+          <button className="ui-button ui-button--neutral" disabled={index <= 0} onClick={() => show(index - 1)} type="button" title="上一张">
             <ArrowLeft size={16} />
             <span>上一张</span>
           </button>
-          <button className="icon-text-button" disabled={index >= items.length - 1} onClick={() => show(index + 1)} type="button" title="下一张">
+          <button className="ui-button ui-button--neutral" disabled={index >= items.length - 1} onClick={() => show(index + 1)} type="button" title="下一张">
             <span>下一张</span>
             <ArrowRight size={16} />
           </button>
-          <a className="icon-button" href={current.url} target="_blank" rel="noreferrer" aria-label="打开原图" title="打开原图">
+          <a className="ui-icon-button" href={current.url} target="_blank" rel="noreferrer" aria-label="打开原图" title="打开原图">
             <Maximize2 size={17} />
           </a>
         </div>
@@ -161,7 +161,7 @@ function ScreenshotChainModal({ items, onClose, title }: { items: ScreenshotChai
 }
 
 export function RunScreenshotChainButton({
-  className = 'icon-text-button',
+  className = 'ui-button ui-button--neutral',
   label = '截图链',
   run,
 }: {
@@ -196,6 +196,7 @@ export function RunScreenshotChainButton({
     <>
       <button aria-label={disabled ? '暂无截图链' : '查看截图链'} className={className} disabled={disabled} onClick={openChain} title={disabled ? '暂无截图链' : '查看截图链'} type="button">
         <Images size={14} />
+        {label ? <span>{label}</span> : null}
       </button>
       {modal && typeof document !== 'undefined' ? createPortal(modal, document.body) : modal}
     </>

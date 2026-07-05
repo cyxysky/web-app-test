@@ -41,9 +41,8 @@ input[type="checkbox"]:disabled {
   opacity: 0.5;
 }
 
-.text-danger-button,
-.icon-text-button,
-.icon-button {
+.ui-button,
+.ui-icon-button {
   align-items: center;
   background: transparent;
   border: 1px solid transparent;
@@ -51,6 +50,8 @@ input[type="checkbox"]:disabled {
   color: var(--muted-strong);
   cursor: pointer;
   display: inline-flex;
+  font-family: inherit;
+  font-size: 14px;
   font-weight: 850;
   gap: 7px;
   justify-content: center;
@@ -63,29 +64,57 @@ input[type="checkbox"]:disabled {
     opacity 0.16s ease;
 }
 
-.text-danger-button,
-.icon-text-button.danger,
-.icon-button.danger {
+.ui-button {
+  min-height: var(--control-height);
+  padding: 0 14px;
+  white-space: nowrap;
+}
+
+.ui-button--neutral {
+  background: var(--button-neutral-bg);
+  color: var(--foreground);
+}
+
+.ui-button--primary {
+  background: var(--button-primary-bg);
+  border-color: var(--button-primary-bg);
+  color: #ffffff;
+}
+
+.ui-button--danger {
+  background: var(--button-danger-bg);
+  border-color: var(--button-danger-bg);
+  color: #ffffff;
+}
+
+.ui-icon-button--danger {
   color: var(--danger);
 }
 
-.icon-button {
-  height: var(--control-icon-size);
-  width: var(--control-icon-size);
-}
-
-:where(.icon-button, .icon-text-button):not(:disabled):hover {
+.ui-button--neutral:not(:disabled):hover,
+.ui-icon-button:not(:disabled):hover {
   background: var(--control-hover-bg);
   color: var(--foreground);
 }
 
-:where(.icon-button.danger, .icon-text-button.danger):not(:disabled):hover {
+.ui-button--primary:not(:disabled):hover {
+  background: var(--button-primary-hover-bg);
+  border-color: var(--button-primary-hover-bg);
+}
+
+.ui-button--danger:not(:disabled):hover {
+  background: var(--button-danger-bg);
+  border-color: var(--button-danger-bg);
+}
+
+.ui-icon-button--danger:not(:disabled):hover {
   background: var(--control-danger-hover-bg);
+  border-color: color-mix(in srgb, var(--danger) 24%, var(--border));
   color: var(--danger);
 }
 
-.icon-text-button:disabled,
-.icon-button:disabled {
+.ui-button:disabled,
+.ui-icon-button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
 }

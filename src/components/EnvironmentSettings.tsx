@@ -408,7 +408,7 @@ export function EnvironmentSettings({
             onChange={(event) => update(index, { value: event.target.value })}
           />
           <button
-            className="settings-picker-button"
+            className="ui-button ui-button--neutral"
             disabled={!hasDirectoryPicker}
             onClick={() => chooseRuntimeDirectory(index, item)}
             title={hasDirectoryPicker ? t('选择目录') : t('仅 Electron 桌面端支持目录选择')}
@@ -551,7 +551,7 @@ export function EnvironmentSettings({
                   <h2>{t('模型配置')}</h2>
                   <span>{t('每个服务商独立保存模型、Key 和 Base URL，切换服务商不会串用密钥。')}</span>
                 </div>
-                <button className="settings-save-button" disabled={savingModel || loading} onClick={saveModel} type="button">
+                <button className="ui-button ui-icon-button" disabled={savingModel || loading} onClick={saveModel} type="button">
                   {savingModel ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
                   {t('保存')}
                 </button>
@@ -613,7 +613,7 @@ export function EnvironmentSettings({
                         </button>
                       </div>
                     ))}
-                    <button className="settings-model-add-button" onClick={addActiveProviderModel} type="button">
+                    <button className="ui-button ui-button--neutral" onClick={addActiveProviderModel} type="button">
                       <Plus size={15} />
                       {t('添加模型')}
                     </button>
@@ -655,7 +655,7 @@ export function EnvironmentSettings({
                   <h2>{t(environmentSettingsTabs.find((tab) => tab.id === activeTab)?.label || '')}</h2>
                   <span>{t('{count} 项网页配置', { count: visibleEnvItems.length })}</span>
                 </div>
-                <button className="settings-save-button" disabled={savingEnv || loading} onClick={saveEnv} type="button">
+                <button className="ui-button ui-icon-button" disabled={savingEnv || loading} onClick={saveEnv} type="button">
                   {savingEnv ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
                   {t('保存')}
                 </button>

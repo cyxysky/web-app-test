@@ -11,6 +11,14 @@ import { richTextToPlainText } from '@/lib/rich-text';
 import type { TestCaseContent } from '@/server/ai/schemas/test-case.schema';
 import { readApiJson } from '@/lib/api-client';
 
+type UploadImageResponse = {
+  imageId: string;
+};
+
+type GenerateTestCaseResponse = {
+  testCaseId?: string;
+};
+
 export function NewTestCaseForm({
   groupId,
   onCreated,
@@ -38,7 +46,7 @@ export function NewTestCaseForm({
     form.append('file', file);
     try {
       const response = await fetch('/api/uploads', { method: 'POST', body: form });
-      const data = await readApiJson<any>(response, t('图片上传失败'));
+      const data = await readApiJson<UploadImageResponse>(response, t('图片上传失败'));
       setImageNames((current) => [...current, data.imageId]);
     } finally {
       setUploading(false);
@@ -61,7 +69,7 @@ export function NewTestCaseForm({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, systemPrompt, targetUrl, browserMode, isMarked, imageNames, groupId }),
       });
-      const data = await readApiJson<any>(response, t('生成失败'));
+      const data = await readApiJson<GenerateTestCaseResponse>(response, t('生成失败'));
       if (typeof data.testCaseId === 'string') onCreated?.(data.testCaseId);
       if (!onCreated) router.push('/dashboard');
       router.refresh();
@@ -74,91 +82,95 @@ export function NewTestCaseForm({
   }
 
   return (
-    <form className="form designer-form" onSubmit={submit}>
-      <div className="field">
-        <label htmlFor="targetUrl">{t('目标地址')}</label>
-        <input className="input" id="targetUrl" onChange={(event) => setTargetUrl(event.target.value)} required value={targetUrl} />
-      </div>
-      <div className="field">
-        <label htmlFor="browserMode">{t('浏览器操作模式')}</label>
-        <CustomSelect
-          id="browserMode"
-          value={browserMode}
-          onChange={(nextValue) => setBrowserMode(nextValue as TestCaseContent['browserMode'])}
-          options={[
-            { label: t('默认配置'), value: 'default' },
-            { label: t('DOM 交互'), value: 'dom' },
-            { label: t('视觉标识'), value: 'visual-markers' },
-          ]}
-        />
-      </div>
-      {browserMode === 'visual-markers' ? (
-        <label className="field">
-          <span>{t('视觉标记截图')}</span>
-          <span className="inline-check">
-            <input
-              type="checkbox"
-              checked={isMarked}
-              onChange={(event) => setIsMarked(event.target.checked)}
-            />
-            {t('启用截图 marker')}
-          </span>
-          <span className="hint">{t('关闭后只发送原始截图，并在提示词中加入可交互元素摘要。')}</span>
-        </label>
-      ) : null}
-      <div className="field">
-        <label htmlFor="prompt">{t('测试目标')}</label>
-        <RichTextEditor
-          id="prompt"
-          onChange={setPrompt}
-          placeholder={t('例如：进入知乎，搜索 gpt，并确认结果页可读')}
-          value={prompt}
-        />
-      </div>
-      <div className="field">
-        <label htmlFor="systemPrompt">{t('AI 操作提示词')}</label>
-        <RichTextEditor
-          id="systemPrompt"
-          onChange={setSystemPrompt}
-          placeholder={t('例如：遇到级联选择器时，必须逐级展开并选择到叶子节点，不能点击一级选项后就认为完成。')}
-          value={systemPrompt}
-          minHeight={160}
-        />
-      </div>
-      <div className="field">
-        <label className="file-label" htmlFor="image">
-          <ImageUp size={16} />
-          {t('图片上下文')}
-        </label>
-        <input
-          className="file-input"
-          id="image"
-          type="file"
-          accept="image/*"
-          onChange={(event) => {
-            const file = event.target.files?.[0];
-            if (file) void uploadImage(file).catch((err) => setError(err.message));
-          }}
-        />
-        {uploading ? <div className="hint">{t('正在上传图片...')}</div> : null}
-        {imageNames.length ? (
-          <div className="upload-list">
-            {imageNames.map((name) => (
-              <span className="upload-chip" key={name}>
-                {name}
-                <button aria-label={t('移除 {name}', { name })} onClick={() => setImageNames((current) => current.filter((item) => item !== name))} type="button">
-                  <X size={12} />
-                </button>
-              </span>
-            ))}
-          </div>
+    <form className="ui-modal-form" onSubmit={submit}>
+      <div className="ui-modal-body form designer-form">
+        <div className="field">
+          <label htmlFor="targetUrl">{t('目标地址')}</label>
+          <input className="input" id="targetUrl" onChange={(event) => setTargetUrl(event.target.value)} required value={targetUrl} />
+        </div>
+        <div className="field">
+          <label htmlFor="browserMode">{t('浏览器操作模式')}</label>
+          <CustomSelect
+            id="browserMode"
+            value={browserMode}
+            onChange={(nextValue) => setBrowserMode(nextValue as TestCaseContent['browserMode'])}
+            options={[
+              { label: t('默认配置'), value: 'default' },
+              { label: t('DOM 交互'), value: 'dom' },
+              { label: t('视觉标识'), value: 'visual-markers' },
+            ]}
+          />
+        </div>
+        {browserMode === 'visual-markers' ? (
+          <label className="field">
+            <span>{t('视觉标记截图')}</span>
+            <span className="inline-check">
+              <input
+                type="checkbox"
+                checked={isMarked}
+                onChange={(event) => setIsMarked(event.target.checked)}
+              />
+              {t('启用截图 marker')}
+            </span>
+            <span className="hint">{t('关闭后只发送原始截图，并在提示词中加入可交互元素摘要。')}</span>
+          </label>
         ) : null}
+        <div className="field">
+          <label htmlFor="prompt">{t('测试目标')}</label>
+          <RichTextEditor
+            id="prompt"
+            onChange={setPrompt}
+            placeholder={t('例如：进入知乎，搜索 gpt，并确认结果页可读')}
+            value={prompt}
+          />
+        </div>
+        <div className="field">
+          <label htmlFor="systemPrompt">{t('AI 操作提示词')}</label>
+          <RichTextEditor
+            id="systemPrompt"
+            onChange={setSystemPrompt}
+            placeholder={t('例如：遇到级联选择器时，必须逐级展开并选择到叶子节点，不能点击一级选项后就认为完成。')}
+            value={systemPrompt}
+            minHeight={160}
+          />
+        </div>
+        <div className="field">
+          <label className="file-label" htmlFor="image">
+            <ImageUp size={16} />
+            {t('图片上下文')}
+          </label>
+          <input
+            className="file-input"
+            id="image"
+            type="file"
+            accept="image/*"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void uploadImage(file).catch((err) => setError(err.message));
+            }}
+          />
+          {uploading ? <div className="hint">{t('正在上传图片...')}</div> : null}
+          {imageNames.length ? (
+            <div className="upload-list">
+              {imageNames.map((name) => (
+                <span className="upload-chip" key={name}>
+                  {name}
+                  <button aria-label={t('移除 {name}', { name })} onClick={() => setImageNames((current) => current.filter((item) => item !== name))} type="button">
+                    <X size={12} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+        {error ? <div className="error">{error}</div> : null}
       </div>
-      {error ? <div className="error">{error}</div> : null}
-      <button className="button full-width" disabled={loading || uploading} type="submit">
-        {loading ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-        {loading ? t('正在生成') : t('生成测试用例')}
-      </button>
+      <footer className="ui-modal-footer">
+        <button className="ui-button ui-button--primary" disabled={loading || uploading} type="submit">
+          {loading ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
+          {loading ? t('正在生成') : t('生成测试用例')}
+        </button>
+      </footer>
     </form>
   );
 }

@@ -232,6 +232,8 @@ type InteractiveCandidate = {
   nearbyText?: string;
   href?: string;
   host?: string;
+  opensExternalApp?: boolean;
+  externalAppProtocol?: string;
   placeholder?: string;
   ariaLabel?: string;
   title?: string;
@@ -272,16 +274,6 @@ type PageInteractiveCandidate = Omit<InteractiveCandidate, 'framePath' | 'frameU
 type PageDomObservationPayload = {
   structuredText: string;
   interactiveCandidates: PageInteractiveCandidate[];
-};
-
-type CandidateIdentityPayload = Pick<
-  InteractiveCandidate,
-  'tag' | 'role' | 'type' | 'href' | 'ariaLabel' | 'placeholder' | 'title' | 'text' | 'name'
->;
-
-type CandidateIdentityValidation = {
-  ok: boolean;
-  reason: string;
 };
 
 type CandidateClickTarget = {
@@ -1760,6 +1752,56 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     );
   }
 
+  function externalAppTargetForUrl(value?: string | null) {
+    const url = normalizeText(value);
+    const match = url.match(/^([a-z][a-z0-9+.-]*):/i);
+    if (!match) return undefined;
+    const protocol = match[1].toLowerCase();
+    if ([
+      'http',
+      'https',
+      'about',
+      'blob',
+      'data',
+      'javascript',
+      'file',
+      'chrome',
+      'chrome-extension',
+      'edge',
+      'devtools',
+      'view-source',
+    ].includes(protocol)) return undefined;
+    return { protocol };
+  }
+
+  function externalAppTargetForElement(element: Element, href?: string) {
+    const direct = externalAppTargetForUrl(href || element.getAttribute('href'));
+    if (direct) return direct;
+
+    const attributeNames = [
+      'data-href',
+      'data-url',
+      'data-link',
+      'data-uri',
+      'data-deeplink',
+      'data-deep-link',
+      'data-scheme',
+      'data-target-url',
+    ];
+    for (const name of attributeNames) {
+      const value = element.getAttribute(name);
+      const result = externalAppTargetForUrl(value)
+        || (name === 'data-scheme' && /^[a-z][a-z0-9+.-]*$/i.test(normalizeText(value))
+          ? externalAppTargetForUrl(`${normalizeText(value)}:`)
+          : undefined);
+      if (result) return result;
+    }
+
+    const inlineHandler = element.getAttribute('onclick') || '';
+    const handlerMatch = inlineHandler.match(/['"]([a-z][a-z0-9+.-]*:[^'"]*)['"]/i);
+    return externalAppTargetForUrl(handlerMatch?.[1]);
+  }
+
   function hasMeaningfulContentOutsideInteractiveDescendants(element: Element) {
     let found = false;
     let visited = 0;
@@ -2013,6 +2055,7 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     } catch {
       host = undefined;
     }
+    const externalAppTarget = externalAppTargetForElement(element, href);
 
     const text = ownText(element);
     const name = nameOf(element);
@@ -2035,6 +2078,8 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
       nearbyText: contextText(element) || undefined,
       href,
       host,
+      opensExternalApp: externalAppTarget ? true : undefined,
+      externalAppProtocol: externalAppTarget?.protocol,
       placeholder,
       ariaLabel,
       title,
@@ -2126,137 +2171,16 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   };
 }
 
-function validateAiCandidateIdentity(input: { path: string; expected: CandidateIdentityPayload }): CandidateIdentityValidation {
-  const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
-  if (!runtime) return { ok: false, reason: 'DOM runtime is not available' };
-
-  const { path: pathValue, expected } = input;
-  const element = runtime.elementFromPath(pathValue);
-  if (!element) return { ok: false, reason: `DOM path ${pathValue} no longer exists` };
-
-  const normalized = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 180);
-  const actualTag = element.tagName.toLowerCase();
-  if (actualTag !== expected.tag) return { ok: false, reason: `tag changed from ${expected.tag} to ${actualTag}` };
-
-  function ownText(target: Element) {
-    let text = '';
-    for (const node of Array.from(target.childNodes)) {
-      if (node.nodeType === Node.TEXT_NODE) text += node.textContent || '';
-    }
-    const inner = normalized((target as HTMLElement).innerText || target.textContent || '');
-    return normalized(text || inner).slice(0, 140);
-  }
-
-  function currentName(target: Element) {
-    const inputElement = target as HTMLInputElement;
-    const labelText = inputElement.labels?.length ? Array.from(inputElement.labels).map((label) => label.textContent || '').join(' ') : '';
-    const imageAlt = Array.from(target.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ');
-    return normalized([
-      target.getAttribute('aria-label'),
-      target.getAttribute('title'),
-      target.getAttribute('alt'),
-      imageAlt,
-      inputElement.placeholder,
-      labelText,
-      ownText(target),
-      inputElement.value,
-    ].filter(Boolean).join(' '));
-  }
-
-  function compare(label: string, expectedValue?: string, actualValue?: string | null) {
-    const left = normalized(expectedValue);
-    const right = normalized(actualValue);
-    if (!left) return undefined;
-    return left === right ? undefined : `${label} changed from "${left}" to "${right || '[empty]'}"`;
-  }
-
-  const inputElement = element as HTMLInputElement;
-  const mismatches = [
-    compare('role', expected.role, element.getAttribute('role')),
-    compare('type', expected.type, element.getAttribute('type')),
-    compare('href', expected.href, actualTag === 'a' ? (element as HTMLAnchorElement).href || element.getAttribute('href') : undefined),
-    compare('aria-label', expected.ariaLabel, element.getAttribute('aria-label')),
-    compare('placeholder', expected.placeholder, inputElement.placeholder),
-    compare('title', expected.title, element.getAttribute('title')),
-  ].filter(Boolean);
-  if (mismatches.length) return { ok: false, reason: mismatches.join('; ') };
-
-  const expectedText = normalized(expected.text);
-  const expectedName = normalized(expected.name);
-  const actualText = ownText(element);
-  const actualName = currentName(element);
-  if (expectedText && actualText && expectedText !== actualText && expectedName && actualName && expectedName !== actualName) {
-    return { ok: false, reason: `text/name changed from "${expectedText}" to "${actualText}"` };
-  }
-  return { ok: true, reason: '' };
-}
-
 function resolveAiCandidateActionTarget(input: {
   path: string;
-  expected: CandidateIdentityPayload;
   center?: { x: number; y: number };
 }): CandidateActionTargetResolution {
   const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
   if (!runtime) return { ok: false, error: 'DOM runtime is not available' };
 
-  const { path: pathValue, expected } = input;
+  const { path: pathValue } = input;
   const originalElement = runtime.elementFromPath(pathValue);
   if (!originalElement) return { ok: false, error: `DOM path ${pathValue} no longer exists` };
-
-  const normalized = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 180);
-  const actualTag = originalElement.tagName.toLowerCase();
-  if (actualTag !== expected.tag) return { ok: false, error: `tag changed from ${expected.tag} to ${actualTag}` };
-
-  function ownText(target: Element) {
-    let text = '';
-    for (const node of Array.from(target.childNodes)) {
-      if (node.nodeType === Node.TEXT_NODE) text += node.textContent || '';
-    }
-    const inner = normalized((target as HTMLElement).innerText || target.textContent || '');
-    return normalized(text || inner).slice(0, 140);
-  }
-
-  function currentName(target: Element) {
-    const inputElement = target as HTMLInputElement;
-    const labelText = inputElement.labels?.length ? Array.from(inputElement.labels).map((label) => label.textContent || '').join(' ') : '';
-    const imageAlt = Array.from(target.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ');
-    return normalized([
-      target.getAttribute('aria-label'),
-      target.getAttribute('title'),
-      target.getAttribute('alt'),
-      imageAlt,
-      inputElement.placeholder,
-      labelText,
-      ownText(target),
-      inputElement.value,
-    ].filter(Boolean).join(' '));
-  }
-
-  function compare(label: string, expectedValue?: string, actualValue?: string | null) {
-    const left = normalized(expectedValue);
-    const right = normalized(actualValue);
-    if (!left) return undefined;
-    return left === right ? undefined : `${label} changed from "${left}" to "${right || '[empty]'}"`;
-  }
-
-  const inputElement = originalElement as HTMLInputElement;
-  const mismatches = [
-    compare('role', expected.role, originalElement.getAttribute('role')),
-    compare('type', expected.type, originalElement.getAttribute('type')),
-    compare('href', expected.href, actualTag === 'a' ? (originalElement as HTMLAnchorElement).href || originalElement.getAttribute('href') : undefined),
-    compare('aria-label', expected.ariaLabel, originalElement.getAttribute('aria-label')),
-    compare('placeholder', expected.placeholder, inputElement.placeholder),
-    compare('title', expected.title, originalElement.getAttribute('title')),
-  ].filter(Boolean);
-  if (mismatches.length) return { ok: false, error: mismatches.join('; ') };
-
-  const expectedText = normalized(expected.text);
-  const expectedName = normalized(expected.name);
-  const actualText = ownText(originalElement);
-  const actualName = currentName(originalElement);
-  if (expectedText && actualText && expectedText !== actualText && expectedName && actualName && expectedName !== actualName) {
-    return { ok: false, error: `text/name changed from "${expectedText}" to "${actualText}"` };
-  }
 
   let element = runtime.actionableTargetFor(originalElement);
 
@@ -3881,6 +3805,7 @@ export class BrowserSession {
           candidate.clickable ? 'clickable' : '',
           candidate.input ? 'input' : '',
           candidate.disabled ? 'disabled' : '',
+          candidate.opensExternalApp ? `external-app=${candidate.externalAppProtocol || 'custom-protocol'}` : '',
           candidate.signals?.length ? `signals=${candidate.signals.join('|')}` : '',
           candidate.href ? `href=${candidate.href}` : '',
           candidate.framePath ? `frame=${candidate.framePath}` : '',
@@ -3967,7 +3892,7 @@ export class BrowserSession {
     }
     let note = '';
     let fallbackNote = '';
-    if (text === undefined && candidate.href && this.activePage.url() === beforeUrl && !newPage) {
+    if (text === undefined && candidate.href && !candidate.opensExternalApp && this.activePage.url() === beforeUrl && !newPage) {
       const fallback = await timedBrowserStep(timings, 'fallbackClickMs', () => (
         candidate.framePath
           ? this.dispatchFrameDomPathClick(candidate.framePath, candidate.path)
@@ -3987,9 +3912,10 @@ export class BrowserSession {
     timings.showMarkerMs = 0;
     void this.showClickMarker(target.x, target.y, 'click');
     const timingNote = formatTimingRecord(timings);
+    const externalAppNote = this.externalAppCandidateNote(candidate);
     return {
       ok: true,
-      actual: `Clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${note}${timingNote ? ` Click timings: ${timingNote}.` : ''}`,
+      actual: `Clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${externalAppNote}${note}${timingNote ? ` Click timings: ${timingNote}.` : ''}`,
     };
   }
 
@@ -4323,6 +4249,8 @@ export class BrowserSession {
       name: candidate.name,
       text: candidate.text,
       href: candidate.href,
+      opensExternalApp: candidate.opensExternalApp,
+      externalAppProtocol: candidate.externalAppProtocol,
       placeholder: candidate.placeholder,
       ariaLabel: candidate.ariaLabel,
       title: candidate.title,
@@ -4375,7 +4303,7 @@ export class BrowserSession {
     }
     let note = '';
     let fallbackNote = '';
-    if (text === undefined && candidate.href && this.activePage.url() === beforeUrl && !newPage) {
+    if (text === undefined && candidate.href && !candidate.opensExternalApp && this.activePage.url() === beforeUrl && !newPage) {
       const fallback = candidate.framePath
         ? await this.dispatchFrameDomPathClick(candidate.framePath, candidate.path)
         : candidate.shadow
@@ -4386,9 +4314,10 @@ export class BrowserSession {
       }
     }
     await this.showClickMarker(target.x, target.y, 'click');
+    const externalAppNote = this.externalAppCandidateNote(candidate);
     return {
       ok: true,
-      actual: `Clicked text locator ${match.locatorId} matching "${match.matchedText}" (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${note}`,
+      actual: `Clicked text locator ${match.locatorId} matching "${match.matchedText}" (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${externalAppNote}${note}`,
     };
   }
 
@@ -5239,11 +5168,18 @@ export class BrowserSession {
       candidate.role ? `role=${candidate.role}` : '',
       candidate.name ? `name="${candidate.name.slice(0, 80)}"` : '',
       candidate.signals?.length ? `signals=${candidate.signals.join('|')}` : '',
+      candidate.opensExternalApp ? `external-app=${candidate.externalAppProtocol || 'custom-protocol'}` : '',
       candidate.href ? `href=${candidate.href.slice(0, 140)}` : '',
       candidate.framePath ? `frame=${candidate.framePath}` : '',
       this.mode === 'visual-markers' ? `box=${candidate.rect.x},${candidate.rect.y},${candidate.rect.width}x${candidate.rect.height}` : '',
     ].filter(Boolean);
     return parts.join(' ');
+  }
+
+  private externalAppCandidateNote(candidate: InteractiveCandidate) {
+    if (!candidate.opensExternalApp) return '';
+    const protocol = candidate.externalAppProtocol ? ` (${candidate.externalAppProtocol}:)` : '';
+    return ` This candidate is marked as an external-application link${protocol}; the browser URL/page may remain unchanged. No host process check is performed, so ok=true means the click was delivered as an external-app launch attempt, not that the native app launch was server-verifiable.`;
   }
 
   private async findInteractiveCandidatesByText(targetText: string, scope?: DomNodeReference) {
@@ -5300,20 +5236,6 @@ export class BrowserSession {
       .slice(0, Math.max(1, Number(process.env.TEXT_LOCATOR_MATCH_LIMIT || 8)));
   }
 
-  private candidateIdentityPayload(candidate: InteractiveCandidate): CandidateIdentityPayload {
-    return {
-      tag: candidate.tag,
-      role: candidate.role,
-      type: candidate.type,
-      href: candidate.href,
-      ariaLabel: candidate.ariaLabel,
-      placeholder: candidate.placeholder,
-      title: candidate.title,
-      text: candidate.text,
-      name: candidate.name,
-    };
-  }
-
   private currentCandidatePool() {
     return this.mode === 'visual-markers'
       ? this.lastScreenshotCandidates
@@ -5339,7 +5261,6 @@ export class BrowserSession {
     await this.ensureBrowserPageRuntime();
     return this.activePage.evaluate(resolveAiCandidateActionTarget, {
       path: candidate.path,
-      expected: this.candidateIdentityPayload(candidate),
       center: candidate.center,
     }).catch((error) => ({
       ok: false,
@@ -5359,7 +5280,6 @@ export class BrowserSession {
     };
     const local = await frame.evaluate(resolveAiCandidateActionTarget, {
       path: candidate.path,
-      expected: this.candidateIdentityPayload(candidate),
       center: localCenter,
     }).catch((error) => ({
       ok: false,
@@ -5375,30 +5295,6 @@ export class BrowserSession {
         descriptor: `iframe ${candidate.framePath} ${local.target.descriptor}`,
       },
     };
-  }
-
-  private async validateMainCandidateIdentity(candidate: InteractiveCandidate) {
-    await this.ensureBrowserPageRuntime();
-    return this.activePage.evaluate(validateAiCandidateIdentity, {
-      path: candidate.path,
-      expected: this.candidateIdentityPayload(candidate),
-    }).catch((error) => ({
-      ok: false,
-      reason: error instanceof Error ? error.message : String(error),
-    }));
-  }
-
-  private async validateFrameCandidateIdentity(candidate: InteractiveCandidate) {
-    const frame = this.frameFromPath(candidate.framePath);
-    if (!frame) return { ok: false, reason: `iframe ${candidate.framePath} no longer exists` };
-    await this.ensureBrowserPageRuntime(frame);
-    return frame.evaluate(validateAiCandidateIdentity, {
-      path: candidate.path,
-      expected: this.candidateIdentityPayload(candidate),
-    }).catch((error) => ({
-      ok: false,
-      reason: error instanceof Error ? error.message : String(error),
-    }));
   }
 
   private async resolveCandidateTarget(candidateId: string, timings?: Record<string, number>) {
@@ -5516,7 +5412,7 @@ export class BrowserSession {
     const py = candidate.center?.y;
     if (typeof px !== 'number' || typeof py !== 'number') return undefined;
     return this.activePage
-      .evaluate(({ x, y, expected }) => {
+      .evaluate(({ x, y }) => {
         if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return undefined;
         function deepTopmost(pointX: number, pointY: number) {
           let root: Document | ShadowRoot = document;
@@ -5541,14 +5437,9 @@ export class BrowserSession {
         const element = deepTopmost(x, y);
         if (!element) return undefined;
         const tag = element.tagName.toLowerCase();
-        if (tag !== expected.tag) return undefined;
-        const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 180);
-        if (normalize(expected.role) && normalize(expected.role) !== normalize(element.getAttribute('role'))) return undefined;
-        if (normalize(expected.ariaLabel) && normalize(expected.ariaLabel) !== normalize(element.getAttribute('aria-label'))) return undefined;
-        if (normalize(expected.title) && normalize(expected.title) !== normalize(element.getAttribute('title'))) return undefined;
         const id = element.id ? `#${element.id}` : '';
         return { x, y, descriptor: `${tag}${id}`, offscreen: false };
-      }, { x: px, y: py, expected: this.candidateIdentityPayload(candidate) })
+      }, { x: px, y: py })
       .catch(() => undefined);
   }
 

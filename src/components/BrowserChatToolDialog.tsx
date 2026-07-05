@@ -55,20 +55,21 @@ export function BrowserChatToolDialog({
   const resultPreview = compactPayloadPreview(detail.tool.result);
 
   return (
-    <div className="modal-overlay" onClick={onClose} role="presentation">
-      <section className="browser-chat-tool-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="工具调用详情">
-        <header>
-          <div>
-            <h2 title={detail.tool.name}>{toolName}</h2>
-            <p>
+    <div className="ui-modal-overlay" onClick={onClose} role="presentation">
+      <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="工具调用详情">
+        <header className="ui-modal-header">
+          <div className="ui-modal-heading">
+            <h2 className="ui-modal-title" title={detail.tool.name}>{toolName}</h2>
+            <p className="ui-modal-subtitle">
               步骤 {detail.stepIndex} · 工具调用 {detail.toolIndex + 1}
             </p>
           </div>
-          <button className="icon-button" onClick={onClose} type="button" aria-label={t('关闭')}>
+          <button className="ui-icon-button ui-modal-close" onClick={onClose} type="button" aria-label={t('关闭')}>
             <X size={18} />
           </button>
         </header>
 
+        <div className="ui-modal-body browser-chat-tool-modal-body">
         <section className="browser-chat-tool-detail-summary" aria-label="工具调用摘要">
           <div>
             <span>状态</span>
@@ -172,6 +173,7 @@ export function BrowserChatToolDialog({
             </ol>
           </section>
         ) : null}
+        </div>
       </section>
     </div>
   );

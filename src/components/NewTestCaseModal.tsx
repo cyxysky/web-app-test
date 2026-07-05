@@ -18,13 +18,13 @@ export function NewTestCaseModal({
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const modal = open ? (
-    <div className="modal-overlay" onClick={() => setOpen(false)} role="presentation">
-      <section className="new-case-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('新增测试用例')}>
-        <header>
-          <div>
-            <h2>{t('新增测试用例')}</h2>
+    <div className="ui-modal-overlay" onClick={() => setOpen(false)} role="presentation">
+      <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('新增测试用例')}>
+        <header className="ui-modal-header">
+          <div className="ui-modal-heading">
+            <h2 className="ui-modal-title">{t('新增测试用例')}</h2>
           </div>
-          <button className="icon-button" onClick={() => setOpen(false)} type="button" aria-label={t('关闭')}>
+          <button className="ui-icon-button ui-modal-close" onClick={() => setOpen(false)} type="button" aria-label={t('关闭')}>
             <X size={18} />
           </button>
         </header>
@@ -43,7 +43,7 @@ export function NewTestCaseModal({
     <>
       <button
         aria-label={t('新增测试用例')}
-        className={iconOnly ? 'icon-button dashboard-action-icon' : 'icon-text-button'}
+        className={iconOnly ? 'ui-icon-button dashboard-action-icon' : 'ui-button ui-button--neutral'}
         onClick={() => setOpen(true)}
         title={t('新增测试用例')}
         type="button"

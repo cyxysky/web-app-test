@@ -1,42 +1,6 @@
-.browser-chat-tool-modal {
-  background: #ffffff;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: var(--shadow);
+.browser-chat-tool-modal-body {
   display: grid;
   gap: 14px;
-  max-height: min(760px, calc(100vh - 56px));
-  overflow: auto;
-  padding: 18px;
-  position: relative;
-  width: min(1080px, calc(100vw - 48px));
-}
-
-.browser-chat-tool-modal header,
-.browser-chat-log-modal header {
-  align-items: start;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  gap: 16px;
-  justify-content: space-between;
-  margin: -2px -2px 4px;
-  padding-bottom: 12px;
-}
-
-.browser-chat-tool-modal h2,
-.browser-chat-log-modal h2 {
-  font-size: 18px;
-  font-weight: 850;
-  line-height: 1.3;
-  margin: 0;
-}
-
-.browser-chat-tool-modal header p,
-.browser-chat-log-modal p {
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.5;
-  margin: 4px 0 0;
 }
 
 .browser-chat-tool-detail-grid div,
@@ -193,18 +157,10 @@
   white-space: pre-wrap;
 }
 
-.browser-chat-log-modal {
-  background: #ffffff;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: var(--shadow);
+.browser-chat-log-modal-body {
   display: grid;
   gap: 16px;
-  max-height: min(1200px, calc(100vh - 56px));
   overflow: hidden;
-  padding: 18px;
-  position: relative;
-  width: min(1200px, calc(100vw - 48px));
 }
 
 .browser-chat-log-modal-list {
