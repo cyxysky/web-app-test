@@ -18,10 +18,6 @@ function shouldIgnoreConsoleError(text: string) {
   );
 }
 
-function shouldUseSeparateMarkerMap() {
-  return !/^(false|0|no|off)$/i.test(String(process.env.VISUAL_MARKER_SEPARATE_MAP || 'false'));
-}
-
 function positiveIntegerEnv(key: string) {
   const raw = process.env[key]?.trim();
   if (!raw) return undefined;
@@ -73,7 +69,7 @@ function stringifyDiagnosticValue(value: unknown) {
   }
 }
 
-export type BrowserSessionMode = 'dom' | 'visual-markers';
+export type BrowserSessionMode = 'dom';
 
 export type BrowserSessionOptions = {
   isMarked?: boolean;
@@ -88,10 +84,7 @@ export type BrowserSessionOptions = {
  * @returns 鉴定模式
  */
 function browserSessionModeFromEnv(): BrowserSessionMode {
-  const raw = process.env.AI_BROWSER_MODE;
-  if (/^(dom|text|html)$/i.test(String(raw || ''))) return 'dom';
-  if (/^(true|1|yes|visual|vision|click|visual-markers)$/i.test(String(raw || ''))) return 'visual-markers';
-  return 'visual-markers';
+  return 'dom';
 }
 
 export type BrowserObservationType = 'text' | 'interactive';
@@ -687,9 +680,7 @@ function installAiBrowserPageRuntime() {
   if (win.__aiDomRuntime?.version === 4) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
-  const actionableTags = new Set(['a', 'button', 'input', 'select', 'textarea', 'summary', 'option', 'label', 'details']);
-  const actionableRoles = new Set(['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'tab', 'checkbox', 'radio', 'switch', 'option']);
-
+  const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
   const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
 
   function isOverlay(element: Element) {
@@ -803,12 +794,28 @@ function installAiBrowserPageRuntime() {
     return value !== null && value.toLowerCase() !== 'false';
   }
 
+  function labelControlFor(element: Element) {
+    if (element.tagName.toLowerCase() !== 'label') return undefined;
+    const control = (element as HTMLLabelElement).control || undefined;
+    const fallback = control ||
+      (element.getAttribute('for') ? document.getElementById(element.getAttribute('for') || '') || undefined : undefined);
+    const target = fallback ||
+      element.querySelector('button, input, select, textarea, [contenteditable=""], [contenteditable="true"]') ||
+      undefined;
+    if (!target) return undefined;
+    const tag = target.tagName.toLowerCase();
+    return ['button', 'input', 'select', 'textarea'].includes(tag) || isContentEditableOwner(target) ? target : undefined;
+  }
+
+  function hasNativeActionSignal(element: Element, tag = element.tagName.toLowerCase()) {
+    if (tag === 'a') return element.hasAttribute('href');
+    if (tag === 'label') return Boolean(labelControlFor(element));
+    return nativeActionableTags.has(tag);
+  }
+
   function isActionable(element: Element) {
     const tag = element.tagName.toLowerCase();
-    if (actionableTags.has(tag)) return true;
-    const role = element.getAttribute('role');
-    if (role && actionableRoles.has(role)) return true;
-    if (element.hasAttribute('aria-haspopup')) return true;
+    if (hasNativeActionSignal(element, tag)) return true;
     if (element.hasAttribute('onclick') || hasActionAttribute(element)) return true;
     if (recordedEventTypes(element).some((type) => /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown|mouseenter|mouseover|pointerenter|pointerover)$/.test(type))) return true;
     if (hasPointerCursor(element)) return true;
@@ -926,8 +933,6 @@ function installAiBrowserPageRuntime() {
     return undefined;
   }
 
-  const visibleDomInteractiveTags = new Set(['a', 'button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
-  const visibleDomInteractiveRoles = new Set(['button', 'checkbox', 'combobox', 'link', 'menuitem', 'option', 'radio', 'slider', 'spinbutton', 'switch', 'tab', 'textbox']);
   const visibleDomRenderedAttributes = [
     'id',
     'class',
@@ -944,13 +949,24 @@ function installAiBrowserPageRuntime() {
     'data-test',
     'data-qa',
     'data-cy',
+    'data-action',
+    'data-click',
+    'data-href',
+    'data-url',
+    'data-target',
     'href',
+    'jsaction',
     'name',
+    'ng-click',
+    'onclick',
     'placeholder',
     'role',
+    'tabindex',
     'title',
     'type',
     'value',
+    'v-on:click',
+    '@click',
   ];
   const visibleDomMeaningfulAttributes = visibleDomRenderedAttributes
     .filter((name) => !['id', 'class', 'aria-describedby', 'aria-controls'].includes(name));
@@ -1030,17 +1046,75 @@ function installAiBrowserPageRuntime() {
       || isVisibleDomStyleHidden(element);
   }
 
-  function isVisibleDomInteractive(element: Element) {
-    if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
+  const visibleDomClickEventPattern = /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/;
+  const visibleDomHoverEventPattern = /^(mouseenter|mouseover|pointerenter|pointerover)$/;
+
+  function hasVisibleDomRecordedClickListener(element: Element) {
+    return recordedEventTypes(element).some((type) => visibleDomClickEventPattern.test(type));
+  }
+
+  function hasVisibleDomRecordedHoverListener(element: Element) {
+    return recordedEventTypes(element).some((type) => visibleDomHoverEventPattern.test(type));
+  }
+
+  function hasVisibleDomOwnHoverAttribute(element: Element) {
+    return element.hasAttribute('onmouseenter')
+      || element.hasAttribute('onmouseover')
+      || element.hasAttribute('onpointerenter')
+      || element.hasAttribute('onpointerover');
+  }
+
+  function visibleDomHoverSelectors() {
+    const selectors: string[] = [];
+    for (const sheet of Array.from(document.styleSheets)) {
+      let rules: CSSRuleList | undefined;
+      try {
+        rules = sheet.cssRules;
+      } catch {
+        continue;
+      }
+      for (const rule of Array.from(rules || [])) {
+        const selectorText = (rule as CSSStyleRule).selectorText;
+        if (!selectorText || !selectorText.includes(':hover')) continue;
+        for (const part of selectorText.split(',')) {
+          const normalized = part
+            .replace(/:hover\b/g, '')
+            .replace(/:(active|focus|focus-visible|focus-within|visited|link)\b/g, '')
+            .trim();
+          if (normalized && !/[>+~]\s*$/.test(normalized)) selectors.push(normalized);
+        }
+      }
+    }
+    return Array.from(new Set(selectors)).slice(0, 600);
+  }
+
+  function hasVisibleDomCssHoverEffect(element: Element, hoverSelectors: string[]) {
+    const className = typeof element.className === 'string' ? element.className : '';
+    if (/(^|\s)hover[:_-]/.test(className)) return true;
+    for (const selector of hoverSelectors) {
+      try {
+        if (element.matches(selector)) return true;
+      } catch {
+        // Ignore selectors that cannot be used with matches().
+      }
+    }
+    return false;
+  }
+
+  function visibleDomInteractionSignals(element: Element, hoverSelectors: string[] = []) {
+    const signals: string[] = [];
     const tag = visibleDomElementName(element);
-    const contentEditable = element.getAttribute('contenteditable');
-    const role = element.getAttribute('role');
-    return visibleDomInteractiveTags.has(tag)
-      || (contentEditable !== null && contentEditable.toLowerCase() !== 'false')
-      || element.hasAttribute('href')
-      || element.hasAttribute('onclick')
-      || (role !== null && visibleDomInteractiveRoles.has(role.trim().toLowerCase()))
-      || Number(element.getAttribute('tabindex') ?? -1) >= 0;
+    if (hasNativeActionSignal(element, tag)) signals.push('native');
+    if (element.hasAttribute('onclick')) signals.push('onclick');
+    if (hasVisibleDomRecordedClickListener(element)) signals.push('listener');
+    if (hasActionAttribute(element)) signals.push('action-attr');
+    if (hasPointerCursor(element)) signals.push('cursor=pointer');
+    const tabindex = element.getAttribute('tabindex');
+    if (tabindex !== null && tabindex !== '-1') signals.push('tabindex');
+    if (isContentEditableOwner(element)) signals.push('contenteditable');
+    if (hasVisibleDomOwnHoverAttribute(element) || hasVisibleDomRecordedHoverListener(element)) signals.push('hover-listener');
+    if (hoverSelectors.length && hasVisibleDomCssHoverEffect(element, hoverSelectors)) signals.push('hover-css');
+    return signals;
   }
 
   function visibleDomRect(element: Element, viewportClip: BrowserUseViewportClip) {
@@ -1064,6 +1138,30 @@ function installAiBrowserPageRuntime() {
       ) {
         return { bottom: rect.bottom, left: rect.left, right: rect.right, top: rect.top };
       }
+    }
+    return undefined;
+  }
+
+  function visibleDomClickablePoint(element: Element, viewportClip: BrowserUseViewportClip) {
+    const rect = visibleDomRect(element, viewportClip);
+    if (!rect) return undefined;
+    const insetX = Math.min(10, Math.max(1, (rect.right - rect.left) / 4));
+    const insetY = Math.min(10, Math.max(1, (rect.bottom - rect.top) / 4));
+    const samples = [
+      [rect.left + (rect.right - rect.left) / 2, rect.top + (rect.bottom - rect.top) / 2],
+      [rect.left + insetX, rect.top + (rect.bottom - rect.top) / 2],
+      [rect.right - insetX, rect.top + (rect.bottom - rect.top) / 2],
+      [rect.left + (rect.right - rect.left) / 2, rect.top + insetY],
+      [rect.left + (rect.right - rect.left) / 2, rect.bottom - insetY],
+      [rect.left + insetX, rect.top + insetY],
+      [rect.right - insetX, rect.top + insetY],
+      [rect.left + insetX, rect.bottom - insetY],
+      [rect.right - insetX, rect.bottom - insetY],
+    ];
+    for (const [x, y] of samples) {
+      const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
+      const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
+      if (pointBelongsToElement(element, px, py, { requirePointerEvents: true })) return { x: px, y: py };
     }
     return undefined;
   }
@@ -1221,7 +1319,7 @@ function installAiBrowserPageRuntime() {
     return ref;
   }
 
-  function visibleDomLine(element: Element, ref: string) {
+  function visibleDomLine(element: Element, ref: string, signals: string[] = []) {
     const attrs = [`node_id=${ref}`];
     for (const name of visibleDomRenderedAttributes) {
       const value = visibleDomAttributeValue(element, name);
@@ -1229,6 +1327,10 @@ function installAiBrowserPageRuntime() {
     }
     for (const name of visibleDomBooleanAttributes) {
       if (element.hasAttribute(name)) attrs.push(`${name}="true"`);
+    }
+    if (signals.length) {
+      attrs.push('data-ai-interactive="true"');
+      attrs.push(`data-ai-signals="${escapeVisibleDomText(Array.from(new Set(signals)).join('|'))}"`);
     }
     const tag = visibleDomElementName(element);
     const text = visibleDomTextContent(element);
@@ -1249,12 +1351,13 @@ function installAiBrowserPageRuntime() {
     const items: BrowserUseVisibleDomSnapshot['items'] = [];
     let chars = 0;
     let truncated = false;
+    const hoverSelectors = visibleDomHoverSelectors();
 
     const stop = () => truncated || items.length >= maxElements || chars >= maxChars;
-    const pushItem = (element: Element) => {
+    const pushItem = (element: Element, signals: string[] = []) => {
       if (stop()) return;
       const ref = visibleDomRef(element);
-      const line = visibleDomLine(element, ref);
+      const line = visibleDomLine(element, ref, signals);
       const lineChars = line.length + (items.length === 0 ? 0 : 1);
       if (chars + lineChars > maxChars) {
         truncated = true;
@@ -1301,10 +1404,17 @@ function installAiBrowserPageRuntime() {
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const element = node as Element;
-      if (isVisibleDomSubtreeHidden(element)) return;
       const tag = visibleDomElementName(element);
       if (tag === 'frame' || tag === 'iframe') pushFrame(element);
-      if (isVisibleDomInteractive(element) && visibleDomRect(element, viewportClip)) pushItem(element);
+      const signals = visibleDomInteractionSignals(element, hoverSelectors);
+      if (
+        signals.length
+        && !isVisibleDomSubtreeHidden(element)
+        && hasVisibleDomPointerEvents(element)
+        && visibleDomClickablePoint(element, viewportClip)
+      ) {
+        pushItem(element, signals);
+      }
       const root = shadowRootOf(element);
       if (root && !stop()) visit(root);
       for (const child of Array.from(element.children)) {
@@ -1328,6 +1438,7 @@ function installAiBrowserPageRuntime() {
     const items: BrowserUseVisibleDomSnapshot['items'] = [];
     let chars = 0;
     let truncated = false;
+    const hoverSelectors = visibleDomHoverSelectors();
 
     const structuralTextTags = new Set([
       'a', 'button', 'dd', 'details', 'dt', 'figcaption', 'input', 'label', 'legend', 'li',
@@ -1337,18 +1448,22 @@ function installAiBrowserPageRuntime() {
     const directTextContainerTags = new Set(['article', 'aside', 'div', 'fieldset', 'footer', 'form', 'header', 'main', 'nav', 'section', 'span']);
     const stop = () => truncated || items.length >= maxElements || chars >= maxChars;
     const hasMeaningfulAttributes = (element: Element) => visibleDomMeaningfulAttributes.some((name) => Boolean(visibleDomAttributeValue(element, name)));
+    const actionableSignals = (element: Element) => {
+      const signals = visibleDomInteractionSignals(element, hoverSelectors);
+      return signals.length && visibleDomClickablePoint(element, viewport) ? signals : [];
+    };
     const shouldIncludeElement = (element: Element) => {
       if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
       const tag = visibleDomElementName(element);
-      if (isVisibleDomInteractive(element)) return true;
+      if (actionableSignals(element).length) return true;
       if (structuralTextTags.has(tag) && visibleDomTextContent(element)) return true;
       if (directTextContainerTags.has(tag) && visibleDomOwnTextContent(element)) return true;
       return hasMeaningfulAttributes(element);
     };
-    const pushItem = (element: Element) => {
+    const pushItem = (element: Element, signals: string[] = []) => {
       if (stop()) return;
       const ref = visibleDomRef(element);
-      const line = visibleDomLine(element, ref);
+      const line = visibleDomLine(element, ref, signals);
       const lineChars = line.length + (items.length === 0 ? 0 : 1);
       if (chars + lineChars > maxChars) {
         truncated = true;
@@ -1396,10 +1511,9 @@ function installAiBrowserPageRuntime() {
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const element = node as Element;
-      if (isVisibleDomSubtreeHidden(element)) return;
       const tag = visibleDomElementName(element);
       if (tag === 'frame' || tag === 'iframe') pushFrame(element);
-      if (shouldIncludeElement(element)) pushItem(element);
+      if (shouldIncludeElement(element)) pushItem(element, actionableSignals(element));
       const root = shadowRootOf(element);
       if (root && !stop()) visit(root);
       for (const child of Array.from(element.children)) {
@@ -1417,6 +1531,8 @@ function installAiBrowserPageRuntime() {
     if (!element?.isConnected) return undefined;
     element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     const clip = viewportClip || visualViewportRect();
+    const clickablePoint = visibleDomClickablePoint(element, clip);
+    if (clickablePoint) return { ...clickablePoint, descriptor: descriptor(element) };
     const pointInRect = (rect: DOMRect | ClientRect) => {
       if (rect.width <= 0 || rect.height <= 0) return undefined;
       const left = Math.max(rect.left, clip.left);
@@ -1498,23 +1614,6 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   const maxStructuredTextChars = Math.max(0, Math.floor(Number(input.structuredTextMaxChars) || 0));
   const structuredLines: string[] = [];
   let structuredChars = 0;
-  const interactiveRoles = new Set([
-    'button',
-    'link',
-    'menuitem',
-    'menuitemcheckbox',
-    'menuitemradio',
-    'tab',
-    'checkbox',
-    'radio',
-    'switch',
-    'option',
-    'searchbox',
-    'combobox',
-    'textbox',
-    'listbox',
-  ]);
-
   const normalizeText = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
   const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__';
   const skippedTextTags = new Set(['script', 'style', 'template', 'noscript']);
@@ -1712,12 +1811,28 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     return value !== null && value.toLowerCase() !== 'false';
   }
 
+  function labelControlFor(element: Element) {
+    if (element.tagName.toLowerCase() !== 'label') return undefined;
+    const control = (element as HTMLLabelElement).control || undefined;
+    const fallback = control ||
+      (element.getAttribute('for') ? document.getElementById(element.getAttribute('for') || '') || undefined : undefined);
+    const target = fallback ||
+      element.querySelector('button, input, select, textarea, [contenteditable=""], [contenteditable="true"]') ||
+      undefined;
+    if (!target) return undefined;
+    const tag = target.tagName.toLowerCase();
+    return ['button', 'input', 'select', 'textarea'].includes(tag) || isContentEditableOwner(target) ? target : undefined;
+  }
+
   function interactionSignals(element: Element, tag = element.tagName.toLowerCase()) {
     const signals: string[] = [];
-    const role = element.getAttribute('role');
-    if (['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag)) signals.push('native');
-    if (role && interactiveRoles.has(role)) signals.push(`role=${role}`);
-    if (element.hasAttribute('aria-haspopup')) signals.push('popup');
+    if (
+      ['button', 'details', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag) ||
+      (tag === 'a' && element.hasAttribute('href')) ||
+      (tag === 'label' && labelControlFor(element))
+    ) {
+      signals.push('native');
+    }
     if (element.hasAttribute('onclick')) signals.push('onclick');
     if (hasRecordedClickListener(element)) signals.push('listener');
     if (hasActionAttribute(element)) signals.push('action-attr');
@@ -1725,6 +1840,8 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     const tabindex = element.getAttribute('tabindex');
     if (tabindex !== null && tabindex !== '-1') signals.push('tabindex');
     if (isContentEditableOwner(element)) signals.push('contenteditable');
+    if (hasOwnHoverSignal(element)) signals.push('hover-listener');
+    if (hasCssHoverEffect(element)) signals.push('hover-css');
     return signals;
   }
 
@@ -1734,22 +1851,9 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
 
   function isInteractiveDescendant(element: Element) {
     const tag = element.tagName.toLowerCase();
-    if (tag === 'label') return true;
+    if (tag === 'label' && labelControlFor(element)) return true;
     const isInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(element);
     return clickableReason(element) || isInput || hasOwnHoverSignal(element) || hasCssHoverEffect(element);
-  }
-
-  function hasStrongOwnInteractionSemantics(element: Element) {
-    const tag = element.tagName.toLowerCase();
-    if (['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag)) return true;
-    if (isContentEditableOwner(element)) return true;
-    const role = (element.getAttribute('role') || '').toLowerCase();
-    if (['combobox', 'textbox', 'listbox', 'checkbox', 'radio', 'switch', 'slider', 'spinbutton'].includes(role)) return true;
-    return Boolean(
-      element.getAttribute('aria-label')?.trim() ||
-      element.getAttribute('title')?.trim() ||
-      element.getAttribute('placeholder')?.trim(),
-    );
   }
 
   function externalAppTargetForUrl(value?: string | null) {
@@ -1800,35 +1904,6 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     const inlineHandler = element.getAttribute('onclick') || '';
     const handlerMatch = inlineHandler.match(/['"]([a-z][a-z0-9+.-]*:[^'"]*)['"]/i);
     return externalAppTargetForUrl(handlerMatch?.[1]);
-  }
-
-  function hasMeaningfulContentOutsideInteractiveDescendants(element: Element) {
-    let found = false;
-    let visited = 0;
-    const visualContentTags = new Set(['img', 'svg', 'canvas', 'video']);
-
-    function visit(parent: Element) {
-      if (found || visited > 2000) return;
-      visited += 1;
-      for (const node of Array.from(parent.childNodes)) {
-        if (found) return;
-        if (node.nodeType === Node.TEXT_NODE) {
-          if (normalizeText(node.textContent)) found = true;
-          continue;
-        }
-        if (node.nodeType !== Node.ELEMENT_NODE) continue;
-        const child = node as Element;
-        if (!isRenderable(child) || isInteractiveDescendant(child)) continue;
-        if (visualContentTags.has(child.tagName.toLowerCase()) && visibleRectOf(child)) {
-          found = true;
-          return;
-        }
-        visit(child);
-      }
-    }
-
-    visit(element);
-    return found;
   }
 
   function nameOf(element: Element) {
@@ -2017,14 +2092,13 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
 
   function candidateFrom(element: Element, path: number[]): PageInteractiveCandidate | undefined {
     const tag = element.tagName.toLowerCase();
-    if (tag === 'label') return undefined;
+    const labelControl = labelControlFor(element);
     const role = element.getAttribute('role') || undefined;
     const inputElement = element as HTMLInputElement;
     const isInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(element);
     const signals = interactionSignals(element, tag);
     const clickable = signals.length > 0;
-    const hoverable = hasOwnHoverSignal(element) || hasCssHoverEffect(element);
-    if (!clickable && !isInput && !hoverable) return undefined;
+    if (!clickable && !isInput) return undefined;
 
     let rect = visibleRectOf(element);
     let visibility = rect ? computeVisibility(element, rect) : undefined;
@@ -2095,14 +2169,14 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
       },
       clickable,
       input: isInput,
-      disabled: Boolean(inputElement.disabled || element.getAttribute('aria-disabled') === 'true'),
+      disabled: Boolean(
+        inputElement.disabled ||
+        (labelControl && (labelControl as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | HTMLButtonElement).disabled) ||
+        element.getAttribute('aria-disabled') === 'true',
+      ),
       hasIndependentClickArea,
       shadow: isInsideShadow(element),
     };
-  }
-
-  function isDomPathAncestor(ancestorPath: string, descendantPath: string) {
-    return descendantPath.startsWith(`${ancestorPath}.`);
   }
 
   function pathParts(value: string) {
@@ -2119,24 +2193,9 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     return ap.length - bp.length;
   }
 
-  function dropParentWhenChildExists(items: PageInteractiveCandidate[], sourceElements: Map<string, Element>) {
-    const sorted = [...items].sort((a, b) => comparePath(a.path, b.path));
-    return sorted.filter((candidate, index) => {
-      const next = sorted[index + 1];
-      const hasChildCandidate = Boolean(next && isDomPathAncestor(candidate.path, next.path));
-      if (!hasChildCandidate) return true;
-      if (!candidate.hasIndependentClickArea) return false;
-      const element = sourceElements.get(candidate.path);
-      return Boolean(
-        element &&
-        (hasStrongOwnInteractionSemantics(element) || hasMeaningfulContentOutsideInteractiveDescendants(element)),
-      );
-    });
-  }
-
   const raw: PageInteractiveCandidate[] = [];
-  const sourceElements = new Map<string, Element>();
   const seenPaths = new Set<string>();
+  let visitedElements = 0;
 
   function pushCandidate(element: Element, path: number[]) {
     const pathKey = path.join('.');
@@ -2145,12 +2204,12 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     const candidate = candidateFrom(element, path);
     if (!candidate) return;
     raw.push(candidate);
-    sourceElements.set(candidate.path, element);
     seenPaths.add(pathKey);
   }
 
   function walk(element: Element, path: number[], depth: number, textDepth: number) {
-    if (depth > 24) return;
+    visitedElements += 1;
+    if (visitedElements > 50000 || depth > 128) return;
     const structured = maxStructuredTextChars ? structuredTextLine(element) : undefined;
     const nextTextDepth = structured?.shown ? textDepth + 1 : textDepth;
     if (structured?.text) appendStructuredText(textDepth, structured.text);
@@ -2163,7 +2222,7 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
 
   walk(document.documentElement, [0], 0, 0);
 
-  const candidates = dropParentWhenChildExists(raw, sourceElements)
+  const candidates = raw
     .sort((a, b) => comparePath(a.path, b.path) || a.rect.y - b.rect.y || a.rect.x - b.rect.x);
   return {
     structuredText: structuredLines.join('\n'),
@@ -3368,7 +3427,7 @@ export class BrowserSession {
           await this.ensureBrowserPageRuntime(frame);
           return frame.evaluate(collectAiDomObservation, {
             includeInteractiveCandidates: options.includeInteractiveCandidates,
-            requirePointerEvents: Boolean(framePath),
+            requirePointerEvents: true,
             structuredTextMaxChars: Math.max(0, maxChars - chars),
           }).catch(() => ({ structuredText: '', interactiveCandidates: [] as PageInteractiveCandidate[] }));
         },
@@ -3450,9 +3509,7 @@ export class BrowserSession {
         : Promise.resolve(undefined),
       domObservationPromise || !includeInteractiveCandidates
         ? Promise.resolve([] as InteractiveCandidate[])
-        : useCachedInteractiveCandidates && this.lastScreenshotCandidates.length
-          ? Promise.resolve(this.lastScreenshotCandidates)
-          : useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
+        : useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
             ? Promise.resolve(this.lastInteractiveCandidates)
             : timedBrowserStep(timings, 'refreshInteractiveCandidatesMs', () => this.refreshInteractiveCandidates().catch(() => this.lastInteractiveCandidates)),
       timedBrowserStep(timings, 'refreshScrollableAreasMs', () => this.refreshScrollableAreas().catch(() => this.lastScrollableAreas)),
@@ -3602,7 +3659,7 @@ export class BrowserSession {
     ];
   }
 
-  // Capture the current viewport. Visual mode draws marker labels inline by default.
+  // Capture the current viewport. Candidate marker overlays are no longer captured automatically.
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
     const totalStartedAt = Date.now();
     const timingSteps: ScreenshotTimingStep[] = [];
@@ -3635,14 +3692,9 @@ export class BrowserSession {
     await timed('prepareArtifactDir', () => mkdir(dir, { recursive: true }));
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    const shouldCaptureCandidates = phase === 'before' || String(phase).startsWith('visual-');
-    const candidateLabelsEnabled = shouldCaptureCandidates
-      && this.mode === 'visual-markers'
-      && this.options.isMarked !== false
-      && process.env.SCREENSHOT_ELEMENT_LABELS !== 'false';
-    const scrollAreaLabelsEnabled = shouldCaptureCandidates
-      && this.mode === 'visual-markers'
-      && process.env.SCREENSHOT_SCROLL_AREA_LABELS !== 'false';
+    const shouldCaptureCandidates = false;
+    const candidateLabelsEnabled = false;
+    const scrollAreaLabelsEnabled = false;
     const candidates = shouldCaptureCandidates
       ? await timed('refreshInteractiveCandidates', () => this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[]), (items) => ({ count: items.length }))
       : [];
@@ -3662,11 +3714,12 @@ export class BrowserSession {
         rect: { ...candidate.rect },
         center: { ...candidate.center },
       }));
+    } else {
+      this.lastScreenshotCandidates = [];
     }
     this.lastCandidateMarkerScreenshotPath = undefined;
     this.lastOriginalScreenshotPath = undefined;
-    // VISUAL_MARKER_SEPARATE_MAP can keep labels in a separate marker map when needed.
-    const separateMarkerMap = candidateLabelsEnabled && shouldUseSeparateMarkerMap();
+    const separateMarkerMap = false;
     await timed('removeCandidateOverlayBefore', () => this.removeCandidateOverlay());
     if (phase === 'before' || String(phase).startsWith('visual-')) {
       await timed('removeClickMarker', () => this.removeClickMarker());
@@ -3824,7 +3877,7 @@ export class BrowserSession {
     const pageTitle = await this.activePage.title().catch(() => '');
     const directObservation = await this.activePage.evaluate(collectAiDomObservation, {
       includeInteractiveCandidates: true,
-      requirePointerEvents: false,
+      requirePointerEvents: true,
       structuredTextMaxChars: 12000,
       debugPause: input.pause !== false,
     });
@@ -5149,7 +5202,7 @@ export class BrowserSession {
   private async refreshInteractiveCandidates() {
     await this.ensureBrowserPageRuntime();
     const mainCandidates = await this.activePage
-      .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: false })
+      .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: true })
       .then((observation) => observation.interactiveCandidates)
       .catch(() => [] as PageInteractiveCandidate[]);
 
@@ -5223,7 +5276,6 @@ export class BrowserSession {
       candidate.opensExternalApp ? `external-app=${candidate.externalAppProtocol || 'custom-protocol'}` : '',
       candidate.href ? `href=${candidate.href.slice(0, 140)}` : '',
       candidate.framePath ? `frame=${candidate.framePath}` : '',
-      this.mode === 'visual-markers' ? `box=${candidate.rect.x},${candidate.rect.y},${candidate.rect.width}x${candidate.rect.height}` : '',
     ].filter(Boolean);
     return parts.join(' ');
   }
@@ -5289,9 +5341,7 @@ export class BrowserSession {
   }
 
   private currentCandidatePool() {
-    return this.mode === 'visual-markers'
-      ? this.lastScreenshotCandidates
-      : (this.lastInteractiveCandidates.length ? this.lastInteractiveCandidates : this.lastScreenshotCandidates);
+    return this.lastInteractiveCandidates;
   }
 
   private findCandidateById(candidateId: string) {
@@ -5305,7 +5355,7 @@ export class BrowserSession {
       .map((item) => `${item.id}: ${this.describeCandidate(item)}`)
       .join('\n');
     return {
-      error: `Candidate ${candidateId} was not found in the current ${this.mode === 'visual-markers' ? 'screenshot' : 'DOM interactive'} snapshot. Refresh getPageState/getInteractiveCandidates and choose one of the returned candidate ids. Available candidates:\n${available || '[none]'}`,
+      error: `Candidate ${candidateId} was not found in the current DOM interactive snapshot. Refresh getPageState/getInteractiveCandidates and choose one of the returned candidate ids. Available candidates:\n${available || '[none]'}`,
     };
   }
 
@@ -5358,17 +5408,6 @@ export class BrowserSession {
 
     if (candidate.disabled) {
       return { candidate, error: `Candidate ${candidate.id} is disabled: ${this.describeCandidate(candidate)}` };
-    }
-
-    if (this.mode === 'visual-markers') {
-      const point = this.resolveCapturedCandidatePoint(candidate, candidate.framePath ? `iframe ${candidate.framePath} screenshot` : 'screenshot');
-      if (!point) {
-        return {
-          candidate,
-          error: `Candidate ${candidate.id} has no valid point in the current visual marker screenshot snapshot.`,
-        };
-      }
-      return { candidate, target: point };
     }
 
     const live = await this.resolveLiveLocatorPoint(candidate, timings);

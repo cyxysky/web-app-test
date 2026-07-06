@@ -39,7 +39,7 @@ export async function GET(request: NextRequest) {
 
     const session = reuse && debugState.session
       ? debugState.session
-      : new BrowserSession('visual-markers', {
+      : new BrowserSession('dom', {
           isMarked: true,
           runId,
           debugDevtools: true,

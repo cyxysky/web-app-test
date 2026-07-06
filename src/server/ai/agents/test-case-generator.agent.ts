@@ -27,8 +27,8 @@ export async function generateTestCase(input: GenerateInput): Promise<TestCaseCo
     userRequirement: prompt,
     systemPrompt: input.systemPrompt,
     priority: 'high',
-    browserMode: input.browserMode || 'default',
-    isMarked: input.isMarked ?? true,
+    browserMode: 'dom',
+    isMarked: false,
     preconditions: [],
     testData: {
       userRequirement: plainPrompt,
@@ -39,7 +39,7 @@ export async function generateTestCase(input: GenerateInput): Promise<TestCaseCo
     expectedResults: [
       'AI 在运行时根据用户需求、当前页面上下文和截图判断下一步操作。',
       '每一次 AI 实际执行的操作都会被记录为运行步骤。',
-      '最终页面状态由 AI 基于截图、页面文本和工具结果综合判定。',
+      '最终页面状态由 AI 基于 DOM 文本、交互节点和工具结果综合判定；需要视觉证据时由模型显式调用截图工具。',
     ],
     risks: [],
   };

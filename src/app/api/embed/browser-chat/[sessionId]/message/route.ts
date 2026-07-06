@@ -29,7 +29,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const session = await sendBrowserChatMessage(
       sessionId,
       content,
-      normalizeMode(body.mode),
+      'dom',
       normalizeSafetyMode(body.safetyMode),
       typeof body.modelProvider === 'string' ? body.modelProvider : undefined,
       typeof body.model === 'string' ? body.model : undefined,

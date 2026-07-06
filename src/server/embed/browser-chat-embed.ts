@@ -177,7 +177,8 @@ export function normalizeString(value: unknown) {
 }
 
 export function normalizeMode(value: unknown) {
-  return value === 'dom' || value === 'visual-markers' ? value : 'visual-markers';
+  void value;
+  return 'dom';
 }
 
 export function normalizeSafetyMode(value: unknown) {

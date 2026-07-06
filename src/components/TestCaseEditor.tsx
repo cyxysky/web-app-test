@@ -3,7 +3,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useState } from 'react';
 import { Loader2, Save, Sparkles } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-import { CustomSelect } from '@/components/CustomSelect';
 import { RichTextEditor } from '@/components/RichTextEditor';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -42,8 +41,8 @@ export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
   const router = useRouter();
   const [draft, setDraft] = useState<TestCaseContent>({
     ...testCase.content,
-    browserMode: testCase.content.browserMode || 'default',
-    isMarked: testCase.content.isMarked ?? true,
+    browserMode: 'dom',
+    isMarked: false,
     userRequirement: testCase.content.userRequirement || testCase.description,
     systemPrompt: testCase.content.systemPrompt || '',
     skillIds: testCase.content.skillIds || [],
@@ -167,32 +166,6 @@ export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
           {t('目标地址')}
           <input className="input" value={draft.targetUrl} onChange={(event) => update({ targetUrl: event.target.value })} />
         </label>
-        <label>
-          {t('浏览器操作模式')}
-          <CustomSelect
-            value={draft.browserMode || 'default'}
-            onChange={(nextValue) => update({ browserMode: nextValue as TestCaseContent['browserMode'] })}
-            options={[
-              { label: t('默认配置'), value: 'default' },
-              { label: t('DOM 交互'), value: 'dom' },
-              { label: t('视觉标识'), value: 'visual-markers' },
-            ]}
-          />
-        </label>
-        {draft.browserMode === 'visual-markers' ? (
-          <label>
-            {t('视觉标记截图')}
-            <span className="inline-check">
-              <input
-                type="checkbox"
-                checked={draft.isMarked ?? true}
-                onChange={(event) => update({ isMarked: event.target.checked })}
-              />
-              {t('启用截图 marker')}
-            </span>
-            <span className="hint">{t('关闭后只发送原始截图，并在提示词中加入可交互元素摘要。')}</span>
-          </label>
-        ) : null}
         <label className="wide">
           Skills
           <div className="skill-picker">

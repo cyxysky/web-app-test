@@ -165,37 +165,30 @@ function modelSupportsScreenshotInput() {
 }
 
 function browserModeFromEnv(): BrowserSessionMode {
-  const raw = process.env.AI_BROWSER_MODE;
-  return /^(true|1|yes|visual|vision|click|visual-markers)$/i.test(String(raw || ''))
-    ? 'visual-markers'
-    : 'dom';
+  return 'dom';
 }
 
 function browserModeOf(testCase: TestCaseRecord): BrowserSessionMode {
-  const configured = testCase.content.browserMode;
-  const requestedMode = configured === 'dom' || configured === 'visual-markers'
-    ? configured
-    : browserModeFromEnv();
-  return requestedMode === 'visual-markers' && !modelSupportsScreenshotInput()
-    ? 'dom'
-    : requestedMode;
+  void testCase;
+  return browserModeFromEnv();
 }
 
 function isVisualMode(mode: BrowserSessionMode) {
-  return mode !== 'dom';
+  void mode;
+  return false;
 }
 
 function runtimePageContextOptions(mode: BrowserSessionMode, options: { includeDomTree?: boolean } = {}) {
-  const visualMode = isVisualMode(mode);
-  const includeDomTree = !visualMode && options.includeDomTree === true;
+  void mode;
+  const includeDomTree = options.includeDomTree === true;
   return {
-    domScope: visualMode ? undefined : 'full' as const,
+    domScope: 'full' as const,
     includeDomTree,
     includeText: false,
     includeManualVerification: false,
-    includeInteractiveCandidates: visualMode,
+    includeInteractiveCandidates: false,
     textMaxChars: 0,
-    useCachedInteractiveCandidates: visualMode,
+    useCachedInteractiveCandidates: false,
   };
 }
 
@@ -226,7 +219,7 @@ function pageTextForPrompt(rawText: string) {
 }
 
 function createDomContextSnapshot(mode: BrowserSessionMode, pageContext: RuntimePageContext): AiDomContextSnapshot | undefined {
-  if (mode !== 'dom') return undefined;
+  void mode;
   const rawTree = pageContext.domTree || '[empty DOM tree]';
   const promptCharLimit = domTreePromptLimit();
   const tree = domTreeForPrompt(rawTree);
@@ -270,7 +263,8 @@ function usesSeparateMarkerMap() {
 
 // 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
 function shouldSendScreenshotToAi(mode: BrowserSessionMode) {
-  return isVisualMode(mode) && modelSupportsScreenshotInput();
+  void mode;
+  return false;
 }
 
 // 将调试数据转成可安全 JSON 序列化的结构，避免 Buffer/BigInt 破坏持久化。
@@ -617,10 +611,7 @@ function parseJsonObjectText(text?: string) {
 
 function toolNameLike(value?: string) {
   if (!value) return false;
-  const names = new Set<string>([
-    ...runtimeToolNames('visual-markers'),
-    ...runtimeToolNames('dom'),
-  ]);
+  const names = new Set<string>(runtimeToolNames('dom'));
   return names.has(value);
 }
 
@@ -1757,6 +1748,7 @@ function makeBrowserTools(
     onDebug?: ExecutionDebug;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
     observePageState?: () => Promise<BrowserActionResult>;
+    observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => Promise<BrowserActionResult>;
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   },
 ) {
@@ -1817,6 +1809,7 @@ function makeBrowserTools(
       }
       return action();
     };
+    const traceVisualContext = referenceOptions?.visualContext;
     return executeTracedBrowserAction({
       session,
       traces,
@@ -1824,20 +1817,20 @@ function makeBrowserTools(
       toolInput: input,
       runId: referenceOptions?.runId,
       stepIndex: referenceOptions?.stepIndex,
-      visualContext: isVisualMode(mode) ? referenceOptions?.visualContext : undefined,
+      visualContext: traceVisualContext,
       abortSignal: referenceOptions?.abortSignal,
       shouldContinue: referenceOptions?.shouldContinue,
       aiRequest: referenceOptions?.getAiRequest?.() || aiRequest,
       onDebug: referenceOptions?.onDebug,
       onToolTrace,
-      onVisualContextChange: isVisualMode(mode) ? referenceOptions?.onVisualContextChange : undefined,
+      onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
       action: actionWithConfirmation,
     }).then((result) => compactToolResultForModel(name, result, referenceOptions?.observationStore, referenceOptions?.runId));
   }
 
   const sharedTools = {
     getPageState: tool({
-      description: 'Read-only observation tool: inspect the current active page state. DOM mode collects the browser DOM tree into the Node backend, where worker threads generate stored text and interactive node_id views for readObservation. Visual mode captures/attaches a fresh screenshot observation for the next model request and returns current visual metadata. Call this after any browser-changing action before choosing another action.',
+      description: 'Read-only observation tool: inspect the current active page state. It collects the browser DOM tree into the Node backend, where worker threads generate stored text and interactive node_id views for readObservation. Call this after any browser-changing action before choosing another DOM action.',
       inputSchema: browserToolInput({}),
       execute: (input) => record('getPageState', input, async () => (
         referenceOptions?.observePageState
@@ -1845,6 +1838,19 @@ function makeBrowserTools(
           : { ok: false, actual: 'getPageState is unavailable in this runtime.' }
       )),
     }),
+    ...(modelSupportsScreenshotInput() ? {
+      getCurrentScreenshot: tool({
+        description: 'Read-only visual observation tool: capture the current browser viewport screenshot and attach it to the NEXT model request. Use only when visual evidence is needed; use DOM tools for clicking/filling.',
+        inputSchema: browserToolInput({
+          capture: z.enum(['viewport', 'fullPage']).optional().describe('Screenshot size. Defaults to viewport; use fullPage only when the visual evidence is outside the current viewport.'),
+        }),
+        execute: (input) => record('getCurrentScreenshot', input, async () => (
+          referenceOptions?.observeCurrentScreenshot
+            ? referenceOptions.observeCurrentScreenshot({ capture: input.capture })
+            : { ok: false, actual: 'getCurrentScreenshot is unavailable in this runtime.' }
+        )),
+      }),
+    } : {}),
     openPage: tool({
       description: 'Open or navigate to a URL in the browser.',
       inputSchema: browserToolInput({
@@ -2062,66 +2068,7 @@ function makeBrowserTools(
     }),
   };
 
-  const candidateSource = mode === 'visual-markers'
-    ? 'current screenshot marker map'
-    : 'latest DOM interactive elements list from getPageState/getInteractiveCandidates';
-  const visualTools = {
-    clickCandidate: tool({
-      description: `Click a visible candidate by its numbered id from the ${candidateSource}. Choose the smallest/tightest candidate that directly represents the intended visible text, icon, or control; avoid larger containing wrapper boxes. A successful tool result only confirms the click was delivered, not that the UI changed. If the current candidate is marked external-app=<protocol>, it may open a native/system application and leave the browser page unchanged; treat ok=true as a delivered external-app launch attempt, not server-verifiable native-app success. The same visible target may be attempted at most twice because the first click can dismiss an overlay while the second activates the target. If text is provided, type it immediately after the click.`,
-      inputSchema: browserToolInput({
-        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current candidate list. Never choose a larger overlapping wrapper when a tighter candidate represents the same visible target.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the current screenshot or DOM interactive list.'),
-        text: z.string().optional().describe('Optional text to type immediately after clicking, useful when the click focuses an input or editable control.'),
-      }),
-      execute: (input) => record('clickCandidate', input, async () => validateCandidateActionBeforeExecution('clickCandidate', input, traces) || session.clickCandidate(input.id, input.text)),
-    }),
-    fillCandidates: tool({
-      description: `Visual mode form helper: click and optionally fill up to ${BATCH_FILL_FIELD_LIMIT} visible candidates from the CURRENT screenshot candidate map in one browser action. Use for stable forms where all fields are visible at once. Do not use across navigation, popups, hover menus, or dynamic multi-step widgets.`,
-      inputSchema: browserToolInput({
-        fields: batchFillFieldsInput.describe('Ordered visual candidates to click/fill. Each id must come from the current visual labels; targetVisual should name the visible label/placeholder for each field.'),
-      }),
-      execute: (input) => record('fillCandidates', input, async () => session.fillCandidates(input.fields.map((field) => ({
-        id: field.id,
-        text: field.text,
-        clear: field.clear,
-      })))),
-    }),
-    hoverCandidate: tool({
-      description: `Move the mouse over a visible candidate by its numbered id from the ${candidateSource}. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.`,
-      inputSchema: browserToolInput({
-        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current candidate list.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the current screenshot or DOM interactive list.'),
-      }),
-      execute: (input) => record('hoverCandidate', input, async () => validateCandidateActionBeforeExecution('hoverCandidate', input, traces) || session.hoverCandidate(input.id)),
-    }),
-    doubleClickCandidate: tool({
-      description: `Double-click a visible candidate by its numbered id from the ${candidateSource}.`,
-      inputSchema: browserToolInput({
-        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current candidate list.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the current screenshot or DOM interactive list.'),
-      }),
-      execute: (input) => record('doubleClickCandidate', input, async () => validateCandidateActionBeforeExecution('doubleClickCandidate', input, traces) || session.doubleClickCandidate(input.id)),
-    }),
-    rightClickCandidate: tool({
-      description: `Right-click a visible candidate by its numbered id from the ${candidateSource}.`,
-      inputSchema: browserToolInput({
-        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current candidate list.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the current screenshot or DOM interactive list.'),
-      }),
-      execute: (input) => record('rightClickCandidate', input, async () => validateCandidateActionBeforeExecution('rightClickCandidate', input, traces) || session.rightClickCandidate(input.id)),
-    }),
-    dragCandidate: tool({
-      description: `Drag from one numbered candidate to another numbered candidate from the ${candidateSource}.`,
-      inputSchema: browserToolInput({
-        fromId: z.string().describe('Start candidate id such as 1.'),
-        toId: z.string().describe('End candidate id such as 2.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the current screenshot or DOM interactive list.'),
-      }),
-      execute: (input) => record('dragCandidate', input, async () => validateCandidateActionBeforeExecution('dragCandidate', input, traces) || session.dragCandidate(input.fromId, input.toId)),
-    }),
-  };
-
-  const tools = mode === 'visual-markers' ? { ...sharedTools, ...visualTools } : { ...sharedTools, ...domTools };
+  const tools = { ...sharedTools, ...domTools };
   const allowedToolTypes = referenceOptions?.allowedToolTypes;
   if (!allowedToolTypes?.length) return tools;
   const allowed = new Set(allowedToolTypes);
@@ -2269,13 +2216,15 @@ function runtimePrompt(input: {
   const { testCase, pageContext, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
   const mode = browserModeOf(testCase);
-  const visualMode = isVisualMode(mode);
-  const attachScreenshot = shouldSendScreenshotToAi(mode);
-  const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
-  const visualMarkersWithoutOverlay = mode === 'visual-markers' && !markerEnabled;
-  const visualTextCandidateFallback = visualMode && !attachScreenshot;
-  const markerOverlayInScreenshot = Boolean(markerEnabled && input.markerOverlayInScreenshot);
-  const separateMarkerScreenshot = Boolean(markerEnabled && input.hasMarkerScreenshot);
+  const visualMode = false;
+  const attachScreenshot = false;
+  const markerEnabled = false;
+  const visualMarkersWithoutOverlay = false;
+  const visualTextCandidateFallback = false;
+  const markerOverlayInScreenshot = false;
+  const separateMarkerScreenshot = false;
+  void input.markerOverlayInScreenshot;
+  void input.hasMarkerScreenshot;
   const rawCaseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
   const browserChatMode = isBrowserChatTestCase(testCase);
@@ -2305,53 +2254,11 @@ function runtimePrompt(input: {
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const candidateContext = visualMode
-    ? visualMarkersWithoutOverlay || visualTextCandidateFallback
-      ? formatVisualInteractiveElements(pageContext.interactiveCandidates)
-      : '[disabled because visual mode uses screenshot labels]'
-    : '[disabled because DOM mode uses fresh DOM tree ids]';
-  const externalAppCandidateContext = formatExternalAppInteractiveElements(pageContext.interactiveCandidates);
-  const evidence = attachScreenshot
-    ? mode === 'visual-markers' && separateMarkerScreenshot
-      ? 'the two attached screenshots'
-      : mode === 'visual-markers' && markerOverlayInScreenshot
-        ? 'the attached viewport screenshot with marker labels overlaid'
-      : visualMarkersWithoutOverlay
-        ? 'the attached clean viewport screenshot plus the visible interactive elements list'
-        : 'the attached clean viewport screenshot'
-    : visualMode
-      ? 'current URL, tabs, scrollable areas, focused element, and the visible interactive elements list generated from the current screenshot'
-      : 'the latest explicit getPageState DOM summary plus Node-processed readObservation text/interactive node_id views, URL, tabs, scroll state, and focused element';
-  const markerSourceRule = separateMarkerScreenshot
-    ? '- Image 1 is the source of truth for what the page means. Image 2 only maps visible click/scroll positions to candidate IDs.'
-    : markerOverlayInScreenshot
-      ? '- The attached screenshot is the source of truth and contains marker labels overlaid only as click/scroll position IDs.'
-      : '- The attached screenshot is the source of truth for what the page means.';
-  const markerTargetRules = mode === 'visual-markers' && attachScreenshot && markerEnabled
-    ? [
-        '',
-        'Visual target selection and no-progress recovery:',
-        markerSourceRule,
-        '- Marker numbers/labels are NOT page content, image/page numbers, item order, progress, status, priority, or business meaning; they only identify where a tool can click/hover/drag/scroll.',
-        '- A tool result with ok=true only confirms that the browser received the action. It does NOT prove the target was correct or that the page changed.',
-        '- Candidate ids in attached reference screenshots are historical only. For the next action, use only ids that are visible in the current screenshot/marker map.',
-        '- For overlapping boxes, choose the smallest/tightest box that directly encloses the intended visible text/icon/control.',
-        '- Count repeated attempts by visible target + action, not only by id. After two ineffective attempts, choose another evidence-based path.',
-        '- Never issue two separate click tools from one screenshot. Re-inspect the new screenshot before a second attempt, except fillCandidates may fill multiple stable form fields in one tool call.',
-      ]
-    : [];
-  const modeActionRules = visualMode
-    ? [
-        '- Candidate IDs are volatile and valid only for the CURRENT screenshot. Re-read the visible target first, then use its current number.',
-        '- For text entry on a numbered candidate, use clickCandidate(id,text) in one tool call. Use typeText only after a fallback click already focused the field.',
-        `- For stable forms with multiple visible fields in the same screenshot, use fillCandidates(fields[]) once instead of one clickCandidate per field. You may include up to ${BATCH_FILL_FIELD_LIMIT} fields. Do not batch across navigation, hover menus, or dynamic multi-step UI.`,
-        '- For hover-only menus, call hoverCandidate on the visible trigger, then act on the revealed target in the next step.',
-        '- If needed content may be outside the visible area, use scrollArea with the green S label shown on the current screenshot.',
-        '- Green dashed boxes/green S labels mark scrollable regions. Use only a green S id visible in the CURRENT screenshot; never reuse historical S ids.',
-        '- Previous screenshots/references are context only; never use their candidate ids.',
-        '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous screenshot.',
-      ]
-    : domModeActionRules();
+  const candidateContext = '[disabled because DOM mode uses fresh DOM tree ids]';
+  const externalAppCandidateContext = '';
+  const evidence = 'the latest explicit getPageState DOM summary plus Node-processed readObservation text/interactive node_id views, URL, tabs, scroll state, and focused element';
+  const markerTargetRules: string[] = [];
+  const modeActionRules = domModeActionRules();
   return [
     browserChatMode
       ? 'You are an AI browser chat agent.'
@@ -2394,17 +2301,7 @@ function runtimePrompt(input: {
     browserChatMode
       ? ''
       : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
-    attachScreenshot
-      ? separateMarkerScreenshot
-        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. After any browser-changing action, call getPageState for the next screenshot observation. DOM text/node tools are unavailable.'
-        : markerOverlayInScreenshot
-          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. White labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. After any browser-changing action, call getPageState for the next screenshot observation. DOM text/node tools are unavailable.'
-        : markerEnabled
-          ? '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. DOM text/node tools are unavailable.'
-          : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. DOM text/node tools are unavailable.'
-      : visualMode
-        ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
-        : domNoScreenshotRule,
+    `${domNoScreenshotRule} If visual evidence is needed and the model supports image input, call getCurrentScreenshot; continue to use DOM node tools for actions.`,
     ...markerTargetRules,
     caseSystemPrompt ? `${browserChatMode ? 'Browser-chat loaded instructions and Skills' : 'Test-case-specific instructions'}:
 ${caseSystemPrompt}` : '',
@@ -2446,19 +2343,15 @@ ${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
     selectedScreenshotReferences.length
       ? 'Reference screenshot rule: selected reference images help connect scroll continuity or compare earlier page state. They may show the same interface at different scroll offsets when sameInterfaceGroup matches, but their candidate ids are historical and must never be used for the current action.'
       : '',
-    attachScreenshot
-      ? mode === 'visual-markers' && separateMarkerScreenshot
-        ? `Screenshot images are attached in this order: Image 1 current clean viewport, Image 2 current marker map${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
-        : mode === 'visual-markers' && markerOverlayInScreenshot
-          ? `Screenshot images are attached in this order: Image 1 current page with marker labels overlaid${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
-        : `Screenshot images are attached in this order: Image 1 current clean viewport${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
-      : 'Screenshot image/path is not attached.',
+    'Screenshot image/path is not attached automatically. getCurrentScreenshot attaches explicit visual evidence to the next model request when available.',
   ].filter(Boolean).join('\n');
 }
 
 function runtimeToolNames(mode: BrowserSessionMode) {
+  void mode;
   const sharedTools = [
     'getPageState',
+    ...(modelSupportsScreenshotInput() ? ['getCurrentScreenshot'] : []),
     'openPage',
     'waitForPage',
     'waitForHumanVerification',
@@ -2473,22 +2366,9 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'reportState',
     'scrollArea',
   ];
-  const visualContextTools = [
-    'selectReferenceScreenshots',
-    'manageVisualContext',
-  ];
-  const candidateTools = [
-    ...sharedTools,
-    ...visualContextTools,
-    'clickCandidate',
-    'fillCandidates',
-    'hoverCandidate',
-    'doubleClickCandidate',
-    'rightClickCandidate',
-    'dragCandidate',
-  ];
   const domTools = [
     ...sharedTools,
+    ...(modelSupportsScreenshotInput() ? ['selectReferenceScreenshots', 'manageVisualContext'] : []),
     'getDomNodeText',
     'clickDomNode',
     'fillDomNodes',
@@ -2498,7 +2378,6 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'findByText',
     'clickLocator',
   ];
-  if (mode === 'visual-markers') return candidateTools;
   return domTools;
 }
 
@@ -2904,14 +2783,12 @@ async function executeRuntimeStep(input: {
   } = input;
   const mode = browserModeOf(testCase);
   const browserChatMode = isBrowserChatTestCase(testCase);
-  const screenshotInputEnabled = shouldSendScreenshotToAi(mode);
-  const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
-  const separateMarkerMap = markerEnabled && usesSeparateMarkerMap();
-  const markerOverlayInScreenshot = markerEnabled && !separateMarkerMap;
+  const screenshotInputEnabled = false;
+  const markerEnabled = false;
+  const separateMarkerMap = false;
+  const markerOverlayInScreenshot = false;
   const ensureActive = () => throwIfStopped(abortSignal, input.shouldContinue);
-  const markerScreenshotPath = separateMarkerMap && screenshotInputEnabled
-    ? session.getLastCandidateMarkerScreenshotPath()
-    : undefined;
+  const markerScreenshotPath = undefined;
   const originalScreenshotPath = session.getLastOriginalScreenshotPath();
   ensureActive();
   await onDebug?.({
@@ -2926,11 +2803,9 @@ async function executeRuntimeStep(input: {
   let currentDomContext = createDomContextSnapshot(mode, pageContext);
   const contextMs = elapsedSince(contextStartedAt);
   const screenshotReadStartedAt = Date.now();
-  const screenshot = screenshotInputEnabled ? await readScreenshotForAi(beforeScreenshotPath) : undefined;
+  const screenshot = undefined;
   ensureActive();
-  const markerScreenshot = screenshot && markerScreenshotPath
-    ? await readMarkerScreenshotForAi(markerScreenshotPath, screenshot).catch(() => undefined)
-    : undefined;
+  const markerScreenshot = undefined;
   ensureActive();
   const userReferenceImagePaths = Array.from(new Set(referenceImagePaths.filter(Boolean))).slice(0, 4);
   const userReferenceImages = modelSupportsScreenshotInput()
@@ -2941,7 +2816,7 @@ async function executeRuntimeStep(input: {
     : [];
   ensureActive();
   let runtimeSelectedScreenshotReferences = [...selectedScreenshotReferences];
-  const loadSelectedReferenceScreenshots = async () => screenshotInputEnabled
+  const loadSelectedReferenceScreenshots = async () => modelSupportsScreenshotInput()
     ? Promise.all(runtimeSelectedScreenshotReferences.map(async (ref) => ({
         ref,
         image: await readScreenshotForAi(ref.path).catch(() => undefined),
@@ -3005,8 +2880,8 @@ async function executeRuntimeStep(input: {
       screenshotReadMs,
       promptMs,
       screenshotInputEnabled,
-      screenshotBytes: screenshot?.length,
-      markerScreenshotBytes: markerScreenshot?.length,
+      screenshotBytes: undefined,
+      markerScreenshotBytes: undefined,
       selectedReferenceScreenshotCount: runtimeSelectedReferenceScreenshots.filter((item) => item.image).length,
       userReferenceImageCount: userReferenceImages.filter((item) => item.image).length,
       browserMode: mode,
@@ -3035,48 +2910,30 @@ async function executeRuntimeStep(input: {
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
-    const initialPageObservation = browserChatMode || mode === 'dom'
-      ? ''
-      : formatVisualPageStateObservation({
-          pageContext,
-          visualContext: visualContext.snapshot(),
-          screenshotInputEnabled,
-          markerEnabled,
-          markerOverlayInScreenshot,
-          separateMarkerMap,
-        });
-    const initialRequestPrompt = initialPageObservation
-      ? `${prompt}\n\nInitial page observation:\n${initialPageObservation}`
-      : prompt;
+    const initialRequestPrompt = prompt;
     const requestPrompt = codexMode ? buildCodexObjectPrompt(initialRequestPrompt, allowedToolTypes) : initialRequestPrompt;
     const requestSystemPrompt: string | undefined = browserChatMode ? requestPrompt : undefined;
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(testCase),
       phase: browserChatMode
         ? 'Browser chat turn; answer directly when current evidence is enough, otherwise use one browser tool.'
-        : mode === 'dom'
-          ? 'Entering DOM Agent Loop; choose one DOM/text tool or report state.'
-          : 'Entering visual Agent Loop; choose one tool from the current visual frame.',
+        : 'Entering DOM Agent Loop; choose one DOM/text tool or report state.',
       completed: [],
       findings: [],
       blockers: [],
       pageUnderstanding: '',
       currentState: browserChatMode
         ? 'No page observation is preloaded; call getPageState when browser evidence is needed.'
-        : mode === 'dom'
-        ? 'No DOM observation is preloaded; call getPageState, then readObservation when page evidence is needed.'
-        : 'Initial visual observation is available; call getPageState again after browser-changing actions.',
+        : 'No DOM observation is preloaded; call getPageState, then readObservation when page evidence is needed.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
-        : mode === 'dom'
-          ? 'Use the latest getPageState Node-processed text/interactive node_id views for the next missing goal; scroll only when content is lazy-loaded or viewport-dependent.'
-          : 'Use the latest getPageState screenshot observation to complete the next missing goal.',
+        : 'Use the latest getPageState Node-processed text/interactive node_id views for the next missing goal; scroll only when content is lazy-loaded or viewport-dependent.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
-    const initialVisualPaths = browserChatMode ? [] : includeImage ? visualContext.imagePaths() : [];
+    const initialVisualPaths: string[] = [];
     const initialSelectedReferenceImagePaths = browserChatMode ? [] : runtimeSelectedReferenceScreenshots.filter((item) => item.image).map((item) => item.ref.path);
     const initialUserReferenceImagePaths = userReferenceImages.filter((item) => item.image).map((item) => item.imagePath);
     type PendingObservationMessage = {
@@ -3161,12 +3018,12 @@ async function executeRuntimeStep(input: {
       stepIndex,
       prompt: browserChatMode ? '[system prompt]' : requestPrompt,
       systemPrompt: requestSystemPrompt,
-      screenshotPath: mode === 'dom' ? undefined : beforeScreenshotPath,
+      screenshotPath: undefined,
       imagePaths: messageImagePaths,
       imageAttached: Boolean(messageImagePaths.length),
       tools: allowedToolTypes,
       domContext: currentDomContext,
-      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, selectedReferenceScreenshotCount: initialSelectedReferenceImagePaths.length, userReferenceImageCount: initialUserReferenceImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId) },
+      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, markerScreenshotPath, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled: false, screenshotToolEnabled: modelSupportsScreenshotInput(), browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: initialSelectedReferenceImagePaths.length, userReferenceImageCount: initialUserReferenceImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId) },
     });
     lastAiRequest = aiRequest;
     const toolExecutionGate = { stepNumber: 0, executed: false };
@@ -3181,111 +3038,104 @@ async function executeRuntimeStep(input: {
       ensureActive();
       const getPageStateStartedAt = Date.now();
       const pageContextStartedAt = Date.now();
-      const currentPageContext = await session.getPageContext(runtimePageContextOptions(mode, { includeDomTree: mode === 'dom' }));
+      const currentPageContext = await session.getPageContext(runtimePageContextOptions(mode, { includeDomTree: true }));
       const pageContextMs = elapsedSince(pageContextStartedAt);
       ensureActive();
       const domContextStartedAt = Date.now();
       currentDomContext = createDomContextSnapshot(mode, currentPageContext);
       const domContextSnapshotMs = elapsedSince(domContextStartedAt);
 
-      if (mode === 'dom') {
-        const nodeProcessingStartedAt = Date.now();
-        const processedObservation = await processDomObservationInNode(currentPageContext.domTree || '');
-        const nodeProcessingMs = elapsedSince(nodeProcessingStartedAt);
-        ensureActive();
-        const storeStartedAt = Date.now();
-        const observationViews = domPageStateObservationViews(processedObservation);
-        const observation = storeRuntimeObservation(
-          observationStore,
-          input.runId,
-          'getPageState',
-          formatDomPageStateObservation(currentPageContext, observationViews),
-          observationViews,
-        );
-        const storeObservationMs = elapsedSince(storeStartedAt);
-        const getPageStateTimings = {
-          totalMs: elapsedSince(getPageStateStartedAt),
-          getPageContextMs: pageContextMs,
-          domContextSnapshotMs,
-          nodeProcessingMs,
-          storeObservationMs,
-          pageContextTimings: currentPageContext.timings || {},
-          nodeProcessingTimings: processedObservation.timings,
-          domTreeChars: (currentPageContext.domTree || '').length,
-          textChars: processedObservation.textCharLength,
-          interactiveChars: processedObservation.interactiveCharLength,
-          domNodeCount: processedObservation.domNodeCount,
-          interactiveNodeCount: processedObservation.interactiveNodeCount,
-        };
-        await onDebug?.({
-          phase: 'browser:get-page-state:dom-timings',
-          stepIndex,
-          message: `DOM getPageState timings: total=${getPageStateTimings.totalMs}ms, getPageContext=${pageContextMs}ms, readSimplifiedDomTree=${Number((currentPageContext.timings || {}).readSimplifiedDomTreeMs || 0)}ms, nodeProcessing=${nodeProcessingMs}ms, store=${storeObservationMs}ms.`,
-          details: getPageStateTimings,
-        });
-        return {
-          ok: true,
-          actual: formatDomPageStateSummary(currentPageContext, observation, processedObservation, getPageStateTimings),
-          observationViews,
-          debug: domSnapshotDebug(currentPageContext, currentDomContext),
-        };
-      }
-
-      let observationImagePaths: string[] = [];
-      if (includeImage && screenshotInputEnabled) {
-        pageStateObservationIndex += 1;
-        const visualIndex = traces.length + pageStateObservationIndex + 1;
-        const screenshotStartedAt = Date.now();
-        const screenshotPath = await session.takeScreenshot(input.runId, stepIndex, `visual-${visualIndex}`, { capture: 'viewport' });
-        ensureActive();
-        const timingSummary = session.formatLastScreenshotTiming();
-        await onDebug?.({
-          phase: 'browser:screenshot:page-state',
-          stepIndex,
-          message: `getPageState screenshot captured in ${elapsedSince(screenshotStartedAt)}ms${timingSummary ? ` ${timingSummary}` : ''}`,
-          details: {
-            elapsedMs: elapsedSince(screenshotStartedAt),
-            path: screenshotPath,
-            capture: 'viewport',
-            toolName: 'getPageState',
-            timings: session.getLastScreenshotTiming(),
-          },
-        });
-        const markerPath = session.getLastCandidateMarkerScreenshotPath();
-        const originalPath = session.getLastOriginalScreenshotPath();
-        const frame = visualContext.apply({
-          path: screenshotPath,
-          originalPath,
-          markerPath,
-          stepIndex,
-          toolName: 'getPageState',
-          capture: 'viewport',
-          reason: 'Explicit getPageState screenshot observation',
-        }, { capture: 'viewport', retention: 'replace', reason: 'Explicit getPageState screenshot observation' });
-        observationImagePaths = [frame.path, ...(frame.markerPath ? [frame.markerPath] : [])];
-        await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated by getPageState.', details: visualContext.snapshot() });
-      }
-
-      const observationText = formatVisualPageStateObservation({
-        pageContext: currentPageContext,
-        visualContext: visualContext.snapshot(),
-        screenshotInputEnabled: Boolean(observationImagePaths.length),
-        markerEnabled,
-        markerOverlayInScreenshot,
-        separateMarkerMap,
+      const nodeProcessingStartedAt = Date.now();
+      const processedObservation = await processDomObservationInNode(currentPageContext.domTree || '');
+      const nodeProcessingMs = elapsedSince(nodeProcessingStartedAt);
+      ensureActive();
+      const storeStartedAt = Date.now();
+      const observationViews = domPageStateObservationViews(processedObservation);
+      const observation = storeRuntimeObservation(
+        observationStore,
+        input.runId,
+        'getPageState',
+        formatDomPageStateObservation(currentPageContext, observationViews),
+        observationViews,
+      );
+      const storeObservationMs = elapsedSince(storeStartedAt);
+      const getPageStateTimings = {
+        totalMs: elapsedSince(getPageStateStartedAt),
+        getPageContextMs: pageContextMs,
+        domContextSnapshotMs,
+        nodeProcessingMs,
+        storeObservationMs,
+        pageContextTimings: currentPageContext.timings || {},
+        nodeProcessingTimings: processedObservation.timings,
+        domTreeChars: (currentPageContext.domTree || '').length,
+        textChars: processedObservation.textCharLength,
+        interactiveChars: processedObservation.interactiveCharLength,
+        domNodeCount: processedObservation.domNodeCount,
+        interactiveNodeCount: processedObservation.interactiveNodeCount,
+      };
+      await onDebug?.({
+        phase: 'browser:get-page-state:dom-timings',
+        stepIndex,
+        message: `DOM getPageState timings: total=${getPageStateTimings.totalMs}ms, getPageContext=${pageContextMs}ms, readSimplifiedDomTree=${Number((currentPageContext.timings || {}).readSimplifiedDomTreeMs || 0)}ms, nodeProcessing=${nodeProcessingMs}ms, store=${storeObservationMs}ms.`,
+        details: getPageStateTimings,
       });
-      if (observationImagePaths.length) {
-        pendingObservationMessages.push({
-          text: `[WebPilot explicit page observation]\n${observationText}`,
-          imagePaths: observationImagePaths,
-          domContext: currentDomContext,
-        });
-      }
       return {
         ok: true,
-        actual: observationImagePaths.length
-          ? `${observationText}\n\n[Current screenshot image will be attached to the next model request as an explicit getPageState observation message.]`
-          : observationText,
+        actual: formatDomPageStateSummary(currentPageContext, observation, processedObservation, getPageStateTimings),
+        observationViews,
+        debug: domSnapshotDebug(currentPageContext, currentDomContext),
+      };
+    }
+
+    async function observeCurrentScreenshot(options: { capture?: ScreenshotCaptureMode } = {}): Promise<BrowserActionResult> {
+      ensureActive();
+      if (!modelSupportsScreenshotInput()) {
+        return { ok: false, actual: 'getCurrentScreenshot is unavailable because the configured model does not support image input.' };
+      }
+      pageStateObservationIndex += 1;
+      const capture = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
+      const visualIndex = traces.length + pageStateObservationIndex + 1;
+      const screenshotStartedAt = Date.now();
+      const screenshotPath = await session.takeScreenshot(input.runId, stepIndex, `visual-${visualIndex}`, { capture });
+      ensureActive();
+      const timingSummary = session.formatLastScreenshotTiming();
+      await onDebug?.({
+        phase: 'browser:screenshot:current',
+        stepIndex,
+        message: `getCurrentScreenshot captured in ${elapsedSince(screenshotStartedAt)}ms${timingSummary ? ` ${timingSummary}` : ''}`,
+        details: {
+          elapsedMs: elapsedSince(screenshotStartedAt),
+          path: screenshotPath,
+          capture,
+          toolName: 'getCurrentScreenshot',
+          timings: session.getLastScreenshotTiming(),
+        },
+      });
+      const frame = visualContext.apply({
+        path: screenshotPath,
+        originalPath: session.getLastOriginalScreenshotPath(),
+        markerPath: undefined,
+        stepIndex,
+        toolName: 'getCurrentScreenshot',
+        capture,
+        reason: 'Explicit screenshot observation',
+      }, { capture, retention: 'replace', reason: 'Explicit screenshot observation' });
+      const observationText = [
+        'Current screenshot observation:',
+        `- ${capture} screenshot captured and attached to the next model request.`,
+        '- Screenshot is visual evidence only. Use getPageState/readObservation and DOM node tools for actionable ids.',
+        `Current URL: ${session.currentUrl()}`,
+        `Image: ${basenameOfPath(frame.path)}`,
+      ].join('\n');
+      pendingObservationMessages.push({
+        text: `[WebPilot explicit screenshot observation]\n${observationText}`,
+        imagePaths: [frame.path],
+        domContext: currentDomContext,
+      });
+      await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated by getCurrentScreenshot.', details: visualContext.snapshot() });
+      return {
+        ok: true,
+        actual: `${observationText}\n\n[The screenshot image will be attached to the next model request.]`,
       };
     }
 
@@ -3404,7 +3254,7 @@ async function executeRuntimeStep(input: {
         agentStepOffset: agentStepIndex - 1,
         observationStore,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: mode === 'dom' ? undefined : (visualContext.current()?.path || beforeScreenshotPath), imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId), explicitPageState: true, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId), explicitPageState: true, screenshotToolEnabled: modelSupportsScreenshotInput(), modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
       return {
         system: requestSystemPrompt || undefined,
@@ -3511,6 +3361,7 @@ async function executeRuntimeStep(input: {
       requestToolConfirmation: input.requestToolConfirmation,
       onDebug,
       observePageState,
+      observeCurrentScreenshot,
       onVisualContextChange: async (snapshot) => {
         ensureActive();
         await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
@@ -3727,7 +3578,7 @@ function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
 
 function createInteractiveBrowserTestCase(input: {
   id: string;
-  mode?: BrowserSessionMode | 'default';
+  mode?: BrowserSessionMode;
   safetyMode?: BrowserChatSafetyMode;
   targetUrl: string;
   instruction: string;
@@ -3755,8 +3606,8 @@ function createInteractiveBrowserTestCase(input: {
       description: input.instruction,
       targetUrl,
       priority: 'medium',
-      browserMode: input.mode || 'default',
-      isMarked: true,
+      browserMode: 'dom',
+      isMarked: false,
       userRequirement: requirement,
       systemPrompt,
       preconditions: [],
@@ -3786,7 +3637,7 @@ export async function executeInteractiveBrowserTurn(input: {
   modelInstruction?: string;
   conversation?: InteractiveBrowserTurnMessage[];
   completedSteps?: StepExecutionResult[];
-  mode?: BrowserSessionMode | 'default';
+  mode?: BrowserSessionMode;
   safetyMode?: BrowserChatSafetyMode;
   referenceImagePaths?: string[];
   skillContext?: string;
@@ -4447,12 +4298,12 @@ async function executeCodexRuntimeObject(input: {
     aiRequest,
     runId,
     stepIndex,
-    visualContext: isVisualMode(mode) ? visualContext : undefined,
+    visualContext,
     abortSignal,
     shouldContinue,
     onDebug,
     onToolTrace,
-    onVisualContextChange: isVisualMode(mode) ? onVisualContextChange : undefined,
+    onVisualContextChange,
     action: async () => {
       if (pendingConfirmation && requestToolConfirmation) {
         const decision = await requestToolConfirmation({

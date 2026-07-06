@@ -31,7 +31,7 @@ export async function POST(request: NextRequest) {
     const userId = requestUserId(request, body);
     const session = createBrowserChatSession({
       targetUrl: normalizeString(body.targetUrl),
-      mode: normalizeMode(body.mode),
+      mode: 'dom',
       safetyMode: normalizeSafetyMode(body.safetyMode),
       modelProvider: typeof body.modelProvider === 'string' ? body.modelProvider : undefined,
       model: typeof body.model === 'string' ? body.model : undefined,

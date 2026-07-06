@@ -55,7 +55,7 @@ export const testCaseContentSchema = z.object({
   description: z.string(),
   targetUrl: z.string(),
   priority: z.enum(['low', 'medium', 'high', 'critical']),
-  browserMode: z.enum(['default', 'dom', 'visual-markers']).default('default'),
+  browserMode: z.literal('dom').default('dom'),
   isMarked: z.boolean().default(true),
   userRequirement: z.string().optional(),
   systemPrompt: z.string().optional(),

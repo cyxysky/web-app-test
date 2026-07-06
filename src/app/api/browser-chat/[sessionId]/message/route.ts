@@ -23,7 +23,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
   try {
     const body = await request.json();
     const content = typeof body.content === 'string' ? body.content : '';
-    const mode = body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers';
+    const mode = 'dom';
     const nextSafetyMode = safetyMode(body.safetyMode);
     const modelProvider = typeof body.modelProvider === 'string' ? body.modelProvider : undefined;
     const model = typeof body.model === 'string' ? body.model : undefined;

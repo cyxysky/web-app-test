@@ -42,24 +42,6 @@ function processDomSnapshot(task: WorkerTask): WorkerResult {
     apos: "'",
     nbsp: ' ',
   };
-  const interactiveTags = new Set(['a', 'button', 'details', 'input', 'label', 'option', 'select', 'summary', 'textarea']);
-  const interactiveRoles = new Set([
-    'button',
-    'checkbox',
-    'combobox',
-    'link',
-    'menuitem',
-    'menuitemcheckbox',
-    'menuitemradio',
-    'option',
-    'radio',
-    'searchbox',
-    'slider',
-    'spinbutton',
-    'switch',
-    'tab',
-    'textbox',
-  ]);
   const textAttributeNames = ['aria-label', 'alt', 'placeholder', 'title', 'value'];
   const interactiveAttributeNames = [
     'aria-label',
@@ -82,6 +64,18 @@ function processDomSnapshot(task: WorkerTask): WorkerResult {
     'data-test',
     'data-qa',
     'data-cy',
+    'data-action',
+    'data-ai-signals',
+    'data-click',
+    'data-href',
+    'data-target',
+    'data-url',
+    'jsaction',
+    'ng-click',
+    'onclick',
+    'tabindex',
+    'v-on:click',
+    '@click',
   ];
 
   const decode = (value: string) => value
@@ -124,10 +118,7 @@ function processDomSnapshot(task: WorkerTask): WorkerResult {
     return { attrs, nodeId, tag, text };
   };
   const isInteractive = (node: NonNullable<ReturnType<typeof parseLine>>) => {
-    const role = String(node.attrs.role || '').toLowerCase();
-    if (interactiveTags.has(node.tag) || interactiveRoles.has(role)) return true;
-    if (node.attrs.href || node.attrs.contenteditable === 'true') return true;
-    return Boolean(node.attrs['aria-expanded'] || node.attrs['aria-pressed'] || node.attrs.onclick);
+    return node.attrs['data-ai-interactive'] === 'true';
   };
   const labelFor = (node: NonNullable<ReturnType<typeof parseLine>>) => unique([
     node.text,

@@ -83,7 +83,7 @@ export type BrowserChatSessionSnapshot = {
   userId?: string;
   targetUrl: string;
   noVncUrl?: string;
-  mode: BrowserSessionMode | 'default';
+  mode: BrowserSessionMode;
   safetyMode: BrowserChatSafetyMode;
   modelProvider: ModelProvider;
   model: string;
@@ -1283,7 +1283,7 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   appendLog(session, 'browser:start', '正在启动或连接浏览器');
   const hasPriorConversation = session.steps.length > 0
     || session.messages.some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
-  const browser = new BrowserSession(session.mode === 'default' ? undefined : session.mode, {
+          const browser = new BrowserSession(session.mode, {
     browserProfileKey: browserChatBrowserProfileKey(session),
     isMarked: true,
     preferExistingPage: false,
@@ -1333,7 +1333,7 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
 
 export function createBrowserChatSession(input: {
   targetUrl?: string;
-  mode?: BrowserSessionMode | 'default';
+  mode?: BrowserSessionMode;
   safetyMode?: BrowserChatSafetyMode;
   modelProvider?: unknown;
   model?: unknown;
@@ -1349,7 +1349,7 @@ export function createBrowserChatSession(input: {
     title: input.title?.trim() || '浏览器对话操作',
     userId: normalizeUserId(input.userId) || undefined,
     targetUrl: exportableTargetUrl(input.targetUrl || ''),
-    mode: input.mode || 'visual-markers',
+    mode: 'dom',
     safetyMode: normalizeSafetyMode(input.safetyMode),
     modelProvider: modelSettings.provider,
     model: modelSettings.model,
@@ -1835,7 +1835,7 @@ export async function generateBrowserChatMessageSkill(sessionId: string, message
 export async function sendBrowserChatMessage(
   sessionId: string,
   content: string,
-  mode?: BrowserSessionMode | 'default',
+  mode?: BrowserSessionMode,
   safetyMode?: BrowserChatSafetyMode,
   modelProvider?: unknown,
   model?: unknown,

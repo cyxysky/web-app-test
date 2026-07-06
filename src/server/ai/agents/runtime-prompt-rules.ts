@@ -1,7 +1,8 @@
 export function domObservationHardRules() {
   return [
-    '- If the page may have changed or you need fresh DOM/text/screenshot evidence, call getPageState explicitly. The backend will not silently refresh page state between model calls.',
-    '- After getPageState in DOM mode, inspect Node-processed content with readObservation(type,offset,maxChars). Use type="text" for plain page text or type="interactive" for actionable DOM node_id entries. maxChars values below 10000 are raised to 10000.',
+    '- If the page may have changed or you need fresh DOM/text evidence, call getPageState explicitly. The backend will not silently refresh page state between model calls.',
+    '- If visual evidence is needed and the configured model supports image input, call getCurrentScreenshot. Screenshot evidence is separate from DOM/action ids.',
+    '- After getPageState, inspect Node-processed content with readObservation(type,offset,maxChars). Use type="text" for plain page text or type="interactive" for actionable DOM node_id entries. maxChars values below 10000 are raised to 10000.',
   ];
 }
 
@@ -14,6 +15,7 @@ export function domModeActionRules() {
     '- For hover-only menus in DOM mode, use current text/interactive node_id evidence to choose a supported hover path, then call getPageState before choosing a revealed target.',
     '- Use scrollArea only when interaction requires changing the visual viewport or lazy-loaded content is absent from the text/interactive context. After scrolling or any browser-changing action, call getPageState before using new ids or locators.',
     '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
+    '- getCurrentScreenshot is read-only visual evidence. Do not use screenshot positions as action ids; use DOM node_id or locator tools for actions.',
     '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
   ];
 }
@@ -24,4 +26,4 @@ export function domCurrentContextLine(browserChatMode: boolean) {
     : 'No initial DOM page observation is included. Call getPageState for fresh URL, tabs, focus, scroll state, DOM snapshot, and page text.';
 }
 
-export const domNoScreenshotRule = '- DOM mode: no screenshot image/path is attached. Use getPageState to collect the DOM tree into Node and refresh the stored observation, then readObservation(type="text"|"interactive") for Node-processed page text and actionable node_id entries. Use clickDomNode/fillDomNodes/hoverDomNode with a current node_id, or findByText/clickLocator only for text-accessible recovery.';
+export const domNoScreenshotRule = '- No live screenshot image/path is attached automatically. Use getPageState to collect the DOM tree into Node and refresh the stored observation, then readObservation(type="text"|"interactive") for Node-processed page text and actionable node_id entries. If visual evidence is needed and getCurrentScreenshot is available, call it explicitly; actions still use DOM node_id or locator tools.';

@@ -163,7 +163,7 @@ type BrowserChatSession = {
 };
 
 type BrowserChatView = 'chat' | 'target' | 'settings';
-type BrowserChatMode = 'dom' | 'visual-markers';
+type BrowserChatMode = 'dom';
 type BrowserChatSafetyMode = 'strict' | 'full';
 type BrowserChatModelConfig = RuntimeModelConfig;
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
@@ -711,7 +711,8 @@ function temporaryId(prefix: string) {
 }
 
 function normalizeMode(value?: string): BrowserChatMode {
-  return value === 'dom' ? 'dom' : 'visual-markers';
+  void value;
+  return 'dom';
 }
 
 function normalizeSafetyMode(value?: string): BrowserChatSafetyMode {
@@ -2346,26 +2347,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             >
               {uploadingImage ? <Loader2 className="spin" size={17} /> : <ImageUp size={17} />}
             </button>
-            <div className="browser-chat-mode-toggle" role="radiogroup" aria-label={t('操作模式')}>
-              <button
-                aria-pressed={mode === 'visual-markers'}
-                className={mode === 'visual-markers' ? 'active' : undefined}
-                disabled={currentBusy || loading || modeLocked}
-                onClick={() => onModeChange('visual-markers')}
-                type="button"
-              >
-                {t('视觉')}
-              </button>
-              <button
-                aria-pressed={mode === 'dom'}
-                className={mode === 'dom' ? 'active' : undefined}
-                disabled={currentBusy || loading || modeLocked}
-                onClick={() => onModeChange('dom')}
-                type="button"
-              >
-                {t('DOM')}
-              </button>
-            </div>
             <div className="browser-chat-safety-toggle" role="radiogroup" aria-label={t('安全性')}>
               <button
                 aria-pressed={safetyMode === 'strict'}
@@ -2910,7 +2891,7 @@ export function BrowserChatWorkspace({
   const [session, setSession] = useState<BrowserChatSession | null>(null);
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
-  const [mode, setMode] = useState<BrowserChatMode>('visual-markers');
+  const [mode, setMode] = useState<BrowserChatMode>('dom');
   const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
   const [modelProvider, setModelProvider] = useState<ModelProvider>(() => initialModelSelection.provider);
   const [modelId, setModelId] = useState(() => initialModelSelection.model);

@@ -30,7 +30,7 @@ type ToolRecordSavePayload = StepToolCallItem & {
   sourceToolIndex?: number;
 };
 type TranslateFn = (value: string, params?: Record<string, string | number>) => string;
-type ToolEditorMode = 'dom' | 'visual-markers';
+type ToolEditorMode = 'dom';
 type ToolParamField = {
   key: string;
   label: string;
@@ -501,30 +501,31 @@ function textToStringList(value: string) {
 }
 
 function toolNamesForMode(mode: ToolEditorMode) {
+  void mode;
   return toolDefinitions
     .filter((definition) => (
       definition.mode === 'shared'
       || definition.mode === 'editor'
-      || (mode === 'dom' ? definition.mode === 'dom' : definition.mode === 'visual')
+      || definition.mode === 'dom'
     ))
     .map((definition) => definition.name);
 }
 
 function normalizeEditorMode(value: unknown): ToolEditorMode | undefined {
-  return value === 'visual-markers' ? 'visual-markers' : value === 'dom' ? 'dom' : undefined;
+  return value === 'dom' ? 'dom' : undefined;
 }
 
 function inferModeFromStep(step?: StepExecutionResult): ToolEditorMode | undefined {
   const requestMode = normalizeEditorMode(step?.aiRequest?.options?.browserMode);
   if (requestMode) return requestMode;
   const names = new Set((step?.tools || []).map((tool) => tool.name));
-  if ([...names].some((name) => toolDefinitionsByName[name]?.mode === 'visual')) return 'visual-markers';
   if ([...names].some((name) => toolDefinitionsByName[name]?.mode === 'dom')) return 'dom';
   return undefined;
 }
 
 function toolModeLabel(mode: ToolEditorMode, t: TranslateFn) {
-  return mode === 'visual-markers' ? t('视觉模式工具') : t('DOM 模式工具');
+  void mode;
+  return t('DOM 模式工具');
 }
 
 function toolModeTag(definition: ToolDefinition | undefined, t: TranslateFn) {
@@ -1337,7 +1338,7 @@ function ReportEvidence({ run }: { run: TestRunRecord }) {
 }
 
 export function RunProgress({
-  browserMode = 'default',
+  browserMode = 'dom',
   initialRun,
   testCaseTitle = '未知用例',
 }: {

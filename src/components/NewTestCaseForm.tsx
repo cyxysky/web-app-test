@@ -3,7 +3,6 @@
 import { FormEvent, useState } from 'react';
 import { ImageUp, Loader2, Sparkles, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-import { CustomSelect } from '@/components/CustomSelect';
 import { RichTextEditor } from '@/components/RichTextEditor';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -31,8 +30,8 @@ export function NewTestCaseForm({
   const [prompt, setPrompt] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
   const [targetUrl, setTargetUrl] = useState('https://www.zhihu.com');
-  const [browserMode, setBrowserMode] = useState<TestCaseContent['browserMode']>('default');
-  const [isMarked, setIsMarked] = useState(true);
+  const browserMode: TestCaseContent['browserMode'] = 'dom';
+  const isMarked = false;
   const [imageNames, setImageNames] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -88,33 +87,6 @@ export function NewTestCaseForm({
           <label htmlFor="targetUrl">{t('目标地址')}</label>
           <input className="input" id="targetUrl" onChange={(event) => setTargetUrl(event.target.value)} required value={targetUrl} />
         </div>
-        <div className="field">
-          <label htmlFor="browserMode">{t('浏览器操作模式')}</label>
-          <CustomSelect
-            id="browserMode"
-            value={browserMode}
-            onChange={(nextValue) => setBrowserMode(nextValue as TestCaseContent['browserMode'])}
-            options={[
-              { label: t('默认配置'), value: 'default' },
-              { label: t('DOM 交互'), value: 'dom' },
-              { label: t('视觉标识'), value: 'visual-markers' },
-            ]}
-          />
-        </div>
-        {browserMode === 'visual-markers' ? (
-          <label className="field">
-            <span>{t('视觉标记截图')}</span>
-            <span className="inline-check">
-              <input
-                type="checkbox"
-                checked={isMarked}
-                onChange={(event) => setIsMarked(event.target.checked)}
-              />
-              {t('启用截图 marker')}
-            </span>
-            <span className="hint">{t('关闭后只发送原始截图，并在提示词中加入可交互元素摘要。')}</span>
-          </label>
-        ) : null}
         <div className="field">
           <label htmlFor="prompt">{t('测试目标')}</label>
           <RichTextEditor

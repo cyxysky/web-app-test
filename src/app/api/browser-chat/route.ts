@@ -23,7 +23,7 @@ export async function POST(request: NextRequest) {
     const body = await request.json().catch(() => ({}));
     const session = createBrowserChatSession({
       targetUrl: typeof body.targetUrl === 'string' ? body.targetUrl : '',
-      mode: body.mode === 'dom' || body.mode === 'visual-markers' ? body.mode : 'visual-markers',
+      mode: 'dom',
       safetyMode: safetyMode(body.safetyMode),
       modelProvider: typeof body.modelProvider === 'string' ? body.modelProvider : undefined,
       model: typeof body.model === 'string' ? body.model : undefined,
