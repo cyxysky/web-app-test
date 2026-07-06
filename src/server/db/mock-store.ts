@@ -1,13 +1,24 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { join as pathJoin } from 'node:path';
 import { defaultModelByProvider, defaultModelForProvider, modelListForProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, SkillContent, SkillRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { sleepSync, writeJsonFileAtomic } from '@/server/storage/atomic-json';
-import { storeFilePath } from '@/server/storage/paths';
+import {
+  appConfigFilePath,
+  targetTestCaseFilePath,
+  targetTestCasesDir,
+  targetTestMetadataFilePath,
+  targetTestRunFilePath,
+  targetTestRunsDir,
+} from '@/server/storage/paths';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
-const storePath = storeFilePath();
+const configPath = appConfigFilePath();
+const targetTestMetadataPath = targetTestMetadataFilePath();
+const targetCasesDir = targetTestCasesDir();
+const targetRunsDir = targetTestRunsDir();
 
 function notifyRunUpdate(runId: string, run: TestRunRecord) {
   publishRefreshEvent({ entityType: 'run', id: runId, updatedAt: run.endedAt || run.startedAt || now() });
@@ -62,14 +73,26 @@ const seedContent: TestCaseContent = {
   risks: ['Use an isolated test account only. Do not connect production accounts.'],
 };
 
-type StoreData = {
-  testCases: TestCaseRecord[];
-  runs: TestRunRecord[];
-  groups?: TestGroupRecord[];
-  skills?: SkillRecord[];
-  runtimeEnv?: RuntimeEnvRecord[];
+type ConfigStoreData = {
+  runtimeEnv: RuntimeEnvRecord[];
   modelConfig?: ModelConfigRecord;
-  schedules?: RunScheduleRecord[];
+};
+
+type TargetTestCaseStoreData = {
+  testCases: TestCaseRecord[];
+  groups: TestGroupRecord[];
+  skills: SkillRecord[];
+  schedules: RunScheduleRecord[];
+};
+
+type TargetTestMetadataStoreData = {
+  groups: TestGroupRecord[];
+  skills: SkillRecord[];
+  schedules: RunScheduleRecord[];
+};
+
+type TargetRunStoreData = {
+  runs: TestRunRecord[];
 };
 
 const seedRecord: TestCaseRecord = {
@@ -334,10 +357,6 @@ function isUserSkippedStep(step?: StepExecutionResult) {
   return Boolean(step?.status === 'blocked' && step.actual === 'User skipped this step manually.');
 }
 
-function writeData(data: StoreData) {
-  writeJsonFileAtomic(storePath, data);
-}
-
 function normalizeSkillContent(content?: Partial<SkillContent>): SkillContent {
   return {
     whenToUse: (content?.whenToUse || []).map((item) => item.trim()).filter(Boolean).slice(0, 12),
@@ -361,25 +380,29 @@ function normalizeSkillRecord(record: SkillRecord): SkillRecord {
 }
 
 // 读取本地存储数据；文件不存在时初始化默认数据。
-function readData(): StoreData {
-  if (!existsSync(storePath)) {
-    const seed: StoreData = { testCases: [seedRecord], runs: [], groups: [], skills: [], runtimeEnv: [], schedules: [] };
-    writeData(seed);
-    return seed;
+function seedConfigData(): ConfigStoreData {
+  return { runtimeEnv: [] };
+}
+
+function seedTargetTestMetadataData(): TargetTestMetadataStoreData {
+  return { groups: [], skills: [], schedules: [] };
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readJsonData<T>(filePath: string, seed: () => T, normalize: (data: Partial<T>) => T): T {
+  if (!existsSync(filePath)) {
+    const initial = seed();
+    writeJsonFileAtomic(filePath, initial);
+    return initial;
   }
 
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const data = JSON.parse(readFileSync(storePath, 'utf8')) as StoreData;
-      return {
-        ...data,
-        groups: data.groups || [],
-        skills: (data.skills || []).map(normalizeSkillRecord),
-        runtimeEnv: data.runtimeEnv || [],
-        modelConfig: data.modelConfig,
-        schedules: data.schedules || [],
-      };
+      return normalize(JSON.parse(readFileSync(filePath, 'utf8')) as Partial<T>);
     } catch (error) {
       lastError = error;
       sleepSync(25);
@@ -388,18 +411,117 @@ function readData(): StoreData {
   throw lastError;
 }
 
+function normalizeConfigData(data: Partial<ConfigStoreData>): ConfigStoreData {
+  return {
+    runtimeEnv: data.runtimeEnv || [],
+    modelConfig: data.modelConfig,
+  };
+}
+
+function normalizeTargetTestMetadataData(data: Partial<TargetTestMetadataStoreData>): TargetTestMetadataStoreData {
+  return {
+    groups: data.groups || [],
+    skills: (data.skills || []).map(normalizeSkillRecord),
+    schedules: data.schedules || [],
+  };
+}
+
+function readJsonRecordFile<T>(filePath: string, isRecord: (value: unknown) => value is T): T | undefined {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const data = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
+      return isRecord(data) ? data : undefined;
+    } catch (error) {
+      lastError = error;
+      sleepSync(25);
+    }
+  }
+  throw lastError;
+}
+
+function readRecordDirectory<T>(directory: string, isRecord: (value: unknown) => value is T) {
+  if (!existsSync(directory)) return [] as T[];
+  return readdirSync(directory, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+    .map((entry) => readJsonRecordFile(pathJoin(directory, entry.name), isRecord))
+    .filter((item): item is T => Boolean(item));
+}
+
+function syncRecordDirectory<T extends { id: string }>(
+  directory: string,
+  records: T[],
+  filePathForId: (id: string) => string,
+) {
+  const keep = new Set(records.map((record) => record.id));
+  for (const record of records) {
+    writeJsonFileAtomic(filePathForId(record.id), record);
+  }
+  if (!existsSync(directory)) return;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const filePath = pathJoin(directory, entry.name);
+    const record = readJsonRecordFile(filePath, (value): value is T => isObjectRecord(value) && typeof value.id === 'string');
+    if (!record || !keep.has(record.id)) rmSync(filePath, { force: true });
+  }
+}
+
+function isTestCaseRecord(value: unknown): value is TestCaseRecord {
+  return isObjectRecord(value) && typeof value.id === 'string';
+}
+
+function isTestRunRecord(value: unknown): value is TestRunRecord {
+  return isObjectRecord(value) && typeof value.id === 'string';
+}
+
+function readConfigData() {
+  return readJsonData(configPath, seedConfigData, normalizeConfigData);
+}
+
+function writeConfigData(data: Partial<ConfigStoreData>) {
+  writeJsonFileAtomic(configPath, normalizeConfigData(data));
+}
+
+function readTargetTestCaseData() {
+  const shouldSeedDefaultCase = !existsSync(targetTestMetadataPath) && !existsSync(targetCasesDir);
+  const metadata = readJsonData(targetTestMetadataPath, seedTargetTestMetadataData, normalizeTargetTestMetadataData);
+  if (shouldSeedDefaultCase) {
+    writeJsonFileAtomic(targetTestCaseFilePath(seedRecord.id), seedRecord);
+  }
+  return {
+    testCases: readRecordDirectory(targetCasesDir, isTestCaseRecord),
+    ...metadata,
+  };
+}
+
+function writeTargetTestCaseData(data: Partial<TargetTestCaseStoreData>) {
+  const metadata = normalizeTargetTestMetadataData(data);
+  writeJsonFileAtomic(targetTestMetadataPath, metadata);
+  syncRecordDirectory(targetCasesDir, data.testCases || [], targetTestCaseFilePath);
+}
+
+function readTargetRunData() {
+  return {
+    runs: readRecordDirectory(targetRunsDir, isTestRunRecord),
+  };
+}
+
+function writeTargetRunData(data: Partial<TargetRunStoreData>) {
+  syncRecordDirectory(targetRunsDir, data.runs || [], targetTestRunFilePath);
+}
+
 export const store = {
   // 列出全部测试用例。
   listTestCases() {
-    return readData().testCases.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return readTargetTestCaseData().testCases.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   },
   // 列出全部测试分组。
   listGroups() {
-    return readData().groups || [];
+    return readTargetTestCaseData().groups;
   },
   listSkills(query?: string) {
     const normalizedQuery = (query || '').trim().toLowerCase();
-    const skills = (readData().skills || [])
+    const skills = readTargetTestCaseData().skills
       .map(normalizeSkillRecord)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     if (!normalizedQuery) return skills;
@@ -411,11 +533,11 @@ export const store = {
     ].some((value) => value.toLowerCase().includes(normalizedQuery)));
   },
   getSkill(skillId: string) {
-    const skill = (readData().skills || []).find((item) => item.id === skillId);
+    const skill = readTargetTestCaseData().skills.find((item) => item.id === skillId);
     return skill ? normalizeSkillRecord(skill) : undefined;
   },
   getSkills(skillIds: string[] = []) {
-    const byId = new Map((readData().skills || []).map((skill) => [skill.id, normalizeSkillRecord(skill)]));
+    const byId = new Map(readTargetTestCaseData().skills.map((skill) => [skill.id, normalizeSkillRecord(skill)]));
     return skillIds.map((skillId) => byId.get(skillId)).filter((item): item is SkillRecord => Boolean(item));
   },
   upsertSkill(input: {
@@ -430,7 +552,7 @@ export const store = {
     sourceSessionId?: string;
     status?: SkillRecord['status'];
   }) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     const timestamp = now();
     const existing = input.id ? (data.skills || []).find((item) => item.id === input.id) : undefined;
     const skill = normalizeSkillRecord({
@@ -451,11 +573,11 @@ export const store = {
     data.skills = existing
       ? (data.skills || []).map((item) => (item.id === skill.id ? skill : item))
       : [skill, ...(data.skills || [])];
-    writeData(data);
+    writeTargetTestCaseData(data);
     return skill;
   },
   deleteSkill(skillId: string) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     const before = (data.skills || []).length;
     data.skills = (data.skills || []).filter((skill) => skill.id !== skillId);
     data.testCases = data.testCases.map((record) => (
@@ -463,18 +585,18 @@ export const store = {
         ? { ...record, content: { ...record.content, skillIds: record.content.skillIds.filter((id) => id !== skillId) }, updatedAt: now() }
         : record
     ));
-    writeData(data);
+    writeTargetTestCaseData(data);
     return before !== data.skills.length;
   },
   // 列出保存到网页配置里的运行时环境变量。
   listRuntimeEnv() {
-    return readData().runtimeEnv || [];
+    return readConfigData().runtimeEnv;
   },
   getModelConfig() {
-    return normalizeStoredModelConfig(readData().modelConfig as LegacyModelConfigRecord | undefined);
+    return normalizeStoredModelConfig(readConfigData().modelConfig as LegacyModelConfigRecord | undefined);
   },
   saveModelConfig(input: Pick<ModelConfigRecord, 'provider' | 'providers'>) {
-    const data = readData();
+    const data = readConfigData();
     const existing = normalizeStoredModelConfig(data.modelConfig as LegacyModelConfigRecord | undefined);
     const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
     const timestamp = now();
@@ -511,13 +633,13 @@ export const store = {
       updatedAt: timestamp,
     };
     data.modelConfig = config;
-    writeData(data);
+    writeConfigData(data);
     applyModelConfig(config);
     return config;
   },
   // 保存网页配置的环境变量，服务端会在运行前加载 enabled=true 的配置。
   saveRuntimeEnv(items: Array<Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'>>) {
-    const data = readData();
+    const data = readConfigData();
     data.runtimeEnv = items
       .filter((item) => item.key.trim())
       .map((item) => ({
@@ -527,13 +649,14 @@ export const store = {
         secret: item.secret,
         updatedAt: now(),
       }));
-    writeData(data);
+    writeConfigData(data);
     return data.runtimeEnv;
   },
   // 把已启用的网页配置同步到当前 Node 进程。
   applyRuntimeEnv() {
     const allowedKeys = new Set(runtimeEnvKeys);
-    const items = readData().runtimeEnv || [];
+    const data = readConfigData();
+    const items = data.runtimeEnv;
     const itemByKey = new Map(items.map((item) => [item.key, item]));
     const savedByKey = new Map(items.filter((item) => allowedKeys.has(item.key)).map((item) => [item.key, item]));
     const legacyTargetPrompt = itemByKey.get('AI_TARGET_MODE_CUSTOM_PROMPT')?.value?.trim();
@@ -549,12 +672,12 @@ export const store = {
       if (item?.enabled === false) continue;
       process.env[definition.key] = item?.value ?? (definition.key === 'AI_CUSTOM_SYSTEM_PROMPT' ? legacyCustomSystemPrompt : definition.defaultValue);
     }
-    applyModelConfig(readData().modelConfig as LegacyModelConfigRecord | undefined);
+    applyModelConfig(data.modelConfig as LegacyModelConfigRecord | undefined);
     return items;
   },
   // 列出定时回归任务。
   listSchedules() {
-    return readData().schedules || [];
+    return readTargetTestCaseData().schedules;
   },
   // 创建或更新定时回归任务。
   upsertSchedule(input: {
@@ -565,7 +688,7 @@ export const store = {
     intervalMinutes: number;
     nextRunAt?: string;
   }) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     const schedules = data.schedules || [];
     const existing = input.id ? schedules.find((item) => item.id === input.id) : undefined;
     const schedule: RunScheduleRecord = {
@@ -582,18 +705,18 @@ export const store = {
     data.schedules = existing
       ? schedules.map((item) => (item.id === schedule.id ? schedule : item))
       : [...schedules, schedule];
-    writeData(data);
+    writeTargetTestCaseData(data);
     return schedule;
   },
   // 删除定时回归任务。
   deleteSchedule(scheduleId: string) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     data.schedules = (data.schedules || []).filter((item) => item.id !== scheduleId);
-    writeData(data);
+    writeTargetTestCaseData(data);
   },
   // 标记定时任务已经触发，并计算下一次运行时间。
   markScheduleTriggered(scheduleId: string) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     let updated: RunScheduleRecord | undefined;
     data.schedules = (data.schedules || []).map((schedule) => {
       if (schedule.id !== scheduleId) return schedule;
@@ -606,12 +729,12 @@ export const store = {
       };
       return updated;
     });
-    writeData(data);
+    writeTargetTestCaseData(data);
     return updated;
   },
   // 创建测试分组，并可挂到父分组下。
   createGroup(name: string, parentId?: string) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     const group: TestGroupRecord = {
       id: id('grp'),
       parentId,
@@ -620,24 +743,24 @@ export const store = {
       updatedAt: now(),
     };
     data.groups = [...(data.groups || []), group];
-    writeData(data);
+    writeTargetTestCaseData(data);
     return group;
   },
   // 更新分组名称或父级关系。
   updateGroup(groupId: string, patch: Partial<Pick<TestGroupRecord, 'name' | 'parentId'>>) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     let updated: TestGroupRecord | undefined;
     data.groups = (data.groups || []).map((group) => {
       if (group.id !== groupId) return group;
       updated = { ...group, ...patch, updatedAt: now() };
       return updated;
     });
-    writeData(data);
+    writeTargetTestCaseData(data);
     return updated;
   },
   // 删除分组及其子分组，并将关联测试用例移回未分组。
   deleteGroup(groupId: string) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     const groups = data.groups || [];
     const deletingIds = new Set<string>();
     const collect = (idToDelete: string) => {
@@ -654,22 +777,22 @@ export const store = {
         ? { ...record, groupId: undefined, updatedAt: now() }
         : record
     ));
-    writeData(data);
+    writeTargetTestCaseData(data);
     return { deleted, deletedIds: [...deletingIds] };
   },
   // 根据 ID 获取单个测试用例。
   getTestCase(testCaseId: string) {
-    return readData().testCases.find((item) => item.id === testCaseId);
+    return readTargetTestCaseData().testCases.find((item) => item.id === testCaseId);
   },
   // 获取指定测试用例的运行历史，并按开始时间倒序返回。
   listRunsForTestCase(testCaseId: string) {
-    return readData().runs
+    return readTargetRunData().runs
       .filter((item) => item.testCaseId === testCaseId)
       .sort((a, b) => (b.startedAt || b.createdAt).localeCompare(a.startedAt || a.createdAt));
   },
   // 创建测试用例，同时保存关联图片和所属分组。
   createTestCase(content: TestCaseContent, imageNames: string[], groupId?: string) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     const record: TestCaseRecord = {
       id: id('tc'),
       groupId,
@@ -684,7 +807,7 @@ export const store = {
       updatedAt: now(),
     };
     data.testCases.push(record);
-    writeData(data);
+    writeTargetTestCaseData(data);
     return record;
   },
   // 删除一条执行记录。这里只移除历史元数据，artifact 文件保留，避免误删仍被报告引用的证据。
@@ -694,61 +817,65 @@ export const store = {
   deleteRuns(runIds: string[]) {
     const targetIds = new Set(runIds.filter(Boolean));
     if (!targetIds.size) return 0;
-    const data = readData();
-    const before = data.runs.length;
-    const deletedRunIds = data.runs.filter((run) => targetIds.has(run.id)).map((run) => run.id);
-    data.runs = data.runs.filter((run) => !targetIds.has(run.id));
-    data.testCases = data.testCases.map((record) => (
+    const runData = readTargetRunData();
+    const testCaseData = readTargetTestCaseData();
+    const before = runData.runs.length;
+    const deletedRunIds = runData.runs.filter((run) => targetIds.has(run.id)).map((run) => run.id);
+    runData.runs = runData.runs.filter((run) => !targetIds.has(run.id));
+    testCaseData.testCases = testCaseData.testCases.map((record) => (
       record.content.defaultRecordedRunId && targetIds.has(record.content.defaultRecordedRunId)
         ? { ...record, content: { ...record.content, defaultRecordedRunId: undefined }, updatedAt: now() }
         : record
     ));
-    writeData(data);
+    writeTargetRunData(runData);
+    writeTargetTestCaseData(testCaseData);
     notifyRunsDeleted(deletedRunIds);
-    return before - data.runs.length;
+    return before - runData.runs.length;
   },
   // 删除测试用例，并移除关联运行记录与定时任务引用。artifact 文件保留，避免误删仍需追溯的证据。
   deleteTestCase(testCaseId: string) {
-    const data = readData();
-    const exists = data.testCases.some((record) => record.id === testCaseId);
+    const testCaseData = readTargetTestCaseData();
+    const runData = readTargetRunData();
+    const exists = testCaseData.testCases.some((record) => record.id === testCaseId);
     if (!exists) return false;
-    const deletedRunIds = data.runs.filter((run) => run.testCaseId === testCaseId).map((run) => run.id);
-    data.testCases = data.testCases.filter((record) => record.id !== testCaseId);
-    data.runs = data.runs.filter((run) => run.testCaseId !== testCaseId);
-    data.schedules = (data.schedules || [])
+    const deletedRunIds = runData.runs.filter((run) => run.testCaseId === testCaseId).map((run) => run.id);
+    testCaseData.testCases = testCaseData.testCases.filter((record) => record.id !== testCaseId);
+    runData.runs = runData.runs.filter((run) => run.testCaseId !== testCaseId);
+    testCaseData.schedules = testCaseData.schedules
       .map((schedule) => ({
         ...schedule,
         testCaseIds: schedule.testCaseIds.filter((id) => id !== testCaseId),
         updatedAt: now(),
       }))
       .filter((schedule) => schedule.testCaseIds.length > 0);
-    writeData(data);
+    writeTargetTestCaseData(testCaseData);
+    writeTargetRunData(runData);
     notifyRunsDeleted(deletedRunIds);
     return true;
   },
   // 更新测试用例的整体执行状态。
   updateTestCaseStatus(testCaseId: string, status: TestCaseRecord['status']) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     data.testCases = data.testCases.map((record) =>
       record.id === testCaseId ? { ...record, status, updatedAt: now() } : record,
     );
-    writeData(data);
+    writeTargetTestCaseData(data);
   },
   // 移动测试用例到指定分组，未传分组则移出分组。
   moveTestCase(testCaseId: string, groupId?: string) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     let updated: TestCaseRecord | undefined;
     data.testCases = data.testCases.map((record) => {
       if (record.id !== testCaseId) return record;
       updated = { ...record, groupId, updatedAt: now() };
       return updated;
     });
-    writeData(data);
+    writeTargetTestCaseData(data);
     return updated;
   },
   // 更新测试用例内容和可选图片列表。
   updateTestCase(testCaseId: string, content: TestCaseContent, imageNames?: string[]) {
-    const data = readData();
+    const data = readTargetTestCaseData();
     let updated: TestCaseRecord | undefined;
     data.testCases = data.testCases.map((record) => {
       if (record.id !== testCaseId) return record;
@@ -764,12 +891,12 @@ export const store = {
       };
       return updated;
     });
-    writeData(data);
+    writeTargetTestCaseData(data);
     return updated;
   },
   // 为测试用例创建一条新的运行记录。
   createRun(testCaseId: string) {
-    const data = readData();
+    const data = readTargetRunData();
     const run: TestRunRecord = {
       id: id('run'),
       testCaseId,
@@ -777,18 +904,18 @@ export const store = {
       createdAt: now(),
     };
     data.runs.push(run);
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(run.id, run);
     return run;
   },
   // 更新运行记录的队列元信息。
   updateRunQueue(runId: string, queue: TestRunRecord['queue']) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     if (!run) return undefined;
     const updated = { ...run, queue };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return updated;
   },
@@ -796,7 +923,7 @@ export const store = {
   appendTestCaseStrategyMemory(testCaseId: string, hints: string[]) {
     const cleanHints = hints.map((hint) => hint.trim()).filter(Boolean);
     if (!cleanHints.length) return this.getTestCase(testCaseId);
-    const data = readData();
+    const data = readTargetTestCaseData();
     let updated: TestCaseRecord | undefined;
     data.testCases = data.testCases.map((record) => {
       if (record.id !== testCaseId) return record;
@@ -804,23 +931,23 @@ export const store = {
       updated = { ...record, strategyMemory: memory, updatedAt: now() };
       return updated;
     });
-    writeData(data);
+    writeTargetTestCaseData(data);
     return updated;
   },
   // 局部更新运行记录，并自动刷新更新时间。
   updateRun(runId: string, patch: Partial<TestRunRecord>) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     if (!run) return undefined;
     const updated = { ...run, ...patch };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return updated;
   },
   // 新增或替换运行步骤结果，保证相同步骤号只保留最新记录。
   updateRunStep(runId: string, step: StepExecutionResult) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     if (!run) return undefined;
 
@@ -845,13 +972,13 @@ export const store = {
       },
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return updated;
   },
   // 追加运行调试事件，最多保留最近 200 条。
   appendRunDebug(runId: string, event: Omit<RunDebugEvent, 'time'>) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     if (!run) return undefined;
     const debug = run.debug || { enabled: false, phase: '', events: [] };
@@ -863,13 +990,13 @@ export const store = {
     };
     const updated = { ...run, debug: updatedDebug };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return updated;
   },
   // 请求跳过指定步骤或当前步骤，并中断正在进行的 AI 请求。
   requestRunSkip(runId: string, stepIndex?: number) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     if (!run) return undefined;
     const updated = {
@@ -881,13 +1008,13 @@ export const store = {
       },
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return updated;
   },
   // 请求暂停运行，并中断当前步骤让执行循环进入暂停态。
   requestRunPause(runId: string, stepIndex?: number) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     if (!run) return undefined;
     const pausedAt = now();
@@ -902,13 +1029,13 @@ export const store = {
       },
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return updated;
   },
   // 请求恢复运行；如果指定步骤则只恢复该步骤。
   requestRunResume(runId: string, stepIndex?: number) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     if (!run) return undefined;
     const updated = {
@@ -925,18 +1052,18 @@ export const store = {
       },
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return updated;
   },
   // 判断运行是否处于暂停状态。
   isRunPaused(runId: string) {
-    const run = readData().runs.find((item) => item.id === runId);
+    const run = readTargetRunData().runs.find((item) => item.id === runId);
     return Boolean(run?.control?.pausedAt);
   },
   // 设置或清除人工介入状态，例如等待用户输入验证码。
   setRunManualIntervention(runId: string, manualIntervention?: NonNullable<TestRunRecord['control']>['manualIntervention']) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     if (!run) return undefined;
     const updated = {
@@ -947,25 +1074,25 @@ export const store = {
       },
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return updated;
   },
   // 消费一次跳过请求；消费后会从控制状态中移除，避免重复跳过。
   consumeRunSkip(runId: string, stepIndex: number) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     const requested = run?.control?.skipRequestedAt && (!run.control.skipStepIndex || run.control.skipStepIndex === stepIndex);
     if (!run || !requested) return false;
     const updated = { ...run, control: { ...run.control, skipRequestedAt: undefined, skipStepIndex: undefined } };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return true;
   },
   // 消费一次恢复请求；消费后清理恢复标记。
   consumeRunResume(runId: string, stepIndex: number) {
-    const data = readData();
+    const data = readTargetRunData();
     const run = data.runs.find((item) => item.id === runId);
     const requested = run?.control?.resumeRequestedAt && (!run.control.resumeStepIndex || run.control.resumeStepIndex === stepIndex);
     if (!run || !requested) return false;
@@ -979,12 +1106,12 @@ export const store = {
       },
     };
     data.runs = data.runs.map((item) => (item.id === runId ? updated : item));
-    writeData(data);
+    writeTargetRunData(data);
     notifyRunUpdate(runId, updated);
     return true;
   },
   // 根据 ID 获取单条运行记录。
   getRun(runId: string) {
-    return readData().runs.find((item) => item.id === runId);
+    return readTargetRunData().runs.find((item) => item.id === runId);
   },
 };

@@ -1,5 +1,5 @@
 ﻿import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
@@ -16,7 +16,7 @@ import type { ModelProvider, RecordedFlowStep, SkillRecord, StepExecutionResult,
 import { store } from '@/server/db/mock-store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { writeTextFileAtomic } from '@/server/storage/atomic-json';
-import { appDataRoot, artifactPath as resolveArtifactPath } from '@/server/storage/paths';
+import { artifactPath as resolveArtifactPath, browserChatSessionFilePath, browserChatSessionsDir } from '@/server/storage/paths';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 
@@ -138,7 +138,7 @@ browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
-const sessionsPath = path.join(appDataRoot(), '.data', 'browser-chat-sessions.json');
+const sessionsDir = browserChatSessionsDir();
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const runningHydrationGraceMs = 2 * 60 * 1000;
@@ -878,21 +878,39 @@ function appendLog(
 }
 
 function readSessionSnapshotsFromFile(): BrowserChatSessionSnapshot[] {
-  if (!existsSync(sessionsPath)) return [];
-  const data = JSON.parse(readFileSync(sessionsPath, 'utf8')) as unknown;
-  if (!Array.isArray(data)) throw new Error('Browser chat sessions file must contain an array.');
-  return data.filter((item): item is BrowserChatSessionSnapshot => (
-    Boolean(item)
-    && typeof item === 'object'
-    && !Array.isArray(item)
-    && typeof (item as { id?: unknown }).id === 'string'
-  ));
+  if (!existsSync(sessionsDir)) return [];
+  return readdirSync(sessionsDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+    .map((entry) => readSessionSnapshotFromFilePath(path.join(sessionsDir, entry.name)))
+    .filter((item): item is BrowserChatSessionSnapshot => Boolean(item));
 }
 
-function writeSessionSnapshotsToFile(items: BrowserChatSessionSnapshot[]) {
-  const payload = stringifyJsonSafe(items, 2);
-  if (!payload) throw new Error('Browser chat sessions could not be serialized.');
-  writeTextFileAtomic(sessionsPath, payload);
+function isBrowserChatSessionSnapshot(value: unknown): value is BrowserChatSessionSnapshot {
+  return Boolean(value)
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && typeof (value as { id?: unknown }).id === 'string';
+}
+
+function readSessionSnapshotFromFilePath(filePath: string) {
+  const data = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
+  return isBrowserChatSessionSnapshot(data) ? data : undefined;
+}
+
+function readSessionSnapshotFromFile(sessionId: string) {
+  const filePath = browserChatSessionFilePath(sessionId);
+  if (!existsSync(filePath)) return undefined;
+  return readSessionSnapshotFromFilePath(filePath);
+}
+
+function writeSessionSnapshotToFile(item: BrowserChatSessionSnapshot) {
+  const payload = stringifyJsonSafe(item, 2);
+  if (!payload) throw new Error(`Browser chat session ${item.id} could not be serialized.`);
+  writeTextFileAtomic(browserChatSessionFilePath(item.id), payload);
+}
+
+function deleteSessionSnapshotFile(sessionId: string) {
+  rmSync(browserChatSessionFilePath(sessionId), { force: true });
 }
 
 function timestampValue(value?: string) {
@@ -1058,26 +1076,16 @@ function applyFileSnapshotToRuntime(snapshotFromFile: BrowserChatSessionSnapshot
 
 function persistSessionToFile(sessionId: string) {
   try {
-    const diskSnapshots = readSessionSnapshotsFromFile();
     const currentSession = sessions.get(sessionId);
     const incoming = currentSession ? snapshot(currentSession, { fullSteps: true }) : undefined;
-    let writtenSnapshot: BrowserChatSessionSnapshot | undefined;
-    let found = false;
-    const nextSnapshots = diskSnapshots
-      .map((item) => {
-        if (item.id !== sessionId) return item;
-        found = true;
-        if (!incoming) return undefined;
-        writtenSnapshot = mergeSessionSnapshotFromFile(item, incoming);
-        return writtenSnapshot;
-      })
-      .filter((item): item is BrowserChatSessionSnapshot => Boolean(item));
-    if (incoming && !found) {
-      writtenSnapshot = mergeSessionSnapshotFromFile(undefined, incoming);
-      nextSnapshots.push(writtenSnapshot);
+    if (!incoming) {
+      deleteSessionSnapshotFile(sessionId);
+      return true;
     }
-    writeSessionSnapshotsToFile(nextSnapshots);
-    if (writtenSnapshot) applyFileSnapshotToRuntime(writtenSnapshot);
+    const diskSnapshot = readSessionSnapshotFromFile(sessionId);
+    const writtenSnapshot = mergeSessionSnapshotFromFile(diskSnapshot, incoming);
+    writeSessionSnapshotToFile(writtenSnapshot);
+    applyFileSnapshotToRuntime(writtenSnapshot);
     return true;
   } catch (error) {
     warnPersistFailure(error);
@@ -1094,9 +1102,9 @@ function persistAndNotify(sessionId: string) {
 
 function persistDeletedSessionsToFile(sessionIds: string[]) {
   try {
-    const deletedIds = new Set(sessionIds);
-    const nextSnapshots = readSessionSnapshotsFromFile().filter((item) => !deletedIds.has(item.id));
-    writeSessionSnapshotsToFile(nextSnapshots);
+    for (const sessionId of new Set(sessionIds.filter(Boolean))) {
+      deleteSessionSnapshotFile(sessionId);
+    }
     return true;
   } catch (error) {
     warnPersistFailure(error);

@@ -19,7 +19,7 @@ function shouldIgnoreConsoleError(text: string) {
 }
 
 function shouldUseSeparateMarkerMap() {
-  return !/^(false|0|no|off)$/i.test(String(process.env.VISUAL_MARKER_SEPARATE_MAP || 'true'));
+  return !/^(false|0|no|off)$/i.test(String(process.env.VISUAL_MARKER_SEPARATE_MAP || 'false'));
 }
 
 function positiveIntegerEnv(key: string) {
@@ -80,6 +80,7 @@ export type BrowserSessionOptions = {
   runId?: string;
   preferExistingPage?: boolean;
   browserProfileKey?: string;
+  debugDevtools?: boolean;
 };
 
 /**
@@ -1485,11 +1486,10 @@ function installAiBrowserPageRuntime() {
   };
 }
 
-function collectAiInteractiveCandidates(input: { requirePointerEvents?: boolean }): PageInteractiveCandidate[] {
-  return collectAiDomObservation(input).interactiveCandidates;
-}
-
-function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean; requirePointerEvents?: boolean; structuredTextMaxChars?: number }): PageDomObservationPayload {
+function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean; requirePointerEvents?: boolean; structuredTextMaxChars?: number; debugPause?: boolean }): PageDomObservationPayload {
+  if (input.debugPause) {
+    debugger;
+  }
   const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
   if (!runtime) return { structuredText: '', interactiveCandidates: [] };
 
@@ -2574,7 +2574,7 @@ export class BrowserSession {
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
     const { chromium } = await import('playwright');
-    const headless = process.env.HEADLESS_BROWSER === 'true';
+    const headless = this.options.debugDevtools ? false : process.env.HEADLESS_BROWSER === 'true';
     const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
     const configuredViewportWidth = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH');
     const configuredViewportHeight = positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT');
@@ -2645,6 +2645,7 @@ export class BrowserSession {
         '--high-dpi-support=1',
         '--no-first-run',
         '--no-default-browser-check',
+        this.options.debugDevtools ? '--auto-open-devtools-for-tabs' : '',
         restoreLastSession ? '--restore-last-session' : '',
         autoTabGroupDebugPort ? `--remote-debugging-port=${autoTabGroupDebugPort}` : '',
       ].filter(Boolean), headless, { exclusive: Boolean(autoTabGroupProfileDir) }),
@@ -3601,7 +3602,7 @@ export class BrowserSession {
     ];
   }
 
-  // 截取当前 viewport。默认保留干净原图，并把视觉标识保存为单独 marker map。
+  // Capture the current viewport. Visual mode draws marker labels inline by default.
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
     const totalStartedAt = Date.now();
     const timingSteps: ScreenshotTimingStep[] = [];
@@ -3664,7 +3665,7 @@ export class BrowserSession {
     }
     this.lastCandidateMarkerScreenshotPath = undefined;
     this.lastOriginalScreenshotPath = undefined;
-    // 默认保留干净页面截图；候选编号写入单独 marker 图，点击光标保留在操作后截图里。
+    // VISUAL_MARKER_SEPARATE_MAP can keep labels in a separate marker map when needed.
     const separateMarkerMap = candidateLabelsEnabled && shouldUseSeparateMarkerMap();
     await timed('removeCandidateOverlayBefore', () => this.removeCandidateOverlay());
     if (phase === 'before' || String(phase).startsWith('visual-')) {
@@ -3813,6 +3814,55 @@ export class BrowserSession {
         ].filter(Boolean).join(', ');
         return `${indent}- #${candidate.id} ${candidate.tag}${className}${role ? `[${role}]` : ''}: "${label.slice(0, 160)}"${state ? ` (${state})` : ''}`;
       }).join('\n') || '[no visible interactive elements detected]',
+    };
+  }
+
+  // Debug entrypoint for stepping through interactive candidate collection on a real page.
+  async debugInteractiveCandidateScan(input: { pause?: boolean; includeScreenshot?: boolean; runId?: string } = {}) {
+    await this.ensureBrowserPageRuntime();
+    const pageUrl = this.activePage.url();
+    const pageTitle = await this.activePage.title().catch(() => '');
+    const directObservation = await this.activePage.evaluate(collectAiDomObservation, {
+      includeInteractiveCandidates: true,
+      requirePointerEvents: false,
+      structuredTextMaxChars: 12000,
+      debugPause: input.pause !== false,
+    });
+    const candidates = this.finalizeInteractiveCandidates(directObservation.interactiveCandidates, []);
+    let screenshotPath: string | undefined;
+    let screenshotTiming: ScreenshotTiming | undefined;
+    if (input.includeScreenshot !== false) {
+      screenshotPath = await this.takeScreenshot(input.runId || `debug_interactive_${Date.now()}`, 1, 'visual-1', { capture: 'viewport' });
+      screenshotTiming = this.getLastScreenshotTiming();
+    }
+    return {
+      url: pageUrl,
+      title: pageTitle,
+      directCandidateCount: directObservation.interactiveCandidates.length,
+      finalizedCandidateCount: candidates.length,
+      screenshotPath,
+      screenshotTiming,
+      candidates: candidates.slice(0, 80).map((candidate) => ({
+        id: candidate.id,
+        tag: candidate.tag,
+        role: candidate.role,
+        type: candidate.type,
+        name: candidate.name,
+        text: candidate.text,
+        className: candidate.className,
+        signals: candidate.signals,
+        rect: candidate.rect,
+        center: candidate.center,
+        clickable: candidate.clickable,
+        input: candidate.input,
+        disabled: candidate.disabled,
+        hasIndependentClickArea: candidate.hasIndependentClickArea,
+        href: candidate.href,
+        placeholder: candidate.placeholder,
+        ariaLabel: candidate.ariaLabel,
+        nearbyText: candidate.nearbyText,
+      })),
+      structuredTextPreview: directObservation.structuredText.slice(0, 2000),
     };
   }
 
@@ -5099,7 +5149,8 @@ export class BrowserSession {
   private async refreshInteractiveCandidates() {
     await this.ensureBrowserPageRuntime();
     const mainCandidates = await this.activePage
-      .evaluate(collectAiInteractiveCandidates, { requirePointerEvents: false })
+      .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: false })
+      .then((observation) => observation.interactiveCandidates)
       .catch(() => [] as PageInteractiveCandidate[]);
 
     const frameCandidates = await this.refreshFrameInteractiveCandidates();
@@ -5133,7 +5184,8 @@ export class BrowserSession {
 
       await this.ensureBrowserPageRuntime(frame);
       const localCandidates = await frame
-        .evaluate(collectAiInteractiveCandidates, { requirePointerEvents: true })
+        .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: true })
+        .then((observation) => observation.interactiveCandidates)
         .catch(() => [] as PageInteractiveCandidate[]);
 
       for (const candidate of localCandidates) {

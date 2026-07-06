@@ -263,9 +263,9 @@ function visualMarkersEnabledFor(testCase: TestCaseRecord) {
   return true;
 }
 
-// Default to a separate marker map to avoid the extra original screenshot from inline labels.
+// Default to inline marker labels so visual mode screenshots show interactive targets.
 function usesSeparateMarkerMap() {
-  return !/^(false|0|no|off)$/i.test(String(process.env.VISUAL_MARKER_SEPARATE_MAP || 'true'));
+  return !/^(false|0|no|off)$/i.test(String(process.env.VISUAL_MARKER_SEPARATE_MAP || 'false'));
 }
 
 // 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。

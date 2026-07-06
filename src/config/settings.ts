@@ -162,7 +162,7 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'BROWSER_CHAT_DOM_SCREENSHOTS', label: 'DOM 模式保存截图', description: '对话 DOM 模式是否保存步骤截图；关闭时不会因截图超时阻塞执行。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'AI_SCREENSHOT_MAX_KB', label: 'AI 截图压缩上限', description: '发送给 AI 的截图大小上限，留空表示不压缩。', tab: 'browser', defaultValue: '', control: 'number' },
   { key: 'VISUAL_MARKERS_IS_MARKED', label: '启用视觉标记', description: '是否在截图上叠加候选编号。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'VISUAL_MARKER_SEPARATE_MAP', label: '单独标记图', description: '把标记图和原截图分开发给模型，运行证据链展示不带标识的原图。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
+  { key: 'VISUAL_MARKER_SEPARATE_MAP', label: '单独标记图', description: '把标记图和原截图分开发给模型，运行证据链展示不带标识的原图。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'SEND_SCREENSHOT_TO_AI', label: '强制发送截图', description: '覆盖模型能力判断，留空表示自动判断。', tab: 'browser', defaultValue: '', control: 'select', options: [{ label: '自动', value: '' }, ...boolOptions] },
   { key: 'DOM_TREE_MAX_NODES', label: 'DOM 节点上限', description: 'DOM 模式下最多读取多少个简化节点。', tab: 'browser', defaultValue: '320', control: 'number' },
   { key: 'DOM_TREE_MAX_DEPTH', label: 'DOM 深度上限', description: 'DOM 模式下读取 DOM 树的最大深度。', tab: 'browser', defaultValue: '14', control: 'number' },
