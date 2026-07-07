@@ -149,7 +149,7 @@ export function BrowserChatToolDialog({
                     onClick={(event) => {
                       if (!url) event.preventDefault();
                     }}
-                    rel="noreferrer"
+                    rel="noopener noreferrer"
                     target="_blank"
                   >
                     {url ? <img alt={shot.title || screenshotKindLabel(shot.kind)} src={url} /> : null}

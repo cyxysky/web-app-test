@@ -6,11 +6,8 @@
 .browser-chat-tool-detail-grid div,
 .browser-chat-tool-detail-section {
   background: #ffffff;
-  border: 1px solid var(--border);
-  border-radius: 8px;
   padding: 10px;
   width: 100%;
-  overflow: hidden;
 }
 
 .browser-chat-tool-detail-grid span,
@@ -38,9 +35,6 @@
 }
 
 .browser-chat-tool-detail-summary div {
-  background: color-mix(in srgb, var(--panel-soft) 76%, #ffffff);
-  border: 1px solid var(--border);
-  border-radius: 8px;
   display: grid;
   gap: 6px;
   min-width: 0;

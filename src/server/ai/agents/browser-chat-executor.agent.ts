@@ -27,7 +27,6 @@ import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
 import { notifyRuntimeToolTrace, runtimeToolTraceId } from './runtime-tool-trace';
-import { processDomObservationInNode, type ProcessedDomObservation } from './dom-observation-processor';
 
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type RuntimeModelMessage = ModelMessage;
@@ -193,6 +192,7 @@ function runtimePageContextOptions(mode: BrowserSessionMode, options: { includeD
 }
 
 type RuntimePageContext = Awaited<ReturnType<BrowserSession['getPageContext']>>;
+type DomPageStateObservation = NonNullable<RuntimePageContext['domObservation']>;
 
 function domTreePromptLimit() {
   const raw = String(process.env.DOM_TREE_PROMPT_MAX_CHARS || '').trim();
@@ -539,6 +539,8 @@ function compactToolResultForModel(
   const { debug: _debug, observationViews, ...modelResult } = result;
   void _debug;
   if (!modelResult.actual) return modelResult;
+  const fileResult = modelResult.ok ? formatFileArtifactResult(name, modelResult.actual) : undefined;
+  if (fileResult) return { ...modelResult, actual: fileResult };
   if (runtimeObservationToolNames.has(name)) return modelResult;
   const limit = modelToolResultLimit(name);
   if (modelResult.actual.length <= limit) return modelResult;
@@ -556,7 +558,7 @@ function compactToolResultForModel(
       modelResult.actual.slice(0, previewLimit),
       '',
       observation
-        ? `[Current getPageState observation refreshed for this run: tool=${name}, defaultType=${observation.defaultType}, availableTypes=${availableTypes}, totalChars=${observation.totalChars}, previewChars=${previewLimit}, omittedChars=${omitted}. Use readObservation(type="text"|"interactive", offset, maxChars>=10000) to inspect the current observation.]`
+        ? `[Current getPageState elements observation refreshed for this run: tool=${name}, availableTypes=${availableTypes}, totalChars=${observation.totalChars}, previewChars=${previewLimit}, omittedChars=${omitted}. Use readObservation(offset, maxChars>=10000) to inspect the current elements observation.]`
         : `[Tool result truncated for model context: ${omitted} characters omitted from ${name}. Use a narrower text query, HTTP filter, or another observation tool call if more detail is required.]`,
     ].join('\n'),
   };
@@ -1248,6 +1250,10 @@ function defaultVisualAfterForTool(name: string): VisualAfterPolicy {
   return { capture: 'auto', retention: 'replace' };
 }
 
+function browserChatDomScreenshotsEnabled() {
+  return process.env.BROWSER_CHAT_DOM_SCREENSHOTS === 'true';
+}
+
 function sanitizeVisualAfterRetention(retention: unknown, fallback: VisualAfterPolicy['retention']) {
   if (typeof retention !== 'string') return fallback;
   if (retention === 'auto' || retention === 'replace' || retention === 'append') return retention;
@@ -1316,6 +1322,7 @@ function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
 }
 
 function shouldCaptureVisualAfter(name: string, visualAfter: VisualAfterPolicy) {
+  if (!browserChatDomScreenshotsEnabled()) return false;
   if (visualAfter.capture === 'viewport' || visualAfter.capture === 'fullPage') return true;
   return !noVisualAfterCaptureToolNames.has(name);
 }
@@ -1544,8 +1551,8 @@ function createToolTrace(input: {
 }) {
   const { traces, name, toolInput, aiRequest, runId, stepIndex, visualContext } = input;
   const screenshots: ToolTrace['screenshots'] = [];
-  pushBeforeFrameScreenshots(screenshots, name, visualContext?.current());
-  const visualAfter = visualAfterFromInput(name, toolInput);
+  if (browserChatDomScreenshotsEnabled()) pushBeforeFrameScreenshots(screenshots, name, visualContext?.current());
+  const visualAfter = browserChatDomScreenshotsEnabled() ? visualAfterFromInput(name, toolInput) : undefined;
   const traceId = runtimeToolTraceId({ runId, stepIndex, traceIndex: traces.length + 1 });
   const trace: ToolTrace = {
     id: traceId,
@@ -1830,7 +1837,7 @@ function makeBrowserTools(
 
   const sharedTools = {
     getPageState: tool({
-      description: 'Read-only observation tool: inspect the current active page state. It collects the browser DOM tree into the Node backend, where worker threads generate stored text and interactive node_id views for readObservation. Call this after any browser-changing action before choosing another DOM action.',
+      description: 'Read-only observation tool: inspect the current active page state. The browser DOM runtime generates one stored elements view for readObservation, with text, attributes, node_id values, and interactive markers in the same hierarchy. Call this after any browser-changing action before choosing another DOM action.',
       inputSchema: browserToolInput({}),
       execute: (input) => record('getPageState', input, async () => (
         referenceOptions?.observePageState
@@ -1906,16 +1913,15 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
     }),
     readObservation: tool({
-      description: 'Read-only context tool: read a typed range from the current getPageState observation for this run. In DOM mode, type="text" returns Node-processed plain page text and type="interactive" returns actionable DOM node_id entries generated from the DOM tree on the Node backend.',
+      description: 'Read-only context tool: read a range from the current getPageState elements observation for this run. The elements view contains HTML-like DOM lines with hierarchy, visible text, attributes, node_id values, and interactive markers.',
       inputSchema: browserToolInput({
-        type: z.enum(['text', 'interactive']).optional().describe('Which observation view to read. Defaults to text. Use interactive for actionable DOM node_id entries. Raw HTML is not exposed through readObservation.'),
         offset: z.number().int().nonnegative().optional().describe('Character offset to start reading from. Defaults to 0.'),
         maxChars: z.number().int().positive().optional().describe('Maximum characters to return. Defaults to 10000; values below 10000 are raised to 10000. No upper cap is applied.'),
       }),
-      execute: (input) => record('readObservation', input, async () => readRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, input.type, input.offset, input.maxChars)),
+      execute: (input) => record('readObservation', input, async () => readRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, input.offset, input.maxChars)),
     }),
     downloadFile: tool({
-      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, an origin-relative path starting with / resolved against the current page origin, or a page-relative path resolved against the current page directory. Use this when the user asks to download/save a file; return the saved URL or local path in the final answer.',
+      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, an origin-relative path starting with / resolved against the current page origin, or a page-relative path resolved against the current page directory. Use this when the user asks to download/save a file; include the returned download target as a clickable Markdown link in the final answer.',
       inputSchema: browserToolInput({
         url: z.string().optional().describe('Absolute download URL. If omitted, path or urlOrPath is used.'),
         path: z.string().optional().describe('Download path. /files/a.pdf resolves against current page origin; report/a.pdf resolves against current page directory.'),
@@ -1925,7 +1931,7 @@ function makeBrowserTools(
       execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
     }),
     generateMarkdownFile: tool({
-      description: 'Create a Markdown .md file in the configured local output directory or this run artifacts from complete Markdown content written by the AI. Use this when the user asks to generate/export/save a Markdown file, then include the saved URL or local path in the final answer.',
+      description: 'Create a Markdown .md file in the configured local output directory or this run artifacts from complete Markdown content written by the AI. Use this when the user asks to generate/export/save a Markdown file, then include the returned Markdown download link exactly as a clickable Markdown link in the final answer.',
       inputSchema: browserToolInput({
         fileName: z.string().optional().describe('Optional Markdown file name. The .md extension is added when missing.'),
         title: z.string().optional().describe('Optional title used as fallback file name.'),
@@ -2005,22 +2011,22 @@ function makeBrowserTools(
     getDomNodeText: tool({
       description: 'DOM mode read-only helper: read expanded text for a fresh DOM node_id from the current DOM snapshot.',
       inputSchema: browserToolInput({
-        id: z.string().min(1).describe('Fresh DOM node_id from readObservation(type="interactive") or the current DOM snapshot.'),
+        id: z.string().min(1).describe('Fresh DOM node_id from readObservation elements or the current DOM snapshot.'),
       }),
       execute: (input) => record('getDomNodeText', input, () => session.getDomNodeText(normalizeDomNodeIdString(input.id))),
     }),
     clickDomNode: tool({
-      description: 'DOM mode click/focus: click a fresh DOM node_id from readObservation(type="interactive"). If text is provided, type it immediately after clicking.',
+      description: 'DOM mode click/focus: click a fresh DOM node_id from readObservation elements. If text is provided, type it immediately after clicking.',
       inputSchema: browserToolInput({
-        id: z.string().min(1).describe('Fresh DOM node_id from readObservation(type="interactive").'),
+        id: z.string().min(1).describe('Fresh DOM node_id from readObservation elements.'),
         text: z.string().optional().describe('Optional text to type immediately after clicking/focusing this DOM node.'),
       }),
       execute: (input) => record('clickDomNode', input, () => session.clickDomNode(normalizeDomNodeIdString(input.id), input.text)),
     }),
     fillDomNodes: tool({
-      description: `DOM mode form helper: click and optionally fill up to ${BATCH_FILL_FIELD_LIMIT} fresh DOM node_id targets from readObservation(type="interactive") in one browser action. Use for stable forms where all fields are present in the current DOM snapshot.`,
+      description: `DOM mode form helper: click and optionally fill up to ${BATCH_FILL_FIELD_LIMIT} fresh DOM node_id targets from readObservation elements in one browser action. Use for stable forms where all fields are present in the current DOM snapshot.`,
       inputSchema: browserToolInput({
-        fields: batchFillFieldsInput.describe('Ordered DOM node_id fields to click/fill. Each id must come from the current readObservation(type="interactive") result.'),
+        fields: batchFillFieldsInput.describe('Ordered DOM node_id fields to click/fill. Each id must come from the current readObservation elements result.'),
       }),
       execute: (input) => record('fillDomNodes', input, () => session.fillDomNodes(input.fields.map((field) => ({
         id: normalizeDomNodeIdString(field.id),
@@ -2029,24 +2035,24 @@ function makeBrowserTools(
       })))),
     }),
     hoverDomNode: tool({
-      description: 'DOM mode hover: move the mouse over a fresh DOM node_id from readObservation(type="interactive") to reveal menus, tooltips, or hover-only controls.',
+      description: 'DOM mode hover: move the mouse over a fresh DOM node_id from readObservation elements to reveal menus, tooltips, or hover-only controls.',
       inputSchema: browserToolInput({
-        id: z.string().min(1).describe('Fresh DOM node_id from readObservation(type="interactive").'),
+        id: z.string().min(1).describe('Fresh DOM node_id from readObservation elements.'),
       }),
       execute: (input) => record('hoverDomNode', input, () => session.hoverDomNode(normalizeDomNodeIdString(input.id))),
     }),
     doubleClickDomNode: tool({
-      description: 'DOM mode double-click: double-click a fresh DOM node_id from readObservation(type="interactive").',
+      description: 'DOM mode double-click: double-click a fresh DOM node_id from readObservation elements.',
       inputSchema: browserToolInput({
-        id: z.string().min(1).describe('Fresh DOM node_id from readObservation(type="interactive").'),
+        id: z.string().min(1).describe('Fresh DOM node_id from readObservation elements.'),
       }),
       execute: (input) => record('doubleClickDomNode', input, () => session.doubleClickDomNode(normalizeDomNodeIdString(input.id))),
     }),
     dragDomNode: tool({
       description: 'DOM mode drag: drag from one fresh DOM node_id to another fresh DOM node_id from the current DOM snapshot.',
       inputSchema: browserToolInput({
-        fromId: z.string().min(1).describe('Fresh source DOM node_id from readObservation(type="interactive").'),
-        toId: z.string().min(1).describe('Fresh target DOM node_id from readObservation(type="interactive").'),
+        fromId: z.string().min(1).describe('Fresh source DOM node_id from readObservation elements.'),
+        toId: z.string().min(1).describe('Fresh target DOM node_id from readObservation elements.'),
       }),
       execute: (input) => record('dragDomNode', input, () => session.dragDomNode(normalizeDomNodeIdString(input.fromId), normalizeDomNodeIdString(input.toId))),
     }),
@@ -2103,13 +2109,12 @@ function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
 
 // 根据当前模式生成验证码/安全校验规则；DOM 模式不要要求 AI 读取截图。
 function formatDomPageStateObservation(pageContext: RuntimePageContext, observationViews?: BrowserActionResult['observationViews']) {
-  const text = observationViews?.text || '[empty page text]';
-  const interactive = observationViews?.interactive || '[no interactive DOM nodes detected]';
+  const elements = observationViews?.elements || '[empty DOM elements]';
   return [
     'Current DOM page state observation:',
-    '- getPageState collected the browser DOM tree into the Node backend.',
-    '- Node worker threads processed that DOM tree into stored readObservation views: text and interactive.',
-    '- Interactive entries expose DOM node_id values. Use DOM node tools such as clickDomNode/fillDomNodes/hoverDomNode with fresh node_id values from readObservation(type="interactive").',
+    '- getPageState collected the browser DOM tree through the browser runtime.',
+    '- The same browser-side DOM traversal generated one stored readObservation elements view.',
+    '- Elements lines expose visible text, attributes, node_id values, and data-ai-interactive markers in hierarchy. Use DOM node tools such as clickDomNode/fillDomNodes/hoverDomNode with fresh node_id values from readObservation.',
     `Current URL: ${pageContext.url}`,
     `Current title: ${pageContext.title}`,
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
@@ -2117,32 +2122,42 @@ function formatDomPageStateObservation(pageContext: RuntimePageContext, observat
     `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
     `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
     `DOM tree snapshot chars: ${(pageContext.domTree || '').length}`,
-    `Node-processed page text (${text.length} chars):\n${pageTextForPrompt(text)}`,
-    `Node-processed interactive DOM nodes:\n${interactive}`,
+    `Browser-generated elements (${elements.length} chars):\n${pageTextForPrompt(elements)}`,
   ].filter(Boolean).join('\n');
 }
 
-function domPageStateObservationViews(processed: ProcessedDomObservation): BrowserActionResult['observationViews'] {
+function fallbackDomPageStateObservation(domTree: string): DomPageStateObservation {
+  const elements = domTree || '[empty DOM elements]';
   return {
-    defaultType: 'text',
-    text: processed.text,
-    interactive: processed.interactive,
+    elements,
+    elementsCharLength: elements.length,
+    domNodeCount: domTree ? domTree.split(/\r?\n/).filter((line) => line.trim() && !line.trim().startsWith('<!--')).length : 0,
+    interactiveNodeCount: 0,
+    usedWorkers: false,
+    errors: [],
+    timings: { totalMs: 0 },
+  };
+}
+
+function domPageStateObservationViews(processed: DomPageStateObservation): BrowserActionResult['observationViews'] {
+  return {
+    defaultType: 'elements',
+    elements: processed.elements,
   };
 }
 
 function formatDomPageStateSummary(
   pageContext: RuntimePageContext,
   observation: RuntimeObservationRecord,
-  processed?: ProcessedDomObservation,
+  processed?: DomPageStateObservation,
   timings?: Record<string, unknown>,
 ) {
-  const textChars = observation.viewCharLengths.text || 0;
-  const interactiveChars = observation.viewCharLengths.interactive || 0;
+  const elementsChars = observation.viewCharLengths.elements || 0;
   return [
     'Current DOM page state summary:',
     '- getPageState refreshed the current observation for this run and replaced the previous one.',
-    '- The browser DOM tree was collected into Node; Node worker threads generated and stored text/interactive views.',
-    '- Read them with readObservation(type="text", offset=0, maxChars=10000) or readObservation(type="interactive", offset=0, maxChars=10000).',
+    '- The browser runtime generated and stored one elements view during the same DOM traversal.',
+    '- Read it with readObservation(offset=0, maxChars=10000).',
     `Current URL: ${pageContext.url}`,
     `Current title: ${pageContext.title}`,
     `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
@@ -2150,9 +2165,9 @@ function formatDomPageStateSummary(
     `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
     `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
     `Page context timings JSON: ${JSON.stringify(pageContext.timings || {})}`,
-    processed ? `Node DOM processing JSON: ${JSON.stringify({ domNodeCount: processed.domNodeCount, interactiveNodeCount: processed.interactiveNodeCount, usedWorkers: processed.usedWorkers, timings: processed.timings, errors: processed.errors })}` : '',
+    processed ? `DOM observation JSON: ${JSON.stringify({ domNodeCount: processed.domNodeCount, interactiveNodeCount: processed.interactiveNodeCount, usedWorkers: processed.usedWorkers, timings: processed.timings, errors: processed.errors })}` : '',
     timings ? `GetPageState timings JSON: ${JSON.stringify(timings)}` : '',
-    `Observation generation: ${observation.generation}. Views: text(${textChars}), interactive(${interactiveChars}); DOM tree chars=${(pageContext.domTree || '').length}.`,
+    `Observation generation: ${observation.generation}. Views: elements(${elementsChars}); DOM tree chars=${(pageContext.domTree || '').length}.`,
   ].filter(Boolean).join('\n');
 }
 
@@ -2256,7 +2271,7 @@ function runtimePrompt(input: {
     .slice(-4);
   const candidateContext = '[disabled because DOM mode uses fresh DOM tree ids]';
   const externalAppCandidateContext = '';
-  const evidence = 'the latest explicit getPageState DOM summary plus Node-processed readObservation text/interactive node_id views, URL, tabs, scroll state, and focused element';
+  const evidence = 'the latest explicit getPageState DOM summary plus browser-generated readObservation elements view, URL, tabs, scroll state, and focused element';
   const markerTargetRules: string[] = [];
   const modeActionRules = domModeActionRules();
   return [
@@ -2285,12 +2300,12 @@ function runtimePrompt(input: {
     browserChatMode ? '' : '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
     '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL.',
     browserChatMode ? '- Strict safety confirmations must use tool params requiresConfirmation=true and confirmationMessage; never ask the user to type a confirmation message for that purpose.' : '',
-    '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. Include the returned URL or local path in the final answer.',
+    '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. In the final answer, include the returned Markdown download link exactly as a clickable Markdown link.',
     ...domObservationHardRules(),
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
-      : '- DOM action reason must cite the current text/interactive evidence or the fresh locator/node_id used for the action.',
+      : '- DOM action reason must cite the current elements evidence or the fresh locator/node_id used for the action.',
     `- Use ${evidence} as the current page state. When this state is stale, call getPageState.`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
@@ -2318,11 +2333,11 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
       : '- Call one tool. Use ordinary assistant text for progress/explanation, and tool params only for the selected tool.',
     visualMode
       ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
-      : '- DOM action reason must mention the current text/interactive evidence or the fresh locator/node_id used for the action.',
+      : '- DOM action reason must mention the current elements evidence or the fresh locator/node_id used for the action.',
     browserChatMode
       ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
       : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
-    '- When a file tool succeeds, mention the saved file name and include its returned URL or local path.',
+    '- When a file tool succeeds, mention the saved file name and include its returned download target as a clickable Markdown link.',
     '',
     'Current context:',
     browserChatMode
@@ -2929,7 +2944,7 @@ async function executeRuntimeStep(input: {
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
-        : 'Use the latest getPageState Node-processed text/interactive node_id views for the next missing goal; scroll only when content is lazy-loaded or viewport-dependent.',
+        : 'Use the latest getPageState browser-generated elements view for the next missing goal; scroll only when content is lazy-loaded or viewport-dependent.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
@@ -3045,9 +3060,9 @@ async function executeRuntimeStep(input: {
       currentDomContext = createDomContextSnapshot(mode, currentPageContext);
       const domContextSnapshotMs = elapsedSince(domContextStartedAt);
 
-      const nodeProcessingStartedAt = Date.now();
-      const processedObservation = await processDomObservationInNode(currentPageContext.domTree || '');
-      const nodeProcessingMs = elapsedSince(nodeProcessingStartedAt);
+      const observationProcessingStartedAt = Date.now();
+      const processedObservation = currentPageContext.domObservation || fallbackDomPageStateObservation(currentPageContext.domTree || '');
+      const observationProcessingMs = elapsedSince(observationProcessingStartedAt);
       ensureActive();
       const storeStartedAt = Date.now();
       const observationViews = domPageStateObservationViews(processedObservation);
@@ -3063,20 +3078,19 @@ async function executeRuntimeStep(input: {
         totalMs: elapsedSince(getPageStateStartedAt),
         getPageContextMs: pageContextMs,
         domContextSnapshotMs,
-        nodeProcessingMs,
+        observationProcessingMs,
         storeObservationMs,
         pageContextTimings: currentPageContext.timings || {},
-        nodeProcessingTimings: processedObservation.timings,
+        observationTimings: processedObservation.timings,
         domTreeChars: (currentPageContext.domTree || '').length,
-        textChars: processedObservation.textCharLength,
-        interactiveChars: processedObservation.interactiveCharLength,
+        elementsChars: processedObservation.elementsCharLength,
         domNodeCount: processedObservation.domNodeCount,
         interactiveNodeCount: processedObservation.interactiveNodeCount,
       };
       await onDebug?.({
         phase: 'browser:get-page-state:dom-timings',
         stepIndex,
-        message: `DOM getPageState timings: total=${getPageStateTimings.totalMs}ms, getPageContext=${pageContextMs}ms, readSimplifiedDomTree=${Number((currentPageContext.timings || {}).readSimplifiedDomTreeMs || 0)}ms, nodeProcessing=${nodeProcessingMs}ms, store=${storeObservationMs}ms.`,
+        message: `DOM getPageState timings: total=${getPageStateTimings.totalMs}ms, getPageContext=${pageContextMs}ms, readSimplifiedDomTree=${Number((currentPageContext.timings || {}).readSimplifiedDomTreeMs || 0)}ms, observationProcessing=${observationProcessingMs}ms, store=${storeObservationMs}ms.`,
         details: getPageStateTimings,
       });
       return {
@@ -3095,44 +3109,18 @@ async function executeRuntimeStep(input: {
       pageStateObservationIndex += 1;
       const capture = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
       const visualIndex = traces.length + pageStateObservationIndex + 1;
-      const screenshotStartedAt = Date.now();
-      const screenshotPath = await session.takeScreenshot(input.runId, stepIndex, `visual-${visualIndex}`, { capture });
+      const screenshotPath = await session.takeCurrentScreenshotOnly(input.runId, stepIndex, `visual-${visualIndex}`, { capture });
       ensureActive();
-      const timingSummary = session.formatLastScreenshotTiming();
-      await onDebug?.({
-        phase: 'browser:screenshot:current',
-        stepIndex,
-        message: `getCurrentScreenshot captured in ${elapsedSince(screenshotStartedAt)}ms${timingSummary ? ` ${timingSummary}` : ''}`,
-        details: {
-          elapsedMs: elapsedSince(screenshotStartedAt),
-          path: screenshotPath,
-          capture,
-          toolName: 'getCurrentScreenshot',
-          timings: session.getLastScreenshotTiming(),
-        },
-      });
-      const frame = visualContext.apply({
-        path: screenshotPath,
-        originalPath: session.getLastOriginalScreenshotPath(),
-        markerPath: undefined,
-        stepIndex,
-        toolName: 'getCurrentScreenshot',
-        capture,
-        reason: 'Explicit screenshot observation',
-      }, { capture, retention: 'replace', reason: 'Explicit screenshot observation' });
       const observationText = [
         'Current screenshot observation:',
         `- ${capture} screenshot captured and attached to the next model request.`,
-        '- Screenshot is visual evidence only. Use getPageState/readObservation and DOM node tools for actionable ids.',
-        `Current URL: ${session.currentUrl()}`,
-        `Image: ${basenameOfPath(frame.path)}`,
+        `Image: ${basenameOfPath(screenshotPath)}`,
       ].join('\n');
       pendingObservationMessages.push({
         text: `[WebPilot explicit screenshot observation]\n${observationText}`,
-        imagePaths: [frame.path],
+        imagePaths: [screenshotPath],
         domContext: currentDomContext,
       });
-      await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated by getCurrentScreenshot.', details: visualContext.snapshot() });
       return {
         ok: true,
         actual: `${observationText}\n\n[The screenshot image will be attached to the next model request.]`,
@@ -3668,12 +3656,12 @@ export async function executeInteractiveBrowserTurn(input: {
   let consecutiveAiRequestFailures = 0;
 
   async function takeStepScreenshot(phase: 'before' | 'after', stepIndex: number) {
-    if (runtimeMode === 'dom') {
+    if (runtimeMode === 'dom' && !browserChatDomScreenshotsEnabled()) {
       await input.onDebug?.({
         phase: `browser:screenshot:${phase}:skipped`,
         stepIndex,
         message: `DOM mode skipped ${phase} screenshot; using DOM page context instead.`,
-        details: { browserMode: runtimeMode },
+        details: { browserMode: runtimeMode, enabledBy: 'BROWSER_CHAT_DOM_SCREENSHOTS=true' },
       });
       return undefined;
     }
@@ -4290,7 +4278,7 @@ async function executeCodexRuntimeObject(input: {
   };
   const pendingConfirmation = requestToolConfirmation ? toolConfirmationFromInput(type, normalizedParams) : undefined;
 
-  await executeTracedBrowserAction({
+  const result = await executeTracedBrowserAction({
     session,
     traces,
     name: type,
@@ -4326,5 +4314,6 @@ async function executeCodexRuntimeObject(input: {
         : await runRecordedTool(session, targetUrl, flow, runId);
     },
   });
-  return { text: readableActionFromRawText(message) || '', executed: true };
+  const fileResult = result.ok ? formatFileArtifactResult(type, result.actual) : undefined;
+  return { text: fileResult || readableActionFromRawText(message) || '', executed: true };
 }

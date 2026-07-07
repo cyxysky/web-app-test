@@ -87,7 +87,7 @@ function browserSessionModeFromEnv(): BrowserSessionMode {
   return 'dom';
 }
 
-export type BrowserObservationType = 'text' | 'interactive';
+export type BrowserObservationType = 'elements';
 
 export type BrowserObservationViews = Partial<Record<BrowserObservationType, string>> & {
   defaultType?: BrowserObservationType;
@@ -362,12 +362,33 @@ type BrowserUseVisibleDomSnapshot = {
   }>;
   items: Array<{
     descriptor: string;
+    interactive: boolean;
+    label: string;
     line: string;
     path: string;
     ref: string;
+    state: string;
+    tag: string;
   }>;
   stateKey: string;
   viewport: BrowserUseViewportClip;
+};
+
+export type BrowserDomObservation = {
+  elements: string;
+  elementsCharLength: number;
+  domNodeCount: number;
+  interactiveNodeCount: number;
+  usedWorkers: boolean;
+  errors: string[];
+  timings: {
+    totalMs: number;
+  };
+};
+
+type BrowserSimplifiedDomTreeResult = {
+  tree: string;
+  observation: BrowserDomObservation;
 };
 
 type AiDomRuntime = {
@@ -1250,6 +1271,120 @@ function installAiBrowserPageRuntime() {
     return normalizeVisibleDomText(parts.join(' ')).slice(0, 160);
   }
 
+  function visibleDomUniqueText(values: string[]) {
+    const seen = new Set<string>();
+    const output: string[] = [];
+    for (const value of values) {
+      const text = normalizeVisibleDomText(value);
+      const key = text.toLowerCase();
+      if (!text || seen.has(key)) continue;
+      seen.add(key);
+      output.push(text);
+    }
+    return output;
+  }
+
+  const visibleDomLabelAttributeNames = ['aria-label', 'alt', 'placeholder', 'title', 'value'];
+  const visibleDomDescendantSemanticAttributeNames = ['aria-label', 'title', 'alt', 'data-testid', 'data-test', 'data-qa', 'data-cy'];
+  const visibleDomInteractiveStateAttributes = [
+    'id',
+    'class',
+    'aria-disabled',
+    'aria-label',
+    'placeholder',
+    'title',
+    'role',
+    'type',
+    'name',
+    'value',
+    'href',
+    'aria-expanded',
+    'aria-pressed',
+    'checked',
+    'disabled',
+    'readonly',
+    'required',
+    'selected',
+    'contenteditable',
+    'data-testid',
+    'data-test',
+    'data-qa',
+    'data-cy',
+    'data-action',
+    'data-click',
+    'data-href',
+    'data-target',
+    'data-url',
+    'jsaction',
+    'ng-click',
+    'onclick',
+    'tabindex',
+    'v-on:click',
+    '@click',
+  ];
+
+  function visibleDomDescendantSemanticText(element: Element) {
+    const values: string[] = [];
+    let chars = 0;
+    const append = (value?: string | null) => {
+      if (chars >= 160) return;
+      const text = normalizeVisibleDomText(value || '');
+      if (!text) return;
+      values.push(text);
+      chars += text.length + 1;
+    };
+    const visit = (node: Node, root = false) => {
+      if (chars >= 160) return;
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const child = node as Element;
+      if (!root && isVisibleDomSubtreeHidden(child)) return;
+      if (!root) {
+        for (const name of visibleDomDescendantSemanticAttributeNames) append(child.getAttribute(name));
+      }
+      const rootNode = shadowRootOf(child);
+      for (const nested of Array.from(child.childNodes || [])) {
+        if (chars >= 160) break;
+        visit(nested, false);
+      }
+      if (rootNode) {
+        for (const nested of Array.from(rootNode.childNodes || [])) {
+          if (chars >= 160) break;
+          visit(nested, false);
+        }
+      }
+    };
+    visit(element, true);
+    return visibleDomUniqueText(values).join(' | ').slice(0, 160);
+  }
+
+  function visibleDomLineText(element: Element, interactive: boolean) {
+    const text = visibleDomTextContent(element);
+    if (text || !interactive) return text;
+    return visibleDomDescendantSemanticText(element);
+  }
+
+  function visibleDomLabelForElement(element: Element, interactive: boolean, lineText: string) {
+    const values = visibleDomUniqueText([
+      lineText,
+      ...visibleDomLabelAttributeNames.map((name) => visibleDomAttributeValue(element, name) || ''),
+      visibleDomAttributeValue(element, 'name') || '',
+    ]);
+    if (values.length) return values.join(' | ').slice(0, 180);
+    if (!interactive) return '';
+    return 'icon-only/unlabeled interactive';
+  }
+
+  function visibleDomInteractiveStateForElement(element: Element, signals: string[]) {
+    const values = visibleDomInteractiveStateAttributes
+      .map((name) => {
+        const value = visibleDomAttributeValue(element, name);
+        return value ? `${name}=${JSON.stringify(value)}` : '';
+      })
+      .filter(Boolean);
+    if (signals.length) values.push(`data-ai-signals=${JSON.stringify(Array.from(new Set(signals)).join('|'))}`);
+    return values.join(' ');
+  }
+
   function renderedTextFromNode(rootNode: Node, maxChars: number) {
     const limit = Math.max(1, Math.floor(Number(maxChars) || 200000));
     const parts: string[] = [];
@@ -1319,7 +1454,7 @@ function installAiBrowserPageRuntime() {
     return ref;
   }
 
-  function visibleDomLine(element: Element, ref: string, signals: string[] = []) {
+  function visibleDomItem(element: Element, ref: string, signals: string[] = []) {
     const attrs = [`node_id=${ref}`];
     for (const name of visibleDomRenderedAttributes) {
       const value = visibleDomAttributeValue(element, name);
@@ -1333,10 +1468,18 @@ function installAiBrowserPageRuntime() {
       attrs.push(`data-ai-signals="${escapeVisibleDomText(Array.from(new Set(signals)).join('|'))}"`);
     }
     const tag = visibleDomElementName(element);
-    const text = visibleDomTextContent(element);
-    return text.length === 0
+    const interactive = signals.length > 0;
+    const text = visibleDomLineText(element, interactive);
+    const line = text.length === 0
       ? `<${tag} ${attrs.join(' ')} />`
       : `<${tag} ${attrs.join(' ')}>${escapeVisibleDomText(text)}</${tag}>`;
+    return {
+      interactive,
+      label: visibleDomLabelForElement(element, interactive, text),
+      line,
+      state: interactive ? visibleDomInteractiveStateForElement(element, signals) : '',
+      tag,
+    };
   }
 
   function visibleDomSnapshot(options: { maxChars: number; maxElements: number; viewportClip?: BrowserUseViewportClip }) {
@@ -1357,7 +1500,8 @@ function installAiBrowserPageRuntime() {
     const pushItem = (element: Element, signals: string[] = []) => {
       if (stop()) return;
       const ref = visibleDomRef(element);
-      const line = visibleDomLine(element, ref, signals);
+      const item = visibleDomItem(element, ref, signals);
+      const line = item.line;
       const lineChars = line.length + (items.length === 0 ? 0 : 1);
       if (chars + lineChars > maxChars) {
         truncated = true;
@@ -1366,9 +1510,13 @@ function installAiBrowserPageRuntime() {
       state.refToElement.set(ref, element);
       items.push({
         descriptor: descriptor(element),
+        interactive: item.interactive,
+        label: item.label,
         line,
         path: pathOf(element) || '',
         ref,
+        state: item.state,
+        tag: item.tag,
       });
       chars += lineChars;
     };
@@ -1463,7 +1611,8 @@ function installAiBrowserPageRuntime() {
     const pushItem = (element: Element, signals: string[] = []) => {
       if (stop()) return;
       const ref = visibleDomRef(element);
-      const line = visibleDomLine(element, ref, signals);
+      const item = visibleDomItem(element, ref, signals);
+      const line = item.line;
       const lineChars = line.length + (items.length === 0 ? 0 : 1);
       if (chars + lineChars > maxChars) {
         truncated = true;
@@ -1472,9 +1621,13 @@ function installAiBrowserPageRuntime() {
       state.refToElement.set(ref, element);
       items.push({
         descriptor: descriptor(element),
+        interactive: item.interactive,
+        label: item.label,
         line,
         path: pathOf(element) || '',
         ref,
+        state: item.state,
+        tag: item.tag,
       });
       chars += lineChars;
     };
@@ -3496,7 +3649,7 @@ export class BrowserSession {
           timings,
         }))
       : undefined;
-    const [title, domObservation, structuredTextFallback, viewportMetrics, focusedElement, domTree, interactiveCandidatesFallback, scrollableAreas, pageScrollState] = await Promise.all([
+    const [title, domObservation, structuredTextFallback, viewportMetrics, focusedElement, domTreeResult, interactiveCandidatesFallback, scrollableAreas, pageScrollState] = await Promise.all([
       timedBrowserStep(timings, 'readTitleMs', () => this.activePage.title().catch(() => '').then((value) => this.stripTabTitlePrefix(value))),
       domObservationPromise || Promise.resolve(undefined),
       !domObservationPromise && includeText
@@ -3505,7 +3658,10 @@ export class BrowserSession {
       timedBrowserStep(timings, 'getViewportMetricsMs', () => this.getViewportMetrics()),
       timedBrowserStep(timings, 'getFocusedElementMs', () => this.getFocusedElement()),
       options.includeDomTree
-        ? timedBrowserStep(timings, 'readSimplifiedDomTreeMs', () => this.readSimplifiedDomTree({ scope: options.domScope || 'visible', timings }).catch((error) => `Unable to read DOM tree: ${error instanceof Error ? error.message : String(error)}`))
+        ? timedBrowserStep(timings, 'readSimplifiedDomTreeMs', () => this.readSimplifiedDomTree({ scope: options.domScope || 'visible', timings }).catch((error) => {
+            const tree = `Unable to read DOM tree: ${error instanceof Error ? error.message : String(error)}`;
+            return { tree, observation: this.emptySimplifiedDomObservation(tree) };
+          }))
         : Promise.resolve(undefined),
       domObservationPromise || !includeInteractiveCandidates
         ? Promise.resolve([] as InteractiveCandidate[])
@@ -3536,7 +3692,8 @@ export class BrowserSession {
       viewportMetrics,
       tabs: this.getTabsSnapshot(),
       focusedElement,
-      domTree,
+      domTree: domTreeResult?.tree,
+      domObservation: domTreeResult?.observation,
       interactiveCandidates,
       scrollableAreas,
       pageScrollState,
@@ -3813,7 +3970,26 @@ export class BrowserSession {
     return filePath;
   }
 
-  // 返回最近一次截图的尺寸和 viewport 信息，供 AI 请求上下文引用。
+  // Minimal getCurrentScreenshot path: save the browser screenshot without DOM, overlay, metadata, or visual-context work.
+  async takeCurrentScreenshotOnly(runId: string, stepIndex: number, phase: `visual-${number}`, options: ScreenshotCaptureOptions = {}) {
+    const capture: ScreenshotCaptureMode = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
+    const dir = artifactPath(runId);
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, `step-${stepIndex}-${phase}.png`);
+    const screenshotTimeoutMs = boundedPositiveIntegerEnv(
+      'SCREENSHOT_TIMEOUT_MS',
+      DEFAULT_SCREENSHOT_TIMEOUT_MS,
+      MIN_SCREENSHOT_TIMEOUT_MS,
+      MAX_SCREENSHOT_TIMEOUT_MS,
+    );
+    await this.activePage.screenshot({
+      path: filePath,
+      fullPage: capture === 'fullPage',
+      timeout: screenshotTimeoutMs,
+    });
+    return filePath;
+  }
+
   getLastScreenshotMetrics() {
     return this.lastScreenshotMetrics;
   }
@@ -3921,7 +4097,8 @@ export class BrowserSession {
 
   // 返回简化后的 DOM 树文本，作为候选列表不足时的兜底定位信息。
   async getSimplifiedDomTree(): Promise<BrowserActionResult> {
-    return { ok: true, actual: await this.readSimplifiedDomTree({ scope: 'full' }) };
+    const result = await this.readSimplifiedDomTree({ scope: 'full' });
+    return { ok: true, actual: result.tree };
   }
 
   private resolveDomNodeReference(nodeId: string) {
@@ -4337,7 +4514,7 @@ export class BrowserSession {
     if (!this.lastTextLocatorCandidates.length) {
       return {
         ok: false,
-        actual: `No visible interactive locator matched text "${targetText}". Retry findByText with a shorter exact label and optional scopeId, or call getPageState and readObservation(type="interactive") to choose a fresh candidate.`,
+        actual: `No visible interactive locator matched text "${targetText}". Retry findByText with a shorter exact label and optional scopeId, or call getPageState and readObservation to choose a fresh node_id from the elements view.`,
       };
     }
 
@@ -5534,7 +5711,37 @@ export class BrowserSession {
       .catch(() => undefined);
   }
 
-  private async readSimplifiedDomTree(options: { scope?: 'visible' | 'full'; timings?: Record<string, number> } = {}) {
+  private emptySimplifiedDomObservation(message?: string): BrowserDomObservation {
+    const elements = message || '[empty DOM elements]';
+    return {
+      elements,
+      elementsCharLength: elements.length,
+      domNodeCount: 0,
+      interactiveNodeCount: 0,
+      usedWorkers: false,
+      errors: [],
+      timings: { totalMs: 0 },
+    };
+  }
+
+  private domObservationDepth(pathValue?: string, framePath?: string) {
+    const depthFromPath = (value?: string) => {
+      const parts = String(value || '')
+        .split('.')
+        .map((item) => Number(String(item).trim()))
+        .filter((item) => Number.isInteger(item) && item >= 0);
+      return Math.max(0, parts.length - 1);
+    };
+    const frameDepth = framePath ? depthFromPath(framePath) + 1 : 0;
+    return Math.min(frameDepth + depthFromPath(pathValue), 24);
+  }
+
+  private domObservationIndent(pathValue?: string, framePath?: string) {
+    return '  '.repeat(this.domObservationDepth(pathValue, framePath));
+  }
+
+  private async readSimplifiedDomTree(options: { scope?: 'visible' | 'full'; timings?: Record<string, number> } = {}): Promise<BrowserSimplifiedDomTreeResult> {
+    const startedAt = Date.now();
     const fullScope = options.scope === 'full';
     const maxElements = fullScope
       ? numericLimitFromEnv('DOM_CUA_FULL_MAX_ELEMENTS', numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 600))
@@ -5553,11 +5760,18 @@ export class BrowserSession {
     const mainSnapshot = fullScope
       ? await timedBrowserStep(options.timings, 'readMainFullDomSnapshotMs', () => this.readFullDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars))
       : await timedBrowserStep(options.timings, 'readMainVisibleDomSnapshotMs', () => this.readVisibleDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars));
-    if (!mainSnapshot) return 'DOM runtime is not available on this page. Retry after the page settles.';
+    if (!mainSnapshot) {
+      const tree = 'DOM runtime is not available on this page. Retry after the page settles.';
+      const observation = this.emptySimplifiedDomObservation(tree);
+      observation.timings.totalMs = Date.now() - startedAt;
+      return { tree, observation };
+    }
     this.resetDomVisibleIdState(mainSnapshot.stateKey);
 
     const lines: string[] = [];
     let chars = 0;
+    let domNodeCount = 0;
+    let interactiveNodeCount = 0;
     const references: DomNodeReference[] = [];
     const appendSnapshot = (snapshot: BrowserUseVisibleDomSnapshot, framePath?: string, frameUrl?: string, viewportClip?: BrowserUseViewportClip) => {
       if (framePath && snapshot.items.length) {
@@ -5571,11 +5785,16 @@ export class BrowserSession {
       for (const item of snapshot.items) {
         if (lines.length >= maxElements || chars >= maxChars) return;
         const publicId = this.publicDomVisibleId(snapshot.stateKey, item.ref);
-        const line = item.line.replace(`node_id=${item.ref}`, `node_id=${publicId}`);
+        const indent = this.domObservationIndent(item.path, framePath);
+        const line = `${indent}${item.line.replace(`node_id=${item.ref}`, `node_id=${publicId}`)}`;
         const lineChars = line.length + (lines.length === 0 ? 0 : 1);
         if (chars + lineChars > maxChars) return;
         lines.push(line);
         chars += lineChars;
+        domNodeCount += 1;
+        if (item.interactive) {
+          interactiveNodeCount += 1;
+        }
         references.push({
           id: publicId,
           localRef: item.ref,
@@ -5603,7 +5822,20 @@ export class BrowserSession {
     const referenceMapStartedAt = Date.now();
     this.lastDomNodeReferences = new Map(references.map((reference) => [reference.id, reference]));
     addTiming('buildDomNodeReferenceMapMs', referenceMapStartedAt);
-    return lines.join('\n') || (fullScope ? '[empty full DOM snapshot]' : '[empty visible DOM snapshot]');
+    const tree = lines.join('\n') || (fullScope ? '[empty full DOM snapshot]' : '[empty visible DOM snapshot]');
+    const elements = tree;
+    return {
+      tree,
+      observation: {
+        elements,
+        elementsCharLength: elements.length,
+        domNodeCount,
+        interactiveNodeCount,
+        usedWorkers: false,
+        errors: [],
+        timings: { totalMs: Date.now() - startedAt },
+      },
+    };
   }
 
   private resetDomVisibleIdState(mainSnapshotKey: string) {

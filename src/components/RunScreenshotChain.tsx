@@ -128,7 +128,7 @@ function ScreenshotChainModal({ items, onClose, title }: { items: ScreenshotChai
             <span>下一张</span>
             <ArrowRight size={16} />
           </button>
-          <a className="ui-icon-button" href={current.url} target="_blank" rel="noreferrer" aria-label="打开原图" title="打开原图">
+          <a className="ui-icon-button" href={current.url} target="_blank" rel="noopener noreferrer" aria-label="打开原图" title="打开原图">
             <Maximize2 size={17} />
           </a>
         </div>

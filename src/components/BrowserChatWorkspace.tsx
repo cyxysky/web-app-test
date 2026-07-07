@@ -823,7 +823,14 @@ const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { ma
   const normalizedMarkdown = useMemo(() => normalizeChatMarkdown(markdown), [markdown]);
   return (
     <div className="browser-chat-agent-markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ node: _node, ...props }) => (
+            <a {...props} target="_blank" rel="noopener noreferrer" />
+          ),
+        }}
+      >
         {normalizedMarkdown}
       </ReactMarkdown>
     </div>
@@ -1401,7 +1408,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
 });
 
 const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
-  availableSkills,
+  skillsById,
   exportingMessageId,
   exportingSelectedMessages,
   generatingSkillMessageId,
@@ -1424,7 +1431,6 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   sessionBusy,
   totalStepCount,
 }: {
-  availableSkills: SkillRecord[];
   exportingMessageId: string | null;
   exportingSelectedMessages: boolean;
   generatingSkillMessageId: string | null;
@@ -1445,22 +1451,22 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   resolvingConfirmationId?: string | null;
   selectedForExport: boolean;
   sessionBusy: boolean;
+  skillsById: Map<string, SkillRecord>;
   totalStepCount: number;
 }) {
   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
   const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
   const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
   const messageSkills = useMemo(() => {
-    const byId = new Map(availableSkills.map((skill) => [skill.id, skill]));
     return Array.from(new Set(item.skillIds || [])).map((skillId) => {
-      const skill = byId.get(skillId);
+      const skill = skillsById.get(skillId);
       return {
         id: skillId,
         title: skill?.title || skillId,
         description: skill?.description || 'Skill',
       };
     });
-  }, [availableSkills, item.skillIds]);
+  }, [item.skillIds, skillsById]);
 
   return (
     <article className={`browser-chat-message ${item.role}`}>
@@ -1688,6 +1694,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
   const lastMessage = messages[messages.length - 1];
+  const skillsById = useMemo(() => new Map(availableSkills.map((skill) => [skill.id, skill])), [availableSkills]);
   const renderEntries = useMemo(
     () => buildBrowserChatMessageRenderEntries(messages, logIndex, browserChatAssistantMessageHasVisibleText),
     [logIndex, messages],
@@ -1778,7 +1785,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
         return (
           <BrowserChatMessageItem
-            availableSkills={availableSkills}
             exportingMessageId={exportingMessageId}
             exportingSelectedMessages={exportingSelectedMessages}
             generatingSkillMessageId={generatingSkillMessageId}
@@ -1800,6 +1806,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             resolvingConfirmationId={resolvingConfirmationId}
             selectedForExport={selectedExportMessageIdSet.has(item.id)}
             sessionBusy={sessionBusy}
+            skillsById={skillsById}
             totalStepCount={totalStepCount}
           />
         );

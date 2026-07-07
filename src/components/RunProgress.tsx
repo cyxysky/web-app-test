@@ -67,7 +67,14 @@ function EvidenceMarkdown({ markdown }: { markdown: string }) {
   const normalizedMarkdown = useMemo(() => normalizeEvidenceMarkdown(markdown), [markdown]);
   return (
     <div className="evidence-markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ node: _node, ...props }) => (
+            <a {...props} target="_blank" rel="noopener noreferrer" />
+          ),
+        }}
+      >
         {normalizedMarkdown}
       </ReactMarkdown>
     </div>
@@ -1685,17 +1692,17 @@ export function RunProgress({
           ) : null}
           <RunScreenshotChainButton className="link-button" label={t('查看截图链')} run={run} />
           {isFinished(run.status) ? (
-            <a className="link-button" href={`/api/runs/${run.id}/pdf`} target="_blank">
+            <a className="link-button" href={`/api/runs/${run.id}/pdf`} target="_blank" rel="noopener noreferrer">
               {t('导出 PDF')}
             </a>
           ) : null}
           {traceUrl(run) ? (
-            <a className="link-button" href={traceUrl(run)} target="_blank">
+            <a className="link-button" href={traceUrl(run)} target="_blank" rel="noopener noreferrer">
               {t('下载 Trace')}
             </a>
           ) : null}
           {isFinished(run.status) && steps.some((step) => step.tools?.some((tool) => tool.ok !== false)) ? (
-            <a className="link-button" href={`/api/runs/${run.id}/recorded-flow`} target="_blank">
+            <a className="link-button" href={`/api/runs/${run.id}/recorded-flow`} target="_blank" rel="noopener noreferrer">
               {t('导出录制流')}
             </a>
           ) : null}

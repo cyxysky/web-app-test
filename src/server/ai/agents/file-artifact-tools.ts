@@ -31,6 +31,10 @@ type ArtifactToolPayload = {
   sourceUrl?: string;
 };
 
+function escapeMarkdownLinkLabel(value: string) {
+  return value.replace(/[[\]\\]/g, '\\$&');
+}
+
 function positiveNumberEnv(name: string, fallback: number) {
   const value = Number(process.env[name] || '');
   return Number.isFinite(value) && value > 0 ? value : fallback;
@@ -107,10 +111,16 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
     const label = toolName === 'downloadFile' ? 'File downloaded' : 'Markdown file generated';
+    const fileName = payload.fileName || 'artifact';
     const target = payload.downloadUrl || payload.url || payload.path || '';
+    const targetLine = target
+      ? `Download: [${escapeMarkdownLinkLabel(fileName)}](${target})`
+      : `Path: ${payload.path || fileName}`;
     return [
-      `${label}: ${payload.fileName || 'artifact'}`,
-      target ? `URL: ${target}` : '',
+      `${label}: ${fileName}`,
+      targetLine,
+      payload.url && payload.url !== target ? `Open: ${payload.url}` : '',
+      payload.path ? `Local path: ${payload.path}` : '',
       typeof payload.bytes === 'number' ? `size=${payload.bytes} bytes` : '',
     ].filter(Boolean).join('; ');
   } catch {

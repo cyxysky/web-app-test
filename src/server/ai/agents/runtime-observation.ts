@@ -2,7 +2,7 @@ import type { ModelMessage } from 'ai';
 import type { BrowserActionResult, BrowserObservationType } from '@/server/browser/browser-session';
 
 export const runtimeObservationToolNames = new Set(['readObservation']);
-export const staleReadObservationText = '已失效：这是一条旧 readObservation 结果，已被后续 getPageState 刷新的当前 observation 取代。需要当前内容时，请调用 readObservation(type, offset, maxChars)。';
+export const staleReadObservationText = '已失效：这是一条旧 readObservation 结果，已被后续 getPageState 刷新的当前 observation 取代。需要当前内容时，请调用 readObservation(offset, maxChars)。';
 
 export type RuntimeObservationRecord = {
   runId: string;
@@ -17,7 +17,7 @@ export type RuntimeObservationRecord = {
 
 export type RuntimeObservationStore = Map<string, RuntimeObservationRecord>;
 
-const runtimeObservationTypes: BrowserObservationType[] = ['text', 'interactive'];
+const runtimeObservationTypes: BrowserObservationType[] = ['elements'];
 const fallbackObservationRunId = '__current__';
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
@@ -65,8 +65,8 @@ function normalizeObservationViews(
     const value = views?.[type];
     if (typeof value === 'string') normalized[type] = value;
   }
-  if (!normalized.text) normalized.text = text;
-  const defaultType = views?.defaultType && normalized[views.defaultType] !== undefined ? views.defaultType : 'text';
+  if (!normalized.elements) normalized.elements = text;
+  const defaultType: BrowserObservationType = 'elements';
   return { defaultType, views: normalized };
 }
 
@@ -119,15 +119,14 @@ export function observationPreviewLimit(name: string) {
 export function readRuntimeObservation(
   store: RuntimeObservationStore | undefined,
   runId: string | undefined,
-  type?: BrowserObservationType,
   offset?: number,
   maxChars?: number,
 ): BrowserActionResult {
   const record = store?.get(observationStoreKey(runId));
   if (!record) {
-    return { ok: false, actual: 'No current DOM observation is available for this run. Call getPageState first, then call readObservation(type, offset, maxChars).' };
+    return { ok: false, actual: 'No current DOM observation is available for this run. Call getPageState first, then call readObservation(offset, maxChars).' };
   }
-  const selectedType = type || record.defaultType;
+  const selectedType: BrowserObservationType = 'elements';
   const text = record.views[selectedType];
   const availableTypes = runtimeObservationAvailableTypes(record);
   if (text === undefined) {
@@ -141,7 +140,7 @@ export function readRuntimeObservation(
     actual: [
       `Current observation from ${record.toolName} generation ${record.generation} at ${record.createdAt}. Type ${selectedType}. Range ${start}-${end}/${text.length}. Available types: ${availableTypes || selectedType}.`,
       text.slice(start, end),
-      end < text.length ? `More available: call readObservation(type="${selectedType}", offset=${end}, maxChars=10000).` : 'End of observation.',
+      end < text.length ? `More available: call readObservation(offset=${end}, maxChars=10000).` : 'End of observation.',
     ].join('\n'),
   };
 }

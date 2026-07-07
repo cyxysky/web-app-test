@@ -1285,9 +1285,6 @@ select {
 }
 
 .empty-state {
-  background: var(--panel-soft);
-  border: 1px dashed var(--border-strong);
-  border-radius: 12px;
   color: var(--muted);
   padding: 28px;
   text-align: center;
@@ -5230,8 +5227,6 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .settings-workspace .empty-state {
-  background: var(--panel-soft);
-  border-color: var(--border-strong);
   color: var(--muted);
 }
 
@@ -7374,6 +7369,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-message {
+  content-visibility: auto;
+  contain-intrinsic-size: 180px;
   max-width: 790px;
 }
 
@@ -7593,7 +7590,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-executed-body {
   display: grid;
-  gap: 10px;
+  gap: 4px;
   padding: 3px 0 2px 16px;
 }
 
@@ -7859,6 +7856,18 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   padding: 6px 0;
 }
 
+.browser-chat-agent-markdown a {
+  color: var(--accent-strong);
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.browser-chat-agent-markdown a:hover {
+  color: var(--accent);
+}
+
 .browser-chat-agent-markdown li {
   font-size: 15px;
   line-height: 1.5;
@@ -7920,6 +7929,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-agent-markdown th {
   background: var(--panel-soft);
   font-weight: 850;
+}
+
+.browser-chat-agent-step,
+.browser-chat-executed-entry {
+  content-visibility: auto;
+  contain-intrinsic-size: 92px;
 }
 
 .browser-chat-message-export-bar {
