@@ -74,7 +74,7 @@ export function buildCompletionVerificationPrompt(input: CompletionVerificationP
 export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
   const answerAllowed = allowedTypes.includes('answer');
   const visualMode = allowedTypes.includes('clickCandidate');
-  const domMode = allowedTypes.includes('readObservation') || allowedTypes.includes('findByText') || allowedTypes.includes('clickLocator');
+  const domMode = allowedTypes.includes('readObservation') || allowedTypes.includes('findByText') || allowedTypes.includes('clickDomNode');
   return [
     prompt,
     '',
@@ -89,9 +89,10 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
     '- In message/reason/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot ids/file names, or tool input JSON.',
     visualMode ? '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.' : '',
-    domMode ? '- DOM mode: use getPageState to collect the browser-generated DOM observation. Then use readObservation(offset, maxChars) to inspect the unified elements view with page text, attributes, interactive markers, and actionable node_id entries. Use clickDomNode/fillDomNodes/hoverDomNode with current node_id values, or findByText then clickLocator for recovery.' : '',
+    domMode ? '- DOM mode: use getPageState with params.read to collect the browser-generated DOM observation and inline-read one view. Prefer params.read={view:"actions",offset:0,maxChars:10000} for actionable node_id entries, and params.read={view:"changes",offset:0,maxChars:10000} after page-changing actions when you need to know what changed. Use readObservation only to page or switch views for the latest observation. Use clickDomNode/fillDomNodes/hoverDomNode with current node_id values; findByText searches the current tree and returns node_id values with interactive flags.' : '',
+    domMode ? '- If DOM text is ambiguous because of stacked overlays, date pickers, duplicate labels, or icon-only controls, use getCurrentScreenshot when available before choosing the action.' : '',
     '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
-    '- For readObservation, do not pass type or an observation id. It always reads the current getPageState elements observation.',
+    '- For readObservation, do not pass an observation id. It always reads the current getPageState observation. The optional view param must be actions, tree, text, or changes; default is actions. Skip readObservation when getPageState already returned the needed inline read.',
     allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
     allowedTypes.includes('generateMarkdownFile') ? '- For generateMarkdownFile, put the complete Markdown document in params.content and the desired file name in params.fileName. The final visible answer must include the returned download link as a clickable Markdown link.' : '',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',

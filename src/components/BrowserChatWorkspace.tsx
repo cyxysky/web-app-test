@@ -602,7 +602,6 @@ function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
     clickCandidate: '点选目标',
     clickDomNode: '点选节点',
-    clickLocator: '点选定位器',
     doubleClickCandidate: '双击目标',
     doubleClickDomNode: '双击节点',
     dragCandidate: '拖拽元素',
@@ -668,7 +667,7 @@ function browserChatToolMeta(name: string, input: unknown) {
   if (name === 'reportState') return toolInputValue(record, ['action', 'actual', 'status']);
   if (lower.includes('fill')) return summarizeToolFields(record.fields) || toolInputValue(record, ['text', 'content', 'value']);
   if (lower.includes('click') || lower.includes('hover') || lower.includes('drag')) {
-    return toolInputValue(record, ['text', 'targetVisual', 'targetText', 'id', 'locatorId', 'fromId']);
+    return toolInputValue(record, ['text', 'targetVisual', 'targetText', 'id', 'fromId']);
   }
   if (lower.includes('find')) return toolInputValue(record, ['targetText', 'scopeId']);
   if (lower.includes('text')) return toolInputValue(record, ['text', 'targetText', 'id']);

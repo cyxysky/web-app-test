@@ -14,7 +14,6 @@ import {
 const OBSERVED_TOOL_NAMES = new Set([
   'clickCandidate',
   'clickDomNode',
-  'clickLocator',
   'doubleClickCandidate',
   'doubleClickDomNode',
   'rightClickCandidate',

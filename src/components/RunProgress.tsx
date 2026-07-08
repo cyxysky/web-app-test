@@ -365,16 +365,6 @@ const toolDefinitions: ToolDefinition[] = [
     ],
   },
   {
-    name: 'clickLocator',
-    label: '点击定位器',
-    mode: 'dom',
-    template: { locatorId: '', text: '' },
-    fields: [
-      { key: 'locatorId', label: '定位器 ID', kind: 'text' },
-      { key: 'text', label: '点击后输入内容', kind: 'textarea' },
-    ],
-  },
-  {
     name: 'getDomNodeText',
     label: '读取 DOM 节点文本',
     mode: 'dom',

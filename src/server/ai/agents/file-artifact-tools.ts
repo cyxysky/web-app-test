@@ -5,6 +5,9 @@ import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
 import type { BrowserActionResult } from '@/server/browser/browser-session';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
 
+const FILE_DOWNLOAD_TIMEOUT_MS = 30000;
+const FILE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
+
 type DownloadArtifactInput = {
   runId?: string;
   url?: string;
@@ -35,11 +38,6 @@ function escapeMarkdownLinkLabel(value: string) {
   return value.replace(/[[\]\\]/g, '\\$&');
 }
 
-function positiveNumberEnv(name: string, fallback: number) {
-  const value = Number(process.env[name] || '');
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
 function sanitizeFileName(value: string | undefined | null, fallback: string) {
   const cleaned = String(value || '')
     .replace(/[\u0000-\u001f<>:"/\\|?*]+/g, '_')
@@ -58,12 +56,6 @@ function ensureMarkdownExtension(fileName: string) {
 
 function artifactDir(runId: string | undefined, kind: 'downloads' | 'markdown') {
   return artifactPath(sanitizeFileName(runId, 'adhoc'), kind);
-}
-
-function fileOutputDir(runId: string | undefined, kind: 'downloads' | 'markdown') {
-  const configured = String(process.env.AI_FILE_OUTPUT_DIR || '').trim();
-  if (!configured) return artifactDir(runId, kind);
-  return path.resolve(configured);
 }
 
 async function uniqueArtifactPath(dir: string, requestedFileName: string) {
@@ -183,10 +175,8 @@ async function readLimitedResponse(response: Response, maxBytes: number) {
 export async function downloadFileArtifact(input: DownloadArtifactInput): Promise<BrowserActionResult> {
   try {
     const url = resolveDownloadUrl(input);
-    const timeoutMs = positiveNumberEnv('AI_FILE_DOWNLOAD_TIMEOUT_MS', 30000);
-    const maxBytes = Math.floor(positiveNumberEnv('AI_FILE_DOWNLOAD_MAX_MB', 50) * 1024 * 1024);
     const abortController = new AbortController();
-    const timer = setTimeout(() => abortController.abort(new Error(`Download timed out after ${timeoutMs}ms`)), timeoutMs);
+    const timer = setTimeout(() => abortController.abort(new Error(`Download timed out after ${FILE_DOWNLOAD_TIMEOUT_MS}ms`)), FILE_DOWNLOAD_TIMEOUT_MS);
 
     let response: Response;
     let buffer = Buffer.alloc(0);
@@ -195,7 +185,7 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
       if (!response.ok) {
         return { ok: false, actual: `downloadFile failed: HTTP ${response.status} ${response.statusText} for ${url}` };
       }
-      buffer = await readLimitedResponse(response, maxBytes);
+      buffer = await readLimitedResponse(response, FILE_DOWNLOAD_MAX_BYTES);
     } finally {
       clearTimeout(timer);
     }
@@ -204,7 +194,7 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
       || fileNameFromUrl(url)
       || `download-${Date.now()}.bin`;
     const fileName = sanitizeFileName(suggestedName, `download-${Date.now()}.bin`);
-    const dir = fileOutputDir(input.runId, 'downloads');
+    const dir = artifactDir(input.runId, 'downloads');
     await mkdir(dir, { recursive: true });
     const target = await uniqueArtifactPath(dir, fileName);
     await writeFile(target.filePath, buffer);
@@ -233,7 +223,7 @@ export async function generateMarkdownArtifact(input: MarkdownArtifactInput): Pr
       sanitizeFileName(input.fileName || input.title || `markdown-${Date.now()}`, `markdown-${Date.now()}`),
     );
     const content = `${body}\n`;
-    const dir = fileOutputDir(input.runId, 'markdown');
+    const dir = artifactDir(input.runId, 'markdown');
     await mkdir(dir, { recursive: true });
     const target = await uniqueArtifactPath(dir, requestedName);
     await writeFile(target.filePath, content, 'utf8');

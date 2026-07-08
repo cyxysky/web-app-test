@@ -87,7 +87,7 @@ function browserSessionModeFromEnv(): BrowserSessionMode {
   return 'dom';
 }
 
-export type BrowserObservationType = 'elements';
+export type BrowserObservationType = 'actions' | 'tree' | 'text' | 'changes' | 'elements';
 
 export type BrowserObservationViews = Partial<Record<BrowserObservationType, string>> & {
   defaultType?: BrowserObservationType;
@@ -246,20 +246,24 @@ type InteractiveCandidate = {
   shadow?: boolean;
 };
 
-type TextLocatorCandidate = {
-  locatorId: string;
+type TextNodeMatch = {
   matchedText: string;
+  reference: DomNodeReference;
   score: number;
-  candidate: InteractiveCandidate;
 };
 
 type DomNodeReference = {
   id: string;
+  interactive: boolean;
+  label: string;
+  line: string;
   localRef?: string;
   path: string;
   framePath?: string;
   frameUrl?: string;
   descriptor: string;
+  state: string;
+  tag: string;
   viewportClip?: BrowserUseViewportClip;
 };
 
@@ -276,6 +280,13 @@ type CandidateClickTarget = {
   descriptor: string;
   offscreen: boolean;
   source?: string;
+};
+
+type ClickActionabilityCheck = {
+  ok: true;
+} | {
+  ok: false;
+  reason: string;
 };
 
 type CandidateActionTargetResolution = {
@@ -375,8 +386,14 @@ type BrowserUseVisibleDomSnapshot = {
 };
 
 export type BrowserDomObservation = {
+  actions: string;
+  actionsCharLength: number;
   elements: string;
   elementsCharLength: number;
+  text: string;
+  textCharLength: number;
+  tree: string;
+  treeCharLength: number;
   domNodeCount: number;
   interactiveNodeCount: number;
   usedWorkers: boolean;
@@ -415,11 +432,13 @@ type AiDomRuntime = {
   visibleDomSnapshot: (options: {
     maxChars: number;
     maxElements: number;
+    preserveExistingRefs?: boolean;
     viewportClip?: BrowserUseViewportClip;
   }) => BrowserUseVisibleDomSnapshot;
   fullDomSnapshot: (options: {
     maxChars: number;
     maxElements: number;
+    preserveExistingRefs?: boolean;
   }) => BrowserUseVisibleDomSnapshot;
   elementText: (pathValue: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
   visibleDomPoint: (
@@ -915,7 +934,12 @@ function installAiBrowserPageRuntime() {
     let found: Element | undefined;
     for (let guard = 0; guard < 24; guard += 1) {
       const stack = root.elementsFromPoint(x, y) as Element[];
-      const top = stack.find((item) => item && isRenderable(item, options));
+      // Occlusion must follow the visual paint stack. Modal backdrops often use
+      // pointer-events:none but still make the covered page unusable for the agent.
+      const renderOptions = options.requirePointerEvents
+        ? { ...options, requirePointerEvents: false }
+        : options;
+      const top = stack.find((item) => item && isRenderable(item, renderOptions));
       if (!top) break;
       found = top;
       const sub = shadowRootOf(top);
@@ -1482,9 +1506,9 @@ function installAiBrowserPageRuntime() {
     };
   }
 
-  function visibleDomSnapshot(options: { maxChars: number; maxElements: number; viewportClip?: BrowserUseViewportClip }) {
+  function visibleDomSnapshot(options: { maxChars: number; maxElements: number; preserveExistingRefs?: boolean; viewportClip?: BrowserUseViewportClip }) {
     const state = visibleDomState();
-    state.refToElement.clear();
+    if (!options.preserveExistingRefs) state.refToElement.clear();
 
     const rawViewport = visualViewportRect();
     const viewportClip = options.viewportClip ? intersectClip(rawViewport, options.viewportClip) || rawViewport : rawViewport;
@@ -1575,9 +1599,9 @@ function installAiBrowserPageRuntime() {
     return { frameElements, items, stateKey: state.instanceId, viewport: rawViewport };
   }
 
-  function fullDomSnapshot(options: { maxChars: number; maxElements: number }) {
+  function fullDomSnapshot(options: { maxChars: number; maxElements: number; preserveExistingRefs?: boolean }) {
     const state = visibleDomState();
-    state.refToElement.clear();
+    if (!options.preserveExistingRefs) state.refToElement.clear();
 
     const viewport = visualViewportRect();
     const maxElements = Math.max(1, Math.floor(Number(options.maxElements) || 500));
@@ -1755,7 +1779,7 @@ function installAiBrowserPageRuntime() {
   };
 }
 
-function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean; requirePointerEvents?: boolean; structuredTextMaxChars?: number; debugPause?: boolean }): PageDomObservationPayload {
+function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean; requirePointerEvents?: boolean; structuredTextMaxChars?: number; debugPause?: boolean; candidateTextQuery?: string }): PageDomObservationPayload {
   if (input.debugPause) {
     debugger;
   }
@@ -1768,6 +1792,8 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   const structuredLines: string[] = [];
   let structuredChars = 0;
   const normalizeText = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
+  const candidateTextQuery = normalizeText(input.candidateTextQuery).toLowerCase();
+  const candidateTextQueryParts = candidateTextQuery.split(/\s+/).filter((item) => item.length >= 2);
   const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__';
   const skippedTextTags = new Set(['script', 'style', 'template', 'noscript']);
   const structuralTextTags = new Set([
@@ -1896,6 +1922,20 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   function contextText(element: Element) {
     const container = element.closest('li, article, tr, form, [role="listitem"], [role="row"], section, main') || element.parentElement || element;
     return normalizeText((container as HTMLElement).innerText || container.textContent || '').slice(0, 220);
+  }
+
+  function labelMatchesCandidateTextQuery(value?: string | null) {
+    if (!candidateTextQuery) return true;
+    const label = normalizeText(value).toLowerCase();
+    if (!label) return false;
+    if (label === candidateTextQuery) return true;
+    if (label.startsWith(candidateTextQuery)) return true;
+    if (label.includes(candidateTextQuery)) return true;
+    return candidateTextQueryParts.length >= 2 && candidateTextQueryParts.every((part) => label.includes(part));
+  }
+
+  function labelsMatchCandidateTextQuery(labels: Array<string | undefined>) {
+    return !candidateTextQuery || labels.some(labelMatchesCandidateTextQuery);
   }
 
   function recordedEventTypes(element: Element) {
@@ -2253,6 +2293,18 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     const clickable = signals.length > 0;
     if (!clickable && !isInput) return undefined;
 
+    const href = tag === 'a' ? ((element as HTMLAnchorElement).href || element.getAttribute('href') || undefined) : undefined;
+    const text = ownText(element);
+    const name = nameOf(element);
+    const placeholder = inputElement.placeholder || undefined;
+    const ariaLabel = element.getAttribute('aria-label') || undefined;
+    const title = element.getAttribute('title') || undefined;
+    let nearbyText: string | undefined;
+    if (!labelsMatchCandidateTextQuery([name, text, ariaLabel || undefined, title || undefined, placeholder, href])) {
+      nearbyText = contextText(element) || undefined;
+      if (!labelsMatchCandidateTextQuery([nearbyText])) return undefined;
+    }
+
     let rect = visibleRectOf(element);
     let visibility = rect ? computeVisibility(element, rect) : undefined;
     if (!rect && clickable) {
@@ -2275,7 +2327,6 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     const area = rect.width * rect.height;
     if (area > viewportArea * 0.75 && !['input', 'textarea', 'select', 'button', 'a'].includes(tag)) return undefined;
 
-    const href = tag === 'a' ? ((element as HTMLAnchorElement).href || element.getAttribute('href') || undefined) : undefined;
     let host: string | undefined;
     try {
       host = href ? new URL(href).hostname : undefined;
@@ -2284,13 +2335,9 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     }
     const externalAppTarget = externalAppTargetForElement(element, href);
 
-    const text = ownText(element);
-    const name = nameOf(element);
     const className = classNameOf(element);
-    const placeholder = inputElement.placeholder || undefined;
-    const ariaLabel = element.getAttribute('aria-label') || undefined;
-    const title = element.getAttribute('title') || undefined;
     const type = tag === 'input' || tag === 'button' ? element.getAttribute('type') || undefined : undefined;
+    nearbyText ||= contextText(element) || undefined;
 
     return {
       id: '',
@@ -2302,7 +2349,7 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
       text: text || undefined,
       className: className || undefined,
       signals: signals.length ? signals : undefined,
-      nearbyText: contextText(element) || undefined,
+      nearbyText,
       href,
       host,
       opensExternalApp: externalAppTarget ? true : undefined,
@@ -2734,7 +2781,6 @@ export class BrowserSession {
   private lastScreenshotMetrics?: ScreenshotMetrics;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
   private lastScreenshotCandidates: InteractiveCandidate[] = [];
-  private lastTextLocatorCandidates: TextLocatorCandidate[] = [];
   private lastDomNodeReferences = new Map<string, DomNodeReference>();
   private domVisiblePublicIdByFrameLocalRef = new Map<string, string>();
   private domVisibleSnapshotKey?: string;
@@ -4155,21 +4201,21 @@ export class BrowserSession {
     if (!resolved.target) return { ok: false, actual: resolved.error };
 
     const { candidate, target } = resolved;
+    const actionability = await timedBrowserStep(timings, 'playwrightActionabilityMs', () => this.checkCandidateClickActionability(candidate, target, 'click'));
+    if (!actionability.ok) {
+      return {
+        ok: false,
+        actual: `Candidate ${candidate.id} is not clickable now: ${actionability.reason}`,
+      };
+    }
     const page = this.activePage;
     const beforeUrl = page.url();
-    const popupWaitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
-    const popup = popupWaitMs > 0
-      ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
-      : Promise.resolve(undefined);
+    const popup = this.watchForPopup(page);
     await timedBrowserStep(timings, 'mouseClickMs', () => page.mouse.click(target.x, target.y));
     if (text !== undefined) {
       await timedBrowserStep(timings, 'typeTextMs', () => this.insertFocusedTextFast(text, timings));
     }
-    const newPage = await timedBrowserStep(timings, 'popupWaitMs', () => popup);
-    if (newPage) {
-      this.claimPage(newPage);
-      await timedBrowserStep(timings, 'bringPopupToFrontMs', () => newPage.bringToFront());
-    }
+    const newPage = await this.settlePopupAfterAction(popup.popup, popup.waitMs, timings);
     let note = '';
     let fallbackNote = '';
     if (text === undefined && candidate.href && !candidate.opensExternalApp && this.activePage.url() === beforeUrl && !newPage) {
@@ -4226,6 +4272,8 @@ export class BrowserSession {
       let clickError = '';
       let typed = false;
       try {
+        const actionability = await this.checkCandidateClickActionability(candidate, target, 'fill');
+        if (!actionability.ok) throw new Error(actionability.reason);
         await this.activePage.mouse.click(target.x, target.y);
         await this.activePage.waitForTimeout(80).catch(() => undefined);
         afterFocus = await this.getFocusedElement();
@@ -4287,6 +4335,8 @@ export class BrowserSession {
     if (!resolved.target) return { ok: false, actual: resolved.error };
 
     const { candidate, target } = resolved;
+    const actionability = await this.checkCandidateClickActionability(candidate, target, 'double-click');
+    if (!actionability.ok) return { ok: false, actual: `Candidate ${candidate.id} is not double-clickable now: ${actionability.reason}` };
     await this.activePage.mouse.dblclick(target.x, target.y);
     const note = await this.waitAfterAction();
     await this.showClickMarker(target.x, target.y, 'double');
@@ -4302,6 +4352,8 @@ export class BrowserSession {
     if (!resolved.target) return { ok: false, actual: resolved.error };
 
     const { candidate, target } = resolved;
+    const actionability = await this.checkCandidateClickActionability(candidate, target, 'right-click', 'right');
+    if (!actionability.ok) return { ok: false, actual: `Candidate ${candidate.id} is not right-clickable now: ${actionability.reason}` };
     await this.activePage.mouse.click(target.x, target.y, { button: 'right' });
     const note = await this.waitAfterAction();
     await this.showClickMarker(target.x, target.y, 'right');
@@ -4352,6 +4404,8 @@ export class BrowserSession {
     if (!resolved.target) return { ok: false, actual: resolved.error };
 
     const { candidate, target } = resolved;
+    const actionability = await this.checkCandidateClickActionability(candidate, target, 'focus');
+    if (!actionability.ok) return { ok: false, actual: `Candidate ${candidate.id} is not focus-clickable now: ${actionability.reason}` };
     await this.activePage.mouse.click(target.x, target.y);
     if (text !== undefined) {
       await this.activePage.keyboard.type(text);
@@ -4376,21 +4430,21 @@ export class BrowserSession {
       };
     }
     const page = this.activePage;
-    const popupWaitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
-    const popup = popupWaitMs > 0
-      ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
-      : Promise.resolve(undefined);
+    const actionability = await this.checkDomReferenceClickActionability(reference, target, 'click');
+    if (!actionability.ok) {
+      return {
+        ok: false,
+        actual: `DOM node ${reference.id} is not clickable now: ${actionability.reason}`,
+      };
+    }
+    const popup = this.watchForPopup(page);
     await page.mouse.click(target.x, target.y);
     if (text !== undefined) {
       await page.keyboard.type(text);
     }
-    const newPage = await popup;
-    if (newPage) {
-      this.claimPage(newPage);
-      await newPage.bringToFront();
-    }
+    await this.settlePopupAfterAction(popup.popup, popup.waitMs);
     const note = '';
-    await this.showClickMarker(target.x, target.y, 'click');
+    void this.showClickMarker(target.x, target.y, 'click');
     return { ok: true, actual: `Clicked DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${note}` };
   }
 
@@ -4422,18 +4476,13 @@ export class BrowserSession {
       };
     }
     const page = this.activePage;
-    const popupWaitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
-    const popup = popupWaitMs > 0
-      ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
-      : Promise.resolve(undefined);
+    const actionability = await this.checkDomReferenceClickActionability(reference, target, 'double-click');
+    if (!actionability.ok) return { ok: false, actual: `DOM node ${reference.id} is not double-clickable now: ${actionability.reason}` };
+    const popup = this.watchForPopup(page);
     await page.mouse.dblclick(target.x, target.y);
-    const newPage = await popup;
-    if (newPage) {
-      this.claimPage(newPage);
-      await newPage.bringToFront();
-    }
+    await this.settlePopupAfterAction(popup.popup, popup.waitMs);
     const note = await this.waitAfterAction();
-    await this.showClickMarker(target.x, target.y, 'double');
+    void this.showClickMarker(target.x, target.y, 'double');
     return { ok: true, actual: `Double-clicked DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${note}` };
   }
 
@@ -4489,6 +4538,12 @@ export class BrowserSession {
         results.push(`${index + 1}. DOM node ${field.id}: stale, missing, or not visible. Use a fresh node_id from the next refreshed DOM context.`);
         continue;
       }
+      const actionability = await this.checkDomReferenceClickActionability(resolved.reference, target, 'fill');
+      if (!actionability.ok) {
+        ok = false;
+        results.push(`${index + 1}. DOM node ${resolved.reference.id}: not clickable now. ${actionability.reason}`);
+        continue;
+      }
       await this.activePage.mouse.click(target.x, target.y);
       if (field.text !== undefined) {
         await this.replaceFocusedText(field.text, field.clear !== false);
@@ -4506,98 +4561,29 @@ export class BrowserSession {
   async findByText(targetText: string, scopeId?: string): Promise<BrowserActionResult> {
     const scope = scopeId ? this.resolveDomNodeReference(scopeId) : undefined;
     if (scope && !scope.reference) return { ok: false, actual: scope.error };
-    const matches = await this.findInteractiveCandidatesByText(targetText, scope?.reference);
-    this.lastTextLocatorCandidates = matches.map((match, index) => ({
-      ...match,
-      locatorId: `T${index + 1}`,
-    }));
-    if (!this.lastTextLocatorCandidates.length) {
+    const matches = this.findDomNodeReferencesByText(targetText, scope?.reference);
+    if (!matches.length) {
       return {
         ok: false,
-        actual: `No visible interactive locator matched text "${targetText}". Retry findByText with a shorter exact label and optional scopeId, or call getPageState and readObservation to choose a fresh node_id from the elements view.`,
+        actual: `No current getPageState tree node_id matched text "${targetText}". Call getPageState first or retry findByText with a shorter exact label and optional scopeId.`,
       };
     }
 
-    const payload = this.lastTextLocatorCandidates.map(({ locatorId, matchedText, score, candidate }) => ({
-      locatorId,
+    const payload = matches.map(({ matchedText, score, reference }) => ({
+      nodeId: reference.id,
+      id: reference.id,
       matchedText,
       score: Number(score.toFixed(3)),
-      tag: candidate.tag,
-      role: candidate.role,
-      className: candidate.className,
-      signals: candidate.signals,
-      name: candidate.name,
-      text: candidate.text,
-      href: candidate.href,
-      opensExternalApp: candidate.opensExternalApp,
-      externalAppProtocol: candidate.externalAppProtocol,
-      placeholder: candidate.placeholder,
-      ariaLabel: candidate.ariaLabel,
-      title: candidate.title,
-      disabled: candidate.disabled,
-      shadow: candidate.shadow,
+      descriptor: reference.descriptor,
+      tag: reference.tag,
+      state: reference.state || undefined,
+      framePath: reference.framePath,
+      frameUrl: reference.frameUrl,
+      interactive: reference.interactive,
     }));
     return {
       ok: true,
-      actual: `Text locator candidates for "${targetText}" (use clickLocator(locatorId) only after choosing one):\n${JSON.stringify(payload, null, 2)}`,
-    };
-  }
-
-  async clickLocator(locatorId: string, text?: string): Promise<BrowserActionResult> {
-    const normalized = locatorId.trim().toUpperCase();
-    const match = this.lastTextLocatorCandidates.find((item) => item.locatorId.toUpperCase() === normalized);
-    if (!match) {
-      const available = this.lastTextLocatorCandidates
-        .map((item) => `${item.locatorId}: ${item.matchedText} (${this.describeCandidate(item.candidate)})`)
-        .join('\n');
-      return {
-        ok: false,
-        actual: `Text locator ${locatorId} was not found. Call findByText again and choose one of the returned locatorIds.${available ? ` Available locators:\n${available}` : ''}`,
-      };
-    }
-    const { candidate } = match;
-    if (candidate.disabled) {
-      return { ok: false, actual: `Text locator ${match.locatorId} is disabled: ${this.describeCandidate(candidate)}` };
-    }
-
-    const resolved = await this.resolveLiveLocatorPoint(candidate);
-    if (!resolved.target) {
-      return { ok: false, actual: `Text locator ${match.locatorId} is no longer actionable: ${resolved.error}. Call findByText again for a fresh locator.` };
-    }
-
-    const page = this.activePage;
-    const beforeUrl = page.url();
-    const popupWaitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
-    const popup = popupWaitMs > 0
-      ? page.waitForEvent('popup', { timeout: popupWaitMs }).catch(() => undefined)
-      : Promise.resolve(undefined);
-    const target = resolved.target;
-    await page.mouse.click(target.x, target.y);
-    if (text !== undefined) {
-      await page.keyboard.type(text);
-    }
-    const newPage = await popup;
-    if (newPage) {
-      this.claimPage(newPage);
-      await newPage.bringToFront();
-    }
-    let note = '';
-    let fallbackNote = '';
-    if (text === undefined && candidate.href && !candidate.opensExternalApp && this.activePage.url() === beforeUrl && !newPage) {
-      const fallback = candidate.framePath
-        ? await this.dispatchFrameDomPathClick(candidate.framePath, candidate.path)
-        : candidate.shadow
-          ? undefined
-          : await this.dispatchDomPathClick(candidate.path);
-      if (fallback) {
-        fallbackNote = ` Primary mouse click did not change the URL; retried ${fallback} with DOM click.`;
-      }
-    }
-    await this.showClickMarker(target.x, target.y, 'click');
-    const externalAppNote = this.externalAppCandidateNote(candidate);
-    return {
-      ok: true,
-      actual: `Clicked text locator ${match.locatorId} matching "${match.matchedText}" (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${externalAppNote}${note}`,
+      actual: `Current getPageState tree node_id matches for "${targetText}". Use clickDomNode(id) only when interactive=true; otherwise use the id as tree evidence or scope:\n${JSON.stringify(payload, null, 2)}`,
     };
   }
 
@@ -4613,6 +4599,8 @@ export class BrowserSession {
         actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
       };
     }
+    const actionability = await this.checkDomReferenceClickActionability(reference, target, 'focus');
+    if (!actionability.ok) return { ok: false, actual: `DOM node ${reference.id} is not focus-clickable now: ${actionability.reason}` };
     await this.activePage.mouse.click(target.x, target.y);
     const note = await this.waitAfterAction();
     return { ok: true, actual: `Focused DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${note}` };
@@ -5376,14 +5364,14 @@ export class BrowserSession {
     return candidates;
   }
 
-  private async refreshInteractiveCandidates() {
+  private async refreshInteractiveCandidates(options: { candidateTextQuery?: string } = {}) {
     await this.ensureBrowserPageRuntime();
     const mainCandidates = await this.activePage
-      .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: true })
+      .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: true, candidateTextQuery: options.candidateTextQuery })
       .then((observation) => observation.interactiveCandidates)
       .catch(() => [] as PageInteractiveCandidate[]);
 
-    const frameCandidates = await this.refreshFrameInteractiveCandidates();
+    const frameCandidates = await this.refreshFrameInteractiveCandidates(options);
     return this.finalizeInteractiveCandidates(mainCandidates, frameCandidates);
   }
 
@@ -5400,7 +5388,7 @@ export class BrowserSession {
     );
   }
 
-  private async refreshFrameInteractiveCandidates(): Promise<InteractiveCandidate[]> {
+  private async refreshFrameInteractiveCandidates(options: { candidateTextQuery?: string } = {}): Promise<InteractiveCandidate[]> {
     const frames = this.activePage.frames().filter((frame) => frame !== this.activePage.mainFrame());
     const viewport = await this.getViewportMetrics().catch(() => ({ width: 0, height: 0, devicePixelRatio: 1 }));
     const all: InteractiveCandidate[] = [];
@@ -5414,7 +5402,7 @@ export class BrowserSession {
 
       await this.ensureBrowserPageRuntime(frame);
       const localCandidates = await frame
-        .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: true })
+        .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: true, candidateTextQuery: options.candidateTextQuery })
         .then((observation) => observation.interactiveCandidates)
         .catch(() => [] as PageInteractiveCandidate[]);
 
@@ -5463,11 +5451,38 @@ export class BrowserSession {
     return ` This candidate is marked as an external-application link${protocol}; the browser URL/page may remain unchanged. No host process check is performed, so ok=true means the click was delivered as an external-app launch attempt, not that the native app launch was server-verifiable.`;
   }
 
-  private async findInteractiveCandidatesByText(targetText: string, scope?: DomNodeReference) {
-    const query = targetText.replace(/\s+/g, ' ').trim().toLowerCase();
-    if (!query) return [] as TextLocatorCandidate[];
+  private watchForPopup(page: Page) {
+    const waitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
+    return {
+      waitMs,
+      popup: waitMs > 0
+        ? page.waitForEvent('popup', { timeout: waitMs }).catch(() => undefined)
+        : Promise.resolve(undefined),
+    };
+  }
 
-    const candidates = await this.refreshInteractiveCandidates();
+  private async claimPopupPage(newPage: Page | undefined, timings?: Record<string, number>) {
+    if (!newPage) return undefined;
+    this.claimPage(newPage);
+    await timedBrowserStep(timings, 'bringPopupToFrontMs', () => newPage.bringToFront().catch(() => undefined));
+    return newPage;
+  }
+
+  private async settlePopupAfterAction(popup: Promise<Page | undefined>, waitMs: number, timings?: Record<string, number>) {
+    if (waitMs <= 0) return undefined;
+    const fastWaitMs = Math.min(waitMs, boundedNonNegativeIntegerEnv('BROWSER_POPUP_FAST_WAIT_MS', 250, 1000));
+    const newPage = await timedBrowserStep(timings, 'popupFastWaitMs', () => Promise.race([
+      popup,
+      sleep(fastWaitMs).then(() => undefined),
+    ]));
+    if (newPage) return this.claimPopupPage(newPage, timings);
+    void popup.then((latePage) => this.claimPopupPage(latePage).catch(() => undefined));
+    return undefined;
+  }
+
+  private findDomNodeReferencesByText(targetText: string, scope?: DomNodeReference) {
+    const query = targetText.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!query) return [] as TextNodeMatch[];
     const queryParts = query.split(/\s+/).filter((item) => item.length >= 2);
     const scoreLabel = (value: string) => {
       const label = value.replace(/\s+/g, ' ').trim().toLowerCase();
@@ -5479,37 +5494,40 @@ export class BrowserSession {
       return undefined;
     };
 
-    const matches: TextLocatorCandidate[] = [];
-    for (const candidate of candidates) {
-      if (scope && (candidate.framePath || '') !== (scope.framePath || '')) {
+    const matches: TextNodeMatch[] = [];
+    for (const reference of this.lastDomNodeReferences.values()) {
+      if (scope && (reference.framePath || '') !== (scope.framePath || '')) {
         continue;
       }
-      if (scope && candidate.path !== scope.path && !candidate.path.startsWith(`${scope.path}.`)) {
+      if (scope && reference.path !== scope.path && !reference.path.startsWith(`${scope.path}.`)) {
         continue;
       }
       const labels = [
-        candidate.name,
-        candidate.text,
-        candidate.ariaLabel,
-        candidate.title,
-        candidate.placeholder,
-        candidate.href,
-        candidate.nearbyText,
+        reference.label,
+        reference.state,
+        reference.line,
+        reference.descriptor,
       ].filter((item): item is string => Boolean(item));
       for (const label of labels) {
         const score = scoreLabel(label);
         if (score === undefined) continue;
-        const areaPenalty = Math.min(8, (candidate.rect.width * candidate.rect.height) / Math.max(1, 1280 * 720) * 8);
-        const tagBonus = candidate.tag === 'a' || candidate.tag === 'button' ? -0.4 : candidate.input ? -0.2 : 0;
-        const finalScore = score + areaPenalty + tagBonus;
-        matches.push({ locatorId: '', candidate, matchedText: label.slice(0, 180), score: finalScore });
+        const tagBonus = reference.tag === 'a' || reference.tag === 'button'
+          ? -0.4
+          : /input|textarea|select/.test(reference.tag)
+            ? -0.2
+            : 0;
+        matches.push({
+          matchedText: label.slice(0, 180),
+          reference,
+          score: score + tagBonus,
+        });
       }
     }
     const seen = new Set<string>();
     return matches
-      .sort((a, b) => a.score - b.score || this.compareCandidateOrder(a.candidate, b.candidate))
+      .sort((a, b) => a.score - b.score || this.comparePathString(a.reference.path, b.reference.path))
       .filter((match) => {
-        const key = `${match.candidate.framePath || 'main'}:${match.candidate.path}`;
+        const key = match.reference.id;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -5711,11 +5729,147 @@ export class BrowserSession {
       .catch(() => undefined);
   }
 
+  private async elementHandleForDomPath(frame: Frame, pathValue: string) {
+    await this.ensureBrowserPageRuntime(frame);
+    const handle = await frame.evaluateHandle((path) => {
+      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+      const element = runtime?.elementFromPath(path);
+      return element ? runtime?.actionableTargetFor(element) || element : null;
+    }, pathValue).catch(() => undefined);
+    const element = handle?.asElement();
+    if (!element) {
+      await handle?.dispose().catch(() => undefined);
+      return undefined;
+    }
+    return element;
+  }
+
+  private formatPlaywrightActionabilityError(error: unknown) {
+    return compactDiagnosticText(unknownErrorMessage(error), 900);
+  }
+
+  private async describeTopmostAtViewportPoint(x: number, y: number) {
+    return this.activePage.evaluate(({ pointX, pointY }) => {
+      if (pointX < 0 || pointY < 0 || pointX >= window.innerWidth || pointY >= window.innerHeight) {
+        return `point outside viewport ${Math.round(pointX)},${Math.round(pointY)}`;
+      }
+      function describe(element: Element) {
+        const tag = element.tagName.toLowerCase();
+        const id = element.id ? `#${element.id}` : '';
+        const cls = typeof element.className === 'string'
+          ? element.className.split(/\s+/).filter(Boolean).slice(0, 4).map((item) => `.${item}`).join('')
+          : '';
+        const role = element.getAttribute('role') ? `[role="${element.getAttribute('role')}"]` : '';
+        const text = ((element as HTMLElement).innerText || element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+        return `${tag}${id}${cls}${role}${text ? ` text="${text}"` : ''}`;
+      }
+      return (document.elementsFromPoint(pointX, pointY) as Element[])
+        .filter((element) => !element.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__'))
+        .slice(0, 5)
+        .map(describe)
+        .join(' > ') || '[none]';
+    }, { pointX: x, pointY: y }).catch(() => undefined);
+  }
+
+  private async checkDomPathClickActionability(input: {
+    path: string;
+    framePath?: string;
+    target: CandidateClickTarget;
+    label: string;
+    button?: 'left' | 'right' | 'middle';
+  }): Promise<ClickActionabilityCheck> {
+    const frame = input.framePath ? this.frameFromPath(input.framePath) : this.activePage.mainFrame();
+    if (!frame) {
+      return { ok: false, reason: `iframe ${input.framePath} no longer exists` };
+    }
+
+    const element = await this.elementHandleForDomPath(frame, input.path);
+    if (!element) {
+      return { ok: false, reason: `DOM path ${input.path} no longer resolves to an actionable element` };
+    }
+
+    try {
+      const box = await element.boundingBox();
+      if (!box || box.width <= 0 || box.height <= 0) {
+        return { ok: false, reason: `target element has no visible Playwright bounding box` };
+      }
+      const localX = input.target.x - box.x;
+      const localY = input.target.y - box.y;
+      const margin = 1;
+      if (localX < -margin || localY < -margin || localX > box.width + margin || localY > box.height + margin) {
+        return {
+          ok: false,
+          reason: `resolved click point (${input.target.x}, ${input.target.y}) is outside Playwright element box (${Math.round(box.x)}, ${Math.round(box.y)}, ${Math.round(box.width)}x${Math.round(box.height)})`,
+        };
+      }
+      const position = {
+        x: Math.min(Math.max(localX, 0), box.width),
+        y: Math.min(Math.max(localY, 0), box.height),
+      };
+      await element.click({
+        trial: true,
+        button: input.button || 'left',
+        position,
+      });
+      return { ok: true };
+    } catch (error) {
+      const topmost = await this.describeTopmostAtViewportPoint(input.target.x, input.target.y);
+      return {
+        ok: false,
+        reason: [
+          `${input.label} failed Playwright click actionability check at (${input.target.x}, ${input.target.y})`,
+          this.formatPlaywrightActionabilityError(error),
+          topmost ? `Top elements at that point: ${topmost}` : '',
+          'Refresh getPageState and choose a currently actionable node. If text-only DOM is ambiguous and getCurrentScreenshot is available, call getCurrentScreenshot before deciding.',
+        ].filter(Boolean).join('. '),
+      };
+    } finally {
+      await element.dispose().catch(() => undefined);
+    }
+  }
+
+  private async checkCandidateClickActionability(
+    candidate: InteractiveCandidate,
+    target: CandidateClickTarget,
+    action: string,
+    button?: 'left' | 'right' | 'middle',
+  ) {
+    if (candidate.shadow) return { ok: true } satisfies ClickActionabilityCheck;
+    return this.checkDomPathClickActionability({
+      path: candidate.path,
+      framePath: candidate.framePath,
+      target,
+      button,
+      label: `${action} candidate ${candidate.id} (${this.describeCandidate(candidate)})`,
+    });
+  }
+
+  private async checkDomReferenceClickActionability(
+    reference: DomNodeReference,
+    target: CandidateClickTarget,
+    action: string,
+    button?: 'left' | 'right' | 'middle',
+  ) {
+    return this.checkDomPathClickActionability({
+      path: reference.path,
+      framePath: reference.framePath,
+      target,
+      button,
+      label: `${action} DOM node ${reference.id} (${reference.label || reference.descriptor})`,
+    });
+  }
+
   private emptySimplifiedDomObservation(message?: string): BrowserDomObservation {
     const elements = message || '[empty DOM elements]';
     return {
+      actions: elements,
+      actionsCharLength: elements.length,
       elements,
       elementsCharLength: elements.length,
+      text: elements,
+      textCharLength: elements.length,
+      tree: elements,
+      treeCharLength: elements.length,
       domNodeCount: 0,
       interactiveNodeCount: 0,
       usedWorkers: false,
@@ -5768,67 +5922,138 @@ export class BrowserSession {
     }
     this.resetDomVisibleIdState(mainSnapshot.stateKey);
 
-    const lines: string[] = [];
+    const treeLines: string[] = [];
+    const actionLines: string[] = [];
+    const textLines: string[] = [];
+    const textSeen = new Set<string>();
     let chars = 0;
+    let actionChars = 0;
+    let textChars = 0;
     let domNodeCount = 0;
     let interactiveNodeCount = 0;
+    const actionReferenceIds = new Set<string>();
     const references: DomNodeReference[] = [];
-    const appendSnapshot = (snapshot: BrowserUseVisibleDomSnapshot, framePath?: string, frameUrl?: string, viewportClip?: BrowserUseViewportClip) => {
-      if (framePath && snapshot.items.length) {
+    const appendText = (value?: string) => {
+      const text = String(value || '').replace(/\s+/g, ' ').trim();
+      if (!text || textSeen.has(text)) return;
+      const lineChars = text.length + (textLines.length === 0 ? 0 : 1);
+      if (textChars + lineChars > maxChars) return;
+      textSeen.add(text);
+      textLines.push(text);
+      textChars += lineChars;
+    };
+    const actionContext = (snapshot: BrowserUseVisibleDomSnapshot, item: BrowserUseVisibleDomSnapshot['items'][number], framePath?: string, frameUrl?: string) => {
+      const byPath = new Map(snapshot.items.map((entry) => [entry.path, entry]));
+      const labels: string[] = [];
+      if (framePath) labels.push(`iframe ${framePath}${frameUrl ? ` ${frameUrl}` : ''}`);
+      const parts = item.path.split('.');
+      for (let length = 1; length < parts.length; length += 1) {
+        const ancestor = byPath.get(parts.slice(0, length).join('.'));
+        const label = ancestor?.label?.replace(/\s+/g, ' ').trim();
+        if (label && label !== item.label && !labels.includes(label)) labels.push(label);
+      }
+      return labels.slice(-4).join(' > ').replace(/--/g, '-');
+    };
+    const appendSnapshot = (
+      snapshot: BrowserUseVisibleDomSnapshot,
+      framePath?: string,
+      frameUrl?: string,
+      viewportClip?: BrowserUseViewportClip,
+      options: { includeTree?: boolean; includeActions?: boolean; includeText?: boolean } = { includeTree: true, includeActions: true, includeText: true },
+    ) => {
+      if (options.includeTree && framePath && snapshot.items.length) {
         const frameLine = `<!-- iframe ${framePath}${frameUrl ? ` url="${frameUrl}"` : ''} -->`;
-        const frameLineChars = frameLine.length + (lines.length === 0 ? 0 : 1);
+        const frameLineChars = frameLine.length + (treeLines.length === 0 ? 0 : 1);
         if (chars + frameLineChars <= maxChars) {
-          lines.push(frameLine);
+          treeLines.push(frameLine);
           chars += frameLineChars;
         }
       }
       for (const item of snapshot.items) {
-        if (lines.length >= maxElements || chars >= maxChars) return;
         const publicId = this.publicDomVisibleId(snapshot.stateKey, item.ref);
         const indent = this.domObservationIndent(item.path, framePath);
         const line = `${indent}${item.line.replace(`node_id=${item.ref}`, `node_id=${publicId}`)}`;
-        const lineChars = line.length + (lines.length === 0 ? 0 : 1);
-        if (chars + lineChars > maxChars) return;
-        lines.push(line);
-        chars += lineChars;
-        domNodeCount += 1;
-        if (item.interactive) {
-          interactiveNodeCount += 1;
+        if (options.includeTree) {
+          const lineChars = line.length + (treeLines.length === 0 ? 0 : 1);
+          if (treeLines.length < maxElements && chars + lineChars <= maxChars) {
+            treeLines.push(line);
+            chars += lineChars;
+            domNodeCount += 1;
+          }
+        }
+        if (options.includeText) appendText(item.label);
+        if (options.includeActions && item.interactive) {
+          const context = actionContext(snapshot, item, framePath, frameUrl);
+          const actionLine = context ? `${line} <!-- context: ${context} -->` : line;
+          const actionLineChars = actionLine.length + (actionLines.length === 0 ? 0 : 1);
+          if (actionChars + actionLineChars <= maxChars && actionLines.length < maxElements) {
+            actionLines.push(actionLine);
+            actionChars += actionLineChars;
+          }
+          if (!actionReferenceIds.has(publicId)) {
+            actionReferenceIds.add(publicId);
+            interactiveNodeCount += 1;
+          }
         }
         references.push({
           id: publicId,
+          interactive: item.interactive,
+          label: item.label,
+          line,
           localRef: item.ref,
           path: item.path,
           framePath,
           frameUrl,
           descriptor: item.descriptor,
+          state: item.state,
+          tag: item.tag,
           viewportClip,
         });
       }
     };
 
     const appendMainStartedAt = Date.now();
-    appendSnapshot(mainSnapshot);
+    appendSnapshot(mainSnapshot, undefined, undefined, undefined, { includeTree: true, includeActions: !fullScope, includeText: true });
     addTiming('appendMainDomSnapshotMs', appendMainStartedAt);
     const frameSnapshots = fullScope
       ? await fullFrameSnapshotsPromise || []
       : await timedBrowserStep(options.timings, 'readVisibleFrameDomSnapshotsMs', () => this.readVisibleFrameDomSnapshots(mainSnapshot.viewport, maxElements, maxChars, frameLimit, options.timings));
     const appendFramesStartedAt = Date.now();
     for (const frameSnapshot of frameSnapshots) {
-      appendSnapshot(frameSnapshot.snapshot, frameSnapshot.framePath, frameSnapshot.frameUrl, frameSnapshot.viewportClip);
+      appendSnapshot(frameSnapshot.snapshot, frameSnapshot.framePath, frameSnapshot.frameUrl, frameSnapshot.viewportClip, { includeTree: true, includeActions: !fullScope, includeText: true });
     }
     addTiming('appendFrameDomSnapshotsMs', appendFramesStartedAt);
+    if (fullScope) {
+      const appendActionsStartedAt = Date.now();
+      const mainActionSnapshot = await timedBrowserStep(options.timings, 'readMainActionDomSnapshotMs', () => this.readVisibleDomSnapshot(this.activePage.mainFrame(), maxElements, maxChars, undefined, true));
+      if (mainActionSnapshot) appendSnapshot(mainActionSnapshot, undefined, undefined, undefined, { includeTree: false, includeActions: true, includeText: true });
+      const actionFrameSnapshots = mainActionSnapshot
+        ? await timedBrowserStep(options.timings, 'readActionFrameDomSnapshotsMs', () => this.readVisibleFrameDomSnapshots(mainActionSnapshot.viewport, maxElements, maxChars, frameLimit, options.timings, true))
+        : [];
+      for (const frameSnapshot of actionFrameSnapshots) {
+        appendSnapshot(frameSnapshot.snapshot, frameSnapshot.framePath, frameSnapshot.frameUrl, frameSnapshot.viewportClip, { includeTree: false, includeActions: true, includeText: true });
+      }
+      addTiming('appendActionDomSnapshotMs', appendActionsStartedAt);
+    }
 
     const referenceMapStartedAt = Date.now();
     this.lastDomNodeReferences = new Map(references.map((reference) => [reference.id, reference]));
     addTiming('buildDomNodeReferenceMapMs', referenceMapStartedAt);
-    const tree = lines.join('\n') || (fullScope ? '[empty full DOM snapshot]' : '[empty visible DOM snapshot]');
+    const tree = treeLines.join('\n') || (fullScope ? '[empty full DOM snapshot]' : '[empty visible DOM snapshot]');
+    const actions = actionLines.join('\n') || '[no visible actionable elements]';
+    const text = textLines.join('\n') || '[no visible page text]';
     const elements = tree;
     return {
       tree,
       observation: {
+        actions,
+        actionsCharLength: actions.length,
         elements,
         elementsCharLength: elements.length,
+        text,
+        textCharLength: text.length,
+        tree,
+        treeCharLength: tree.length,
         domNodeCount,
         interactiveNodeCount,
         usedWorkers: false,
@@ -5958,24 +6183,26 @@ export class BrowserSession {
     maxElements: number,
     maxChars: number,
     viewportClip?: BrowserUseViewportClip,
+    preserveExistingRefs = false,
   ) {
     await this.ensureBrowserPageRuntime(target);
     return target.evaluate((input) => {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
       return runtime?.visibleDomSnapshot(input);
-    }, { maxChars, maxElements, viewportClip }).catch(() => undefined);
+    }, { maxChars, maxElements, preserveExistingRefs, viewportClip }).catch(() => undefined);
   }
 
   private async readFullDomSnapshot(
     target: Page | Frame,
     maxElements: number,
     maxChars: number,
+    preserveExistingRefs = false,
   ) {
     await this.ensureBrowserPageRuntime(target);
     return target.evaluate((input) => {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
       return runtime?.fullDomSnapshot(input);
-    }, { maxChars, maxElements }).catch(() => undefined);
+    }, { maxChars, maxElements, preserveExistingRefs }).catch(() => undefined);
   }
 
   private async readFullFrameDomSnapshots(
@@ -5983,6 +6210,7 @@ export class BrowserSession {
     maxChars: number,
     frameLimit: number,
     timings?: Record<string, number>,
+    preserveExistingRefs = false,
   ): Promise<Array<{
     framePath: string;
     frameUrl?: string;
@@ -6000,7 +6228,7 @@ export class BrowserSession {
     const snapshots = await Promise.all(frames.slice(0, frameLimit).map(async (frame): Promise<FullFrameSnapshot | undefined> => {
       const framePath = this.getFramePath(frame);
       if (framePath === undefined) return undefined;
-      const snapshot = await timedBrowserStep(timings, 'readFrameFullDomSnapshotMs', () => this.readFullDomSnapshot(frame, maxElements, maxChars));
+      const snapshot = await timedBrowserStep(timings, 'readFrameFullDomSnapshotMs', () => this.readFullDomSnapshot(frame, maxElements, maxChars, preserveExistingRefs));
       if (!snapshot) return undefined;
       return {
         framePath,
@@ -6017,6 +6245,7 @@ export class BrowserSession {
     maxChars: number,
     frameLimit: number,
     timings?: Record<string, number>,
+    preserveExistingRefs = false,
   ): Promise<Array<{
     framePath: string;
     frameUrl?: string;
@@ -6050,7 +6279,7 @@ export class BrowserSession {
         right: visibleFrameRect.right - box.x,
         top: visibleFrameRect.top - box.y,
       };
-      const snapshot = await timedBrowserStep(timings, 'readFrameVisibleDomSnapshotMs', () => this.readVisibleDomSnapshot(frame, maxElements, maxChars, viewportClip));
+      const snapshot = await timedBrowserStep(timings, 'readFrameVisibleDomSnapshotMs', () => this.readVisibleDomSnapshot(frame, maxElements, maxChars, viewportClip, preserveExistingRefs));
       if (!snapshot) return undefined;
       return {
         framePath,

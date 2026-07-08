@@ -117,6 +117,7 @@ type BrowserChatRuntimeState = {
     sessionId: string;
     resolve: (decision: BrowserToolConfirmationDecision) => void;
   }>;
+  pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
   sessionsHydrated: boolean;
   lastPersistWarningAt: number;
 };
@@ -130,17 +131,20 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
     sessionId: string;
     resolve: (decision: BrowserToolConfirmationDecision) => void;
   }>(),
+  pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   sessionsHydrated: false,
   lastPersistWarningAt: 0,
 });
 browserChatRuntimeState.sessions ??= new Map();
 browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
+browserChatRuntimeState.pendingPersistTimers ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
 const sessionsDir = browserChatSessionsDir();
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
+const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
 const runningHydrationGraceMs = 2 * 60 * 1000;
 const fullLogDetailsFlag = '__browserChatFullLogDetails';
 
@@ -169,6 +173,12 @@ function browserChatLogLimit() {
   const raw = Number(process.env.BROWSER_CHAT_LOG_LIMIT || 2000);
   const normalized = Number.isFinite(raw) ? Math.floor(raw) : 2000;
   return Math.min(Math.max(normalized, 300), 10000);
+}
+
+function browserChatProgressPersistDelayMs() {
+  const raw = Number(process.env.BROWSER_CHAT_PROGRESS_PERSIST_DELAY_MS || 100);
+  const normalized = Number.isFinite(raw) ? Math.floor(raw) : 100;
+  return Math.min(Math.max(normalized, 0), 1000);
 }
 
 function trimBrowserChatLogs(logs: BrowserChatLogRecord[]) {
@@ -255,12 +265,64 @@ function unwrapLogDetails(value: unknown) {
   return { value: record.value, full: true };
 }
 
+function compactDomContextForLog(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  return {
+    mode: record.mode,
+    source: record.source,
+    generatedAt: record.generatedAt,
+    url: record.url,
+    title: record.title,
+    treeCharLength: record.treeCharLength,
+    textLength: record.textLength,
+    promptCharLimit: record.promptCharLimit,
+    truncated: record.truncated,
+    focusedElement: record.focusedElement,
+    pageScrollState: record.pageScrollState,
+    interactiveCandidateCount: Array.isArray(record.interactiveCandidates) ? record.interactiveCandidates.length : undefined,
+    scrollableAreaCount: Array.isArray(record.scrollableAreas) ? record.scrollableAreas.length : undefined,
+  };
+}
+
+function stringifyCompactLogDetails(value: unknown) {
+  const seen = new WeakSet<object>();
+  return JSON.stringify(value, (key, item) => {
+    if (typeof item === 'bigint') return item.toString();
+    if (typeof item === 'function' || typeof item === 'symbol') return undefined;
+    if (typeof item === 'string') {
+      const max = /^(tree|elements|structuredText|text|actual|result|system|prompt|content)$/i.test(key) ? 1200 : 600;
+      return trimLogText(item, max);
+    }
+    if (!item || typeof item !== 'object') return item;
+    if (item instanceof Error) {
+      return {
+        name: item.name,
+        message: item.message,
+        stack: trimLogText(item.stack || '', 1200),
+      };
+    }
+    if (item instanceof ArrayBuffer) return `[ArrayBuffer ${item.byteLength} bytes]`;
+    if (ArrayBuffer.isView(item)) {
+      const view = item as ArrayBufferView;
+      return `[${item.constructor.name || 'TypedArray'} ${view.byteLength} bytes]`;
+    }
+    if (seen.has(item)) return '[Circular]';
+    seen.add(item);
+    if (key === 'domContext') return compactDomContextForLog(item);
+    if (Array.isArray(item) && /^(interactiveCandidates|scrollableAreas|messages|modelMessages|conversation|tabs)$/i.test(key)) {
+      return `[${item.length} items]`;
+    }
+    return item;
+  }, 2);
+}
+
 function logDetailsFromUnknown(input: unknown) {
   const { value, full } = unwrapLogDetails(input);
   if (value === undefined || value === null || value === '') return undefined;
   if (typeof value === 'string') return full ? value.trim() : trimLogText(value);
   try {
-    const serialized = stringifyJsonSafe(value, 2) || String(value);
+    const serialized = (full ? stringifyJsonSafe(value, 2) : stringifyCompactLogDetails(value)) || String(value);
     return full ? serialized.trim() : trimLogText(serialized);
   } catch {
     const fallback = String(value);
@@ -842,7 +904,7 @@ function appendLog(
   session: BrowserChatSessionRecord,
   phase: string,
   message: string,
-  input: { stepIndex?: number; elapsedMs?: number; details?: unknown; messageId?: string | null } = {},
+  input: { stepIndex?: number; elapsedMs?: number; details?: unknown; messageId?: string | null; deferPersist?: boolean } = {},
 ) {
   const timestamp = now();
   const runningActivity = runningActivityFromLog(phase, message);
@@ -874,7 +936,7 @@ function appendLog(
     }));
   }
   session.updatedAt = timestamp;
-  persistAndNotify(session.id);
+  persistAndNotify(session.id, { defer: input.deferPersist === true });
 }
 
 function readSessionSnapshotsFromFile(): BrowserChatSessionSnapshot[] {
@@ -1074,7 +1136,7 @@ function applyFileSnapshotToRuntime(snapshotFromFile: BrowserChatSessionSnapshot
   Object.assign(existing, fromDisk, runtimeState);
 }
 
-function persistSessionToFile(sessionId: string) {
+function persistSessionToFile(sessionId: string, options: { mergeFromDisk?: boolean } = {}) {
   try {
     const currentSession = sessions.get(sessionId);
     const incoming = currentSession ? snapshot(currentSession, { fullSteps: true }) : undefined;
@@ -1082,10 +1144,11 @@ function persistSessionToFile(sessionId: string) {
       deleteSessionSnapshotFile(sessionId);
       return true;
     }
-    const diskSnapshot = readSessionSnapshotFromFile(sessionId);
-    const writtenSnapshot = mergeSessionSnapshotFromFile(diskSnapshot, incoming);
+    const writtenSnapshot = options.mergeFromDisk === false
+      ? incoming
+      : mergeSessionSnapshotFromFile(readSessionSnapshotFromFile(sessionId), incoming);
     writeSessionSnapshotToFile(writtenSnapshot);
-    applyFileSnapshotToRuntime(writtenSnapshot);
+    if (options.mergeFromDisk !== false) applyFileSnapshotToRuntime(writtenSnapshot);
     return true;
   } catch (error) {
     warnPersistFailure(error);
@@ -1093,8 +1156,30 @@ function persistSessionToFile(sessionId: string) {
   }
 }
 
-function persistAndNotify(sessionId: string) {
-  const persisted = persistSessionToFile(sessionId);
+function clearPendingPersist(sessionId: string) {
+  const timer = pendingPersistTimers.get(sessionId);
+  if (!timer) return;
+  clearTimeout(timer);
+  pendingPersistTimers.delete(sessionId);
+}
+
+function schedulePersistAndNotify(sessionId: string) {
+  if (pendingPersistTimers.has(sessionId)) return;
+  const timer = setTimeout(() => {
+    pendingPersistTimers.delete(sessionId);
+    persistAndNotify(sessionId, { mergeFromDisk: false });
+  }, browserChatProgressPersistDelayMs());
+  pendingPersistTimers.set(sessionId, timer);
+}
+
+function persistAndNotify(sessionId: string, options: { defer?: boolean; mergeFromDisk?: boolean } = {}) {
+  if (options.defer) {
+    schedulePersistAndNotify(sessionId);
+    notifySessionUpdate(sessionId);
+    return true;
+  }
+  clearPendingPersist(sessionId);
+  const persisted = persistSessionToFile(sessionId, { mergeFromDisk: options.mergeFromDisk });
   if (!persisted) return false;
   notifySessionUpdate(sessionId);
   return true;
@@ -2241,7 +2326,7 @@ async function runBrowserChatMessage(
             }));
           }
           session.updatedAt = now();
-          persistAndNotify(session.id);
+          persistAndNotify(session.id, { defer: true });
         },
         onDebug: (event) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
@@ -2249,11 +2334,12 @@ async function runBrowserChatMessage(
             stepIndex: event.stepIndex,
             elapsedMs: elapsedFromDetails(event.details),
             details: event.details,
+            deferPersist: true,
           });
         },
       });
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      appendLog(session, 'chat:run:saving', '正在写入本轮对话最终结果');
+      appendLog(session, 'chat:run:saving', '正在写入本轮对话最终结果', { deferPersist: true });
       session.steps = result.steps;
       session.consoleErrors = result.consoleErrors;
       session.networkErrors = result.networkErrors;
@@ -2314,7 +2400,7 @@ async function runBrowserChatMessage(
         session,
         interrupted ? 'chat:run:interrupted' : 'chat:run:error',
         interrupted ? '用户主动中断了本轮对话。' : `本轮对话异常：${message}`,
-        { details },
+        { details, deferPersist: true },
       );
       session.error = interrupted ? undefined : message;
       session.status = interrupted ? 'idle' : 'error';
