@@ -2851,7 +2851,8 @@ export class BrowserSession {
         ? `--window-size=${headlessFallbackViewport.width},${headlessFallbackViewport.height + 120}`
         : '';
     const ignoreHTTPSErrors = process.env.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
-    const forceBundledBrowser = process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !electronEmbeddedBrowserEnabled();
+    const useElectronEmbeddedBrowser = electronEmbeddedBrowserEnabled();
+    const forceBundledBrowser = process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !useElectronEmbeddedBrowser;
     const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
     const executablePath = process.env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
     const browserProfileKey = this.options.browserProfileKey ? normalizePageGroupId(this.options.browserProfileKey) : '';
@@ -2862,7 +2863,7 @@ export class BrowserSession {
         || process.env.CHROME_REMOTE_DEBUGGING_URL?.trim()
         || electronEmbeddedBrowserCdpEndpoint()
         || '';
-    const cdpEndpoint = browserProfileKey && rawCdpEndpoint
+    const cdpEndpoint = browserProfileKey && rawCdpEndpoint && !useElectronEmbeddedBrowser
       ? /\{(?:browserProfileKey|profileKey)\}/.test(rawCdpEndpoint)
         ? rawCdpEndpoint
           .replace(/\{browserProfileKey\}/g, encodeURIComponent(browserProfileKey))
@@ -2876,7 +2877,7 @@ export class BrowserSession {
       ? path.join(configuredUserDataDir, browserProfileKey)
       : configuredUserDataDir;
     const tabGrouperEnabled = sessionTabGrouperEnabled(headless);
-    const useSharedBrowserTabs = sharedBrowserTabsEnabled() && !electronEmbeddedBrowserEnabled() && !browserProfileKey;
+    const useSharedBrowserTabs = sharedBrowserTabsEnabled() && !useElectronEmbeddedBrowser && !browserProfileKey;
     const useSessionGroupPageSelection = tabGrouperEnabled || Boolean(browserProfileKey);
     const restoreLastSession = tabGrouperEnabled && process.env.BROWSER_RESTORE_LAST_SESSION !== 'false';
     const autoTabGroupProfileKey = browserProfileKey || (useSharedBrowserTabs ? 'shared' : this.pageGroupId);
@@ -2930,7 +2931,7 @@ export class BrowserSession {
       const existingContext = this.browser.contexts()[0];
       const context = existingContext || await this.browser.newContext(contextOptions);
       this.context = context;
-      if (electronEmbeddedBrowserEnabled()) {
+      if (useElectronEmbeddedBrowser) {
         await this.prepareContext(context, { claimPages: false });
         this.installElectronEmbeddedBrowserPageDiscovery(context);
         const embeddedPages = await this.findInitialElectronEmbeddedBrowserPages(context);

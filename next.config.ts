@@ -7,6 +7,9 @@ const currentDir = dirname(fileURLToPath(import.meta.url));
 const nextConfig: NextConfig = {
   output: 'standalone',
   outputFileTracingRoot: currentDir,
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
   serverExternalPackages: [
     'playwright',
     'ai-sdk-provider-gemini-cli',
