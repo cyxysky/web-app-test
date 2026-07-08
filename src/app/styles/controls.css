@@ -91,10 +91,16 @@ input[type="checkbox"]:disabled {
   color: var(--danger);
 }
 
-.ui-button--neutral:not(:disabled):hover,
-.ui-icon-button:not(:disabled):hover {
+.ui-button--neutral:not(:disabled):hover {
   background: var(--control-hover-bg);
   color: var(--foreground);
+}
+
+.ui-icon-button:not(:disabled):hover {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--accent-strong);
 }
 
 .ui-button--primary:not(:disabled):hover {
@@ -108,9 +114,10 @@ input[type="checkbox"]:disabled {
 }
 
 .ui-icon-button--danger:not(:disabled):hover {
-  background: var(--control-danger-hover-bg);
-  border-color: color-mix(in srgb, var(--danger) 24%, var(--border));
-  color: var(--danger);
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--accent-strong);
 }
 
 .ui-button:disabled,

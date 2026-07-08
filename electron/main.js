@@ -24,6 +24,7 @@ const embeddedBrowserTabs = new Map();
 let embeddedBrowserBounds = { x: 0, y: 0, width: 0, height: 0 };
 let embeddedBrowserFitTimer;
 let embeddedBrowserFitAllowZoomIn = false;
+const EMBEDDED_BROWSER_ROUTE_LOADING_MS = 1200;
 let startupLogPath;
 let recentServerOutput = [];
 
@@ -148,13 +149,20 @@ function embeddedBrowserPlaceholderUrl() {
   const html = [
     '<!doctype html>',
     '<html data-webpilot-embedded-browser="true">',
-    '<head><meta charset="utf-8"><title>WebPilot Embedded Browser</title></head>',
+    '<head><meta charset="utf-8"><title>新建标签页</title></head>',
     '<body style="margin:0;font:14px system-ui;background:#f8fafc;color:#334155;display:grid;place-items:center;height:100vh">',
-    '<div>WebPilot embedded browser</div>',
+    '<div>新建标签页</div>',
     '</body>',
     '</html>',
   ].join('');
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
+function embeddedBrowserTabTitle(webContents) {
+  const url = webContents.getURL() || '';
+  const title = webContents.getTitle() || '';
+  if (!url || /^data:text\/html/i.test(url) || /^WebPilot Embedded Browser$/i.test(title)) return '新建标签页';
+  return title || url || '新建标签页';
 }
 
 function sanitizeEmbeddedBounds(bounds) {
@@ -229,6 +237,8 @@ function markEmbeddedBrowserSession(tab) {
 
 function loadEmbeddedBrowserTabUrl(tab, url) {
   if (!tab || tab.view.webContents.isDestroyed()) return Promise.resolve();
+  tab.clientNavigation = undefined;
+  tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
   tab.readyPromise = tab.view.webContents.loadURL(url)
     .then(() => markEmbeddedBrowserSession(tab));
   return tab.readyPromise;
@@ -291,6 +301,14 @@ function setActiveEmbeddedBrowserTab(tab) {
   embeddedBrowserAttached = Boolean(tab?.attached);
 }
 
+function embeddedBrowserTabForWebContents(webContents) {
+  if (!webContents) return undefined;
+  for (const tab of embeddedBrowserTabs.values()) {
+    if (!tab.view.webContents.isDestroyed() && tab.view.webContents === webContents) return tab;
+  }
+  return undefined;
+}
+
 function setActiveEmbeddedBrowserGroup(groupId) {
   embeddedBrowserActiveGroupId = String(groupId || '').trim();
   embeddedBrowserActiveTabId = '';
@@ -344,6 +362,9 @@ function installEmbeddedBrowserTabHandlers(tab) {
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 140, { allowZoomIn: true });
   });
+  view.webContents.on('did-start-loading', () => {
+    tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
+  });
   view.webContents.on('did-finish-load', () => {
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
@@ -357,6 +378,12 @@ function installEmbeddedBrowserTabHandlers(tab) {
     scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   });
   view.webContents.on('did-navigate-in-page', () => {
+    tab.clientNavigation = {
+      ...(tab.clientNavigation || {}),
+      canGoBack: true,
+      url: view.webContents.getURL() || tab.clientNavigation?.url || '',
+    };
+    tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 220, { allowZoomIn: true });
   });
@@ -591,8 +618,69 @@ async function fitEmbeddedBrowserToWidth(allowZoomIn = false) {
   }
 }
 
+function embeddedBrowserNavigationState(tab) {
+  if (!tab || tab.view.webContents.isDestroyed()) return { canGoBack: false, canGoForward: false };
+  const webContents = tab.view.webContents;
+  const history = webContents.navigationHistory;
+  const nativeCanGoBack = (typeof history?.canGoBack === 'function' && history.canGoBack())
+    || (typeof webContents.canGoBack === 'function' && webContents.canGoBack());
+  const nativeCanGoForward = (typeof history?.canGoForward === 'function' && history.canGoForward())
+    || (typeof webContents.canGoForward === 'function' && webContents.canGoForward());
+  const clientNavigation = tab.clientNavigation || {};
+  return {
+    canGoBack: Boolean(nativeCanGoBack || clientNavigation.canGoBack),
+    canGoForward: Boolean(nativeCanGoForward || clientNavigation.canGoForward),
+  };
+}
+
+async function navigateEmbeddedBrowserHistory(direction) {
+  const tab = activeEmbeddedBrowserTab();
+  if (!tab || tab.view.webContents.isDestroyed()) return embeddedBrowserState();
+  const webContents = tab.view.webContents;
+  const history = webContents.navigationHistory;
+  if (direction === 'back') {
+    const historyCanGoBack = typeof history?.canGoBack === 'function' && history.canGoBack();
+    const webContentsCanGoBack = typeof webContents.canGoBack === 'function' && webContents.canGoBack();
+    const canGoBack = Boolean(historyCanGoBack || webContentsCanGoBack || tab.clientNavigation?.canGoBack);
+    if (!canGoBack) return embeddedBrowserState();
+    const clientNavigated = await webContents.executeJavaScript('window.history.back(); true', true).catch((error) => {
+      appendLog(`Embedded browser client back failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    });
+    if (!clientNavigated) {
+      if (historyCanGoBack && typeof history?.goBack === 'function') history.goBack();
+      else if (webContentsCanGoBack && typeof webContents.goBack === 'function') webContents.goBack();
+    }
+  } else {
+    const historyCanGoForward = typeof history?.canGoForward === 'function' && history.canGoForward();
+    const webContentsCanGoForward = typeof webContents.canGoForward === 'function' && webContents.canGoForward();
+    const canGoForward = Boolean(historyCanGoForward || webContentsCanGoForward || tab.clientNavigation?.canGoForward);
+    if (!canGoForward) return embeddedBrowserState();
+    const clientNavigated = await webContents.executeJavaScript('window.history.forward(); true', true).catch((error) => {
+      appendLog(`Embedded browser client forward failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    });
+    if (!clientNavigated) {
+      if (historyCanGoForward && typeof history?.goForward === 'function') history.goForward();
+      else if (webContentsCanGoForward && typeof webContents.goForward === 'function') webContents.goForward();
+    }
+  }
+  tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
+  scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
+  return embeddedBrowserState();
+}
+
+function reloadEmbeddedBrowserTab() {
+  const tab = activeEmbeddedBrowserTab();
+  if (!tab || tab.view.webContents.isDestroyed()) return embeddedBrowserState();
+  tab.view.webContents.reload();
+  scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
+  return embeddedBrowserState();
+}
+
 function embeddedBrowserState() {
   const active = activeEmbeddedBrowserTab();
+  const navigation = embeddedBrowserNavigationState(active);
   const tabs = [];
   const groups = [];
   let activeIndex = -1;
@@ -624,11 +712,11 @@ function embeddedBrowserState() {
       if (canonicalSessionId && group.sessionId !== canonicalSessionId) group.sessionId = canonicalSessionId;
       const webContents = tab.view.webContents;
       const url = webContents.getURL() || '';
-      const title = webContents.getTitle() || url || 'New tab';
+      const title = embeddedBrowserTabTitle(webContents);
       const item = {
         groupId: tab.groupId,
         id: tab.id,
-        loading: webContents.isLoading(),
+        loading: webContents.isLoading() || Date.now() < (tab.routeLoadingUntil || 0),
         sessionId: tab.sessionId || undefined,
         title,
         url,
@@ -653,6 +741,8 @@ function embeddedBrowserState() {
     activeGroupId: embeddedBrowserActiveGroupId || undefined,
     activeIndex,
     activeTabId: embeddedBrowserActiveTabId || undefined,
+    canGoBack: navigation.canGoBack,
+    canGoForward: navigation.canGoForward,
     groups,
     zoomFactor: active?.view.webContents.isDestroyed() ? undefined : active?.view.webContents.getZoomFactor(),
     tabs,
@@ -756,6 +846,20 @@ function registerEmbeddedBrowserIpc() {
     scheduleEmbeddedBrowserFitForTab(tab, 420);
   });
 
+  ipcMain.on('webpilot:embedded-browser:client-navigation', (event, payload = {}) => {
+    const tab = embeddedBrowserTabForWebContents(event.sender);
+    if (!tab) return;
+    tab.clientNavigation = {
+      canGoBack: Boolean(payload.canGoBack),
+      canGoForward: Boolean(payload.canGoForward),
+      index: Number.isFinite(Number(payload.index)) ? Number(payload.index) : 0,
+      length: Number.isFinite(Number(payload.length)) ? Number(payload.length) : 1,
+      url: typeof payload.url === 'string' ? payload.url : '',
+    };
+    tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
+    scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
+  });
+
   ipcMain.handle('webpilot:embedded-browser:get-state', async () => {
     try {
       return embeddedBrowserState();
@@ -767,6 +871,30 @@ function registerEmbeddedBrowserIpc() {
   ipcMain.handle('webpilot:embedded-browser:create-tab', async (_event, input = {}) => {
     try {
       return await createManualEmbeddedBrowserTab(input);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:go-back', async () => {
+    try {
+      return await navigateEmbeddedBrowserHistory('back');
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:go-forward', async () => {
+    try {
+      return await navigateEmbeddedBrowserHistory('forward');
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:reload', async () => {
+    try {
+      return reloadEmbeddedBrowserTab();
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }

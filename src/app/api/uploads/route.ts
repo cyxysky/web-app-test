@@ -11,23 +11,21 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'File is required' }, { status: 400 });
   }
 
-  if (!file.type.startsWith('image/')) {
-    return NextResponse.json({ error: 'Only image uploads are supported' }, { status: 400 });
-  }
-
-  const ext = path.extname(file.name) || '.png';
-  const imageId = `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
+  const ext = path.extname(file.name) || (file.type.startsWith('image/') ? '.png' : '.bin');
+  const prefix = file.type.startsWith('image/') ? 'img' : 'file';
+  const fileId = `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
   const dir = artifactPath('uploads');
-  const filePath = path.join(dir, imageId);
+  const filePath = path.join(dir, fileId);
 
   await mkdir(dir, { recursive: true });
   await writeFile(filePath, Buffer.from(await file.arrayBuffer()));
 
   return NextResponse.json({
-    imageId,
+    fileId,
+    imageId: file.type.startsWith('image/') ? fileId : undefined,
     filePath,
-    path: `uploads/${imageId}`,
-    url: `/api/artifacts/uploads/${encodeURIComponent(imageId)}`,
+    path: `uploads/${fileId}`,
+    url: `/api/artifacts/uploads/${encodeURIComponent(fileId)}`,
     name: file.name,
     type: file.type,
     size: file.size,

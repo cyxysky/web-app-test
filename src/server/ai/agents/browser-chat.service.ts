@@ -27,6 +27,8 @@ export type BrowserChatAttachment = {
   size?: number;
   path: string;
   url: string;
+  kind?: 'image' | 'file' | 'tab';
+  sourceUrl?: string;
 };
 
 export type BrowserChatMessage = {
@@ -488,19 +490,30 @@ function normalizeAttachments(value: unknown): BrowserChatAttachment[] {
   for (const item of value.slice(0, 8)) {
     if (!item || typeof item !== 'object') continue;
     const record = item as Record<string, unknown>;
-    const pathValue = normalizeAttachmentPath(record.path);
-    if (!pathValue) continue;
-    const type = typeof record.type === 'string' && record.type.startsWith('image/') ? record.type : 'image/*';
-    const idValue = typeof record.id === 'string' && record.id.trim() ? record.id.trim().slice(0, 160) : path.basename(pathValue);
-    const nameValue = typeof record.name === 'string' && record.name.trim() ? record.name.trim().slice(0, 180) : path.basename(pathValue);
+    const rawType = typeof record.type === 'string' && record.type.trim() ? record.type.trim().slice(0, 160) : 'application/octet-stream';
+    const requestedKind = record.kind === 'tab' || record.kind === 'file' || record.kind === 'image' ? record.kind : undefined;
+    const isTabReference = requestedKind === 'tab' || rawType === 'application/x-webpilot-tab';
+    const pathValue = isTabReference ? '' : normalizeAttachmentPath(record.path);
+    if (!isTabReference && !pathValue) continue;
+    const attachmentPath = pathValue || '';
+    const type = isTabReference ? 'application/x-webpilot-tab' : rawType;
+    const kind = isTabReference ? 'tab' : (type.startsWith('image/') ? 'image' : 'file');
+    const sourceUrl = typeof record.sourceUrl === 'string' ? record.sourceUrl.trim().slice(0, 2000) : '';
+    const urlValue = typeof record.url === 'string' ? record.url.trim().slice(0, 2000) : '';
+    const idValue = typeof record.id === 'string' && record.id.trim() ? record.id.trim().slice(0, 160) : (attachmentPath ? path.basename(attachmentPath) : randomUUID());
+    const nameValue = typeof record.name === 'string' && record.name.trim() ? record.name.trim().slice(0, 180) : (attachmentPath ? path.basename(attachmentPath) : sourceUrl || urlValue || '新建标签页');
     const sizeValue = typeof record.size === 'number' && Number.isFinite(record.size) ? Math.max(0, Math.floor(record.size)) : undefined;
     attachments.push({
       id: idValue,
+      kind,
       name: nameValue,
       type,
       size: sizeValue,
-      path: pathValue,
-      url: typeof record.url === 'string' && record.url.startsWith('/api/artifacts/') ? record.url : artifactApiUrlFromRelative(pathValue),
+      path: attachmentPath,
+      sourceUrl: isTabReference ? sourceUrl || urlValue : undefined,
+      url: isTabReference
+        ? sourceUrl || urlValue
+        : (typeof record.url === 'string' && record.url.startsWith('/api/artifacts/') ? record.url : artifactApiUrlFromRelative(attachmentPath)),
     });
   }
   return attachments;
@@ -515,24 +528,82 @@ function normalizeSkillIds(value: unknown) {
 }
 
 function attachmentAbsolutePath(attachment: BrowserChatAttachment) {
+  if (attachment.kind === 'tab' || !attachment.type.startsWith('image/')) return undefined;
   const relativePath = normalizeAttachmentPath(attachment.path);
   if (!relativePath) return undefined;
   return resolveArtifactPath(...relativePath.split('/'));
 }
 
-function attachmentSummary(attachments?: BrowserChatAttachment[]) {
-  if (!attachments?.length) return '';
+function attachmentKindLabel(attachment: BrowserChatAttachment) {
+  if (attachment.kind === 'tab' || attachment.type === 'application/x-webpilot-tab') return '标签页';
+  if (attachment.kind === 'image' || attachment.type.startsWith('image/')) return '图片';
+  return '文件';
+}
+
+const inlineReferenceTokenPattern = /\[\[(skill|ref):([^\]]+)\]\]/g;
+
+function decodeInlineReferenceId(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function attachmentPromptText(attachment: BrowserChatAttachment, index?: number) {
+  const location = attachment.kind === 'tab'
+    ? attachment.sourceUrl || attachment.url || '新建标签页'
+    : attachment.path;
+  const prefix = typeof index === 'number' ? `${index}. ` : '';
+  return `${prefix}[${attachmentKindLabel(attachment)}] ${attachment.name}${location ? ` (${location})` : ''}`;
+}
+
+function inlineReferencedIds(text: string, type: 'ref' | 'skill') {
+  const ids = new Set<string>();
+  inlineReferenceTokenPattern.lastIndex = 0;
+  for (const match of text.matchAll(inlineReferenceTokenPattern)) {
+    if (match[1] === type) ids.add(decodeInlineReferenceId(match[2] || ''));
+  }
+  return ids;
+}
+
+function attachmentSummary(attachments?: BrowserChatAttachment[], options: { excludeIds?: Set<string> } = {}) {
+  const visibleAttachments = (attachments || []).filter((attachment) => !options.excludeIds?.has(attachment.id));
+  if (!visibleAttachments.length) return '';
   return [
-    '用户上传图片：',
-    ...attachments.map((attachment, index) => `${index + 1}. ${attachment.name} (${attachment.path})`),
+    '用户提供的引用：',
+    ...visibleAttachments.map((attachment, index) => attachmentPromptText(attachment, index + 1)),
   ].join('\n');
 }
 
+function contentWithInlineReferencesForPrompt(content: string, attachments: BrowserChatAttachment[] = [], skills: SkillRecord[] = []) {
+  const attachmentsById = new Map(attachments.map((attachment) => [attachment.id, attachment]));
+  const skillsById = new Map(skills.map((skill) => [skill.id, skill]));
+  return content.replace(inlineReferenceTokenPattern, (_match, type: string, rawId: string) => {
+    const id = decodeInlineReferenceId(rawId || '');
+    if (type === 'ref') {
+      const attachment = attachmentsById.get(id);
+      return attachment ? attachmentPromptText(attachment) : '';
+    }
+    const skill = skillsById.get(id);
+    return skill ? `[Skill] ${skill.title}${skill.description ? `：${skill.description}` : ''}` : '';
+  }).replace(/[ \t]{2,}/g, ' ').trim();
+}
+
 function messageContentForPrompt(message: BrowserChatMessage) {
-  const skillReferences = message.skillIds?.length
-    ? formatSkillReferencesForUser(store.getSkills(message.skillIds).filter((skill) => skill.status === 'ready'))
+  const selectedSkills = message.skillIds?.length
+    ? store.getSkills(message.skillIds).filter((skill) => skill.status === 'ready')
+    : [];
+  const text = textFromUnknown(message.content);
+  const referencedAttachmentIds = inlineReferencedIds(text, 'ref');
+  const skillReferences = selectedSkills.length
+    ? formatSkillReferencesForUser(selectedSkills)
     : '';
-  return [textFromUnknown(message.content), skillReferences, attachmentSummary(message.attachments)].filter(Boolean).join('\n\n');
+  return [
+    contentWithInlineReferencesForPrompt(text, message.attachments || [], selectedSkills),
+    skillReferences,
+    attachmentSummary(message.attachments, { excludeIds: referencedAttachmentIds }),
+  ].filter(Boolean).join('\n\n');
 }
 
 function stableConversationMessages(messages: BrowserChatMessage[]) {
@@ -1939,9 +2010,12 @@ export async function sendBrowserChatMessage(
   const skillIds = normalizeSkillIds(skillIdsInput);
   const selectedSkills = store.getSkills(skillIds).filter((skill) => skill.status === 'ready');
   if (!text && !attachments.length && !selectedSkills.length) throw new Error('Message is empty');
-  const messageText = text || (selectedSkills.length ? '请结合已选择的 Skills 继续处理当前任务。' : '请结合我上传的图片继续处理当前任务。');
+  const messageText = text || (selectedSkills.length ? '请结合已选择的 Skills 继续处理当前任务。' : '请结合我提供的引用继续处理当前任务。');
   const skillReferences = formatSkillReferencesForUser(selectedSkills);
-  const modelMessageText = [messageText, skillReferences].filter(Boolean).join('\n\n');
+  const referencedAttachmentIds = inlineReferencedIds(messageText, 'ref');
+  const inlineMessageText = contentWithInlineReferencesForPrompt(messageText, attachments, selectedSkills);
+  const attachmentReferences = attachmentSummary(attachments, { excludeIds: referencedAttachmentIds });
+  const modelMessageText = [inlineMessageText, skillReferences, attachmentReferences].filter(Boolean).join('\n\n');
   const normalizedClientMessageId = clientMessageId?.trim().slice(0, 120) || undefined;
   if (normalizedClientMessageId && session.messages.some((message) => message.clientMessageId === normalizedClientMessageId)) {
     return snapshot(session);
@@ -1956,7 +2030,7 @@ export async function sendBrowserChatMessage(
   session.modelProvider = modelSettings.provider;
   session.model = modelSettings.model;
   const firstUserMessage = !session.messages.some((message) => message.role === 'user');
-  if (firstUserMessage) session.title = compactText(messageText, 42);
+  if (firstUserMessage) session.title = compactText(inlineMessageText || messageText, 42);
 
   const timestamp = now();
   const fromStepIndex = Math.max(0, ...session.steps.map((step) => step.index)) + 1;
