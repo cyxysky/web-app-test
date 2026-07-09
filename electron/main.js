@@ -1,5 +1,6 @@
-const { app, BrowserWindow, WebContentsView, dialog, ipcMain, nativeTheme } = require('electron');
+const { app, BrowserWindow, WebContentsView, dialog, ipcMain, nativeTheme, shell } = require('electron');
 const { spawn } = require('node:child_process');
+const { once } = require('node:events');
 const fs = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
@@ -27,6 +28,9 @@ let embeddedBrowserFitAllowZoomIn = false;
 const EMBEDDED_BROWSER_ROUTE_LOADING_MS = 1200;
 let startupLogPath;
 let recentServerOutput = [];
+let lastDownloadDirectory = '';
+let nextDownloadId = 1;
+const systemDownloads = new Map();
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -169,6 +173,326 @@ function embeddedBrowserPlaceholderUrl() {
     '</html>',
   ].join('');
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
+const DOWNLOAD_URL_EXTENSIONS = new Set([
+  '.7z',
+  '.apk',
+  '.bin',
+  '.bz2',
+  '.csv',
+  '.deb',
+  '.dmg',
+  '.doc',
+  '.docx',
+  '.exe',
+  '.gz',
+  '.ipa',
+  '.msi',
+  '.pkg',
+  '.ppt',
+  '.pptx',
+  '.rar',
+  '.rpm',
+  '.tar',
+  '.tgz',
+  '.xls',
+  '.xlsx',
+  '.xz',
+  '.zip',
+]);
+
+function normalizeEmbeddedBrowserOpenUrl(value, baseUrl = '') {
+  const rawUrl = String(value || '').trim();
+  if (!rawUrl) return '';
+  try {
+    return new URL(rawUrl).toString();
+  } catch {
+    const base = String(baseUrl || '').trim();
+    if (!base) return '';
+    try {
+      return new URL(rawUrl, base).toString();
+    } catch {
+      return '';
+    }
+  }
+}
+
+function isBlankPageUrl(url) {
+  return /^about:blank(?:[#?].*)?$/i.test(String(url || '').trim());
+}
+
+function isEmbeddedBrowserWebLikeUrl(url) {
+  const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url);
+  if (!normalizedUrl) return false;
+  try {
+    const protocol = new URL(normalizedUrl).protocol;
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'about:' || protocol === 'data:' || protocol === 'file:' || protocol === 'blob:';
+  } catch {
+    return false;
+  }
+}
+
+function isDownloadLikeUrl(url, details = {}) {
+  if (String(details.disposition || '').toLowerCase() === 'save-to-disk') return true;
+  const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url);
+  if (!normalizedUrl) return false;
+  try {
+    const parsed = new URL(normalizedUrl);
+    const downloadValue = parsed.searchParams.get('download');
+    if (downloadValue !== null && !/^(0|false|no)$/i.test(downloadValue)) return true;
+    const attachmentValue = [
+      parsed.searchParams.get('content-disposition'),
+      parsed.searchParams.get('response-content-disposition'),
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (attachmentValue.includes('attachment')) return true;
+    const pathname = decodeURIComponent(parsed.pathname || '').toLowerCase();
+    const extension = pathname.match(/\.([a-z0-9]{1,8})$/)?.[0] || '';
+    return DOWNLOAD_URL_EXTENSIONS.has(extension);
+  } catch {
+    return false;
+  }
+}
+
+function downloadFileNameFromUrl(url) {
+  try {
+    const pathname = decodeURIComponent(new URL(url).pathname || '');
+    return path.basename(pathname);
+  } catch {
+    return '';
+  }
+}
+
+function sanitizeDownloadFileName(value) {
+  const basename = path.basename(String(value || '').trim()).replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim();
+  if (!basename || basename === '.' || basename === '..') return 'download';
+  return basename;
+}
+
+function uniqueDownloadPath(directory, fileName) {
+  const safeName = sanitizeDownloadFileName(fileName);
+  const extension = path.extname(safeName);
+  const stem = extension ? safeName.slice(0, -extension.length) : safeName;
+  let candidate = path.join(directory, safeName);
+  for (let index = 1; fs.existsSync(candidate); index += 1) {
+    candidate = path.join(directory, `${stem || 'download'} (${index})${extension}`);
+  }
+  return candidate;
+}
+
+function parseDownloadFileNameFromContentDisposition(value) {
+  const header = String(value || '');
+  const encoded = header.match(/filename\*\s*=\s*(?:UTF-8''|)([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded.trim().replace(/^"|"$/g, ''));
+    } catch {
+      return encoded.trim().replace(/^"|"$/g, '');
+    }
+  }
+  return header.match(/filename\s*=\s*"([^"]+)"/i)?.[1]
+    || header.match(/filename\s*=\s*([^;]+)/i)?.[1]?.trim()
+    || '';
+}
+
+function downloadProgressPayload(download) {
+  const totalBytes = Number(download.totalBytes || 0);
+  const receivedBytes = Number(download.receivedBytes || 0);
+  return {
+    completedAt: download.completedAt,
+    error: download.error,
+    fileName: download.fileName,
+    id: download.id,
+    path: download.path,
+    progress: totalBytes > 0 ? Math.max(0, Math.min(1, receivedBytes / totalBytes)) : undefined,
+    receivedBytes,
+    startedAt: download.startedAt,
+    status: download.status,
+    totalBytes: totalBytes || undefined,
+    updatedAt: download.updatedAt,
+    url: download.url,
+  };
+}
+
+function emitDownloadProgress(download) {
+  const payload = downloadProgressPayload(download);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('webpilot:system:download-progress', payload);
+  }
+  return payload;
+}
+
+function updateSystemDownload(download, patch = {}) {
+  Object.assign(download, patch, { updatedAt: Date.now() });
+  systemDownloads.set(download.id, download);
+  return emitDownloadProgress(download);
+}
+
+function systemDownloadState() {
+  return {
+    downloads: Array.from(systemDownloads.values())
+      .sort((left, right) => Number(right.startedAt || 0) - Number(left.startedAt || 0))
+      .map(downloadProgressPayload),
+    ok: true,
+  };
+}
+
+async function chooseDownloadDirectory(input = {}) {
+  const defaultPath = typeof input.defaultPath === 'string' && input.defaultPath.trim()
+    ? input.defaultPath.trim()
+    : (lastDownloadDirectory || undefined);
+  const result = await dialog.showOpenDialog(mainWindow, {
+    defaultPath,
+    properties: ['openDirectory', 'createDirectory'],
+    title: 'Select download directory',
+  });
+  if (result.canceled || !result.filePaths?.[0]) return { ok: true, canceled: true };
+  lastDownloadDirectory = result.filePaths[0];
+  return { ok: true, path: result.filePaths[0] };
+}
+
+async function downloadCookieHeader(webContents, url) {
+  try {
+    const cookies = await webContents?.session?.cookies?.get?.({ url });
+    if (!Array.isArray(cookies) || !cookies.length) return '';
+    return cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
+  } catch {
+    return '';
+  }
+}
+
+async function startElectronDownload(webContents, url, context, options = {}) {
+  const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url, mainWindow?.webContents?.getURL?.() || '');
+  if (!normalizedUrl) return { ok: false, error: 'Download URL is invalid.' };
+  const download = {
+    error: '',
+    fileName: sanitizeDownloadFileName(options.fileName || downloadFileNameFromUrl(normalizedUrl)),
+    id: `download:${Date.now()}:${nextDownloadId++}`,
+    path: '',
+    receivedBytes: 0,
+    startedAt: Date.now(),
+    status: 'selecting',
+    totalBytes: 0,
+    updatedAt: Date.now(),
+    url: normalizedUrl,
+  };
+  systemDownloads.set(download.id, download);
+  emitDownloadProgress(download);
+  let directory = String(options.directory || '').trim();
+  if (options.promptForDirectory || !directory) {
+    const selected = await chooseDownloadDirectory({ defaultPath: options.defaultPath });
+    if (!selected.ok || selected.canceled) {
+      updateSystemDownload(download, { completedAt: Date.now(), status: selected.canceled ? 'cancelled' : 'failed', error: selected.error || '' });
+      return selected;
+    }
+    directory = selected.path;
+  }
+  await fs.promises.mkdir(directory, { recursive: true });
+  updateSystemDownload(download, { status: 'pending' });
+  let savePath = '';
+  let fileStream;
+  try {
+    const headers = {};
+    const cookieHeader = await downloadCookieHeader(webContents, normalizedUrl);
+    if (cookieHeader) headers.Cookie = cookieHeader;
+    const userAgent = typeof webContents?.getUserAgent === 'function' ? webContents.getUserAgent() : '';
+    if (userAgent) headers['User-Agent'] = userAgent;
+    headers.Accept = '*/*';
+    const response = await fetch(normalizedUrl, {
+      headers,
+      redirect: 'follow',
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+    const responseUrl = response.url || normalizedUrl;
+    const fileName = sanitizeDownloadFileName(
+      options.fileName
+      || parseDownloadFileNameFromContentDisposition(response.headers.get('content-disposition'))
+      || downloadFileNameFromUrl(responseUrl)
+      || download.fileName,
+    );
+    const totalBytes = Number(response.headers.get('content-length') || 0);
+    savePath = uniqueDownloadPath(directory, fileName);
+    fileStream = fs.createWriteStream(savePath);
+    const fileStreamError = new Promise((_, reject) => {
+      fileStream.once('error', reject);
+    });
+    updateSystemDownload(download, {
+      fileName,
+      path: savePath,
+      status: 'downloading',
+      totalBytes: Number.isFinite(totalBytes) && totalBytes > 0 ? totalBytes : 0,
+    });
+
+    let receivedBytes = 0;
+    let lastEmitAt = 0;
+    const emitChunkProgress = () => {
+      const now = Date.now();
+      if (now - lastEmitAt < 160 && receivedBytes !== totalBytes) return;
+      lastEmitAt = now;
+      updateSystemDownload(download, { receivedBytes });
+    };
+
+    if (response.body?.getReader) {
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const buffer = Buffer.from(value);
+        receivedBytes += buffer.byteLength;
+        if (!fileStream.write(buffer)) await Promise.race([once(fileStream, 'drain'), fileStreamError]);
+        emitChunkProgress();
+      }
+    } else {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      receivedBytes = buffer.byteLength;
+      if (!fileStream.write(buffer)) await Promise.race([once(fileStream, 'drain'), fileStreamError]);
+      emitChunkProgress();
+    }
+
+    await Promise.race([
+      new Promise((resolve) => fileStream.end(resolve)),
+      fileStreamError,
+    ]);
+    updateSystemDownload(download, {
+      completedAt: Date.now(),
+      receivedBytes,
+      status: 'completed',
+      totalBytes: download.totalBytes || receivedBytes,
+    });
+    return { ok: true, path: savePath };
+  } catch (error) {
+    try {
+      if (fileStream) fileStream.destroy();
+      if (savePath && fs.existsSync(savePath)) fs.unlinkSync(savePath);
+    } catch {
+      // Best-effort cleanup of incomplete downloads.
+    }
+    appendLog(`${context} failed: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    updateSystemDownload(download, { completedAt: Date.now(), error: message, status: 'failed' });
+    return { ok: false, error: message };
+  }
+}
+
+function preferredDownloadWebContents() {
+  const embeddedTab = activeEmbeddedBrowserTab();
+  if (embeddedBrowserVisible && embeddedTab && !embeddedTab.view.webContents.isDestroyed()) {
+    return embeddedTab.view.webContents;
+  }
+  return mainWindow?.webContents;
+}
+
+async function openAppShellUrlInEmbeddedBrowser(url) {
+  const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url, mainWindow?.webContents?.getURL?.() || '');
+  if (!normalizedUrl || isBlankPageUrl(normalizedUrl)) return;
+  if (!isEmbeddedBrowserWebLikeUrl(normalizedUrl)) {
+    await shell.openExternal(normalizedUrl);
+    return;
+  }
+  const result = await createManualEmbeddedBrowserTab({ url: normalizedUrl });
+  if (result && result.ok === false) appendLog(`App shell link open failed: ${result.error || 'unknown error'}`);
 }
 
 function embeddedBrowserTabTitle(webContents) {
@@ -359,13 +683,32 @@ function scheduleEmbeddedBrowserFitForTab(tab, delayMs = 180, options = {}) {
 
 function installEmbeddedBrowserTabHandlers(tab) {
   const { view } = tab;
-  view.webContents.setWindowOpenHandler(({ url }) => {
-    const popupTab = createEmbeddedBrowserTab({ groupId: tab.groupId, sessionId: tab.sessionId });
-    loadEmbeddedBrowserTabUrl(popupTab, url || embeddedBrowserPlaceholderUrl())
+  view.webContents.setWindowOpenHandler((details) => {
+    const url = String(details.url || '').trim();
+    const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url, view.webContents.getURL() || '');
+    if (!normalizedUrl || isBlankPageUrl(normalizedUrl)) return { action: 'deny' };
+    if (isDownloadLikeUrl(normalizedUrl, details)) {
+      startElectronDownload(view.webContents, normalizedUrl, 'Embedded browser popup download', { promptForDirectory: true })
+        .then((result) => {
+          if (result?.ok === false) appendLog(`Embedded browser popup download failed: ${result.error || 'unknown error'}`);
+        })
+        .catch((error) => appendLog(`Embedded browser popup download failed: ${error instanceof Error ? error.message : String(error)}`));
+      return { action: 'deny' };
+    }
+    let popupTab;
+    try {
+      popupTab = createEmbeddedBrowserTab({ groupId: tab.groupId, sessionId: tab.sessionId, url: normalizedUrl });
+    } catch (error) {
+      appendLog(`Embedded browser popup tab create failed: ${error instanceof Error ? error.message : String(error)}`);
+      return { action: 'deny' };
+    }
+    if (embeddedBrowserVisible) {
+      attachEmbeddedBrowserView({ id: popupTab.id });
+    } else {
+      setActiveEmbeddedBrowserTab(popupTab);
+    }
+    ensureEmbeddedBrowserTabReady(popupTab)
       .then(() => {
-        if (embeddedBrowserVisible && embeddedBrowserActiveGroupId === popupTab.groupId) {
-          attachEmbeddedBrowserView({ id: popupTab.id });
-        }
         scheduleEmbeddedBrowserFitForTab(popupTab, 180, { allowZoomIn: true });
       })
       .catch((error) => appendLog(`Embedded browser popup navigation failed: ${error.message}`));
@@ -421,6 +764,11 @@ function createEmbeddedBrowserTab(input = {}) {
   const group = ensureEmbeddedBrowserGroup(input);
   const sessionId = embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || normalizeEmbeddedBrowserSessionId(input.sessionId);
   const tabId = input.id || `tab:${embeddedBrowserNextTabId++}`;
+  const rawInitialUrl = String(input.url || '').trim();
+  const initialUrl = rawInitialUrl
+    ? normalizeEmbeddedBrowserOpenUrl(rawInitialUrl, mainWindow?.webContents?.getURL?.() || '')
+    : embeddedBrowserPlaceholderUrl();
+  if (rawInitialUrl && !initialUrl) throw new Error(`Invalid embedded browser URL: ${rawInitialUrl}`);
   const view = new WebContentsView({
     webPreferences: {
       contextIsolation: true,
@@ -443,8 +791,8 @@ function createEmbeddedBrowserTab(input = {}) {
   embeddedBrowserTabs.set(tab.id, tab);
   group.activeTabId = tab.id;
   installEmbeddedBrowserTabHandlers(tab);
-  tab.readyPromise = loadEmbeddedBrowserTabUrl(tab, embeddedBrowserPlaceholderUrl()).catch((error) => {
-    appendLog(`Embedded browser placeholder load failed: ${error.message}`);
+  tab.readyPromise = loadEmbeddedBrowserTabUrl(tab, initialUrl).catch((error) => {
+    appendLog(`Embedded browser initial load failed: ${error.message}`);
   });
   return tab;
 }
@@ -846,10 +1194,16 @@ function moveEmbeddedBrowserTab(input = {}) {
 async function createManualEmbeddedBrowserTab(input = {}) {
   const group = ensureEmbeddedBrowserGroup(input);
   const sessionId = embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || normalizeEmbeddedBrowserSessionId(input.sessionId);
-  const tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId });
+  const rawUrl = String(input.url || '').trim();
+  const url = rawUrl ? normalizeEmbeddedBrowserOpenUrl(rawUrl, mainWindow?.webContents?.getURL?.() || '') : '';
+  if (rawUrl && !url) throw new Error(`Invalid embedded browser URL: ${rawUrl}`);
+  const tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId, url });
   if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id: tab.id });
   else setActiveEmbeddedBrowserTab(tab);
-  await ensureEmbeddedBrowserTabReady(tab);
+  ensureEmbeddedBrowserTabReady(tab)
+    .then(() => scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true }))
+    .catch((error) => appendLog(`Embedded browser tab ready failed: ${error instanceof Error ? error.message : String(error)}`));
+  scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   return embeddedBrowserState();
 }
 
@@ -1044,6 +1398,29 @@ function registerSystemIpc() {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
+
+  ipcMain.handle('webpilot:system:download-url', async (_event, input = {}) => {
+    try {
+      const url = String(input.url || '').trim();
+      if (!url) throw new Error('Download URL is required.');
+      const webContents = preferredDownloadWebContents();
+      return await startElectronDownload(webContents, url, 'Selected directory download', {
+        defaultPath: typeof input.defaultPath === 'string' ? input.defaultPath : undefined,
+        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+        promptForDirectory: true,
+      });
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:system:get-downloads', async () => {
+    try {
+      return systemDownloadState();
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
 }
 
 async function startServer(appDataDir) {
@@ -1124,6 +1501,23 @@ function createWindow() {
     },
   });
   mainWindow.setMenuBarVisibility(false);
+  mainWindow.webContents.setWindowOpenHandler((details) => {
+    const url = String(details.url || '').trim();
+    if (!url) return { action: 'deny' };
+    const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url, mainWindow.webContents.getURL() || '');
+    if (!normalizedUrl || isBlankPageUrl(normalizedUrl)) return { action: 'deny' };
+    if (isDownloadLikeUrl(normalizedUrl, details)) {
+      startElectronDownload(preferredDownloadWebContents(), normalizedUrl, 'App shell download', { promptForDirectory: true })
+        .then((result) => {
+          if (result?.ok === false) appendLog(`App shell download failed: ${result.error || 'unknown error'}`);
+        })
+        .catch((error) => appendLog(`App shell download failed: ${error instanceof Error ? error.message : String(error)}`));
+      return { action: 'deny' };
+    }
+    openAppShellUrlInEmbeddedBrowser(normalizedUrl)
+      .catch((error) => appendLog(`App shell link open failed: ${error instanceof Error ? error.message : String(error)}`));
+    return { action: 'deny' };
+  });
   const loadingHtml = `
     <style>
       * { box-sizing: border-box; }

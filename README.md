@@ -100,6 +100,3 @@ npx electron .
 
 gpt-5.3-codex-spark
 
-Open page timed out after 6000ms before navigation committed 不是浏览器限制，是项目自己写的 openPage 硬超时。
-在 [browser-session.ts (line 33)](C:/Users/chenjf/Desktop/test2/web-app-test/src/server/browser/browser-session.ts:33) 里默认 DEFAULT_BROWSER_OPEN_TIMEOUT_MS = 6000，然后 [open() (line 3737)](C:/Users/chenjf/Desktop/test2/web-app-test/src/server/browser/browser-session.ts:3737) 用 page.goto(url, { waitUntil: 'commit', timeout: timeoutMs })，同时又 Promise.race 了一个 6000ms 的 hard timeout。
-所以只要 6 秒内连“导航提交 commit”都没发生，且 URL 还是空白页或未变化，就会返回这个错误。这个值可以通过 BROWSER_OPEN_TIMEOUT_MS 调，代码限制范围是 1000-30000。

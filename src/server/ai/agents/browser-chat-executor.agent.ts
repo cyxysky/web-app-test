@@ -15,12 +15,14 @@ import {
   compactStaleReadObservationMessages,
   decodeRuntimeObservationCursor,
   encodeRuntimeObservationCursor,
+  invalidateRuntimeObservation,
   observationPreviewLimit,
   observationStoreKey,
   readRuntimeObservation,
   restoreRuntimeObservationStore,
   runtimeObservationAvailableTypes,
   runtimeObservationCount,
+  runtimeObservationInvalidatingToolNames,
   runtimeObservationToolNames,
   storeRuntimeObservation,
   type RuntimeObservationReadOptions,
@@ -1822,6 +1824,7 @@ function makeBrowserTools(
     }
     toolExecutionGate.executed = true;
     const pendingConfirmation = referenceOptions?.requestToolConfirmation ? toolConfirmationFromInput(name, input) : undefined;
+    let browserActionExecuted = false;
     const actionWithConfirmation = async () => {
       if (pendingConfirmation && referenceOptions?.requestToolConfirmation) {
         const decision = await referenceOptions.requestToolConfirmation({
@@ -1839,6 +1842,7 @@ function makeBrowserTools(
           } satisfies BrowserActionResult;
         }
       }
+      browserActionExecuted = true;
       return action();
     };
     const traceVisualContext = referenceOptions?.visualContext;
@@ -1857,7 +1861,12 @@ function makeBrowserTools(
       onToolTrace,
       onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
       action: actionWithConfirmation,
-    }).then((result) => compactToolResultForModel(name, result, referenceOptions?.observationStore, referenceOptions?.runId));
+    }).then((result) => {
+      if (browserActionExecuted && runtimeObservationInvalidatingToolNames.has(name)) {
+        invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
+      }
+      return compactToolResultForModel(name, result, referenceOptions?.observationStore, referenceOptions?.runId);
+    });
   }
 
   const sharedTools = {
@@ -3005,7 +3014,8 @@ async function executeRuntimeStep(input: {
       const requestedView = decodedCursor?.view || options.view || 'actions';
       const storedRecord = observationStore.get(observationStoreKey(input.runId));
       const maxChars = Math.max(10000, Math.floor(Number(options.maxChars) || 10000));
-      const shouldRefresh = options.refresh === true || (!storedRecord && !decodedCursor && options.offset === undefined);
+      const storedRecordIsStale = storedRecord?.stale === true;
+      const shouldRefresh = options.refresh === true || ((!storedRecord || storedRecordIsStale) && !decodedCursor && options.offset === undefined);
       if (!shouldRefresh && !decodedCursor) {
         return readRuntimeObservation(observationStore, input.runId, options.offset, options.maxChars, requestedView);
       }
@@ -3016,6 +3026,9 @@ async function executeRuntimeStep(input: {
         }
         if (storedRecord.generation !== decodedCursor.generation) {
           return { ok: false, actual: `Stale readObservation cursor: cursor generation ${decodedCursor.generation}, current generation ${storedRecord.generation}. Refresh with readObservation({refresh:true,view:"actions",maxChars:10000}).` };
+        }
+        if (storedRecord.stale) {
+          return { ok: false, actual: `Stale readObservation cursor: current generation ${storedRecord.generation} was invalidated after ${storedRecord.staleReason || 'a browser action'}. Refresh with readObservation({refresh:true,view:"actions",maxChars:10000}).` };
         }
       }
 

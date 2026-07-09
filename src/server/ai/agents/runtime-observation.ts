@@ -2,7 +2,21 @@ import type { ModelMessage } from 'ai';
 import type { BrowserActionResult, BrowserObservationType } from '@/server/browser/browser-session';
 
 export const runtimeObservationToolNames = new Set(['readObservation']);
-export const staleReadObservationText = 'Stale: this old readObservation result was replaced by a later refreshed observation. Use readObservation({refresh:true,view:"actions",maxChars:10000}) for fresh actionable nodes, or continue the current observation with its nextCursor.';
+export const staleReadObservationText = 'Stale: this old readObservation result was replaced by a later refreshed observation or invalidated by a browser action. Use readObservation({refresh:true,view:"actions",maxChars:10000}) for fresh actionable nodes, or continue the current observation with its nextCursor only when no browser action happened after it.';
+export const runtimeObservationInvalidatingToolNames = new Set([
+  'openPage',
+  'scrollArea',
+  'typeText',
+  'pressKey',
+  'waitForPage',
+  'waitForHumanVerification',
+  'switchTab',
+  'clickDomNode',
+  'fillDomNodes',
+  'hoverDomNode',
+  'doubleClickDomNode',
+  'dragDomNode',
+]);
 
 export type RuntimeObservationRecord = {
   runId: string;
@@ -13,6 +27,9 @@ export type RuntimeObservationRecord = {
   views: Partial<Record<BrowserObservationType, string>>;
   totalChars: number;
   viewCharLengths: Partial<Record<BrowserObservationType, number>>;
+  stale?: boolean;
+  staleReason?: string;
+  invalidatedAt?: string;
 };
 
 export type RuntimeObservationStore = Map<string, RuntimeObservationRecord>;
@@ -97,6 +114,14 @@ export function restoreRuntimeObservationStore(target: RuntimeObservationStore, 
   const cloned = cloneRuntimeObservationStore(source);
   if (!cloned) return;
   for (const [key, record] of cloned) target.set(key, record);
+}
+
+export function invalidateRuntimeObservation(store: RuntimeObservationStore | undefined, runId: string | undefined, reason: string) {
+  const record = store?.get(observationStoreKey(runId));
+  if (!record) return;
+  record.stale = true;
+  record.staleReason = reason;
+  record.invalidatedAt = new Date().toISOString();
 }
 
 function normalizeObservationViews(
@@ -315,6 +340,12 @@ export function readRuntimeObservation(
   if (!record) {
     return { ok: false, actual: 'No current DOM observation is available for this run. Call readObservation({refresh:true,view:"actions",maxChars:10000}) first.' };
   }
+  if (record.stale) {
+    return {
+      ok: false,
+      actual: `Current DOM observation generation ${record.generation} is stale${record.staleReason ? ` after ${record.staleReason}` : ''}${record.invalidatedAt ? ` at ${record.invalidatedAt}` : ''}. Refresh with readObservation({refresh:true,view:"actions",maxChars:10000}) before using actionable node_id values.`,
+    };
+  }
   const selectedType = view || record.defaultType || 'actions';
   const text = record.views[selectedType];
   const availableTypes = runtimeObservationAvailableTypes(record);
@@ -388,6 +419,11 @@ function modelToolPartRefreshesObservation(part: unknown) {
   return false;
 }
 
+function modelToolPartInvalidatesObservation(part: unknown) {
+  const name = modelToolPartName(part);
+  return Boolean(name && runtimeObservationInvalidatingToolNames.has(name));
+}
+
 function modelToolPartType(part: unknown) {
   if (!part || typeof part !== 'object' || Array.isArray(part)) return undefined;
   const type = (part as Record<string, unknown>).type;
@@ -443,7 +479,7 @@ function compactStaleReadObservationPart(part: unknown): unknown {
 
 export function compactStaleReadObservationMessages<T extends ModelMessage>(messages: T[]) {
   let position = 0;
-  let lastObservationRefreshPosition = -1;
+  let staleBoundaryPosition = -1;
   for (const message of messages) {
     const parts = modelMessageContentParts(message);
     if (!parts) {
@@ -451,11 +487,13 @@ export function compactStaleReadObservationMessages<T extends ModelMessage>(mess
       continue;
     }
     for (const part of parts) {
-      if (modelToolPartRefreshesObservation(part)) lastObservationRefreshPosition = position;
+      if (modelToolPartRefreshesObservation(part) || modelToolPartInvalidatesObservation(part)) {
+        staleBoundaryPosition = position;
+      }
       position += 1;
     }
   }
-  if (lastObservationRefreshPosition < 0) return messages;
+  if (staleBoundaryPosition < 0) return messages;
 
   position = 0;
   let changed = false;
@@ -470,7 +508,7 @@ export function compactStaleReadObservationMessages<T extends ModelMessage>(mess
       const currentPosition = position;
       position += 1;
       if (
-        currentPosition < lastObservationRefreshPosition
+        currentPosition < staleBoundaryPosition
         && modelToolPartType(part) === 'tool-result'
         && modelToolPartName(part) === 'readObservation'
       ) {

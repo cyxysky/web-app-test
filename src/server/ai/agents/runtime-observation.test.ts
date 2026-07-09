@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   cloneRuntimeObservationStore,
+  compactStaleReadObservationMessages,
   decodeRuntimeObservationCursor,
   encodeRuntimeObservationCursor,
+  invalidateRuntimeObservation,
   readRuntimeObservation,
   restoreRuntimeObservationStore,
+  staleReadObservationText,
   storeRuntimeObservation,
   type RuntimeObservationStore,
 } from './runtime-observation';
@@ -89,4 +92,67 @@ test('clone and restore keep observation stores isolated', () => {
   assert.equal(read.ok, true);
   assert.match(String(read.actual), /source page/);
   assert.doesNotMatch(String(read.actual), /changed page/);
+});
+
+test('invalidated observations cannot be reused without a refresh', () => {
+  const store: RuntimeObservationStore = new Map();
+  storeRuntimeObservation(store, 'run-1', 'readObservation', 'first page', {
+    defaultType: 'actions',
+    actions: '<button node_id=1 data-ai-interactive="true">Open</button>',
+    text: 'First page',
+  });
+
+  invalidateRuntimeObservation(store, 'run-1', 'clickDomNode');
+  const staleRead = readRuntimeObservation(store, 'run-1', 0, 10000, 'actions');
+
+  assert.equal(staleRead.ok, false);
+  assert.match(String(staleRead.actual), /stale/);
+  assert.match(String(staleRead.actual), /clickDomNode/);
+
+  storeRuntimeObservation(store, 'run-1', 'readObservation', 'second page', {
+    defaultType: 'actions',
+    actions: '<button node_id=2 data-ai-interactive="true">Save</button>',
+    text: 'Second page',
+  });
+  const changes = readRuntimeObservation(store, 'run-1', 0, 10000, 'changes');
+
+  assert.equal(changes.ok, true);
+  assert.match(String(changes.actual), /Previous generation: 1/);
+  assert.match(String(changes.actual), /Current generation: 2/);
+  assert.match(String(changes.actual), /node_id=2/);
+});
+
+test('compactStaleReadObservationMessages stales read results before browser actions', () => {
+  type RuntimeObservationTestMessage = Parameters<typeof compactStaleReadObservationMessages>[0][number];
+  const toolActual = (message: unknown) => {
+    const content = (message as { content?: unknown }).content;
+    assert.ok(Array.isArray(content));
+    const [part] = content as Array<{ output?: { value?: { actual?: unknown } } }>;
+    const actual = part.output?.value?.actual;
+    assert.equal(typeof actual, 'string');
+    return actual;
+  };
+  const messages = [
+    {
+      role: 'assistant',
+      content: [{ type: 'tool-call', toolCallId: 'read-1', toolName: 'readObservation', input: { refresh: true } }],
+    },
+    {
+      role: 'tool',
+      content: [{ type: 'tool-result', toolCallId: 'read-1', toolName: 'readObservation', output: { type: 'json', value: { ok: true, actual: 'old node_id=1' } } }],
+    },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool-call', toolCallId: 'click-1', toolName: 'clickDomNode', input: { id: '1' } }],
+    },
+    {
+      role: 'tool',
+      content: [{ type: 'tool-result', toolCallId: 'click-1', toolName: 'clickDomNode', output: { type: 'json', value: { ok: true, actual: 'clicked' } } }],
+    },
+  ];
+
+  const compacted = compactStaleReadObservationMessages(messages as RuntimeObservationTestMessage[]);
+
+  assert.equal(toolActual(compacted[1]), staleReadObservationText);
+  assert.equal(toolActual(compacted[3]), 'clicked');
 });

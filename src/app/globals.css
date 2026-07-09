@@ -6387,6 +6387,177 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   grid-template-columns: 64px minmax(0, 1fr);
 }
 
+.browser-chat-download-center {
+  position: relative;
+  z-index: 2;
+}
+
+.browser-chat-download-button {
+  backdrop-filter: blur(14px) saturate(1.1);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.12);
+  position: relative;
+}
+
+.browser-chat-download-button.active {
+  color: var(--accent);
+}
+
+.browser-chat-download-badge {
+  align-items: center;
+  background: #ef4444;
+  border: 2px solid var(--panel);
+  border-radius: 999px;
+  color: white;
+  display: flex;
+  font-size: 10px;
+  font-weight: 800;
+  height: 18px;
+  justify-content: center;
+  min-width: 18px;
+  padding: 0 4px;
+  position: absolute;
+  right: -6px;
+  top: -6px;
+}
+
+.browser-chat-download-popover {
+  animation: browser-chat-download-popover-in 0.18s ease-out;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg);
+  color: var(--foreground);
+  margin-top: 10px;
+  max-height: min(520px, calc(100vh - 88px));
+  overflow: hidden;
+  pointer-events: auto;
+  position: absolute;
+  right: 0;
+  top: 100%;
+  transform-origin: top right;
+  width: min(var(--browser-chat-download-panel-width, 380px), calc(100vw - 48px));
+}
+
+@keyframes browser-chat-download-popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.975);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.browser-chat-download-popover header {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 12px;
+}
+
+.browser-chat-download-popover header strong {
+  font-size: 14px;
+}
+
+.browser-chat-download-list {
+  display: grid;
+  gap: 0;
+  list-style: none;
+  margin: 0;
+  max-height: 455px;
+  overflow: auto;
+  padding: 0;
+}
+
+.browser-chat-download-item {
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.browser-chat-download-item:last-child {
+  border-bottom: 0;
+}
+
+.browser-chat-download-item-head {
+  align-items: center;
+  display: grid;
+  gap: 9px;
+  grid-template-columns: 22px minmax(0, 1fr);
+}
+
+.browser-chat-download-status-icon {
+  align-items: center;
+  color: var(--muted-foreground);
+  display: flex;
+  justify-content: center;
+}
+
+.browser-chat-download-item.completed .browser-chat-download-status-icon {
+  color: #16a34a;
+}
+
+.browser-chat-download-item.failed .browser-chat-download-status-icon {
+  color: #dc2626;
+}
+
+.browser-chat-download-item-head strong,
+.browser-chat-download-item-head span,
+.browser-chat-download-meta span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-chat-download-item-head strong {
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.browser-chat-download-item-head span,
+.browser-chat-download-meta {
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
+.browser-chat-download-progress {
+  background: color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 999px;
+  height: 6px;
+  overflow: hidden;
+}
+
+.browser-chat-download-progress span {
+  background: var(--accent);
+  border-radius: inherit;
+  display: block;
+  height: 100%;
+  min-width: 0;
+  transition: width 0.18s ease;
+}
+
+.browser-chat-download-meta {
+  display: grid;
+  gap: 3px;
+}
+
+.browser-chat-download-meta .error {
+  color: #dc2626;
+}
+
+.browser-chat-download-empty {
+  color: var(--muted-foreground);
+  font-size: 13px;
+  padding: 22px 14px;
+  text-align: center;
+}
+
 .browser-chat-sidebar {
   background: rgba(255, 255, 255, 0.74);
   border-right: 1px solid var(--border);
@@ -6898,7 +7069,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-embedded-browser {
   background: #edf0f3;
   display: grid;
-  grid-template-rows: 92px minmax(0, 1fr);
+  grid-template-rows: 84px minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
   overflow: hidden;
@@ -6908,12 +7079,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-embedded-browser header {
   background:
-    linear-gradient(180deg, rgba(253, 254, 255, 0.86), rgba(233, 237, 242, 0.78)),
-    color-mix(in srgb, var(--panel) 72%, #d9dee6);
-  backdrop-filter: blur(18px) saturate(1.18);
+    linear-gradient(180deg, rgba(252, 253, 255, 0.9), rgba(234, 238, 244, 0.84)),
+    color-mix(in srgb, var(--panel) 74%, #d9dee6);
+  backdrop-filter: blur(16px) saturate(1.12);
   border-bottom: 1px solid rgba(120, 132, 148, 0.24);
   display: grid;
-  grid-template-rows: 42px 49px;
+  grid-template-rows: 40px 43px;
   min-width: 0;
   overflow: hidden;
   padding: 0;
@@ -6955,7 +7126,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: transparent;
   min-width: 0;
   overflow: hidden;
-  padding: 7px 12px 0;
+  padding: 7px 18px 0;
 }
 
 .browser-chat-embedded-tab-list {
@@ -6963,8 +7134,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: transparent;
   display: flex;
   flex: 1 1 auto;
-  gap: 3px;
-  height: 35px;
+  gap: 6px;
+  height: 32px;
   min-width: 0;
   overflow-x: hidden;
   overflow-y: hidden;
@@ -6976,7 +7147,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: inline-flex;
   flex: 1 1 0;
   gap: 6px;
-  height: 35px;
+  height: 32px;
   min-width: 0;
   padding-top: 0;
   position: relative;
@@ -7001,11 +7172,11 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     inset 0 1px 0 rgba(255, 255, 255, 0.42);
   color: color-mix(in srgb, var(--foreground) 54%, var(--muted));
   display: inline-flex;
-  flex: 0 0 38px;
+  flex: 0 0 44px;
   gap: 0;
-  height: 30px;
-  max-width: 38px;
-  min-width: 38px;
+  height: 32px;
+  max-width: 44px;
+  min-width: 44px;
   overflow: hidden;
   position: relative;
   transition:
@@ -7029,7 +7200,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   color: inherit;
   cursor: pointer;
   display: inline-flex;
-  flex: 0 0 36px;
+  flex: 0 0 42px;
   font-size: 13px;
   font-weight: 500;
   gap: 1px;
@@ -7072,9 +7243,9 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: rgba(255, 255, 255, 0.5);
   border-color: rgba(92, 105, 124, 0.18);
   color: var(--accent-strong);
-  flex-basis: 84px;
-  max-width: 84px;
-  min-width: 84px;
+  flex-basis: 92px;
+  max-width: 92px;
+  min-width: 92px;
 }
 
 .browser-chat-embedded-tab-group-label:focus-visible {
@@ -7130,7 +7301,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   align-items: flex-end;
   display: inline-flex;
   flex: 1 1 auto;
-  gap: 3px;
+  gap: 6px;
   min-width: 0;
 }
 
@@ -7151,9 +7322,9 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: inline-flex;
   flex: 1 1 170px;
   gap: 8px;
-  height: 30px;
+  height: 32px;
   isolation: isolate;
-  max-width: 204px;
+  max-width: 220px;
   min-width: 28px;
   overflow: hidden;
   padding: 0 30px 0 11px;
@@ -7323,11 +7494,11 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: transparent;
   border-top: 0;
   display: grid;
-  gap: 10px;
+  gap: 12px;
   grid-template-columns: auto minmax(0, 1fr);
-  height: 49px;
+  height: 43px;
   min-width: 0;
-  padding: 6px 12px 10px;
+  padding: 5px 18px 7px;
   position: relative;
   width: 100%;
 }
@@ -7345,7 +7516,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   cursor: pointer;
   display: inline-flex;
   flex: 0 0 auto;
-  height: 34px;
+  height: 32px;
   justify-content: center;
   padding: 0;
   transition:
@@ -7354,11 +7525,11 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     box-shadow 0.16s ease,
     color 0.16s ease,
     transform 0.16s ease;
-  width: 34px;
+  width: 32px;
 }
 
 .browser-chat-embedded-tool-button:not(:disabled):hover {
-  background: rgba(255, 255, 255, 0.46);
+  background: rgba(255, 255, 255, 0.42);
   border-color: transparent;
   box-shadow: none;
   color: var(--accent-strong);
@@ -7379,14 +7550,14 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-embedded-nav-controls {
   align-items: center;
-  background: rgba(255, 255, 255, 0.34);
+  background: rgba(255, 255, 255, 0.36);
   border: 1px solid rgba(118, 130, 148, 0.2);
   border-radius: 999px;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.42);
   display: inline-flex;
   flex: 0 0 auto;
   gap: 1px;
-  height: 34px;
+  height: 32px;
   min-width: 0;
   padding: 0;
 }
@@ -7394,16 +7565,16 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-embedded-address-bar {
   align-items: center;
   align-self: center;
-  background: rgba(255, 255, 255, 0.66);
+  background: rgba(255, 255, 255, 0.58);
   border: 1px solid rgba(118, 130, 148, 0.24);
   border-radius: 999px;
   color: var(--muted-strong);
   display: flex;
-  gap: 7px;
-  height: 34px;
+  gap: 8px;
+  height: 32px;
   justify-self: stretch;
   min-width: 0;
-  padding: 0 13px;
+  padding: 0 14px;
   transition:
     background 0.16s ease,
     border-color 0.16s ease,
@@ -7443,6 +7614,52 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-embedded-address-bar input:disabled {
   color: var(--muted);
   cursor: default;
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-browser {
+  background: #0b0f15;
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-browser header {
+  background:
+    linear-gradient(180deg, rgba(29, 35, 45, 0.94), rgba(18, 23, 31, 0.94)),
+    #11151d;
+  border-bottom-color: rgba(255, 255, 255, 0.08);
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-tab-group-tag,
+:root[data-theme="dark"] .browser-chat-embedded-nav-controls,
+:root[data-theme="dark"] .browser-chat-embedded-address-bar {
+  background: rgba(255, 255, 255, 0.075);
+  border-color: rgba(255, 255, 255, 0.11);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag,
+:root[data-theme="dark"] .browser-chat-embedded-tab.active {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.13);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 1px 4px rgba(0, 0, 0, 0.18);
+  color: var(--foreground);
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-tab {
+  color: var(--muted-strong);
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-tab:hover,
+:root[data-theme="dark"] .browser-chat-embedded-tab-group-tag:hover,
+:root[data-theme="dark"] .browser-chat-embedded-tool-button:not(:disabled):hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.12);
+  color: var(--foreground);
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-address-bar:focus-within {
+  background: rgba(255, 255, 255, 0.13);
+  border-color: color-mix(in srgb, var(--accent) 52%, var(--border));
 }
 
 @media (max-width: 1120px) {
@@ -7621,9 +7838,25 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   padding: 18px 14px 20px;
 }
 
+.browser-chat-pane-actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  position: absolute;
+  right: 18px;
+  top: 18px;
+  z-index: 18;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-pane-actions {
+  right: 14px;
+  top: 16px;
+}
+
 .browser-chat-chat-pane.embedded-chat .browser-chat-message-list {
   max-width: none;
-  padding-top: 42px;
+  padding-top: 58px;
   width: 100%;
 }
 
@@ -7678,9 +7911,6 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: inline-flex;
   height: 36px;
   justify-content: center;
-  position: absolute;
-  right: 22px;
-  top: 22px;
   width: 36px;
 }
 

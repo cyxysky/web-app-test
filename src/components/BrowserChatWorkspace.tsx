@@ -1,8 +1,9 @@
 'use client';
 
-import { memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   AppWindow,
+  AlertCircle,
   ArrowLeft,
   ArrowRight,
   BadgeCheck,
@@ -14,6 +15,8 @@ import {
   ClipboardCheck,
   Compass,
   CornerDownLeft,
+  CheckCircle2,
+  Download,
   FileSearch,
   Folder,
   GalleryHorizontalEnd,
@@ -279,12 +282,29 @@ type EmbeddedBrowserState = EmbeddedBrowserBridgeResult & {
   zoomFactor?: number;
 };
 
+type SystemDownloadStatus = 'selecting' | 'pending' | 'downloading' | 'completed' | 'cancelled' | 'failed' | string;
+
+type SystemDownloadItem = {
+  completedAt?: number;
+  error?: string;
+  fileName?: string;
+  id: string;
+  path?: string;
+  progress?: number;
+  receivedBytes?: number;
+  startedAt?: number;
+  status?: SystemDownloadStatus;
+  totalBytes?: number;
+  updatedAt?: number;
+  url?: string;
+};
+
 type EmbeddedBrowserBridge = {
   activateTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   closeActiveTab: () => Promise<EmbeddedBrowserBridgeResult>;
   closeGroup: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   closeTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
-  createTab: (input: { groupId?: string; sessionId?: string }) => Promise<EmbeddedBrowserState>;
+  createTab: (input: { groupId?: string; sessionId?: string; url?: string }) => Promise<EmbeddedBrowserState>;
   getState: () => Promise<EmbeddedBrowserState>;
   goBack: () => Promise<EmbeddedBrowserState>;
   goForward: () => Promise<EmbeddedBrowserState>;
@@ -868,6 +888,85 @@ function normalizeChatMarkdown(markdown: string) {
     .trim();
 }
 
+const BROWSER_CHAT_DOWNLOAD_EXTENSIONS = new Set([
+  '.7z',
+  '.apk',
+  '.bin',
+  '.bz2',
+  '.csv',
+  '.deb',
+  '.dmg',
+  '.doc',
+  '.docx',
+  '.exe',
+  '.gz',
+  '.ipa',
+  '.msi',
+  '.pkg',
+  '.ppt',
+  '.pptx',
+  '.rar',
+  '.rpm',
+  '.tar',
+  '.tgz',
+  '.xls',
+  '.xlsx',
+  '.xz',
+  '.zip',
+]);
+
+function normalizeBrowserChatMarkdownHref(href: string) {
+  const trimmed = href.trim();
+  if (!trimmed) return '';
+  if (/^[./?#/]/.test(trimmed)) {
+    try {
+      return new URL(trimmed, typeof window === 'undefined' ? 'http://127.0.0.1/' : window.location.href).toString();
+    } catch {
+      return '';
+    }
+  }
+  return normalizeEmbeddedBrowserAddress(trimmed);
+}
+
+function isBrowserChatDownloadHref(href: string) {
+  const normalizedHref = normalizeBrowserChatMarkdownHref(href);
+  if (!normalizedHref) return false;
+  try {
+    const parsed = new URL(normalizedHref);
+    const downloadValue = parsed.searchParams.get('download');
+    if (downloadValue !== null && !/^(0|false|no)$/i.test(downloadValue)) return true;
+    const attachmentValue = [
+      parsed.searchParams.get('content-disposition'),
+      parsed.searchParams.get('response-content-disposition'),
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (attachmentValue.includes('attachment')) return true;
+    const pathname = decodeURIComponent(parsed.pathname || '').toLowerCase();
+    const extension = pathname.match(/\.([a-z0-9]{1,8})$/)?.[0] || '';
+    return BROWSER_CHAT_DOWNLOAD_EXTENSIONS.has(extension);
+  } catch {
+    return false;
+  }
+}
+
+function handleBrowserChatMarkdownLinkClick(event: ReactMouseEvent<HTMLAnchorElement>, href?: string) {
+  const rawHref = String(href || '').trim();
+  if (!rawHref || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (rawHref.startsWith('#') || /^(javascript|mailto|tel):/i.test(rawHref)) return;
+  const url = normalizeBrowserChatMarkdownHref(rawHref);
+  if (!url) return;
+  if (isBrowserChatDownloadHref(rawHref)) {
+    const systemBridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
+    if (!systemBridge?.downloadUrl) return;
+    event.preventDefault();
+    systemBridge.downloadUrl({ url }).catch(() => undefined);
+    return;
+  }
+  const bridge = typeof window === 'undefined' ? undefined : window.webPilotEmbeddedBrowser;
+  if (!bridge) return;
+  event.preventDefault();
+  bridge.createTab({ url }).catch(() => undefined);
+}
+
 const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { markdown: string }) {
   const normalizedMarkdown = useMemo(() => normalizeChatMarkdown(markdown), [markdown]);
   return (
@@ -875,13 +974,129 @@ const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { ma
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          a: ({ node: _node, ...props }) => (
-            <a {...props} target="_blank" rel="noopener noreferrer" />
+          a: ({ node: _node, href, onClick, ...props }) => (
+            <a
+              {...props}
+              href={href}
+              onClick={(event) => {
+                onClick?.(event);
+                handleBrowserChatMarkdownLinkClick(event, href);
+              }}
+              target="_blank"
+              rel="noopener noreferrer"
+            />
           ),
         }}
       >
         {normalizedMarkdown}
       </ReactMarkdown>
+    </div>
+  );
+});
+
+function formatDownloadBytes(value?: number) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 102.4) / 10} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${Math.round(bytes / 1024 / 102.4) / 10} MB`;
+  return `${Math.round(bytes / 1024 / 1024 / 102.4) / 10} GB`;
+}
+
+function browserChatDownloadStatusLabel(status?: SystemDownloadStatus) {
+  if (status === 'selecting') return '选择保存目录';
+  if (status === 'pending') return '准备下载';
+  if (status === 'downloading') return '下载中';
+  if (status === 'completed') return '已完成';
+  if (status === 'cancelled') return '已取消';
+  if (status === 'failed') return '下载失败';
+  return '下载';
+}
+
+function browserChatDownloadPercent(download: SystemDownloadItem) {
+  if (typeof download.progress === 'number' && Number.isFinite(download.progress)) {
+    return Math.max(0, Math.min(100, Math.round(download.progress * 100)));
+  }
+  if (download.status === 'completed') return 100;
+  return undefined;
+}
+
+function BrowserChatDownloadStatusIcon({ status }: { status?: SystemDownloadStatus }) {
+  if (status === 'completed') return <CheckCircle2 size={15} />;
+  if (status === 'failed') return <AlertCircle size={15} />;
+  if (status === 'downloading' || status === 'pending' || status === 'selecting') return <Loader2 className="spin" size={15} />;
+  return <Download size={15} />;
+}
+
+const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
+  downloads,
+  open,
+  onClose,
+  onToggle,
+}: {
+  downloads: SystemDownloadItem[];
+  open: boolean;
+  onClose: () => void;
+  onToggle: () => void;
+}) {
+  const activeCount = downloads.filter((download) => download.status === 'selecting' || download.status === 'pending' || download.status === 'downloading').length;
+  const recentDownloads = downloads.slice(0, 12);
+  return (
+    <div className="browser-chat-download-center">
+      <button
+        aria-expanded={open}
+        aria-label="下载"
+        className={activeCount ? 'ui-icon-button browser-chat-download-button active' : 'ui-icon-button browser-chat-download-button'}
+        onClick={onToggle}
+        title="下载"
+        type="button"
+      >
+        <Download size={17} />
+        {activeCount ? <span className="browser-chat-download-badge">{activeCount}</span> : null}
+      </button>
+      {open ? (
+        <div className="browser-chat-download-popover" role="dialog" aria-label="下载进度">
+          <header>
+            <strong>下载</strong>
+            <button className="ui-icon-button" onClick={onClose} type="button" aria-label="关闭下载面板">
+              <X size={15} />
+            </button>
+          </header>
+          {recentDownloads.length ? (
+            <ol className="browser-chat-download-list">
+              {recentDownloads.map((download) => {
+                const percent = browserChatDownloadPercent(download);
+                const received = formatDownloadBytes(download.receivedBytes);
+                const total = formatDownloadBytes(download.totalBytes);
+                const progressWidth = percent === undefined ? (download.status === 'downloading' ? 18 : 0) : percent;
+                return (
+                  <li className={`browser-chat-download-item ${download.status || 'pending'}`} key={download.id}>
+                    <div className="browser-chat-download-item-head">
+                      <span className="browser-chat-download-status-icon">
+                        <BrowserChatDownloadStatusIcon status={download.status} />
+                      </span>
+                      <div>
+                        <strong>{download.fileName || 'download'}</strong>
+                        <span>{browserChatDownloadStatusLabel(download.status)}{percent !== undefined ? ` · ${percent}%` : ''}</span>
+                      </div>
+                    </div>
+                    <div className="browser-chat-download-progress" aria-hidden="true">
+                      <span style={{ width: `${progressWidth}%` }} />
+                    </div>
+                    <div className="browser-chat-download-meta">
+                      <span>{total ? `${received || '0 B'} / ${total}` : (received || '')}</span>
+                      {download.error ? <span className="error">{download.error}</span> : null}
+                      {download.path ? <span title={download.path}>{download.path}</span> : null}
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+          ) : (
+            <div className="browser-chat-download-empty">暂无下载</div>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 });
@@ -1009,6 +1224,7 @@ const BrowserChatReferenceChip = memo(function BrowserChatReferenceChip({
         <a
           className="browser-chat-reference-main"
           href={attachment.url}
+          onClick={(event) => handleBrowserChatMarkdownLinkClick(event, attachment.url)}
           rel="noopener noreferrer"
           target="_blank"
           title={attachment.sourceUrl || attachment.url}
@@ -3374,6 +3590,8 @@ export function BrowserChatWorkspace({
   const [resolvingConfirmationAction, setResolvingConfirmationAction] = useState<BrowserChatToolConfirmationAction | null>(null);
   const [imagePreview, setImagePreview] = useState<BrowserChatAttachment | null>(null);
   const [error, setError] = useState('');
+  const [downloads, setDownloads] = useState<SystemDownloadItem[]>([]);
+  const [downloadCenterOpen, setDownloadCenterOpen] = useState(false);
   const selectedSessionRunning = isBrowserChatSessionRunning(session);
   const selectedRunningSession = selectedSessionRunning ? session : undefined;
   const currentBusy = busy || selectedSessionRunning;
@@ -3400,6 +3618,7 @@ export function BrowserChatWorkspace({
     setEmbeddedChatCollapsed((current) => {
       const next = !current;
       writeStoredEmbeddedChatCollapsed(next);
+      if (next) setDownloadCenterOpen(false);
       return next;
     });
   }, []);
@@ -3407,6 +3626,30 @@ export function BrowserChatWorkspace({
   useEffect(() => {
     setSidebarCollapsed(readStoredSidebarCollapsed());
     setEmbeddedChatCollapsed(readStoredEmbeddedChatCollapsed());
+  }, []);
+
+  useEffect(() => {
+    const bridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
+    if (!bridge) return undefined;
+    let mounted = true;
+    const applyDownload = (download: SystemDownloadItem) => {
+      if (!download?.id) return;
+      setDownloads((current) => {
+        const next = [download, ...current.filter((item) => item.id !== download.id)];
+        return next.sort((left, right) => Number(right.startedAt || right.updatedAt || 0) - Number(left.startedAt || left.updatedAt || 0));
+      });
+    };
+    bridge.getDownloads?.()
+      .then((result) => {
+        if (!mounted || !result?.ok || !Array.isArray(result.downloads)) return;
+        setDownloads(result.downloads);
+      })
+      .catch(() => undefined);
+    const unsubscribe = bridge.onDownloadProgress?.(applyDownload);
+    return () => {
+      mounted = false;
+      unsubscribe?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -3499,6 +3742,13 @@ export function BrowserChatWorkspace({
   const modelSelection = modelSelectionValueForConfig(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionDiagnostic = modelSelectionDiagnosticLabel(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionOptions = useMemo(() => modelSelectionOptionsForConfig(modelConfig), [modelConfig]);
+  const downloadPanelWidth = embeddedBrowserActive
+    ? Math.max(260, Math.min(360, embeddedChatWidth - 36))
+    : 380;
+  const chatPaneStyle = useMemo(() => ({
+    '--browser-chat-download-panel-width': `${downloadPanelWidth}px`,
+  }) as CSSProperties, [downloadPanelWidth]);
+  const toggleDownloadCenter = useCallback(() => setDownloadCenterOpen((current) => !current), []);
 
   const changeModelSelection = useCallback((selection: { provider: ModelProvider; model: string }) => {
     const next = resolveRuntimeModelSelection(modelConfig, selection);
@@ -4245,19 +4495,31 @@ export function BrowserChatWorkspace({
     );
   }
 
+  const renderChatPaneActions = () => (
+    <div className="browser-chat-pane-actions">
+      {session ? (
+        <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title="结束会话" type="button">
+          <Power size={17} />
+        </button>
+      ) : null}
+      <BrowserChatDownloadCenter
+        downloads={downloads}
+        open={downloadCenterOpen}
+        onClose={() => setDownloadCenterOpen(false)}
+        onToggle={toggleDownloadCenter}
+      />
+    </div>
+  );
+
   const renderChatPane = () => (
-    <div className={`${hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`}>
+    <div className={`${hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`} style={chatPaneStyle}>
       {loadingSessionId ? (
         <div className="browser-chat-inline-loading">
           <Loader2 className="spin" size={15} />
           <span>正在加载对话</span>
         </div>
       ) : null}
-      {session ? (
-        <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title="结束会话" type="button">
-          <Power size={17} />
-        </button>
-      ) : null}
+      {renderChatPaneActions()}
 
       {hasMessages ? (
         <BrowserChatMessageList
@@ -4473,18 +4735,14 @@ export function BrowserChatWorkspace({
             </aside>
           </div>
         ) : (
-          <div className={hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}>
+          <div className={hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'} style={chatPaneStyle}>
             {loadingSessionId ? (
               <div className="browser-chat-inline-loading">
                 <Loader2 className="spin" size={15} />
                 <span>正在加载对话</span>
               </div>
             ) : null}
-            {session ? (
-              <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title="结束会话" type="button">
-                <Power size={17} />
-              </button>
-            ) : null}
+            {renderChatPaneActions()}
 
             {hasMessages ? (
               <BrowserChatMessageList

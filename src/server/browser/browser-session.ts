@@ -30,7 +30,6 @@ const DEFAULT_SCREENSHOT_TIMEOUT_MS = 15000;
 const MIN_SCREENSHOT_TIMEOUT_MS = 1000;
 const MAX_SCREENSHOT_TIMEOUT_MS = 120000;
 const SCREENSHOT_FAILURE_CONTEXT_TIMEOUT_MS = 2000;
-const DEFAULT_BROWSER_OPEN_TIMEOUT_MS = 6000;
 const DEFAULT_BROWSER_ACTION_LOAD_STATE_TIMEOUT_MS = 3000;
 const DEFAULT_BROWSER_POPUP_WAIT_MS = 0;
 const DEFAULT_BROWSER_DIRECT_HREF_TIMEOUT_MS = 0;
@@ -3735,29 +3734,19 @@ export class BrowserSession {
   // 打开目标页面，只等待导航提交，页面稳定由模型显式调用 waitForPage/readObservation 决定。
   async open(url: string): Promise<BrowserActionResult> {
     const beforeUrl = this.activePage.url();
-    const timeoutMs = boundedPositiveIntegerEnv('BROWSER_OPEN_TIMEOUT_MS', DEFAULT_BROWSER_OPEN_TIMEOUT_MS, 1000, 30000);
     let navigationNote = '';
-    const navigation = this.activePage
-      .goto(url, { waitUntil: 'commit', timeout: timeoutMs })
-      .then(() => ({ status: 'committed' as const }))
-      .catch((error) => ({ status: 'failed' as const, error }));
-    const navigationResult = await Promise.race([
-      navigation,
-      sleep(timeoutMs).then(() => ({ status: 'hard-timeout' as const })),
-    ]);
-    if (navigationResult.status !== 'committed') {
+    try {
+      await this.activePage.goto(url, { waitUntil: 'commit', timeout: 0 });
+    } catch (error) {
       const currentUrl = this.activePage.url();
       const unchanged = currentUrl === beforeUrl && currentUrl !== url;
       if (!currentUrl || isBlankBrowserUrlLike(currentUrl) || unchanged) {
-        const errorMessage = navigationResult.status === 'failed'
-          ? `: ${navigationResult.error instanceof Error ? navigationResult.error.message : String(navigationResult.error)}`
-          : '';
         return {
           ok: false,
-          actual: `Open page timed out after ${timeoutMs}ms before navigation committed${errorMessage}`,
+          actual: `Open page failed before navigation committed: ${error instanceof Error ? error.message : String(error)}`,
         };
       }
-      navigationNote = ` Navigation did not commit within hard timeout ${timeoutMs}ms; continuing from current URL: ${currentUrl}.`;
+      navigationNote = ` Navigation reported an error before commit; continuing from current URL: ${currentUrl}.`;
     }
     void this.markPageGroup(this.activePage);
     return { ok: true, actual: `Opened page: ${url}${navigationNote}` };

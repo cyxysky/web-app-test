@@ -71,6 +71,18 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
 });
 
 contextBridge.exposeInMainWorld('webPilotSystem', {
+  downloadUrl(input) {
+    return ipcRenderer.invoke('webpilot:system:download-url', input || {});
+  },
+  getDownloads() {
+    return ipcRenderer.invoke('webpilot:system:get-downloads');
+  },
+  onDownloadProgress(listener) {
+    if (typeof listener !== 'function') return () => {};
+    const handler = (_event, payload) => listener(payload);
+    ipcRenderer.on('webpilot:system:download-progress', handler);
+    return () => ipcRenderer.removeListener('webpilot:system:download-progress', handler);
+  },
   selectDirectory(input) {
     return ipcRenderer.invoke('webpilot:system:select-directory', input || {});
   },
