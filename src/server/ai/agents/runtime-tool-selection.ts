@@ -11,7 +11,7 @@ export function runtimeAllowedToolTypes({
 }) {
   const nativeAllowedToolTypes = nativeToolNames.filter((name) => !(browserChatMode && name === 'reportState'));
   const baseAllowedToolTypes = codexMode
-    ? nativeAllowedToolTypes.filter((name) => !observationToolNames.has(name) && name !== 'getPageState')
+    ? nativeAllowedToolTypes.filter((name) => !observationToolNames.has(name))
     : nativeAllowedToolTypes;
 
   return browserChatMode && codexMode ? [...baseAllowedToolTypes, 'answer'] : baseAllowedToolTypes;

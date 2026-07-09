@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
 
-const nativeToolNames = ['getPageState', 'readObservation', 'clickDomNode', 'reportState'];
+const nativeToolNames = ['readObservation', 'clickDomNode', 'reportState'];
 const observationToolNames = new Set(['readObservation']);
 
 test('runtimeAllowedToolTypes keeps native tools outside Codex mode', () => {

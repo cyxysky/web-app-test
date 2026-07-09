@@ -2,7 +2,7 @@ import type { ModelMessage } from 'ai';
 import type { BrowserActionResult, BrowserObservationType } from '@/server/browser/browser-session';
 
 export const runtimeObservationToolNames = new Set(['readObservation']);
-export const staleReadObservationText = 'Stale: this old readObservation result was replaced by a later getPageState observation. Use getPageState({read:{view:"actions",offset:0,maxChars:10000}}) for fresh actionable nodes, or readObservation(view="actions", offset=0, maxChars=10000) to page the current observation.';
+export const staleReadObservationText = 'Stale: this old readObservation result was replaced by a later refreshed observation. Use readObservation({refresh:true,view:"actions",maxChars:10000}) for fresh actionable nodes, or continue the current observation with its nextCursor.';
 
 export type RuntimeObservationRecord = {
   runId: string;
@@ -18,16 +18,17 @@ export type RuntimeObservationRecord = {
 export type RuntimeObservationStore = Map<string, RuntimeObservationRecord>;
 
 export type RuntimeObservationReadOptions = {
+  cursor?: string;
+  refresh?: boolean;
   view?: BrowserObservationType;
   offset?: number;
   maxChars?: number;
 };
 
-export type RuntimeObservationInlineReadInput = {
-  read?: RuntimeObservationReadOptions;
-  readView?: BrowserObservationType;
-  offset?: number;
-  maxChars?: number;
+export type RuntimeObservationCursorPayload = {
+  generation: number;
+  index: number;
+  view: BrowserObservationType;
 };
 
 const runtimeObservationTypes: BrowserObservationType[] = ['actions', 'tree', 'text', 'changes', 'elements'];
@@ -50,15 +51,32 @@ export function observationStoreKey(runId?: string) {
   return runId || fallbackObservationRunId;
 }
 
-export function normalizeInlineObservationRead(input?: RuntimeObservationInlineReadInput): RuntimeObservationReadOptions | undefined {
-  const read = input?.read && typeof input.read === 'object' ? input.read : undefined;
-  const view = read?.view || input?.readView;
-  if (!read && !view && input?.offset === undefined && input?.maxChars === undefined) return undefined;
-  return {
-    view: view || 'actions',
-    offset: read?.offset ?? input?.offset,
-    maxChars: read?.maxChars ?? input?.maxChars,
-  };
+export function encodeRuntimeObservationCursor(payload: RuntimeObservationCursorPayload) {
+  return Buffer.from(JSON.stringify({ generation: payload.generation, index: payload.index, view: payload.view }), 'utf8').toString('base64url');
+}
+
+export function decodeRuntimeObservationCursor(cursor?: string): RuntimeObservationCursorPayload | undefined {
+  if (!cursor) return undefined;
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<RuntimeObservationCursorPayload>;
+    if (
+      typeof parsed.generation === 'number'
+      && Number.isFinite(parsed.generation)
+      && typeof parsed.index === 'number'
+      && Number.isFinite(parsed.index)
+      && runtimeObservationTypes.includes(parsed.view as BrowserObservationType)
+      && parsed.view !== 'changes'
+    ) {
+      return {
+        generation: Math.max(0, Math.floor(parsed.generation)),
+        index: Math.max(0, Math.floor(parsed.index)),
+        view: parsed.view as BrowserObservationType,
+      };
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 export function cloneRuntimeObservationStore(store?: RuntimeObservationStore): RuntimeObservationStore | undefined {
@@ -170,8 +188,8 @@ function buildObservationChanges(
   const currentTextLines = observationTextLines(current.text);
   if (!previous) {
     return [
-      'Changes since previous getPageState observation:',
-      'No previous getPageState observation exists for this run yet; this is the baseline snapshot.',
+      'Changes since previous refreshed observation:',
+      'No previous refreshed observation exists for this run yet; this is the baseline snapshot.',
       `Current generation: ${nextGeneration}.`,
       `Current interactive elements: ${currentActions.length}. Current visible text lines: ${currentTextLines.length}.`,
       'Current actionable node_id entries are in the actions view; use readObservation(view="actions") only if they were not already returned inline.',
@@ -204,7 +222,7 @@ function buildObservationChanges(
   const removedText = [...previousText].filter((line) => !currentText.has(line));
   const totalChanges = addedActions.length + removedActions.length + changedActions.length + addedText.length + removedText.length;
   const lines = [
-    'Changes since previous getPageState observation:',
+    'Changes since previous refreshed observation:',
     `Previous generation: ${previous.generation}. Current generation: ${nextGeneration}.`,
     'Current node_id values in added/changed interactive entries are actionable only if they still appear in readObservation(view="actions"). Removed entries are historical evidence only.',
   ];
@@ -250,6 +268,24 @@ export function storeRuntimeObservation(
   return record;
 }
 
+export function appendRuntimeObservationView(
+  store: RuntimeObservationStore,
+  runId: string | undefined,
+  view: BrowserObservationType,
+  content: string,
+) {
+  const record = store.get(observationStoreKey(runId));
+  if (!record) return undefined;
+  const previous = record.views[view];
+  const nextValue = previous && previous !== content
+    ? `${previous}\n${content}`
+    : previous || content;
+  record.views[view] = nextValue;
+  record.viewCharLengths[view] = nextValue.length;
+  record.totalChars = record.views[record.defaultType]?.length || nextValue.length;
+  return record;
+}
+
 export function runtimeObservationCount(store: RuntimeObservationStore | undefined, runId?: string) {
   return store?.has(observationStoreKey(runId)) ? 1 : 0;
 }
@@ -262,7 +298,8 @@ export function runtimeObservationAvailableTypes(record: RuntimeObservationRecor
 }
 
 export function observationPreviewLimit(name: string) {
-  const raw = Number(process.env.AI_TOOL_RESULT_PREVIEW_MAX_CHARS || (name === 'getPageState' ? 10000 : 2400));
+  void name;
+  const raw = Number(process.env.AI_TOOL_RESULT_PREVIEW_MAX_CHARS || 2400);
   const value = Math.floor(Number.isFinite(raw) ? raw : 10000);
   return Math.min(Math.max(value, 10000), 60000);
 }
@@ -276,7 +313,7 @@ export function readRuntimeObservation(
 ): BrowserActionResult {
   const record = store?.get(observationStoreKey(runId));
   if (!record) {
-    return { ok: false, actual: 'No current DOM observation is available for this run. Call getPageState({read:{view:"actions",offset:0,maxChars:10000}}) first.' };
+    return { ok: false, actual: 'No current DOM observation is available for this run. Call readObservation({refresh:true,view:"actions",maxChars:10000}) first.' };
   }
   const selectedType = view || record.defaultType || 'actions';
   const text = record.views[selectedType];
@@ -292,7 +329,7 @@ export function readRuntimeObservation(
     actual: [
       `Current observation from ${record.toolName} generation ${record.generation} at ${record.createdAt}. Type ${selectedType}. Range ${start}-${end}/${text.length}. Available types: ${availableTypes || selectedType}.`,
       text.slice(start, end),
-      end < text.length ? `More available: call readObservation(view="${selectedType}", offset=${end}, maxChars=10000).` : 'End of observation.',
+      end < text.length ? `More stored text available: call readObservation(view="${selectedType}", offset=${end}, maxChars=10000), or use nextCursor from a lazy read result to parse a fresh DOM slice.` : 'End of stored observation text.',
     ].join('\n'),
   };
 }
@@ -315,6 +352,40 @@ function modelToolPartName(part: unknown) {
     if (typeof toolName === 'string') return toolName;
   }
   return undefined;
+}
+
+function modelToolPartInput(part: unknown): unknown {
+  if (!part || typeof part !== 'object' || Array.isArray(part)) return undefined;
+  const record = part as Record<string, unknown>;
+  for (const key of ['input', 'args', 'arguments']) {
+    if (record[key] !== undefined) return record[key];
+  }
+  const toolCall = record.toolCall;
+  if (toolCall && typeof toolCall === 'object' && !Array.isArray(toolCall)) {
+    const callRecord = toolCall as Record<string, unknown>;
+    for (const key of ['input', 'args', 'arguments']) {
+      if (callRecord[key] !== undefined) return callRecord[key];
+    }
+  }
+  return undefined;
+}
+
+function modelToolPartRefreshesObservation(part: unknown) {
+  const name = modelToolPartName(part);
+  if (name !== 'readObservation') return false;
+  const input = modelToolPartInput(part);
+  if (input && typeof input === 'object' && !Array.isArray(input)) {
+    return (input as Record<string, unknown>).refresh === true;
+  }
+  if (typeof input === 'string') {
+    try {
+      const parsed = JSON.parse(input) as Record<string, unknown>;
+      return parsed.refresh === true;
+    } catch {
+      return input.includes('"refresh":true') || input.includes('"refresh": true');
+    }
+  }
+  return false;
 }
 
 function modelToolPartType(part: unknown) {
@@ -372,7 +443,7 @@ function compactStaleReadObservationPart(part: unknown): unknown {
 
 export function compactStaleReadObservationMessages<T extends ModelMessage>(messages: T[]) {
   let position = 0;
-  let lastGetPageStatePosition = -1;
+  let lastObservationRefreshPosition = -1;
   for (const message of messages) {
     const parts = modelMessageContentParts(message);
     if (!parts) {
@@ -380,11 +451,11 @@ export function compactStaleReadObservationMessages<T extends ModelMessage>(mess
       continue;
     }
     for (const part of parts) {
-      if (modelToolPartName(part) === 'getPageState') lastGetPageStatePosition = position;
+      if (modelToolPartRefreshesObservation(part)) lastObservationRefreshPosition = position;
       position += 1;
     }
   }
-  if (lastGetPageStatePosition < 0) return messages;
+  if (lastObservationRefreshPosition < 0) return messages;
 
   position = 0;
   let changed = false;
@@ -399,7 +470,7 @@ export function compactStaleReadObservationMessages<T extends ModelMessage>(mess
       const currentPosition = position;
       position += 1;
       if (
-        currentPosition < lastGetPageStatePosition
+        currentPosition < lastObservationRefreshPosition
         && modelToolPartType(part) === 'tool-result'
         && modelToolPartName(part) === 'readObservation'
       ) {

@@ -381,7 +381,14 @@ type BrowserUseVisibleDomSnapshot = {
     state: string;
     tag: string;
   }>;
+  candidateEstimate?: number;
+  hasMore?: boolean;
   stateKey: string;
+  nextIndex?: number;
+  returnedEntries?: number;
+  scannedCandidates?: number;
+  startIndex?: number;
+  totalEntries?: number;
   viewport: BrowserUseViewportClip;
 };
 
@@ -433,6 +440,14 @@ type AiDomRuntime = {
     maxChars: number;
     maxElements: number;
     preserveExistingRefs?: boolean;
+    viewportClip?: BrowserUseViewportClip;
+  }) => BrowserUseVisibleDomSnapshot;
+  domObservationSlice: (options: {
+    maxChars: number;
+    maxElements: number;
+    preserveExistingRefs?: boolean;
+    startIndex?: number;
+    view?: BrowserObservationType;
     viewportClip?: BrowserUseViewportClip;
   }) => BrowserUseVisibleDomSnapshot;
   fullDomSnapshot: (options: {
@@ -1599,6 +1614,174 @@ function installAiBrowserPageRuntime() {
     return { frameElements, items, stateKey: state.instanceId, viewport: rawViewport };
   }
 
+  function domObservationSlice(options: {
+    maxChars: number;
+    maxElements: number;
+    preserveExistingRefs?: boolean;
+    startIndex?: number;
+    view?: BrowserObservationType;
+    viewportClip?: BrowserUseViewportClip;
+  }) {
+    const state = visibleDomState();
+    if (!options.preserveExistingRefs) state.refToElement.clear();
+
+    const rawViewport = visualViewportRect();
+    const viewportClip = options.viewportClip ? intersectClip(rawViewport, options.viewportClip) || rawViewport : rawViewport;
+    const view = options.view === 'tree' || options.view === 'elements' || options.view === 'text'
+      ? options.view
+      : 'actions';
+    const maxElements = Math.max(1, Math.floor(Number(options.maxElements) || 120));
+    const maxChars = Math.max(1, Math.floor(Number(options.maxChars) || 10000));
+    const startIndex = Math.max(0, Math.floor(Number(options.startIndex) || 0));
+    const frameElements: BrowserUseVisibleDomSnapshot['frameElements'] = [];
+    const items: BrowserUseVisibleDomSnapshot['items'] = [];
+    const hoverSelectors = visibleDomHoverSelectors();
+    const structuralTextTags = new Set([
+      'a', 'button', 'dd', 'details', 'dt', 'figcaption', 'input', 'label', 'legend', 'li',
+      'option', 'p', 'select', 'summary', 'td', 'textarea', 'th',
+      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    ]);
+    const directTextContainerTags = new Set(['article', 'aside', 'div', 'fieldset', 'footer', 'form', 'header', 'main', 'nav', 'section', 'span']);
+    let chars = 0;
+    let candidateIndex = 0;
+    let nextIndex = startIndex;
+    let hasMore = false;
+    let stopped = false;
+
+    const actionSignals = (element: Element) => {
+      const signals = visibleDomInteractionSignals(element, hoverSelectors);
+      return signals.length && visibleDomClickablePoint(element, viewportClip) ? signals : [];
+    };
+    const hasMeaningfulAttributes = (element: Element) => visibleDomMeaningfulAttributes.some((name) => Boolean(visibleDomAttributeValue(element, name)));
+    const shouldIncludeElement = (element: Element, signals: string[]) => {
+      if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
+      if (view === 'actions') return signals.length > 0;
+      const tag = visibleDomElementName(element);
+      if (signals.length) return true;
+      if (structuralTextTags.has(tag) && visibleDomTextContent(element)) return true;
+      if (directTextContainerTags.has(tag) && visibleDomOwnTextContent(element)) return true;
+      return hasMeaningfulAttributes(element);
+    };
+    const pushFrame = (element: Element) => {
+      if (frameElements.length >= maxElements) return;
+      const rect = visibleDomRect(element, viewportClip);
+      if (!rect) return;
+      const ref = visibleDomRef(element);
+      state.refToElement.set(ref, element);
+      const frameElement = element as HTMLIFrameElement;
+      const width = frameElement.clientWidth > 0 ? frameElement.clientWidth : rect.right - rect.left;
+      const height = frameElement.clientHeight > 0 ? frameElement.clientHeight : rect.bottom - rect.top;
+      frameElements.push({
+        rect,
+        ref,
+        size: { height, width },
+        ...(frameElement.src ? { url: frameElement.src } : {}),
+      });
+    };
+    const pushCandidate = (element: Element, signals: string[]) => {
+      if (stopped || !shouldIncludeElement(element, signals)) return;
+      const ordinal = candidateIndex;
+      candidateIndex += 1;
+      if (ordinal < startIndex) {
+        nextIndex = ordinal + 1;
+        return;
+      }
+      if (items.length >= maxElements) {
+        hasMore = true;
+        stopped = true;
+        nextIndex = ordinal;
+        return;
+      }
+      const ref = visibleDomRef(element);
+      const item = visibleDomItem(element, ref, signals);
+      const line = item.line;
+      const lineChars = line.length + (items.length === 0 ? 0 : 1);
+      if (items.length > 0 && chars + lineChars > maxChars) {
+        hasMore = true;
+        stopped = true;
+        nextIndex = ordinal;
+        return;
+      }
+      state.refToElement.set(ref, element);
+      items.push({
+        descriptor: descriptor(element),
+        interactive: item.interactive,
+        label: item.label,
+        line,
+        path: pathOf(element) || '',
+        ref,
+        state: item.state,
+        tag: item.tag,
+      });
+      chars += lineChars;
+      nextIndex = ordinal + 1;
+    };
+    const visit = (node: Node) => {
+      if (stopped) return;
+      if (node.nodeType === Node.DOCUMENT_NODE) {
+        const root = document.documentElement;
+        if (root) visit(root);
+        return;
+      }
+      if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+        for (const child of Array.from((node as DocumentFragment).children)) {
+          if (stopped) break;
+          visit(child);
+        }
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const element = node as Element;
+      const tag = visibleDomElementName(element);
+      if (tag === 'frame' || tag === 'iframe') pushFrame(element);
+      pushCandidate(element, actionSignals(element));
+      const root = shadowRootOf(element);
+      if (root && !stopped) visit(root);
+      for (const child of Array.from(element.children)) {
+        if (stopped) break;
+        visit(child);
+      }
+    };
+
+    visit(document);
+    const selectorCandidateCount = view === 'actions'
+      ? (() => {
+          try {
+            return document.querySelectorAll([
+              'a[href]',
+              'button',
+              'input',
+              'select',
+              'textarea',
+              '[role]',
+              '[onclick]',
+              '[tabindex]:not([tabindex="-1"])',
+              '[contenteditable="true"]',
+              '[data-action]',
+              '[data-click]',
+              '[data-href]',
+              '[data-url]',
+            ].join(',')).length;
+          } catch {
+            return undefined;
+          }
+        })()
+      : undefined;
+    return {
+      candidateEstimate: selectorCandidateCount,
+      frameElements,
+      hasMore,
+      items,
+      nextIndex,
+      returnedEntries: items.length,
+      scannedCandidates: candidateIndex,
+      startIndex,
+      stateKey: state.instanceId,
+      totalEntries: hasMore ? undefined : candidateIndex,
+      viewport: rawViewport,
+    };
+  }
+
   function fullDomSnapshot(options: { maxChars: number; maxElements: number; preserveExistingRefs?: boolean }) {
     const state = visibleDomState();
     if (!options.preserveExistingRefs) state.refToElement.clear();
@@ -1772,6 +1955,7 @@ function installAiBrowserPageRuntime() {
     pointBelongsToElement,
     visiblePointForElement,
     visibleDomSnapshot,
+    domObservationSlice,
     fullDomSnapshot,
     elementText,
     visibleDomPoint,
@@ -3548,7 +3732,7 @@ export class BrowserSession {
     return this.page;
   }
 
-  // 打开目标页面，只等待导航提交，页面稳定由模型显式调用 waitForPage/getPageState 决定。
+  // 打开目标页面，只等待导航提交，页面稳定由模型显式调用 waitForPage/readObservation 决定。
   async open(url: string): Promise<BrowserActionResult> {
     const beforeUrl = this.activePage.url();
     const timeoutMs = boundedPositiveIntegerEnv('BROWSER_OPEN_TIMEOUT_MS', DEFAULT_BROWSER_OPEN_TIMEOUT_MS, 1000, 30000);
@@ -4566,7 +4750,7 @@ export class BrowserSession {
     if (!matches.length) {
       return {
         ok: false,
-        actual: `No current getPageState tree node_id matched text "${targetText}". Call getPageState first or retry findByText with a shorter exact label and optional scopeId.`,
+        actual: `No current observation node_id matched text "${targetText}". Call readObservation({refresh:true,view:"actions",maxChars:10000}) first or retry findByText with a shorter exact label and optional scopeId.`,
       };
     }
 
@@ -4584,7 +4768,7 @@ export class BrowserSession {
     }));
     return {
       ok: true,
-      actual: `Current getPageState tree node_id matches for "${targetText}". Use clickDomNode(id) only when interactive=true; otherwise use the id as tree evidence or scope:\n${JSON.stringify(payload, null, 2)}`,
+      actual: `Current observation node_id matches for "${targetText}". Use clickDomNode(id) only when interactive=true; otherwise use the id as tree evidence or scope:\n${JSON.stringify(payload, null, 2)}`,
     };
   }
 
@@ -4662,7 +4846,7 @@ export class BrowserSession {
       const timingNote = formatTimingRecord(timings);
       return {
         ok: false,
-        actual: `Scrollable area ${area.id} could not be scrolled: ${result.error}. Refresh getPageState and choose a fresh scrollable area id.${timingNote ? ` Scroll timings: ${timingNote}.` : ''}`,
+        actual: `Scrollable area ${area.id} could not be scrolled: ${result.error}. Refresh readObservation({refresh:true,view:"actions",maxChars:10000}) and choose a fresh scrollable area id.${timingNote ? ` Scroll timings: ${timingNote}.` : ''}`,
       };
     }
     await timedBrowserStep(timings, 'updateScrollCacheMs', async () => {
@@ -5551,7 +5735,7 @@ export class BrowserSession {
       .map((item) => `${item.id}: ${this.describeCandidate(item)}`)
       .join('\n');
     return {
-      error: `Candidate ${candidateId} was not found in the current DOM interactive snapshot. Refresh getPageState/getInteractiveCandidates and choose one of the returned candidate ids. Available candidates:\n${available || '[none]'}`,
+      error: `Candidate ${candidateId} was not found in the current DOM interactive snapshot. Refresh readObservation({refresh:true,view:"actions",maxChars:10000})/getInteractiveCandidates and choose one of the returned candidate ids. Available candidates:\n${available || '[none]'}`,
     };
   }
 
@@ -5610,7 +5794,7 @@ export class BrowserSession {
     if (!live.target) {
       return {
         candidate,
-        error: `Candidate ${candidate.id} is no longer actionable in the current DOM snapshot: ${live.error}. Refresh getPageState/getInteractiveCandidates and choose a fresh candidate id.`,
+        error: `Candidate ${candidate.id} is no longer actionable in the current DOM snapshot: ${live.error}. Refresh readObservation({refresh:true,view:"actions",maxChars:10000})/getInteractiveCandidates and choose a fresh candidate id.`,
       };
     }
     return { candidate, target: live.target };
@@ -5821,7 +6005,7 @@ export class BrowserSession {
           `${input.label} failed Playwright click actionability check at (${input.target.x}, ${input.target.y})`,
           this.formatPlaywrightActionabilityError(error),
           topmost ? `Top elements at that point: ${topmost}` : '',
-          'Refresh getPageState and choose a currently actionable node. If text-only DOM is ambiguous and getCurrentScreenshot is available, call getCurrentScreenshot before deciding.',
+          'Refresh readObservation({refresh:true,view:"actions",maxChars:10000}) and choose a currently actionable node. If text-only DOM is ambiguous and getCurrentScreenshot is available, call getCurrentScreenshot before deciding.',
         ].filter(Boolean).join('. '),
       };
     } finally {
@@ -6064,8 +6248,111 @@ export class BrowserSession {
     };
   }
 
-  private resetDomVisibleIdState(mainSnapshotKey: string) {
-    if (this.domVisibleSnapshotKey === mainSnapshotKey) return;
+  async readDomObservationSlice(options: {
+    cursorIndex?: number;
+    maxChars?: number;
+    resetReferences?: boolean;
+    view?: BrowserObservationType;
+  } = {}) {
+    const startedAt = Date.now();
+    const selectedView: BrowserObservationType = options.view === 'tree' || options.view === 'elements' || options.view === 'text'
+      ? options.view
+      : 'actions';
+    const maxChars = Math.max(10000, Math.floor(Number(options.maxChars) || 10000));
+    const maxElements = Number.MAX_SAFE_INTEGER;
+    const startIndex = Math.max(0, Math.floor(Number(options.cursorIndex) || 0));
+    const snapshot = await this.readDomObservationSliceSnapshot(
+      this.activePage.mainFrame(),
+      selectedView,
+      startIndex,
+      maxElements,
+      maxChars,
+      options.resetReferences !== true,
+    );
+    if (!snapshot) {
+      return {
+        candidateEstimate: undefined as number | undefined,
+        content: 'DOM runtime is not available on this page. Retry after the page settles.',
+        contentCharLength: 'DOM runtime is not available on this page. Retry after the page settles.'.length,
+        hasMore: false,
+        nextIndex: startIndex,
+        returnedEntries: 0,
+        scannedCandidates: 0,
+        startIndex,
+        timings: { totalMs: Date.now() - startedAt },
+        totalEntries: 0,
+        view: selectedView,
+      };
+    }
+
+    this.resetDomVisibleIdState(snapshot.stateKey, options.resetReferences === true);
+    if (options.resetReferences) this.lastDomNodeReferences = new Map();
+    const byPath = new Map(snapshot.items.map((entry) => [entry.path, entry]));
+    const actionContext = (item: BrowserUseVisibleDomSnapshot['items'][number]) => {
+      const labels: string[] = [];
+      const parts = item.path.split('.');
+      for (let length = 1; length < parts.length; length += 1) {
+        const ancestor = byPath.get(parts.slice(0, length).join('.'));
+        const label = ancestor?.label?.replace(/\s+/g, ' ').trim();
+        if (label && label !== item.label && !labels.includes(label)) labels.push(label);
+      }
+      return labels.slice(-4).join(' > ').replace(/--/g, '-');
+    };
+    const textSeen = new Set<string>();
+    const lines: string[] = [];
+    const references: DomNodeReference[] = [];
+    for (const item of snapshot.items) {
+      const publicId = this.publicDomVisibleId(snapshot.stateKey, item.ref);
+      const indent = selectedView === 'actions' || selectedView === 'text' ? '' : this.domObservationIndent(item.path);
+      const line = `${indent}${item.line.replace(`node_id=${item.ref}`, `node_id=${publicId}`)}`;
+      if (selectedView === 'text') {
+        const text = item.label.replace(/\s+/g, ' ').trim();
+        if (text && !textSeen.has(text)) {
+          textSeen.add(text);
+          lines.push(text);
+        }
+      } else if (selectedView === 'actions') {
+        const context = actionContext(item);
+        lines.push(context ? `${line} <!-- context: ${context} -->` : line);
+      } else {
+        lines.push(line);
+      }
+      references.push({
+        id: publicId,
+        interactive: item.interactive,
+        label: item.label,
+        line,
+        localRef: item.ref,
+        path: item.path,
+        descriptor: item.descriptor,
+        state: item.state,
+        tag: item.tag,
+      });
+    }
+    for (const reference of references) this.lastDomNodeReferences.set(reference.id, reference);
+    const emptyText = selectedView === 'actions'
+      ? '[no visible actionable elements in this slice]'
+      : selectedView === 'text'
+        ? '[no visible page text in this slice]'
+        : '[no visible DOM entries in this slice]';
+    const content = lines.join('\n') || emptyText;
+    return {
+      candidateEstimate: snapshot.candidateEstimate,
+      content,
+      contentCharLength: content.length,
+      hasMore: Boolean(snapshot.hasMore),
+      nextIndex: Math.max(startIndex, snapshot.nextIndex ?? startIndex + lines.length),
+      returnedEntries: snapshot.returnedEntries ?? snapshot.items.length,
+      scannedCandidates: snapshot.scannedCandidates ?? 0,
+      startIndex,
+      timings: { totalMs: Date.now() - startedAt },
+      totalEntries: snapshot.totalEntries,
+      view: selectedView,
+    };
+  }
+
+  private resetDomVisibleIdState(mainSnapshotKey: string, force = false) {
+    if (!force && this.domVisibleSnapshotKey === mainSnapshotKey) return;
     this.domVisibleSnapshotKey = mainSnapshotKey;
     this.domVisiblePublicIdByFrameLocalRef.clear();
     this.domVisibleNextPublicId = 1;
@@ -6191,6 +6478,27 @@ export class BrowserSession {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
       return runtime?.visibleDomSnapshot(input);
     }, { maxChars, maxElements, preserveExistingRefs, viewportClip }).catch(() => undefined);
+  }
+
+  private async readDomObservationSliceSnapshot(
+    target: Page | Frame,
+    view: BrowserObservationType,
+    startIndex: number,
+    maxElements: number,
+    maxChars: number,
+    preserveExistingRefs = false,
+  ) {
+    await this.ensureBrowserPageRuntime(target);
+    return target.evaluate((input) => {
+      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
+      return runtime?.domObservationSlice(input);
+    }, {
+      maxChars,
+      maxElements,
+      preserveExistingRefs,
+      startIndex,
+      view,
+    }).catch(() => undefined);
   }
 
   private async readFullDomSnapshot(

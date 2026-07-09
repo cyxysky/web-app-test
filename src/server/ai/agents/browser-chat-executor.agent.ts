@@ -11,8 +11,10 @@ import { normalizeDomNodeIdParam, normalizeDomNodeIdString } from '@/lib/dom-pat
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 import {
+  appendRuntimeObservationView,
   compactStaleReadObservationMessages,
-  normalizeInlineObservationRead,
+  decodeRuntimeObservationCursor,
+  encodeRuntimeObservationCursor,
   observationPreviewLimit,
   observationStoreKey,
   readRuntimeObservation,
@@ -21,9 +23,7 @@ import {
   runtimeObservationCount,
   runtimeObservationToolNames,
   storeRuntimeObservation,
-  type RuntimeObservationInlineReadInput,
   type RuntimeObservationReadOptions,
-  type RuntimeObservationRecord,
   type RuntimeObservationStore,
 } from './runtime-observation';
 import { domCurrentContextLine, domModeActionRules, domNoScreenshotRule, domObservationHardRules } from './runtime-prompt-rules';
@@ -204,7 +204,6 @@ function runtimePageContextOptions(mode: BrowserSessionMode, options: { includeD
 }
 
 type RuntimePageContext = Awaited<ReturnType<BrowserSession['getPageContext']>>;
-type DomPageStateObservation = NonNullable<RuntimePageContext['domObservation']>;
 
 function domTreePromptLimit() {
   const raw = String(process.env.DOM_TREE_PROMPT_MAX_CHARS || '').trim();
@@ -531,7 +530,7 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, max = 
 }
 
 function modelToolResultLimit(name: string) {
-  const observationTool = name === 'getPageState' || name === 'readObservation';
+  const observationTool = name === 'readObservation';
   const raw = Number(
     observationTool
       ? process.env.AI_OBSERVATION_TOOL_RESULT_MAX_CHARS || process.env.AI_TOOL_RESULT_MAX_CHARS || 10000
@@ -549,32 +548,22 @@ function compactToolResultForModel(
   observationStore?: RuntimeObservationStore,
   runId?: string,
 ): BrowserActionResult {
-  const { debug: _debug, observationViews, ...modelResult } = result;
+  const { debug: _debug, ...modelResult } = result;
   void _debug;
   if (!modelResult.actual) return modelResult;
   const fileResult = modelResult.ok ? formatFileArtifactResult(name, modelResult.actual) : undefined;
   if (fileResult) return { ...modelResult, actual: fileResult };
   if (runtimeObservationToolNames.has(name)) return modelResult;
-  const limit = name === 'getPageState' && modelResult.actual.includes('Inline readObservation')
-    ? 30000
-    : modelToolResultLimit(name);
+  const limit = modelToolResultLimit(name);
   if (modelResult.actual.length <= limit) return modelResult;
   const previewLimit = observationStore ? Math.min(limit, observationPreviewLimit(name)) : limit;
   const omitted = modelResult.actual.length - previewLimit;
-  const observation = observationStore && name === 'getPageState'
-    ? observationStore.get(observationStoreKey(runId)) || storeRuntimeObservation(observationStore, runId, name, modelResult.actual, observationViews)
-    : undefined;
-  const availableTypes = observation
-    ? runtimeObservationAvailableTypes(observation)
-    : '';
   return {
     ...modelResult,
     actual: [
       modelResult.actual.slice(0, previewLimit),
       '',
-      observation
-        ? `[Current getPageState observation refreshed for this run: tool=${name}, defaultView=${observation.defaultType}, availableTypes=${availableTypes}, defaultChars=${observation.totalChars}, previewChars=${previewLimit}, omittedChars=${omitted}. Use readObservation(view="actions", offset=0, maxChars>=10000) to page current actionable nodes, or getPageState({read:{view:"changes",offset:0,maxChars:10000}}) after the next browser-changing action.]`
-        : `[Tool result truncated for model context: ${omitted} characters omitted from ${name}. Use a narrower text query, HTTP filter, or another observation tool call if more detail is required.]`,
+      `[Tool result truncated for model context: ${omitted} characters omitted from ${name}. Use a narrower text query, HTTP filter, or another observation tool call if more detail is required.]`,
     ].join('\n'),
   };
 }
@@ -949,7 +938,7 @@ function buildContinuationSummaryPrompt(input: {
     '{ "goal": string, "completed": string[], "currentPage": string, "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
     '',
     'Rules:',
-    '- Preserve that readObservation always reads only the latest getPageState observation; old readObservation output may be stale.',
+    '- Preserve that readObservation always reads only the latest refreshed observation generation; old readObservation output may be stale.',
     '- Preserve tool results that materially affect the next action.',
     '- Preserve current URL/page state, blockers, manual verification state, and user constraints.',
     '- Do not include raw screenshots, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON unless essential.',
@@ -1790,7 +1779,7 @@ function makeBrowserTools(
     shouldContinue?: () => boolean;
     onDebug?: ExecutionDebug;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
-    observePageState?: (input?: RuntimeObservationInlineReadInput) => Promise<BrowserActionResult>;
+    readObservation?: (input?: RuntimeObservationReadOptions) => Promise<BrowserActionResult>;
     observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => Promise<BrowserActionResult>;
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   },
@@ -1872,24 +1861,6 @@ function makeBrowserTools(
   }
 
   const sharedTools = {
-    getPageState: tool({
-      description: 'Read-only observation tool: refresh the current active page state. Optionally inline-read one current observation view in the same tool call. The browser DOM runtime stores readObservation views: actions for actionable node_id entries, tree for full hierarchy, text for page copy, and changes for the previous-to-current page state diff. Call this after any browser-changing action before choosing another DOM action.',
-      inputSchema: browserToolInput({
-        read: z.object({
-          view: z.enum(['actions', 'tree', 'text', 'changes']).optional().describe('Observation view to read immediately after refreshing. Defaults to actions when read is provided. Use changes after page-changing actions.'),
-          offset: z.number().int().nonnegative().optional().describe('Character offset for the inline read. Defaults to 0.'),
-          maxChars: z.number().int().positive().optional().describe('Maximum inline characters. Defaults to 10000; values below 10000 are raised to 10000.'),
-        }).optional().describe('Optional inline readObservation request to return together with this getPageState result.'),
-        readView: z.enum(['actions', 'tree', 'text', 'changes']).optional().describe('Shorthand inline read view. Equivalent to read.view.'),
-        offset: z.number().int().nonnegative().optional().describe('Shorthand inline read offset. Used with readView.'),
-        maxChars: z.number().int().positive().optional().describe('Shorthand inline read max characters. Used with readView.'),
-      }),
-      execute: (input) => record('getPageState', input, async () => (
-        referenceOptions?.observePageState
-          ? referenceOptions.observePageState(input)
-          : { ok: false, actual: 'getPageState is unavailable in this runtime.' }
-      )),
-    }),
     ...(modelSupportsScreenshotInput() ? {
       getCurrentScreenshot: tool({
         description: 'Read-only visual observation tool: capture the current browser viewport screenshot and attach it to the NEXT model request. Use when visual evidence is needed or text-only DOM evidence is ambiguous, especially stacked overlays, date pickers, popovers, duplicate labels, or icon-only controls; use DOM tools for clicking/filling.',
@@ -1958,13 +1929,19 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
     }),
     readObservation: tool({
-      description: 'Read-only context tool: read a range from the current getPageState observation for this run. Default view actions returns only actionable DOM node_id lines; view tree returns the full hierarchy; view text returns visible page text; view changes returns the previous-to-current page state diff.',
+      description: 'Read-only context tool: lazily read the current page observation. Use refresh=true after page changes or when no current observation exists. The first refreshed read returns a nextCursor when more DOM candidates can be parsed; pass cursor to continue. No scanBudgetMs is supported.',
       inputSchema: browserToolInput({
-        view: z.enum(['actions', 'tree', 'text', 'changes']).optional().describe('Observation view to read. Defaults to actions. Use changes after a browser-changing action to inspect what changed since the previous getPageState; use tree only when full DOM hierarchy is needed; use text for page copy/content search.'),
-        offset: z.number().int().nonnegative().optional().describe('Character offset to start reading from. Defaults to 0.'),
+        refresh: z.boolean().optional().describe('When true, start a fresh observation generation before reading this slice. Use after browser-changing actions or when page evidence may be stale.'),
+        view: z.enum(['actions', 'tree', 'text', 'changes']).optional().describe('Observation view to read. Defaults to actions. actions returns actionable node_id entries; tree/text are lazy DOM slices; changes summarizes the latest refresh boundary.'),
+        cursor: z.string().optional().describe('Opaque cursor returned by the previous readObservation result. Use it to continue the same generation/view.'),
+        offset: z.number().int().nonnegative().optional().describe('Legacy character offset for already stored observation text. Prefer cursor for lazy DOM paging.'),
         maxChars: z.number().int().positive().optional().describe('Maximum characters to return. Defaults to 10000; values below 10000 are raised to 10000. No upper cap is applied.'),
       }),
-      execute: (input) => record('readObservation', input, async () => readRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, input.offset, input.maxChars, input.view)),
+      execute: (input) => record('readObservation', input, async () => (
+        referenceOptions?.readObservation
+          ? referenceOptions.readObservation(input)
+          : readRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, input.offset, input.maxChars, input.view)
+      )),
     }),
     downloadFile: tool({
       description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, an origin-relative path starting with / resolved against the current page origin, or a page-relative path resolved against the current page directory. Use this when the user asks to download/save a file; include the returned download target as a clickable Markdown link in the final answer.',
@@ -2103,7 +2080,7 @@ function makeBrowserTools(
       execute: (input) => record('dragDomNode', input, () => session.dragDomNode(normalizeDomNodeIdString(input.fromId), normalizeDomNodeIdString(input.toId))),
     }),
     findByText: tool({
-      description: 'DOM mode recovery, read-only: find current getPageState tree node_id entries whose text/accessibility label/title/placeholder/href matches targetText. This does not click. Use clickDomNode only for a returned id whose interactive flag is true.',
+      description: 'DOM mode recovery, read-only: find current observation tree/reference node_id entries whose text/accessibility label/title/placeholder/href matches targetText. This does not click. Use clickDomNode only for a returned id whose interactive flag is true.',
       inputSchema: browserToolInput({
         targetText: z.string().min(1).max(300).describe('Exact visible or accessible text to search for from the CURRENT DOM/page context. Prefer short unique labels over long surrounding snippets.'),
         scopeId: z.string().optional().describe('Optional numeric DOM id that scopes the search to a subtree, such as 12 or [12].'),
@@ -2146,88 +2123,6 @@ function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
 }
 
 // 根据当前模式生成验证码/安全校验规则；DOM 模式不要要求 AI 读取截图。
-function formatDomPageStateObservation(pageContext: RuntimePageContext, observationViews?: BrowserActionResult['observationViews']) {
-  const actions = observationViews?.actions || '[no visible actionable elements]';
-  const tree = observationViews?.tree || observationViews?.elements || '[empty DOM tree]';
-  const text = observationViews?.text || '[no visible page text]';
-  return [
-    'Current DOM page state observation:',
-    '- getPageState collected the browser DOM tree through the browser runtime.',
-    '- The browser runtime generated separate readObservation views: actions, tree, text, and changes.',
-    '- getPageState can inline-read one view with read={view,offset,maxChars}; default/action evidence exposes visible actionable node_id lines first.',
-    '- Use readObservation only to page or switch views for the latest getPageState observation. Use changes after a browser-changing action, tree only when full DOM hierarchy is needed, and text for page copy/content search.',
-    `Current URL: ${pageContext.url}`,
-    `Current title: ${pageContext.title}`,
-    `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
-    `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
-    `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
-    `DOM tree snapshot chars: ${tree.length}; text chars: ${text.length}`,
-    `Browser-generated actions (${actions.length} chars):\n${pageTextForPrompt(actions)}`,
-  ].filter(Boolean).join('\n');
-}
-
-function fallbackDomPageStateObservation(domTree: string): DomPageStateObservation {
-  const tree = domTree || '[empty DOM tree]';
-  return {
-    actions: tree,
-    actionsCharLength: tree.length,
-    elements: tree,
-    elementsCharLength: tree.length,
-    text: tree,
-    textCharLength: tree.length,
-    tree,
-    treeCharLength: tree.length,
-    domNodeCount: domTree ? domTree.split(/\r?\n/).filter((line) => line.trim() && !line.trim().startsWith('<!--')).length : 0,
-    interactiveNodeCount: 0,
-    usedWorkers: false,
-    errors: [],
-    timings: { totalMs: 0 },
-  };
-}
-
-function domPageStateObservationViews(processed: DomPageStateObservation): BrowserActionResult['observationViews'] {
-  const tree = processed.tree || processed.elements || '[empty DOM tree]';
-  const elements = processed.elements || tree;
-  const text = processed.text || tree;
-  const actions = processed.actions || '[no visible actionable elements]';
-  return {
-    defaultType: 'actions',
-    actions,
-    elements,
-    text,
-    tree,
-  };
-}
-
-function formatDomPageStateSummary(
-  pageContext: RuntimePageContext,
-  observation: RuntimeObservationRecord,
-  processed?: DomPageStateObservation,
-  timings?: Record<string, unknown>,
-) {
-  const actionsChars = observation.viewCharLengths.actions || 0;
-  const treeChars = observation.viewCharLengths.tree || observation.viewCharLengths.elements || 0;
-  const textChars = observation.viewCharLengths.text || 0;
-  const changesChars = observation.viewCharLengths.changes || 0;
-  return [
-    'Current DOM page state summary:',
-    '- getPageState refreshed the current observation for this run and replaced the previous one.',
-    '- The browser runtime generated and stored separate actions/tree/text/changes views.',
-    '- Prefer getPageState({ read: { view: "actions", offset: 0, maxChars: 10000 } }) when refreshing actionable node_id entries. Use readObservation only to page or switch views for this latest observation.',
-    `Current URL: ${pageContext.url}`,
-    `Current title: ${pageContext.title}`,
-    `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
-    `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
-    `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
-    `Page context timings JSON: ${JSON.stringify(pageContext.timings || {})}`,
-    processed ? `DOM observation JSON: ${JSON.stringify({ domNodeCount: processed.domNodeCount, interactiveNodeCount: processed.interactiveNodeCount, usedWorkers: processed.usedWorkers, timings: processed.timings, errors: processed.errors })}` : '',
-    timings ? `GetPageState timings JSON: ${JSON.stringify(timings)}` : '',
-    `Observation generation: ${observation.generation}. Default view=${observation.defaultType}. Views: actions(${actionsChars}), tree(${treeChars}), text(${textChars}), changes(${changesChars}).`,
-  ].filter(Boolean).join('\n');
-}
-
 function formatVisualPageStateObservation(input: {
   pageContext: RuntimePageContext;
   visualContext: ReturnType<VisualContextManager['snapshot']>;
@@ -2328,7 +2223,7 @@ function runtimePrompt(input: {
     .slice(-4);
   const candidateContext = '[disabled because DOM mode uses fresh DOM tree ids]';
   const externalAppCandidateContext = '';
-  const evidence = 'the latest explicit getPageState DOM summary plus browser-generated readObservation actions view, URL, tabs, scroll state, and focused element';
+  const evidence = 'the latest refreshed readObservation DOM summary plus browser-generated actions view, URL, tabs, scroll state, and focused element';
   const markerTargetRules: string[] = [];
   const modeActionRules = domModeActionRules();
   return [
@@ -2363,7 +2258,7 @@ function runtimePrompt(input: {
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
       : '- DOM action reason must cite the current actions evidence or the fresh node_id used for the action.',
-    `- Use ${evidence} as the current page state. When this state is stale, call getPageState.`,
+    `- Use ${evidence} as the current page state. When this state is stale, call readObservation({refresh:true,view:"actions",maxChars:10000}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
@@ -2422,7 +2317,6 @@ ${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
 function runtimeToolNames(mode: BrowserSessionMode) {
   void mode;
   const sharedTools = [
-    'getPageState',
     ...(modelSupportsScreenshotInput() ? ['getCurrentScreenshot'] : []),
     'openPage',
     'waitForPage',
@@ -2994,13 +2888,13 @@ async function executeRuntimeStep(input: {
       blockers: [],
       pageUnderstanding: '',
       currentState: browserChatMode
-        ? 'No page observation is preloaded; call getPageState when browser evidence is needed.'
-        : 'No DOM observation is preloaded; call getPageState with read when page evidence is needed.',
+        ? 'No page observation is preloaded; call readObservation({refresh:true,view:"actions",maxChars:10000}) when browser evidence is needed.'
+        : 'No DOM observation is preloaded; call readObservation({refresh:true,view:"actions",maxChars:10000}) when page evidence is needed.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
-        : 'Use the latest getPageState browser-generated actions view for the next missing goal; scroll only when content is lazy-loaded or viewport-dependent.',
+        : 'Use the latest refreshed readObservation actions view for the next missing goal; scroll only when content is lazy-loaded or viewport-dependent.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
@@ -3105,68 +2999,96 @@ async function executeRuntimeStep(input: {
     let pageStateObservationIndex = 0;
     const continuationSummaryMarker = '[WebPilot continuation summary]';
 
-    async function observePageState(options?: RuntimeObservationInlineReadInput): Promise<BrowserActionResult> {
+    async function readObservation(options: RuntimeObservationReadOptions = {}): Promise<BrowserActionResult> {
       ensureActive();
-      const inlineRead = normalizeInlineObservationRead(options);
-      const getPageStateStartedAt = Date.now();
-      const pageContextStartedAt = Date.now();
-      const currentPageContext = await session.getPageContext(runtimePageContextOptions(mode, { includeDomTree: true }));
-      const pageContextMs = elapsedSince(pageContextStartedAt);
-      ensureActive();
-      const domContextStartedAt = Date.now();
-      currentDomContext = createDomContextSnapshot(mode, currentPageContext);
-      const domContextSnapshotMs = elapsedSince(domContextStartedAt);
+      const decodedCursor = decodeRuntimeObservationCursor(options.cursor);
+      const requestedView = decodedCursor?.view || options.view || 'actions';
+      const storedRecord = observationStore.get(observationStoreKey(input.runId));
+      const maxChars = Math.max(10000, Math.floor(Number(options.maxChars) || 10000));
+      const shouldRefresh = options.refresh === true || (!storedRecord && !decodedCursor && options.offset === undefined);
+      if (!shouldRefresh && !decodedCursor) {
+        return readRuntimeObservation(observationStore, input.runId, options.offset, options.maxChars, requestedView);
+      }
 
-      const observationProcessingStartedAt = Date.now();
-      const processedObservation = currentPageContext.domObservation || fallbackDomPageStateObservation(currentPageContext.domTree || '');
-      const observationProcessingMs = elapsedSince(observationProcessingStartedAt);
-      ensureActive();
-      const storeStartedAt = Date.now();
-      const observationViews = domPageStateObservationViews(processedObservation);
-      const observation = storeRuntimeObservation(
-        observationStore,
-        input.runId,
-        'getPageState',
-        formatDomPageStateObservation(currentPageContext, observationViews),
-        observationViews,
-      );
-      const storeObservationMs = elapsedSince(storeStartedAt);
-      const getPageStateTimings = {
-        totalMs: elapsedSince(getPageStateStartedAt),
-        getPageContextMs: pageContextMs,
-        domContextSnapshotMs,
-        observationProcessingMs,
-        storeObservationMs,
-        pageContextTimings: currentPageContext.timings || {},
-        observationTimings: processedObservation.timings,
-        domTreeChars: (currentPageContext.domTree || '').length,
-        elementsChars: processedObservation.elementsCharLength,
-        domNodeCount: processedObservation.domNodeCount,
-        interactiveNodeCount: processedObservation.interactiveNodeCount,
-      };
-      await onDebug?.({
-        phase: 'browser:get-page-state:dom-timings',
-        stepIndex,
-        message: `DOM getPageState timings: total=${getPageStateTimings.totalMs}ms, getPageContext=${pageContextMs}ms, readSimplifiedDomTree=${Number((currentPageContext.timings || {}).readSimplifiedDomTreeMs || 0)}ms, observationProcessing=${observationProcessingMs}ms, store=${storeObservationMs}ms.`,
-        details: getPageStateTimings,
-      });
-      const summary = formatDomPageStateSummary(currentPageContext, observation, processedObservation, getPageStateTimings);
-      const inlineReadResult = inlineRead
-        ? readRuntimeObservation(observationStore, input.runId, inlineRead.offset, inlineRead.maxChars, inlineRead.view)
+      if (decodedCursor) {
+        if (!storedRecord) {
+          return { ok: false, actual: 'The readObservation cursor has no current observation store. Refresh with readObservation({refresh:true,view:"actions",maxChars:10000}).' };
+        }
+        if (storedRecord.generation !== decodedCursor.generation) {
+          return { ok: false, actual: `Stale readObservation cursor: cursor generation ${decodedCursor.generation}, current generation ${storedRecord.generation}. Refresh with readObservation({refresh:true,view:"actions",maxChars:10000}).` };
+        }
+      }
+
+      const readStartedAt = Date.now();
+      const pageContextStartedAt = shouldRefresh ? Date.now() : 0;
+      const currentPageContext = shouldRefresh
+        ? await session.getPageContext(runtimePageContextOptions(mode, { includeDomTree: false }))
         : undefined;
-      const actual = inlineReadResult
-        ? [
-          summary,
-          '',
-          inlineReadResult.ok ? 'Inline readObservation result:' : 'Inline readObservation failed:',
-          inlineReadResult.actual,
-        ].join('\n')
-        : summary;
+      const pageContextMs = shouldRefresh ? elapsedSince(pageContextStartedAt) : 0;
+      ensureActive();
+      if (currentPageContext) currentDomContext = createDomContextSnapshot(mode, currentPageContext);
+      const sliceView = requestedView === 'changes' ? 'actions' : requestedView;
+      const slice = await session.readDomObservationSlice({
+        cursorIndex: decodedCursor?.index || 0,
+        maxChars,
+        resetReferences: shouldRefresh,
+        view: sliceView,
+      });
+      ensureActive();
+      const observationViews: BrowserActionResult['observationViews'] = {
+        defaultType: sliceView,
+        [sliceView]: slice.content,
+      };
+      if (sliceView === 'tree') observationViews.elements = slice.content;
+      if (sliceView === 'elements') observationViews.tree = slice.content;
+      const observation = shouldRefresh
+        ? storeRuntimeObservation(observationStore, input.runId, 'readObservation', slice.content, observationViews)
+        : appendRuntimeObservationView(observationStore, input.runId, sliceView, slice.content) || storedRecord;
+      if (!observation) {
+        return { ok: false, actual: 'Unable to store the current readObservation slice. Refresh and retry.' };
+      }
+      const nextCursor = slice.hasMore
+        ? encodeRuntimeObservationCursor({ generation: observation.generation, index: slice.nextIndex, view: sliceView })
+        : undefined;
+      const availableTypes = runtimeObservationAvailableTypes(observation);
+      const readView = requestedView === 'changes' ? 'changes' : sliceView;
+      const storedRead = requestedView === 'changes'
+        ? readRuntimeObservation(observationStore, input.runId, 0, maxChars, 'changes')
+        : undefined;
+      const header = [
+        shouldRefresh
+          ? 'Current DOM observation refreshed lazily for this run.'
+          : 'Current DOM observation continued lazily for this run.',
+        currentPageContext ? `Current URL: ${currentPageContext.url}` : '',
+        currentPageContext ? `Current title: ${currentPageContext.title}` : '',
+        currentPageContext ? `Open tabs JSON: ${JSON.stringify(currentPageContext.tabs)}` : '',
+        currentPageContext ? `Focused element JSON: ${JSON.stringify(currentPageContext.focusedElement)}` : '',
+        currentPageContext ? `Page scroll state JSON: ${JSON.stringify(currentPageContext.pageScrollState)}` : '',
+        currentPageContext ? `Scrollable areas summary:\n${formatScrollableAreaSummary(currentPageContext.scrollableAreas)}` : '',
+        `Observation generation: ${observation.generation}. Read view=${readView}. Stored views: ${availableTypes || sliceView}.`,
+        `Slice metadata JSON: ${JSON.stringify({ view: sliceView, startIndex: slice.startIndex, nextIndex: slice.nextIndex, hasMore: slice.hasMore, returnedEntries: slice.returnedEntries, scannedCandidates: slice.scannedCandidates, totalEntries: slice.totalEntries, candidateEstimate: slice.candidateEstimate, timings: slice.timings })}`,
+        nextCursor ? `More available: call readObservation({cursor:"${nextCursor}",maxChars:${maxChars}}).` : 'End of this lazy DOM observation view.',
+      ].filter(Boolean);
+      await onDebug?.({
+        phase: 'browser:read-observation:dom-timings',
+        stepIndex,
+        message: `DOM readObservation timings: total=${elapsedSince(readStartedAt)}ms, pageContext=${pageContextMs}ms, slice=${slice.timings.totalMs}ms, refresh=${shouldRefresh}.`,
+        details: { pageContextMs, slice, totalMs: elapsedSince(readStartedAt), refresh: shouldRefresh },
+      });
       return {
         ok: true,
-        actual,
-        observationViews,
-        debug: domSnapshotDebug(currentPageContext, currentDomContext),
+        actual: [
+          ...header,
+          '',
+          requestedView === 'changes' && storedRead
+            ? storedRead.actual
+            : slice.content,
+        ].join('\n'),
+        observationViews: {
+          ...observation.views,
+          defaultType: observation.defaultType,
+        },
+        debug: currentPageContext ? domSnapshotDebug(currentPageContext, currentDomContext) : undefined,
       };
     }
 
@@ -3282,7 +3204,7 @@ async function executeRuntimeStep(input: {
           { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
           ...(appendedMessages.length
             ? appendedMessages
-            : [{ role: 'user' as const, content: 'Continue from the continuation summary. If fresh page state is needed before acting, call getPageState.' }]),
+            : [{ role: 'user' as const, content: 'Continue from the continuation summary. If fresh page state is needed before acting, call readObservation({refresh:true,view:"actions",maxChars:10000}).' }]),
         ];
         attachedImagePaths = appendedImagePaths;
         messageImagePaths = [...attachedImagePaths];
@@ -3364,8 +3286,7 @@ async function executeRuntimeStep(input: {
           await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
         },
         onSelectReferenceScreenshots: async (selection) => { ensureActive(); await applySelectedReferenceScreenshots(selection); },
-        observePageState,
-        readObservation: (options) => readRuntimeObservation(observationStore, input.runId, options?.offset, options?.maxChars, options?.view),
+        readObservation,
       });
       ensureActive();
       await onDebug?.({
@@ -3419,8 +3340,8 @@ async function executeRuntimeStep(input: {
       shouldContinue: input.shouldContinue,
       requestToolConfirmation: input.requestToolConfirmation,
       onDebug,
-      observePageState,
       observeCurrentScreenshot,
+      readObservation,
       onVisualContextChange: async (snapshot) => {
         ensureActive();
         await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
@@ -4285,10 +4206,9 @@ async function executeCodexRuntimeObject(input: {
     selectionReason: string;
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
-  observePageState?: (input?: RuntimeObservationInlineReadInput) => Promise<BrowserActionResult>;
   readObservation?: (input?: RuntimeObservationReadOptions) => BrowserActionResult | Promise<BrowserActionResult>;
 }) {
-  const { session, targetUrl, runId, stepIndex, mode, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observePageState, readObservation } = input;
+  const { session, targetUrl, runId, stepIndex, mode, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, readObservation } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -4349,11 +4269,6 @@ async function executeCodexRuntimeObject(input: {
   };
   const pendingConfirmation = requestToolConfirmation ? toolConfirmationFromInput(type, normalizedParams) : undefined;
   const runTool = async () => {
-    if (type === 'getPageState') {
-      return observePageState
-        ? observePageState(normalizedParams as RuntimeObservationInlineReadInput)
-        : { ok: false, actual: 'getPageState is unavailable in this runtime.' };
-    }
     if (type === 'readObservation') {
       return readObservation
         ? readObservation(normalizedParams as RuntimeObservationReadOptions)
