@@ -704,8 +704,28 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
   const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
   const upstream = options.abortSignal;
   const abortSignal = upstream ? AbortSignal.any([upstream, timeoutController.signal]) : timeoutController.signal;
+  let stopAbortWatch = () => {};
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    const onAbort = () => {
+      if (upstream?.aborted) {
+        reject(browserChatAbortError(upstream));
+        return;
+      }
+      if (timeoutController.signal.aborted) {
+        reject(timeoutController.signal.reason || new Error(`AI request timed out after ${timeoutMs}ms`));
+        return;
+      }
+      reject(browserChatAbortError(upstream));
+    };
+    abortSignal.addEventListener('abort', onAbort, { once: true });
+    stopAbortWatch = () => abortSignal.removeEventListener('abort', onAbort);
+    if (abortSignal.aborted) onAbort();
+  });
   try {
-    return await generateText({ ...options, abortSignal });
+    return await Promise.race([
+      generateText({ ...options, abortSignal }),
+      abortPromise,
+    ]);
   } catch (error) {
     if (isBrowserChatAbortError(error, upstream)) throw browserChatAbortError(upstream);
     if (timeoutController.signal.aborted && !upstream?.aborted) {
@@ -715,6 +735,7 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
     }
     throw error;
   } finally {
+    stopAbortWatch();
     clearTimeout(timer);
   }
 }

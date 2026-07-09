@@ -2,7 +2,8 @@ export function domObservationHardRules() {
   return [
     '- If the page may have changed or you need fresh DOM/text evidence, call getPageState explicitly. The backend will not silently refresh page state between model calls.',
     '- If visual evidence is needed and the configured model supports image input, call getCurrentScreenshot. Screenshot evidence is separate from DOM/action ids.',
-    '- If text-only DOM evidence is ambiguous because of stacked overlays, date pickers, popovers, duplicated labels, icon-only controls, or uncertainty about the active layer, and getCurrentScreenshot is available, call getCurrentScreenshot before choosing an action.',
+    '- In DOM mode, if you cannot confidently identify the target element from getPageState/readObservation/findByText, call getCurrentScreenshot before deciding the action or declaring the task blocked.',
+    '- If text-only DOM evidence is ambiguous because of stacked overlays, date pickers, popovers, duplicated labels, icon-only controls, hidden hover menus, or uncertainty about the active layer, and getCurrentScreenshot is available, call getCurrentScreenshot before choosing an action.',
     '- Prefer getPageState({ read: { view, offset, maxChars } }) to refresh page state and inline-read one browser-generated view in the same call. The default actions view lists visible actionable node_id entries first; changes compares the previous and current page state; tree gives full hierarchy; text gives visible page copy. maxChars values below 10000 are raised to 10000.',
   ];
 }
@@ -18,7 +19,7 @@ export function domModeActionRules() {
     '- For hover-only menus in DOM mode, use current actions node_id evidence to choose a supported hover path, then call getPageState before choosing a revealed target.',
     '- Use scrollArea only when interaction requires changing the visual viewport or lazy-loaded content is absent from the elements context. After scrolling or any browser-changing action, call getPageState before using new ids.',
     '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
-    '- getCurrentScreenshot is read-only visual evidence. Do not use screenshot positions as action ids; use DOM node_id tools for actions.',
+    '- getCurrentScreenshot is read-only visual evidence. Use it to decide which visible target/layer is correct when DOM evidence is hard to interpret; do not use screenshot positions as action ids. Actions still use DOM node_id tools.',
     '- When multiple visible layers contain similar actions such as 确定/取消, use screenshot evidence if available to identify the currently topmost active layer before clicking.',
     '- In DOM mode, ordinary tool visualAfter screenshots are disabled unless DOM screenshot saving is enabled in settings. Normally omit visualAfter; call getCurrentScreenshot only when explicit visual evidence is needed.',
   ];
@@ -30,4 +31,4 @@ export function domCurrentContextLine(browserChatMode: boolean) {
     : 'No initial DOM page observation is included. Call getPageState with read for fresh URL, tabs, focus, scroll state, DOM snapshot, and page text.';
 }
 
-export const domNoScreenshotRule = '- No live screenshot image/path is attached automatically. Use getPageState({ read: { view: "actions", offset: 0, maxChars: 10000 } }) to collect the browser-generated DOM observation and actionable node_id entries in one call. Use read.view="changes" to inspect what changed since the previous page state, and read.view="tree" or read.view="text" only when structure or copy is needed. If visual evidence is needed, or text-only DOM evidence is ambiguous because of stacked overlays/date pickers/duplicate labels, and getCurrentScreenshot is available, call it explicitly; actions still use DOM node_id tools.';
+export const domNoScreenshotRule = '- No live screenshot image/path is attached automatically. Use getPageState({ read: { view: "actions", offset: 0, maxChars: 10000 } }) to collect the browser-generated DOM observation and actionable node_id entries in one call. Use read.view="changes" to inspect what changed since the previous page state, and read.view="tree" or read.view="text" only when structure or copy is needed. If you cannot confidently find the target from DOM evidence, or text-only DOM evidence is ambiguous because of stacked overlays/date pickers/duplicate labels/icon-only controls/hidden hover menus, and getCurrentScreenshot is available, call it explicitly before choosing an action or declaring the task blocked; actions still use DOM node_id tools.';

@@ -7,6 +7,7 @@ import {
   ArrowRight,
   BadgeCheck,
   Bot,
+  Brain,
   Braces,
   Bug,
   ChevronDown,
@@ -318,6 +319,7 @@ function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'browser') return <PanelLeft size={15} />;
   if (tab === 'runtime') return <SquareTerminal size={15} />;
   if (tab === 'skills') return <Braces size={15} />;
+  if (tab === 'memory') return <Brain size={15} />;
   if (tab === 'debug') return <Bug size={15} />;
   return <SlidersHorizontal size={15} />;
 }
@@ -2765,6 +2767,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [addressValue, setAddressValue] = useState('');
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
+  const [collapsedGroupIds, setCollapsedGroupIds] = useState<string[]>([]);
   const [closedGroupIds, setClosedGroupIds] = useState<string[]>([]);
   const [draggingTabId, setDraggingTabId] = useState('');
   const [dragDropTarget, setDragDropTarget] = useState<{ position: 'before' | 'after'; tabId: string } | null>(null);
@@ -2949,6 +2952,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     applyEmbeddedBrowserState(result);
     if (result.ok) {
       setClosedGroupIds((current) => (current.includes(group.id) ? current : [...current, group.id]));
+      setCollapsedGroupIds((current) => current.filter((item) => item !== group.id));
       const nextActiveGroup = result.groups?.find((item) => item.active) || result.groups?.find((item) => item.tabs.length);
       const nextSessionId = nextActiveGroup?.sessionId || nextActiveGroup?.tabs.find((tab) => tab.sessionId)?.sessionId;
       if (nextSessionId && nextSessionId !== sessionId) onSelectSession?.(nextSessionId);
@@ -2967,8 +2971,17 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     applyEmbeddedBrowserState(result);
     if (result.ok) {
       setClosedGroupIds((current) => current.filter((item) => item !== group.id));
+      setCollapsedGroupIds((current) => current.filter((item) => item !== group.id));
       if (groupSessionId && groupSessionId !== sessionId) onSelectSession?.(groupSessionId);
     }
+  }
+
+  function toggleEmbeddedBrowserGroupCollapsed(groupId: string) {
+    setCollapsedGroupIds((current) => (
+      current.includes(groupId)
+        ? current.filter((item) => item !== groupId)
+        : [...current, groupId]
+    ));
   }
 
   function embeddedTabDragPosition(event: ReactDragEvent<HTMLElement>) {
@@ -3075,6 +3088,14 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const isEmbeddedBrowserLoading = Boolean(activeEmbeddedTab?.loading);
 
   useEffect(() => {
+    const visibleIds = new Set(visibleGroups.map((group) => group.id));
+    setCollapsedGroupIds((current) => {
+      const next = current.filter((groupId) => visibleIds.has(groupId));
+      return next.length === current.length ? current : next;
+    });
+  }, [visibleGroups]);
+
+  useEffect(() => {
     if (!addressFocusedRef.current) setAddressValue(embeddedBrowserDisplayUrl(activeEmbeddedTab));
   }, [activeEmbeddedTab?.id, activeEmbeddedTab?.url]);
 
@@ -3094,25 +3115,27 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
               || group.tabs.find((tab) => tab.sessionId)?.sessionId
               || (group.id.startsWith('session:') ? group.id.slice('session:'.length) : sessionId);
             const isActiveGroup = Boolean(group.active || group.id === selectedGroupId);
+            const isCollapsedGroup = collapsedGroupIds.includes(group.id);
             return (
               <div
                 className={[
                   'browser-chat-embedded-tab-group-shell',
                   isActiveGroup ? 'active' : '',
+                  isCollapsedGroup ? 'collapsed' : '',
                   group.tabs.length ? '' : 'empty',
                 ].filter(Boolean).join(' ')}
                 key={group.id}
               >
                 <div className="browser-chat-embedded-tab-group-tag">
                   <button
+                    aria-expanded={!isCollapsedGroup}
                     className="browser-chat-embedded-tab-group-label"
-                    onClick={(event) => {
-                      event.currentTarget.blur();
-                    }}
-                    title={embeddedSessionGroupLabel(groupSessionId)}
+                    onClick={() => toggleEmbeddedBrowserGroupCollapsed(group.id)}
+                    title={`${isCollapsedGroup ? '展开' : '收起'} ${embeddedSessionGroupLabel(groupSessionId)} 标签组`}
                     type="button"
                   >
                     <Folder size={14} />
+                    <ChevronDown className="browser-chat-embedded-tab-group-chevron" size={11} />
                   </button>
                   <button
                     aria-label={`关闭 ${embeddedSessionGroupLabel(groupSessionId)} 标签组`}

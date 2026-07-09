@@ -21,6 +21,10 @@ export function browserChatSessionFilePath(sessionId: string) {
   return path.join(browserChatSessionsDir(), `${safeDataFileSegment(sessionId)}.json`);
 }
 
+export function personalMemoryFilePath() {
+  return path.join(appDataRoot(), '.data', 'personal-memory', 'items.json');
+}
+
 export function targetTestMetadataFilePath() {
   return path.join(appDataRoot(), '.data', 'target-test-metadata.json');
 }

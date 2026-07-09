@@ -5,6 +5,7 @@ import { X } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { BrowserChatPayloadDetails } from '@/components/BrowserChatPayloadDetails';
 import {
+  isBrowserChatAiFailureLog,
   isBrowserChatContextCompressionLog,
   isBrowserChatScreenshotPerformanceLog,
   summarizeBrowserChatLogs,
@@ -192,6 +193,7 @@ function BrowserChatLogDetails({ log }: { log: BrowserChatLogDialogRecord }) {
   const parsed = parseJsonObjectText(log.details);
   const isAiRequestLog = log.phase === 'ai:runtime:request';
   const isAiResponseLog = log.phase === 'ai:runtime:response' || log.phase === 'ai:runtime:object';
+  const isAiFailureLog = isBrowserChatAiFailureLog(log);
   const isConversationSummaryRequest = log.phase === 'conversation:context:request';
   const isConversationSummaryResponse = log.phase === 'conversation:context:response';
   if (!parsed) return null;
@@ -219,13 +221,15 @@ function BrowserChatLogDetails({ log }: { log: BrowserChatLogDialogRecord }) {
         })
       : '';
   const timingPayload = isAiResponseLog ? aiLogTimingPayload(parsed) : '';
+  const errorPayload = isAiFailureLog ? formatToolPayload(parsed) : '';
   const performancePayload = isBrowserChatScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
-  if (!requestPayload && !responsePayload && !timingPayload && !performancePayload) return null;
+  if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload) return null;
   return (
     <div className="browser-chat-log-details">
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" payload={timingPayload} title="耗时明细" />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block" payload={requestPayload} title="AI input JSON" />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-response" payload={responsePayload} title="AI output JSON" />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-error" payload={errorPayload} title="错误详情" />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-performance" payload={performancePayload} title="Screenshot performance" />
     </div>
   );

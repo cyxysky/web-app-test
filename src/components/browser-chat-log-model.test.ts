@@ -5,6 +5,8 @@ import { summarizeBrowserChatLogs, visibleBrowserChatExecutionLogs } from './bro
 test('visibleBrowserChatExecutionLogs keeps ai, context, and screenshot logs', () => {
   const logs = [
     { phase: 'ai:runtime:request' },
+    { phase: 'ai:runtime:recoverable-error' },
+    { phase: 'chat:runtime:request-aborted' },
     { phase: 'conversation:context:response' },
     { phase: 'browser:screenshot:capture' },
     { phase: 'chat:message' },
@@ -12,6 +14,8 @@ test('visibleBrowserChatExecutionLogs keeps ai, context, and screenshot logs', (
 
   assert.deepEqual(visibleBrowserChatExecutionLogs(logs).map((log) => log.phase), [
     'ai:runtime:request',
+    'ai:runtime:recoverable-error',
+    'chat:runtime:request-aborted',
     'conversation:context:response',
     'browser:screenshot:capture',
   ]);
@@ -20,14 +24,15 @@ test('visibleBrowserChatExecutionLogs keeps ai, context, and screenshot logs', (
 test('summarizeBrowserChatLogs counts visible log categories', () => {
   const summary = summarizeBrowserChatLogs([
     { phase: 'ai:runtime:response' },
+    { phase: 'ai:runtime:retry' },
     { phase: 'conversation:context:error' },
     { phase: 'perf:screenshot:compress' },
   ]);
 
   assert.deepEqual(summary, {
-    ai: 1,
+    ai: 2,
     context: 1,
     screenshot: 1,
-    total: 3,
+    total: 4,
   });
 });

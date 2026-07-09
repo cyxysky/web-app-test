@@ -4816,6 +4816,15 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   padding: 22px;
 }
 
+.settings-loading-panel:not(.compact) {
+  justify-content: center;
+  min-height: min(62vh, 560px);
+}
+
+.settings-loading-panel:not(.compact) > div {
+  min-width: min(420px, 100%);
+}
+
 .settings-loading-panel h2 {
   font-size: 18px;
   margin: 0 0 4px;
@@ -5238,6 +5247,182 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .settings-workspace .empty-state {
   color: var(--muted);
+}
+
+.personal-memory-settings {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.personal-memory-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.ui-modal--personal-memory {
+  height: auto;
+  width: min(92vw, 920px);
+}
+
+.personal-memory-editor {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.personal-memory-form,
+.personal-memory-editor-grid {
+  display: grid;
+  gap: 14px 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
+}
+
+.personal-memory-form {
+  align-content: start;
+}
+
+.personal-memory-field {
+  color: var(--muted-strong);
+  display: grid;
+  font-size: 12px;
+  font-weight: 850;
+  gap: 6px;
+  min-width: 0;
+}
+
+.personal-memory-field.wide {
+  grid-column: 1 / -1;
+}
+
+.personal-memory-field .settings-control {
+  justify-self: stretch;
+  width: 100%;
+}
+
+.personal-memory-field .custom-select {
+  z-index: 1;
+}
+
+.personal-memory-field .custom-select:has(.custom-select-menu.open) {
+  z-index: 80;
+}
+
+.personal-memory-field textarea {
+  line-height: 1.5;
+  min-height: 92px;
+  resize: vertical;
+}
+
+.personal-memory-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.personal-memory-list {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.personal-memory-item {
+  align-items: start;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+  padding: 14px;
+}
+
+.personal-memory-item.disabled {
+  opacity: 0.72;
+}
+
+.personal-memory-item-main {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.personal-memory-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.personal-memory-meta span {
+  align-items: center;
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted-strong);
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 850;
+  min-height: 24px;
+  padding: 2px 8px;
+}
+
+.personal-memory-status.active {
+  background: rgba(22, 101, 52, 0.08);
+  border-color: rgba(22, 101, 52, 0.2);
+  color: var(--success);
+}
+
+.personal-memory-status.disabled {
+  background: rgba(127, 29, 29, 0.08);
+  border-color: rgba(127, 29, 29, 0.2);
+  color: var(--danger);
+}
+
+.personal-memory-item h3 {
+  color: var(--foreground);
+  font-size: 15px;
+  font-weight: 850;
+  letter-spacing: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.personal-memory-item p {
+  color: var(--muted-strong);
+  font-size: 14px;
+  line-height: 1.55;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.personal-memory-item small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.personal-memory-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.personal-memory-delete-error {
+  background: rgba(127, 29, 29, 0.08);
+  border: 1px solid rgba(127, 29, 29, 0.2);
+  border-radius: 8px;
+  color: var(--danger);
+  padding: 10px 12px;
 }
 
 .skills-manager {
@@ -6041,6 +6226,18 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     width: 100%;
   }
 
+  .personal-memory-form,
+  .personal-memory-editor-grid,
+  .personal-memory-item {
+    grid-template-columns: 1fr;
+  }
+
+  .personal-memory-head-actions,
+  .personal-memory-editor-actions,
+  .personal-memory-actions {
+    justify-content: flex-start;
+  }
+
   .skills-manager-layout,
   .skills-manager-form,
   .skills-manager-section-grid {
@@ -6738,8 +6935,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-embedded-browser.loading header::after {
   background:
-    linear-gradient(90deg, transparent 0%, #ff3b30 24%, #ff8a00 48%, #ff3b30 72%, transparent 100%);
-  background-size: 220% 100%;
+    linear-gradient(90deg, transparent 0%, #ff3b30 14%, #ffcc00 28%, #34c759 42%, #00c7ff 56%, #5856d6 70%, #ff2d55 84%, transparent 100%);
+  background-size: 260% 100%;
   animation: embedded-browser-loading-sweep 1.05s ease-in-out infinite;
 }
 
@@ -6786,6 +6983,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   transition: flex-basis 0.16s ease;
 }
 
+.browser-chat-embedded-tab-group-shell.collapsed {
+  flex: 0 0 auto;
+}
+
 .browser-chat-embedded-tab-group-shell::before {
   content: none;
 }
@@ -6800,11 +7001,11 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     inset 0 1px 0 rgba(255, 255, 255, 0.42);
   color: color-mix(in srgb, var(--foreground) 54%, var(--muted));
   display: inline-flex;
-  flex: 0 0 32px;
+  flex: 0 0 38px;
   gap: 0;
   height: 30px;
-  max-width: 32px;
-  min-width: 32px;
+  max-width: 38px;
+  min-width: 38px;
   overflow: hidden;
   position: relative;
   transition:
@@ -6828,10 +7029,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   color: inherit;
   cursor: pointer;
   display: inline-flex;
-  flex: 0 0 30px;
+  flex: 0 0 36px;
   font-size: 13px;
   font-weight: 500;
-  gap: 0;
+  gap: 1px;
   height: 100%;
   justify-content: center;
   line-height: 1;
@@ -6849,6 +7050,15 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   flex: 0 0 auto;
 }
 
+.browser-chat-embedded-tab-group-chevron {
+  opacity: 0.7;
+  transition: transform 0.16s ease;
+}
+
+.browser-chat-embedded-tab-group-shell.collapsed .browser-chat-embedded-tab-group-chevron {
+  transform: rotate(-90deg);
+}
+
 .browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag {
   background: rgba(255, 255, 255, 0.56);
   border-color: rgba(92, 105, 124, 0.2);
@@ -6862,9 +7072,9 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: rgba(255, 255, 255, 0.5);
   border-color: rgba(92, 105, 124, 0.18);
   color: var(--accent-strong);
-  flex-basis: 78px;
-  max-width: 78px;
-  min-width: 78px;
+  flex-basis: 84px;
+  max-width: 84px;
+  min-width: 84px;
 }
 
 .browser-chat-embedded-tab-group-label:focus-visible {
@@ -6922,6 +7132,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   flex: 1 1 auto;
   gap: 3px;
   min-width: 0;
+}
+
+.browser-chat-embedded-tab-group-shell.collapsed .browser-chat-embedded-tab-stack {
+  display: none;
 }
 
 .browser-chat-embedded-tab {
@@ -9990,6 +10204,40 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: var(--button-danger-bg);
   border-color: var(--button-danger-bg);
   color: #ffffff;
+}
+
+:root[data-theme="dark"] :where(.personal-memory-head-actions .ui-button,
+  .browser-chat-new-chat-button,
+  .browser-chat-sub-sidebar .group-create-button) {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--muted-strong);
+}
+
+:root[data-theme="dark"] :where(.personal-memory-head-actions .ui-button,
+  .browser-chat-new-chat-button,
+  .browser-chat-sub-sidebar .group-create-button):not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  border-color: transparent;
+  color: var(--foreground);
+}
+
+:root[data-theme="dark"] :where(.browser-chat-nav-item:hover,
+  .browser-chat-subnav button:hover,
+  .group-tree-button:hover) {
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+}
+
+:root[data-theme="dark"] :where(.browser-chat-nav-item.active,
+  .browser-chat-nav-item.active:hover,
+  .browser-chat-subnav button.active,
+  .browser-chat-subnav button.active:hover,
+  .group-tree-button.active,
+  .group-tree-button.active:hover) {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent);
+  color: var(--foreground);
 }
 
 :is(.ui-icon-button,

@@ -17,6 +17,17 @@ export function isBrowserChatAiInputOutputLog(log: BrowserChatLogRecordLike) {
     || log.phase === 'conversation:context:response';
 }
 
+export function isBrowserChatAiFailureLog(log: BrowserChatLogRecordLike) {
+  return log.phase === 'ai:runtime:retry'
+    || log.phase === 'ai:runtime:retry-skipped'
+    || log.phase === 'ai:runtime:recoverable-error'
+    || log.phase === 'chat:runtime:request-aborted';
+}
+
+export function isBrowserChatAiLog(log: BrowserChatLogRecordLike) {
+  return isBrowserChatAiInputOutputLog(log) || isBrowserChatAiFailureLog(log);
+}
+
 export function isBrowserChatContextCompressionLog(log: BrowserChatLogRecordLike) {
   return log.phase === 'ai:context-segmented'
     || log.phase === 'conversation:context:request'
@@ -31,7 +42,7 @@ export function isBrowserChatScreenshotPerformanceLog(log: BrowserChatLogRecordL
 }
 
 export function isBrowserChatVisibleExecutionLog(log: BrowserChatLogRecordLike) {
-  return isBrowserChatAiInputOutputLog(log)
+  return isBrowserChatAiLog(log)
     || isBrowserChatContextCompressionLog(log)
     || isBrowserChatScreenshotPerformanceLog(log);
 }
@@ -42,7 +53,7 @@ export function visibleBrowserChatExecutionLogs<TLog extends BrowserChatLogRecor
 
 export function summarizeBrowserChatLogs(logs: BrowserChatLogRecordLike[]): BrowserChatLogSummary {
   return logs.reduce<BrowserChatLogSummary>((summary, log) => ({
-    ai: summary.ai + (isBrowserChatAiInputOutputLog(log) ? 1 : 0),
+    ai: summary.ai + (isBrowserChatAiLog(log) ? 1 : 0),
     context: summary.context + (isBrowserChatContextCompressionLog(log) ? 1 : 0),
     screenshot: summary.screenshot + (isBrowserChatScreenshotPerformanceLog(log) ? 1 : 0),
     total: summary.total + 1,

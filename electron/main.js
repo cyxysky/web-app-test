@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, WebContentsView, dialog, ipcMain, nativeTheme } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -124,6 +124,19 @@ function preloadPath() {
 
 function embeddedBrowserPreloadPath() {
   return path.join(__dirname, 'embedded-browser-preload.js');
+}
+
+function embeddedBrowserUserAgent() {
+  const configured = String(process.env.ELECTRON_EMBEDDED_BROWSER_USER_AGENT || '').trim();
+  if (configured) return configured;
+  const chromeVersion = process.versions.chrome || '148.0.0.0';
+  if (process.platform === 'darwin') {
+    return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
+  }
+  if (process.platform === 'linux') {
+    return `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
+  }
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
 }
 
 function packagedChromiumExecutable() {
@@ -426,6 +439,7 @@ function createEmbeddedBrowserTab(input = {}) {
     view,
   };
   view.webContents.setZoomFactor(1);
+  view.webContents.setUserAgent(embeddedBrowserUserAgent());
   embeddedBrowserTabs.set(tab.id, tab);
   group.activeTabId = tab.id;
   installEmbeddedBrowserTabHandlers(tab);
@@ -1094,6 +1108,7 @@ async function startServer(appDataDir) {
 }
 
 function createWindow() {
+  nativeTheme.themeSource = 'dark';
   mainWindow = new BrowserWindow({
     width: 1320,
     height: 900,
@@ -1101,6 +1116,7 @@ function createWindow() {
     minHeight: 680,
     title: APP_NAME,
     icon: appIconPath(),
+    backgroundColor: '#0f131b',
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -1108,7 +1124,22 @@ function createWindow() {
     },
   });
   mainWindow.setMenuBarVisibility(false);
-  const loadingHtml = `<body style="font-family:system-ui;margin:0;display:grid;place-items:center;height:100vh;color:#242f3a"><div><h2>${APP_NAME}</h2><p>Starting local service...</p></div></body>`;
+  const loadingHtml = `
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        background: #0f131b;
+        color: #d7dee8;
+        display: grid;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        height: 100vh;
+        margin: 0;
+        place-items: center;
+      }
+      h2 { font-size: 22px; margin: 0 0 8px; }
+      p { color: #9ca3af; font-size: 14px; margin: 0; }
+    </style>
+    <body><div><h2>${APP_NAME}</h2><p>Starting local service...</p></div></body>`;
   mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(loadingHtml)}`);
   return mainWindow;
 }

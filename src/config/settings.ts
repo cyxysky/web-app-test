@@ -1,6 +1,6 @@
 import type { ModelProvider } from '@/server/ai/schemas/test-case.schema';
 
-export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'debug';
+export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'memory' | 'debug';
 
 export type ModelProviderDefinition = {
   value: ModelProvider;
@@ -23,7 +23,7 @@ export type RuntimeEnvDefinition = {
   key: string;
   label: string;
   description: string;
-  tab: Exclude<SettingsTab, 'general' | 'model' | 'skills'>;
+  tab: Exclude<SettingsTab, 'general' | 'model' | 'skills' | 'memory'>;
   defaultValue: string;
   control: 'boolean' | 'number' | 'select' | 'text' | 'secret' | 'textarea';
   options?: Array<{ label: string; value: string }>;
@@ -173,6 +173,10 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_RUNTIME_REQUEST_RETRY_ATTEMPTS', label: 'AI 请求连续失败上限', description: 'Agent Loop 中上游连接或请求级错误连续失败达到该次数后停止；成功一次会清零。', tab: 'runtime', defaultValue: '3', control: 'number' },
   { key: 'BROWSER_CHAT_KEEP_BROWSER_OPEN_AFTER_TURN', label: '对话完成保留浏览器', description: '浏览器对话每轮完成后是否保留浏览器，便于同一用户后续对话复用。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'BROWSER_CHAT_LOG_LIMIT', label: '对话日志保留上限', description: '每个浏览器对话最多保留多少条执行日志；前端日志弹窗使用虚拟滚动。', tab: 'runtime', defaultValue: '2000', control: 'number' },
+  { key: 'AI_PERSONAL_MEMORY_ENABLED', label: 'Personal memory', description: 'Enable concise user/domain memory recall in browser chat prompts.', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
+  { key: 'AI_PERSONAL_MEMORY_EXTRACT_ENABLED', label: 'Personal memory extraction', description: 'Extract durable aliases, preferences, workflows, and domain facts after each completed browser chat turn.', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
+  { key: 'AI_PERSONAL_MEMORY_PROMPT_LIMIT', label: 'Personal memory prompt limit', description: 'Maximum number of personal memory items injected into one browser chat turn.', tab: 'runtime', defaultValue: '6', control: 'number' },
+  { key: 'AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS', label: 'Personal memory extraction timeout', description: 'Maximum time allowed for the post-turn memory extraction model request.', tab: 'runtime', defaultValue: '30000', control: 'number' },
   { key: 'AI_CONTEXT_WINDOW_TOKENS', label: '上下文窗口大小', description: '估算模型上下文窗口大小。', tab: 'runtime', defaultValue: '32000', control: 'number' },
   { key: 'AI_CONTEXT_COMPRESSION_THRESHOLD', label: '上下文压缩阈值', description: '超过上下文窗口多少比例后压缩历史。', tab: 'runtime', defaultValue: '0.7', control: 'number' },
   { key: 'AI_IMAGE_CONTEXT_ESTIMATE_TOKENS', label: '单张图片估算 Token', description: '估算每张截图占用的上下文 token。', tab: 'runtime', defaultValue: '1200', control: 'number' },

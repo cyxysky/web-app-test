@@ -25,6 +25,27 @@ If the model call fails, generation falls back to a local structured test case a
 
 Browser execution accepts `http` and `https` target URLs by default. Set `ALLOWED_TEST_DOMAINS=localhost,127.0.0.1,example.com` to restrict runs to a domain allowlist.
 
+## Personal Memory
+
+Browser chat keeps a first-pass local personal memory store at `.data/personal-memory/items.json`.
+It does not require an embedding model or vector database. After a completed browser-chat turn, the app asks the current chat model to extract only concise durable items such as aliases, preferences, workflows, and domain facts. Future turns recall matching active items by user id, current domain, and keyword/alias match.
+
+You can view, add, edit, disable, and delete memory items in Settings -> Personal Memory. The local JSON file remains the source of truth for backup or bulk cleanup.
+
+Runtime controls:
+
+- `AI_PERSONAL_MEMORY_ENABLED=false` disables recall and extraction.
+- `AI_PERSONAL_MEMORY_EXTRACT_ENABLED=false` disables post-turn extraction while keeping manual memory recall available.
+- `AI_PERSONAL_MEMORY_PROMPT_LIMIT=6` controls how many memory items are injected into one turn.
+- `AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS=30000` controls the extraction request timeout.
+
+Minimal management API:
+
+- `GET /api/personal-memory?userId=...&domain=...&includeDisabled=true`
+- `POST /api/personal-memory`
+- `PATCH /api/personal-memory/{id}`
+- `DELETE /api/personal-memory/{id}`
+
 Each test case can choose a browser operation mode:
 
 - `Default configuration` keeps compatibility with `isClick` / `AI_BROWSER_MODE`.

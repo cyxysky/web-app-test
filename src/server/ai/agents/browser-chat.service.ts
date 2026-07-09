@@ -8,9 +8,18 @@ import {
   type BrowserToolConfirmationDecision,
   type BrowserToolConfirmationRequest,
   type InteractiveBrowserTurnMessage,
+  type InteractiveBrowserTurnResult,
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
 import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
+import {
+  extractPersonalMemoryFromTurn,
+  formatPersonalMemoryForPrompt,
+  markPersonalMemoryItemsUsed,
+  normalizePersonalMemoryDomain,
+  personalMemoryEnabled,
+  searchPersonalMemory,
+} from '@/server/ai/personal-memory';
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
 import type { ModelProvider, RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
@@ -189,6 +198,101 @@ function trimBrowserChatLogs(logs: BrowserChatLogRecord[]) {
 
 function browserChatKeepBrowserOpenAfterTurn() {
   return process.env.BROWSER_CHAT_KEEP_BROWSER_OPEN_AFTER_TURN !== 'false';
+}
+
+function browserChatMemoryUrl(browser: BrowserSession | undefined, session: Pick<BrowserChatSessionSnapshot, 'targetUrl'>) {
+  const currentUrl = browser?.currentUrl() || '';
+  return currentUrl || session.targetUrl || '';
+}
+
+function browserChatPersonalMemoryContext(input: {
+  session: BrowserChatSessionRecord;
+  browser: BrowserSession;
+  text: string;
+  modelText: string;
+}) {
+  if (!personalMemoryEnabled()) return '';
+  const currentUrl = browserChatMemoryUrl(input.browser, input.session);
+  const results = searchPersonalMemory({
+    userId: input.session.userId,
+    query: [input.text, input.modelText, input.session.title].filter(Boolean).join('\n'),
+    domain: currentUrl || input.session.targetUrl,
+  });
+  if (!results.length) return '';
+  markPersonalMemoryItemsUsed(results.map((result) => result.item.id));
+  appendLog(input.session, 'memory:prompt', `已注入 ${results.length} 条个性化短记忆。`, {
+    details: {
+      currentDomain: normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl),
+      items: results.map((result) => ({
+        id: result.item.id,
+        scope: result.item.scope,
+        domain: result.item.domain,
+        type: result.item.type,
+        key: result.item.key,
+        score: result.score,
+        reasons: result.reasons,
+      })),
+    },
+    deferPersist: true,
+  });
+  return formatPersonalMemoryForPrompt(results);
+}
+
+function queuePersonalMemoryExtraction(input: {
+  session: BrowserChatSessionRecord;
+  browser: BrowserSession;
+  text: string;
+  result: InteractiveBrowserTurnResult;
+  userMessageId: string;
+  assistantMessageId: string;
+}) {
+  if (!personalMemoryEnabled()) return;
+  const currentUrl = browserChatMemoryUrl(input.browser, input.session);
+  const conversation = input.session.messages
+    .filter((message) => message.role === 'user' || message.role === 'assistant')
+    .map((message) => ({
+      role: message.role,
+      content: message.content,
+    }));
+  const startedAt = Date.now();
+  void extractPersonalMemoryFromTurn({
+    userId: input.session.userId,
+    currentUrl,
+    targetUrl: input.session.targetUrl,
+    userMessage: input.text,
+    assistantReply: input.result.reply,
+    conversation,
+    steps: input.result.newSteps,
+    sourceSessionId: input.session.id,
+    sourceMessageIds: [input.userMessageId, input.assistantMessageId],
+  }).then((memoryResult) => {
+    const current = sessions.get(input.session.id);
+    if (!current || current !== input.session || memoryResult.skipped || !memoryResult.items.length) return;
+    appendLog(current, 'memory:extract:done', `已提炼 ${memoryResult.items.length} 条个性化短记忆。`, {
+      elapsedMs: elapsedMs(startedAt),
+      messageId: null,
+      details: {
+        currentDomain: normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl),
+        items: memoryResult.items.map((item) => ({
+          id: item.id,
+          scope: item.scope,
+          domain: item.domain,
+          type: item.type,
+          key: item.key,
+          value: item.value,
+          confidence: item.confidence,
+        })),
+      },
+    });
+  }).catch((error) => {
+    const current = sessions.get(input.session.id);
+    if (!current || current !== input.session) return;
+    appendLog(current, 'memory:extract:error', `个性化短记忆提炼失败：${error instanceof Error ? error.message : 'unknown error'}`, {
+      elapsedMs: elapsedMs(startedAt),
+      messageId: null,
+      details: errorLogDetails(error),
+    });
+  });
 }
 
 function normalizeSafetyMode(value: unknown): BrowserChatSafetyMode {
@@ -2364,6 +2468,11 @@ async function runBrowserChatMessage(
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      const personalMemoryContext = browserChatPersonalMemoryContext({ session, browser, text, modelText });
+      const skillContext = [
+        personalMemoryContext,
+        formatSkillsForPrompt(skills),
+      ].filter(Boolean).join('\n\n');
       appendLog(session, 'ai:prepare', '浏览器已准备好，正在请求 AI 决策');
       const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
       const result = await executeInteractiveBrowserTurn({
@@ -2377,7 +2486,7 @@ async function runBrowserChatMessage(
         mode: session.mode,
         safetyMode: session.safetyMode,
         referenceImagePaths,
-        skillContext: formatSkillsForPrompt(skills),
+        skillContext,
         abortSignal: abortController.signal,
         shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
         requestToolConfirmation: session.safetyMode === 'strict'
@@ -2417,6 +2526,7 @@ async function runBrowserChatMessage(
       session.steps = result.steps;
       session.consoleErrors = result.consoleErrors;
       session.networkErrors = result.networkErrors;
+      queuePersonalMemoryExtraction({ session, browser, text, result, userMessageId, assistantMessageId });
       const finishedAt = now();
       updateAssistantMessage(session, assistantMessageId, (message) => ({
         ...message,
