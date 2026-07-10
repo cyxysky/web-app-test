@@ -1,13 +1,13 @@
 :root {
   --background: #f7f7f8;
-  --foreground: #0d0d0d;
+  --foreground: #171717;
   --muted: #6e6e80;
   --muted-strong: #3f3f46;
-  --border: #d9d9e3;
-  --border-strong: #c5c5d2;
+  --border: #e1e1e5;
+  --border-strong: #ccccd3;
   --panel: #ffffff;
   --panel-soft: #f7f7f8;
-  --panel-warm: #ececf1;
+  --panel-warm: #ededf0;
   --accent: #10a37f;
   --accent-hover: #0e8f70;
   --accent-strong: #0f8f73;
@@ -26,16 +26,16 @@
   --code-foreground: #e5e7eb;
   --inverse-panel: #0d0d0d;
   --inverse-foreground: #ffffff;
-  --shadow-soft: 0 16px 48px rgba(13, 13, 13, 0.08);
-  --shadow-tight: 0 8px 22px rgba(13, 13, 13, 0.08);
-  --control-radius: 8px;
+  --shadow-soft: 0 18px 50px rgba(13, 13, 13, 0.07);
+  --shadow-tight: 0 8px 24px rgba(13, 13, 13, 0.07);
+  --control-radius: 9px;
   --control-height: 40px;
   --control-compact-height: 36px;
   --control-icon-size: 36px;
   --control-icon-compact-size: 34px;
   --control-hover-bg: color-mix(in srgb, var(--foreground) 7%, transparent);
   --control-danger-hover-bg: color-mix(in srgb, var(--danger) 10%, transparent);
-  --modal-radius: 8px;
+  --modal-radius: 12px;
   --modal-overlay-bg: rgba(13, 13, 13, 0.42);
   --modal-shadow: 0 28px 90px rgba(13, 13, 13, 0.26);
   --button-neutral-bg: var(--panel);
@@ -44,6 +44,14 @@
   --button-primary-bg: var(--accent);
   --button-primary-hover-bg: var(--accent-hover);
   --button-danger-bg: var(--danger);
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --surface-hover: color-mix(in srgb, var(--foreground) 3.5%, transparent);
+  --surface-active: color-mix(in srgb, var(--foreground) 6.5%, transparent);
+  --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --motion-fast: 150ms;
+  --motion-normal: 220ms;
 }
 
 :root[data-theme="dark"] {
@@ -51,11 +59,11 @@
   --foreground: #f5f5f6;
   --muted: #9ca3af;
   --muted-strong: #d1d5db;
-  --border: #2a303b;
-  --border-strong: #3b4352;
-  --panel: #171a21;
-  --panel-soft: #11141a;
-  --panel-warm: #232936;
+  --border: #292d35;
+  --border-strong: #3a404b;
+  --panel: #181a20;
+  --panel-soft: #121419;
+  --panel-warm: #242832;
   --danger: #f87171;
   --warning: #fbbf24;
   --success: #34d399;

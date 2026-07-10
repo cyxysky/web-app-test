@@ -9771,54 +9771,6 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   }
 }
 
-.app-shell,
-.dashboard-shell,
-.dashboard-v2,
-.browser-chat-shell,
-.settings-layout {
-  animation: ui-rise-in 0.48s cubic-bezier(0.2, 0.8, 0.2, 1) both;
-}
-
-.browser-chat-sidebar,
-.browser-chat-sub-sidebar {
-  animation: ui-slide-in-left 0.42s cubic-bezier(0.2, 0.8, 0.2, 1) both;
-}
-
-:where(.hero-board,
-  .case-hero,
-  .run-hero,
-  .plain-section-head,
-  .dashboard-v2-metrics>div,
-  .case-item,
-  .run-history-row,
-  .ledger-item-card,
-  .report-accordion,
-  .tool-call-list li,
-  .browser-chat-composer-shell,
-  .browser-chat-message>div:last-child,
-  .browser-chat-recent-item,
-  .browser-chat-step-mini li,
-  .theme-color-picker,
-  .tool-shot-button,
-  .browser-chat-tool-shot-card,
-) {
-  animation: ui-rise-in 0.38s cubic-bezier(0.2, 0.8, 0.2, 1) both;
-}
-
-.browser-chat-message:nth-child(2n)>div:last-child,
-.browser-chat-recent-list li:nth-child(2n),
-.run-history-row:nth-child(2n),
-.tool-call-list li:nth-child(2n) {
-  animation-delay: 0.035s;
-}
-
-.browser-chat-message:nth-child(3n)>div:last-child,
-.browser-chat-recent-list li:nth-child(3n),
-.run-history-row:nth-child(3n),
-.tool-call-list li:nth-child(3n) {
-  animation-delay: 0.07s;
-}
-
 :where(.ui-button,
   .ui-icon-button,
   .browser-chat-log-button,
@@ -9838,11 +9790,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   .browser-chat-tool-shot-card,
   .browser-chat-reference-main) {
   transition:
-    background 0.18s ease,
-    border-color 0.18s ease,
-    box-shadow 0.18s ease,
-    color 0.18s ease,
-    opacity 0.18s ease;
+    background var(--motion-fast) ease,
+    border-color var(--motion-fast) ease,
+    box-shadow var(--motion-fast) ease,
+    color var(--motion-fast) ease,
+    opacity var(--motion-fast) ease,
+    transform var(--motion-fast) ease;
 }
 
 :where(.ui-button,
@@ -9860,36 +9813,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   .browser-chat-recent-delete,
   .tool-call-toggle,
   .browser-chat-tool-card):not(:disabled):active {
-  opacity: 0.82;
-}
-
-:where(.ui-button, .browser-chat-send, .browser-chat-stop) {
-  overflow: hidden;
-  position: relative;
-}
-
-:where(.ui-button, .browser-chat-send, .browser-chat-stop)::after {
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.32), transparent);
-  content: "";
-  inset: 0;
-  pointer-events: none;
-  position: absolute;
-  transform: translateX(-140%) skewX(-18deg);
-}
-
-:where(.ui-button, .browser-chat-send, .browser-chat-stop):not(:disabled):hover::after {
-  animation: ui-sheen 0.72s ease;
-}
-
-.browser-chat-tool-icon,
-.browser-chat-avatar {
-  animation: ui-icon-breathe 3.4s ease-in-out infinite;
-}
-
-.browser-chat-compose:focus-within,
-.custom-select-button:focus,
-.theme-color-picker:focus-within {
-  animation: ui-soft-pulse 1.1s ease both;
+  opacity: 0.9;
+  transform: scale(0.975);
 }
 
 .ui-modal-overlay,
@@ -11004,6 +10929,146 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 :root[data-theme="dark"] .browser-chat-settings-pane .settings-workspace .textarea,
 :root[data-theme="dark"] .browser-chat-settings-pane .theme-color-picker {
   background: color-mix(in srgb, var(--panel-soft) 88%, #000000);
+}
+
+/* Global refinement layer */
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+*::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  border-width: 2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  color: var(--foreground);
+}
+
+:where(button, a, input, textarea, select, summary) {
+  -webkit-tap-highlight-color: transparent;
+}
+
+:where(button, a, input, textarea, select, summary):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 52%, transparent);
+  outline-offset: 2px;
+}
+
+:where(.page-title, .dashboard-v2-head h1, .settings-section-head h2, .ui-modal-title) {
+  letter-spacing: -0.025em;
+}
+
+:where(.input, .textarea, .file-input, .custom-select-button) {
+  box-shadow: inset 0 1px 0 color-mix(in srgb, #ffffff 36%, transparent);
+  transition:
+    background var(--motion-fast) ease,
+    border-color var(--motion-fast) ease,
+    box-shadow var(--motion-fast) ease;
+}
+
+:where(.input, .textarea, .file-input, .custom-select-button):hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+
+:where(.input, .textarea, .file-input):focus,
+.custom-select-button:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 68%, var(--border));
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 28%, transparent);
+}
+
+:where(.hero-board,
+  .case-hero,
+  .run-hero,
+  .dashboard-v2-metrics>div,
+  .case-item,
+  .run-history-row,
+  .ledger-item-card,
+  .report-accordion,
+  .tool-call-list li,
+  .personal-memory-item,
+  .skills-manager-item) {
+  transition:
+    background var(--motion-normal) ease,
+    border-color var(--motion-normal) ease,
+    box-shadow var(--motion-normal) ease,
+    transform var(--motion-normal) var(--ease-standard);
+}
+
+.browser-chat-sidebar {
+  box-shadow: inset -1px 0 0 color-mix(in srgb, #ffffff 28%, transparent);
+}
+
+.browser-chat-compose {
+  border-color: color-mix(in srgb, var(--border) 88%, transparent);
+  transition:
+    border-color var(--motion-normal) ease,
+    box-shadow var(--motion-normal) ease,
+    transform var(--motion-normal) var(--ease-standard);
+}
+
+.browser-chat-compose:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 44%, var(--border));
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--accent) 9%, transparent),
+    0 18px 46px color-mix(in srgb, #000000 9%, transparent);
+  transform: translateY(-1px);
+}
+
+.ui-modal-overlay {
+  backdrop-filter: blur(5px) saturate(0.82);
+}
+
+.ui-modal {
+  border-color: color-mix(in srgb, var(--border) 86%, transparent);
+  box-shadow: var(--modal-shadow);
+}
+
+:where(.ui-modal-header, .ui-modal-footer) {
+  background: color-mix(in srgb, var(--panel) 96%, var(--panel-soft));
+}
+
+.custom-select-menu,
+.browser-chat-overflow-menu {
+  backdrop-filter: blur(12px) saturate(1.08);
+  border-color: color-mix(in srgb, var(--border) 90%, transparent);
+}
+
+.empty-state {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+@media (hover: hover) {
+  :where(.dashboard-v2-metrics>div,
+    .case-item,
+    .run-history-row,
+    .ledger-item-card,
+    .report-accordion,
+    .tool-call-list li):hover {
+    border-color: color-mix(in srgb, var(--accent) 18%, var(--border));
+    box-shadow: 0 10px 28px color-mix(in srgb, #000000 6%, transparent);
+    transform: translateY(-1px);
+  }
+
+  :where(.browser-chat-nav-item,
+    .browser-chat-subnav button,
+    .group-tree-button,
+    .browser-chat-recent-item):hover {
+    background: var(--surface-hover);
+  }
 }
 
 @media (max-width: 760px) {
