@@ -4570,7 +4570,7 @@ export function BrowserChatWorkspace({
     <div className={`${hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`} style={chatPaneStyle}>
       {loadingSessionId ? (
         <div className="browser-chat-inline-loading">
-          <Loader2 className="spin" size={15} />
+          <span aria-hidden="true" className="ui-loading-spinner ui-loading-spinner--small" />
           <span>正在加载对话</span>
         </div>
       ) : null}
@@ -4793,7 +4793,7 @@ export function BrowserChatWorkspace({
           <div className={hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'} style={chatPaneStyle}>
             {loadingSessionId ? (
               <div className="browser-chat-inline-loading">
-                <Loader2 className="spin" size={15} />
+                <span aria-hidden="true" className="ui-loading-spinner ui-loading-spinner--small" />
                 <span>正在加载对话</span>
               </div>
             ) : null}
@@ -4918,7 +4918,7 @@ export function BrowserChatWorkspace({
             </div>
             <footer className="ui-modal-footer">
               <button className="ui-button ui-button--primary" disabled={creatingGroup} onClick={() => createGroup(targetGroupId)} type="button">
-                {creatingGroup ? <Loader2 className="spin" size={16} /> : null}
+                {creatingGroup ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
                 {creatingGroup ? '创建中' : '创建'}
               </button>
             </footer>

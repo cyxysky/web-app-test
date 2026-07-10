@@ -792,10 +792,11 @@ export function EnvironmentSettings({
 
           <footer className="ui-modal-footer">
             <button className="ui-button ui-button--neutral" disabled={savingPersonalMemory} onClick={closePersonalMemoryEditor} type="button">
+              <X size={15} />
               {t('取消')}
             </button>
-            <button className="ui-button ui-icon-button" disabled={savingPersonalMemory} onClick={() => void savePersonalMemory()} type="button">
-              {savingPersonalMemory ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+            <button className="ui-button ui-button--primary" disabled={savingPersonalMemory} onClick={() => void savePersonalMemory()} type="button">
+              {savingPersonalMemory ? <Loader2 className="spin" size={15} /> : editing ? <Save size={15} /> : <Plus size={15} />}
               {t(editing ? '保存记忆' : '新增记忆')}
             </button>
           </footer>
@@ -829,9 +830,10 @@ export function EnvironmentSettings({
           </div>
           <footer className="ui-modal-footer">
             <button className="ui-button ui-button--neutral" disabled={deleting} onClick={closeDeletePersonalMemoryModal} type="button">
+              <X size={15} />
               {t('取消')}
             </button>
-            <button className="ui-button ui-icon-button ui-icon-button--danger" disabled={deleting} onClick={() => void confirmDeletePersonalMemory()} type="button">
+            <button className="ui-button ui-button--danger" disabled={deleting} onClick={() => void confirmDeletePersonalMemory()} type="button">
               {deleting ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
               {t('删除')}
             </button>
@@ -863,7 +865,7 @@ export function EnvironmentSettings({
 
         {loadingPersonalMemory ? (
           <section className="settings-loading-panel compact" role="status" aria-live="polite">
-            <Loader2 className="spin" size={18} />
+            <span aria-hidden="true" className="ui-loading-spinner" />
             <div>
               <h2>{t('正在读取个性化记忆')}</h2>
             </div>
@@ -966,7 +968,7 @@ export function EnvironmentSettings({
         <div className="settings-content">
           {loading ? (
             <section className="settings-loading-panel" role="status" aria-live="polite">
-              <Loader2 className="spin" size={18} />
+              <span aria-hidden="true" className="ui-loading-spinner ui-loading-spinner--large" />
               <div>
                 <h2>{t('正在读取环境配置')}</h2>
                 <span>{t('正在加载模型、浏览器、运行控制和调试参数。')}</span>
@@ -1107,7 +1109,7 @@ export function EnvironmentSettings({
                         </button>
                       </div>
                     ))}
-                    <button className="ui-button ui-button--neutral" onClick={addActiveProviderModel} type="button">
+                    <button className="ui-button settings-add-model-button" onClick={addActiveProviderModel} type="button">
                       <Plus size={15} />
                       {t('添加模型')}
                     </button>

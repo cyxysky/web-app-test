@@ -288,7 +288,7 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
           <div className="skills-manager-list-body">
             {loading ? (
               <div className="settings-loading-panel compact">
-                <Loader2 className="spin" size={16} />
+                <span aria-hidden="true" className="ui-loading-spinner" />
                 <span>{t('正在加载 Skills')}</span>
               </div>
             ) : skills.length ? skills.map((skill) => {
@@ -465,9 +465,10 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
 
             <footer className="ui-modal-footer">
               <button className="ui-button ui-button--neutral" disabled={saving} onClick={closeEditorModal} type="button">
+                <X size={15} />
                 {t('取消')}
               </button>
-              <button className="ui-button ui-icon-button" disabled={saving} onClick={() => void saveSkill()} type="button">
+              <button className="ui-button ui-button--primary" disabled={saving} onClick={() => void saveSkill()} type="button">
                 {saving ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
                 {t('保存')}
               </button>
@@ -500,6 +501,7 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
             </div>
             <footer className="ui-modal-footer">
               <button className="ui-button ui-button--neutral" disabled={Boolean(deletingSkillId)} onClick={closeDeleteModal} type="button">
+                <X size={15} />
                 {t('取消')}
               </button>
               <button className="ui-button ui-button--danger" disabled={Boolean(deletingSkillId)} onClick={() => void confirmDeleteSkill()} type="button">

@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useReducer, useRef, useState, useTransition, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowLeft, CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, MoreHorizontal, Play, RotateCcw, Settings, Trash2, X } from 'lucide-react';
+import { ArrowLeft, CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, MoreHorizontal, Play, RotateCcw, Save, Settings, Trash2, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { CustomSelect } from '@/components/CustomSelect';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
@@ -946,7 +946,7 @@ export function DashboardWorkspace({
             </div>
             <footer className="ui-modal-footer">
               <button className="ui-button ui-button--primary" disabled={creatingGroup} onClick={() => createGroup(selectedGroupId)} type="button">
-                {creatingGroup ? <Loader2 className="spin" size={16} /> : null}
+                {creatingGroup ? <Loader2 className="spin" size={16} /> : <FolderPlus size={16} />}
                 {creatingGroup ? t('创建中') : t('创建')}
               </button>
             </footer>
@@ -977,7 +977,7 @@ export function DashboardWorkspace({
             </div>
             <footer className="ui-modal-footer">
               <button className="ui-button ui-button--primary" disabled={savingSchedule} onClick={saveSchedule} type="button">
-                {savingSchedule ? <Loader2 className="spin" size={16} /> : null}
+                {savingSchedule ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
                 {savingSchedule ? t('保存中') : t('保存并启用')}
               </button>
             </footer>
