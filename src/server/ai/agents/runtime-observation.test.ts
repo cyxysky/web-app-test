@@ -2,43 +2,43 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   cloneRuntimeObservationStore,
-  compactStaleReadObservationMessages,
+  compactStaleSnapshotMessages,
   decodeRuntimeObservationCursor,
   encodeRuntimeObservationCursor,
   invalidateRuntimeObservation,
-  readRuntimeObservation,
+  readStoredSnapshot,
   restoreRuntimeObservationStore,
-  staleReadObservationText,
+  staleSnapshotText,
   storeRuntimeObservation,
   type RuntimeObservationStore,
 } from './runtime-observation';
 
-test('readRuntimeObservation requires an explicit refreshed store entry', () => {
+test('readStoredSnapshot requires an explicit refreshed store entry', () => {
   const store: RuntimeObservationStore = new Map();
-  const result = readRuntimeObservation(store, 'run-1');
+  const result = readStoredSnapshot(store, 'run-1');
 
   assert.equal(result.ok, false);
-  assert.match(String(result.actual), /refresh:true/);
+  assert.match(String(result.actual), /takeSnapshot/);
   assert.equal(store.size, 0);
 });
 
 test('runtime observation cursors round-trip generation view and index', () => {
-  const cursor = encodeRuntimeObservationCursor({ generation: 3, index: 120, view: 'actions' });
+  const cursor = encodeRuntimeObservationCursor({ generation: 3, index: 120, view: 'actionable' });
 
-  assert.deepEqual(decodeRuntimeObservationCursor(cursor), { generation: 3, index: 120, view: 'actions' });
+  assert.deepEqual(decodeRuntimeObservationCursor(cursor), { generation: 3, index: 120, view: 'actionable' });
   assert.equal(decodeRuntimeObservationCursor('not-json'), undefined);
 });
 
 test('storeRuntimeObservation advances generation only when storing a new page state', () => {
   const store: RuntimeObservationStore = new Map();
 
-  const first = storeRuntimeObservation(store, 'run-1', 'readObservation', 'first page');
-  const second = storeRuntimeObservation(store, 'run-1', 'readObservation', 'second page');
-  const read = readRuntimeObservation(store, 'run-1', 0, 10000);
+  const first = storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'first page');
+  const second = storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'second page');
+  const read = readStoredSnapshot(store, 'run-1', 0, 10000);
 
   assert.equal(first.generation, 1);
   assert.equal(second.generation, 2);
-  assert.equal(second.defaultType, 'actions');
+  assert.equal(second.defaultType, 'actionable');
   assert.equal(read.ok, true);
   assert.match(String(read.actual), /generation 2/);
   assert.match(String(read.actual), /second page/);
@@ -47,33 +47,33 @@ test('storeRuntimeObservation advances generation only when storing a new page s
 test('storeRuntimeObservation exposes previous-to-current changes view', () => {
   const store: RuntimeObservationStore = new Map();
 
-  const first = storeRuntimeObservation(store, 'run-1', 'readObservation', 'first page', {
-    defaultType: 'actions',
-    actions: '<button node_id=1 data-ai-interactive="true">Open</button>\n<input node_id=2 value="old" data-ai-interactive="true" />',
+  const first = storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'first page', {
+    defaultType: 'actionable',
+    actionable: 'uid=1 button "Open"\nuid=2 textbox "Name" value="old"',
     text: 'Old value\nShared text',
-    tree: '<main node_id=0>Old value</main>',
+    full: 'uid=0 main "Old value"',
   });
-  const firstRead = readRuntimeObservation(store, 'run-1', 0, 10000, 'changes');
+  const firstRead = readStoredSnapshot(store, 'run-1', 0, 10000, 'changes');
 
   assert.equal(first.generation, 1);
   assert.equal(firstRead.ok, true);
   assert.match(String(firstRead.actual), /baseline snapshot/);
 
-  const second = storeRuntimeObservation(store, 'run-1', 'readObservation', 'second page', {
-    defaultType: 'actions',
-    actions: '<button node_id=1 data-ai-interactive="true">Open</button>\n<input node_id=2 value="new" data-ai-interactive="true" />\n<button node_id=3 data-ai-interactive="true">Save</button>',
+  const second = storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'second page', {
+    defaultType: 'actionable',
+    actionable: 'uid=1 button "Open"\nuid=2 textbox "Name" value="new"\nuid=3 button "Save"',
     text: 'New value\nShared text',
-    tree: '<main node_id=0>New value</main>',
+    full: 'uid=0 main "New value"',
   });
-  const read = readRuntimeObservation(store, 'run-1', 0, 10000, 'changes');
+  const read = readStoredSnapshot(store, 'run-1', 0, 10000, 'changes');
 
   assert.equal(second.generation, 2);
   assert.equal(read.ok, true);
   assert.match(String(read.actual), /Type changes/);
   assert.match(String(read.actual), /Added interactive elements/);
-  assert.match(String(read.actual), /node_id=3/);
+  assert.match(String(read.actual), /uid=3/);
   assert.match(String(read.actual), /Changed interactive elements/);
-  assert.match(String(read.actual), /node_id=2/);
+  assert.match(String(read.actual), /uid=2/);
   assert.match(String(read.actual), /"New value"/);
   assert.match(String(read.actual), /"Old value"/);
 });
@@ -81,13 +81,13 @@ test('storeRuntimeObservation exposes previous-to-current changes view', () => {
 test('clone and restore keep observation stores isolated', () => {
   const source: RuntimeObservationStore = new Map();
   const target: RuntimeObservationStore = new Map();
-  storeRuntimeObservation(source, 'run-1', 'readObservation', 'source page');
+  storeRuntimeObservation(source, 'run-1', 'takeSnapshot', 'source page');
 
   const cloned = cloneRuntimeObservationStore(source);
-  storeRuntimeObservation(source, 'run-1', 'readObservation', 'changed page');
+  storeRuntimeObservation(source, 'run-1', 'takeSnapshot', 'changed page');
   restoreRuntimeObservationStore(target, cloned);
 
-  const read = readRuntimeObservation(target, 'run-1', 0, 10000);
+  const read = readStoredSnapshot(target, 'run-1', 0, 10000);
 
   assert.equal(read.ok, true);
   assert.match(String(read.actual), /source page/);
@@ -96,34 +96,34 @@ test('clone and restore keep observation stores isolated', () => {
 
 test('invalidated observations cannot be reused without a refresh', () => {
   const store: RuntimeObservationStore = new Map();
-  storeRuntimeObservation(store, 'run-1', 'readObservation', 'first page', {
-    defaultType: 'actions',
-    actions: '<button node_id=1 data-ai-interactive="true">Open</button>',
+  storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'first page', {
+    defaultType: 'actionable',
+    actionable: 'uid=1 button "Open"',
     text: 'First page',
   });
 
-  invalidateRuntimeObservation(store, 'run-1', 'clickDomNode');
-  const staleRead = readRuntimeObservation(store, 'run-1', 0, 10000, 'actions');
+  invalidateRuntimeObservation(store, 'run-1', 'mouse');
+  const staleRead = readStoredSnapshot(store, 'run-1', 0, 10000, 'actionable');
 
   assert.equal(staleRead.ok, false);
   assert.match(String(staleRead.actual), /stale/);
-  assert.match(String(staleRead.actual), /clickDomNode/);
+  assert.match(String(staleRead.actual), /mouse/);
 
-  storeRuntimeObservation(store, 'run-1', 'readObservation', 'second page', {
-    defaultType: 'actions',
-    actions: '<button node_id=2 data-ai-interactive="true">Save</button>',
+  storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'second page', {
+    defaultType: 'actionable',
+    actionable: 'uid=2 button "Save"',
     text: 'Second page',
   });
-  const changes = readRuntimeObservation(store, 'run-1', 0, 10000, 'changes');
+  const changes = readStoredSnapshot(store, 'run-1', 0, 10000, 'changes');
 
   assert.equal(changes.ok, true);
   assert.match(String(changes.actual), /Previous generation: 1/);
   assert.match(String(changes.actual), /Current generation: 2/);
-  assert.match(String(changes.actual), /node_id=2/);
+  assert.match(String(changes.actual), /uid=2/);
 });
 
-test('compactStaleReadObservationMessages stales read results before browser actions', () => {
-  type RuntimeObservationTestMessage = Parameters<typeof compactStaleReadObservationMessages>[0][number];
+test('compactStaleSnapshotMessages stales snapshot results before browser actions', () => {
+  type RuntimeObservationTestMessage = Parameters<typeof compactStaleSnapshotMessages>[0][number];
   const toolActual = (message: unknown) => {
     const content = (message as { content?: unknown }).content;
     assert.ok(Array.isArray(content));
@@ -135,24 +135,33 @@ test('compactStaleReadObservationMessages stales read results before browser act
   const messages = [
     {
       role: 'assistant',
-      content: [{ type: 'tool-call', toolCallId: 'read-1', toolName: 'readObservation', input: { refresh: true } }],
+      content: [{ type: 'tool-call', toolCallId: 'read-1', toolName: 'takeSnapshot', input: { mode: 'actionable' } }],
     },
     {
       role: 'tool',
-      content: [{ type: 'tool-result', toolCallId: 'read-1', toolName: 'readObservation', output: { type: 'json', value: { ok: true, actual: 'old node_id=1' } } }],
+      content: [{ type: 'tool-result', toolCallId: 'read-1', toolName: 'takeSnapshot', output: { type: 'json', value: { ok: true, actual: 'old uid=1' } } }],
     },
     {
       role: 'assistant',
-      content: [{ type: 'tool-call', toolCallId: 'click-1', toolName: 'clickDomNode', input: { id: '1' } }],
+      content: [{ type: 'tool-call', toolCallId: 'search-1', toolName: 'searchSnapshot', input: { query: 'Open' } }],
     },
     {
       role: 'tool',
-      content: [{ type: 'tool-result', toolCallId: 'click-1', toolName: 'clickDomNode', output: { type: 'json', value: { ok: true, actual: 'clicked' } } }],
+      content: [{ type: 'tool-result', toolCallId: 'search-1', toolName: 'searchSnapshot', output: { type: 'json', value: { ok: true, actual: 'match uid=1' } } }],
+    },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool-call', toolCallId: 'click-1', toolName: 'mouse', input: { action: 'click', uid: '1' } }],
+    },
+    {
+      role: 'tool',
+      content: [{ type: 'tool-result', toolCallId: 'click-1', toolName: 'mouse', output: { type: 'json', value: { ok: true, actual: 'clicked' } } }],
     },
   ];
 
-  const compacted = compactStaleReadObservationMessages(messages as RuntimeObservationTestMessage[]);
+  const compacted = compactStaleSnapshotMessages(messages as RuntimeObservationTestMessage[]);
 
-  assert.equal(toolActual(compacted[1]), staleReadObservationText);
-  assert.equal(toolActual(compacted[3]), 'clicked');
+  assert.equal(toolActual(compacted[1]), staleSnapshotText);
+  assert.equal(toolActual(compacted[3]), staleSnapshotText);
+  assert.equal(toolActual(compacted[5]), 'clicked');
 });

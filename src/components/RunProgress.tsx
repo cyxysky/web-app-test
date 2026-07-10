@@ -113,14 +113,68 @@ const toolDefinitions: ToolDefinition[] = [
     fields: [{ key: 'url', label: '目标地址', kind: 'text', placeholder: 'https://example.com' }],
   },
   {
-    name: 'scrollArea',
-    label: '滚动区域',
-    mode: 'shared',
-    template: { areaId: 'S1', deltaY: 700, deltaX: 0 },
+    name: 'takeSnapshot',
+    label: '获取页面快照',
+    mode: 'dom',
+    template: { mode: 'actionable', maxChars: 10000 },
     fields: [
-      { key: 'areaId', label: '滚动区域 ID', kind: 'text', placeholder: 'S1' },
-      { key: 'deltaY', label: '纵向滚动量', kind: 'number' },
+      { key: 'mode', label: '快照视图', kind: 'select', options: [{ label: '可操作节点', value: 'actionable' }, { label: '完整结构', value: 'full' }, { label: '页面文本', value: 'text' }] },
+      { key: 'cursor', label: '继续游标', kind: 'text' },
+      { key: 'maxChars', label: '单段最大字符', kind: 'number' },
+    ],
+  },
+  {
+    name: 'searchSnapshot',
+    label: '搜索页面快照',
+    mode: 'dom',
+    template: { query: '', roles: [], limit: 20 },
+    fields: [
+      { key: 'query', label: '搜索内容', kind: 'text' },
+      { key: 'roles', label: '角色筛选', kind: 'stringList', helper: '每行一个无障碍角色，例如 button、link、textbox。' },
+      { key: 'limit', label: '结果数量', kind: 'number' },
+    ],
+  },
+  {
+    name: 'takeScreenshot',
+    label: '获取页面截图',
+    mode: 'visual',
+    template: { capture: 'viewport' },
+    fields: [{ key: 'capture', label: '截图范围', kind: 'select', options: [{ label: '当前视口', value: 'viewport' }, { label: '完整页面', value: 'fullPage' }] }],
+  },
+  {
+    name: 'mouse',
+    label: '鼠标操作',
+    mode: 'shared',
+    template: { action: 'click', uid: '' },
+    fields: [
+      { key: 'action', label: '鼠标动作', kind: 'select', options: [{ label: '点击', value: 'click' }, { label: '移动 / 悬停', value: 'move' }, { label: '拖拽', value: 'drag' }, { label: '滚动', value: 'scroll' }, { label: '滚入可视区', value: 'scrollIntoView' }] },
+      { key: 'uid', label: '目标 UID', kind: 'text' },
+      { key: 'x_thousandth', label: '截图横坐标（千分比）', kind: 'number' },
+      { key: 'y_thousandth', label: '截图纵坐标（千分比）', kind: 'number' },
+      { key: 'toUid', label: '拖拽终点 UID', kind: 'text' },
+      { key: 'toX_thousandth', label: '终点横坐标（千分比）', kind: 'number' },
+      { key: 'toY_thousandth', label: '终点纵坐标（千分比）', kind: 'number' },
+      { key: 'button', label: '鼠标按键', kind: 'select', options: [{ label: '左键', value: 'left' }, { label: '右键', value: 'right' }, { label: '中键', value: 'middle' }] },
+      { key: 'clickCount', label: '点击次数', kind: 'number' },
       { key: 'deltaX', label: '横向滚动量', kind: 'number' },
+      { key: 'deltaY', label: '纵向滚动量', kind: 'number' },
+    ],
+  },
+  {
+    name: 'keyboard',
+    label: '键盘操作',
+    mode: 'shared',
+    template: { action: 'type', uid: '', text: '', replace: true },
+    fields: [
+      { key: 'action', label: '键盘动作', kind: 'select', options: [{ label: '输入文本', value: 'type' }, { label: '单个按键', value: 'press' }, { label: '快捷键', value: 'shortcut' }] },
+      { key: 'uid', label: '聚焦目标 UID', kind: 'text' },
+      { key: 'x_thousandth', label: '截图横坐标（千分比）', kind: 'number' },
+      { key: 'y_thousandth', label: '截图纵坐标（千分比）', kind: 'number' },
+      { key: 'text', label: '输入内容', kind: 'textarea' },
+      { key: 'key', label: '按键', kind: 'select', options: keyFieldOptions },
+      { key: 'keys', label: '快捷键组合', kind: 'stringList', helper: '每行一个按键，例如 Control、A。' },
+      { key: 'replace', label: '替换原内容', kind: 'boolean' },
+      { key: 'followByEnter', label: '输入后按 Enter', kind: 'boolean' },
     ],
   },
   {
@@ -157,20 +211,6 @@ const toolDefinitions: ToolDefinition[] = [
     mode: 'shared',
     template: {},
     fields: [],
-  },
-  {
-    name: 'typeText',
-    label: '输入文本',
-    mode: 'shared',
-    template: { text: '' },
-    fields: [{ key: 'text', label: '输入内容', kind: 'textarea' }],
-  },
-  {
-    name: 'pressKey',
-    label: '按键',
-    mode: 'shared',
-    template: { key: 'Enter' },
-    fields: [{ key: 'key', label: '按键', kind: 'select', options: keyFieldOptions }],
   },
   {
     name: 'downloadFile',
@@ -232,144 +272,6 @@ const toolDefinitions: ToolDefinition[] = [
       { key: 'includeScreenshot', label: '包含当前截图', kind: 'boolean' },
       { key: 'maxCharacters', label: '最长输出字符', kind: 'number' },
     ],
-  },
-  {
-    name: 'clickCandidate',
-    label: '点击候选元素',
-    mode: 'visual',
-    template: { id: '', targetVisual: '', text: '' },
-    fields: [
-      { key: 'id', label: '候选 ID', kind: 'text' },
-      { key: 'targetVisual', label: '可见目标描述', kind: 'textarea' },
-      { key: 'text', label: '点击后输入内容', kind: 'textarea' },
-    ],
-  },
-  {
-    name: 'fillCandidates',
-    label: '填写候选元素',
-    mode: 'visual',
-    template: { fields: [{ id: '', text: '', clear: true }] },
-    fields: [{ key: 'fields', label: '填写字段', kind: 'fieldList', helper: '每行一个字段，格式：候选ID=文本。' }],
-  },
-  {
-    name: 'focusCandidate',
-    label: '聚焦候选元素',
-    mode: 'visual',
-    template: { id: '' },
-    fields: [{ key: 'id', label: '候选 ID', kind: 'text' }],
-  },
-  {
-    name: 'hoverCandidate',
-    label: '悬停候选元素',
-    mode: 'visual',
-    template: { id: '', targetVisual: '' },
-    fields: [
-      { key: 'id', label: '候选 ID', kind: 'text' },
-      { key: 'targetVisual', label: '可见目标描述', kind: 'textarea' },
-    ],
-  },
-  {
-    name: 'doubleClickCandidate',
-    label: '双击候选元素',
-    mode: 'visual',
-    template: { id: '', targetVisual: '' },
-    fields: [
-      { key: 'id', label: '候选 ID', kind: 'text' },
-      { key: 'targetVisual', label: '可见目标描述', kind: 'textarea' },
-    ],
-  },
-  {
-    name: 'rightClickCandidate',
-    label: '右击候选元素',
-    mode: 'visual',
-    template: { id: '', targetVisual: '' },
-    fields: [
-      { key: 'id', label: '候选 ID', kind: 'text' },
-      { key: 'targetVisual', label: '可见目标描述', kind: 'textarea' },
-    ],
-  },
-  {
-    name: 'dragCandidate',
-    label: '拖拽候选元素',
-    mode: 'visual',
-    template: { fromId: '', toId: '', targetVisual: '' },
-    fields: [
-      { key: 'fromId', label: '起点候选 ID', kind: 'text' },
-      { key: 'toId', label: '终点候选 ID', kind: 'text' },
-      { key: 'targetVisual', label: '可见目标描述', kind: 'textarea' },
-    ],
-  },
-  {
-    name: 'getInteractiveCandidates',
-    label: '获取交互候选',
-    mode: 'visual',
-    template: {},
-    fields: [],
-  },
-  {
-    name: 'clickDomNode',
-    label: '点击 DOM 节点',
-    mode: 'dom',
-    template: { id: '', text: '' },
-    fields: [
-      { key: 'id', label: 'DOM 节点 ID', kind: 'text' },
-      { key: 'text', label: '点击后输入内容', kind: 'textarea' },
-    ],
-  },
-  {
-    name: 'fillDomNodes',
-    label: '填写 DOM 节点',
-    mode: 'dom',
-    template: { fields: [{ id: '', text: '', clear: true }] },
-    fields: [{ key: 'fields', label: '填写字段', kind: 'fieldList', helper: '每行一个字段，格式：DOM节点ID=文本。' }],
-  },
-  {
-    name: 'focusDomNode',
-    label: '聚焦 DOM 节点',
-    mode: 'dom',
-    template: { id: '' },
-    fields: [{ key: 'id', label: 'DOM 节点 ID', kind: 'text' }],
-  },
-  {
-    name: 'hoverDomNode',
-    label: '悬停 DOM 节点',
-    mode: 'dom',
-    template: { id: '' },
-    fields: [{ key: 'id', label: 'DOM 节点 ID', kind: 'text' }],
-  },
-  {
-    name: 'doubleClickDomNode',
-    label: '双击 DOM 节点',
-    mode: 'dom',
-    template: { id: '' },
-    fields: [{ key: 'id', label: 'DOM 节点 ID', kind: 'text' }],
-  },
-  {
-    name: 'dragDomNode',
-    label: '拖拽 DOM 节点',
-    mode: 'dom',
-    template: { fromId: '', toId: '' },
-    fields: [
-      { key: 'fromId', label: '起点 DOM 节点 ID', kind: 'text' },
-      { key: 'toId', label: '终点 DOM 节点 ID', kind: 'text' },
-    ],
-  },
-  {
-    name: 'findByText',
-    label: '查找文本',
-    mode: 'dom',
-    template: { targetText: '', scopeId: '' },
-    fields: [
-      { key: 'targetText', label: '目标文本', kind: 'textarea' },
-      { key: 'scopeId', label: '范围 DOM ID', kind: 'text' },
-    ],
-  },
-  {
-    name: 'getDomNodeText',
-    label: '读取 DOM 节点文本',
-    mode: 'dom',
-    template: { id: '' },
-    fields: [{ key: 'id', label: 'DOM 节点 ID', kind: 'text' }],
   },
 ];
 
@@ -504,6 +406,7 @@ function toolNamesForMode(mode: ToolEditorMode) {
       definition.mode === 'shared'
       || definition.mode === 'editor'
       || definition.mode === 'dom'
+      || definition.mode === 'visual'
     ))
     .map((definition) => definition.name);
 }
@@ -522,12 +425,12 @@ function inferModeFromStep(step?: StepExecutionResult): ToolEditorMode | undefin
 
 function toolModeLabel(mode: ToolEditorMode, t: TranslateFn) {
   void mode;
-  return t('DOM 模式工具');
+  return t('浏览器工具');
 }
 
 function toolModeTag(definition: ToolDefinition | undefined, t: TranslateFn) {
   if (!definition) return t('未知工具');
-  if (definition.mode === 'dom') return t('DOM');
+  if (definition.mode === 'dom') return t('语义快照');
   if (definition.mode === 'visual') return t('视觉');
   if (definition.mode === 'editor') return t('编辑专用');
   return t('通用');

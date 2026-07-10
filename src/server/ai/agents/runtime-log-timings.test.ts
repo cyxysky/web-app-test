@@ -40,7 +40,7 @@ test('summarizeRuntimeLogTimings prefers explicit AI elapsed time', () => {
   const timings = summarizeRuntimeLogTimings({
     aiElapsedMs: 390,
     totalElapsedMs: 900,
-    traces: [{ name: 'clickCandidate', elapsedMs: 120 }],
+    traces: [{ name: 'mouse', elapsedMs: 120 }],
   });
 
   assert.equal(timings.aiRequestElapsedMs, 390);

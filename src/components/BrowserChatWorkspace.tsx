@@ -341,6 +341,7 @@ function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'runtime') return <SquareTerminal size={15} />;
   if (tab === 'skills') return <Braces size={15} />;
   if (tab === 'memory') return <Brain size={15} />;
+  if (tab === 'dom-test') return <ScanSearch size={15} />;
   if (tab === 'debug') return <Bug size={15} />;
   return <SlidersHorizontal size={15} />;
 }
@@ -671,28 +672,18 @@ function summarizeToolFields(fields: unknown) {
 
 function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
-    clickCandidate: '点选目标',
-    clickDomNode: '点选节点',
-    doubleClickCandidate: '双击目标',
-    doubleClickDomNode: '双击节点',
-    dragCandidate: '拖拽元素',
-    dragDomNode: '拖拽节点',
-    fillCandidates: '填写表单',
-    fillDomNodes: '填写节点',
-    findByText: '定位文本',
-    getDomNodeText: '读取节点',
     getHttpRequests: '检查请求',
-    hoverDomNode: '悬停节点',
+    keyboard: '键盘操作',
     listTabs: '扫描标签页',
     manageVisualContext: '整理视觉上下文',
+    mouse: '鼠标操作',
     openPage: '导航页面',
-    pressKey: '发送按键',
     reportState: '确认状态',
-    rightClickCandidate: '右键目标',
-    scrollArea: '移动视窗',
+    searchSnapshot: '搜索页面快照',
     selectReferenceScreenshots: '引用截图',
     switchTab: '切换标签',
-    typeText: '键入内容',
+    takeScreenshot: '截屏取证',
+    takeSnapshot: '读取页面快照',
     waitForHumanVerification: '等待人工验证',
     waitForPage: '等待页面稳定',
   };
@@ -719,17 +710,20 @@ function browserChatToolMeta(name: string, input: unknown) {
   if (!record) return toolStringValue(input);
 
   const lower = name.toLowerCase();
-  if (name === 'typeText') return toolInputValue(record, ['text', 'content', 'value']);
-  if (name === 'pressKey') return toolInputValue(record, ['key']);
+  if (name === 'keyboard') return [toolInputValue(record, ['action']), toolInputValue(record, ['text', 'key', 'uid'])].filter(Boolean).join(' · ');
   if (name === 'openPage') return toolInputValue(record, ['url']);
   if (name === 'switchTab') return toolInputValue(record, ['index']);
   if (name === 'waitForPage') return toolInputValue(record, ['ms']);
   if (name === 'waitForHumanVerification') return toolInputValue(record, ['maxMs']);
-  if (name === 'scrollArea') {
-    const area = toolInputValue(record, ['areaId']);
+  if (name === 'mouse') {
+    const action = toolInputValue(record, ['action']);
+    const target = toolInputValue(record, ['uid', 'x_thousandth']);
     const deltaY = toolInputValue(record, ['deltaY']);
-    return [area, deltaY ? `Y ${deltaY}` : ''].filter(Boolean).join(' · ');
+    return [action, target, deltaY ? `Y ${deltaY}` : ''].filter(Boolean).join(' · ');
   }
+  if (name === 'takeSnapshot') return toolInputValue(record, ['mode', 'cursor']);
+  if (name === 'searchSnapshot') return toolInputValue(record, ['query']);
+  if (name === 'takeScreenshot') return toolInputValue(record, ['capture']);
   if (name === 'selectReferenceScreenshots') {
     const ids = Array.isArray(record.ids) ? record.ids : [];
     return ids.length ? `${ids.length} 张` : '';
@@ -742,7 +736,7 @@ function browserChatToolMeta(name: string, input: unknown) {
   }
   if (lower.includes('find')) return toolInputValue(record, ['targetText', 'scopeId']);
   if (lower.includes('text')) return toolInputValue(record, ['text', 'targetText', 'id']);
-  return toolInputValue(record, ['url', 'text', 'targetVisual', 'targetText', 'id', 'areaId', 'action', 'status']);
+  return toolInputValue(record, ['url', 'text', 'uid', 'query', 'action', 'status']);
 }
 
 function BrowserChatToolIcon({ name }: { name: string }) {

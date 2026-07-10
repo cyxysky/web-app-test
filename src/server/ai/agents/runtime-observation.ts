@@ -1,21 +1,15 @@
 import type { ModelMessage } from 'ai';
-import type { BrowserActionResult, BrowserObservationType } from '@/server/browser/browser-session';
+import type { BrowserActionResult, BrowserSnapshotView } from '@/server/browser/browser-session';
 
-export const runtimeObservationToolNames = new Set(['readObservation']);
-export const staleReadObservationText = 'Stale: this old readObservation result was replaced by a later refreshed observation or invalidated by a browser action. Use readObservation({refresh:true,view:"actions",maxChars:10000}) for fresh actionable nodes, or continue the current observation with its nextCursor only when no browser action happened after it.';
+export const runtimeObservationToolNames = new Set(['takeSnapshot', 'searchSnapshot']);
+export const staleSnapshotText = 'Stale: this old accessibility snapshot was replaced or invalidated by a browser action. Call takeSnapshot({mode:"actionable",maxChars:10000}) for fresh UIDs.';
 export const runtimeObservationInvalidatingToolNames = new Set([
   'openPage',
-  'scrollArea',
-  'typeText',
-  'pressKey',
+  'mouse',
+  'keyboard',
   'waitForPage',
   'waitForHumanVerification',
   'switchTab',
-  'clickDomNode',
-  'fillDomNodes',
-  'hoverDomNode',
-  'doubleClickDomNode',
-  'dragDomNode',
 ]);
 
 export type RuntimeObservationRecord = {
@@ -23,10 +17,10 @@ export type RuntimeObservationRecord = {
   toolName: string;
   createdAt: string;
   generation: number;
-  defaultType: BrowserObservationType;
-  views: Partial<Record<BrowserObservationType, string>>;
+  defaultType: BrowserSnapshotView;
+  views: Partial<Record<BrowserSnapshotView, string>>;
   totalChars: number;
-  viewCharLengths: Partial<Record<BrowserObservationType, number>>;
+  viewCharLengths: Partial<Record<BrowserSnapshotView, number>>;
   stale?: boolean;
   staleReason?: string;
   invalidatedAt?: string;
@@ -36,19 +30,17 @@ export type RuntimeObservationStore = Map<string, RuntimeObservationRecord>;
 
 export type RuntimeObservationReadOptions = {
   cursor?: string;
-  refresh?: boolean;
-  view?: BrowserObservationType;
-  offset?: number;
+  mode?: 'actionable' | 'full' | 'text';
   maxChars?: number;
 };
 
 export type RuntimeObservationCursorPayload = {
   generation: number;
   index: number;
-  view: BrowserObservationType;
+  view: BrowserSnapshotView;
 };
 
-const runtimeObservationTypes: BrowserObservationType[] = ['actions', 'tree', 'text', 'changes', 'elements'];
+const runtimeObservationTypes: BrowserSnapshotView[] = ['actionable', 'full', 'text', 'changes'];
 const fallbackObservationRunId = '__current__';
 const maxObservationChangeItems = 80;
 
@@ -81,13 +73,13 @@ export function decodeRuntimeObservationCursor(cursor?: string): RuntimeObservat
       && Number.isFinite(parsed.generation)
       && typeof parsed.index === 'number'
       && Number.isFinite(parsed.index)
-      && runtimeObservationTypes.includes(parsed.view as BrowserObservationType)
+      && runtimeObservationTypes.includes(parsed.view as BrowserSnapshotView)
       && parsed.view !== 'changes'
     ) {
       return {
         generation: Math.max(0, Math.floor(parsed.generation)),
         index: Math.max(0, Math.floor(parsed.index)),
-        view: parsed.view as BrowserObservationType,
+        view: parsed.view as BrowserSnapshotView,
       };
     }
   } catch {
@@ -128,25 +120,22 @@ function normalizeObservationViews(
   text: string,
   views?: BrowserActionResult['observationViews'],
 ) {
-  const normalized: Partial<Record<BrowserObservationType, string>> = {};
+  const normalized: Partial<Record<BrowserSnapshotView, string>> = {};
   for (const type of runtimeObservationTypes) {
     const value = views?.[type];
     if (typeof value === 'string') normalized[type] = value;
   }
-  if (!normalized.actions) normalized.actions = text;
-  if (!normalized.tree && normalized.elements) normalized.tree = normalized.elements;
-  if (!normalized.elements && normalized.tree) normalized.elements = normalized.tree;
-  if (!normalized.text && normalized.tree) normalized.text = normalized.tree;
+  if (!normalized.actionable) normalized.actionable = text;
   const requestedDefault = views?.defaultType;
-  const defaultType: BrowserObservationType = requestedDefault && normalized[requestedDefault] !== undefined
+  const defaultType: BrowserSnapshotView = requestedDefault && normalized[requestedDefault] !== undefined
     ? requestedDefault
-    : normalized.actions !== undefined
-      ? 'actions'
-      : normalized.tree !== undefined
-        ? 'tree'
+    : normalized.actionable !== undefined
+      ? 'actionable'
+      : normalized.full !== undefined
+        ? 'full'
         : normalized.text !== undefined
           ? 'text'
-          : 'elements';
+          : 'actionable';
   return { defaultType, views: normalized };
 }
 
@@ -170,7 +159,7 @@ type ObservationActionEntry = {
 };
 
 function extractActionNodeId(line: string) {
-  const match = line.match(/\bnode_id=(?:"([^"]+)"|([^\s>]+))/);
+  const match = line.match(/\buid=(?:"([^"]+)"|([^\s>]+))/);
   return match?.[1] || match?.[2] || '';
 }
 
@@ -206,10 +195,10 @@ function pushLimitedSection(lines: string[], title: string, items: string[], emp
 
 function buildObservationChanges(
   previous: RuntimeObservationRecord | undefined,
-  current: Partial<Record<BrowserObservationType, string>>,
+  current: Partial<Record<BrowserSnapshotView, string>>,
   nextGeneration: number,
 ) {
-  const currentActions = parseObservationActions(current.actions);
+  const currentActions = parseObservationActions(current.actionable);
   const currentTextLines = observationTextLines(current.text);
   if (!previous) {
     return [
@@ -217,11 +206,11 @@ function buildObservationChanges(
       'No previous refreshed observation exists for this run yet; this is the baseline snapshot.',
       `Current generation: ${nextGeneration}.`,
       `Current interactive elements: ${currentActions.length}. Current visible text lines: ${currentTextLines.length}.`,
-      'Current actionable node_id entries are in the actions view; use readObservation(view="actions") only if they were not already returned inline.',
+      'Current actionable UID entries are in the actionable snapshot view.',
     ].join('\n');
   }
 
-  const previousActions = parseObservationActions(previous.views.actions);
+  const previousActions = parseObservationActions(previous.views.actionable);
   const previousActionById = new Map(previousActions.map((entry) => [entry.nodeId, entry]));
   const currentActionById = new Map(currentActions.map((entry) => [entry.nodeId, entry]));
   const addedActions: string[] = [];
@@ -232,7 +221,7 @@ function buildObservationChanges(
     if (!oldEntry) {
       addedActions.push(entry.display);
     } else if (oldEntry.line !== entry.line) {
-      changedActions.push(`node_id=${entry.nodeId} before: ${oldEntry.display} | now: ${entry.display}`);
+      changedActions.push(`uid=${entry.nodeId} before: ${oldEntry.display} | now: ${entry.display}`);
     }
   }
   for (const entry of previousActions) {
@@ -249,7 +238,7 @@ function buildObservationChanges(
   const lines = [
     'Changes since previous refreshed observation:',
     `Previous generation: ${previous.generation}. Current generation: ${nextGeneration}.`,
-    'Current node_id values in added/changed interactive entries are actionable only if they still appear in readObservation(view="actions"). Removed entries are historical evidence only.',
+    'Current UIDs in added/changed interactive entries are actionable only if they still appear in the latest snapshot. Removed entries are historical evidence only.',
   ];
   if (totalChanges === 0) {
     lines.push('No actionable or visible text changes detected since the previous observation.');
@@ -278,7 +267,7 @@ export function storeRuntimeObservation(
     runtimeObservationTypes
       .filter((type) => normalized.views[type] !== undefined)
       .map((type) => [type, normalized.views[type]?.length || 0]),
-  ) as Partial<Record<BrowserObservationType, number>>;
+  ) as Partial<Record<BrowserSnapshotView, number>>;
   const record: RuntimeObservationRecord = {
     runId: key,
     toolName,
@@ -296,7 +285,7 @@ export function storeRuntimeObservation(
 export function appendRuntimeObservationView(
   store: RuntimeObservationStore,
   runId: string | undefined,
-  view: BrowserObservationType,
+  view: BrowserSnapshotView,
   content: string,
 ) {
   const record = store.get(observationStoreKey(runId));
@@ -329,24 +318,24 @@ export function observationPreviewLimit(name: string) {
   return Math.min(Math.max(value, 10000), 60000);
 }
 
-export function readRuntimeObservation(
+export function readStoredSnapshot(
   store: RuntimeObservationStore | undefined,
   runId: string | undefined,
   offset?: number,
   maxChars?: number,
-  view?: BrowserObservationType,
+  view?: BrowserSnapshotView,
 ): BrowserActionResult {
   const record = store?.get(observationStoreKey(runId));
   if (!record) {
-    return { ok: false, actual: 'No current DOM observation is available for this run. Call readObservation({refresh:true,view:"actions",maxChars:10000}) first.' };
+    return { ok: false, actual: 'No current accessibility snapshot is available for this run. Call takeSnapshot({mode:"actionable",maxChars:10000}) first.' };
   }
   if (record.stale) {
     return {
       ok: false,
-      actual: `Current DOM observation generation ${record.generation} is stale${record.staleReason ? ` after ${record.staleReason}` : ''}${record.invalidatedAt ? ` at ${record.invalidatedAt}` : ''}. Refresh with readObservation({refresh:true,view:"actions",maxChars:10000}) before using actionable node_id values.`,
+      actual: `Current snapshot generation ${record.generation} is stale${record.staleReason ? ` after ${record.staleReason}` : ''}${record.invalidatedAt ? ` at ${record.invalidatedAt}` : ''}. Call takeSnapshot({mode:"actionable",maxChars:10000}) before using UIDs.`,
     };
   }
-  const selectedType = view || record.defaultType || 'actions';
+  const selectedType = view || record.defaultType || 'actionable';
   const text = record.views[selectedType];
   const availableTypes = runtimeObservationAvailableTypes(record);
   if (text === undefined) {
@@ -360,7 +349,7 @@ export function readRuntimeObservation(
     actual: [
       `Current observation from ${record.toolName} generation ${record.generation} at ${record.createdAt}. Type ${selectedType}. Range ${start}-${end}/${text.length}. Available types: ${availableTypes || selectedType}.`,
       text.slice(start, end),
-      end < text.length ? `More stored text available: call readObservation(view="${selectedType}", offset=${end}, maxChars=10000), or use nextCursor from a lazy read result to parse a fresh DOM slice.` : 'End of stored observation text.',
+      end < text.length ? 'More stored snapshot text exists; continue with the nextCursor returned by takeSnapshot.' : 'End of stored snapshot text.',
     ].join('\n'),
   };
 }
@@ -403,17 +392,18 @@ function modelToolPartInput(part: unknown): unknown {
 
 function modelToolPartRefreshesObservation(part: unknown) {
   const name = modelToolPartName(part);
-  if (name !== 'readObservation') return false;
+  if (name === 'searchSnapshot') return true;
+  if (name !== 'takeSnapshot') return false;
   const input = modelToolPartInput(part);
   if (input && typeof input === 'object' && !Array.isArray(input)) {
-    return (input as Record<string, unknown>).refresh === true;
+    return typeof (input as Record<string, unknown>).cursor !== 'string';
   }
   if (typeof input === 'string') {
     try {
       const parsed = JSON.parse(input) as Record<string, unknown>;
-      return parsed.refresh === true;
+      return typeof parsed.cursor !== 'string';
     } catch {
-      return input.includes('"refresh":true') || input.includes('"refresh": true');
+      return !input.includes('"cursor"');
     }
   }
   return false;
@@ -430,54 +420,54 @@ function modelToolPartType(part: unknown) {
   return typeof type === 'string' ? type : undefined;
 }
 
-function compactStaleReadObservationOutput(output: unknown): unknown {
-  if (typeof output === 'string') return staleReadObservationText;
+function compactStaleSnapshotOutput(output: unknown): unknown {
+  if (typeof output === 'string') return staleSnapshotText;
   if (!output || typeof output !== 'object' || Array.isArray(output)) return output;
   const record = output as Record<string, unknown>;
   const next: Record<string, unknown> = { ...record };
   let changed = false;
   if ('value' in record) {
-    next.value = compactStaleReadObservationOutput(record.value);
+    next.value = compactStaleSnapshotOutput(record.value);
     changed = true;
   }
   if (typeof record.actual === 'string') {
-    next.actual = staleReadObservationText;
+    next.actual = staleSnapshotText;
     changed = true;
   }
   if (typeof record.text === 'string') {
-    next.text = staleReadObservationText;
+    next.text = staleSnapshotText;
     changed = true;
   }
   if (typeof record.content === 'string') {
-    next.content = staleReadObservationText;
+    next.content = staleSnapshotText;
     changed = true;
   }
   if (changed) return next;
-  return { ...record, actual: staleReadObservationText };
+  return { ...record, actual: staleSnapshotText };
 }
 
-function compactStaleReadObservationPart(part: unknown): unknown {
+function compactStaleSnapshotPart(part: unknown): unknown {
   if (!part || typeof part !== 'object' || Array.isArray(part)) return part;
   const record = part as Record<string, unknown>;
   const next: Record<string, unknown> = { ...record };
   let changed = false;
   if ('output' in record) {
-    next.output = compactStaleReadObservationOutput(record.output);
+    next.output = compactStaleSnapshotOutput(record.output);
     changed = true;
   }
   if ('value' in record) {
-    next.value = compactStaleReadObservationOutput(record.value);
+    next.value = compactStaleSnapshotOutput(record.value);
     changed = true;
   }
   if ('result' in record) {
-    next.result = compactStaleReadObservationOutput(record.result);
+    next.result = compactStaleSnapshotOutput(record.result);
     changed = true;
   }
   if (changed) return next;
-  return { ...record, output: { type: 'json', value: { ok: true, actual: staleReadObservationText } } };
+  return { ...record, output: { type: 'json', value: { ok: true, actual: staleSnapshotText } } };
 }
 
-export function compactStaleReadObservationMessages<T extends ModelMessage>(messages: T[]) {
+export function compactStaleSnapshotMessages<T extends ModelMessage>(messages: T[]) {
   let position = 0;
   let staleBoundaryPosition = -1;
   for (const message of messages) {
@@ -510,11 +500,11 @@ export function compactStaleReadObservationMessages<T extends ModelMessage>(mess
       if (
         currentPosition < staleBoundaryPosition
         && modelToolPartType(part) === 'tool-result'
-        && modelToolPartName(part) === 'readObservation'
+        && runtimeObservationToolNames.has(modelToolPartName(part) || '')
       ) {
         messageChanged = true;
         changed = true;
-        return compactStaleReadObservationPart(part);
+        return compactStaleSnapshotPart(part);
       }
       return part;
     });

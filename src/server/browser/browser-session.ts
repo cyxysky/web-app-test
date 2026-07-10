@@ -5,6 +5,15 @@ import { spawn } from 'node:child_process';
 import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Frame, LaunchOptions, Page, Request, Worker as PlaywrightWorker } from 'playwright';
 import { normalizeDomNodeIdString, normalizeDomPathString } from '@/lib/dom-path';
 import { appDataRoot, artifactPath } from '@/server/storage/paths';
+import {
+  buildSnapshotViews,
+  captureAxSnapshot,
+  snapshotRoleIsActionable,
+  type CapturedSnapshotFrame,
+  type SnapshotNodeWithUid,
+  type SnapshotRecord,
+  type SnapshotView,
+} from './ax-snapshot';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
   if (errorText === 'net::ERR_ABORTED' && /analytics|collector|apm|beacon|log|track/i.test(url)) return true;
@@ -76,6 +85,16 @@ export type BrowserSessionOptions = {
   preferExistingPage?: boolean;
   browserProfileKey?: string;
   debugDevtools?: boolean;
+  headless?: boolean;
+  isolated?: boolean;
+};
+
+export type AccessibilitySnapshotExportControlResult = {
+  ok: boolean;
+  fileName?: string;
+  path?: string;
+  downloadUrl?: string;
+  error?: string;
 };
 
 /**
@@ -86,28 +105,22 @@ function browserSessionModeFromEnv(): BrowserSessionMode {
   return 'dom';
 }
 
-export type BrowserObservationType = 'actions' | 'tree' | 'text' | 'changes' | 'elements';
+export type BrowserSnapshotView = 'actionable' | 'full' | 'text' | 'changes';
 
-export type BrowserObservationViews = Partial<Record<BrowserObservationType, string>> & {
-  defaultType?: BrowserObservationType;
+export type BrowserSnapshotViews = Partial<Record<BrowserSnapshotView, string>> & {
+  defaultType?: BrowserSnapshotView;
 };
 
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
-  observationViews?: BrowserObservationViews;
+  observationViews?: BrowserSnapshotViews;
   debug?: {
     fullDomSnapshot?: string;
     fullDomSnapshotCharLength?: number;
     domSnapshotPromptCharLimit?: number;
     domSnapshotTruncatedForModel?: boolean;
   };
-};
-
-type BrowserBatchFillAction = {
-  id: string;
-  text?: string;
-  clear?: boolean;
 };
 
 type FocusedElementSummary = {
@@ -166,6 +179,12 @@ type ScreenshotMetrics = {
   devicePixelRatio: number;
   scale: 'css';
   capture: ScreenshotCaptureMode;
+  generation: number;
+  page: Page;
+  url: string;
+  scrollX: number;
+  scrollY: number;
+  capturedAt: number;
 };
 
 type ScreenshotTimingStep = {
@@ -245,19 +264,18 @@ type InteractiveCandidate = {
   shadow?: boolean;
 };
 
-type TextNodeMatch = {
-  matchedText: string;
-  reference: DomNodeReference;
-  score: number;
-};
-
 type DomNodeReference = {
   id: string;
   interactive: boolean;
+  capabilities?: DomActionCapability[];
+  confidence?: DomActionConfidence;
+  contextId?: string;
   label: string;
   line: string;
+  locatorCandidates?: string[];
   localRef?: string;
   path: string;
+  signals?: string[];
   framePath?: string;
   frameUrl?: string;
   descriptor: string;
@@ -271,29 +289,6 @@ type PageInteractiveCandidate = Omit<InteractiveCandidate, 'framePath' | 'frameU
 type PageDomObservationPayload = {
   structuredText: string;
   interactiveCandidates: PageInteractiveCandidate[];
-};
-
-type CandidateClickTarget = {
-  x: number;
-  y: number;
-  descriptor: string;
-  offscreen: boolean;
-  source?: string;
-};
-
-type ClickActionabilityCheck = {
-  ok: true;
-} | {
-  ok: false;
-  reason: string;
-};
-
-type CandidateActionTargetResolution = {
-  ok: true;
-  target: CandidateClickTarget;
-} | {
-  ok: false;
-  error: string;
 };
 
 type ScrollableArea = {
@@ -363,6 +358,9 @@ type BrowserUseViewportClip = {
   top: number;
 };
 
+type DomActionCapability = 'click' | 'drag' | 'fill' | 'focus' | 'hover' | 'select';
+type DomActionConfidence = 'high' | 'medium' | 'low';
+
 type BrowserUseVisibleDomSnapshot = {
   frameElements: Array<{
     rect: BrowserUseViewportClip;
@@ -371,14 +369,21 @@ type BrowserUseVisibleDomSnapshot = {
     url?: string;
   }>;
   items: Array<{
+    capabilities: DomActionCapability[];
+    confidence: DomActionConfidence;
+    contextText: string;
     descriptor: string;
     interactive: boolean;
     label: string;
     line: string;
+    locatorCandidates: string[];
     path: string;
+    rect?: BrowserUseViewportClip;
     ref: string;
+    signals: string[];
     state: string;
     tag: string;
+    text: string;
   }>;
   candidateEstimate?: number;
   hasMore?: boolean;
@@ -441,14 +446,6 @@ type AiDomRuntime = {
     preserveExistingRefs?: boolean;
     viewportClip?: BrowserUseViewportClip;
   }) => BrowserUseVisibleDomSnapshot;
-  domObservationSlice: (options: {
-    maxChars: number;
-    maxElements: number;
-    preserveExistingRefs?: boolean;
-    startIndex?: number;
-    view?: BrowserObservationType;
-    viewportClip?: BrowserUseViewportClip;
-  }) => BrowserUseVisibleDomSnapshot;
   fullDomSnapshot: (options: {
     maxChars: number;
     maxElements: number;
@@ -460,6 +457,70 @@ type AiDomRuntime = {
     viewportClip?: BrowserUseViewportClip,
   ) => ({ x: number; y: number; descriptor: string } | undefined);
   visibleDomText: (ref: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
+};
+
+type SnapshotReference = {
+  uid: string;
+  generationId: string;
+  page: Page;
+  documentId: string;
+  frameId: string;
+  framePath?: string;
+  frameUrl?: string;
+  axNodeId?: string;
+  backendDOMNodeId?: number;
+  selector?: string;
+  role: string;
+  name: string;
+  url?: string;
+  actionable: boolean;
+  actions: string[];
+};
+
+type SnapshotGeneration = {
+  id: string;
+  createdAt: string;
+  page: Page;
+  url: string;
+  frames: CapturedSnapshotFrame[];
+  references: Map<string, SnapshotReference>;
+  views: Record<SnapshotView, SnapshotRecord[]>;
+  nodeCount: number;
+  actionableCount: number;
+  skippedFrameCount: number;
+  timings: {
+    totalMs: number;
+    captureAxMs: number;
+    frameTreeMs: number;
+    axTreeMs: number;
+    domFallbackMs: number;
+  };
+};
+
+export type BrowserMouseAction = {
+  action: 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView';
+  uid?: string;
+  xThousandth?: number;
+  yThousandth?: number;
+  toUid?: string;
+  toXThousandth?: number;
+  toYThousandth?: number;
+  button?: 'left' | 'right' | 'middle';
+  clickCount?: number;
+  deltaX?: number;
+  deltaY?: number;
+};
+
+export type BrowserKeyboardAction = {
+  action: 'type' | 'press' | 'shortcut';
+  uid?: string;
+  xThousandth?: number;
+  yThousandth?: number;
+  text?: string;
+  key?: string;
+  keys?: string[];
+  replace?: boolean;
+  followByEnter?: boolean;
 };
 
 type WindowWithAiDomRuntime = Window & {
@@ -701,6 +762,77 @@ function isBlankBrowserUrlLike(url: string) {
     );
 }
 
+function installAccessibilitySnapshotExportControl() {
+  if (window.top !== window) return;
+  const controlId = '__ai_dom_export_control__';
+  const browserWindow = window as Window & {
+    __webPilotExportAccessibilitySnapshot?: () => Promise<AccessibilitySnapshotExportControlResult>;
+  };
+  const mount = () => {
+    if (!document.documentElement || document.getElementById(controlId)) return;
+    const button = document.createElement('button');
+    button.id = controlId;
+    button.type = 'button';
+    button.textContent = '导出页面快照';
+    button.title = '获取当前页面及全部 iframe 的无障碍树，并按每段 10000 字符导出 JSON';
+    button.setAttribute('aria-label', '导出当前页面无障碍树快照');
+    Object.assign(button.style, {
+      alignItems: 'center',
+      appearance: 'none',
+      background: '#171717',
+      border: '1px solid rgba(255,255,255,.18)',
+      borderRadius: '8px',
+      boxShadow: '0 8px 24px rgba(0,0,0,.24)',
+      color: '#fff',
+      cursor: 'pointer',
+      display: 'inline-flex',
+      font: '600 13px/1 system-ui, sans-serif',
+      height: '34px',
+      padding: '0 12px',
+      position: 'fixed',
+      right: '16px',
+      top: '16px',
+      zIndex: '2147483647',
+    });
+    button.addEventListener('click', async () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      button.style.cursor = 'wait';
+      button.textContent = '正在采集...';
+      try {
+        const result = await browserWindow.__webPilotExportAccessibilitySnapshot?.();
+        if (!result?.ok) throw new Error(result?.error || '页面快照导出失败');
+        button.textContent = '导出完成';
+        button.title = result.path || result.fileName || '页面快照已导出';
+        if (result.downloadUrl) {
+          const link = document.createElement('a');
+          link.href = result.downloadUrl;
+          link.download = result.fileName || 'accessibility-snapshot.json';
+          link.style.display = 'none';
+          document.documentElement.appendChild(link);
+          link.click();
+          link.remove();
+        }
+      } catch (error) {
+        button.textContent = '导出失败';
+        button.title = error instanceof Error ? error.message : String(error);
+      } finally {
+        window.setTimeout(() => {
+          button.disabled = false;
+          button.style.cursor = 'pointer';
+          button.textContent = '导出页面快照';
+        }, 1800);
+      }
+    });
+    document.documentElement.appendChild(button);
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', mount, { once: true });
+  } else {
+    mount();
+  }
+}
+
 function installAiBrowserPageRuntime() {
   const win = window as WindowWithAiDomRuntime;
   if (!win.__aiBrowserPageRuntimeInstalled) {
@@ -731,14 +863,14 @@ function installAiBrowserPageRuntime() {
     win.__aiBrowserPageRuntimeInstalled = true;
   }
 
-  if (win.__aiDomRuntime?.version === 4) return;
+  if (win.__aiDomRuntime?.version === 8) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
   const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
 
   function isOverlay(element: Element) {
-    return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__'));
+    return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__'));
   }
 
   function shadowRootOf(element: Element) {
@@ -768,7 +900,16 @@ function installAiBrowserPageRuntime() {
     return !skippedTags.has(element.tagName.toLowerCase());
   }
 
+  function isDisplayNone(element: Element) {
+    try {
+      return window.getComputedStyle(element).display === 'none';
+    } catch {
+      return false;
+    }
+  }
+
   function children(element: Element) {
+    if (isDisplayNone(element)) return [];
     const list = Array.from(element.children);
     const root = shadowRootOf(element);
     if (root) list.push(...Array.from(root.children));
@@ -1107,14 +1248,7 @@ function installAiBrowserPageRuntime() {
 
   const visibleDomClickEventPattern = /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/;
   const visibleDomHoverEventPattern = /^(mouseenter|mouseover|pointerenter|pointerover)$/;
-
-  function hasVisibleDomRecordedClickListener(element: Element) {
-    return recordedEventTypes(element).some((type) => visibleDomClickEventPattern.test(type));
-  }
-
-  function hasVisibleDomRecordedHoverListener(element: Element) {
-    return recordedEventTypes(element).some((type) => visibleDomHoverEventPattern.test(type));
-  }
+  const visibleDomActionRolePattern = /^(button|checkbox|combobox|link|menuitem|menuitemcheckbox|menuitemradio|option|radio|slider|spinbutton|switch|tab|textbox|treeitem)$/;
 
   function hasVisibleDomOwnHoverAttribute(element: Element) {
     return element.hasAttribute('onmouseenter')
@@ -1165,15 +1299,96 @@ function installAiBrowserPageRuntime() {
     const tag = visibleDomElementName(element);
     if (hasNativeActionSignal(element, tag)) signals.push('native');
     if (element.hasAttribute('onclick')) signals.push('onclick');
-    if (hasVisibleDomRecordedClickListener(element)) signals.push('listener');
+    const role = normalizeVisibleDomText(element.getAttribute('role') || '').toLowerCase();
+    if (visibleDomActionRolePattern.test(role)) signals.push(`role:${role}`);
+    for (const type of recordedEventTypes(element)) {
+      if (visibleDomClickEventPattern.test(type) || visibleDomHoverEventPattern.test(type)) signals.push(`listener:${type}`);
+    }
     if (hasActionAttribute(element)) signals.push('action-attr');
     if (hasPointerCursor(element)) signals.push('cursor=pointer');
     const tabindex = element.getAttribute('tabindex');
     if (tabindex !== null && tabindex !== '-1') signals.push('tabindex');
     if (isContentEditableOwner(element)) signals.push('contenteditable');
-    if (hasVisibleDomOwnHoverAttribute(element) || hasVisibleDomRecordedHoverListener(element)) signals.push('hover-listener');
-    if (hoverSelectors.length && hasVisibleDomCssHoverEffect(element, hoverSelectors)) signals.push('hover-css');
-    return signals;
+    if (hasVisibleDomOwnHoverAttribute(element)) signals.push('hover-attribute');
+    const shouldInspectCssHover = signals.some((signal) => !/^listener:(mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/.test(signal));
+    if (shouldInspectCssHover && hoverSelectors.length && hasVisibleDomCssHoverEffect(element, hoverSelectors)) signals.push('hover-css');
+    return Array.from(new Set(signals));
+  }
+
+  function visibleDomActionCapabilities(element: Element, signals: string[]) {
+    const capabilities = new Set<DomActionCapability>();
+    const tag = visibleDomElementName(element);
+    const type = normalizeVisibleDomText(element.getAttribute('type') || '').toLowerCase();
+    const role = normalizeVisibleDomText(element.getAttribute('role') || '').toLowerCase();
+    if (tag === 'input') {
+      if (/^(button|checkbox|color|file|image|radio|range|reset|submit)$/i.test(type)) capabilities.add('click');
+      else capabilities.add('fill');
+      capabilities.add('focus');
+    } else if (tag === 'textarea') {
+      capabilities.add('fill');
+      capabilities.add('focus');
+    } else if (tag === 'select' || tag === 'option') {
+      capabilities.add('select');
+      capabilities.add('focus');
+    } else if (['a', 'button', 'details', 'label', 'summary'].includes(tag)) {
+      capabilities.add('click');
+    }
+    if (isContentEditableOwner(element) || role === 'textbox') {
+      capabilities.add('fill');
+      capabilities.add('focus');
+    }
+    if (visibleDomActionRolePattern.test(role) && role !== 'textbox' && role !== 'combobox') capabilities.add('click');
+    if (role === 'combobox') {
+      capabilities.add('select');
+      capabilities.add('focus');
+    }
+    if (signals.some((signal) => /^(onclick|action-attr|listener:(click|dblclick|mouseup|pointerup))$/.test(signal))) capabilities.add('click');
+    if (signals.includes('cursor=pointer')) capabilities.add('click');
+    if (signals.includes('tabindex')) capabilities.add('focus');
+    if (signals.some((signal) => /^(hover-attribute|hover-css|listener:(mouseenter|mouseover|pointerenter|pointerover))$/.test(signal))) capabilities.add('hover');
+    const dragSignal = signals.some((signal) => /^listener:(mousedown|pointerdown|touchstart)$/.test(signal));
+    if (dragSignal && (
+      element.getAttribute('draggable') === 'true'
+      || element.hasAttribute('cdkdraghandle')
+      || element.hasAttribute('data-drag-handle')
+    )) capabilities.add('drag');
+    return Array.from(capabilities);
+  }
+
+  function visibleDomActionConfidence(element: Element, signals: string[], capabilities: DomActionCapability[]): DomActionConfidence {
+    if (signals.some((signal) => /^(native|onclick|action-attr|role:|listener:(click|dblclick))/.test(signal))) return 'high';
+    if (signals.includes('cursor=pointer') || signals.includes('contenteditable')) return 'medium';
+    if (capabilities.includes('fill') || capabilities.includes('select')) return 'high';
+    if (signals.some((signal) => /^(tabindex|hover-attribute|listener:(mouseenter|pointerenter))$/.test(signal))) return 'medium';
+    if (element.getAttribute('draggable') === 'true' || element.hasAttribute('cdkdraghandle') || element.hasAttribute('data-drag-handle')) return 'medium';
+    return 'low';
+  }
+
+  function visibleDomLocatorCandidates(element: Element) {
+    const values: string[] = [];
+    const quote = (value: string) => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const addAttribute = (name: string, value?: string | null, prefix = '') => {
+      const normalized = normalizeVisibleDomText(value || '');
+      if (!normalized || normalized.length > 240) return;
+      values.push(`${prefix}[${name}="${quote(normalized)}"]`);
+    };
+    const tag = visibleDomElementName(element);
+    for (const name of ['data-testid', 'data-test', 'data-qa', 'data-cy']) addAttribute(name, element.getAttribute(name));
+    const id = normalizeVisibleDomText(element.id || '');
+    if (id && id.length <= 120) {
+      try {
+        values.push(`#${CSS.escape(id)}`);
+      } catch {
+        addAttribute('id', id);
+      }
+    }
+    if (tag === 'a') addAttribute('href', element.getAttribute('href'), 'a');
+    const role = element.getAttribute('role');
+    const ariaLabel = element.getAttribute('aria-label');
+    if (role && ariaLabel) values.push(`[role="${quote(role)}"][aria-label="${quote(ariaLabel)}"]`);
+    const name = element.getAttribute('name');
+    if (name) addAttribute('name', name, tag);
+    return Array.from(new Set(values)).slice(0, 8);
   }
 
   function visibleDomRect(element: Element, viewportClip: BrowserUseViewportClip) {
@@ -1195,6 +1410,16 @@ function installAiBrowserPageRuntime() {
         && rect.bottom > viewportClip.top
         && rect.top < viewportClip.bottom
       ) {
+        return { bottom: rect.bottom, left: rect.left, right: rect.right, top: rect.top };
+      }
+    }
+    return undefined;
+  }
+
+  function renderedDomRect(element: Element) {
+    if (!isRenderable(element, { requirePointerEvents: true })) return undefined;
+    for (const rect of Array.from(element.getClientRects())) {
+      if (rect.width > 0 && rect.height > 0) {
         return { bottom: rect.bottom, left: rect.left, right: rect.right, top: rect.top };
       }
     }
@@ -1252,11 +1477,11 @@ function installAiBrowserPageRuntime() {
     return normalized.slice(0, 140);
   }
 
-  function visibleDomTextContent(element: Element) {
+  function visibleDomTextContent(element: Element, maxChars = 160) {
     const parts: string[] = [];
     let chars = 0;
     const visit = (node: Node) => {
-      if (chars >= 160) return;
+      if (chars >= maxChars) return;
       if (node.nodeType === Node.TEXT_NODE) {
         const text = normalizeVisibleDomText(node.nodeValue || '');
         if (text) {
@@ -1270,7 +1495,7 @@ function installAiBrowserPageRuntime() {
         if (isVisibleDomSubtreeHidden(element) || visibleDomSkippedTextTags.has(visibleDomElementName(element))) return;
       }
       for (const child of Array.from(node.childNodes || [])) {
-        if (chars >= 160) break;
+        if (chars >= maxChars) break;
         visit(child);
       }
       if (node.nodeType === Node.ELEMENT_NODE) {
@@ -1279,13 +1504,13 @@ function installAiBrowserPageRuntime() {
         const root = shadowRootOf(element);
         if (!root) return;
         for (const child of Array.from(root.childNodes)) {
-          if (chars >= 160) break;
+          if (chars >= maxChars) break;
           visit(child);
         }
       }
     };
     visit(element);
-    return normalizeVisibleDomText(parts.join(' ')).slice(0, 160);
+    return normalizeVisibleDomText(parts.join(' ')).slice(0, maxChars);
   }
 
   function visibleDomOwnTextContent(element: Element) {
@@ -1419,7 +1644,7 @@ function installAiBrowserPageRuntime() {
         return value ? `${name}=${JSON.stringify(value)}` : '';
       })
       .filter(Boolean);
-    if (signals.length) values.push(`data-ai-signals=${JSON.stringify(Array.from(new Set(signals)).join('|'))}`);
+    if (signals.length) values.push(`signals=${JSON.stringify(Array.from(new Set(signals)).join('|'))}`);
     return values.join(' ');
   }
 
@@ -1502,21 +1727,41 @@ function installAiBrowserPageRuntime() {
       if (element.hasAttribute(name)) attrs.push(`${name}="true"`);
     }
     if (signals.length) {
-      attrs.push('data-ai-interactive="true"');
-      attrs.push(`data-ai-signals="${escapeVisibleDomText(Array.from(new Set(signals)).join('|'))}"`);
+      attrs.push(`signals="${escapeVisibleDomText(Array.from(new Set(signals)).join('|'))}"`);
     }
     const tag = visibleDomElementName(element);
-    const interactive = signals.length > 0;
+    const capabilities = visibleDomActionCapabilities(element, signals);
+    const confidence = visibleDomActionConfidence(element, signals, capabilities);
+    const interactive = capabilities.length > 0;
     const text = visibleDomLineText(element, interactive);
+    const ownText = visibleDomOwnTextContent(element);
+    const semanticTextTags = new Set(['a', 'button', 'dd', 'dt', 'figcaption', 'label', 'legend', 'li', 'option', 'p', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+    const formText = ['input', 'select', 'textarea'].includes(tag)
+      ? visibleDomUniqueText(['aria-label', 'placeholder', 'value', 'name'].map((name) => visibleDomAttributeValue(element, name) || '')).join(' | ')
+      : '';
+    const textEntry = ownText || formText || (semanticTextTags.has(tag) ? text : '');
+    const contextText = tag === 'tr'
+      ? visibleDomTextContent(element, 800)
+      : ['article', 'dialog', 'fieldset', 'form', 'li', 'nav', 'section'].includes(tag)
+        ? visibleDomTextContent(element, 320)
+        : '';
+    const rect = renderedDomRect(element);
     const line = text.length === 0
       ? `<${tag} ${attrs.join(' ')} />`
       : `<${tag} ${attrs.join(' ')}>${escapeVisibleDomText(text)}</${tag}>`;
     return {
+      capabilities,
+      confidence,
+      contextText,
       interactive,
       label: visibleDomLabelForElement(element, interactive, text),
       line,
+      locatorCandidates: visibleDomLocatorCandidates(element),
+      rect,
+      signals,
       state: interactive ? visibleDomInteractiveStateForElement(element, signals) : '',
       tag,
+      text: textEntry,
     };
   }
 
@@ -1547,14 +1792,10 @@ function installAiBrowserPageRuntime() {
       }
       state.refToElement.set(ref, element);
       items.push({
+        ...item,
         descriptor: descriptor(element),
-        interactive: item.interactive,
-        label: item.label,
-        line,
         path: pathOf(element) || '',
         ref,
-        state: item.state,
-        tag: item.tag,
       });
       chars += lineChars;
     };
@@ -1590,6 +1831,7 @@ function installAiBrowserPageRuntime() {
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const element = node as Element;
+      if (isDisplayNone(element)) return;
       const tag = visibleDomElementName(element);
       if (tag === 'frame' || tag === 'iframe') pushFrame(element);
       const signals = visibleDomInteractionSignals(element, hoverSelectors);
@@ -1611,174 +1853,6 @@ function installAiBrowserPageRuntime() {
 
     visit(document);
     return { frameElements, items, stateKey: state.instanceId, viewport: rawViewport };
-  }
-
-  function domObservationSlice(options: {
-    maxChars: number;
-    maxElements: number;
-    preserveExistingRefs?: boolean;
-    startIndex?: number;
-    view?: BrowserObservationType;
-    viewportClip?: BrowserUseViewportClip;
-  }) {
-    const state = visibleDomState();
-    if (!options.preserveExistingRefs) state.refToElement.clear();
-
-    const rawViewport = visualViewportRect();
-    const viewportClip = options.viewportClip ? intersectClip(rawViewport, options.viewportClip) || rawViewport : rawViewport;
-    const view = options.view === 'tree' || options.view === 'elements' || options.view === 'text'
-      ? options.view
-      : 'actions';
-    const maxElements = Math.max(1, Math.floor(Number(options.maxElements) || 120));
-    const maxChars = Math.max(1, Math.floor(Number(options.maxChars) || 10000));
-    const startIndex = Math.max(0, Math.floor(Number(options.startIndex) || 0));
-    const frameElements: BrowserUseVisibleDomSnapshot['frameElements'] = [];
-    const items: BrowserUseVisibleDomSnapshot['items'] = [];
-    const hoverSelectors = visibleDomHoverSelectors();
-    const structuralTextTags = new Set([
-      'a', 'button', 'dd', 'details', 'dt', 'figcaption', 'input', 'label', 'legend', 'li',
-      'option', 'p', 'select', 'summary', 'td', 'textarea', 'th',
-      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-    ]);
-    const directTextContainerTags = new Set(['article', 'aside', 'div', 'fieldset', 'footer', 'form', 'header', 'main', 'nav', 'section', 'span']);
-    let chars = 0;
-    let candidateIndex = 0;
-    let nextIndex = startIndex;
-    let hasMore = false;
-    let stopped = false;
-
-    const actionSignals = (element: Element) => {
-      const signals = visibleDomInteractionSignals(element, hoverSelectors);
-      return signals.length && visibleDomClickablePoint(element, viewportClip) ? signals : [];
-    };
-    const hasMeaningfulAttributes = (element: Element) => visibleDomMeaningfulAttributes.some((name) => Boolean(visibleDomAttributeValue(element, name)));
-    const shouldIncludeElement = (element: Element, signals: string[]) => {
-      if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
-      if (view === 'actions') return signals.length > 0;
-      const tag = visibleDomElementName(element);
-      if (signals.length) return true;
-      if (structuralTextTags.has(tag) && visibleDomTextContent(element)) return true;
-      if (directTextContainerTags.has(tag) && visibleDomOwnTextContent(element)) return true;
-      return hasMeaningfulAttributes(element);
-    };
-    const pushFrame = (element: Element) => {
-      if (frameElements.length >= maxElements) return;
-      const rect = visibleDomRect(element, viewportClip);
-      if (!rect) return;
-      const ref = visibleDomRef(element);
-      state.refToElement.set(ref, element);
-      const frameElement = element as HTMLIFrameElement;
-      const width = frameElement.clientWidth > 0 ? frameElement.clientWidth : rect.right - rect.left;
-      const height = frameElement.clientHeight > 0 ? frameElement.clientHeight : rect.bottom - rect.top;
-      frameElements.push({
-        rect,
-        ref,
-        size: { height, width },
-        ...(frameElement.src ? { url: frameElement.src } : {}),
-      });
-    };
-    const pushCandidate = (element: Element, signals: string[]) => {
-      if (stopped || !shouldIncludeElement(element, signals)) return;
-      const ordinal = candidateIndex;
-      candidateIndex += 1;
-      if (ordinal < startIndex) {
-        nextIndex = ordinal + 1;
-        return;
-      }
-      if (items.length >= maxElements) {
-        hasMore = true;
-        stopped = true;
-        nextIndex = ordinal;
-        return;
-      }
-      const ref = visibleDomRef(element);
-      const item = visibleDomItem(element, ref, signals);
-      const line = item.line;
-      const lineChars = line.length + (items.length === 0 ? 0 : 1);
-      if (items.length > 0 && chars + lineChars > maxChars) {
-        hasMore = true;
-        stopped = true;
-        nextIndex = ordinal;
-        return;
-      }
-      state.refToElement.set(ref, element);
-      items.push({
-        descriptor: descriptor(element),
-        interactive: item.interactive,
-        label: item.label,
-        line,
-        path: pathOf(element) || '',
-        ref,
-        state: item.state,
-        tag: item.tag,
-      });
-      chars += lineChars;
-      nextIndex = ordinal + 1;
-    };
-    const visit = (node: Node) => {
-      if (stopped) return;
-      if (node.nodeType === Node.DOCUMENT_NODE) {
-        const root = document.documentElement;
-        if (root) visit(root);
-        return;
-      }
-      if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
-        for (const child of Array.from((node as DocumentFragment).children)) {
-          if (stopped) break;
-          visit(child);
-        }
-        return;
-      }
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      const element = node as Element;
-      const tag = visibleDomElementName(element);
-      if (tag === 'frame' || tag === 'iframe') pushFrame(element);
-      pushCandidate(element, actionSignals(element));
-      const root = shadowRootOf(element);
-      if (root && !stopped) visit(root);
-      for (const child of Array.from(element.children)) {
-        if (stopped) break;
-        visit(child);
-      }
-    };
-
-    visit(document);
-    const selectorCandidateCount = view === 'actions'
-      ? (() => {
-          try {
-            return document.querySelectorAll([
-              'a[href]',
-              'button',
-              'input',
-              'select',
-              'textarea',
-              '[role]',
-              '[onclick]',
-              '[tabindex]:not([tabindex="-1"])',
-              '[contenteditable="true"]',
-              '[data-action]',
-              '[data-click]',
-              '[data-href]',
-              '[data-url]',
-            ].join(',')).length;
-          } catch {
-            return undefined;
-          }
-        })()
-      : undefined;
-    return {
-      candidateEstimate: selectorCandidateCount,
-      frameElements,
-      hasMore,
-      items,
-      nextIndex,
-      returnedEntries: items.length,
-      scannedCandidates: candidateIndex,
-      startIndex,
-      stateKey: state.instanceId,
-      totalEntries: hasMore ? undefined : candidateIndex,
-      viewport: rawViewport,
-    };
   }
 
   function fullDomSnapshot(options: { maxChars: number; maxElements: number; preserveExistingRefs?: boolean }) {
@@ -1804,7 +1878,7 @@ function installAiBrowserPageRuntime() {
     const hasMeaningfulAttributes = (element: Element) => visibleDomMeaningfulAttributes.some((name) => Boolean(visibleDomAttributeValue(element, name)));
     const actionableSignals = (element: Element) => {
       const signals = visibleDomInteractionSignals(element, hoverSelectors);
-      return signals.length && visibleDomClickablePoint(element, viewport) ? signals : [];
+      return signals.length && renderedDomRect(element) ? signals : [];
     };
     const shouldIncludeElement = (element: Element) => {
       if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
@@ -1826,14 +1900,10 @@ function installAiBrowserPageRuntime() {
       }
       state.refToElement.set(ref, element);
       items.push({
+        ...item,
         descriptor: descriptor(element),
-        interactive: item.interactive,
-        label: item.label,
-        line,
         path: pathOf(element) || '',
         ref,
-        state: item.state,
-        tag: item.tag,
       });
       chars += lineChars;
     };
@@ -1870,6 +1940,7 @@ function installAiBrowserPageRuntime() {
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const element = node as Element;
+      if (isDisplayNone(element)) return;
       const tag = visibleDomElementName(element);
       if (tag === 'frame' || tag === 'iframe') pushFrame(element);
       if (shouldIncludeElement(element)) pushItem(element, actionableSignals(element));
@@ -1933,7 +2004,7 @@ function installAiBrowserPageRuntime() {
   }
 
   win.__aiDomRuntime = {
-    version: 4,
+    version: 8,
     isOverlay,
     isTraversable,
     isRenderable,
@@ -1954,7 +2025,6 @@ function installAiBrowserPageRuntime() {
     pointBelongsToElement,
     visiblePointForElement,
     visibleDomSnapshot,
-    domObservationSlice,
     fullDomSnapshot,
     elementText,
     visibleDomPoint,
@@ -1977,7 +2047,7 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   const normalizeText = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
   const candidateTextQuery = normalizeText(input.candidateTextQuery).toLowerCase();
   const candidateTextQueryParts = candidateTextQuery.split(/\s+/).filter((item) => item.length >= 2);
-  const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__';
+  const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__';
   const skippedTextTags = new Set(['script', 'style', 'template', 'noscript']);
   const structuralTextTags = new Set([
     'article',
@@ -2079,10 +2149,6 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   function isInsideShadow(element: Element) {
     const root = element.getRootNode();
     return Boolean(root && (root as ShadowRoot).host);
-  }
-
-  function isRenderable(element: Element) {
-    return runtime.isRenderable(element, { requirePointerEvents });
   }
 
   function visibleRectOf(element: Element) {
@@ -2593,6 +2659,7 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   function walk(element: Element, path: number[], depth: number, textDepth: number) {
     visitedElements += 1;
     if (visitedElements > 50000 || depth > 128) return;
+    if (window.getComputedStyle(element).display === 'none') return;
     const structured = maxStructuredTextChars ? structuredTextLine(element) : undefined;
     const nextTextDepth = structured?.shown ? textDepth + 1 : textDepth;
     if (structured?.text) appendStructuredText(textDepth, structured.text);
@@ -2610,89 +2677,6 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   return {
     structuredText: structuredLines.join('\n'),
     interactiveCandidates: candidates.map((candidate, index) => ({ ...candidate, id: `${index + 1}` })),
-  };
-}
-
-function resolveAiCandidateActionTarget(input: {
-  path: string;
-  center?: { x: number; y: number };
-}): CandidateActionTargetResolution {
-  const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
-  if (!runtime) return { ok: false, error: 'DOM runtime is not available' };
-
-  const { path: pathValue } = input;
-  const originalElement = runtime.elementFromPath(pathValue);
-  if (!originalElement) return { ok: false, error: `DOM path ${pathValue} no longer exists` };
-
-  let element = runtime.actionableTargetFor(originalElement);
-
-  const cachedCenter = input.center;
-  if (
-    cachedCenter &&
-    Number.isFinite(cachedCenter.x) &&
-    Number.isFinite(cachedCenter.y) &&
-    cachedCenter.x >= 0 &&
-    cachedCenter.y >= 0 &&
-    cachedCenter.x < window.innerWidth &&
-    cachedCenter.y < window.innerHeight
-  ) {
-    const top = runtime.topmostRenderableAt(cachedCenter.x, cachedCenter.y, { requirePointerEvents: true });
-    if (
-      top &&
-      (top === element || runtime.composedContains(element, top) || top === originalElement || runtime.composedContains(originalElement, top))
-    ) {
-      return {
-        ok: true,
-        target: {
-          x: Math.round(cachedCenter.x),
-          y: Math.round(cachedCenter.y),
-          descriptor: runtime.descriptor(element),
-          offscreen: false,
-          source: 'cached-center',
-        },
-      };
-    }
-  }
-
-  let rect = element.getBoundingClientRect();
-  let point = runtime.visiblePointForElement(element, { requirePointerEvents: true });
-  if (!point) {
-    element.scrollIntoView({ block: 'center', inline: 'center' });
-    rect = element.getBoundingClientRect();
-    point = runtime.visiblePointForElement(element, { requirePointerEvents: true });
-  }
-
-  if (!point || rect.width <= 0 || rect.height <= 0) {
-    const queue = runtime.children(element);
-    let guard = 0;
-    while (queue.length && guard < 4000) {
-      const candidate = queue.shift() as Element;
-      const candidateRect = candidate.getBoundingClientRect();
-      const candidatePoint = runtime.visiblePointForElement(candidate, { requirePointerEvents: true });
-      if (candidateRect.width > 0 && candidateRect.height > 0 && candidatePoint) {
-        element = candidate;
-        rect = candidateRect;
-        point = candidatePoint;
-        break;
-      }
-      queue.push(...runtime.children(candidate));
-      guard += 1;
-    }
-  }
-
-  if (!point || rect.width <= 0 || rect.height <= 0) {
-    return { ok: false, error: `DOM path ${pathValue} is not visible` };
-  }
-
-  return {
-    ok: true,
-    target: {
-      x: Math.round(Math.min(Math.max(point.x, 0), window.innerWidth - 1)),
-      y: Math.round(Math.min(Math.max(point.y, 0), window.innerHeight - 1)),
-      descriptor: runtime.descriptor(element),
-      offscreen: rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth,
-      source: 'resolved-point',
-    },
   };
 }
 
@@ -2962,6 +2946,7 @@ export class BrowserSession {
   private httpRequestsByPage = new WeakMap<Page, HttpRequestRecord[]>();
   private httpRequestByRequest = new WeakMap<Request, HttpRequestRecord>();
   private lastScreenshotMetrics?: ScreenshotMetrics;
+  private screenshotGenerationSequence = 0;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
   private lastScreenshotCandidates: InteractiveCandidate[] = [];
   private lastDomNodeReferences = new Map<string, DomNodeReference>();
@@ -2977,6 +2962,15 @@ export class BrowserSession {
   private releaseSharedBrowser?: () => Promise<void>;
   private pageDiscoveryListener?: (page: Page) => void;
   private pageGroupInitScriptPages = new WeakSet<Page>();
+  private snapshotGeneration?: SnapshotGeneration;
+  private snapshotGenerationPromise?: Promise<SnapshotGeneration>;
+  private snapshotGenerationSequence = 0;
+  private snapshotUidSequence = 0;
+  private snapshotUidByIdentity = new Map<string, string>();
+  private snapshotPageSequence = 0;
+  private snapshotPageIds = new WeakMap<Page, string>();
+  private accessibilitySnapshotExportControlInstalled = false;
+  private accessibilitySnapshotExporter?: () => Promise<AccessibilitySnapshotExportControlResult>;
   private readonly pageGroupId: string;
 
   constructor(
@@ -3015,7 +3009,8 @@ export class BrowserSession {
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
     const { chromium } = await import('playwright');
-    const headless = this.options.debugDevtools ? false : process.env.HEADLESS_BROWSER === 'true';
+    const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
+    const isolated = this.options.isolated === true;
     const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
     const configuredViewportWidth = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH');
     const configuredViewportHeight = positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT');
@@ -3034,8 +3029,8 @@ export class BrowserSession {
         ? `--window-size=${headlessFallbackViewport.width},${headlessFallbackViewport.height + 120}`
         : '';
     const ignoreHTTPSErrors = process.env.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
-    const useElectronEmbeddedBrowser = electronEmbeddedBrowserEnabled();
-    const forceBundledBrowser = process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !useElectronEmbeddedBrowser;
+    const useElectronEmbeddedBrowser = !isolated && electronEmbeddedBrowserEnabled();
+    const forceBundledBrowser = isolated || (process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !useElectronEmbeddedBrowser);
     const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
     const executablePath = process.env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
     const browserProfileKey = this.options.browserProfileKey ? normalizePageGroupId(this.options.browserProfileKey) : '';
@@ -3053,14 +3048,16 @@ export class BrowserSession {
           .replace(/\{profileKey\}/g, encodeURIComponent(browserProfileKey))
         : ''
       : rawCdpEndpoint;
-    const configuredUserDataDir = process.env.BROWSER_USER_DATA_DIR?.trim()
-      || process.env.AI_WEB_TEST_BROWSER_PROFILE_DIR?.trim()
-      || '';
+    const configuredUserDataDir = isolated
+      ? ''
+      : process.env.BROWSER_USER_DATA_DIR?.trim()
+        || process.env.AI_WEB_TEST_BROWSER_PROFILE_DIR?.trim()
+        || '';
     const requestedUserDataDir = configuredUserDataDir && browserProfileKey
       ? path.join(configuredUserDataDir, browserProfileKey)
       : configuredUserDataDir;
-    const tabGrouperEnabled = sessionTabGrouperEnabled(headless);
-    const useSharedBrowserTabs = sharedBrowserTabsEnabled() && !useElectronEmbeddedBrowser && !browserProfileKey;
+    const tabGrouperEnabled = !isolated && sessionTabGrouperEnabled(headless);
+    const useSharedBrowserTabs = !isolated && sharedBrowserTabsEnabled() && !useElectronEmbeddedBrowser && !browserProfileKey;
     const useSessionGroupPageSelection = tabGrouperEnabled || Boolean(browserProfileKey);
     const restoreLastSession = tabGrouperEnabled && process.env.BROWSER_RESTORE_LAST_SESSION !== 'false';
     const autoTabGroupProfileKey = browserProfileKey || (useSharedBrowserTabs ? 'shared' : this.pageGroupId);
@@ -3574,6 +3571,41 @@ export class BrowserSession {
     await target.evaluate(installAiBrowserPageRuntime).catch(() => undefined);
   }
 
+  async currentTitle() {
+    try {
+      return await this.activePage.title();
+    } catch {
+      return '';
+    }
+  }
+
+  async bringToFront() {
+    await this.activePage.bringToFront();
+  }
+
+  async installAccessibilitySnapshotExportControl(exporter: () => Promise<AccessibilitySnapshotExportControlResult>) {
+    if (!this.context) throw new Error('Browser session has not started');
+    this.accessibilitySnapshotExporter = exporter;
+    if (!this.accessibilitySnapshotExportControlInstalled) {
+      this.accessibilitySnapshotExportControlInstalled = true;
+      await this.context.exposeBinding('__webPilotExportAccessibilitySnapshot', async (source) => {
+        if (source.page && !source.page.isClosed()) {
+          this.claimPage(source.page, { allowSteal: true });
+          await source.page.bringToFront().catch(() => undefined);
+        }
+        const handler = this.accessibilitySnapshotExporter;
+        if (!handler) return { ok: false, error: 'Accessibility snapshot exporter is unavailable.' };
+        try {
+          return await handler();
+        } catch (error) {
+          return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      });
+      await this.context.addInitScript(installAccessibilitySnapshotExportControl);
+    }
+    await Promise.all(this.sessionPages().map((page) => page.evaluate(installAccessibilitySnapshotExportControl).catch(() => undefined)));
+  }
+
   private async readPageGroupId(page: Page) {
     if (page.isClosed()) return undefined;
     return page.evaluate(() => {
@@ -3731,7 +3763,7 @@ export class BrowserSession {
     return this.page;
   }
 
-  // 打开目标页面，只等待导航提交，页面稳定由模型显式调用 waitForPage/readObservation 决定。
+  // 打开目标页面，只等待导航提交；页面稳定与新快照由模型显式触发。
   async open(url: string): Promise<BrowserActionResult> {
     const beforeUrl = this.activePage.url();
     let navigationNote = '';
@@ -3749,6 +3781,7 @@ export class BrowserSession {
       navigationNote = ` Navigation reported an error before commit; continuing from current URL: ${currentUrl}.`;
     }
     void this.markPageGroup(this.activePage);
+    this.invalidateBrowserEvidence();
     return { ok: true, actual: `Opened page: ${url}${navigationNote}` };
   }
 
@@ -4160,9 +4193,10 @@ export class BrowserSession {
       skipped('captureMarkerScreenshot');
       skipped('removeMarkerOverlay');
     }
-    const [image, viewportMetrics] = await timed('readScreenshotMetadata', () => Promise.all([
+    const [image, viewportMetrics, scrollPosition] = await timed('readScreenshotMetadata', () => Promise.all([
       this.readPngSize(filePath),
       this.getViewportMetrics(),
+      this.activePage.evaluate(() => ({ x: window.scrollX, y: window.scrollY })).catch(() => ({ x: 0, y: 0 })),
     ]));
     this.lastScreenshotMetrics = {
       path: filePath,
@@ -4172,6 +4206,12 @@ export class BrowserSession {
       devicePixelRatio: viewportMetrics.devicePixelRatio,
       scale: 'css',
       capture,
+      generation: ++this.screenshotGenerationSequence,
+      page: this.activePage,
+      url: this.activePage.url(),
+      scrollX: scrollPosition.x,
+      scrollY: scrollPosition.y,
+      capturedAt: Date.now(),
     };
     this.lastScreenshotTiming = {
       phase: String(phase),
@@ -4190,7 +4230,7 @@ export class BrowserSession {
     return filePath;
   }
 
-  // Minimal getCurrentScreenshot path: save the browser screenshot without DOM, overlay, metadata, or visual-context work.
+  // Minimal takeScreenshot path: save the browser screenshot without DOM, overlay, metadata, or visual-context work.
   async takeCurrentScreenshotOnly(runId: string, stepIndex: number, phase: `visual-${number}`, options: ScreenshotCaptureOptions = {}) {
     const capture: ScreenshotCaptureMode = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
     const dir = artifactPath(runId);
@@ -4206,7 +4246,28 @@ export class BrowserSession {
       path: filePath,
       fullPage: capture === 'fullPage',
       timeout: screenshotTimeoutMs,
+      scale: 'css',
     });
+    const [image, viewportMetrics, scrollPosition] = await Promise.all([
+      this.readPngSize(filePath),
+      this.getViewportMetrics(),
+      this.activePage.evaluate(() => ({ x: window.scrollX, y: window.scrollY })).catch(() => ({ x: 0, y: 0 })),
+    ]);
+    this.lastScreenshotMetrics = {
+      path: filePath,
+      image,
+      viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
+      viewportMetrics,
+      devicePixelRatio: viewportMetrics.devicePixelRatio,
+      scale: 'css',
+      capture,
+      generation: ++this.screenshotGenerationSequence,
+      page: this.activePage,
+      url: this.activePage.url(),
+      scrollX: scrollPosition.x,
+      scrollY: scrollPosition.y,
+      capturedAt: Date.now(),
+    };
     return filePath;
   }
 
@@ -4321,619 +4382,6 @@ export class BrowserSession {
     return { ok: true, actual: result.tree };
   }
 
-  private resolveDomNodeReference(nodeId: string) {
-    const normalizedId = normalizeDomNodeIdString(nodeId);
-    const reference = normalizedId ? this.lastDomNodeReferences.get(normalizedId) : undefined;
-    if (reference) return { reference };
-    const available = [...this.lastDomNodeReferences.values()]
-      .slice(0, 40)
-      .map((item) => `${item.id}: ${item.descriptor}${item.framePath ? ` frame=${item.framePath}` : ''}`)
-      .join('\n');
-    return {
-      error: `DOM node id "${nodeId}" was not found in the current DOM snapshot. Use a node_id from the next refreshed DOM context.${available ? ` Available ids from the last snapshot:\n${available}` : ''}`,
-    };
-  }
-
-  private async readDomNodeText(reference: DomNodeReference) {
-    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
-    if (!frame) return undefined;
-    await this.ensureBrowserPageRuntime(frame);
-    return frame.evaluate(({ localRef, pathValue, maxChars }) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      if (localRef) return runtime?.visibleDomText(localRef, { maxChars });
-      const element = pathValue ? runtime?.elementFromPath(pathValue) : undefined;
-      if (!element) return undefined;
-      return runtime?.elementText(pathValue, { maxChars });
-    }, {
-      localRef: reference.localRef,
-      maxChars: numericLimitFromEnv('DOM_NODE_TEXT_MAX_CHARS', 200000),
-      pathValue: reference.path,
-    }).catch(() => undefined);
-  }
-
-  async getDomNodeText(nodeId: string): Promise<BrowserActionResult> {
-    const resolved = this.resolveDomNodeReference(nodeId);
-    if (!resolved.reference) return { ok: false, actual: resolved.error };
-    const result = await this.readDomNodeText(resolved.reference);
-
-    if (!result) {
-      return {
-        ok: false,
-        actual: `DOM node id ${nodeId} was not found. Use a node_id from the next refreshed DOM context; the DOM may have changed.`,
-      };
-    }
-    return {
-      ok: true,
-      actual: `DOM node ${resolved.reference.id} (${result.descriptor}) full text, ${result.textLength} characters:\n${result.text || '[empty text]'}`,
-    };
-  }
-
-  // 点击指定编号的候选元素中心点。
-  async clickCandidate(candidateId: string, text?: string): Promise<BrowserActionResult> {
-    const timings: Record<string, number> = {};
-    const resolved = await timedBrowserStep(timings, 'resolveCandidateMs', () => this.resolveCandidateTarget(candidateId, timings));
-    if (!resolved.target) return { ok: false, actual: resolved.error };
-
-    const { candidate, target } = resolved;
-    const actionability = await timedBrowserStep(timings, 'playwrightActionabilityMs', () => this.checkCandidateClickActionability(candidate, target, 'click'));
-    if (!actionability.ok) {
-      return {
-        ok: false,
-        actual: `Candidate ${candidate.id} is not clickable now: ${actionability.reason}`,
-      };
-    }
-    const page = this.activePage;
-    const beforeUrl = page.url();
-    const popup = this.watchForPopup(page);
-    await timedBrowserStep(timings, 'mouseClickMs', () => page.mouse.click(target.x, target.y));
-    if (text !== undefined) {
-      await timedBrowserStep(timings, 'typeTextMs', () => this.insertFocusedTextFast(text, timings));
-    }
-    const newPage = await this.settlePopupAfterAction(popup.popup, popup.waitMs, timings);
-    let note = '';
-    let fallbackNote = '';
-    if (text === undefined && candidate.href && !candidate.opensExternalApp && this.activePage.url() === beforeUrl && !newPage) {
-      const fallback = await timedBrowserStep(timings, 'fallbackClickMs', () => (
-        candidate.framePath
-          ? this.dispatchFrameDomPathClick(candidate.framePath, candidate.path)
-          : this.dispatchDomPathClick(candidate.path)
-      ));
-      if (fallback) {
-        fallbackNote += ` Primary mouse click did not navigate; retried ${fallback} with DOM click.`;
-      }
-      const directHrefTimeoutMs = boundedNonNegativeIntegerEnv('BROWSER_DIRECT_HREF_TIMEOUT_MS', DEFAULT_BROWSER_DIRECT_HREF_TIMEOUT_MS, 30000);
-      if (directHrefTimeoutMs > 0 && this.activePage.url() === beforeUrl && /^https?:\/\//i.test(candidate.href)) {
-        const href = candidate.href;
-        await timedBrowserStep(timings, 'directHrefMs', () => this.activePage.goto(href, { waitUntil: 'commit', timeout: directHrefTimeoutMs }).catch(() => undefined));
-        fallbackNote += ' Link href was opened directly as a final fallback.';
-      }
-    }
-    void this.markPageGroup(this.activePage);
-    timings.showMarkerMs = 0;
-    void this.showClickMarker(target.x, target.y, 'click');
-    const timingNote = formatTimingRecord(timings);
-    const externalAppNote = this.externalAppCandidateNote(candidate);
-    return {
-      ok: true,
-      actual: `Clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${target.offscreen ? ' It was scrolled/clamped before clicking.' : ''}${fallbackNote}${externalAppNote}${note}${timingNote ? ` Click timings: ${timingNote}.` : ''}`,
-    };
-  }
-
-  async fillCandidates(actions: BrowserBatchFillAction[]): Promise<BrowserActionResult> {
-    const fields = actions
-      .filter((action) => action.id && action.id.trim())
-      .slice(0, 80);
-    if (!fields.length) return { ok: false, actual: 'fillCandidates requires at least one candidate id.' };
-
-    const results: string[] = [];
-    let ok = true;
-    let suspicious = 0;
-    let failed = 0;
-    for (const [index, field] of fields.entries()) {
-      const resolved = await this.resolveCandidateTarget(field.id);
-      if (!resolved.target) {
-        ok = false;
-        failed += 1;
-        results.push(`${index + 1}. Candidate ${field.id}: failed before click. ${resolved.error}`);
-        continue;
-      }
-      const { candidate, target } = resolved;
-      const beforeUrl = this.activePage.url();
-      const beforeState = await this.candidateDomState(candidate);
-      const beforeFocus = await this.getFocusedElement();
-      let afterFocus: FocusedElementSummary | undefined;
-      let afterState: CandidateDomState | undefined;
-      let clickError = '';
-      let typed = false;
-      try {
-        const actionability = await this.checkCandidateClickActionability(candidate, target, 'fill');
-        if (!actionability.ok) throw new Error(actionability.reason);
-        await this.activePage.mouse.click(target.x, target.y);
-        await this.activePage.waitForTimeout(80).catch(() => undefined);
-        afterFocus = await this.getFocusedElement();
-        if (field.text !== undefined) {
-          if (afterFocus.isTextEntryTarget && !afterFocus.disabled && !afterFocus.readOnly) {
-            await this.replaceFocusedText(field.text, field.clear !== false);
-            typed = true;
-            await this.activePage.waitForTimeout(40).catch(() => undefined);
-            afterFocus = await this.getFocusedElement();
-          } else {
-            ok = false;
-            suspicious += 1;
-          }
-        }
-        afterState = await this.candidateDomState(candidate);
-        await this.showClickMarker(target.x, target.y, 'fill');
-      } catch (error) {
-        ok = false;
-        failed += 1;
-        clickError = error instanceof Error ? error.message : String(error);
-      }
-      const afterUrl = this.activePage.url();
-      const stateChanged = this.candidateDomStateChanged(beforeState, afterState);
-      const urlChanged = afterUrl !== beforeUrl;
-      const focusSummary = afterFocus?.summary || 'Focus was not inspected after click.';
-      const status = clickError
-        ? 'failed'
-        : field.text !== undefined && !typed
-          ? 'suspicious'
-          : 'clicked';
-      const signals = [
-        urlChanged ? `url changed from ${beforeUrl} to ${afterUrl}` : `url unchanged (${afterUrl})`,
-        stateChanged ? 'candidate DOM state changed' : 'candidate DOM state did not change',
-        field.text !== undefined ? (typed ? `filled ${field.text.length} characters` : `text was not typed because click did not focus an editable target`) : '',
-        target.offscreen ? 'target was offscreen/clamped' : '',
-      ].filter(Boolean).join('; ');
-      results.push([
-        `${index + 1}. Candidate ${candidate.id}: ${status}.`,
-        `target="${this.describeCandidate(candidate)}"`,
-        `point=(${target.x}, ${target.y})`,
-        `beforeState=[${this.candidateDomStateSummary(beforeState)}]`,
-        `afterState=[${this.candidateDomStateSummary(afterState)}]`,
-        `beforeFocus=[${beforeFocus.summary}]`,
-        `afterFocus=[${focusSummary}]`,
-        `signals=[${signals || 'no observable signal'}]`,
-        clickError ? `error="${clickError}"` : '',
-      ].filter(Boolean).join(' '));
-    }
-    const note = await this.waitAfterAction();
-    return {
-      ok,
-      actual: `Batch candidate fill completed without fallback clicks: ${fields.length - failed}/${fields.length} clicked, ${suspicious} suspicious, ${failed} failed.\n${results.join('\n')}${note}`,
-    };
-  }
-
-  // 双击指定编号的候选元素，用于打开链接、表格行等双击场景。
-  async doubleClickCandidate(candidateId: string): Promise<BrowserActionResult> {
-    const resolved = await this.resolveCandidateTarget(candidateId);
-    if (!resolved.target) return { ok: false, actual: resolved.error };
-
-    const { candidate, target } = resolved;
-    const actionability = await this.checkCandidateClickActionability(candidate, target, 'double-click');
-    if (!actionability.ok) return { ok: false, actual: `Candidate ${candidate.id} is not double-clickable now: ${actionability.reason}` };
-    await this.activePage.mouse.dblclick(target.x, target.y);
-    const note = await this.waitAfterAction();
-    await this.showClickMarker(target.x, target.y, 'double');
-    return {
-      ok: true,
-      actual: `Double-clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before double-clicking.' : ''}${note}`,
-    };
-  }
-
-  // 右键点击指定候选元素，用于上下文菜单类操作。
-  async rightClickCandidate(candidateId: string): Promise<BrowserActionResult> {
-    const resolved = await this.resolveCandidateTarget(candidateId);
-    if (!resolved.target) return { ok: false, actual: resolved.error };
-
-    const { candidate, target } = resolved;
-    const actionability = await this.checkCandidateClickActionability(candidate, target, 'right-click', 'right');
-    if (!actionability.ok) return { ok: false, actual: `Candidate ${candidate.id} is not right-clickable now: ${actionability.reason}` };
-    await this.activePage.mouse.click(target.x, target.y, { button: 'right' });
-    const note = await this.waitAfterAction();
-    await this.showClickMarker(target.x, target.y, 'right');
-    return {
-      ok: true,
-      actual: `Right-clicked candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before right-clicking.' : ''}${note}`,
-    };
-  }
-
-  // 悬停指定候选元素，用于触发下拉菜单、tooltip 或 hover 展开控件。
-  async hoverCandidate(candidateId: string): Promise<BrowserActionResult> {
-    const resolved = await this.resolveCandidateTarget(candidateId);
-    if (!resolved.target) return { ok: false, actual: resolved.error };
-
-    const { candidate, target } = resolved;
-    await this.activePage.mouse.move(target.x, target.y);
-    const note = await this.waitAfterAction();
-    return {
-      ok: true,
-      actual: `Hovered candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${target.offscreen ? ' It was scrolled/clamped before hovering.' : ''}${note}`,
-    };
-  }
-
-  // 将一个候选元素从起点拖拽到另一个候选元素位置。
-  async dragCandidate(fromCandidateId: string, toCandidateId: string): Promise<BrowserActionResult> {
-    const fromResolved = await this.resolveCandidateTarget(fromCandidateId);
-    if (!fromResolved.target) return { ok: false, actual: fromResolved.error };
-    const toResolved = await this.resolveCandidateTarget(toCandidateId);
-    if (!toResolved.target) return { ok: false, actual: toResolved.error };
-
-    const { candidate: fromCandidate, target: fromTarget } = fromResolved;
-    const { candidate: toCandidate, target: toTarget } = toResolved;
-    await this.activePage.mouse.move(fromTarget.x, fromTarget.y);
-    await this.activePage.mouse.down();
-    await this.activePage.mouse.move(toTarget.x, toTarget.y, { steps: 12 });
-    await this.activePage.mouse.up();
-    const note = await this.waitAfterAction();
-    await this.showClickMarker(toTarget.x, toTarget.y, 'drag');
-    return {
-      ok: true,
-      actual: `Dragged candidate ${fromCandidate.id} (${this.describeCandidate(fromCandidate)}) to candidate ${toCandidate.id} (${this.describeCandidate(toCandidate)}).${fromTarget.offscreen || toTarget.offscreen ? ' One or both candidates were scrolled/clamped before dragging.' : ''}${note}`,
-    };
-  }
-
-  // 聚焦指定候选元素，通常在输入文本前调用。
-  async focusCandidate(candidateId: string, text?: string): Promise<BrowserActionResult> {
-    const resolved = await this.resolveCandidateTarget(candidateId);
-    if (!resolved.target) return { ok: false, actual: resolved.error };
-
-    const { candidate, target } = resolved;
-    const actionability = await this.checkCandidateClickActionability(candidate, target, 'focus');
-    if (!actionability.ok) return { ok: false, actual: `Candidate ${candidate.id} is not focus-clickable now: ${actionability.reason}` };
-    await this.activePage.mouse.click(target.x, target.y);
-    if (text !== undefined) {
-      await this.activePage.keyboard.type(text);
-    }
-    const note = await this.waitAfterAction();
-    return {
-      ok: true,
-      actual: `Focused candidate ${candidate.id} (${this.describeCandidate(candidate)}) at its visible center.${text !== undefined ? ` Typed ${text.length} characters after focusing.` : ''}${target.offscreen ? ' It was scrolled/clamped before focusing.' : ''}${note}`,
-    };
-  }
-
-  // 通过当前 DOM snapshot 的短 ID 解析元素并点击。
-  async clickDomNode(nodeId: string, text?: string): Promise<BrowserActionResult> {
-    const resolved = this.resolveDomNodeReference(nodeId);
-    if (!resolved.reference) return { ok: false, actual: resolved.error };
-    const reference = resolved.reference;
-    const target = await this.resolveDomReferenceToClickablePoint(reference);
-    if (!target) {
-      return {
-        ok: false,
-        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
-      };
-    }
-    const page = this.activePage;
-    const actionability = await this.checkDomReferenceClickActionability(reference, target, 'click');
-    if (!actionability.ok) {
-      return {
-        ok: false,
-        actual: `DOM node ${reference.id} is not clickable now: ${actionability.reason}`,
-      };
-    }
-    const popup = this.watchForPopup(page);
-    await page.mouse.click(target.x, target.y);
-    if (text !== undefined) {
-      await page.keyboard.type(text);
-    }
-    await this.settlePopupAfterAction(popup.popup, popup.waitMs);
-    const note = '';
-    void this.showClickMarker(target.x, target.y, 'click');
-    return { ok: true, actual: `Clicked DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${text !== undefined ? ` Typed ${text.length} characters after clicking.` : ''}${note}` };
-  }
-
-  async hoverDomNode(nodeId: string): Promise<BrowserActionResult> {
-    const resolved = this.resolveDomNodeReference(nodeId);
-    if (!resolved.reference) return { ok: false, actual: resolved.error };
-    const reference = resolved.reference;
-    const target = await this.resolveDomReferenceToClickablePoint(reference);
-    if (!target) {
-      return {
-        ok: false,
-        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
-      };
-    }
-    await this.activePage.mouse.move(target.x, target.y);
-    const note = await this.waitAfterAction();
-    return { ok: true, actual: `Hovered DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${note}` };
-  }
-
-  async doubleClickDomNode(nodeId: string): Promise<BrowserActionResult> {
-    const resolved = this.resolveDomNodeReference(nodeId);
-    if (!resolved.reference) return { ok: false, actual: resolved.error };
-    const reference = resolved.reference;
-    const target = await this.resolveDomReferenceToClickablePoint(reference);
-    if (!target) {
-      return {
-        ok: false,
-        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
-      };
-    }
-    const page = this.activePage;
-    const actionability = await this.checkDomReferenceClickActionability(reference, target, 'double-click');
-    if (!actionability.ok) return { ok: false, actual: `DOM node ${reference.id} is not double-clickable now: ${actionability.reason}` };
-    const popup = this.watchForPopup(page);
-    await page.mouse.dblclick(target.x, target.y);
-    await this.settlePopupAfterAction(popup.popup, popup.waitMs);
-    const note = await this.waitAfterAction();
-    void this.showClickMarker(target.x, target.y, 'double');
-    return { ok: true, actual: `Double-clicked DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${note}` };
-  }
-
-  async dragDomNode(fromNodeId: string, toNodeId: string): Promise<BrowserActionResult> {
-    const fromResolved = this.resolveDomNodeReference(fromNodeId);
-    if (!fromResolved.reference) return { ok: false, actual: fromResolved.error };
-    const toResolved = this.resolveDomNodeReference(toNodeId);
-    if (!toResolved.reference) return { ok: false, actual: toResolved.error };
-    const fromTarget = await this.resolveDomReferenceToClickablePoint(fromResolved.reference);
-    if (!fromTarget) {
-      return {
-        ok: false,
-        actual: `DOM node id ${fromNodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
-      };
-    }
-    const toTarget = await this.resolveDomReferenceToClickablePoint(toResolved.reference);
-    if (!toTarget) {
-      return {
-        ok: false,
-        actual: `DOM node id ${toNodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
-      };
-    }
-    await this.activePage.mouse.move(fromTarget.x, fromTarget.y);
-    await this.activePage.mouse.down();
-    await this.activePage.mouse.move(toTarget.x, toTarget.y, { steps: 12 });
-    await this.activePage.mouse.up();
-    const note = await this.waitAfterAction();
-    await this.showClickMarker(toTarget.x, toTarget.y, 'drag');
-    return {
-      ok: true,
-      actual: `Dragged DOM node ${fromResolved.reference.id} (${fromTarget.descriptor}) to DOM node ${toResolved.reference.id} (${toTarget.descriptor}).${note}`,
-    };
-  }
-
-  async fillDomNodes(actions: BrowserBatchFillAction[]): Promise<BrowserActionResult> {
-    const fields = actions
-      .filter((action) => action.id && action.id.trim())
-      .slice(0, 80);
-    if (!fields.length) return { ok: false, actual: 'fillDomNodes requires at least one DOM node id.' };
-
-    const results: string[] = [];
-    let ok = true;
-    for (const [index, field] of fields.entries()) {
-      const resolved = this.resolveDomNodeReference(field.id);
-      if (!resolved.reference) {
-        ok = false;
-        results.push(`${index + 1}. DOM node ${field.id}: ${resolved.error}`);
-        continue;
-      }
-      const target = await this.resolveDomReferenceToClickablePoint(resolved.reference);
-      if (!target) {
-        ok = false;
-        results.push(`${index + 1}. DOM node ${field.id}: stale, missing, or not visible. Use a fresh node_id from the next refreshed DOM context.`);
-        continue;
-      }
-      const actionability = await this.checkDomReferenceClickActionability(resolved.reference, target, 'fill');
-      if (!actionability.ok) {
-        ok = false;
-        results.push(`${index + 1}. DOM node ${resolved.reference.id}: not clickable now. ${actionability.reason}`);
-        continue;
-      }
-      await this.activePage.mouse.click(target.x, target.y);
-      if (field.text !== undefined) {
-        await this.replaceFocusedText(field.text, field.clear !== false);
-      }
-      await this.showClickMarker(target.x, target.y, 'fill');
-      results.push(`${index + 1}. DOM node ${resolved.reference.id} (${target.descriptor}) clicked${field.text !== undefined ? ` and filled ${field.text.length} characters` : ''}.`);
-    }
-    const note = await this.waitAfterAction();
-    return {
-      ok,
-      actual: `Batch DOM fill completed: ${results.length}/${fields.length} attempted.\n${results.join('\n')}${note}`,
-    };
-  }
-
-  async findByText(targetText: string, scopeId?: string): Promise<BrowserActionResult> {
-    const scope = scopeId ? this.resolveDomNodeReference(scopeId) : undefined;
-    if (scope && !scope.reference) return { ok: false, actual: scope.error };
-    const matches = this.findDomNodeReferencesByText(targetText, scope?.reference);
-    if (!matches.length) {
-      return {
-        ok: false,
-        actual: `No current observation node_id matched text "${targetText}". Call readObservation({refresh:true,view:"actions",maxChars:10000}) first or retry findByText with a shorter exact label and optional scopeId.`,
-      };
-    }
-
-    const payload = matches.map(({ matchedText, score, reference }) => ({
-      nodeId: reference.id,
-      id: reference.id,
-      matchedText,
-      score: Number(score.toFixed(3)),
-      descriptor: reference.descriptor,
-      tag: reference.tag,
-      state: reference.state || undefined,
-      framePath: reference.framePath,
-      frameUrl: reference.frameUrl,
-      interactive: reference.interactive,
-    }));
-    return {
-      ok: true,
-      actual: `Current observation node_id matches for "${targetText}". Use clickDomNode(id) only when interactive=true; otherwise use the id as tree evidence or scope:\n${JSON.stringify(payload, null, 2)}`,
-    };
-  }
-
-  // 通过当前 DOM snapshot 的短 ID 聚焦元素，作为文本输入前的兜底聚焦方式。
-  async focusDomNode(nodeId: string): Promise<BrowserActionResult> {
-    const resolved = this.resolveDomNodeReference(nodeId);
-    if (!resolved.reference) return { ok: false, actual: resolved.error };
-    const reference = resolved.reference;
-    const target = await this.resolveDomReferenceToClickablePoint(reference);
-    if (!target) {
-      return {
-        ok: false,
-        actual: `DOM node id ${nodeId} is stale, missing, or not visible in the current viewport. Use a fresh node_id from the next refreshed DOM context.`,
-      };
-    }
-    const actionability = await this.checkDomReferenceClickActionability(reference, target, 'focus');
-    if (!actionability.ok) return { ok: false, actual: `DOM node ${reference.id} is not focus-clickable now: ${actionability.reason}` };
-    await this.activePage.mouse.click(target.x, target.y);
-    const note = await this.waitAfterAction();
-    return { ok: true, actual: `Focused DOM node ${reference.id} (${target.descriptor}) at browser point (${target.x}, ${target.y}).${note}` };
-  }
-
-  // 滚动页面或指定滚动容器，支持虚拟表格/列表的局部滚动。
-  async scroll(deltaY: number, deltaX = 0, target: { domPath?: string } = {}): Promise<BrowserActionResult> {
-    const scrollTarget = await this.resolveScrollTarget({ domPath: target.domPath ? normalizeDomPathString(target.domPath) : undefined });
-    await this.activePage.mouse.move(scrollTarget.x, scrollTarget.y);
-    await this.activePage.mouse.wheel(deltaX, deltaY);
-    const note = await this.waitAfterAction();
-    return { ok: true, actual: `Scrolled ${scrollTarget.descriptor} at browser point (${scrollTarget.x}, ${scrollTarget.y}) by x=${deltaX}, y=${deltaY}.${scrollTarget.note}${note}` };
-  }
-
-  // 按可滚动区域编号滚动任意滚动容器。编号来自 getPageContext().scrollableAreas。
-  async scrollArea(areaId: string, deltaY: number, deltaX = 0): Promise<BrowserActionResult> {
-    const timings: Record<string, number> = {};
-    const area = await timedBrowserStep(timings, 'lookupAreaMs', async () => (
-      this.lastScrollableAreas.find((item) => item.id === areaId)
-      || (await this.refreshScrollableAreas()).find((item) => item.id === areaId)
-    ));
-    if (!area) {
-      const timingNote = formatTimingRecord(timings);
-      return {
-        ok: false,
-        actual: `Scrollable area ${areaId} was not found. Use the latest scrollableAreas list and choose an id such as S1.${timingNote ? ` Scroll timings: ${timingNote}.` : ''}`,
-      };
-    }
-    const scrollStateText = (scroll: ScrollableArea['scroll']) => {
-      const yBoundary = scroll.atBottom
-        ? 'atBottom'
-        : scroll.atTop
-          ? 'atTop'
-          : `remainingDown=${scroll.remainingDown}, remainingUp=${scroll.remainingUp}`;
-      const xBoundary = scroll.atRight
-        ? 'atRight'
-        : scroll.atLeft
-          ? 'atLeft'
-          : `remainingRight=${scroll.remainingRight}, remainingLeft=${scroll.remainingLeft}`;
-      return `top=${scroll.top}/${scroll.maxTop}, left=${scroll.left}/${scroll.maxLeft}, ${yBoundary}, ${xBoundary}`;
-    };
-    if (deltaY === 0 && deltaX === 0) {
-      return {
-        ok: false,
-        actual: `Scrollable area ${area.id} was not scrolled because both deltaY and deltaX are 0. Current state: ${scrollStateText(area.scroll)}.`,
-      };
-    }
-    const canMoveY = (deltaY > 0 && area.scroll.canScrollDown) || (deltaY < 0 && area.scroll.canScrollUp) || deltaY === 0;
-    const canMoveX = (deltaX > 0 && area.scroll.canScrollRight) || (deltaX < 0 && area.scroll.canScrollLeft) || deltaX === 0;
-    if (!canMoveY || !canMoveX) {
-      return {
-        ok: false,
-        actual: `Scrollable area ${area.id} cannot scroll in the requested direction. Current state: ${scrollStateText(area.scroll)}. Choose a different action or a different scroll direction/area instead of repeating this scroll.`,
-      };
-    }
-    const result = await timedBrowserStep(timings, 'directScrollMs', () => this.scrollAreaByPath(area, deltaY, deltaX));
-    if (!result.ok) {
-      const timingNote = formatTimingRecord(timings);
-      return {
-        ok: false,
-        actual: `Scrollable area ${area.id} could not be scrolled: ${result.error}. Refresh readObservation({refresh:true,view:"actions",maxChars:10000}) and choose a fresh scrollable area id.${timingNote ? ` Scroll timings: ${timingNote}.` : ''}`,
-      };
-    }
-    await timedBrowserStep(timings, 'updateScrollCacheMs', async () => {
-      const updatedArea = { ...area, scroll: result.after };
-      this.lastScrollableAreas = this.lastScrollableAreas.map((item) => (item.id === area.id ? updatedArea : item));
-    });
-    void this.markPageGroup(this.activePage);
-    const state = ` Before: ${scrollStateText(result.before)}. After: ${scrollStateText(result.after)}. Moved: y=${result.after.top - result.before.top}, x=${result.after.left - result.before.left}.`;
-    const timingNote = formatTimingRecord(timings);
-    return {
-      ok: true,
-      actual: `Scrolled area ${area.id} (${area.tag}${area.name ? ` "${area.name}"` : ''}) by x=${deltaX}, y=${deltaY}.${state}${timingNote ? ` Scroll timings: ${timingNote}.` : ''}`,
-    };
-  }
-
-  // 列出当前浏览器上下文中的所有标签页，供 AI 判断是否需要切换。
-  // Scroll an already-known scrollable area without mouse wheel or a full area refresh.
-  private async scrollAreaByPath(area: ScrollableArea, deltaY: number, deltaX: number): Promise<ScrollAreaDirectResult> {
-    await this.ensureBrowserPageRuntime();
-    return this.activePage.evaluate(({ path, deltaY: y, deltaX: x }): ScrollAreaDirectResult => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
-      const isDocumentArea = path === 'document';
-      const root = document.scrollingElement || document.documentElement;
-      const element = isDocumentArea ? root : runtime?.elementFromPath(path);
-      if (!element) return { ok: false, error: `scrollable area path ${path} no longer exists` };
-
-      const scrollElement = element as HTMLElement;
-      const readState = () => {
-        const top = Math.round(scrollElement.scrollTop);
-        const left = Math.round(scrollElement.scrollLeft);
-        const height = Math.round(scrollElement.scrollHeight);
-        const width = Math.round(scrollElement.scrollWidth);
-        const clientHeight = Math.round(scrollElement.clientHeight);
-        const clientWidth = Math.round(scrollElement.clientWidth);
-        const maxTop = Math.max(0, height - clientHeight);
-        const maxLeft = Math.max(0, width - clientWidth);
-        const remainingUp = Math.max(0, top);
-        const remainingDown = Math.max(0, maxTop - top);
-        const remainingLeft = Math.max(0, left);
-        const remainingRight = Math.max(0, maxLeft - left);
-        return {
-          top,
-          left,
-          height,
-          width,
-          clientHeight,
-          clientWidth,
-          maxTop,
-          maxLeft,
-          remainingUp,
-          remainingDown,
-          remainingLeft,
-          remainingRight,
-          atTop: remainingUp <= 1,
-          atBottom: remainingDown <= 1,
-          atLeft: remainingLeft <= 1,
-          atRight: remainingRight <= 1,
-          canScrollUp: remainingUp > 1,
-          canScrollDown: remainingDown > 1,
-          canScrollLeft: remainingLeft > 1,
-          canScrollRight: remainingRight > 1,
-        };
-      };
-
-      const before = readState();
-      const targetTop = Math.min(Math.max(before.top + Math.trunc(Number(y) || 0), 0), before.maxTop);
-      const targetLeft = Math.min(Math.max(before.left + Math.trunc(Number(x) || 0), 0), before.maxLeft);
-      try {
-        scrollElement.scrollTo({ top: targetTop, left: targetLeft, behavior: 'auto' });
-      } catch {
-        scrollElement.scrollTop = targetTop;
-        scrollElement.scrollLeft = targetLeft;
-      }
-      scrollElement.scrollTop = targetTop;
-      scrollElement.scrollLeft = targetLeft;
-      if (isDocumentArea) {
-        try {
-          window.scrollTo({ top: targetTop, left: targetLeft, behavior: 'auto' });
-        } catch {
-          window.scrollTo(targetLeft, targetTop);
-        }
-        window.dispatchEvent(new Event('scroll'));
-      }
-      scrollElement.dispatchEvent(new Event('scroll', { bubbles: true }));
-      const after = readState();
-      return {
-        ok: true,
-        descriptor: isDocumentArea ? 'document' : runtime?.descriptor(element) || element.tagName.toLowerCase(),
-        before,
-        after,
-      };
-    }, { path: area.path, deltaY, deltaX }).catch((error) => ({
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    }));
-  }
-
-  // List current browser tabs so the agent can decide whether to switch.
   async listTabs(): Promise<BrowserActionResult> {
     const tabs = this.getTabsSnapshot();
     return {
@@ -4974,24 +4422,11 @@ export class BrowserSession {
     if (!page) return { ok: false, actual: `Tab ${index} not found.` };
     this.page = page;
     await page.bringToFront();
+    this.invalidateBrowserEvidence();
     return { ok: true, actual: `Switched to tab ${index}: ${page.url()}` };
   }
 
   // 向当前焦点元素输入文本。
-  async typeText(input: string): Promise<BrowserActionResult> {
-    await this.activePage.keyboard.type(input, { delay: 20 });
-    const note = await this.waitAfterAction();
-    return { ok: true, actual: `Typed text into the currently focused element: ${input}${note}` };
-  }
-
-  // 发送键盘按键，例如 Enter、Escape、Ctrl+A。
-  async press(input: string): Promise<BrowserActionResult> {
-    await this.activePage.keyboard.press(input);
-    const note = await this.waitAfterAction();
-    return { ok: true, actual: `Pressed key: ${input}${note}` };
-  }
-
-  // 等待页面进入较稳定状态，用于加载、跳转或动画后的观察。
   async waitForPage(): Promise<BrowserActionResult> {
     const loadStateTimeoutMs = boundedPositiveIntegerEnv(
       'BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS',
@@ -5009,12 +4444,14 @@ export class BrowserSession {
     );
     if (stableMs > 0) await this.waitForStableViewport(stableMs);
     const note = await this.manualVerificationNote();
+    this.invalidateBrowserEvidence();
     return { ok: true, actual: `Page wait completed.${note}` };
   }
 
   // 等待固定时间，给短动画、下拉面板或异步更新留出渲染时间。
   async wait(ms = 800): Promise<BrowserActionResult> {
     await this.waitForStableViewport(Math.min(Math.max(ms, 100), 5000));
+    this.invalidateBrowserEvidence();
     return { ok: true, actual: `Waited ${ms}ms.` };
   }
 
@@ -5654,156 +5091,6 @@ export class BrowserSession {
     return undefined;
   }
 
-  private findDomNodeReferencesByText(targetText: string, scope?: DomNodeReference) {
-    const query = targetText.replace(/\s+/g, ' ').trim().toLowerCase();
-    if (!query) return [] as TextNodeMatch[];
-    const queryParts = query.split(/\s+/).filter((item) => item.length >= 2);
-    const scoreLabel = (value: string) => {
-      const label = value.replace(/\s+/g, ' ').trim().toLowerCase();
-      if (!label) return undefined;
-      if (label === query) return 0;
-      if (label.startsWith(query)) return 1;
-      if (label.includes(query)) return 2;
-      if (queryParts.length >= 2 && queryParts.every((part) => label.includes(part))) return 3;
-      return undefined;
-    };
-
-    const matches: TextNodeMatch[] = [];
-    for (const reference of this.lastDomNodeReferences.values()) {
-      if (scope && (reference.framePath || '') !== (scope.framePath || '')) {
-        continue;
-      }
-      if (scope && reference.path !== scope.path && !reference.path.startsWith(`${scope.path}.`)) {
-        continue;
-      }
-      const labels = [
-        reference.label,
-        reference.state,
-        reference.line,
-        reference.descriptor,
-      ].filter((item): item is string => Boolean(item));
-      for (const label of labels) {
-        const score = scoreLabel(label);
-        if (score === undefined) continue;
-        const tagBonus = reference.tag === 'a' || reference.tag === 'button'
-          ? -0.4
-          : /input|textarea|select/.test(reference.tag)
-            ? -0.2
-            : 0;
-        matches.push({
-          matchedText: label.slice(0, 180),
-          reference,
-          score: score + tagBonus,
-        });
-      }
-    }
-    const seen = new Set<string>();
-    return matches
-      .sort((a, b) => a.score - b.score || this.comparePathString(a.reference.path, b.reference.path))
-      .filter((match) => {
-        const key = match.reference.id;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, Math.max(1, Number(process.env.TEXT_LOCATOR_MATCH_LIMIT || 8)));
-  }
-
-  private currentCandidatePool() {
-    return this.lastInteractiveCandidates;
-  }
-
-  private findCandidateById(candidateId: string) {
-    const normalized = candidateId.trim().toUpperCase().replace(/^E(?=\d+$)/, '');
-    const candidates = this.currentCandidatePool();
-    const candidate = candidates.find((item) => item.id.toUpperCase() === normalized);
-    if (candidate) return { candidate };
-
-    const available = candidates
-      .slice(0, 30)
-      .map((item) => `${item.id}: ${this.describeCandidate(item)}`)
-      .join('\n');
-    return {
-      error: `Candidate ${candidateId} was not found in the current DOM interactive snapshot. Refresh readObservation({refresh:true,view:"actions",maxChars:10000})/getInteractiveCandidates and choose one of the returned candidate ids. Available candidates:\n${available || '[none]'}`,
-    };
-  }
-
-  private async resolveMainCandidateActionTarget(candidate: InteractiveCandidate): Promise<CandidateActionTargetResolution> {
-    await this.ensureBrowserPageRuntime();
-    return this.activePage.evaluate(resolveAiCandidateActionTarget, {
-      path: candidate.path,
-      center: candidate.center,
-    }).catch((error) => ({
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    }));
-  }
-
-  private async resolveFrameCandidateActionTarget(candidate: InteractiveCandidate): Promise<CandidateActionTargetResolution> {
-    const frame = this.frameFromPath(candidate.framePath);
-    if (!frame) return { ok: false, error: `iframe ${candidate.framePath} no longer exists` };
-    const frameBox = await frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined);
-    if (!frameBox) return { ok: false, error: `iframe ${candidate.framePath} is not visible` };
-    await this.ensureBrowserPageRuntime(frame);
-    const localCenter = {
-      x: candidate.center.x - frameBox.x,
-      y: candidate.center.y - frameBox.y,
-    };
-    const local = await frame.evaluate(resolveAiCandidateActionTarget, {
-      path: candidate.path,
-      center: localCenter,
-    }).catch((error) => ({
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    } as CandidateActionTargetResolution));
-    if (!local.ok) return local;
-    return {
-      ok: true,
-      target: {
-        ...local.target,
-        x: Math.round(frameBox.x + local.target.x),
-        y: Math.round(frameBox.y + local.target.y),
-        descriptor: `iframe ${candidate.framePath} ${local.target.descriptor}`,
-      },
-    };
-  }
-
-  private async resolveCandidateTarget(candidateId: string, timings?: Record<string, number>) {
-    const lookup = this.findCandidateById(candidateId);
-    const candidate = lookup.candidate;
-    if (!candidate) {
-      return { error: lookup.error };
-    }
-
-    if (candidate.disabled) {
-      return { candidate, error: `Candidate ${candidate.id} is disabled: ${this.describeCandidate(candidate)}` };
-    }
-
-    const live = await this.resolveLiveLocatorPoint(candidate, timings);
-    if (!live.target) {
-      return {
-        candidate,
-        error: `Candidate ${candidate.id} is no longer actionable in the current DOM snapshot: ${live.error}. Refresh readObservation({refresh:true,view:"actions",maxChars:10000})/getInteractiveCandidates and choose a fresh candidate id.`,
-      };
-    }
-    return { candidate, target: live.target };
-  }
-
-  private async resolveLiveLocatorPoint(candidate: InteractiveCandidate, timings?: Record<string, number>) {
-    if (candidate.framePath) {
-      const resolved = await timedBrowserStep(timings, 'validateAndResolvePointMs', () => this.resolveFrameCandidateActionTarget(candidate));
-      return resolved.ok ? { target: resolved.target } : { error: resolved.error };
-    }
-
-    if (candidate.shadow) {
-      const target = await timedBrowserStep(timings, 'resolvePointMs', () => this.resolveShadowCandidatePoint(candidate));
-      return target ? { target } : { error: 'shadow DOM target is no longer at its matched viewport point' };
-    }
-
-    const resolved = await timedBrowserStep(timings, 'validateAndResolvePointMs', () => this.resolveMainCandidateActionTarget(candidate));
-    return resolved.ok ? { target: resolved.target } : { error: resolved.error };
-  }
-
   private compareCandidateOrder(a: InteractiveCandidate, b: InteractiveCandidate) {
     const frameCompare =
       (a.framePath || '').localeCompare(b.framePath || '') ||
@@ -5882,7 +5169,7 @@ export class BrowserSession {
             let top: Element | undefined;
             for (const item of stack) {
               if (!item) continue;
-              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) continue;
+              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) continue;
               top = item;
               break;
             }
@@ -5903,7 +5190,17 @@ export class BrowserSession {
       .catch(() => undefined);
   }
 
-  private async elementHandleForDomPath(frame: Frame, pathValue: string) {
+  private async elementHandleForDomPath(frame: Frame, pathValue: string, locatorCandidates: string[] = []) {
+    for (const selector of locatorCandidates) {
+      try {
+        const locator = frame.locator(selector);
+        if (await locator.count() !== 1) continue;
+        const element = await locator.elementHandle();
+        if (element) return element;
+      } catch {
+        // A stale or unsupported selector falls back to the generation DOM path.
+      }
+    }
     await this.ensureBrowserPageRuntime(frame);
     const handle = await frame.evaluateHandle((path) => {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
@@ -5916,10 +5213,6 @@ export class BrowserSession {
       return undefined;
     }
     return element;
-  }
-
-  private formatPlaywrightActionabilityError(error: unknown) {
-    return compactDiagnosticText(unknownErrorMessage(error), 900);
   }
 
   private async describeTopmostAtViewportPoint(x: number, y: number) {
@@ -5938,99 +5231,621 @@ export class BrowserSession {
         return `${tag}${id}${cls}${role}${text ? ` text="${text}"` : ''}`;
       }
       return (document.elementsFromPoint(pointX, pointY) as Element[])
-        .filter((element) => !element.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__'))
+        .filter((element) => !element.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__'))
         .slice(0, 5)
         .map(describe)
         .join(' > ') || '[none]';
     }, { pointX: x, pointY: y }).catch(() => undefined);
   }
 
-  private async checkDomPathClickActionability(input: {
-    path: string;
-    framePath?: string;
-    target: CandidateClickTarget;
-    label: string;
-    button?: 'left' | 'right' | 'middle';
-  }): Promise<ClickActionabilityCheck> {
-    const frame = input.framePath ? this.frameFromPath(input.framePath) : this.activePage.mainFrame();
-    if (!frame) {
-      return { ok: false, reason: `iframe ${input.framePath} no longer exists` };
+  private snapshotPageId(page: Page) {
+    let id = this.snapshotPageIds.get(page);
+    if (!id) {
+      id = `p${++this.snapshotPageSequence}`;
+      this.snapshotPageIds.set(page, id);
     }
+    return id;
+  }
 
-    const element = await this.elementHandleForDomPath(frame, input.path);
-    if (!element) {
-      return { ok: false, reason: `DOM path ${input.path} no longer resolves to an actionable element` };
+  private snapshotUid(page: Page, identity: string) {
+    const key = `${this.snapshotPageId(page)}:${identity}`;
+    let uid = this.snapshotUidByIdentity.get(key);
+    if (!uid) {
+      uid = String(++this.snapshotUidSequence);
+      this.snapshotUidByIdentity.set(key, uid);
     }
+    return uid;
+  }
 
-    try {
-      const box = await element.boundingBox();
-      if (!box || box.width <= 0 || box.height <= 0) {
-        return { ok: false, reason: `target element has no visible Playwright bounding box` };
+  private snapshotActionsForNode(node: SnapshotNodeWithUid) {
+    const role = node.role.toLowerCase();
+    const actions = new Set<string>();
+    if (node.actionable || snapshotRoleIsActionable(role)) actions.add('click');
+    if (['textbox', 'searchbox', 'combobox', 'spinbutton'].includes(role)) {
+      actions.add('focus');
+      actions.add('type');
+    }
+    if (['slider', 'scrollbar'].includes(role)) actions.add('scroll');
+    return [...actions];
+  }
+
+  private async collectSnapshotDomFallback(
+    page: Page,
+    frames: CapturedSnapshotFrame[],
+    axNodes: SnapshotNodeWithUid[],
+    playwrightFrames: Frame[],
+  ) {
+    type FallbackCandidate = {
+      selector: string;
+      role: string;
+      name: string;
+      actions: string[];
+      depth: number;
+      actionable: boolean;
+    };
+    const existing = new Set(axNodes
+      .filter((node) => node.actionable)
+      .map((node) => `${node.frameId}:${node.role.toLowerCase()}:${node.name.toLowerCase()}`));
+    const fallbackNodes: SnapshotNodeWithUid[] = [];
+    const usedFrameIds = new Set<string>();
+    for (const [frameIndex, frame] of playwrightFrames.entries()) {
+      const privateFrameId = (frame as unknown as { _id?: string })._id;
+      let frameInfo = privateFrameId ? frames.find((item) => item.frameId === privateFrameId) : undefined;
+      if (!frameInfo) {
+        frameInfo = frames.find((item) => !usedFrameIds.has(item.frameId) && item.url === frame.url());
       }
-      const localX = input.target.x - box.x;
-      const localY = input.target.y - box.y;
-      const margin = 1;
-      if (localX < -margin || localY < -margin || localX > box.width + margin || localY > box.height + margin) {
-        return {
-          ok: false,
-          reason: `resolved click point (${input.target.x}, ${input.target.y}) is outside Playwright element box (${Math.round(box.x)}, ${Math.round(box.y)}, ${Math.round(box.width)}x${Math.round(box.height)})`,
+      const framePath = frame === page.mainFrame() ? undefined : this.getFramePath(frame);
+      if (!frameInfo) {
+        frameInfo = {
+          frameId: `dom-frame-${frameIndex}`,
+          documentId: `dom-document-${frameIndex}`,
+          parentFrameId: undefined,
+          url: frame.url() || undefined,
+          depth: framePath ? framePath.split('.').length : 0,
         };
+        frames.push(frameInfo);
       }
-      const position = {
-        x: Math.min(Math.max(localX, 0), box.width),
-        y: Math.min(Math.max(localY, 0), box.height),
-      };
-      await element.click({
-        trial: true,
-        button: input.button || 'left',
-        position,
+      usedFrameIds.add(frameInfo.frameId);
+      const includeSemanticFallback = Boolean(frameInfo.error) || !axNodes.some((node) => node.frameId === frameInfo.frameId);
+      const candidates = await frame.evaluate((includeSemantic): FallbackCandidate[] => {
+        const win = window as Window & { __aiGetEventListenerTypes?: (target: EventTarget) => string[] };
+        const flatParent = (element: Element): Element | null => {
+          if (element.parentElement) return element.parentElement;
+          const root = element.getRootNode();
+          return root instanceof ShadowRoot ? root.host : null;
+        };
+        const selectorFor = (element: Element) => {
+          const id = element.getAttribute('id');
+          if (id) return `#${CSS.escape(id)}`;
+          for (const attribute of ['data-testid', 'data-test', 'name']) {
+            const value = element.getAttribute(attribute);
+            if (value) return `${element.tagName.toLowerCase()}[${attribute}="${CSS.escape(value)}"]`;
+          }
+          const parts: string[] = [];
+          let current: Element | null = element;
+          while (current && parts.length < 10) {
+            const tag = current.tagName.toLowerCase();
+            const parent = flatParent(current);
+            if (!parent) {
+              parts.unshift(tag);
+              break;
+            }
+            const siblings = Array.from(parent.children).filter((child) => child.tagName === current!.tagName);
+            const index = Math.max(1, siblings.indexOf(current) + 1);
+            parts.unshift(`${tag}:nth-of-type(${index})`);
+            current = parent;
+          }
+          return parts.join(' > ');
+        };
+        const roleFor = (element: Element) => {
+          const explicit = element.getAttribute('role');
+          if (explicit) return explicit;
+          const tag = element.tagName.toLowerCase();
+          if (tag === 'a') return 'link';
+          if (tag === 'button') return 'button';
+          if (tag === 'select') return 'combobox';
+          if (tag === 'textarea') return 'textbox';
+          if (tag === 'input') {
+            const type = (element.getAttribute('type') || 'text').toLowerCase();
+            if (type === 'checkbox') return 'checkbox';
+            if (type === 'radio') return 'radio';
+            if (['button', 'submit', 'reset'].includes(type)) return 'button';
+            return 'textbox';
+          }
+          if (/^h[1-6]$/.test(tag)) return 'heading';
+          if (tag === 'p') return 'paragraph';
+          if (tag === 'li') return 'listitem';
+          if (tag === 'tr') return 'row';
+          if (tag === 'th') return 'columnheader';
+          if (tag === 'td') return 'cell';
+          if (tag === 'img') return 'image';
+          if (tag === 'nav') return 'navigation';
+          if (tag === 'main') return 'main';
+          if (tag === 'form') return 'form';
+          return 'generic';
+        };
+        const results: FallbackCandidate[] = [];
+        const stack = Array.from(document.children).reverse().map((element) => ({ element, depth: 0 }));
+        while (stack.length) {
+          const { element, depth } = stack.pop()!;
+          const style = getComputedStyle(element);
+          if (style.display === 'none') continue;
+          const tag = element.tagName.toLowerCase();
+          if (['head', 'script', 'style', 'noscript', 'template', 'meta', 'link'].includes(tag)) continue;
+          const children = [
+            ...Array.from(element.children),
+            ...(element.shadowRoot ? Array.from(element.shadowRoot.children) : []),
+          ];
+          for (let childIndex = children.length - 1; childIndex >= 0; childIndex -= 1) {
+            stack.push({ element: children[childIndex], depth: depth + 1 });
+          }
+          if (style.visibility === 'hidden' || style.visibility === 'collapse') continue;
+          const rect = element.getBoundingClientRect();
+          const eventTypes = win.__aiGetEventListenerTypes?.(element) || [];
+          const actions = new Set<string>();
+          if (
+            tag === 'a'
+            || tag === 'button'
+            || element.hasAttribute('onclick')
+            || typeof (element as HTMLElement).onclick === 'function'
+            || eventTypes.some((event) => ['click', 'mousedown', 'pointerdown'].includes(event))
+            || element.hasAttribute('data-action')
+            || element.hasAttribute('data-click')
+          ) actions.add('click');
+          if (['input', 'textarea', 'select'].includes(tag) || element.getAttribute('contenteditable') === 'true') {
+            actions.add('focus');
+            actions.add('type');
+          }
+          if (!actions.size && (element.hasAttribute('role') || element.hasAttribute('tabindex'))) actions.add('click');
+          const actionable = actions.size > 0 && style.pointerEvents !== 'none' && rect.width > 0 && rect.height > 0;
+          const directText = Array.from(element.childNodes)
+            .filter((node) => node.nodeType === Node.TEXT_NODE)
+            .map((node) => node.textContent || '')
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          const role = roleFor(element);
+          const semantic = includeSemantic && (role !== 'generic' || directText.length > 0);
+          if (!actionable && !semantic) continue;
+          const name = String(
+            element.getAttribute('aria-label')
+            || element.getAttribute('placeholder')
+            || element.getAttribute('title')
+            || (element as HTMLInputElement).value
+            || (actionable || role !== 'generic' ? element.textContent : directText)
+            || '',
+          ).replace(/\s+/g, ' ').trim().slice(0, 300);
+          if (!name && !actionable) continue;
+          results.push({
+            selector: selectorFor(element),
+            role,
+            name,
+            actions: [...actions],
+            depth: Math.min(64, depth),
+            actionable,
+          });
+        }
+        return results.slice(0, 2000);
+      }, includeSemanticFallback).catch(() => [] as FallbackCandidate[]);
+
+      for (const candidate of candidates) {
+        const duplicateKey = `${frameInfo.frameId}:${candidate.role.toLowerCase()}:${candidate.name.toLowerCase()}`;
+        if (candidate.name && existing.has(duplicateKey)) continue;
+        const identity = `${frameInfo.documentId}:${frameInfo.frameId}:dom:${candidate.selector}`;
+        const node: SnapshotNodeWithUid = {
+          identity,
+          uid: this.snapshotUid(page, identity),
+          source: 'dom',
+          selector: candidate.selector,
+          framePath,
+          frameId: frameInfo.frameId,
+          documentId: frameInfo.documentId,
+          frameUrl: frameInfo.url,
+          frameDepth: frameInfo.depth,
+          axNodeId: `dom:${candidate.selector}`,
+          childAxNodeIds: [],
+          depth: candidate.depth,
+          ignored: false,
+          role: candidate.role,
+          name: candidate.name,
+          description: '',
+          value: '',
+          url: '',
+          properties: {},
+          actionable: candidate.actionable,
+          actions: candidate.actions,
+        };
+        fallbackNodes.push(node);
+        existing.add(duplicateKey);
+      }
+    }
+    return fallbackNodes;
+  }
+
+  private async buildSnapshotGeneration(): Promise<SnapshotGeneration> {
+    const startedAt = Date.now();
+    const page = this.activePage;
+    const id = `snapshot-${++this.snapshotGenerationSequence}`;
+    const visibleFrameTargets = await this.snapshotFrameTargets();
+    const visiblePlaywrightFrames = visibleFrameTargets.map((target) => target.frame);
+    const allowedFrameIds = new Set(visiblePlaywrightFrames
+      .map((frame) => (frame as unknown as { _id?: string })._id)
+      .filter((frameId): frameId is string => Boolean(frameId)));
+    const captured = await captureAxSnapshot(page, allowedFrameIds.size ? allowedFrameIds : undefined);
+    const axNodes = captured.nodes.map((node): SnapshotNodeWithUid => ({
+      ...node,
+      uid: this.snapshotUid(page, node.identity),
+      source: 'ax',
+      actions: this.snapshotActionsForNode({ ...node, uid: '' }),
+    }));
+    const fallbackStartedAt = Date.now();
+    const domFallback = await this.collectSnapshotDomFallback(page, captured.frames, axNodes, visiblePlaywrightFrames);
+    const domFallbackMs = Date.now() - fallbackStartedAt;
+    const nodes = [...axNodes, ...domFallback];
+    const views = buildSnapshotViews(captured.frames, nodes);
+    const references = new Map<string, SnapshotReference>();
+    for (const node of nodes) {
+      references.set(node.uid, {
+        uid: node.uid,
+        generationId: id,
+        page,
+        documentId: node.documentId,
+        frameId: node.frameId,
+        framePath: node.framePath,
+        frameUrl: node.frameUrl,
+        axNodeId: node.axNodeId,
+        backendDOMNodeId: node.backendDOMNodeId,
+        selector: node.selector,
+        role: node.role,
+        name: node.name || node.description || node.value,
+        url: node.url || undefined,
+        actionable: node.actionable,
+        actions: node.actions || this.snapshotActionsForNode(node),
       });
-      return { ok: true };
-    } catch (error) {
-      const topmost = await this.describeTopmostAtViewportPoint(input.target.x, input.target.y);
-      return {
-        ok: false,
-        reason: [
-          `${input.label} failed Playwright click actionability check at (${input.target.x}, ${input.target.y})`,
-          this.formatPlaywrightActionabilityError(error),
-          topmost ? `Top elements at that point: ${topmost}` : '',
-          'Refresh readObservation({refresh:true,view:"actions",maxChars:10000}) and choose a currently actionable node. If text-only DOM is ambiguous and getCurrentScreenshot is available, call getCurrentScreenshot before deciding.',
-        ].filter(Boolean).join('. '),
-      };
+    }
+    return {
+      id,
+      createdAt: new Date().toISOString(),
+      page,
+      url: page.url(),
+      frames: captured.frames,
+      references,
+      views,
+      nodeCount: nodes.length,
+      actionableCount: nodes.filter((node) => node.actionable).length,
+      skippedFrameCount: captured.skippedFrames.length,
+      timings: {
+        totalMs: Date.now() - startedAt,
+        captureAxMs: captured.timings.totalMs,
+        frameTreeMs: captured.timings.frameTreeMs,
+        axTreeMs: captured.timings.axTreeMs,
+        domFallbackMs,
+      },
+    };
+  }
+
+  private async ensureSnapshotGeneration(refresh = false) {
+    const page = this.activePage;
+    if (!refresh && this.snapshotGeneration?.page === page && this.snapshotGeneration.url === page.url()) {
+      return this.snapshotGeneration;
+    }
+    if (!refresh && this.snapshotGenerationPromise) return this.snapshotGenerationPromise;
+    if (refresh && this.snapshotGenerationPromise) await this.snapshotGenerationPromise.catch(() => undefined);
+    const promise = this.buildSnapshotGeneration();
+    this.snapshotGenerationPromise = promise;
+    try {
+      const generation = await promise;
+      this.snapshotGeneration = generation;
+      return generation;
     } finally {
-      await element.dispose().catch(() => undefined);
+      if (this.snapshotGenerationPromise === promise) this.snapshotGenerationPromise = undefined;
     }
   }
 
-  private async checkCandidateClickActionability(
-    candidate: InteractiveCandidate,
-    target: CandidateClickTarget,
-    action: string,
-    button?: 'left' | 'right' | 'middle',
-  ) {
-    if (candidate.shadow) return { ok: true } satisfies ClickActionabilityCheck;
-    return this.checkDomPathClickActionability({
-      path: candidate.path,
-      framePath: candidate.framePath,
-      target,
-      button,
-      label: `${action} candidate ${candidate.id} (${this.describeCandidate(candidate)})`,
-    });
+  private invalidateSnapshotGeneration() {
+    this.snapshotGeneration = undefined;
+    this.snapshotGenerationPromise = undefined;
   }
 
-  private async checkDomReferenceClickActionability(
-    reference: DomNodeReference,
-    target: CandidateClickTarget,
-    action: string,
-    button?: 'left' | 'right' | 'middle',
-  ) {
-    return this.checkDomPathClickActionability({
-      path: reference.path,
-      framePath: reference.framePath,
-      target,
-      button,
-      label: `${action} DOM node ${reference.id} (${reference.label || reference.descriptor})`,
-    });
+  private invalidateBrowserEvidence() {
+    this.invalidateSnapshotGeneration();
+    this.lastScreenshotMetrics = undefined;
+  }
+
+  async readSnapshotSlice(options: {
+    cursorIndex?: number;
+    maxChars?: number;
+    refresh?: boolean;
+    mode?: SnapshotView;
+  } = {}) {
+    const startedAt = Date.now();
+    const mode = options.mode === 'full' || options.mode === 'text' ? options.mode : 'actionable';
+    const maxChars = Math.max(10000, Math.floor(Number(options.maxChars) || 10000));
+    const startIndex = Math.max(0, Math.floor(Number(options.cursorIndex) || 0));
+    const generation = await this.ensureSnapshotGeneration(options.refresh === true);
+    const records = generation.views[mode];
+    const lines: string[] = [];
+    let chars = 0;
+    let nextIndex = Math.min(startIndex, records.length);
+    for (let index = startIndex; index < records.length; index += 1) {
+      const line = records[index].line;
+      const addition = line.length + (lines.length ? 1 : 0);
+      if (lines.length && chars + addition > maxChars) break;
+      lines.push(line);
+      chars += addition;
+      nextIndex = index + 1;
+    }
+    const empty = mode === 'actionable'
+      ? '[no actionable accessibility nodes in the current page snapshot]'
+      : mode === 'text'
+        ? '[no accessible page text in the current snapshot]'
+        : '[empty accessibility snapshot]';
+    const content = lines.join('\n') || empty;
+    return {
+      content,
+      contentCharLength: content.length,
+      generationId: generation.id,
+      hasMore: nextIndex < records.length,
+      nextIndex,
+      returnedEntries: Math.max(0, nextIndex - startIndex),
+      startIndex,
+      totalEntries: records.length,
+      mode,
+      nodeCount: generation.nodeCount,
+      actionableCount: generation.actionableCount,
+      frameCount: generation.frames.length,
+      skippedFrameCount: generation.skippedFrameCount,
+      timings: { ...generation.timings, readSliceMs: Date.now() - startedAt },
+    };
+  }
+
+  async searchSnapshot(input: { query: string; roles?: string[]; limit?: number }): Promise<BrowserActionResult> {
+    const query = input.query.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!query) return { ok: false, actual: 'Snapshot search requires a non-empty query.' };
+    const generation = await this.ensureSnapshotGeneration(false);
+    const roles = new Set((input.roles || []).map((role) => role.toLowerCase()));
+    const limit = Math.min(100, Math.max(1, Math.floor(Number(input.limit) || 20)));
+    const matches = generation.views.full
+      .filter((record) => {
+        if (roles.size && !roles.has(String(record.role || '').toLowerCase())) return false;
+        return [record.name, record.url, record.line].some((value) => String(value || '').toLowerCase().includes(query));
+      })
+      .sort((left, right) => {
+        const score = (record: SnapshotRecord) => {
+          const name = String(record.name || '').toLowerCase();
+          if (name === query) return 100;
+          if (name.startsWith(query)) return 80;
+          if (name.includes(query)) return 60;
+          return record.actionable ? 30 : 10;
+        };
+        return score(right) - score(left);
+      })
+      .slice(0, limit);
+    return {
+      ok: true,
+      actual: [
+        `Snapshot ${generation.id} search for "${input.query}" returned ${matches.length} result(s). Only UIDs from this current snapshot are actionable.`,
+        matches.map((record) => record.line).join('\n') || '[no snapshot matches]',
+      ].join('\n'),
+    };
+  }
+
+  private currentSnapshotReference(uid: string) {
+    const generation = this.snapshotGeneration;
+    if (!generation || generation.page !== this.activePage || generation.url !== this.activePage.url()) {
+      return { error: 'No current snapshot generation is available. Call takeSnapshot before using a UID.' };
+    }
+    const reference = generation.references.get(String(uid));
+    if (!reference) {
+      return { error: `UID ${uid} is not present in the latest snapshot ${generation.id}. Take a new snapshot and choose a current UID.` };
+    }
+    return { reference };
+  }
+
+  private async resolveSnapshotReferencePoint(uid: string, allowNonActionable = false) {
+    const resolved = this.currentSnapshotReference(uid);
+    if (!resolved.reference) return { error: resolved.error };
+    const reference = resolved.reference;
+    if (!allowNonActionable && !reference.actionable) {
+      return { error: `UID ${uid} (${reference.role} "${reference.name}") is structural text, not an actionable control.` };
+    }
+    if (reference.selector) {
+      const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
+      if (!frame) return { error: `The frame for UID ${uid} is no longer attached.` };
+      const locator = frame.locator(reference.selector).first();
+      await locator.scrollIntoViewIfNeeded().catch(() => undefined);
+      const box = await locator.boundingBox().catch(() => undefined);
+      if (!box || box.width <= 0 || box.height <= 0) return { error: `UID ${uid} no longer has a rendered box.` };
+      return {
+        reference,
+        point: {
+          x: Math.round(box.x + box.width / 2),
+          y: Math.round(box.y + box.height / 2),
+          descriptor: `${reference.role} "${reference.name}"`,
+          source: 'dom-fallback',
+        },
+      };
+    }
+    if (!reference.backendDOMNodeId) {
+      return { error: `UID ${uid} has no backing DOM node and cannot receive a mouse or keyboard action.` };
+    }
+    const client = await this.activePage.context().newCDPSession(this.activePage);
+    try {
+      await client.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: reference.backendDOMNodeId });
+      const result = await client.send('DOM.getContentQuads', { backendNodeId: reference.backendDOMNodeId }) as { quads?: number[][] };
+      const quads = (result.quads || []).filter((quad) => quad.length >= 8);
+      const quad = quads.sort((left, right) => {
+        const area = (value: number[]) => Math.abs(
+          value[0] * value[3] + value[2] * value[5] + value[4] * value[7] + value[6] * value[1]
+          - value[1] * value[2] - value[3] * value[4] - value[5] * value[6] - value[7] * value[0],
+        ) / 2;
+        return area(right) - area(left);
+      })[0];
+      if (!quad) return { error: `UID ${uid} no longer has a rendered content quad.` };
+      const x = Math.round((quad[0] + quad[2] + quad[4] + quad[6]) / 4);
+      const y = Math.round((quad[1] + quad[3] + quad[5] + quad[7]) / 4);
+      const viewport = await this.getViewportMetrics();
+      if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
+        return { error: `UID ${uid} was scrolled but resolved outside the viewport at (${x}, ${y}).` };
+      }
+      return {
+        reference,
+        point: {
+          x,
+          y,
+          descriptor: `${reference.role} "${reference.name}"`,
+          source: 'accessibility-tree',
+        },
+      };
+    } catch (error) {
+      return { error: `UID ${uid} could not be resolved from the latest accessibility snapshot: ${unknownErrorMessage(error)}` };
+    } finally {
+      await client.detach().catch(() => undefined);
+    }
+  }
+
+  private async resolveScreenshotPoint(xThousandth?: number, yThousandth?: number) {
+    const xPart = Number(xThousandth);
+    const yPart = Number(yThousandth);
+    if (!Number.isInteger(xPart) || !Number.isInteger(yPart) || xPart < 1 || xPart > 999 || yPart < 1 || yPart > 999) {
+      return { error: 'Screenshot coordinates must provide integer x_thousandth and y_thousandth values from 1 to 999.' };
+    }
+    const metrics = this.lastScreenshotMetrics;
+    if (!metrics || metrics.capture !== 'viewport') {
+      return { error: 'No current actionable viewport screenshot exists. Call takeScreenshot with capture="viewport" first.' };
+    }
+    if (metrics.page !== this.activePage || metrics.url !== this.activePage.url()) {
+      return { error: 'The latest screenshot is stale because the active page or URL changed. Capture a new viewport screenshot.' };
+    }
+    const maxAgeMs = boundedPositiveIntegerEnv('SCREENSHOT_COORDINATE_MAX_AGE_MS', 30000, 1000, 300000);
+    if (Date.now() - metrics.capturedAt > maxAgeMs) {
+      return { error: `The latest screenshot is older than ${maxAgeMs}ms. Capture a new viewport screenshot before coordinate input.` };
+    }
+    const [viewport, scroll] = await Promise.all([
+      this.getViewportMetrics(),
+      this.activePage.evaluate(() => ({ x: window.scrollX, y: window.scrollY })).catch(() => ({ x: 0, y: 0 })),
+    ]);
+    if (
+      viewport.width !== metrics.viewport.width
+      || viewport.height !== metrics.viewport.height
+      || Math.abs(scroll.x - metrics.scrollX) > 1
+      || Math.abs(scroll.y - metrics.scrollY) > 1
+    ) {
+      return { error: 'The latest screenshot is stale because the viewport size or scroll position changed. Capture a new viewport screenshot.' };
+    }
+    const x = Math.min(viewport.width - 1, Math.max(1, Math.round(viewport.width * xPart / 1000)));
+    const y = Math.min(viewport.height - 1, Math.max(1, Math.round(viewport.height * yPart / 1000)));
+    const topmost = await this.describeTopmostAtViewportPoint(x, y);
+    return {
+      point: {
+        x,
+        y,
+        descriptor: topmost || `latest screenshot coordinate (${xPart}, ${yPart})`,
+        source: `viewport-screenshot-${metrics.generation}`,
+      },
+    };
+  }
+
+  private async unifiedActionPoint(input: { uid?: string; xThousandth?: number; yThousandth?: number }, allowNonActionable = false) {
+    const hasUid = typeof input.uid === 'string' && input.uid.trim().length > 0;
+    const hasAnyCoordinate = input.xThousandth !== undefined || input.yThousandth !== undefined;
+    if (hasUid && hasAnyCoordinate) return { error: 'Use either uid or screenshot coordinates, never both.' };
+    if (hasUid) return this.resolveSnapshotReferencePoint(input.uid!, allowNonActionable);
+    if (hasAnyCoordinate) return this.resolveScreenshotPoint(input.xThousandth, input.yThousandth);
+    return { error: 'A uid or the latest screenshot x_thousandth/y_thousandth coordinates are required.' };
+  }
+
+  async mouse(input: BrowserMouseAction): Promise<BrowserActionResult> {
+    const page = this.activePage;
+    if (input.action === 'scroll') {
+      let point: { x: number; y: number; descriptor: string; source: string } | undefined;
+      if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
+        const resolved = await this.unifiedActionPoint(input, true);
+        if (!resolved.point) return { ok: false, actual: resolved.error || 'Unable to resolve scroll target.' };
+        point = resolved.point;
+        await page.mouse.move(point.x, point.y);
+      }
+      const deltaX = Number.isFinite(input.deltaX) ? Number(input.deltaX) : 0;
+      const deltaY = Number.isFinite(input.deltaY) ? Number(input.deltaY) : 0;
+      if (!deltaX && !deltaY) return { ok: false, actual: 'Mouse scroll requires a non-zero deltaX or deltaY.' };
+      await page.mouse.wheel(deltaX, deltaY);
+      this.invalidateBrowserEvidence();
+      return { ok: true, actual: `Scrolled${point ? ` over ${point.descriptor}` : ' the page'} by (${deltaX}, ${deltaY}).` };
+    }
+
+    if (input.action === 'scrollIntoView') {
+      if (!input.uid) return { ok: false, actual: 'scrollIntoView requires a current snapshot uid.' };
+      const resolved = await this.resolveSnapshotReferencePoint(input.uid, true);
+      if (!resolved.point) return { ok: false, actual: resolved.error || `Unable to scroll UID ${input.uid} into view.` };
+      this.invalidateBrowserEvidence();
+      return { ok: true, actual: `Scrolled UID ${input.uid} (${resolved.point.descriptor}) into view.` };
+    }
+
+    const from = await this.unifiedActionPoint(input, input.action === 'move');
+    if (!from.point) return { ok: false, actual: from.error || 'Unable to resolve mouse target.' };
+    if (input.action === 'move') {
+      await page.mouse.move(from.point.x, from.point.y);
+      this.invalidateBrowserEvidence();
+      return { ok: true, actual: `Moved mouse to ${from.point.descriptor} at (${from.point.x}, ${from.point.y}).` };
+    }
+    if (input.action === 'drag') {
+      const to = await this.unifiedActionPoint({
+        uid: input.toUid,
+        xThousandth: input.toXThousandth,
+        yThousandth: input.toYThousandth,
+      }, true);
+      if (!to.point) return { ok: false, actual: to.error || 'Unable to resolve drag destination.' };
+      await page.mouse.move(from.point.x, from.point.y);
+      await page.mouse.down({ button: input.button || 'left' });
+      await page.mouse.move(to.point.x, to.point.y, { steps: 12 });
+      await page.mouse.up({ button: input.button || 'left' });
+      this.invalidateBrowserEvidence();
+      void this.showClickMarker(to.point.x, to.point.y, 'drag');
+      return { ok: true, actual: `Dragged ${from.point.descriptor} to ${to.point.descriptor}.` };
+    }
+
+    const button = input.button || 'left';
+    const clickCount = Math.min(3, Math.max(1, Math.floor(Number(input.clickCount) || 1)));
+    const popup = this.watchForPopup(page);
+    await page.mouse.click(from.point.x, from.point.y, { button, clickCount });
+    await this.settlePopupAfterAction(popup.popup, popup.waitMs);
+    this.invalidateBrowserEvidence();
+    void this.showClickMarker(from.point.x, from.point.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
+    return {
+      ok: true,
+      actual: `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${from.point.source}.`,
+    };
+  }
+
+  async keyboard(input: BrowserKeyboardAction): Promise<BrowserActionResult> {
+    const page = this.activePage;
+    if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
+      const target = await this.unifiedActionPoint(input);
+      if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
+      await page.mouse.click(target.point.x, target.point.y);
+    }
+    if (input.action === 'type') {
+      if (typeof input.text !== 'string') return { ok: false, actual: 'Keyboard type requires text.' };
+      if (input.replace !== false) {
+        await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
+        await page.keyboard.press('Backspace').catch(() => undefined);
+      }
+      await page.keyboard.insertText(input.text);
+      if (input.followByEnter) await page.keyboard.press('Enter');
+      this.invalidateBrowserEvidence();
+      return { ok: true, actual: `Typed ${input.text.length} characters${input.followByEnter ? ' and pressed Enter' : ''}.` };
+    }
+    if (input.action === 'press') {
+      if (!input.key) return { ok: false, actual: 'Keyboard press requires key.' };
+      await page.keyboard.press(input.key);
+      this.invalidateBrowserEvidence();
+      return { ok: true, actual: `Pressed ${input.key}.` };
+    }
+    const keys = (input.keys || []).map((key) => key.trim()).filter(Boolean);
+    if (!keys.length) return { ok: false, actual: 'Keyboard shortcut requires a non-empty keys array.' };
+    await page.keyboard.press(keys.join('+'));
+    this.invalidateBrowserEvidence();
+    return { ok: true, actual: `Pressed shortcut ${keys.join('+')}.` };
   }
 
   private emptySimplifiedDomObservation(message?: string): BrowserDomObservation {
@@ -6237,107 +6052,56 @@ export class BrowserSession {
     };
   }
 
-  async readDomObservationSlice(options: {
-    cursorIndex?: number;
-    maxChars?: number;
-    resetReferences?: boolean;
-    view?: BrowserObservationType;
-  } = {}) {
-    const startedAt = Date.now();
-    const selectedView: BrowserObservationType = options.view === 'tree' || options.view === 'elements' || options.view === 'text'
-      ? options.view
-      : 'actions';
-    const maxChars = Math.max(10000, Math.floor(Number(options.maxChars) || 10000));
-    const maxElements = Number.MAX_SAFE_INTEGER;
-    const startIndex = Math.max(0, Math.floor(Number(options.cursorIndex) || 0));
-    const snapshot = await this.readDomObservationSliceSnapshot(
-      this.activePage.mainFrame(),
-      selectedView,
-      startIndex,
-      maxElements,
-      maxChars,
-      options.resetReferences !== true,
-    );
-    if (!snapshot) {
-      return {
-        candidateEstimate: undefined as number | undefined,
-        content: 'DOM runtime is not available on this page. Retry after the page settles.',
-        contentCharLength: 'DOM runtime is not available on this page. Retry after the page settles.'.length,
-        hasMore: false,
-        nextIndex: startIndex,
-        returnedEntries: 0,
-        scannedCandidates: 0,
-        startIndex,
-        timings: { totalMs: Date.now() - startedAt },
-        totalEntries: 0,
-        view: selectedView,
-      };
-    }
+  private async snapshotFrameTargets() {
+    const mainFrame = this.activePage.mainFrame();
+    const iframeTargets = this.activePage.frames()
+      .filter((frame) => frame !== mainFrame)
+      .map((frame) => ({ frame, framePath: this.getFramePath(frame) }))
+      .filter((target): target is { frame: Frame; framePath: string } => target.framePath !== undefined)
+      .sort((left, right) => this.comparePathString(left.framePath, right.framePath));
+    const displayNoneFramePaths = new Set<string>();
+    const targets: Array<{ frame: Frame; framePath?: string; frameUrl?: string }> = [
+      { frame: mainFrame, frameUrl: mainFrame.url() || undefined },
+    ];
 
-    this.resetDomVisibleIdState(snapshot.stateKey, options.resetReferences === true);
-    if (options.resetReferences) this.lastDomNodeReferences = new Map();
-    const byPath = new Map(snapshot.items.map((entry) => [entry.path, entry]));
-    const actionContext = (item: BrowserUseVisibleDomSnapshot['items'][number]) => {
-      const labels: string[] = [];
-      const parts = item.path.split('.');
-      for (let length = 1; length < parts.length; length += 1) {
-        const ancestor = byPath.get(parts.slice(0, length).join('.'));
-        const label = ancestor?.label?.replace(/\s+/g, ' ').trim();
-        if (label && label !== item.label && !labels.includes(label)) labels.push(label);
+    for (const target of iframeTargets) {
+      const separator = target.framePath.lastIndexOf('.');
+      const parentFramePath = separator >= 0 ? target.framePath.slice(0, separator) : undefined;
+      if (parentFramePath && displayNoneFramePaths.has(parentFramePath)) {
+        displayNoneFramePaths.add(target.framePath);
+        continue;
       }
-      return labels.slice(-4).join(' > ').replace(/--/g, '-');
-    };
-    const textSeen = new Set<string>();
-    const lines: string[] = [];
-    const references: DomNodeReference[] = [];
-    for (const item of snapshot.items) {
-      const publicId = this.publicDomVisibleId(snapshot.stateKey, item.ref);
-      const indent = selectedView === 'actions' || selectedView === 'text' ? '' : this.domObservationIndent(item.path);
-      const line = `${indent}${item.line.replace(`node_id=${item.ref}`, `node_id=${publicId}`)}`;
-      if (selectedView === 'text') {
-        const text = item.label.replace(/\s+/g, ' ').trim();
-        if (text && !textSeen.has(text)) {
-          textSeen.add(text);
-          lines.push(text);
-        }
-      } else if (selectedView === 'actions') {
-        const context = actionContext(item);
-        lines.push(context ? `${line} <!-- context: ${context} -->` : line);
-      } else {
-        lines.push(line);
+      if (await this.frameElementIsInsideDisplayNoneSubtree(target.frame)) {
+        displayNoneFramePaths.add(target.framePath);
+        continue;
       }
-      references.push({
-        id: publicId,
-        interactive: item.interactive,
-        label: item.label,
-        line,
-        localRef: item.ref,
-        path: item.path,
-        descriptor: item.descriptor,
-        state: item.state,
-        tag: item.tag,
+      targets.push({
+        frame: target.frame,
+        framePath: target.framePath,
+        frameUrl: target.frame.url() || undefined,
       });
     }
-    for (const reference of references) this.lastDomNodeReferences.set(reference.id, reference);
-    const emptyText = selectedView === 'actions'
-      ? '[no visible actionable elements in this slice]'
-      : selectedView === 'text'
-        ? '[no visible page text in this slice]'
-        : '[no visible DOM entries in this slice]';
-    const content = lines.join('\n') || emptyText;
-    return {
-      candidateEstimate: snapshot.candidateEstimate,
-      content,
-      contentCharLength: content.length,
-      hasMore: Boolean(snapshot.hasMore),
-      nextIndex: Math.max(startIndex, snapshot.nextIndex ?? startIndex + lines.length),
-      returnedEntries: snapshot.returnedEntries ?? snapshot.items.length,
-      scannedCandidates: snapshot.scannedCandidates ?? 0,
-      startIndex,
-      timings: { totalMs: Date.now() - startedAt },
-      totalEntries: snapshot.totalEntries,
-      view: selectedView,
-    };
+    return targets;
+  }
+
+  private async frameElementIsInsideDisplayNoneSubtree(frame: Frame) {
+    const handle = await frame.frameElement().catch(() => undefined);
+    if (!handle) return true;
+    try {
+      return await handle.evaluate((frameElement) => {
+        let current: Element | null = frameElement as Element;
+        while (current) {
+          if (window.getComputedStyle(current).display === 'none') return true;
+          const root = current.getRootNode();
+          current = current.parentElement || (root instanceof ShadowRoot ? root.host : null);
+        }
+        return false;
+      });
+    } catch {
+      return true;
+    } finally {
+      await handle.dispose().catch(() => undefined);
+    }
   }
 
   private resetDomVisibleIdState(mainSnapshotKey: string, force = false) {
@@ -6390,7 +6154,7 @@ export class BrowserSession {
 
   private async readFrameRawDom(target: Page | Frame) {
     return target.evaluate(() => {
-      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__';
+      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__';
       const voidTags = new Set([
         'area',
         'base',
@@ -6467,27 +6231,6 @@ export class BrowserSession {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
       return runtime?.visibleDomSnapshot(input);
     }, { maxChars, maxElements, preserveExistingRefs, viewportClip }).catch(() => undefined);
-  }
-
-  private async readDomObservationSliceSnapshot(
-    target: Page | Frame,
-    view: BrowserObservationType,
-    startIndex: number,
-    maxElements: number,
-    maxChars: number,
-    preserveExistingRefs = false,
-  ) {
-    await this.ensureBrowserPageRuntime(target);
-    return target.evaluate((input) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      return runtime?.domObservationSlice(input);
-    }, {
-      maxChars,
-      maxElements,
-      preserveExistingRefs,
-      startIndex,
-      view,
-    }).catch(() => undefined);
   }
 
   private async readFullDomSnapshot(
@@ -6587,214 +6330,6 @@ export class BrowserSession {
       };
     }));
     return snapshots.filter((snapshot): snapshot is VisibleFrameSnapshot => Boolean(snapshot));
-  }
-
-  private async resolveDomReferenceToClickablePoint(reference: DomNodeReference) {
-    if (!reference.localRef) {
-      return reference.framePath
-        ? this.resolveFrameDomPathToClickablePoint(reference.framePath, reference.path)
-        : this.resolveDomPathToClickablePoint(reference.path);
-    }
-    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
-    if (!frame) return undefined;
-    await this.ensureBrowserPageRuntime(frame);
-    const local = await frame.evaluate(({ localRef, viewportClip }) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      return runtime?.visibleDomPoint(localRef, viewportClip);
-    }, { localRef: reference.localRef, viewportClip: reference.viewportClip }).catch(() => undefined);
-    if (!local) return undefined;
-
-    if (!reference.framePath) {
-      return {
-        x: Math.round(local.x),
-        y: Math.round(local.y),
-        descriptor: local.descriptor,
-        offscreen: false,
-      };
-    }
-
-    const frameBox = await frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined);
-    if (!frameBox) return undefined;
-    return {
-      x: Math.round(frameBox.x + local.x),
-      y: Math.round(frameBox.y + local.y),
-      descriptor: `iframe ${reference.framePath} ${local.descriptor}`,
-      offscreen: false,
-    };
-  }
-
-  private async resolveDomPathToClickablePoint(pathValue: string) {
-    await this.ensureBrowserPageRuntime();
-    return this.activePage.evaluate((path) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      let element = runtime?.elementFromPath(path);
-      if (!element) return undefined;
-      element = runtime.actionableTargetFor(element);
-
-      let rect = element.getBoundingClientRect();
-      let point = runtime.visiblePointForElement(element, { requirePointerEvents: true });
-      if (!point) {
-        element.scrollIntoView({ block: 'center', inline: 'center' });
-        rect = element.getBoundingClientRect();
-        point = runtime.visiblePointForElement(element, { requirePointerEvents: true });
-      }
-      // Some wrappers have zero size but contain a visible interactive child. Descend to the first
-      // rendered descendant that actually has a box so the click lands on something visible.
-      if (!point || rect.width <= 0 || rect.height <= 0) {
-        const queue = runtime.children(element);
-        while (queue.length) {
-          const candidate = queue.shift() as Element;
-          const candidateRect = candidate.getBoundingClientRect();
-          const candidatePoint = runtime.visiblePointForElement(candidate, { requirePointerEvents: true });
-          if (candidateRect.width > 0 && candidateRect.height > 0 && candidatePoint) {
-            element = candidate;
-            rect = candidateRect;
-            point = candidatePoint;
-            break;
-          }
-          queue.push(...runtime.children(candidate));
-        }
-      }
-      if (!point || rect.width <= 0 || rect.height <= 0) return undefined;
-
-      const centerX = point.x;
-      const centerY = point.y;
-      const offscreen = rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth;
-      return {
-        x: Math.min(Math.max(centerX, 0), window.innerWidth - 1),
-        y: Math.min(Math.max(centerY, 0), window.innerHeight - 1),
-        descriptor: runtime.descriptor(element),
-        offscreen,
-      };
-    }, pathValue).catch(() => undefined);
-  }
-
-  private async resolveFrameDomPathToClickablePoint(framePath: string, pathValue: string) {
-    const frame = this.frameFromPath(framePath);
-    if (!frame) return undefined;
-    const frameBox = await frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined);
-    if (!frameBox) return undefined;
-    await this.ensureBrowserPageRuntime(frame);
-    const local = await frame.evaluate((path) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      let element = runtime?.elementFromPath(path);
-      if (!element) return undefined;
-      element = runtime.actionableTargetFor(element);
-
-      let rect = element.getBoundingClientRect();
-      let point = runtime.visiblePointForElement(element, { requirePointerEvents: true });
-      if (!point) {
-        element.scrollIntoView({ block: 'center', inline: 'center' });
-        rect = element.getBoundingClientRect();
-        point = runtime.visiblePointForElement(element, { requirePointerEvents: true });
-      }
-      if (!point || rect.width <= 0 || rect.height <= 0) return undefined;
-      const x = Math.min(Math.max(point.x, 0), window.innerWidth - 1);
-      const y = Math.min(Math.max(point.y, 0), window.innerHeight - 1);
-      return {
-        x,
-        y,
-        descriptor: runtime.descriptor(element),
-        offscreen: rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth,
-      };
-    }, pathValue).catch(() => undefined);
-    if (!local) return undefined;
-    return {
-      x: Math.round(frameBox.x + local.x),
-      y: Math.round(frameBox.y + local.y),
-      descriptor: `iframe ${framePath} ${local.descriptor}`,
-      offscreen: local.offscreen,
-    };
-  }
-
-  private async dispatchDomPathClick(pathValue: string) {
-    await this.ensureBrowserPageRuntime();
-    return this.activePage.evaluate((path) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      if (!runtime) return undefined;
-      let element = runtime.elementFromPath(path);
-      if (!element) return undefined;
-      element = runtime.actionableTargetFor(element);
-      const descriptor = runtime.descriptor(element);
-      (element as HTMLElement).click();
-      return descriptor;
-    }, pathValue).catch(() => undefined);
-  }
-
-  private async dispatchFrameDomPathClick(framePath: string, pathValue: string) {
-    const frame = this.frameFromPath(framePath);
-    if (!frame) return undefined;
-    await this.ensureBrowserPageRuntime(frame);
-    return frame.evaluate((path) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      if (!runtime) return undefined;
-      let element = runtime.elementFromPath(path);
-      if (!element) return undefined;
-      element = runtime.actionableTargetFor(element);
-      const descriptor = runtime.descriptor(element);
-      (element as HTMLElement).click();
-      return `iframe DOM click ${descriptor}`;
-    }, pathValue).catch(() => undefined);
-  }
-
-  private async resolveScrollTarget(target: { domPath?: string }) {
-    await this.ensureBrowserPageRuntime();
-    return this.activePage.evaluate(({ domPath }) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      if (!runtime) {
-        return {
-          x: 1,
-          y: 1,
-          descriptor: 'document',
-          note: ' DOM runtime was not available; fell back to document.',
-        };
-      }
-
-      function isScrollable(element: Element) {
-        const style = window.getComputedStyle(element);
-        const overflowY = style.overflowY;
-        const overflowX = style.overflowX;
-        const canScrollY = element.scrollHeight > element.clientHeight + 1 && /(auto|scroll|overlay)/i.test(overflowY);
-        const canScrollX = element.scrollWidth > element.clientWidth + 1 && /(auto|scroll|overlay)/i.test(overflowX);
-        return canScrollY || canScrollX;
-      }
-
-      function closestScrollable(element?: Element | null) {
-        let current: Element | null | undefined = element;
-        while (current && current !== document.documentElement) {
-          if (isScrollable(current)) return current;
-          current = runtime.flatParentElement(current);
-        }
-        return document.scrollingElement || document.documentElement;
-      }
-
-      const sourceElement =
-        runtime.elementFromPath(domPath) ||
-        document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2) ||
-        document.documentElement;
-      const scrollElement = closestScrollable(sourceElement);
-      const rect = scrollElement.getBoundingClientRect();
-      const targetX = scrollElement === document.documentElement || scrollElement === document.body || scrollElement === document.scrollingElement
-        ? window.innerWidth / 2
-        : rect.left + rect.width / 2;
-      const targetY = scrollElement === document.documentElement || scrollElement === document.body || scrollElement === document.scrollingElement
-        ? window.innerHeight / 2
-        : rect.top + rect.height / 2;
-
-      return {
-        x: Math.min(Math.max(targetX, 0), window.innerWidth - 1),
-        y: Math.min(Math.max(targetY, 0), window.innerHeight - 1),
-        descriptor: runtime.descriptor(scrollElement),
-        note: ` Source element: ${runtime.descriptor(sourceElement)}.`,
-      };
-    }, {
-      domPath: target.domPath,
-    }).catch(() => ({
-      x: 1,
-      y: 1,
-      descriptor: 'document',
-      note: ' Scroll target resolution failed; fell back to document.',
-    }));
   }
 
   private async readPngSize(filePath: string) {

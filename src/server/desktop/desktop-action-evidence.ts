@@ -12,18 +12,8 @@ import {
 } from '@/server/desktop/desktop-observer';
 
 const OBSERVED_TOOL_NAMES = new Set([
-  'clickCandidate',
-  'clickDomNode',
-  'doubleClickCandidate',
-  'doubleClickDomNode',
-  'rightClickCandidate',
-  'dragCandidate',
-  'dragDomNode',
-  'hoverDomNode',
-  'pressKey',
-  'typeText',
-  'fillCandidates',
-  'fillDomNodes',
+  'mouse',
+  'keyboard',
 ]);
 
 const MAX_EVIDENCE_ITEMS = 5;

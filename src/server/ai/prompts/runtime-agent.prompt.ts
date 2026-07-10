@@ -73,8 +73,8 @@ export function buildCompletionVerificationPrompt(input: CompletionVerificationP
 
 export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
   const answerAllowed = allowedTypes.includes('answer');
-  const visualMode = allowedTypes.includes('clickCandidate');
-  const domMode = allowedTypes.includes('readObservation') || allowedTypes.includes('findByText') || allowedTypes.includes('clickDomNode');
+  const snapshotMode = allowedTypes.includes('takeSnapshot');
+  const screenshotMode = allowedTypes.includes('takeScreenshot');
   return [
     prompt,
     '',
@@ -87,12 +87,12 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- params should include only keys required by that tool plus a concise reason.',
     answerAllowed ? '- In browser chat strict safety mode, important actions must still return the intended tool object; add params.requiresConfirmation=true and a concise Chinese params.confirmationMessage so the UI can pause with Confirm/Cancel buttons before execution. Do not ask the user to type confirmation text.' : '',
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
-    '- In message/reason/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot ids/file names, or tool input JSON.',
-    visualMode ? '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.' : '',
-    domMode ? '- DOM mode: use readObservation with params.refresh=true to collect fresh browser-generated DOM evidence. Prefer params={refresh:true,view:"actions",maxChars:10000} for actionable node_id entries. If the result has nextCursor, continue with params={cursor:nextCursor,maxChars:10000}. Use clickDomNode/fillDomNodes/hoverDomNode with current node_id values; findByText searches current observation evidence and returns node_id values with interactive flags.' : '',
-    domMode ? '- If DOM text is ambiguous because of stacked overlays, date pickers, duplicate labels, or icon-only controls, use getCurrentScreenshot when available before choosing the action.' : '',
-    '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
-    '- For readObservation, do not pass an observation id. Use refresh=true for a new generation, cursor to continue the same generation/view, and view actions/tree/text/changes when starting a read. Do not invent cursor values.',
+    '- In message/reason/action/expected/actual, do not output UIDs, coordinates, deltas, screenshot ids/file names, or tool input JSON as business meaning.',
+    snapshotMode ? '- Use takeSnapshot with params={mode:"actionable",maxChars:10000} for a fresh Chromium accessibility snapshot. Continue only with its opaque params.cursor; do not invent cursor values.' : '',
+    snapshotMode ? '- Use searchSnapshot to search the complete latest snapshot. Use only UIDs from that latest snapshot; any mouse or keyboard action invalidates them.' : '',
+    snapshotMode ? '- Use mouse for every pointer operation and keyboard for every keyboard operation. A UID action scrolls an offscreen target into view automatically.' : '',
+    screenshotMode ? '- takeScreenshot is the visual tool. Only coordinates derived from its latest viewport capture may be used in mouse/keyboard; fullPage captures are read-only evidence.' : '',
+    screenshotMode ? '- If accessibility evidence is missing or visual layering is ambiguous, call takeScreenshot before choosing coordinates.' : '',
     allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
     allowedTypes.includes('generateMarkdownFile') ? '- For generateMarkdownFile, put the complete Markdown document in params.content and the desired file name in params.fileName. The final visible answer must include the returned download link as a clickable Markdown link.' : '',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',

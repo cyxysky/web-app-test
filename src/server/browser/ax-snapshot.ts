@@ -1,0 +1,480 @@
+import type { CDPSession, Page } from 'playwright';
+
+export type SnapshotView = 'actionable' | 'full' | 'text';
+
+type CdpAxValue = {
+  type?: string;
+  value?: unknown;
+};
+
+type CdpAxProperty = {
+  name?: string;
+  value?: CdpAxValue;
+};
+
+type CdpAxNode = {
+  nodeId?: string;
+  ignored?: boolean;
+  role?: CdpAxValue;
+  chromeRole?: CdpAxValue;
+  name?: CdpAxValue;
+  description?: CdpAxValue;
+  value?: CdpAxValue;
+  properties?: CdpAxProperty[];
+  parentId?: string;
+  childIds?: string[];
+  backendDOMNodeId?: number;
+};
+
+type CdpFrameTree = {
+  frame: {
+    id: string;
+    loaderId?: string;
+    name?: string;
+    parentId?: string;
+    url?: string;
+  };
+  childFrames?: CdpFrameTree[];
+};
+
+export type CapturedSnapshotFrame = {
+  frameId: string;
+  documentId: string;
+  name?: string;
+  parentFrameId?: string;
+  url?: string;
+  depth: number;
+  error?: string;
+};
+
+export type CapturedSnapshotNode = {
+  identity: string;
+  frameId: string;
+  documentId: string;
+  frameUrl?: string;
+  frameDepth: number;
+  axNodeId: string;
+  backendDOMNodeId?: number;
+  parentAxNodeId?: string;
+  childAxNodeIds: string[];
+  depth: number;
+  ignored: boolean;
+  role: string;
+  name: string;
+  description: string;
+  value: string;
+  url: string;
+  properties: Record<string, string | number | boolean>;
+  actionable: boolean;
+};
+
+export type CapturedAxSnapshot = {
+  frames: CapturedSnapshotFrame[];
+  nodes: CapturedSnapshotNode[];
+  skippedFrames: CapturedSnapshotFrame[];
+  timings: {
+    totalMs: number;
+    frameTreeMs: number;
+    axTreeMs: number;
+  };
+};
+
+export type SnapshotNodeWithUid = CapturedSnapshotNode & {
+  uid: string;
+  source?: 'ax' | 'dom';
+  selector?: string;
+  framePath?: string;
+  actions?: string[];
+};
+
+export type SnapshotRecord = {
+  line: string;
+  uid?: string;
+  role?: string;
+  name?: string;
+  url?: string;
+  actionable?: boolean;
+  frameId?: string;
+};
+
+export type SnapshotViews = {
+  actionable: SnapshotRecord[];
+  full: SnapshotRecord[];
+  text: SnapshotRecord[];
+};
+
+const actionableRoles = new Set([
+  'button',
+  'checkbox',
+  'combobox',
+  'gridcell',
+  'link',
+  'listbox',
+  'menuitem',
+  'menuitemcheckbox',
+  'menuitemradio',
+  'option',
+  'radio',
+  'scrollbar',
+  'searchbox',
+  'slider',
+  'spinbutton',
+  'switch',
+  'tab',
+  'textbox',
+  'treeitem',
+]);
+
+const actionableProperties = new Set([
+  'actions',
+  'editable',
+  'focusable',
+  'settable',
+]);
+
+const contextualRoles = new Set([
+  'alert',
+  'article',
+  'banner',
+  'cell',
+  'columnheader',
+  'complementary',
+  'contentinfo',
+  'dialog',
+  'form',
+  'heading',
+  'labeltext',
+  'list',
+  'listitem',
+  'main',
+  'menu',
+  'navigation',
+  'paragraph',
+  'row',
+  'rowgroup',
+  'rowheader',
+  'status',
+  'table',
+  'toolbar',
+]);
+
+const actionableContextRoots = new Set([
+  'dialog',
+  'form',
+  'listitem',
+  'menu',
+  'row',
+  'toolbar',
+]);
+
+const serializedProperties = [
+  'checked',
+  'disabled',
+  'expanded',
+  'focused',
+  'hasPopup',
+  'invalid',
+  'level',
+  'modal',
+  'multiline',
+  'multiselectable',
+  'orientation',
+  'pressed',
+  'readonly',
+  'required',
+  'selected',
+  'valuemax',
+  'valuemin',
+  'valuetext',
+] as const;
+
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function valueOf(value?: CdpAxValue) {
+  const raw = value?.value;
+  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'number' || typeof raw === 'boolean') return raw;
+  if (raw === null || raw === undefined) return '';
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    const record = raw as Record<string, unknown>;
+    if (typeof record.value === 'string' || typeof record.value === 'number' || typeof record.value === 'boolean') {
+      return record.value;
+    }
+  }
+  return String(raw);
+}
+
+function stringValue(value?: CdpAxValue) {
+  const raw = valueOf(value);
+  return typeof raw === 'string' ? raw : String(raw || '');
+}
+
+function normalizeWhitespace(value: string) {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function propertyRecord(properties?: CdpAxProperty[]) {
+  const result: Record<string, string | number | boolean> = {};
+  for (const property of properties || []) {
+    if (!property.name) continue;
+    const value = valueOf(property.value);
+    if (value === '') continue;
+    result[property.name] = value;
+  }
+  return result;
+}
+
+function roleOf(node: CdpAxNode) {
+  return normalizeWhitespace(stringValue(node.role) || stringValue(node.chromeRole) || 'generic');
+}
+
+function isActionable(role: string, properties: Record<string, string | number | boolean>) {
+  if (actionableRoles.has(role.toLowerCase())) return true;
+  return Object.keys(properties).some((name) => actionableProperties.has(name) && properties[name] !== false && properties[name] !== 'false');
+}
+
+function flattenFrameTree(tree: CdpFrameTree, depth = 0, output: CapturedSnapshotFrame[] = []) {
+  output.push({
+    frameId: tree.frame.id,
+    documentId: tree.frame.loaderId || tree.frame.id,
+    name: tree.frame.name || undefined,
+    parentFrameId: tree.frame.parentId || undefined,
+    url: tree.frame.url || undefined,
+    depth,
+  });
+  for (const child of tree.childFrames || []) flattenFrameTree(child, depth + 1, output);
+  return output;
+}
+
+async function concurrentMap<T, R>(values: T[], concurrency: number, mapper: (value: T) => Promise<R>) {
+  const results = new Array<R>(values.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), Math.max(1, values.length)) }, async () => {
+    while (cursor < values.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await mapper(values[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function normalizeFrameNodes(frame: CapturedSnapshotFrame, rawNodes: CdpAxNode[]) {
+  const rawById = new Map(rawNodes.map((node) => [String(node.nodeId || ''), node]));
+  const depthById = new Map<string, number>();
+  const depthOf = (nodeId: string, visiting = new Set<string>()): number => {
+    const cached = depthById.get(nodeId);
+    if (cached !== undefined) return cached;
+    if (!nodeId || visiting.has(nodeId)) return 0;
+    visiting.add(nodeId);
+    const parentId = rawById.get(nodeId)?.parentId;
+    const depth = parentId ? depthOf(parentId, visiting) + 1 : 0;
+    visiting.delete(nodeId);
+    depthById.set(nodeId, depth);
+    return depth;
+  };
+
+  return rawNodes.map((node, index): CapturedSnapshotNode => {
+    const axNodeId = String(node.nodeId || `${frame.frameId}:${index}`);
+    const properties = propertyRecord(node.properties);
+    const role = roleOf(node);
+    const urlProperty = properties.url;
+    return {
+      identity: `${frame.documentId}:${frame.frameId}:${node.backendDOMNodeId || axNodeId}`,
+      frameId: frame.frameId,
+      documentId: frame.documentId,
+      frameUrl: frame.url,
+      frameDepth: frame.depth,
+      axNodeId,
+      backendDOMNodeId: node.backendDOMNodeId,
+      parentAxNodeId: node.parentId,
+      childAxNodeIds: (node.childIds || []).map(String),
+      depth: depthOf(axNodeId),
+      ignored: node.ignored === true,
+      role,
+      name: normalizeWhitespace(stringValue(node.name)),
+      description: normalizeWhitespace(stringValue(node.description)),
+      value: normalizeWhitespace(stringValue(node.value)),
+      url: typeof urlProperty === 'string' ? urlProperty : '',
+      properties,
+      actionable: isActionable(role, properties),
+    };
+  });
+}
+
+export async function captureAxSnapshot(page: Page, allowedFrameIds?: ReadonlySet<string>): Promise<CapturedAxSnapshot> {
+  const totalStartedAt = Date.now();
+  const client: CDPSession = await page.context().newCDPSession(page);
+  try {
+    const frameTreeStartedAt = Date.now();
+    const frameTreeResult = await client.send('Page.getFrameTree') as { frameTree: CdpFrameTree };
+    const frames = flattenFrameTree(frameTreeResult.frameTree)
+      .filter((frame) => !allowedFrameIds || allowedFrameIds.has(frame.frameId));
+    const frameTreeMs = Date.now() - frameTreeStartedAt;
+    const axTreeStartedAt = Date.now();
+    const perFrame = await concurrentMap(frames, 4, async (frame) => {
+      try {
+        const result = await client.send('Accessibility.getFullAXTree', { frameId: frame.frameId }) as { nodes?: CdpAxNode[] };
+        return { frame, nodes: normalizeFrameNodes(frame, result.nodes || []) };
+      } catch (error) {
+        return { frame: { ...frame, error: errorText(error) }, nodes: [] as CapturedSnapshotNode[] };
+      }
+    });
+    const axTreeMs = Date.now() - axTreeStartedAt;
+    const normalizedFrames = perFrame.map((item) => item.frame);
+    return {
+      frames: normalizedFrames,
+      nodes: perFrame.flatMap((item) => item.nodes),
+      skippedFrames: normalizedFrames.filter((frame) => Boolean(frame.error)),
+      timings: {
+        totalMs: Date.now() - totalStartedAt,
+        frameTreeMs,
+        axTreeMs,
+      },
+    };
+  } finally {
+    await client.detach().catch(() => undefined);
+  }
+}
+
+function escaped(value: string, maxLength = 500) {
+  const normalized = normalizeWhitespace(value);
+  const compact = normalized.length > maxLength ? `${normalized.slice(0, maxLength)}…` : normalized;
+  return compact.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\n', '\\n');
+}
+
+function meaningfulNode(node: SnapshotNodeWithUid) {
+  if (node.ignored) return false;
+  const role = node.role.toLowerCase();
+  if (role === 'inlinetextbox') return false;
+  if (node.actionable || node.name || node.value || node.description || node.url) return true;
+  return role === 'rootwebarea' || role === 'webarea' || contextualRoles.has(role);
+}
+
+function serializeNode(node: SnapshotNodeWithUid) {
+  const parts = [`uid=${node.uid}`, node.role || 'generic'];
+  const primaryName = node.name || node.description;
+  if (primaryName) parts.push(`"${escaped(primaryName)}"`);
+  if (node.value && normalizeWhitespace(node.value) !== normalizeWhitespace(primaryName)) {
+    parts.push(`value="${escaped(node.value, 300)}"`);
+  }
+  if (node.url) parts.push(`url="${escaped(node.url, 800)}"`);
+  for (const name of serializedProperties) {
+    const value = node.properties[name];
+    if (value === undefined || value === '' || value === false || value === 'false') continue;
+    parts.push(`${name}=${typeof value === 'string' && /\s/.test(value) ? `"${escaped(value, 200)}"` : String(value)}`);
+  }
+  if (node.source === 'dom' && node.actions?.length) parts.push(`actions=${node.actions.join('|')}`);
+  return `${'  '.repeat(Math.min(24, node.frameDepth + node.depth))}${parts.join(' ')}`;
+}
+
+function frameBoundary(frame: CapturedSnapshotFrame): SnapshotRecord {
+  const details = [
+    `frame=${frame.frameId}`,
+    frame.url ? `url="${escaped(frame.url, 800)}"` : '',
+    frame.name ? `name="${escaped(frame.name, 200)}"` : '',
+    frame.error ? `error="${escaped(frame.error, 500)}"` : '',
+  ].filter(Boolean).join(' ');
+  return { line: `${'  '.repeat(Math.min(24, frame.depth))}[${details}]`, frameId: frame.frameId };
+}
+
+function recordForNode(node: SnapshotNodeWithUid): SnapshotRecord {
+  return {
+    line: serializeNode(node),
+    uid: node.uid,
+    role: node.role,
+    name: node.name || node.description || node.value,
+    url: node.url || undefined,
+    actionable: node.actionable,
+    frameId: node.frameId,
+  };
+}
+
+function actionableNodeIds(nodes: SnapshotNodeWithUid[]) {
+  const included = new Set<string>();
+  const byFrameAndId = new Map(nodes.map((node) => [`${node.frameId}:${node.axNodeId}`, node]));
+  const contextRoots = new Set<string>();
+
+  for (const node of nodes) {
+    if (!node.actionable) continue;
+    included.add(`${node.frameId}:${node.axNodeId}`);
+    let current: SnapshotNodeWithUid | undefined = node;
+    let hops = 0;
+    while (current?.parentAxNodeId && hops < 30) {
+      const parent = byFrameAndId.get(`${node.frameId}:${current.parentAxNodeId}`);
+      if (!parent) break;
+      const key = `${parent.frameId}:${parent.axNodeId}`;
+      included.add(key);
+      if (actionableContextRoots.has(parent.role.toLowerCase())) contextRoots.add(key);
+      current = parent;
+      hops += 1;
+    }
+  }
+
+  const withinContextRoot = (node: SnapshotNodeWithUid) => {
+    let current: SnapshotNodeWithUid | undefined = node;
+    let hops = 0;
+    while (current && hops < 12) {
+      const key = `${current.frameId}:${current.axNodeId}`;
+      if (contextRoots.has(key)) return true;
+      if (!current.parentAxNodeId) return false;
+      current = byFrameAndId.get(`${current.frameId}:${current.parentAxNodeId}`);
+      hops += 1;
+    }
+    return false;
+  };
+
+  for (const node of nodes) {
+    if (!node.name && !node.value && !node.description) continue;
+    const role = node.role.toLowerCase();
+    if (withinContextRoot(node) && (contextualRoles.has(role) || role === 'statictext')) {
+      included.add(`${node.frameId}:${node.axNodeId}`);
+    }
+  }
+  return included;
+}
+
+export function buildSnapshotViews(
+  frames: CapturedSnapshotFrame[],
+  nodes: SnapshotNodeWithUid[],
+): SnapshotViews {
+  const meaningful = nodes.filter(meaningfulNode);
+  const actionableIds = actionableNodeIds(meaningful);
+  const actionable: SnapshotRecord[] = [];
+  const full: SnapshotRecord[] = [];
+  const text: SnapshotRecord[] = [];
+  const textSeen = new Set<string>();
+  const nodesByFrame = new Map<string, SnapshotNodeWithUid[]>();
+  for (const node of meaningful) {
+    const list = nodesByFrame.get(node.frameId) || [];
+    list.push(node);
+    nodesByFrame.set(node.frameId, list);
+  }
+
+  for (const frame of frames) {
+    const frameNodes = nodesByFrame.get(frame.frameId) || [];
+    const boundary = frameBoundary(frame);
+    full.push(boundary);
+    if (frameNodes.some((node) => actionableIds.has(`${node.frameId}:${node.axNodeId}`))) actionable.push(boundary);
+    if (frameNodes.some((node) => normalizeWhitespace(node.name || node.value || node.description))) text.push(boundary);
+    for (const node of frameNodes) {
+      const record = recordForNode(node);
+      full.push(record);
+      if (actionableIds.has(`${node.frameId}:${node.axNodeId}`) || (node.source === 'dom' && node.actionable)) actionable.push(record);
+      const textValue = normalizeWhitespace(node.name || node.value || node.description);
+      if (!textValue) continue;
+      const textKey = `${frame.frameId}:${textValue}`;
+      if (textSeen.has(textKey)) continue;
+      textSeen.add(textKey);
+      text.push({ ...record, line: `${'  '.repeat(Math.min(24, node.frameDepth))}${textValue}` });
+    }
+  }
+  return { actionable, full, text };
+}
+
+export function snapshotRoleIsActionable(role: string) {
+  return actionableRoles.has(role.toLowerCase());
+}
