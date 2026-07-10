@@ -26,6 +26,7 @@ import {
   Loader2,
   Lock,
   MessageSquare,
+  MoreHorizontal,
   Moon,
   MousePointer2,
   Network,
@@ -3577,6 +3578,7 @@ export function BrowserChatWorkspace({
   const [interrupting, setInterrupting] = useState(false);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
+  const [recentSelectionMode, setRecentSelectionMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
   const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
   const [exportingSelectedMessages, setExportingSelectedMessages] = useState(false);
@@ -3626,6 +3628,18 @@ export function BrowserChatWorkspace({
   useEffect(() => {
     setSidebarCollapsed(readStoredSidebarCollapsed());
     setEmbeddedChatCollapsed(readStoredEmbeddedChatCollapsed());
+  }, []);
+
+  useEffect(() => {
+    function closeSidebarMenus(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      document.querySelectorAll<HTMLDetailsElement>('.browser-chat-overflow[open]').forEach((menu) => {
+        if (!menu.contains(target)) menu.removeAttribute('open');
+      });
+    }
+    document.addEventListener('pointerdown', closeSidebarMenus);
+    return () => document.removeEventListener('pointerdown', closeSidebarMenus);
   }, []);
 
   useEffect(() => {
@@ -4240,7 +4254,12 @@ export function BrowserChatWorkspace({
       setError(deleteError instanceof Error ? deleteError.message : '批量删除历史对话失败');
     } finally {
       setDeletingSelectedSessions(false);
+      setRecentSelectionMode(false);
     }
+  }
+
+  function closeSidebarOverflowMenu(event: ReactMouseEvent<HTMLButtonElement>) {
+    event.currentTarget.closest('details')?.removeAttribute('open');
   }
 
   const openTargetCaseDetail = useCallback((testCaseId: string) => {
@@ -4413,52 +4432,82 @@ export function BrowserChatWorkspace({
 
     return (
       <section className="browser-chat-sidebar-section browser-chat-recent-section">
-        <button className="ui-button ui-button--neutral browser-chat-new-chat-button" onClick={() => void startNewConversation()} type="button">
-          <Plus size={15} />
-          <span>{t('新建对话')}</span>
-        </button>
         <div className="browser-chat-recent-header">
-          <h2>{t('最近')}</h2>
-          {recentSessions.length ? (
-            <div>
-              <label className="browser-chat-recent-select-all">
-                <input
-                  aria-label={t('选择全部历史对话')}
-                  checked={allSelectableRecentSessionsSelected}
-                  disabled={!selectableRecentSessionIds.length || deletingSelectedSessions}
-                  onChange={() => toggleAllRecentSelections()}
-                  type="checkbox"
-                />
-                <span>{t('全选')}</span>
-              </label>
+          <h2>对话</h2>
+          <details className="browser-chat-overflow browser-chat-recent-actions">
+            <summary aria-label="对话操作" title="对话操作">
+              <MoreHorizontal size={16} />
+            </summary>
+            <div className="browser-chat-overflow-menu">
               <button
-                aria-label={t('批量删除历史对话')}
-                className="browser-chat-recent-bulk-delete"
-                disabled={!selectedDeletableSessionIds.length || deletingSelectedSessions}
-                onClick={() => void deleteSelectedSessionHistory()}
-                title={t('批量删除历史对话')}
+                onClick={(event) => {
+                  closeSidebarOverflowMenu(event);
+                  void startNewConversation();
+                }}
                 type="button"
               >
-                {deletingSelectedSessions ? <Loader2 className="spin" size={13} /> : <Trash2 size={14} />}
+                <Plus size={15} />
+                <span>新建对话</span>
               </button>
+              {recentSessions.length ? (
+                <button
+                  onClick={(event) => {
+                    closeSidebarOverflowMenu(event);
+                    setRecentSelectionMode((current) => !current);
+                    if (recentSelectionMode) setSelectedSessionIds([]);
+                  }}
+                  type="button"
+                >
+                  <Square size={14} />
+                  <span>{recentSelectionMode ? '退出选择' : '选择对话'}</span>
+                </button>
+              ) : null}
+              {recentSelectionMode ? (
+                <button
+                  onClick={(event) => {
+                    closeSidebarOverflowMenu(event);
+                    toggleAllRecentSelections();
+                  }}
+                  type="button"
+                >
+                  <CheckCircle2 size={15} />
+                  <span>{allSelectableRecentSessionsSelected ? '取消全选' : '全选'}</span>
+                </button>
+              ) : null}
+              {recentSelectionMode && selectedDeletableSessionIds.length ? (
+                <button
+                  className="danger"
+                  disabled={deletingSelectedSessions}
+                  onClick={(event) => {
+                    closeSidebarOverflowMenu(event);
+                    void deleteSelectedSessionHistory();
+                  }}
+                  type="button"
+                >
+                  {deletingSelectedSessions ? <Loader2 className="spin" size={14} /> : <Trash2 size={15} />}
+                  <span>删除已选（{selectedDeletableSessionIds.length}）</span>
+                </button>
+              ) : null}
             </div>
-          ) : null}
+          </details>
         </div>
         {recentSessions.length ? (
           <ol className="browser-chat-recent-list">
             {recentSessions.map((item) => (
               <li key={item.id}>
                 <div
-                  className={session?.id === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}
+                  className={`${session?.id === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}${recentSelectionMode ? ' selecting' : ''}`}
                 >
-                  <input
-                    aria-label={`选择 ${sessionDisplayTitle(item)}`}
-                    checked={selectedSessionIdSet.has(item.id)}
-                    className="browser-chat-recent-check"
-                    disabled={item.busy || deletingSelectedSessions}
-                    onChange={(event) => toggleSessionSelection(item.id, event.currentTarget.checked)}
-                    type="checkbox"
-                  />
+                  {recentSelectionMode ? (
+                    <input
+                      aria-label={`选择 ${sessionDisplayTitle(item)}`}
+                      checked={selectedSessionIdSet.has(item.id)}
+                      className="browser-chat-recent-check"
+                      disabled={item.busy || deletingSelectedSessions}
+                      onChange={(event) => toggleSessionSelection(item.id, event.currentTarget.checked)}
+                      type="checkbox"
+                    />
+                  ) : null}
                   <button
                     className="browser-chat-recent-open"
                     disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
@@ -4470,20 +4519,26 @@ export function BrowserChatWorkspace({
                   >
                     {sidebarCollapsed ? <MessageSquare className="browser-chat-recent-icon" size={17} /> : null}
                     <span>{sessionDisplayTitle(item)}</span>
-                    <small>
-                      {sessionSortTime(item) ? <time dateTime={sessionSortTime(item)}>{formatLogTime(sessionSortTime(item))}</time> : null}
-                    </small>
                   </button>
-                  <button
-                    aria-label={t('删除历史对话')}
-                    className="browser-chat-recent-delete"
-                    disabled={item.busy || deletingSessionId === item.id || deletingSelectedSessions}
-                    onClick={() => void deleteSessionHistory(item.id)}
-                    title={item.busy ? t('执行中不能删除') : t('删除历史对话')}
-                    type="button"
-                  >
-                    {deletingSessionId === item.id ? <Loader2 className="spin" size={13} /> : <Trash2 size={14} />}
-                  </button>
+                  <details className="browser-chat-overflow browser-chat-recent-row-menu">
+                    <summary aria-label={`${sessionDisplayTitle(item)} 操作`} title="更多操作">
+                      {deletingSessionId === item.id ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
+                    </summary>
+                    <div className="browser-chat-overflow-menu">
+                      <button
+                        className="danger"
+                        disabled={item.busy || deletingSessionId === item.id || deletingSelectedSessions}
+                        onClick={(event) => {
+                          closeSidebarOverflowMenu(event);
+                          void deleteSessionHistory(item.id);
+                        }}
+                        type="button"
+                      >
+                        <Trash2 size={15} />
+                        <span>{item.busy ? '执行中，无法删除' : '删除对话'}</span>
+                      </button>
+                    </div>
+                  </details>
                 </div>
               </li>
             ))}

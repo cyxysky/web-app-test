@@ -850,7 +850,7 @@ export function EnvironmentSettings({
             <span>{t('{count} 条记录，文件：.data/personal-memory/items.json', { count: personalMemoryItems.length })}</span>
           </div>
           <div className="personal-memory-head-actions">
-            <button className="ui-button ui-button--neutral" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">
+            <button className="ui-button ui-icon-button" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">
               {loadingPersonalMemory ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
               {t('刷新')}
             </button>

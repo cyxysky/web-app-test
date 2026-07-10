@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useReducer, useRef, useState, useTransition, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowLeft, CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, Play, RotateCcw, Settings, Trash2, X } from 'lucide-react';
+import { ArrowLeft, CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, MoreHorizontal, Play, RotateCcw, Settings, Trash2, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { CustomSelect } from '@/components/CustomSelect';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
@@ -52,6 +52,7 @@ function GroupNode({
   deletingGroupId,
   group,
   groups,
+  onCreateChild,
   onDelete,
   selectedGroupId,
   onSelect,
@@ -59,6 +60,7 @@ function GroupNode({
   deletingGroupId?: string | null;
   group: TestGroupRecord;
   groups: TestGroupRecord[];
+  onCreateChild?: (group: TestGroupRecord) => void;
   onDelete?: (group: TestGroupRecord) => void;
   selectedGroupId?: string;
   onSelect: (groupId?: string) => void;
@@ -79,16 +81,46 @@ function GroupNode({
           <Folder size={15} />
           <span>{group.name}</span>
         </button>
-        {onDelete ? (
-          <button aria-label={t('删除 {name}', { name: group.name })} className="group-tree-delete" disabled={deletingGroupId === group.id} onClick={() => onDelete(group)} title={t('删除 {name}', { name: group.name })} type="button">
-            {deletingGroupId === group.id ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
-          </button>
+        {onDelete || onCreateChild ? (
+          <details className="browser-chat-overflow group-tree-overflow">
+            <summary aria-label={t('{name} 操作', { name: group.name })} title={t('更多操作')}>
+              {deletingGroupId === group.id ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
+            </summary>
+            <div className="browser-chat-overflow-menu">
+              {onCreateChild ? (
+                <button
+                  onClick={(event) => {
+                    event.currentTarget.closest('details')?.removeAttribute('open');
+                    onCreateChild(group);
+                  }}
+                  type="button"
+                >
+                  <FolderPlus size={15} />
+                  <span>{t('创建子组')}</span>
+                </button>
+              ) : null}
+              {onDelete ? (
+                <button
+                  className="danger"
+                  disabled={deletingGroupId === group.id}
+                  onClick={(event) => {
+                    event.currentTarget.closest('details')?.removeAttribute('open');
+                    onDelete(group);
+                  }}
+                  type="button"
+                >
+                  <Trash2 size={15} />
+                  <span>{t('删除分组')}</span>
+                </button>
+              ) : null}
+            </div>
+          </details>
         ) : null}
       </div>
       {children.length ? (
         <ol>
           {children.map((child) => (
-            <GroupNode deletingGroupId={deletingGroupId} group={child} groups={groups} key={child.id} selectedGroupId={selectedGroupId} onDelete={onDelete} onSelect={onSelect} />
+            <GroupNode deletingGroupId={deletingGroupId} group={child} groups={groups} key={child.id} selectedGroupId={selectedGroupId} onCreateChild={onCreateChild} onDelete={onDelete} onSelect={onSelect} />
           ))}
         </ol>
       ) : null}
@@ -116,24 +148,57 @@ export function DashboardGroupSidebar({
   const { t } = useI18n();
   const rootGroups = groups.filter((group) => !group.parentId);
 
+  useEffect(() => {
+    function closeGroupMenus(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      document.querySelectorAll<HTMLDetailsElement>('.group-tree-overflow[open], .group-sidebar-actions[open]').forEach((menu) => {
+        if (!menu.contains(target)) menu.removeAttribute('open');
+      });
+    }
+    document.addEventListener('pointerdown', closeGroupMenus);
+    return () => document.removeEventListener('pointerdown', closeGroupMenus);
+  }, []);
+
+  function createRootGroup() {
+    onSelect(undefined);
+    onCreateGroup();
+  }
+
+  function createChildGroup(group: TestGroupRecord) {
+    onSelect(group.id);
+    onCreateGroup();
+  }
+
   return (
     <aside className={className}>
-      <button
-        className="ui-button ui-button--neutral group-create-button"
-        onClick={onCreateGroup}
-        title={selectedGroupId ? t('在当前组内创建子组') : t('创建组')}
-        type="button"
-      >
-        <FolderPlus size={15} />
-        <span>{selectedGroupId ? t('在当前组内创建子组') : t('创建组')}</span>
-      </button>
+      <div className="group-sidebar-head">
+        <span>{t('分组')}</span>
+        <details className="browser-chat-overflow group-sidebar-actions">
+          <summary aria-label={t('分组操作')} title={t('分组操作')}>
+            <MoreHorizontal size={16} />
+          </summary>
+          <div className="browser-chat-overflow-menu">
+            <button
+              onClick={(event) => {
+                event.currentTarget.closest('details')?.removeAttribute('open');
+                createRootGroup();
+              }}
+              type="button"
+            >
+              <FolderPlus size={15} />
+              <span>{t('创建分组')}</span>
+            </button>
+          </div>
+        </details>
+      </div>
       <button aria-label={t('未分组')} className={!selectedGroupId ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(undefined)} title={t('未分组')} type="button">
         <Folder size={15} />
         <span>{t('未分组')}</span>
       </button>
       <ol className="group-tree">
         {rootGroups.map((group) => (
-          <GroupNode deletingGroupId={deletingGroupId} group={group} groups={groups} key={group.id} selectedGroupId={selectedGroupId} onDelete={onDeleteGroup} onSelect={onSelect} />
+          <GroupNode deletingGroupId={deletingGroupId} group={group} groups={groups} key={group.id} selectedGroupId={selectedGroupId} onCreateChild={createChildGroup} onDelete={onDeleteGroup} onSelect={onSelect} />
         ))}
       </ol>
     </aside>
