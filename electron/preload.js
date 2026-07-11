@@ -38,6 +38,9 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
   closeGroup(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:close-group', input);
   },
+  clearHistory() {
+    return ipcRenderer.invoke('webpilot:embedded-browser:clear-history');
+  },
   createTab(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:create-tab', input);
   },
@@ -53,8 +56,17 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
   navigate(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:navigate', input);
   },
+  onStateChange(listener) {
+    if (typeof listener !== 'function') return () => {};
+    const handler = (_event, state) => listener(state);
+    ipcRenderer.on('webpilot:embedded-browser:state-changed', handler);
+    return () => ipcRenderer.removeListener('webpilot:embedded-browser:state-changed', handler);
+  },
   reload() {
     return ipcRenderer.invoke('webpilot:embedded-browser:reload');
+  },
+  removeBookmark(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:remove-bookmark', input);
   },
   moveTab(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:move-tab', input);
@@ -65,8 +77,17 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
   setBounds(bounds) {
     return ipcRenderer.invoke('webpilot:embedded-browser:set-bounds', bounds);
   },
+  setLibraryPanel(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:set-library-panel', input);
+  },
+  setTabMuted(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:set-tab-muted', input);
+  },
   setVisible(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:set-visible', input);
+  },
+  toggleBookmark() {
+    return ipcRenderer.invoke('webpilot:embedded-browser:toggle-bookmark');
   },
 });
 

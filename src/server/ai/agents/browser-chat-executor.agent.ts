@@ -563,6 +563,10 @@ function compactToolResultForModel(
   };
 }
 
+function staleUidActionError(value?: string) {
+  return /\bUID\s+\S+.*(?:is stale|could not be refreshed after the page changed|is detached or no longer rendered|no longer has a rendered box)\b/i.test(value || '');
+}
+
 function elapsedSince(startedAt: number) {
   return Date.now() - startedAt;
 }
@@ -1816,6 +1820,7 @@ function makeBrowserTools(
     shouldContinue?: () => boolean;
     onDebug?: ExecutionDebug;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
+    onAutomaticSnapshot?: (input: { actionable: string; generationId: string; reason?: 'post-action' | 'stale-uid'; toolName: string }) => void | Promise<void>;
     takeSnapshot?: (input?: RuntimeObservationReadOptions) => Promise<BrowserActionResult>;
     observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => Promise<BrowserActionResult>;
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
@@ -1889,12 +1894,41 @@ function makeBrowserTools(
       onToolTrace,
       onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
       action: actionWithConfirmation,
-    }).then((result) => {
+    }).then(async (result) => {
+      let staleUidSnapshotRecovered = false;
+      let staleUidSnapshot: { actionable: string; generationId: string } | undefined;
+      if (browserActionExecuted && !result.ok && staleUidActionError(result.actual) && referenceOptions?.takeSnapshot) {
+        const refreshedSnapshot = await referenceOptions.takeSnapshot({ mode: 'actionable', maxChars: 10000 });
+        if (refreshedSnapshot.ok) {
+          staleUidSnapshotRecovered = true;
+          const actionable = session.currentSnapshotObservationViews()?.actionable;
+          const generationId = session.currentSnapshotGenerationId();
+          if (actionable && generationId) staleUidSnapshot = { actionable, generationId };
+          result = {
+            ...result,
+            actual: [
+              result.actual,
+              '',
+              'Automatic recovery: captured a fresh actionable DOM snapshot after this UID became stale. Do not retry the old UID; choose a current UID from the refreshed snapshot in the next step.',
+            ].join('\n'),
+            autoSnapshot: generationId ? { generationId, refreshed: true } : result.autoSnapshot,
+            observationViews: session.currentSnapshotObservationViews() || refreshedSnapshot.observationViews,
+          };
+          await referenceOptions.onDebug?.({
+            phase: 'browser:stale-uid-recovery',
+            stepIndex: referenceOptions.stepIndex,
+            message: `Captured a fresh actionable snapshot after ${name} received a stale UID.`,
+            details: { toolName: name, generationId },
+          });
+        }
+      }
       if (browserActionExecuted && runtimeObservationInvalidatingToolNames.has(name)) {
         const autoViews = result.autoSnapshot
           ? session.currentSnapshotObservationViews()
           : result.observationViews;
-        if (result.ok && autoViews?.actionable && referenceOptions?.observationStore) {
+        if (staleUidSnapshotRecovered) {
+          // takeSnapshot already replaced the observation store; do not invalidate this fresh recovery snapshot.
+        } else if (result.ok && autoViews?.actionable && referenceOptions?.observationStore) {
           const observation = storeRuntimeObservation(
             referenceOptions.observationStore,
             referenceOptions.runId,
@@ -1911,6 +1945,21 @@ function makeBrowserTools(
           };
         } else {
           invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
+        }
+        if (staleUidSnapshot) {
+          await referenceOptions?.onAutomaticSnapshot?.({
+            actionable: staleUidSnapshot.actionable,
+            generationId: staleUidSnapshot.generationId,
+            reason: 'stale-uid',
+            toolName: name,
+          });
+        } else if (result.ok && result.autoSnapshot?.refreshed && autoViews?.actionable) {
+          await referenceOptions?.onAutomaticSnapshot?.({
+            actionable: autoViews.actionable,
+            generationId: result.autoSnapshot.generationId,
+            reason: 'post-action',
+            toolName: name,
+          });
         }
       }
       return compactToolResultForModel(name, result, referenceOptions?.observationStore, referenceOptions?.runId);
@@ -1978,7 +2027,7 @@ function makeBrowserTools(
       execute: (input) => record('waitForPage', input, () => (input.ms ? session.wait(input.ms) : session.waitForPage())),
     }),
     waitForHumanVerification: tool({
-      description: 'Wait while the user completes a visible CAPTCHA, login verification, or security check in the non-headless browser.',
+      description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever the page detector or snapshot shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
       inputSchema: browserToolInput({
         maxMs: z.number().optional().describe('Maximum wait time in milliseconds. Defaults to MANUAL_VERIFICATION_TIMEOUT_MS or 180000.'),
       }),
@@ -2245,6 +2294,13 @@ function runtimePrompt(input: {
     : 'the latest semantic DOM snapshot across the main document and all attached iframes';
   const markerTargetRules: string[] = [];
   const modeActionRules = browserActionRules(screenshotAvailable);
+  const manualVerificationBlocker = pageContext.isManualVerification
+    ? [
+        'CURRENT BLOCKER: The page detector found a user-side verification challenge.',
+        `Evidence: ${pageContext.manualVerification?.evidence || 'visible captcha, OTP, login security check, or anti-bot verification'}.`,
+        'Call waitForHumanVerification immediately. Do not attempt to solve, guess, bypass, or submit this verification yourself.',
+      ].join('\n')
+    : '';
   return [
     browserChatMode
       ? 'You are an AI browser chat agent.'
@@ -2253,6 +2309,7 @@ function runtimePrompt(input: {
     `Target URL: ${testCase.targetUrl}`,
     `Target host: ${targetHost}`,
     `Current URL: ${pageContext.url}`,
+    manualVerificationBlocker,
     '',
     'Hard rules:',
     browserChatMode
@@ -2286,6 +2343,7 @@ function runtimePrompt(input: {
     '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
     '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
+    '- If login, password, OTP, QR-code scan, payment confirmation, or identity confirmation requires user-owned credentials or a personal device and those credentials were not explicitly supplied, call waitForHumanVerification instead of inventing credentials or only describing the blocker in text.',
     browserChatMode
       ? ''
       : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
@@ -3365,6 +3423,26 @@ async function executeRuntimeStep(input: {
       onVisualContextChange: async (snapshot) => {
         ensureActive();
         await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
+      },
+      onAutomaticSnapshot: async ({ actionable, generationId, reason, toolName }) => {
+        ensureActive();
+        const currentActionableView = trimDebugText(actionable, 10000);
+        if (!currentActionableView.trim()) return;
+        pendingObservationMessages.push({
+          text: [
+            reason === 'stale-uid'
+              ? '[WebPilot automatic stale-UID recovery snapshot]'
+              : '[WebPilot automatic post-action DOM snapshot]',
+            reason === 'stale-uid'
+              ? `The ${toolName} target is no longer valid. Semantic snapshot ${generationId} was refreshed automatically.`
+              : `The ${toolName} action changed the page and refreshed semantic snapshot ${generationId}.`,
+            'Discard every UID from earlier snapshots. For the next action, choose only a UID from the current snapshot below.',
+            '',
+            currentActionableView,
+          ].join('\n'),
+          imagePaths: [],
+          domContext: currentDomContext,
+        });
       },
       onSelectReferenceScreenshots: async (selection) => {
         ensureActive();

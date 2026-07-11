@@ -17,15 +17,29 @@ let mainWindow;
 let embeddedBrowserView;
 let embeddedBrowserAttached = false;
 let embeddedBrowserVisible = false;
+let embeddedBrowserLibraryView;
+let embeddedBrowserLibraryPanel = '';
 let embeddedBrowserActiveGroupId = '';
 let embeddedBrowserActiveTabId = '';
 let embeddedBrowserNextTabId = 1;
 const embeddedBrowserGroups = new Map();
 const embeddedBrowserTabs = new Map();
+const embeddedBrowserBookmarks = new Map();
+let embeddedBrowserHistory = [];
+let embeddedBrowserNextBookmarkId = 1;
+let embeddedBrowserNextHistoryId = 1;
 let embeddedBrowserBounds = { x: 0, y: 0, width: 0, height: 0 };
 let embeddedBrowserFitTimer;
 let embeddedBrowserFitAllowZoomIn = false;
+let embeddedBrowserPersistencePath = '';
+let embeddedBrowserPersistenceTimer;
+let embeddedBrowserPersistenceStopped = false;
+let embeddedBrowserPersistenceRestoring = false;
+let embeddedBrowserStateChangeTimer;
 const EMBEDDED_BROWSER_ROUTE_LOADING_MS = 1200;
+const EMBEDDED_BROWSER_PERSISTENCE_FILE = 'embedded-browser-state.json';
+const EMBEDDED_BROWSER_PERSISTENCE_VERSION = 2;
+const EMBEDDED_BROWSER_HISTORY_LIMIT = 300;
 let startupLogPath;
 let recentServerOutput = [];
 let lastDownloadDirectory = '';
@@ -130,6 +144,10 @@ function embeddedBrowserPreloadPath() {
   return path.join(__dirname, 'embedded-browser-preload.js');
 }
 
+function embeddedBrowserLibraryPreloadPath() {
+  return path.join(__dirname, 'embedded-browser-library-preload.js');
+}
+
 function embeddedBrowserUserAgent() {
   const configured = String(process.env.ELECTRON_EMBEDDED_BROWSER_USER_AGENT || '').trim();
   if (configured) return configured;
@@ -173,6 +191,149 @@ function embeddedBrowserPlaceholderUrl() {
     '</html>',
   ].join('');
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
+function embeddedBrowserLibraryRouteUrl() {
+  if (!mainWindow || mainWindow.isDestroyed()) return '';
+  try {
+    const current = new URL(mainWindow.webContents.getURL());
+    if (!['http:', 'https:'].includes(current.protocol)) return '';
+    return new URL('/embedded-browser-library', current.origin).toString();
+  } catch {
+    return '';
+  }
+}
+
+function embeddedBrowserLibraryViewBounds() {
+  return sanitizeEmbeddedBounds(embeddedBrowserBounds);
+}
+
+function ensureEmbeddedBrowserLibraryView() {
+  if (embeddedBrowserLibraryView && !embeddedBrowserLibraryView.webContents.isDestroyed()) {
+    return embeddedBrowserLibraryView;
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Main window is not ready.');
+  if (!WebContentsView) throw new Error('Electron WebContentsView is not available.');
+  const routeUrl = embeddedBrowserLibraryRouteUrl();
+  if (!routeUrl) throw new Error('Embedded browser library route is not ready.');
+
+  const view = new WebContentsView({
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: embeddedBrowserLibraryPreloadPath(),
+      sandbox: false,
+    },
+  });
+  view.setBackgroundColor('#00000000');
+  view.setBorderRadius(0);
+  view.setVisible(false);
+  view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  view.webContents.on('will-navigate', (event, url) => {
+    try {
+      const requested = new URL(url);
+      const expected = new URL(routeUrl);
+      if (requested.origin !== expected.origin || requested.pathname !== expected.pathname) event.preventDefault();
+    } catch {
+      event.preventDefault();
+    }
+  });
+  view.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && input.key === 'Escape') {
+      event.preventDefault();
+      setEmbeddedBrowserLibraryPanel('');
+    }
+  });
+  view.webContents.on('did-finish-load', () => {
+    notifyEmbeddedBrowserStateChange();
+  });
+  view.webContents.on('did-fail-load', (_event, errorCode, errorDescription, _validatedUrl, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3) return;
+    appendLog(`Embedded browser library load failed: ${errorDescription} (${errorCode})`);
+    if (embeddedBrowserLibraryView === view) {
+      embeddedBrowserLibraryPanel = '';
+      view.setVisible(false);
+      notifyEmbeddedBrowserStateChange();
+    }
+  });
+  view.webContents.once('destroyed', () => {
+    if (embeddedBrowserLibraryView === view) {
+      embeddedBrowserLibraryView = undefined;
+      embeddedBrowserLibraryPanel = '';
+      notifyEmbeddedBrowserStateChange();
+    }
+  });
+  embeddedBrowserLibraryView = view;
+  void view.webContents.loadURL(routeUrl).catch((error) => {
+    appendLog(`Embedded browser library load failed: ${error instanceof Error ? error.message : String(error)}`);
+    if (embeddedBrowserLibraryView === view) {
+      embeddedBrowserLibraryPanel = '';
+      view.setVisible(false);
+      notifyEmbeddedBrowserStateChange();
+    }
+  });
+  return view;
+}
+
+function attachEmbeddedBrowserLibraryView() {
+  if (!embeddedBrowserLibraryPanel || !embeddedBrowserVisible || !mainWindow || mainWindow.isDestroyed()) {
+    embeddedBrowserLibraryView?.setVisible(false);
+    return;
+  }
+  const view = ensureEmbeddedBrowserLibraryView();
+  mainWindow.contentView.addChildView(view);
+  view.setBounds(embeddedBrowserLibraryViewBounds());
+  view.setVisible(true);
+  view.webContents.focus();
+}
+
+function setEmbeddedBrowserLibraryPanel(value) {
+  const nextPanel = value === 'bookmarks' || value === 'history' ? value : '';
+  embeddedBrowserLibraryPanel = nextPanel;
+  if (nextPanel) attachEmbeddedBrowserLibraryView();
+  else embeddedBrowserLibraryView?.setVisible(false);
+  notifyEmbeddedBrowserStateChange();
+  return embeddedBrowserState();
+}
+
+function destroyEmbeddedBrowserLibraryView() {
+  const view = embeddedBrowserLibraryView;
+  embeddedBrowserLibraryPanel = '';
+  embeddedBrowserLibraryView = undefined;
+  if (!view) return;
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.contentView.removeChildView(view);
+  } catch (error) {
+    appendLog(`Embedded browser library detach failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    if (!view.webContents.isDestroyed()) view.webContents.close();
+  } catch (error) {
+    appendLog(`Embedded browser library close failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function clearEmbeddedBrowserStateChangeTimer() {
+  if (!embeddedBrowserStateChangeTimer) return;
+  clearTimeout(embeddedBrowserStateChangeTimer);
+  embeddedBrowserStateChangeTimer = undefined;
+}
+
+function notifyEmbeddedBrowserStateChange() {
+  if (embeddedBrowserStateChangeTimer) return;
+  embeddedBrowserStateChangeTimer = setTimeout(() => {
+    embeddedBrowserStateChangeTimer = undefined;
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+    try {
+      const state = embeddedBrowserState();
+      mainWindow.webContents.send('webpilot:embedded-browser:state-changed', state);
+      if (embeddedBrowserLibraryView && !embeddedBrowserLibraryView.webContents.isDestroyed()) {
+        embeddedBrowserLibraryView.webContents.send('webpilot:embedded-browser:state-changed', state);
+      }
+    } catch (error) {
+      appendLog(`Embedded browser state event failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, 0);
 }
 
 const DOWNLOAD_URL_EXTENSIONS = new Set([
@@ -543,6 +704,313 @@ function embeddedBrowserGroupId(input = {}) {
   return embeddedBrowserActiveGroupId || 'default';
 }
 
+function persistedEmbeddedBrowserId(value) {
+  const id = String(value || '').trim();
+  return /^[a-zA-Z0-9:_-]{1,160}$/.test(id) ? id : '';
+}
+
+function embeddedBrowserPersistableUrl(value) {
+  const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(value);
+  if (!normalizedUrl) return '';
+  try {
+    const protocol = new URL(normalizedUrl).protocol;
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'file:' ? normalizedUrl : '';
+  } catch {
+    return '';
+  }
+}
+
+function embeddedBrowserRecordTitle(value, fallback = '') {
+  return String(value || fallback || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+}
+
+function embeddedBrowserBookmarkList() {
+  return Array.from(embeddedBrowserBookmarks.values())
+    .sort((left, right) => Number(right.createdAt) - Number(left.createdAt));
+}
+
+function embeddedBrowserIsBookmarked(value) {
+  const url = embeddedBrowserPersistableUrl(value);
+  return Boolean(url && embeddedBrowserBookmarks.has(url));
+}
+
+function recordEmbeddedBrowserHistory(tab) {
+  if (!tab || tab.restorePending || tab.view.webContents.isDestroyed()) return;
+  const url = embeddedBrowserPersistableUrl(tab.lastKnownUrl || tab.view.webContents.getURL() || '');
+  if (!url) return;
+  const now = Date.now();
+  const title = embeddedBrowserRecordTitle(embeddedBrowserTabTitle(tab.view.webContents), url);
+  const existingIndex = embeddedBrowserHistory.findIndex((item) => item.url === url);
+  const existing = existingIndex >= 0 ? embeddedBrowserHistory[existingIndex] : undefined;
+  const record = {
+    id: existing?.id || `history:${embeddedBrowserNextHistoryId++}`,
+    lastVisitedAt: now,
+    title: title || existing?.title || url,
+    url,
+    visitCount: existing
+      ? Math.max(1, Number(existing.visitCount) || 0) + (now - Number(existing.lastVisitedAt || 0) < 2000 ? 0 : 1)
+      : 1,
+  };
+  if (existingIndex >= 0) embeddedBrowserHistory.splice(existingIndex, 1);
+  embeddedBrowserHistory.unshift(record);
+  if (embeddedBrowserHistory.length > EMBEDDED_BROWSER_HISTORY_LIMIT) {
+    embeddedBrowserHistory = embeddedBrowserHistory.slice(0, EMBEDDED_BROWSER_HISTORY_LIMIT);
+  }
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
+}
+
+function toggleEmbeddedBrowserBookmark() {
+  const tab = activeEmbeddedBrowserTab();
+  if (!tab || tab.view.webContents.isDestroyed()) throw new Error('No active embedded browser tab is available.');
+  const url = embeddedBrowserPersistableUrl(tab.lastKnownUrl || tab.view.webContents.getURL() || '');
+  if (!url) throw new Error('Only http, https, or file pages can be bookmarked.');
+  if (embeddedBrowserBookmarks.has(url)) {
+    embeddedBrowserBookmarks.delete(url);
+  } else {
+    embeddedBrowserBookmarks.set(url, {
+      createdAt: Date.now(),
+      id: `bookmark:${embeddedBrowserNextBookmarkId++}`,
+      title: embeddedBrowserRecordTitle(embeddedBrowserTabTitle(tab.view.webContents), url),
+      url,
+    });
+  }
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
+  return embeddedBrowserState();
+}
+
+function removeEmbeddedBrowserBookmark(value) {
+  const url = embeddedBrowserPersistableUrl(value);
+  if (url) embeddedBrowserBookmarks.delete(url);
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
+  return embeddedBrowserState();
+}
+
+function clearEmbeddedBrowserHistory() {
+  embeddedBrowserHistory = [];
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
+  return embeddedBrowserState();
+}
+
+function setEmbeddedBrowserTabMuted(input = {}) {
+  const id = String(input.id || embeddedBrowserActiveTabId || '').trim();
+  const tab = embeddedBrowserTabs.get(id) || activeEmbeddedBrowserTab();
+  if (!tab || tab.view.webContents.isDestroyed()) throw new Error('Embedded browser tab not found.');
+  const currentMuted = Boolean(tab.audioMuted || tab.view.webContents.isAudioMuted?.());
+  const muted = typeof input.muted === 'boolean' ? input.muted : !currentMuted;
+  tab.audioMuted = muted;
+  tab.view.webContents.setAudioMuted(muted);
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
+  return embeddedBrowserState();
+}
+
+function embeddedBrowserPersistenceSnapshot() {
+  const tabs = [];
+  const groupIdsWithTabs = new Set();
+  for (const tab of embeddedBrowserTabs.values()) {
+    if (!tab || tab.view.webContents.isDestroyed()) continue;
+    const url = embeddedBrowserPersistableUrl(tab.lastKnownUrl || tab.view.webContents.getURL() || '');
+    tabs.push({
+      audioMuted: Boolean(tab.audioMuted || tab.view.webContents.isAudioMuted?.()),
+      createdAt: Number(tab.createdAt) || Date.now(),
+      groupId: tab.groupId,
+      id: tab.id,
+      sessionId: tab.sessionId || undefined,
+      url,
+    });
+    groupIdsWithTabs.add(tab.groupId);
+  }
+
+  const groups = Array.from(embeddedBrowserGroups.values())
+    .filter((group) => groupIdsWithTabs.has(group.id) || group.id === embeddedBrowserActiveGroupId)
+    .map((group) => ({
+      activeTabId: group.activeTabId || undefined,
+      createdAt: Number(group.createdAt) || Date.now(),
+      id: group.id,
+      sessionId: embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || undefined,
+    }));
+
+  return {
+    activeGroupId: embeddedBrowserActiveGroupId || undefined,
+    activeTabId: embeddedBrowserActiveTabId || undefined,
+    bookmarks: embeddedBrowserBookmarkList(),
+    groups,
+    history: embeddedBrowserHistory,
+    nextBookmarkId: embeddedBrowserNextBookmarkId,
+    nextHistoryId: embeddedBrowserNextHistoryId,
+    nextTabId: embeddedBrowserNextTabId,
+    tabs,
+    updatedAt: new Date().toISOString(),
+    version: EMBEDDED_BROWSER_PERSISTENCE_VERSION,
+  };
+}
+
+function writeEmbeddedBrowserPersistence() {
+  if (!embeddedBrowserPersistencePath || embeddedBrowserPersistenceRestoring || embeddedBrowserPersistenceStopped) return;
+  try {
+    ensureDir(path.dirname(embeddedBrowserPersistencePath));
+    const temporaryPath = `${embeddedBrowserPersistencePath}.tmp`;
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(embeddedBrowserPersistenceSnapshot(), null, 2)}\n`, 'utf8');
+    fs.renameSync(temporaryPath, embeddedBrowserPersistencePath);
+  } catch (error) {
+    appendLog(`Embedded browser state save failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function clearEmbeddedBrowserPersistenceTimer() {
+  if (!embeddedBrowserPersistenceTimer) return;
+  clearTimeout(embeddedBrowserPersistenceTimer);
+  embeddedBrowserPersistenceTimer = undefined;
+}
+
+function scheduleEmbeddedBrowserPersistence() {
+  if (!embeddedBrowserPersistencePath || embeddedBrowserPersistenceStopped) return;
+  clearEmbeddedBrowserPersistenceTimer();
+  embeddedBrowserPersistenceTimer = setTimeout(() => {
+    embeddedBrowserPersistenceTimer = undefined;
+    writeEmbeddedBrowserPersistence();
+  }, 180);
+}
+
+function restoreEmbeddedBrowserPersistence() {
+  if (!embeddedBrowserPersistencePath || embeddedBrowserTabs.size || embeddedBrowserGroups.size) return false;
+
+  let saved;
+  try {
+    if (!fs.existsSync(embeddedBrowserPersistencePath)) return false;
+    saved = JSON.parse(fs.readFileSync(embeddedBrowserPersistencePath, 'utf8'));
+  } catch (error) {
+    appendLog(`Embedded browser state restore failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+
+  const savedVersion = Number(saved?.version);
+  if (!saved || typeof saved !== 'object' || ![1, EMBEDDED_BROWSER_PERSISTENCE_VERSION].includes(savedVersion)) return false;
+
+  embeddedBrowserPersistenceRestoring = true;
+  try {
+    const savedBookmarks = Array.isArray(saved.bookmarks) ? saved.bookmarks : [];
+    for (const item of savedBookmarks) {
+      const url = embeddedBrowserPersistableUrl(item?.url);
+      if (!url || embeddedBrowserBookmarks.has(url)) continue;
+      const id = persistedEmbeddedBrowserId(item?.id) || `bookmark:${embeddedBrowserNextBookmarkId++}`;
+      embeddedBrowserBookmarks.set(url, {
+        createdAt: Number.isFinite(Number(item?.createdAt)) ? Number(item.createdAt) : Date.now(),
+        id,
+        title: embeddedBrowserRecordTitle(item?.title, url),
+        url,
+      });
+      const matched = /^bookmark:(\d+)$/.exec(id);
+      if (matched) embeddedBrowserNextBookmarkId = Math.max(embeddedBrowserNextBookmarkId, Number(matched[1]) + 1);
+    }
+    embeddedBrowserNextBookmarkId = Math.max(embeddedBrowserNextBookmarkId, Number(saved.nextBookmarkId) || 1);
+
+    const seenHistoryUrls = new Set();
+    const savedHistory = Array.isArray(saved.history) ? saved.history : [];
+    embeddedBrowserHistory = savedHistory.flatMap((item) => {
+      const url = embeddedBrowserPersistableUrl(item?.url);
+      if (!url || seenHistoryUrls.has(url)) return [];
+      seenHistoryUrls.add(url);
+      const id = persistedEmbeddedBrowserId(item?.id) || `history:${embeddedBrowserNextHistoryId++}`;
+      const matched = /^history:(\d+)$/.exec(id);
+      if (matched) embeddedBrowserNextHistoryId = Math.max(embeddedBrowserNextHistoryId, Number(matched[1]) + 1);
+      return [{
+        id,
+        lastVisitedAt: Number.isFinite(Number(item?.lastVisitedAt)) ? Number(item.lastVisitedAt) : Date.now(),
+        title: embeddedBrowserRecordTitle(item?.title, url),
+        url,
+        visitCount: Math.max(1, Number(item?.visitCount) || 1),
+      }];
+    }).slice(0, EMBEDDED_BROWSER_HISTORY_LIMIT);
+    embeddedBrowserNextHistoryId = Math.max(embeddedBrowserNextHistoryId, Number(saved.nextHistoryId) || 1);
+
+    const savedGroups = Array.isArray(saved.groups) ? saved.groups : [];
+    const savedTabs = Array.isArray(saved.tabs) ? saved.tabs : [];
+    const savedGroupActiveTabIds = new Map();
+    for (const item of savedGroups) {
+      const id = persistedEmbeddedBrowserId(item?.id);
+      if (!id || embeddedBrowserGroups.has(id)) continue;
+      const sessionId = embeddedBrowserSessionIdFromGroupId(id) || normalizeEmbeddedBrowserSessionId(item?.sessionId);
+      embeddedBrowserGroups.set(id, {
+        activeTabId: persistedEmbeddedBrowserId(item?.activeTabId),
+        createdAt: Number.isFinite(Number(item?.createdAt)) ? Number(item.createdAt) : Date.now(),
+        id,
+        sessionId,
+      });
+      savedGroupActiveTabIds.set(id, persistedEmbeddedBrowserId(item?.activeTabId));
+    }
+
+    const restoredTabIds = new Set();
+    let restoredNextTabId = Math.max(1, Number(saved.nextTabId) || 1);
+    for (const item of savedTabs) {
+      const id = persistedEmbeddedBrowserId(item?.id);
+      const groupId = persistedEmbeddedBrowserId(item?.groupId);
+      if (!id || !groupId || restoredTabIds.has(id)) continue;
+      if (!embeddedBrowserGroups.has(groupId)) {
+        embeddedBrowserGroups.set(groupId, {
+          activeTabId: '',
+          createdAt: Date.now(),
+          id: groupId,
+          sessionId: embeddedBrowserSessionIdFromGroupId(groupId) || normalizeEmbeddedBrowserSessionId(item?.sessionId),
+        });
+      }
+      try {
+        const tab = createEmbeddedBrowserTab({
+          audioMuted: Boolean(item?.audioMuted),
+          groupId,
+          id,
+          sessionId: embeddedBrowserSessionIdFromGroupId(groupId) || normalizeEmbeddedBrowserSessionId(item?.sessionId),
+          restore: true,
+          url: embeddedBrowserPersistableUrl(item?.url),
+        });
+        tab.createdAt = Number.isFinite(Number(item?.createdAt)) ? Number(item.createdAt) : tab.createdAt;
+        restoredTabIds.add(id);
+        const matched = /^tab:(\d+)$/.exec(id);
+        if (matched) restoredNextTabId = Math.max(restoredNextTabId, Number(matched[1]) + 1);
+      } catch (error) {
+        appendLog(`Embedded browser tab restore failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    embeddedBrowserNextTabId = restoredNextTabId;
+
+    for (const group of embeddedBrowserGroups.values()) {
+      const tabs = embeddedBrowserTabsForGroup(group.id);
+      const savedActiveTabId = savedGroupActiveTabIds.get(group.id);
+      group.activeTabId = tabs.some((tab) => tab.id === savedActiveTabId)
+        ? savedActiveTabId
+        : tabs[0]?.id || '';
+    }
+
+    const savedActiveGroupId = persistedEmbeddedBrowserId(saved.activeGroupId);
+    const savedActiveTabId = persistedEmbeddedBrowserId(saved.activeTabId);
+    const savedActiveTab = embeddedBrowserTabs.get(savedActiveTabId);
+    if (savedActiveTab && !savedActiveTab.view.webContents.isDestroyed()) {
+      setActiveEmbeddedBrowserTab(savedActiveTab);
+    } else if (savedActiveGroupId && embeddedBrowserGroups.has(savedActiveGroupId)) {
+      const group = embeddedBrowserGroups.get(savedActiveGroupId);
+      const tab = embeddedBrowserTabs.get(group?.activeTabId);
+      if (tab && !tab.view.webContents.isDestroyed()) setActiveEmbeddedBrowserTab(tab);
+      else setActiveEmbeddedBrowserGroup(savedActiveGroupId);
+    } else {
+      const firstTab = embeddedBrowserTabs.values().next().value;
+      if (firstTab && !firstTab.view.webContents.isDestroyed()) setActiveEmbeddedBrowserTab(firstTab);
+    }
+    return restoredTabIds.size > 0;
+  } finally {
+    embeddedBrowserPersistenceRestoring = false;
+    scheduleEmbeddedBrowserPersistence();
+  }
+}
+
 function embeddedBrowserSessionScript(tab) {
   const sessionId = JSON.stringify(tab.sessionId || '');
   const tabId = JSON.stringify(tab.id);
@@ -572,10 +1040,15 @@ function markEmbeddedBrowserSession(tab) {
   return tab.view.webContents.executeJavaScript(embeddedBrowserSessionScript(tab), true).catch(() => undefined);
 }
 
-function loadEmbeddedBrowserTabUrl(tab, url) {
+function loadEmbeddedBrowserTabUrl(tab, url, options = {}) {
   if (!tab || tab.view.webContents.isDestroyed()) return Promise.resolve();
+  if (!options.restore) tab.restorePending = false;
+  tab.lastKnownUrl = String(url || '').trim();
   tab.clientNavigation = undefined;
   tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
   tab.readyPromise = tab.view.webContents.loadURL(url)
     .then(() => markEmbeddedBrowserSession(tab));
   return tab.readyPromise;
@@ -636,6 +1109,8 @@ function setActiveEmbeddedBrowserTab(tab) {
   embeddedBrowserActiveTabId = tab?.id || '';
   embeddedBrowserView = tab?.view;
   embeddedBrowserAttached = Boolean(tab?.attached);
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
 }
 
 function embeddedBrowserTabForWebContents(webContents) {
@@ -651,6 +1126,8 @@ function setActiveEmbeddedBrowserGroup(groupId) {
   embeddedBrowserActiveTabId = '';
   embeddedBrowserView = undefined;
   embeddedBrowserAttached = false;
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
 }
 
 function embeddedBrowserTabsForGroup(groupId) {
@@ -670,8 +1147,12 @@ function ensureEmbeddedBrowserGroup(input = {}) {
       sessionId,
     };
     embeddedBrowserGroups.set(group.id, group);
+    scheduleEmbeddedBrowserPersistence();
+    notifyEmbeddedBrowserStateChange();
   } else if (sessionId && group.sessionId !== sessionId) {
     group.sessionId = sessionId;
+    scheduleEmbeddedBrowserPersistence();
+    notifyEmbeddedBrowserStateChange();
   }
   return group;
 }
@@ -720,18 +1201,32 @@ function installEmbeddedBrowserTabHandlers(tab) {
   });
   view.webContents.on('did-start-loading', () => {
     tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
+    scheduleEmbeddedBrowserPersistence();
+    notifyEmbeddedBrowserStateChange();
   });
   view.webContents.on('did-finish-load', () => {
+    tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
+    scheduleEmbeddedBrowserPersistence();
+    notifyEmbeddedBrowserStateChange();
+    recordEmbeddedBrowserHistory(tab);
+    tab.restorePending = false;
   });
   view.webContents.on('did-stop-loading', () => {
+    tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 240, { allowZoomIn: true });
+    scheduleEmbeddedBrowserPersistence();
+    notifyEmbeddedBrowserStateChange();
   });
   view.webContents.on('did-navigate', () => {
+    tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
+    scheduleEmbeddedBrowserPersistence();
+    notifyEmbeddedBrowserStateChange();
+    recordEmbeddedBrowserHistory(tab);
   });
   view.webContents.on('did-navigate-in-page', () => {
     tab.clientNavigation = {
@@ -739,9 +1234,17 @@ function installEmbeddedBrowserTabHandlers(tab) {
       canGoBack: true,
       url: view.webContents.getURL() || tab.clientNavigation?.url || '',
     };
+    tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
     tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 220, { allowZoomIn: true });
+    scheduleEmbeddedBrowserPersistence();
+    notifyEmbeddedBrowserStateChange();
+    recordEmbeddedBrowserHistory(tab);
+  });
+  view.webContents.on('page-title-updated', () => {
+    notifyEmbeddedBrowserStateChange();
+    recordEmbeddedBrowserHistory(tab);
   });
   view.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
     appendLog(`Embedded browser failed to load ${validatedURL}: ${errorCode} ${errorDescription}`);
@@ -755,6 +1258,8 @@ function installEmbeddedBrowserTabHandlers(tab) {
       embeddedBrowserView = undefined;
       embeddedBrowserAttached = false;
     }
+    scheduleEmbeddedBrowserPersistence();
+    notifyEmbeddedBrowserStateChange();
   });
 }
 
@@ -778,20 +1283,27 @@ function createEmbeddedBrowserTab(input = {}) {
     },
   });
   const tab = {
+    audioMuted: Boolean(input.audioMuted),
     attached: false,
     createdAt: Date.now(),
     groupId: group.id,
     id: tabId,
+    lastKnownUrl: initialUrl,
     readyPromise: undefined,
+    restorePending: Boolean(input.restore),
     sessionId,
     view,
   };
   view.webContents.setZoomFactor(1);
+  view.webContents.setAudioMuted(tab.audioMuted);
   view.webContents.setUserAgent(embeddedBrowserUserAgent());
   embeddedBrowserTabs.set(tab.id, tab);
   group.activeTabId = tab.id;
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
   installEmbeddedBrowserTabHandlers(tab);
-  tab.readyPromise = loadEmbeddedBrowserTabUrl(tab, initialUrl).catch((error) => {
+  tab.readyPromise = loadEmbeddedBrowserTabUrl(tab, initialUrl, { restore: tab.restorePending }).catch((error) => {
     appendLog(`Embedded browser initial load failed: ${error.message}`);
   });
   return tab;
@@ -845,9 +1357,13 @@ function destroyEmbeddedBrowserTab(tab) {
     embeddedBrowserView = undefined;
     embeddedBrowserAttached = false;
   }
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
 }
 
 function attachEmbeddedBrowserView(input = {}) {
+  const restoredTab = embeddedBrowserVisible ? undefined : activeEmbeddedBrowserTab();
   embeddedBrowserVisible = true;
   const groupId = embeddedBrowserGroupId(input);
   const shouldCreateTab = input.createIfMissing === true;
@@ -855,8 +1371,9 @@ function attachEmbeddedBrowserView(input = {}) {
   let tab;
   if (shouldCreateTab || existingGroup) {
     tab = ensureEmbeddedBrowserTab({ ...input, createIfMissing: shouldCreateTab });
-  } else {
-    setActiveEmbeddedBrowserGroup(groupId);
+  }
+  if (!tab && !shouldCreateTab && restoredTab && !restoredTab.view.webContents.isDestroyed()) {
+    tab = restoredTab;
   }
   if (!tab) {
     setActiveEmbeddedBrowserGroup(groupId);
@@ -872,6 +1389,7 @@ function attachEmbeddedBrowserView(input = {}) {
   }
   setActiveEmbeddedBrowserTab(tab);
   tab.view.setBounds(embeddedBrowserBounds);
+  attachEmbeddedBrowserLibraryView();
   void markEmbeddedBrowserSession(tab);
   scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   return tab.view;
@@ -881,6 +1399,9 @@ function detachEmbeddedBrowserView() {
   for (const tab of embeddedBrowserTabs.values()) detachEmbeddedBrowserTab(tab);
   embeddedBrowserVisible = false;
   embeddedBrowserAttached = false;
+  embeddedBrowserLibraryPanel = '';
+  embeddedBrowserLibraryView?.setVisible(false);
+  notifyEmbeddedBrowserStateChange();
 }
 
 function setEmbeddedBrowserBounds(bounds) {
@@ -895,6 +1416,7 @@ function setEmbeddedBrowserBounds(bounds) {
     tab.view.setBounds(embeddedBrowserBounds);
     if (boundsChanged) scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   }
+  if (embeddedBrowserLibraryPanel) attachEmbeddedBrowserLibraryView();
   return embeddedBrowserBounds;
 }
 
@@ -1076,6 +1598,8 @@ function embeddedBrowserState() {
       const url = webContents.getURL() || '';
       const title = embeddedBrowserTabTitle(webContents);
       const item = {
+        audioMuted: Boolean(tab.audioMuted || webContents.isAudioMuted?.()),
+        bookmarked: embeddedBrowserIsBookmarked(tab.lastKnownUrl || url),
         groupId: tab.groupId,
         id: tab.id,
         loading: webContents.isLoading() || Date.now() < (tab.routeLoadingUntil || 0),
@@ -1103,9 +1627,12 @@ function embeddedBrowserState() {
     activeGroupId: embeddedBrowserActiveGroupId || undefined,
     activeIndex,
     activeTabId: embeddedBrowserActiveTabId || undefined,
+    bookmarks: embeddedBrowserBookmarkList(),
     canGoBack: navigation.canGoBack,
     canGoForward: navigation.canGoForward,
     groups,
+    history: embeddedBrowserHistory,
+    libraryPanel: embeddedBrowserLibraryPanel || undefined,
     zoomFactor: active?.view.webContents.isDestroyed() ? undefined : active?.view.webContents.getZoomFactor(),
     tabs,
   };
@@ -1149,6 +1676,9 @@ function closeEmbeddedBrowserGroup(groupIdInput) {
 
   for (const tab of groupTabs) destroyEmbeddedBrowserTab(tab);
   embeddedBrowserGroups.delete(groupId);
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
 
   if (wasActiveGroup) {
     const nextTab = Array.from(embeddedBrowserTabs.values()).find((tab) => !tab.view.webContents.isDestroyed());
@@ -1188,6 +1718,8 @@ function moveEmbeddedBrowserTab(input = {}) {
 
   embeddedBrowserTabs.clear();
   for (const item of orderedTabs) embeddedBrowserTabs.set(item.id, item);
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
   return embeddedBrowserState();
 }
 
@@ -1224,8 +1756,12 @@ function registerEmbeddedBrowserIpc() {
       length: Number.isFinite(Number(payload.length)) ? Number(payload.length) : 1,
       url: typeof payload.url === 'string' ? payload.url : '',
     };
+    if (tab.clientNavigation.url) tab.lastKnownUrl = tab.clientNavigation.url;
+    tab.restorePending = false;
     tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
     scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
+    recordEmbeddedBrowserHistory(tab);
+    notifyEmbeddedBrowserStateChange();
   });
 
   ipcMain.handle('webpilot:embedded-browser:get-state', async () => {
@@ -1239,6 +1775,38 @@ function registerEmbeddedBrowserIpc() {
   ipcMain.handle('webpilot:embedded-browser:create-tab', async (_event, input = {}) => {
     try {
       return await createManualEmbeddedBrowserTab(input);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:set-library-panel', async (_event, input = {}) => {
+    try {
+      return setEmbeddedBrowserLibraryPanel(input.panel);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:clear-history', async () => {
+    try {
+      return clearEmbeddedBrowserHistory();
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:remove-bookmark', async (_event, input = {}) => {
+    try {
+      return removeEmbeddedBrowserBookmark(typeof input.url === 'string' ? input.url : '');
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:set-tab-muted', async (_event, input = {}) => {
+    try {
+      return setEmbeddedBrowserTabMuted({ id: input.id, muted: input.muted });
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
@@ -1263,6 +1831,14 @@ function registerEmbeddedBrowserIpc() {
   ipcMain.handle('webpilot:embedded-browser:reload', async () => {
     try {
       return reloadEmbeddedBrowserTab();
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:toggle-bookmark', async () => {
+    try {
+      return toggleEmbeddedBrowserBookmark();
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
@@ -1501,6 +2077,12 @@ function createWindow() {
     },
   });
   mainWindow.setMenuBarVisibility(false);
+  mainWindow.on('close', () => {
+    clearEmbeddedBrowserStateChangeTimer();
+    clearEmbeddedBrowserPersistenceTimer();
+    writeEmbeddedBrowserPersistence();
+    embeddedBrowserPersistenceStopped = true;
+  });
   mainWindow.webContents.setWindowOpenHandler((details) => {
     const url = String(details.url || '').trim();
     if (!url) return { action: 'deny' };
@@ -1540,12 +2122,14 @@ function createWindow() {
 
 async function boot() {
   const appDataDir = ensureDir(path.join(app.getPath('userData'), 'runtime'));
+  embeddedBrowserPersistencePath = path.join(appDataDir, EMBEDDED_BROWSER_PERSISTENCE_FILE);
   startupLogPath = path.join(appDataDir, 'startup.log');
   fs.writeFileSync(startupLogPath, '');
   appendLog(`App starting. packaged=${app.isPackaged}`);
   appendLog(`resourcesPath=${process.resourcesPath}`);
   appendLog(`WEBPILOT_ELECTRON_CDP_PORT=${EMBEDDED_BROWSER_CDP_PORT}`);
   createWindow();
+  if (restoreEmbeddedBrowserPersistence()) appendLog('Embedded browser tabs restored from local cache.');
 
   try {
     const externalServerUrl = String(process.env.WEBPILOT_ELECTRON_SERVER_URL || '').trim().replace(/\/+$/, '');
@@ -1575,6 +2159,13 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   clearEmbeddedBrowserFitTimer();
+  clearEmbeddedBrowserStateChangeTimer();
+  clearEmbeddedBrowserPersistenceTimer();
+  if (!embeddedBrowserPersistenceStopped) {
+    writeEmbeddedBrowserPersistence();
+    embeddedBrowserPersistenceStopped = true;
+  }
+  destroyEmbeddedBrowserLibraryView();
   detachEmbeddedBrowserView();
   for (const tab of Array.from(embeddedBrowserTabs.values())) destroyEmbeddedBrowserTab(tab);
   if (serverProcess && !serverProcess.killed) serverProcess.kill();

@@ -4571,12 +4571,13 @@ export class BrowserSession {
 
   // 等待用户手动完成验证码/安全校验，超时后返回阻塞信息。
   async waitForManualVerification(maxMs = Number(process.env.MANUAL_VERIFICATION_TIMEOUT_MS || 180000)): Promise<BrowserActionResult> {
+    void maxMs;
     const note = await this.manualVerificationNote();
     return {
       ok: true,
       actual: note
-        ? `Manual verification is visible. The run is paused for user intervention instead of waiting ${maxMs}ms inside the AI request.`
-        : 'AI requested a manual verification pause. Ask the user to inspect the browser and continue after completing any required verification.',
+        ? '已暂停自动操作：页面需要人工完成验证。请在浏览器中完成验证码、登录/安全验证或其他需要本人确认的步骤；完成后在对话中发送“验证已完成”，我会重新读取当前页面并继续。'
+        : '已暂停自动操作，等待您检查浏览器并完成可能需要的人工验证；完成后请发送“验证已完成”继续。',
     };
   }
 
@@ -4732,7 +4733,7 @@ export class BrowserSession {
   private async manualVerificationNote() {
     const details = await this.detectManualVerification();
     if (!details.detected) return '';
-    return ` Manual verification is visible (${details.evidence || 'matched verification challenge'}). The run UI should pause and wait for the user to complete it.`;
+    return ' 检测到页面需要人工验证，请等待用户在浏览器中完成后再继续。';
   }
 
   private async focusNote() {
@@ -5878,6 +5879,12 @@ export class BrowserSession {
     const generation = this.snapshotGeneration;
     if (!generation || generation.page !== this.activePage || generation.url !== this.activePage.url()) return undefined;
     return this.snapshotObservationViews(generation);
+  }
+
+  currentSnapshotGenerationId() {
+    const generation = this.snapshotGeneration;
+    if (!generation || generation.page !== this.activePage || generation.url !== this.activePage.url()) return undefined;
+    return generation.id;
   }
 
   private async readInteractionCounts(): Promise<BrowserInteractionCounts> {

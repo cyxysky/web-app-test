@@ -99,20 +99,3 @@ $env:WEBPILOT_ELECTRON_SERVER_URL="http://127.0.0.1:3000"
 npx electron .
 
 gpt-5.3-codex-spark
-
-报错
-而且没有调用正确的工具
-{
-      "role": "tool",
-      "content": [
-        {
-          "type": "tool-result",
-          "toolCallId": "call_00_ALQUD4khlCw2slLJWOGP6386",
-          "toolName": "takeScreenshot",
-          "output": {
-            "type": "error-text",
-            "value": "Model tried to call unavailable tool 'takeScreenshot'. Available tools: openPage, mouse, keyboard, waitForPage, waitForHumanVerification, listTabs, getHttpRequests, takeSnapshot, searchSnapshot, downloadFile, generateMarkdownFile, switchTab."
-          }
-        }
-      ]
-    }

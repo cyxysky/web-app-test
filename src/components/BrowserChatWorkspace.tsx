@@ -23,6 +23,7 @@ import {
   GalleryHorizontalEnd,
   Gauge,
   Globe,
+  History,
   ImageUp,
   Loader2,
   Lock,
@@ -48,8 +49,11 @@ import {
   SquareArrowOutUpRight,
   SquareTerminal,
   Square,
+  Star,
   Sun,
   Trash2,
+  Volume2,
+  VolumeX,
   Waypoints,
   Workflow,
   X,
@@ -257,6 +261,8 @@ type EmbeddedBrowserBridgeResult = {
 };
 
 type EmbeddedBrowserTab = {
+  audioMuted?: boolean;
+  bookmarked?: boolean;
   groupId?: string;
   id: string;
   sessionId?: string;
@@ -280,6 +286,7 @@ type EmbeddedBrowserState = EmbeddedBrowserBridgeResult & {
   canGoBack?: boolean;
   canGoForward?: boolean;
   groups?: EmbeddedBrowserGroup[];
+  libraryPanel?: 'bookmarks' | 'history';
   tabs?: EmbeddedBrowserTab[];
   zoomFactor?: number;
 };
@@ -312,9 +319,12 @@ type EmbeddedBrowserBridge = {
   goForward: () => Promise<EmbeddedBrowserState>;
   moveTab: (input: { id: string; position: 'before' | 'after'; targetId: string }) => Promise<EmbeddedBrowserState>;
   navigate: (input: { groupId?: string; sessionId?: string; url: string }) => Promise<EmbeddedBrowserBridgeResult>;
+  onStateChange: (listener: (state: EmbeddedBrowserState) => void) => () => void;
   reload: () => Promise<EmbeddedBrowserState>;
   reset: () => Promise<EmbeddedBrowserBridgeResult>;
   setBounds: (bounds: EmbeddedBrowserBounds) => Promise<EmbeddedBrowserBridgeResult>;
+  setLibraryPanel: (input: { panel: 'bookmarks' | 'history' | null }) => Promise<EmbeddedBrowserState>;
+  setTabMuted: (input: { id: string; muted?: boolean }) => Promise<EmbeddedBrowserState>;
   setVisible: (input: {
     bounds?: EmbeddedBrowserBounds;
     createIfMissing?: boolean;
@@ -324,6 +334,7 @@ type EmbeddedBrowserBridge = {
     url?: string;
     visible: boolean;
   }) => Promise<EmbeddedBrowserState>;
+  toggleBookmark: () => Promise<EmbeddedBrowserState>;
 };
 
 declare global {
@@ -1660,6 +1671,27 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
   );
 });
 
+function isManualVerificationStatusText(text: string) {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return /^AI requested a manual verification pause\. Ask the user to inspect the browser and continue after completing any required verification\.$/i.test(normalized)
+    || /^Manual verification is visible \(.+\)\. The run UI should pause and wait for the user to complete it\.$/i.test(normalized)
+    || /^已暂停自动操作[：:]/.test(normalized)
+    || /^已暂停，等待您检查浏览器/.test(normalized);
+}
+
+const BrowserChatManualVerificationCard = memo(function BrowserChatManualVerificationCard() {
+  return (
+    <section className="browser-chat-manual-verification" role="status">
+      <span aria-hidden="true" className="browser-chat-manual-verification-icon"><Lock size={18} /></span>
+      <div>
+        <strong>需要人工完成验证</strong>
+        <p>请在浏览器中完成验证码、登录/安全验证或其他需要本人确认的步骤。</p>
+        <small>完成后发送“验证已完成”，我会重新读取当前页面并继续。</small>
+      </div>
+    </section>
+  );
+});
+
 const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
   logs,
   message,
@@ -1723,7 +1755,10 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const timelineStepsToRender = showPendingTimelineFallback ? pendingTimelineSteps : timelineSteps;
   const shouldShowStepTimeline = (!aiOutputCycles.length && (toolCount > 0 || waitingForTool))
     || (showPendingTimelineFallback && pendingTimelineSteps.length > 0);
+  const manualVerificationPaused = steps.some((step) => (step.tools || []).some((tool) => tool.name === 'waitForHumanVerification'))
+    || aiOutputCycles.some((cycle) => cycle.output.tools.some((tool) => tool.name === 'waitForHumanVerification'));
   const hasFinalText = Boolean(finalText.trim());
+  const hideManualVerificationStatusText = manualVerificationPaused && isManualVerificationStatusText(finalText);
   const toolSummary = failedToolCount
     ? failedToolCount === 1
       ? '工具调用失败'
@@ -1814,7 +1849,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
           )) : null}
         </div>
       ) : null}
-      {hasFinalText && !aiOutputTextSet.has(finalText.replace(/\s+/g, ' ').trim()) ? renderText(finalText, 'final-text') : null}
+      {manualVerificationPaused ? <BrowserChatManualVerificationCard /> : null}
+      {hasFinalText && !hideManualVerificationStatusText && !aiOutputTextSet.has(finalText.replace(/\s+/g, ' ').trim()) ? renderText(finalText, 'final-text') : null}
       {!hasFinalText && !shouldShowStepTimeline ? (
         <p className="browser-chat-agent-empty">{running ? 'AI 正在处理当前请求。' : 'AI 已完成本轮操作，未返回额外文本。'}</p>
       ) : null}
@@ -2936,13 +2972,23 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
 function embeddedBoundsFromElement(element: HTMLElement, options: { leftInset?: number } = {}): EmbeddedBrowserBounds {
   const rect = element.getBoundingClientRect();
   const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
   const leftInset = Math.max(0, Math.min(Math.round(options.leftInset || 0), width - 1));
   return {
     x: Math.max(0, Math.round(rect.left) + leftInset),
     y: Math.max(0, Math.round(rect.top)),
     width: Math.max(1, width - leftInset),
-    height: Math.max(1, Math.round(rect.height)),
+    height,
   };
+}
+
+function EmbeddedBrowserFavoritesIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg aria-hidden="true" fill="none" height={size} viewBox="0 0 24 24" width={size}>
+      <path d="m7.1 3.2 1.45 2.95 3.25.47-2.35 2.3.56 3.23-2.91-1.53-2.91 1.53.56-3.23-2.35-2.3 3.25-.47L7.1 3.2Z" />
+      <path d="M13.4 6.25h7.1M13.8 10.7h6.7M12.2 15.15h8.3" />
+    </svg>
+  );
 }
 
 function embeddedBoundsKey(bounds?: EmbeddedBrowserBounds) {
@@ -2995,6 +3041,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [closedGroupIds, setClosedGroupIds] = useState<string[]>([]);
   const [draggingTabId, setDraggingTabId] = useState('');
   const [dragDropTarget, setDragDropTarget] = useState<{ position: 'before' | 'after'; tabId: string } | null>(null);
+  const [libraryPanel, setLibraryPanel] = useState<'bookmarks' | 'history' | null>(null);
 
   const applyEmbeddedBrowserState = useCallback((result: EmbeddedBrowserState) => {
     if (!result.ok) {
@@ -3004,6 +3051,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     setBridgeError('');
     setBrowserGroups(Array.isArray(result.groups) ? result.groups : []);
     setBrowserTabs(Array.isArray(result.tabs) ? result.tabs : []);
+    setLibraryPanel(result.libraryPanel === 'bookmarks' || result.libraryPanel === 'history' ? result.libraryPanel : null);
     setActiveGroupId(result.activeGroupId || '');
     setActiveTabIndex(typeof result.activeIndex === 'number' && result.activeIndex >= 0 ? result.activeIndex : 0);
     setActiveTabId(result.activeTabId || '');
@@ -3023,6 +3071,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       setAddressValue('');
       setCanGoBack(false);
       setCanGoForward(false);
+      setLibraryPanel(null);
       return;
     }
 
@@ -3039,7 +3088,9 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const viewport = viewportRef.current;
     const visible = enabled && active && Boolean(viewport);
     const groupId = embeddedGroupIdForSession(sessionId);
-    const bounds = visible && viewport ? embeddedBoundsFromElement(viewport, { leftInset: leftOverlayInset }) : undefined;
+    const bounds = visible && viewport
+      ? embeddedBoundsFromElement(viewport, { leftInset: leftOverlayInset })
+      : undefined;
     const boundsKey = embeddedBoundsKey(bounds);
     const previous = embeddedBrowserSyncRef.current;
     setBridgeAvailable(Boolean(bridge));
@@ -3108,11 +3159,9 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   useEffect(() => {
     if (!enabled || !active) return undefined;
     void loadEmbeddedBrowserState();
-    const timer = window.setInterval(() => {
-      void loadEmbeddedBrowserState();
-    }, 300);
-    return () => window.clearInterval(timer);
-  }, [active, enabled, loadEmbeddedBrowserState]);
+    const bridge = window.webPilotEmbeddedBrowser;
+    return bridge?.onStateChange?.((result) => applyEmbeddedBrowserState(result)) || undefined;
+  }, [active, applyEmbeddedBrowserState, enabled, loadEmbeddedBrowserState]);
 
   async function goEmbeddedBrowserBack() {
     const bridge = window.webPilotEmbeddedBrowser;
@@ -3140,6 +3189,36 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const result = await bridge.reload().catch((error: unknown) => ({
       ok: false,
       error: error instanceof Error ? error.message : 'Browser reload failed',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function toggleEmbeddedBrowserBookmark() {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.toggleBookmark().catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '收藏操作失败',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function setEmbeddedBrowserTabMuted(tab: EmbeddedBrowserTab) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.setTabMuted({ id: tab.id, muted: !tab.audioMuted }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '标签静音操作失败',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function toggleEmbeddedBrowserLibraryPanel(panel: 'bookmarks' | 'history') {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.setLibraryPanel({ panel: libraryPanel === panel ? null : panel }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '打开收藏与历史记录失败',
     }));
     applyEmbeddedBrowserState(result);
   }
@@ -3454,6 +3533,18 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                           </span>
                         ) : null}
                         <button
+                          aria-label={tab.audioMuted ? '取消静音标签页' : '静音标签页'}
+                          className={tab.audioMuted ? 'browser-chat-embedded-tab-mute is-muted' : 'browser-chat-embedded-tab-mute'}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void setEmbeddedBrowserTabMuted(tab);
+                          }}
+                          title={tab.audioMuted ? '取消静音' : '静音'}
+                          type="button"
+                        >
+                          {tab.audioMuted ? <VolumeX size={13} /> : <Volume2 size={13} />}
+                        </button>
+                        <button
                           aria-label="关闭当前标签页"
                           className="browser-chat-embedded-tab-close"
                           onClick={(event) => {
@@ -3504,7 +3595,39 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
               spellCheck={false}
               value={addressValue}
             />
+            <button
+              aria-label={activeEmbeddedTab?.bookmarked ? '取消收藏当前页面' : '收藏当前页面'}
+              className={activeEmbeddedTab?.bookmarked ? 'browser-chat-embedded-address-action active' : 'browser-chat-embedded-address-action'}
+              disabled={!activeEmbeddedTab}
+              onClick={() => void toggleEmbeddedBrowserBookmark()}
+              title={activeEmbeddedTab?.bookmarked ? '取消收藏' : '收藏此页面'}
+              type="button"
+            >
+              <Star fill={activeEmbeddedTab?.bookmarked ? 'currentColor' : 'none'} size={18} />
+            </button>
           </form>
+          <div className="browser-chat-embedded-library-actions">
+            <button
+              aria-expanded={libraryPanel === 'bookmarks'}
+              aria-label="收藏夹"
+              className={libraryPanel === 'bookmarks' ? 'browser-chat-embedded-tool-button active' : 'browser-chat-embedded-tool-button'}
+              onClick={() => void toggleEmbeddedBrowserLibraryPanel('bookmarks')}
+              title="收藏夹"
+              type="button"
+            >
+              <EmbeddedBrowserFavoritesIcon size={19} />
+            </button>
+            <button
+              aria-expanded={libraryPanel === 'history'}
+              aria-label="历史记录"
+              className={libraryPanel === 'history' ? 'browser-chat-embedded-tool-button active' : 'browser-chat-embedded-tool-button'}
+              onClick={() => void toggleEmbeddedBrowserLibraryPanel('history')}
+              title="历史记录"
+              type="button"
+            >
+              <History size={18} />
+            </button>
+          </div>
         </div>
       </header>
       <div className="browser-chat-embedded-viewport" ref={viewportRef}>
