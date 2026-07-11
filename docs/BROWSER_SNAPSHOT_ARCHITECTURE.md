@@ -1,14 +1,14 @@
 # Browser snapshot and input architecture
 
-The browser agent uses a snapshot-first protocol modeled after modern accessibility-tree browser tools. The old HTML-like DOM observation and per-action tool set are not part of the model contract.
+The browser agent uses a DOMSnapshot-first protocol with selective accessibility enrichment. The old HTML-like DOM serialization, full-AX-first capture, and per-action tool set are not part of the model contract.
 
 ## Observation
 
-`takeSnapshot` captures Chromium's accessibility tree with CDP for the main document and every frame in the current frame tree. It returns one of three semantic views:
+`takeSnapshot` calls CDP `DOMSnapshot.captureSnapshot` for the main document, flattened shadow DOM, and every captured frame. It requests a small computed-style whitelist, layout rectangles, scroll rectangles, clickability, input state, and paint order. Only ranked actionable candidates are enriched with `Accessibility.getPartialAXTree(fetchRelatives=false)`; a full AX tree is captured only if DOMSnapshot itself is unavailable. It returns one of three semantic views:
 
 - `actionable`: controls plus the minimum useful structural context.
-- `full`: all meaningful accessibility nodes.
-- `text`: deduplicated accessible text.
+- `full`: meaningful DOM controls, content, and structural nodes.
+- `text`: deduplicated rendered text.
 
 Every line uses a short-lived `uid`:
 
@@ -21,14 +21,16 @@ The output does not contain redundant `data-ai-*` attributes or an interactive m
 
 `searchSnapshot` searches the complete latest cached generation, so the model does not need to page through a large tree merely to find a known label or role.
 
-### Frames and fallback
+The actionable view is relevance-ranked within each frame instead of emitted in raw DOM or AX order. Text entry controls and selectors come first, followed by buttons and other non-link controls, DOM fallback targets, links, and finally structural context. Descendant text is assigned to its nearest actionable/card ancestor, nested pointer targets for the same entity are collapsed, and container text is bounded. This prevents a large navigation or result-link collection from consuming the first snapshot slice before search boxes and primary controls appear. Focusability is represented as `actions=focus`; it is not automatically treated as clickability, and structural focusable list/table nodes are excluded from the fallback action set.
 
-CDP capture is attempted for every frame concurrently. If Chromium cannot expose an AX tree for a frame, a lightweight Playwright-frame traversal supplies semantic text and actionable controls. This traversal:
+### Frames, enrichment, and fallback
+
+DOMSnapshot supplies the primary flattened DOM/layout model. Candidate names are derived from `aria-labelledby`, `aria-label`, associated labels, alt text, descendant rendered text, value, placeholder, title, and name metadata. Partial AX then replaces or augments role, computed accessible name, value, and widget state for the highest-value candidates. A lightweight Playwright-frame traversal remains as a final supplement for runtime-specific controls that DOMSnapshot misses; same-name controls are counted rather than globally collapsed. The pipeline:
 
 - enters every attached iframe and open shadow root;
 - immediately prunes a subtree when the current element has `display:none`;
 - ignores `script`, `style`, and other non-semantic content by selecting meaningful nodes rather than serializing HTML;
-- treats accessible SVG controls through their AX role/name and only uses the DOM fallback when AX data is unavailable.
+- treats accessible SVG controls through partial AX role/name and uses full AX only as a capture-failure fallback.
 
 ## Input
 
@@ -44,9 +46,13 @@ Both tools accept either:
 1. a fresh snapshot `uid`; or
 2. thousandth coordinates from the latest viewport screenshot.
 
-A UID operation calls CDP `DOM.scrollIntoViewIfNeeded`, resolves the current content quad, and performs the action in one tool call. This keeps offscreen elements discoverable without pretending that they are already visible and avoids an extra model-driven scroll step.
+A UID operation resolves a unique Playwright accessibility locator, scrolls it into view, verifies visibility, enabled state, and top-layer hit testing, then performs the action in one tool call. Move uses locator hover, click preserves button and click count, and drag follows a real pointer path with an HTML5 `DataTransfer` fallback. Coordinate drag resolves its source and destination with `elementFromPoint` and uses the same fallback, so custom HTML5 drop zones receive a populated transfer object in either targeting mode. Keyboard typing explicitly focuses the target and emits the normal keydown/keypress/input/keyup sequence. CDP content quads remain the fallback for AX nodes without a unique locator.
 
-`takeScreenshot` is the visual fallback for canvas, charts, ambiguous overlays, and custom rendering. Only the latest `viewport` screenshot can be used for coordinates; `fullPage` screenshots are evidence only. Any browser-changing action invalidates both the current UID generation and coordinate screenshot.
+Every input result includes a post-action check. Mouse checks use delivered browser-event counts plus hover, scroll-offset, drop, focus, popup, and navigation evidence as appropriate. Keyboard checks verify key/input events and editable-value changes. A mechanically undelivered action returns `ok=false` even when Playwright itself did not throw. The mouse and keyboard schemas live in one shared module and are consumed by both runtime executors.
+
+`takeScreenshot` is the visual fallback for canvas, charts, ambiguous overlays, and custom rendering. Only the latest `viewport` screenshot can be used for coordinates; `fullPage` screenshots are evidence only.
+
+Browser actions automatically maintain the semantic DOM snapshot through one page-state epoch, without classifying actions by invalidation level. An injected `MutationObserver` advances the epoch for DOM, text, and relevant attribute changes, while interaction listeners cover focus, keyboard, input, hover, scroll, click, and drag/drop state that may affect the actionable view without an immediate DOM mutation. Interaction counts remain exact for post-action verification, while synchronous event bursts are microtask-coalesced into one epoch increment. After every action, the generation refreshes only when that epoch changed and is otherwise reused. Screenshot coordinates are invalidated after every action. The action result exposes the current generation and a compact change view, so a separate `takeSnapshot` call is needed only when the increment is insufficient.
 
 ## Runtime rules
 
@@ -54,7 +60,7 @@ A UID operation calls CDP `DOM.scrollIntoViewIfNeeded`, resolves the current con
 - Use `searchSnapshot` for a known target in a large snapshot.
 - Use a UID directly; the executor reveals offscreen targets internally.
 - Use `takeScreenshot` plus coordinates only when semantic evidence is insufficient.
-- Capture a fresh snapshot after every browser-changing action.
+- Use the incremental snapshot returned after a browser action. Capture a separate fresh snapshot only when the returned changes do not contain enough evidence for the next decision.
 - `takeSnapshot` is structure, while `takeScreenshot` is pixels; progress text must not confuse them.
 
 ## Debug export

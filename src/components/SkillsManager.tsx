@@ -15,12 +15,9 @@ type SkillDraft = {
   status: SkillRecord['status'];
   tags: string;
   triggerPhrases: string;
-  whenToUse: string;
   workflow: string;
-  reusablePatterns: string;
-  cautions: string;
+  recovery: string;
   verification: string;
-  sourceSummary: string;
 };
 
 type EditorMode = 'create' | 'edit' | null;
@@ -39,12 +36,9 @@ const emptyDraft: SkillDraft = {
   status: 'ready',
   tags: '',
   triggerPhrases: '',
-  whenToUse: '',
   workflow: '',
-  reusablePatterns: '',
-  cautions: '',
+  recovery: '',
   verification: '',
-  sourceSummary: '',
 };
 
 function lines(items?: string[]) {
@@ -58,12 +52,9 @@ function draftFromSkill(skill: SkillRecord): SkillDraft {
     status: skill.status,
     tags: skill.tags.join(', '),
     triggerPhrases: skill.triggerPhrases.join('\n'),
-    whenToUse: lines(skill.content.whenToUse),
     workflow: lines(skill.content.workflow),
-    reusablePatterns: lines(skill.content.reusablePatterns),
-    cautions: lines(skill.content.cautions),
+    recovery: lines(skill.content.recovery),
     verification: lines(skill.content.verification),
-    sourceSummary: skill.content.sourceSummary || '',
   };
 }
 
@@ -83,12 +74,9 @@ function payloadFromDraft(draft: SkillDraft) {
     tags: splitList(draft.tags),
     triggerPhrases: splitList(draft.triggerPhrases),
     content: {
-      whenToUse: splitLines(draft.whenToUse),
       workflow: splitLines(draft.workflow),
-      reusablePatterns: splitLines(draft.reusablePatterns),
-      cautions: splitLines(draft.cautions),
+      recovery: splitLines(draft.recovery),
       verification: splitLines(draft.verification),
-      sourceSummary: draft.sourceSummary.trim(),
     },
   };
 }
@@ -204,10 +192,8 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
 
   function detailSections(skill: SkillRecord) {
     return [
-      { key: 'when-to-use', label: t('何时使用'), items: skill.content.whenToUse },
       { key: 'workflow', label: t('操作流程'), items: skill.content.workflow },
-      { key: 'reusable-patterns', label: t('可复用模式'), items: skill.content.reusablePatterns },
-      { key: 'cautions', label: t('注意事项'), items: skill.content.cautions },
+      { key: 'recovery', label: t('恢复策略'), items: skill.content.recovery },
       { key: 'verification', label: t('验证方式'), items: skill.content.verification },
     ];
   }
@@ -353,15 +339,6 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
                         </div>
                       </div>
 
-                      {skill.content.sourceSummary ? (
-                        <div className="skills-manager-section wide">
-                          <div>
-                            <h4>{t('来源摘要')}</h4>
-                          </div>
-                          <p>{skill.content.sourceSummary}</p>
-                        </div>
-                      ) : null}
-
                       <div className="skills-manager-section-grid">
                         {detailSections(skill).map((section) => (
                           <div className={section.key === 'workflow' ? 'skills-manager-section wide' : 'skills-manager-section'} key={section.key}>
@@ -408,11 +385,11 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
             </header>
 
             <div className="ui-modal-body skills-manager-form">
-              <label className="skills-manager-field">
+              <label className={editorMode === 'create' ? 'skills-manager-field wide' : 'skills-manager-field'}>
                 <span>{t('标题')}</span>
                 <input className="input settings-control" value={draft.title} onChange={(event) => update({ title: event.target.value })} />
               </label>
-              <label className="skills-manager-field">
+              {editorMode === 'edit' ? <label className="skills-manager-field">
                 <span>{t('状态')}</span>
                 <CustomSelect
                   className="settings-control"
@@ -424,42 +401,30 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
                     { label: t('停用'), value: 'disabled' },
                   ]}
                 />
-              </label>
+              </label> : null}
               <label className="skills-manager-field wide">
                 <span>{t('描述')}</span>
-                <textarea className="textarea settings-control" value={draft.description} onChange={(event) => update({ description: event.target.value })} />
+                <textarea className="textarea settings-control" value={draft.description} onChange={(event) => update({ description: event.target.value })} placeholder={t('一句话说明能力和适用场景')} />
               </label>
-              <label className="skills-manager-field">
+              {editorMode === 'edit' ? <label className="skills-manager-field">
                 <span>{t('标签')}</span>
                 <textarea className="textarea settings-control compact" value={draft.tags} onChange={(event) => update({ tags: event.target.value })} placeholder={t('逗号或换行分隔')} />
-              </label>
-              <label className="skills-manager-field">
+              </label> : null}
+              <label className={editorMode === 'create' ? 'skills-manager-field wide' : 'skills-manager-field'}>
                 <span>{t('触发词')}</span>
-                <textarea className="textarea settings-control compact" value={draft.triggerPhrases} onChange={(event) => update({ triggerPhrases: event.target.value })} placeholder={t('逗号或换行分隔')} />
-              </label>
-              <label className="skills-manager-field wide">
-                <span>{t('何时使用')}</span>
-                <textarea className="textarea settings-control" value={draft.whenToUse} onChange={(event) => update({ whenToUse: event.target.value })} placeholder={t('每行一条')} />
+                <textarea className="textarea settings-control compact" value={draft.triggerPhrases} onChange={(event) => update({ triggerPhrases: event.target.value })} placeholder={t('每行一个精确的用户意图')} />
               </label>
               <label className="skills-manager-field wide">
                 <span>{t('操作流程')}</span>
                 <textarea className="textarea settings-control tall" value={draft.workflow} onChange={(event) => update({ workflow: event.target.value })} placeholder={t('每行一个步骤')} />
               </label>
               <label className="skills-manager-field">
-                <span>{t('可复用模式')}</span>
-                <textarea className="textarea settings-control" value={draft.reusablePatterns} onChange={(event) => update({ reusablePatterns: event.target.value })} placeholder={t('每行一条')} />
+                <span>{t('恢复策略')}</span>
+                <textarea className="textarea settings-control" value={draft.recovery} onChange={(event) => update({ recovery: event.target.value })} placeholder={t('只填写失败时的替代操作')} />
               </label>
               <label className="skills-manager-field">
-                <span>{t('注意事项')}</span>
-                <textarea className="textarea settings-control" value={draft.cautions} onChange={(event) => update({ cautions: event.target.value })} placeholder={t('每行一条')} />
-              </label>
-              <label className="skills-manager-field wide">
                 <span>{t('验证方式')}</span>
-                <textarea className="textarea settings-control" value={draft.verification} onChange={(event) => update({ verification: event.target.value })} placeholder={t('每行一条')} />
-              </label>
-              <label className="skills-manager-field wide">
-                <span>{t('来源摘要')}</span>
-                <textarea className="textarea settings-control" value={draft.sourceSummary} onChange={(event) => update({ sourceSummary: event.target.value })} />
+                <textarea className="textarea settings-control" value={draft.verification} onChange={(event) => update({ verification: event.target.value })} placeholder={t('只填写最终可观察的成功信号')} />
               </label>
             </div>
 

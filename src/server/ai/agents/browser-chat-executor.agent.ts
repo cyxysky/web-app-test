@@ -10,6 +10,12 @@ import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 import {
+  browserKeyboardToolDescription,
+  browserKeyboardToolShape,
+  browserMouseToolDescription,
+  browserMouseToolShape,
+} from './browser-input-tool-schema';
+import {
   appendRuntimeObservationView,
   compactStaleSnapshotMessages,
   decodeRuntimeObservationCursor,
@@ -26,7 +32,7 @@ import {
   type RuntimeObservationReadOptions,
   type RuntimeObservationStore,
 } from './runtime-observation';
-import { browserActionRules, currentSnapshotContextLine, noAutomaticScreenshotRule, snapshotHardRules } from './runtime-prompt-rules';
+import { browserActionRules, currentSnapshotContextLine, screenshotObservationRule, snapshotHardRules } from './runtime-prompt-rules';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
@@ -511,7 +517,7 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, max = 
   if (!result.ok && providerToolSchemaError(result.actual)) return userFacingInfrastructureError(result.actual);
   if (!result.ok) return trimDebugText(result.actual, resultMax);
   if (name === 'takeSnapshot') return trimDebugText(result.actual, 10000);
-  if (looksLikeDomSnapshot(result.actual)) return '已读取当前页面无障碍树快照。';
+  if (looksLikeDomSnapshot(result.actual)) return '已读取当前页面语义 DOM 快照。';
   if (name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
   if (name === 'listTabs') return '已读取浏览器标签页列表。';
   if (name === 'downloadFile' || name === 'generateMarkdownFile') return formatFileArtifactResult(name, result.actual);
@@ -653,7 +659,7 @@ function explicitlyRequestsScreenshot(value?: string) {
 function toolConsistentAssistantText(value: string | undefined, toolName?: string) {
   const text = readableActionFromRawText(value) || '';
   if (toolName === 'takeSnapshot' && explicitlyRequestsScreenshot(text)) {
-    return '我先读取当前页面的无障碍树快照，以确认页面结构与可执行目标。';
+    return '我先读取当前页面的语义 DOM 快照，以确认页面结构与可执行目标。';
   }
   return text;
 }
@@ -1885,7 +1891,27 @@ function makeBrowserTools(
       action: actionWithConfirmation,
     }).then((result) => {
       if (browserActionExecuted && runtimeObservationInvalidatingToolNames.has(name)) {
-        invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
+        const autoViews = result.autoSnapshot
+          ? session.currentSnapshotObservationViews()
+          : result.observationViews;
+        if (result.ok && autoViews?.actionable && referenceOptions?.observationStore) {
+          const observation = storeRuntimeObservation(
+            referenceOptions.observationStore,
+            referenceOptions.runId,
+            name,
+            autoViews.actionable,
+            autoViews,
+          );
+          const changes = observation.views.changes || 'No semantic DOM snapshot changes were detected after the action.';
+          result = {
+            ...result,
+            actual: `${result.actual}\n\n${changes}`,
+            autoSnapshot: result.autoSnapshot,
+            observationViews: { defaultType: 'changes', changes },
+          };
+        } else {
+          invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
+        }
       }
       return compactToolResultForModel(name, result, referenceOptions?.observationStore, referenceOptions?.runId);
     });
@@ -1913,20 +1939,8 @@ function makeBrowserTools(
       execute: (input) => record('openPage', input, () => session.open(input.url || targetUrl)),
     }),
     mouse: tool({
-      description: 'Unified mouse tool. Use a fresh snapshot uid for semantic targets. Use x_thousandth/y_thousandth only against the latest viewport screenshot. UID actions automatically reveal offscreen targets. action=scroll may omit a target to scroll the page; drag uses toUid or toX/toY.',
-      inputSchema: browserToolInput({
-        action: z.enum(['click', 'move', 'drag', 'scroll', 'scrollIntoView']),
-        uid: z.string().optional().describe('Fresh uid from the latest takeSnapshot result.'),
-        x_thousandth: z.number().int().min(1).max(999).optional().describe('Horizontal position in the latest viewport screenshot, from 1 to 999.'),
-        y_thousandth: z.number().int().min(1).max(999).optional().describe('Vertical position in the latest viewport screenshot, from 1 to 999.'),
-        toUid: z.string().optional().describe('Drag destination uid.'),
-        toX_thousandth: z.number().int().min(1).max(999).optional().describe('Drag destination horizontal screenshot coordinate.'),
-        toY_thousandth: z.number().int().min(1).max(999).optional().describe('Drag destination vertical screenshot coordinate.'),
-        button: z.enum(['left', 'right', 'middle']).optional(),
-        clickCount: z.number().int().min(1).max(3).optional(),
-        deltaX: z.number().optional().describe('Horizontal wheel delta for action=scroll.'),
-        deltaY: z.number().optional().describe('Vertical wheel delta for action=scroll.'),
-      }),
+      description: browserMouseToolDescription,
+      inputSchema: browserToolInput(browserMouseToolShape),
       execute: (input) => record('mouse', input, () => session.mouse({
         action: input.action,
         uid: input.uid,
@@ -1942,18 +1956,8 @@ function makeBrowserTools(
       })),
     }),
     keyboard: tool({
-      description: 'Unified keyboard tool. action=type can focus a fresh uid or latest screenshot coordinate before entering text. action=press sends one key; action=shortcut sends a key combination.',
-      inputSchema: browserToolInput({
-        action: z.enum(['type', 'press', 'shortcut']),
-        uid: z.string().optional().describe('Fresh uid to focus before keyboard input.'),
-        x_thousandth: z.number().int().min(1).max(999).optional(),
-        y_thousandth: z.number().int().min(1).max(999).optional(),
-        text: z.string().optional(),
-        key: z.string().optional(),
-        keys: z.array(z.string().min(1)).max(6).optional(),
-        replace: z.boolean().optional().describe('For action=type, replace existing content unless false.'),
-        followByEnter: z.boolean().optional(),
-      }),
+      description: browserKeyboardToolDescription,
+      inputSchema: browserToolInput(browserKeyboardToolShape),
       execute: (input) => record('keyboard', input, () => session.keyboard({
         action: input.action,
         uid: input.uid,
@@ -1991,7 +1995,7 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
     }),
     takeSnapshot: tool({
-      description: 'Capture a fresh Chromium accessibility-tree snapshot for the main document and every attached iframe. mode=actionable is the default compact semantic view; full includes all meaningful AX nodes; text returns deduplicated accessible text. Continue a large unchanged snapshot with nextCursor.',
+      description: 'Capture a fresh Chromium DOMSnapshot for the main document, flattened shadow DOM, and attached iframes, enriched with partial AX data for high-value candidates. mode=actionable is the default ranked control/card view; full includes meaningful DOM structure; text returns deduplicated rendered text. Continue a large unchanged snapshot with nextCursor.',
       inputSchema: browserToolInput({
         mode: z.enum(['actionable', 'full', 'text']).optional(),
         cursor: z.string().optional().describe('Opaque nextCursor from the preceding takeSnapshot result. Omit it to capture a fresh snapshot.'),
@@ -2231,11 +2235,16 @@ function runtimePrompt(input: {
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const candidateContext = '[legacy candidate map disabled; use snapshot UIDs or latest screenshot coordinates]';
+  const screenshotAvailable = modelSupportsScreenshotInput();
+  const candidateContext = screenshotAvailable
+    ? '[legacy candidate map disabled; use snapshot UIDs or latest screenshot coordinates]'
+    : '[legacy candidate map disabled; use fresh snapshot UIDs]';
   const externalAppCandidateContext = '';
-  const evidence = 'the latest accessibility snapshot across the main document and all attached iframes, plus an optional latest viewport screenshot';
+  const evidence = screenshotAvailable
+    ? 'the latest semantic DOM snapshot across the main document and all attached iframes, plus an optional latest viewport screenshot'
+    : 'the latest semantic DOM snapshot across the main document and all attached iframes';
   const markerTargetRules: string[] = [];
-  const modeActionRules = browserActionRules();
+  const modeActionRules = browserActionRules(screenshotAvailable);
   return [
     browserChatMode
       ? 'You are an AI browser chat agent.'
@@ -2263,11 +2272,13 @@ function runtimePrompt(input: {
     '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL.',
     browserChatMode ? '- Strict safety confirmations must use tool params requiresConfirmation=true and confirmationMessage; never ask the user to type a confirmation message for that purpose.' : '',
     '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. In the final answer, include the returned Markdown download link exactly as a clickable Markdown link.',
-    ...snapshotHardRules(),
+    ...snapshotHardRules(screenshotAvailable),
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
-      : '- Browser action reason must cite the current snapshot UID or latest screenshot target used for the action.',
+      : screenshotAvailable
+        ? '- Browser action reason must cite the current snapshot UID or latest screenshot target used for the action.'
+        : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
     `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"actionable",maxChars:10000}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
@@ -2278,7 +2289,7 @@ function runtimePrompt(input: {
     browserChatMode
       ? ''
       : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
-    noAutomaticScreenshotRule,
+    screenshotObservationRule(screenshotAvailable),
     ...markerTargetRules,
     caseSystemPrompt ? `${browserChatMode ? 'Browser-chat loaded instructions and Skills' : 'Test-case-specific instructions'}:
 ${caseSystemPrompt}` : '',
@@ -2295,11 +2306,15 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
       : '- Call one tool. Use ordinary assistant text for progress/explanation, and tool params only for the selected tool.',
     visualMode
       ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
-      : '- Browser action reason must mention the current UID or latest screenshot visual target.',
+      : screenshotAvailable
+        ? '- Browser action reason must mention the current UID or latest screenshot visual target.'
+        : '- Browser action reason must mention the current snapshot UID.',
     browserChatMode
       ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
       : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
-    '- Progress text and the selected tool must agree. Use takeScreenshot for pixels and takeSnapshot for the accessibility tree.',
+    screenshotAvailable
+      ? '- Progress text and the selected tool must agree. Use takeScreenshot for pixels and takeSnapshot for the accessibility tree.'
+      : '- Progress text must describe takeSnapshot as a semantic DOM snapshot, not as a screenshot.',
     '- When a file tool succeeds, mention the saved file name and include its returned download target as a clickable Markdown link.',
     '',
     'Current context:',
@@ -2321,7 +2336,9 @@ ${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
     selectedScreenshotReferences.length
       ? 'Reference screenshot rule: selected reference images help connect scroll continuity or compare earlier page state. They may show the same interface at different scroll offsets when sameInterfaceGroup matches, but their candidate ids are historical and must never be used for the current action.'
       : '',
-    'Screenshot image/path is not attached automatically. takeScreenshot attaches explicit visual evidence to the next model request when available.',
+    screenshotAvailable
+      ? 'Screenshot image/path is not attached automatically. takeScreenshot attaches explicit visual evidence to the next model request when available.'
+      : '',
   ].filter(Boolean).join('\n');
 }
 
@@ -2730,6 +2747,7 @@ async function executeRuntimeStep(input: {
   shouldContinue?: () => boolean;
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
+  getDynamicSkillContext?: () => string | Promise<string>;
   repairContext?: string;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
 }) {
@@ -3036,26 +3054,26 @@ async function executeRuntimeStep(input: {
         ? storeRuntimeObservation(observationStore, input.runId, 'takeSnapshot', slice.content, observationViews)
         : appendRuntimeObservationView(observationStore, input.runId, snapshotView, slice.content) || storedRecord;
       if (!observation) {
-        return { ok: false, actual: 'Unable to store the current accessibility snapshot. Capture it again.' };
+        return { ok: false, actual: 'Unable to store the current semantic DOM snapshot. Capture it again.' };
       }
       const nextCursor = slice.hasMore
         ? encodeRuntimeObservationCursor({ generation: observation.generation, index: slice.nextIndex, view: snapshotView })
         : undefined;
       const availableTypes = runtimeObservationAvailableTypes(observation);
       const header = [
-        decodedCursor ? 'Continued the current accessibility snapshot.' : 'Captured a fresh accessibility snapshot.',
+        decodedCursor ? 'Continued the current semantic DOM snapshot.' : 'Captured a fresh semantic DOM snapshot.',
         `Current URL: ${session.currentUrl()}`,
         `Open tabs JSON: ${JSON.stringify(session.getTabsSnapshot())}`,
         `Snapshot generation: ${observation.generation}. Mode=${requestedMode}. Stored views: ${availableTypes || snapshotView}.`,
-        `Slice metadata JSON: ${JSON.stringify({ generationId: slice.generationId, mode: requestedMode, startIndex: slice.startIndex, nextIndex: slice.nextIndex, hasMore: slice.hasMore, returnedEntries: slice.returnedEntries, totalEntries: slice.totalEntries, nodeCount: slice.nodeCount, actionableCount: slice.actionableCount, frameCount: slice.frameCount, skippedFrameCount: slice.skippedFrameCount, timings: slice.timings })}`,
+        `Slice metadata JSON: ${JSON.stringify({ generationId: slice.generationId, captureSource: slice.captureSource, mode: requestedMode, startIndex: slice.startIndex, nextIndex: slice.nextIndex, hasMore: slice.hasMore, returnedEntries: slice.returnedEntries, totalEntries: slice.totalEntries, nodeCount: slice.nodeCount, actionableCount: slice.actionableCount, frameCount: slice.frameCount, skippedFrameCount: slice.skippedFrameCount, timings: slice.timings })}`,
         nextCursor
           ? `More entries exist in this same snapshot; continue with takeSnapshot({cursor:"${nextCursor}",maxChars:${maxChars}}). Do not scroll to reach them.`
-          : 'End of this accessibility snapshot view.',
+          : 'End of this semantic DOM snapshot view.',
       ].filter(Boolean);
       await onDebug?.({
-        phase: 'browser:take-snapshot:ax-timings',
+        phase: 'browser:take-snapshot:dom-timings',
         stepIndex,
-        message: `AX takeSnapshot timings: total=${elapsedSince(readStartedAt)}ms, capture=${slice.timings.captureAxMs || 0}ms, fallback=${slice.timings.domFallbackMs || 0}ms.`,
+        message: `DOM takeSnapshot timings: total=${elapsedSince(readStartedAt)}ms, DOMSnapshot=${slice.timings.captureDomMs || 0}ms, partialAX=${slice.timings.axEnrichmentMs || 0}ms, fallback=${slice.timings.domFallbackMs || 0}ms.`,
         details: { slice, totalMs: elapsedSince(readStartedAt), continued: Boolean(decodedCursor) },
       });
       return {
@@ -3149,6 +3167,25 @@ async function executeRuntimeStep(input: {
       const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
       const appendedMessages: RuntimeModelMessage[] = [];
       const appendedImagePaths: string[] = [];
+      if (input.getDynamicSkillContext) {
+        try {
+          const dynamicSkillContext = textFromUnknown(await input.getDynamicSkillContext()).trim();
+          ensureActive();
+          if (dynamicSkillContext) {
+            pendingObservationMessages.push({
+              text: `[WebPilot domain memory recalled for the current page]\n${dynamicSkillContext}`,
+              imagePaths: [],
+            });
+          }
+        } catch (error) {
+          await onDebug?.({
+            phase: 'memory:prompt:domain-refresh:error',
+            stepIndex,
+            message: `Unable to refresh domain memory for the current page: ${infrastructureError(error)}`,
+            details: serializeError(error),
+          });
+        }
+      }
       while (pendingObservationMessages.length) {
         const observation = pendingObservationMessages.shift();
         if (!observation) break;
@@ -3604,6 +3641,7 @@ export async function executeInteractiveBrowserTurn(input: {
   safetyMode?: BrowserChatSafetyMode;
   referenceImagePaths?: string[];
   skillContext?: string;
+  getDynamicSkillContext?: () => string | Promise<string>;
   onProgress?: (step: StepExecutionResult) => void | Promise<void>;
   onDebug?: ExecutionDebug;
   abortSignal?: AbortSignal;
@@ -3696,6 +3734,7 @@ export async function executeInteractiveBrowserTurn(input: {
         runtimeObservationStore,
         selectedScreenshotReferences,
         referenceImagePaths: input.referenceImagePaths,
+        getDynamicSkillContext: input.getDynamicSkillContext,
         onSelectReferenceScreenshots: async (selection) => {
           selectedScreenshotReferences = selection.ids
             .map((id) => selection.availableReferences.find((ref) => ref.id === id))

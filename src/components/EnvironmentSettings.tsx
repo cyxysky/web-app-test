@@ -1202,7 +1202,7 @@ export function EnvironmentSettings({
               <div className="settings-section-head">
                 <div>
                   <h2>{t('页面快照测试')}</h2>
-                  <span>{t('在独立测试浏览器中检查 Chromium 无障碍树、可操作节点和全部 iframe 的实际采集结果。')}</span>
+                  <span>{t('在独立测试浏览器中检查 Chromium DOMSnapshot、局部无障碍语义、可操作节点和全部 iframe 的实际采集结果。')}</span>
                 </div>
               </div>
               <div className="settings-card">

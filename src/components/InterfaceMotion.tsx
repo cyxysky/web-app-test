@@ -10,17 +10,24 @@ const PAGE_SELECTOR = [
   '.case-workspace',
   '.redesigned-run-shell',
   '.browser-chat-main',
+  '.settings-layout',
 ].join(',');
 
 const NAV_SELECTOR = [
   '.browser-chat-sidebar',
   '.browser-chat-sub-sidebar',
+  '.browser-chat-recent-header',
+  '.group-sidebar-head',
 ].join(',');
 
 const PANEL_SELECTOR = [
   '.browser-chat-settings-pane .settings-content > section',
   '.browser-chat-cases-pane .dashboard-folder-layout',
   '.browser-chat-chat-pane',
+  '.browser-chat-target-model-bar',
+  '.browser-chat-composer-shell',
+  '.settings-card',
+  '.skills-manager-list',
   '.case-main-panel',
   '.run-execution-panel',
 ].join(',');
@@ -31,10 +38,16 @@ const LIST_SELECTOR = [
   '.case-table-row',
   '.run-history-row',
   '.browser-chat-recent-item',
+  '.browser-chat-subnav button',
+  '.group-tree-row',
+  '.browser-chat-embedded-tab',
+  '.browser-chat-step',
   '.browser-chat-message > div:last-child',
   '.settings-row',
+  '.settings-model-list-row',
   '.personal-memory-item',
   '.skills-manager-item',
+  '.skills-manager-section',
   '.tool-call-list li',
   '.ledger-item-card',
   '.report-accordion',
@@ -51,6 +64,7 @@ function clearMotionStyles(elements: HTMLElement[]) {
   elements.forEach((element) => {
     element.style.removeProperty('opacity');
     element.style.removeProperty('transform');
+    element.style.removeProperty('will-change');
   });
 }
 
@@ -69,21 +83,23 @@ export function InterfaceMotion() {
       if (self?.matches.reduceMotion) return undefined;
 
       const run = (elements: HTMLElement[], type: 'list' | 'nav' | 'page' | 'panel') => {
-        const targets = elements.filter((element) => {
+        const fresh = elements.filter((element) => {
           if (animated.has(element)) return false;
           animated.add(element);
-          return true;
+          return element.getClientRects().length > 0;
         });
+        const targets = fresh.slice(0, 36);
         if (!targets.length) return;
 
-        const distance = type === 'page' ? 12 : type === 'panel' ? 9 : 7;
+        targets.forEach((element) => element.style.setProperty('will-change', 'transform, opacity'));
+        const distance = type === 'page' ? 10 : type === 'panel' ? 8 : 5;
         animate(targets, {
           opacity: [0, 1],
-          ...(type === 'nav' ? { x: [-10, 0] } : { y: [distance, 0] }),
-          scale: type === 'list' ? [0.992, 1] : [0.997, 1],
-          delay: type === 'list' ? stagger(24) : stagger(35),
-          duration: type === 'page' ? 460 : 360,
-          ease: 'out(4)',
+          ...(type === 'nav' ? { x: [-7, 0] } : { y: [distance, 0] }),
+          scale: type === 'list' ? [0.995, 1] : [0.998, 1],
+          delay: type === 'list' ? stagger(16) : stagger(24),
+          duration: type === 'page' ? 380 : type === 'panel' ? 320 : 270,
+          ease: 'out(5)',
           onComplete: () => clearMotionStyles(targets),
         });
       };

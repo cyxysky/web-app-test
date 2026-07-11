@@ -26,7 +26,7 @@ async function readWholeView(session: BrowserSession, mode: SnapshotMode, refres
   throw new Error(`${mode} snapshot did not finish within 100 chunks`);
 }
 
-test('AX snapshot covers offscreen content and iframes, paginates records, and powers unified input', async (context) => {
+test('DOMSnapshot covers offscreen content and iframes, paginates records, and powers unified input', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'ax-snapshot-test' });
   context.after(async () => session.close());
   await session.start();
@@ -53,6 +53,9 @@ test('AX snapshot covers offscreen content and iframes, paginates records, and p
   const textSlices = await readWholeView(session, 'text');
   const allSlices = [...actionableSlices, ...fullSlices, ...textSlices];
   assert.equal(new Set(allSlices.map((slice) => slice.generationId)).size, 1, 'all views must share one cached generation');
+  assert.ok((actionableSlices[0].timings.captureDomMs || 0) > 0, 'DOMSnapshot must be the primary capture source');
+  assert.equal(actionableSlices[0].timings.captureAxMs, 0, 'full AX capture should not run when DOMSnapshot succeeds');
+  assert.equal(actionableSlices[0].captureSource, 'dom-snapshot');
   assert.ok(actionableSlices.length > 1, 'large actionable views should be paginated');
   assert.ok(allSlices.every((slice) => slice.content.length <= 10000));
 
@@ -70,9 +73,8 @@ test('AX snapshot covers offscreen content and iframes, paginates records, and p
   const click = await session.mouse({ action: 'click', uid: stableUid });
   assert.equal(click.ok, true, click.actual);
   assert.equal(await page.locator('body').getAttribute('data-stable-clicked'), 'true');
-  const staleClick = await session.mouse({ action: 'click', uid: stableUid });
-  assert.equal(staleClick.ok, false, 'UIDs must be invalid after a browser-changing action');
-  assert.match(staleClick.actual, /takeSnapshot/);
+  assert.match(click.actual, /Semantic DOM snapshot snapshot-\d+ is current \(refreshed\)/);
+  assert.ok(session.currentSnapshotObservationViews()?.actionable?.includes('Stable action'), 'actions should retain a refreshed actionable snapshot');
 
   const refreshed = await readWholeView(session, 'actionable', true);
   const refreshedActionable = refreshed.map((slice) => slice.content).join('\n');
@@ -99,8 +101,8 @@ test('AX snapshot covers offscreen content and iframes, paginates records, and p
     generationId?: string;
     views?: Record<string, { generationId?: string; chunks?: Array<{ charLength?: number; content?: string }> }>;
   };
-  assert.equal(payload.version, 2);
-  assert.equal(payload.format, 'chromium-accessibility-tree');
+  assert.equal(payload.version, 3);
+  assert.equal(payload.format, 'chromium-dom-snapshot-with-partial-ax');
   assert.ok(payload.generationId);
   assert.deepEqual(Object.keys(payload.views || {}).sort(), ['actionable', 'full', 'text']);
   const exportedViews = Object.values(payload.views || {});
@@ -110,4 +112,276 @@ test('AX snapshot covers offscreen content and iframes, paginates records, and p
   assert.ok(exportedChunks.every((chunk) => (chunk.charLength || 0) <= 10000));
   assert.ok(exportedChunks.every((chunk) => !chunk.content?.includes('data-ai-interactive')));
   await unlink(exported.path);
+});
+
+test('snapshot lifecycle refreshes on page-state changes, ranks actionable matches, and rejects covered targets', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'snapshot-lifecycle-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  const contextualText = Array.from({ length: 60 }, (_, index) => `<p>Context ${index}</p>`).join('');
+  const html = [
+    '<!doctype html><html><body>',
+    '<h2>Save settings</h2>',
+    '<form>',
+    contextualText,
+    '<button id="save" type="button" onclick="document.body.dataset.saved=\'true\'">Save</button>',
+    '</form>',
+    '<button>Duplicate</button><button>Duplicate</button>',
+    '<div id="cover" style="position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.1)"></div>',
+    '</body></html>',
+  ].join('');
+  await page.goto(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+
+  const initial = await readWholeView(session, 'actionable', true);
+  const actionable = initial.map((slice) => slice.content).join('\n');
+  const saveUid = actionable.match(/^\s*uid=(\S+)\s+button\s+"Save"/m)?.[1];
+  assert.ok(saveUid);
+  assert.equal((actionable.match(/Context \d+/g) || []).length <= 24, true, 'context roots should be token-bounded');
+  assert.equal((actionable.match(/button\s+"Duplicate"/g) || []).length, 2, 'same-name controls must not be deduplicated away');
+
+  const search = await session.searchSnapshot({ query: 'Save' });
+  assert.equal(search.ok, true, search.actual);
+  assert.match(search.actual.split('\n')[1] || '', /button\s+"Save"/, 'exact actionable names should rank before structural text');
+
+  const covered = await session.mouse({ action: 'click', uid: saveUid });
+  assert.equal(covered.ok, false);
+  assert.match(covered.actual, /covered/);
+
+  await page.locator('#cover').evaluate((element) => element.remove());
+  const mutationRefresh = await session.wait(100);
+  assert.equal(mutationRefresh.ok, true, mutationRefresh.actual);
+  assert.match(mutationRefresh.actual, /current \(refreshed\)/);
+  assert.ok(session.currentSnapshotObservationViews()?.actionable?.includes('Save'));
+
+  const unchangedReuse = await session.wait(100);
+  assert.equal(unchangedReuse.ok, true, unchangedReuse.actual);
+  assert.match(unchangedReuse.actual, /reused; no page-state change detected/);
+
+  await page.mouse.move(3, 3);
+  const interactionOnlyReuse = await session.wait(0);
+  assert.equal(interactionOnlyReuse.ok, true, interactionOnlyReuse.actual);
+  assert.match(interactionOnlyReuse.actual, /reused; no page-state change detected/, 'pointer events alone must not invalidate semantic DOM snapshots');
+
+  await page.locator('body').evaluate((body) => body.insertAdjacentHTML('beforeend', '<button>Late action</button>'));
+  const clickAfterUnrelatedMutation = await session.mouse({ action: 'click', uid: saveUid });
+  assert.equal(clickAfterUnrelatedMutation.ok, true, clickAfterUnrelatedMutation.actual);
+  assert.doesNotMatch(clickAfterUnrelatedMutation.actual, /Capture a fresh snapshot/, 'stable UIDs should rebind after unrelated DOM mutations');
+  assert.equal(await page.locator('body').getAttribute('data-saved'), 'true');
+
+  const lateSearch = await session.searchSnapshot({ query: 'Late action', roles: ['button'] });
+  assert.equal(lateSearch.ok, true, lateSearch.actual);
+  assert.match(lateSearch.actual, /button\s+"Late action"/, 'search should refresh a mutation-stale cached generation');
+
+  await page.locator('#save').evaluate((button) => button.replaceWith(button.cloneNode(true)));
+  const replacedTarget = await session.mouse({ action: 'click', uid: saveUid });
+  assert.equal(replacedTarget.ok, false, replacedTarget.actual);
+  assert.match(replacedTarget.actual, /DOM node no longer exists in the refreshed snapshot/);
+});
+
+test('unified mouse and keyboard actions emit real browser events', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'input-events-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  const html = `<!doctype html><html><head><style>
+    #hover-menu { display: none; }
+    #hover-target:hover + #hover-menu { display: block; }
+    #source, #drop { width: 140px; height: 48px; margin: 8px; border: 1px solid #333; }
+    #scroller { width: 240px; height: 100px; overflow: auto; border: 1px solid #333; }
+    #scroll-content { height: 900px; padding-top: 780px; }
+  </style></head><body>
+    <button id="hover-target" type="button">Hover target</button><div id="hover-menu">Hover menu</div>
+    <input id="editor" aria-label="Editor" value="old">
+    <div id="source" role="button" tabindex="0" draggable="true" aria-label="Drag source">Drag source</div>
+    <div id="drop" role="button" tabindex="0" aria-label="Drop target">Drop target</div>
+    <div id="scroller" role="region" tabindex="0" aria-label="Scroll box"><div id="scroll-content"><button type="button">Deep action</button></div></div>
+    <script>
+      window.inputEvents = [];
+      const hover = document.getElementById('hover-target');
+      hover.addEventListener('mousemove', () => document.body.dataset.hovered = 'true');
+      hover.addEventListener('contextmenu', event => { event.preventDefault(); document.body.dataset.contextmenu = 'true'; });
+      hover.addEventListener('dblclick', () => document.body.dataset.doubleClicked = 'true');
+      const editor = document.getElementById('editor');
+      for (const type of ['keydown', 'keypress', 'input', 'keyup', 'change']) editor.addEventListener(type, () => window.inputEvents.push(type));
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Enter') document.body.dataset.enterPressed = 'true';
+        if (event.ctrlKey && event.key.toLowerCase() === 'k') document.body.dataset.shortcutPressed = 'true';
+      });
+      document.getElementById('source').addEventListener('dragstart', event => {
+        document.body.dataset.dragStarted = 'true';
+        event.dataTransfer.setData('text/plain', 'dragged');
+      });
+      const drop = document.getElementById('drop');
+      drop.addEventListener('dragover', event => event.preventDefault());
+      drop.addEventListener('drop', event => {
+        event.preventDefault();
+        document.body.dataset.dropped = event.dataTransfer.getData('text/plain');
+      });
+    </script>
+  </body></html>`;
+  await page.goto(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+
+  const initial = await readWholeView(session, 'actionable', true);
+  const actionable = initial.map((slice) => slice.content).join('\n');
+  const uidFor = (role: string, name: string) => actionable.match(new RegExp(`^\\s*uid=(\\S+)\\s+${role}\\s+"${name}"`, 'm'))?.[1];
+  const hoverUid = uidFor('button', 'Hover target');
+  const editorUid = uidFor('textbox', 'Editor');
+  const sourceUid = uidFor('button', 'Drag source');
+  const dropUid = uidFor('button', 'Drop target');
+  const scrollerUid = uidFor('region', 'Scroll box');
+  const deepUid = uidFor('button', 'Deep action');
+  assert.ok(hoverUid && editorUid && sourceUid && dropUid && scrollerUid && deepUid, actionable);
+
+  const move = await session.mouse({ action: 'move', uid: hoverUid });
+  assert.equal(move.ok, true, move.actual);
+  assert.match(move.actual, /Playwright hover/);
+  assert.match(move.actual, /Post-action check: \d+ mousemove event/);
+  assert.equal(await page.locator('body').getAttribute('data-hovered'), 'true');
+  assert.equal(await page.locator('#hover-menu').evaluate((element) => getComputedStyle(element).display), 'block');
+
+  const rightClick = await session.mouse({ action: 'click', uid: hoverUid, button: 'right' });
+  assert.equal(rightClick.ok, true, rightClick.actual);
+  assert.equal(await page.locator('body').getAttribute('data-contextmenu'), 'true');
+
+  const doubleClick = await session.mouse({ action: 'click', uid: hoverUid, clickCount: 2 });
+  assert.equal(doubleClick.ok, true, doubleClick.actual);
+  assert.equal(await page.locator('body').getAttribute('data-double-clicked'), 'true');
+
+  const drag = await session.mouse({ action: 'drag', uid: sourceUid, toUid: dropUid });
+  assert.equal(drag.ok, true, drag.actual);
+  assert.match(drag.actual, /Post-action check: \d+ mousemove and \d+ drop event/);
+  assert.equal(await page.locator('body').getAttribute('data-drag-started'), 'true');
+  assert.equal(await page.locator('body').getAttribute('data-dropped'), 'dragged');
+
+  const typed = await session.keyboard({ action: 'type', uid: editorUid, text: 'hello', replace: true });
+  assert.equal(typed.ok, true, typed.actual);
+  assert.match(typed.actual, /keydown and \d+ input event/);
+  const inputState = await page.evaluate(() => ({
+    activeId: (document.activeElement as HTMLElement | null)?.id || '',
+    events: (window as Window & { inputEvents?: string[] }).inputEvents || [],
+    value: (document.getElementById('editor') as HTMLInputElement).value,
+  }));
+  assert.equal(inputState.value, 'hello', JSON.stringify(inputState));
+  const inputEvents = await page.evaluate(() => (window as Window & { inputEvents?: string[] }).inputEvents || []);
+  assert.ok(inputEvents.includes('keydown'));
+  assert.ok(inputEvents.includes('keypress'));
+  assert.ok(inputEvents.includes('input'));
+  assert.ok(inputEvents.includes('keyup'));
+
+  const press = await session.keyboard({ action: 'press', key: 'Enter' });
+  assert.equal(press.ok, true, press.actual);
+  assert.equal(await page.locator('body').getAttribute('data-enter-pressed'), 'true');
+
+  const shortcut = await session.keyboard({ action: 'shortcut', keys: ['Control', 'k'] });
+  assert.equal(shortcut.ok, true, shortcut.actual);
+  assert.equal(await page.locator('body').getAttribute('data-shortcut-pressed'), 'true');
+
+  const scroll = await session.mouse({ action: 'scroll', uid: scrollerUid, deltaY: 420 });
+  assert.equal(scroll.ok, true, scroll.actual);
+  assert.ok(await page.locator('#scroller').evaluate((element) => element.scrollTop) > 0);
+
+  const scrollIntoView = await session.mouse({ action: 'scrollIntoView', uid: deepUid });
+  assert.equal(scrollIntoView.ok, true, scrollIntoView.actual);
+  const deepVisible = await page.locator('text=Deep action').evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    const scroller = document.getElementById('scroller')!.getBoundingClientRect();
+    return rect.top >= scroller.top && rect.bottom <= scroller.bottom;
+  });
+  assert.equal(deepVisible, true);
+
+  await page.locator('body').evaluate((body) => {
+    delete body.dataset.dragStarted;
+    delete body.dataset.dropped;
+  });
+  await session.takeCurrentScreenshotOnly('coordinate-drag-test', 1, 'visual-1', { capture: 'viewport' });
+  const viewport = page.viewportSize();
+  const sourceBox = await page.locator('#source').boundingBox();
+  const dropBox = await page.locator('#drop').boundingBox();
+  assert.ok(viewport && sourceBox && dropBox);
+  const thousandth = (value: number, size: number) => Math.max(1, Math.min(999, Math.round(value / size * 1000)));
+  const coordinateDrag = await session.mouse({
+    action: 'drag',
+    xThousandth: thousandth(sourceBox.x + sourceBox.width / 2, viewport.width),
+    yThousandth: thousandth(sourceBox.y + sourceBox.height / 2, viewport.height),
+    toXThousandth: thousandth(dropBox.x + dropBox.width / 2, viewport.width),
+    toYThousandth: thousandth(dropBox.y + dropBox.height / 2, viewport.height),
+  });
+  assert.equal(coordinateDrag.ok, true, coordinateDrag.actual);
+  assert.match(coordinateDrag.actual, /viewport-coordinate pointer input/);
+  assert.equal(await page.locator('body').getAttribute('data-dropped'), 'dragged');
+
+  const coalescing = await page.evaluate(async () => {
+    const state = (window as Window & {
+      __aiDomMutationState?: { epoch: number; interactionCounts: Record<string, number> };
+    }).__aiDomMutationState!;
+    const epochBefore = state.epoch;
+    const countBefore = state.interactionCounts.mousemove || 0;
+    for (let index = 0; index < 5; index += 1) {
+      document.body.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+    }
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    return {
+      countDelta: (state.interactionCounts.mousemove || 0) - countBefore,
+      epochDelta: state.epoch - epochBefore,
+    };
+  });
+  assert.equal(coalescing.countDelta, 5);
+  assert.equal(coalescing.epochDelta, 0, 'interaction telemetry must not invalidate the semantic DOM generation');
+});
+
+test('actionable view prioritizes controls and DOM fallback ahead of large link collections', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'actionable-priority-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  const links = Array.from({ length: 260 }, (_, index) => (
+    `<li tabindex="0"><a href="#item-${index}">Streaming result ${index} with a deliberately long accessible label</a></li>`
+  )).join('');
+  await page.setContent(`<!doctype html><html><body>
+    <a href="/room/5351842" style="cursor:pointer"><span><strong>Sylar card</strong></span></a>
+    <ul>${links}</ul>
+    <input aria-label="Search streams" value="sylar">
+    <button type="button">Apply filter</button>
+    <div id="custom" tabindex="0" aria-label="Focusable panel">Focusable panel</div>
+  </body></html>`);
+
+  const firstSlice = await session.readSnapshotSlice({ mode: 'actionable', refresh: true, maxChars: 10000 });
+  assert.equal(firstSlice.hasMore, true);
+  const textboxIndex = firstSlice.content.indexOf('textbox "Search streams"');
+  const buttonIndex = firstSlice.content.indexOf('button "Apply filter"');
+  const firstLinkIndex = firstSlice.content.indexOf('link "Streaming result');
+  assert.ok(textboxIndex >= 0, firstSlice.content);
+  assert.ok(buttonIndex >= 0, firstSlice.content);
+  assert.ok(firstLinkIndex >= 0, firstSlice.content);
+  assert.ok(textboxIndex < firstLinkIndex, firstSlice.content);
+  assert.ok(buttonIndex < firstLinkIndex, firstSlice.content);
+  assert.match(firstSlice.content, /generic "Focusable panel".*actions=focus/);
+  assert.equal((firstSlice.content.match(/Sylar card/g) || []).length, 1, 'nested pointer descendants should collapse into one card target');
+});
+
+test('snapshot UID mappings evict identities outside the retention window', async (context) => {
+  const previousRetention = process.env.SNAPSHOT_UID_RETENTION_GENERATIONS;
+  process.env.SNAPSHOT_UID_RETENTION_GENERATIONS = '2';
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'snapshot-uid-prune-test' });
+  context.after(async () => {
+    if (previousRetention === undefined) delete process.env.SNAPSHOT_UID_RETENTION_GENERATIONS;
+    else process.env.SNAPSHOT_UID_RETENTION_GENERATIONS = previousRetention;
+    await session.close();
+  });
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  const snapshotUid = Reflect.get(session, 'snapshotUid').bind(session) as (page: Page, identity: string) => string;
+  const pruneSnapshotUidMappings = Reflect.get(session, 'pruneSnapshotUidMappings').bind(session) as () => void;
+
+  Reflect.set(session, 'snapshotGenerationSequence', 1);
+  const expiredUid = snapshotUid(page, 'expired-identity');
+  for (let generation = 2; generation <= 4; generation += 1) {
+    Reflect.set(session, 'snapshotGenerationSequence', generation);
+    snapshotUid(page, `current-${generation}`);
+  }
+  pruneSnapshotUidMappings();
+
+  const mappings = Reflect.get(session, 'snapshotUidByIdentity') as Map<string, { uid: string }>;
+  assert.equal([...mappings.values()].some((entry) => entry.uid === expiredUid), false);
 });

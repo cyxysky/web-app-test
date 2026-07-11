@@ -1,9 +1,9 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useEffect, useReducer, useRef, useState, useTransition, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState, useTransition, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowLeft, CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, MoreHorizontal, Play, RotateCcw, Save, Settings, Trash2, X } from 'lucide-react';
+import { ArrowLeft, CalendarClock, Folder, FolderPlus, Loader2, MessageSquare, MoreHorizontal, Play, Plus, RotateCcw, Save, Settings, Trash2, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { CustomSelect } from '@/components/CustomSelect';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
@@ -132,6 +132,8 @@ export function DashboardGroupSidebar({
   className = 'group-sidebar',
   deletingGroupId,
   groups,
+  headerAction,
+  headerLabel,
   onDeleteGroup,
   selectedGroupId,
   onCreateGroup,
@@ -140,6 +142,8 @@ export function DashboardGroupSidebar({
   className?: string;
   deletingGroupId?: string | null;
   groups: TestGroupRecord[];
+  headerAction?: ReactNode;
+  headerLabel?: string;
   onDeleteGroup?: (group: TestGroupRecord) => void;
   selectedGroupId?: string;
   onCreateGroup: () => void;
@@ -173,25 +177,38 @@ export function DashboardGroupSidebar({
   return (
     <aside className={className}>
       <div className="group-sidebar-head">
-        <span>{t('分组')}</span>
-        <details className="browser-chat-overflow group-sidebar-actions">
-          <summary aria-label={t('分组操作')} title={t('分组操作')}>
-            <MoreHorizontal size={16} />
-          </summary>
-          <div className="browser-chat-overflow-menu">
-            <button
-              onClick={(event) => {
-                event.currentTarget.closest('details')?.removeAttribute('open');
-                createRootGroup();
-              }}
-              type="button"
-            >
-              <FolderPlus size={15} />
-              <span>{t('创建分组')}</span>
-            </button>
-          </div>
-        </details>
+        <span>{headerLabel || t('分组')}</span>
+        <div className="group-sidebar-head-actions">
+          {headerAction}
+          <details className="browser-chat-overflow group-sidebar-actions">
+            <summary aria-label={t('分组操作')} title={t('分组操作')}>
+              <MoreHorizontal size={16} />
+            </summary>
+            <div className="browser-chat-overflow-menu">
+              <button
+                onClick={(event) => {
+                  event.currentTarget.closest('details')?.removeAttribute('open');
+                  createRootGroup();
+                }}
+                type="button"
+              >
+                <FolderPlus size={15} />
+                <span>{t('创建分组')}</span>
+              </button>
+            </div>
+          </details>
+        </div>
       </div>
+      <button
+        aria-label={t('创建分组')}
+        className="ui-button ui-button--neutral group-create-button"
+        onClick={createRootGroup}
+        title={t('创建分组')}
+        type="button"
+      >
+        <Plus size={16} />
+        <span>{t('创建分组')}</span>
+      </button>
       <button aria-label={t('未分组')} className={!selectedGroupId ? 'group-tree-button active' : 'group-tree-button'} onClick={() => onSelect(undefined)} title={t('未分组')} type="button">
         <Folder size={15} />
         <span>{t('未分组')}</span>

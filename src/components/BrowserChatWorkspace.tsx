@@ -1,11 +1,12 @@
 'use client';
 
-import { memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useContext, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   AppWindow,
   AlertCircle,
   ArrowLeft,
   ArrowRight,
+  ArrowUp,
   BadgeCheck,
   Bot,
   Brain,
@@ -39,7 +40,6 @@ import {
   Route,
   ScanSearch,
   ScrollText,
-  Send,
   SendHorizontal,
   Settings,
   SlidersHorizontal,
@@ -62,6 +62,7 @@ import { BrowserChatLogDialog } from '@/components/BrowserChatLogDialog';
 import { BrowserChatToolDialog } from '@/components/BrowserChatToolDialog';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
 import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
+import { NewTestCaseModal } from '@/components/NewTestCaseModal';
 import {
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
@@ -428,6 +429,8 @@ type BrowserChatAiOutputCycle = {
   output: BrowserChatAiOutputView;
   stepIndex?: number;
 };
+
+const BrowserChatReasoningVisibilityContext = createContext(false);
 
 function stringFromUnknown(value: unknown): string {
   if (typeof value === 'string') return stripAnsiControlCodes(value).trim();
@@ -1485,8 +1488,9 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   resolvingConfirmationId?: string | null;
   toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
+  const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
   const { output } = cycle;
-  if (!hasAiOutputView(output)) return null;
+  if (!output.tools.length && !output.texts.length && (!showReasoning || !output.reasoning.length)) return null;
   const firstTool = output.tools[0];
   const firstToolLabel = firstTool ? browserChatToolLabel(firstTool.name, (value) => value) : '';
   const firstToolMeta = firstTool ? browserChatToolMeta(firstTool.name, firstTool.input) || firstTool.reason : '';
@@ -1503,7 +1507,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   });
   return (
     <div className="browser-chat-ai-cycle">
-      {output.reasoning.length ? (
+      {showReasoning && output.reasoning.length ? (
         <details className="browser-chat-ai-line-collapse">
           <summary className="browser-chat-ai-collapse-summary">
             <Sparkles size={14} />
@@ -1609,8 +1613,9 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
   resolvingConfirmationId?: string | null;
   toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
+  const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
   const toolCount = cycles.reduce((count, cycle) => count + cycle.output.tools.length, 0);
-  const reasoningCount = cycles.reduce((count, cycle) => count + cycle.output.reasoning.length, 0);
+  const reasoningCount = showReasoning ? cycles.reduce((count, cycle) => count + cycle.output.reasoning.length, 0) : 0;
   const hasPendingConfirmation = cycles.some((cycle) => (
     cycle.output.tools.some((tool, index) => {
       const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
@@ -1676,10 +1681,16 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   running: boolean;
   steps: StepExecutionResult[];
 }) {
+  const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
   const autoExpandedToolsRef = useRef(false);
   const [toolsExpanded, setToolsExpanded] = useState(() => running);
   const finalText = stringFromUnknown(message.content);
-  const aiOutputCycles = useMemo(() => aiOutputCyclesFromLogs(logs), [logs]);
+  const aiOutputCycles = useMemo(() => aiOutputCyclesFromLogs(logs)
+    .map((cycle) => (showReasoning ? cycle : {
+      ...cycle,
+      output: { ...cycle.output, reasoning: [] },
+    }))
+    .filter((cycle) => hasAiOutputView(cycle.output)), [logs, showReasoning]);
   const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(aiOutputCycles), [aiOutputCycles]);
   const aiOutputTextSet = useMemo(() => aiOutputTextSetFromCycles(aiOutputCycles), [aiOutputCycles]);
   const aiCycleToolDetails = useMemo(() => buildAiCycleToolDetailMap(aiOutputCycles, steps), [aiOutputCycles, steps]);
@@ -2729,7 +2740,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
         </div>
       ) : null}
       <form
-        className="browser-chat-compose"
+        className="browser-chat-compose browser-chat-compose--reference"
         onDragOver={handleReferenceDragOver}
         onDrop={handleReferenceDrop}
         onSubmit={(event) => {
@@ -2858,7 +2869,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
               title="上传文件"
               type="button"
             >
-              {uploadingImage ? <Loader2 className="spin" size={17} /> : <FilePlus2 size={17} />}
+              {uploadingImage ? <Loader2 className="spin" size={17} /> : <Plus size={19} />}
             </button>
             <div className="browser-chat-safety-toggle" role="radiogroup" aria-label={t('安全性')}>
               <button
@@ -2882,16 +2893,18 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                 {t('完全')}
               </button>
             </div>
-            <CustomSelect
-              className="browser-chat-provider-select"
-              disabled={currentBusy || loading}
-              onChange={(value) => onModelSelectionChange(parseModelSelectionValue(value))}
-              options={modelSelectionOptions}
-              title={modelSelectionTitle}
-              value={modelSelection}
-            />
           </div>
           <div className="browser-chat-compose-submit">
+            <div className="browser-chat-model-control">
+              <CustomSelect
+                className="browser-chat-provider-select"
+                disabled={currentBusy || loading}
+                onChange={(value) => onModelSelectionChange(parseModelSelectionValue(value))}
+                options={modelSelectionOptions}
+                title={modelSelectionTitle}
+                value={modelSelection}
+              />
+            </div>
             {showStop ? (
               <button
                 className="browser-chat-stop"
@@ -2910,7 +2923,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                 type="submit"
                 aria-label={t('发送')}
               >
-                {busy ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+                {busy ? <Loader2 className="spin" size={18} /> : <ArrowUp size={20} strokeWidth={2.2} />}
               </button>
             )}
           </div>
@@ -3566,6 +3579,7 @@ export function BrowserChatWorkspace({
   const [uploadingImage, setUploadingImage] = useState(false);
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [embeddedBrowserEnabled, setEmbeddedBrowserEnabled] = useState(false);
+  const [showReasoning, setShowReasoning] = useState(false);
   const [embeddedChatWidth, setEmbeddedChatWidth] = useState(420);
   const [embeddedChatCollapsed, setEmbeddedChatCollapsed] = useState(false);
   const [, setEmbeddedChatResizing] = useState(false);
@@ -3581,6 +3595,7 @@ export function BrowserChatWorkspace({
   const [selectedExportMessageIds, setSelectedExportMessageIds] = useState<string[]>([]);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
+  const fullLogSessionIdsRef = useRef(new Set<string>());
   const [toolDialog, setToolDialog] = useState<BrowserChatToolDetail | null>(null);
   const [resolvingConfirmationId, setResolvingConfirmationId] = useState<string | null>(null);
   const [resolvingConfirmationAction, setResolvingConfirmationAction] = useState<BrowserChatToolConfirmationAction | null>(null);
@@ -3711,6 +3726,18 @@ export function BrowserChatWorkspace({
   }, []);
   const showMessageLogs = useCallback((messageId: string) => {
     setLogDialogMessageId(messageId);
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId || fullLogSessionIdsRef.current.has(sessionId)) return;
+    fullLogSessionIdsRef.current.add(sessionId);
+    void fetch(`/api/browser-chat/${sessionId}/logs`, { cache: 'no-store' })
+      .then((response) => readApiJson<{ logs?: BrowserChatLogRecord[] }>(response, '加载对话日志失败'))
+      .then((data) => {
+        if (!Array.isArray(data.logs)) return;
+        setSession((current) => current?.id === sessionId ? { ...current, logs: data.logs || [] } : current);
+      })
+      .catch(() => {
+        fullLogSessionIdsRef.current.delete(sessionId);
+      });
   }, []);
   const toggleExportMessageSelection = useCallback((messageId: string, selected: boolean) => {
     setSelectedExportMessageIds((current) => {
@@ -3769,7 +3796,9 @@ export function BrowserChatWorkspace({
     const data = await readApiJson<any>(response, '加载浏览器配置失败');
     const saved = Array.isArray(data.saved) ? data.saved as Array<{ key?: string; value?: string }> : [];
     const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
+    const reasoningSetting = saved.find((item) => item.key === 'BROWSER_CHAT_SHOW_REASONING');
     setEmbeddedBrowserEnabled(embeddedSetting?.value === 'true');
+    setShowReasoning(reasoningSetting?.value === 'true');
   }, []);
 
   const loadSkills = useCallback(async () => {
@@ -3938,7 +3967,7 @@ export function BrowserChatWorkspace({
         return;
       }
       if (activeSessionIdRef.current === event.id) scheduleSessionRefresh(event.id);
-      scheduleLoadSessions();
+      else scheduleLoadSessions();
     }, { onStatus: setRealtimeConnected });
   }, [scheduleLoadSessions, scheduleSessionRefresh]);
 
@@ -4381,7 +4410,6 @@ export function BrowserChatWorkspace({
       });
       setModelProvider(nextModel.provider);
       setModelId(nextModel.model);
-      void loadSessions().catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');
       void loadSessions().catch(() => undefined);
@@ -4400,6 +4428,15 @@ export function BrowserChatWorkspace({
           className="browser-chat-sub-sidebar"
           deletingGroupId={deletingTargetGroupId}
           groups={groups}
+          headerAction={(
+            <NewTestCaseModal
+              groupId={targetGroupId}
+              icon={<Plus size={16} />}
+              iconOnly
+              onCreated={openTargetCaseDetail}
+            />
+          )}
+          headerLabel="目标"
           selectedGroupId={targetGroupId}
           onDeleteGroup={deleteTargetGroup}
           onCreateGroup={() => setGroupDialogOpen(true)}
@@ -4428,63 +4465,76 @@ export function BrowserChatWorkspace({
       <section className="browser-chat-sidebar-section browser-chat-recent-section">
         <div className="browser-chat-recent-header">
           <h2>对话</h2>
-          <details className="browser-chat-overflow browser-chat-recent-actions">
-            <summary aria-label="对话操作" title="对话操作">
-              <MoreHorizontal size={16} />
-            </summary>
-            <div className="browser-chat-overflow-menu">
-              <button
-                onClick={(event) => {
-                  closeSidebarOverflowMenu(event);
-                  void startNewConversation();
-                }}
-                type="button"
-              >
-                <Plus size={15} />
-                <span>新建对话</span>
-              </button>
-              {recentSessions.length ? (
-                <button
-                  onClick={(event) => {
-                    closeSidebarOverflowMenu(event);
-                    setRecentSelectionMode((current) => !current);
-                    if (recentSelectionMode) setSelectedSessionIds([]);
-                  }}
-                  type="button"
-                >
-                  <Square size={14} />
-                  <span>{recentSelectionMode ? '退出选择' : '选择对话'}</span>
-                </button>
-              ) : null}
-              {recentSelectionMode ? (
-                <button
-                  onClick={(event) => {
-                    closeSidebarOverflowMenu(event);
-                    toggleAllRecentSelections();
-                  }}
-                  type="button"
-                >
-                  <CheckCircle2 size={15} />
-                  <span>{allSelectableRecentSessionsSelected ? '取消全选' : '全选'}</span>
-                </button>
-              ) : null}
-              {recentSelectionMode && selectedDeletableSessionIds.length ? (
-                <button
-                  className="danger"
-                  disabled={deletingSelectedSessions}
-                  onClick={(event) => {
-                    closeSidebarOverflowMenu(event);
-                    void deleteSelectedSessionHistory();
-                  }}
-                  type="button"
-                >
-                  {deletingSelectedSessions ? <Loader2 className="spin" size={14} /> : <Trash2 size={15} />}
-                  <span>删除已选（{selectedDeletableSessionIds.length}）</span>
-                </button>
-              ) : null}
-            </div>
-          </details>
+          <div className="browser-chat-recent-header-actions">
+            <button
+              aria-label={t('新建对话')}
+              className="ui-icon-button browser-chat-section-create"
+              disabled={busy || Boolean(loadingSessionId)}
+              onClick={() => void startNewConversation()}
+              title={t('新建对话')}
+              type="button"
+            >
+              <Plus size={16} />
+            </button>
+            <details className="browser-chat-overflow browser-chat-recent-actions">
+              <summary aria-label="对话操作" title="对话操作">
+                <MoreHorizontal size={16} />
+              </summary>
+              <div className="browser-chat-overflow-menu">
+                {recentSessions.length ? (
+                  <button
+                    onClick={(event) => {
+                      closeSidebarOverflowMenu(event);
+                      setRecentSelectionMode((current) => !current);
+                      if (recentSelectionMode) setSelectedSessionIds([]);
+                    }}
+                    type="button"
+                  >
+                    <Square size={14} />
+                    <span>{recentSelectionMode ? '退出选择' : '选择对话'}</span>
+                  </button>
+                ) : null}
+                {recentSelectionMode ? (
+                  <button
+                    onClick={(event) => {
+                      closeSidebarOverflowMenu(event);
+                      toggleAllRecentSelections();
+                    }}
+                    type="button"
+                  >
+                    <CheckCircle2 size={15} />
+                    <span>{allSelectableRecentSessionsSelected ? '取消全选' : '全选'}</span>
+                  </button>
+                ) : null}
+                {recentSelectionMode && selectedDeletableSessionIds.length ? (
+                  <button
+                    className="danger"
+                    disabled={deletingSelectedSessions}
+                    onClick={(event) => {
+                      closeSidebarOverflowMenu(event);
+                      void deleteSelectedSessionHistory();
+                    }}
+                    type="button"
+                  >
+                    {deletingSelectedSessions ? <Loader2 className="spin" size={14} /> : <Trash2 size={15} />}
+                    <span>删除已选（{selectedDeletableSessionIds.length}）</span>
+                  </button>
+                ) : null}
+              </div>
+            </details>
+          </div>
         </div>
+        <button
+          aria-label={t('新建对话')}
+          className="ui-button ui-button--neutral browser-chat-new-chat-button"
+          disabled={busy || Boolean(loadingSessionId)}
+          onClick={() => void startNewConversation()}
+          title={t('新建对话')}
+          type="button"
+        >
+          <Plus size={16} />
+          <span>{t('新建对话')}</span>
+        </button>
         {recentSessions.length ? (
           <ol className="browser-chat-recent-list">
             {recentSessions.map((item) => (
@@ -4600,11 +4650,7 @@ export function BrowserChatWorkspace({
           stepsByIndex={stepsByIndex}
           totalStepCount={steps.length}
         />
-      ) : (
-        <div className="browser-chat-hero">
-          <h1>今天要做什么？</h1>
-        </div>
-      )}
+      ) : null}
 
       <div className="browser-chat-composer-shell">
         {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
@@ -4639,6 +4685,7 @@ export function BrowserChatWorkspace({
   );
 
   return (
+    <BrowserChatReasoningVisibilityContext.Provider value={showReasoning}>
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed' : 'browser-chat-layout'}>
       <aside className="browser-chat-sidebar">
         <div className="browser-chat-brand">
@@ -4823,11 +4870,7 @@ export function BrowserChatWorkspace({
                 stepsByIndex={stepsByIndex}
                 totalStepCount={steps.length}
               />
-            ) : (
-              <div className="browser-chat-hero">
-                <h1>今天要做什么？</h1>
-              </div>
-            )}
+            ) : null}
 
             <div className="browser-chat-composer-shell">
               {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
@@ -4920,5 +4963,6 @@ export function BrowserChatWorkspace({
         </div>
       ) : null}
     </section>
+    </BrowserChatReasoningVisibilityContext.Provider>
   );
 }

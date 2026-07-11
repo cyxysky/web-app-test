@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { skillContentSchema, type SkillRecord } from '@/server/ai/schemas/test-case.schema';
+import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/mock-store';
 
 type RouteContext = {
@@ -27,7 +27,7 @@ export async function PUT(request: NextRequest, context: RouteContext) {
 
   try {
     const body = await request.json();
-    const content = skillContentSchema.parse(body.content || {});
+    const content = parseSkillContent(body.content);
     const skill = store.upsertSkill({
       id: skillId,
       title: String(body.title || ''),

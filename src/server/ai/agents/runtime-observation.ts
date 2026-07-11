@@ -2,7 +2,7 @@ import type { ModelMessage } from 'ai';
 import type { BrowserActionResult, BrowserSnapshotView } from '@/server/browser/browser-session';
 
 export const runtimeObservationToolNames = new Set(['takeSnapshot', 'searchSnapshot']);
-export const staleSnapshotText = 'Stale: this old accessibility snapshot was replaced or invalidated by a browser action. Call takeSnapshot({mode:"actionable",maxChars:10000}) for fresh UIDs.';
+export const staleSnapshotText = 'Stale: this old semantic DOM snapshot was replaced or invalidated by a browser action. Call takeSnapshot({mode:"actionable",maxChars:10000}) for fresh UIDs.';
 export const runtimeObservationInvalidatingToolNames = new Set([
   'openPage',
   'mouse',
@@ -327,7 +327,7 @@ export function readStoredSnapshot(
 ): BrowserActionResult {
   const record = store?.get(observationStoreKey(runId));
   if (!record) {
-    return { ok: false, actual: 'No current accessibility snapshot is available for this run. Call takeSnapshot({mode:"actionable",maxChars:10000}) first.' };
+    return { ok: false, actual: 'No current semantic DOM snapshot is available for this run. Call takeSnapshot({mode:"actionable",maxChars:10000}) first.' };
   }
   if (record.stale) {
     return {

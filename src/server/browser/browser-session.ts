@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Frame, LaunchOptions, Page, Request, Worker as PlaywrightWorker } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
 import { normalizeDomNodeIdString, normalizeDomPathString } from '@/lib/dom-path';
 import { appDataRoot, artifactPath } from '@/server/storage/paths';
 import {
@@ -14,6 +14,7 @@ import {
   type SnapshotRecord,
   type SnapshotView,
 } from './ax-snapshot';
+import { captureDomSnapshot } from './dom-snapshot';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
   if (errorText === 'net::ERR_ABORTED' && /analytics|collector|apm|beacon|log|track/i.test(url)) return true;
@@ -115,6 +116,10 @@ export type BrowserActionResult = {
   ok: boolean;
   actual: string;
   observationViews?: BrowserSnapshotViews;
+  autoSnapshot?: {
+    generationId: string;
+    refreshed: boolean;
+  };
   debug?: {
     fullDomSnapshot?: string;
     fullDomSnapshotCharLength?: number;
@@ -421,6 +426,7 @@ type BrowserSimplifiedDomTreeResult = {
 
 type AiDomRuntime = {
   version: number;
+  mutationState: () => AiDomMutationStateSnapshot;
   isOverlay: (element: Element) => boolean;
   isTraversable: (element: Element) => boolean;
   isRenderable: (element: Element, options?: { requirePointerEvents?: boolean }) => boolean;
@@ -459,6 +465,72 @@ type AiDomRuntime = {
   visibleDomText: (ref: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
 };
 
+type AiDomMutationStateSnapshot = {
+  epoch: number;
+  lastMutationAt: number;
+};
+
+type BrowserInteractionCounts = Record<string, number>;
+
+type BrowserScrollPosition = {
+  descriptor: string;
+  left: number;
+  top: number;
+};
+
+type BrowserActionVerification = {
+  ok: boolean;
+  detail: string;
+};
+
+const aiDomMutationObserverScript = `(() => {
+  const win = window;
+  if (typeof win.__name !== 'function') {
+    Object.defineProperty(win, '__name', {
+      configurable: true,
+      enumerable: false,
+      value(target, value) {
+        try { Object.defineProperty(target, 'name', { configurable: true, value }); } catch {}
+        return target;
+      },
+    });
+  }
+  const state = win.__aiDomMutationState || { epoch: 0, lastMutationAt: Date.now() };
+  state.interactionCounts = state.interactionCounts || {};
+  state.interactionSequence = Number(state.interactionSequence) || 0;
+  win.__aiDomMutationState = state;
+  if (!state.observer) {
+    state.observer = new MutationObserver((mutations) => {
+      let meaningful = false;
+      for (const mutation of mutations) {
+        const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+        if (!target || !target.closest || !target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) {
+          meaningful = true;
+          break;
+        }
+      }
+      if (!meaningful) return;
+      state.epoch += 1;
+      state.lastMutationAt = Date.now();
+    });
+    state.observer.observe(document, { attributes: true, characterData: true, childList: true, subtree: true });
+  }
+  if (!state.interactionListenersInstalled) {
+    state.interactionListenersInstalled = true;
+    const markInteraction = (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target && target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) return;
+      state.interactionSequence += 1;
+      state.interactionCounts[event.type] = (state.interactionCounts[event.type] || 0) + 1;
+      state.lastInteractionType = event.type;
+      state.lastInteractionAt = Date.now();
+    };
+    for (const type of ['click', 'auxclick', 'contextmenu', 'dblclick', 'input', 'change', 'focusin', 'focusout', 'keydown', 'keyup', 'mousemove', 'mouseover', 'wheel', 'scroll', 'dragstart', 'dragover', 'drop']) {
+      document.addEventListener(type, markInteraction, { capture: true, passive: true });
+    }
+  }
+})()`;
+
 type SnapshotReference = {
   uid: string;
   generationId: string;
@@ -488,11 +560,15 @@ type SnapshotGeneration = {
   nodeCount: number;
   actionableCount: number;
   skippedFrameCount: number;
+  captureSource: 'dom-snapshot' | 'full-ax-fallback';
+  mutationEpochs: Record<string, number>;
   timings: {
     totalMs: number;
     captureAxMs: number;
+    captureDomMs: number;
     frameTreeMs: number;
     axTreeMs: number;
+    axEnrichmentMs: number;
     domFallbackMs: number;
   };
 };
@@ -523,10 +599,22 @@ export type BrowserKeyboardAction = {
   followByEnter?: boolean;
 };
 
+type ResolvedBrowserActionPoint = {
+  error?: string;
+  reference?: SnapshotReference;
+  point?: {
+    x: number;
+    y: number;
+    descriptor: string;
+    source: string;
+  };
+};
+
 type WindowWithAiDomRuntime = Window & {
   __aiBrowserPageRuntimeInstalled?: boolean;
   __aiGetEventListenerTypes?: (target: EventTarget) => string[];
   __aiDomRuntime?: AiDomRuntime;
+  __aiDomMutationState?: AiDomMutationStateSnapshot & { observer?: MutationObserver };
   __browserUseVisibleDomState?: {
     elementToRef: WeakMap<Element, string>;
     instanceId: string;
@@ -775,7 +863,7 @@ function installAccessibilitySnapshotExportControl() {
     button.type = 'button';
     button.textContent = '导出页面快照';
     button.title = '获取当前页面及全部 iframe 的无障碍树，并按每段 10000 字符导出 JSON';
-    button.setAttribute('aria-label', '导出当前页面无障碍树快照');
+    button.setAttribute('aria-label', '导出当前页面语义 DOM 快照');
     Object.assign(button.style, {
       alignItems: 'center',
       appearance: 'none',
@@ -863,7 +951,27 @@ function installAiBrowserPageRuntime() {
     win.__aiBrowserPageRuntimeInstalled = true;
   }
 
-  if (win.__aiDomRuntime?.version === 8) return;
+  const mutationState = win.__aiDomMutationState || { epoch: 0, lastMutationAt: Date.now() };
+  win.__aiDomMutationState = mutationState;
+  if (!mutationState.observer) {
+    mutationState.observer = new MutationObserver((mutations) => {
+      const meaningful = mutations.some((mutation) => {
+        const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+        return !target?.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__');
+      });
+      if (!meaningful) return;
+      mutationState.epoch += 1;
+      mutationState.lastMutationAt = Date.now();
+    });
+    mutationState.observer.observe(document, {
+      attributes: true,
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  if (win.__aiDomRuntime?.version === 9) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
@@ -2004,7 +2112,8 @@ function installAiBrowserPageRuntime() {
   }
 
   win.__aiDomRuntime = {
-    version: 8,
+    version: 9,
+    mutationState: () => ({ epoch: mutationState.epoch, lastMutationAt: mutationState.lastMutationAt }),
     isOverlay,
     isTraversable,
     isRenderable,
@@ -2966,7 +3075,7 @@ export class BrowserSession {
   private snapshotGenerationPromise?: Promise<SnapshotGeneration>;
   private snapshotGenerationSequence = 0;
   private snapshotUidSequence = 0;
-  private snapshotUidByIdentity = new Map<string, string>();
+  private snapshotUidByIdentity = new Map<string, { uid: string; lastSeenGeneration: number }>();
   private snapshotPageSequence = 0;
   private snapshotPageIds = new WeakMap<Page, string>();
   private accessibilitySnapshotExportControlInstalled = false;
@@ -3425,6 +3534,10 @@ export class BrowserSession {
   private async prepareContext(context: BrowserContext, options: { claimPages?: boolean } = {}) {
     if (!preparedContextInitScripts.has(context)) {
       preparedContextInitScripts.add(context);
+      await context.addInitScript({ content: aiDomMutationObserverScript }).catch((error) => {
+        preparedContextInitScripts.delete(context);
+        throw error;
+      });
       await context.addInitScript(installAiBrowserPageRuntime).catch((error) => {
         preparedContextInitScripts.delete(context);
         throw error;
@@ -3568,6 +3681,7 @@ export class BrowserSession {
   }
 
   private async ensureBrowserPageRuntime(target: Page | Frame = this.activePage) {
+    await target.evaluate(aiDomMutationObserverScript).catch(() => undefined);
     await target.evaluate(installAiBrowserPageRuntime).catch(() => undefined);
   }
 
@@ -3594,7 +3708,7 @@ export class BrowserSession {
           await source.page.bringToFront().catch(() => undefined);
         }
         const handler = this.accessibilitySnapshotExporter;
-        if (!handler) return { ok: false, error: 'Accessibility snapshot exporter is unavailable.' };
+        if (!handler) return { ok: false, error: 'Semantic DOM snapshot exporter is unavailable.' };
         try {
           return await handler();
         } catch (error) {
@@ -3765,6 +3879,7 @@ export class BrowserSession {
 
   // 打开目标页面，只等待导航提交；页面稳定与新快照由模型显式触发。
   async open(url: string): Promise<BrowserActionResult> {
+    const previousGeneration = this.snapshotGeneration;
     const beforeUrl = this.activePage.url();
     let navigationNote = '';
     try {
@@ -3781,8 +3896,7 @@ export class BrowserSession {
       navigationNote = ` Navigation reported an error before commit; continuing from current URL: ${currentUrl}.`;
     }
     void this.markPageGroup(this.activePage);
-    this.invalidateBrowserEvidence();
-    return { ok: true, actual: `Opened page: ${url}${navigationNote}` };
+    return this.completeActionWithSnapshot(`Opened page: ${url}${navigationNote}`, previousGeneration);
   }
 
   async readStructuredPageText() {
@@ -4418,16 +4532,17 @@ export class BrowserSession {
 
   // 切换到指定标签页，并把它设为后续操作的活动页。
   async switchTab(index: number): Promise<BrowserActionResult> {
+    const previousGeneration = this.snapshotGeneration;
     const page = this.sessionPages()[index];
     if (!page) return { ok: false, actual: `Tab ${index} not found.` };
     this.page = page;
     await page.bringToFront();
-    this.invalidateBrowserEvidence();
-    return { ok: true, actual: `Switched to tab ${index}: ${page.url()}` };
+    return this.completeActionWithSnapshot(`Switched to tab ${index}: ${page.url()}`, previousGeneration);
   }
 
   // 向当前焦点元素输入文本。
   async waitForPage(): Promise<BrowserActionResult> {
+    const previousGeneration = this.snapshotGeneration;
     const loadStateTimeoutMs = boundedPositiveIntegerEnv(
       'BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS',
       DEFAULT_BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS,
@@ -4444,15 +4559,14 @@ export class BrowserSession {
     );
     if (stableMs > 0) await this.waitForStableViewport(stableMs);
     const note = await this.manualVerificationNote();
-    this.invalidateBrowserEvidence();
-    return { ok: true, actual: `Page wait completed.${note}` };
+    return this.completeActionWithSnapshot(`Page wait completed.${note}`, previousGeneration);
   }
 
   // 等待固定时间，给短动画、下拉面板或异步更新留出渲染时间。
   async wait(ms = 800): Promise<BrowserActionResult> {
+    const previousGeneration = this.snapshotGeneration;
     await this.waitForStableViewport(Math.min(Math.max(ms, 100), 5000));
-    this.invalidateBrowserEvidence();
-    return { ok: true, actual: `Waited ${ms}ms.` };
+    return this.completeActionWithSnapshot(`Waited ${ms}ms.`, previousGeneration);
   }
 
   // 等待用户手动完成验证码/安全校验，超时后返回阻塞信息。
@@ -5249,18 +5363,39 @@ export class BrowserSession {
 
   private snapshotUid(page: Page, identity: string) {
     const key = `${this.snapshotPageId(page)}:${identity}`;
-    let uid = this.snapshotUidByIdentity.get(key);
-    if (!uid) {
-      uid = String(++this.snapshotUidSequence);
-      this.snapshotUidByIdentity.set(key, uid);
+    let entry = this.snapshotUidByIdentity.get(key);
+    if (!entry) {
+      entry = {
+        uid: String(++this.snapshotUidSequence),
+        lastSeenGeneration: this.snapshotGenerationSequence,
+      };
+      this.snapshotUidByIdentity.set(key, entry);
+    } else {
+      entry.lastSeenGeneration = this.snapshotGenerationSequence;
     }
-    return uid;
+    return entry.uid;
+  }
+
+  private pruneSnapshotUidMappings() {
+    const retentionGenerations = boundedPositiveIntegerEnv('SNAPSHOT_UID_RETENTION_GENERATIONS', 12, 2, 200);
+    const maxEntries = boundedPositiveIntegerEnv('SNAPSHOT_UID_MAX_ENTRIES', 20000, 1000, 200000);
+    const oldestGeneration = Math.max(0, this.snapshotGenerationSequence - retentionGenerations);
+    for (const [key, entry] of this.snapshotUidByIdentity) {
+      if (entry.lastSeenGeneration < oldestGeneration) this.snapshotUidByIdentity.delete(key);
+    }
+    if (this.snapshotUidByIdentity.size <= maxEntries) return;
+    const overflow = this.snapshotUidByIdentity.size - maxEntries;
+    const oldest = [...this.snapshotUidByIdentity.entries()]
+      .sort((left, right) => left[1].lastSeenGeneration - right[1].lastSeenGeneration)
+      .slice(0, overflow);
+    for (const [key] of oldest) this.snapshotUidByIdentity.delete(key);
   }
 
   private snapshotActionsForNode(node: SnapshotNodeWithUid) {
     const role = node.role.toLowerCase();
     const actions = new Set<string>();
-    if (node.actionable || snapshotRoleIsActionable(role)) actions.add('click');
+    if (snapshotRoleIsActionable(role) || node.properties.actions) actions.add('click');
+    if (node.properties.focusable) actions.add('focus');
     if (['textbox', 'searchbox', 'combobox', 'spinbutton'].includes(role)) {
       actions.add('focus');
       actions.add('type');
@@ -5279,13 +5414,19 @@ export class BrowserSession {
       selector: string;
       role: string;
       name: string;
+      value: string;
+      url: string;
+      properties: Record<string, string | number | boolean>;
       actions: string[];
       depth: number;
       actionable: boolean;
     };
-    const existing = new Set(axNodes
-      .filter((node) => node.actionable)
-      .map((node) => `${node.frameId}:${node.role.toLowerCase()}:${node.name.toLowerCase()}`));
+    const remainingAxDuplicates = new Map<string, number>();
+    for (const node of axNodes.filter((item) => item.actionable)) {
+      const key = `${node.frameId}:${node.role.toLowerCase()}:${node.name.toLowerCase()}`;
+      remainingAxDuplicates.set(key, (remainingAxDuplicates.get(key) || 0) + 1);
+    }
+    const fallbackIdentities = new Set<string>();
     const fallbackNodes: SnapshotNodeWithUid[] = [];
     const usedFrameIds = new Set<string>();
     for (const [frameIndex, frame] of playwrightFrames.entries()) {
@@ -5339,7 +5480,7 @@ export class BrowserSession {
         };
         const roleFor = (element: Element) => {
           const explicit = element.getAttribute('role');
-          if (explicit) return explicit;
+          if (explicit) return explicit.toLowerCase();
           const tag = element.tagName.toLowerCase();
           if (tag === 'a') return 'link';
           if (tag === 'button') return 'button';
@@ -5364,6 +5505,71 @@ export class BrowserSession {
           if (tag === 'form') return 'form';
           return 'generic';
         };
+        const normalize = (value: unknown) => String(value || '').replace(/\s+/g, ' ').trim();
+        const referencedText = (element: Element, attribute: string) => normalize(
+          (element.getAttribute(attribute) || '')
+            .split(/\s+/)
+            .filter(Boolean)
+            .map((id) => document.getElementById(id)?.textContent || '')
+            .join(' '),
+        );
+        const associatedLabel = (element: Element) => {
+          const field = element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+          const labels = 'labels' in field && field.labels ? Array.from(field.labels) : [];
+          const closest = element.closest('label');
+          if (closest && !labels.includes(closest as HTMLLabelElement)) labels.push(closest as HTMLLabelElement);
+          return normalize(labels.map((label) => label.textContent || '').join(' '));
+        };
+        const accessibleName = (element: Element, role: string, directText: string) => {
+          const tag = element.tagName.toLowerCase();
+          const type = (element.getAttribute('type') || '').toLowerCase();
+          const labelledBy = referencedText(element, 'aria-labelledby');
+          if (labelledBy) return labelledBy;
+          const ariaLabel = normalize(element.getAttribute('aria-label'));
+          if (ariaLabel) return ariaLabel;
+          const label = associatedLabel(element);
+          if (label) return label;
+          if (tag === 'img') {
+            const alt = normalize(element.getAttribute('alt'));
+            if (alt) return alt;
+          }
+          const text = normalize(element.textContent || directText);
+          if (text && (role !== 'generic' || ['a', 'button', 'label', 'summary'].includes(tag))) return text;
+          if (tag === 'input' && ['button', 'submit', 'reset'].includes(type)) {
+            const buttonValue = normalize((element as HTMLInputElement).value);
+            if (buttonValue) return buttonValue;
+          }
+          return normalize(
+            element.getAttribute('placeholder')
+            || element.getAttribute('title')
+            || element.getAttribute('name')
+            || directText,
+          );
+        };
+        const stateProperties = (element: Element) => {
+          const field = element as unknown as Record<string, unknown>;
+          const properties: Record<string, string | number | boolean> = {};
+          const booleanProperties = ['checked', 'disabled', 'multiple', 'readOnly', 'required', 'selected'] as const;
+          for (const property of booleanProperties) {
+            if (property in field && Boolean(field[property])) {
+              properties[property === 'readOnly' ? 'readonly' : property] = true;
+            }
+          }
+          for (const [attribute, property] of [
+            ['aria-checked', 'checked'],
+            ['aria-disabled', 'disabled'],
+            ['aria-expanded', 'expanded'],
+            ['aria-invalid', 'invalid'],
+            ['aria-pressed', 'pressed'],
+            ['aria-readonly', 'readonly'],
+            ['aria-required', 'required'],
+            ['aria-selected', 'selected'],
+          ] as const) {
+            const value = element.getAttribute(attribute);
+            if (value !== null && value !== 'false') properties[property] = value === 'true' ? true : value;
+          }
+          return properties;
+        };
         const results: FallbackCandidate[] = [];
         const stack = Array.from(document.children).reverse().map((element) => ({ element, depth: 0 }));
         while (stack.length) {
@@ -5383,43 +5589,65 @@ export class BrowserSession {
           const rect = element.getBoundingClientRect();
           const eventTypes = win.__aiGetEventListenerTypes?.(element) || [];
           const actions = new Set<string>();
+          const role = roleFor(element);
+          const inputType = tag === 'input' ? (element.getAttribute('type') || 'text').toLowerCase() : '';
+          const roleSupportsClick = new Set([
+            'button', 'checkbox', 'gridcell', 'link', 'listbox', 'menuitem', 'menuitemcheckbox',
+            'menuitemradio', 'option', 'radio', 'scrollbar', 'slider', 'switch', 'tab', 'treeitem',
+          ]).has(role);
           if (
             tag === 'a'
             || tag === 'button'
+            || (tag === 'input' && ['button', 'checkbox', 'color', 'file', 'image', 'radio', 'range', 'reset', 'submit'].includes(inputType))
             || element.hasAttribute('onclick')
             || typeof (element as HTMLElement).onclick === 'function'
             || eventTypes.some((event) => ['click', 'mousedown', 'pointerdown'].includes(event))
             || element.hasAttribute('data-action')
             || element.hasAttribute('data-click')
+            || roleSupportsClick
           ) actions.add('click');
-          if (['input', 'textarea', 'select'].includes(tag) || element.getAttribute('contenteditable') === 'true') {
+          if (
+            tag === 'textarea'
+            || (tag === 'input' && !['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes(inputType))
+            || element.getAttribute('contenteditable') === 'true'
+            || ['textbox', 'searchbox', 'spinbutton'].includes(role)
+          ) {
             actions.add('focus');
             actions.add('type');
           }
-          if (!actions.size && (element.hasAttribute('role') || element.hasAttribute('tabindex'))) actions.add('click');
-          const actionable = actions.size > 0 && style.pointerEvents !== 'none' && rect.width > 0 && rect.height > 0;
+          if (tag === 'select' || role === 'combobox') {
+            actions.add('click');
+            actions.add('focus');
+          }
+          if (element.hasAttribute('tabindex') && !['list', 'listitem', 'row', 'rowgroup', 'table'].includes(role)) {
+            actions.add('focus');
+          }
+          const properties = stateProperties(element);
+          const actionable = actions.size > 0
+            && properties.disabled !== true
+            && style.pointerEvents !== 'none'
+            && rect.width > 0
+            && rect.height > 0;
           const directText = Array.from(element.childNodes)
             .filter((node) => node.nodeType === Node.TEXT_NODE)
             .map((node) => node.textContent || '')
             .join(' ')
             .replace(/\s+/g, ' ')
             .trim();
-          const role = roleFor(element);
           const semantic = includeSemantic && (role !== 'generic' || directText.length > 0);
           if (!actionable && !semantic) continue;
-          const name = String(
-            element.getAttribute('aria-label')
-            || element.getAttribute('placeholder')
-            || element.getAttribute('title')
-            || (element as HTMLInputElement).value
-            || (actionable || role !== 'generic' ? element.textContent : directText)
-            || '',
-          ).replace(/\s+/g, ' ').trim().slice(0, 300);
+          const name = accessibleName(element, role, directText).slice(0, 300);
+          const field = element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+          const value = ['input', 'select', 'textarea'].includes(tag) ? normalize(field.value).slice(0, 300) : '';
+          const url = tag === 'a' ? String((element as HTMLAnchorElement).href || '') : '';
           if (!name && !actionable) continue;
           results.push({
             selector: selectorFor(element),
             role,
             name,
+            value,
+            url,
+            properties,
             actions: [...actions],
             depth: Math.min(64, depth),
             actionable,
@@ -5430,8 +5658,13 @@ export class BrowserSession {
 
       for (const candidate of candidates) {
         const duplicateKey = `${frameInfo.frameId}:${candidate.role.toLowerCase()}:${candidate.name.toLowerCase()}`;
-        if (candidate.name && existing.has(duplicateKey)) continue;
+        const remainingDuplicates = remainingAxDuplicates.get(duplicateKey) || 0;
+        if (remainingDuplicates > 0) {
+          remainingAxDuplicates.set(duplicateKey, remainingDuplicates - 1);
+          continue;
+        }
         const identity = `${frameInfo.documentId}:${frameInfo.frameId}:dom:${candidate.selector}`;
+        if (fallbackIdentities.has(identity)) continue;
         const node: SnapshotNodeWithUid = {
           identity,
           uid: this.snapshotUid(page, identity),
@@ -5449,40 +5682,79 @@ export class BrowserSession {
           role: candidate.role,
           name: candidate.name,
           description: '',
-          value: '',
-          url: '',
-          properties: {},
+          value: candidate.value,
+          url: candidate.url,
+          properties: candidate.properties,
           actionable: candidate.actionable,
           actions: candidate.actions,
         };
         fallbackNodes.push(node);
-        existing.add(duplicateKey);
+        fallbackIdentities.add(identity);
       }
     }
     return fallbackNodes;
   }
 
-  private async buildSnapshotGeneration(): Promise<SnapshotGeneration> {
+  private async buildSnapshotGeneration(retryAfterMutation = false): Promise<SnapshotGeneration> {
     const startedAt = Date.now();
     const page = this.activePage;
     const id = `snapshot-${++this.snapshotGenerationSequence}`;
     const visibleFrameTargets = await this.snapshotFrameTargets();
+    const mutationEpochsBefore = await this.readSnapshotMutationEpochs(visibleFrameTargets);
     const visiblePlaywrightFrames = visibleFrameTargets.map((target) => target.frame);
     const allowedFrameIds = new Set(visiblePlaywrightFrames
       .map((frame) => (frame as unknown as { _id?: string })._id)
       .filter((frameId): frameId is string => Boolean(frameId)));
-    const captured = await captureAxSnapshot(page, allowedFrameIds.size ? allowedFrameIds : undefined);
-    const axNodes = captured.nodes.map((node): SnapshotNodeWithUid => ({
-      ...node,
-      uid: this.snapshotUid(page, node.identity),
-      source: 'ax',
-      actions: this.snapshotActionsForNode({ ...node, uid: '' }),
-    }));
+    const framePathById = new Map(visiblePlaywrightFrames.map((frame) => [
+      (frame as unknown as { _id?: string })._id || '',
+      frame === page.mainFrame() ? undefined : this.getFramePath(frame),
+    ]));
+    let frames: CapturedSnapshotFrame[];
+    let primaryNodes: SnapshotNodeWithUid[];
+    let skippedFrameCount = 0;
+    let captureAxMs = 0;
+    let captureDomMs = 0;
+    let frameTreeMs = 0;
+    let axTreeMs = 0;
+    let axEnrichmentMs = 0;
+    let captureSource: SnapshotGeneration['captureSource'] = 'dom-snapshot';
+    try {
+      const capturedDom = await captureDomSnapshot(page, {
+        axCandidateLimit: boundedNonNegativeIntegerEnv('DOM_SNAPSHOT_AX_CANDIDATE_LIMIT', 200, 500),
+      });
+      frames = capturedDom.frames.filter((frame) => !allowedFrameIds.size || allowedFrameIds.has(frame.frameId));
+      primaryNodes = capturedDom.nodes
+        .filter((node) => !allowedFrameIds.size || allowedFrameIds.has(node.frameId))
+        .map((node): SnapshotNodeWithUid => ({
+          ...node,
+          uid: this.snapshotUid(page, node.identity),
+          framePath: framePathById.get(node.frameId),
+        }));
+      skippedFrameCount = capturedDom.skippedFrames.length;
+      captureDomMs = capturedDom.timings.domSnapshotMs;
+      frameTreeMs = capturedDom.timings.frameTreeMs;
+      axEnrichmentMs = capturedDom.timings.axEnrichmentMs;
+    } catch {
+      captureSource = 'full-ax-fallback';
+      const capturedAx = await captureAxSnapshot(page, allowedFrameIds.size ? allowedFrameIds : undefined);
+      frames = capturedAx.frames;
+      primaryNodes = capturedAx.nodes.map((node): SnapshotNodeWithUid => ({
+        ...node,
+        uid: this.snapshotUid(page, node.identity),
+        source: 'ax',
+        framePath: framePathById.get(node.frameId),
+        actions: this.snapshotActionsForNode({ ...node, uid: '' }),
+      }));
+      skippedFrameCount = capturedAx.skippedFrames.length;
+      captureAxMs = capturedAx.timings.totalMs;
+      frameTreeMs = capturedAx.timings.frameTreeMs;
+      axTreeMs = capturedAx.timings.axTreeMs;
+    }
     const fallbackStartedAt = Date.now();
-    const domFallback = await this.collectSnapshotDomFallback(page, captured.frames, axNodes, visiblePlaywrightFrames);
+    const domFallback = await this.collectSnapshotDomFallback(page, frames, primaryNodes, visiblePlaywrightFrames);
     const domFallbackMs = Date.now() - fallbackStartedAt;
-    const nodes = [...axNodes, ...domFallback];
-    const views = buildSnapshotViews(captured.frames, nodes);
+    const nodes = [...primaryNodes, ...domFallback];
+    const views = buildSnapshotViews(frames, nodes);
     const references = new Map<string, SnapshotReference>();
     for (const node of nodes) {
       references.set(node.uid, {
@@ -5503,22 +5775,33 @@ export class BrowserSession {
         actions: node.actions || this.snapshotActionsForNode(node),
       });
     }
+    const mutationEpochs = await this.readSnapshotMutationEpochs(visibleFrameTargets);
+    const mutationChangedDuringCapture = Object.keys(mutationEpochsBefore).length !== Object.keys(mutationEpochs).length
+      || Object.keys(mutationEpochs).some((key) => mutationEpochs[key] !== mutationEpochsBefore[key]);
+    if (mutationChangedDuringCapture && !retryAfterMutation) {
+      return this.buildSnapshotGeneration(true);
+    }
+    this.pruneSnapshotUidMappings();
     return {
       id,
       createdAt: new Date().toISOString(),
       page,
       url: page.url(),
-      frames: captured.frames,
+      frames,
       references,
       views,
       nodeCount: nodes.length,
       actionableCount: nodes.filter((node) => node.actionable).length,
-      skippedFrameCount: captured.skippedFrames.length,
+      skippedFrameCount,
+      captureSource,
+      mutationEpochs,
       timings: {
         totalMs: Date.now() - startedAt,
-        captureAxMs: captured.timings.totalMs,
-        frameTreeMs: captured.timings.frameTreeMs,
-        axTreeMs: captured.timings.axTreeMs,
+        captureAxMs,
+        captureDomMs,
+        frameTreeMs,
+        axTreeMs,
+        axEnrichmentMs,
         domFallbackMs,
       },
     };
@@ -5547,9 +5830,202 @@ export class BrowserSession {
     this.snapshotGenerationPromise = undefined;
   }
 
-  private invalidateBrowserEvidence() {
-    this.invalidateSnapshotGeneration();
+  private snapshotMutationKey(target: { frame: Frame; framePath?: string }) {
+    return target.framePath || 'main';
+  }
+
+  private async readSnapshotMutationEpochs(
+    targets?: Array<{ frame: Frame; framePath?: string; frameUrl?: string }>,
+  ) {
+    const frameTargets = targets || await this.snapshotFrameTargets();
+    const entries = await Promise.all(frameTargets.map(async (target) => {
+      await this.ensureBrowserPageRuntime(target.frame);
+      const state = await target.frame.evaluate(() => (
+        (window as WindowWithAiDomRuntime).__aiDomMutationState || { epoch: 0, lastMutationAt: 0 }
+      )).catch(() => ({ epoch: -1, lastMutationAt: 0 }));
+      return [this.snapshotMutationKey(target), state.epoch] as const;
+    }));
+    return Object.fromEntries(entries);
+  }
+
+  private async snapshotMutationChanged(generation: SnapshotGeneration) {
+    if (generation.page !== this.activePage || generation.url !== this.activePage.url()) return true;
+    const current = await this.readSnapshotMutationEpochs();
+    const previousKeys = Object.keys(generation.mutationEpochs);
+    const currentKeys = Object.keys(current);
+    if (previousKeys.length !== currentKeys.length) return true;
+    return currentKeys.some((key) => current[key] !== generation.mutationEpochs[key]);
+  }
+
+  private snapshotViewText(generation: SnapshotGeneration, mode: SnapshotView) {
+    const content = generation.views[mode].map((record) => record.line).join('\n');
+    if (content) return content;
+    if (mode === 'actionable') return '[no actionable accessibility nodes in the current page snapshot]';
+    if (mode === 'text') return '[no accessible page text in the current snapshot]';
+    return '[empty semantic DOM snapshot]';
+  }
+
+  private snapshotObservationViews(generation: SnapshotGeneration): BrowserSnapshotViews {
+    return {
+      defaultType: 'actionable',
+      actionable: this.snapshotViewText(generation, 'actionable'),
+      full: this.snapshotViewText(generation, 'full'),
+      text: this.snapshotViewText(generation, 'text'),
+    };
+  }
+
+  currentSnapshotObservationViews() {
+    const generation = this.snapshotGeneration;
+    if (!generation || generation.page !== this.activePage || generation.url !== this.activePage.url()) return undefined;
+    return this.snapshotObservationViews(generation);
+  }
+
+  private async readInteractionCounts(): Promise<BrowserInteractionCounts> {
+    const frames = [...new Set(this.sessionPages().flatMap((page) => page.frames()))];
+    const records = await Promise.all(frames.map((frame) => frame.evaluate(() => {
+      const state = (window as Window & {
+        __aiDomMutationState?: { interactionCounts?: Record<string, number> };
+      }).__aiDomMutationState;
+      return state?.interactionCounts || {};
+    }).catch(() => ({} as BrowserInteractionCounts))));
+    const totals: BrowserInteractionCounts = {};
+    for (const record of records) {
+      for (const [type, count] of Object.entries(record)) {
+        totals[type] = (totals[type] || 0) + Number(count || 0);
+      }
+    }
+    return totals;
+  }
+
+  private interactionDelta(before: BrowserInteractionCounts, after: BrowserInteractionCounts, ...types: string[]) {
+    return types.reduce((total, type) => total + Math.max(0, (after[type] || 0) - (before[type] || 0)), 0);
+  }
+
+  private async completeVerifiedAction(
+    actual: string,
+    previousGeneration: SnapshotGeneration | undefined,
+    verify: () => Promise<BrowserActionVerification>,
+  ): Promise<BrowserActionResult> {
+    await this.activePage.waitForTimeout(40).catch(() => undefined);
+    let verification: BrowserActionVerification;
+    try {
+      verification = await verify();
+    } catch (error) {
+      verification = { ok: false, detail: `verification failed: ${unknownErrorMessage(error)}` };
+    }
+    const result = await this.completeActionWithSnapshot(
+      `${actual} Post-action check: ${verification.detail}`,
+      previousGeneration,
+    );
+    return verification.ok ? result : { ...result, ok: false };
+  }
+
+  private async readScrollPosition(
+    locator: Locator | undefined,
+    point?: { x: number; y: number },
+  ): Promise<BrowserScrollPosition | undefined> {
+    const read = (start: Element | null): BrowserScrollPosition | undefined => {
+      const describe = (element: Element) => {
+        const tag = element.tagName.toLowerCase();
+        return `${tag}${element.id ? `#${element.id}` : ''}`;
+      };
+      let current = start;
+      while (current) {
+        const element = current as HTMLElement;
+        if (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth) {
+          return { descriptor: describe(element), left: element.scrollLeft, top: element.scrollTop };
+        }
+        current = current.parentElement;
+      }
+      const scrolling = document.scrollingElement;
+      if (!scrolling) return undefined;
+      return {
+        descriptor: describe(scrolling),
+        left: scrolling.scrollLeft,
+        top: scrolling.scrollTop,
+      };
+    };
+    if (locator) return locator.evaluate(read).catch(() => undefined);
+    return this.activePage.evaluate(({ x, y }): BrowserScrollPosition | undefined => {
+      const describe = (element: Element) => `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ''}`;
+      let current = document.elementFromPoint(x, y);
+      while (current) {
+        const element = current as HTMLElement;
+        if (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth) {
+          return { descriptor: describe(element), left: element.scrollLeft, top: element.scrollTop };
+        }
+        current = current.parentElement;
+      }
+      const scrolling = document.scrollingElement;
+      return scrolling
+        ? { descriptor: describe(scrolling), left: scrolling.scrollLeft, top: scrolling.scrollTop }
+        : undefined;
+    }, point || { x: 1, y: 1 }).catch(() => undefined);
+  }
+
+  private async editableValue(locator: Locator | undefined) {
+    if (!locator) return undefined;
+    return locator.evaluate((element) => {
+      const field = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+      return 'value' in field ? String(field.value) : String(element.textContent || '');
+    }).catch(() => undefined);
+  }
+
+  private async viewportDragTarget(page: Page, x: number, y: number, source: boolean) {
+    const handle = await page.evaluateHandle(({ pointX, pointY, dragSource }) => {
+      const hit = document.elementFromPoint(pointX, pointY);
+      return dragSource ? hit?.closest('[draggable="true"]') || hit : hit;
+    }, { pointX: x, pointY: y, dragSource: source }).catch(() => undefined);
+    const element = handle?.asElement() as ElementHandle<Element> | null | undefined;
+    if (!element) await handle?.dispose().catch(() => undefined);
+    return element || undefined;
+  }
+
+  private async dispatchHtml5Drag(
+    page: Page,
+    source: Locator | ElementHandle<Element>,
+    destination: Locator | ElementHandle<Element>,
+  ) {
+    const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
+    try {
+      await source.dispatchEvent('dragstart', { dataTransfer });
+      await destination.dispatchEvent('dragenter', { dataTransfer });
+      await destination.dispatchEvent('dragover', { dataTransfer });
+      await destination.dispatchEvent('drop', { dataTransfer });
+      await source.dispatchEvent('dragend', { dataTransfer });
+    } finally {
+      await dataTransfer.dispose();
+    }
+  }
+
+  private async completeActionWithSnapshot(
+    actual: string,
+    previousGeneration: SnapshotGeneration | undefined,
+  ): Promise<BrowserActionResult> {
     this.lastScreenshotMetrics = undefined;
+    await this.activePage.waitForTimeout(60).catch(() => undefined);
+    try {
+      const baselineGeneration = this.snapshotGeneration || previousGeneration;
+      const changed = baselineGeneration
+        ? await this.snapshotMutationChanged(baselineGeneration).catch(() => true)
+        : true;
+      const shouldRefresh = !baselineGeneration || changed;
+      const generation = shouldRefresh
+        ? await this.ensureSnapshotGeneration(true)
+        : baselineGeneration;
+      if (!shouldRefresh) this.snapshotGeneration = baselineGeneration;
+      return {
+        ok: true,
+        actual: `${actual} Semantic DOM snapshot ${generation.id} is current (${shouldRefresh ? 'refreshed' : 'reused; no page-state change detected'}).`,
+        autoSnapshot: { generationId: generation.id, refreshed: shouldRefresh },
+      };
+    } catch (error) {
+      this.invalidateSnapshotGeneration();
+      return {
+        ok: true,
+        actual: `${actual} Automatic semantic DOM snapshot refresh was unavailable: ${unknownErrorMessage(error)}`,
+      };
+    }
   }
 
   async readSnapshotSlice(options: {
@@ -5579,7 +6055,7 @@ export class BrowserSession {
       ? '[no actionable accessibility nodes in the current page snapshot]'
       : mode === 'text'
         ? '[no accessible page text in the current snapshot]'
-        : '[empty accessibility snapshot]';
+        : '[empty semantic DOM snapshot]';
     const content = lines.join('\n') || empty;
     return {
       content,
@@ -5595,37 +6071,60 @@ export class BrowserSession {
       actionableCount: generation.actionableCount,
       frameCount: generation.frames.length,
       skippedFrameCount: generation.skippedFrameCount,
+      captureSource: generation.captureSource,
       timings: { ...generation.timings, readSliceMs: Date.now() - startedAt },
     };
   }
 
   async searchSnapshot(input: { query: string; roles?: string[]; limit?: number }): Promise<BrowserActionResult> {
-    const query = input.query.replace(/\s+/g, ' ').trim().toLowerCase();
+    const normalizeSearchText = (value: unknown) => String(value || '')
+      .normalize('NFKC')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    const query = normalizeSearchText(input.query);
     if (!query) return { ok: false, actual: 'Snapshot search requires a non-empty query.' };
-    const generation = await this.ensureSnapshotGeneration(false);
-    const roles = new Set((input.roles || []).map((role) => role.toLowerCase()));
+    let generation = await this.ensureSnapshotGeneration(false);
+    if (await this.snapshotMutationChanged(generation).catch(() => false)) {
+      generation = await this.ensureSnapshotGeneration(true);
+    }
+    const roles = new Set((input.roles || []).map(normalizeSearchText));
+    const queryParts = query.split(/\s+/).filter(Boolean);
     const limit = Math.min(100, Math.max(1, Math.floor(Number(input.limit) || 20)));
+    const mainFrameId = generation.frames[0]?.frameId;
     const matches = generation.views.full
-      .filter((record) => {
+      .map((record, index) => ({ record, index }))
+      .filter(({ record }) => {
         if (roles.size && !roles.has(String(record.role || '').toLowerCase())) return false;
-        return [record.name, record.url, record.line].some((value) => String(value || '').toLowerCase().includes(query));
+        const searchable = normalizeSearchText([record.name, record.url, record.line].filter(Boolean).join(' '));
+        return searchable.includes(query) || queryParts.every((part) => searchable.includes(part));
       })
       .sort((left, right) => {
         const score = (record: SnapshotRecord) => {
-          const name = String(record.name || '').toLowerCase();
-          if (name === query) return 100;
-          if (name.startsWith(query)) return 80;
-          if (name.includes(query)) return 60;
-          return record.actionable ? 30 : 10;
+          const name = normalizeSearchText(record.name);
+          const url = normalizeSearchText(record.url);
+          const line = normalizeSearchText(record.line);
+          let value = 0;
+          if (name === query) value += 140;
+          else if (name.startsWith(query)) value += 110;
+          else if (name.includes(query)) value += 85;
+          else if (queryParts.length > 1 && queryParts.every((part) => name.includes(part))) value += 72;
+          else if (url.includes(query)) value += 45;
+          else if (line.includes(query)) value += 35;
+          if (record.actionable) value += 30;
+          if (record.frameId === mainFrameId) value += 6;
+          if (/\b(?:focused|selected|modal)=true\b/.test(line)) value += 12;
+          if (/\bdisabled=true\b/.test(line)) value -= 35;
+          return value;
         };
-        return score(right) - score(left);
+        return score(right.record) - score(left.record) || left.index - right.index;
       })
       .slice(0, limit);
     return {
       ok: true,
       actual: [
         `Snapshot ${generation.id} search for "${input.query}" returned ${matches.length} result(s). Only UIDs from this current snapshot are actionable.`,
-        matches.map((record) => record.line).join('\n') || '[no snapshot matches]',
+        matches.map(({ record }) => record.line).join('\n') || '[no snapshot matches]',
       ].join('\n'),
     };
   }
@@ -5642,35 +6141,183 @@ export class BrowserSession {
     return { reference };
   }
 
+  private async snapshotReferenceLocator(reference: SnapshotReference) {
+    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
+    if (!frame) return undefined;
+    if (reference.selector) {
+      const locator = frame.locator(reference.selector);
+      return await locator.count().catch(() => 0) === 1 ? locator : undefined;
+    }
+    if (!reference.name || !snapshotRoleIsActionable(reference.role)) return undefined;
+    const locator = frame.getByRole(
+      reference.role as Parameters<Frame['getByRole']>[0],
+      { name: reference.name, exact: true },
+    );
+    return await locator.count().catch(() => 0) === 1 ? locator : undefined;
+  }
+
+  private async validateLocatorActionPoint(
+    locator: Locator,
+    reference: SnapshotReference,
+    allowNonActionable: boolean,
+  ) {
+    await locator.scrollIntoViewIfNeeded().catch(() => undefined);
+    if (!await locator.isVisible().catch(() => false)) {
+      return { error: `UID ${reference.uid} is no longer visible.` };
+    }
+    if (!allowNonActionable && !await locator.isEnabled().catch(() => false)) {
+      return { error: `UID ${reference.uid} is disabled and cannot receive an action.` };
+    }
+    const ariaSnapshot = await locator.ariaSnapshot().catch(() => '');
+    let validationError = '';
+    const validation = await locator.evaluate((element) => {
+      const target = element as HTMLElement;
+      const style = window.getComputedStyle(target);
+      const disabled = Boolean(
+        (target as HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).disabled
+        || target.getAttribute('aria-disabled') === 'true',
+      );
+      const rect = target.getBoundingClientRect();
+      const ratios = [
+        [0.5, 0.5], [0.2, 0.5], [0.8, 0.5], [0.5, 0.2], [0.5, 0.8],
+        [0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8],
+      ];
+      let point: number[] | undefined;
+      for (const ratio of ratios) {
+        const xRatio = ratio[0];
+        const yRatio = ratio[1];
+        const x = Math.min(window.innerWidth - 1, Math.max(0, rect.left + rect.width * xRatio));
+        const y = Math.min(window.innerHeight - 1, Math.max(0, rect.top + rect.height * yRatio));
+        let top: Element | undefined;
+        for (const candidate of document.elementsFromPoint(x, y)) {
+          if (candidate.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) continue;
+          const candidateStyle = window.getComputedStyle(candidate);
+          if (candidateStyle.display !== 'none' && candidateStyle.visibility !== 'hidden') {
+            top = candidate;
+            break;
+          }
+        }
+        let current: Element | null | undefined = top;
+        for (let guard = 0; current && guard < 64; guard += 1) {
+          if (current === target) {
+            point = ratio;
+            break;
+          }
+          const root = current.getRootNode();
+          current = current.parentElement || (root instanceof ShadowRoot ? root.host : null);
+        }
+        if (point) break;
+      }
+      return {
+        connected: target.isConnected,
+        disabled,
+        visible: rect.width > 0
+          && rect.height > 0
+          && style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && style.visibility !== 'collapse'
+          && Number(style.opacity || '1') > 0.01,
+        point,
+      };
+    }).catch((error) => {
+      validationError = unknownErrorMessage(error);
+      return undefined;
+    });
+    if (!validation) {
+      return { error: `UID ${reference.uid} could not be validated before action: ${validationError || 'unknown Playwright locator error'}.` };
+    }
+    if (!validation?.connected || !validation.visible) {
+      return { error: `UID ${reference.uid} is detached or no longer rendered.` };
+    }
+    if (!allowNonActionable && validation.disabled) {
+      return { error: `UID ${reference.uid} is disabled and cannot receive an action.` };
+    }
+    if (!validation.point) {
+      return { error: `UID ${reference.uid} is covered by another rendered element.` };
+    }
+    const box = await locator.boundingBox().catch(() => undefined);
+    if (!box || box.width <= 0 || box.height <= 0) {
+      return { error: `UID ${reference.uid} no longer has a rendered box.` };
+    }
+    const [xRatio, yRatio] = validation.point;
+    return {
+      point: {
+        x: Math.round(box.x + box.width * xRatio),
+        y: Math.round(box.y + box.height * yRatio),
+        descriptor: `${reference.role} "${reference.name}"${ariaSnapshot ? ' (Playwright accessibility match)' : ''}`,
+        source: 'playwright-accessibility',
+      },
+    };
+  }
+
   private async resolveSnapshotReferencePoint(uid: string, allowNonActionable = false) {
+    const previousGeneration = this.snapshotGeneration;
+    if (previousGeneration && await this.snapshotMutationChanged(previousGeneration).catch(() => true)) {
+      let refreshedGeneration: SnapshotGeneration;
+      try {
+        refreshedGeneration = await this.ensureSnapshotGeneration(true);
+      } catch (error) {
+        return { error: `UID ${uid} could not be refreshed after the page changed: ${unknownErrorMessage(error)}` };
+      }
+      const previousReference = previousGeneration.references.get(String(uid));
+      const refreshedReference = refreshedGeneration.references.get(String(uid));
+      if (!previousReference || !refreshedReference) {
+        return { error: `UID ${uid} is stale because its DOM node no longer exists in the refreshed snapshot. Capture a fresh snapshot and choose the current target.` };
+      }
+      const previousRole = previousReference.role.trim().toLowerCase();
+      const refreshedRole = refreshedReference.role.trim().toLowerCase();
+      const previousName = previousReference.name.replace(/\s+/g, ' ').trim();
+      const refreshedName = refreshedReference.name.replace(/\s+/g, ' ').trim();
+      if (previousRole !== refreshedRole || previousName !== refreshedName) {
+        return {
+          error: `UID ${uid} is stale because the target semantics changed from ${previousReference.role} "${previousName}" to ${refreshedReference.role} "${refreshedName}". Capture a fresh snapshot and confirm the target.`,
+        };
+      }
+    }
     const resolved = this.currentSnapshotReference(uid);
     if (!resolved.reference) return { error: resolved.error };
     const reference = resolved.reference;
     if (!allowNonActionable && !reference.actionable) {
       return { error: `UID ${uid} (${reference.role} "${reference.name}") is structural text, not an actionable control.` };
     }
-    if (reference.selector) {
-      const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
-      if (!frame) return { error: `The frame for UID ${uid} is no longer attached.` };
-      const locator = frame.locator(reference.selector).first();
-      await locator.scrollIntoViewIfNeeded().catch(() => undefined);
-      const box = await locator.boundingBox().catch(() => undefined);
-      if (!box || box.width <= 0 || box.height <= 0) return { error: `UID ${uid} no longer has a rendered box.` };
-      return {
-        reference,
-        point: {
-          x: Math.round(box.x + box.width / 2),
-          y: Math.round(box.y + box.height / 2),
-          descriptor: `${reference.role} "${reference.name}"`,
-          source: 'dom-fallback',
-        },
-      };
+    const locator = await this.snapshotReferenceLocator(reference);
+    if (locator) {
+      const validated = await this.validateLocatorActionPoint(locator, reference, allowNonActionable);
+      if (!validated.point) return { error: validated.error };
+      return { reference, point: validated.point };
     }
     if (!reference.backendDOMNodeId) {
       return { error: `UID ${uid} has no backing DOM node and cannot receive a mouse or keyboard action.` };
     }
     const client = await this.activePage.context().newCDPSession(this.activePage);
+    let targetObjectId: string | undefined;
     try {
+      const resolvedTarget = await client.send('DOM.resolveNode', {
+        backendNodeId: reference.backendDOMNodeId,
+      }) as { object?: { objectId?: string } };
+      targetObjectId = resolvedTarget.object?.objectId;
+      if (!targetObjectId) return { error: `UID ${uid} no longer resolves to a live DOM element.` };
+      const stateResult = await client.send('Runtime.callFunctionOn', {
+        objectId: targetObjectId,
+        functionDeclaration: `function () {
+          const element = this;
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return {
+            connected: element.isConnected,
+            disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
+            visible: rect.width > 0 && rect.height > 0
+              && style.display !== 'none'
+              && style.visibility !== 'hidden'
+              && style.visibility !== 'collapse'
+              && Number(style.opacity || '1') > 0.01,
+          };
+        }`,
+        returnByValue: true,
+      }) as { result?: { value?: { connected?: boolean; disabled?: boolean; visible?: boolean } } };
+      const state = stateResult.result?.value;
+      if (!state?.connected || !state.visible) return { error: `UID ${uid} is detached or no longer rendered.` };
+      if (!allowNonActionable && state.disabled) return { error: `UID ${uid} is disabled and cannot receive an action.` };
       await client.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: reference.backendDOMNodeId });
       const result = await client.send('DOM.getContentQuads', { backendNodeId: reference.backendDOMNodeId }) as { quads?: number[][] };
       const quads = (result.quads || []).filter((quad) => quad.length >= 8);
@@ -5682,24 +6329,69 @@ export class BrowserSession {
         return area(right) - area(left);
       })[0];
       if (!quad) return { error: `UID ${uid} no longer has a rendered content quad.` };
-      const x = Math.round((quad[0] + quad[2] + quad[4] + quad[6]) / 4);
-      const y = Math.round((quad[1] + quad[3] + quad[5] + quad[7]) / 4);
       const viewport = await this.getViewportMetrics();
-      if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
-        return { error: `UID ${uid} was scrolled but resolved outside the viewport at (${x}, ${y}).` };
+      const center = {
+        x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
+        y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
+      };
+      const candidates = [center, ...[0, 2, 4, 6].map((index) => ({
+        x: center.x * 0.7 + quad[index] * 0.3,
+        y: center.y * 0.7 + quad[index + 1] * 0.3,
+      }))];
+      let actionablePoint: { x: number; y: number } | undefined;
+      for (const candidate of candidates) {
+        const x = Math.round(candidate.x);
+        const y = Math.round(candidate.y);
+        if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) continue;
+        const hit = await client.send('DOM.getNodeForLocation', {
+          x,
+          y,
+          includeUserAgentShadowDOM: true,
+        }).catch(() => undefined) as { backendNodeId?: number } | undefined;
+        if (!hit?.backendNodeId) continue;
+        if (hit.backendNodeId === reference.backendDOMNodeId) {
+          actionablePoint = { x, y };
+          break;
+        }
+        const resolvedHit = await client.send('DOM.resolveNode', { backendNodeId: hit.backendNodeId })
+          .catch(() => undefined) as { object?: { objectId?: string } } | undefined;
+        const hitObjectId = resolvedHit?.object?.objectId;
+        if (!hitObjectId) continue;
+        const containsResult = await client.send('Runtime.callFunctionOn', {
+          objectId: targetObjectId,
+          functionDeclaration: `function (hit) {
+            if (!hit) return false;
+            let current = hit;
+            for (let guard = 0; current && guard < 64; guard += 1) {
+              if (current === this) return true;
+              const root = current.getRootNode ? current.getRootNode() : null;
+              current = current.parentElement || (root && root.host) || null;
+            }
+            return false;
+          }`,
+          arguments: [{ objectId: hitObjectId }],
+          returnByValue: true,
+        }).catch(() => undefined) as { result?: { value?: boolean } } | undefined;
+        await client.send('Runtime.releaseObject', { objectId: hitObjectId }).catch(() => undefined);
+        if (containsResult?.result?.value) {
+          actionablePoint = { x, y };
+          break;
+        }
       }
+      if (!actionablePoint) return { error: `UID ${uid} is covered by another rendered element.` };
       return {
         reference,
         point: {
-          x,
-          y,
+          x: actionablePoint.x,
+          y: actionablePoint.y,
           descriptor: `${reference.role} "${reference.name}"`,
           source: 'accessibility-tree',
         },
       };
     } catch (error) {
-      return { error: `UID ${uid} could not be resolved from the latest accessibility snapshot: ${unknownErrorMessage(error)}` };
+      return { error: `UID ${uid} could not be resolved from the latest semantic DOM snapshot: ${unknownErrorMessage(error)}` };
     } finally {
+      if (targetObjectId) await client.send('Runtime.releaseObject', { objectId: targetObjectId }).catch(() => undefined);
       await client.detach().catch(() => undefined);
     }
   }
@@ -5746,7 +6438,10 @@ export class BrowserSession {
     };
   }
 
-  private async unifiedActionPoint(input: { uid?: string; xThousandth?: number; yThousandth?: number }, allowNonActionable = false) {
+  private async unifiedActionPoint(
+    input: { uid?: string; xThousandth?: number; yThousandth?: number },
+    allowNonActionable = false,
+  ): Promise<ResolvedBrowserActionPoint> {
     const hasUid = typeof input.uid === 'string' && input.uid.trim().length > 0;
     const hasAnyCoordinate = input.xThousandth !== undefined || input.yThousandth !== undefined;
     if (hasUid && hasAnyCoordinate) return { error: 'Use either uid or screenshot coordinates, never both.' };
@@ -5757,36 +6452,93 @@ export class BrowserSession {
 
   async mouse(input: BrowserMouseAction): Promise<BrowserActionResult> {
     const page = this.activePage;
+    const previousGeneration = this.snapshotGeneration;
     if (input.action === 'scroll') {
       let point: { x: number; y: number; descriptor: string; source: string } | undefined;
+      let targetLocator: Locator | undefined;
       if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
         const resolved = await this.unifiedActionPoint(input, true);
         if (!resolved.point) return { ok: false, actual: resolved.error || 'Unable to resolve scroll target.' };
         point = resolved.point;
-        await page.mouse.move(point.x, point.y);
+        targetLocator = resolved.reference ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
+        if (targetLocator) await targetLocator.hover();
+        else await page.mouse.move(point.x, point.y);
       }
       const deltaX = Number.isFinite(input.deltaX) ? Number(input.deltaX) : 0;
       const deltaY = Number.isFinite(input.deltaY) ? Number(input.deltaY) : 0;
       if (!deltaX && !deltaY) return { ok: false, actual: 'Mouse scroll requires a non-zero deltaX or deltaY.' };
+      const eventsBefore = await this.readInteractionCounts();
+      const scrollBefore = await this.readScrollPosition(targetLocator, point);
       await page.mouse.wheel(deltaX, deltaY);
-      this.invalidateBrowserEvidence();
-      return { ok: true, actual: `Scrolled${point ? ` over ${point.descriptor}` : ' the page'} by (${deltaX}, ${deltaY}).` };
+      return this.completeVerifiedAction(
+        `Scrolled${point ? ` over ${point.descriptor}` : ' the page'} by (${deltaX}, ${deltaY}).`,
+        previousGeneration,
+        async () => {
+          const eventsAfter = await this.readInteractionCounts();
+          const scrollAfter = await this.readScrollPosition(targetLocator, point);
+          const wheelEvents = this.interactionDelta(eventsBefore, eventsAfter, 'wheel');
+          const moved = Boolean(scrollBefore && scrollAfter
+            && (scrollBefore.left !== scrollAfter.left || scrollBefore.top !== scrollAfter.top));
+          const movement = scrollBefore && scrollAfter
+            ? `${scrollBefore.descriptor} (${scrollBefore.left},${scrollBefore.top})→(${scrollAfter.left},${scrollAfter.top})`
+            : 'scroll position unavailable';
+          return {
+            ok: wheelEvents > 0 || moved,
+            detail: `${wheelEvents} wheel event(s) observed; ${movement}${moved ? '' : ' (at boundary or handled without offset change)'}.`,
+          };
+        },
+      );
     }
 
     if (input.action === 'scrollIntoView') {
       if (!input.uid) return { ok: false, actual: 'scrollIntoView requires a current snapshot uid.' };
       const resolved = await this.resolveSnapshotReferencePoint(input.uid, true);
       if (!resolved.point) return { ok: false, actual: resolved.error || `Unable to scroll UID ${input.uid} into view.` };
-      this.invalidateBrowserEvidence();
-      return { ok: true, actual: `Scrolled UID ${input.uid} (${resolved.point.descriptor}) into view.` };
+      const targetLocator = resolved.reference ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
+      return this.completeVerifiedAction(
+        `Scrolled UID ${input.uid} (${resolved.point.descriptor}) into view.`,
+        previousGeneration,
+        async () => {
+          if (!targetLocator) {
+            return { ok: true, detail: `CDP returned an actionable viewport point at (${resolved.point!.x},${resolved.point!.y}).` };
+          }
+          const box = await targetLocator.boundingBox().catch(() => undefined);
+          const viewport = await this.getViewportMetrics();
+          const visible = Boolean(box
+            && box.x < viewport.width
+            && box.y < viewport.height
+            && box.x + box.width > 0
+            && box.y + box.height > 0);
+          return { ok: visible, detail: visible ? 'target bounding box intersects the viewport.' : 'target did not enter the viewport.' };
+        },
+      );
     }
 
     const from = await this.unifiedActionPoint(input, input.action === 'move');
     if (!from.point) return { ok: false, actual: from.error || 'Unable to resolve mouse target.' };
+    const fromLocator = from.reference ? await this.snapshotReferenceLocator(from.reference) : undefined;
     if (input.action === 'move') {
-      await page.mouse.move(from.point.x, from.point.y);
-      this.invalidateBrowserEvidence();
-      return { ok: true, actual: `Moved mouse to ${from.point.descriptor} at (${from.point.x}, ${from.point.y}).` };
+      const eventsBefore = await this.readInteractionCounts();
+      if (fromLocator) await fromLocator.hover();
+      else await page.mouse.move(from.point.x, from.point.y);
+      return this.completeVerifiedAction(
+        `Moved mouse to ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) using ${fromLocator ? 'Playwright hover' : 'viewport coordinates'}.`,
+        previousGeneration,
+        async () => {
+          const eventsAfter = await this.readInteractionCounts();
+          const moveEvents = this.interactionDelta(eventsBefore, eventsAfter, 'mousemove');
+          const hovered = fromLocator
+            ? await fromLocator.evaluate((element) => element.matches(':hover')).catch(() => false)
+            : await page.evaluate(({ x, y }) => {
+              const hit = document.elementFromPoint(x, y);
+              return Boolean(hit && hit.matches(':hover'));
+            }, { x: from.point!.x, y: from.point!.y }).catch(() => false);
+          return {
+            ok: moveEvents > 0 || hovered,
+            detail: `${moveEvents} mousemove event(s) observed; target hover=${hovered}.`,
+          };
+        },
+      );
     }
     if (input.action === 'drag') {
       const to = await this.unifiedActionPoint({
@@ -5795,57 +6547,165 @@ export class BrowserSession {
         yThousandth: input.toYThousandth,
       }, true);
       if (!to.point) return { ok: false, actual: to.error || 'Unable to resolve drag destination.' };
-      await page.mouse.move(from.point.x, from.point.y);
-      await page.mouse.down({ button: input.button || 'left' });
-      await page.mouse.move(to.point.x, to.point.y, { steps: 12 });
-      await page.mouse.up({ button: input.button || 'left' });
-      this.invalidateBrowserEvidence();
+      const toLocator = to.reference ? await this.snapshotReferenceLocator(to.reference) : undefined;
+      const button = input.button || 'left';
+      const eventsBefore = await this.readInteractionCounts();
+      const sourceHandle = fromLocator ? undefined : await this.viewportDragTarget(page, from.point.x, from.point.y, true);
+      const destinationHandle = toLocator ? undefined : await this.viewportDragTarget(page, to.point.x, to.point.y, false);
+      const sourceTarget = fromLocator || sourceHandle;
+      const destinationTarget = toLocator || destinationHandle;
+      let usedHtml5Fallback = false;
+      try {
+        if (fromLocator) await fromLocator.hover();
+        else await page.mouse.move(from.point.x, from.point.y);
+        await page.mouse.down({ button });
+        await page.mouse.move(from.point.x + 8, from.point.y + 4, { steps: 3 });
+        await page.mouse.move(to.point.x, to.point.y, { steps: 12 });
+        await page.mouse.up({ button });
+        const nativeEvents = await this.readInteractionCounts();
+        const nativeDropCompleted = this.interactionDelta(eventsBefore, nativeEvents, 'drop') > 0;
+        if (button === 'left' && !nativeDropCompleted && sourceTarget && destinationTarget) {
+          await this.dispatchHtml5Drag(page, sourceTarget, destinationTarget);
+          usedHtml5Fallback = true;
+        }
+      } finally {
+        await sourceHandle?.dispose().catch(() => undefined);
+        await destinationHandle?.dispose().catch(() => undefined);
+      }
       void this.showClickMarker(to.point.x, to.point.y, 'drag');
-      return { ok: true, actual: `Dragged ${from.point.descriptor} to ${to.point.descriptor}.` };
+      return this.completeVerifiedAction(
+        `Dragged ${from.point.descriptor} to ${to.point.descriptor} using ${fromLocator && toLocator ? 'Playwright locator-guided' : 'viewport-coordinate'} pointer input${usedHtml5Fallback ? ' plus HTML5 DataTransfer fallback' : ''}.`,
+        previousGeneration,
+        async () => {
+          const eventsAfter = await this.readInteractionCounts();
+          const drops = this.interactionDelta(eventsBefore, eventsAfter, 'drop');
+          const moves = this.interactionDelta(eventsBefore, eventsAfter, 'mousemove');
+          const ok = button === 'left' ? drops > 0 : moves > 0;
+          return {
+            ok,
+            detail: `${moves} mousemove and ${drops} drop event(s) observed${usedHtml5Fallback ? '; DataTransfer fallback used' : ''}.`,
+          };
+        },
+      );
     }
 
     const button = input.button || 'left';
     const clickCount = Math.min(3, Math.max(1, Math.floor(Number(input.clickCount) || 1)));
+    const eventsBefore = await this.readInteractionCounts();
+    const urlBefore = page.url();
     const popup = this.watchForPopup(page);
-    await page.mouse.click(from.point.x, from.point.y, { button, clickCount });
-    await this.settlePopupAfterAction(popup.popup, popup.waitMs);
-    this.invalidateBrowserEvidence();
+    if (fromLocator) await fromLocator.click({ button, clickCount, noWaitAfter: true });
+    else await page.mouse.click(from.point.x, from.point.y, { button, clickCount });
+    const claimedPopup = await this.settlePopupAfterAction(popup.popup, popup.waitMs);
     void this.showClickMarker(from.point.x, from.point.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
-    return {
-      ok: true,
-      actual: `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${from.point.source}.`,
-    };
+    return this.completeVerifiedAction(
+      `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${from.point.source}.`,
+      previousGeneration,
+      async () => {
+        const eventsAfter = await this.readInteractionCounts();
+        const expectedEvent = button === 'right'
+          ? 'contextmenu'
+          : button === 'middle'
+            ? 'auxclick'
+            : clickCount > 1 ? 'dblclick' : 'click';
+        const delivered = this.interactionDelta(eventsBefore, eventsAfter, expectedEvent);
+        const navigated = Boolean(claimedPopup) || page.url() !== urlBefore;
+        const focus = await this.getFocusedElement();
+        return {
+          ok: delivered > 0 || navigated,
+          detail: `${delivered} ${expectedEvent} event(s) observed; navigation=${navigated}; ${focus.summary}`,
+        };
+      },
+    );
   }
 
   async keyboard(input: BrowserKeyboardAction): Promise<BrowserActionResult> {
     const page = this.activePage;
+    const previousGeneration = this.snapshotGeneration;
+    let targetLocator: Locator | undefined;
     if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
       const target = await this.unifiedActionPoint(input);
       if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
-      await page.mouse.click(target.point.x, target.point.y);
+      targetLocator = target.reference ? await this.snapshotReferenceLocator(target.reference) : undefined;
+      if (targetLocator) {
+        await targetLocator.click({ noWaitAfter: true });
+        await targetLocator.focus();
+        const focused = await targetLocator.evaluate((element) => (
+          element === document.activeElement || element.contains(document.activeElement)
+        )).catch(() => false);
+        if (!focused) return { ok: false, actual: 'The keyboard target did not receive focus after Playwright click and focus.' };
+      } else {
+        await page.mouse.click(target.point.x, target.point.y);
+        const focused = page.locator(':focus');
+        if (await focused.count().catch(() => 0) === 1) targetLocator = focused;
+      }
     }
     if (input.action === 'type') {
       if (typeof input.text !== 'string') return { ok: false, actual: 'Keyboard type requires text.' };
+      const text = input.text;
+      const editable = targetLocator
+        ? await targetLocator.isEditable().catch(() => false)
+        : await page.locator(':focus').isEditable().catch(() => false);
+      if (!editable) return { ok: false, actual: 'Keyboard type requires an editable focused textbox or contenteditable target.' };
+      const valueBefore = await this.editableValue(targetLocator);
+      const eventsBefore = await this.readInteractionCounts();
+      const selectAllKey = process.platform === 'darwin' ? 'Meta+A' : 'Control+A';
       if (input.replace !== false) {
-        await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
-        await page.keyboard.press('Backspace').catch(() => undefined);
+        if (targetLocator) {
+          await targetLocator.press(selectAllKey);
+          await targetLocator.press('Backspace');
+        } else {
+          await page.keyboard.press(selectAllKey);
+          await page.keyboard.press('Backspace');
+        }
       }
-      await page.keyboard.insertText(input.text);
-      if (input.followByEnter) await page.keyboard.press('Enter');
-      this.invalidateBrowserEvidence();
-      return { ok: true, actual: `Typed ${input.text.length} characters${input.followByEnter ? ' and pressed Enter' : ''}.` };
+      const delay = boundedNonNegativeIntegerEnv('BROWSER_KEYBOARD_TYPE_DELAY_MS', 0, 200);
+      if (targetLocator) await targetLocator.pressSequentially(text, { delay });
+      else await page.keyboard.type(text, { delay });
+      if (input.followByEnter) {
+        if (targetLocator) await targetLocator.press('Enter');
+        else await page.keyboard.press('Enter');
+      }
+      return this.completeVerifiedAction(
+        `Typed ${text.length} characters${input.followByEnter ? ' and pressed Enter' : ''}.`,
+        previousGeneration,
+        async () => {
+          const eventsAfter = await this.readInteractionCounts();
+          const valueAfter = await this.editableValue(targetLocator);
+          const keyEvents = this.interactionDelta(eventsBefore, eventsAfter, 'keydown');
+          const inputEvents = this.interactionDelta(eventsBefore, eventsAfter, 'input');
+          const valueChanged = valueBefore !== undefined && valueAfter !== undefined && valueBefore !== valueAfter;
+          const delivered = text.length > 0
+            ? inputEvents > 0 || valueChanged
+            : input.replace !== false ? inputEvents > 0 || valueChanged || valueBefore === '' : true;
+          return {
+            ok: keyEvents > 0 && delivered,
+            detail: `${keyEvents} keydown and ${inputEvents} input event(s) observed; valueLength ${valueBefore?.length ?? '?'}→${valueAfter?.length ?? '?'}.`,
+          };
+        },
+      );
     }
     if (input.action === 'press') {
       if (!input.key) return { ok: false, actual: 'Keyboard press requires key.' };
+      const eventsBefore = await this.readInteractionCounts();
+      const urlBefore = page.url();
       await page.keyboard.press(input.key);
-      this.invalidateBrowserEvidence();
-      return { ok: true, actual: `Pressed ${input.key}.` };
+      return this.completeVerifiedAction(`Pressed ${input.key}.`, previousGeneration, async () => {
+        const eventsAfter = await this.readInteractionCounts();
+        const keyEvents = this.interactionDelta(eventsBefore, eventsAfter, 'keydown');
+        const navigated = page.url() !== urlBefore;
+        return { ok: keyEvents > 0 || navigated, detail: `${keyEvents} keydown event(s) observed; navigation=${navigated}.` };
+      });
     }
     const keys = (input.keys || []).map((key) => key.trim()).filter(Boolean);
     if (!keys.length) return { ok: false, actual: 'Keyboard shortcut requires a non-empty keys array.' };
+    const eventsBefore = await this.readInteractionCounts();
     await page.keyboard.press(keys.join('+'));
-    this.invalidateBrowserEvidence();
-    return { ok: true, actual: `Pressed shortcut ${keys.join('+')}.` };
+    return this.completeVerifiedAction(`Pressed shortcut ${keys.join('+')}.`, previousGeneration, async () => {
+      const eventsAfter = await this.readInteractionCounts();
+      const keyEvents = this.interactionDelta(eventsBefore, eventsAfter, 'keydown');
+      return { ok: keyEvents > 0, detail: `${keyEvents} keydown event(s) observed for the shortcut.` };
+    });
   }
 
   private emptySimplifiedDomObservation(message?: string): BrowserDomObservation {

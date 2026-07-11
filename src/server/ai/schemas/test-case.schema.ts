@@ -42,13 +42,20 @@ export const taskFrameSchema = z.object({
 });
 
 export const skillContentSchema = z.object({
-  whenToUse: z.array(z.string()).default([]),
   workflow: z.array(z.string()).default([]),
-  reusablePatterns: z.array(z.string()).default([]),
-  cautions: z.array(z.string()).default([]),
+  recovery: z.array(z.string()).default([]),
   verification: z.array(z.string()).default([]),
-  sourceSummary: z.string().optional(),
 });
+
+export function parseSkillContent(value: unknown) {
+  const record = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  return skillContentSchema.parse({
+    ...record,
+    recovery: record.recovery ?? record.cautions ?? [],
+  });
+}
 
 export const testCaseContentSchema = z.object({
   title: z.string(),

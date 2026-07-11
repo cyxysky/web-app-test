@@ -357,22 +357,35 @@ function isUserSkippedStep(step?: StepExecutionResult) {
   return Boolean(step?.status === 'blocked' && step.actual === 'User skipped this step manually.');
 }
 
-function normalizeSkillContent(content?: Partial<SkillContent>): SkillContent {
+function normalizeSkillItems(items: string[] | undefined, limit: number) {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const item of items || []) {
+    const value = item.trim();
+    const key = value.toLowerCase().replace(/\s+/g, ' ');
+    if (!value || seen.has(key)) continue;
+    seen.add(key);
+    output.push(value);
+    if (output.length >= limit) break;
+  }
+  return output;
+}
+
+function normalizeSkillContent(content?: Partial<SkillContent> & {
+  cautions?: string[];
+}): SkillContent {
   return {
-    whenToUse: (content?.whenToUse || []).map((item) => item.trim()).filter(Boolean).slice(0, 12),
-    workflow: (content?.workflow || []).map((item) => item.trim()).filter(Boolean).slice(0, 18),
-    reusablePatterns: (content?.reusablePatterns || []).map((item) => item.trim()).filter(Boolean).slice(0, 16),
-    cautions: (content?.cautions || []).map((item) => item.trim()).filter(Boolean).slice(0, 12),
-    verification: (content?.verification || []).map((item) => item.trim()).filter(Boolean).slice(0, 12),
-    sourceSummary: content?.sourceSummary?.trim() || undefined,
+    workflow: normalizeSkillItems(content?.workflow, 8),
+    recovery: normalizeSkillItems(content?.recovery || content?.cautions, 3),
+    verification: normalizeSkillItems(content?.verification, 4),
   };
 }
 
 function normalizeSkillRecord(record: SkillRecord): SkillRecord {
   return {
     ...record,
-    tags: (record.tags || []).map((item) => item.trim()).filter(Boolean).slice(0, 12),
-    triggerPhrases: (record.triggerPhrases || []).map((item) => item.trim()).filter(Boolean).slice(0, 16),
+    tags: normalizeSkillItems(record.tags, 6),
+    triggerPhrases: normalizeSkillItems(record.triggerPhrases, 8),
     content: normalizeSkillContent(record.content),
     status: record.status || 'ready',
     version: record.version || 1,

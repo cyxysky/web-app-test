@@ -1,5 +1,5 @@
 ﻿import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
@@ -25,7 +25,13 @@ import type { ModelProvider, RecordedFlowStep, SkillRecord, StepExecutionResult,
 import { store } from '@/server/db/mock-store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import { writeTextFileAtomic } from '@/server/storage/atomic-json';
-import { artifactPath as resolveArtifactPath, browserChatSessionFilePath, browserChatSessionsDir } from '@/server/storage/paths';
+import {
+  artifactPath as resolveArtifactPath,
+  browserChatSessionFilePath,
+  browserChatSessionSummariesDir,
+  browserChatSessionSummaryFilePath,
+  browserChatSessionsDir,
+} from '@/server/storage/paths';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 
@@ -129,7 +135,7 @@ type BrowserChatRuntimeState = {
     resolve: (decision: BrowserToolConfirmationDecision) => void;
   }>;
   pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
-  sessionsHydrated: boolean;
+  sessionFileCache: Map<string, { mtimeMs: number; size: number; snapshot: BrowserChatSessionSnapshot }>;
   lastPersistWarningAt: number;
 };
 
@@ -143,16 +149,19 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
     resolve: (decision: BrowserToolConfirmationDecision) => void;
   }>(),
   pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
-  sessionsHydrated: false,
+  sessionFileCache: new Map<string, { mtimeMs: number; size: number; snapshot: BrowserChatSessionSnapshot }>(),
   lastPersistWarningAt: 0,
 });
 browserChatRuntimeState.sessions ??= new Map();
 browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
+browserChatRuntimeState.sessionFileCache ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
 const sessionsDir = browserChatSessionsDir();
+const sessionSummariesDir = browserChatSessionSummariesDir();
+const sessionFileCache = browserChatRuntimeState.sessionFileCache;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
@@ -210,19 +219,27 @@ function browserChatPersonalMemoryContext(input: {
   browser: BrowserSession;
   text: string;
   modelText: string;
+  currentUrl?: string;
+  domainOnly?: boolean;
+  excludedIds?: ReadonlySet<string>;
+  logPhase?: string;
 }) {
-  if (!personalMemoryEnabled()) return '';
-  const currentUrl = browserChatMemoryUrl(input.browser, input.session);
+  const currentUrl = input.currentUrl || browserChatMemoryUrl(input.browser, input.session);
+  const currentDomain = normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl);
+  if (!personalMemoryEnabled()) return { context: '', itemIds: [] as string[], domain: currentDomain };
   const results = searchPersonalMemory({
     userId: input.session.userId,
     query: [input.text, input.modelText, input.session.title].filter(Boolean).join('\n'),
     domain: currentUrl || input.session.targetUrl,
-  });
-  if (!results.length) return '';
+  }).filter((result) => (
+    (!input.domainOnly || result.item.scope === 'domain')
+    && !input.excludedIds?.has(result.item.id)
+  ));
+  if (!results.length) return { context: '', itemIds: [] as string[], domain: currentDomain };
   markPersonalMemoryItemsUsed(results.map((result) => result.item.id));
-  appendLog(input.session, 'memory:prompt', `已注入 ${results.length} 条个性化短记忆。`, {
+  appendLog(input.session, input.logPhase || 'memory:prompt', `已注入 ${results.length} 条个性化短记忆。`, {
     details: {
-      currentDomain: normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl),
+      currentDomain,
       items: results.map((result) => ({
         id: result.item.id,
         scope: result.item.scope,
@@ -235,7 +252,11 @@ function browserChatPersonalMemoryContext(input: {
     },
     deferPersist: true,
   });
-  return formatPersonalMemoryForPrompt(results);
+  return {
+    context: formatPersonalMemoryForPrompt(results),
+    itemIds: results.map((result) => result.item.id),
+    domain: currentDomain,
+  };
 }
 
 function queuePersonalMemoryExtraction(input: {
@@ -680,17 +701,15 @@ function attachmentSummary(attachments?: BrowserChatAttachment[], options: { exc
   ].join('\n');
 }
 
-function contentWithInlineReferencesForPrompt(content: string, attachments: BrowserChatAttachment[] = [], skills: SkillRecord[] = []) {
+function contentWithInlineReferencesForPrompt(content: string, attachments: BrowserChatAttachment[] = []) {
   const attachmentsById = new Map(attachments.map((attachment) => [attachment.id, attachment]));
-  const skillsById = new Map(skills.map((skill) => [skill.id, skill]));
   return content.replace(inlineReferenceTokenPattern, (_match, type: string, rawId: string) => {
     const id = decodeInlineReferenceId(rawId || '');
     if (type === 'ref') {
       const attachment = attachmentsById.get(id);
       return attachment ? attachmentPromptText(attachment) : '';
     }
-    const skill = skillsById.get(id);
-    return skill ? `[Skill] ${skill.title}${skill.description ? `：${skill.description}` : ''}` : '';
+    return '';
   }).replace(/[ \t]{2,}/g, ' ').trim();
 }
 
@@ -704,7 +723,7 @@ function messageContentForPrompt(message: BrowserChatMessage) {
     ? formatSkillReferencesForUser(selectedSkills)
     : '';
   return [
-    contentWithInlineReferencesForPrompt(text, message.attachments || [], selectedSkills),
+    contentWithInlineReferencesForPrompt(text, message.attachments || []),
     skillReferences,
     attachmentSummary(message.attachments, { excludeIds: referencedAttachmentIds }),
   ].filter(Boolean).join('\n\n');
@@ -826,7 +845,7 @@ function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
   return clientStep;
 }
 
-function previewMessages(session: BrowserChatSessionRecord) {
+function previewMessages(session: Pick<BrowserChatSessionSnapshot, 'messages'>) {
   const firstUserMessage = session.messages.find((message) => message.role === 'user');
   const latestMessage = session.messages.at(-1);
   const selected = [firstUserMessage, latestMessage].filter((message): message is BrowserChatMessage => Boolean(message));
@@ -834,6 +853,17 @@ function previewMessages(session: BrowserChatSessionRecord) {
     ...message,
     content: compactText(message.content, 180),
   }])).values());
+}
+
+function summaryFromSnapshot(session: BrowserChatSessionSnapshot): BrowserChatSessionSnapshot {
+  return {
+    ...session,
+    messages: previewMessages(session),
+    steps: [],
+    consoleErrors: [],
+    networkErrors: [],
+    logs: session.busy ? session.logs.slice(-8) : [],
+  };
 }
 
 function browserChatTabs(session: BrowserChatSessionRecord): BrowserTabSnapshot[] {
@@ -875,7 +905,7 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
 
 function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionSnapshot {
   finalizeIdleRunningAssistantMessages(session);
-  return {
+  return summaryFromSnapshot({
     id: session.id,
     title: session.title,
     userId: session.userId,
@@ -892,14 +922,14 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
     updatedAt: session.updatedAt,
     closedAt: session.closedAt,
     error: session.error,
-    messages: previewMessages(session),
+    messages: [...session.messages],
     steps: [],
     consoleErrors: [],
     networkErrors: [],
-    logs: session.busy ? [...(session.logs || []).slice(-8)] : [],
+    logs: [...(session.logs || [])],
     conversationContext: normalizeConversationContext(session.conversationContext),
     pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
-  };
+  });
 }
 
 function isTransientBrowserChatProgress(value?: string) {
@@ -1114,12 +1144,27 @@ function appendLog(
   persistAndNotify(session.id, { defer: input.deferPersist === true });
 }
 
-function readSessionSnapshotsFromFile(): BrowserChatSessionSnapshot[] {
-  if (!existsSync(sessionsDir)) return [];
-  return readdirSync(sessionsDir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
-    .map((entry) => readSessionSnapshotFromFilePath(path.join(sessionsDir, entry.name)))
-    .filter((item): item is BrowserChatSessionSnapshot => Boolean(item));
+function readSessionSummariesFromFile(): BrowserChatSessionSnapshot[] {
+  const summaries = new Map<string, BrowserChatSessionSnapshot>();
+  if (existsSync(sessionSummariesDir)) {
+    for (const entry of readdirSync(sessionSummariesDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const item = readSessionSnapshotFromFilePath(path.join(sessionSummariesDir, entry.name));
+      if (item) summaries.set(item.id, item);
+    }
+  }
+  if (!existsSync(sessionsDir)) return [...summaries.values()];
+  for (const entry of readdirSync(sessionsDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const sessionId = entry.name.slice(0, -'.json'.length);
+    if (summaries.has(sessionId)) continue;
+    const item = readSessionSnapshotFromFilePath(path.join(sessionsDir, entry.name));
+    if (!item) continue;
+    const summary = summaryFromSnapshot(item);
+    writeSessionSummaryToFile(summary);
+    summaries.set(summary.id, summary);
+  }
+  return [...summaries.values()];
 }
 
 function isBrowserChatSessionSnapshot(value: unknown): value is BrowserChatSessionSnapshot {
@@ -1130,8 +1175,13 @@ function isBrowserChatSessionSnapshot(value: unknown): value is BrowserChatSessi
 }
 
 function readSessionSnapshotFromFilePath(filePath: string) {
+  const stat = statSync(filePath);
+  const cached = sessionFileCache.get(filePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.snapshot;
   const data = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
-  return isBrowserChatSessionSnapshot(data) ? data : undefined;
+  if (!isBrowserChatSessionSnapshot(data)) return undefined;
+  sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, snapshot: data });
+  return data;
 }
 
 function readSessionSnapshotFromFile(sessionId: string) {
@@ -1143,11 +1193,29 @@ function readSessionSnapshotFromFile(sessionId: string) {
 function writeSessionSnapshotToFile(item: BrowserChatSessionSnapshot) {
   const payload = stringifyJsonSafe(item, 2);
   if (!payload) throw new Error(`Browser chat session ${item.id} could not be serialized.`);
-  writeTextFileAtomic(browserChatSessionFilePath(item.id), payload);
+  const filePath = browserChatSessionFilePath(item.id);
+  writeTextFileAtomic(filePath, payload);
+  const stat = statSync(filePath);
+  sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, snapshot: item });
+  writeSessionSummaryToFile(summaryFromSnapshot(item));
+}
+
+function writeSessionSummaryToFile(item: BrowserChatSessionSnapshot) {
+  const payload = stringifyJsonSafe(item, 2);
+  if (!payload) throw new Error(`Browser chat session summary ${item.id} could not be serialized.`);
+  const filePath = browserChatSessionSummaryFilePath(item.id);
+  writeTextFileAtomic(filePath, payload);
+  const stat = statSync(filePath);
+  sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, snapshot: item });
 }
 
 function deleteSessionSnapshotFile(sessionId: string) {
-  rmSync(browserChatSessionFilePath(sessionId), { force: true });
+  const sessionPath = browserChatSessionFilePath(sessionId);
+  const summaryPath = browserChatSessionSummaryFilePath(sessionId);
+  rmSync(sessionPath, { force: true });
+  rmSync(summaryPath, { force: true });
+  sessionFileCache.delete(sessionPath);
+  sessionFileCache.delete(summaryPath);
 }
 
 function timestampValue(value?: string) {
@@ -1311,6 +1379,12 @@ function applyFileSnapshotToRuntime(snapshotFromFile: BrowserChatSessionSnapshot
   Object.assign(existing, fromDisk, runtimeState);
 }
 
+function hydrateSession(sessionId: string) {
+  const fromDisk = readSessionSnapshotFromFile(sessionId);
+  if (fromDisk) applyFileSnapshotToRuntime(fromDisk);
+  return sessions.get(sessionId);
+}
+
 function persistSessionToFile(sessionId: string, options: { mergeFromDisk?: boolean } = {}) {
   try {
     const currentSession = sessions.get(sessionId);
@@ -1369,50 +1443,6 @@ function persistDeletedSessionsToFile(sessionIds: string[]) {
   } catch (error) {
     warnPersistFailure(error);
     return false;
-  }
-}
-
-function hydrateSessions() {
-  const wasHydrated = browserChatRuntimeState.sessionsHydrated;
-  browserChatRuntimeState.sessionsHydrated = true;
-  try {
-    const data = readSessionSnapshotsFromFile();
-    const diskSessionIds = new Set<string>();
-    for (const item of data) {
-      diskSessionIds.add(item.id);
-      const existing = sessions.get(item.id);
-      if (!existing) {
-        sessions.set(item.id, recordFromSnapshot(item));
-        continue;
-      }
-      const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, item);
-      const fromDisk = mergeRuntimeSessionState(
-        recordFromSnapshot(item, { preserveRunningState: preserveRuntimeTurn }),
-        existing,
-      );
-      const runtimeState = {
-        activeAbortController: preserveRuntimeTurn ? existing.activeAbortController : undefined,
-        activeAssistantMessageId: preserveRuntimeTurn ? existing.activeAssistantMessageId : undefined,
-        browser: existing.browser,
-        started: existing.started,
-      };
-      Object.assign(existing, fromDisk, runtimeState);
-    }
-    for (const [sessionId, session] of sessions) {
-      if (diskSessionIds.has(sessionId)) continue;
-      if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
-        session.activeAbortController.abort(new Error('Browser chat session no longer exists in the session file.'));
-      }
-      cancelPendingToolConfirmation(session);
-      session.activeAbortController = undefined;
-      session.activeAssistantMessageId = undefined;
-      session.pendingToolConfirmation = undefined;
-      session.busy = false;
-      sessions.delete(sessionId);
-    }
-  } catch (error) {
-    warnPersistFailure(error);
-    if (!wasHydrated) sessions.clear();
   }
 }
 
@@ -1600,7 +1630,6 @@ export function createBrowserChatSession(input: {
   title?: string;
   userId?: string | number;
 } = {}) {
-  hydrateSessions();
   store.applyRuntimeEnv();
   const modelSettings = browserChatModelSettings(input.modelProvider, input.model);
   const timestamp = now();
@@ -1631,23 +1660,27 @@ export function createBrowserChatSession(input: {
 }
 
 export function getBrowserChatSession(sessionId: string, userId?: string | number) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
   return session ? snapshot(session) : undefined;
 }
 
+export function getBrowserChatSessionLogs(sessionId: string, userId?: string | number) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) return undefined;
+  return [...(session.logs || [])];
+}
+
 export function listBrowserChatSessions(input: { userId?: string | number } = {}) {
-  hydrateSessions();
-  return [...sessions.values()]
+  const summaries = new Map(readSessionSummariesFromFile().map((session) => [session.id, session]));
+  for (const session of sessions.values()) summaries.set(session.id, summarySnapshot(session));
+  return [...summaries.values()]
     .filter((session) => sessionBelongsToUser(session, input.userId))
-    .map(summarySnapshot)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 export async function closeBrowserChatSession(sessionId: string, userId?: string | number) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (!session) return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
   if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
@@ -1669,8 +1702,7 @@ export async function closeBrowserChatSession(sessionId: string, userId?: string
 }
 
 export async function deleteBrowserChatSession(sessionId: string, userId?: string | number) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
   const removed = await deleteBrowserChatSessionFromMemory(sessionId);
   if (!removed) return undefined;
@@ -1682,8 +1714,7 @@ export async function deleteBrowserChatSession(sessionId: string, userId?: strin
 }
 
 export async function switchBrowserChatTab(sessionId: string, index: number, userId?: string | number) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (!session || session.status === 'closed') return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
   const normalizedIndex = Math.floor(Number(index));
@@ -1718,8 +1749,7 @@ export async function startBrowserChatScreencast(
     onFrame: (frame: BrowserScreencastFrame) => void | Promise<void>;
   },
 ) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (!session || session.status === 'closed') return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
 
@@ -1756,12 +1786,11 @@ async function deleteBrowserChatSessionFromMemory(sessionId: string) {
 }
 
 export async function deleteBrowserChatSessions(sessionIds: string[], userId?: string | number) {
-  hydrateSessions();
   const uniqueIds = Array.from(new Set(sessionIds.map((item) => item.trim()).filter(Boolean)));
   const deleted: Array<{ id: string }> = [];
   const removed: Array<{ deleted: { id: string }; session: BrowserChatSessionRecord }> = [];
   for (const sessionId of uniqueIds) {
-    const session = sessions.get(sessionId);
+    const session = hydrateSession(sessionId);
     if (session && !sessionBelongsToUser(session, userId)) continue;
     const result = await deleteBrowserChatSessionFromMemory(sessionId);
     if (result) {
@@ -1781,8 +1810,7 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
 }
 
 export function exportBrowserChatMessageToTestCase(sessionId: string, messageId: string) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (!session) throw new Error('Browser chat session not found');
   const messageIndex = session.messages.findIndex((message) => message.id === messageId && message.role === 'assistant');
   if (messageIndex < 0) throw new Error('Browser chat assistant message not found');
@@ -1861,8 +1889,7 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
 }
 
 export function exportBrowserChatMessagesToTestCase(sessionId: string, messageIds: string[]) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (!session) throw new Error('Browser chat session not found');
   const uniqueMessageIds = Array.from(new Set(messageIds.map((item) => item.trim()).filter(Boolean)));
   if (!uniqueMessageIds.length) throw new Error('请选择要导出的对话轮次');
@@ -1908,6 +1935,9 @@ export function exportBrowserChatMessagesToTestCase(sessionId: string, messageId
       message.content ? `AI 输出：${message.content}` : '',
     ].filter(Boolean).join('\n');
   });
+  const selectedUserGoals = Array.from(new Set(selectedMessages
+    .map(({ index }) => [...session.messages.slice(0, index)].reverse().find((item) => item.role === 'user')?.content?.trim())
+    .filter((item): item is string => Boolean(item))));
   const firstSelected = selectedMessages[0];
   const firstPreviousUser = firstSelected
     ? [...session.messages.slice(0, firstSelected.index)].reverse().find((item) => item.role === 'user')
@@ -1924,7 +1954,7 @@ export function exportBrowserChatMessagesToTestCase(sessionId: string, messageId
     priority: 'medium',
     browserMode: session.mode,
     isMarked: true,
-    userRequirement: turnDescriptions.join('\n\n') || titleSeed,
+    userRequirement: selectedUserGoals.join('\n') || titleSeed,
     systemPrompt: '该用例由浏览器对话中的多轮消息导出，已包含所选轮次中 AI 实际执行过的步骤记录。',
     preconditions: ['已根据所选浏览器对话轮次完成过执行，导出时同步创建一条已完成运行记录。'],
     testData: {},
@@ -1967,8 +1997,7 @@ export function exportBrowserChatMessagesToTestCase(sessionId: string, messageId
 }
 
 export async function generateBrowserChatMessagesSkill(sessionId: string, messageIds: string[]) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (!session) throw new Error('Browser chat session not found');
   const uniqueMessageIds = Array.from(new Set(messageIds.map((item) => item.trim()).filter(Boolean)));
   if (!uniqueMessageIds.length) throw new Error('请选择要生成 Skill 的对话轮次');
@@ -2104,8 +2133,7 @@ export async function sendBrowserChatMessage(
   skillIdsInput?: unknown,
   userId?: string | number,
 ) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (!session) throw new Error('Browser chat session not found');
   if (!sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   if (session.status === 'closed') throw new Error('Browser chat session is closed');
@@ -2117,7 +2145,7 @@ export async function sendBrowserChatMessage(
   const messageText = text || (selectedSkills.length ? '请结合已选择的 Skills 继续处理当前任务。' : '请结合我提供的引用继续处理当前任务。');
   const skillReferences = formatSkillReferencesForUser(selectedSkills);
   const referencedAttachmentIds = inlineReferencedIds(messageText, 'ref');
-  const inlineMessageText = contentWithInlineReferencesForPrompt(messageText, attachments, selectedSkills);
+  const inlineMessageText = contentWithInlineReferencesForPrompt(messageText, attachments);
   const attachmentReferences = attachmentSummary(attachments, { excludeIds: referencedAttachmentIds });
   const modelMessageText = [inlineMessageText, skillReferences, attachmentReferences].filter(Boolean).join('\n\n');
   const normalizedClientMessageId = clientMessageId?.trim().slice(0, 120) || undefined;
@@ -2372,8 +2400,7 @@ export function resolveBrowserChatToolConfirmation(
   action: 'confirm' | 'cancel',
   userId?: string | number,
 ) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (!session) throw new Error('Browser chat session not found');
   if (!sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   const normalizedConfirmationId = confirmationId.trim();
@@ -2400,8 +2427,7 @@ export function resolveBrowserChatToolConfirmation(
 }
 
 export function interruptBrowserChatSession(sessionId: string, userId?: string | number) {
-  hydrateSessions();
-  const session = sessions.get(sessionId);
+  const session = hydrateSession(sessionId);
   if (!session) return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
   const timestamp = now();
@@ -2468,9 +2494,13 @@ async function runBrowserChatMessage(
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      const personalMemoryContext = browserChatPersonalMemoryContext({ session, browser, text, modelText });
+      const recalledMemoryIds = new Set<string>();
+      const recalledDomains = new Set<string>();
+      const initialPersonalMemory = browserChatPersonalMemoryContext({ session, browser, text, modelText });
+      initialPersonalMemory.itemIds.forEach((id) => recalledMemoryIds.add(id));
+      if (initialPersonalMemory.domain) recalledDomains.add(initialPersonalMemory.domain);
       const skillContext = [
-        personalMemoryContext,
+        initialPersonalMemory.context,
         formatSkillsForPrompt(skills),
       ].filter(Boolean).join('\n\n');
       appendLog(session, 'ai:prepare', '浏览器已准备好，正在请求 AI 决策');
@@ -2487,6 +2517,24 @@ async function runBrowserChatMessage(
         safetyMode: session.safetyMode,
         referenceImagePaths,
         skillContext,
+        getDynamicSkillContext: () => {
+          const currentUrl = browserChatMemoryUrl(browser, session);
+          const currentDomain = normalizePersonalMemoryDomain(currentUrl || session.targetUrl);
+          if (!currentDomain || recalledDomains.has(currentDomain)) return '';
+          const recalled = browserChatPersonalMemoryContext({
+            session,
+            browser,
+            text,
+            modelText,
+            currentUrl,
+            domainOnly: true,
+            excludedIds: recalledMemoryIds,
+            logPhase: 'memory:prompt:domain-refresh',
+          });
+          recalledDomains.add(currentDomain);
+          recalled.itemIds.forEach((id) => recalledMemoryIds.add(id));
+          return recalled.context;
+        },
         abortSignal: abortController.signal,
         shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
         requestToolConfirmation: session.safetyMode === 'strict'

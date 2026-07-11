@@ -11,6 +11,12 @@ import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 import {
+  browserKeyboardToolDescription,
+  browserKeyboardToolShape,
+  browserMouseToolDescription,
+  browserMouseToolShape,
+} from './browser-input-tool-schema';
+import {
   appendRuntimeObservationView,
   compactStaleSnapshotMessages,
   decodeRuntimeObservationCursor,
@@ -27,7 +33,7 @@ import {
   type RuntimeObservationReadOptions,
   type RuntimeObservationStore,
 } from './runtime-observation';
-import { browserActionRules, currentSnapshotContextLine, noAutomaticScreenshotRule, snapshotHardRules } from './runtime-prompt-rules';
+import { browserActionRules, currentSnapshotContextLine, screenshotObservationRule, snapshotHardRules } from './runtime-prompt-rules';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
@@ -434,7 +440,7 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, max = 
   if (!result) return undefined;
   if (!result.ok) return trimDebugText(result.actual, max);
   if (name === 'takeSnapshot') return trimDebugText(result.actual, 10000);
-  if (looksLikeDomSnapshot(result.actual)) return '已读取当前页面无障碍树快照。';
+  if (looksLikeDomSnapshot(result.actual)) return '已读取当前页面语义 DOM 快照。';
   if (name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
   if (name === 'listTabs') return '已读取浏览器标签页列表。';
   if (name === 'downloadFile' || name === 'generateMarkdownFile') return formatFileArtifactResult(name, result.actual);
@@ -1604,7 +1610,27 @@ function makeBrowserTools(
       action,
     }).then((result) => {
       if (runtimeObservationInvalidatingToolNames.has(name)) {
-        invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
+        const autoViews = result.autoSnapshot
+          ? session.currentSnapshotObservationViews()
+          : result.observationViews;
+        if (result.ok && autoViews?.actionable && referenceOptions?.observationStore) {
+          const observation = storeRuntimeObservation(
+            referenceOptions.observationStore,
+            referenceOptions.runId,
+            name,
+            autoViews.actionable,
+            autoViews,
+          );
+          const changes = observation.views.changes || 'No semantic DOM snapshot changes were detected after the action.';
+          result = {
+            ...result,
+            actual: `${result.actual}\n\n${changes}`,
+            autoSnapshot: result.autoSnapshot,
+            observationViews: { defaultType: 'changes', changes },
+          };
+        } else {
+          invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
+        }
       }
       return compactToolResultForModel(name, result, referenceOptions?.observationStore, referenceOptions?.runId);
     });
@@ -1632,20 +1658,8 @@ function makeBrowserTools(
       execute: (input) => record('openPage', input, () => session.open(input.url || targetUrl)),
     }),
     mouse: tool({
-      description: 'Unified mouse tool. Prefer a fresh snapshot uid. Use thousandth coordinates only from the latest viewport screenshot. UID actions automatically reveal offscreen targets.',
-      inputSchema: browserToolInput({
-        action: z.enum(['click', 'move', 'drag', 'scroll', 'scrollIntoView']),
-        uid: z.string().optional(),
-        x_thousandth: z.number().int().min(1).max(999).optional(),
-        y_thousandth: z.number().int().min(1).max(999).optional(),
-        toUid: z.string().optional(),
-        toX_thousandth: z.number().int().min(1).max(999).optional(),
-        toY_thousandth: z.number().int().min(1).max(999).optional(),
-        button: z.enum(['left', 'right', 'middle']).optional(),
-        clickCount: z.number().int().min(1).max(3).optional(),
-        deltaX: z.number().optional(),
-        deltaY: z.number().optional(),
-      }),
+      description: browserMouseToolDescription,
+      inputSchema: browserToolInput(browserMouseToolShape),
       execute: (input) => record('mouse', input, () => session.mouse({
         action: input.action,
         uid: input.uid,
@@ -1661,18 +1675,8 @@ function makeBrowserTools(
       })),
     }),
     keyboard: tool({
-      description: 'Unified keyboard tool for text, one key, or a shortcut. It can focus a fresh uid or latest screenshot coordinate first.',
-      inputSchema: browserToolInput({
-        action: z.enum(['type', 'press', 'shortcut']),
-        uid: z.string().optional(),
-        x_thousandth: z.number().int().min(1).max(999).optional(),
-        y_thousandth: z.number().int().min(1).max(999).optional(),
-        text: z.string().optional(),
-        key: z.string().optional(),
-        keys: z.array(z.string().min(1)).max(6).optional(),
-        replace: z.boolean().optional(),
-        followByEnter: z.boolean().optional(),
-      }),
+      description: browserKeyboardToolDescription,
+      inputSchema: browserToolInput(browserKeyboardToolShape),
       execute: (input) => record('keyboard', input, () => session.keyboard({
         action: input.action,
         uid: input.uid,
@@ -1710,7 +1714,7 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
     }),
     takeSnapshot: tool({
-      description: 'Capture a fresh Chromium accessibility-tree snapshot for the main document and every attached iframe. Continue a large unchanged snapshot with nextCursor.',
+      description: 'Capture a fresh Chromium DOMSnapshot for the main document, flattened shadow DOM, and attached iframes, enriched with partial AX data for high-value candidates. Continue a large unchanged snapshot with nextCursor.',
       inputSchema: browserToolInput({
         mode: z.enum(['actionable', 'full', 'text']).optional(),
         cursor: z.string().optional(),
@@ -2028,9 +2032,12 @@ function runtimePrompt(input: {
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const evidence = 'the latest accessibility snapshot across all attached frames plus an optional latest viewport screenshot';
+  const screenshotAvailable = modelSupportsScreenshotInput();
+  const evidence = screenshotAvailable
+    ? 'the latest semantic DOM snapshot across all attached frames plus an optional latest viewport screenshot'
+    : 'the latest semantic DOM snapshot across all attached frames';
   const markerTargetRules: string[] = [];
-  const modeActionRules = browserActionRules();
+  const modeActionRules = browserActionRules(screenshotAvailable);
   return [
     browserChatMode
       ? 'You are an AI browser chat agent. Call a browser tool only when live browser action or inspection is needed; otherwise answer directly in Chinese Markdown.'
@@ -2057,11 +2064,13 @@ function runtimePrompt(input: {
     '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
     '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL.',
     '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. In the final answer, include the returned Markdown download link exactly as a clickable Markdown link.',
-    ...snapshotHardRules(),
+    ...snapshotHardRules(screenshotAvailable),
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
-      : '- Browser action reason must cite the current snapshot UID or latest screenshot target.',
+      : screenshotAvailable
+        ? '- Browser action reason must cite the current snapshot UID or latest screenshot target.'
+        : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
     `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"actionable",maxChars:10000}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
@@ -2072,7 +2081,7 @@ function runtimePrompt(input: {
     browserChatMode
       ? '- Finish the chat turn by returning normal Chinese Markdown text with no tool call once the latest user message is satisfied, blocked, or needs clarification.'
       : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
-    noAutomaticScreenshotRule,
+    screenshotObservationRule(screenshotAvailable),
     ...markerTargetRules,
     caseSystemPrompt ? `Test-case-specific instructions:
 ${caseSystemPrompt}` : '',
@@ -2090,7 +2099,9 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
     browserChatMode ? '- Browser chat: when the user can be answered from current evidence, output normal Chinese Markdown text and call no tool.' : '',
     visualMode
       ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
-      : '- Browser action reason must mention the current UID or latest screenshot target.',
+      : screenshotAvailable
+        ? '- Browser action reason must mention the current UID or latest screenshot target.'
+        : '- Browser action reason must mention the current snapshot UID.',
     browserChatMode
       ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
       : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
@@ -2106,7 +2117,9 @@ ${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
     selectedScreenshotReferences.length
       ? 'Reference screenshot rule: selected reference images help connect scroll continuity or compare earlier page state. They may show the same interface at different scroll offsets when sameInterfaceGroup matches, but their candidate ids are historical and must never be used for the current action.'
       : '',
-    'Screenshot image/path is not attached automatically. takeScreenshot attaches explicit visual evidence to the next model request when available.',
+    screenshotAvailable
+      ? 'Screenshot image/path is not attached automatically. takeScreenshot attaches explicit visual evidence to the next model request when available.'
+      : '',
   ].filter(Boolean).join('\n');
 }
 
@@ -2726,24 +2739,24 @@ async function executeRuntimeStep(input: {
         ? storeRuntimeObservation(observationStore, input.runId, 'takeSnapshot', slice.content, observationViews)
         : appendRuntimeObservationView(observationStore, input.runId, snapshotView, slice.content) || storedRecord;
       if (!observation) {
-        return { ok: false, actual: 'Unable to store the current accessibility snapshot. Capture it again.' };
+        return { ok: false, actual: 'Unable to store the current semantic DOM snapshot. Capture it again.' };
       }
       const nextCursor = slice.hasMore
         ? encodeRuntimeObservationCursor({ generation: observation.generation, index: slice.nextIndex, view: snapshotView })
         : undefined;
       const availableTypes = runtimeObservationAvailableTypes(observation);
       const header = [
-        decodedCursor ? 'Continued the current accessibility snapshot.' : 'Captured a fresh accessibility snapshot.',
+        decodedCursor ? 'Continued the current semantic DOM snapshot.' : 'Captured a fresh semantic DOM snapshot.',
         `Current URL: ${session.currentUrl()}`,
         `Open tabs JSON: ${JSON.stringify(session.getTabsSnapshot())}`,
         `Snapshot generation: ${observation.generation}. Mode=${requestedMode}. Stored views: ${availableTypes || snapshotView}.`,
-        `Slice metadata JSON: ${JSON.stringify({ generationId: slice.generationId, mode: requestedMode, startIndex: slice.startIndex, nextIndex: slice.nextIndex, hasMore: slice.hasMore, returnedEntries: slice.returnedEntries, totalEntries: slice.totalEntries, nodeCount: slice.nodeCount, actionableCount: slice.actionableCount, frameCount: slice.frameCount, skippedFrameCount: slice.skippedFrameCount, timings: slice.timings })}`,
-        nextCursor ? `More available: call takeSnapshot({cursor:"${nextCursor}",maxChars:${maxChars}}).` : 'End of this accessibility snapshot view.',
+        `Slice metadata JSON: ${JSON.stringify({ generationId: slice.generationId, captureSource: slice.captureSource, mode: requestedMode, startIndex: slice.startIndex, nextIndex: slice.nextIndex, hasMore: slice.hasMore, returnedEntries: slice.returnedEntries, totalEntries: slice.totalEntries, nodeCount: slice.nodeCount, actionableCount: slice.actionableCount, frameCount: slice.frameCount, skippedFrameCount: slice.skippedFrameCount, timings: slice.timings })}`,
+        nextCursor ? `More available: call takeSnapshot({cursor:"${nextCursor}",maxChars:${maxChars}}).` : 'End of this semantic DOM snapshot view.',
       ].filter(Boolean);
       await onDebug?.({
-        phase: 'browser:take-snapshot:ax-timings',
+        phase: 'browser:take-snapshot:dom-timings',
         stepIndex,
-        message: `AX takeSnapshot timings: total=${elapsedSince(readStartedAt)}ms, capture=${slice.timings.captureAxMs || 0}ms, fallback=${slice.timings.domFallbackMs || 0}ms.`,
+        message: `DOM takeSnapshot timings: total=${elapsedSince(readStartedAt)}ms, DOMSnapshot=${slice.timings.captureDomMs || 0}ms, partialAX=${slice.timings.axEnrichmentMs || 0}ms, fallback=${slice.timings.domFallbackMs || 0}ms.`,
         details: { slice, totalMs: elapsedSince(readStartedAt), continued: Boolean(decodedCursor) },
       });
       return {

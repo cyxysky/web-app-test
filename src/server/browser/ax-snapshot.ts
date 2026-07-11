@@ -81,7 +81,7 @@ export type CapturedAxSnapshot = {
 
 export type SnapshotNodeWithUid = CapturedSnapshotNode & {
   uid: string;
-  source?: 'ax' | 'dom';
+  source?: 'ax' | 'dom' | 'dom-snapshot';
   selector?: string;
   framePath?: string;
   actions?: string[];
@@ -128,7 +128,6 @@ const actionableRoles = new Set([
 const actionableProperties = new Set([
   'actions',
   'editable',
-  'focusable',
   'settable',
 ]);
 
@@ -231,8 +230,14 @@ function roleOf(node: CdpAxNode) {
 }
 
 function isActionable(role: string, properties: Record<string, string | number | boolean>) {
-  if (actionableRoles.has(role.toLowerCase())) return true;
-  return Object.keys(properties).some((name) => actionableProperties.has(name) && properties[name] !== false && properties[name] !== 'false');
+  const normalizedRole = role.toLowerCase();
+  if (actionableRoles.has(normalizedRole)) return true;
+  if (Object.keys(properties).some((name) => actionableProperties.has(name) && properties[name] !== false && properties[name] !== 'false')) return true;
+  return properties.focusable !== false
+    && properties.focusable !== 'false'
+    && Boolean(properties.focusable)
+    && !contextualRoles.has(normalizedRole)
+    && !['generic', 'none', 'rootwebarea', 'statictext', 'webarea'].includes(normalizedRole);
 }
 
 function flattenFrameTree(tree: CdpFrameTree, depth = 0, output: CapturedSnapshotFrame[] = []) {
@@ -367,7 +372,7 @@ function serializeNode(node: SnapshotNodeWithUid) {
     if (value === undefined || value === '' || value === false || value === 'false') continue;
     parts.push(`${name}=${typeof value === 'string' && /\s/.test(value) ? `"${escaped(value, 200)}"` : String(value)}`);
   }
-  if (node.source === 'dom' && node.actions?.length) parts.push(`actions=${node.actions.join('|')}`);
+  if (node.source !== 'ax' && node.actions?.length) parts.push(`actions=${node.actions.join('|')}`);
   return `${'  '.repeat(Math.min(24, node.frameDepth + node.depth))}${parts.join(' ')}`;
 }
 
@@ -407,8 +412,13 @@ function actionableNodeIds(nodes: SnapshotNodeWithUid[]) {
       const parent = byFrameAndId.get(`${node.frameId}:${current.parentAxNodeId}`);
       if (!parent) break;
       const key = `${parent.frameId}:${parent.axNodeId}`;
-      included.add(key);
-      if (actionableContextRoots.has(parent.role.toLowerCase())) contextRoots.add(key);
+      const parentRole = parent.role.toLowerCase();
+      if (
+        contextualRoles.has(parentRole)
+        || parentRole === 'rootwebarea'
+        || parentRole === 'webarea'
+      ) included.add(key);
+      if (actionableContextRoots.has(parentRole)) contextRoots.add(key);
       current = parent;
       hops += 1;
     }
@@ -419,22 +429,50 @@ function actionableNodeIds(nodes: SnapshotNodeWithUid[]) {
     let hops = 0;
     while (current && hops < 12) {
       const key = `${current.frameId}:${current.axNodeId}`;
-      if (contextRoots.has(key)) return true;
-      if (!current.parentAxNodeId) return false;
+      if (contextRoots.has(key)) return { key, distance: hops };
+      if (!current.parentAxNodeId) return undefined;
       current = byFrameAndId.get(`${current.frameId}:${current.parentAxNodeId}`);
       hops += 1;
     }
-    return false;
+    return undefined;
   };
 
+  const contextCandidates = new Map<string, Array<{ key: string; distance: number; priority: number }>>();
   for (const node of nodes) {
     if (!node.name && !node.value && !node.description) continue;
     const role = node.role.toLowerCase();
-    if (withinContextRoot(node) && (contextualRoles.has(role) || role === 'statictext')) {
-      included.add(`${node.frameId}:${node.axNodeId}`);
-    }
+    if (!contextualRoles.has(role) && role !== 'statictext' && role !== 'labeltext') continue;
+    const root = withinContextRoot(node);
+    if (!root) continue;
+    const candidates = contextCandidates.get(root.key) || [];
+    candidates.push({
+      key: `${node.frameId}:${node.axNodeId}`,
+      distance: root.distance,
+      priority: role === 'labeltext' ? 0 : role === 'statictext' ? 2 : 1,
+    });
+    contextCandidates.set(root.key, candidates);
+  }
+  for (const candidates of contextCandidates.values()) {
+    candidates
+      .sort((left, right) => left.priority - right.priority || left.distance - right.distance)
+      .slice(0, 24)
+      .forEach((candidate) => included.add(candidate.key));
   }
   return included;
+}
+
+function actionableViewPriority(node: SnapshotNodeWithUid, includedAsContext: boolean) {
+  if (includedAsContext && !node.actionable) return 1000;
+  const role = node.role.toLowerCase();
+  let priority = 300;
+  if (['textbox', 'searchbox', 'combobox', 'spinbutton', 'listbox'].includes(role)) priority = 0;
+  else if (['button', 'checkbox', 'radio', 'switch', 'slider', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem'].includes(role)) priority = 100;
+  else if (role === 'link') priority = 200;
+  if (node.source !== 'ax' && node.actions?.includes('focus') && !node.actions.includes('click')) priority = 150;
+  if (node.source !== 'ax') priority -= 20;
+  if (node.name || node.description || node.value) priority -= 10;
+  if (node.properties.disabled === true || node.properties.disabled === 'true') priority += 40;
+  return priority;
 }
 
 export function buildSnapshotViews(
@@ -460,10 +498,21 @@ export function buildSnapshotViews(
     full.push(boundary);
     if (frameNodes.some((node) => actionableIds.has(`${node.frameId}:${node.axNodeId}`))) actionable.push(boundary);
     if (frameNodes.some((node) => normalizeWhitespace(node.name || node.value || node.description))) text.push(boundary);
+    const actionableFrameNodes = frameNodes
+      .map((node, index) => ({
+        index,
+        node,
+        included: actionableIds.has(`${node.frameId}:${node.axNodeId}`) || (node.source !== 'ax' && node.actionable),
+      }))
+      .filter((item) => item.included)
+      .sort((left, right) => (
+        actionableViewPriority(left.node, !left.node.actionable) - actionableViewPriority(right.node, !right.node.actionable)
+        || left.index - right.index
+      ));
+    for (const { node } of actionableFrameNodes) actionable.push(recordForNode(node));
     for (const node of frameNodes) {
       const record = recordForNode(node);
       full.push(record);
-      if (actionableIds.has(`${node.frameId}:${node.axNodeId}`) || (node.source === 'dom' && node.actionable)) actionable.push(record);
       const textValue = normalizeWhitespace(node.name || node.value || node.description);
       if (!textValue) continue;
       const textKey = `${frame.frameId}:${textValue}`;

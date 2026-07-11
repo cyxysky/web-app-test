@@ -21,6 +21,14 @@ export function browserChatSessionFilePath(sessionId: string) {
   return path.join(browserChatSessionsDir(), `${safeDataFileSegment(sessionId)}.json`);
 }
 
+export function browserChatSessionSummariesDir() {
+  return path.join(appDataRoot(), '.data', 'browser-chat-session-summaries');
+}
+
+export function browserChatSessionSummaryFilePath(sessionId: string) {
+  return path.join(browserChatSessionSummariesDir(), `${safeDataFileSegment(sessionId)}.json`);
+}
+
 export function personalMemoryFilePath() {
   return path.join(appDataRoot(), '.data', 'personal-memory', 'items.json');
 }

@@ -601,12 +601,12 @@ select {
   border: 1px solid var(--border);
   border-radius: 10px;
   box-shadow: 0 14px 34px rgba(13, 13, 13, 0.13);
-  display: grid;
-  gap: 1px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
   left: 0;
   max-height: 320px;
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 5px;
   position: absolute;
   right: 0;
@@ -4857,7 +4857,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   text-align: center;
 }
 
-.settings-loading-panel:not(.compact) > div {
+.settings-loading-panel:not(.compact)>div {
   display: grid;
   gap: 5px;
   min-width: min(420px, 100%);
@@ -5476,8 +5476,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   margin-bottom: 0;
 }
 
-.skills-manager-layout {
-}
+.skills-manager-layout {}
 
 .skills-manager-list {
   align-content: start;
@@ -5820,6 +5819,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   justify-content: space-between;
   min-height: 30px;
   padding: 0 6px;
+}
+
+.group-sidebar-head-actions {
+  align-items: center;
+  display: inline-flex;
+  gap: 2px;
 }
 
 .group-tree,
@@ -6696,7 +6701,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   justify-content: space-between;
 }
 
-.browser-chat-brand .ui-icon-button{
+.browser-chat-brand .ui-icon-button {
   height: 32px;
   min-height: 32px;
   width: 32px;
@@ -6960,6 +6965,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button {
+  background: transparent;
+  border-color: transparent;
+  border-radius: 12px;
+  color: var(--muted-strong);
   height: 36px;
   justify-content: center;
   margin-bottom: 2px;
@@ -7181,6 +7190,60 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: none;
 }
 
+.custom-select-search {
+  align-items: center;
+  background: #ffffff;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex: none;
+  gap: 7px;
+  padding: 2px 3px 7px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.custom-select-search svg {
+  color: var(--muted);
+  flex: none;
+}
+
+.custom-select-search input {
+  background: transparent;
+  border: 0;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 13px;
+  min-width: 0;
+  outline: 0;
+  padding: 5px 0;
+  width: 100%;
+}
+
+.custom-select-search input::placeholder {
+  color: var(--muted);
+}
+
+.custom-select-options {
+  display: grid;
+  gap: 1px;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.custom-select-empty {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+  padding: 18px 8px;
+  text-align: center;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-recent-section>p {
+  display: none;
+}
+
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-header h2,
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-row-menu {
   display: none;
@@ -7269,6 +7332,21 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   min-height: 34px;
   padding: 0;
   width: 36px;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-create-button {
+  background: transparent;
+  border-color: transparent;
+  border-radius: 12px;
+  color: var(--muted-strong);
+  margin-bottom: 2px;
+}
+
+.browser-chat-layout.sidebar-collapsed :where(.browser-chat-new-chat-button,
+  .browser-chat-sub-sidebar .group-create-button):not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+  border-color: transparent;
+  color: var(--foreground);
 }
 
 .browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-tree-row {
@@ -9927,6 +10005,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   color: var(--muted-strong);
 }
 
+:root[data-theme="dark"] .custom-select-search {
+  background: var(--panel);
+}
+
 :root[data-theme="dark"] .settings-card {
   background: transparent;
   border-color: transparent;
@@ -10721,7 +10803,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   min-height: 0;
 }
 
-.browser-chat-settings-pane .settings-content > section,
+.browser-chat-settings-pane .settings-content>section,
 .browser-chat-settings-pane .personal-memory-settings,
 .browser-chat-settings-pane .skills-manager {
   background: transparent;
@@ -10732,7 +10814,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   padding: 0;
 }
 
-.browser-chat-settings-pane .settings-content > section::before,
+.browser-chat-settings-pane .settings-content>section::before,
 .browser-chat-settings-pane .personal-memory-settings::before,
 .browser-chat-settings-pane .skills-manager::before {
   content: none;
@@ -10760,7 +10842,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   max-width: 680px;
 }
 
-.browser-chat-settings-pane .settings-section-head > .ui-button {
+.browser-chat-settings-pane .settings-section-head>.ui-button {
   border-radius: 8px;
   min-height: 36px;
   padding-inline: 13px;
@@ -10795,21 +10877,21 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: color-mix(in srgb, var(--foreground) 2.5%, transparent);
 }
 
-.browser-chat-settings-pane .settings-row > div:first-child {
+.browser-chat-settings-pane .settings-row>div:first-child {
   align-content: center;
   display: grid;
   gap: 5px;
 }
 
-.browser-chat-settings-pane .settings-section-head > div:first-child,
+.browser-chat-settings-pane .settings-section-head>div:first-child,
 .browser-chat-settings-pane .env-name {
   display: grid;
   gap: 5px;
 }
 
-.browser-chat-settings-pane .settings-row > div:first-child > :where(strong, span),
-.browser-chat-settings-pane .settings-section-head > div:first-child > :where(h2, span),
-.browser-chat-settings-pane .env-name > :where(strong, span) {
+.browser-chat-settings-pane .settings-row>div:first-child> :where(strong, span),
+.browser-chat-settings-pane .settings-section-head>div:first-child> :where(h2, span),
+.browser-chat-settings-pane .env-name> :where(strong, span) {
   display: block;
 }
 
@@ -11052,6 +11134,7 @@ body {
 }
 
 @media (hover: hover) {
+
   :where(.dashboard-v2-metrics>div,
     .case-item,
     .run-history-row,
@@ -11076,7 +11159,7 @@ body {
     padding: 18px 14px 36px;
   }
 
-  .browser-chat-settings-pane .settings-content > section,
+  .browser-chat-settings-pane .settings-content>section,
   .browser-chat-settings-pane .personal-memory-settings,
   .browser-chat-settings-pane .skills-manager {
     border-radius: 0;
@@ -11193,5 +11276,412 @@ body {
 
   .browser-chat-compose-tools {
     flex-wrap: wrap;
+  }
+}
+
+/* Reference-style browser chat composer */
+.browser-chat-composer-shell:has(.browser-chat-compose--reference) {
+  gap: 10px;
+  max-width: 920px;
+  width: min(100%, 920px);
+}
+
+.browser-chat-compose.browser-chat-compose--reference {
+  background: var(--panel);
+  border: 1px solid color-mix(in srgb, var(--border-strong) 70%, var(--border));
+  border-radius: 28px;
+  box-shadow:
+    0 10px 28px rgba(15, 23, 42, 0.06),
+    0 1px 4px rgba(15, 23, 42, 0.025);
+  display: grid;
+  gap: 0;
+  grid-template-rows: minmax(84px, auto) 63px;
+  min-height: 148px;
+  overflow: visible;
+  padding: 0;
+  position: relative;
+}
+
+.browser-chat-compose--reference .browser-chat-inline-editor {
+  font-size: 15px;
+  line-height: 1.55;
+  max-height: 180px;
+  min-height: 84px;
+  padding: 21px 18px 6px;
+}
+
+.browser-chat-compose--reference .browser-chat-inline-editor:empty::before {
+  color: color-mix(in srgb, var(--muted) 76%, transparent);
+}
+
+.browser-chat-compose--reference .browser-chat-compose-actions {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  min-height: 63px;
+  padding: 8px 12px 12px 14px;
+}
+
+.browser-chat-compose--reference .browser-chat-compose-tools,
+.browser-chat-compose--reference .browser-chat-compose-submit {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  min-width: 0;
+}
+
+.browser-chat-compose--reference .browser-chat-compose-tools {
+  flex: 0 0 auto;
+}
+
+.browser-chat-compose--reference .browser-chat-compose-submit {
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
+.browser-chat-compose--reference .browser-chat-attach {
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  color: var(--muted-strong);
+  height: 38px;
+  width: 38px;
+}
+
+.browser-chat-compose--reference .browser-chat-attach:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+  color: var(--foreground);
+}
+
+.browser-chat-compose--reference .browser-chat-model-control {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  display: flex;
+  max-width: min(38vw, 270px);
+  min-height: 38px;
+  padding: 0;
+}
+
+.browser-chat-compose--reference .browser-chat-provider-select {
+  max-width: 100%;
+}
+
+.browser-chat-compose--reference .browser-chat-provider-select .custom-select-button {
+  color: var(--muted-strong);
+  font-size: 13px;
+  font-weight: 580;
+  min-height: 38px;
+  padding: 0 2px;
+}
+
+.browser-chat-compose--reference .browser-chat-send,
+.browser-chat-compose--reference .browser-chat-stop {
+  border-radius: 999px;
+  height: 42px;
+  width: 42px;
+}
+
+.browser-chat-compose--reference .browser-chat-send {
+  background: var(--accent-strong);
+  box-shadow: none;
+  color: #ffffff;
+}
+
+.browser-chat-compose--reference .browser-chat-send:disabled {
+  background: color-mix(in srgb, var(--muted) 24%, var(--panel));
+  color: color-mix(in srgb, var(--foreground) 62%, transparent);
+  opacity: 1;
+}
+
+.browser-chat-composer-shell:has(.browser-chat-compose--reference) .browser-chat-composer-mode {
+  align-items: center;
+  display: flex;
+  min-height: 24px;
+  padding-left: 22px;
+}
+
+.browser-chat-composer-shell:has(.browser-chat-compose--reference) .browser-chat-composer-mode button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted-strong);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 620;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 5px;
+}
+
+.browser-chat-composer-shell:has(.browser-chat-compose--reference) .browser-chat-composer-mode button:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+  color: var(--foreground);
+}
+
+.browser-chat-composer-shell:has(.browser-chat-compose--reference) .browser-chat-composer-mode button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.browser-chat-compose.browser-chat-compose--reference:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 26%, var(--border));
+  box-shadow:
+    0 11px 30px rgba(15, 23, 42, 0.075),
+    0 1px 4px rgba(15, 23, 42, 0.03);
+  transform: none;
+}
+
+:root[data-theme="dark"] .browser-chat-compose.browser-chat-compose--reference {
+  background: #17191a;
+  border-color: #343738;
+  box-shadow:
+    0 9px 26px rgba(0, 0, 0, 0.12),
+    0 1px 4px rgba(0, 0, 0, 0.08);
+  color: #e6e6e6;
+}
+
+:root[data-theme="dark"] .browser-chat-compose.browser-chat-compose--reference:focus-within {
+  border-color: #414546;
+  box-shadow:
+    0 10px 28px rgba(0, 0, 0, 0.14),
+    0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+:root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-inline-editor:empty::before {
+  color: #444748;
+}
+
+:root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button,
+
+
+:root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-send:disabled {
+  background: #6f7173;
+  color: #292b2c;
+}
+
+:root[data-theme="dark"] .browser-chat-composer-shell:has(.browser-chat-compose--reference) .browser-chat-composer-mode button {
+  color: #9a9c9e;
+}
+
+@media (max-width: 760px) {
+  .browser-chat-composer-shell:has(.browser-chat-compose--reference) {
+    width: 100%;
+  }
+
+  .browser-chat-compose.browser-chat-compose--reference {
+    border-radius: 22px;
+    grid-template-rows: minmax(76px, auto) auto;
+  }
+
+  .browser-chat-compose--reference .browser-chat-compose-actions {
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 8px;
+    min-height: 58px;
+    padding: 7px 9px 10px;
+  }
+
+  .browser-chat-compose--reference .browser-chat-compose-tools,
+  .browser-chat-compose--reference .browser-chat-compose-submit {
+    gap: 5px;
+  }
+
+  .browser-chat-compose--reference .browser-chat-model-control {
+    max-width: min(42vw, 190px);
+  }
+}
+
+.browser-chat-section-create,
+.browser-chat-sub-sidebar .group-sidebar-head .dashboard-action-icon {
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  width: 28px;
+}
+
+.browser-chat-section-create:not(:disabled):hover,
+.browser-chat-sub-sidebar .group-sidebar-head .dashboard-action-icon:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+  color: var(--foreground);
+}
+
+.browser-chat-layout:not(.sidebar-collapsed) .browser-chat-new-chat-button,
+.browser-chat-layout:not(.sidebar-collapsed) .browser-chat-sub-sidebar .group-create-button {
+  display: none;
+}
+
+/* Unified refined motion */
+@keyframes ui-disclosure-in {
+  from {
+    opacity: 0;
+    transform: translateY(-5px) scale(0.995);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes ui-icon-settle {
+  0% {
+    transform: scale(0.86);
+  }
+
+  62% {
+    transform: scale(1.08);
+  }
+
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes ui-check-in {
+  0% {
+    opacity: 0.5;
+    transform: scale(0.72);
+  }
+
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+:where(
+  .browser-chat-embedded-tab,
+  .browser-chat-overflow-menu button,
+  .browser-chat-recent-item,
+  .browser-chat-section-create,
+  .browser-chat-target-model-bar,
+  .case-table-row,
+  .custom-select-menu button,
+  .group-tree-button,
+  .settings-tabs button,
+  .skills-manager-item-main,
+  .tool-record-action
+) {
+  transition:
+    background-color var(--motion-fast) ease,
+    border-color var(--motion-fast) ease,
+    box-shadow var(--motion-normal) var(--ease-standard),
+    color var(--motion-fast) ease,
+    opacity var(--motion-fast) ease,
+    transform var(--motion-normal) var(--ease-emphasized);
+}
+
+:where(
+  .ui-button,
+  .ui-icon-button,
+  .browser-chat-nav-item,
+  .browser-chat-subnav button,
+  .group-tree-button,
+  .browser-chat-overflow-menu button,
+  .custom-select-menu button,
+  .skills-manager-item-main
+) > svg {
+  transform-origin: center;
+  transition:
+    color var(--motion-fast) ease,
+    opacity var(--motion-fast) ease,
+    transform var(--motion-normal) var(--ease-spring);
+}
+
+:where(
+  .browser-chat-nav-item.active,
+  .browser-chat-subnav button.active,
+  .group-tree-button.active,
+  .settings-tabs button.active
+) > svg {
+  animation: ui-icon-settle var(--motion-slow) var(--ease-emphasized) both;
+}
+
+:where(
+  .skills-manager-item-detail,
+  .browser-chat-tool-detail-grid,
+  .report-accordion[open] > :not(summary),
+  .debug-details[open] > :not(summary),
+  .tool-call-list details[open] > :not(summary)
+) {
+  animation: ui-disclosure-in var(--motion-normal) var(--ease-emphasized) both;
+  transform-origin: top center;
+}
+
+:where(input[type="checkbox"], input[type="radio"]):checked {
+  animation: ui-check-in var(--motion-normal) var(--ease-spring) both;
+}
+
+.settings-toggle,
+.settings-toggle span,
+.browser-chat-safety-toggle::before,
+.browser-chat-embedded-chat-toggle svg,
+.custom-select-button svg {
+  transition:
+    background-color var(--motion-normal) ease,
+    border-color var(--motion-normal) ease,
+    color var(--motion-fast) ease,
+    transform var(--motion-normal) var(--ease-emphasized);
+}
+
+:where(
+  .settings-card,
+  .personal-memory-item,
+  .skills-manager-item,
+  .browser-chat-message > div:last-child,
+  .browser-chat-tool-card,
+  .browser-chat-tool-shot-card,
+  .case-main-panel,
+  .run-execution-panel
+) {
+  transition:
+    background-color var(--motion-normal) ease,
+    border-color var(--motion-normal) ease,
+    box-shadow var(--motion-normal) var(--ease-standard),
+    transform var(--motion-normal) var(--ease-emphasized);
+}
+
+@media (hover: hover) {
+  :where(
+    .ui-button,
+    .ui-icon-button,
+    .browser-chat-section-create,
+    .browser-chat-overflow-menu button,
+    .custom-select-menu button
+  ):not(:disabled):hover {
+    transform: translateY(-1px);
+  }
+
+  :where(
+    .ui-icon-button,
+    .browser-chat-section-create,
+    .browser-chat-nav-item,
+    .browser-chat-subnav button,
+    .group-tree-button
+  ):not(:disabled):hover > svg {
+    transform: scale(1.08);
+  }
+
+  :where(
+    .settings-card,
+    .personal-memory-item,
+    .skills-manager-item,
+    .browser-chat-tool-card,
+    .browser-chat-tool-shot-card
+  ):hover {
+    border-color: color-mix(in srgb, var(--accent) 14%, var(--border));
+    box-shadow: 0 10px 28px color-mix(in srgb, #000000 5%, transparent);
+    transform: translateY(-1px);
   }
 }

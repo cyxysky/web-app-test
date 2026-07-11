@@ -108,8 +108,8 @@ export async function exportAccessibilitySnapshotJson(session: BrowserSession): 
   const full = await collectView(session, 'full');
   const text = await collectView(session, 'text');
   const payload = {
-    version: 2,
-    format: 'chromium-accessibility-tree',
+    version: 3,
+    format: 'chromium-dom-snapshot-with-partial-ax',
     createdAt,
     url: session.currentUrl(),
     title,

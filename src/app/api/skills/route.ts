@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { store } from '@/server/db/mock-store';
-import { skillContentSchema } from '@/server/ai/schemas/test-case.schema';
+import { parseSkillContent } from '@/server/ai/schemas/test-case.schema';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -14,7 +14,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const content = skillContentSchema.parse(body.content || {});
+    const content = parseSkillContent(body.content);
     const skill = store.upsertSkill({
       id: typeof body.id === 'string' ? body.id : undefined,
       title: String(body.title || ''),

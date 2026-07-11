@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { CirclePlus, X } from 'lucide-react';
 import { NewTestCaseForm } from '@/components/NewTestCaseForm';
@@ -8,10 +8,12 @@ import { useI18n } from '@/i18n/I18nProvider';
 
 export function NewTestCaseModal({
   groupId,
+  icon,
   iconOnly = false,
   onCreated,
 }: {
   groupId?: string;
+  icon?: ReactNode;
   iconOnly?: boolean;
   onCreated?: (testCaseId: string) => void;
 } = {}) {
@@ -48,7 +50,7 @@ export function NewTestCaseModal({
         title={t('新增测试用例')}
         type="button"
       >
-        <CirclePlus size={16} />
+        {icon || <CirclePlus size={16} />}
         {iconOnly ? null : t('新增测试用例')}
       </button>
       {modal && typeof document !== 'undefined' ? createPortal(modal, document.body) : modal}
