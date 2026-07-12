@@ -38,6 +38,9 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
   closeGroup(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:close-group', input);
   },
+  discardGroup(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:discard-group', input);
+  },
   clearHistory() {
     return ipcRenderer.invoke('webpilot:embedded-browser:clear-history');
   },
@@ -62,8 +65,17 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
     ipcRenderer.on('webpilot:embedded-browser:state-changed', handler);
     return () => ipcRenderer.removeListener('webpilot:embedded-browser:state-changed', handler);
   },
+  onFocusAddress(listener) {
+    if (typeof listener !== 'function') return () => {};
+    const handler = () => listener();
+    ipcRenderer.on('webpilot:embedded-browser:focus-address', handler);
+    return () => ipcRenderer.removeListener('webpilot:embedded-browser:focus-address', handler);
+  },
   reload() {
     return ipcRenderer.invoke('webpilot:embedded-browser:reload');
+  },
+  stop() {
+    return ipcRenderer.invoke('webpilot:embedded-browser:stop');
   },
   removeBookmark(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:remove-bookmark', input);
@@ -77,11 +89,17 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
   setBounds(bounds) {
     return ipcRenderer.invoke('webpilot:embedded-browser:set-bounds', bounds);
   },
+  setGroupCollapsed(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:set-group-collapsed', input);
+  },
   setLibraryPanel(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:set-library-panel', input);
   },
   setTabMuted(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:set-tab-muted', input);
+  },
+  showTabContextMenu(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:show-tab-context-menu', input);
   },
   setVisible(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:set-visible', input);

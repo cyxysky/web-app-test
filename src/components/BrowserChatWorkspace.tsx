@@ -20,6 +20,7 @@ import {
   Download,
   FileSearch,
   Folder,
+  FolderOpen,
   GalleryHorizontalEnd,
   Gauge,
   Globe,
@@ -35,6 +36,7 @@ import {
   PanelLeft,
   PanelRight,
   PencilLine,
+  Pin,
   Plus,
   Power,
   RefreshCw,
@@ -263,8 +265,10 @@ type EmbeddedBrowserBridgeResult = {
 type EmbeddedBrowserTab = {
   audioMuted?: boolean;
   bookmarked?: boolean;
+  faviconUrl?: string;
   groupId?: string;
   id: string;
+  pinned?: boolean;
   sessionId?: string;
   title: string;
   url: string;
@@ -274,6 +278,7 @@ type EmbeddedBrowserTab = {
 type EmbeddedBrowserGroup = {
   active?: boolean;
   activeTabId?: string;
+  collapsed?: boolean;
   id: string;
   sessionId?: string;
   tabs: EmbeddedBrowserTab[];
@@ -312,19 +317,23 @@ type EmbeddedBrowserBridge = {
   activateTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   closeActiveTab: () => Promise<EmbeddedBrowserBridgeResult>;
   closeGroup: (input: { id: string }) => Promise<EmbeddedBrowserState>;
+  discardGroup?: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   closeTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   createTab: (input: { groupId?: string; sessionId?: string; url?: string }) => Promise<EmbeddedBrowserState>;
   getState: () => Promise<EmbeddedBrowserState>;
   goBack: () => Promise<EmbeddedBrowserState>;
   goForward: () => Promise<EmbeddedBrowserState>;
-  moveTab: (input: { id: string; position: 'before' | 'after'; targetId: string }) => Promise<EmbeddedBrowserState>;
+  moveTab: (input: { id: string; position?: 'before' | 'after' | 'end'; targetGroupId?: string; targetId?: string; targetSessionId?: string }) => Promise<EmbeddedBrowserState>;
   navigate: (input: { groupId?: string; sessionId?: string; url: string }) => Promise<EmbeddedBrowserBridgeResult>;
+  onFocusAddress: (listener: () => void) => () => void;
   onStateChange: (listener: (state: EmbeddedBrowserState) => void) => () => void;
   reload: () => Promise<EmbeddedBrowserState>;
   reset: () => Promise<EmbeddedBrowserBridgeResult>;
   setBounds: (bounds: EmbeddedBrowserBounds) => Promise<EmbeddedBrowserBridgeResult>;
+  setGroupCollapsed: (input: { collapsed: boolean; id: string }) => Promise<EmbeddedBrowserState>;
   setLibraryPanel: (input: { panel: 'bookmarks' | 'history' | null }) => Promise<EmbeddedBrowserState>;
   setTabMuted: (input: { id: string; muted?: boolean }) => Promise<EmbeddedBrowserState>;
+  showTabContextMenu: (input: { groups: Array<{ id: string; label: string }>; id: string }) => Promise<EmbeddedBrowserBridgeResult>;
   setVisible: (input: {
     bounds?: EmbeddedBrowserBounds;
     createIfMissing?: boolean;
@@ -334,6 +343,7 @@ type EmbeddedBrowserBridge = {
     url?: string;
     visible: boolean;
   }) => Promise<EmbeddedBrowserState>;
+  stop?: () => Promise<EmbeddedBrowserState>;
   toggleBookmark: () => Promise<EmbeddedBrowserState>;
 };
 
@@ -371,6 +381,14 @@ function embeddedSessionGroupLabel(sessionId?: string) {
   const parts = normalized.split('_');
   const shortId = (parts.at(-1) || normalized || 'session').slice(-6).toLowerCase();
   return `ai-${shortId}`;
+}
+
+const EMBEDDED_BROWSER_GROUP_ICON_COLORS = ['#10a37f', '#4f8cff', '#9b6fe8', '#e38b2d', '#d85b7d', '#27a9b2', '#7aa83e', '#c65ed0', '#e05b45', '#3978c5'];
+
+function embeddedBrowserGroupIconColorIndex(groupId: string) {
+  let hash = 0;
+  for (const character of groupId) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
+  return Math.abs(hash) % EMBEDDED_BROWSER_GROUP_ICON_COLORS.length;
 }
 
 function embeddedGroupIdForSession(sessionId?: string) {
@@ -3009,6 +3027,26 @@ function normalizeEmbeddedBrowserAddress(value: string) {
   return `https://${trimmed}`;
 }
 
+function EmbeddedBrowserTabFavicon({ faviconUrl }: { faviconUrl?: string }) {
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [faviconUrl]);
+
+  if (!faviconUrl || failed) return <AppWindow aria-hidden="true" size={14} />;
+  return (
+    <img
+      alt=""
+      decoding="async"
+      draggable={false}
+      onError={() => setFailed(true)}
+      referrerPolicy="no-referrer"
+      src={faviconUrl}
+    />
+  );
+}
+
 const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   active,
   enabled,
@@ -3023,9 +3061,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   sessionId?: string;
 }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const addressInputRef = useRef<HTMLInputElement | null>(null);
+  const requestedSessionIdRef = useRef('');
   const embeddedBrowserSyncRef = useRef({ boundsKey: '', groupId: '', sessionId: '', visible: false });
   const addressFocusedRef = useRef(false);
-  const draggingGroupIdRef = useRef('');
   const draggingTabIdRef = useRef('');
   const [bridgeAvailable, setBridgeAvailable] = useState(false);
   const [bridgeError, setBridgeError] = useState('');
@@ -3037,10 +3076,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [addressValue, setAddressValue] = useState('');
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
-  const [collapsedGroupIds, setCollapsedGroupIds] = useState<string[]>([]);
   const [closedGroupIds, setClosedGroupIds] = useState<string[]>([]);
   const [draggingTabId, setDraggingTabId] = useState('');
   const [dragDropTarget, setDragDropTarget] = useState<{ position: 'before' | 'after'; tabId: string } | null>(null);
+  const [dragDropGroupId, setDragDropGroupId] = useState('');
   const [libraryPanel, setLibraryPanel] = useState<'bookmarks' | 'history' | null>(null);
 
   const applyEmbeddedBrowserState = useCallback((result: EmbeddedBrowserState) => {
@@ -3163,6 +3202,16 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     return bridge?.onStateChange?.((result) => applyEmbeddedBrowserState(result)) || undefined;
   }, [active, applyEmbeddedBrowserState, enabled, loadEmbeddedBrowserState]);
 
+  useEffect(() => {
+    if (!enabled || !active) return undefined;
+    return window.webPilotEmbeddedBrowser?.onFocusAddress?.(() => {
+      window.requestAnimationFrame(() => {
+        addressInputRef.current?.focus();
+        addressInputRef.current?.select();
+      });
+    }) || undefined;
+  }, [active, enabled]);
+
   async function goEmbeddedBrowserBack() {
     const bridge = window.webPilotEmbeddedBrowser;
     if (!bridge || !canGoBack) return;
@@ -3189,6 +3238,16 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const result = await bridge.reload().catch((error: unknown) => ({
       ok: false,
       error: error instanceof Error ? error.message : 'Browser reload failed',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function stopEmbeddedBrowserLoading() {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge?.stop) return;
+    const result = await bridge.stop().catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '停止页面加载失败',
     }));
     applyEmbeddedBrowserState(result);
   }
@@ -3231,7 +3290,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       error: error instanceof Error ? error.message : '切换嵌入浏览器标签失败',
     }));
     applyEmbeddedBrowserState(result);
-    if (result.ok && tab.sessionId && tab.sessionId !== sessionId) onSelectSession?.(tab.sessionId);
+    if (result.ok && tab.sessionId && tab.sessionId !== sessionId) {
+      requestedSessionIdRef.current = tab.sessionId;
+      onSelectSession?.(tab.sessionId);
+    }
   }
 
   async function closeEmbeddedBrowserTab(tab: EmbeddedBrowserTab) {
@@ -3255,10 +3317,12 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     applyEmbeddedBrowserState(result);
     if (result.ok) {
       setClosedGroupIds((current) => (current.includes(group.id) ? current : [...current, group.id]));
-      setCollapsedGroupIds((current) => current.filter((item) => item !== group.id));
       const nextActiveGroup = result.groups?.find((item) => item.active) || result.groups?.find((item) => item.tabs.length);
       const nextSessionId = nextActiveGroup?.sessionId || nextActiveGroup?.tabs.find((tab) => tab.sessionId)?.sessionId;
-      if (nextSessionId && nextSessionId !== sessionId) onSelectSession?.(nextSessionId);
+      if (nextSessionId && nextSessionId !== sessionId) {
+        requestedSessionIdRef.current = nextSessionId;
+        onSelectSession?.(nextSessionId);
+      }
       void syncEmbeddedBrowser();
     }
   }
@@ -3274,17 +3338,21 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     applyEmbeddedBrowserState(result);
     if (result.ok) {
       setClosedGroupIds((current) => current.filter((item) => item !== group.id));
-      setCollapsedGroupIds((current) => current.filter((item) => item !== group.id));
-      if (groupSessionId && groupSessionId !== sessionId) onSelectSession?.(groupSessionId);
+      if (groupSessionId && groupSessionId !== sessionId) {
+        requestedSessionIdRef.current = groupSessionId;
+        onSelectSession?.(groupSessionId);
+      }
     }
   }
 
-  function toggleEmbeddedBrowserGroupCollapsed(groupId: string) {
-    setCollapsedGroupIds((current) => (
-      current.includes(groupId)
-        ? current.filter((item) => item !== groupId)
-        : [...current, groupId]
-    ));
+  async function toggleEmbeddedBrowserGroupCollapsed(group: EmbeddedBrowserGroup) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.setGroupCollapsed({ collapsed: !group.collapsed, id: group.id }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '更新标签组状态失败',
+    }));
+    applyEmbeddedBrowserState(result);
   }
 
   function embeddedTabDragPosition(event: ReactDragEvent<HTMLElement>) {
@@ -3292,14 +3360,35 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     return event.clientX > rect.left + rect.width / 2 ? 'after' : 'before';
   }
 
-  async function moveEmbeddedBrowserTab(tabId: string, targetId: string, position: 'before' | 'after') {
+  async function moveEmbeddedBrowserTab(tabId: string, options: { position?: 'before' | 'after' | 'end'; targetGroupId?: string; targetId?: string; targetSessionId?: string }) {
     const bridge = window.webPilotEmbeddedBrowser;
-    if (!bridge || !tabId || !targetId || tabId === targetId) return;
-    const result = await bridge.moveTab({ id: tabId, position, targetId }).catch((error: unknown) => ({
+    if (!bridge || !tabId || (options.targetId && tabId === options.targetId)) return;
+    const result = await bridge.moveTab({ id: tabId, ...options }).catch((error: unknown): EmbeddedBrowserState => ({
       ok: false,
       error: error instanceof Error ? error.message : '移动嵌入浏览器标签失败',
     }));
     applyEmbeddedBrowserState(result);
+    if (result.ok && result.activeTabId === tabId) {
+      const movedTab = result.tabs?.find((item) => item.id === tabId);
+      if (movedTab?.sessionId && movedTab.sessionId !== sessionId) {
+        requestedSessionIdRef.current = movedTab.sessionId;
+        onSelectSession?.(movedTab.sessionId);
+      }
+    }
+  }
+
+  function showEmbeddedBrowserTabContextMenu(event: ReactMouseEvent<HTMLElement>, tab: EmbeddedBrowserTab) {
+    event.preventDefault();
+    event.stopPropagation();
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    void bridge.showTabContextMenu({
+      groups: visibleGroups.map((group) => ({
+        id: group.id,
+        label: embeddedSessionGroupLabel(group.sessionId || embeddedSessionIdFromGroupId(group.id)),
+      })),
+      id: tab.id,
+    }).catch(() => undefined);
   }
 
   async function navigateEmbeddedBrowserAddress(event: FormEvent<HTMLFormElement>) {
@@ -3323,10 +3412,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   }
 
   function clearEmbeddedTabDrag() {
-    draggingGroupIdRef.current = '';
     draggingTabIdRef.current = '';
     setDraggingTabId('');
     setDragDropTarget(null);
+    setDragDropGroupId('');
   }
 
   const selectedGroupId = embeddedGroupIdForSession(sessionId);
@@ -3343,6 +3432,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         group = {
           active: normalizedId === resolvedActiveGroupId,
           activeTabId: input.activeTabId,
+          collapsed: Boolean(input.collapsed),
           id: normalizedId,
           sessionId: input.sessionId,
           tabs: [],
@@ -3379,6 +3469,25 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     return orderedIds.map((id) => groupsById.get(id)!).filter(Boolean);
   }, [activeGroupId, activeTabId, browserGroups, browserTabs, closedGroupIds, selectedGroupId, sessionId]);
 
+  const visibleGroupIconColors = useMemo(() => {
+    const assigned = new Map<string, string>();
+    const usedIndexes = new Set<number>();
+    for (const group of visibleGroups) {
+      const initialIndex = embeddedBrowserGroupIconColorIndex(group.id);
+      let colorIndex = initialIndex;
+      for (let offset = 0; offset < EMBEDDED_BROWSER_GROUP_ICON_COLORS.length; offset += 1) {
+        const candidate = (initialIndex + offset) % EMBEDDED_BROWSER_GROUP_ICON_COLORS.length;
+        if (!usedIndexes.has(candidate)) {
+          colorIndex = candidate;
+          break;
+        }
+      }
+      usedIndexes.add(colorIndex);
+      assigned.set(group.id, EMBEDDED_BROWSER_GROUP_ICON_COLORS[colorIndex]);
+    }
+    return assigned;
+  }, [visibleGroups]);
+
   const activeEmbeddedTab = useMemo(() => {
     if (!sessionId) return undefined;
     const groupedTabs = visibleGroups.flatMap((group) => group.tabs);
@@ -3391,16 +3500,18 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const isEmbeddedBrowserLoading = Boolean(activeEmbeddedTab?.loading);
 
   useEffect(() => {
-    const visibleIds = new Set(visibleGroups.map((group) => group.id));
-    setCollapsedGroupIds((current) => {
-      const next = current.filter((groupId) => visibleIds.has(groupId));
-      return next.length === current.length ? current : next;
-    });
-  }, [visibleGroups]);
-
-  useEffect(() => {
     if (!addressFocusedRef.current) setAddressValue(embeddedBrowserDisplayUrl(activeEmbeddedTab));
   }, [activeEmbeddedTab?.id, activeEmbeddedTab?.url]);
+
+  useEffect(() => {
+    if (!active || !activeEmbeddedTab?.sessionId || activeEmbeddedTab.sessionId === sessionId) {
+      requestedSessionIdRef.current = '';
+      return;
+    }
+    if (requestedSessionIdRef.current === activeEmbeddedTab.sessionId) return;
+    requestedSessionIdRef.current = activeEmbeddedTab.sessionId;
+    onSelectSession?.(activeEmbeddedTab.sessionId);
+  }, [active, activeEmbeddedTab?.sessionId, onSelectSession, sessionId]);
 
   return (
     <section
@@ -3418,7 +3529,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
               || group.tabs.find((tab) => tab.sessionId)?.sessionId
               || (group.id.startsWith('session:') ? group.id.slice('session:'.length) : sessionId);
             const isActiveGroup = Boolean(group.active || group.id === selectedGroupId);
-            const isCollapsedGroup = collapsedGroupIds.includes(group.id);
+            const isCollapsedGroup = Boolean(group.collapsed);
             return (
               <div
                 className={[
@@ -3426,19 +3537,65 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                   isActiveGroup ? 'active' : '',
                   isCollapsedGroup ? 'collapsed' : '',
                   group.tabs.length ? '' : 'empty',
+                  dragDropGroupId === group.id ? 'drop-target' : '',
                 ].filter(Boolean).join(' ')}
                 key={group.id}
+                onDragOver={(event) => {
+                  const sourceTabId = draggingTabIdRef.current || draggingTabId;
+                  if (!sourceTabId) return;
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = 'move';
+                  setDragDropTarget(null);
+                  setDragDropGroupId(group.id);
+                }}
+                onDrop={(event) => {
+                  const sourceTabId = draggingTabIdRef.current || draggingTabId || event.dataTransfer.getData('application/x-webpilot-tab-id');
+                  if (!sourceTabId) return;
+                  event.preventDefault();
+                  clearEmbeddedTabDrag();
+                  void moveEmbeddedBrowserTab(sourceTabId, {
+                    position: 'end',
+                    targetGroupId: group.id,
+                    targetSessionId: groupSessionId,
+                  });
+                }}
+                style={{ '--embedded-group-icon-color': visibleGroupIconColors.get(group.id) } as CSSProperties}
               >
+                {group.tabs.length ? null : (
+                  <div className="browser-chat-embedded-empty-group">
+                    <button
+                      aria-label={`在 ${embeddedSessionGroupLabel(groupSessionId)} 中新建标签页`}
+                      className="browser-chat-embedded-empty-group-create"
+                      onClick={() => void createEmbeddedBrowserTab(group)}
+                      title={`在 ${embeddedSessionGroupLabel(groupSessionId)} 中新建标签页`}
+                      type="button"
+                    >
+                      <Plus size={17} />
+                      <span>新建标签页</span>
+                    </button>
+                    <button
+                      aria-label={`关闭 ${embeddedSessionGroupLabel(groupSessionId)} 标签组`}
+                      className="browser-chat-embedded-empty-group-close"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void closeEmbeddedBrowserGroup(group);
+                      }}
+                      title={`关闭 ${embeddedSessionGroupLabel(groupSessionId)} 标签组`}
+                      type="button"
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                )}
                 <div className="browser-chat-embedded-tab-group-tag">
                   <button
                     aria-expanded={!isCollapsedGroup}
                     className="browser-chat-embedded-tab-group-label"
-                    onClick={() => toggleEmbeddedBrowserGroupCollapsed(group.id)}
+                    onClick={() => void toggleEmbeddedBrowserGroupCollapsed(group)}
                     title={`${isCollapsedGroup ? '展开' : '收起'} ${embeddedSessionGroupLabel(groupSessionId)} 标签组`}
                     type="button"
                   >
-                    <Folder size={14} />
-                    <ChevronDown className="browser-chat-embedded-tab-group-chevron" size={11} />
+                    {isCollapsedGroup ? <Folder size={16} /> : <FolderOpen size={16} />}
                   </button>
                   <button
                     aria-label={`关闭 ${embeddedSessionGroupLabel(groupSessionId)} 标签组`}
@@ -3476,6 +3633,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                         className={[
                           'browser-chat-embedded-tab',
                           isActiveTab ? 'active' : '',
+                          tab.pinned ? 'pinned' : '',
                           tab.loading ? 'loading' : '',
                           draggingTabId === tab.id ? 'dragging' : '',
                           dragPosition ? `drop-${dragPosition}` : '',
@@ -3483,17 +3641,19 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                         draggable
                         key={tab.id || `${tab.url}-${tabIndex}`}
                         onClick={() => void activateEmbeddedBrowserTab(tab)}
+                        onContextMenu={(event) => showEmbeddedBrowserTabContextMenu(event, tab)}
                         onDragEnd={clearEmbeddedTabDrag}
                         onDragOver={(event) => {
                           const sourceTabId = draggingTabIdRef.current || draggingTabId;
-                          if (!sourceTabId || sourceTabId === tab.id) return;
-                          if (draggingGroupIdRef.current && draggingGroupIdRef.current !== group.id) return;
+                          if (!sourceTabId) return;
                           event.preventDefault();
+                          event.stopPropagation();
+                          if (sourceTabId === tab.id) return;
                           event.dataTransfer.dropEffect = 'move';
+                          setDragDropGroupId('');
                           setDragDropTarget({ position: embeddedTabDragPosition(event), tabId: tab.id });
                         }}
                         onDragStart={(event) => {
-                          draggingGroupIdRef.current = group.id;
                           draggingTabIdRef.current = tab.id;
                           setDraggingTabId(tab.id);
                           const tabDragPayload: EmbeddedBrowserTabDragPayload = {
@@ -3510,20 +3670,25 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                           event.dataTransfer.setData('text/plain', tabDragPayload.url || tabDragPayload.title || tab.id);
                         }}
                         onDrop={(event) => {
-                          const droppedTabId = draggingTabIdRef.current || draggingTabId || event.dataTransfer.getData('application/x-webpilot-tab-id') || event.dataTransfer.getData('text/plain');
-                          if (!droppedTabId || droppedTabId === tab.id) return;
-                          if (draggingGroupIdRef.current && draggingGroupIdRef.current !== group.id) return;
+                          const droppedTabId = draggingTabIdRef.current || draggingTabId || event.dataTransfer.getData('application/x-webpilot-tab-id');
+                          if (!droppedTabId) return;
                           event.preventDefault();
+                          event.stopPropagation();
+                          if (droppedTabId === tab.id) {
+                            clearEmbeddedTabDrag();
+                            return;
+                          }
                           const position = dragDropTarget?.tabId === tab.id ? dragDropTarget.position : embeddedTabDragPosition(event);
                           clearEmbeddedTabDrag();
-                          void moveEmbeddedBrowserTab(droppedTabId, tab.id, position);
+                          void moveEmbeddedBrowserTab(droppedTabId, { position, targetId: tab.id });
                         }}
                         role="tab"
                         title={tab.url || tab.title}
                       >
                         <span className="browser-chat-embedded-tab-icon">
-                          <AppWindow size={14} />
+                          <EmbeddedBrowserTabFavicon faviconUrl={tab.faviconUrl} />
                         </span>
+                        {tab.pinned ? <Pin aria-label="已固定" className="browser-chat-embedded-tab-pin" size={11} /> : null}
                         <span className="browser-chat-embedded-tab-text">
                           <strong>{compactText(tab.title || tab.url || '新建标签页', 56)}</strong>
                         </span>
@@ -3573,8 +3738,15 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
             <button className="browser-chat-embedded-tool-button" disabled={!canGoForward} onClick={() => void goEmbeddedBrowserForward()} title="Forward" type="button" aria-label="Forward">
               <ArrowRight size={16} />
             </button>
-            <button className="browser-chat-embedded-tool-button" disabled={!activeEmbeddedTab} onClick={() => void reloadEmbeddedBrowser()} title="Reload" type="button" aria-label="Reload">
-              <RefreshCw size={15} />
+            <button
+              aria-label={isEmbeddedBrowserLoading ? '停止加载' : '重新加载'}
+              className={isEmbeddedBrowserLoading ? 'browser-chat-embedded-tool-button is-stop' : 'browser-chat-embedded-tool-button'}
+              disabled={!activeEmbeddedTab}
+              onClick={() => void (isEmbeddedBrowserLoading ? stopEmbeddedBrowserLoading() : reloadEmbeddedBrowser())}
+              title={isEmbeddedBrowserLoading ? '停止加载' : '重新加载'}
+              type="button"
+            >
+              {isEmbeddedBrowserLoading ? <X size={16} /> : <RefreshCw size={15} />}
             </button>
           </div>
           <form className="browser-chat-embedded-address-bar" onSubmit={navigateEmbeddedBrowserAddress}>
@@ -3582,6 +3754,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
               {addressValue.startsWith('https://') ? <Lock size={14} /> : <Globe size={14} />}
             </span>
             <input
+              ref={addressInputRef}
               aria-label="Address"
               disabled={!bridgeAvailable || !activeEmbeddedTab}
               onBlur={() => {
@@ -4350,6 +4523,7 @@ export function BrowserChatWorkspace({
       setSessions((current) => current.filter((item) => item.id !== sessionId));
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
       if (session?.id === sessionId) setSession(null);
+      await window.webPilotEmbeddedBrowser?.discardGroup?.({ id: embeddedGroupIdForSession(sessionId) }).catch(() => undefined);
       await loadSessions().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '删除历史对话失败');
@@ -4395,6 +4569,9 @@ export function BrowserChatWorkspace({
       setSessions((current) => current.filter((item) => !deletingIdSet.has(item.id)));
       setSelectedSessionIds((current) => current.filter((id) => !deletingIdSet.has(id)));
       if (session?.id && deletingIdSet.has(session.id)) setSession(null);
+      for (const sessionId of deletingIds) {
+        await window.webPilotEmbeddedBrowser?.discardGroup?.({ id: embeddedGroupIdForSession(sessionId) }).catch(() => undefined);
+      }
       await loadSessions().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '批量删除历史对话失败');
@@ -4574,7 +4751,7 @@ export function BrowserChatWorkspace({
           <h2>设置</h2>
           <nav className="browser-chat-subnav" aria-label="环境配置分类">
             {environmentSettingsTabs.map((tab) => (
-              <button className={settingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={tab.label} type="button">
+              <button aria-label={tab.label} className={settingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={tab.label} type="button">
                 <SettingsTabIcon tab={tab.id} />
                 <span>{tab.label}</span>
               </button>
@@ -4676,6 +4853,7 @@ export function BrowserChatWorkspace({
                     />
                   ) : null}
                   <button
+                    aria-label={sessionDisplayTitle(item)}
                     className="browser-chat-recent-open"
                     disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
                     onClick={() => {
@@ -4816,6 +4994,7 @@ export function BrowserChatWorkspace({
           <button
             className="ui-icon-button"
             onClick={toggleSidebarCollapsed}
+            title={sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'}
             type="button"
             aria-label={sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'}
           >
@@ -4834,11 +5013,11 @@ export function BrowserChatWorkspace({
             <MessageSquare size={17} />
             <span>{t('对话模式')}</span>
           </button>
-          <button className={activeView === 'target' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => setActiveView('target')} type="button">
+          <button aria-label="目标模式" className={activeView === 'target' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => setActiveView('target')} title="目标模式" type="button">
             <Folder size={17} />
             <span>目标模式</span>
           </button>
-          <button className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => setActiveView('settings')} type="button">
+          <button aria-label="设置" className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => setActiveView('settings')} title="设置" type="button">
             <Settings size={17} />
             <span>设置</span>
           </button>

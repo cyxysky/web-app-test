@@ -7481,15 +7481,21 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   gap: 5px;
   height: 35px;
   min-width: 0;
-  overflow-x: hidden;
-  overflow-y: visible;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
   padding: 0;
+  scrollbar-width: none;
+}
+
+.browser-chat-embedded-tab-list::-webkit-scrollbar {
+  display: none;
 }
 
 .browser-chat-embedded-tab-group-shell {
   align-items: flex-end;
   display: inline-flex;
-  flex: 1 1 0;
+  flex: 0 0 auto;
   gap: 5px;
   height: 35px;
   min-width: 0;
@@ -7502,8 +7508,124 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   flex: 0 0 auto;
 }
 
-.browser-chat-embedded-tab-group-shell::before {
-  content: none;
+.browser-chat-embedded-tab-group-shell.empty>.browser-chat-embedded-tab-group-tag,
+.browser-chat-embedded-tab-group-shell.empty>.browser-chat-embedded-tab-stack {
+  display: none;
+}
+
+.browser-chat-embedded-empty-group {
+  align-items: flex-end;
+  display: inline-flex;
+  flex: 0 0 40px;
+  height: 35px;
+  overflow: hidden;
+  position: relative;
+  transition:
+    flex-basis 0.18s var(--ease-standard),
+    width 0.18s var(--ease-standard);
+  width: 40px;
+}
+
+.browser-chat-embedded-empty-group:hover,
+.browser-chat-embedded-empty-group:focus-within {
+  flex-basis: 132px;
+  width: 132px;
+}
+
+.browser-chat-embedded-empty-group-create {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 9px;
+  color: var(--muted-strong);
+  cursor: pointer;
+  display: inline-flex;
+  flex-flow: row nowrap;
+  gap: 7px;
+  height: 35px;
+  justify-content: flex-start;
+  min-width: 132px;
+  padding: 0 28px 0 12px;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease,
+    transform 0.16s ease;
+  width: 132px;
+}
+
+.browser-chat-embedded-empty-group-create:hover {
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+  color: var(--foreground);
+}
+
+.browser-chat-embedded-empty-group-create svg {
+  flex: 0 0 auto;
+}
+
+.browser-chat-embedded-empty-group-create span {
+  display: block;
+  line-height: 1;
+  opacity: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transform: translateX(-3px);
+  transition:
+    opacity 0.12s ease,
+    transform 0.18s var(--ease-standard);
+  white-space: nowrap;
+}
+
+.browser-chat-embedded-empty-group:hover .browser-chat-embedded-empty-group-create span,
+.browser-chat-embedded-empty-group:focus-within .browser-chat-embedded-empty-group-create span {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.browser-chat-embedded-tab-group-label>svg:first-child,
+.browser-chat-embedded-empty-group-create>svg,
+.browser-chat-embedded-tab-group-shell .browser-chat-embedded-tab-icon>svg {
+  color: var(--embedded-group-icon-color, var(--accent-strong));
+}
+
+.browser-chat-embedded-empty-group-close {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  height: 16px;
+  justify-content: center;
+  opacity: 0;
+  padding: 0;
+  pointer-events: none;
+  position: absolute;
+  right: 1px;
+  top: 2px;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease,
+    opacity 0.16s ease;
+  width: 16px;
+  z-index: 5;
+}
+
+.browser-chat-embedded-empty-group:hover .browser-chat-embedded-empty-group-close,
+.browser-chat-embedded-empty-group-close:focus-visible {
+  opacity: 0.72;
+  pointer-events: auto;
+}
+
+.browser-chat-embedded-empty-group-close:hover {
+  background: rgba(15, 23, 42, 0.08);
+  color: var(--danger);
+}
+
+.browser-chat-embedded-tab-group-shell.drop-target .browser-chat-embedded-tab-group-tag,
+.browser-chat-embedded-tab-group-shell.drop-target .browser-chat-embedded-empty-group-create {
+  background: color-mix(in srgb, var(--embedded-group-icon-color) 13%, var(--panel));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--embedded-group-icon-color) 36%, transparent);
 }
 
 .browser-chat-embedded-tab-group-tag {
@@ -7564,15 +7686,6 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-embedded-tab-group-label svg {
   flex: 0 0 auto;
-}
-
-.browser-chat-embedded-tab-group-chevron {
-  opacity: 0.7;
-  transition: transform 0.16s ease;
-}
-
-.browser-chat-embedded-tab-group-shell.collapsed .browser-chat-embedded-tab-group-chevron {
-  transform: rotate(-90deg);
 }
 
 .browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag {
@@ -7643,7 +7756,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-embedded-tab-stack {
   align-items: flex-end;
   display: inline-flex;
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   gap: 5px;
   height: 35px;
   min-width: 0;
@@ -7665,12 +7778,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   cursor: grab;
   container-type: inline-size;
   display: inline-flex;
-  flex: 1 1 170px;
+  flex: 0 0 clamp(168px, 18vw, 220px);
   gap: 8px;
   height: 35px;
   isolation: isolate;
   max-width: 220px;
-  min-width: 28px;
+  min-width: 168px;
   overflow: hidden;
   padding: 0 52px 0 11px;
   position: relative;
@@ -7680,6 +7793,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     box-shadow 0.16s ease,
     color 0.16s ease,
     transform 0.16s ease;
+  width: clamp(168px, 18vw, 220px);
 }
 
 .browser-chat-embedded-tab:active {
@@ -7739,6 +7853,24 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     color 0.16s ease,
     opacity 0.12s ease;
   width: 20px;
+}
+
+.browser-chat-embedded-tab-icon img {
+  border-radius: 3px;
+  display: block;
+  height: 16px;
+  object-fit: contain;
+  width: 16px;
+}
+
+.browser-chat-embedded-tab-pin {
+  color: var(--muted);
+  flex: 0 0 auto;
+  transform: rotate(32deg);
+}
+
+.browser-chat-embedded-tab.active .browser-chat-embedded-tab-pin {
+  color: var(--foreground);
 }
 
 .browser-chat-embedded-tab.active .browser-chat-embedded-tab-icon {
@@ -8114,9 +8246,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 @media (max-width: 1120px) {
   .browser-chat-embedded-tab {
-    flex-basis: 150px;
-    max-width: 164px;
-    min-width: 26px;
+    flex-basis: 168px;
+    max-width: 168px;
+    min-width: 168px;
+    width: 168px;
   }
 
   .browser-chat-embedded-tab-group-label {
@@ -8131,7 +8264,6 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     padding: 0 26px 0 4px;
   }
 
-  .browser-chat-embedded-tab-text,
   .browser-chat-embedded-tab-loading,
   .browser-chat-embedded-tab-mute {
     display: none;
@@ -10800,6 +10932,20 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   color: var(--accent-strong);
 }
 
+:root[data-theme="dark"] .browser-chat-embedded-empty-group-create {
+  background: transparent;
+  color: var(--muted-strong);
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-empty-group-create:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--foreground);
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-empty-group-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
 :root[data-theme="dark"] .browser-chat-embedded-address-bar {
   background: rgba(255, 255, 255, 0.075);
   border-color: rgba(255, 255, 255, 0.1);
@@ -11724,6 +11870,179 @@ body {
 .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-new-chat-button,
 .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-sub-sidebar .group-create-button {
   display: none;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button,
+.browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-create-button,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-create-button {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  transition:
+    color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button:not(:disabled):hover,
+.browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-create-button:not(:disabled):hover,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button:not(:disabled):hover,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-create-button:not(:disabled):hover {
+  background: transparent;
+  border-color: transparent;
+  color: var(--foreground);
+  transform: scale(1.06);
+}
+
+/* Expanded sidebar: use one active surface across primary and secondary navigation. */
+.browser-chat-layout:not(.sidebar-collapsed) :is(
+  .browser-chat-nav-item.active,
+  .browser-chat-nav-item.active:hover,
+  .browser-chat-subnav button.active,
+  .browser-chat-subnav button.active:hover
+),
+:root[data-theme="dark"] .browser-chat-layout:not(.sidebar-collapsed) :is(
+  .browser-chat-nav-item.active,
+  .browser-chat-nav-item.active:hover,
+  .browser-chat-subnav button.active,
+  .browser-chat-subnav button.active:hover
+) {
+  background: var(--surface-active);
+  box-shadow: none;
+  color: var(--foreground);
+}
+
+/* Collapsed sidebar: consistent optical rhythm and compact active state. */
+.browser-chat-sidebar {
+  border-right-color: color-mix(in srgb, var(--border) 58%, transparent);
+  box-shadow: none;
+}
+
+.browser-chat-sidebar-footer {
+  border-top-color: color-mix(in srgb, var(--border) 58%, transparent);
+}
+
+:root[data-theme="dark"] .browser-chat-sidebar {
+  border-right-color: rgba(255, 255, 255, 0.055);
+  box-shadow: none;
+}
+
+:root[data-theme="dark"] .browser-chat-sidebar-footer {
+  border-top-color: rgba(255, 255, 255, 0.055);
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-nav {
+  padding-bottom: 8px;
+  position: relative;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-nav::after {
+  background: color-mix(in srgb, var(--border) 72%, transparent);
+  bottom: 0;
+  content: "";
+  height: 1px;
+  left: 50%;
+  position: absolute;
+  transform: translateX(-50%);
+  width: 20px;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar {
+  padding-top: 0;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-sidebar :where(
+  .browser-chat-brand .ui-icon-button,
+  .browser-chat-nav-item,
+  .browser-chat-new-chat-button,
+  .browser-chat-theme-toggle,
+  .browser-chat-subnav button,
+  .browser-chat-sub-sidebar .group-create-button,
+  .browser-chat-sub-sidebar .group-tree-button,
+  .browser-chat-recent-open
+) {
+  align-items: center;
+  border-radius: 10px;
+  display: inline-flex;
+  height: 36px;
+  justify-content: center;
+  min-height: 36px;
+  overflow: visible;
+  padding: 0;
+  position: relative;
+  width: 36px;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-recent-item {
+  border-radius: 10px;
+  height: 36px;
+  overflow: visible;
+  position: relative;
+  width: 36px;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-sidebar :where(
+  .browser-chat-brand .ui-icon-button,
+  .browser-chat-nav-item,
+  .browser-chat-new-chat-button,
+  .browser-chat-theme-toggle,
+  .browser-chat-subnav button,
+  .browser-chat-sub-sidebar .group-create-button,
+  .browser-chat-sub-sidebar .group-tree-button,
+  .browser-chat-recent-open
+) > svg:not(.spin) {
+  flex: 0 0 auto;
+  height: 20px;
+  width: 20px;
+}
+
+.browser-chat-layout.sidebar-collapsed :is(
+  .browser-chat-nav-item.active,
+  .browser-chat-subnav button.active,
+  .browser-chat-sub-sidebar .group-tree-button.active,
+  .browser-chat-recent-item.active
+)::before {
+  background: var(--accent);
+  border-radius: 0 999px 999px 0;
+  content: "";
+  height: 18px;
+  left: -10px;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2px;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-nav-item.active,
+.browser-chat-layout.sidebar-collapsed .browser-chat-nav-item.active:hover,
+.browser-chat-layout.sidebar-collapsed .browser-chat-subnav button.active,
+.browser-chat-layout.sidebar-collapsed .browser-chat-subnav button.active:hover,
+.browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-tree-button.active,
+.browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-tree-button.active:hover,
+.browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active,
+.browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active:hover,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-nav-item.active,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-nav-item.active:hover,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-subnav button.active,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-subnav button.active:hover,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-tree-button.active,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-sub-sidebar .group-tree-button.active:hover,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active,
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active:hover {
+  background: transparent;
+  box-shadow: none;
+}
+
+.browser-chat-layout.sidebar-collapsed :is(
+  .browser-chat-nav-item.active,
+  .browser-chat-subnav button.active,
+  .browser-chat-sub-sidebar .group-tree-button.active
+) {
+  color: var(--accent-strong);
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active .browser-chat-recent-icon {
+  color: var(--accent-strong);
 }
 
 /* Unified refined motion */

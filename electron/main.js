@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, dialog, ipcMain, nativeTheme, shell } = require('electron');
+const { app, BrowserWindow, Menu, WebContentsView, dialog, ipcMain, nativeTheme, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const fs = require('node:fs');
@@ -28,6 +28,7 @@ const embeddedBrowserBookmarks = new Map();
 let embeddedBrowserHistory = [];
 let embeddedBrowserNextBookmarkId = 1;
 let embeddedBrowserNextHistoryId = 1;
+const embeddedBrowserRecentlyClosedTabs = [];
 let embeddedBrowserBounds = { x: 0, y: 0, width: 0, height: 0 };
 let embeddedBrowserFitTimer;
 let embeddedBrowserFitAllowZoomIn = false;
@@ -242,7 +243,9 @@ function ensureEmbeddedBrowserLibraryView() {
     if (input.type === 'keyDown' && input.key === 'Escape') {
       event.preventDefault();
       setEmbeddedBrowserLibraryPanel('');
+      return;
     }
+    handleEmbeddedBrowserShortcut(event, input);
   });
   view.webContents.on('did-finish-load', () => {
     notifyEmbeddedBrowserStateChange();
@@ -724,6 +727,21 @@ function embeddedBrowserRecordTitle(value, fallback = '') {
   return String(value || fallback || '').replace(/\s+/g, ' ').trim().slice(0, 240);
 }
 
+function embeddedBrowserFaviconUrl(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) return '';
+  if (/^data:image\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*,/i.test(normalized)) {
+    return normalized.length <= 256 * 1024 ? normalized : '';
+  }
+  if (normalized.length > 8192) return '';
+  try {
+    const protocol = new URL(normalized).protocol;
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'file:' ? normalized : '';
+  } catch {
+    return '';
+  }
+}
+
 function embeddedBrowserBookmarkList() {
   return Array.from(embeddedBrowserBookmarks.values())
     .sort((left, right) => Number(right.createdAt) - Number(left.createdAt));
@@ -799,14 +817,24 @@ function clearEmbeddedBrowserHistory() {
   return embeddedBrowserState();
 }
 
+function applyEmbeddedBrowserTabAudioPolicy(tab) {
+  if (!tab || tab.view.webContents.isDestroyed()) return;
+  const muted = Boolean(tab.audioMuted || !embeddedBrowserVisible);
+  if (tab.view.webContents.isAudioMuted?.() !== muted) tab.view.webContents.setAudioMuted(muted);
+}
+
+function applyEmbeddedBrowserAudioPolicy() {
+  for (const tab of embeddedBrowserTabs.values()) applyEmbeddedBrowserTabAudioPolicy(tab);
+}
+
 function setEmbeddedBrowserTabMuted(input = {}) {
   const id = String(input.id || embeddedBrowserActiveTabId || '').trim();
   const tab = embeddedBrowserTabs.get(id) || activeEmbeddedBrowserTab();
   if (!tab || tab.view.webContents.isDestroyed()) throw new Error('Embedded browser tab not found.');
-  const currentMuted = Boolean(tab.audioMuted || tab.view.webContents.isAudioMuted?.());
+  const currentMuted = Boolean(tab.audioMuted);
   const muted = typeof input.muted === 'boolean' ? input.muted : !currentMuted;
   tab.audioMuted = muted;
-  tab.view.webContents.setAudioMuted(muted);
+  applyEmbeddedBrowserTabAudioPolicy(tab);
   writeEmbeddedBrowserPersistence();
   scheduleEmbeddedBrowserPersistence();
   notifyEmbeddedBrowserStateChange();
@@ -815,25 +843,26 @@ function setEmbeddedBrowserTabMuted(input = {}) {
 
 function embeddedBrowserPersistenceSnapshot() {
   const tabs = [];
-  const groupIdsWithTabs = new Set();
   for (const tab of embeddedBrowserTabs.values()) {
     if (!tab || tab.view.webContents.isDestroyed()) continue;
     const url = embeddedBrowserPersistableUrl(tab.lastKnownUrl || tab.view.webContents.getURL() || '');
     tabs.push({
-      audioMuted: Boolean(tab.audioMuted || tab.view.webContents.isAudioMuted?.()),
+      audioMuted: Boolean(tab.audioMuted),
       createdAt: Number(tab.createdAt) || Date.now(),
+      faviconUrl: embeddedBrowserFaviconUrl(tab.faviconUrl) || undefined,
       groupId: tab.groupId,
       id: tab.id,
+      pinned: Boolean(tab.pinned),
       sessionId: tab.sessionId || undefined,
+      title: embeddedBrowserRecordTitle(tab.lastKnownTitle),
       url,
     });
-    groupIdsWithTabs.add(tab.groupId);
   }
 
   const groups = Array.from(embeddedBrowserGroups.values())
-    .filter((group) => groupIdsWithTabs.has(group.id) || group.id === embeddedBrowserActiveGroupId)
     .map((group) => ({
       activeTabId: group.activeTabId || undefined,
+      collapsed: Boolean(group.collapsed),
       createdAt: Number(group.createdAt) || Date.now(),
       id: group.id,
       sessionId: embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || undefined,
@@ -942,6 +971,7 @@ function restoreEmbeddedBrowserPersistence() {
       const sessionId = embeddedBrowserSessionIdFromGroupId(id) || normalizeEmbeddedBrowserSessionId(item?.sessionId);
       embeddedBrowserGroups.set(id, {
         activeTabId: persistedEmbeddedBrowserId(item?.activeTabId),
+        collapsed: Boolean(item?.collapsed),
         createdAt: Number.isFinite(Number(item?.createdAt)) ? Number(item.createdAt) : Date.now(),
         id,
         sessionId,
@@ -958,6 +988,7 @@ function restoreEmbeddedBrowserPersistence() {
       if (!embeddedBrowserGroups.has(groupId)) {
         embeddedBrowserGroups.set(groupId, {
           activeTabId: '',
+          collapsed: false,
           createdAt: Date.now(),
           id: groupId,
           sessionId: embeddedBrowserSessionIdFromGroupId(groupId) || normalizeEmbeddedBrowserSessionId(item?.sessionId),
@@ -966,10 +997,13 @@ function restoreEmbeddedBrowserPersistence() {
       try {
         const tab = createEmbeddedBrowserTab({
           audioMuted: Boolean(item?.audioMuted),
+          faviconUrl: embeddedBrowserFaviconUrl(item?.faviconUrl),
           groupId,
           id,
+          pinned: Boolean(item?.pinned),
           sessionId: embeddedBrowserSessionIdFromGroupId(groupId) || normalizeEmbeddedBrowserSessionId(item?.sessionId),
           restore: true,
+          title: embeddedBrowserRecordTitle(item?.title),
           url: embeddedBrowserPersistableUrl(item?.url),
         });
         tab.createdAt = Number.isFinite(Number(item?.createdAt)) ? Number(item.createdAt) : tab.createdAt;
@@ -1004,7 +1038,7 @@ function restoreEmbeddedBrowserPersistence() {
       const firstTab = embeddedBrowserTabs.values().next().value;
       if (firstTab && !firstTab.view.webContents.isDestroyed()) setActiveEmbeddedBrowserTab(firstTab);
     }
-    return restoredTabIds.size > 0;
+    return restoredTabIds.size > 0 || embeddedBrowserGroups.size > 0;
   } finally {
     embeddedBrowserPersistenceRestoring = false;
     scheduleEmbeddedBrowserPersistence();
@@ -1029,7 +1063,8 @@ function embeddedBrowserSessionScript(tab) {
         });
         document.documentElement?.setAttribute('data-webpilot-embedded-browser-session-id', ${sessionId});
         document.documentElement?.setAttribute('data-webpilot-embedded-browser-tab-id', ${tabId});
-        if (${sessionId}) window.name = 'AI_WEB_TEST_SESSION_GROUP:' + ${sessionId} + ';' + String(window.name || '').replace(/^AI_WEB_TEST_SESSION_GROUP:[^;]+;/, '');
+        const cleanWindowName = String(window.name || '').replace(/^AI_WEB_TEST_SESSION_GROUP:[^;]+;/, '');
+        window.name = ${sessionId} ? 'AI_WEB_TEST_SESSION_GROUP:' + ${sessionId} + ';' + cleanWindowName : cleanWindowName;
       } catch {}
     })()
   `;
@@ -1142,6 +1177,7 @@ function ensureEmbeddedBrowserGroup(input = {}) {
   if (!group) {
     group = {
       activeTabId: '',
+      collapsed: Boolean(input.collapsed),
       createdAt: Date.now(),
       id: groupId,
       sessionId,
@@ -1157,6 +1193,53 @@ function ensureEmbeddedBrowserGroup(input = {}) {
   return group;
 }
 
+function setEmbeddedBrowserGroupCollapsed(input = {}) {
+  const groupId = String(input.id || '').trim();
+  const group = embeddedBrowserGroups.get(groupId);
+  if (!group) return embeddedBrowserState();
+  group.collapsed = Boolean(input.collapsed);
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
+  return embeddedBrowserState();
+}
+
+function focusEmbeddedBrowserAddressBar() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (embeddedBrowserLibraryPanel) setEmbeddedBrowserLibraryPanel('');
+  mainWindow.focus();
+  mainWindow.webContents.focus();
+  mainWindow.webContents.send('webpilot:embedded-browser:focus-address');
+}
+
+function handleEmbeddedBrowserShortcut(event, input, sourceTab) {
+  if (!embeddedBrowserVisible || input?.type !== 'keyDown' || input.isAutoRepeat || input.isComposing) return false;
+  if (!(input.control || input.meta) || input.alt) return false;
+  const key = String(input.key || '').toLowerCase();
+  if (!['l', 't', 'w'].includes(key)) return false;
+  if (key === 'w' && input.shift) return false;
+  event.preventDefault();
+  if (key === 'l') {
+    focusEmbeddedBrowserAddressBar();
+    return true;
+  }
+  if (key === 't' && input.shift) {
+    reopenClosedEmbeddedBrowserTab();
+    return true;
+  }
+  if (key === 't') {
+    const active = sourceTab && !sourceTab.view.webContents.isDestroyed() ? sourceTab : activeEmbeddedBrowserTab();
+    void createManualEmbeddedBrowserTab({
+      groupId: active?.groupId || embeddedBrowserActiveGroupId || 'default',
+      sessionId: active?.sessionId,
+    }).catch((error) => appendLog(`Embedded browser shortcut new tab failed: ${error instanceof Error ? error.message : String(error)}`));
+    return true;
+  }
+  const active = sourceTab && !sourceTab.view.webContents.isDestroyed() ? sourceTab : activeEmbeddedBrowserTab();
+  if (active) closeEmbeddedBrowserTab(active.id);
+  return true;
+}
+
 function scheduleEmbeddedBrowserFitForTab(tab, delayMs = 180, options = {}) {
   if (activeEmbeddedBrowserTab()?.id !== tab?.id) return;
   scheduleEmbeddedBrowserFitToWidth(delayMs, options);
@@ -1164,6 +1247,9 @@ function scheduleEmbeddedBrowserFitForTab(tab, delayMs = 180, options = {}) {
 
 function installEmbeddedBrowserTabHandlers(tab) {
   const { view } = tab;
+  view.webContents.on('before-input-event', (event, input) => {
+    handleEmbeddedBrowserShortcut(event, input, tab);
+  });
   view.webContents.setWindowOpenHandler((details) => {
     const url = String(details.url || '').trim();
     const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url, view.webContents.getURL() || '');
@@ -1199,6 +1285,15 @@ function installEmbeddedBrowserTabHandlers(tab) {
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 140, { allowZoomIn: true });
   });
+  view.webContents.on('did-start-navigation', (_event, url, isInPlace, isMainFrame) => {
+    if (!isMainFrame || isInPlace) return;
+    const nextUrl = String(url || '').trim();
+    if (!nextUrl || nextUrl === tab.lastKnownUrl) return;
+    tab.faviconUrl = '';
+    tab.lastKnownTitle = '';
+    tab.lastKnownUrl = nextUrl;
+    notifyEmbeddedBrowserStateChange();
+  });
   view.webContents.on('did-start-loading', () => {
     tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
     scheduleEmbeddedBrowserPersistence();
@@ -1206,6 +1301,7 @@ function installEmbeddedBrowserTabHandlers(tab) {
   });
   view.webContents.on('did-finish-load', () => {
     tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
+    tab.lastKnownTitle = embeddedBrowserRecordTitle(embeddedBrowserTabTitle(view.webContents), tab.lastKnownTitle);
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
     scheduleEmbeddedBrowserPersistence();
@@ -1214,7 +1310,9 @@ function installEmbeddedBrowserTabHandlers(tab) {
     tab.restorePending = false;
   });
   view.webContents.on('did-stop-loading', () => {
+    tab.routeLoadingUntil = 0;
     tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
+    tab.lastKnownTitle = embeddedBrowserRecordTitle(embeddedBrowserTabTitle(view.webContents), tab.lastKnownTitle);
     void markEmbeddedBrowserSession(tab);
     scheduleEmbeddedBrowserFitForTab(tab, 240, { allowZoomIn: true });
     scheduleEmbeddedBrowserPersistence();
@@ -1242,11 +1340,27 @@ function installEmbeddedBrowserTabHandlers(tab) {
     notifyEmbeddedBrowserStateChange();
     recordEmbeddedBrowserHistory(tab);
   });
-  view.webContents.on('page-title-updated', () => {
+  view.webContents.on('page-title-updated', (_event, title) => {
+    tab.lastKnownTitle = embeddedBrowserRecordTitle(title, embeddedBrowserTabTitle(view.webContents));
+    scheduleEmbeddedBrowserPersistence();
     notifyEmbeddedBrowserStateChange();
     recordEmbeddedBrowserHistory(tab);
   });
-  view.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+  view.webContents.on('page-favicon-updated', (_event, faviconUrls) => {
+    const nextFaviconUrl = (Array.isArray(faviconUrls) ? faviconUrls : [])
+      .map((value) => embeddedBrowserFaviconUrl(value))
+      .find(Boolean) || '';
+    if (nextFaviconUrl === tab.faviconUrl) return;
+    tab.faviconUrl = nextFaviconUrl;
+    scheduleEmbeddedBrowserPersistence();
+    notifyEmbeddedBrowserStateChange();
+  });
+  view.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (isMainFrame) {
+      tab.routeLoadingUntil = 0;
+      notifyEmbeddedBrowserStateChange();
+    }
+    if (errorCode === -3) return;
     appendLog(`Embedded browser failed to load ${validatedURL}: ${errorCode} ${errorDescription}`);
   });
   view.webContents.once('destroyed', () => {
@@ -1286,18 +1400,22 @@ function createEmbeddedBrowserTab(input = {}) {
     audioMuted: Boolean(input.audioMuted),
     attached: false,
     createdAt: Date.now(),
+    faviconUrl: embeddedBrowserFaviconUrl(input.faviconUrl),
     groupId: group.id,
     id: tabId,
+    lastKnownTitle: embeddedBrowserRecordTitle(input.title),
     lastKnownUrl: initialUrl,
+    pinned: Boolean(input.pinned),
     readyPromise: undefined,
     restorePending: Boolean(input.restore),
     sessionId,
     view,
   };
   view.webContents.setZoomFactor(1);
-  view.webContents.setAudioMuted(tab.audioMuted);
+  applyEmbeddedBrowserTabAudioPolicy(tab);
   view.webContents.setUserAgent(embeddedBrowserUserAgent());
   embeddedBrowserTabs.set(tab.id, tab);
+  if (!input.restore) group.collapsed = false;
   group.activeTabId = tab.id;
   writeEmbeddedBrowserPersistence();
   scheduleEmbeddedBrowserPersistence();
@@ -1365,6 +1483,7 @@ function destroyEmbeddedBrowserTab(tab) {
 function attachEmbeddedBrowserView(input = {}) {
   const restoredTab = embeddedBrowserVisible ? undefined : activeEmbeddedBrowserTab();
   embeddedBrowserVisible = true;
+  applyEmbeddedBrowserAudioPolicy();
   const groupId = embeddedBrowserGroupId(input);
   const shouldCreateTab = input.createIfMissing === true;
   const existingGroup = embeddedBrowserGroups.get(groupId);
@@ -1396,8 +1515,9 @@ function attachEmbeddedBrowserView(input = {}) {
 }
 
 function detachEmbeddedBrowserView() {
-  for (const tab of embeddedBrowserTabs.values()) detachEmbeddedBrowserTab(tab);
   embeddedBrowserVisible = false;
+  applyEmbeddedBrowserAudioPolicy();
+  for (const tab of embeddedBrowserTabs.values()) detachEmbeddedBrowserTab(tab);
   embeddedBrowserAttached = false;
   embeddedBrowserLibraryPanel = '';
   embeddedBrowserLibraryView?.setVisible(false);
@@ -1557,8 +1677,19 @@ async function navigateEmbeddedBrowserHistory(direction) {
 function reloadEmbeddedBrowserTab() {
   const tab = activeEmbeddedBrowserTab();
   if (!tab || tab.view.webContents.isDestroyed()) return embeddedBrowserState();
+  tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
   tab.view.webContents.reload();
   scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
+  notifyEmbeddedBrowserStateChange();
+  return embeddedBrowserState();
+}
+
+function stopEmbeddedBrowserTabLoading() {
+  const tab = activeEmbeddedBrowserTab();
+  if (!tab || tab.view.webContents.isDestroyed()) return embeddedBrowserState();
+  tab.routeLoadingUntil = 0;
+  tab.view.webContents.stop();
+  notifyEmbeddedBrowserStateChange();
   return embeddedBrowserState();
 }
 
@@ -1573,15 +1704,11 @@ function embeddedBrowserState() {
     if (tab.view.webContents.isDestroyed() || embeddedBrowserGroups.has(tab.groupId)) continue;
     embeddedBrowserGroups.set(tab.groupId, {
       activeTabId: tab.id,
+      collapsed: false,
       createdAt: tab.createdAt || Date.now(),
       id: tab.groupId,
       sessionId: tab.sessionId || '',
     });
-  }
-
-  const groupIdsWithTabs = new Set();
-  for (const tab of embeddedBrowserTabs.values()) {
-    if (!tab.view.webContents.isDestroyed()) groupIdsWithTabs.add(tab.groupId);
   }
 
   for (const group of embeddedBrowserGroups.values()) {
@@ -1596,13 +1723,17 @@ function embeddedBrowserState() {
       if (canonicalSessionId && group.sessionId !== canonicalSessionId) group.sessionId = canonicalSessionId;
       const webContents = tab.view.webContents;
       const url = webContents.getURL() || '';
-      const title = embeddedBrowserTabTitle(webContents);
+      const liveTitle = embeddedBrowserTabTitle(webContents);
+      if (!tab.lastKnownTitle && liveTitle) tab.lastKnownTitle = embeddedBrowserRecordTitle(liveTitle);
+      const title = tab.lastKnownTitle || liveTitle;
       const item = {
-        audioMuted: Boolean(tab.audioMuted || webContents.isAudioMuted?.()),
+        audioMuted: Boolean(tab.audioMuted),
         bookmarked: embeddedBrowserIsBookmarked(tab.lastKnownUrl || url),
+        faviconUrl: embeddedBrowserFaviconUrl(tab.faviconUrl) || undefined,
         groupId: tab.groupId,
         id: tab.id,
-        loading: webContents.isLoading() || Date.now() < (tab.routeLoadingUntil || 0),
+        loading: webContents.isLoading(),
+        pinned: Boolean(tab.pinned),
         sessionId: tab.sessionId || undefined,
         title,
         url,
@@ -1612,15 +1743,14 @@ function embeddedBrowserState() {
       groupTabs.push(item);
       index += 1;
     }
-    if (groupTabs.length || group.id === embeddedBrowserActiveGroupId || groupIdsWithTabs.has(group.id)) {
-      groups.push({
-        active: group.id === embeddedBrowserActiveGroupId,
-        activeTabId: group.activeTabId || undefined,
-        id: group.id,
-        sessionId: group.sessionId || undefined,
-        tabs: groupTabs,
-      });
-    }
+    groups.push({
+      active: group.id === embeddedBrowserActiveGroupId,
+      activeTabId: group.activeTabId || undefined,
+      collapsed: Boolean(group.collapsed),
+      id: group.id,
+      sessionId: group.sessionId || undefined,
+      tabs: groupTabs,
+    });
   }
   return {
     ok: true,
@@ -1638,12 +1768,115 @@ function embeddedBrowserState() {
   };
 }
 
+function rememberClosedEmbeddedBrowserTab(tab) {
+  if (!tab || tab.view.webContents.isDestroyed()) return;
+  embeddedBrowserRecentlyClosedTabs.push({
+    audioMuted: Boolean(tab.audioMuted),
+    faviconUrl: embeddedBrowserFaviconUrl(tab.faviconUrl),
+    groupId: tab.groupId,
+    pinned: Boolean(tab.pinned),
+    sessionId: tab.sessionId || undefined,
+    title: embeddedBrowserRecordTitle(tab.lastKnownTitle),
+    url: embeddedBrowserPersistableUrl(tab.lastKnownUrl || tab.view.webContents.getURL() || ''),
+  });
+  if (embeddedBrowserRecentlyClosedTabs.length > 20) embeddedBrowserRecentlyClosedTabs.splice(0, embeddedBrowserRecentlyClosedTabs.length - 20);
+}
+
+function openEmbeddedBrowserTabFromRecord(record = {}, options = {}) {
+  const group = ensureEmbeddedBrowserGroup({
+    groupId: record.groupId || embeddedBrowserActiveGroupId || 'default',
+    sessionId: record.sessionId,
+  });
+  const tab = createEmbeddedBrowserTab({
+    audioMuted: Boolean(record.audioMuted),
+    faviconUrl: embeddedBrowserFaviconUrl(record.faviconUrl),
+    groupId: group.id,
+    pinned: Boolean(options.pinned ?? record.pinned),
+    sessionId: embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || normalizeEmbeddedBrowserSessionId(record.sessionId),
+    title: embeddedBrowserRecordTitle(record.title),
+    url: embeddedBrowserPersistableUrl(record.url),
+  });
+  if (tab.pinned) setEmbeddedBrowserTabPinned({ id: tab.id, pinned: true });
+  if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id: tab.id });
+  else setActiveEmbeddedBrowserTab(tab);
+  return tab;
+}
+
+function reopenClosedEmbeddedBrowserTab() {
+  const record = embeddedBrowserRecentlyClosedTabs.pop();
+  if (!record) return embeddedBrowserState();
+  openEmbeddedBrowserTabFromRecord(record);
+  return embeddedBrowserState();
+}
+
+function duplicateEmbeddedBrowserTab(tabIdInput) {
+  const tabId = String(tabIdInput || '').trim();
+  const source = tabId ? embeddedBrowserTabs.get(tabId) : activeEmbeddedBrowserTab();
+  if (!source || source.view.webContents.isDestroyed()) return embeddedBrowserState();
+  const duplicate = openEmbeddedBrowserTabFromRecord({
+    audioMuted: source.audioMuted,
+    faviconUrl: source.faviconUrl,
+    groupId: source.groupId,
+    sessionId: source.sessionId,
+    title: source.lastKnownTitle,
+    url: source.lastKnownUrl || source.view.webContents.getURL() || '',
+  }, { pinned: false });
+  moveEmbeddedBrowserTab({ id: duplicate.id, position: 'after', targetId: source.id });
+  if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id: duplicate.id });
+  else setActiveEmbeddedBrowserTab(duplicate);
+  return embeddedBrowserState();
+}
+
+function setEmbeddedBrowserTabPinned(input = {}) {
+  const tabId = String(input.id || '').trim();
+  const tab = tabId ? embeddedBrowserTabs.get(tabId) : activeEmbeddedBrowserTab();
+  if (!tab || tab.view.webContents.isDestroyed()) return embeddedBrowserState();
+  tab.pinned = typeof input.pinned === 'boolean' ? input.pinned : !tab.pinned;
+  const siblings = embeddedBrowserTabsForGroup(tab.groupId).filter((item) => item.id !== tab.id);
+  let target;
+  let position = 'end';
+  if (tab.pinned) {
+    target = [...siblings].reverse().find((item) => item.pinned) || siblings[0];
+    position = siblings.some((item) => item.pinned) ? 'after' : 'before';
+  } else {
+    target = siblings.at(-1);
+    position = target ? 'after' : 'end';
+  }
+  if (target) return moveEmbeddedBrowserTab({ id: tab.id, position, targetId: target.id });
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
+  return embeddedBrowserState();
+}
+
+function closeOtherEmbeddedBrowserTabs(tabIdInput) {
+  const tabId = String(tabIdInput || '').trim();
+  const selected = tabId ? embeddedBrowserTabs.get(tabId) : activeEmbeddedBrowserTab();
+  if (!selected || selected.view.webContents.isDestroyed()) return embeddedBrowserState();
+  const closingTabs = embeddedBrowserTabsForGroup(selected.groupId)
+    .filter((tab) => tab.id !== selected.id && !tab.pinned);
+  const activeWasClosed = closingTabs.some((tab) => tab.id === embeddedBrowserActiveTabId);
+  for (const tab of closingTabs) {
+    rememberClosedEmbeddedBrowserTab(tab);
+    destroyEmbeddedBrowserTab(tab);
+  }
+  if (activeWasClosed) {
+    if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id: selected.id });
+    else setActiveEmbeddedBrowserTab(selected);
+  }
+  writeEmbeddedBrowserPersistence();
+  scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
+  return embeddedBrowserState();
+}
+
 function closeEmbeddedBrowserTab(tabId) {
   const tab = embeddedBrowserTabs.get(tabId) || activeEmbeddedBrowserTab();
   if (!tab) return embeddedBrowserState();
   const currentTabs = embeddedBrowserTabsForGroup(tab.groupId);
   const tabIndex = Math.max(0, currentTabs.findIndex((item) => item.id === tab.id));
   const wasActive = embeddedBrowserActiveTabId === tab.id;
+  rememberClosedEmbeddedBrowserTab(tab);
   destroyEmbeddedBrowserTab(tab);
 
   let nextTab;
@@ -1663,7 +1896,7 @@ function closeEmbeddedBrowserTab(tabId) {
   return embeddedBrowserState();
 }
 
-function closeEmbeddedBrowserGroup(groupIdInput) {
+function closeEmbeddedBrowserGroup(groupIdInput, options = {}) {
   const groupId = String(groupIdInput || embeddedBrowserActiveGroupId || '').trim();
   if (!groupId) return embeddedBrowserState();
 
@@ -1674,7 +1907,10 @@ function closeEmbeddedBrowserGroup(groupIdInput) {
   const wasActiveGroup = embeddedBrowserActiveGroupId === groupId
     || groupTabs.some((tab) => tab.id === embeddedBrowserActiveTabId);
 
-  for (const tab of groupTabs) destroyEmbeddedBrowserTab(tab);
+  for (const tab of groupTabs) {
+    if (options.rememberClosed !== false) rememberClosedEmbeddedBrowserTab(tab);
+    destroyEmbeddedBrowserTab(tab);
+  }
   embeddedBrowserGroups.delete(groupId);
   writeEmbeddedBrowserPersistence();
   scheduleEmbeddedBrowserPersistence();
@@ -1699,27 +1935,73 @@ function closeEmbeddedBrowserGroup(groupIdInput) {
 function moveEmbeddedBrowserTab(input = {}) {
   const tabId = String(input.id || '').trim();
   const targetId = String(input.targetId || '').trim();
-  const position = input.position === 'after' ? 'after' : 'before';
-  if (!tabId || !targetId || tabId === targetId) return embeddedBrowserState();
+  const requestedGroupId = String(input.targetGroupId || '').trim();
+  const position = input.position === 'before' ? 'before' : input.position === 'after' ? 'after' : 'end';
+  if (!tabId) return embeddedBrowserState();
 
   const tab = embeddedBrowserTabs.get(tabId);
-  const target = embeddedBrowserTabs.get(targetId);
-  if (!tab || !target || tab.view.webContents.isDestroyed() || target.view.webContents.isDestroyed()) {
+  const target = targetId ? embeddedBrowserTabs.get(targetId) : undefined;
+  if (!tab || tab.view.webContents.isDestroyed() || (target && target.view.webContents.isDestroyed())) {
     return embeddedBrowserState();
   }
-  if (tab.groupId !== target.groupId) {
-    throw new Error('Tabs can only be moved within the same tab group.');
-  }
+  if (target?.id === tab.id && !requestedGroupId) return embeddedBrowserState();
+
+  const sourceGroup = embeddedBrowserGroups.get(tab.groupId);
+  const destinationGroupId = target?.groupId || requestedGroupId || tab.groupId;
+  const destinationGroup = embeddedBrowserGroups.get(destinationGroupId);
+  if (!destinationGroup) throw new Error('Target tab group was not found.');
+  const movedActiveTab = embeddedBrowserActiveTabId === tab.id;
+  const previousGroupId = tab.groupId;
 
   const orderedTabs = Array.from(embeddedBrowserTabs.values()).filter((item) => item.id !== tab.id);
-  const targetIndex = orderedTabs.findIndex((item) => item.id === target.id);
-  if (targetIndex < 0) return embeddedBrowserState();
-  orderedTabs.splice(targetIndex + (position === 'after' ? 1 : 0), 0, tab);
+  tab.groupId = destinationGroup.id;
+  tab.sessionId = embeddedBrowserSessionIdFromGroupId(destinationGroup.id)
+    || destinationGroup.sessionId
+    || normalizeEmbeddedBrowserSessionId(input.targetSessionId);
+  destinationGroup.sessionId = tab.sessionId || destinationGroup.sessionId || '';
+  destinationGroup.collapsed = false;
+
+  let insertionIndex = orderedTabs.length;
+  if (target && target.id !== tab.id) {
+    const targetIndex = orderedTabs.findIndex((item) => item.id === target.id);
+    if (targetIndex >= 0) insertionIndex = targetIndex + (position === 'after' ? 1 : 0);
+  } else {
+    for (let index = orderedTabs.length - 1; index >= 0; index -= 1) {
+      if (orderedTabs[index].groupId === destinationGroup.id) {
+        insertionIndex = index + 1;
+        break;
+      }
+    }
+  }
+  orderedTabs.splice(insertionIndex, 0, tab);
+
+  const destinationIndexes = [];
+  const destinationTabs = [];
+  for (let index = 0; index < orderedTabs.length; index += 1) {
+    if (orderedTabs[index].groupId !== destinationGroup.id) continue;
+    destinationIndexes.push(index);
+    destinationTabs.push(orderedTabs[index]);
+  }
+  const partitionedDestinationTabs = [
+    ...destinationTabs.filter((item) => item.pinned),
+    ...destinationTabs.filter((item) => !item.pinned),
+  ];
+  for (let index = 0; index < destinationIndexes.length; index += 1) {
+    orderedTabs[destinationIndexes[index]] = partitionedDestinationTabs[index];
+  }
+
+  if (sourceGroup && sourceGroup.id !== destinationGroup.id && sourceGroup.activeTabId === tab.id) {
+    sourceGroup.activeTabId = orderedTabs.find((item) => item.groupId === sourceGroup.id)?.id || '';
+  }
+  if (!destinationGroup.activeTabId || movedActiveTab) destinationGroup.activeTabId = tab.id;
+  if (movedActiveTab) embeddedBrowserActiveGroupId = destinationGroup.id;
 
   embeddedBrowserTabs.clear();
   for (const item of orderedTabs) embeddedBrowserTabs.set(item.id, item);
+  if (previousGroupId !== destinationGroup.id) void markEmbeddedBrowserSession(tab);
   writeEmbeddedBrowserPersistence();
   scheduleEmbeddedBrowserPersistence();
+  notifyEmbeddedBrowserStateChange();
   return embeddedBrowserState();
 }
 
@@ -1737,6 +2019,51 @@ async function createManualEmbeddedBrowserTab(input = {}) {
     .catch((error) => appendLog(`Embedded browser tab ready failed: ${error instanceof Error ? error.message : String(error)}`));
   scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   return embeddedBrowserState();
+}
+
+function showEmbeddedBrowserTabContextMenu(input = {}) {
+  const tab = embeddedBrowserTabs.get(String(input.id || '').trim());
+  if (!tab || tab.view.webContents.isDestroyed() || !mainWindow || mainWindow.isDestroyed()) {
+    return { ok: false, error: 'Embedded browser tab not found.' };
+  }
+  const labels = new Map((Array.isArray(input.groups) ? input.groups : []).flatMap((item) => {
+    const id = String(item?.id || '').trim();
+    return id ? [[id, embeddedBrowserRecordTitle(item?.label, id)]] : [];
+  }));
+  const moveTargets = Array.from(embeddedBrowserGroups.values()).filter((group) => group.id !== tab.groupId);
+  const closeableOtherTabs = embeddedBrowserTabsForGroup(tab.groupId)
+    .filter((item) => item.id !== tab.id && !item.pinned);
+  const menu = Menu.buildFromTemplate([
+    {
+      label: '复制标签页',
+      click: () => duplicateEmbeddedBrowserTab(tab.id),
+    },
+    {
+      label: tab.pinned ? '取消固定标签页' : '固定标签页',
+      click: () => setEmbeddedBrowserTabPinned({ id: tab.id, pinned: !tab.pinned }),
+    },
+    {
+      enabled: closeableOtherTabs.length > 0,
+      label: '关闭其他标签页',
+      click: () => closeOtherEmbeddedBrowserTabs(tab.id),
+    },
+    { type: 'separator' },
+    {
+      enabled: moveTargets.length > 0,
+      label: '移动到分组',
+      submenu: moveTargets.map((group) => ({
+        label: labels.get(group.id) || `标签组 ${String(group.sessionId || group.id).slice(-6)}`,
+        click: () => moveEmbeddedBrowserTab({
+          id: tab.id,
+          position: 'end',
+          targetGroupId: group.id,
+          targetSessionId: group.sessionId,
+        }),
+      })),
+    },
+  ]);
+  menu.popup({ window: mainWindow });
+  return { ok: true };
 }
 
 function registerEmbeddedBrowserIpc() {
@@ -1836,6 +2163,14 @@ function registerEmbeddedBrowserIpc() {
     }
   });
 
+  ipcMain.handle('webpilot:embedded-browser:stop', async () => {
+    try {
+      return stopEmbeddedBrowserTabLoading();
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
   ipcMain.handle('webpilot:embedded-browser:toggle-bookmark', async () => {
     try {
       return toggleEmbeddedBrowserBookmark();
@@ -1902,6 +2237,22 @@ function registerEmbeddedBrowserIpc() {
     }
   });
 
+  ipcMain.handle('webpilot:embedded-browser:show-tab-context-menu', async (_event, input = {}) => {
+    try {
+      return showEmbeddedBrowserTabContextMenu(input);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:set-group-collapsed', async (_event, input = {}) => {
+    try {
+      return setEmbeddedBrowserGroupCollapsed(input);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
   ipcMain.handle('webpilot:embedded-browser:close-active-tab', async () => {
     try {
       return closeEmbeddedBrowserTab(embeddedBrowserActiveTabId);
@@ -1921,6 +2272,14 @@ function registerEmbeddedBrowserIpc() {
   ipcMain.handle('webpilot:embedded-browser:close-group', async (_event, input = {}) => {
     try {
       return closeEmbeddedBrowserGroup(typeof input.id === 'string' ? input.id : embeddedBrowserActiveGroupId);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:embedded-browser:discard-group', async (_event, input = {}) => {
+    try {
+      return closeEmbeddedBrowserGroup(typeof input.id === 'string' ? input.id : '', { rememberClosed: false });
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
@@ -2077,6 +2436,9 @@ function createWindow() {
     },
   });
   mainWindow.setMenuBarVisibility(false);
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    handleEmbeddedBrowserShortcut(event, input);
+  });
   mainWindow.on('close', () => {
     clearEmbeddedBrowserStateChangeTimer();
     clearEmbeddedBrowserPersistenceTimer();
