@@ -14,7 +14,7 @@ async function readWholeView(session: BrowserSession, mode: SnapshotMode, refres
   for (let guard = 0; guard < 100; guard += 1) {
     const slice = await session.readSnapshotSlice({
       cursorIndex,
-      maxChars: 10000,
+      maxChars: 20000,
       refresh: refresh && guard === 0,
       mode,
     });
@@ -39,6 +39,8 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
     '<!doctype html><html><body>',
     '<div style="display:none"><button>Hidden child action</button></div>',
     '<div style="display:none"><iframe srcdoc="<button>Hidden frame action</button>"></iframe></div>',
+    '<div id="filter-action" class="filter-btn" style="width:32px;height:32px;cursor:pointer" onclick="document.body.dataset.filterClicked=\'true\'"><svg class="icon-Filter-Fill" aria-hidden="true"><path d="M0 0h10v10H0z"></path></svg></div>',
+    '<section aria-label="Snapshot test tools"><div id="icon-only-action" onclick="document.body.dataset.iconOnlyClicked=\'true\'"><svg aria-hidden="true"><path d="M0 0h10v10H0z"></path></svg></div></section>',
     '<button data-testid="stable-action" onclick="document.body.dataset.stableClicked=\'true\'">Stable action</button>',
     '<input aria-label="Name" value="old value">',
     buttons,
@@ -57,16 +59,41 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
   assert.equal(actionableSlices[0].timings.captureAxMs, 0, 'full AX capture should not run when DOMSnapshot succeeds');
   assert.equal(actionableSlices[0].captureSource, 'dom-snapshot');
   assert.ok(actionableSlices.length > 1, 'large actionable views should be paginated');
-  assert.ok(allSlices.every((slice) => slice.content.length <= 10000));
+  assert.ok(allSlices.every((slice) => slice.content.length <= 20000));
+  const expandedActionableSlice = await session.readSnapshotSlice({ mode: 'actionable', maxChars: 25000 });
+  assert.ok(expandedActionableSlice.content.length > 20000, 'requests above the 20k floor must not be capped at 20k');
+  assert.ok(expandedActionableSlice.content.length <= 25000);
 
   const actionable = actionableSlices.map((slice) => slice.content).join('\n');
   const full = fullSlices.map((slice) => slice.content).join('\n');
   const text = textSlices.map((slice) => slice.content).join('\n');
   assert.match(actionable, /Action 499/, 'offscreen actions must remain discoverable without scrolling');
   assert.match(actionable, /Frame action/, 'same-origin iframe actions must be included');
-  assert.doesNotMatch(`${actionable}\n${full}\n${text}`, /Hidden child action/, 'display:none ancestors must prune descendants');
-  assert.doesNotMatch(`${actionable}\n${full}\n${text}`, /Hidden frame action/, 'display:none iframe ancestors must prune the entire child document');
+  assert.match(full, /^RootWebArea/m, 'full view must retain the DOMSnapshot root');
+  assert.ok(text.split('\n').every((line) => line === line.trim()), 'text view must remain indentation-free plain text');
+  const hiddenSnapshotLines = `${actionable}\n${full}\n${text}`.split('\n').filter((line) => /Hidden (?:child|frame) action/.test(line));
+  assert.equal(hiddenSnapshotLines.length, 0, `display:none content leaked into the snapshot:\n${hiddenSnapshotLines.join('\n')}`);
   assert.doesNotMatch(`${actionable}\n${full}`, /data-ai-interactive|data-ai-signals|signals=/, 'snapshot output must not spend tokens on redundant markers');
+
+  const iconUid = actionable.match(/^\s*uid=(\S+)\s+generic\s+"\[无标签控件：Snapshot test tools\]".*actions=click/m)?.[1];
+  const iconContextLines = actionable.split('\n').filter((line) => /Snapshot test tools|无标签控件/.test(line)).join('\n');
+  assert.ok(iconUid, `a click-only SVG container must be retained with explicit, non-guessed context:\n${iconContextLines}`);
+  const iconClick = await session.mouse({ action: 'click', uid: iconUid });
+  assert.equal(iconClick.ok, true, iconClick.actual);
+  assert.equal(await page.locator('body').getAttribute('data-icon-only-clicked'), 'true');
+
+  const filterLine = actionable.split('\n').find((line) => (
+    /^\s*uid=\S+\s+generic\b/.test(line)
+    && line.includes('class=filter-btn')
+    && line.includes('icon=svg.icon-Filter-Fill')
+    && line.includes('actions=click')
+  ));
+  const filterUid = filterLine?.match(/^\s*uid=(\S+)/)?.[1];
+  assert.ok(filterUid, `an unlabeled icon action must preserve its DOM class and nested SVG class:\n${actionable}`);
+  assert.doesNotMatch(filterLine!, /过滤/, 'class names must not be translated into guessed business labels');
+  const filterClick = await session.mouse({ action: 'click', uid: filterUid });
+  assert.equal(filterClick.ok, true, filterClick.actual);
+  assert.equal(await page.locator('body').getAttribute('data-filter-clicked'), 'true');
 
   const stableUid = actionable.match(/^\s*uid=(\S+)\s+button\s+"Stable action"/m)?.[1];
   assert.ok(stableUid, 'stable action UID should be present');
@@ -99,9 +126,9 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
     version?: number;
     format?: string;
     generationId?: string;
-    views?: Record<string, { generationId?: string; chunks?: Array<{ charLength?: number; content?: string }> }>;
+    views?: Record<string, { content?: string; generationId?: string; chunks?: Array<{ charLength?: number; content?: string }> }>;
   };
-  assert.equal(payload.version, 3);
+  assert.equal(payload.version, 4);
   assert.equal(payload.format, 'chromium-dom-snapshot-with-partial-ax');
   assert.ok(payload.generationId);
   assert.deepEqual(Object.keys(payload.views || {}).sort(), ['actionable', 'full', 'text']);
@@ -109,8 +136,9 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
   assert.ok(exportedViews.every((view) => view.generationId === payload.generationId));
   const exportedChunks = exportedViews.flatMap((view) => view.chunks || []);
   assert.ok(exportedChunks.length > 0);
-  assert.ok(exportedChunks.every((chunk) => (chunk.charLength || 0) <= 10000));
+  assert.ok(exportedChunks.every((chunk) => (chunk.charLength || 0) <= 20000));
   assert.ok(exportedChunks.every((chunk) => !chunk.content?.includes('data-ai-interactive')));
+  assert.ok(exportedViews.every((view) => view.content === (view.chunks || []).map((chunk) => chunk.content).join('\n')));
   await unlink(exported.path);
 });
 
@@ -330,7 +358,7 @@ test('unified mouse and keyboard actions emit real browser events', async (conte
   assert.equal(coalescing.epochDelta, 0, 'interaction telemetry must not invalidate the semantic DOM generation');
 });
 
-test('actionable view prioritizes controls and DOM fallback ahead of large link collections', async (context) => {
+test('actionable view preserves flattened DOMSnapshot order across paginated slices', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'actionable-priority-test' });
   context.after(async () => session.close());
   await session.start();
@@ -346,18 +374,25 @@ test('actionable view prioritizes controls and DOM fallback ahead of large link 
     <div id="custom" tabindex="0" aria-label="Focusable panel">Focusable panel</div>
   </body></html>`);
 
-  const firstSlice = await session.readSnapshotSlice({ mode: 'actionable', refresh: true, maxChars: 10000 });
+  const firstSlice = await session.readSnapshotSlice({ mode: 'actionable', refresh: true, maxChars: 20000 });
   assert.equal(firstSlice.hasMore, true);
-  const textboxIndex = firstSlice.content.indexOf('textbox "Search streams"');
-  const buttonIndex = firstSlice.content.indexOf('button "Apply filter"');
-  const firstLinkIndex = firstSlice.content.indexOf('link "Streaming result');
-  assert.ok(textboxIndex >= 0, firstSlice.content);
-  assert.ok(buttonIndex >= 0, firstSlice.content);
-  assert.ok(firstLinkIndex >= 0, firstSlice.content);
-  assert.ok(textboxIndex < firstLinkIndex, firstSlice.content);
-  assert.ok(buttonIndex < firstLinkIndex, firstSlice.content);
-  assert.match(firstSlice.content, /generic "Focusable panel".*actions=focus/);
-  assert.equal((firstSlice.content.match(/Sylar card/g) || []).length, 1, 'nested pointer descendants should collapse into one card target');
+  const slices = await readWholeView(session, 'actionable');
+  const actionable = slices.map((slice) => slice.content).join('\n');
+  const cardIndex = actionable.indexOf('Sylar card');
+  const firstLinkIndex = actionable.indexOf('link "Streaming result');
+  const textboxIndex = actionable.indexOf('textbox "Search streams"');
+  const buttonIndex = actionable.indexOf('button "Apply filter"');
+  const panelIndex = actionable.indexOf('generic "Focusable panel"');
+  assert.ok(cardIndex >= 0, actionable);
+  assert.ok(firstLinkIndex >= 0, actionable);
+  assert.ok(textboxIndex >= 0, actionable);
+  assert.ok(buttonIndex >= 0, actionable);
+  assert.ok(panelIndex >= 0, actionable);
+  assert.ok(cardIndex < firstLinkIndex, actionable);
+  assert.ok(firstLinkIndex < textboxIndex, actionable);
+  assert.ok(textboxIndex < buttonIndex, actionable);
+  assert.ok(buttonIndex < panelIndex, actionable);
+  assert.equal((actionable.match(/Sylar card/g) || []).length, 1, 'nested pointer descendants should collapse into one card target');
 });
 
 test('snapshot UID mappings evict identities outside the retention window', async (context) => {

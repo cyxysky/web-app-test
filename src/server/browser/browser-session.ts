@@ -1,10 +1,25 @@
-import { existsSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
-import { normalizeDomNodeIdString, normalizeDomPathString } from '@/lib/dom-path';
-import { appDataRoot, artifactPath } from '@/server/storage/paths';
+import { artifactPath } from '@/server/storage/paths';
+import {
+  boundedNonNegativeIntegerEnv,
+  boundedPositiveIntegerEnv,
+  browserTabTitlePrefixEnabled,
+  cdpEndpointForPort,
+  cdpPortFromEndpoint,
+  electronEmbeddedBrowserCdpEndpoint,
+  electronEmbeddedBrowserEnabled,
+  normalizePageGroupId,
+  numericLimitFromEnv,
+  positiveIntegerEnv,
+  sessionTabGrouperDebugPort,
+  sessionTabGrouperEnabled,
+  sessionTabGrouperProfileDir,
+  sharedBrowserTabsEnabled,
+  withSessionTabGrouperArgs,
+} from './browser-session-runtime';
 import {
   buildSnapshotViews,
   captureAxSnapshot,
@@ -21,6 +36,16 @@ function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
   return /zhihu-web-analytics|datahub\.zhihu|apm\.zhihu|local\.adspower|118\.89\.204\.198/i.test(url);
 }
 
+function snapshotFrameUrl(value?: string) {
+  try {
+    const url = new URL(value || '');
+    url.hash = '';
+    return url.href;
+  } catch {
+    return String(value || '').split('#', 1)[0];
+  }
+}
+
 function shouldIgnoreConsoleError(text: string) {
   return (
     /zhihu-web-analytics|datahub\.zhihu|apm\.zhihu|local\.adspower|118\.89\.204\.198/i.test(text) ||
@@ -28,13 +53,6 @@ function shouldIgnoreConsoleError(text: string) {
   );
 }
 
-function positiveIntegerEnv(key: string) {
-  const raw = process.env[key]?.trim();
-  if (!raw) return undefined;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) return undefined;
-  return Math.floor(value);
-}
 
 const DEFAULT_SCREENSHOT_TIMEOUT_MS = 15000;
 const MIN_SCREENSHOT_TIMEOUT_MS = 1000;
@@ -42,22 +60,10 @@ const MAX_SCREENSHOT_TIMEOUT_MS = 120000;
 const SCREENSHOT_FAILURE_CONTEXT_TIMEOUT_MS = 2000;
 const DEFAULT_BROWSER_ACTION_LOAD_STATE_TIMEOUT_MS = 3000;
 const DEFAULT_BROWSER_POPUP_WAIT_MS = 0;
-const DEFAULT_BROWSER_DIRECT_HREF_TIMEOUT_MS = 0;
 const DEFAULT_BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS = 1500;
 const DEFAULT_BROWSER_WAIT_FOR_PAGE_STABLE_MS = 250;
 
-function boundedPositiveIntegerEnv(key: string, fallback: number, min: number, max: number) {
-  const value = positiveIntegerEnv(key) ?? fallback;
-  return Math.min(Math.max(value, min), max);
-}
 
-function boundedNonNegativeIntegerEnv(key: string, fallback: number, max: number) {
-  const raw = process.env[key]?.trim();
-  if (!raw) return Math.min(Math.max(Math.floor(fallback), 0), max);
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0) return Math.min(Math.max(Math.floor(fallback), 0), max);
-  return Math.min(Math.floor(value), max);
-}
 
 function compactDiagnosticText(value: string, maxLength: number) {
   const normalized = value.replace(/\s+/g, ' ').trim();
@@ -327,16 +333,6 @@ type ScrollableArea = {
     canScrollLeft: boolean;
     canScrollRight: boolean;
   };
-};
-
-type ScrollAreaDirectResult = {
-  ok: true;
-  descriptor: string;
-  before: ScrollableArea['scroll'];
-  after: ScrollableArea['scroll'];
-} | {
-  ok: false;
-  error: string;
 };
 
 type AiDomVisibleRect = {
@@ -664,12 +660,6 @@ const manualVerificationTextPatterns = [
   /身份验证/,
 ];
 
-function numericLimitFromEnv(name: string, fallback: number) {
-  const raw = String(process.env[name] || '').trim();
-  if (/^(0|false|none|off|unlimited)$/i.test(raw)) return Number.MAX_SAFE_INTEGER;
-  const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
 
 type BrowserOwnership = 'launched' | 'connected' | 'persistent' | 'shared';
 type SharedBrowserOwnership = Exclude<BrowserOwnership, 'shared'>;
@@ -735,82 +725,18 @@ const sharedBrowserState: {
   refCount: 0,
 };
 
-function sharedBrowserTabsEnabled() {
-  return process.env.BROWSER_SHARED_TABS !== 'false';
-}
 
-function nativeBrowserTabGroupsEnabled(headless: boolean) {
-  return !headless && process.env.BROWSER_NATIVE_TAB_GROUPS !== 'false';
-}
 
-function browserTabTitlePrefixEnabled() {
-  return process.env.BROWSER_TAB_TITLE_PREFIX === 'true';
-}
 
-function electronEmbeddedBrowserEnabled() {
-  return process.env.ELECTRON_EMBEDDED_BROWSER === 'true';
-}
 
-function electronEmbeddedBrowserCdpEndpoint() {
-  if (!electronEmbeddedBrowserEnabled()) return '';
-  const port = Number(process.env.ELECTRON_EMBEDDED_BROWSER_CDP_PORT || process.env.WEBPILOT_ELECTRON_CDP_PORT || 19333);
-  return cdpEndpointForPort(Number.isInteger(port) && port > 0 ? port : 19333);
-}
 
-function sessionTabGrouperExtensionPath() {
-  return path.join(process.cwd(), 'src', 'server', 'browser', 'session-tab-grouper-extension');
-}
 
-function sessionTabGrouperEnabled(headless: boolean) {
-  const extensionPath = sessionTabGrouperExtensionPath();
-  return nativeBrowserTabGroupsEnabled(headless) && existsSync(path.join(extensionPath, 'manifest.json'));
-}
 
-function withSessionTabGrouperArgs(args: string[], headless: boolean, options: { exclusive?: boolean } = {}) {
-  if (!sessionTabGrouperEnabled(headless)) return args;
-  const extensionPath = sessionTabGrouperExtensionPath();
-  return [
-    ...args,
-    ...(options.exclusive ? [`--disable-extensions-except=${extensionPath}`] : []),
-    `--load-extension=${extensionPath}`,
-  ];
-}
 
-function normalizePageGroupId(value?: string) {
-  const normalized = (value || 'browser-session')
-    .trim()
-    .replace(/[^a-zA-Z0-9_-]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 96);
-  return normalized || 'browser-session';
-}
 
-function sessionTabGrouperProfileDir(profileKey: string) {
-  return path.join(appDataRoot(), '.data', 'browser-profiles', 'tab-groups', normalizePageGroupId(profileKey));
-}
 
-function sessionTabGrouperDebugPort(profileKey: string) {
-  const configured = Number(process.env.BROWSER_TAB_GROUP_CDP_PORT || '');
-  if (Number.isInteger(configured) && configured > 0 && configured < 65536) return configured;
-  const key = normalizePageGroupId(profileKey);
-  let hash = 0;
-  for (const char of key) hash = ((hash * 31) + char.charCodeAt(0)) >>> 0;
-  return 24000 + (hash % 10000);
-}
 
-function cdpEndpointForPort(port?: number) {
-  return port ? `http://127.0.0.1:${port}` : '';
-}
 
-function cdpPortFromEndpoint(endpoint: string) {
-  try {
-    const url = new URL(endpoint);
-    const port = Number(url.port);
-    return Number.isInteger(port) && port > 0 && port < 65536 ? port : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -829,11 +755,6 @@ async function timedBrowserStep<T>(
   }
 }
 
-function formatTimingRecord(timings: Record<string, number>) {
-  return Object.entries(timings)
-    .map(([name, elapsedMs]) => `${name}=${elapsedMs}ms`)
-    .join(', ');
-}
 
 function isBlankPage(page: Page) {
   const url = page.url();
@@ -862,7 +783,7 @@ function installAccessibilitySnapshotExportControl() {
     button.id = controlId;
     button.type = 'button';
     button.textContent = '导出页面快照';
-    button.title = '获取当前页面及全部 iframe 的无障碍树，并按每段 10000 字符导出 JSON';
+    button.title = '获取当前页面及全部 iframe 的语义 DOM 快照，并按每段 20000 字符导出 JSON';
     button.setAttribute('aria-label', '导出当前页面语义 DOM 快照');
     Object.assign(button.style, {
       alignItems: 'center',
@@ -5415,6 +5336,7 @@ export class BrowserSession {
       selector: string;
       role: string;
       name: string;
+      description: string;
       value: string;
       url: string;
       properties: Record<string, string | number | boolean>;
@@ -5422,9 +5344,17 @@ export class BrowserSession {
       depth: number;
       actionable: boolean;
     };
+    const hasPrimaryAxTree = axNodes.some((item) => item.source === 'ax');
+    const duplicateName = (name: string, properties: Record<string, string | number | boolean> = {}) => {
+      const readable = name.replace(/\p{Co}/gu, '').trim().toLowerCase();
+      if (readable) return `name:${readable}`;
+      const className = String(properties.class || '').trim().toLowerCase();
+      const icon = String(properties.icon || '').trim().toLowerCase();
+      return className || icon ? `marker:${className}|${icon}` : 'unnamed';
+    };
     const remainingAxDuplicates = new Map<string, number>();
-    for (const node of axNodes.filter((item) => item.actionable)) {
-      const key = `${node.frameId}:${node.role.toLowerCase()}:${node.name.toLowerCase()}`;
+    for (const node of axNodes.filter((item) => item.actionable && !hasPrimaryAxTree)) {
+      const key = `${node.frameId}:${node.role.toLowerCase()}:${duplicateName(node.name, node.properties)}`;
       remainingAxDuplicates.set(key, (remainingAxDuplicates.get(key) || 0) + 1);
     }
     const fallbackIdentities = new Set<string>();
@@ -5434,7 +5364,11 @@ export class BrowserSession {
       const privateFrameId = (frame as unknown as { _id?: string })._id;
       let frameInfo = privateFrameId ? frames.find((item) => item.frameId === privateFrameId) : undefined;
       if (!frameInfo) {
-        frameInfo = frames.find((item) => !usedFrameIds.has(item.frameId) && item.url === frame.url());
+        const frameUrl = snapshotFrameUrl(frame.url());
+        frameInfo = frames.find((item) => (
+          !usedFrameIds.has(item.frameId)
+          && snapshotFrameUrl(item.url) === frameUrl
+        ));
       }
       const framePath = frame === page.mainFrame() ? undefined : this.getFramePath(frame);
       if (!frameInfo) {
@@ -5521,6 +5455,16 @@ export class BrowserSession {
           if (closest && !labels.includes(closest as HTMLLabelElement)) labels.push(closest as HTMLLabelElement);
           return normalize(labels.map((label) => label.textContent || '').join(' '));
         };
+        const classDescriptor = (tag: string, className: string) => {
+          const tokens = normalize(className).split(/\s+/).filter(Boolean);
+          return tokens.length ? `${tag.toLowerCase()}.${tokens.join('.')}` : '';
+        };
+        const embeddedSvgIcons = (element: Element) => {
+          const icons = Array.from(element.querySelectorAll('svg[class]'))
+            .map((icon) => classDescriptor('svg', icon.getAttribute('class') || ''))
+            .filter(Boolean);
+          return [...new Set(icons)].slice(0, 4).join(', ');
+        };
         const accessibleName = (element: Element, role: string, directText: string) => {
           const tag = element.tagName.toLowerCase();
           const type = (element.getAttribute('type') || '').toLowerCase();
@@ -5546,6 +5490,30 @@ export class BrowserSession {
             || element.getAttribute('name')
             || directText,
           );
+        };
+        const readable = (value: unknown) => normalize(String(value || '').replace(/\p{Co}/gu, ' '));
+        const unnamedActionContext = (element: Element, role: string) => {
+          const row = element.closest('tr,[role="row"]');
+          const rowText = readable(row?.textContent).slice(0, 180);
+          const column = element.closest('th,[role="columnheader"]');
+          const columnText = readable(column?.textContent).slice(0, 120);
+          if (role === 'checkbox' && rowText) return `[上下文] 选择：${rowText}`;
+          if (role === 'checkbox' && columnText) return `[上下文] ${columnText}列全选`;
+          if (columnText) return `[无标签控件：${columnText}列]`;
+          if (rowText) return `[无标签控件：${rowText}行]`;
+          let current: Element | null = element.parentElement;
+          for (let hops = 0; current && hops < 10; hops += 1) {
+            if (['body', 'html'].includes(current.tagName.toLowerCase())) break;
+            const text = readable(
+              current.getAttribute('aria-label')
+              || current.getAttribute('title')
+              || current.textContent,
+            ).slice(0, 120);
+            if (text) return `[无标签控件：${text}]`;
+            current = flatParent(current);
+          }
+          const title = readable(document.title).slice(0, 100);
+          return title ? `[无标签页面控件：${title}]` : '[无标签页面控件]';
         };
         const stateProperties = (element: Element) => {
           const field = element as unknown as Record<string, unknown>;
@@ -5629,6 +5597,13 @@ export class BrowserSession {
             && style.pointerEvents !== 'none'
             && rect.width > 0
             && rect.height > 0;
+          const representedByAx = ['a', 'button', 'input', 'select', 'textarea', 'summary'].includes(tag)
+            || [
+              'button', 'checkbox', 'combobox', 'gridcell', 'link', 'listbox', 'menuitem', 'menuitemcheckbox',
+              'menuitemradio', 'option', 'radio', 'scrollbar', 'searchbox', 'slider', 'spinbutton', 'switch', 'tab',
+              'textbox', 'treeitem',
+            ].includes(role);
+          if (!includeSemantic && representedByAx) continue;
           const directText = Array.from(element.childNodes)
             .filter((node) => node.nodeType === Node.TEXT_NODE)
             .map((node) => node.textContent || '')
@@ -5638,6 +5613,13 @@ export class BrowserSession {
           const semantic = includeSemantic && (role !== 'generic' || directText.length > 0);
           if (!actionable && !semantic) continue;
           const name = accessibleName(element, role, directText).slice(0, 300);
+          if (actionable && !readable(name)) {
+            const className = normalize(element.getAttribute('class') || '').slice(0, 300);
+            const icon = embeddedSvgIcons(element);
+            if (className) properties.class = className;
+            if (icon) properties.icon = icon;
+          }
+          const description = name ? '' : unnamedActionContext(element, role);
           const field = element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
           const value = ['input', 'select', 'textarea'].includes(tag) ? normalize(field.value).slice(0, 300) : '';
           const url = tag === 'a' ? String((element as HTMLAnchorElement).href || '') : '';
@@ -5646,6 +5628,7 @@ export class BrowserSession {
             selector: selectorFor(element),
             role,
             name,
+            description,
             value,
             url,
             properties,
@@ -5658,7 +5641,7 @@ export class BrowserSession {
       }, includeSemanticFallback).catch(() => [] as FallbackCandidate[]);
 
       for (const candidate of candidates) {
-        const duplicateKey = `${frameInfo.frameId}:${candidate.role.toLowerCase()}:${candidate.name.toLowerCase()}`;
+        const duplicateKey = `${frameInfo.frameId}:${candidate.role.toLowerCase()}:${duplicateName(candidate.name, candidate.properties)}`;
         const remainingDuplicates = remainingAxDuplicates.get(duplicateKey) || 0;
         if (remainingDuplicates > 0) {
           remainingAxDuplicates.set(duplicateKey, remainingDuplicates - 1);
@@ -5682,7 +5665,7 @@ export class BrowserSession {
           ignored: false,
           role: candidate.role,
           name: candidate.name,
-          description: '',
+          description: candidate.description,
           value: candidate.value,
           url: candidate.url,
           properties: candidate.properties,
@@ -6043,7 +6026,7 @@ export class BrowserSession {
   } = {}) {
     const startedAt = Date.now();
     const mode = options.mode === 'full' || options.mode === 'text' ? options.mode : 'actionable';
-    const maxChars = Math.max(10000, Math.floor(Number(options.maxChars) || 10000));
+    const maxChars = Math.max(20000, Math.floor(Number(options.maxChars) || 20000));
     const startIndex = Math.max(0, Math.floor(Number(options.cursorIndex) || 0));
     const generation = await this.ensureSnapshotGeneration(options.refresh === true);
     const records = generation.views[mode];
@@ -6051,7 +6034,7 @@ export class BrowserSession {
     let chars = 0;
     let nextIndex = Math.min(startIndex, records.length);
     for (let index = startIndex; index < records.length; index += 1) {
-      const line = records[index].line;
+      const line = records[index].line.trim();
       const addition = line.length + (lines.length ? 1 : 0);
       if (lines.length && chars + addition > maxChars) break;
       lines.push(line);

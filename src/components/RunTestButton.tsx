@@ -36,7 +36,7 @@ export function RunTestButton({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(modelPayload),
       });
-      const data = await readApiJson<any>(response, '启动失败');
+      const data = await readApiJson<{ runId?: string }>(response, '启动失败');
       if (!data.runId) throw new Error('启动失败');
       if (onStarted) {
         stopGlobalLoading();

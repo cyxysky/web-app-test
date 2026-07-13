@@ -39,7 +39,7 @@ export function RunDefaultRecordedRunButton({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(modelPayload),
       });
-      const data = await readApiJson<any>(response, '按默认记录执行失败');
+      const data = await readApiJson<{ runId?: string }>(response, '按默认记录执行失败');
       if (!data.runId) throw new Error('按默认记录执行失败');
       if (onStarted) {
         stopGlobalLoading();

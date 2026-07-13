@@ -70,7 +70,7 @@ function EvidenceMarkdown({ markdown }: { markdown: string }) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          a: ({ node: _node, ...props }) => (
+          a: ({ ...props }) => (
             <a {...props} target="_blank" rel="noopener noreferrer" />
           ),
         }}
@@ -1498,7 +1498,7 @@ export function RunProgress({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tools }),
       });
-      const data = await readApiJson<any>(response, t('保存工具记录失败'));
+      const data = await readApiJson<Record<string, unknown>>(response, t('保存工具记录失败'));
       if (!data.run) throw new Error(t('保存工具记录失败'));
       setRun(data.run as TestRunRecord);
       cancelToolRecordEdit();
@@ -1516,7 +1516,7 @@ export function RunProgress({
     startGlobalLoading(t('正在按记录执行'));
     try {
       const response = await fetch(`/api/runs/${run.id}/replay`, { method: 'POST' });
-      const data = await readApiJson<any>(response, t('按记录执行失败'));
+      const data = await readApiJson<Record<string, unknown>>(response, t('按记录执行失败'));
       if (!data.runId) throw new Error(t('按记录执行失败'));
       window.location.href = `/runs/${data.runId}`;
     } catch (error) {

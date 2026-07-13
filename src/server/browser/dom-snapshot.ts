@@ -122,6 +122,25 @@ function text(value: unknown) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
+function canonicalUrl(value: string) {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    return url.href;
+  } catch {
+    return value.split('#', 1)[0];
+  }
+}
+
+function readableName(value: unknown) {
+  return text(value).replace(/\p{Co}/gu, '').trim();
+}
+
+function classDescriptor(tag: string, className: string) {
+  const tokens = text(className).split(/\s+/).filter(Boolean);
+  return tokens.length ? `${tag.toLowerCase()}.${tokens.join('.')}` : '';
+}
+
 function axValue(value?: CdpAxValue) {
   const raw = value?.value;
   return typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean' ? raw : '';
@@ -195,13 +214,17 @@ function inferredRole(tag: string, attributes: Record<string, string>) {
   return 'generic';
 }
 
-function actionsFor(tag: string, role: string, attributes: Record<string, string>, clickable: boolean, cursor: string) {
-  const actions = new Set<string>();
-  const inputType = (attributes.type || 'text').toLowerCase();
-  const clickAttribute = Object.keys(attributes).some((name) => (
+function hasClickAttribute(attributes: Record<string, string>) {
+  return Object.keys(attributes).some((name) => (
     /^(onclick|jsaction|ng-click|@click|v-on:click|data-.+?(click|action|href|url|target))$/i.test(name)
     && attributes[name] !== 'false'
   ));
+}
+
+function actionsFor(tag: string, role: string, attributes: Record<string, string>, clickable: boolean, cursor: string) {
+  const actions = new Set<string>();
+  const inputType = (attributes.type || 'text').toLowerCase();
+  const clickAttribute = hasClickAttribute(attributes);
   if (
     clickable
     || clickRoles.has(role)
@@ -276,7 +299,8 @@ function enrichFromAx(node: CapturedDomSnapshotNode, axNode: CdpAxNode | undefin
   }
   const axRole = text(axValue(axNode.role) || axValue(axNode.chromeRole));
   const role = axRole && !['generic', 'none'].includes(axRole.toLowerCase()) ? axRole : node.role;
-  const name = text(axValue(axNode.name)) || node.name;
+  const axName = text(axValue(axNode.name));
+  const name = readableName(axName) ? axName : node.name;
   const actions = new Set(node.actions);
   if (clickRoles.has(role.toLowerCase())) actions.add('click');
   if (typeRoles.has(role.toLowerCase())) {
@@ -318,20 +342,29 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
     const strings = snapshot.strings || [];
     const output: CapturedDomSnapshotNode[] = [];
     const rawParentByBackend = new Map<string, number>();
+    const capturedDocumentUrls = new Set<string>();
 
     for (const [documentIndex, document] of (snapshot.documents || []).entries()) {
+      const snapshotDocumentUrl = strings[document.documentURL] || '';
+      const normalizedDocumentUrl = canonicalUrl(snapshotDocumentUrl);
       const frameId = strings[document.frameId] || `dom-frame-${documentIndex}`;
       const knownFrame = frameById.get(frameId);
+      const matchingTopLevelFrame = frames.find((candidate) => (
+        candidate.depth === 0
+        && canonicalUrl(candidate.url || '') === normalizedDocumentUrl
+      ));
+      if (!knownFrame && matchingTopLevelFrame && capturedDocumentUrls.has(normalizedDocumentUrl)) continue;
       const frame: CapturedSnapshotFrame = knownFrame || {
         frameId,
         documentId: frameId,
-        url: strings[document.documentURL] || undefined,
+        url: snapshotDocumentUrl || undefined,
         depth: 0,
       };
       if (!knownFrame) {
         frames.push(frame);
         frameById.set(frameId, frame);
       }
+      if (normalizedDocumentUrl) capturedDocumentUrls.add(normalizedDocumentUrl);
       const nodes = document.nodes;
       const count = nodes.backendNodeId?.length || nodes.nodeType?.length || 0;
       const parents = nodes.parentIndex || [];
@@ -376,6 +409,20 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
           labelByTarget.set(attrs[index].for, descendantText[index]);
         }
       }
+      const embeddedSvgIcons = (index: number) => {
+        const result: string[] = [];
+        const stack = [...children[index]].reverse();
+        while (stack.length && result.length < 4) {
+          const current = stack.pop()!;
+          const tag = (strings[nodes.nodeName?.[current] || 0] || '').toUpperCase();
+          if (tag === 'SVG') {
+            const descriptor = classDescriptor(tag, attrs[current]?.class || '');
+            if (descriptor && !result.includes(descriptor)) result.push(descriptor);
+          }
+          for (const child of [...children[current]].reverse()) stack.push(child);
+        }
+        return result.join(', ');
+      };
       const depthCache = new Map<number, number>();
       const depthOf = (index: number): number => {
         const cached = depthCache.get(index);
@@ -385,8 +432,25 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
         depthCache.set(index, depth);
         return depth;
       };
-      const documentUrl = strings[document.documentURL] || frame.url || '';
+      const documentUrl = snapshotDocumentUrl || frame.url || '';
       const baseUrl = strings[document.baseURL] || documentUrl;
+      const contextualActionName = (index: number, tag: string, attributes: Record<string, string>) => {
+        const inputType = (attributes.type || '').toLowerCase();
+        let current = parents[index];
+        for (let hops = 0; current >= 0 && hops < 24; hops += 1) {
+          const parentAttributes = attrs[current] || {};
+          const labelled = text(parentAttributes['aria-label'] || parentAttributes.title || '');
+          if (labelled) return `[无标签控件：${labelled}]`;
+          const parentTag = (strings[nodes.nodeName?.[current] || 0] || '').toUpperCase();
+          const parentText = descendantText[current];
+          if (tag === 'INPUT' && inputType === 'checkbox' && parentTag === 'TR' && parentText) {
+            return `[上下文] 选择：${parentText.slice(0, 180)}`;
+          }
+          if (parentTag === 'TH' && parentText) return `[无标签控件：${parentText.slice(0, 120)}列]`;
+          current = parents[current];
+        }
+        return '';
+      };
       for (let index = 0; index < count; index += 1) {
         const nodeType = nodes.nodeType?.[index];
         const backendDOMNodeId = nodes.backendNodeId?.[index];
@@ -431,7 +495,23 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
           && styles['content-visibility'] !== 'hidden'
           && Number(styles.opacity || '1') > 0.01);
         const role = inferredRole(tag, attributes);
-        const actions = actionsFor(tag, role, attributes, clickable.has(index), styles.cursor || '');
+        let actions = actionsFor(tag, role, attributes, clickable.has(index), styles.cursor || '');
+        const nativeInteractive = clickRoles.has(role)
+          || tag === 'BUTTON'
+          || (tag === 'A' && Boolean(attributes.href))
+          || tag === 'INPUT'
+          || tag === 'SELECT'
+          || tag === 'TEXTAREA';
+        const delegatedPageContainer = actions.length === 1
+          && actions[0] === 'click'
+          && clickable.has(index)
+          && role === 'generic'
+          && !nativeInteractive
+          && !hasClickAttribute(attributes)
+          && styles.cursor !== 'pointer'
+          && bounds[2] >= viewport.width * 0.9
+          && bounds[3] >= viewport.height * 0.9;
+        if (delegatedPageContainer || tag === 'HTML' || tag === 'BODY') actions = [];
         const disabled = 'disabled' in attributes || attributes['aria-disabled'] === 'true';
         const actionable = rendered && actions.length > 0 && !disabled;
         const labelledBy = text((attributes['aria-labelledby'] || '').split(/\s+/)
@@ -441,6 +521,7 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
         const inputType = (attributes.type || '').toLowerCase();
         const value = text(inputValues.get(index) || textValues.get(index) || attributes.value || '');
         const semanticText = actionable || textBearingRoles.has(role) ? ownText : '';
+        const contextualDescription = actionable ? contextualActionName(index, tag, attributes) : '';
         const name = text(
           labelledBy
           || attributes['aria-label']
@@ -474,6 +555,12 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
         if ('readonly' in attributes || attributes['aria-readonly'] === 'true') properties.readonly = true;
         if (attributes['aria-expanded'] && attributes['aria-expanded'] !== 'false') properties.expanded = attributes['aria-expanded'];
         if (layout?.scrollRect && (layout.scrollRect[2] > bounds[2] || layout.scrollRect[3] > bounds[3])) properties.scrollable = true;
+        if (actionable && !readableName(name)) {
+          const className = text(attributes.class).slice(0, 300);
+          const icon = embeddedSvgIcons(index);
+          if (className) properties.class = className;
+          if (icon) properties.icon = icon;
+        }
         output.push({
           identity: `${frame.documentId}:${frameId}:${backendDOMNodeId}`,
           source: 'dom-snapshot',
@@ -492,7 +579,7 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
           ignored: false,
           role,
           name,
-          description: '',
+          description: !readableName(name) ? contextualDescription : '',
           value,
           url: resolveUrl(attributes.href || '', baseUrl),
           properties,

@@ -33,7 +33,7 @@ export function DeleteTestCaseButton({
     if (!window.confirm(t('确定删除{name}吗？关联执行记录会一起移除。', { name }))) return;
     await run(async () => {
       const response = await fetch(`/api/test-cases/${testCaseId}`, { method: 'DELETE' });
-      await readApiJson<any>(response, t('删除用例失败'));
+      await readApiJson<Record<string, unknown>>(response, t('删除用例失败'));
       if (onDeleted) {
         onDeleted();
         return;

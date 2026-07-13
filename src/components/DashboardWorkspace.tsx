@@ -29,11 +29,6 @@ function statusLabel(status: string) {
   return labels[status] || status;
 }
 
-function caseProgressLabel(status: string) {
-  if (status === 'running') return '执行中';
-  if (['passed', 'failed', 'blocked'].includes(status)) return '已完成';
-  return '待执行';
-}
 
 type CaseDetailPayload = {
   runs: TestRunRecord[];
@@ -491,7 +486,7 @@ export function DashboardWorkspace({
     setDetailError('');
     fetch(`/api/test-cases/${activeDetailCaseId}/detail`, { cache: 'no-store' })
       .then(async (response) => {
-        const data = await readApiJson<any>(response, t('加载测试用例失败'));
+        const data = await readApiJson<Record<string, unknown>>(response, t('加载测试用例失败'));
         return data as CaseDetailPayload;
       })
       .then((data) => {
@@ -506,7 +501,7 @@ export function DashboardWorkspace({
       .finally(() => {
         if (detailRequestIdRef.current === requestId) setDetailLoading(false);
       });
-  }, [activeDetailCaseId, t]);
+  }, [activeDetailCaseId, setActiveRunId, t]);
 
   useEffect(() => {
     if (!activeRunId) {
@@ -522,7 +517,7 @@ export function DashboardWorkspace({
     setRunError('');
     fetch(`/api/runs/${activeRunId}`, { cache: 'no-store' })
       .then(async (response) => {
-        const data = await readApiJson<any>(response, t('加载执行记录失败'));
+        const data = await readApiJson<Record<string, unknown>>(response, t('加载执行记录失败'));
         return data as TestRunRecord;
       })
       .then((data) => {
@@ -537,7 +532,7 @@ export function DashboardWorkspace({
       .finally(() => {
         if (runRequestIdRef.current === requestId) setRunLoading(false);
       });
-  }, [activeRunId, t]);
+  }, [activeRunId, setActiveRunId, t]);
 
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
@@ -579,7 +574,7 @@ export function DashboardWorkspace({
     startGlobalLoading(t('正在删除分组'));
     try {
       const response = await fetch(`/api/groups/${group.id}`, { method: 'DELETE' });
-      const data = await readApiJson<any>(response, t('删除分组失败'));
+      await readApiJson<Record<string, unknown>>(response, t('删除分组失败'));
       if (selectedGroupId && descendantIds.has(selectedGroupId)) selectGroup(undefined);
       startTransition(() => router.refresh());
     } catch (error) {
@@ -622,7 +617,7 @@ export function DashboardWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(modelPayload),
       });
-      const data = await readApiJson<any>(response, t('启动失败'));
+      const data = await readApiJson<{ runId?: string }>(response, t('启动失败'));
       if (!data.runId) throw new Error(t('启动失败'));
       setStartingCaseId(null);
       stopGlobalLoading();
@@ -649,7 +644,7 @@ export function DashboardWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(modelPayload),
       });
-      const data = await readApiJson<any>(response, t('默认记录执行失败'));
+      const data = await readApiJson<{ runId?: string }>(response, t('默认记录执行失败'));
       if (!data.runId) throw new Error(t('默认记录执行失败'));
       setStartingDefaultCaseId(null);
       stopGlobalLoading();
@@ -673,7 +668,7 @@ export function DashboardWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ testCaseIds: selectedCaseIds, ...modelPayload }),
       });
-      const data = await readApiJson<any>(response, t('批量运行启动失败'));
+      const data = await readApiJson<Record<string, unknown>>(response, t('批量运行启动失败'));
       const runs: Array<{ id?: string }> = Array.isArray(data.runs) ? data.runs : [];
       runs.forEach((run, index) => {
         if (!run?.id) return;
@@ -715,7 +710,7 @@ export function DashboardWorkspace({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(modelPayload),
         });
-        const data = await readApiJson<any>(response, t('默认记录执行失败'));
+        const data = await readApiJson<Record<string, unknown>>(response, t('默认记录执行失败'));
       if (!data.runId) throw new Error(t('默认记录执行失败'));
         const url = `/runs/${data.runId}`;
         const tab = openedTabs[index];
@@ -750,7 +745,7 @@ export function DashboardWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ testCaseIds: selectedCaseIds }),
       });
-      const data = await readApiJson<any>(response, t('批量删除失败'));
+      await readApiJson<Record<string, unknown>>(response, t('批量删除失败'));
       setSelectedCaseIds([]);
       startTransition(() => router.refresh());
     } catch (error) {

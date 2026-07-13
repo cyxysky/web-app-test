@@ -1,13 +1,12 @@
 'use client';
 
 import { forwardRef, useEffect, useImperativeHandle, useState } from 'react';
-import { Loader2, Save, Sparkles } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { RichTextEditor } from '@/components/RichTextEditor';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
-import type { ModelProvider, SkillRecord, TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import type { ModelProvider, SkillRecord, TaskFrame, TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
 import { readApiJson } from '@/lib/api-client';
 
 export type TestCaseEditorActionState = {
@@ -33,7 +32,6 @@ export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
   modelProvider,
   onActionStateChange,
   onSaved,
-  showSectionActions = true,
   skills,
   testCase,
 }, ref) {
@@ -107,8 +105,8 @@ export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await readApiJson<any>(response, t('保存失败'));
-      onSaved?.(data as TestCaseRecord);
+      const data = await readApiJson<TestCaseRecord>(response, t('保存失败'));
+      onSaved?.(data);
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : t('保存失败'));
@@ -139,7 +137,7 @@ export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
           targetUrl: draft.targetUrl,
         }),
       });
-      const data = await readApiJson<any>(response, t('生成内容框架失败'));
+      const data = await readApiJson<{ taskFrame: TaskFrame }>(response, t('生成内容框架失败'));
       setFrameText(JSON.stringify(data.taskFrame, null, 2));
       update({ taskFrame: data.taskFrame });
     } catch (err) {
