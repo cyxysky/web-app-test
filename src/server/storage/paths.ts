@@ -21,6 +21,14 @@ export function browserChatSessionFilePath(sessionId: string) {
   return path.join(browserChatSessionsDir(), `${safeDataFileSegment(sessionId)}.json`);
 }
 
+export function browserChatSessionLogsDir() {
+  return path.join(appDataRoot(), '.data', 'browser-chat-session-logs');
+}
+
+export function browserChatSessionLogFilePath(sessionId: string) {
+  return path.join(browserChatSessionLogsDir(), `${safeDataFileSegment(sessionId)}.jsonl`);
+}
+
 export function browserChatSessionSummariesDir() {
   return path.join(appDataRoot(), '.data', 'browser-chat-session-summaries');
 }

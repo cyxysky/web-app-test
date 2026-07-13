@@ -84,7 +84,7 @@ export function TestCaseDetailWorkspace({
     async function loadModelConfig() {
       try {
         const response = await fetch('/api/settings/model', { cache: 'no-store' });
-        const data = await readApiJson<any>(response, '加载模型配置失败');
+        const data = await readApiJson<Record<string, unknown>>(response, '加载模型配置失败');
         if (!alive) return;
         const nextConfig = normalizeRuntimeModelConfig(data.config as Partial<RuntimeModelConfig> | undefined);
         if (!nextConfig) return;
@@ -106,7 +106,7 @@ export function TestCaseDetailWorkspace({
     return () => {
       alive = false;
     };
-  }, []);
+  }, [initialModel, initialModelProvider]);
 
   useEffect(() => {
     setModelId((current) => resolveRuntimeModelSelection(modelConfig, { model: current, provider: modelProvider }).model);

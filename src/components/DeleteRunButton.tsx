@@ -16,7 +16,7 @@ export function DeleteRunButton({ runId, disabled }: { runId: string; disabled?:
     if (!window.confirm(t('确定删除这条历史执行记录吗？'))) return;
     await run(async () => {
       const response = await fetch(`/api/runs/${runId}/delete`, { method: 'POST' });
-      await readApiJson<any>(response, t('删除失败'));
+      await readApiJson<Record<string, unknown>>(response, t('删除失败'));
       router.refresh();
     }, { loadingLabel: t('正在删除执行记录') }).catch((error) => {
       window.alert(error instanceof Error ? error.message : t('删除失败'));

@@ -7,7 +7,6 @@ import {
   embedErrorJson,
   embedJson,
   embedOptionsResponse,
-  normalizeMode,
   normalizeSafetyMode,
   normalizeString,
   publicBaseUrl,

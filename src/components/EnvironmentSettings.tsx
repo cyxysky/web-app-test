@@ -341,6 +341,8 @@ export function EnvironmentSettings({
     }
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
+  // The close handlers intentionally read the latest editor state when Escape is pressed.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deletePersonalMemoryTarget, deletingPersonalMemoryId, personalMemoryEditorMode, savingPersonalMemory]);
 
   async function load() {
@@ -403,7 +405,7 @@ export function EnvironmentSettings({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ items: items.map((item) => ({ ...item, enabled: true, secret: isSecret(item) })) }),
       });
-      const data = await readApiJson<any>(response, t('保存环境配置失败'));
+      const data = await readApiJson<{ saved?: EnvRow[] }>(response, t('保存环境配置失败'));
       setItems(data.saved || []);
       onRuntimeEnvSaved?.();
     } finally {
@@ -516,7 +518,7 @@ export function EnvironmentSettings({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await readApiJson<any>(response, t('保存模型配置失败'));
+      const data = await readApiJson<{ config?: Partial<ModelConfig> }>(response, t('保存模型配置失败'));
       const nextModel = createModelConfig(data.config);
       setModelConfig(nextModel);
       setModelDraft(nextModel);

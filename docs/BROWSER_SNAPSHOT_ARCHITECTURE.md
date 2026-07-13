@@ -1,36 +1,37 @@
 # Browser snapshot and input architecture
 
-The browser agent uses a DOMSnapshot-first protocol with selective accessibility enrichment. The old HTML-like DOM serialization, full-AX-first capture, and per-action tool set are not part of the model contract.
+The browser agent uses a DOMSnapshot-first protocol with selective accessibility enrichment. A full AX tree is only a capture-failure fallback; it is not the normal model-facing representation.
 
 ## Observation
 
-`takeSnapshot` calls CDP `DOMSnapshot.captureSnapshot` for the main document, flattened shadow DOM, and every captured frame. It requests a small computed-style whitelist, layout rectangles, scroll rectangles, clickability, input state, and paint order. Only ranked actionable candidates are enriched with `Accessibility.getPartialAXTree(fetchRelatives=false)`; a full AX tree is captured only if DOMSnapshot itself is unavailable. It returns one of three semantic views:
+`takeSnapshot` calls CDP `DOMSnapshot.captureSnapshot` for the main document, flattened shadow DOM, and every captured frame. It requests a small computed-style whitelist, layout rectangles, clickability, input state, and paint order. Only ranked actionable candidates are enriched with `Accessibility.getPartialAXTree(fetchRelatives=false)`. It returns one of three semantic views:
 
 - `actionable`: controls plus the minimum useful structural context.
 - `full`: meaningful DOM controls, content, and structural nodes.
 - `text`: deduplicated rendered text.
 
-Every line uses a short-lived `uid`:
+Actionable lines use a short-lived `uid`:
 
 ```text
 uid=17 button "Save"
 uid=18 textbox "Name" value="Alice" required=true
 ```
 
-The output does not contain redundant `data-ai-*` attributes or an interactive marker. A snapshot is paged by whole records at 10,000 characters by default. `nextCursor` continues the same cached generation and never scrolls the page.
+The output does not contain redundant `data-ai-*` attributes or an interactive marker. Snapshot records are flattened and slices remove hierarchy indentation for compact reading. A snapshot is paged by whole records at 20,000 characters by default. `nextCursor` continues the same cached generation and never scrolls the page.
 
 `searchSnapshot` searches the complete latest cached generation, so the model does not need to page through a large tree merely to find a known label or role.
 
-The actionable view is relevance-ranked within each frame instead of emitted in raw DOM or AX order. Text entry controls and selectors come first, followed by buttons and other non-link controls, DOM fallback targets, links, and finally structural context. Descendant text is assigned to its nearest actionable/card ancestor, nested pointer targets for the same entity are collapsed, and container text is bounded. This prevents a large navigation or result-link collection from consuming the first snapshot slice before search boxes and primary controls appear. Focusability is represented as `actions=focus`; it is not automatically treated as clickability, and structural focusable list/table nodes are excluded from the fallback action set.
+The actionable view preserves the original flattened DOMSnapshot order within each captured frame. It includes actionable nodes plus bounded structural context, but does not re-rank controls by role, text, or viewport position. Descendant text is assigned to its nearest actionable/card ancestor, nested pointer targets for the same entity are collapsed, and container text is bounded. Focusability is represented as `actions=focus`; it is not automatically treated as clickability, and structural focusable list/table nodes are excluded from the fallback action set.
 
 ### Frames, enrichment, and fallback
 
-DOMSnapshot supplies the primary flattened DOM/layout model. Candidate names are derived from `aria-labelledby`, `aria-label`, associated labels, alt text, descendant rendered text, value, placeholder, title, and name metadata. Partial AX then replaces or augments role, computed accessible name, value, and widget state for the highest-value candidates. A lightweight Playwright-frame traversal remains as a final supplement for runtime-specific controls that DOMSnapshot misses; same-name controls are counted rather than globally collapsed. The pipeline:
+DOMSnapshot supplies the primary flattened DOM/layout model. Candidate names are derived from `aria-labelledby`, `aria-label`, associated labels, alt text, descendant rendered text, value, placeholder, title, and name metadata. Partial AX then replaces or augments role, computed accessible name, value, and widget state for ranked candidates. A lightweight Playwright-frame traversal remains a final supplement for runtime-specific controls that DOMSnapshot misses. When an actionable target has no readable accessible name, its output keeps the element's actual `class` and up to four nested SVG class descriptors (for example `icon=svg.icon-Filter-Fill`), then adds reliable nearby context without guessing the icon's purpose. The pipeline:
 
 - enters every attached iframe and open shadow root;
 - immediately prunes a subtree when the current element has `display:none`;
 - ignores `script`, `style`, and other non-semantic content by selecting meaningful nodes rather than serializing HTML;
-- treats accessible SVG controls through partial AX role/name and uses full AX only as a capture-failure fallback.
+- de-duplicates a synthetic same-page DOM document before serialization;
+- preserves class evidence for bare unlabeled SVG controls, rather than inventing an action name.
 
 ## Input
 
@@ -56,7 +57,7 @@ Browser actions automatically maintain the semantic DOM snapshot through one pag
 
 ## Runtime rules
 
-- Start with `takeSnapshot({ mode: "actionable", maxChars: 10000 })` for semantic UI.
+- Start with `takeSnapshot({ mode: "actionable", maxChars: 20000 })` for semantic UI.
 - Use `searchSnapshot` for a known target in a large snapshot.
 - Use a UID directly; the executor reveals offscreen targets internally.
 - Use `takeScreenshot` plus coordinates only when semantic evidence is insufficient.
@@ -65,4 +66,4 @@ Browser actions automatically maintain the semantic DOM snapshot through one pag
 
 ## Debug export
 
-The settings page's snapshot test browser exports `actionable`, `full`, and `text` from one generation into a JSON file. Every view is split into whole-record chunks of at most 10,000 characters.
+The settings page's snapshot test browser exports `actionable`, `full`, and `text` from one generation into a JSON file (`version: 4`, `chromium-dom-snapshot-with-partial-ax`). Every view is split into whole-record chunks of at most 20,000 characters, and the aggregate `content` field joins those chunks for direct inspection.

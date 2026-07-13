@@ -2,7 +2,7 @@
 
 import { useRouter } from 'next/navigation';
 import { useMemo, useState } from 'react';
-import { BadgeCheck, Clock3, ExternalLink, FileText, Loader2, Sparkles, Star, Trash2 } from 'lucide-react';
+import { BadgeCheck, Clock3, ExternalLink, Loader2, Sparkles, Star, Trash2 } from 'lucide-react';
 import { DeleteRunButton } from '@/components/DeleteRunButton';
 import { RecordedFlowToCaseButton } from '@/components/RecordedFlowToCaseButton';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
@@ -83,7 +83,7 @@ export function RunHistoryList({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ runIds }),
       });
-      const data = await readApiJson<any>(response, t('批量删除失败'));
+      await readApiJson<Record<string, unknown>>(response, t('批量删除失败'));
       setSelectedIds([]);
       router.refresh();
     } catch (error) {
@@ -104,7 +104,7 @@ export function RunHistoryList({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ runId }),
       });
-      const data = await readApiJson<any>(response, t('设置默认记录失败'));
+      await readApiJson<Record<string, unknown>>(response, t('设置默认记录失败'));
       router.refresh();
     } catch (error) {
       window.alert(error instanceof Error ? error.message : t('设置默认记录失败'));
@@ -120,7 +120,7 @@ export function RunHistoryList({
     startGlobalLoading(t('正在生成 Skill'));
     try {
       const response = await fetch(`/api/runs/${runId}/skills`, { method: 'POST' });
-      const data = await readApiJson<any>(response, t('生成 Skill 失败'));
+      await readApiJson<Record<string, unknown>>(response, t('生成 Skill 失败'));
       router.refresh();
     } catch (error) {
       window.alert(error instanceof Error ? error.message : t('生成 Skill 失败'));
@@ -158,8 +158,6 @@ export function RunHistoryList({
             <span title={deletableIds.length ? t('全选执行记录') : t('暂无执行记录')}>{deletableIds.length ? t('全选执行记录') : t('暂无执行记录')}</span>
           </label>
           {runs.map((run) => {
-            const completedStepCount = run.result?.steps.filter((step) => step.status !== 'queued').length || 0;
-            const totalStepCount = run.result?.steps.length || 0;
             const replayable = Boolean(run.result?.steps.some((step) => step.tools?.some((tool) => tool.name && tool.ok !== false)));
             const startedAt = formatRunTime(run.startedAt || run.createdAt, language);
             const endedAt = run.endedAt ? formatRunTime(run.endedAt, language) : undefined;
@@ -167,7 +165,6 @@ export function RunHistoryList({
             const selected = selectedSet.has(run.id);
             const isDefaultRecordedRun = run.id === defaultRecordedRunId;
             const skillable = !active && Boolean(run.result?.steps?.length);
-            const reportText = run.report ? t('报告已生成') : t('报告生成中');
             return (
               <div className={selected ? 'run-history-row selected' : 'run-history-row'} key={run.id}>
                 <label className="run-history-select" title={t('选择这条执行记录')}>

@@ -8,7 +8,7 @@ import {
 } from '@/server/browser/browser-session';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
 
-const DOM_EXPORT_CHUNK_CHARS = 10000;
+const DOM_EXPORT_CHUNK_CHARS = 20000;
 const DOM_EXPORT_MAX_CHUNKS = 10000;
 
 type SnapshotExportView = 'actionable' | 'full' | 'text';
@@ -26,6 +26,7 @@ type DomExportViewResult = {
   generationId: string;
   chunkCount: number;
   totalChars: number;
+  content: string;
   chunks: DomExportChunk[];
 };
 
@@ -85,7 +86,14 @@ async function collectView(session: BrowserSession, view: SnapshotExportView, re
       content,
     });
     if (!slice.hasMore) {
-      return { type: view, generationId, chunkCount: chunks.length, totalChars, chunks };
+      return {
+        type: view,
+        generationId,
+        chunkCount: chunks.length,
+        totalChars,
+        content: chunks.map((chunk) => chunk.content).join('\n'),
+        chunks,
+      };
     }
     if (slice.nextIndex <= cursorIndex) {
       throw new Error(`${view} snapshot cursor did not advance: ${cursorIndex} -> ${slice.nextIndex}`);
@@ -108,7 +116,7 @@ export async function exportAccessibilitySnapshotJson(session: BrowserSession): 
   const full = await collectView(session, 'full');
   const text = await collectView(session, 'text');
   const payload = {
-    version: 3,
+    version: 4,
     format: 'chromium-dom-snapshot-with-partial-ax',
     createdAt,
     url: session.currentUrl(),
@@ -117,7 +125,7 @@ export async function exportAccessibilitySnapshotJson(session: BrowserSession): 
     chunkChars: DOM_EXPORT_CHUNK_CHARS,
     views: { actionable, full, text },
   };
-  const content = `${JSON.stringify(payload, null, 2)}\n`;
+  const content = `${JSON.stringify(payload)}\n`;
   const dir = artifactPath('accessibility-snapshot-test', 'exports');
   const fileName = exportFileName();
   const filePath = path.join(dir, fileName);

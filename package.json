@@ -14,8 +14,7 @@
     "docker:build": "docker build -t webpilot-qa:latest .",
     "docker:up": "docker compose up -d --build",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit",
-    "prisma:generate": "prisma generate"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@ai-sdk/alibaba": "^1.0.28",
@@ -40,7 +39,6 @@
     "@ai-sdk/vercel": "^2.0.52",
     "@ai-sdk/xai": "^3.0.95",
     "@openrouter/ai-sdk-provider": "^2.9.0",
-    "@prisma/client": "^6.8.2",
     "@tanstack/react-virtual": "^3.14.3",
     "@tinymce/tinymce-react": "^6.3.0",
     "ai": "^6.0.193",
@@ -69,7 +67,6 @@
     "electron-builder": "^26.15.0",
     "eslint": "^9.27.0",
     "eslint-config-next": "^15.3.3",
-    "prisma": "^6.8.2",
     "tailwindcss": "^4.1.8",
     "typescript": "^5.8.3"
   },

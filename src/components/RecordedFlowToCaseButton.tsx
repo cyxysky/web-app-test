@@ -15,7 +15,7 @@ export function RecordedFlowToCaseButton({ runId, disabled }: { runId: string; d
     if (loading || disabled) return;
     await run(async () => {
       const response = await fetch(`/api/runs/${runId}/recorded-flow/to-test-case`, { method: 'POST' });
-      const data = await readApiJson<any>(response, t('生成用例失败'));
+      const data = await readApiJson<{ testCase?: { id?: string } }>(response, t('生成用例失败'));
       if (!data.testCase?.id) throw new Error(t('生成用例失败'));
       router.push('/dashboard');
     }, { loadingLabel: t('正在转为测试用例') }).catch((error) => {

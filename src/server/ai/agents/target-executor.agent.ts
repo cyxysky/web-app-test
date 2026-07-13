@@ -273,22 +273,10 @@ function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextS
 }
 
 // 是否启用视觉候选标识。关闭时仍发送截图，但候选元素只以文本摘要进入 prompt。
-function visualMarkersEnabledFor(testCase: TestCaseRecord) {
-  if (typeof testCase.content.isMarked === 'boolean') return testCase.content.isMarked;
-  if (process.env.VISUAL_MARKERS_IS_MARKED === 'false' || process.env.SCREENSHOT_IS_MARKED === 'false') return false;
-  return true;
-}
 
 // Default to inline marker labels so visual mode screenshots show interactive targets.
-function usesSeparateMarkerMap() {
-  return !/^(false|0|no|off)$/i.test(String(process.env.VISUAL_MARKER_SEPARATE_MAP || 'false'));
-}
 
 // 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
-function shouldSendScreenshotToAi(mode: BrowserSessionMode) {
-  void mode;
-  return false;
-}
 
 // 将调试数据转成可安全 JSON 序列化的结构，避免 Buffer/BigInt 破坏持久化。
 function jsonSafe(value: unknown) {
@@ -352,21 +340,6 @@ async function readScreenshotForAi(filePath: string) {
 }
 
 // 纯标识图必须跟随原图最终发送尺寸缩放，否则两张图经过压缩后会失去像素对齐关系。
-async function readMarkerScreenshotForAi(filePath: string, referenceScreenshot: Buffer) {
-  const markerBuffer = await readFile(filePath);
-  const [referenceMetadata, markerMetadata] = await Promise.all([
-    sharp(referenceScreenshot, { failOn: 'none' }).metadata(),
-    sharp(markerBuffer, { failOn: 'none' }).metadata(),
-  ]);
-  const width = referenceMetadata.width;
-  const height = referenceMetadata.height;
-  if (!width || !height || (markerMetadata.width === width && markerMetadata.height === height)) return markerBuffer;
-
-  return sharp(markerBuffer, { failOn: 'none' })
-    .resize({ width, height, fit: 'fill' })
-    .png({ compressionLevel: 9 })
-    .toBuffer();
-}
 
 function trimDebugText(value: string, max = 4000) {
   return value.length > max ? `${value.slice(0, max)}...` : value;
@@ -905,159 +878,10 @@ function hostOf(url: string) {
   }
 }
 
-function candidateExternalAppState(candidate: Record<string, unknown>) {
-  if (candidate.opensExternalApp !== true) return '';
-  const protocol = typeof candidate.externalAppProtocol === 'string' && candidate.externalAppProtocol.trim()
-    ? candidate.externalAppProtocol.trim()
-    : 'custom-protocol';
-  return `external-app=${protocol}`;
-}
 
-function formatVisualInteractiveElements(candidates: unknown) {
-  if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive elements detected]';
-  return candidates.map((item, index) => {
-    const candidate = item as Record<string, unknown>;
-    const label = [
-      candidate.name,
-      candidate.text,
-      candidate.ariaLabel,
-      candidate.placeholder,
-      candidate.title,
-      candidate.nearbyText,
-    ]
-      .map((value) => (typeof value === 'string' ? value.trim() : ''))
-      .find(Boolean) || '[unlabeled]';
-    const role = [candidate.tag, candidate.role, candidate.type].filter(Boolean).join('/');
-    const rect = candidate.rect ? ` rect=${JSON.stringify(candidate.rect)}` : '';
-    const state = [
-      candidate.input ? 'input' : '',
-      candidate.disabled ? 'disabled' : '',
-      candidateExternalAppState(candidate),
-      candidate.href ? `href=${candidate.href}` : '',
-      candidate.framePath ? `frame=${candidate.framePath}` : '',
-    ].filter(Boolean).join(', ');
-    return `${index + 1}. id=${candidate.id} ${role || 'element'} "${String(label).slice(0, 120)}"${state ? ` (${state})` : ''}${rect}`;
-  }).join('\n');
-}
 
-function formatExternalAppInteractiveElements(candidates: unknown) {
-  if (!Array.isArray(candidates) || !candidates.length) return '';
-  const lines = candidates
-    .map((item) => item as Record<string, unknown>)
-    .filter((candidate) => candidate.opensExternalApp === true)
-    .map((candidate) => {
-      const label = [
-        candidate.name,
-        candidate.text,
-        candidate.ariaLabel,
-        candidate.placeholder,
-        candidate.title,
-        candidate.nearbyText,
-      ]
-        .map((value) => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : ''))
-        .find(Boolean) || '[unlabeled]';
-      const href = typeof candidate.href === 'string' && candidate.href ? ` href=${candidate.href}` : '';
-      return `- id=${candidate.id} ${candidateExternalAppState(candidate)} "${String(label).slice(0, 120)}"${href}`;
-    });
-  return lines.join('\n');
-}
 
-function formatDomInteractiveElements(candidates: unknown) {
-  if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive elements detected]';
-  return candidates.map((item) => {
-    const candidate = item as Record<string, unknown>;
-    const label = [
-      candidate.name,
-      candidate.text,
-      candidate.ariaLabel,
-      candidate.placeholder,
-      candidate.title,
-      candidate.nearbyText,
-    ]
-      .map((value) => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : ''))
-      .find(Boolean) || '[unlabeled]';
-    const pathDepth = typeof candidate.path === 'string'
-      ? Math.max(0, candidate.path.split('.').filter(Boolean).length - 1)
-      : 0;
-    const indent = '  '.repeat(Math.min(pathDepth, 10));
-    const className = typeof candidate.className === 'string' && candidate.className.trim()
-      ? `.${candidate.className.trim().split(/\s+/).slice(0, 3).join('.')}`
-      : '';
-    const role = [candidate.role, candidate.type].filter(Boolean).join('/');
-    const descriptor = `${candidate.tag || 'element'}${className}${role ? `[${role}]` : ''}`;
-    const signals = Array.isArray(candidate.signals)
-      ? candidate.signals.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).join('|')
-      : '';
-    const state = [
-      candidate.clickable ? 'clickable' : '',
-      candidate.input ? 'input' : '',
-      candidate.disabled ? 'disabled' : '',
-      signals ? `signals=${signals}` : '',
-      candidateExternalAppState(candidate),
-      candidate.href ? `href=${candidate.href}` : '',
-      candidate.framePath ? `frame=${candidate.framePath}` : '',
-      candidate.shadow ? 'shadow' : '',
-    ].filter(Boolean).join(', ');
-    const id = typeof candidate.id === 'string' || typeof candidate.id === 'number' ? `#${candidate.id} ` : '';
-    return `${indent}- ${id}${descriptor}: "${String(label).slice(0, 160)}"${state ? ` (${state})` : ''}`;
-  }).join('\n');
-}
 
-function formatScrollableAreaSummary(areas: unknown, limit = 10) {
-  if (!Array.isArray(areas) || !areas.length) return '[no scrollable areas detected]';
-  return areas.slice(0, limit).map((item) => {
-    const area = item as Record<string, unknown>;
-    const scroll = area.scroll && typeof area.scroll === 'object' && !Array.isArray(area.scroll)
-      ? area.scroll as Record<string, unknown>
-      : {};
-    const label = [area.name, area.text, area.role, area.tag]
-      .map((value) => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : ''))
-      .find(Boolean);
-    const directions = [
-      scroll.canScrollUp ? 'up' : '',
-      scroll.canScrollDown ? 'down' : '',
-      scroll.canScrollLeft ? 'left' : '',
-      scroll.canScrollRight ? 'right' : '',
-    ].filter(Boolean).join('/');
-    const top = Number(scroll.top);
-    const left = Number(scroll.left);
-    const height = Number(scroll.height);
-    const width = Number(scroll.width);
-    const clientHeight = Number(scroll.clientHeight);
-    const clientWidth = Number(scroll.clientWidth);
-    const configuredMaxTop = Number(scroll.maxTop);
-    const configuredMaxLeft = Number(scroll.maxLeft);
-    const maxTop = Number.isFinite(configuredMaxTop)
-      ? configuredMaxTop
-      : Number.isFinite(height) && Number.isFinite(clientHeight) ? Math.max(0, height - clientHeight) : undefined;
-    const maxLeft = Number.isFinite(configuredMaxLeft)
-      ? configuredMaxLeft
-      : Number.isFinite(width) && Number.isFinite(clientWidth) ? Math.max(0, width - clientWidth) : undefined;
-    const configuredRemainingDown = Number(scroll.remainingDown);
-    const configuredRemainingUp = Number(scroll.remainingUp);
-    const configuredRemainingRight = Number(scroll.remainingRight);
-    const configuredRemainingLeft = Number(scroll.remainingLeft);
-    const remainingDown = Number.isFinite(configuredRemainingDown)
-      ? configuredRemainingDown
-      : Number.isFinite(top) && maxTop !== undefined ? Math.max(0, maxTop - top) : undefined;
-    const remainingUp = Number.isFinite(configuredRemainingUp)
-      ? configuredRemainingUp
-      : Number.isFinite(top) ? Math.max(0, top) : undefined;
-    const remainingRight = Number.isFinite(configuredRemainingRight)
-      ? configuredRemainingRight
-      : Number.isFinite(left) && maxLeft !== undefined ? Math.max(0, maxLeft - left) : undefined;
-    const remainingLeft = Number.isFinite(configuredRemainingLeft)
-      ? configuredRemainingLeft
-      : Number.isFinite(left) ? Math.max(0, left) : undefined;
-    const yState = Number.isFinite(top) && maxTop !== undefined
-      ? ` y=${Math.round(top)}/${Math.round(maxTop)} ${remainingDown && remainingDown > 1 ? `remainingDown=${Math.round(remainingDown)}` : 'atBottom'} ${remainingUp && remainingUp > 1 ? `remainingUp=${Math.round(remainingUp)}` : 'atTop'}`
-      : '';
-    const xState = Number.isFinite(left) && maxLeft !== undefined && maxLeft > 0
-      ? ` x=${Math.round(left)}/${Math.round(maxLeft)} ${remainingRight && remainingRight > 1 ? `remainingRight=${Math.round(remainingRight)}` : 'atRight'} ${remainingLeft && remainingLeft > 1 ? `remainingLeft=${Math.round(remainingLeft)}` : 'atLeft'}`
-      : '';
-    return `${area.id || '?'}${directions ? ` can=${directions}` : ' can=none'}${yState}${xState}${label ? ` "${String(label).slice(0, 60)}"` : ''}`;
-  }).join('\n');
-}
 
 function defaultVisualAfterForTool(name: string): VisualAfterPolicy {
   void name;
@@ -1098,11 +922,6 @@ function sanitizeCurrentState(value: unknown) {
 }
 
 const noVisualAfterCaptureToolNames = new Set<string>();
-const noDomAfterContextToolNames = new Set([
-  ...noVisualAfterCaptureToolNames,
-  'listTabs',
-  'waitForPage',
-]);
 
 function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
   const fallback = defaultVisualAfterForTool(name);
@@ -1868,49 +1687,6 @@ async function verifyRuntimeCompletion(input: {
 }
 
 // 根据当前模式生成验证码/安全校验规则；DOM 模式不要要求 AI 读取截图。
-function formatVisualPageStateObservation(input: {
-  pageContext: RuntimePageContext;
-  visualContext: ReturnType<VisualContextManager['snapshot']>;
-  screenshotInputEnabled: boolean;
-  markerEnabled: boolean;
-  markerOverlayInScreenshot: boolean;
-  separateMarkerMap: boolean;
-}) {
-  const { pageContext, visualContext, screenshotInputEnabled, markerEnabled, markerOverlayInScreenshot, separateMarkerMap } = input;
-  const shouldIncludeCandidates = !screenshotInputEnabled || !markerEnabled;
-  const externalAppCandidates = formatExternalAppInteractiveElements(pageContext.interactiveCandidates);
-  const imageRule = screenshotInputEnabled
-    ? separateMarkerMap
-      ? 'Screenshot images are attached: clean viewport first, pixel-aligned marker map second.'
-      : markerOverlayInScreenshot
-        ? 'A current viewport screenshot with marker labels overlaid is attached.'
-        : 'A current clean viewport screenshot is attached.'
-    : 'No screenshot image is attached; use the visible interactive elements list as the screenshot-derived candidate map.';
-  const frameSummary = (frame: VisualFrameRecord) => (
-    `${frame.id} ${concise(frame.reason, 80)} image=${basenameOfPath(frame.path)}${frame.originalPath ? ` original=${basenameOfPath(frame.originalPath)}` : ''}${frame.markerPath ? ` marker=${basenameOfPath(frame.markerPath)}` : ''}${frame.capture ? ` capture=${frame.capture}` : ''}`
-  );
-  return [
-    'Current visual page state observation:',
-    imageRule,
-    '- Candidate ids and scroll area ids are volatile. Use them only until the next browser-changing action.',
-    `Current URL: ${pageContext.url}`,
-    `Current title: ${pageContext.title}`,
-    `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
-    `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
-    `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
-    shouldIncludeCandidates
-      ? `Visible interactive elements:\n${formatVisualInteractiveElements(pageContext.interactiveCandidates)}`
-      : '',
-    !shouldIncludeCandidates && externalAppCandidates
-      ? `External application candidates in the current marker map:\n${externalAppCandidates}`
-      : '',
-    'Visual Context Manager:',
-    `current: ${visualContext.current ? frameSummary(visualContext.current) : '[none]'}`,
-    visualContext.history.length
-      ? `history is context only, never use its ids for current actions:\n${visualContext.history.map((frame) => `- ${frameSummary(frame)} role=${frame.role} group=${frame.group || '-'}`).join('\n')}`
-      : 'history: [none]',
-  ].filter(Boolean).join('\n');
-}
 
 function runtimePrompt(input: {
   testCase: TestCaseRecord;
@@ -1930,9 +1706,6 @@ function runtimePrompt(input: {
   const mode = browserModeOf(testCase);
   const visualMode = false;
   const attachScreenshot = false;
-  const markerEnabled = false;
-  const markerOverlayInScreenshot = false;
-  const separateMarkerScreenshot = false;
   void input.markerOverlayInScreenshot;
   void input.hasMarkerScreenshot;
   const caseSystemPrompt = systemPromptOf(testCase);
@@ -2438,7 +2211,6 @@ async function executeRuntimeStep(input: {
   const browserChatMode = isBrowserChatTestCase(testCase);
   const screenshotInputEnabled = false;
   const markerEnabled = false;
-  const separateMarkerMap = false;
   const markerOverlayInScreenshot = false;
   const markerScreenshotPath = undefined;
   const originalScreenshotPath = session.getLastOriginalScreenshotPath();

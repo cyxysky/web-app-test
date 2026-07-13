@@ -4,7 +4,6 @@ import {
   embedErrorJson,
   embedJson,
   embedOptionsResponse,
-  normalizeMode,
   normalizeSafetyMode,
   readEmbedAuth,
 } from '@/server/embed/browser-chat-embed';

@@ -66,6 +66,13 @@ import remarkGfm from 'remark-gfm';
 import { CustomSelect } from '@/components/CustomSelect';
 import { BrowserChatLogDialog } from '@/components/BrowserChatLogDialog';
 import { BrowserChatToolDialog } from '@/components/BrowserChatToolDialog';
+import {
+  browserChatDownloadPercent,
+  browserChatDownloadStatusLabel,
+  formatDownloadBytes,
+  type SystemDownloadItem,
+  type SystemDownloadStatus,
+} from '@/components/browser-chat-download-model';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
 import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
 import { NewTestCaseModal } from '@/components/NewTestCaseModal';
@@ -296,23 +303,6 @@ type EmbeddedBrowserState = EmbeddedBrowserBridgeResult & {
   zoomFactor?: number;
 };
 
-type SystemDownloadStatus = 'selecting' | 'pending' | 'downloading' | 'completed' | 'cancelled' | 'failed' | string;
-
-type SystemDownloadItem = {
-  completedAt?: number;
-  error?: string;
-  fileName?: string;
-  id: string;
-  path?: string;
-  progress?: number;
-  receivedBytes?: number;
-  startedAt?: number;
-  status?: SystemDownloadStatus;
-  totalBytes?: number;
-  updatedAt?: number;
-  url?: string;
-};
-
 type EmbeddedBrowserBridge = {
   activateTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   closeActiveTab: () => Promise<EmbeddedBrowserBridgeResult>;
@@ -353,9 +343,6 @@ declare global {
   }
 }
 
-function statusLabel(status: string) {
-  return status === 'running' ? '进行中' : '已完成';
-}
 
 function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'model') return <Bot size={15} />;
@@ -794,13 +781,6 @@ function BrowserChatToolIcon({ name }: { name: string }) {
   return <Workflow size={13} />;
 }
 
-function screenshotKindLabel(kind?: string) {
-  if (kind === 'original') return '原始图';
-  if (kind === 'marker') return '标识图';
-  if (kind === 'current' || kind === 'pinned' || kind === 'after') return '操作后';
-  if (kind === 'history') return '操作前';
-  return '截图';
-}
 
 function temporaryId(prefix: string) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -891,13 +871,6 @@ function messageUpdateTime(message: BrowserChatMessage) {
   return message.updatedAt || message.createdAt;
 }
 
-function phaseLabel(phase: string) {
-  if (phase.startsWith('browser:')) return '浏览器';
-  if (phase.startsWith('ai:')) return 'AI';
-  if (phase.startsWith('chat:')) return '对话';
-  if (phase.startsWith('perf:')) return '性能';
-  return phase;
-}
 
 function normalizeMarkdownSegment(value: string) {
   return value
@@ -1001,7 +974,7 @@ const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { ma
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          a: ({ node: _node, href, onClick, ...props }) => (
+          a: ({ href, onClick, ...props }) => (
             <a
               {...props}
               href={href}
@@ -1020,33 +993,6 @@ const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { ma
     </div>
   );
 });
-
-function formatDownloadBytes(value?: number) {
-  const bytes = Number(value || 0);
-  if (!Number.isFinite(bytes) || bytes <= 0) return '';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 102.4) / 10} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${Math.round(bytes / 1024 / 102.4) / 10} MB`;
-  return `${Math.round(bytes / 1024 / 1024 / 102.4) / 10} GB`;
-}
-
-function browserChatDownloadStatusLabel(status?: SystemDownloadStatus) {
-  if (status === 'selecting') return '选择保存目录';
-  if (status === 'pending') return '准备下载';
-  if (status === 'downloading') return '下载中';
-  if (status === 'completed') return '已完成';
-  if (status === 'cancelled') return '已取消';
-  if (status === 'failed') return '下载失败';
-  return '下载';
-}
-
-function browserChatDownloadPercent(download: SystemDownloadItem) {
-  if (typeof download.progress === 'number' && Number.isFinite(download.progress)) {
-    return Math.max(0, Math.min(100, Math.round(download.progress * 100)));
-  }
-  if (download.status === 'completed') return 100;
-  return undefined;
-}
 
 function BrowserChatDownloadStatusIcon({ status }: { status?: SystemDownloadStatus }) {
   if (status === 'completed') return <CheckCircle2 size={15} />;
@@ -2328,6 +2274,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   showStop: boolean;
   uploadingImage: boolean;
 }) {
+  void mode;
+  void modeLocked;
+  void onModeChange;
   const { t } = useI18n();
   const editorRef = useRef<HTMLDivElement | null>(null);
   const [draft, setDraft] = useState('');
@@ -3501,7 +3450,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
 
   useEffect(() => {
     if (!addressFocusedRef.current) setAddressValue(embeddedBrowserDisplayUrl(activeEmbeddedTab));
-  }, [activeEmbeddedTab?.id, activeEmbeddedTab?.url]);
+  }, [activeEmbeddedTab]);
 
   useEffect(() => {
     if (!active || !activeEmbeddedTab?.sessionId || activeEmbeddedTab.sessionId === sessionId) {
@@ -3511,7 +3460,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     if (requestedSessionIdRef.current === activeEmbeddedTab.sessionId) return;
     requestedSessionIdRef.current = activeEmbeddedTab.sessionId;
     onSelectSession?.(activeEmbeddedTab.sessionId);
-  }, [active, activeEmbeddedTab?.sessionId, onSelectSession, sessionId]);
+  }, [active, activeEmbeddedTab, onSelectSession, sessionId]);
 
   return (
     <section
@@ -4089,7 +4038,7 @@ export function BrowserChatWorkspace({
 
   const loadBrowserRuntimeSettings = useCallback(async () => {
     const response = await fetch('/api/settings/env', { cache: 'no-store' });
-    const data = await readApiJson<any>(response, '加载浏览器配置失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '加载浏览器配置失败');
     const saved = Array.isArray(data.saved) ? data.saved as Array<{ key?: string; value?: string }> : [];
     const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
     const reasoningSetting = saved.find((item) => item.key === 'BROWSER_CHAT_SHOW_REASONING');
@@ -4099,13 +4048,13 @@ export function BrowserChatWorkspace({
 
   const loadSkills = useCallback(async () => {
     const response = await fetch('/api/skills', { cache: 'no-store' });
-    const data = await readApiJson<any>(response, '加载 Skills 失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '加载 Skills 失败');
     setSkills(Array.isArray(data.skills) ? data.skills : []);
   }, []);
 
   const loadModelConfig = useCallback(async () => {
     const response = await fetch('/api/settings/model', { cache: 'no-store' });
-    const data = await readApiJson<any>(response, '加载模型配置失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '加载模型配置失败');
     const config = normalizeRuntimeModelConfig(data.config as Partial<BrowserChatModelConfig> | undefined);
     if (config) setModelConfig(config);
   }, []);
@@ -4173,14 +4122,14 @@ export function BrowserChatWorkspace({
 
   const loadSessions = useCallback(async () => {
     const response = await fetch('/api/browser-chat', { cache: 'no-store' });
-    const data = await readApiJson<any>(response, '加载对话历史失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '加载对话历史失败');
     const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => normalizeSession(item)) : [];
     setSessions(nextSessions);
   }, []);
 
   const refreshSession = useCallback(async (sessionId: string, options: { activate?: boolean } = {}) => {
     const response = await fetch(`/api/browser-chat/${sessionId}`, { cache: 'no-store' });
-    const data = await readApiJson<any>(response, '加载对话失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '加载对话失败');
     const shouldActivate = options.activate ?? activeSessionIdRef.current === sessionId;
     const loadedSession = upsertSession(data.session as BrowserChatSession, { activate: shouldActivate });
     if (shouldActivate) {
@@ -4324,7 +4273,7 @@ export function BrowserChatWorkspace({
     startGlobalLoading('正在删除分组');
     try {
       const response = await fetch(`/api/groups/${group.id}`, { method: 'DELETE' });
-      const data = await readApiJson<any>(response, '删除分组失败');
+      await readApiJson<Record<string, unknown>>(response, '删除分组失败');
       if (targetGroupId && descendantIds.has(targetGroupId)) setTargetGroupId(undefined);
       startTransition(() => router.refresh());
     } catch (error) {
@@ -4339,9 +4288,9 @@ export function BrowserChatWorkspace({
     const response = await fetch('/api/browser-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode, safetyMode, modelProvider, model: modelId }),
+      body: JSON.stringify({ safetyMode, modelProvider, model: modelId }),
     });
-    const data = await readApiJson<any>(response, '创建对话会话失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '创建对话会话失败');
     return upsertSession(data.session as BrowserChatSession, { activate: true });
   }
 
@@ -4354,9 +4303,9 @@ export function BrowserChatWorkspace({
     const response = await fetch(`/api/browser-chat/${sessionId}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, safetyMode, modelProvider, model: modelId, skillIds }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds }),
     });
-    const data = await readApiJson<any>(response, '发送消息失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '发送消息失败');
     return data.session as BrowserChatSession;
   }
 
@@ -4393,7 +4342,7 @@ export function BrowserChatWorkspace({
         const form = new FormData();
         form.append('file', file);
         const response = await fetch('/api/uploads', { method: 'POST', body: form });
-        const data = await readApiJson<any>(response, '文件上传失败');
+        const data = await readApiJson<Record<string, unknown>>(response, '文件上传失败');
         const fileId = String(data.fileId || data.imageId || temporaryId(file.type.startsWith('image/') ? 'image' : 'file'));
         const kind: BrowserChatAttachmentKind = String(data.type || file.type || '').startsWith('image/') ? 'image' : 'file';
         uploaded.push({
@@ -4464,7 +4413,7 @@ export function BrowserChatWorkspace({
     setError('');
     try {
       const response = await fetch(`/api/browser-chat/${targetId}/interrupt`, { method: 'POST' });
-      const data = await readApiJson<any>(response, '中断对话失败');
+      const data = await readApiJson<Record<string, unknown>>(response, '中断对话失败');
       upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === targetId });
     } catch (interruptError) {
       setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
@@ -4485,7 +4434,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, confirmationId }),
       });
-      const data = await readApiJson<any>(response, '工具确认失败');
+      const data = await readApiJson<Record<string, unknown>>(response, '工具确认失败');
       upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === sessionId });
       scheduleSessionRefresh(sessionId, 120);
     } catch (resolveError) {
@@ -4503,7 +4452,7 @@ export function BrowserChatWorkspace({
     try {
       const response = await fetch(`/api/browser-chat/${session.id}`, { method: 'DELETE' });
       if (response.ok) {
-        const data = await readApiJson<any>(response, '??????');
+        const data = await readApiJson<{ session: BrowserChatSession }>(response, '结束浏览器对话失败');
         upsertSession(data.session, { activate: true });
         await loadSessions().catch(() => undefined);
       }
@@ -4519,7 +4468,7 @@ export function BrowserChatWorkspace({
     setError('');
     try {
       const response = await fetch(`/api/browser-chat/${sessionId}/delete`, { method: 'POST' });
-      const data = await readApiJson<any>(response, '删除历史对话失败');
+      await readApiJson<Record<string, unknown>>(response, '删除历史对话失败');
       setSessions((current) => current.filter((item) => item.id !== sessionId));
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
       if (session?.id === sessionId) setSession(null);
@@ -4565,7 +4514,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: deletingIds }),
       });
-      const data = await readApiJson<any>(response, '批量删除历史对话失败');
+      await readApiJson<Record<string, unknown>>(response, '批量删除历史对话失败');
       setSessions((current) => current.filter((item) => !deletingIdSet.has(item.id)));
       setSelectedSessionIds((current) => current.filter((id) => !deletingIdSet.has(id)));
       if (session?.id && deletingIdSet.has(session.id)) setSession(null);
@@ -4604,7 +4553,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageIds }),
       });
-      const data = await readApiJson<any>(response, '导出测试用例失败');
+      const data = await readApiJson<Record<string, unknown>>(response, '导出测试用例失败');
       setSelectedExportMessageIds([]);
       if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
     } catch (exportError) {
@@ -4626,7 +4575,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageId }),
       });
-      const data = await readApiJson<any>(response, '导出测试用例失败');
+      const data = await readApiJson<Record<string, unknown>>(response, '导出测试用例失败');
       if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
     } catch (exportError) {
       setError(exportError instanceof Error ? exportError.message : '导出测试用例失败');
@@ -4648,7 +4597,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageIds }),
       });
-      const data = await readApiJson<any>(response, '生成 Skill 失败');
+      await readApiJson<Record<string, unknown>>(response, '生成 Skill 失败');
       setSelectedExportMessageIds([]);
       await loadSkills();
     } catch (skillError) {
@@ -4671,7 +4620,7 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageId }),
       });
-      const data = await readApiJson<any>(response, '生成 Skill 失败');
+      await readApiJson<Record<string, unknown>>(response, '生成 Skill 失败');
       await loadSkills();
     } catch (skillError) {
       setError(skillError instanceof Error ? skillError.message : '生成 Skill 失败');

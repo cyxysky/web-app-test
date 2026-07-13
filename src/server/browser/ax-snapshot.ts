@@ -167,6 +167,8 @@ const actionableContextRoots = new Set([
 ]);
 
 const serializedProperties = [
+  'class',
+  'icon',
   'checked',
   'disabled',
   'expanded',
@@ -212,6 +214,10 @@ function stringValue(value?: CdpAxValue) {
 
 function normalizeWhitespace(value: string) {
   return value.replace(/\s+/g, ' ').trim();
+}
+
+function readableText(value: unknown) {
+  return normalizeWhitespace(String(value || '').replace(/\p{Co}/gu, ' '));
 }
 
 function propertyRecord(properties?: CdpAxProperty[]) {
@@ -359,11 +365,67 @@ function meaningfulNode(node: SnapshotNodeWithUid) {
   return role === 'rootwebarea' || role === 'webarea' || contextualRoles.has(role);
 }
 
-function serializeNode(node: SnapshotNodeWithUid) {
-  const parts = [`uid=${node.uid}`, node.role || 'generic'];
-  const primaryName = node.name || node.description;
+function snapshotNodeKey(node: SnapshotNodeWithUid) {
+  return `${node.frameId}:${node.axNodeId}`;
+}
+
+function displayTextForNode(node: SnapshotNodeWithUid) {
+  return readableText(node.name) || readableText(node.description) || readableText(node.value);
+}
+
+function ancestorsForNode(
+  node: SnapshotNodeWithUid,
+  byFrameAndId: ReadonlyMap<string, SnapshotNodeWithUid>,
+  maxHops = 24,
+) {
+  const ancestors: SnapshotNodeWithUid[] = [];
+  let current = node;
+  for (let hops = 0; current.parentAxNodeId && hops < maxHops; hops += 1) {
+    const parent = byFrameAndId.get(`${current.frameId}:${current.parentAxNodeId}`);
+    if (!parent) break;
+    ancestors.push(parent);
+    current = parent;
+  }
+  return ancestors;
+}
+
+function contextLabelForUnnamedAction(
+  node: SnapshotNodeWithUid,
+  byFrameAndId: ReadonlyMap<string, SnapshotNodeWithUid>,
+) {
+  if (!node.actionable) return '';
+  const ancestors = ancestorsForNode(node, byFrameAndId);
+  const namedAncestor = (roles: ReadonlySet<string>) => ancestors.find((ancestor) => (
+    roles.has(ancestor.role.toLowerCase()) && displayTextForNode(ancestor)
+  ));
+  const row = namedAncestor(new Set(['row', 'rowheader']));
+  const column = namedAncestor(new Set(['columnheader']));
+  const container = namedAncestor(new Set(['toolbar', 'menu', 'dialog', 'form', 'navigation', 'list']));
+  const page = namedAncestor(new Set(['rootwebarea', 'webarea']));
+  const context = (candidate?: SnapshotNodeWithUid) => displayTextForNode(candidate || node).slice(0, 180);
+  const role = node.role.toLowerCase();
+
+  if (role === 'checkbox' && row) return `[上下文] 选择：${context(row)}`;
+  if (role === 'checkbox' && column) return `[上下文] ${context(column)}列全选`;
+  if (column) return `[无标签控件：${context(column)}列]`;
+  if (row) return `[无标签控件：${context(row)}行]`;
+  if (container) return `[无标签控件：${context(container)}]`;
+  if (page) return `[无标签页面控件：${context(page)}]`;
+  return '[无标签页面控件]';
+}
+
+function displayNameForNode(
+  node: SnapshotNodeWithUid,
+  byFrameAndId: ReadonlyMap<string, SnapshotNodeWithUid>,
+) {
+  return displayTextForNode(node) || contextLabelForUnnamedAction(node, byFrameAndId);
+}
+
+function serializeNode(node: SnapshotNodeWithUid, displayName: string) {
+  const parts = node.actionable ? [`uid=${node.uid}`, node.role || 'generic'] : [node.role || 'generic'];
+  const primaryName = displayName;
   if (primaryName) parts.push(`"${escaped(primaryName)}"`);
-  if (node.value && normalizeWhitespace(node.value) !== normalizeWhitespace(primaryName)) {
+  if (node.value && readableText(node.value) !== normalizeWhitespace(primaryName)) {
     parts.push(`value="${escaped(node.value, 300)}"`);
   }
   if (node.url) parts.push(`url="${escaped(node.url, 800)}"`);
@@ -386,12 +448,12 @@ function frameBoundary(frame: CapturedSnapshotFrame): SnapshotRecord {
   return { line: `${'  '.repeat(Math.min(24, frame.depth))}[${details}]`, frameId: frame.frameId };
 }
 
-function recordForNode(node: SnapshotNodeWithUid): SnapshotRecord {
+function recordForNode(node: SnapshotNodeWithUid, displayName: string): SnapshotRecord {
   return {
-    line: serializeNode(node),
+    line: serializeNode(node, displayName),
     uid: node.uid,
     role: node.role,
-    name: node.name || node.description || node.value,
+    name: displayName || undefined,
     url: node.url || undefined,
     actionable: node.actionable,
     frameId: node.frameId,
@@ -461,25 +523,16 @@ function actionableNodeIds(nodes: SnapshotNodeWithUid[]) {
   return included;
 }
 
-function actionableViewPriority(node: SnapshotNodeWithUid, includedAsContext: boolean) {
-  if (includedAsContext && !node.actionable) return 1000;
-  const role = node.role.toLowerCase();
-  let priority = 300;
-  if (['textbox', 'searchbox', 'combobox', 'spinbutton', 'listbox'].includes(role)) priority = 0;
-  else if (['button', 'checkbox', 'radio', 'switch', 'slider', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem'].includes(role)) priority = 100;
-  else if (role === 'link') priority = 200;
-  if (node.source !== 'ax' && node.actions?.includes('focus') && !node.actions.includes('click')) priority = 150;
-  if (node.source !== 'ax') priority -= 20;
-  if (node.name || node.description || node.value) priority -= 10;
-  if (node.properties.disabled === true || node.properties.disabled === 'true') priority += 40;
-  return priority;
-}
-
 export function buildSnapshotViews(
   frames: CapturedSnapshotFrame[],
   nodes: SnapshotNodeWithUid[],
 ): SnapshotViews {
   const meaningful = nodes.filter(meaningfulNode);
+  const nodeByFrameAndId = new Map(meaningful.map((node) => [snapshotNodeKey(node), node]));
+  const displayNameByKey = new Map(meaningful.map((node) => [
+    snapshotNodeKey(node),
+    displayNameForNode(node, nodeByFrameAndId),
+  ]));
   const actionableIds = actionableNodeIds(meaningful);
   const actionable: SnapshotRecord[] = [];
   const full: SnapshotRecord[] = [];
@@ -494,31 +547,35 @@ export function buildSnapshotViews(
 
   for (const frame of frames) {
     const frameNodes = nodesByFrame.get(frame.frameId) || [];
+    const hasAxTree = frameNodes.some((node) => node.source === 'ax');
+    const treeNodes = hasAxTree ? frameNodes.filter((node) => node.source === 'ax') : frameNodes;
+    const domOnlyNodes = hasAxTree ? frameNodes.filter((node) => node.source !== 'ax') : [];
     const boundary = frameBoundary(frame);
     full.push(boundary);
     if (frameNodes.some((node) => actionableIds.has(`${node.frameId}:${node.axNodeId}`))) actionable.push(boundary);
-    if (frameNodes.some((node) => normalizeWhitespace(node.name || node.value || node.description))) text.push(boundary);
-    const actionableFrameNodes = frameNodes
-      .map((node, index) => ({
-        index,
-        node,
-        included: actionableIds.has(`${node.frameId}:${node.axNodeId}`) || (node.source !== 'ax' && node.actionable),
-      }))
-      .filter((item) => item.included)
-      .sort((left, right) => (
-        actionableViewPriority(left.node, !left.node.actionable) - actionableViewPriority(right.node, !right.node.actionable)
-        || left.index - right.index
-      ));
-    for (const { node } of actionableFrameNodes) actionable.push(recordForNode(node));
-    for (const node of frameNodes) {
-      const record = recordForNode(node);
+    if (treeNodes.some((node) => displayTextForNode(node))) text.push(boundary);
+    const actionableFrameNodes = frameNodes.filter((node) => (
+      actionableIds.has(`${node.frameId}:${node.axNodeId}`) || (node.source !== 'ax' && node.actionable)
+    ));
+    for (const node of actionableFrameNodes) {
+      actionable.push(recordForNode(node, displayNameByKey.get(snapshotNodeKey(node)) || ''));
+    }
+    for (const node of treeNodes) {
+      const displayName = displayNameByKey.get(snapshotNodeKey(node)) || '';
+      const record = recordForNode(node, displayName);
       full.push(record);
-      const textValue = normalizeWhitespace(node.name || node.value || node.description);
+      const textValue = displayTextForNode(node);
       if (!textValue) continue;
       const textKey = `${frame.frameId}:${textValue}`;
       if (textSeen.has(textKey)) continue;
       textSeen.add(textKey);
       text.push({ ...record, line: `${'  '.repeat(Math.min(24, node.frameDepth))}${textValue}` });
+    }
+    if (domOnlyNodes.length) {
+      full.push({ line: `${'  '.repeat(Math.min(24, frame.depth + 1))}[DOM-only interactive controls]`, frameId: frame.frameId });
+      for (const node of domOnlyNodes) {
+        full.push(recordForNode(node, displayNameByKey.get(snapshotNodeKey(node)) || ''));
+      }
     }
   }
   return { actionable, full, text };

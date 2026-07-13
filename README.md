@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:3000`. Create a `.env.local` file for local development; for Docker, create `.env` in the project root.
 
 The app uses DeepSeek by default:
 
@@ -78,7 +78,7 @@ During AI execution, `getHttpRequests` is available as a read-only diagnostic to
 
 Docker is available for packaged runs because the app depends on Playwright and a Chromium runtime.
 
-1. Copy `.env.example` to `.env` and fill the provider key you want to use.
+1. Create `.env` and fill the provider key you want to use.
 2. Build and start:
 
 ```bash
@@ -89,13 +89,19 @@ Then open `http://localhost:3000`.
 
 The compose setup keeps runtime data outside the image:
 
-- `.data/store.json` stores test cases and runs.
-- `artifacts/` stores screenshots and reports.
+- `.data/app-config.json` stores model and runtime settings.
+- `.data/target-test-cases/`, `.data/target-test-runs/`, and `.data/target-test-metadata.json` store test cases and runs.
+- `.data/browser-chat-sessions/` and `.data/browser-chat-session-summaries/` store browser-chat sessions and their lightweight list summaries.
+- `.data/personal-memory/items.json` stores personal memory.
+- `artifacts/` stores screenshots, traces, uploads, and reports.
 
 For unattended packaged regression runs, keep `HEADLESS_BROWSER=true`. For account-based exploratory testing or manual verification, prefer a visible or CDP-connected browser.
 
+## Desktop development
 
+Start the Next.js server first, then launch Electron in another PowerShell window:
+
+```powershell
 $env:WEBPILOT_ELECTRON_SERVER_URL="http://127.0.0.1:3000"
 npx electron .
-
-gpt-5.3-codex-spark
+```

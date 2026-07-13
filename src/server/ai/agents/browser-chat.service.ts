@@ -1,5 +1,5 @@
 ﻿import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
@@ -28,6 +28,7 @@ import { writeTextFileAtomic } from '@/server/storage/atomic-json';
 import {
   artifactPath as resolveArtifactPath,
   browserChatSessionFilePath,
+  browserChatSessionLogFilePath,
   browserChatSessionSummariesDir,
   browserChatSessionSummaryFilePath,
   browserChatSessionsDir,
@@ -136,6 +137,7 @@ type BrowserChatRuntimeState = {
   }>;
   pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
   sessionFileCache: Map<string, { mtimeMs: number; size: number; snapshot: BrowserChatSessionSnapshot }>;
+  sessionLogFileCache: Map<string, { mtimeMs: number; size: number; logs: BrowserChatLogRecord[] }>;
   lastPersistWarningAt: number;
 };
 
@@ -150,6 +152,7 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
   }>(),
   pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   sessionFileCache: new Map<string, { mtimeMs: number; size: number; snapshot: BrowserChatSessionSnapshot }>(),
+  sessionLogFileCache: new Map<string, { mtimeMs: number; size: number; logs: BrowserChatLogRecord[] }>(),
   lastPersistWarningAt: 0,
 });
 browserChatRuntimeState.sessions ??= new Map();
@@ -157,11 +160,13 @@ browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
 browserChatRuntimeState.sessionFileCache ??= new Map();
+browserChatRuntimeState.sessionLogFileCache ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
 const sessionsDir = browserChatSessionsDir();
 const sessionSummariesDir = browserChatSessionSummariesDir();
 const sessionFileCache = browserChatRuntimeState.sessionFileCache;
+const sessionLogFileCache = browserChatRuntimeState.sessionLogFileCache;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
@@ -203,6 +208,10 @@ function browserChatProgressPersistDelayMs() {
 
 function trimBrowserChatLogs(logs: BrowserChatLogRecord[]) {
   return logs.slice(-browserChatLogLimit());
+}
+
+function browserChatLogStorageLimit() {
+  return Math.min(browserChatLogLimit() + 200, 10200);
 }
 
 function browserChatKeepBrowserOpenAfterTurn() {
@@ -1148,14 +1157,100 @@ function isBrowserChatSessionSnapshot(value: unknown): value is BrowserChatSessi
     && typeof (value as { id?: unknown }).id === 'string';
 }
 
+function discardInterruptedTurn(session: BrowserChatSessionRecord, assistantMessageId?: string) {
+  if (!assistantMessageId) return;
+  const assistantIndex = session.messages.findIndex((message) => message.id === assistantMessageId);
+  if (assistantIndex < 0) return;
+  const assistantMessage = session.messages[assistantIndex];
+  const previousMessage = session.messages[assistantIndex - 1];
+  const discardedMessageIds = new Set([assistantMessageId]);
+  if (previousMessage?.role === 'user') discardedMessageIds.add(previousMessage.id);
+  const discardedStepIndexes = new Set(assistantMessage.stepIndexes || []);
+  session.messages = session.messages.filter((message) => !discardedMessageIds.has(message.id));
+  if (discardedStepIndexes.size) {
+    session.steps = session.steps.filter((step) => !discardedStepIndexes.has(step.index));
+  }
+  session.logs = (session.logs || []).filter((log) => (
+    log.messageId !== assistantMessageId
+    && (!log.stepIndex || !discardedStepIndexes.has(log.stepIndex))
+  ));
+}
+
+function isBrowserChatLogRecord(value: unknown): value is BrowserChatLogRecord {
+  return Boolean(value)
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && typeof (value as { id?: unknown }).id === 'string'
+    && typeof (value as { time?: unknown }).time === 'string'
+    && typeof (value as { phase?: unknown }).phase === 'string'
+    && typeof (value as { message?: unknown }).message === 'string';
+}
+
+function readSessionLogRecords(sessionId: string) {
+  const filePath = browserChatSessionLogFilePath(sessionId);
+  if (!existsSync(filePath)) return [] as BrowserChatLogRecord[];
+  const stat = statSync(filePath);
+  const cached = sessionLogFileCache.get(filePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.logs;
+  const logs = readFileSync(filePath, 'utf8')
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        const item = JSON.parse(line) as unknown;
+        return isBrowserChatLogRecord(item) ? [item] : [];
+      } catch {
+        return [];
+      }
+    });
+  sessionLogFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, logs });
+  return logs;
+}
+
+function logRecordKey(item: BrowserChatLogRecord) {
+  return item.id || [item.time, item.phase, item.message, item.stepIndex || ''].join('|');
+}
+
+function writeSessionLogRecords(sessionId: string, incoming: BrowserChatLogRecord[]) {
+  const filePath = browserChatSessionLogFilePath(sessionId);
+  const existing = readSessionLogRecords(sessionId);
+  const known = new Set(existing.map(logRecordKey));
+  const additions = incoming.filter((item) => !known.has(logRecordKey(item)));
+  const merged = additions.length
+    ? [...existing, ...additions].sort((a, b) => timestampValue(a.time) - timestampValue(b.time))
+    : existing;
+  const shouldCompact = merged.length > browserChatLogStorageLimit();
+  const next = shouldCompact ? trimBrowserChatLogs(merged) : merged;
+  if (!existsSync(filePath) || shouldCompact) {
+    const content = next.map((item) => stringifyJsonSafe(item)).filter(Boolean).join('\n');
+    writeTextFileAtomic(filePath, content ? `${content}\n` : '');
+  } else if (additions.length) {
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    const content = additions.map((item) => stringifyJsonSafe(item)).filter(Boolean).join('\n');
+    if (content) appendFileSync(filePath, `${content}\n`, 'utf8');
+  }
+  if (existsSync(filePath)) {
+    const stat = statSync(filePath);
+    sessionLogFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, logs: next });
+  }
+  return trimBrowserChatLogs(next);
+}
+
+function withPersistedLogs(snapshot: BrowserChatSessionSnapshot) {
+  const persistedLogs = readSessionLogRecords(snapshot.id);
+  return persistedLogs.length
+    ? { ...snapshot, logs: trimBrowserChatLogs(persistedLogs) }
+    : snapshot;
+}
+
 function readSessionSnapshotFromFilePath(filePath: string) {
   const stat = statSync(filePath);
   const cached = sessionFileCache.get(filePath);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.snapshot;
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return withPersistedLogs(cached.snapshot);
   const data = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
   if (!isBrowserChatSessionSnapshot(data)) return undefined;
   sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, snapshot: data });
-  return data;
+  return withPersistedLogs(data);
 }
 
 function readSessionSnapshotFromFile(sessionId: string) {
@@ -1165,13 +1260,15 @@ function readSessionSnapshotFromFile(sessionId: string) {
 }
 
 function writeSessionSnapshotToFile(item: BrowserChatSessionSnapshot) {
-  const payload = stringifyJsonSafe(item, 2);
+  const logs = writeSessionLogRecords(item.id, item.logs);
+  const durableSnapshot = { ...item, logs: [] };
+  const payload = stringifyJsonSafe(durableSnapshot, 2);
   if (!payload) throw new Error(`Browser chat session ${item.id} could not be serialized.`);
   const filePath = browserChatSessionFilePath(item.id);
   writeTextFileAtomic(filePath, payload);
   const stat = statSync(filePath);
-  sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, snapshot: item });
-  writeSessionSummaryToFile(summaryFromSnapshot(item));
+  sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, snapshot: durableSnapshot });
+  writeSessionSummaryToFile(summaryFromSnapshot({ ...item, logs }));
 }
 
 function writeSessionSummaryToFile(item: BrowserChatSessionSnapshot) {
@@ -1186,10 +1283,13 @@ function writeSessionSummaryToFile(item: BrowserChatSessionSnapshot) {
 function deleteSessionSnapshotFile(sessionId: string) {
   const sessionPath = browserChatSessionFilePath(sessionId);
   const summaryPath = browserChatSessionSummaryFilePath(sessionId);
+  const logPath = browserChatSessionLogFilePath(sessionId);
   rmSync(sessionPath, { force: true });
   rmSync(summaryPath, { force: true });
+  rmSync(logPath, { force: true });
   sessionFileCache.delete(sessionPath);
   sessionFileCache.delete(summaryPath);
+  sessionLogFileCache.delete(logPath);
 }
 
 function timestampValue(value?: string) {
@@ -2411,21 +2511,9 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
   markAssistantMessageInterrupted(assistantMessageId);
   if (abortController && !abortController.signal.aborted) {
     abortController.abort(new Error('Browser chat operation interrupted by user.'));
-  } else if (assistantMessageId) {
-    appendLog(session, 'chat:interrupt:controller-missing', 'Interrupt requested, but the active AbortController was not available; stale runtime writes will be ignored by message id.', {
-      details: { assistantMessageId },
-    });
   }
   cancelPendingToolConfirmation(session);
-  if (assistantMessageId) {
-    updateAssistantMessage(session, assistantMessageId, (message) => ({
-      ...message,
-      content: '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。',
-      updatedAt: timestamp,
-      status: 'interrupted',
-      activity: undefined,
-    }));
-  }
+  discardInterruptedTurn(session, assistantMessageId);
   session.activeAbortController = undefined;
   session.activeAssistantMessageId = undefined;
   session.pendingToolConfirmation = undefined;
@@ -2433,16 +2521,6 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
   if (session.status !== 'closed') session.status = 'idle';
   session.error = undefined;
   session.updatedAt = timestamp;
-  session.logs = trimBrowserChatLogs([
-    ...(session.logs || []),
-    {
-      id: id('log'),
-      time: timestamp,
-      phase: 'chat:interrupted',
-      message: '用户中断了本轮对话操作，浏览器保持当前状态。',
-      messageId: assistantMessageId,
-    },
-  ]);
   if (!persistAndNotify(session.id)) {
     throw new Error('Browser chat interrupt state could not be persisted.');
   }
