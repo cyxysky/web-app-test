@@ -126,6 +126,7 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
     '<form>',
     contextualText,
     '<button id="save" type="button" onclick="document.body.dataset.saved=\'true\'">Save</button>',
+    '<input id="renamed-editor" aria-label="Original editor" value="">',
     '</form>',
     '<button>Duplicate</button><button>Duplicate</button>',
     '<div id="cover" style="position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.1)"></div>',
@@ -136,7 +137,8 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   const initial = await readWholeView(session, 'actionable', true);
   const actionable = initial.map((slice) => slice.content).join('\n');
   const saveUid = actionable.match(/^\s*uid=(\S+)\s+button\s+"Save"/m)?.[1];
-  assert.ok(saveUid);
+  const renamedEditorUid = actionable.match(/^\s*uid=(\S+)\s+textbox\s+"Original editor"/m)?.[1];
+  assert.ok(saveUid && renamedEditorUid);
   assert.equal((actionable.match(/Context \d+/g) || []).length <= 24, true, 'context roots should be token-bounded');
   assert.equal((actionable.match(/button\s+"Duplicate"/g) || []).length, 2, 'same-name controls must not be deduplicated away');
 
@@ -162,6 +164,12 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   const interactionOnlyReuse = await session.wait(0);
   assert.equal(interactionOnlyReuse.ok, true, interactionOnlyReuse.actual);
   assert.match(interactionOnlyReuse.actual, /reused; no page-state change detected/, 'pointer events alone must not invalidate semantic DOM snapshots');
+
+  await page.locator('#renamed-editor').evaluate((element) => element.setAttribute('aria-label', 'Renamed editor'));
+  const renamedEditor = await session.keyboard({ action: 'type', uid: renamedEditorUid, text: 'retained', replace: true });
+  assert.equal(renamedEditor.ok, true, renamedEditor.actual);
+  assert.doesNotMatch(renamedEditor.actual, /target semantics changed|Capture a fresh snapshot/, 'a stable DOM node must remain actionable when its accessible name changes');
+  assert.equal(await page.locator('#renamed-editor').inputValue(), 'retained');
 
   await page.locator('body').evaluate((body) => body.insertAdjacentHTML('beforeend', '<button>Late action</button>'));
   const clickAfterUnrelatedMutation = await session.mouse({ action: 'click', uid: saveUid });

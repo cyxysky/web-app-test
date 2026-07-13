@@ -120,12 +120,38 @@
 
 .sectionHeading {
   align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
   color: var(--muted-strong);
+  cursor: pointer;
   display: flex;
   flex: 0 0 auto;
   gap: 7px;
   min-height: 36px;
   padding: 0 8px;
+  text-align: left;
+  transition: background 0.15s ease, color 0.15s ease;
+  width: 100%;
+}
+
+.sectionHeading:hover {
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  color: var(--foreground);
+}
+
+.sectionHeading:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: -2px;
+}
+
+.sectionHeading>svg:first-child {
+  transform: rotate(-90deg);
+  transition: transform 0.16s ease;
+}
+
+.sectionHeading>svg.expandedChevron {
+  transform: rotate(0deg);
 }
 
 .sectionHeading strong {
@@ -186,6 +212,14 @@
   height: 32px;
   justify-content: center;
   width: 32px;
+}
+
+.itemIcon img {
+  border-radius: 4px;
+  display: block;
+  height: 18px;
+  object-fit: contain;
+  width: 18px;
 }
 
 .itemCopy {
@@ -273,10 +307,14 @@
 }
 
 :global(:root[data-theme='dark']) .card {
-  background: linear-gradient(180deg, #20242b 0%, #1b1e24 100%);
+  background: var(--panel);
   box-shadow:
     0 26px 70px rgba(0, 0, 0, 0.48),
     inset 0 0 0 1px rgba(255, 255, 255, 0.11);
+}
+
+:global(:root[data-theme='dark']) .itemIcon {
+  background: transparent;
 }
 
 :global(:root[data-theme='dark']) .header {

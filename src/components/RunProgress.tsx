@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowDown, ArrowUp, Bug, CheckCircle2, ChevronRight, Eye, Loader2, Maximize2, Minus, PlayCircle, Plus, Radar, RotateCcw, Save, SkipForward, Trash2, Wrench, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Bug, CheckCircle2, ChevronRight, CircleAlert, Eye, Loader2, Maximize2, Minus, PlayCircle, Plus, Radar, RotateCcw, Save, SkipForward, Trash2, Wrench, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -9,7 +9,6 @@ import { MarkdownReport } from '@/components/MarkdownReport';
 import { RunMetaDrawer } from '@/components/RunMetaDrawer';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
 import { useI18n } from '@/i18n/I18nProvider';
-import { domTreeFromToolCall, fullDomSnapshotFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
@@ -263,11 +262,10 @@ const toolDefinitions: ToolDefinition[] = [
     name: 'generateText',
     label: 'AI 文本生成',
     mode: 'editor',
-    template: { prompt: '', outputFormat: 'markdown', includeDomTree: true, includePageText: true, includeScreenshot: true, maxCharacters: 1200 },
+    template: { prompt: '', outputFormat: 'markdown', includePageText: true, includeScreenshot: true, maxCharacters: 1200 },
     fields: [
       { key: 'prompt', label: '生成提示词', kind: 'textarea', helper: '写清楚需要 AI 基于当前界面分析、总结或提取什么。' },
       { key: 'outputFormat', label: '输出格式', kind: 'select', options: outputFormatOptions },
-      { key: 'includeDomTree', label: '包含 DOM 树', kind: 'boolean' },
       { key: 'includePageText', label: '包含页面文本', kind: 'boolean' },
       { key: 'includeScreenshot', label: '包含当前截图', kind: 'boolean' },
       { key: 'maxCharacters', label: '最长输出字符', kind: 'number' },
@@ -307,6 +305,9 @@ function statusLabel(status: string) {
 
 function StepIcon({ status }: { status: string }) {
   if (status === 'running') return <Loader2 className="spin" size={16} />;
+  if (status === 'passed') return <CheckCircle2 size={16} />;
+  if (status === 'failed') return <X size={16} />;
+  if (status === 'blocked') return <CircleAlert size={16} />;
   return <Wrench size={16} />;
 }
 
@@ -669,7 +670,6 @@ function newToolDraft(name = 'waitForPage'): ToolDraft {
     name,
     inputText: toolTemplateText(name),
     okState: 'success',
-    reason: '',
   };
 }
 
@@ -840,14 +840,10 @@ function toolCallScreenshotItems(tool: StepToolCallItem, t: TranslateFn) {
 }
 
 function ToolDraftEvidenceButtons({
-  index,
-  openDomTree,
   openScreenshots,
   step,
   tool,
 }: {
-  index: number;
-  openDomTree: (payload: { domTree: string; stepIndex: number; toolIndex: number; toolName: string }) => void;
   openScreenshots: (images: ImageItem[]) => void;
   step: StepExecutionResult;
   tool: ToolDraft;
@@ -855,8 +851,7 @@ function ToolDraftEvidenceButtons({
   const { t } = useI18n();
   const evidenceTool = evidenceSourceForDraft(tool, step);
   const screenshots = evidenceTool ? toolCallScreenshotItems(evidenceTool, t) : [];
-  const domTree = evidenceTool ? domTreeFromToolCall(evidenceTool, step.aiRequest) : '';
-  if (!screenshots.length && !domTree) return null;
+  if (!screenshots.length) return null;
 
   return (
     <div className="run-tool-editor-evidence">
@@ -865,16 +860,6 @@ function ToolDraftEvidenceButtons({
           <Eye size={14} />
           {t('操作截图')}
           <span>{screenshots.length}</span>
-        </button>
-      ) : null}
-      {domTree ? (
-        <button
-          className="ui-button ui-button--neutral tool-evidence-button"
-          onClick={() => openDomTree({ domTree, stepIndex: step.index, toolIndex: index, toolName: toolDisplayName(tool.name, t) })}
-          type="button"
-        >
-          <Bug size={14} />
-          {t('DOM 树')}
         </button>
       ) : null}
     </div>
@@ -900,9 +885,6 @@ function ToolCallCard({
   const input = formatToolInput(tool.input);
   const screenshots = toolScreenshotItems(step, index, t);
   const preview = toolPreviewText(tool, input, screenshots.length);
-  const domTree = domTreeFromToolCall(tool, step.aiRequest);
-  const fullDomSnapshot = fullDomSnapshotFromToolCall(tool);
-
   return (
     <li className={expanded ? 'expanded' : undefined}>
       <button className="tool-call-toggle" onClick={onToggle} type="button" aria-expanded={expanded}>
@@ -934,21 +916,6 @@ function ToolCallCard({
               <span>结果</span>
               <p>{tool.result}</p>
             </div>
-          ) : null}
-          {fullDomSnapshot ? (
-            <details className="debug-details">
-              <summary>
-                完整 DOM 快照
-                {typeof tool.debug?.fullDomSnapshotCharLength === 'number' ? `（${tool.debug.fullDomSnapshotCharLength} 字符）` : ''}
-              </summary>
-              <pre>{fullDomSnapshot}</pre>
-            </details>
-          ) : null}
-          {domTree ? (
-            <details className="debug-details">
-              <summary>模型上下文 DOM 树{tool.debug?.domSnapshotTruncatedForModel ? '（已按上下文限制截断）' : ''}</summary>
-              <pre>{domTree}</pre>
-            </details>
           ) : null}
           {screenshots.length ? (
             <div className="tool-shot-grid">
@@ -1250,7 +1217,6 @@ export function RunProgress({
   const [run, setRun] = useState(initialRun);
   const [selectedIndex, setSelectedIndex] = useState<number | undefined>(() => initialRun.result?.steps.at(-1)?.index);
   const [imagePreview, setImagePreview] = useState<{ images: ImageItem[]; index: number } | null>(null);
-  const [domTreeDialog, setDomTreeDialog] = useState<{ domTree: string; stepIndex: number; toolIndex: number; toolName: string } | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
   const [requestOpen, setRequestOpen] = useState(false);
   const [expandedToolCards, setExpandedToolCards] = useState<Record<string, boolean>>({});
@@ -1472,7 +1438,6 @@ export function RunProgress({
         contextBefore: tool.contextBefore,
         contextAfter: tool.contextAfter,
         visualAfter: tool.visualAfter,
-        debug: tool.debug,
         desktopEvidence: tool.desktopEvidence,
         screenshots: tool.screenshots,
       };
@@ -1575,9 +1540,8 @@ export function RunProgress({
   return (
     <div className="test-cockpit">
       <div className="cockpit-toolbar">
-        <div style={{ display: "flex", gap: "16px", alignItems: "center" }}>
+        <div className="cockpit-toolbar-primary">
           <span>{progressText}</span>
-          <span>{t('{count} 条操作', { count: steps.length })}</span>
           {run.report?.markdown ? (
             <button className="link-button" onClick={() => setReportOpen(true)} type="button">
               {t('查看最终报告')}
@@ -1585,7 +1549,7 @@ export function RunProgress({
           ) : null}
           <RunScreenshotChainButton className="link-button" label={t('查看截图链')} run={run} />
           {isFinished(run.status) ? (
-            <a className="link-button" href={`/api/runs/${run.id}/pdf`} target="_blank" rel="noopener noreferrer">
+            <a className="link-button" href={`/api/runs/${run.id}/pdf?download=1`} target="_blank" rel="noopener noreferrer">
               {t('导出 PDF')}
             </a>
           ) : null}
@@ -1613,7 +1577,7 @@ export function RunProgress({
             </span>
           ) : null}
         </div>
-        <div style={{ display: "flex", gap: "16px" }}>
+        <div className="cockpit-toolbar-actions">
           {canContinueBlockedRun ? (
             <button className="link-button" onClick={continueBlockedRun} type="button">
               <PlayCircle size={16} />
@@ -1658,7 +1622,7 @@ export function RunProgress({
             const toolPopover = badges.map((badge) => toolBadgeLabel(badge, t)).join(' · ');
             return (
               <button className={selectedStep?.index === step.index ? 'rail-step active' : 'rail-step'} key={step.index} onClick={() => setSelectedIndex(step.index)} type="button">
-                <span className="rail-icon"><StepIcon status={step.status} /></span>
+                <span className={`rail-icon status-${step.status}`}><StepIcon status={step.status} /></span>
                 <span className="rail-copy">
                   <strong>{step.action}</strong>
                   <small className="rail-step-meta">
@@ -1686,7 +1650,7 @@ export function RunProgress({
             <>
               <header className="evidence-title">
                 <div>
-                  <span className="rail-icon"><StepIcon status={selectedStep.status} /></span>
+                  <span className={`rail-icon status-${selectedStep.status}`}><StepIcon status={selectedStep.status} /></span>
                   <div>
                     <h3>{selectedStep.action}</h3>
                     <p>{t('步骤 {index}', { index: selectedStep.index })}</p>
@@ -1700,7 +1664,7 @@ export function RunProgress({
                     </button>
                   ) : null}
                   {selectedStep.status === 'running' ? (
-                    <button className="ui-button ui-button--danger" onClick={skipSelectedStep} type="button">
+                    <button className="link-button run-skip-step" onClick={skipSelectedStep} type="button">
                       <SkipForward size={15} />
                       {t('跳过当前步骤')}
                     </button>
@@ -1733,33 +1697,36 @@ export function RunProgress({
                 <div>
                   <dt>{t('工具调用')}</dt>
                   <dd>
-                    {canEditToolRecord ? (
+                    {canEditToolRecord && editingToolsStepIndex !== selectedStep.index ? (
                       <div className="tool-record-toolbar">
-                        {editingToolsStepIndex === selectedStep.index ? (
-                          <>
-                            <button className="ui-button ui-button--primary tool-record-action" disabled={savingTools} onClick={saveToolRecordEdit} type="button">
-                              {savingTools ? <Loader2 className="spin" size={14} /> : <Save size={14} />}
-                              {t('保存工具记录')}
-                            </button>
-                            <button className="ui-button ui-button--neutral tool-record-action" disabled={savingTools} onClick={cancelToolRecordEdit} type="button">
-                              <X size={14} />
-                              {t('取消')}
-                            </button>
-                          </>
-                        ) : (
-                          <button className="ui-button ui-button--neutral tool-record-action" onClick={() => beginToolRecordEdit(selectedStep)} type="button">
-                            <Wrench size={14} />
-                            {t('编辑工具记录')}
-                          </button>
-                        )}
+                        <button className="link-button" onClick={() => beginToolRecordEdit(selectedStep)} type="button">
+                          <Wrench size={14} />
+                          {t('编辑工具记录')}
+                        </button>
                       </div>
                     ) : null}
                     {editingToolsStepIndex === selectedStep.index ? (
                       <div className="run-tool-editor">
+                        <header className="run-tool-editor-header">
+                          <div className="run-tool-editor-title">
+                            <strong>{t('编辑工具记录')}</strong>
+                            <span>{t('{count} 个工具调用', { count: toolDrafts.length })}</span>
+                          </div>
+                          <div className="run-tool-editor-header-actions">
+                            <button className="link-button run-tool-editor-cancel" disabled={savingTools} onClick={cancelToolRecordEdit} type="button">
+                              <X size={14} />
+                              {t('取消')}
+                            </button>
+                            <button className="link-button run-tool-editor-save" disabled={savingTools} onClick={saveToolRecordEdit} type="button">
+                              {savingTools ? <Loader2 className="spin" size={14} /> : <Save size={14} />}
+                              {t('保存')}
+                            </button>
+                          </div>
+                        </header>
                         {toolEditError ? <div className="error compact-error">{toolEditError}</div> : null}
                         <div className="run-tool-editor-mode">
                           <span>{toolModeLabel(editorMode, t)}</span>
-                          <small>{t('工具列表已按当前执行模式过滤，AI 文本生成仅用于编辑后的记录回放。')}</small>
+                          <small>{t('编辑后的工具记录仅用于后续回放，不会改写本次已经完成的执行结果。')}</small>
                         </div>
                         <ol className="run-tool-editor-list">
                           {toolDrafts.map((tool, index) => (
@@ -1825,19 +1792,9 @@ export function RunProgress({
                                   tool={tool}
                                   onChange={(inputText) => updateToolDraft(index, { inputText, sourceToolIndex: undefined })}
                                 />
-                                <label>
-                                  {t('调用原因')}
-                                  <textarea
-                                    className="textarea compact run-tool-reason-textarea"
-                                    value={tool.reason || ''}
-                                    onChange={(event) => updateToolDraft(index, { reason: event.target.value })}
-                                  />
-                                </label>
                               </div>
                               {selectedStep ? (
                                 <ToolDraftEvidenceButtons
-                                  index={index}
-                                  openDomTree={setDomTreeDialog}
                                   openScreenshots={openToolScreenshots}
                                   step={selectedStep}
                                   tool={tool}
@@ -1846,7 +1803,7 @@ export function RunProgress({
                             </li>
                           ))}
                         </ol>
-                        <button className="ui-button ui-button--neutral add-step-button" disabled={savingTools} onClick={addToolDraft} type="button">
+                        <button className="link-button run-tool-add" disabled={savingTools} onClick={addToolDraft} type="button">
                           <Plus size={15} />
                           {t('新增工具调用')}
                         </button>
@@ -1893,12 +1850,12 @@ export function RunProgress({
 
       {reportOpen && run.report?.markdown ? (
         <div className="ui-modal-overlay" onClick={() => setReportOpen(false)} role="presentation">
-          <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('最终报告')}>
+          <section className="ui-modal ui-modal--wide final-report-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('最终报告')}>
             <header className="ui-modal-header">
               <h2>{t('最终报告')}</h2>
               <button className="ui-icon-button ui-modal-close" onClick={() => setReportOpen(false)} type="button" aria-label={t('关闭')}><X size={18} /></button>
             </header>
-            <div className="ui-modal-body">
+            <div className="ui-modal-body final-report-body">
               <ReportEvidence run={run} />
               <MarkdownReport markdown={run.report.markdown} onImageClick={openImageByUrl} />
             </div>
@@ -1915,23 +1872,6 @@ export function RunProgress({
             </header>
             <div className="ui-modal-body">
               <pre className="ai-request-pre">{JSON.stringify(selectedStep.aiRequest, null, 2)}</pre>
-            </div>
-          </section>
-        </div>
-      ) : null}
-
-      {domTreeDialog ? (
-        <div className="ui-modal-overlay" onClick={() => setDomTreeDialog(null)} role="presentation">
-          <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('DOM 树')}>
-            <header className="ui-modal-header">
-              <div>
-                <h2>{t('DOM 树')}</h2>
-                <p>{t('步骤 {index}', { index: domTreeDialog.stepIndex })} · {domTreeDialog.toolName} · #{domTreeDialog.toolIndex + 1}</p>
-              </div>
-              <button className="ui-icon-button ui-modal-close" onClick={() => setDomTreeDialog(null)} type="button" aria-label={t('关闭')}><X size={18} /></button>
-            </header>
-            <div className="ui-modal-body">
-              <pre className="dom-tree-pre">{domTreeDialog.domTree}</pre>
             </div>
           </section>
         </div>

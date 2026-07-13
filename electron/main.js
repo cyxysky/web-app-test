@@ -761,6 +761,7 @@ function recordEmbeddedBrowserHistory(tab) {
   const existingIndex = embeddedBrowserHistory.findIndex((item) => item.url === url);
   const existing = existingIndex >= 0 ? embeddedBrowserHistory[existingIndex] : undefined;
   const record = {
+    faviconUrl: embeddedBrowserFaviconUrl(tab.faviconUrl) || existing?.faviconUrl || undefined,
     id: existing?.id || `history:${embeddedBrowserNextHistoryId++}`,
     lastVisitedAt: now,
     title: title || existing?.title || url,
@@ -789,6 +790,7 @@ function toggleEmbeddedBrowserBookmark() {
   } else {
     embeddedBrowserBookmarks.set(url, {
       createdAt: Date.now(),
+      faviconUrl: embeddedBrowserFaviconUrl(tab.faviconUrl) || undefined,
       id: `bookmark:${embeddedBrowserNextBookmarkId++}`,
       title: embeddedBrowserRecordTitle(embeddedBrowserTabTitle(tab.view.webContents), url),
       url,
@@ -934,6 +936,7 @@ function restoreEmbeddedBrowserPersistence() {
       const id = persistedEmbeddedBrowserId(item?.id) || `bookmark:${embeddedBrowserNextBookmarkId++}`;
       embeddedBrowserBookmarks.set(url, {
         createdAt: Number.isFinite(Number(item?.createdAt)) ? Number(item.createdAt) : Date.now(),
+        faviconUrl: embeddedBrowserFaviconUrl(item?.faviconUrl) || undefined,
         id,
         title: embeddedBrowserRecordTitle(item?.title, url),
         url,
@@ -953,6 +956,7 @@ function restoreEmbeddedBrowserPersistence() {
       const matched = /^history:(\d+)$/.exec(id);
       if (matched) embeddedBrowserNextHistoryId = Math.max(embeddedBrowserNextHistoryId, Number(matched[1]) + 1);
       return [{
+        faviconUrl: embeddedBrowserFaviconUrl(item?.faviconUrl) || undefined,
         id,
         lastVisitedAt: Number.isFinite(Number(item?.lastVisitedAt)) ? Number(item.lastVisitedAt) : Date.now(),
         title: embeddedBrowserRecordTitle(item?.title, url),
@@ -1352,6 +1356,12 @@ function installEmbeddedBrowserTabHandlers(tab) {
       .find(Boolean) || '';
     if (nextFaviconUrl === tab.faviconUrl) return;
     tab.faviconUrl = nextFaviconUrl;
+    const recordUrl = embeddedBrowserPersistableUrl(tab.lastKnownUrl || view.webContents.getURL() || '');
+    const historyRecord = embeddedBrowserHistory.find((item) => item.url === recordUrl);
+    if (historyRecord) historyRecord.faviconUrl = nextFaviconUrl || undefined;
+    const bookmarkRecord = embeddedBrowserBookmarks.get(recordUrl);
+    if (bookmarkRecord) bookmarkRecord.faviconUrl = nextFaviconUrl || undefined;
+    writeEmbeddedBrowserPersistence();
     scheduleEmbeddedBrowserPersistence();
     notifyEmbeddedBrowserStateChange();
   });

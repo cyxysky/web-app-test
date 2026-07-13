@@ -11,7 +11,7 @@ export function RunMetaDrawer({ run, testCaseTitle }: { run: TestRunRecord; test
 
   return (
     <>
-      <button className="ui-button ui-button--neutral" onClick={() => setOpen(true)} type="button">
+      <button className="link-button run-meta-trigger" onClick={() => setOpen(true)} type="button">
         <Info size={16} />
         {t('运行信息')}
       </button>

@@ -15,6 +15,7 @@ import {
   type SnapshotView,
 } from './ax-snapshot';
 import { captureDomSnapshot } from './dom-snapshot';
+import { resolveBrowserSessionSurface, type BrowserSessionSurface } from './browser-session-surface';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
   if (errorText === 'net::ERR_ABORTED' && /analytics|collector|apm|beacon|log|track/i.test(url)) return true;
@@ -81,6 +82,7 @@ function stringifyDiagnosticValue(value: unknown) {
 export type BrowserSessionMode = 'dom';
 
 export type BrowserSessionOptions = {
+  browserSurface?: BrowserSessionSurface;
   isMarked?: boolean;
   runId?: string;
   preferExistingPage?: boolean;
@@ -119,12 +121,6 @@ export type BrowserActionResult = {
   autoSnapshot?: {
     generationId: string;
     refreshed: boolean;
-  };
-  debug?: {
-    fullDomSnapshot?: string;
-    fullDomSnapshotCharLength?: number;
-    domSnapshotPromptCharLimit?: number;
-    domSnapshotTruncatedForModel?: boolean;
   };
 };
 
@@ -3081,6 +3077,7 @@ export class BrowserSession {
   private accessibilitySnapshotExportControlInstalled = false;
   private accessibilitySnapshotExporter?: () => Promise<AccessibilitySnapshotExportControlResult>;
   private readonly pageGroupId: string;
+  private browserSurface: BrowserSessionSurface = 'external';
 
   constructor(
     private readonly mode: BrowserSessionMode = browserSessionModeFromEnv(),
@@ -3120,6 +3117,7 @@ export class BrowserSession {
     const { chromium } = await import('playwright');
     const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
     const isolated = this.options.isolated === true;
+    this.browserSurface = resolveBrowserSessionSurface(this.options, electronEmbeddedBrowserEnabled());
     const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
     const configuredViewportWidth = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH');
     const configuredViewportHeight = positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT');
@@ -3138,18 +3136,19 @@ export class BrowserSession {
         ? `--window-size=${headlessFallbackViewport.width},${headlessFallbackViewport.height + 120}`
         : '';
     const ignoreHTTPSErrors = process.env.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
-    const useElectronEmbeddedBrowser = !isolated && electronEmbeddedBrowserEnabled();
+    const useElectronEmbeddedBrowser = this.browserSurface === 'electron-embedded';
     const forceBundledBrowser = isolated || (process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !useElectronEmbeddedBrowser);
     const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
     const executablePath = process.env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
     const browserProfileKey = this.options.browserProfileKey ? normalizePageGroupId(this.options.browserProfileKey) : '';
     const rawCdpEndpoint = forceBundledBrowser
       ? ''
-      : process.env.BROWSER_CDP_ENDPOINT?.trim()
-        || process.env.BROWSER_CONNECT_CDP_ENDPOINT?.trim()
-        || process.env.CHROME_REMOTE_DEBUGGING_URL?.trim()
-        || electronEmbeddedBrowserCdpEndpoint()
-        || '';
+      : useElectronEmbeddedBrowser
+        ? electronEmbeddedBrowserCdpEndpoint()
+        : process.env.BROWSER_CDP_ENDPOINT?.trim()
+          || process.env.BROWSER_CONNECT_CDP_ENDPOINT?.trim()
+          || process.env.CHROME_REMOTE_DEBUGGING_URL?.trim()
+          || '';
     const cdpEndpoint = browserProfileKey && rawCdpEndpoint && !useElectronEmbeddedBrowser
       ? /\{(?:browserProfileKey|profileKey)\}/.test(rawCdpEndpoint)
         ? rawCdpEndpoint
@@ -3368,7 +3367,7 @@ export class BrowserSession {
   }
 
   private async isElectronEmbeddedBrowserPage(page: Page) {
-    if (!electronEmbeddedBrowserEnabled() || page.isClosed()) return false;
+    if (this.browserSurface !== 'electron-embedded' || page.isClosed()) return false;
     return page.evaluate(() => {
       const win = window as Window & { __webPilotEmbeddedBrowserView?: unknown };
       return win.__webPilotEmbeddedBrowserView === true
@@ -3389,7 +3388,7 @@ export class BrowserSession {
   }
 
   private async isElectronAppShellPage(page: Page) {
-    if (!electronEmbeddedBrowserEnabled() || page.isClosed()) return false;
+    if (this.browserSurface !== 'electron-embedded' || page.isClosed()) return false;
     return page.evaluate(() => {
       const win = window as Window & { __webPilotAppShell?: unknown };
       return win.__webPilotAppShell === true
@@ -3398,7 +3397,7 @@ export class BrowserSession {
   }
 
   private async findElectronEmbeddedBrowserPage(context: BrowserContext) {
-    if (!electronEmbeddedBrowserEnabled()) return undefined;
+    if (this.browserSurface !== 'electron-embedded') return undefined;
     for (const page of [...context.pages()].reverse()) {
       if (page.isClosed()) continue;
       if (await this.isElectronEmbeddedBrowserPage(page)) return page;
@@ -3407,7 +3406,7 @@ export class BrowserSession {
   }
 
   private async findInitialElectronEmbeddedBrowserPages(context: BrowserContext) {
-    if (!electronEmbeddedBrowserEnabled()) return [];
+    if (this.browserSurface !== 'electron-embedded') return [];
     for (let attempt = 0; attempt < 12; attempt += 1) {
       const pages: Page[] = [];
       for (const page of [...context.pages()].reverse()) {
@@ -4599,7 +4598,7 @@ export class BrowserSession {
         this.pageDiscoveryListener = undefined;
       }
       if (this.browserOwnership === 'shared') {
-        if (!electronEmbeddedBrowserEnabled() && !options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
+        if (this.browserSurface !== 'electron-embedded' && !options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
           await this.closeOwnedPages();
         }
         await this.releaseSharedBrowser?.();
@@ -4608,7 +4607,7 @@ export class BrowserSession {
       }
       if (options.keepOpen || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true') return;
       if (this.browserOwnership === 'connected') {
-        if (electronEmbeddedBrowserEnabled()) return;
+        if (this.browserSurface === 'electron-embedded') return;
         await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
         return;
       }
@@ -6271,15 +6270,9 @@ export class BrowserSession {
       if (!previousReference || !refreshedReference) {
         return { error: `UID ${uid} is stale because its DOM node no longer exists in the refreshed snapshot. Capture a fresh snapshot and choose the current target.` };
       }
-      const previousRole = previousReference.role.trim().toLowerCase();
-      const refreshedRole = refreshedReference.role.trim().toLowerCase();
-      const previousName = previousReference.name.replace(/\s+/g, ' ').trim();
-      const refreshedName = refreshedReference.name.replace(/\s+/g, ' ').trim();
-      if (previousRole !== refreshedRole || previousName !== refreshedName) {
-        return {
-          error: `UID ${uid} is stale because the target semantics changed from ${previousReference.role} "${previousName}" to ${refreshedReference.role} "${refreshedName}". Capture a fresh snapshot and confirm the target.`,
-        };
-      }
+      // UIDs follow the backing DOM node, not its mutable accessible metadata. Reactive pages
+      // commonly update a field's name/value in place; the live locator checks below still
+      // reject detached, hidden, disabled, or covered nodes before any action is dispatched.
     }
     const resolved = this.currentSnapshotReference(uid);
     if (!resolved.reference) return { error: resolved.error };

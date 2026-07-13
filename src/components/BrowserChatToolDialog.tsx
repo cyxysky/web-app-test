@@ -4,7 +4,6 @@ import { X } from 'lucide-react';
 import { BrowserChatPayloadDetails } from '@/components/BrowserChatPayloadDetails';
 import { formatToolPayload } from '@/components/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
-import { domTreeFromToolCall, fullDomSnapshotFromToolCall } from '@/lib/ai-request-inspection';
 import { artifactApiUrl } from '@/lib/artifacts';
 import type { StepExecutionResult } from '@/server/ai/schemas/test-case.schema';
 
@@ -48,8 +47,6 @@ export function BrowserChatToolDialog({
 }) {
   const { t } = useI18n();
   const toolName = toolLabel(detail.tool.name);
-  const domTree = domTreeFromToolCall(detail.tool, detail.step.aiRequest);
-  const fullDomSnapshot = fullDomSnapshotFromToolCall(detail.tool);
   const status = toolStatusLabel(detail.tool);
   const inputPreview = compactPayloadPreview(detail.tool.input);
   const resultPreview = compactPayloadPreview(detail.tool.result);
@@ -105,28 +102,6 @@ export function BrowserChatToolDialog({
           <h3>输出结果</h3>
           <BrowserChatPayloadDetails className="browser-chat-tool-detail-payload" payload={formatToolPayload(detail.tool.result)} title="查看输出结果" />
         </section>
-
-        {fullDomSnapshot ? (
-          <section className="browser-chat-tool-detail-section is-full-dom">
-            <h3>
-              完整 DOM 快照
-              {typeof detail.tool.debug?.fullDomSnapshotCharLength === 'number'
-                ? `（${detail.tool.debug.fullDomSnapshotCharLength} 字符）`
-                : ''}
-            </h3>
-            <BrowserChatPayloadDetails className="browser-chat-tool-detail-payload" payload={fullDomSnapshot} title="查看完整 DOM" />
-          </section>
-        ) : null}
-
-        {domTree ? (
-          <section className="browser-chat-tool-detail-section">
-            <h3>
-              模型上下文 DOM 树
-              {detail.tool.debug?.domSnapshotTruncatedForModel ? '（已按上下文限制截断）' : ''}
-            </h3>
-            <BrowserChatPayloadDetails className="browser-chat-tool-detail-payload" payload={domTree} title="查看 DOM 内容" />
-          </section>
-        ) : null}
 
         {detail.tool.visualAfter ? (
           <section className="browser-chat-tool-detail-section">

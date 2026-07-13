@@ -1008,6 +1008,7 @@ select {
 
 .run-status-large {
   align-items: center;
+  border: 1px solid currentColor;
   border-radius: 999px;
   display: inline-flex;
   font-weight: 850;
@@ -1191,7 +1192,7 @@ select {
 }
 
 .report-shot {
-  background: #ffffff;
+  background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 12px;
   margin: 0;
@@ -1226,15 +1227,25 @@ select {
 
 .markdown-report {
   display: grid;
-  gap: 12px;
+  gap: 14px;
+  line-height: 1.72;
+  min-width: 0;
 }
 
 .markdown-report h1,
 .markdown-report h2,
 .markdown-report h3,
 .markdown-report p,
-.markdown-report ul {
+.markdown-report ul,
+.markdown-report ol,
+.markdown-report blockquote,
+.markdown-report pre,
+.markdown-report hr {
   margin: 0;
+  max-width: 100%;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
 }
 
 .markdown-report h1 {
@@ -1249,10 +1260,93 @@ select {
   padding-top: 14px;
 }
 
-.markdown-report ul {
+.markdown-report h3 {
+  font-size: 15px;
+  line-height: 1.4;
+  margin-top: 4px;
+}
+
+.markdown-report p {
+  color: var(--foreground);
+  line-height: 1.72;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.markdown-report ul,
+.markdown-report ol {
   display: grid;
   gap: 6px;
-  padding-left: 20px;
+  padding-left: 24px;
+}
+
+.markdown-report li {
+  line-height: 1.65;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.markdown-report blockquote {
+  background: var(--panel-soft);
+  border-left: 3px solid var(--accent);
+  color: var(--muted-strong);
+  padding: 10px 14px;
+}
+
+.markdown-report a {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 42%, transparent);
+  text-underline-offset: 3px;
+}
+
+.markdown-report code {
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.12em 0.36em;
+}
+
+.markdown-report pre {
+  background: var(--code-panel, #111827);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--code-foreground, #e5e7eb);
+  overflow: auto;
+  padding: 14px;
+  white-space: pre;
+}
+
+.markdown-report pre code {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0;
+}
+
+.markdown-report hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+.markdown-report input[type="checkbox"] {
+  margin-right: 7px;
+}
+
+.report-markdown-image {
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: zoom-in;
+  display: block;
+  max-height: 520px;
+  max-width: 100%;
+  object-fit: contain;
+  width: auto;
 }
 
 .report-step-card {
@@ -1269,7 +1363,7 @@ select {
 }
 
 .report-step-list {
-  background: #ffffff;
+  background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 6px;
   margin: 0;
@@ -1645,6 +1739,7 @@ select {
 }
 
 .test-cockpit {
+  align-content: start;
   background: transparent;
   border: 0;
   border-radius: 0;
@@ -1659,14 +1754,35 @@ select {
 
 .cockpit-toolbar {
   align-items: center;
-  border-bottom: 1px solid var(--border);
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 12px;
   color: var(--muted);
   display: flex;
   flex-wrap: wrap;
   font-size: 13px;
   gap: 10px 18px;
-  padding-bottom: 10px;
+  padding: 11px 14px;
   justify-content: space-between;
+}
+
+.cockpit-toolbar-primary,
+.cockpit-toolbar-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  min-width: 0;
+}
+
+.cockpit-toolbar-primary {
+  flex: 1 1 auto;
+}
+
+.cockpit-toolbar-actions {
+  flex: 0 1 auto;
+  justify-content: flex-end;
+  max-width: 100%;
 }
 
 .cockpit-toolbar .run-status-large {
@@ -1790,9 +1906,11 @@ select {
 }
 
 .cockpit-body {
-  display: flex;
-  gap: 14px;
-  overflow: hidden;
+  align-items: start;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+  overflow: visible;
   width: 100%;
 }
 
@@ -1814,8 +1932,8 @@ select {
 
 .rail-step {
   align-items: center;
-  background: #ffffff;
-  border: 1px solid transparent;
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 12px;
   color: var(--foreground);
   cursor: pointer;
@@ -1826,8 +1944,15 @@ select {
   text-align: left;
 }
 
+.rail-step:hover {
+  background: var(--panel-soft);
+  border-color: var(--border-strong);
+}
+
 .rail-step.active {
-  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+  border-color: color-mix(in srgb, var(--accent) 62%, var(--border));
+  box-shadow: 0 8px 20px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 .rail-icon {
@@ -1958,12 +2083,15 @@ select {
 }
 
 .evidence-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  padding: 0;
+  padding: 16px 18px 18px;
   max-width: 100%;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .screenshot-chain {
@@ -2665,14 +2793,21 @@ select {
     flex-wrap: wrap;
   }
 
-  .test-cockpit,
+  .cockpit-toolbar-actions {
+    flex-basis: 100%;
+    justify-content: flex-start;
+  }
+
+  .test-cockpit {
+    padding: 0;
+  }
+
   .evidence-panel {
-    padding: 12px 0;
+    padding: 14px;
   }
 
   .editor-grid,
   .run-tool-editor-head,
-  .run-tool-editor-grid,
   .debug-timeline li {
     grid-template-columns: 1fr;
   }
@@ -2683,6 +2818,11 @@ select {
 
   .run-tool-editor-actions {
     justify-content: flex-start;
+  }
+
+  .run-tool-editor-header {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .run-tool-editor-param {
@@ -2971,8 +3111,10 @@ select {
 }
 
 .run-panel-workspace {
+  align-content: start;
   display: grid;
   gap: 18px;
+  grid-auto-rows: max-content;
   height: 100%;
   min-height: 100%;
   overflow: auto;
@@ -3374,13 +3516,14 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .run-history-bulk-delete {
-  background: #ffffff;
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: 8px;
+  color: var(--danger);
 }
 
 .run-history-bulk-delete:not(:disabled):hover {
-  border-color: var(--foreground);
+  border-color: transparent;
 }
 
 .run-history-replay:disabled,
@@ -3941,15 +4084,15 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .tool-record-toolbar {
   align-items: center;
-  background: var(--panel-soft);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  justify-content: flex-end;
+  justify-content: flex-start;
   margin-bottom: 12px;
-  padding: 8px;
+  padding: 0;
 }
 
 .tool-record-action {
@@ -3973,34 +4116,96 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .run-tool-editor {
+  background: color-mix(in srgb, var(--panel-soft) 72%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 12px;
   display: grid;
-  gap: 10px;
+  gap: 12px;
+  max-width: 1180px;
   min-width: 0;
+  padding: 12px;
+  width: 100%;
+}
+
+.run-tool-editor-header {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.run-tool-editor-title {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.run-tool-editor-title strong {
+  color: var(--foreground);
+  font-size: 14px;
+}
+
+.run-tool-editor-title span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.run-tool-editor-header-actions {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 14px;
+}
+
+.run-tool-editor-header-actions .link-button {
+  font-size: 12px;
+  min-height: 28px;
+}
+
+.link-button.run-tool-editor-cancel {
+  color: var(--muted-strong);
+}
+
+.link-button.run-tool-editor-save {
+  color: var(--accent-strong);
+}
+
+.run-tool-editor-header-actions .link-button:disabled,
+.run-tool-add:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .run-tool-editor-mode {
   align-items: center;
-  background: var(--panel-soft);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+  border: 0;
+  border-radius: 7px;
   color: var(--muted);
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 12px;
-  justify-content: space-between;
-  padding: 8px 10px;
+  gap: 6px 10px;
+  justify-content: flex-start;
+  padding: 7px 9px;
 }
 
 .run-tool-editor-mode span {
-  color: var(--text);
-  font-size: 13px;
+  color: var(--accent-strong);
+  font-size: 11px;
   font-weight: 900;
+  white-space: nowrap;
 }
 
 .run-tool-editor-mode small {
   color: var(--muted);
+  flex: 1 1 360px;
   font-size: 12px;
-  font-weight: 750;
+  font-weight: 700;
+  line-height: 1.45;
 }
 
 .compact-error {
@@ -4009,28 +4214,28 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .run-tool-editor-list {
   display: grid;
-  gap: 10px;
+  gap: 8px;
   list-style: none;
   margin: 0;
   padding: 0;
 }
 
 .run-tool-editor-item {
-  background: #ffffff;
+  background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 10px 26px rgba(13, 13, 13, 0.04);
+  border-radius: 9px;
+  box-shadow: none;
   display: grid;
-  gap: 10px;
+  gap: 9px;
   min-width: 0;
-  padding: 10px;
+  padding: 10px 11px;
 }
 
 .run-tool-editor-head {
   align-items: end;
   display: grid;
-  gap: 10px;
-  grid-template-columns: 34px minmax(220px, 1fr) minmax(170px, 230px) auto;
+  gap: 8px;
+  grid-template-columns: 30px minmax(220px, 1fr) minmax(160px, 220px) auto;
   min-width: 0;
 }
 
@@ -4048,14 +4253,14 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   align-items: center;
   background: var(--panel-soft);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 7px;
   color: var(--muted-strong);
   display: inline-flex;
   font-size: 12px;
   font-weight: 900;
-  height: 42px;
+  height: 36px;
   justify-content: center;
-  width: 34px;
+  width: 30px;
 }
 
 .run-tool-name-input,
@@ -4064,26 +4269,26 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .run-tool-editor-head .input {
-  min-height: 42px;
+  min-height: 36px;
 }
 
 .run-tool-editor-actions {
   align-items: center;
   display: inline-flex;
-  gap: 6px;
+  gap: 2px;
   justify-content: flex-end;
   padding-bottom: 0;
 }
 
 .run-tool-editor-actions .ui-icon-button {
-  background: #ffffff;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
   flex: 0 0 auto;
-  height: 42px;
+  height: 34px;
   justify-content: center;
   padding: 0;
-  width: 38px;
+  width: 32px;
 }
 
 .run-tool-editor-actions .ui-icon-button:not(:disabled):hover {
@@ -4091,21 +4296,30 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   border-color: var(--accent-border);
 }
 
+.run-tool-editor .run-tool-editor-actions .ui-icon-button.ui-icon-button--danger:not(:disabled):hover {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  color: var(--danger) !important;
+}
+
 .run-tool-editor-grid {
   align-items: start;
   display: grid;
-  gap: 10px;
-  grid-template-columns: minmax(360px, 1fr) minmax(280px, 0.82fr);
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
 }
 
-.run-tool-fields {
+.run-tool-fields,
+.run-tool-editor-param {
+  background: var(--panel-soft);
   border: 1px solid var(--border);
   border-radius: 8px;
   display: grid;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
-  padding: 10px;
+  padding: 9px 10px;
 }
 
 .run-tool-fields-head {
@@ -4133,7 +4347,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   white-space: nowrap;
 }
 
-.run-tool-field-grid,
+.run-tool-field-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+
 .browser-chat-tool-detail-grid {
   display: grid;
   gap: 10px;
@@ -4175,7 +4394,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .run-tool-field-textarea {
-  min-height: 78px;
+  min-height: 72px;
 }
 
 .run-tool-empty-fields {
@@ -4186,37 +4405,38 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .run-tool-param-textarea {
-  min-height: 164px;
+  min-height: 96px;
 }
 
 .run-tool-editor-grid .textarea.compact {
-  min-height: 78px;
+  min-height: 88px;
   resize: vertical;
 }
 
 .run-tool-editor-param .textarea.compact {
-  min-height: 164px;
-}
-
-.run-tool-reason-textarea {
-  min-height: 164px;
+  min-height: 96px;
 }
 
 .run-tool-status-select .custom-select-button {
-  min-height: 42px;
+  min-height: 36px;
 }
 
 .run-tool-name-select .custom-select-button {
   font-family: var(--font-mono, "SFMono-Regular"), Consolas, monospace;
-  min-height: 42px;
+  min-height: 36px;
 }
 
-.run-tool-name-select .custom-select-menu {
-  z-index: 40;
+.run-tool-add {
+  justify-self: start;
+  margin: 0;
+  min-height: 30px;
+  width: auto;
 }
 
-.run-tool-status-select .custom-select-menu {
-  z-index: 40;
+@media (max-width: 960px) {
+  .run-tool-editor-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .tool-call-block {
@@ -4255,7 +4475,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .tool-evidence-button {
-  background: #ffffff;
+  background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
   min-height: 34px;
@@ -4352,6 +4572,25 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   font-weight: 850;
   gap: 6px;
   padding: 0;
+}
+
+.run-meta-trigger {
+  color: var(--foreground);
+}
+
+.run-meta-trigger:not(:disabled):hover {
+  background: transparent;
+  color: var(--accent-strong);
+}
+
+.run-skip-step {
+  color: var(--danger);
+}
+
+.run-skip-step:not(:disabled):hover {
+  background: transparent;
+  color: var(--danger);
+  opacity: 0.72;
 }
 
 .ui-modal-overlay {
@@ -4586,7 +4825,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .report-shot-button {
   align-items: center;
-  background: #fff;
+  background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--foreground);
@@ -4616,7 +4855,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .report-accordion summary {
   align-items: center;
-  background: #fbfaf7;
+  background: var(--panel-soft);
+  color: var(--foreground);
   cursor: pointer;
   display: flex;
   gap: 10px;
@@ -4644,6 +4884,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .report-accordion>div {
+  background: var(--panel);
   border-top: 1px solid var(--border);
   padding: 14px;
 }
@@ -4659,7 +4900,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .report-accordion li {
-  background: #fff;
+  background: var(--panel-soft);
   border: 1px solid var(--border);
   border-radius: 8px;
   font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -4667,6 +4908,15 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   line-height: 1.5;
   overflow-wrap: anywhere;
   padding: 9px 10px;
+}
+
+.final-report-modal {
+  width: min(92vw, 1120px);
+}
+
+.final-report-body {
+  background: var(--panel);
+  padding: 22px 24px 30px;
 }
 
 .runtime-case-form {
@@ -5906,7 +6156,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .group-tree-delete:not(:disabled):hover {
-  background: var(--control-danger-hover-bg);
+  background: transparent;
 }
 
 .group-tree-delete:disabled {
@@ -6015,7 +6265,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .case-row-icon-button.ui-icon-button--danger:not(:disabled):hover {
-  background: var(--control-danger-hover-bg);
+  background: transparent;
   color: var(--danger);
 }
 
@@ -6181,9 +6431,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   .settings-model-row-button.danger,
   .group-tree-delete,
   .browser-chat-recent-bulk-delete,
-  .run-history-replay.danger):not(:disabled):hover {
-  background: var(--control-danger-hover-bg);
-  border-color: color-mix(in srgb, var(--danger) 24%, var(--border));
+  .browser-chat-recent-delete,
+  .browser-chat-overflow-menu button.danger,
+  .run-history-replay.danger,
+  .run-history-bulk-delete):not(:disabled):hover {
+  background: transparent;
+  border-color: transparent;
   color: var(--danger);
 }
 
@@ -6210,8 +6463,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   .run-history-replay,
   .run-history-open,
   .run-history-bulk-delete,
-  .tool-record-action,
-  .tool-evidence-button):not(:disabled):hover {
+  .tool-record-action):not(:disabled):hover {
   background: var(--control-hover-bg) !important;
   border-color: transparent !important;
   box-shadow: none !important;
@@ -6230,8 +6482,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   .run-history-replay,
   .run-history-open,
   .run-history-bulk-delete,
-  .tool-record-action,
-  .tool-evidence-button) {
+  .tool-record-action) {
   background: transparent !important;
   border-color: transparent !important;
   box-shadow: none !important;
@@ -6258,8 +6509,13 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   .settings-model-row-button.danger,
   .group-tree-delete,
   .browser-chat-recent-bulk-delete,
-  .run-history-replay.danger):not(:disabled):hover {
-  background: var(--control-danger-hover-bg) !important;
+  .browser-chat-recent-delete,
+  .browser-chat-overflow-menu button.danger,
+  .run-history-replay.danger,
+  .run-history-bulk-delete):not(:disabled):hover {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
   color: var(--danger) !important;
 }
 
@@ -7024,7 +7280,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-recent-bulk-delete:hover {
-  background: rgba(180, 35, 24, 0.08);
+  background: transparent;
   color: var(--danger);
 }
 
@@ -7116,7 +7372,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-recent-delete:hover {
-  background: rgba(180, 35, 24, 0.08);
+  background: transparent;
   color: var(--danger);
 }
 
@@ -7407,10 +7663,13 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-embedded-browser {
-  background: linear-gradient(180deg, #f5f7fa 0%, #eef1f5 100%);
+  --embedded-row-divider: rgba(105, 117, 134, 0.2);
+  --embedded-tab-strip-bg: #eef1f5;
+  --embedded-toolbar-bg: var(--panel);
+  background: #f4f6f9;
   border-left: 1px solid rgba(116, 128, 146, 0.12);
   display: grid;
-  grid-template-rows: 88px minmax(0, 1fr);
+  grid-template-rows: 82px minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
   overflow: hidden;
@@ -7419,14 +7678,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-embedded-browser>header {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(236, 240, 246, 0.9)),
-    color-mix(in srgb, var(--panel) 78%, #d9e0e8);
-  backdrop-filter: blur(18px) saturate(1.08);
-  border-bottom: 1px solid rgba(120, 132, 148, 0.18);
-  box-shadow: 0 5px 14px rgba(30, 41, 59, 0.045);
+  background: var(--embedded-tab-strip-bg);
+  backdrop-filter: blur(16px) saturate(1.04);
+  border-bottom: 1px solid rgba(120, 132, 148, 0.14);
+  box-shadow: none;
   display: grid;
-  grid-template-rows: 42px 46px;
+  grid-template-rows: 40px 42px;
   min-width: 0;
   overflow: hidden;
   padding: 0;
@@ -7465,10 +7722,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-embedded-tab-strip {
   align-items: flex-end;
-  background: transparent;
+  background: var(--embedded-tab-strip-bg);
   min-width: 0;
   overflow: hidden;
-  padding: 7px 14px 0;
+  padding: 6px 12px 0;
   position: relative;
   z-index: 2;
 }
@@ -7478,8 +7735,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: transparent;
   display: flex;
   flex: 1 1 auto;
-  gap: 5px;
-  height: 35px;
+  gap: 4px;
+  height: 34px;
   min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
@@ -7496,8 +7753,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   align-items: flex-end;
   display: inline-flex;
   flex: 0 0 auto;
-  gap: 5px;
-  height: 35px;
+  gap: 4px;
+  height: 34px;
   min-width: 0;
   padding-top: 0;
   position: relative;
@@ -7517,7 +7774,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   align-items: flex-end;
   display: inline-flex;
   flex: 0 0 40px;
-  height: 35px;
+  height: 34px;
   overflow: hidden;
   position: relative;
   transition:
@@ -7542,7 +7799,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: inline-flex;
   flex-flow: row nowrap;
   gap: 7px;
-  height: 35px;
+  height: 34px;
   justify-content: flex-start;
   min-width: 132px;
   padding: 0 28px 0 12px;
@@ -7634,14 +7891,14 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: rgba(255, 255, 255, 0.3);
   border: 1px solid rgba(115, 127, 145, 0.11);
   border-bottom: 0;
-  border-radius: 10px 10px 0 0;
+  border-radius: 9px 9px 0 0;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.42);
   color: color-mix(in srgb, var(--foreground) 54%, var(--muted));
   display: inline-flex;
   flex: 0 0 46px;
   gap: 0;
-  height: 35px;
+  height: 34px;
   max-width: 46px;
   min-width: 46px;
   overflow: hidden;
@@ -7689,7 +7946,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag {
-  background: rgba(255, 255, 255, 0.82);
+  background: var(--embedded-toolbar-bg);
   border-color: rgba(92, 105, 124, 0.16);
   color: var(--accent-strong);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.82);
@@ -7758,7 +8015,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: inline-flex;
   flex: 0 0 auto;
   gap: 5px;
-  height: 35px;
+  height: 34px;
   min-width: 0;
 }
 
@@ -7772,18 +8029,18 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: rgba(255, 255, 255, 0.2);
   border: 1px solid rgba(115, 127, 145, 0.08);
   border-bottom: 0;
-  border-radius: 10px 10px 0 0;
+  border-radius: 9px 9px 0 0;
   box-shadow: none;
   color: #101820;
   cursor: grab;
   container-type: inline-size;
   display: inline-flex;
-  flex: 0 0 clamp(168px, 18vw, 220px);
+  flex: 0 0 clamp(156px, 17vw, 210px);
   gap: 8px;
-  height: 35px;
+  height: 34px;
   isolation: isolate;
-  max-width: 220px;
-  min-width: 168px;
+  max-width: 210px;
+  min-width: 156px;
   overflow: hidden;
   padding: 0 52px 0 11px;
   position: relative;
@@ -7793,7 +8050,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     box-shadow 0.16s ease,
     color 0.16s ease,
     transform 0.16s ease;
-  width: clamp(168px, 18vw, 220px);
+  width: clamp(156px, 17vw, 210px);
 }
 
 .browser-chat-embedded-tab:active {
@@ -7820,7 +8077,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-embedded-tab.active {
-  background: rgba(255, 255, 255, 0.92);
+  background: var(--embedded-toolbar-bg);
   border-color: rgba(92, 105, 124, 0.16);
   color: #07131f;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.92);
@@ -8004,26 +8261,20 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-embedded-toolbar {
   align-items: center;
-  background: rgba(250, 251, 253, 0.7);
-  border-top: 1px solid rgba(120, 132, 148, 0.09);
+  background: var(--embedded-toolbar-bg);
+  border-top: 1px solid var(--embedded-row-divider);
   display: grid;
   gap: 10px;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  height: 46px;
+  height: 42px;
   min-width: 0;
-  padding: 6px 14px;
+  padding: 4px 12px;
   position: relative;
   width: 100%;
 }
 
 .browser-chat-embedded-toolbar::before {
-  background: linear-gradient(90deg, transparent, rgba(120, 132, 148, 0.08) 12%, rgba(120, 132, 148, 0.08) 88%, transparent);
-  content: "";
-  height: 1px;
-  left: 14px;
-  position: absolute;
-  right: 14px;
-  top: 0;
+  content: none;
 }
 
 .browser-chat-embedded-tool-button {
@@ -8090,14 +8341,14 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-embedded-address-bar {
   align-items: center;
   align-self: center;
-  background: rgba(255, 255, 255, 0.8);
+  background: color-mix(in srgb, var(--panel) 86%, #eef2f6);
   border: 1px solid rgba(118, 130, 148, 0.17);
   border-radius: 999px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.76);
+  box-shadow: none;
   color: var(--muted-strong);
   display: flex;
   gap: 8px;
-  height: 34px;
+  height: 32px;
   justify-self: stretch;
   min-width: 0;
   padding: 0 12px;
@@ -8246,10 +8497,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 @media (max-width: 1120px) {
   .browser-chat-embedded-tab {
-    flex-basis: 168px;
-    max-width: 168px;
-    min-width: 168px;
-    width: 168px;
+    flex-basis: 156px;
+    max-width: 156px;
+    min-width: 156px;
+    width: 156px;
   }
 
   .browser-chat-embedded-tab-group-label {
@@ -10305,7 +10556,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 :root[data-theme="dark"] .custom-select-search {
-  background: var(--panel);
+  background: transparent;
 }
 
 :root[data-theme="dark"] .settings-card {
@@ -10415,8 +10666,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 :root[data-theme="dark"] .group-tree-delete:not(:disabled):hover {
-  background: color-mix(in srgb, #fb7185 12%, transparent);
-  border-color: color-mix(in srgb, #fb7185 28%, var(--border));
+  background: transparent;
+  border-color: transparent;
 }
 
 :root[data-theme="dark"] .run-history-replay.default-record {
@@ -10525,6 +10776,26 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   color: var(--foreground);
 }
 
+:root[data-theme="dark"] .rail-icon.status-passed {
+  background: color-mix(in srgb, var(--success) 82%, #080b11);
+  color: #ffffff;
+}
+
+:root[data-theme="dark"] .rail-icon.status-failed {
+  background: color-mix(in srgb, var(--danger) 82%, #080b11);
+  color: #ffffff;
+}
+
+:root[data-theme="dark"] .rail-icon.status-blocked {
+  background: color-mix(in srgb, var(--warning) 82%, #080b11);
+  color: #171717;
+}
+
+:root[data-theme="dark"] .rail-icon.status-running {
+  background: color-mix(in srgb, var(--accent-strong) 82%, #080b11);
+  color: #ffffff;
+}
+
 :root[data-theme="dark"] .rail-copy small {
   color: var(--muted);
 }
@@ -10561,6 +10832,11 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 :root[data-theme="dark"] .evidence-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+:root[data-theme="dark"] .tool-record-toolbar {
   background: transparent;
   border: 0;
 }
@@ -10826,25 +11102,26 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-browser {
-  background: linear-gradient(180deg, #141a23 0%, #0d1219 100%);
+  --embedded-row-divider: rgba(255, 255, 255, 0.11);
+  --embedded-tab-strip-bg: #151b24;
+  --embedded-toolbar-bg: #10161e;
+  background: #0d1219;
   border-left-color: rgba(255, 255, 255, 0.07);
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-browser>header {
-  background:
-    linear-gradient(180deg, rgba(35, 42, 53, 0.94), rgba(19, 25, 34, 0.94)),
-    #11151d;
+  background: var(--embedded-tab-strip-bg);
   border-bottom-color: rgba(255, 255, 255, 0.08);
-  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.16);
+  box-shadow: none;
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-tab-strip {
-  background: transparent;
+  background: var(--embedded-tab-strip-bg);
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-toolbar {
-  background: rgba(14, 19, 27, 0.7);
-  border-top-color: rgba(255, 255, 255, 0.055);
+  background: var(--embedded-toolbar-bg);
+  border-top-color: var(--embedded-row-divider);
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-viewport {
@@ -10869,7 +11146,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-tab.active {
-  background: rgba(255, 255, 255, 0.13);
+  background: var(--embedded-toolbar-bg);
   border-color: rgba(255, 255, 255, 0.1);
   color: var(--foreground);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
@@ -10920,7 +11197,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--embedded-toolbar-bg);
   border-color: rgba(255, 255, 255, 0.09);
   color: var(--accent-strong);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
@@ -11044,9 +11321,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   .settings-model-row-button.danger,
   .group-tree-delete,
   .browser-chat-recent-bulk-delete,
-  .run-history-replay.danger):not(:disabled):hover {
-  background: var(--control-danger-hover-bg);
-  border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
+  .browser-chat-recent-delete,
+  .browser-chat-overflow-menu button.danger,
+  .run-history-replay.danger,
+  .run-history-bulk-delete):not(:disabled):hover {
+  background: transparent;
+  border-color: transparent;
   color: var(--danger);
 }
 
@@ -11107,8 +11387,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   .run-history-replay,
   .run-history-open,
   .run-history-bulk-delete,
-  .tool-record-action,
-  .tool-evidence-button):not(:disabled):hover {
+  .tool-record-action):not(:disabled):hover {
   background: transparent !important;
   border-color: transparent !important;
   box-shadow: none !important;

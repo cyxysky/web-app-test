@@ -8,12 +8,14 @@ type LibraryPanel = 'bookmarks' | 'history';
 
 type BookmarkItem = {
   createdAt: number;
+  faviconUrl?: string;
   id: string;
   title: string;
   url: string;
 };
 
 type HistoryItem = {
+  faviconUrl?: string;
   id: string;
   lastVisitedAt: number;
   title: string;
@@ -60,6 +62,36 @@ function historyTime(value: number): string {
   }).format(new Date(value));
 }
 
+function defaultFaviconUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? new URL('/favicon.ico', url.origin).toString() : '';
+  } catch {
+    return '';
+  }
+}
+
+function LibraryFavicon({ faviconUrl, pageUrl }: { faviconUrl?: string; pageUrl: string }) {
+  const [failed, setFailed] = useState(false);
+  const source = faviconUrl || defaultFaviconUrl(pageUrl);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [source]);
+
+  if (!source || failed) return <Globe2 size={16} />;
+  return (
+    <img
+      alt=""
+      decoding="async"
+      draggable={false}
+      onError={() => setFailed(true)}
+      referrerPolicy="no-referrer"
+      src={source}
+    />
+  );
+}
+
 export function EmbeddedBrowserLibraryOverlay() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [bookmarks, setBookmarks] = useState<BookmarkItem[]>([]);
@@ -68,6 +100,7 @@ export function EmbeddedBrowserLibraryOverlay() {
   const [panel, setPanel] = useState<LibraryPanel>('bookmarks');
   const [query, setQuery] = useState('');
   const [searchVisible, setSearchVisible] = useState(false);
+  const [sectionExpanded, setSectionExpanded] = useState(true);
 
   function applyState(state: LibraryState) {
     if (!state?.ok) {
@@ -200,22 +233,27 @@ export function EmbeddedBrowserLibraryOverlay() {
       ) : null}
 
       <section className={styles.content}>
-        <div className={styles.sectionHeading}>
-          <ChevronDown size={15} />
+        <button
+          aria-expanded={sectionExpanded}
+          className={styles.sectionHeading}
+          onClick={() => setSectionExpanded((current) => !current)}
+          type="button"
+        >
+          <ChevronDown className={sectionExpanded ? styles.expandedChevron : undefined} size={15} />
           {panel === 'bookmarks' ? <Star size={16} /> : <History size={16} />}
           <strong>{panel === 'bookmarks' ? '收藏夹栏' : '最近访问'}</strong>
           <span>{total}</span>
-        </div>
+        </button>
 
         {error ? <div className={styles.error}>{error}</div> : null}
 
-        {items.length ? (
+        {sectionExpanded && items.length ? (
           <div className={styles.list}>
             {items.map((item) => (
               <article className={styles.item} key={item.id}>
                 <button className={styles.openItem} onClick={() => void openUrl(item.url)} title={item.url} type="button">
                   <span className={styles.itemIcon} aria-hidden="true">
-                    <Globe2 size={16} />
+                    <LibraryFavicon faviconUrl={item.faviconUrl} pageUrl={item.url} />
                   </span>
                   <span className={styles.itemCopy}>
                     <strong>{item.title || hostnameForUrl(item.url)}</strong>
@@ -240,7 +278,7 @@ export function EmbeddedBrowserLibraryOverlay() {
               </article>
             ))}
           </div>
-        ) : (
+        ) : sectionExpanded ? (
           <div className={styles.empty}>
             <span aria-hidden="true">{panel === 'bookmarks' ? <Star size={24} /> : <History size={24} />}</span>
             <strong>{query ? '没有匹配结果' : panel === 'bookmarks' ? '暂无收藏' : '暂无浏览历史'}</strong>
@@ -252,7 +290,7 @@ export function EmbeddedBrowserLibraryOverlay() {
                   : '访问过的页面会显示在这里'}
             </p>
           </div>
-        )}
+        ) : null}
       </section>
       </section>
     </main>

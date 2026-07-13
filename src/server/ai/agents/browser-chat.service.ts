@@ -392,26 +392,6 @@ function unwrapLogDetails(value: unknown) {
   return { value: record.value, full: true };
 }
 
-function compactDomContextForLog(value: unknown) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
-  const record = value as Record<string, unknown>;
-  return {
-    mode: record.mode,
-    source: record.source,
-    generatedAt: record.generatedAt,
-    url: record.url,
-    title: record.title,
-    treeCharLength: record.treeCharLength,
-    textLength: record.textLength,
-    promptCharLimit: record.promptCharLimit,
-    truncated: record.truncated,
-    focusedElement: record.focusedElement,
-    pageScrollState: record.pageScrollState,
-    interactiveCandidateCount: Array.isArray(record.interactiveCandidates) ? record.interactiveCandidates.length : undefined,
-    scrollableAreaCount: Array.isArray(record.scrollableAreas) ? record.scrollableAreas.length : undefined,
-  };
-}
-
 function stringifyCompactLogDetails(value: unknown) {
   const seen = new WeakSet<object>();
   return JSON.stringify(value, (key, item) => {
@@ -436,7 +416,6 @@ function stringifyCompactLogDetails(value: unknown) {
     }
     if (seen.has(item)) return '[Circular]';
     seen.add(item);
-    if (key === 'domContext') return compactDomContextForLog(item);
     if (Array.isArray(item) && /^(interactiveCandidates|scrollableAreas|messages|modelMessages|conversation|tabs)$/i.test(key)) {
       return `[${item.length} items]`;
     }
@@ -521,10 +500,6 @@ function firstExportableTargetUrl(candidates: Array<string | undefined>) {
 
 function exportedTargetUrl(session: BrowserChatSessionRecord, steps: StepExecutionResult[]) {
   const browserCurrentUrl = session.browser?.currentUrl();
-  const urlsFromToolContexts = steps.flatMap((step) => (step.tools || []).flatMap((tool) => [
-    tool.contextBefore?.domContext?.url,
-    tool.contextAfter?.domContext?.url,
-  ]));
   const urlsFromOpenTools = steps.flatMap((step) => (step.tools || []).flatMap((tool) => (
     /^openPage$/i.test(tool.name) ? [inputUrl(tool.input)] : []
   )));
@@ -532,7 +507,6 @@ function exportedTargetUrl(session: BrowserChatSessionRecord, steps: StepExecuti
     session.targetUrl,
     browserCurrentUrl,
     ...urlsFromOpenTools,
-    ...urlsFromToolContexts,
   ]);
 }
 
@@ -1573,7 +1547,8 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   appendLog(session, 'browser:start', '正在启动或连接浏览器');
   const hasPriorConversation = session.steps.length > 0
     || session.messages.some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
-          const browser = new BrowserSession(session.mode, {
+  const browser = new BrowserSession(session.mode, {
+    browserSurface: 'electron-embedded',
     browserProfileKey: browserChatBrowserProfileKey(session),
     isMarked: true,
     preferExistingPage: false,

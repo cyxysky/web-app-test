@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { generateText, hasToolCall, tool, type ModelMessage } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
@@ -188,12 +188,11 @@ function isVisualMode(mode: BrowserSessionMode) {
   return false;
 }
 
-function runtimePageContextOptions(mode: BrowserSessionMode, options: { includeDomTree?: boolean } = {}) {
+function runtimePageContextOptions(mode: BrowserSessionMode) {
   void mode;
-  const includeDomTree = options.includeDomTree === true;
   return {
     domScope: 'full' as const,
-    includeDomTree,
+    includeDomTree: false,
     includeText: false,
     includeManualVerification: false,
     includeInteractiveCandidates: false,
@@ -203,18 +202,6 @@ function runtimePageContextOptions(mode: BrowserSessionMode, options: { includeD
 }
 
 type RuntimePageContext = Awaited<ReturnType<BrowserSession['getPageContext']>>;
-
-function domTreePromptLimit() {
-  const raw = String(process.env.DOM_TREE_PROMPT_MAX_CHARS || '').trim();
-  if (!raw || /^(0|false|none|off|unlimited)$/i.test(raw)) return undefined;
-  const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
-}
-
-function domTreeForPrompt(rawTree: string) {
-  const limit = domTreePromptLimit();
-  return limit ? trimDebugText(rawTree, limit) : rawTree;
-}
 
 function domPageTextPromptLimit() {
   const raw = String(process.env.DOM_PAGE_TEXT_PROMPT_MAX_CHARS || process.env.PAGE_TEXT_PROMPT_MAX_CHARS || '').trim();
@@ -228,34 +215,11 @@ function pageTextForPrompt(rawText: string) {
   return limit ? trimDebugText(rawText, limit) : rawText;
 }
 
-function createDomContextSnapshot(mode: BrowserSessionMode, pageContext: RuntimePageContext): AiDomContextSnapshot | undefined {
-  void mode;
-  const rawTree = pageContext.domTree || '[empty DOM tree]';
-  const promptCharLimit = domTreePromptLimit();
-  const tree = domTreeForPrompt(rawTree);
-  return {
-    mode: 'dom',
-    source: 'runtime-page-context',
-    generatedAt: new Date().toISOString(),
-    url: pageContext.url,
-    title: pageContext.title,
-    tree,
-    treeCharLength: rawTree.length,
-    promptCharLimit,
-    truncated: Boolean(promptCharLimit && rawTree.length > promptCharLimit),
-    focusedElement: pageContext.focusedElement,
-    pageScrollState: pageContext.pageScrollState,
-    scrollableAreas: pageContext.scrollableAreas,
-    interactiveCandidates: pageContext.interactiveCandidates,
-  };
-}
-
 function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
-  if (!aiRequest?.id && !aiRequest?.domContext) return undefined;
+  if (!aiRequest?.id) return undefined;
   return {
     requestId: aiRequest.id,
     requestCreatedAt: aiRequest.createdAt,
-    domContext: aiRequest.domContext,
   };
 }
 
@@ -396,17 +360,6 @@ function runtimeRequestConsecutiveFailureLimit(browserChatMode: boolean) {
   return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, browserChatMode ? 3 : 2, 1, 10);
 }
 
-function domSnapshotDebug(pageContext: RuntimePageContext, domContext?: AiDomContextSnapshot) {
-  if (!pageContext.domTree) return undefined;
-  const rawTree = pageContext.domTree || '[empty DOM tree]';
-  return {
-    fullDomSnapshot: rawTree,
-    fullDomSnapshotCharLength: rawTree.length,
-    domSnapshotPromptCharLimit: domContext?.promptCharLimit,
-    domSnapshotTruncatedForModel: domContext?.truncated,
-  };
-}
-
 function upstreamApiDisconnectReason(value?: string) {
   const text = value || '';
   const apiMatch = text.match(/Cannot connect to API:\s*([^\n]+)/i);
@@ -543,8 +496,7 @@ function compactToolResultForModel(
   observationStore?: RuntimeObservationStore,
   runId?: string,
 ): BrowserActionResult {
-  const { debug: _debug, ...modelResult } = result;
-  void _debug;
+  const modelResult = result;
   if (!modelResult.actual) return modelResult;
   const fileResult = modelResult.ok ? formatFileArtifactResult(name, modelResult.actual) : undefined;
   if (fileResult) return { ...modelResult, actual: fileResult };
@@ -834,7 +786,6 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       reason,
       ok: trace.result?.ok,
       result: userFacingToolResult(trace.name, trace.result, 360),
-      debug: trace.result?.debug,
       desktopEvidence: trace.desktopEvidence,
       contextBefore: trace.contextBefore,
       contextAfter: trace.contextAfter,
@@ -1393,11 +1344,6 @@ function shouldCaptureVisualAfter(name: string, visualAfter: VisualAfterPolicy) 
   return !noVisualAfterCaptureToolNames.has(name);
 }
 
-function shouldCollectDomContextAfter(trace: ToolTrace) {
-  void trace;
-  return false;
-}
-
 function screenshotOptionsFromVisualAfter(visualAfter: VisualAfterPolicy): { capture: ScreenshotCaptureMode } {
   if (visualAfter.capture === 'fullPage') return { capture: 'fullPage' };
   return { capture: 'viewport' };
@@ -1697,25 +1643,6 @@ async function finalizeToolTraceVisuals(input: {
     }
   } else if (!result.ok && visualContext) {
     pushFailureFrameScreenshots(screenshots, trace.name, visualContext.current());
-  }
-
-  if (shouldCollectDomContextAfter(trace)) {
-    throwIfStopped(abortSignal, shouldContinue);
-    const afterPageContext = await session.getPageContext({
-      includeDomTree: true,
-      includeText: false,
-      includeManualVerification: false,
-      includeInteractiveCandidates: false,
-    }).catch(() => undefined);
-    throwIfStopped(abortSignal, shouldContinue);
-    const domContext = afterPageContext ? createDomContextSnapshot('dom', afterPageContext) : undefined;
-    if (domContext) {
-      trace.contextAfter = {
-        requestId: trace.contextBefore?.requestId,
-        requestCreatedAt: trace.contextBefore?.requestCreatedAt,
-        domContext,
-      };
-    }
   }
 
   trace.result = result;
@@ -2435,7 +2362,6 @@ function createAiRequestSnapshot(input: {
   imageAttached: boolean;
   tools?: string[];
   options?: Record<string, unknown>;
-  domContext?: AiDomContextSnapshot;
   systemPrompt?: string;
 }): AiRequestSnapshot {
   const { provider, model } = getModelSettings();
@@ -2463,7 +2389,6 @@ function createAiRequestSnapshot(input: {
     imageAttached: input.imageAttached,
     tools: input.tools,
     options: input.options,
-    domContext: input.domContext,
     messages: [
       {
         role: 'user',
@@ -2841,7 +2766,6 @@ async function executeRuntimeStep(input: {
   const contextStartedAt = Date.now();
   const pageContext = await session.getPageContext(runtimePageContextOptions(mode));
   ensureActive();
-  let currentDomContext = createDomContextSnapshot(mode, pageContext);
   const contextMs = elapsedSince(contextStartedAt);
   const screenshotReadStartedAt = Date.now();
   const screenshot = undefined;
@@ -2980,7 +2904,6 @@ async function executeRuntimeStep(input: {
     type PendingObservationMessage = {
       text: string;
       imagePaths: string[];
-      domContext?: AiDomContextSnapshot;
     };
     const pendingObservationMessages: PendingObservationMessage[] = [];
     const historyMessages = (input.conversation || [])
@@ -3063,7 +2986,6 @@ async function executeRuntimeStep(input: {
       imagePaths: messageImagePaths,
       imageAttached: Boolean(messageImagePaths.length),
       tools: allowedToolTypes,
-      domContext: currentDomContext,
       options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, markerScreenshotPath, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled: false, screenshotToolEnabled: modelSupportsScreenshotInput(), browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: initialSelectedReferenceImagePaths.length, userReferenceImageCount: initialUserReferenceImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId) },
     });
     lastAiRequest = aiRequest;
@@ -3165,7 +3087,6 @@ async function executeRuntimeStep(input: {
       pendingObservationMessages.push({
         text: `[WebPilot explicit screenshot observation]\n${observationText}`,
         imagePaths: [screenshotPath],
-        domContext: currentDomContext,
       });
       return {
         ok: true,
@@ -3247,7 +3168,6 @@ async function executeRuntimeStep(input: {
       while (pendingObservationMessages.length) {
         const observation = pendingObservationMessages.shift();
         if (!observation) break;
-        if (observation.domContext) currentDomContext = observation.domContext;
         const content: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: observation.text }];
         for (const imagePath of observation.imagePaths) {
           const image = await readScreenshotForAi(imagePath).catch(() => undefined);
@@ -3307,7 +3227,7 @@ async function executeRuntimeStep(input: {
         agentStepOffset: agentStepIndex - 1,
         observationStore,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId), explicitPageState: true, screenshotToolEnabled: modelSupportsScreenshotInput(), modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId), explicitPageState: true, screenshotToolEnabled: modelSupportsScreenshotInput(), modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
       return {
         system: requestSystemPrompt || undefined,
@@ -3441,7 +3361,6 @@ async function executeRuntimeStep(input: {
             currentActionableView,
           ].join('\n'),
           imagePaths: [],
-          domContext: currentDomContext,
         });
       },
       onSelectReferenceScreenshots: async (selection) => {
