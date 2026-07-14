@@ -3101,7 +3101,7 @@ export class BrowserSession {
     if (userDataDir) await mkdir(userDataDir, { recursive: true });
     const launchOptions: LaunchOptions = {
       headless,
-      slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 250),
+      slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 0),
       ...(channel ? { channel } : {}),
       ...(executablePath && !channel ? { executablePath } : {}),
       ...(tabGrouperEnabled ? { ignoreDefaultArgs: ['--disable-extensions'] } : {}),
@@ -5702,9 +5702,7 @@ export class BrowserSession {
     let axEnrichmentMs = 0;
     let captureSource: SnapshotGeneration['captureSource'] = 'dom-snapshot';
     try {
-      const capturedDom = await captureDomSnapshot(page, {
-        axCandidateLimit: boundedNonNegativeIntegerEnv('DOM_SNAPSHOT_AX_CANDIDATE_LIMIT', 200, 500),
-      });
+      const capturedDom = await captureDomSnapshot(page);
       frames = capturedDom.frames.filter((frame) => !allowedFrameIds.size || allowedFrameIds.has(frame.frameId));
       primaryNodes = capturedDom.nodes
         .filter((node) => !allowedFrameIds.size || allowedFrameIds.has(node.frameId))
@@ -5793,7 +5791,8 @@ export class BrowserSession {
   private async ensureSnapshotGeneration(refresh = false) {
     const page = this.activePage;
     if (!refresh && this.snapshotGeneration?.page === page && this.snapshotGeneration.url === page.url()) {
-      return this.snapshotGeneration;
+      const changed = await this.snapshotMutationChanged(this.snapshotGeneration).catch(() => true);
+      if (!changed) return this.snapshotGeneration;
     }
     if (!refresh && this.snapshotGenerationPromise) return this.snapshotGenerationPromise;
     if (refresh && this.snapshotGenerationPromise) await this.snapshotGenerationPromise.catch(() => undefined);

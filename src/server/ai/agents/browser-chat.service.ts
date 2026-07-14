@@ -99,6 +99,7 @@ export type BrowserChatSessionSnapshot = {
   id: string;
   title: string;
   userId?: string;
+  browserGroupId: string;
   targetUrl: string;
   noVncUrl?: string;
   mode: BrowserSessionMode;
@@ -170,6 +171,7 @@ const sessionLogFileCache = browserChatRuntimeState.sessionLogFileCache;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
+const browserStartPromises = new Map<string, Promise<BrowserSession>>();
 const runningHydrationGraceMs = 2 * 60 * 1000;
 const fullLogDetailsFlag = '__browserChatFullLogDetails';
 
@@ -201,7 +203,7 @@ function browserChatLogLimit() {
 }
 
 function browserChatProgressPersistDelayMs() {
-  const raw = Number(process.env.BROWSER_CHAT_PROGRESS_PERSIST_DELAY_MS || 100);
+  const raw = Number(process.env.BROWSER_CHAT_PROGRESS_PERSIST_DELAY_MS || 600);
   const normalized = Number.isFinite(raw) ? Math.floor(raw) : 100;
   return Math.min(Math.max(normalized, 0), 1000);
 }
@@ -863,6 +865,7 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     id: session.id,
     title: session.title,
     userId: session.userId,
+    browserGroupId: session.browserGroupId,
     targetUrl: session.targetUrl,
     noVncUrl: browserChatNoVncUrl(session),
     mode: session.mode,
@@ -892,6 +895,7 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
     id: session.id,
     title: session.title,
     userId: session.userId,
+    browserGroupId: session.browserGroupId,
     targetUrl: session.targetUrl,
     noVncUrl: browserChatNoVncUrl(session),
     mode: session.mode,
@@ -1548,11 +1552,11 @@ function conversationForPrompt(
 
 async function ensureConversationContextWithinThreshold(
   session: BrowserChatSessionRecord,
-  currentUserMessageId: string,
+  currentUserMessageId?: string,
   abortSignal?: AbortSignal,
 ) {
   const stableMessages = stableConversationMessages(session.messages);
-  const currentUserIndex = stableMessages.findIndex((message) => message.id === currentUserMessageId);
+  const currentUserIndex = currentUserMessageId ? stableMessages.findIndex((message) => message.id === currentUserMessageId) : -1;
   const historicalMessages = (currentUserIndex >= 0 ? stableMessages.slice(0, currentUserIndex) : stableMessages)
     .filter((message) => message.id !== session.activeAssistantMessageId);
   const currentConversation = conversationForPrompt(historicalMessages, session.conversationContext);
@@ -1630,13 +1634,25 @@ function isDeadBrowserSessionError(error: unknown) {
 }
 
 async function ensureStarted(session: BrowserChatSessionRecord) {
+  const existing = browserStartPromises.get(session.id);
+  if (existing) return existing;
+  const startPromise = ensureStartedNow(session);
+  browserStartPromises.set(session.id, startPromise);
+  try {
+    return await startPromise;
+  } finally {
+    if (browserStartPromises.get(session.id) === startPromise) browserStartPromises.delete(session.id);
+  }
+}
+
+async function ensureStartedNow(session: BrowserChatSessionRecord) {
   if (session.started && session.browser) {
     if (session.browser.isUsable()) {
       appendLog(session, 'browser:reuse', '复用当前会话已有浏览器标签');
       return session.browser;
     }
     appendLog(session, 'browser:stale', '历史对话的浏览器已关闭或页面已失效，正在重新接管本会话。');
-    await session.browser.close().catch(() => undefined);
+    await session.browser.close({ keepOpen: true }).catch(() => undefined);
     session.browser = undefined;
     session.started = false;
     session.updatedAt = now();
@@ -1661,7 +1677,7 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   try {
     await browser.start();
   } catch (error) {
-    await browser.close().catch(() => undefined);
+    await browser.close({ keepOpen: true }).catch(() => undefined);
     if (session.browser === browser) {
       session.browser = undefined;
       session.started = false;
@@ -1696,6 +1712,20 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   return browser;
 }
 
+function warmBrowserChatSession(session: BrowserChatSessionRecord) {
+  if (session.status === 'closed' || (session.started && session.browser?.isUsable())) return;
+  void ensureStarted(session).catch((error) => {
+    if (session.status === 'closed' || session.busy) return;
+    session.status = 'idle';
+    session.error = undefined;
+    session.updatedAt = now();
+    appendLog(session, 'browser:warm:error', '常驻测试浏览器预热失败；发送消息时将自动重试。', {
+      details: errorLogDetails(error),
+    });
+    persistAndNotify(session.id);
+  });
+}
+
 export function createBrowserChatSession(input: {
   targetUrl?: string;
   mode?: BrowserSessionMode;
@@ -1712,6 +1742,7 @@ export function createBrowserChatSession(input: {
     id: id('chat'),
     title: input.title?.trim() || '浏览器对话操作',
     userId: normalizeUserId(input.userId) || undefined,
+    browserGroupId: '',
     targetUrl: exportableTargetUrl(input.targetUrl || ''),
     mode: 'dom',
     safetyMode: normalizeSafetyMode(input.safetyMode),
@@ -1729,15 +1760,29 @@ export function createBrowserChatSession(input: {
     networkErrors: [],
     logs: [],
   };
+  session.browserGroupId = `session:${session.id}`;
   sessions.set(session.id, session);
   persistAndNotify(session.id);
+  warmBrowserChatSession(session);
   return snapshot(session);
 }
 
 export function getBrowserChatSession(sessionId: string, userId?: string | number) {
   const session = hydrateSession(sessionId);
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
+  if (session) warmBrowserChatSession(session);
   return session ? snapshot(session) : undefined;
+}
+
+export function setBrowserChatSessionGroup(sessionId: string, groupId: string, userId?: string | number) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) return undefined;
+  const normalized = groupId.trim();
+  if (!/^[a-zA-Z0-9:_-]{1,160}$/.test(normalized)) throw new Error('Invalid browser group id');
+  session.browserGroupId = normalized;
+  session.updatedAt = now();
+  persistAndNotify(session.id);
+  return snapshot(session);
 }
 
 export function getBrowserChatSessionLogs(sessionId: string, userId?: string | number) {
@@ -1762,7 +1807,7 @@ export async function closeBrowserChatSession(sessionId: string, userId?: string
     session.activeAbortController.abort(new Error('Browser chat session closed by user.'));
   }
   cancelPendingToolConfirmation(session);
-  await session.browser?.close().catch(() => undefined);
+  await session.browser?.close({ keepOpen: true }).catch(() => undefined);
   session.browser = undefined;
   session.started = false;
   session.activeAbortController = undefined;
@@ -1850,7 +1895,7 @@ async function deleteBrowserChatSessionFromMemory(sessionId: string) {
     session.activeAbortController.abort(new Error('Browser chat session deleted by user.'));
   }
   cancelPendingToolConfirmation(session);
-  await session.browser?.close().catch(() => undefined);
+  await session.browser?.close({ keepOpen: true }).catch(() => undefined);
   session.browser = undefined;
   session.started = false;
   session.activeAbortController = undefined;
@@ -2614,11 +2659,12 @@ async function runBrowserChatMessage(
         },
         onDebug: (event) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+          const toolLifecycle = event.phase === 'ai:tool' && /(?:started|->)/i.test(event.message);
           appendLog(session, event.phase, event.message, {
             stepIndex: event.stepIndex,
             elapsedMs: elapsedFromDetails(event.details),
             details: event.details,
-            deferPersist: true,
+            deferPersist: !toolLifecycle,
           });
         },
       });
@@ -2645,7 +2691,7 @@ async function runBrowserChatMessage(
       const keepCompletedBrowser = browserChatKeepBrowserOpenAfterTurn() && Boolean(session.browser?.isUsable());
       const shouldCloseCompletedBrowser = Boolean(session.browser || session.started) && !keepCompletedBrowser;
       if (shouldCloseCompletedBrowser) {
-        await session.browser?.close().catch(() => undefined);
+        await session.browser?.close({ keepOpen: true }).catch(() => undefined);
         session.browser = undefined;
         session.started = false;
       }
@@ -2670,6 +2716,7 @@ async function runBrowserChatMessage(
         },
       ]);
       persistAndNotify(session.id);
+      void ensureConversationContextWithinThreshold(session).catch(() => undefined);
     } catch (error) {
       const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);
       const interrupted = abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId);
@@ -2677,7 +2724,7 @@ async function runBrowserChatMessage(
       const message = userFacingErrorMessage(error);
       const details = errorLogDetails(error);
       if (isDeadBrowserSessionError(error)) {
-        await session.browser?.close().catch(() => undefined);
+        await session.browser?.close({ keepOpen: true }).catch(() => undefined);
         session.browser = undefined;
         session.started = false;
       }

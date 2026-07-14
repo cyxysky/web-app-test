@@ -2,7 +2,7 @@
 
 import { animate, createScope, stagger } from 'animejs';
 import { usePathname } from 'next/navigation';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 
 const PAGE_SELECTOR = [
   '.app-shell',
@@ -70,9 +70,12 @@ function clearMotionStyles(elements: HTMLElement[]) {
 
 export function InterfaceMotion() {
   const pathname = usePathname();
+  const previousPathnameRef = useRef(pathname);
 
   useEffect(() => {
     if (typeof document === 'undefined') return undefined;
+    const isNavigation = previousPathnameRef.current !== pathname;
+    previousPathnameRef.current = pathname;
     const animated = new WeakSet<HTMLElement>();
     const scope = createScope({
       root: document.body,
@@ -111,7 +114,12 @@ export function InterfaceMotion() {
         run(matchingElements(root, LIST_SELECTOR), 'list');
       };
 
-      animateWithin(document.body);
+      // The initial DOM is server-rendered and may still contain client-component
+      // hydration boundaries when this parent effect runs. Mutating it here causes
+      // React hydration mismatches, so reserve full-page entrance motion for real
+      // client-side navigations. Newly inserted client-side nodes still animate via
+      // the observer below.
+      if (isNavigation) animateWithin(document.body);
       const pendingRoots = new Set<HTMLElement>();
       let animationFrame = 0;
       const observer = new MutationObserver((records) => {

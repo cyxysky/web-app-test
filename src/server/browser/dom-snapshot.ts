@@ -261,21 +261,6 @@ function resolveUrl(value: string, baseUrl: string) {
   }
 }
 
-function candidateScore(node: CapturedDomSnapshotNode) {
-  const role = node.role.toLowerCase();
-  let score = 0;
-  if (typeRoles.has(role) || role === 'combobox') score += 100;
-  else if (role === 'button') score += 80;
-  else if (role === 'link') score += 45;
-  else if (node.actionable) score += 55;
-  if (node.name) score += 20;
-  if (node.properties.rendered === true) score += 15;
-  if (node.properties.viewportVisible === true) score += 25;
-  if (node.properties.disabled === true) score -= 40;
-  if (node.actions.includes('type')) score += 20;
-  return score;
-}
-
 async function mapConcurrent<T, R>(items: T[], concurrency: number, mapper: (item: T) => Promise<R>) {
   const output = new Array<R>(items.length);
   let cursor = 0;
@@ -320,7 +305,7 @@ function enrichFromAx(node: CapturedDomSnapshotNode, axNode: CdpAxNode | undefin
   };
 }
 
-export async function captureDomSnapshot(page: Page, options: { axCandidateLimit?: number } = {}): Promise<CapturedDomSnapshot> {
+export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapshot> {
   const totalStartedAt = Date.now();
   const viewport = page.viewportSize() || await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }))
     .catch(() => ({ width: 0, height: 0 }));
@@ -502,6 +487,7 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
           || tag === 'INPUT'
           || tag === 'SELECT'
           || tag === 'TEXTAREA';
+        const positionedOverlay = ['absolute', 'fixed', 'sticky'].includes(styles.position);
         const delegatedPageContainer = actions.length === 1
           && actions[0] === 'click'
           && clickable.has(index)
@@ -509,6 +495,7 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
           && !nativeInteractive
           && !hasClickAttribute(attributes)
           && styles.cursor !== 'pointer'
+          && !positionedOverlay
           && bounds[2] >= viewport.width * 0.9
           && bounds[3] >= viewport.height * 0.9;
         if (delegatedPageContainer || tag === 'HTML' || tag === 'BODY') actions = [];
@@ -613,19 +600,21 @@ export async function captureDomSnapshot(page: Page, options: { axCandidateLimit
     });
 
     const enrichmentStartedAt = Date.now();
-    const candidateLimit = Math.min(500, Math.max(0, options.axCandidateLimit ?? 200));
     const candidates = deduplicated
-      .filter((node) => node.actionable && node.backendDOMNodeId)
-      .sort((left, right) => candidateScore(right) - candidateScore(left))
-      .slice(0, candidateLimit);
-    const enriched = await mapConcurrent(candidates, 8, async (node) => {
-      const result = await client.send('Accessibility.getPartialAXTree', {
-        backendNodeId: node.backendDOMNodeId,
-        fetchRelatives: false,
-      }).catch(() => undefined) as { nodes?: CdpAxNode[] } | undefined;
-      const matching = result?.nodes?.find((item) => item.backendDOMNodeId === node.backendDOMNodeId) || result?.nodes?.[0];
-      return enrichFromAx(node, matching);
+      .filter((node) => node.actionable && node.backendDOMNodeId);
+    const candidateBackendIds = new Set(candidates.map((node) => node.backendDOMNodeId));
+    const candidateFrameIds = [...new Set(candidates.map((node) => node.frameId))];
+    const axNodesByBackendId = new Map<number, CdpAxNode>();
+    await mapConcurrent(candidateFrameIds, 4, async (frameId) => {
+      const result = await client.send('Accessibility.getFullAXTree', { frameId })
+        .catch(() => undefined) as { nodes?: CdpAxNode[] } | undefined;
+      for (const axNode of result?.nodes || []) {
+        if (axNode.backendDOMNodeId && candidateBackendIds.has(axNode.backendDOMNodeId)) {
+          axNodesByBackendId.set(axNode.backendDOMNodeId, axNode);
+        }
+      }
     });
+    const enriched = candidates.map((node) => enrichFromAx(node, axNodesByBackendId.get(node.backendDOMNodeId!)));
     const enrichedByIdentity = new Map(enriched.map((node) => [node.identity, node]));
     const nodes = deduplicated.map((node) => enrichedByIdentity.get(node.identity) || node);
     const axEnrichmentMs = Date.now() - enrichmentStartedAt;

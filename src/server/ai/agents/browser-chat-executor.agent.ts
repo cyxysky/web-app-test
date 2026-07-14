@@ -325,10 +325,6 @@ function runtimeRequestConsecutiveFailureLimit(browserChatMode: boolean) {
   return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, browserChatMode ? 3 : 2, 1, 10);
 }
 
-<<<<<<< HEAD
-=======
-
->>>>>>> 918c64097b8dd8098e24dc95b34fe3a3dca52406
 function upstreamApiDisconnectReason(value?: string) {
   const text = value || '';
   const apiMatch = text.match(/Cannot connect to API:\s*([^\n]+)/i);

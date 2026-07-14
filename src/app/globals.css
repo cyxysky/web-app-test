@@ -6771,8 +6771,105 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   position: relative;
 }
 
+.browser-chat-download-button:not(:disabled),
+.browser-chat-download-button:not(:disabled):hover {
+  background: transparent;
+}
+
 .browser-chat-download-button.active {
   color: var(--accent);
+}
+
+.browser-chat-group-binding-center {
+  position: relative;
+  z-index: 2;
+}
+
+.browser-chat-group-binding-button {
+  color: var(--browser-chat-bound-group-color, var(--muted-strong));
+}
+
+.browser-chat-group-binding-button:not(:disabled),
+.browser-chat-group-binding-button:not(:disabled):hover {
+  background: transparent;
+}
+
+.browser-chat-group-binding-popover {
+  animation: browser-chat-download-popover-in 0.18s ease-out;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg);
+  color: var(--foreground);
+  margin-top: 10px;
+  max-height: min(520px, calc(100vh - 88px));
+  overflow: hidden;
+  position: absolute;
+  right: 0;
+  top: 100%;
+  transform-origin: top right;
+  width: min(var(--browser-chat-download-panel-width, 380px), calc(100vw - 48px));
+}
+
+.browser-chat-group-binding-popover header {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 12px;
+}
+
+.browser-chat-group-binding-list {
+  list-style: none;
+  margin: 0;
+  max-height: 455px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.browser-chat-group-binding-list button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: inherit;
+  cursor: pointer;
+  display: grid;
+  gap: 9px;
+  grid-template-columns: 18px minmax(0, 1fr) 18px;
+  min-height: 36px;
+  padding: 0 9px;
+  text-align: left;
+  width: 100%;
+}
+
+.browser-chat-group-binding-list button:hover,
+.browser-chat-group-binding-list button.selected {
+  background: color-mix(in srgb, var(--accent-strong) 10%, transparent);
+}
+
+.browser-chat-group-binding-list button>span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-chat-group-binding-list button>svg:last-child {
+  color: var(--accent-strong);
+}
+
+.browser-chat-group-binding-empty,
+.browser-chat-group-binding-error {
+  color: var(--muted-foreground);
+  font-size: 13px;
+  margin: 0;
+  padding: 18px 14px;
+}
+
+.browser-chat-group-binding-error {
+  color: var(--danger);
+  padding-bottom: 0;
 }
 
 .browser-chat-download-badge {
@@ -7644,6 +7741,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: block;
   min-height: 100vh;
   overflow: auto;
+  overflow-x: hidden;
   min-width: 0;
 }
 
@@ -7723,6 +7821,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-embedded-tab-strip {
   align-items: flex-end;
   background: var(--embedded-tab-strip-bg);
+  display: flex;
+  gap: 4px;
   min-width: 0;
   overflow: hidden;
   padding: 6px 12px 0;
@@ -7765,7 +7865,6 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   flex: 0 0 auto;
 }
 
-.browser-chat-embedded-tab-group-shell.empty>.browser-chat-embedded-tab-group-tag,
 .browser-chat-embedded-tab-group-shell.empty>.browser-chat-embedded-tab-stack {
   display: none;
 }
@@ -7896,11 +7995,11 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
     inset 0 1px 0 rgba(255, 255, 255, 0.42);
   color: color-mix(in srgb, var(--foreground) 54%, var(--muted));
   display: inline-flex;
-  flex: 0 0 46px;
-  gap: 0;
+  flex: 0 0 36px;
+  gap: 2px;
   height: 34px;
-  max-width: 46px;
-  min-width: 46px;
+  max-width: 36px;
+  min-width: 36px;
   overflow: hidden;
   position: relative;
   transition:
@@ -7924,7 +8023,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   color: inherit;
   cursor: pointer;
   display: inline-flex;
-  flex: 0 0 44px;
+  flex: 0 0 32px;
   font-size: 13px;
   font-weight: 500;
   gap: 1px;
@@ -7956,9 +8055,9 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: rgba(255, 255, 255, 0.68);
   border-color: rgba(92, 105, 124, 0.16);
   color: var(--accent-strong);
-  flex-basis: 92px;
-  max-width: 92px;
-  min-width: 92px;
+  flex-basis: 80px;
+  max-width: 80px;
+  min-width: 80px;
 }
 
 .browser-chat-embedded-tab-group-label:focus-visible {
@@ -7995,10 +8094,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-embedded-tab-group-tag:hover .browser-chat-embedded-tab-group-action {
-  flex-basis: 22px;
+  flex-basis: 20px;
   opacity: 0.74;
   pointer-events: auto;
-  width: 22px;
+  width: 20px;
 }
 
 .browser-chat-embedded-tab-group-action:focus-visible {
@@ -8008,6 +8107,33 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-embedded-tab-group-action svg {
   flex: 0 0 auto;
+}
+
+.browser-chat-embedded-new-group {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 28px;
+  height: 28px;
+  justify-content: center;
+  margin: 0 0 3px 2px;
+  opacity: 0.76;
+  padding: 0;
+}
+
+.browser-chat-embedded-new-group:hover {
+  background: color-mix(in srgb, var(--accent-strong) 14%, transparent);
+  color: var(--accent-strong);
+  opacity: 1;
+}
+
+.browser-chat-embedded-new-group:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: -2px;
 }
 
 .browser-chat-embedded-tab-stack {
@@ -8621,11 +8747,21 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-embedded-chat-toggle {
+  backdrop-filter: blur(14px) saturate(1.1);
+  background: color-mix(in srgb, var(--panel) 68%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 10px;
   left: 10px;
+  min-height: 32px;
   position: absolute;
   top: 16px;
-  width: 40px;
+  width: 32px;
   z-index: 8;
+}
+
+.browser-chat-embedded-chat-toggle:not(:disabled):hover {
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+  border-color: color-mix(in srgb, var(--accent-strong) 28%, var(--border));
 }
 
 .browser-chat-embedded-chat-toggle svg {
@@ -8675,7 +8811,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-pane-actions {
   align-items: center;
   display: flex;
-  gap: 8px;
+  gap: 4px;
   justify-content: flex-end;
   position: absolute;
   right: 18px;
@@ -8685,12 +8821,20 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-chat-pane.embedded-chat .browser-chat-pane-actions {
   right: 14px;
-  top: 16px;
+  top: 12px;
+}
+
+.browser-chat-pane-actions>.browser-chat-close,
+.browser-chat-pane-actions>.browser-chat-download-center>.browser-chat-download-button,
+.browser-chat-pane-actions>.browser-chat-group-binding-center>.browser-chat-group-binding-button {
+  min-width: 32px;
+  width: 32px;
 }
 
 .browser-chat-chat-pane.embedded-chat .browser-chat-message-list {
   max-width: none;
-  padding-top: 58px;
+  overflow-x: hidden;
+  padding-top: 64px;
   width: 100%;
 }
 
@@ -8756,6 +8900,32 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-close:disabled {
   cursor: not-allowed;
   opacity: 0.42;
+}
+
+.browser-chat-pane-actions>.browser-chat-close,
+.browser-chat-pane-actions>.browser-chat-download-center>.browser-chat-download-button:not(:disabled),
+.browser-chat-pane-actions>.browser-chat-group-binding-center>.browser-chat-group-binding-button:not(:disabled) {
+  backdrop-filter: blur(14px) saturate(1.1);
+  background: color-mix(in srgb, var(--panel) 68%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 10px;
+  min-height: 32px;
+  width: 32px;
+}
+
+.browser-chat-pane-actions>.browser-chat-close {
+  border-color: transparent;
+}
+
+.browser-chat-pane-actions>.browser-chat-close:not(:disabled):hover,
+.browser-chat-pane-actions>.browser-chat-download-center>.browser-chat-download-button:not(:disabled):hover,
+.browser-chat-pane-actions>.browser-chat-group-binding-center>.browser-chat-group-binding-button:not(:disabled):hover {
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+  border-color: color-mix(in srgb, var(--accent-strong) 28%, var(--border));
+}
+
+.browser-chat-pane-actions>.browser-chat-close:not(:disabled):hover {
+  border-color: transparent;
 }
 
 .browser-chat-hero {
@@ -12077,8 +12247,9 @@ body {
   color: #444748;
 }
 
-:root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button,
-
+:root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button {
+  color: #d7d9da;
+}
 
 :root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-send:disabled {
   background: #6f7173;
