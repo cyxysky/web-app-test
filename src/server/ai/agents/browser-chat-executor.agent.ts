@@ -36,7 +36,13 @@ import { browserActionRules, currentSnapshotContextLine, screenshotObservationRu
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
-import { notifyRuntimeToolTrace, runtimeToolTraceId } from './runtime-tool-trace';
+import {
+  isEffectiveToolTraceFailure,
+  isRecoveredTransientToolTrace,
+  markRuntimeToolTraceRecovered,
+  notifyRuntimeToolTrace,
+  runtimeToolTraceId,
+} from './runtime-tool-trace';
 
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type RuntimeModelMessage = ModelMessage;
@@ -47,6 +53,8 @@ type ToolTrace = {
   name: string;
   input: unknown;
   result?: BrowserActionResult;
+  recovered?: boolean;
+  transient?: boolean;
   startedAt?: number;
   completedAt?: number;
   elapsedMs?: number;
@@ -750,6 +758,8 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       input,
       reason,
       ok: trace.result?.ok,
+      recovered: trace.recovered,
+      transient: trace.transient,
       result: userFacingToolResult(trace.name, trace.result, 360),
       desktopEvidence: trace.desktopEvidence,
       contextBefore: trace.contextBefore,
@@ -840,7 +850,9 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
     const fileResult = trace.result?.ok ? formatFileArtifactResult(trace.name, trace.result.actual) : undefined;
     const status = !trace.result
       ? 'running'
-      : trace.result.ok
+      : isRecoveredTransientToolTrace(trace)
+        ? 'recovered: a fresh DOM snapshot replaced the stale UID; continue with a current UID'
+        : trace.result.ok
         ? fileResult ? `ok: ${sanitizeHistoricalToolText(fileResult, 260)}` : 'ok'
         : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
     const shots = trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
@@ -983,7 +995,10 @@ function sanitizeHistoricalToolText(value: unknown, max = 180) {
 function summarizeStepToolCallForPrompt(toolCall: StepToolCall) {
   const reason = sanitizeHistoricalToolText(toolCall.reason, 140);
   const result = sanitizeHistoricalToolText(toolCall.result, 140);
-  return `${toolCall.name}${toolCall.ok === false ? ' failed' : ''}${reason ? `: ${reason}` : result ? `: ${result}` : ''}`;
+  const status = toolCall.recovered === true && toolCall.transient === true
+    ? ' recovered'
+    : toolCall.ok === false ? ' failed' : '';
+  return `${toolCall.name}${status}${reason ? `: ${reason}` : result ? `: ${result}` : ''}`;
 }
 
 function buildCompactRunContext(steps: StepExecutionResult[], activeMemory?: RuntimeWorkingMemory) {
@@ -1212,6 +1227,8 @@ function summarizeTraceForMemory(trace: ToolTrace) {
   const displayResult = userFacingToolResult(trace.name, trace.result, trace.result?.ok ? 160 : 180);
   const result = !trace.result
     ? 'running'
+    : isRecoveredTransientToolTrace(trace)
+    ? 'recovered: fresh DOM snapshot captured; the old UID is transient and must not be reused'
     : trace.result.ok
     ? sanitizeHistoricalToolText(displayResult, 160) || 'ok'
     : `failed: ${sanitizeHistoricalToolText(displayResult || trace.result.actual, 180)}`;
@@ -1221,18 +1238,33 @@ function summarizeTraceForMemory(trace: ToolTrace) {
   ].join('；');
 }
 
+function toolTraceStatus(trace: ToolTrace) {
+  if (!trace.result) return 'started';
+  if (isRecoveredTransientToolTrace(trace)) return 'recovered';
+  return trace.result.ok ? 'ok' : 'failed';
+}
+
 function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolTrace, sourceStep?: number) {
   void sourceStep;
   const next: RuntimeWorkingMemory = { ...memory };
   const displayResult = userFacingToolResult(trace.name, trace.result, 400);
-  const resultText = sanitizeHistoricalToolText(displayResult || '', 400);
+  const recoveredTransient = isRecoveredTransientToolTrace(trace);
+  const resultText = recoveredTransient
+    ? '旧 UID 已失效，已自动刷新当前 DOM 快照；下一步应从新快照选择当前 UID。'
+    : sanitizeHistoricalToolText(displayResult || '', 400);
   next.lastAction = summarizeTraceForMemory(trace);
-  next.lastResult = concise(displayResult || trace.result?.actual || '工具调用已开始，正在等待页面反馈。', 240);
+  next.lastResult = recoveredTransient
+    ? resultText
+    : concise(displayResult || trace.result?.actual || '工具调用已开始，正在等待页面反馈。', 240);
   if (resultText) {
     next.pageUnderstanding = resultText;
     next.currentState = concise(`${trace.name}: ${resultText}`, 260);
   }
-  if (trace.result && !trace.result.ok) next.blockers = Array.from(new Set([...next.blockers, concise(trace.result.actual, 220)])).slice(-8);
+  if (recoveredTransient) {
+    next.blockers = next.blockers.filter((blocker) => !staleUidActionError(blocker));
+  } else if (isEffectiveToolTraceFailure(trace)) {
+    next.blockers = Array.from(new Set([...next.blockers, concise(trace.result?.actual || '', 220)])).slice(-8);
+  }
   if (trace.name === 'mouse' && trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input) && (trace.input as Record<string, unknown>).action === 'scroll') {
     next.phase = '正在查看滚动区域或长页面内容';
     next.scrollSummary = concise([next.scrollSummary, resultText || trace.result?.actual].filter(Boolean).join('；'), 600);
@@ -1655,6 +1687,7 @@ function makeBrowserTools(
       return action();
     };
     const traceVisualContext = referenceOptions?.visualContext;
+    const traceIndex = traces.length;
     return executeTracedBrowserAction({
       session,
       traces,
@@ -1671,6 +1704,7 @@ function makeBrowserTools(
       onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
       action: actionWithConfirmation,
     }).then(async (result) => {
+      const actionTrace = traces[traceIndex];
       let staleUidSnapshotRecovered = false;
       let staleUidSnapshot: { actionable: string; generationId: string } | undefined;
       if (browserActionExecuted && !result.ok && staleUidActionError(result.actual) && referenceOptions?.takeSnapshot) {
@@ -1690,6 +1724,13 @@ function makeBrowserTools(
             autoSnapshot: generationId ? { generationId, refreshed: true } : result.autoSnapshot,
             observationViews: session.currentSnapshotObservationViews() || refreshedSnapshot.observationViews,
           };
+          if (actionTrace) {
+            markRuntimeToolTraceRecovered(actionTrace);
+            actionTrace.result = result;
+            actionTrace.completedAt = Date.now();
+            actionTrace.elapsedMs = actionTrace.startedAt ? actionTrace.completedAt - actionTrace.startedAt : undefined;
+            await notifyRuntimeToolTrace(onToolTrace, actionTrace);
+          }
           await referenceOptions.onDebug?.({
             phase: 'browser:stale-uid-recovery',
             stepIndex: referenceOptions.stepIndex,
@@ -2423,7 +2464,7 @@ function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''):
 function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal = ''): RuntimeDecision {
   const executed = traces.filter((trace) => trace.name && trace.result);
   const last = executed.at(-1);
-  const failed = executed.find((trace) => trace.result && !trace.result.ok);
+  const failed = executed.find(isEffectiveToolTraceFailure);
   const names = executed.map((trace) => summarizeTraceForMemory(trace)).join('; ');
   const note = extractProgressNote(text);
   const assistantInfo = extractAssistantStepInfoFromToolInputs(executed, goal);
@@ -2462,7 +2503,9 @@ function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal =
     action: note || readableActionFromTrace(last) || toolReason || `AI executed browser-chat action: ${names || last?.name || 'browser action'}`,
     expected: 'This browser-chat action should move the conversation forward; the next turn will decide whether to continue or answer.',
     actual: last
-      ? userFacingToolResult(last.name, last.result, 500) || 'Tool call finished; waiting for the next browser-chat turn.'
+      ? isRecoveredTransientToolTrace(last)
+        ? 'The stale UID was transient. A fresh DOM snapshot is available for the next action.'
+        : userFacingToolResult(last.name, last.result, 500) || 'Tool call finished; waiting for the next browser-chat turn.'
       : text || 'Browser chat returned no browser tool result.',
     status: failed ? 'failed' : 'passed',
     done: false,
@@ -3082,7 +3125,7 @@ async function executeRuntimeStep(input: {
           workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
           await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
           ensureActive();
-          await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
+          await onDebug?.({ phase: 'ai:tool', stepIndex, message: `${trace.name} -> ${toolTraceStatus(trace)}`, details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
         },
         onSelectReferenceScreenshots: async (selection) => { ensureActive(); await applySelectedReferenceScreenshots(selection); },
         observeCurrentScreenshot,
@@ -3124,7 +3167,7 @@ async function executeRuntimeStep(input: {
       await onDebug?.({
         phase: 'ai:tool',
         stepIndex,
-        message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'),
+        message: `${trace.name} -> ${toolTraceStatus(trace)}`,
         details: { trace, visualContext: visualContext.snapshot(), workingMemory },
       });
     }, {

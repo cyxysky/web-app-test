@@ -61,13 +61,15 @@ function distinctText(items: unknown[], max: number) {
 function compactTool(tool: NonNullable<StepExecutionResult['tools']>[number], stepAction: string) {
   const reason = compactText(tool.reason, 180);
   const semanticInput = semanticToolInput(tool.input);
+  const recoveredTransient = tool.recovered === true && tool.transient === true;
   return {
     name: tool.name,
     intent: reason && !normalizedText(stepAction).includes(normalizedText(reason)) ? reason : undefined,
     input: semanticInput && Object.keys(semanticInput as Record<string, unknown>).length
       ? safeJson(semanticInput, 420)
       : undefined,
-    failed: tool.ok === false || undefined,
+    recovered: recoveredTransient || undefined,
+    failed: (tool.ok === false && !recoveredTransient) || undefined,
   };
 }
 

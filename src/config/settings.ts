@@ -149,6 +149,8 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'BROWSER_VIEWPORT_HEIGHT', label: '视口高度', description: '固定模式下的浏览器视口高度；留空则自动跟随窗口。', tab: 'browser', defaultValue: '', control: 'number' },
   { key: 'BROWSER_SLOW_MO_MS', label: '浏览器动作延迟', description: 'Playwright 每个动作的慢速延迟，单位毫秒。', tab: 'browser', defaultValue: '250', control: 'number' },
   { key: 'BROWSER_ACTION_SETTLE_MS', label: '动作后等待', description: '每次动作后额外等待页面稳定的时间。', tab: 'browser', defaultValue: '0', control: 'number' },
+  { key: 'BROWSER_NAVIGATION_DOM_QUIET_MS', label: '导航后 DOM 静默窗口', description: '导航提交后 DOM 连续保持不变达到该时长即生成语义快照，单位毫秒；0 表示关闭。', tab: 'browser', defaultValue: '250', control: 'number' },
+  { key: 'BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS', label: '导航后 DOM 稳定上限', description: '等待导航后 DOM 稳定的最长时间，达到上限后继续生成当前快照，单位毫秒；0 表示关闭。', tab: 'browser', defaultValue: '1000', control: 'number' },
   { key: 'BROWSER_POPUP_WAIT_MS', label: '弹窗等待时间', description: '点击后等待新标签页或弹窗出现的时间。', tab: 'browser', defaultValue: '600', control: 'number' },
   { key: 'BROWSER_IGNORE_HTTPS_ERRORS', label: '忽略 HTTPS 错误', description: '测试环境证书异常时允许继续打开页面。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'BROWSER_HTTP_REQUEST_HISTORY_LIMIT', label: 'HTTP 请求历史上限', description: '每个标签页保留多少条 HTTP 请求记录，供 AI 诊断接口和资源加载问题。', tab: 'browser', defaultValue: '400', control: 'number' },

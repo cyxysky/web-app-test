@@ -666,7 +666,12 @@ function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: St
   return details;
 }
 
+function isRecoveredTransientTool(tool: BrowserChatToolCall | undefined) {
+  return tool?.recovered === true && tool.transient === true;
+}
+
 function toolStatusLabel(tool: BrowserChatToolCall) {
+  if (isRecoveredTransientTool(tool)) return '已恢复';
   if (tool.ok === true) return '完成';
   if (tool.ok === false) return '失败';
   return '运行中';
@@ -1516,7 +1521,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
         const meta = compactText(browserChatToolMeta(tool.name, tool.input), 56);
         const status = toolStatusLabel(tool);
         const displayText = `${label}${meta ? `: ${meta}` : ''}`;
-        const stateClass = tool.ok === false ? ' is-failed' : tool.ok === undefined ? ' is-running' : '';
+        const stateClass = tool.ok === false && !isRecoveredTransientTool(tool) ? ' is-failed' : tool.ok === undefined ? ' is-running' : '';
         const pendingConfirmation = pendingConfirmationForTool({
           pending: pendingToolConfirmation,
           stepIndex: step.index,
@@ -1623,7 +1628,9 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
               const label = browserChatToolLabel(tool.name, (value) => value);
               const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
               const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
-              const stateClass = toolDetail?.tool.ok === false ? ' is-failed' : toolDetail?.tool.ok === undefined ? ' is-running' : '';
+              const stateClass = toolDetail?.tool.ok === false && !isRecoveredTransientTool(toolDetail.tool)
+                ? ' is-failed'
+                : toolDetail?.tool.ok === undefined ? ' is-running' : '';
               const pendingConfirmation = pendingConfirmationForTool({
                 pending: pendingToolConfirmation,
                 stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
@@ -1807,7 +1814,9 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const aiCycleToolDetails = useMemo(() => buildAiCycleToolDetailMap(aiOutputCycles, steps), [aiOutputCycles, steps]);
   const seenTexts = new Set<string>();
   const toolCount = steps.reduce((count, step) => count + (step.tools || []).length, 0);
-  const failedToolCount = steps.reduce((count, step) => count + (step.tools || []).filter((tool) => tool.ok === false).length, 0);
+  const failedToolCount = steps.reduce((count, step) => count + (step.tools || []).filter((tool) => (
+    tool.ok === false && !isRecoveredTransientTool(tool)
+  )).length, 0);
   const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
   const timelineSteps = steps.filter((step) => (step.tools || []).length || (running && step.status === 'running'));
   const hasPendingConfirmation = Boolean(pendingToolConfirmation);

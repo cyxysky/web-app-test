@@ -17,6 +17,7 @@ export type BrowserChatToolDialogDetail = {
 };
 
 function toolStatusLabel(tool: BrowserChatToolCall) {
+  if (tool.recovered === true && tool.transient === true) return '已恢复';
   if (tool.ok === true) return '完成';
   if (tool.ok === false) return '失败';
   return '运行中';

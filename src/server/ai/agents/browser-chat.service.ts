@@ -1929,6 +1929,16 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
   return { deleted, requested: uniqueIds.length };
 }
 
+type BrowserChatStepToolCall = NonNullable<StepExecutionResult['tools']>[number];
+
+function isRecoveredTransientStepTool(tool: BrowserChatStepToolCall | undefined) {
+  return tool?.recovered === true && tool.transient === true;
+}
+
+function firstPersistentStepTool(step: StepExecutionResult) {
+  return step.tools?.find((tool) => !isRecoveredTransientStepTool(tool));
+}
+
 export function exportBrowserChatMessageToTestCase(sessionId: string, messageId: string) {
   const session = hydrateSession(sessionId);
   if (!session) throw new Error('Browser chat session not found');
@@ -1944,7 +1954,8 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
   if (!selectedSteps.length) throw new Error('No executed browser steps found for this message');
   const targetUrl = exportedTargetUrl(session, selectedSteps);
 
-  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).map((tool, toolIndex) => ({
+  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).flatMap((tool, toolIndex) => (
+    isRecoveredTransientStepTool(tool) ? [] : [{
     index: 0,
     name: tool.name,
     input: exportedRecordedToolInput(tool.name, tool.input, targetUrl),
@@ -1953,7 +1964,7 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
     sourceStepAction: step.action,
     sourceStepExpected: step.expected,
     sourceToolIndex: toolIndex + 1,
-  }))).map((flow, index) => ({ ...flow, index: index + 1 }));
+  }]))).map((flow, index) => ({ ...flow, index: index + 1 }));
 
   const titleSeed = previousUser?.content || message.content || '浏览器对话导出用例';
   const content: TestCaseContent = {
@@ -1971,7 +1982,7 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
     preconditions: ['已根据浏览器对话完成过一次执行，导出时同步创建一条已完成运行记录。'],
     testData: {},
     steps: selectedSteps.map((step, index) => {
-      const firstTool = step.tools?.[0];
+      const firstTool = firstPersistentStepTool(step);
       return {
         index: index + 1,
         operation: testOperationFromToolName(firstTool?.name),
@@ -2036,7 +2047,8 @@ export function exportBrowserChatMessagesToTestCase(sessionId: string, messageId
     index: index + 1,
   }));
   const targetUrl = exportedTargetUrl(session, selectedSteps);
-  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).map((tool, toolIndex) => ({
+  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).flatMap((tool, toolIndex) => (
+    isRecoveredTransientStepTool(tool) ? [] : [{
     index: 0,
     name: tool.name,
     input: exportedRecordedToolInput(tool.name, tool.input, targetUrl),
@@ -2045,7 +2057,7 @@ export function exportBrowserChatMessagesToTestCase(sessionId: string, messageId
     sourceStepAction: step.action,
     sourceStepExpected: step.expected,
     sourceToolIndex: toolIndex + 1,
-  }))).map((flow, index) => ({ ...flow, index: index + 1 }));
+  }]))).map((flow, index) => ({ ...flow, index: index + 1 }));
 
   const turnDescriptions = selectedMessages.map(({ message, index }, turnIndex) => {
     const previousUser = [...session.messages.slice(0, index)].reverse().find((item) => item.role === 'user');
@@ -2079,7 +2091,7 @@ export function exportBrowserChatMessagesToTestCase(sessionId: string, messageId
     preconditions: ['已根据所选浏览器对话轮次完成过执行，导出时同步创建一条已完成运行记录。'],
     testData: {},
     steps: selectedSteps.map((step, index) => {
-      const firstTool = step.tools?.[0];
+      const firstTool = firstPersistentStepTool(step);
       return {
         index: index + 1,
         operation: testOperationFromToolName(firstTool?.name),
@@ -2171,7 +2183,7 @@ export async function generateBrowserChatMessagesSkill(sessionId: string, messag
     preconditions: ['已在浏览器对话中完成过相关操作，Skill 只保留可复用的操作经验。'],
     testData: {},
     steps: selectedSteps.map((step, index) => {
-      const firstTool = step.tools?.[0];
+      const firstTool = firstPersistentStepTool(step);
       return {
         index: index + 1,
         operation: testOperationFromToolName(firstTool?.name),
@@ -2369,6 +2381,9 @@ function warnPersistFailure(error: unknown) {
 
 function runningAssistantActivity(step: StepExecutionResult, timestamp: string) {
   const latestTool = step.tools?.at(-1);
+  if (latestTool && isRecoveredTransientStepTool(latestTool)) {
+    return { phase: 'tool:recovered', label: `工具目标已刷新：${latestTool.name}`, updatedAt: timestamp };
+  }
   if (step.status === 'failed' && latestTool?.ok !== false) {
     return { phase: 'ai:runtime:recoverable-error', label: 'AI 请求异常，已保留现场', updatedAt: timestamp };
   }

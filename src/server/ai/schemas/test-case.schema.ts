@@ -257,6 +257,8 @@ export type StepToolCall = {
   input?: unknown;
   reason?: string;
   ok?: boolean;
+  recovered?: boolean;
+  transient?: boolean;
   result?: string;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;

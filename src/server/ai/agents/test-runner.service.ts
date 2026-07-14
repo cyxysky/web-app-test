@@ -282,10 +282,13 @@ async function analyzeRunOutcome(run: TestRunRecord) {
 
   const failedSteps = steps.filter((step) => step.status === 'failed' || step.status === 'blocked');
   const noChangeFailed = failedSteps.filter((step) => !pageChanges.find((change) => change.stepIndex === step.index)?.changed);
-  const toolFailures = steps.flatMap((step) => (step.tools || []).filter((tool) => tool.ok === false).map((tool) => ({ step, tool })));
+  const toolFailures = steps.flatMap((step) => (step.tools || []).filter((tool) => (
+    tool.ok === false && !(tool.recovered === true && tool.transient === true)
+  )).map((tool) => ({ step, tool })));
   const repeatedTools = new Map<string, number>();
   for (const step of steps) {
     for (const toolCall of step.tools || []) {
+      if (toolCall.recovered === true && toolCall.transient === true) continue;
       const key = `${toolCall.name}:${JSON.stringify(toolCall.input || {})}`;
       repeatedTools.set(key, (repeatedTools.get(key) || 0) + 1);
     }

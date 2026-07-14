@@ -679,15 +679,21 @@ function toolOkFromDraft(status: ToolDraftStatus) {
   return undefined;
 }
 
-function toolStatusLabel(ok?: boolean) {
-  if (ok === true) return '成功';
-  if (ok === false) return '失败';
+function isRecoveredTransientToolCall(tool: StepToolCallItem) {
+  return tool.recovered === true && tool.transient === true;
+}
+
+function toolStatusLabel(tool: StepToolCallItem) {
+  if (isRecoveredTransientToolCall(tool)) return '已恢复';
+  if (tool.ok === true) return '成功';
+  if (tool.ok === false) return '失败';
   return '执行中';
 }
 
-function toolStatusClass(ok?: boolean) {
-  if (ok === false) return 'tool-status failed';
-  if (ok === undefined) return 'tool-status pending';
+function toolStatusClass(tool: StepToolCallItem) {
+  if (isRecoveredTransientToolCall(tool)) return 'tool-status';
+  if (tool.ok === false) return 'tool-status failed';
+  if (tool.ok === undefined) return 'tool-status pending';
   return 'tool-status';
 }
 
@@ -710,13 +716,14 @@ function compactText(value?: string, max = 120) {
 function stepToolBadges(step: StepExecutionResult) {
   const badges: Array<{ name: string; count: number; ok?: boolean }> = [];
   for (const tool of step.tools || []) {
+    const effectiveOk = isRecoveredTransientToolCall(tool) ? true : tool.ok;
     const current = badges.find((badge) => badge.name === tool.name);
     if (current) {
       current.count += 1;
-      if (tool.ok === false) current.ok = false;
-      else if (current.ok !== false && tool.ok === undefined) current.ok = undefined;
+      if (effectiveOk === false) current.ok = false;
+      else if (current.ok !== false && effectiveOk === undefined) current.ok = undefined;
     } else {
-      badges.push({ name: tool.name, count: 1, ok: tool.ok });
+      badges.push({ name: tool.name, count: 1, ok: effectiveOk });
     }
   }
   return badges;
@@ -892,7 +899,7 @@ function ToolCallCard({
           <span className="tool-call-title">
             <strong title={tool.name}>{toolDisplayName(tool.name, t)}</strong>
           </span>
-          <span className={toolStatusClass(tool.ok)}>{t(toolStatusLabel(tool.ok))}</span>
+          <span className={toolStatusClass(tool)}>{t(toolStatusLabel(tool))}</span>
           <ChevronRight className="tool-call-chevron" size={16} />
         </span>
         {preview ? <span className="tool-call-preview">{preview}</span> : null}

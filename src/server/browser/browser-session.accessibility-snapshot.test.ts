@@ -215,6 +215,107 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.match(replacedTarget.actual, /DOM node no longer exists in the refreshed snapshot/);
 });
 
+test('open waits for a bounded DOM quiet window before capturing the navigation snapshot', async (context) => {
+  const previousQuietMs = process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
+  const previousTimeoutMs = process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
+  process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = '120';
+  process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = '800';
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'navigation-dom-stability-test' });
+  context.after(async () => {
+    if (previousQuietMs === undefined) delete process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
+    else process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = previousQuietMs;
+    if (previousTimeoutMs === undefined) delete process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
+    else process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = previousTimeoutMs;
+    await session.close();
+  });
+  await session.start();
+  const html = `<!doctype html><html><body>
+    <main id="app"><button type="button">Initial action</button></main>
+    <script>
+      const replaceAction = (label, finalAction) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        if (finalAction) button.addEventListener('click', () => document.body.dataset.finalClicked = 'true');
+        document.getElementById('app').replaceChildren(button);
+      };
+      setTimeout(() => replaceAction('Intermediate action', false), 40);
+      setTimeout(() => replaceAction('Final action', true), 180);
+    </script>
+  </body></html>`;
+
+  const opened = await session.open(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+
+  assert.equal(opened.ok, true, opened.actual);
+  assert.match(opened.actual, /Navigation DOM stabilized for 120ms/);
+  const actionable = session.currentSnapshotObservationViews()?.actionable || '';
+  assert.match(actionable, /button\s+"Final action"/);
+  assert.doesNotMatch(actionable, /Initial action|Intermediate action/);
+  const finalUid = actionable.match(/^\s*uid=(\S+)\s+button\s+"Final action"/m)?.[1];
+  assert.ok(finalUid, actionable);
+  const clicked = await session.mouse({ action: 'click', uid: finalUid });
+  assert.equal(clicked.ok, true, clicked.actual);
+  const page = Reflect.get(session, 'activePage') as Page;
+  assert.equal(await page.locator('body').getAttribute('data-final-clicked'), 'true');
+
+  await page.reload({ waitUntil: 'commit' });
+  const sameUrlNavigation = await session.wait(0);
+  assert.match(sameUrlNavigation.actual, /Navigation DOM stabilized for 120ms/, 'same-URL navigations must also use the DOM quiet window');
+  assert.match(session.currentSnapshotObservationViews()?.actionable || '', /button\s+"Final action"/);
+});
+
+test('open continues when continuous DOM mutations reach the navigation stability cap', async (context) => {
+  const previousQuietMs = process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
+  const previousTimeoutMs = process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
+  process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = '120';
+  process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = '250';
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'navigation-dom-stability-cap-test' });
+  context.after(async () => {
+    if (previousQuietMs === undefined) delete process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
+    else process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = previousQuietMs;
+    if (previousTimeoutMs === undefined) delete process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
+    else process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = previousTimeoutMs;
+    await session.close();
+  });
+  await session.start();
+  const html = `<!doctype html><html><body><button type="button">Live action</button><script>
+    let tick = 0;
+    setInterval(() => document.body.dataset.tick = String(++tick), 10);
+  </script></body></html>`;
+
+  const startedAt = Date.now();
+  const opened = await session.open(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+
+  assert.equal(opened.ok, true, opened.actual);
+  assert.match(opened.actual, /Navigation DOM stability wait reached the 250ms cap/);
+  assert.ok(Date.now() - startedAt < 5000, 'the bounded stability wait must not block indefinitely');
+  assert.match(session.currentSnapshotObservationViews()?.actionable || '', /Live action/);
+});
+
+test('navigation stability cap also bounds a stalled DOM sample', async (context) => {
+  const previousQuietMs = process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
+  const previousTimeoutMs = process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
+  process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = '120';
+  process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = '150';
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'navigation-dom-sample-cap-test' });
+  context.after(async () => {
+    if (previousQuietMs === undefined) delete process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
+    else process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = previousQuietMs;
+    if (previousTimeoutMs === undefined) delete process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
+    else process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = previousTimeoutMs;
+    await session.close();
+  });
+  await session.start();
+  Reflect.set(session, 'readNavigationDomStabilitySample', () => new Promise<never>(() => undefined));
+
+  const startedAt = Date.now();
+  const opened = await session.open('data:text/html;charset=utf-8,<button>Bounded action</button>');
+
+  assert.equal(opened.ok, true, opened.actual);
+  assert.match(opened.actual, /Navigation DOM stability wait reached the 150ms cap/);
+  assert.ok(Date.now() - startedAt < 3000, 'a stalled DOM sample must remain bounded by the navigation deadline');
+});
+
 test('unified mouse and keyboard actions emit real browser events', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'input-events-test' });
   context.after(async () => session.close());

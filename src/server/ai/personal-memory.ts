@@ -487,6 +487,8 @@ function summarizeStep(step: StepExecutionResult) {
       reason: compactText(tool.reason, 160),
       result: compactText(tool.result, 180),
       ok: tool.ok,
+      recovered: tool.recovered,
+      transient: tool.transient,
     })),
   };
 }

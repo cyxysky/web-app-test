@@ -63,6 +63,9 @@ const DEFAULT_BROWSER_ACTION_LOAD_STATE_TIMEOUT_MS = 3000;
 const DEFAULT_BROWSER_POPUP_WAIT_MS = 0;
 const DEFAULT_BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS = 1500;
 const DEFAULT_BROWSER_WAIT_FOR_PAGE_STABLE_MS = 250;
+const DEFAULT_BROWSER_NAVIGATION_DOM_QUIET_MS = 250;
+const DEFAULT_BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = 1000;
+const BROWSER_NAVIGATION_DOM_STABILITY_POLL_MS = 50;
 
 
 
@@ -462,6 +465,18 @@ type AiDomMutationStateSnapshot = {
   lastMutationAt: number;
 };
 
+type NavigationDomStabilitySample = {
+  ready: boolean;
+  signature: string;
+};
+
+type NavigationDomStabilityResult = {
+  stable: boolean;
+  waitedMs: number;
+  quietMs: number;
+  timeoutMs: number;
+};
+
 type BrowserInteractionCounts = Record<string, number>;
 
 type BrowserScrollPosition = {
@@ -546,6 +561,7 @@ type SnapshotGeneration = {
   createdAt: string;
   page: Page;
   url: string;
+  navigationSequence: number;
   frames: CapturedSnapshotFrame[];
   references: Map<string, SnapshotReference>;
   views: Record<SnapshotView, SnapshotRecord[]>;
@@ -2988,6 +3004,7 @@ export class BrowserSession {
   private releaseSharedBrowser?: () => Promise<void>;
   private pageDiscoveryListener?: (page: Page) => void;
   private pageGroupInitScriptPages = new WeakSet<Page>();
+  private navigationSequenceByPage = new WeakMap<Page, number>();
   private snapshotGeneration?: SnapshotGeneration;
   private snapshotGenerationPromise?: Promise<SnapshotGeneration>;
   private snapshotGenerationSequence = 0;
@@ -3740,7 +3757,12 @@ export class BrowserSession {
   private attachPageListeners(page: Page) {
     if (this.attachedPages.has(page)) return;
     this.attachedPages.add(page);
+    this.navigationSequenceByPage.set(page, this.navigationSequenceByPage.get(page) || 0);
     page.setDefaultTimeout(8000);
+    page.on('framenavigated', (frame) => {
+      if (frame !== page.mainFrame()) return;
+      this.navigationSequenceByPage.set(page, (this.navigationSequenceByPage.get(page) || 0) + 1);
+    });
     page.on('console', (message) => {
       const text = message.text();
       if (message.type() === 'error' && !shouldIgnoreConsoleError(text)) this.consoleErrors.push(text);
@@ -3797,7 +3819,7 @@ export class BrowserSession {
     return this.page;
   }
 
-  // 打开目标页面，只等待导航提交；页面稳定与新快照由模型显式触发。
+  // 打开目标页面先等待导航提交，再在有限的 DOM 静默窗口后生成新快照。
   async open(url: string): Promise<BrowserActionResult> {
     const previousGeneration = this.snapshotGeneration;
     const beforeUrl = this.activePage.url();
@@ -3815,8 +3837,12 @@ export class BrowserSession {
       }
       navigationNote = ` Navigation reported an error before commit; continuing from current URL: ${currentUrl}.`;
     }
-    void this.markPageGroup(this.activePage);
-    return this.completeActionWithSnapshot(`Opened page: ${url}${navigationNote}`, previousGeneration);
+    await this.markPageGroup(this.activePage);
+    return this.completeActionWithSnapshot(
+      `Opened page: ${url}${navigationNote}`,
+      previousGeneration,
+      { postNavigation: true },
+    );
   }
 
   async readStructuredPageText() {
@@ -5681,6 +5707,7 @@ export class BrowserSession {
   private async buildSnapshotGeneration(retryAfterMutation = false): Promise<SnapshotGeneration> {
     const startedAt = Date.now();
     const page = this.activePage;
+    const navigationSequenceBefore = this.navigationSequenceByPage.get(page) || 0;
     const id = `snapshot-${++this.snapshotGenerationSequence}`;
     const visibleFrameTargets = await this.snapshotFrameTargets();
     const mutationEpochsBefore = await this.readSnapshotMutationEpochs(visibleFrameTargets);
@@ -5757,9 +5784,10 @@ export class BrowserSession {
       });
     }
     const mutationEpochs = await this.readSnapshotMutationEpochs(visibleFrameTargets);
+    const navigationSequence = this.navigationSequenceByPage.get(page) || 0;
     const mutationChangedDuringCapture = Object.keys(mutationEpochsBefore).length !== Object.keys(mutationEpochs).length
       || Object.keys(mutationEpochs).some((key) => mutationEpochs[key] !== mutationEpochsBefore[key]);
-    if (mutationChangedDuringCapture && !retryAfterMutation) {
+    if ((mutationChangedDuringCapture || navigationSequence !== navigationSequenceBefore) && !retryAfterMutation) {
       return this.buildSnapshotGeneration(true);
     }
     this.pruneSnapshotUidMappings();
@@ -5768,6 +5796,7 @@ export class BrowserSession {
       createdAt: new Date().toISOString(),
       page,
       url: page.url(),
+      navigationSequence,
       frames,
       references,
       views,
@@ -5832,11 +5861,88 @@ export class BrowserSession {
 
   private async snapshotMutationChanged(generation: SnapshotGeneration) {
     if (generation.page !== this.activePage || generation.url !== this.activePage.url()) return true;
+    if (generation.navigationSequence !== (this.navigationSequenceByPage.get(this.activePage) || 0)) return true;
     const current = await this.readSnapshotMutationEpochs();
     const previousKeys = Object.keys(generation.mutationEpochs);
     const currentKeys = Object.keys(current);
     if (previousKeys.length !== currentKeys.length) return true;
     return currentKeys.some((key) => current[key] !== generation.mutationEpochs[key]);
+  }
+
+  private async readNavigationDomStabilitySample(): Promise<NavigationDomStabilitySample> {
+    const frameTargets = await this.snapshotFrameTargets();
+    const entries = await Promise.all(frameTargets.map(async (target) => {
+      await this.ensureBrowserPageRuntime(target.frame);
+      const state = await target.frame.evaluate(() => {
+        const mutation = (window as WindowWithAiDomRuntime).__aiDomMutationState;
+        return {
+          url: window.location.href,
+          readyState: document.readyState,
+          epoch: Number(mutation?.epoch || 0),
+          lastMutationAt: Number(mutation?.lastMutationAt || 0),
+        };
+      }).catch(() => undefined);
+      if (!state) return undefined;
+      return {
+        key: this.snapshotMutationKey(target),
+        url: snapshotFrameUrl(state.url),
+        readyState: state.readyState,
+        epoch: state.epoch,
+        lastMutationAt: state.lastMutationAt,
+      };
+    }));
+    if (entries.some((entry) => !entry)) return { ready: false, signature: '' };
+    const resolved = entries.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+    return {
+      ready: resolved.length > 0 && resolved.every((entry) => entry.readyState !== 'loading'),
+      signature: JSON.stringify(resolved),
+    };
+  }
+
+  private async waitForNavigationDomStability(): Promise<NavigationDomStabilityResult | undefined> {
+    const quietMs = boundedNonNegativeIntegerEnv(
+      'BROWSER_NAVIGATION_DOM_QUIET_MS',
+      DEFAULT_BROWSER_NAVIGATION_DOM_QUIET_MS,
+      2000,
+    );
+    const timeoutMs = boundedNonNegativeIntegerEnv(
+      'BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS',
+      DEFAULT_BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS,
+      5000,
+    );
+    if (quietMs === 0 || timeoutMs === 0) return undefined;
+
+    const startedAt = Date.now();
+    let stableSince: number | undefined;
+    let previousSignature: string | undefined;
+    while (Date.now() - startedAt < timeoutMs) {
+      const remainingBeforeSampleMs = timeoutMs - (Date.now() - startedAt);
+      if (remainingBeforeSampleMs <= 0) break;
+      let sampleDeadline: ReturnType<typeof setTimeout> | undefined;
+      const sample = await Promise.race([
+        this.readNavigationDomStabilitySample().catch(() => ({ ready: false, signature: '' })),
+        new Promise<undefined>((resolve) => {
+          sampleDeadline = setTimeout(() => resolve(undefined), remainingBeforeSampleMs);
+        }),
+      ]);
+      if (sampleDeadline) clearTimeout(sampleDeadline);
+      if (!sample) break;
+      const sampledAt = Date.now();
+      if (!sample.ready) {
+        previousSignature = undefined;
+        stableSince = undefined;
+      } else if (sample.signature !== previousSignature) {
+        previousSignature = sample.signature;
+        stableSince = sampledAt;
+      } else if (stableSince !== undefined && sampledAt - stableSince >= quietMs) {
+        return { stable: true, waitedMs: sampledAt - startedAt, quietMs, timeoutMs };
+      }
+
+      const remainingMs = timeoutMs - (Date.now() - startedAt);
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(BROWSER_NAVIGATION_DOM_STABILITY_POLL_MS, remainingMs));
+    }
+    return { stable: false, waitedMs: Date.now() - startedAt, quietMs, timeoutMs };
   }
 
   private snapshotViewText(generation: SnapshotGeneration, mode: SnapshotView) {
@@ -5989,10 +6095,23 @@ export class BrowserSession {
   private async completeActionWithSnapshot(
     actual: string,
     previousGeneration: SnapshotGeneration | undefined,
+    options: { postNavigation?: boolean } = {},
   ): Promise<BrowserActionResult> {
     this.lastScreenshotMetrics = undefined;
     await this.activePage.waitForTimeout(60).catch(() => undefined);
     try {
+      const currentPage = this.activePage;
+      const postNavigation = options.postNavigation === true || Boolean(previousGeneration && (
+        previousGeneration.page !== currentPage
+        || snapshotFrameUrl(previousGeneration.url) !== snapshotFrameUrl(currentPage.url())
+        || previousGeneration.navigationSequence !== (this.navigationSequenceByPage.get(currentPage) || 0)
+      ));
+      const stability = postNavigation ? await this.waitForNavigationDomStability() : undefined;
+      const stabilityNote = !stability
+        ? ''
+        : stability.stable
+          ? ` Navigation DOM stabilized for ${stability.quietMs}ms after ${stability.waitedMs}ms.`
+          : ` Navigation DOM stability wait reached the ${stability.timeoutMs}ms cap; continuing with the current DOM.`;
       const baselineGeneration = this.snapshotGeneration || previousGeneration;
       const changed = baselineGeneration
         ? await this.snapshotMutationChanged(baselineGeneration).catch(() => true)
@@ -6004,7 +6123,7 @@ export class BrowserSession {
       if (!shouldRefresh) this.snapshotGeneration = baselineGeneration;
       return {
         ok: true,
-        actual: `${actual} Semantic DOM snapshot ${generation.id} is current (${shouldRefresh ? 'refreshed' : 'reused; no page-state change detected'}).`,
+        actual: `${actual}${stabilityNote} Semantic DOM snapshot ${generation.id} is current (${shouldRefresh ? 'refreshed' : 'reused; no page-state change detected'}).`,
         autoSnapshot: { generationId: generation.id, refreshed: shouldRefresh },
       };
     } catch (error) {
