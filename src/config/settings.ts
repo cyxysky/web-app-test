@@ -28,7 +28,6 @@ export type RuntimeEnvDefinition = {
   control: 'boolean' | 'number' | 'select' | 'text' | 'secret' | 'textarea';
   options?: Array<{ label: string; value: string }>;
   picker?: 'directory';
-  variables?: Array<{ label: string; value: string; description?: string }>;
   secret?: boolean;
 };
 
@@ -119,23 +118,6 @@ const boolOptions = [
   { label: '关闭', value: 'false' },
 ];
 
-export const promptVariableOptions = [
-  { label: '用户需求', value: '{{requirement}}', description: '当前对话或测试目标的完整需求文本' },
-  { label: '目标地址', value: '{{targetUrl}}', description: '测试用例或对话默认目标 URL' },
-  { label: '当前地址', value: '{{currentUrl}}', description: '浏览器当前页面 URL' },
-  { label: '当前标题', value: '{{currentTitle}}', description: '浏览器当前页面标题' },
-  { label: '浏览器模式', value: '{{browserMode}}', description: '固定为 dom' },
-  { label: '步骤序号', value: '{{stepIndex}}', description: '当前运行步骤序号' },
-  { label: '运行上下文', value: '{{runState}}', description: '压缩后的历史步骤、进展和待办上下文' },
-  { label: '工作记忆', value: '{{workingMemory}}', description: '当前 agent loop 的短期工作记忆' },
-  { label: '标签页', value: '{{openTabs}}', description: '当前浏览器标签页列表 JSON' },
-  { label: '滚动状态', value: '{{pageScrollState}}', description: '当前页面滚动状态 JSON' },
-  { label: '用例标题', value: '{{testCaseTitle}}', description: '目标模式测试用例标题' },
-  { label: '用例描述', value: '{{testCaseDescription}}', description: '目标模式测试用例描述' },
-  { label: '用例提示词', value: '{{systemPrompt}}', description: '测试用例内置的 AI 操作提示词' },
-  { label: '当前时间', value: '{{currentDate}}', description: '运行时 ISO 时间' },
-];
-
 export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: '使用 DOMSnapshot 与局部无障碍语义生成 UID；视觉信息通过 takeScreenshot 按需获取。', tab: 'browser', defaultValue: 'dom', control: 'select', options: [{ label: '语义快照', value: 'dom' }] },
@@ -163,7 +145,7 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
 
   { key: 'KEEP_BROWSER_OPEN_AFTER_RUN', label: '运行后保留浏览器', description: '运行结束后是否保持浏览器打开。', tab: 'runtime', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'KEEP_BROWSER_OPEN_ON_AI_ERROR', label: 'AI 错误时保留浏览器', description: 'AI 调用异常时是否保留浏览器用于排查。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。对话模式和目标模式都会生效，支持点击下方变量标签插入 {{变量名}}。', tab: 'runtime', defaultValue: '', control: 'textarea', variables: promptVariableOptions },
+  { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。对话模式和目标模式都会生效。', tab: 'runtime', defaultValue: '', control: 'textarea' },
   { key: 'RUN_WORKER_CONCURRENCY', label: '运行并发数', description: '同时执行多少个测试运行。', tab: 'runtime', defaultValue: '1', control: 'number' },
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
   { key: 'REPLAY_STEP_DELAY_MS', label: '回放步骤间隔', description: '固定流程回放时每个录制动作前的等待时间，用于模拟 AI 每轮观察和页面加载间隔。', tab: 'runtime', defaultValue: '1500', control: 'number' },

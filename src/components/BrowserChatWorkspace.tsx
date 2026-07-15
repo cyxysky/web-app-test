@@ -317,7 +317,7 @@ type EmbeddedBrowserBridge = {
   goBack: () => Promise<EmbeddedBrowserState>;
   goForward: () => Promise<EmbeddedBrowserState>;
   moveTab: (input: { id: string; position?: 'before' | 'after' | 'end'; targetGroupId?: string; targetId?: string; targetSessionId?: string }) => Promise<EmbeddedBrowserState>;
-  navigate: (input: { groupId?: string; sessionId?: string; url: string }) => Promise<EmbeddedBrowserBridgeResult>;
+  navigate: (input: { groupId?: string; id?: string; sessionId?: string; url: string }) => Promise<EmbeddedBrowserBridgeResult>;
   onFocusAddress: (listener: () => void) => () => void;
   onStateChange: (listener: (state: EmbeddedBrowserState) => void) => () => void;
   reload: () => Promise<EmbeddedBrowserState>;
@@ -3499,8 +3499,16 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const bridge = window.webPilotEmbeddedBrowser;
     const url = normalizeEmbeddedBrowserAddress(addressValue);
     if (!bridge || !url) return;
-    const groupId = browserGroupId || embeddedGroupIdForSession(sessionId);
-    const result = await bridge.navigate({ groupId, sessionId, url }).catch((error: unknown) => ({
+    const groupId = activeEmbeddedTab?.groupId || activeGroupId || browserGroupId || undefined;
+    const targetSessionId = activeEmbeddedTab?.sessionId
+      || (groupId?.startsWith('session:') ? embeddedSessionIdFromGroupId(groupId) : undefined)
+      || (groupId === browserGroupId ? sessionId : undefined);
+    const result = await bridge.navigate({
+      groupId,
+      id: activeEmbeddedTab?.id,
+      sessionId: targetSessionId,
+      url,
+    }).catch((error: unknown) => ({
       ok: false,
       error: error instanceof Error ? error.message : 'Browser navigation failed',
     }));
@@ -3579,12 +3587,16 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
 
   const activeEmbeddedTab = useMemo(() => {
     const groupedTabs = visibleGroups.flatMap((group) => group.tabs);
-    return groupedTabs.find((tab) => tab.id === activeTabId)
-      || browserTabs.find((tab) => tab.id === activeTabId)
-      || browserTabs[activeTabIndex]
-      || groupedTabs[activeTabIndex]
-      || groupedTabs[0];
-  }, [activeTabId, activeTabIndex, browserTabs, sessionId, visibleGroups]);
+    const activeGroup = visibleGroups.find((group) => group.id === activeGroupId)
+      || visibleGroups.find((group) => group.active);
+    const activeGroupTabs = activeGroup?.tabs || [];
+    if (activeTabId) {
+      return activeGroupTabs.find((tab) => tab.id === activeTabId)
+        || groupedTabs.find((tab) => tab.id === activeTabId);
+    }
+    if (activeGroup) return activeGroupTabs[0];
+    return browserTabs[activeTabIndex] || groupedTabs[activeTabIndex] || groupedTabs[0];
+  }, [activeGroupId, activeTabId, activeTabIndex, browserTabs, visibleGroups]);
   const isEmbeddedBrowserLoading = Boolean(activeEmbeddedTab?.loading);
 
   useEffect(() => {
@@ -3832,7 +3844,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
             <input
               ref={addressInputRef}
               aria-label="Address"
-              disabled={!bridgeAvailable || !activeEmbeddedTab}
+              disabled={!bridgeAvailable}
               onBlur={() => {
                 addressFocusedRef.current = false;
                 setAddressValue(embeddedBrowserDisplayUrl(activeEmbeddedTab));
@@ -4227,6 +4239,34 @@ export function BrowserChatWorkspace({
     const next = resolveRuntimeModelSelection(modelConfig, selection);
     setModelProvider(next.provider);
     setModelId(next.model);
+
+    const providerConfig = modelConfig?.providers[next.provider];
+    if (!modelConfig || !providerConfig) return;
+    const nextConfig: BrowserChatModelConfig = {
+      ...modelConfig,
+      provider: next.provider,
+      providers: {
+        ...modelConfig.providers,
+        [next.provider]: {
+          ...providerConfig,
+          defaultModel: next.model,
+          model: next.model,
+          models: Array.from(new Set([...(providerConfig.models || []), next.model])),
+        },
+      },
+    };
+    setModelConfig(nextConfig);
+    void fetch('/api/settings/model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: nextConfig.provider, providers: nextConfig.providers }),
+    })
+      .then(async (response) => {
+        const data = await readApiJson<Record<string, unknown>>(response, '保存模型选择失败');
+        const persisted = normalizeRuntimeModelConfig(data.config as Partial<BrowserChatModelConfig> | undefined);
+        if (persisted) setModelConfig(persisted);
+      })
+      .catch(() => undefined);
   }, [modelConfig]);
 
   const loadBrowserRuntimeSettings = useCallback(async () => {
@@ -4918,6 +4958,18 @@ export function BrowserChatWorkspace({
             >
               <Plus size={16} />
             </button>
+            {recentSelectionMode ? (
+              <button
+                aria-label={`删除已选对话（${selectedDeletableSessionIds.length}）`}
+                className="ui-icon-button ui-icon-button--danger browser-chat-section-create"
+                disabled={!selectedDeletableSessionIds.length || deletingSelectedSessions}
+                onClick={() => void deleteSelectedSessionHistory()}
+                title={selectedDeletableSessionIds.length ? `删除已选对话（${selectedDeletableSessionIds.length}）` : '请选择要删除的对话'}
+                type="button"
+              >
+                {deletingSelectedSessions ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
+              </button>
+            ) : null}
             <details className="browser-chat-overflow browser-chat-recent-actions">
               <summary aria-label="对话操作" title="对话操作">
                 <MoreHorizontal size={16} />
@@ -4946,20 +4998,6 @@ export function BrowserChatWorkspace({
                   >
                     <CheckCircle2 size={15} />
                     <span>{allSelectableRecentSessionsSelected ? '取消全选' : '全选'}</span>
-                  </button>
-                ) : null}
-                {recentSelectionMode && selectedDeletableSessionIds.length ? (
-                  <button
-                    className="danger"
-                    disabled={deletingSelectedSessions}
-                    onClick={(event) => {
-                      closeSidebarOverflowMenu(event);
-                      void deleteSelectedSessionHistory();
-                    }}
-                    type="button"
-                  >
-                    {deletingSelectedSessions ? <Loader2 className="spin" size={14} /> : <Trash2 size={15} />}
-                    <span>删除已选（{selectedDeletableSessionIds.length}）</span>
                   </button>
                 ) : null}
               </div>

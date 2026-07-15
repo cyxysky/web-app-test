@@ -37,6 +37,7 @@ type LibraryBridge = {
   getState: () => Promise<LibraryState>;
   navigate: (input: { url: string }) => Promise<{ error?: string; ok: boolean }>;
   onStateChange: (listener: (state: LibraryState) => void) => () => void;
+  panelReady: (input: { panel: LibraryPanel }) => Promise<LibraryState>;
   removeBookmark: (input: { url: string }) => Promise<LibraryState>;
 };
 
@@ -97,6 +98,7 @@ export function EmbeddedBrowserLibraryOverlay() {
   const [bookmarks, setBookmarks] = useState<BookmarkItem[]>([]);
   const [error, setError] = useState('');
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
+  const [hydrated, setHydrated] = useState(false);
   const [panel, setPanel] = useState<LibraryPanel>('bookmarks');
   const [query, setQuery] = useState('');
   const [searchVisible, setSearchVisible] = useState(false);
@@ -108,7 +110,10 @@ export function EmbeddedBrowserLibraryOverlay() {
       return;
     }
     setError('');
-    if (state.libraryPanel) setPanel(state.libraryPanel);
+    if (state.libraryPanel) {
+      setPanel(state.libraryPanel);
+      setHydrated(true);
+    }
     setBookmarks(Array.isArray(state.bookmarks) ? state.bookmarks : []);
     setHistoryItems(Array.isArray(state.history) ? state.history : []);
   }
@@ -129,6 +134,16 @@ export function EmbeddedBrowserLibraryOverlay() {
     setQuery('');
     setSearchVisible(false);
   }, [panel]);
+
+  useEffect(() => {
+    if (!hydrated) return undefined;
+    const bridge = libraryBridge();
+    if (!bridge) return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      void bridge.panelReady({ panel }).catch(() => undefined);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [hydrated, panel]);
 
   useEffect(() => {
     if (searchVisible) searchInputRef.current?.focus();

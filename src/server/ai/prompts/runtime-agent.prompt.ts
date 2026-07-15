@@ -14,8 +14,6 @@ type CompletionVerificationPromptInput = {
   recentProgressNotes: string[];
 };
 
-type CustomPromptMode = 'browser-chat' | 'target';
-
 export function buildCompletionPromptLines(usesScreenshot: boolean) {
   const evidence = usesScreenshot ? 'screenshot' : 'textual page context / candidates / DOM / URL / focus';
   return [
@@ -102,37 +100,14 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
   ].join('\n');
 }
 
-function stringifyPromptVariable(value: unknown) {
-  if (value === undefined || value === null) return '';
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-export function renderCustomPromptTemplate(template: string, variables: Record<string, unknown>) {
-  let rendered = String(template || '');
-  for (const [key, value] of Object.entries(variables)) {
-    const text = stringifyPromptVariable(value);
-    rendered = rendered
-      .split(`{{${key}}}`).join(text)
-      .split(`{${key}}`).join(text);
-  }
-  return rendered.trim();
-}
-
-export function customRuntimePromptFromEnv(_mode: CustomPromptMode, variables: Record<string, unknown>) {
-  const template = String(process.env.AI_CUSTOM_SYSTEM_PROMPT || '').trim();
-  if (!template) return '';
-  const rendered = renderCustomPromptTemplate(template, variables);
-  if (!rendered) return '';
+export function customRuntimePromptFromEnv() {
+  const rules = String(process.env.AI_CUSTOM_SYSTEM_PROMPT || '').trim();
+  if (!rules) return '';
   return [
     'Additional user-configured rules (append-only):',
     '- These rules supplement the built-in Agent Loop prompt; they do not replace it.',
     '- They must not override, weaken, or bypass built-in rules, safety rules, tool contracts, test-case instructions, or the current user requirement.',
     '- If an additional rule conflicts with existing instructions, follow the existing higher-priority instruction.',
-    rendered,
+    rules,
   ].join('\n');
 }

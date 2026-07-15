@@ -19,6 +19,10 @@ let embeddedBrowserAttached = false;
 let embeddedBrowserVisible = false;
 let embeddedBrowserLibraryView;
 let embeddedBrowserLibraryPanel = '';
+let embeddedBrowserLibraryAttached = false;
+let embeddedBrowserLibraryVisible = false;
+let embeddedBrowserLibraryPendingPanel = '';
+let embeddedBrowserLibraryReadyPanel = '';
 let embeddedBrowserActiveGroupId = '';
 let embeddedBrowserActiveTabId = '';
 let embeddedBrowserNextTabId = 1;
@@ -255,6 +259,9 @@ function ensureEmbeddedBrowserLibraryView() {
     appendLog(`Embedded browser library load failed: ${errorDescription} (${errorCode})`);
     if (embeddedBrowserLibraryView === view) {
       embeddedBrowserLibraryPanel = '';
+      embeddedBrowserLibraryVisible = false;
+      embeddedBrowserLibraryPendingPanel = '';
+      embeddedBrowserLibraryReadyPanel = '';
       view.setVisible(false);
       notifyEmbeddedBrowserStateChange();
     }
@@ -263,14 +270,25 @@ function ensureEmbeddedBrowserLibraryView() {
     if (embeddedBrowserLibraryView === view) {
       embeddedBrowserLibraryView = undefined;
       embeddedBrowserLibraryPanel = '';
+      embeddedBrowserLibraryAttached = false;
+      embeddedBrowserLibraryVisible = false;
+      embeddedBrowserLibraryPendingPanel = '';
+      embeddedBrowserLibraryReadyPanel = '';
       notifyEmbeddedBrowserStateChange();
     }
   });
   embeddedBrowserLibraryView = view;
+  embeddedBrowserLibraryAttached = false;
+  embeddedBrowserLibraryVisible = false;
+  embeddedBrowserLibraryPendingPanel = '';
+  embeddedBrowserLibraryReadyPanel = '';
   void view.webContents.loadURL(routeUrl).catch((error) => {
     appendLog(`Embedded browser library load failed: ${error instanceof Error ? error.message : String(error)}`);
     if (embeddedBrowserLibraryView === view) {
       embeddedBrowserLibraryPanel = '';
+      embeddedBrowserLibraryVisible = false;
+      embeddedBrowserLibraryPendingPanel = '';
+      embeddedBrowserLibraryReadyPanel = '';
       view.setVisible(false);
       notifyEmbeddedBrowserStateChange();
     }
@@ -280,21 +298,41 @@ function ensureEmbeddedBrowserLibraryView() {
 
 function attachEmbeddedBrowserLibraryView() {
   if (!embeddedBrowserLibraryPanel || !embeddedBrowserVisible || !mainWindow || mainWindow.isDestroyed()) {
-    embeddedBrowserLibraryView?.setVisible(false);
+    if (embeddedBrowserLibraryVisible) embeddedBrowserLibraryView?.setVisible(false);
+    embeddedBrowserLibraryVisible = false;
     return;
   }
   const view = ensureEmbeddedBrowserLibraryView();
-  mainWindow.contentView.addChildView(view);
+  if (!embeddedBrowserLibraryAttached) {
+    mainWindow.contentView.addChildView(view);
+    embeddedBrowserLibraryAttached = true;
+  }
   view.setBounds(embeddedBrowserLibraryViewBounds());
-  view.setVisible(true);
-  view.webContents.focus();
+  const canShow = !embeddedBrowserLibraryPendingPanel
+    || embeddedBrowserLibraryReadyPanel === embeddedBrowserLibraryPanel;
+  if (canShow && !embeddedBrowserLibraryVisible) {
+    view.setVisible(true);
+    embeddedBrowserLibraryVisible = true;
+    view.webContents.focus();
+  }
 }
 
 function setEmbeddedBrowserLibraryPanel(value) {
   const nextPanel = value === 'bookmarks' || value === 'history' ? value : '';
   embeddedBrowserLibraryPanel = nextPanel;
-  if (nextPanel) attachEmbeddedBrowserLibraryView();
-  else embeddedBrowserLibraryView?.setVisible(false);
+  if (nextPanel) {
+    embeddedBrowserLibraryPendingPanel = embeddedBrowserLibraryReadyPanel === nextPanel ? '' : nextPanel;
+    if (embeddedBrowserLibraryPendingPanel && embeddedBrowserLibraryVisible) {
+      embeddedBrowserLibraryView?.setVisible(false);
+      embeddedBrowserLibraryVisible = false;
+    }
+    attachEmbeddedBrowserLibraryView();
+  }
+  else {
+    embeddedBrowserLibraryPendingPanel = '';
+    if (embeddedBrowserLibraryVisible) embeddedBrowserLibraryView?.setVisible(false);
+    embeddedBrowserLibraryVisible = false;
+  }
   notifyEmbeddedBrowserStateChange();
   return embeddedBrowserState();
 }
@@ -302,10 +340,15 @@ function setEmbeddedBrowserLibraryPanel(value) {
 function destroyEmbeddedBrowserLibraryView() {
   const view = embeddedBrowserLibraryView;
   embeddedBrowserLibraryPanel = '';
+  embeddedBrowserLibraryPendingPanel = '';
+  embeddedBrowserLibraryReadyPanel = '';
   embeddedBrowserLibraryView = undefined;
+  embeddedBrowserLibraryVisible = false;
+  const wasAttached = embeddedBrowserLibraryAttached;
+  embeddedBrowserLibraryAttached = false;
   if (!view) return;
   try {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.contentView.removeChildView(view);
+    if (wasAttached && mainWindow && !mainWindow.isDestroyed()) mainWindow.contentView.removeChildView(view);
   } catch (error) {
     appendLog(`Embedded browser library detach failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1545,7 +1588,9 @@ function detachEmbeddedBrowserView() {
   for (const tab of embeddedBrowserTabs.values()) detachEmbeddedBrowserTab(tab);
   embeddedBrowserAttached = false;
   embeddedBrowserLibraryPanel = '';
-  embeddedBrowserLibraryView?.setVisible(false);
+  embeddedBrowserLibraryPendingPanel = '';
+  if (embeddedBrowserLibraryVisible) embeddedBrowserLibraryView?.setVisible(false);
+  embeddedBrowserLibraryVisible = false;
   notifyEmbeddedBrowserStateChange();
 }
 
@@ -2154,6 +2199,16 @@ function registerEmbeddedBrowserIpc() {
     }
   });
 
+  ipcMain.handle('webpilot:embedded-browser:library-panel-ready', async (_event, input = {}) => {
+    const panel = input.panel === 'bookmarks' || input.panel === 'history' ? input.panel : '';
+    if (panel && panel === embeddedBrowserLibraryPanel) {
+      embeddedBrowserLibraryReadyPanel = panel;
+      if (embeddedBrowserLibraryPendingPanel === panel) embeddedBrowserLibraryPendingPanel = '';
+      attachEmbeddedBrowserLibraryView();
+    }
+    return embeddedBrowserState();
+  });
+
   ipcMain.handle('webpilot:embedded-browser:clear-history', async () => {
     try {
       return clearEmbeddedBrowserHistory();
@@ -2257,7 +2312,12 @@ function registerEmbeddedBrowserIpc() {
     try {
       const url = typeof input.url === 'string' ? input.url.trim() : '';
       if (!url) throw new Error('URL is empty.');
-      attachEmbeddedBrowserView({ createIfMissing: true, groupId: input.groupId, sessionId: input.sessionId });
+      attachEmbeddedBrowserView({
+        createIfMissing: true,
+        groupId: input.groupId,
+        id: input.id,
+        sessionId: input.sessionId,
+      });
       const tab = activeEmbeddedBrowserTab();
       if (!tab) throw new Error('Embedded browser tab is not ready.');
       await loadEmbeddedBrowserTabUrl(tab, url);
@@ -2504,19 +2564,74 @@ function createWindow() {
   const loadingHtml = `
     <style>
       * { box-sizing: border-box; }
+      :root { color-scheme: light; }
       body {
-        background: #0f131b;
-        color: #d7dee8;
+        background:
+          radial-gradient(circle at 18% 12%, rgba(118, 198, 175, 0.18), transparent 30%),
+          radial-gradient(circle at 82% 88%, rgba(104, 150, 224, 0.13), transparent 34%),
+          #f6f8fa;
+        color: #18212d;
         display: grid;
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         height: 100vh;
         margin: 0;
         place-items: center;
       }
-      h2 { font-size: 22px; margin: 0 0 8px; }
-      p { color: #9ca3af; font-size: 14px; margin: 0; }
+      .shell {
+        align-items: center;
+        background: rgba(255, 255, 255, 0.74);
+        border: 1px solid rgba(31, 41, 55, 0.09);
+        border-radius: 22px;
+        box-shadow: 0 24px 72px rgba(35, 52, 72, 0.15);
+        display: grid;
+        gap: 18px;
+        grid-template-columns: 46px minmax(0, 1fr);
+        max-width: 440px;
+        padding: 25px 27px;
+        width: calc(100vw - 56px);
+      }
+      .mark {
+        align-items: center;
+        background: linear-gradient(145deg, #467bcb, #5fb99e);
+        border-radius: 14px;
+        box-shadow: 0 8px 20px rgba(60, 122, 179, 0.22);
+        color: #fff;
+        display: flex;
+        font-size: 18px;
+        font-weight: 780;
+        height: 46px;
+        justify-content: center;
+        letter-spacing: -0.08em;
+        position: relative;
+        width: 46px;
+      }
+      .mark::after {
+        animation: pulse 1.45s ease-out infinite;
+        border: 2px solid rgba(95, 185, 158, 0.5);
+        border-radius: 18px;
+        content: "";
+        inset: -5px;
+        position: absolute;
+      }
+      .eyebrow { color: #718096; font-size: 11px; font-weight: 750; letter-spacing: 0.08em; margin: 0 0 5px; text-transform: uppercase; }
+      h2 { font-size: 20px; letter-spacing: -0.02em; line-height: 1.2; margin: 0 0 7px; }
+      p { color: #687587; font-size: 13px; line-height: 1.55; margin: 0; }
+      .progress { background: #e7edf1; border-radius: 99px; grid-column: 1 / -1; height: 4px; overflow: hidden; }
+      .progress::after { animation: loading 1.35s ease-in-out infinite; background: linear-gradient(90deg, #4d86d6, #69c2a7); border-radius: inherit; content: ""; display: block; height: 100%; width: 42%; }
+      @keyframes loading { from { transform: translateX(-110%); } to { transform: translateX(260%); } }
+      @keyframes pulse { 0% { opacity: 0.8; transform: scale(0.82); } 100% { opacity: 0; transform: scale(1.18); } }
     </style>
-    <body><div><h2>${APP_NAME}</h2><p>Starting local service...</p></div></body>`;
+    <body>
+      <main class="shell">
+        <div class="mark">WP</div>
+        <div>
+          <div class="eyebrow">${APP_NAME}</div>
+          <h2>正在启动工作区</h2>
+          <p>正在连接本地服务并恢复浏览器状态…</p>
+        </div>
+        <div class="progress" aria-label="正在加载"></div>
+      </main>
+    </body>`;
   mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(loadingHtml)}`);
   return mainWindow;
 }

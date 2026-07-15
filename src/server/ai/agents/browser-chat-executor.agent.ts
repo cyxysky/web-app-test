@@ -2033,22 +2033,7 @@ function runtimePrompt(input: {
   const compactRunContext = browserChatMode
     ? buildCompactBrowserChatContext(completedSteps, input.workingMemory)
     : buildCompactRunContext(completedSteps, input.workingMemory);
-  const customPrompt = customRuntimePromptFromEnv(browserChatMode ? 'browser-chat' : 'target', {
-    requirement,
-    targetUrl: testCase.targetUrl,
-    currentUrl: pageContext.url,
-    currentTitle: pageContext.title,
-    browserMode: mode,
-    stepIndex: input.stepIndex,
-    runState: compactRunContext,
-    workingMemory: input.workingMemory ? formatWorkingMemory(input.workingMemory) : '',
-    openTabs: pageContext.tabs,
-    pageScrollState: pageContext.pageScrollState,
-    testCaseTitle: testCase.title,
-    testCaseDescription: testCase.description,
-    systemPrompt: caseSystemPrompt,
-    currentDate: new Date().toISOString(),
-  });
+  const customPrompt = customRuntimePromptFromEnv();
   const availableScreenshotReferences = input.availableScreenshotReferences || [];
   const selectedScreenshotReferences = input.selectedScreenshotReferences || [];
   const strategyMemory = (testCase.strategyMemory || [])

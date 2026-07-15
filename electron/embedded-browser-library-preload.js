@@ -13,6 +13,9 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowserLibrary', {
   navigate(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:navigate', input);
   },
+  panelReady(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:library-panel-ready', input);
+  },
   onStateChange(listener) {
     if (typeof listener !== 'function') return () => {};
     const handler = (_event, state) => listener(state);

@@ -77,7 +77,6 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
 }
 
 export async function GET() {
-  store.applyRuntimeEnv();
   const saved = store.getModelConfig();
   const provider = saved?.provider || 'openrouter';
   return NextResponse.json({

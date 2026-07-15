@@ -139,7 +139,6 @@ const en: Record<string, string> = {
   '选择': 'Choose',
   '选择目录': 'Choose folder',
   '仅 Electron 桌面端支持目录选择': 'Directory picking is only supported in the Electron desktop app.',
-  '可用变量': 'Available variables',
   '网页配置项。': 'Web setting.',
   '{count} 项网页配置': '{count} web settings',
   '这个分类暂无配置。': 'No settings in this category yet.',

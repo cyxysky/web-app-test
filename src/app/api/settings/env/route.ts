@@ -3,21 +3,6 @@ import { runtimeEnvDefinitions } from '@/config/settings';
 import { store } from '@/server/db/mock-store';
 
 const allowedKeys = new Set(runtimeEnvDefinitions.map((item) => item.key));
-const legacyCustomPromptKeys = {
-  browserEnabled: 'AI_BROWSER_CHAT_CUSTOM_PROMPT_ENABLED',
-  browserPrompt: 'AI_BROWSER_CHAT_CUSTOM_PROMPT',
-  targetEnabled: 'AI_TARGET_MODE_CUSTOM_PROMPT_ENABLED',
-  targetPrompt: 'AI_TARGET_MODE_CUSTOM_PROMPT',
-};
-
-function legacyCustomSystemPrompt(savedByKey: ReadonlyMap<string, { value?: string }>) {
-  const targetPrompt = savedByKey.get(legacyCustomPromptKeys.targetPrompt)?.value?.trim();
-  const browserPrompt = savedByKey.get(legacyCustomPromptKeys.browserPrompt)?.value?.trim();
-  if (savedByKey.get(legacyCustomPromptKeys.targetEnabled)?.value === 'true' && targetPrompt) return targetPrompt;
-  if (savedByKey.get(legacyCustomPromptKeys.browserEnabled)?.value === 'true' && browserPrompt) return browserPrompt;
-  return '';
-}
-
 function defaultRuntimeItems() {
   return runtimeEnvDefinitions.map((definition) => ({
     key: definition.key,
@@ -29,13 +14,11 @@ function defaultRuntimeItems() {
 
 function mergedRuntimeItems() {
   const savedByKey = new Map(store.listRuntimeEnv().map((item) => [item.key, item]));
-  const migratedCustomSystemPrompt = legacyCustomSystemPrompt(savedByKey);
   return defaultRuntimeItems().map((item) => {
     const saved = savedByKey.get(item.key);
-    const migratedValue = item.key === 'AI_CUSTOM_SYSTEM_PROMPT' ? migratedCustomSystemPrompt : '';
     return {
       ...item,
-      value: saved?.value ?? (migratedValue || item.value),
+      value: saved?.value ?? item.value,
       enabled: true,
       secret: saved?.secret ?? item.secret,
       updatedAt: saved?.updatedAt,
@@ -44,7 +27,6 @@ function mergedRuntimeItems() {
 }
 
 export async function GET() {
-  store.applyRuntimeEnv();
   return NextResponse.json({ saved: mergedRuntimeItems() });
 }
 

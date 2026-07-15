@@ -1,7 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, FileJson2, FolderOpen, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
@@ -217,44 +216,6 @@ function isSecret(item: EnvRow) {
   return Boolean(item.secret || runtimeEnvDefinition(item.key)?.secret || /KEY|TOKEN|SECRET|PASSWORD|COOKIE|DATABASE_URL/i.test(item.key));
 }
 
-function pushPromptPreviewText(parts: ReactNode[], text: string, keyPrefix: string) {
-  const lines = text.split('\n');
-  lines.forEach((line, lineIndex) => {
-    if (line) parts.push(<span className="settings-prompt-preview-text" key={`${keyPrefix}-text-${lineIndex}`}>{line}</span>);
-    if (lineIndex < lines.length - 1) parts.push(<br key={`${keyPrefix}-break-${lineIndex}`} />);
-  });
-}
-
-function renderPromptTemplatePreview(
-  value: string,
-  variables: Array<{ label: string; value: string }>,
-  translate: (value: string) => string,
-) {
-  const parts: ReactNode[] = [];
-  const labelsByToken = new Map(variables.map((variable) => [variable.value, translate(variable.label)]));
-  const pattern = /\{\{[a-zA-Z][a-zA-Z0-9_]*\}\}/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  let hasToken = false;
-
-  while ((match = pattern.exec(value)) !== null) {
-    const token = match[0];
-    const index = match.index;
-    if (index > lastIndex) {
-      pushPromptPreviewText(parts, value.slice(lastIndex, index), `text-${lastIndex}`);
-    }
-    parts.push(<span className="settings-prompt-token" key={`token-${index}`} title={token}>{labelsByToken.get(token) || token}</span>);
-    lastIndex = index + token.length;
-    hasToken = true;
-  }
-
-  if (!hasToken) return null;
-  if (lastIndex < value.length) {
-    pushPromptPreviewText(parts, value.slice(lastIndex), `text-${lastIndex}`);
-  }
-  return parts;
-}
-
 export function EnvironmentSettings({
   activeTab: controlledActiveTab,
   embedded = false,
@@ -294,7 +255,6 @@ export function EnvironmentSettings({
   const [deletePersonalMemoryTarget, setDeletePersonalMemoryTarget] = useState<PersonalMemoryItem | null>(null);
   const [deletePersonalMemoryError, setDeletePersonalMemoryError] = useState('');
   const [hasDirectoryPicker, setHasDirectoryPicker] = useState(false);
-  const textareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   const activeTab = controlledActiveTab || internalActiveTab;
   const selectTab = onActiveTabChange || setInternalActiveTab;
 
@@ -311,6 +271,11 @@ export function EnvironmentSettings({
   useEffect(() => {
     setPortalReady(true);
   }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'memory') return;
+    void loadPersonalMemoryItems().catch(() => undefined);
+  }, [activeTab]);
 
   useEffect(() => {
     if (activeTab !== 'dom-test') return undefined;
@@ -348,19 +313,16 @@ export function EnvironmentSettings({
   async function load() {
     setLoading(true);
     try {
-      const [envResponse, modelResponse, memoryResponse] = await Promise.all([
+      const [envResponse, modelResponse] = await Promise.all([
         fetch('/api/settings/env', { cache: 'no-store' }),
         fetch('/api/settings/model', { cache: 'no-store' }),
-        fetch('/api/personal-memory?includeDisabled=true', { cache: 'no-store' }),
       ]);
       const envData = await envResponse.json();
       const modelData = await modelResponse.json();
-      const memoryData = memoryResponse.ok ? await memoryResponse.json() : { items: [] };
       const nextModel = createModelConfig(modelData.config);
       setItems(envData.saved || []);
       setModelConfig(nextModel);
       setModelDraft(nextModel);
-      setPersonalMemoryItems(Array.isArray(memoryData.items) ? memoryData.items : []);
     } finally {
       setLoading(false);
     }
@@ -368,21 +330,6 @@ export function EnvironmentSettings({
 
   function update(index: number, patch: Partial<EnvRow>) {
     setItems((current) => current.map((item, itemIndex) => (itemIndex === index ? { ...item, enabled: true, ...patch } : item)));
-  }
-
-  function insertRuntimeVariable(index: number, key: string, token: string) {
-    const textarea = textareaRefs.current[key];
-    const current = items[index]?.value || '';
-    const start = textarea?.selectionStart ?? current.length;
-    const end = textarea?.selectionEnd ?? current.length;
-    const nextValue = `${current.slice(0, start)}${token}${current.slice(end)}`;
-    update(index, { value: nextValue });
-    requestAnimationFrame(() => {
-      const nextTextarea = textareaRefs.current[key];
-      const nextPosition = start + token.length;
-      nextTextarea?.focus();
-      nextTextarea?.setSelectionRange(nextPosition, nextPosition);
-    });
   }
 
   async function chooseRuntimeDirectory(index: number, item: EnvRow) {
@@ -685,36 +632,14 @@ export function EnvironmentSettings({
     }
 
     if (definition?.control === 'textarea') {
-      const preview = renderPromptTemplatePreview(item.value, definition.variables || [], t);
       return (
         <div className="settings-prompt-control">
           <textarea
-            ref={(node) => {
-              textareaRefs.current[item.key] = node;
-            }}
             className="textarea settings-control settings-textarea-control"
             placeholder={t('未设置')}
             value={item.value}
             onChange={(event) => update(index, { value: event.target.value })}
           />
-          {definition.variables?.length ? (
-            <div className="settings-variable-tags" aria-label={t('可用变量')}>
-              {definition.variables.map((variable) => (
-                <button
-                  className="settings-variable-tag"
-                  key={variable.value}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => insertRuntimeVariable(index, item.key, variable.value)}
-                  title={variable.description ? t(variable.description) : variable.value}
-                  type="button"
-                >
-                  <span>{t(variable.label)}</span>
-                  <code>{variable.value}</code>
-                </button>
-              ))}
-            </div>
-          ) : null}
-          {preview ? <div className="settings-prompt-token-preview">{preview}</div> : null}
         </div>
       );
     }
