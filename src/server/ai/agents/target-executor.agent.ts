@@ -15,15 +15,13 @@ import {
   browserKeyboardToolShape,
   browserMouseToolDescription,
   browserMouseToolShape,
+  browserSelectOptionToolDescription,
+  browserSelectOptionToolShape,
 } from './browser-input-tool-schema';
 import {
-  appendRuntimeObservationView,
   compactStaleSnapshotMessages,
-  decodeRuntimeObservationCursor,
-  encodeRuntimeObservationCursor,
   invalidateRuntimeObservation,
   observationPreviewLimit,
-  observationStoreKey,
   restoreRuntimeObservationStore,
   runtimeObservationCount,
   runtimeObservationInvalidatingToolNames,
@@ -184,11 +182,12 @@ const codexRuntimeObjectSchema = z.object({
     status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
     done: z.boolean().nullable().optional(),
     mode: z.enum(['actionable', 'full', 'text']).nullable().optional(),
-    cursor: z.string().nullable().optional(),
     maxChars: z.number().nullable().optional(),
     query: z.string().nullable().optional(),
     roles: z.array(z.string()).nullable().optional(),
     limit: z.number().nullable().optional(),
+    value: z.string().nullable().optional(),
+    label: z.string().nullable().optional(),
     replace: z.boolean().nullable().optional(),
     followByEnter: z.boolean().nullable().optional(),
     ids: z.array(z.string()).nullable().optional(),
@@ -1482,6 +1481,15 @@ function makeBrowserTools(
         followByEnter: input.followByEnter,
       })),
     }),
+    selectOption: tool({
+      description: browserSelectOptionToolDescription,
+      inputSchema: browserToolInput(browserSelectOptionToolShape),
+      execute: (input) => record('selectOption', input, () => session.selectOption({
+        uid: input.uid,
+        value: input.value,
+        label: input.label,
+      })),
+    }),
     waitForPage: tool({
       description: 'Wait for the page to settle after navigation or UI changes.',
       inputSchema: browserToolInput({
@@ -1507,11 +1515,10 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
     }),
     takeSnapshot: tool({
-      description: 'Capture a fresh Chromium DOMSnapshot for the main document, flattened shadow DOM, and attached iframes, enriched with partial AX data for high-value candidates. Continue a large unchanged snapshot with nextCursor.',
+      description: 'Capture a fresh DOM-observation baseline. mode=actionable returns interactive controls, full returns visible structure, and text returns visible copy. It establishes the only dom-* UID registry used by searchSnapshot and browser actions.',
       inputSchema: browserToolInput({
         mode: z.enum(['actionable', 'full', 'text']).optional(),
-        cursor: z.string().optional(),
-        maxChars: z.number().int().positive().optional().describe('Maximum characters to return. Defaults to 10000; values below 10000 are raised to 10000. No upper cap is applied.'),
+        maxChars: z.number().int().positive().optional().describe('Requested response budget. The DOM-observation baseline is bounded by configured runtime limits.'),
       }),
       execute: (input) => record('takeSnapshot', input, async () => (
         referenceOptions?.takeSnapshot
@@ -1520,7 +1527,7 @@ function makeBrowserTools(
       )),
     }),
     searchSnapshot: tool({
-      description: 'Search the complete latest cached snapshot and return matching current UIDs.',
+      description: 'Search the current DOM-observation baseline and return matching dom-* UIDs. Call takeSnapshot first; no separate CDP UID namespace exists.',
       inputSchema: browserToolInput({
         query: z.string().min(1).max(500),
         roles: z.array(z.string().min(1)).max(20).optional(),
@@ -2447,55 +2454,30 @@ async function executeRuntimeStep(input: {
     }
 
     async function takeSnapshot(options: RuntimeObservationReadOptions = {}): Promise<BrowserActionResult> {
-      const decodedCursor = decodeRuntimeObservationCursor(options.cursor);
-      const requestedMode: 'actionable' | 'full' | 'text' = decodedCursor?.view === 'full' || decodedCursor?.view === 'text' || decodedCursor?.view === 'actionable'
-        ? decodedCursor.view
-        : options.mode || 'actionable';
-      const snapshotView = requestedMode;
-      const storedRecord = observationStore.get(observationStoreKey(input.runId));
-      const maxChars = Math.max(10000, Math.floor(Number(options.maxChars) || 10000));
-      if (decodedCursor) {
-        if (!storedRecord) {
-          return { ok: false, actual: 'The takeSnapshot cursor has no current snapshot. Capture a new snapshot without a cursor.' };
-        }
-        if (storedRecord.generation !== decodedCursor.generation) {
-          return { ok: false, actual: `Stale takeSnapshot cursor: cursor generation ${decodedCursor.generation}, current generation ${storedRecord.generation}. Capture a fresh snapshot.` };
-        }
-        if (storedRecord.stale) {
-          return { ok: false, actual: `Stale takeSnapshot cursor: snapshot ${storedRecord.generation} was invalidated after ${storedRecord.staleReason || 'a browser action'}. Capture a fresh snapshot.` };
-        }
+      if (options.cursor) {
+        return { ok: false, actual: 'DOM-observation snapshots are current-document baselines and do not use cursors. Capture a new takeSnapshot instead.' };
       }
+      const snapshotView = options.mode || 'actionable';
 
       const readStartedAt = Date.now();
-      const slice = await session.readSnapshotSlice({
-        cursorIndex: decodedCursor?.index || 0,
-        maxChars,
-        refresh: !decodedCursor,
-        mode: requestedMode,
-      });
+      const snapshot = await session.readDomObservationSnapshot({ mode: snapshotView });
       const observationViews: BrowserSnapshotViews = {
         defaultType: snapshotView,
-        [snapshotView]: slice.content,
+        [snapshotView]: snapshot.content,
       };
-      const observation = !decodedCursor
-        ? storeRuntimeObservation(observationStore, input.runId, 'takeSnapshot', slice.content, observationViews)
-        : appendRuntimeObservationView(observationStore, input.runId, snapshotView, slice.content) || storedRecord;
+      const observation = storeRuntimeObservation(observationStore, input.runId, 'takeSnapshot', snapshot.content, observationViews);
       if (!observation) {
         return { ok: false, actual: 'Unable to store the current semantic DOM snapshot. Capture it again.' };
       }
-      const nextCursor = slice.hasMore
-        ? encodeRuntimeObservationCursor({ generation: observation.generation, index: slice.nextIndex, view: snapshotView })
-        : undefined;
       await onDebug?.({
         phase: 'browser:take-snapshot:dom-timings',
         stepIndex,
-        message: `DOM takeSnapshot timings: total=${elapsedSince(readStartedAt)}ms, DOMSnapshot=${slice.timings.captureDomMs || 0}ms, partialAX=${slice.timings.axEnrichmentMs || 0}ms, fallback=${slice.timings.domFallbackMs || 0}ms.`,
-        details: { slice, totalMs: elapsedSince(readStartedAt), continued: Boolean(decodedCursor) },
+        message: `DOM-observation takeSnapshot timings: total=${elapsedSince(readStartedAt)}ms, runtime=${snapshot.timings.readDomObservationMs || 0}ms.`,
+        details: { snapshot, totalMs: elapsedSince(readStartedAt) },
       });
       return {
         ok: true,
-        actual: slice.content,
-        nextCursor,
+        actual: snapshot.content,
       };
     }
 
@@ -3198,20 +3180,13 @@ async function runRecordedTool(
         const url = normalizeBrowserUrl(rawUrl);
         if (!url) return { ok: false, actual: 'Recorded openPage failed because the target URL is empty.' };
         return session.open(url);
-      }
+    }
     case 'takeSnapshot': {
       const mode = input.mode === 'full' || input.mode === 'text' ? input.mode : 'actionable';
-      const slice = await session.readSnapshotSlice({
-        refresh: true,
-        mode,
-        maxChars: typeof input.maxChars === 'number' ? input.maxChars : 10000,
-      });
+      const snapshot = await session.readDomObservationSnapshot({ mode });
       return {
         ok: true,
-        actual: [
-          `Captured snapshot ${slice.generationId}, mode=${mode}, entries=${slice.returnedEntries}/${slice.totalEntries}.`,
-          slice.content,
-        ].join('\n'),
+        actual: snapshot.content,
       };
     }
     case 'takeScreenshot': {
@@ -3256,6 +3231,12 @@ async function runRecordedTool(
         keys: Array.isArray(input.keys) ? input.keys.filter((key): key is string => typeof key === 'string') : undefined,
         replace: typeof input.replace === 'boolean' ? input.replace : undefined,
         followByEnter: typeof input.followByEnter === 'boolean' ? input.followByEnter : undefined,
+      });
+    case 'selectOption':
+      return session.selectOption({
+        uid: typeof input.uid === 'string' ? input.uid : '',
+        value: typeof input.value === 'string' ? input.value : undefined,
+        label: typeof input.label === 'string' ? input.label : undefined,
       });
     case 'waitForPage':
       return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();

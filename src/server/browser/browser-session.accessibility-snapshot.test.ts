@@ -105,13 +105,17 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
   assert.ok(session.currentSnapshotObservationViews()?.actionable?.includes('Stable action'), 'an action must not replace the explicitly captured snapshot');
 
   const refreshed = await readWholeView(session, 'actionable', true);
-  const refreshedActionable = refreshed.map((slice) => slice.content).join('\n');
-  const inputUid = refreshedActionable.match(/^\s*uid=(\S+)\s+textbox\s+"Name"/m)?.[1];
-  assert.ok(inputUid, 'textbox UID should be present after refresh');
+  assert.ok(refreshed.length > 0);
+  const searchWithoutBaseline = await session.searchSnapshot({ query: 'Name', roles: ['textbox'] });
+  assert.equal(searchWithoutBaseline.ok, false, searchWithoutBaseline.actual);
+  assert.match(searchWithoutBaseline.actual, /requires an active DOM baseline/);
+  const domBaseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  const domInputUid = domBaseline.content.match(/<input\s+uid=(dom-\S+)\s+aria-label="Name"/m)?.[1];
+  assert.ok(domInputUid, domBaseline.content);
   const search = await session.searchSnapshot({ query: 'Name', roles: ['textbox'] });
   assert.equal(search.ok, true, search.actual);
-  assert.match(search.actual, new RegExp(`uid=${inputUid}\\b`));
-  const typed = await session.keyboard({ action: 'type', uid: inputUid, text: 'new value', replace: true });
+  assert.match(search.actual, new RegExp(`uid=${domInputUid}\\b`));
+  const typed = await session.keyboard({ action: 'type', uid: domInputUid, text: 'new value', replace: true });
   assert.equal(typed.ok, true, typed.actual);
   assert.equal(await page.locator('input[aria-label="Name"]').inputValue(), 'new value');
 
@@ -171,9 +175,9 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.equal((actionable.match(/Context \d+/g) || []).length <= 24, true, 'context roots should be token-bounded');
   assert.equal((actionable.match(/button\s+"Duplicate"/g) || []).length, 2, 'same-name controls must not be deduplicated away');
 
-  const search = await session.searchSnapshot({ query: 'Save' });
-  assert.equal(search.ok, true, search.actual);
-  assert.match(search.actual.split('\n')[1] || '', /button\s+"Save"/, 'exact actionable names should rank before structural text');
+  const searchWithoutBaseline = await session.searchSnapshot({ query: 'Save' });
+  assert.equal(searchWithoutBaseline.ok, false, searchWithoutBaseline.actual);
+  assert.match(searchWithoutBaseline.actual, /requires an active DOM baseline/);
 
   const covered = await session.mouse({ action: 'click', uid: saveUid });
   assert.equal(covered.ok, false);
@@ -216,13 +220,15 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.doesNotMatch(clickAfterUnrelatedMutation.actual, /Capture a fresh snapshot/, 'stable UIDs should rebind after unrelated DOM mutations');
   assert.equal(await page.locator('body').getAttribute('data-saved'), 'true');
 
-  const lateSearch = await session.searchSnapshot({ query: 'Late action', roles: ['button'] });
-  assert.equal(lateSearch.ok, true, lateSearch.actual);
-  assert.match(lateSearch.actual, /button\s+"Late action"/, 'search should refresh a mutation-stale cached generation');
-
   const domBaseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
   const domSaveUid = domBaseline.content.match(/uid=(dom-\d+)[^\n]*id="save"/)?.[1];
   assert.ok(domSaveUid, domBaseline.content);
+  const domSearch = await session.searchSnapshot({ query: 'Save', roles: ['button'] });
+  assert.equal(domSearch.ok, true, domSearch.actual);
+  assert.match(domSearch.actual, new RegExp(`uid=${domSaveUid}\\b`), 'a DOM-baseline search must return the same dom-* namespace as takeSnapshot');
+  const lateSearch = await session.searchSnapshot({ query: 'Late action', roles: ['button'] });
+  assert.equal(lateSearch.ok, true, lateSearch.actual);
+  assert.match(lateSearch.actual, /<button\b[^>]*>Late action<\/button>/, 'search must use the current DOM baseline after an incremental mutation');
   const domUidClick = await session.mouse({ action: 'click', uid: domSaveUid });
   assert.equal(domUidClick.ok, true, domUidClick.actual);
   await page.locator('#save').evaluate((button) => button.replaceWith(button.cloneNode(true)));
@@ -230,7 +236,7 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.ok(replacementDelta.domChanges?.removed.includes(domSaveUid), replacementDelta.actual);
   const replacedTarget = await session.mouse({ action: 'click', uid: domSaveUid });
   assert.equal(replacedTarget.ok, false, replacedTarget.actual);
-  assert.match(replacedTarget.actual, /not present in the current DOM UID registry/);
+  assert.match(replacedTarget.actual, /absent from the current DOM UID registry/);
 });
 
 test('open waits for a bounded DOM quiet window before capturing the navigation snapshot', async (context) => {
@@ -503,6 +509,31 @@ test('typing followed by Enter accepts navigation when the old document telemetr
   assert.equal(typed.ok, true, typed.actual);
   assert.match(typed.actual, /navigation=true/);
   assert.equal(page.url(), 'about:blank?query=go');
+});
+
+test('native select options and rich-text iframe entry use explicit DOM-baseline actions', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'select-and-rich-text-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.goto(`data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html><html><body>
+    <select id="category" aria-label="故障分类"><option value="">无</option><option value="15002">新增需求或本身的bug</option><option value="15004">其他问题</option></select>
+    <iframe title="Rich Text Area" srcdoc="<!doctype html><body contenteditable='true' aria-label='Rich Text Area'></body>"></iframe>
+  </body></html>`)} `);
+  const actionable = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  const selectUid = actionable.content.match(/<select\s+uid=(dom-\S+)[^>]*options="[^"]*15002=新增需求或本身的bug/)?.[1];
+  assert.ok(selectUid, actionable.content);
+  const selected = await session.selectOption({ uid: selectUid, value: '15002' });
+  assert.equal(selected.ok, true, selected.actual);
+  assert.equal(await page.locator('#category').inputValue(), '15002');
+
+  const full = await session.readDomObservationSnapshot({ mode: 'full' });
+  const iframeUid = full.content.match(/<iframe\s+uid=(dom-\S+)[^>]*title="Rich Text Area"/)?.[1];
+  assert.ok(iframeUid, full.content);
+  const typed = await session.keyboard({ action: 'type', uid: iframeUid, text: '富文本内容', replace: true });
+  assert.equal(typed.ok, true, typed.actual);
+  const richTextFrame = page.frames().find((frame) => frame !== page.mainFrame());
+  assert.equal(await richTextFrame?.locator('body').textContent(), '富文本内容');
 });
 
 test('actionable view preserves flattened DOMSnapshot order across paginated slices', async (context) => {

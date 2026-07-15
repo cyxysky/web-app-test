@@ -14,9 +14,10 @@ import {
   browserKeyboardToolShape,
   browserMouseToolDescription,
   browserMouseToolShape,
+  browserSelectOptionToolDescription,
+  browserSelectOptionToolShape,
 } from './browser-input-tool-schema';
 import {
-  decodeRuntimeObservationCursor,
   invalidateRuntimeObservation,
   observationPreviewLimit,
   restoreRuntimeObservationStore,
@@ -150,11 +151,12 @@ const codexRuntimeObjectSchema = z.object({
     status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
     done: z.boolean().nullable().optional(),
     mode: z.enum(['actionable', 'full', 'text']).nullable().optional(),
-    cursor: z.string().nullable().optional(),
     maxChars: z.number().nullable().optional(),
     query: z.string().nullable().optional(),
     roles: z.array(z.string()).nullable().optional(),
     limit: z.number().nullable().optional(),
+    value: z.string().nullable().optional(),
+    label: z.string().nullable().optional(),
     replace: z.boolean().nullable().optional(),
     followByEnter: z.boolean().nullable().optional(),
     ids: z.array(z.string()).nullable().optional(),
@@ -1737,6 +1739,15 @@ function makeBrowserTools(
             actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
           } satisfies BrowserActionResult;
         }
+        browserActionExecuted = true;
+        const result = await action(actionSignal);
+        // This becomes the native tool-result message for the next model step
+        // and is also retained by working-memory/continuation compression.
+        // A confirmation log alone is UI state and is not model context.
+        return {
+          ...result,
+          actual: `用户已确认本次工具调用，现已执行。\n${result.actual}`,
+        } satisfies BrowserActionResult;
       }
       browserActionExecuted = true;
       return action(actionSignal);
@@ -1826,6 +1837,15 @@ function makeBrowserTools(
         followByEnter: input.followByEnter,
       })),
     }),
+    selectOption: tool({
+      description: browserSelectOptionToolDescription,
+      inputSchema: browserToolInput(browserSelectOptionToolShape),
+      execute: (input) => record('selectOption', input, () => session.selectOption({
+        uid: input.uid,
+        value: input.value,
+        label: input.label,
+      })),
+    }),
     waitForPage: tool({
       description: 'Wait for the page to settle after navigation or UI changes.',
       inputSchema: browserToolInput({
@@ -1862,13 +1882,8 @@ function makeBrowserTools(
           : { ok: false, actual: 'takeSnapshot is unavailable in this runtime.' }
       )),
     }),
-    readDomChanges: tool({
-      description: 'Read only pending MutationObserver DOM changes since the previous action or readDomChanges call. Added and updated entries include current dom-* UIDs. Removed entries are already deleted from the UID registry and cannot be used. Use this when the page may have changed without a browser action.',
-      inputSchema: browserToolInput({}),
-      execute: (input) => record('readDomChanges', input, () => session.readDomChanges()),
-    }),
     searchSnapshot: tool({
-      description: 'Search the complete latest cached snapshot without paging through every slice. Returns matching current UIDs and semantic context.',
+      description: 'Search the current DOM-observation baseline without paging through it. Call takeSnapshot first; this returns matching dom-* UIDs from that same live registry and never searches a separate CDP snapshot.',
       inputSchema: browserToolInput({
         query: z.string().min(1).max(500),
         roles: z.array(z.string().min(1)).max(20).optional(),
@@ -2160,7 +2175,6 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'listTabs',
     'getHttpRequests',
     'takeSnapshot',
-    'readDomChanges',
     'searchSnapshot',
     'mouse',
     'keyboard',
@@ -2840,17 +2854,13 @@ async function executeRuntimeStep(input: {
 
     async function takeSnapshot(options: RuntimeObservationReadOptions = {}): Promise<BrowserActionResult> {
       ensureActive();
-      const decodedCursor = decodeRuntimeObservationCursor(options.cursor);
-      const requestedMode: 'actionable' | 'full' | 'text' = decodedCursor?.view === 'full' || decodedCursor?.view === 'text' || decodedCursor?.view === 'actionable'
-        ? decodedCursor.view
-        : options.mode || 'actionable';
-      const snapshotView = requestedMode;
-      if (decodedCursor) {
+      if (options.cursor) {
         return { ok: false, actual: 'DOM-observation snapshots are current-document baselines and do not use cursors. Capture a new takeSnapshot instead.' };
       }
+      const snapshotView = options.mode || 'actionable';
 
       const readStartedAt = Date.now();
-      const snapshot = await session.readDomObservationSnapshot({ mode: requestedMode });
+      const snapshot = await session.readDomObservationSnapshot({ mode: snapshotView });
       ensureActive();
       const observationViews: BrowserSnapshotViews = {
         defaultType: snapshotView,
@@ -3911,8 +3921,6 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         roles: Array.isArray(input.roles) ? input.roles.filter((role): role is string => typeof role === 'string') : undefined,
         limit: typeof input.limit === 'number' ? input.limit : undefined,
       });
-    case 'readDomChanges':
-      return session.readDomChanges();
     case 'mouse':
       return session.mouse({
         action: String(input.action || 'click') as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
@@ -3938,6 +3946,12 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         keys: Array.isArray(input.keys) ? input.keys.filter((key): key is string => typeof key === 'string') : undefined,
         replace: typeof input.replace === 'boolean' ? input.replace : undefined,
         followByEnter: typeof input.followByEnter === 'boolean' ? input.followByEnter : undefined,
+      });
+    case 'selectOption':
+      return session.selectOption({
+        uid: typeof input.uid === 'string' ? input.uid : '',
+        value: typeof input.value === 'string' ? input.value : undefined,
+        label: typeof input.label === 'string' ? input.label : undefined,
       });
     case 'waitForPage':
       return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
@@ -4084,6 +4098,11 @@ async function executeCodexRuntimeObject(input: {
             actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
           } satisfies BrowserActionResult;
         }
+        const result = await runTool();
+        return {
+          ...result,
+          actual: `用户已确认本次工具调用，现已执行。\n${result.actual}`,
+        } satisfies BrowserActionResult;
       }
       return runTool();
     },

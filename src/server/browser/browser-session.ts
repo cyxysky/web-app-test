@@ -477,6 +477,12 @@ type AiDomRuntime = {
     viewportClip?: BrowserUseViewportClip,
   ) => ({ x: number; y: number; descriptor: string } | undefined);
   visibleDomText: (ref: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
+  selectVisibleDomOption: (ref: string, input: { value?: string; label?: string }) => ({
+    ok: boolean;
+    actual: string;
+    value?: string;
+    label?: string;
+  } | undefined);
 };
 
 type AiDomMutationStateSnapshot = {
@@ -633,6 +639,12 @@ export type BrowserKeyboardAction = {
   keys?: string[];
   replace?: boolean;
   followByEnter?: boolean;
+};
+
+export type BrowserSelectOptionAction = {
+  uid: string;
+  value?: string;
+  label?: string;
 };
 
 type ResolvedBrowserActionPoint = {
@@ -1802,7 +1814,22 @@ function installAiBrowserPageRuntime() {
     return ref;
   }
 
+  function visibleDomSelectOptions(element: HTMLSelectElement) {
+    const options: string[] = [];
+    let chars = 0;
+    for (const option of Array.from(element.options)) {
+      const label = normalizeVisibleDomText(option.label || option.text || option.textContent || '');
+      const value = normalizeVisibleDomText(option.value || '');
+      const entry = `${option.selected ? '*' : ''}${value || '[empty]'}=${label || '[empty]'}`;
+      if (options.length >= 60 || chars + entry.length + 3 > 2400) break;
+      options.push(entry);
+      chars += entry.length + 3;
+    }
+    return options.join(' | ');
+  }
+
   function visibleDomItem(element: Element, ref: string, signals: string[] = []) {
+    const tag = visibleDomElementName(element);
     const attrs = [`node_id=${ref}`];
     for (const name of visibleDomRenderedAttributes) {
       const value = visibleDomAttributeValue(element, name);
@@ -1814,7 +1841,13 @@ function installAiBrowserPageRuntime() {
     if (signals.length) {
       attrs.push(`signals="${escapeVisibleDomText(Array.from(new Set(signals)).join('|'))}"`);
     }
-    const tag = visibleDomElementName(element);
+    if (tag === 'select') {
+      const select = element as HTMLSelectElement;
+      const selected = select.selectedOptions[0];
+      const options = visibleDomSelectOptions(select);
+      if (selected) attrs.push(`selected_value="${escapeVisibleDomText(selected.value)}"`);
+      if (options) attrs.push(`options="${escapeVisibleDomText(options)}"`);
+    }
     const capabilities = visibleDomActionCapabilities(element, signals);
     const confidence = visibleDomActionConfidence(element, signals, capabilities);
     const interactive = capabilities.length > 0;
@@ -2216,6 +2249,33 @@ function installAiBrowserPageRuntime() {
     };
   }
 
+  function selectVisibleDomOption(ref: string, input: { value?: string; label?: string }) {
+    const element = visibleDomState().refToElement.get(ref);
+    if (!(element instanceof HTMLSelectElement) || !element.isConnected) {
+      return { ok: false, actual: 'UID is not a live native select element.' };
+    }
+    const value = normalizeVisibleDomText(input.value || '');
+    const label = normalizeVisibleDomText(input.label || '');
+    if (!value && !label) return { ok: false, actual: 'selectOption requires a non-empty value or label.' };
+    const option = Array.from(element.options).find((candidate) => (
+      (value && candidate.value === value)
+      || (!value && label && normalizeVisibleDomText(candidate.label || candidate.text || candidate.textContent || '') === label)
+    ));
+    if (!option) return { ok: false, actual: `No option matched ${value ? `value=${value}` : `label=${label}`}.` };
+    if (option.disabled || element.disabled) return { ok: false, actual: 'The requested select option is disabled.' };
+    const previousValue = element.value;
+    element.value = option.value;
+    if (element.value !== option.value) return { ok: false, actual: 'The native select rejected the requested option value.' };
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+    return {
+      ok: true,
+      actual: previousValue === option.value ? 'The requested option was already selected.' : 'Native select value changed and input/change events were dispatched.',
+      value: option.value,
+      label: normalizeVisibleDomText(option.label || option.text || option.textContent || option.value),
+    };
+  }
+
   win.__aiDomRuntime = {
     version: 10,
     mutationState: () => ({ epoch: mutationState.epoch, lastMutationAt: mutationState.lastMutationAt }),
@@ -2245,6 +2305,7 @@ function installAiBrowserPageRuntime() {
     elementText,
     visibleDomPoint,
     visibleDomText,
+    selectVisibleDomOption,
   };
 }
 
@@ -4782,15 +4843,15 @@ export class BrowserSession {
     if (text) await this.activePage.keyboard.type(text, { delay: 20 });
   }
 
-  private async insertFocusedTextFast(text: string, timings?: Record<string, number>) {
-    if (!text) return;
-    const domInserted = await timedBrowserStep(timings, 'domTextMs', () => this.insertTextIntoFocusedElement(text));
-    if (domInserted) return;
-    const timeoutMs = boundedPositiveIntegerEnv('BROWSER_FAST_TEXT_TIMEOUT_MS', 1500, 100, 10000);
-    await timedBrowserStep(timings, 'insertTextMs', () => Promise.race([
-      this.activePage.keyboard.insertText(text).then(() => undefined),
-      sleep(timeoutMs).then(() => false),
-    ]));
+  private async insertFocusedTextFast(text: string, timings?: Record<string, number>): Promise<boolean> {
+    if (!text) return true;
+    // Do the value update inside the document first.  Unlike
+    // locator.pressSequentially(), this has no per-character actionability
+    // wait, so a focused search box cannot spend the full default timeout
+    // while an application rerenders around it.  Returning false is reserved
+    // for controls that are not native text inputs/contenteditables; callers
+    // can then use Playwright's keyboard path as the compatibility fallback.
+    return Boolean(await timedBrowserStep(timings, 'domTextMs', () => this.insertTextIntoFocusedElement(text)));
   }
 
   private async insertTextIntoFocusedElement(text: string) {
@@ -4800,6 +4861,13 @@ export class BrowserSession {
       const input = active as HTMLInputElement;
       const isTextControl = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement;
       if (isTextControl) {
+        // Preserve the observable keyboard lifecycle expected by pages that
+        // listen for it, but dispatch it inside one page evaluation rather
+        // than waiting for Playwright to type every character.
+        for (const key of Array.from(value)) {
+          active.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key }));
+          active.dispatchEvent(new KeyboardEvent('keypress', { bubbles: true, cancelable: true, key }));
+        }
         const currentValue = String(input.value || '');
         const start = typeof input.selectionStart === 'number' ? input.selectionStart : currentValue.length;
         const end = typeof input.selectionEnd === 'number' ? input.selectionEnd : start;
@@ -4823,6 +4891,9 @@ export class BrowserSession {
           inputType: 'insertText',
         }));
         active.dispatchEvent(new Event('change', { bubbles: true }));
+        for (const key of Array.from(value)) {
+          active.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key }));
+        }
         return true;
       }
       const editable = active.closest('[contenteditable=""], [contenteditable="true"]') as HTMLElement | null;
@@ -6378,48 +6449,80 @@ export class BrowserSession {
       .toLowerCase();
     const query = normalizeSearchText(input.query);
     if (!query) return { ok: false, actual: 'Snapshot search requires a non-empty query.' };
-    let generation = await this.ensureSnapshotGeneration(false);
-    if (await this.snapshotMutationChanged(generation).catch(() => false)) {
-      generation = await this.ensureSnapshotGeneration(true);
-    }
     const roles = new Set((input.roles || []).map(normalizeSearchText));
     const queryParts = query.split(/\s+/).filter(Boolean);
     const limit = Math.min(100, Math.max(1, Math.floor(Number(input.limit) || 20)));
-    const mainFrameId = generation.frames[0]?.frameId;
-    const matches = generation.views.full
-      .map((record, index) => ({ record, index }))
-      .filter(({ record }) => {
-        if (roles.size && !roles.has(String(record.role || '').toLowerCase())) return false;
-        const searchable = normalizeSearchText([record.name, record.url, record.line].filter(Boolean).join(' '));
-        return searchable.includes(query) || queryParts.every((part) => searchable.includes(part));
-      })
-      .sort((left, right) => {
-        const score = (record: SnapshotRecord) => {
-          const name = normalizeSearchText(record.name);
-          const url = normalizeSearchText(record.url);
-          const line = normalizeSearchText(record.line);
-          let value = 0;
-          if (name === query) value += 140;
-          else if (name.startsWith(query)) value += 110;
-          else if (name.includes(query)) value += 85;
-          else if (queryParts.length > 1 && queryParts.every((part) => name.includes(part))) value += 72;
-          else if (url.includes(query)) value += 45;
-          else if (line.includes(query)) value += 35;
-          if (record.actionable) value += 30;
-          if (record.frameId === mainFrameId) value += 6;
-          if (/\b(?:focused|selected|modal)=true\b/.test(line)) value += 12;
-          if (/\bdisabled=true\b/.test(line)) value -= 35;
-          return value;
+
+    // takeSnapshot establishes the only actionable UID namespace. Search that
+    // same registry after first consuming its pending MutationObserver delta;
+    // never create a second CDP UID namespace for the model to mix with dom-*.
+    if (this.domVisibleSnapshotKey && this.lastDomNodeReferences.size > 0) {
+      const changes = await this.readDomChanges();
+      if (changes.domChanges?.overflow) {
+        return {
+          ok: false,
+          actual: 'DOM changes overflowed while preparing the snapshot search. Call takeSnapshot to establish a fresh DOM baseline before choosing a UID.',
+          domChanges: changes.domChanges,
         };
-        return score(right.record) - score(left.record) || left.index - right.index;
-      })
-      .slice(0, limit);
+      }
+      const roleMatches = (reference: DomNodeReference) => {
+        if (!roles.size) return true;
+        const line = normalizeSearchText(reference.line);
+        const tag = normalizeSearchText(reference.tag);
+        const lineTerms = new Set(line.split(/[^a-z0-9_-]+/).filter(Boolean));
+        const semanticRoles = new Set<string>([tag]);
+        for (const match of line.matchAll(/\brole="([^"]+)"/g)) {
+          semanticRoles.add(normalizeSearchText(match[1]));
+        }
+        if (tag === 'input' || tag === 'textarea' || tag === 'contenteditable') semanticRoles.add('textbox');
+        if (tag === 'select') semanticRoles.add('combobox');
+        if (tag === 'a') semanticRoles.add('link');
+        if (tag === 'button') semanticRoles.add('button');
+        if (tag === 'input' && /\btype="checkbox"/.test(line)) semanticRoles.add('checkbox');
+        if (tag === 'input' && /\btype="radio"/.test(line)) semanticRoles.add('radio');
+        return [...roles].some((role) => semanticRoles.has(role) || lineTerms.has(role));
+      };
+      const matches = [...this.lastDomNodeReferences.values()]
+        .filter((reference) => {
+          if (!roleMatches(reference)) return false;
+          const searchable = normalizeSearchText([
+            reference.label,
+            reference.line,
+            reference.tag,
+            reference.descriptor,
+            reference.state,
+          ].filter(Boolean).join(' '));
+          return searchable.includes(query) || queryParts.every((part) => searchable.includes(part));
+        })
+        .sort((left, right) => {
+          const score = (reference: DomNodeReference) => {
+            const label = normalizeSearchText(reference.label);
+            const line = normalizeSearchText(reference.line);
+            let value = 0;
+            if (label === query) value += 140;
+            else if (label.startsWith(query)) value += 110;
+            else if (label.includes(query)) value += 85;
+            else if (queryParts.length > 1 && queryParts.every((part) => label.includes(part))) value += 72;
+            else if (line.includes(query)) value += 35;
+            if (reference.interactive) value += 30;
+            if (/\b(?:focused|selected|modal)=true\b/.test(line)) value += 12;
+            if (/\bdisabled=true\b/.test(line)) value -= 35;
+            return value;
+          };
+          return score(right) - score(left) || left.id.localeCompare(right.id, undefined, { numeric: true });
+        })
+        .slice(0, limit);
+      return {
+        ok: true,
+        actual: [
+          `DOM baseline search for "${input.query}" returned ${matches.length} result(s). Use only the dom-* UIDs shown below exactly as returned.`,
+          matches.map((reference) => reference.line).join('\n') || '[no DOM baseline matches]',
+        ].join('\n'),
+      };
+    }
     return {
-      ok: true,
-      actual: [
-        `Snapshot ${generation.id} search for "${input.query}" returned ${matches.length} result(s). Only UIDs from this current snapshot are actionable.`,
-        matches.map(({ record }) => record.line).join('\n') || '[no snapshot matches]',
-      ].join('\n'),
+      ok: false,
+      actual: 'searchSnapshot requires an active DOM baseline. Call takeSnapshot first; searchSnapshot never creates or searches a separate CDP UID namespace.',
     };
   }
 
@@ -6670,7 +6773,11 @@ export class BrowserSession {
   private async resolveDomObservationReferencePoint(uid: string, allowNonActionable = false) {
     const reference = this.lastDomNodeReferences.get(uid);
     if (!reference) {
-      return { error: `UID ${uid} is not present in the current DOM UID registry. It may have been removed; call takeSnapshot to inspect the current page.` };
+      const registryCount = this.lastDomNodeReferences.size;
+      const baselineState = this.domVisibleSnapshotKey ? 'an active DOM baseline' : 'no active DOM baseline';
+      return {
+        error: `UID ${uid} is absent from the current DOM UID registry (${registryCount} registered UIDs; ${baselineState}). It was not necessarily removed: it may belong to a different snapshot/UID namespace, or it may appear in domChanges.removed. Use a UID exactly as returned by the latest takeSnapshot or searchSnapshot; do not add or change the dom- prefix.`,
+      };
     }
     if (!allowNonActionable && !reference.interactive) {
       return { error: `UID ${uid} (${reference.tag} "${reference.label}") is structural text, not an actionable control.` };
@@ -6706,6 +6813,29 @@ export class BrowserSession {
         source: 'dom-observation',
       },
     };
+  }
+
+  private async editableIframeLocator(reference: DomNodeReference, point: { x: number; y: number }) {
+    if (reference.tag !== 'iframe' && reference.tag !== 'frame') return undefined;
+    const parentFrame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
+    if (!parentFrame) return undefined;
+    const childFrames = this.activePage.frames().filter((frame) => frame.parentFrame() === parentFrame);
+    const matchedFrames: Frame[] = [];
+    for (const frame of childFrames) {
+      const box = await frame.frameElement().then((element) => element.boundingBox()).catch(() => undefined);
+      if (box && point.x >= box.x && point.x <= box.x + box.width && point.y >= box.y && point.y <= box.y + box.height) {
+        matchedFrames.push(frame);
+      }
+    }
+    const frame = matchedFrames[0] || (childFrames.length === 1 ? childFrames[0] : undefined);
+    if (!frame) return undefined;
+    const candidates = frame.locator('[contenteditable=""], [contenteditable="true"], textarea, input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"])');
+    const count = Math.min(20, await candidates.count().catch(() => 0));
+    for (let index = 0; index < count; index += 1) {
+      const candidate = candidates.nth(index);
+      if (await candidate.isEditable().catch(() => false)) return candidate;
+    }
+    return undefined;
   }
 
   private async resolveScreenshotPoint(xThousandth?: number, yThousandth?: number) {
@@ -6948,14 +7078,43 @@ export class BrowserSession {
     );
   }
 
+  async selectOption(input: BrowserSelectOptionAction): Promise<BrowserActionResult> {
+    const uid = String(input.uid || '').trim();
+    if (!uid) return { ok: false, actual: 'selectOption requires a fresh select UID.' };
+    const reference = this.lastDomNodeReferences.get(uid);
+    if (!reference) return { ok: false, actual: `UID ${uid} is not present in the current DOM UID registry. Call takeSnapshot and choose a current native select UID.` };
+    if (reference.tag !== 'select') return { ok: false, actual: `UID ${uid} (${reference.tag} "${reference.label}") is not a native select element.` };
+    if (!reference.localRef) return { ok: false, actual: `UID ${uid} has no live select reference. Call takeSnapshot again.` };
+    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
+    if (!frame) return { ok: false, actual: `UID ${uid} belongs to an iframe that no longer exists.` };
+    await this.ensureBrowserPageRuntime(frame);
+    const selected = await frame.evaluate((selection) => {
+      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+      return runtime?.selectVisibleDomOption(selection.ref, { value: selection.value, label: selection.label });
+    }, { ref: reference.localRef, value: input.value, label: input.label }).catch(() => undefined);
+    if (!selected?.ok) return { ok: false, actual: selected?.actual || `Unable to select an option for UID ${uid}.` };
+    const selectedLabel = selected.label ? ` (${selected.label})` : '';
+    return this.completeVerifiedAction(
+      `Selected native option ${selected.value || input.value || input.label}${selectedLabel}.`,
+      this.snapshotGeneration,
+      async () => ({ ok: true, detail: selected.actual }),
+    );
+  }
+
   async keyboard(input: BrowserKeyboardAction): Promise<BrowserActionResult> {
     const page = this.activePage;
     const previousGeneration = this.snapshotGeneration;
     let targetLocator: Locator | undefined;
     if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
-      const target = await this.unifiedActionPoint(input);
+      const target = await this.unifiedActionPoint(input, true);
       if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
       targetLocator = target.reference && isSnapshotReference(target.reference) ? await this.snapshotReferenceLocator(target.reference) : undefined;
+      if (!targetLocator && target.reference && !isSnapshotReference(target.reference) && !target.reference.interactive) {
+        targetLocator = await this.editableIframeLocator(target.reference, target.point);
+        if (!targetLocator) {
+          return { ok: false, actual: `UID ${input.uid} (${target.reference.tag} "${target.reference.label}") is structural text, not an editable target.` };
+        }
+      }
       if (targetLocator) {
         await targetLocator.click({ noWaitAfter: true });
         await targetLocator.focus();
@@ -6991,8 +7150,11 @@ export class BrowserSession {
         }
       }
       const delay = boundedNonNegativeIntegerEnv('BROWSER_KEYBOARD_TYPE_DELAY_MS', 0, 200);
-      if (targetLocator) await targetLocator.pressSequentially(text, { delay });
-      else await page.keyboard.type(text, { delay });
+      const fastInserted = await this.insertFocusedTextFast(text);
+      if (!fastInserted) {
+        if (targetLocator) await targetLocator.pressSequentially(text, { delay });
+        else await page.keyboard.type(text, { delay });
+      }
       if (input.followByEnter) {
         if (targetLocator) await targetLocator.press('Enter');
         else await page.keyboard.press('Enter');
@@ -7012,7 +7174,10 @@ export class BrowserSession {
             ? inputEvents > 0 || valueChanged
             : input.replace !== false ? inputEvents > 0 || valueChanged || valueBefore === '' : true;
           return {
-            ok: navigated || (keyEvents > 0 && delivered),
+            // Fast DOM insertion intentionally emits input/change rather than
+            // synthetic keydown events. The observable value/input result is
+            // the delivery contract for text entry.
+            ok: navigated || delivered,
             detail: `${keyEvents} keydown and ${inputEvents} input event(s) observed; valueLength ${valueBefore?.length ?? '?'}→${valueAfter?.length ?? '?'}; navigation=${navigated}.`,
           };
         },
@@ -7170,7 +7335,7 @@ export class BrowserSession {
       for (const item of snapshot.items) {
         const publicId = this.publicDomVisibleId(snapshot.stateKey, item.ref);
         const indent = this.domObservationIndent(item.path, framePath);
-        const line = `${indent}${item.line.replace(`node_id=${item.ref}`, `node_id=${publicId}`)}`;
+        const line = `${indent}${item.line.replace(`node_id=${item.ref}`, `uid=${publicId}`)}`;
         if (options.includeTree) {
           const lineChars = line.length + (treeLines.length === 0 ? 0 : 1);
           if (treeLines.length < maxElements && chars + lineChars <= maxChars) {

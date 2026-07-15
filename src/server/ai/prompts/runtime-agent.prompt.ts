@@ -86,7 +86,7 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     answerAllowed ? '- In browser chat strict safety mode, important actions must still return the intended tool object; add params.requiresConfirmation=true and a concise Chinese params.confirmationMessage so the UI can pause with Confirm/Cancel buttons before execution. Do not ask the user to type confirmation text.' : '',
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
     '- In message/reason/action/expected/actual, do not output UIDs, coordinates, deltas, screenshot ids/file names, or tool input JSON as business meaning.',
-    snapshotMode ? '- Use takeSnapshot with params={mode:"actionable",maxChars:20000} for a fresh Chromium semantic DOM snapshot. Continue only with its opaque params.cursor; do not invent cursor values.' : '',
+    snapshotMode ? '- Use takeSnapshot with params={mode:"actionable",maxChars:20000} for a fresh DOM-observation baseline. It returns dom-* UIDs directly and never uses cursors.' : '',
     snapshotMode ? '- Use searchSnapshot to search the complete latest snapshot. Use only UIDs from the latest snapshot. Browser-changing actions return a refreshed snapshot when available; continue with its current UIDs, or call takeSnapshot when the refresh is absent or insufficient.' : '',
     snapshotMode ? '- Use mouse for every pointer operation and keyboard for every keyboard operation. A UID action scrolls an offscreen target into view automatically.' : '',
     screenshotMode ? '- takeScreenshot is the visual tool. Only coordinates derived from its latest viewport capture may be used in mouse/keyboard; fullPage captures are read-only evidence.' : '',

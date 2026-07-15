@@ -90,6 +90,7 @@ export type BrowserChatToolConfirmation = {
   messageId: string;
   stepIndex?: number;
   toolName: string;
+  inputSignature: string;
   reason?: string;
   prompt: string;
   requestedAt: string;
@@ -347,6 +348,7 @@ function normalizeToolConfirmation(value: unknown): BrowserChatToolConfirmation 
   const confirmationId = typeof record.id === 'string' ? record.id.trim() : '';
   const messageId = typeof record.messageId === 'string' ? record.messageId.trim() : '';
   const toolName = typeof record.toolName === 'string' ? record.toolName.trim() : '';
+  const inputSignature = typeof record.inputSignature === 'string' ? record.inputSignature : '';
   const prompt = typeof record.prompt === 'string' ? record.prompt.trim() : '';
   if (!confirmationId || !messageId || !toolName || !prompt) return undefined;
   return {
@@ -354,6 +356,7 @@ function normalizeToolConfirmation(value: unknown): BrowserChatToolConfirmation 
     messageId,
     stepIndex: typeof record.stepIndex === 'number' && Number.isFinite(record.stepIndex) ? Math.floor(record.stepIndex) : undefined,
     toolName,
+    inputSignature,
     reason: typeof record.reason === 'string' && record.reason.trim() ? compactText(record.reason, 300) : undefined,
     prompt: compactText(prompt, 500),
     requestedAt: typeof record.requestedAt === 'string' ? record.requestedAt : now(),
@@ -2459,6 +2462,23 @@ function toolConfirmationLog(decision: BrowserToolConfirmationDecision) {
       };
 }
 
+function toolConfirmationInputSignature(value: unknown) {
+  const omitToolPresentationFields = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(omitToolPresentationFields);
+    if (!input || typeof input !== 'object') return input;
+    const record = input as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(record)
+      .filter((key) => key !== 'reason' && key !== 'requiresConfirmation' && key !== 'confirmationMessage')
+      .sort()
+      .map((key) => [key, omitToolPresentationFields(record[key])]));
+  };
+  try {
+    return JSON.stringify(omitToolPresentationFields(value)) || '';
+  } catch {
+    return '';
+  }
+}
+
 function cancelPendingToolConfirmation(session: BrowserChatSessionRecord) {
   const pending = session.pendingToolConfirmation;
   if (!pending) return false;
@@ -2494,6 +2514,7 @@ function requestBrowserChatToolConfirmation(
     messageId: assistantMessageId,
     stepIndex: request.stepIndex,
     toolName: request.toolName,
+    inputSignature: toolConfirmationInputSignature(request.input),
     reason: request.reason ? compactText(request.reason, 300) : undefined,
     prompt: compactText(request.prompt || `请确认是否执行工具 ${request.toolName}`, 500),
     requestedAt,
@@ -2512,7 +2533,7 @@ function requestBrowserChatToolConfirmation(
         appendLog(session, log.phase, log.message, {
           stepIndex: pending.stepIndex,
           messageId: assistantMessageId,
-          details: { confirmationId, decision, toolName: pending.toolName },
+          details: { confirmationId, decision, toolName: pending.toolName, inputSignature: pending.inputSignature },
         });
       }
       resolve(decision);

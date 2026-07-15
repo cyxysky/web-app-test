@@ -184,6 +184,7 @@ type BrowserChatToolConfirmation = {
   messageId: string;
   stepIndex?: number;
   toolName: string;
+  inputSignature: string;
   reason?: string;
   prompt: string;
   requestedAt: string;
@@ -622,18 +623,20 @@ function aiCycleToolKey(cycleId: string, toolIndex: number) {
 }
 
 function toolInputSignature(value: unknown) {
-  // Persisted StepToolCall separates `reason` from the executable parameters.
-  // Compare the same canonical shape here; otherwise every tool call with a
-  // reason misses its real trace and can be paired with a different same-name
-  // call from the step.
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return formatToolPayload(value).replace(/\s+/g, ' ').trim();
+  const canonicalize = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(canonicalize);
+    if (!input || typeof input !== 'object') return input;
+    const record = input as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(record)
+      .filter((key) => key !== 'reason' && key !== 'requiresConfirmation' && key !== 'confirmationMessage')
+      .sort()
+      .map((key) => [key, canonicalize(record[key])]));
+  };
+  try {
+    return JSON.stringify(canonicalize(value)) || '';
+  } catch {
+    return '';
   }
-  const { reason, requiresConfirmation, confirmationMessage, ...executableInput } = value as Record<string, unknown>;
-  void reason;
-  void requiresConfirmation;
-  void confirmationMessage;
-  return formatToolPayload(Object.keys(executableInput).length ? executableInput : undefined).replace(/\s+/g, ' ').trim();
 }
 
 function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[]) {
@@ -750,6 +753,7 @@ function browserChatToolLabel(name: string, t: (value: string) => string) {
     openPage: '导航页面',
     reportState: '确认状态',
     searchSnapshot: '搜索页面快照',
+    selectOption: '选择下拉选项',
     selectReferenceScreenshots: '引用截图',
     switchTab: '切换标签',
     takeScreenshot: '截屏取证',
@@ -781,6 +785,7 @@ function browserChatToolMeta(name: string, input: unknown) {
 
   const lower = name.toLowerCase();
   if (name === 'keyboard') return [toolInputValue(record, ['action']), toolInputValue(record, ['text', 'key', 'uid'])].filter(Boolean).join(' · ');
+  if (name === 'selectOption') return [toolInputValue(record, ['uid']), toolInputValue(record, ['value', 'label'])].filter(Boolean).join(' · ');
   if (name === 'openPage') return toolInputValue(record, ['url']);
   if (name === 'switchTab') return toolInputValue(record, ['index']);
   if (name === 'waitForPage') return toolInputValue(record, ['ms']);
@@ -851,6 +856,7 @@ function normalizeToolConfirmation(value?: BrowserChatToolConfirmation): Browser
   const id = typeof value.id === 'string' ? value.id.trim() : '';
   const messageId = typeof value.messageId === 'string' ? value.messageId.trim() : '';
   const toolName = typeof value.toolName === 'string' ? value.toolName.trim() : '';
+  const inputSignature = typeof value.inputSignature === 'string' ? value.inputSignature : '';
   const prompt = typeof value.prompt === 'string' ? value.prompt.trim() : '';
   if (!id || !messageId || !toolName || !prompt) return undefined;
   return {
@@ -858,6 +864,7 @@ function normalizeToolConfirmation(value?: BrowserChatToolConfirmation): Browser
     messageId,
     stepIndex: typeof value.stepIndex === 'number' && Number.isFinite(value.stepIndex) ? Math.floor(value.stepIndex) : undefined,
     toolName,
+    inputSignature,
     reason: typeof value.reason === 'string' && value.reason.trim() ? compactText(value.reason, 300) : undefined,
     prompt: compactText(prompt, 500),
     requestedAt: typeof value.requestedAt === 'string' ? value.requestedAt : '',
@@ -1434,23 +1441,28 @@ function pendingConfirmationForTool(input: {
   pending?: BrowserChatToolConfirmation;
   stepIndex?: number;
   toolName: string;
+  toolInput: unknown;
   toolOk?: boolean;
 }) {
-  const { pending, stepIndex, toolName, toolOk } = input;
+  const { pending, stepIndex, toolName, toolInput, toolOk } = input;
   if (!pending || toolOk !== undefined) return undefined;
   if (pending.toolName !== toolName) return undefined;
   if (pending.stepIndex !== undefined && stepIndex !== pending.stepIndex) return undefined;
+  if (!pending.inputSignature || pending.inputSignature !== toolInputSignature(toolInput)) return undefined;
   return pending;
 }
 
-function toolUserActionForTool(logs: BrowserChatLogRecord[], stepIndex: number | undefined, toolName: string) {
+function toolUserActionForTool(logs: BrowserChatLogRecord[], stepIndex: number | undefined, toolName: string, toolInput: unknown) {
   if (stepIndex === undefined) return undefined;
+  const inputSignature = toolInputSignature(toolInput);
   for (const log of [...logs].reverse()) {
     if (log.stepIndex !== stepIndex) continue;
     if (log.phase !== 'tool:confirmation:confirmed' && log.phase !== 'tool:confirmation:cancelled') continue;
     const details = parseJsonObjectText(log.details);
     const loggedToolName = typeof details?.toolName === 'string' ? details.toolName : '';
     if (loggedToolName && loggedToolName !== toolName) continue;
+    const loggedInputSignature = typeof details?.inputSignature === 'string' ? details.inputSignature : '';
+    if (!loggedInputSignature || loggedInputSignature !== inputSignature) continue;
     return log.phase === 'tool:confirmation:confirmed'
       ? { className: 'is-confirmed', label: '用户已确认' }
       : { className: 'is-cancelled', label: '用户已取消' };
@@ -1533,6 +1545,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
     pending: pendingToolConfirmation,
     stepIndex: step.index,
     toolName: tool.name,
+    toolInput: tool.input,
     toolOk: tool.ok,
   }))) return null;
   if (running && !toolCalls.length) {
@@ -1565,10 +1578,11 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
           pending: pendingToolConfirmation,
           stepIndex: step.index,
           toolName: tool.name,
+          toolInput: tool.input,
           toolOk: tool.ok,
         });
         if (onlyPendingConfirmation && !pendingConfirmation) return null;
-        const userAction = toolUserActionForTool(logs, step.index, tool.name);
+        const userAction = toolUserActionForTool(logs, step.index, tool.name, tool.input);
         return (
           <div className="browser-chat-tool-call" key={`${step.index}-${toolIndex}-${tool.name}`}>
             {tool.reason ? <p className="browser-chat-tool-reason">{tool.reason}</p> : null}
@@ -1636,6 +1650,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
       pending: pendingToolConfirmation,
       stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
       toolName: tool.name,
+      toolInput: toolDetail?.tool.input ?? tool.input,
       toolOk: toolDetail?.tool.ok,
     }));
   });
@@ -1675,9 +1690,10 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                 pending: pendingToolConfirmation,
                 stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
                 toolName: tool.name,
+                toolInput: toolDetail?.tool.input ?? tool.input,
                 toolOk: toolDetail?.tool.ok,
               });
-              const userAction = toolUserActionForTool(logs, toolDetail?.stepIndex ?? cycle.stepIndex, tool.name);
+              const userAction = toolUserActionForTool(logs, toolDetail?.stepIndex ?? cycle.stepIndex, tool.name, toolDetail?.tool.input ?? tool.input);
               const card = (
                 <>
                   <span className="browser-chat-tool-icon" aria-hidden="true">
@@ -1754,6 +1770,7 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
         pending: pendingToolConfirmation,
         stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
         toolName: tool.name,
+        toolInput: toolDetail?.tool.input ?? tool.input,
         toolOk: toolDetail?.tool.ok,
       }));
     })
@@ -1861,6 +1878,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
         pending: pendingToolConfirmation,
         stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
         toolName: tool.name,
+        toolInput: toolDetail?.tool.input ?? tool.input,
         toolOk: toolDetail?.tool.ok,
       }));
     })
@@ -1870,6 +1888,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       pending: pendingToolConfirmation,
       stepIndex: step.index,
       toolName: tool.name,
+      toolInput: tool.input,
       toolOk: tool.ok,
     })))
     : [];

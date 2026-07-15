@@ -3,8 +3,8 @@ export function snapshotHardRules(screenshotAvailable = true) {
     '- takeSnapshot captures a lightweight DOM-observation baseline, not a screenshot.',
     '- Use mode="actionable" normally, mode="full" for wider DOM structure, and mode="text" for deduplicated rendered copy.',
     '- Browser-changing actions return an incremental DOM delta, not a full snapshot. Keep an existing dom-* UID unless that delta lists it as removed; removed UIDs are invalid immediately.',
-    '- Call readDomChanges when the page may have changed without one of your browser actions. Call takeSnapshot when you need a new baseline or a delta reports overflow.',
-    '- Use searchSnapshot only when its explicit full CDP search is needed; prefer the current DOM baseline and deltas for normal interaction.',
+    '- Browser-changing actions already return their incremental DOM delta. When the page may have changed outside an action, call takeSnapshot for a fresh baseline; call it again if an action delta reports overflow.',
+    '- Use searchSnapshot to narrow the current DOM baseline when needed; it returns the same dom-* UID namespace as takeSnapshot. Prefer existing DOM deltas when they already contain the needed target.',
     '- Never conclude that a control or result is absent from one bounded observation. Take a fresh snapshot or screenshot when broader evidence is needed.',
     '- Never invent a room id, entity id, href, or navigation URL. Navigation targets and factual identifiers must come from the user, the current semantic DOM snapshot, a screenshot, or an observed network response.',
     screenshotAvailable
@@ -23,7 +23,7 @@ export function snapshotHardRules(screenshotAvailable = true) {
 
 export function browserActionRules(screenshotAvailable = true) {
   return [
-    '- Prefer takeSnapshot -> UID -> mouse/keyboard for buttons, links, forms, tables, menus, and offscreen elements.',
+    '- Prefer takeSnapshot -> UID -> mouse/keyboard for buttons, links, forms, tables, menus, and offscreen elements. For a native <select>, use selectOption with its UID and an exact value or label exposed in the snapshot; do not open the platform dropdown to look for DOM changes.',
     screenshotAvailable
       ? '- Use takeScreenshot -> thousandth coordinates for canvas, charts, icon-only controls, custom rendered widgets, or ambiguous overlays.'
       : '- Use only fresh semantic-snapshot UIDs for pointer and keyboard actions; do not invent image coordinates.',

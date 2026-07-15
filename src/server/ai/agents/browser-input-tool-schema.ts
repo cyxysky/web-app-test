@@ -29,3 +29,11 @@ export const browserKeyboardToolShape = {
   replace: z.boolean().optional().describe('For action=type, replace existing content unless false.'),
   followByEnter: z.boolean().optional(),
 } satisfies z.ZodRawShape;
+
+export const browserSelectOptionToolDescription = 'Select one option from a native HTML <select>. Use the select uid from takeSnapshot plus an exact option value or visible label shown in that select\'s options attribute. This does not open the platform dropdown.';
+
+export const browserSelectOptionToolShape = {
+  uid: z.string().min(1).describe('Fresh uid of the native select from takeSnapshot.'),
+  value: z.string().min(1).optional().describe('Exact option value shown in the select options attribute. Preferred when present.'),
+  label: z.string().min(1).optional().describe('Exact visible option label shown in the select options attribute.'),
+} satisfies z.ZodRawShape;

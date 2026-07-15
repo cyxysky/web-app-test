@@ -7,6 +7,7 @@ export const runtimeObservationInvalidatingToolNames = new Set([
   'openPage',
   'mouse',
   'keyboard',
+  'selectOption',
   'waitForPage',
   'waitForHumanVerification',
   'switchTab',
