@@ -6,10 +6,12 @@ const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
 
-const APP_NAME = 'WebPilot QA';
+const APP_NAME = 'WebPilot';
+const APP_TITLE = APP_NAME;
 const DEFAULT_PORT = 17890;
 const EMBEDDED_BROWSER_CDP_PORT = Number(process.env.WEBPILOT_ELECTRON_CDP_PORT || process.env.ELECTRON_EMBEDDED_BROWSER_CDP_PORT || 19333);
 
+app.setName(APP_NAME);
 app.commandLine.appendSwitch('remote-debugging-port', String(EMBEDDED_BROWSER_CDP_PORT));
 
 let serverProcess;
@@ -21,8 +23,8 @@ let embeddedBrowserLibraryView;
 let embeddedBrowserLibraryPanel = '';
 let embeddedBrowserLibraryAttached = false;
 let embeddedBrowserLibraryVisible = false;
-let embeddedBrowserLibraryPendingPanel = '';
-let embeddedBrowserLibraryReadyPanel = '';
+let embeddedBrowserLibraryOpenSequence = 0;
+let embeddedBrowserLibraryPendingSequence = 0;
 let embeddedBrowserActiveGroupId = '';
 let embeddedBrowserActiveTabId = '';
 let embeddedBrowserNextTabId = 1;
@@ -137,8 +139,9 @@ function tinymceRoot() {
 }
 
 function appIconPath() {
-  if (app.isPackaged) return path.join(process.resourcesPath, 'app-icon.png');
-  return path.join(process.cwd(), 'assets', 'app-icon.png');
+  const fileName = process.platform === 'win32' ? 'app-icon.ico' : 'app-icon.png';
+  if (app.isPackaged) return path.join(process.resourcesPath, fileName);
+  return path.join(process.cwd(), 'assets', fileName);
 }
 
 function preloadPath() {
@@ -252,6 +255,7 @@ function ensureEmbeddedBrowserLibraryView() {
     handleEmbeddedBrowserShortcut(event, input);
   });
   view.webContents.on('did-finish-load', () => {
+    notifyEmbeddedBrowserLibraryStateChange();
     notifyEmbeddedBrowserStateChange();
   });
   view.webContents.on('did-fail-load', (_event, errorCode, errorDescription, _validatedUrl, isMainFrame) => {
@@ -260,8 +264,7 @@ function ensureEmbeddedBrowserLibraryView() {
     if (embeddedBrowserLibraryView === view) {
       embeddedBrowserLibraryPanel = '';
       embeddedBrowserLibraryVisible = false;
-      embeddedBrowserLibraryPendingPanel = '';
-      embeddedBrowserLibraryReadyPanel = '';
+      embeddedBrowserLibraryPendingSequence = 0;
       view.setVisible(false);
       notifyEmbeddedBrowserStateChange();
     }
@@ -272,23 +275,19 @@ function ensureEmbeddedBrowserLibraryView() {
       embeddedBrowserLibraryPanel = '';
       embeddedBrowserLibraryAttached = false;
       embeddedBrowserLibraryVisible = false;
-      embeddedBrowserLibraryPendingPanel = '';
-      embeddedBrowserLibraryReadyPanel = '';
+      embeddedBrowserLibraryPendingSequence = 0;
       notifyEmbeddedBrowserStateChange();
     }
   });
   embeddedBrowserLibraryView = view;
   embeddedBrowserLibraryAttached = false;
   embeddedBrowserLibraryVisible = false;
-  embeddedBrowserLibraryPendingPanel = '';
-  embeddedBrowserLibraryReadyPanel = '';
   void view.webContents.loadURL(routeUrl).catch((error) => {
     appendLog(`Embedded browser library load failed: ${error instanceof Error ? error.message : String(error)}`);
     if (embeddedBrowserLibraryView === view) {
       embeddedBrowserLibraryPanel = '';
       embeddedBrowserLibraryVisible = false;
-      embeddedBrowserLibraryPendingPanel = '';
-      embeddedBrowserLibraryReadyPanel = '';
+      embeddedBrowserLibraryPendingSequence = 0;
       view.setVisible(false);
       notifyEmbeddedBrowserStateChange();
     }
@@ -297,7 +296,7 @@ function ensureEmbeddedBrowserLibraryView() {
 }
 
 function attachEmbeddedBrowserLibraryView() {
-  if (!embeddedBrowserLibraryPanel || !embeddedBrowserVisible || !mainWindow || mainWindow.isDestroyed()) {
+  if (!embeddedBrowserLibraryPanel || !mainWindow || mainWindow.isDestroyed()) {
     if (embeddedBrowserLibraryVisible) embeddedBrowserLibraryView?.setVisible(false);
     embeddedBrowserLibraryVisible = false;
     return;
@@ -308,8 +307,7 @@ function attachEmbeddedBrowserLibraryView() {
     embeddedBrowserLibraryAttached = true;
   }
   view.setBounds(embeddedBrowserLibraryViewBounds());
-  const canShow = !embeddedBrowserLibraryPendingPanel
-    || embeddedBrowserLibraryReadyPanel === embeddedBrowserLibraryPanel;
+  const canShow = embeddedBrowserLibraryPendingSequence === 0;
   if (canShow && !embeddedBrowserLibraryVisible) {
     view.setVisible(true);
     embeddedBrowserLibraryVisible = true;
@@ -321,15 +319,17 @@ function setEmbeddedBrowserLibraryPanel(value) {
   const nextPanel = value === 'bookmarks' || value === 'history' ? value : '';
   embeddedBrowserLibraryPanel = nextPanel;
   if (nextPanel) {
-    embeddedBrowserLibraryPendingPanel = embeddedBrowserLibraryReadyPanel === nextPanel ? '' : nextPanel;
-    if (embeddedBrowserLibraryPendingPanel && embeddedBrowserLibraryVisible) {
+    embeddedBrowserLibraryOpenSequence += 1;
+    embeddedBrowserLibraryPendingSequence = embeddedBrowserLibraryOpenSequence;
+    if (embeddedBrowserLibraryVisible) {
       embeddedBrowserLibraryView?.setVisible(false);
       embeddedBrowserLibraryVisible = false;
     }
     attachEmbeddedBrowserLibraryView();
+    notifyEmbeddedBrowserLibraryStateChange();
   }
   else {
-    embeddedBrowserLibraryPendingPanel = '';
+    embeddedBrowserLibraryPendingSequence = 0;
     if (embeddedBrowserLibraryVisible) embeddedBrowserLibraryView?.setVisible(false);
     embeddedBrowserLibraryVisible = false;
   }
@@ -340,8 +340,7 @@ function setEmbeddedBrowserLibraryPanel(value) {
 function destroyEmbeddedBrowserLibraryView() {
   const view = embeddedBrowserLibraryView;
   embeddedBrowserLibraryPanel = '';
-  embeddedBrowserLibraryPendingPanel = '';
-  embeddedBrowserLibraryReadyPanel = '';
+  embeddedBrowserLibraryPendingSequence = 0;
   embeddedBrowserLibraryView = undefined;
   embeddedBrowserLibraryVisible = false;
   const wasAttached = embeddedBrowserLibraryAttached;
@@ -363,6 +362,15 @@ function clearEmbeddedBrowserStateChangeTimer() {
   if (!embeddedBrowserStateChangeTimer) return;
   clearTimeout(embeddedBrowserStateChangeTimer);
   embeddedBrowserStateChangeTimer = undefined;
+}
+
+function notifyEmbeddedBrowserLibraryStateChange() {
+  if (!embeddedBrowserLibraryView || embeddedBrowserLibraryView.webContents.isDestroyed()) return;
+  try {
+    embeddedBrowserLibraryView.webContents.send('webpilot:embedded-browser:state-changed', embeddedBrowserState());
+  } catch (error) {
+    appendLog(`Embedded browser library state event failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function notifyEmbeddedBrowserStateChange() {
@@ -1588,7 +1596,7 @@ function detachEmbeddedBrowserView() {
   for (const tab of embeddedBrowserTabs.values()) detachEmbeddedBrowserTab(tab);
   embeddedBrowserAttached = false;
   embeddedBrowserLibraryPanel = '';
-  embeddedBrowserLibraryPendingPanel = '';
+  embeddedBrowserLibraryPendingSequence = 0;
   if (embeddedBrowserLibraryVisible) embeddedBrowserLibraryView?.setVisible(false);
   embeddedBrowserLibraryVisible = false;
   notifyEmbeddedBrowserStateChange();
@@ -1836,6 +1844,7 @@ function embeddedBrowserState() {
     groups,
     history: embeddedBrowserHistory,
     libraryPanel: embeddedBrowserLibraryPanel || undefined,
+    libraryPanelSequence: embeddedBrowserLibraryPanel ? embeddedBrowserLibraryOpenSequence : undefined,
     zoomFactor: active?.view.webContents.isDestroyed() ? undefined : active?.view.webContents.getZoomFactor(),
     tabs,
   };
@@ -2201,9 +2210,9 @@ function registerEmbeddedBrowserIpc() {
 
   ipcMain.handle('webpilot:embedded-browser:library-panel-ready', async (_event, input = {}) => {
     const panel = input.panel === 'bookmarks' || input.panel === 'history' ? input.panel : '';
-    if (panel && panel === embeddedBrowserLibraryPanel) {
-      embeddedBrowserLibraryReadyPanel = panel;
-      if (embeddedBrowserLibraryPendingPanel === panel) embeddedBrowserLibraryPendingPanel = '';
+    const sequence = Number(input.sequence);
+    if (panel && panel === embeddedBrowserLibraryPanel && sequence === embeddedBrowserLibraryOpenSequence) {
+      embeddedBrowserLibraryPendingSequence = 0;
       attachEmbeddedBrowserLibraryView();
     }
     return embeddedBrowserState();
@@ -2525,7 +2534,7 @@ function createWindow() {
     height: 900,
     minWidth: 980,
     minHeight: 680,
-    title: APP_NAME,
+    title: APP_TITLE,
     icon: appIconPath(),
     backgroundColor: '#0f131b',
     webPreferences: {
@@ -2626,8 +2635,8 @@ function createWindow() {
         <div class="mark">WP</div>
         <div>
           <div class="eyebrow">${APP_NAME}</div>
-          <h2>正在启动工作区</h2>
-          <p>正在连接本地服务并恢复浏览器状态…</p>
+          <h2>智能浏览器测试工作区</h2>
+          <p>正在连接本地服务，并恢复你的浏览器工作区…</p>
         </div>
         <div class="progress" aria-label="正在加载"></div>
       </main>
@@ -2659,7 +2668,7 @@ async function boot() {
       ? `\n\nRecent server output:\n${recentServerOutput.slice(-10).join('\n')}`
       : '';
     const logHint = startupLogPath ? `\n\nStartup log: ${startupLogPath}` : '';
-    dialog.showErrorBox(APP_NAME, `${error instanceof Error ? error.message : String(error)}${output}${logHint}`);
+    dialog.showErrorBox(APP_TITLE, `${error instanceof Error ? error.message : String(error)}${output}${logHint}`);
     app.quit();
   }
 }

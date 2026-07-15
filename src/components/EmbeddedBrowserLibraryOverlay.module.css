@@ -10,6 +10,7 @@
 }
 
 .card {
+  animation: library-card-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1) both;
   background: color-mix(in srgb, var(--panel) 97%, #f4f7fb);
   border-radius: 16px;
   box-shadow:
@@ -21,6 +22,18 @@
   height: min(680px, 100%);
   overflow: hidden;
   width: min(520px, 100%);
+}
+
+@keyframes library-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.985);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
 .header {
@@ -322,6 +335,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .card,
   .headerActions button,
   .searchBar button,
   .removeItem {

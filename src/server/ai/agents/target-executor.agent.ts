@@ -7,7 +7,7 @@ import type { AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, R
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
-import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type BrowserSnapshotViews, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 import {
@@ -25,7 +25,6 @@ import {
   observationPreviewLimit,
   observationStoreKey,
   restoreRuntimeObservationStore,
-  runtimeObservationAvailableTypes,
   runtimeObservationCount,
   runtimeObservationInvalidatingToolNames,
   runtimeObservationToolNames,
@@ -702,8 +701,64 @@ function agentStepLabel(stepIndex: number) {
 }
 
 function agentLoopSummaryInputCharLimit() {
-  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS || 60000);
-  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 60000;
+  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS || 120000);
+  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 120000;
+}
+
+function agentLoopSummaryOutputCharLimit() {
+  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_OUTPUT_MAX_CHARS || 24000);
+  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 24000;
+}
+
+function compactContinuationText(value: string, max: number) {
+  if (value.length <= max) return value;
+  const headLength = Math.max(1, Math.floor(max * 0.72));
+  const tailLength = Math.max(1, max - headLength);
+  return `${value.slice(0, headLength)}\n...[${value.length - headLength - tailLength} characters omitted; tail retained]...\n${value.slice(-tailLength)}`;
+}
+
+function continuationSummaryMessageExcerpt(modelMessages: unknown, maxChars: number) {
+  const record = modelMessages && typeof modelMessages === 'object' && !Array.isArray(modelMessages)
+    ? modelMessages as Record<string, unknown>
+    : {};
+  const messages = Array.isArray(record.messages) ? record.messages : [];
+  const marker = '[WebPilot continuation summary]';
+  const previousSummary = messages
+    .map((message) => message && typeof message === 'object' && !Array.isArray(message)
+      ? message as Record<string, unknown>
+      : undefined)
+    .filter((message): message is Record<string, unknown> => Boolean(message))
+    .map((message) => typeof message.content === 'string' ? message.content : '')
+    .filter((content) => content.startsWith(marker))
+    .at(-1);
+  const result: {
+    previousContinuationSummary?: string;
+    recentMessages: Array<{ index: number; content: string }>;
+  } = { recentMessages: [] };
+  if (previousSummary) result.previousContinuationSummary = compactContinuationText(previousSummary, Math.min(24000, Math.floor(maxChars * 0.28)));
+
+  let remaining = maxChars - JSON.stringify(result).length - 256;
+  for (let index = messages.length - 1; index >= 0 && result.recentMessages.length < 16 && remaining >= 1200; index -= 1) {
+    const serialized = JSON.stringify(messages[index], null, 2);
+    const excerpt = compactContinuationText(serialized, Math.min(14000, Math.max(1200, remaining)));
+    result.recentMessages.unshift({ index, content: excerpt });
+    remaining -= excerpt.length + 96;
+  }
+  return JSON.stringify(result, null, 2);
+}
+
+function continuationRuntimeState(memory: RuntimeWorkingMemory) {
+  return {
+    completed: memory.completed.slice(-30),
+    findings: memory.findings.slice(-40),
+    blockers: memory.blockers.slice(-20),
+    userConstraints: memory.userConstraints.slice(-20),
+    pageUnderstanding: concise(memory.pageUnderstanding, 1800),
+    currentState: concise(memory.currentState, 2600),
+    lastAction: concise(memory.lastAction, 1400),
+    lastResult: concise(memory.lastResult, 2200),
+    nextStep: concise(memory.nextStep, 1400),
+  };
 }
 
 function buildContinuationSummaryPrompt(input: {
@@ -714,22 +769,22 @@ function buildContinuationSummaryPrompt(input: {
   estimatedTokens: number;
   thresholdTokens: number;
   modelMessages: unknown;
+  workingMemory: RuntimeWorkingMemory;
 }) {
-  const serializedMessages = trimDebugText(
-    JSON.stringify(input.modelMessages, null, 2),
-    agentLoopSummaryInputCharLimit(),
-  );
+  const serializedMessages = continuationSummaryMessageExcerpt(input.modelMessages, agentLoopSummaryInputCharLimit());
   return [
     'You are compressing a WebPilot browser-agent loop so the SAME user request can continue in a fresh model context.',
     'Return concise JSON only. Do not use markdown.',
     '',
     'Required JSON shape:',
-    '{ "goal": string, "completed": string[], "currentPage": string, "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
+    '{ "goal": string, "completed": string[], "currentPage": string, "confirmedFacts": string[], "negativeResults": string[], "failedAttempts": string[], "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
     '',
     'Rules:',
     '- Preserve that only UIDs from the latest takeSnapshot and coordinates from the latest viewport takeScreenshot are actionable.',
     '- Preserve tool results that materially affect the next action.',
     '- Preserve current URL/page state, blockers, manual verification state, and user constraints.',
+    '- Preserve every completed search/query and its observed result. If a query had no result, put the exact query and outcome in negativeResults; do not schedule that same query again unless the user changed it or new evidence contradicts it.',
+    '- Merge the previousContinuationSummary with the newest evidence. The authoritative runtime state below is produced after the latest completed tool call and wins on conflict.',
     '- Do not include raw screenshots, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON unless essential.',
     '- Write Chinese for user-facing summaries when possible.',
     '',
@@ -739,7 +794,9 @@ function buildContinuationSummaryPrompt(input: {
     `Browser mode: ${input.browserMode}`,
     `Estimated model-context tokens: ${input.estimatedTokens}/${input.thresholdTokens}`,
     '',
-    `Sanitized model messages JSON:\n${serializedMessages}`,
+    `Authoritative current runtime state JSON:\n${JSON.stringify(continuationRuntimeState(input.workingMemory), null, 2)}`,
+    '',
+    `Selected message history JSON (previous overview plus newest messages, not a head-only truncation):\n${serializedMessages}`,
   ].join('\n');
 }
 
@@ -759,6 +816,9 @@ function fallbackContinuationSummary(input: {
     completed: input.workingMemory.completed,
     currentPage: input.workingMemory.currentState || input.workingMemory.pageUnderstanding || '',
     importantEvidence: input.workingMemory.findings,
+    confirmedFacts: input.workingMemory.findings,
+    negativeResults: [],
+    failedAttempts: [],
     openObservations: [],
     remaining: input.workingMemory.nextStep ? [input.workingMemory.nextStep] : [],
     nextStep: input.workingMemory.nextStep || 'Continue from the latest live browser state.',
@@ -1358,25 +1418,10 @@ function makeBrowserTools(
       action,
     }).then((result) => {
       if (runtimeObservationInvalidatingToolNames.has(name)) {
-        const autoViews = result.autoSnapshot
-          ? session.currentSnapshotObservationViews()
-          : result.observationViews;
-        if (result.ok && autoViews?.actionable && referenceOptions?.observationStore) {
-          const observation = storeRuntimeObservation(
-            referenceOptions.observationStore,
-            referenceOptions.runId,
-            name,
-            autoViews.actionable,
-            autoViews,
-          );
-          const changes = observation.views.changes || 'No semantic DOM snapshot changes were detected after the action.';
-          result = {
-            ...result,
-            actual: `${result.actual}\n\n${changes}`,
-            autoSnapshot: result.autoSnapshot,
-            observationViews: { defaultType: 'changes', changes },
-          };
-        } else {
+        // Action results carry their authoritative incremental delta in
+        // domChanges. Snapshots remain explicit, server-side observations;
+        // never append or return a second text representation after an action.
+        if (!result.ok || !result.domChanges) {
           invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
         }
       }
@@ -2384,6 +2429,22 @@ async function executeRuntimeStep(input: {
     let contextSegmentationTurns = 0;
     let pageStateObservationIndex = 0;
     const continuationSummaryMarker = '[WebPilot continuation summary]';
+    let compactedModelContext: RuntimeModelMessage[] | undefined;
+    let compactedSourceMessageCount = 0;
+
+    function messagesAddedAfterCompactedContext(sourceMessages: RuntimeModelMessage[]) {
+      if (!compactedModelContext?.length) return sourceMessages;
+      const markerIndex = sourceMessages.findIndex((message) => (
+        typeof message.content === 'string' && message.content.startsWith(continuationSummaryMarker)
+      ));
+      if (markerIndex >= 0) {
+        return sourceMessages.slice(markerIndex + Math.min(
+          compactedModelContext.length,
+          sourceMessages.length - markerIndex,
+        ));
+      }
+      return sourceMessages.slice(Math.min(compactedSourceMessageCount, sourceMessages.length));
+    }
 
     async function takeSnapshot(options: RuntimeObservationReadOptions = {}): Promise<BrowserActionResult> {
       const decodedCursor = decodeRuntimeObservationCursor(options.cursor);
@@ -2412,7 +2473,7 @@ async function executeRuntimeStep(input: {
         refresh: !decodedCursor,
         mode: requestedMode,
       });
-      const observationViews: BrowserActionResult['observationViews'] = {
+      const observationViews: BrowserSnapshotViews = {
         defaultType: snapshotView,
         [snapshotView]: slice.content,
       };
@@ -2425,15 +2486,6 @@ async function executeRuntimeStep(input: {
       const nextCursor = slice.hasMore
         ? encodeRuntimeObservationCursor({ generation: observation.generation, index: slice.nextIndex, view: snapshotView })
         : undefined;
-      const availableTypes = runtimeObservationAvailableTypes(observation);
-      const header = [
-        decodedCursor ? 'Continued the current semantic DOM snapshot.' : 'Captured a fresh semantic DOM snapshot.',
-        `Current URL: ${session.currentUrl()}`,
-        `Open tabs JSON: ${JSON.stringify(session.getTabsSnapshot())}`,
-        `Snapshot generation: ${observation.generation}. Mode=${requestedMode}. Stored views: ${availableTypes || snapshotView}.`,
-        `Slice metadata JSON: ${JSON.stringify({ generationId: slice.generationId, captureSource: slice.captureSource, mode: requestedMode, startIndex: slice.startIndex, nextIndex: slice.nextIndex, hasMore: slice.hasMore, returnedEntries: slice.returnedEntries, totalEntries: slice.totalEntries, nodeCount: slice.nodeCount, actionableCount: slice.actionableCount, frameCount: slice.frameCount, skippedFrameCount: slice.skippedFrameCount, timings: slice.timings })}`,
-        nextCursor ? `More available: call takeSnapshot({cursor:"${nextCursor}",maxChars:${maxChars}}).` : 'End of this semantic DOM snapshot view.',
-      ].filter(Boolean);
       await onDebug?.({
         phase: 'browser:take-snapshot:dom-timings',
         stepIndex,
@@ -2442,11 +2494,8 @@ async function executeRuntimeStep(input: {
       });
       return {
         ok: true,
-        actual: [...header, '', slice.content].join('\n'),
-        observationViews: {
-          ...observation.views,
-          defaultType: observation.defaultType,
-        },
+        actual: slice.content,
+        nextCursor,
       };
     }
 
@@ -2490,13 +2539,14 @@ async function executeRuntimeStep(input: {
               estimatedTokens: messageStats.estimatedTotalTokens,
               thresholdTokens,
               modelMessages: modelMessagesForLog,
+              workingMemory,
             }),
           }],
           temperature: 0.1,
           maxRetries: 0,
           abortSignal,
         });
-        return trimDebugText(result.text || '', 12000) || fallbackContinuationSummary({
+        return trimDebugText(result.text || '', agentLoopSummaryOutputCharLimit()) || fallbackContinuationSummary({
           goal: requirementOf(testCase),
           browserMode: mode,
           stepIndex,
@@ -2538,7 +2588,10 @@ async function executeRuntimeStep(input: {
         appendedMessages.push({ role: 'user' as const, content });
       }
 
-      let messagesToSend = previousMessages?.length ? [...previousMessages] : [...initialMessages];
+      const sourceMessages = previousMessages?.length ? [...previousMessages] : [...initialMessages];
+      let messagesToSend = compactedModelContext?.length
+        ? [...compactedModelContext, ...messagesAddedAfterCompactedContext(sourceMessages)]
+        : sourceMessages;
       if (appendedMessages.length) {
         messagesToSend = [...messagesToSend, ...appendedMessages];
         messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
@@ -2557,7 +2610,7 @@ async function executeRuntimeStep(input: {
           { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
           ...(appendedMessages.length
             ? appendedMessages
-            : [{ role: 'user' as const, content: 'Continue from the continuation summary. If fresh page state is needed before acting, call takeSnapshot({mode:"actionable",maxChars:10000}).' }]),
+            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"actionable",maxChars:10000}).' }]),
         ];
         attachedImagePaths = appendedImagePaths;
         messageImagePaths = [...attachedImagePaths];
@@ -2580,6 +2633,12 @@ async function executeRuntimeStep(input: {
       const finalStats = modelContextSegmentation
         ? modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current)
         : messageStats;
+      if (compactedModelContext?.length || modelContextSegmentation) {
+        // The SDK passes its full pre-segmentation history back to every prepareStep.
+        // Retain the compact form locally and append only newly produced SDK messages.
+        compactedModelContext = [...messagesToSend];
+        compactedSourceMessageCount = sourceMessages.length;
+      }
       rememberRetryState({
         messages: [...messagesToSend],
         imagePaths: [...attachedImagePaths],

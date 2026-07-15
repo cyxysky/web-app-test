@@ -50,7 +50,9 @@ export function BrowserChatToolDialog({
   const toolName = toolLabel(detail.tool.name);
   const status = toolStatusLabel(detail.tool);
   const inputPreview = compactPayloadPreview(detail.tool.input);
-  const resultPreview = compactPayloadPreview(detail.tool.result);
+  const completeResult = detail.tool.rawResult ?? detail.tool.result;
+  const hasActualResult = completeResult !== undefined && completeResult !== null && completeResult !== '';
+  const resultPreview = compactPayloadPreview(completeResult);
 
   return (
     <div className="ui-modal-overlay" onClick={onClose} role="presentation">
@@ -101,7 +103,11 @@ export function BrowserChatToolDialog({
 
         <section className="browser-chat-tool-detail-section">
           <h3>输出结果</h3>
-          <BrowserChatPayloadDetails className="browser-chat-tool-detail-payload" payload={formatToolPayload(detail.tool.result)} title="查看输出结果" />
+          {hasActualResult ? (
+            <BrowserChatPayloadDetails className="browser-chat-tool-detail-payload" defaultOpen payload={formatToolPayload(completeResult)} title="完整输出结果" />
+          ) : (
+            <p>该卡片只有模型发出的工具请求，当前没有对应的真实执行结果。</p>
+          )}
         </section>
 
         {detail.tool.visualAfter ? (

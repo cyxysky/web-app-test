@@ -1,7 +1,7 @@
 'use client';
 
 import { ChevronDown, Globe2, History, Search, Star, Trash2, X } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import styles from './EmbeddedBrowserLibraryOverlay.module.css';
 
 type LibraryPanel = 'bookmarks' | 'history';
@@ -28,6 +28,7 @@ type LibraryState = {
   error?: string;
   history?: HistoryItem[];
   libraryPanel?: LibraryPanel;
+  libraryPanelSequence?: number;
   ok: boolean;
 };
 
@@ -37,7 +38,7 @@ type LibraryBridge = {
   getState: () => Promise<LibraryState>;
   navigate: (input: { url: string }) => Promise<{ error?: string; ok: boolean }>;
   onStateChange: (listener: (state: LibraryState) => void) => () => void;
-  panelReady: (input: { panel: LibraryPanel }) => Promise<LibraryState>;
+  panelReady: (input: { panel: LibraryPanel; sequence: number }) => Promise<LibraryState>;
   removeBookmark: (input: { url: string }) => Promise<LibraryState>;
 };
 
@@ -100,6 +101,7 @@ export function EmbeddedBrowserLibraryOverlay() {
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [hydrated, setHydrated] = useState(false);
   const [panel, setPanel] = useState<LibraryPanel>('bookmarks');
+  const [panelSequence, setPanelSequence] = useState(0);
   const [query, setQuery] = useState('');
   const [searchVisible, setSearchVisible] = useState(false);
   const [sectionExpanded, setSectionExpanded] = useState(true);
@@ -112,6 +114,7 @@ export function EmbeddedBrowserLibraryOverlay() {
     setError('');
     if (state.libraryPanel) {
       setPanel(state.libraryPanel);
+      setPanelSequence(Number.isFinite(state.libraryPanelSequence) ? Number(state.libraryPanelSequence) : 0);
       setHydrated(true);
     }
     setBookmarks(Array.isArray(state.bookmarks) ? state.bookmarks : []);
@@ -135,15 +138,13 @@ export function EmbeddedBrowserLibraryOverlay() {
     setSearchVisible(false);
   }, [panel]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!hydrated) return undefined;
     const bridge = libraryBridge();
     if (!bridge) return undefined;
-    const frame = window.requestAnimationFrame(() => {
-      void bridge.panelReady({ panel }).catch(() => undefined);
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [hydrated, panel]);
+    void bridge.panelReady({ panel, sequence: panelSequence }).catch(() => undefined);
+    return undefined;
+  }, [hydrated, panel, panelSequence]);
 
   useEffect(() => {
     if (searchVisible) searchInputRef.current?.focus();
@@ -205,7 +206,7 @@ export function EmbeddedBrowserLibraryOverlay() {
         if (event.target === event.currentTarget) void closePanel();
       }}
     >
-      <section className={styles.card} onMouseDown={(event) => event.stopPropagation()}>
+      <section className={styles.card} key={`${panel}-${panelSequence}`} onMouseDown={(event) => event.stopPropagation()}>
       <header className={styles.header}>
         <strong>{panel === 'bookmarks' ? '收藏夹' : '历史记录'}</strong>
         <div className={styles.headerActions}>

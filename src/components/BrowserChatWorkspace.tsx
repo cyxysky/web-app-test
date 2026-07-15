@@ -622,21 +622,35 @@ function aiCycleToolKey(cycleId: string, toolIndex: number) {
 }
 
 function toolInputSignature(value: unknown) {
-  return formatToolPayload(value).replace(/\s+/g, ' ').trim();
+  // Persisted StepToolCall separates `reason` from the executable parameters.
+  // Compare the same canonical shape here; otherwise every tool call with a
+  // reason misses its real trace and can be paired with a different same-name
+  // call from the step.
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return formatToolPayload(value).replace(/\s+/g, ' ').trim();
+  }
+  const { reason, requiresConfirmation, confirmationMessage, ...executableInput } = value as Record<string, unknown>;
+  void reason;
+  void requiresConfirmation;
+  void confirmationMessage;
+  return formatToolPayload(Object.keys(executableInput).length ? executableInput : undefined).replace(/\s+/g, ' ').trim();
 }
 
 function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[]) {
   const details = new Map<string, BrowserChatToolDetail>();
-  const usedStepTools = new Set<string>();
 
   cycles.forEach((cycle) => {
+    // An AI response can be present in several log records (request/response/retry).
+    // Each rendered copy must point to the same persisted tool trace; only prevent a
+    // duplicate match within this one response cycle.
+    const usedStepTools = new Set<string>();
     const candidateSteps = cycle.stepIndex
       ? steps.filter((step) => step.index === cycle.stepIndex)
       : steps;
 
     cycle.output.tools.forEach((aiTool, aiToolIndex) => {
       const exactInput = toolInputSignature(aiTool.input);
-      let fallback: BrowserChatToolDetail | undefined;
+      const sameNameCandidates: BrowserChatToolDetail[] = [];
 
       for (const step of candidateSteps) {
         const toolCalls = step.tools || [];
@@ -647,7 +661,7 @@ function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: St
           if (usedStepTools.has(usedKey) || tool.name !== aiTool.name) continue;
 
           const detail = { stepIndex: step.index, step, toolIndex, tool };
-          if (!fallback) fallback = detail;
+          sameNameCandidates.push(detail);
           if (!exactInput || toolInputSignature(tool.input) === exactInput) {
             details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
             usedStepTools.add(usedKey);
@@ -656,14 +670,39 @@ function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: St
         }
       }
 
-      if (fallback) {
-        details.set(aiCycleToolKey(cycle.id, aiToolIndex), fallback);
-        usedStepTools.add(`${fallback.step.index}:${fallback.toolIndex}`);
+      // A same-name fallback is valid only when it is unambiguous. Showing a
+      // real result from another takeSnapshot is worse than showing the raw
+      // model request without a result: it makes debugging impossible.
+      if (sameNameCandidates.length === 1) {
+        const [detail] = sameNameCandidates;
+        details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
+        usedStepTools.add(`${detail.step.index}:${detail.toolIndex}`);
       }
     });
   });
 
   return details;
+}
+
+function fallbackAiCycleToolDetail(cycle: BrowserChatAiOutputCycle, tool: BrowserChatAiOutputTool, toolIndex: number): BrowserChatToolDetail {
+  const fallbackTool: BrowserChatToolCall = {
+    name: tool.name,
+    input: tool.input,
+    reason: tool.reason,
+  };
+  return {
+    stepIndex: cycle.stepIndex || 0,
+    step: {
+      index: cycle.stepIndex || 0,
+      action: tool.reason || tool.name,
+      actual: '',
+      expected: '',
+      status: 'running',
+      tools: [fallbackTool],
+    },
+    toolIndex,
+    tool: fallbackTool,
+  };
 }
 
 function isRecoveredTransientTool(tool: BrowserChatToolCall | undefined) {
@@ -1628,6 +1667,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
               const label = browserChatToolLabel(tool.name, (value) => value);
               const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
               const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+              const selectableToolDetail = toolDetail || fallbackAiCycleToolDetail(cycle, tool, index);
               const stateClass = toolDetail?.tool.ok === false && !isRecoveredTransientTool(toolDetail.tool)
                 ? ' is-failed'
                 : toolDetail?.tool.ok === undefined ? ' is-running' : '';
@@ -1654,20 +1694,14 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
               );
               return (
                 <div className="browser-chat-tool-call" key={`${tool.id}-${index}`}>
-                  {toolDetail ? (
-                    <button
-                      className={`browser-chat-tool-card browser-chat-ai-call-card${stateClass}`}
-                      onClick={() => onSelectTool(toolDetail)}
-                      title={`${label}${meta ? ` - ${meta}` : ''}`}
-                      type="button"
-                    >
-                      {card}
-                    </button>
-                  ) : (
-                    <div className="browser-chat-tool-card browser-chat-ai-call-card" title={`${label}${meta ? ` - ${meta}` : ''}`}>
-                      {card}
-                    </div>
-                  )}
+                  <button
+                    className={`browser-chat-tool-card browser-chat-ai-call-card${stateClass}`}
+                    onClick={() => onSelectTool(selectableToolDetail)}
+                    title={`${label}${meta ? ` - ${meta}` : ''}`}
+                    type="button"
+                  >
+                    {card}
+                  </button>
                   <BrowserChatToolConfirmationActions
                     pending={pendingConfirmation}
                     resolvingConfirmationAction={resolvingConfirmationAction}
@@ -5201,7 +5235,7 @@ export function BrowserChatWorkspace({
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed' : 'browser-chat-layout'}>
       <aside className="browser-chat-sidebar">
         <div className="browser-chat-brand">
-          <strong>WebPilot QA</strong>
+          <strong>WebPilot</strong>
           <button
             className="ui-icon-button"
             onClick={toggleSidebarCollapsed}

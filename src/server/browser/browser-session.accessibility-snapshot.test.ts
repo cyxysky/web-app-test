@@ -100,8 +100,9 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
   const click = await session.mouse({ action: 'click', uid: stableUid });
   assert.equal(click.ok, true, click.actual);
   assert.equal(await page.locator('body').getAttribute('data-stable-clicked'), 'true');
-  assert.match(click.actual, /Semantic DOM snapshot snapshot-\d+ is current \(refreshed\)/);
-  assert.ok(session.currentSnapshotObservationViews()?.actionable?.includes('Stable action'), 'actions should retain a refreshed actionable snapshot');
+  assert.ok(click.domChanges, 'browser actions must expose page changes structurally');
+  assert.doesNotMatch(click.actual, /DOM incremental changes/);
+  assert.ok(session.currentSnapshotObservationViews()?.actionable?.includes('Stable action'), 'an action must not replace the explicitly captured snapshot');
 
   const refreshed = await readWholeView(session, 'actionable', true);
   const refreshedActionable = refreshed.map((slice) => slice.content).join('\n');
@@ -181,26 +182,36 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   await page.locator('#cover').evaluate((element) => element.remove());
   const mutationRefresh = await session.wait(100);
   assert.equal(mutationRefresh.ok, true, mutationRefresh.actual);
-  assert.match(mutationRefresh.actual, /current \(refreshed\)/);
+  assert.ok(mutationRefresh.domChanges, 'wait must expose observed changes structurally');
+  assert.doesNotMatch(mutationRefresh.actual, /DOM incremental changes/);
   assert.ok(session.currentSnapshotObservationViews()?.actionable?.includes('Save'));
 
   const unchangedReuse = await session.wait(100);
   assert.equal(unchangedReuse.ok, true, unchangedReuse.actual);
-  assert.match(unchangedReuse.actual, /reused; no page-state change detected/);
+  assert.ok(unchangedReuse.domChanges);
+  assert.doesNotMatch(unchangedReuse.actual, /DOM incremental changes/);
 
   await page.mouse.move(3, 3);
   const interactionOnlyReuse = await session.wait(0);
   assert.equal(interactionOnlyReuse.ok, true, interactionOnlyReuse.actual);
-  assert.match(interactionOnlyReuse.actual, /reused; no page-state change detected/, 'pointer events alone must not invalidate semantic DOM snapshots');
+  assert.ok(interactionOnlyReuse.domChanges, 'pointer events alone must not force a full semantic snapshot');
+  assert.doesNotMatch(interactionOnlyReuse.actual, /DOM incremental changes/);
 
   await page.locator('#renamed-editor').evaluate((element) => element.setAttribute('aria-label', 'Renamed editor'));
-  const renamedEditor = await session.keyboard({ action: 'type', uid: renamedEditorUid, text: 'retained', replace: true });
+  const afterRename = (await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n');
+  const currentSaveUid = afterRename.match(/^\s*uid=(\S+)\s+button\s+"Save"/m)?.[1];
+  const currentRenamedEditorUid = afterRename.match(/^\s*uid=(\S+)\s+textbox\s+"Renamed editor"/m)?.[1];
+  assert.ok(currentSaveUid && currentRenamedEditorUid);
+  const renamedEditor = await session.keyboard({ action: 'type', uid: currentRenamedEditorUid, text: 'retained', replace: true });
   assert.equal(renamedEditor.ok, true, renamedEditor.actual);
   assert.doesNotMatch(renamedEditor.actual, /target semantics changed|Capture a fresh snapshot/, 'a stable DOM node must remain actionable when its accessible name changes');
+  assert.ok(renamedEditor.domChanges, 'an action must return its page delta as structured domChanges');
+  assert.equal('observationViews' in renamedEditor, false, 'an action must not return a duplicate text observation view');
+  assert.doesNotMatch(renamedEditor.actual, /DOM incremental changes/, 'action text must not embed the DOM delta a second time');
   assert.equal(await page.locator('#renamed-editor').inputValue(), 'retained');
 
   await page.locator('body').evaluate((body) => body.insertAdjacentHTML('beforeend', '<button>Late action</button>'));
-  const clickAfterUnrelatedMutation = await session.mouse({ action: 'click', uid: saveUid });
+  const clickAfterUnrelatedMutation = await session.mouse({ action: 'click', uid: currentSaveUid });
   assert.equal(clickAfterUnrelatedMutation.ok, true, clickAfterUnrelatedMutation.actual);
   assert.doesNotMatch(clickAfterUnrelatedMutation.actual, /Capture a fresh snapshot/, 'stable UIDs should rebind after unrelated DOM mutations');
   assert.equal(await page.locator('body').getAttribute('data-saved'), 'true');
@@ -209,10 +220,17 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.equal(lateSearch.ok, true, lateSearch.actual);
   assert.match(lateSearch.actual, /button\s+"Late action"/, 'search should refresh a mutation-stale cached generation');
 
+  const domBaseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  const domSaveUid = domBaseline.content.match(/uid=(dom-\d+)[^\n]*id="save"/)?.[1];
+  assert.ok(domSaveUid, domBaseline.content);
+  const domUidClick = await session.mouse({ action: 'click', uid: domSaveUid });
+  assert.equal(domUidClick.ok, true, domUidClick.actual);
   await page.locator('#save').evaluate((button) => button.replaceWith(button.cloneNode(true)));
-  const replacedTarget = await session.mouse({ action: 'click', uid: saveUid });
+  const replacementDelta = await session.readDomChanges();
+  assert.ok(replacementDelta.domChanges?.removed.includes(domSaveUid), replacementDelta.actual);
+  const replacedTarget = await session.mouse({ action: 'click', uid: domSaveUid });
   assert.equal(replacedTarget.ok, false, replacedTarget.actual);
-  assert.match(replacedTarget.actual, /DOM node no longer exists in the refreshed snapshot/);
+  assert.match(replacedTarget.actual, /not present in the current DOM UID registry/);
 });
 
 test('open waits for a bounded DOM quiet window before capturing the navigation snapshot', async (context) => {
@@ -248,7 +266,7 @@ test('open waits for a bounded DOM quiet window before capturing the navigation 
 
   assert.equal(opened.ok, true, opened.actual);
   assert.match(opened.actual, /Navigation DOM stabilized for 120ms/);
-  const actionable = session.currentSnapshotObservationViews()?.actionable || '';
+  const actionable = (await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n');
   assert.match(actionable, /button\s+"Final action"/);
   assert.doesNotMatch(actionable, /Initial action|Intermediate action/);
   const finalUid = actionable.match(/^\s*uid=(\S+)\s+button\s+"Final action"/m)?.[1];
@@ -261,7 +279,7 @@ test('open waits for a bounded DOM quiet window before capturing the navigation 
   await page.reload({ waitUntil: 'commit' });
   const sameUrlNavigation = await session.wait(0);
   assert.match(sameUrlNavigation.actual, /Navigation DOM stabilized for 120ms/, 'same-URL navigations must also use the DOM quiet window');
-  assert.match(session.currentSnapshotObservationViews()?.actionable || '', /button\s+"Final action"/);
+  assert.match((await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n'), /button\s+"Final action"/);
 });
 
 test('open continues when continuous DOM mutations reach the navigation stability cap', async (context) => {
@@ -289,7 +307,7 @@ test('open continues when continuous DOM mutations reach the navigation stabilit
   assert.equal(opened.ok, true, opened.actual);
   assert.match(opened.actual, /Navigation DOM stability wait reached the 250ms cap/);
   assert.ok(Date.now() - startedAt < 5000, 'the bounded stability wait must not block indefinitely');
-  assert.match(session.currentSnapshotObservationViews()?.actionable || '', /Live action/);
+  assert.match((await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n'), /Live action/);
 });
 
 test('navigation stability cap also bounds a stalled DOM sample', async (context) => {
@@ -465,6 +483,26 @@ test('unified mouse and keyboard actions emit real browser events', async (conte
   });
   assert.equal(coalescing.countDelta, 5);
   assert.equal(coalescing.epochDelta, 0, 'interaction telemetry must not invalidate the semantic DOM generation');
+});
+
+test('typing followed by Enter accepts navigation when the old document telemetry is replaced', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'keyboard-navigation-verification-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.goto('data:text/html;charset=utf-8,' + encodeURIComponent(`<!doctype html>
+    <form action="about:blank">
+      <input aria-label="Navigate away" name="query" value="">
+    </form>`));
+
+  const actionable = (await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n');
+  const inputUid = actionable.match(/^\s*uid=(\S+)\s+textbox "Navigate away"/m)?.[1];
+  assert.ok(inputUid, actionable);
+
+  const typed = await session.keyboard({ action: 'type', followByEnter: true, text: 'go', uid: inputUid });
+  assert.equal(typed.ok, true, typed.actual);
+  assert.match(typed.actual, /navigation=true/);
+  assert.equal(page.url(), 'about:blank?query=go');
 });
 
 test('actionable view preserves flattened DOMSnapshot order across paginated slices', async (context) => {

@@ -1,5 +1,5 @@
 import type { ModelMessage } from 'ai';
-import type { BrowserActionResult, BrowserSnapshotView } from '@/server/browser/browser-session';
+import type { BrowserActionResult, BrowserSnapshotView, BrowserSnapshotViews } from '@/server/browser/browser-session';
 
 export const runtimeObservationToolNames = new Set(['takeSnapshot', 'searchSnapshot']);
 export const staleSnapshotText = 'Stale: this old semantic DOM snapshot was replaced or invalidated by a browser action. Call takeSnapshot({mode:"actionable",maxChars:10000}) for fresh UIDs.';
@@ -118,14 +118,17 @@ export function invalidateRuntimeObservation(store: RuntimeObservationStore | un
 
 function normalizeObservationViews(
   text: string,
-  views?: BrowserActionResult['observationViews'],
+  views?: BrowserSnapshotViews,
 ) {
   const normalized: Partial<Record<BrowserSnapshotView, string>> = {};
   for (const type of runtimeObservationTypes) {
     const value = views?.[type];
     if (typeof value === 'string') normalized[type] = value;
   }
-  if (!normalized.actionable) normalized.actionable = text;
+  // A caller that explicitly supplies one view (for example mode="text")
+  // must not be silently relabelled as an actionable snapshot. The fallback is
+  // only for older callers that supplied no typed view at all.
+  if (!Object.keys(normalized).length) normalized.actionable = text;
   const requestedDefault = views?.defaultType;
   const defaultType: BrowserSnapshotView = requestedDefault && normalized[requestedDefault] !== undefined
     ? requestedDefault
@@ -257,12 +260,15 @@ export function storeRuntimeObservation(
   runId: string | undefined,
   toolName: string,
   text: string,
-  views?: BrowserActionResult['observationViews'],
+  views?: BrowserSnapshotViews,
+  options: { includeChanges?: boolean } = {},
 ) {
   const key = observationStoreKey(runId);
   const previous = store.get(key);
   const normalized = normalizeObservationViews(text, views);
-  normalized.views.changes = buildObservationChanges(previous, normalized.views, (previous?.generation || 0) + 1);
+  if (options.includeChanges !== false) {
+    normalized.views.changes = buildObservationChanges(previous, normalized.views, (previous?.generation || 0) + 1);
+  }
   const viewCharLengths = Object.fromEntries(
     runtimeObservationTypes
       .filter((type) => normalized.views[type] !== undefined)

@@ -6,7 +6,7 @@ import { z } from 'zod';
 import type { AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
-import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type BrowserSnapshotViews, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 import {
@@ -16,15 +16,10 @@ import {
   browserMouseToolShape,
 } from './browser-input-tool-schema';
 import {
-  appendRuntimeObservationView,
-  compactStaleSnapshotMessages,
   decodeRuntimeObservationCursor,
-  encodeRuntimeObservationCursor,
   invalidateRuntimeObservation,
   observationPreviewLimit,
-  observationStoreKey,
   restoreRuntimeObservationStore,
-  runtimeObservationAvailableTypes,
   runtimeObservationCount,
   runtimeObservationInvalidatingToolNames,
   runtimeObservationToolNames,
@@ -39,7 +34,6 @@ import { runtimeAllowedToolTypes } from './runtime-tool-selection';
 import {
   isEffectiveToolTraceFailure,
   isRecoveredTransientToolTrace,
-  markRuntimeToolTraceRecovered,
   notifyRuntimeToolTrace,
   runtimeToolTraceId,
 } from './runtime-tool-trace';
@@ -761,6 +755,7 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       recovered: trace.recovered,
       transient: trace.transient,
       result: userFacingToolResult(trace.name, trace.result, 360),
+      rawResult: trace.result,
       desktopEvidence: trace.desktopEvidence,
       contextBefore: trace.contextBefore,
       contextAfter: trace.contextAfter,
@@ -879,8 +874,64 @@ function agentStepLabel(stepIndex: number) {
 }
 
 function agentLoopSummaryInputCharLimit() {
-  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS || 60000);
-  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 60000;
+  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS || 120000);
+  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 120000;
+}
+
+function agentLoopSummaryOutputCharLimit() {
+  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_OUTPUT_MAX_CHARS || 24000);
+  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 24000;
+}
+
+function compactContinuationText(value: string, max: number) {
+  if (value.length <= max) return value;
+  const headLength = Math.max(1, Math.floor(max * 0.72));
+  const tailLength = Math.max(1, max - headLength);
+  return `${value.slice(0, headLength)}\n...[${value.length - headLength - tailLength} characters omitted; tail retained]...\n${value.slice(-tailLength)}`;
+}
+
+function continuationSummaryMessageExcerpt(modelMessages: unknown, maxChars: number) {
+  const record = modelMessages && typeof modelMessages === 'object' && !Array.isArray(modelMessages)
+    ? modelMessages as Record<string, unknown>
+    : {};
+  const messages = Array.isArray(record.messages) ? record.messages : [];
+  const marker = '[WebPilot continuation summary]';
+  const previousSummary = messages
+    .map((message) => message && typeof message === 'object' && !Array.isArray(message)
+      ? message as Record<string, unknown>
+      : undefined)
+    .filter((message): message is Record<string, unknown> => Boolean(message))
+    .map((message) => typeof message.content === 'string' ? message.content : '')
+    .filter((content) => content.startsWith(marker))
+    .at(-1);
+  const result: {
+    previousContinuationSummary?: string;
+    recentMessages: Array<{ index: number; content: string }>;
+  } = { recentMessages: [] };
+  if (previousSummary) result.previousContinuationSummary = compactContinuationText(previousSummary, Math.min(24000, Math.floor(maxChars * 0.28)));
+
+  let remaining = maxChars - JSON.stringify(result).length - 256;
+  for (let index = messages.length - 1; index >= 0 && result.recentMessages.length < 16 && remaining >= 1200; index -= 1) {
+    const serialized = JSON.stringify(messages[index], null, 2);
+    const excerpt = compactContinuationText(serialized, Math.min(14000, Math.max(1200, remaining)));
+    result.recentMessages.unshift({ index, content: excerpt });
+    remaining -= excerpt.length + 96;
+  }
+  return JSON.stringify(result, null, 2);
+}
+
+function continuationRuntimeState(memory: RuntimeWorkingMemory) {
+  return {
+    completed: memory.completed.slice(-30),
+    findings: memory.findings.slice(-40),
+    blockers: memory.blockers.slice(-20),
+    userConstraints: memory.userConstraints.slice(-20),
+    pageUnderstanding: concise(memory.pageUnderstanding, 1800),
+    currentState: concise(memory.currentState, 2600),
+    lastAction: concise(memory.lastAction, 1400),
+    lastResult: concise(memory.lastResult, 2200),
+    nextStep: concise(memory.nextStep, 1400),
+  };
 }
 
 function buildContinuationSummaryPrompt(input: {
@@ -891,22 +942,22 @@ function buildContinuationSummaryPrompt(input: {
   estimatedTokens: number;
   thresholdTokens: number;
   modelMessages: unknown;
+  workingMemory: RuntimeWorkingMemory;
 }) {
-  const serializedMessages = trimDebugText(
-    JSON.stringify(input.modelMessages, null, 2),
-    agentLoopSummaryInputCharLimit(),
-  );
+  const serializedMessages = continuationSummaryMessageExcerpt(input.modelMessages, agentLoopSummaryInputCharLimit());
   return [
     'You are compressing a WebPilot browser-agent loop so the SAME user request can continue in a fresh model context.',
     'Return concise JSON only. Do not use markdown.',
     '',
     'Required JSON shape:',
-    '{ "goal": string, "completed": string[], "currentPage": string, "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
+    '{ "goal": string, "completed": string[], "currentPage": string, "confirmedFacts": string[], "negativeResults": string[], "failedAttempts": string[], "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
     '',
     'Rules:',
-    '- Preserve that only UIDs from the latest takeSnapshot result and coordinates from the latest viewport takeScreenshot result are actionable.',
+    '- Preserve current dom-* UIDs and every removed UID from action deltas. A dom-* UID remains actionable until a delta removes it; viewport screenshot coordinates still require the latest viewport screenshot.',
     '- Preserve tool results that materially affect the next action.',
     '- Preserve current URL/page state, blockers, manual verification state, and user constraints.',
+    '- Preserve every completed search/query and its observed result. If a query had no result, put the exact query and outcome in negativeResults; do not schedule that same query again unless the user changed it or new evidence contradicts it.',
+    '- Merge the previousContinuationSummary with the newest evidence. The authoritative runtime state below is produced after the latest completed tool call and wins on conflict.',
     '- Do not include raw screenshots, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON unless essential.',
     '- Write Chinese for user-facing summaries when possible.',
     '',
@@ -916,7 +967,9 @@ function buildContinuationSummaryPrompt(input: {
     `Browser mode: ${input.browserMode}`,
     `Estimated model-context tokens: ${input.estimatedTokens}/${input.thresholdTokens}`,
     '',
-    `Sanitized model messages JSON:\n${serializedMessages}`,
+    `Authoritative current runtime state JSON:\n${JSON.stringify(continuationRuntimeState(input.workingMemory), null, 2)}`,
+    '',
+    `Selected message history JSON (previous overview plus newest messages, not a head-only truncation):\n${serializedMessages}`,
   ].join('\n');
 }
 
@@ -936,6 +989,9 @@ function fallbackContinuationSummary(input: {
     completed: input.workingMemory.completed,
     currentPage: input.workingMemory.currentState || input.workingMemory.pageUnderstanding || '',
     importantEvidence: input.workingMemory.findings,
+    confirmedFacts: input.workingMemory.findings,
+    negativeResults: [],
+    failedAttempts: [],
     openObservations: [],
     remaining: input.workingMemory.nextStep ? [input.workingMemory.nextStep] : [],
     nextStep: input.workingMemory.nextStep || 'Continue from the latest live browser state.',
@@ -1536,7 +1592,7 @@ async function executeTracedBrowserAction(input: {
   traces: ToolTrace[];
   name: string;
   toolInput: unknown;
-  action: () => Promise<BrowserActionResult>;
+  action: (abortSignal?: AbortSignal) => Promise<BrowserActionResult>;
   aiRequest?: AiRequestSnapshot;
   runId?: string;
   stepIndex?: number;
@@ -1560,7 +1616,7 @@ async function executeTracedBrowserAction(input: {
   let result: BrowserActionResult;
   const actionStartedAt = Date.now();
   try {
-    result = await action();
+    result = await action(abortSignal);
     throwIfStopped(abortSignal, shouldContinue);
   } catch (error) {
     if (abortSignal?.aborted || (shouldContinue && !shouldContinue())) throw browserChatAbortError(abortSignal);
@@ -1628,7 +1684,6 @@ function makeBrowserTools(
     shouldContinue?: () => boolean;
     onDebug?: ExecutionDebug;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
-    onAutomaticSnapshot?: (input: { actionable: string; generationId: string; reason?: 'post-action' | 'stale-uid'; toolName: string }) => void | Promise<void>;
     takeSnapshot?: (input?: RuntimeObservationReadOptions) => Promise<BrowserActionResult>;
     observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => Promise<BrowserActionResult>;
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
@@ -1653,7 +1708,7 @@ function makeBrowserTools(
     }).optional(),
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
-  async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
+  async function record(name: string, input: unknown, action: (abortSignal?: AbortSignal) => Promise<BrowserActionResult>) {
     throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
     if (toolExecutionGate.executed) {
       // Do not execute or trace extra calls; just tell the model to stop. This keeps the recorded
@@ -1666,7 +1721,7 @@ function makeBrowserTools(
     toolExecutionGate.executed = true;
     const pendingConfirmation = referenceOptions?.requestToolConfirmation ? toolConfirmationFromInput(name, input) : undefined;
     let browserActionExecuted = false;
-    const actionWithConfirmation = async () => {
+    const actionWithConfirmation = async (actionSignal?: AbortSignal) => {
       if (pendingConfirmation && referenceOptions?.requestToolConfirmation) {
         const decision = await referenceOptions.requestToolConfirmation({
           toolName: name,
@@ -1684,7 +1739,7 @@ function makeBrowserTools(
         }
       }
       browserActionExecuted = true;
-      return action();
+      return action(actionSignal);
     };
     const traceVisualContext = referenceOptions?.visualContext;
     const traceIndex = traces.length;
@@ -1705,78 +1760,12 @@ function makeBrowserTools(
       action: actionWithConfirmation,
     }).then(async (result) => {
       const actionTrace = traces[traceIndex];
-      let staleUidSnapshotRecovered = false;
-      let staleUidSnapshot: { actionable: string; generationId: string } | undefined;
-      if (browserActionExecuted && !result.ok && staleUidActionError(result.actual) && referenceOptions?.takeSnapshot) {
-        const refreshedSnapshot = await referenceOptions.takeSnapshot({ mode: 'actionable', maxChars: 20000 });
-        if (refreshedSnapshot.ok) {
-          staleUidSnapshotRecovered = true;
-          const actionable = session.currentSnapshotObservationViews()?.actionable;
-          const generationId = session.currentSnapshotGenerationId();
-          if (actionable && generationId) staleUidSnapshot = { actionable, generationId };
-          result = {
-            ...result,
-            actual: [
-              result.actual,
-              '',
-              'Automatic recovery: captured a fresh actionable DOM snapshot after this UID became stale. Do not retry the old UID; choose a current UID from the refreshed snapshot in the next step.',
-            ].join('\n'),
-            autoSnapshot: generationId ? { generationId, refreshed: true } : result.autoSnapshot,
-            observationViews: session.currentSnapshotObservationViews() || refreshedSnapshot.observationViews,
-          };
-          if (actionTrace) {
-            markRuntimeToolTraceRecovered(actionTrace);
-            actionTrace.result = result;
-            actionTrace.completedAt = Date.now();
-            actionTrace.elapsedMs = actionTrace.startedAt ? actionTrace.completedAt - actionTrace.startedAt : undefined;
-            await notifyRuntimeToolTrace(onToolTrace, actionTrace);
-          }
-          await referenceOptions.onDebug?.({
-            phase: 'browser:stale-uid-recovery',
-            stepIndex: referenceOptions.stepIndex,
-            message: `Captured a fresh actionable snapshot after ${name} received a stale UID.`,
-            details: { toolName: name, generationId },
-          });
-        }
-      }
       if (browserActionExecuted && runtimeObservationInvalidatingToolNames.has(name)) {
-        const autoViews = result.autoSnapshot
-          ? session.currentSnapshotObservationViews()
-          : result.observationViews;
-        if (staleUidSnapshotRecovered) {
-          // takeSnapshot already replaced the observation store; do not invalidate this fresh recovery snapshot.
-        } else if (result.ok && autoViews?.actionable && referenceOptions?.observationStore) {
-          const observation = storeRuntimeObservation(
-            referenceOptions.observationStore,
-            referenceOptions.runId,
-            name,
-            autoViews.actionable,
-            autoViews,
-          );
-          const changes = observation.views.changes || 'No semantic DOM snapshot changes were detected after the action.';
-          result = {
-            ...result,
-            actual: `${result.actual}\n\n${changes}`,
-            autoSnapshot: result.autoSnapshot,
-            observationViews: { defaultType: 'changes', changes },
-          };
-        } else {
+        // The action result already carries a bounded DOM delta. Never capture or
+        // inject a full replacement snapshot here; the model decides when it needs
+        // one through takeSnapshot.
+        if (!result.ok || !result.domChanges) {
           invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
-        }
-        if (staleUidSnapshot) {
-          await referenceOptions?.onAutomaticSnapshot?.({
-            actionable: staleUidSnapshot.actionable,
-            generationId: staleUidSnapshot.generationId,
-            reason: 'stale-uid',
-            toolName: name,
-          });
-        } else if (result.ok && result.autoSnapshot?.refreshed && autoViews?.actionable) {
-          await referenceOptions?.onAutomaticSnapshot?.({
-            actionable: autoViews.actionable,
-            generationId: result.autoSnapshot.generationId,
-            reason: 'post-action',
-            toolName: name,
-          });
         }
       }
       return compactToolResultForModel(name, result, referenceOptions?.observationStore, referenceOptions?.runId);
@@ -1807,8 +1796,9 @@ function makeBrowserTools(
     mouse: tool({
       description: browserMouseToolDescription,
       inputSchema: browserToolInput(browserMouseToolShape),
-      execute: (input) => record('mouse', input, () => session.mouse({
+      execute: (input) => record('mouse', input, (abortSignal) => session.mouse({
         action: input.action,
+        abortSignal,
         uid: input.uid,
         xThousandth: input.x_thousandth,
         yThousandth: input.y_thousandth,
@@ -1861,17 +1851,21 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
     }),
     takeSnapshot: tool({
-      description: 'Capture a fresh Chromium DOMSnapshot for the main document, flattened shadow DOM, and attached iframes, enriched with partial AX data for high-value candidates. mode=actionable is the default ranked control/card view; full includes meaningful DOM structure; text returns deduplicated rendered text. Continue a large unchanged snapshot with nextCursor.',
+      description: 'Capture a fresh DOM-observation baseline for the current document. mode=actionable is the default interactive control view; full includes visible structure; text returns visible text. It establishes dom-* UIDs that later action deltas update or remove.',
       inputSchema: browserToolInput({
         mode: z.enum(['actionable', 'full', 'text']).optional(),
-        cursor: z.string().optional().describe('Opaque nextCursor from the preceding takeSnapshot result. Omit it to capture a fresh snapshot.'),
-        maxChars: z.number().int().positive().optional().describe('Maximum characters to return. Defaults to 20000; values below 20000 are raised to 20000. No upper cap is applied.'),
+        maxChars: z.number().int().positive().optional().describe('Requested response budget. The DOM-observation baseline is bounded by the configured runtime limits.'),
       }),
       execute: (input) => record('takeSnapshot', input, async () => (
         referenceOptions?.takeSnapshot
           ? referenceOptions.takeSnapshot(input)
           : { ok: false, actual: 'takeSnapshot is unavailable in this runtime.' }
       )),
+    }),
+    readDomChanges: tool({
+      description: 'Read only pending MutationObserver DOM changes since the previous action or readDomChanges call. Added and updated entries include current dom-* UIDs. Removed entries are already deleted from the UID registry and cannot be used. Use this when the page may have changed without a browser action.',
+      inputSchema: browserToolInput({}),
+      execute: (input) => record('readDomChanges', input, () => session.readDomChanges()),
     }),
     searchSnapshot: tool({
       description: 'Search the complete latest cached snapshot without paging through every slice. Returns matching current UIDs and semantic context.',
@@ -2166,6 +2160,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'listTabs',
     'getHttpRequests',
     'takeSnapshot',
+    'readDomChanges',
     'searchSnapshot',
     'mouse',
     'keyboard',
@@ -2724,7 +2719,7 @@ async function executeRuntimeStep(input: {
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
-        : 'Use the latest takeSnapshot actionable view for the next missing goal; use mouse scroll only when content is lazy-loaded or virtualized.',
+        : 'Use the current DOM baseline plus the latest incremental changes for the next missing goal; use mouse scroll only when content is lazy-loaded or virtualized.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
@@ -2826,6 +2821,22 @@ async function executeRuntimeStep(input: {
     let contextSegmentationTurns = 0;
     let pageStateObservationIndex = 0;
     const continuationSummaryMarker = '[WebPilot continuation summary]';
+    let compactedModelContext: RuntimeModelMessage[] | undefined;
+    let compactedSourceMessageCount = 0;
+
+    function messagesAddedAfterCompactedContext(sourceMessages: RuntimeModelMessage[]) {
+      if (!compactedModelContext?.length) return sourceMessages;
+      const markerIndex = sourceMessages.findIndex((message) => (
+        textFromUnknown(message.content).startsWith(continuationSummaryMarker)
+      ));
+      if (markerIndex >= 0) {
+        return sourceMessages.slice(markerIndex + Math.min(
+          compactedModelContext.length,
+          sourceMessages.length - markerIndex,
+        ));
+      }
+      return sourceMessages.slice(Math.min(compactedSourceMessageCount, sourceMessages.length));
+    }
 
     async function takeSnapshot(options: RuntimeObservationReadOptions = {}): Promise<BrowserActionResult> {
       ensureActive();
@@ -2834,65 +2845,41 @@ async function executeRuntimeStep(input: {
         ? decodedCursor.view
         : options.mode || 'actionable';
       const snapshotView = requestedMode;
-      const storedRecord = observationStore.get(observationStoreKey(input.runId));
-      const maxChars = Math.max(20000, Math.floor(Number(options.maxChars) || 20000));
       if (decodedCursor) {
-        if (!storedRecord) {
-          return { ok: false, actual: 'The takeSnapshot cursor has no current snapshot. Capture a new snapshot without a cursor.' };
-        }
-        if (storedRecord.generation !== decodedCursor.generation) {
-          return { ok: false, actual: `Stale takeSnapshot cursor: cursor generation ${decodedCursor.generation}, current generation ${storedRecord.generation}. Capture a fresh snapshot.` };
-        }
-        if (storedRecord.stale) {
-          return { ok: false, actual: `Stale takeSnapshot cursor: snapshot ${storedRecord.generation} was invalidated after ${storedRecord.staleReason || 'a browser action'}. Capture a fresh snapshot.` };
-        }
+        return { ok: false, actual: 'DOM-observation snapshots are current-document baselines and do not use cursors. Capture a new takeSnapshot instead.' };
       }
 
       const readStartedAt = Date.now();
-      const slice = await session.readSnapshotSlice({
-        cursorIndex: decodedCursor?.index || 0,
-        maxChars,
-        refresh: !decodedCursor,
-        mode: requestedMode,
-      });
+      const snapshot = await session.readDomObservationSnapshot({ mode: requestedMode });
       ensureActive();
-      const observationViews: BrowserActionResult['observationViews'] = {
+      const observationViews: BrowserSnapshotViews = {
         defaultType: snapshotView,
-        [snapshotView]: slice.content,
+        [snapshotView]: snapshot.content,
       };
-      const observation = !decodedCursor
-        ? storeRuntimeObservation(observationStore, input.runId, 'takeSnapshot', slice.content, observationViews)
-        : appendRuntimeObservationView(observationStore, input.runId, snapshotView, slice.content) || storedRecord;
+      const observation = storeRuntimeObservation(
+        observationStore,
+        input.runId,
+        'takeSnapshot',
+        snapshot.content,
+        observationViews,
+        { includeChanges: false },
+      );
       if (!observation) {
         return { ok: false, actual: 'Unable to store the current semantic DOM snapshot. Capture it again.' };
       }
-      const nextCursor = slice.hasMore
-        ? encodeRuntimeObservationCursor({ generation: observation.generation, index: slice.nextIndex, view: snapshotView })
-        : undefined;
-      const availableTypes = runtimeObservationAvailableTypes(observation);
-      const header = [
-        decodedCursor ? 'Continued the current semantic DOM snapshot.' : 'Captured a fresh semantic DOM snapshot.',
-        `Current URL: ${session.currentUrl()}`,
-        `Open tabs JSON: ${JSON.stringify(session.getTabsSnapshot())}`,
-        `Snapshot generation: ${observation.generation}. Mode=${requestedMode}. Stored views: ${availableTypes || snapshotView}.`,
-        `Slice metadata JSON: ${JSON.stringify({ generationId: slice.generationId, captureSource: slice.captureSource, mode: requestedMode, startIndex: slice.startIndex, nextIndex: slice.nextIndex, hasMore: slice.hasMore, returnedEntries: slice.returnedEntries, totalEntries: slice.totalEntries, nodeCount: slice.nodeCount, actionableCount: slice.actionableCount, frameCount: slice.frameCount, skippedFrameCount: slice.skippedFrameCount, timings: slice.timings })}`,
-        nextCursor
-          ? `More entries exist in this same snapshot; continue with takeSnapshot({cursor:"${nextCursor}",maxChars:${maxChars}}). Do not scroll to reach them.`
-          : 'End of this semantic DOM snapshot view.',
-      ].filter(Boolean);
       await onDebug?.({
         phase: 'browser:take-snapshot:dom-timings',
         stepIndex,
-        message: `DOM takeSnapshot timings: total=${elapsedSince(readStartedAt)}ms, DOMSnapshot=${slice.timings.captureDomMs || 0}ms, partialAX=${slice.timings.axEnrichmentMs || 0}ms, fallback=${slice.timings.domFallbackMs || 0}ms.`,
-        details: { slice, totalMs: elapsedSince(readStartedAt), continued: Boolean(decodedCursor) },
+        message: `DOM-observation takeSnapshot timings: total=${elapsedSince(readStartedAt)}ms, runtime=${snapshot.timings.readDomObservationMs || 0}ms.`,
+        details: { snapshot, totalMs: elapsedSince(readStartedAt) },
       });
       return {
         ok: true,
-        actual: [...header, '', slice.content].join('\n'),
-        observationViews: {
-          ...observation.views,
-          defaultType: observation.defaultType,
-        },
+        // The observation store and its change view are server-side state.
+        // Returning them leaks unrelated modes into both the model context and
+        // the tool-result dialog. A snapshot tool result is exactly its
+        // requested mode's content, nothing else.
+        actual: snapshot.content,
       };
     }
 
@@ -2940,6 +2927,7 @@ async function executeRuntimeStep(input: {
               estimatedTokens: messageStats.estimatedTotalTokens,
               thresholdTokens,
               modelMessages: modelMessagesForLog,
+              workingMemory,
             }),
           }],
           temperature: 0.1,
@@ -2947,7 +2935,7 @@ async function executeRuntimeStep(input: {
           abortSignal,
         });
         ensureActive();
-        return trimDebugText(result.text || '', 12000) || fallbackContinuationSummary({
+        return trimDebugText(result.text || '', agentLoopSummaryOutputCharLimit()) || fallbackContinuationSummary({
           goal: requirementOf(testCase),
           browserMode: mode,
           stepIndex,
@@ -3009,12 +2997,14 @@ async function executeRuntimeStep(input: {
         appendedMessages.push({ role: 'user' as const, content });
       }
 
-      let messagesToSend = previousMessages?.length ? [...previousMessages] : [...initialMessages];
+      const sourceMessages = previousMessages?.length ? [...previousMessages] : [...initialMessages];
+      let messagesToSend = compactedModelContext?.length
+        ? [...compactedModelContext, ...messagesAddedAfterCompactedContext(sourceMessages)]
+        : sourceMessages;
       if (appendedMessages.length) {
         messagesToSend = [...messagesToSend, ...appendedMessages];
         messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
       }
-      messagesToSend = compactStaleSnapshotMessages(messagesToSend);
 
       let attachedImagePaths = [...messageImagePaths];
       let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
@@ -3028,7 +3018,7 @@ async function executeRuntimeStep(input: {
           { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
           ...(appendedMessages.length
             ? appendedMessages
-            : [{ role: 'user' as const, content: 'Continue from the continuation summary. If fresh page state is needed before acting, call takeSnapshot({mode:"actionable",maxChars:20000}).' }]),
+            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"actionable",maxChars:20000}).' }]),
         ];
         attachedImagePaths = appendedImagePaths;
         messageImagePaths = [...attachedImagePaths];
@@ -3051,6 +3041,12 @@ async function executeRuntimeStep(input: {
       const finalStats = modelContextSegmentation
         ? modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current)
         : messageStats;
+      if (compactedModelContext?.length || modelContextSegmentation) {
+        // The SDK passes its full pre-segmentation history back to every prepareStep.
+        // Retain the compact form locally and append only newly produced SDK messages.
+        compactedModelContext = [...messagesToSend];
+        compactedSourceMessageCount = sourceMessages.length;
+      }
       rememberRetryState({
         messages: [...messagesToSend],
         imagePaths: [...attachedImagePaths],
@@ -3173,25 +3169,6 @@ async function executeRuntimeStep(input: {
       onVisualContextChange: async (snapshot) => {
         ensureActive();
         await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
-      },
-      onAutomaticSnapshot: async ({ actionable, generationId, reason, toolName }) => {
-        ensureActive();
-        const currentActionableView = actionable;
-        if (!currentActionableView.trim()) return;
-        pendingObservationMessages.push({
-          text: [
-            reason === 'stale-uid'
-              ? '[WebPilot automatic stale-UID recovery snapshot]'
-              : '[WebPilot automatic post-action DOM snapshot]',
-            reason === 'stale-uid'
-              ? `The ${toolName} target is no longer valid. Semantic snapshot ${generationId} was refreshed automatically.`
-              : `The ${toolName} action changed the page and refreshed semantic snapshot ${generationId}.`,
-            'Discard every UID from earlier snapshots. For the next action, choose only a UID from the current snapshot below.',
-            '',
-            currentActionableView,
-          ].join('\n'),
-          imagePaths: [],
-        });
       },
       onSelectReferenceScreenshots: async (selection) => {
         ensureActive();
@@ -3934,6 +3911,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
         roles: Array.isArray(input.roles) ? input.roles.filter((role): role is string => typeof role === 'string') : undefined,
         limit: typeof input.limit === 'number' ? input.limit : undefined,
       });
+    case 'readDomChanges':
+      return session.readDomChanges();
     case 'mouse':
       return session.mouse({
         action: String(input.action || 'click') as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',

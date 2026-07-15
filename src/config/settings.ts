@@ -164,6 +164,8 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS', label: '个性化记忆提炼超时', description: '对话结束后，记忆提炼模型请求允许的最长时间，单位毫秒。', tab: 'runtime', defaultValue: '30000', control: 'number' },
   { key: 'AI_CONTEXT_WINDOW_TOKENS', label: '上下文窗口大小', description: '估算模型上下文窗口大小。', tab: 'runtime', defaultValue: '32000', control: 'number' },
   { key: 'AI_CONTEXT_COMPRESSION_THRESHOLD', label: '上下文压缩阈值', description: '超过上下文窗口多少比例后压缩历史。', tab: 'runtime', defaultValue: '0.7', control: 'number' },
+  { key: 'AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS', label: '压缩摘要输入上限', description: 'Agent Loop 生成续接摘要时保留的历史字符上限；会优先保留上一摘要和最新工具结果。', tab: 'runtime', defaultValue: '120000', control: 'number' },
+  { key: 'AI_AGENT_LOOP_SUMMARY_OUTPUT_MAX_CHARS', label: '压缩摘要输出上限', description: 'Agent Loop 续接摘要允许的最大字符数。', tab: 'runtime', defaultValue: '24000', control: 'number' },
   { key: 'AI_IMAGE_CONTEXT_ESTIMATE_TOKENS', label: '单张图片估算 Token', description: '估算每张截图占用的上下文 token。', tab: 'runtime', defaultValue: '1200', control: 'number' },
   { key: 'AI_VISUAL_HISTORY_LIMIT', label: '视觉历史上限', description: 'Visual Context Manager 保留多少张历史图。', tab: 'runtime', defaultValue: '6', control: 'number' },
   { key: 'AI_VISUAL_COMPRESSED_HISTORY_LIMIT', label: '压缩后历史图上限', description: '上下文压缩后保留多少张历史图。', tab: 'runtime', defaultValue: '2', control: 'number' },

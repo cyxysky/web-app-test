@@ -1,11 +1,11 @@
 export function snapshotHardRules(screenshotAvailable = true) {
   return [
-    '- takeSnapshot captures a Chromium DOMSnapshot enriched with partial accessibility data for high-value candidates. It is not a screenshot.',
-    '- Omit cursor to capture a fresh snapshot. A nextCursor only continues the same cached snapshot and never means the page should be scrolled.',
+    '- takeSnapshot captures a lightweight DOM-observation baseline, not a screenshot.',
     '- Use mode="actionable" normally, mode="full" for wider DOM structure, and mode="text" for deduplicated rendered copy.',
-    '- UIDs are valid only in the latest snapshot. Browser-changing actions automatically return a refreshed incremental snapshot when DOM state is available; use its fresh UIDs. Call takeSnapshot when that increment is absent or insufficient.',
-    '- Use searchSnapshot to search the complete latest snapshot instead of paging blindly through a large result.',
-    '- Never conclude that a control or result is absent from one truncated snapshot slice. Search the complete generation first, then inspect the next cursor or screenshot when needed.',
+    '- Browser-changing actions return an incremental DOM delta, not a full snapshot. Keep an existing dom-* UID unless that delta lists it as removed; removed UIDs are invalid immediately.',
+    '- Call readDomChanges when the page may have changed without one of your browser actions. Call takeSnapshot when you need a new baseline or a delta reports overflow.',
+    '- Use searchSnapshot only when its explicit full CDP search is needed; prefer the current DOM baseline and deltas for normal interaction.',
+    '- Never conclude that a control or result is absent from one bounded observation. Take a fresh snapshot or screenshot when broader evidence is needed.',
     '- Never invent a room id, entity id, href, or navigation URL. Navigation targets and factual identifiers must come from the user, the current semantic DOM snapshot, a screenshot, or an observed network response.',
     screenshotAvailable
       ? '- mouse and keyboard accept either one fresh UID or coordinates from the latest viewport screenshot, never both.'

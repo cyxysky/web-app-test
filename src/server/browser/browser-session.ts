@@ -126,7 +126,15 @@ export type BrowserSnapshotViews = Partial<Record<BrowserSnapshotView, string>> 
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
-  observationViews?: BrowserSnapshotViews;
+  /** A compact continuation cursor for paged snapshot readers. */
+  nextCursor?: string;
+  domChanges?: {
+    epoch: number;
+    added: string[];
+    updated: string[];
+    removed: string[];
+    overflow: boolean;
+  };
   autoSnapshot?: {
     generationId: string;
     refreshed: boolean;
@@ -396,6 +404,15 @@ type BrowserUseVisibleDomSnapshot = {
   viewport: BrowserUseViewportClip;
 };
 
+type BrowserUseDomDelta = {
+  epoch: number;
+  stateKey: string;
+  added: BrowserUseVisibleDomSnapshot['items'];
+  updated: BrowserUseVisibleDomSnapshot['items'];
+  removedRefs: string[];
+  overflow: boolean;
+};
+
 export type BrowserDomObservation = {
   actions: string;
   actionsCharLength: number;
@@ -452,6 +469,8 @@ type AiDomRuntime = {
     maxElements: number;
     preserveExistingRefs?: boolean;
   }) => BrowserUseVisibleDomSnapshot;
+  visibleDomDelta: () => BrowserUseDomDelta;
+  discardDomChanges: () => { epoch: number; overflow: boolean; discardedMutations: number };
   elementText: (pathValue: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
   visibleDomPoint: (
     ref: string,
@@ -517,6 +536,14 @@ const aiDomMutationObserverScript = `(() => {
         }
       }
       if (!meaningful) return;
+      state.pendingMutations = state.pendingMutations || [];
+      for (const mutation of mutations) {
+        if (state.pendingMutations.length >= 500) {
+          state.pendingOverflow = true;
+          break;
+        }
+        state.pendingMutations.push(mutation);
+      }
       state.epoch += 1;
       state.lastMutationAt = Date.now();
     });
@@ -583,6 +610,7 @@ type SnapshotGeneration = {
 
 export type BrowserMouseAction = {
   action: 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView';
+  abortSignal?: AbortSignal;
   uid?: string;
   xThousandth?: number;
   yThousandth?: number;
@@ -609,7 +637,7 @@ export type BrowserKeyboardAction = {
 
 type ResolvedBrowserActionPoint = {
   error?: string;
-  reference?: SnapshotReference;
+  reference?: SnapshotReference | DomNodeReference;
   point?: {
     x: number;
     y: number;
@@ -618,11 +646,19 @@ type ResolvedBrowserActionPoint = {
   };
 };
 
+function isSnapshotReference(reference: SnapshotReference | DomNodeReference): reference is SnapshotReference {
+  return 'uid' in reference;
+}
+
 type WindowWithAiDomRuntime = Window & {
   __aiBrowserPageRuntimeInstalled?: boolean;
   __aiGetEventListenerTypes?: (target: EventTarget) => string[];
   __aiDomRuntime?: AiDomRuntime;
-  __aiDomMutationState?: AiDomMutationStateSnapshot & { observer?: MutationObserver };
+  __aiDomMutationState?: AiDomMutationStateSnapshot & {
+    observer?: MutationObserver;
+    pendingMutations?: MutationRecord[];
+    pendingOverflow?: boolean;
+  };
   __browserUseVisibleDomState?: {
     elementToRef: WeakMap<Element, string>;
     instanceId: string;
@@ -893,6 +929,14 @@ function installAiBrowserPageRuntime() {
         return !target?.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__');
       });
       if (!meaningful) return;
+      mutationState.pendingMutations = mutationState.pendingMutations || [];
+      for (const mutation of mutations) {
+        if (mutationState.pendingMutations.length >= 500) {
+          mutationState.pendingOverflow = true;
+          break;
+        }
+        mutationState.pendingMutations.push(mutation);
+      }
       mutationState.epoch += 1;
       mutationState.lastMutationAt = Date.now();
     });
@@ -904,7 +948,7 @@ function installAiBrowserPageRuntime() {
     });
   }
 
-  if (win.__aiDomRuntime?.version === 9) return;
+  if (win.__aiDomRuntime?.version === 10) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
@@ -1997,6 +2041,134 @@ function installAiBrowserPageRuntime() {
     return { frameElements, items, stateKey: state.instanceId, viewport };
   }
 
+  function discardDomChanges() {
+    const discardedMutations = mutationState.pendingMutations?.length || 0;
+    const overflow = Boolean(mutationState.pendingOverflow);
+    mutationState.pendingMutations = [];
+    mutationState.pendingOverflow = false;
+    return { epoch: mutationState.epoch, overflow, discardedMutations };
+  }
+
+  function visibleDomDelta(): BrowserUseDomDelta {
+    const state = visibleDomState();
+    const pending = [...(mutationState.pendingMutations || [])];
+    const overflow = Boolean(mutationState.pendingOverflow);
+    mutationState.pendingMutations = [];
+    mutationState.pendingOverflow = false;
+    if (!pending.length) {
+      return { epoch: mutationState.epoch, stateKey: state.instanceId, added: [], updated: [], removedRefs: [], overflow };
+    }
+    const addedRoots = new Set<Element>();
+    const updatedRoots = new Set<Element>();
+    const removedRefs = new Set<string>();
+    const maxNodes = 1000;
+    let remainingNodes = maxNodes;
+    let remainingRemovedNodes = maxNodes;
+    const hoverSelectors = visibleDomHoverSelectors();
+    const viewportClip = visualViewportRect();
+
+    const asElement = (node: Node | null | undefined) => {
+      if (!node) return undefined;
+      if (node.nodeType === Node.ELEMENT_NODE) return node as Element;
+      return flatParentElement(node);
+    };
+    const rememberRemoved = (node: Node) => {
+      const stack: Node[] = [node];
+      while (stack.length && remainingRemovedNodes > 0) {
+        const current = stack.pop()!;
+        remainingRemovedNodes -= 1;
+        if (current.nodeType === Node.ELEMENT_NODE) {
+          const element = current as Element;
+          const ref = state.elementToRef.get(element);
+          if (ref) removedRefs.add(ref);
+          for (const child of Array.from(element.children)) stack.push(child);
+          const root = shadowRootOf(element);
+          if (root) for (const child of Array.from(root.children)) stack.push(child);
+        }
+      }
+    };
+
+    for (const mutation of pending) {
+      const target = asElement(mutation.target);
+      if (mutation.type === 'childList') {
+        // The inserted subtree supplies new UIDs. Only update a small tracked
+        // container itself; never rescan a broad parent such as <body>.
+        if (target && !isOverlay(target) && state.refToElement.has(state.elementToRef.get(target) || '') && target.children.length <= 64) {
+          updatedRoots.add(target);
+        }
+        for (const node of Array.from(mutation.addedNodes)) {
+          const element = asElement(node);
+          if (element && !isOverlay(element)) addedRoots.add(element);
+        }
+        for (const node of Array.from(mutation.removedNodes)) rememberRemoved(node);
+      } else if (target && !isOverlay(target)) {
+        updatedRoots.add(target);
+      }
+    }
+
+    const addedByRef = new Map<string, BrowserUseVisibleDomSnapshot['items'][number]>();
+    const updatedByRef = new Map<string, BrowserUseVisibleDomSnapshot['items'][number]>();
+    const hasAncestorRoot = (element: Element, roots: Set<Element>) => {
+      let parent = flatParentElement(element);
+      for (let guard = 0; parent && guard < 128; guard += 1) {
+        if (roots.has(parent)) return true;
+        parent = flatParentElement(parent);
+      }
+      return false;
+    };
+    const inspect = (element: Element, destination: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>) => {
+      if (!element.isConnected || isOverlay(element) || isDisplayNone(element)) return;
+      const signals = visibleDomInteractionSignals(element, hoverSelectors);
+      if (signals.length && !isVisibleDomSubtreeHidden(element) && hasVisibleDomPointerEvents(element) && visibleDomClickablePoint(element, viewportClip)) {
+        const ref = visibleDomRef(element);
+        state.refToElement.set(ref, element);
+        removedRefs.delete(ref);
+        destination.set(ref, {
+          ...visibleDomItem(element, ref, signals),
+          descriptor: descriptor(element),
+          path: pathOf(element) || '',
+          ref,
+        });
+      } else {
+        const ref = state.elementToRef.get(element);
+        if (ref) removedRefs.add(ref);
+      }
+    };
+    const collectSubtree = (root: Element, destination: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>) => {
+      const stack: Element[] = [root];
+      while (stack.length && remainingNodes > 0) {
+        const element = stack.pop()!;
+        remainingNodes -= 1;
+        inspect(element, destination);
+        if (!element.isConnected || isOverlay(element) || isDisplayNone(element)) continue;
+        const rootNode = shadowRootOf(element);
+        if (rootNode) for (const child of Array.from(rootNode.children).reverse()) stack.push(child);
+        for (const child of Array.from(element.children).reverse()) stack.push(child);
+      }
+    };
+
+    for (const root of addedRoots) {
+      if (!hasAncestorRoot(root, addedRoots)) collectSubtree(root, addedByRef);
+      if (remainingNodes <= 0) break;
+    }
+    for (const root of updatedRoots) {
+      if (hasAncestorRoot(root, addedRoots) || hasAncestorRoot(root, updatedRoots)) continue;
+      if (remainingNodes <= 0) break;
+      remainingNodes -= 1;
+      inspect(root, updatedByRef);
+    }
+    for (const ref of addedByRef.keys()) removedRefs.delete(ref);
+    for (const ref of removedRefs) state.refToElement.delete(ref);
+    return {
+      epoch: mutationState.epoch,
+      stateKey: state.instanceId,
+      added: [...addedByRef.values()],
+      updated: [...updatedByRef.values()].filter((item) => !addedByRef.has(item.ref)),
+      removedRefs: [...removedRefs],
+      overflow,
+    };
+  }
+
   function visibleDomPoint(ref: string, viewportClip?: BrowserUseViewportClip) {
     const element = visibleDomState().refToElement.get(ref);
     if (!element?.isConnected) return undefined;
@@ -2045,7 +2217,7 @@ function installAiBrowserPageRuntime() {
   }
 
   win.__aiDomRuntime = {
-    version: 9,
+    version: 10,
     mutationState: () => ({ epoch: mutationState.epoch, lastMutationAt: mutationState.lastMutationAt }),
     isOverlay,
     isTraversable,
@@ -2068,6 +2240,8 @@ function installAiBrowserPageRuntime() {
     visiblePointForElement,
     visibleDomSnapshot,
     fullDomSnapshot,
+    visibleDomDelta,
+    discardDomChanges,
     elementText,
     visibleDomPoint,
     visibleDomText,
@@ -3838,7 +4012,7 @@ export class BrowserSession {
       navigationNote = ` Navigation reported an error before commit; continuing from current URL: ${currentUrl}.`;
     }
     await this.markPageGroup(this.activePage);
-    return this.completeActionWithSnapshot(
+    return this.completeActionWithDomChanges(
       `Opened page: ${url}${navigationNote}`,
       previousGeneration,
       { postNavigation: true },
@@ -4483,7 +4657,7 @@ export class BrowserSession {
     if (!page) return { ok: false, actual: `Tab ${index} not found.` };
     this.page = page;
     await page.bringToFront();
-    return this.completeActionWithSnapshot(`Switched to tab ${index}: ${page.url()}`, previousGeneration);
+    return this.completeActionWithDomChanges(`Switched to tab ${index}: ${page.url()}`, previousGeneration);
   }
 
   // 向当前焦点元素输入文本。
@@ -4495,8 +4669,15 @@ export class BrowserSession {
       100,
       30000,
     );
+    let loadStateTimedOut = false;
     await this.activePage.waitForLoadState('domcontentloaded', { timeout: loadStateTimeoutMs }).catch((error) => {
-      if (!this.isTargetClosedError(error)) throw error;
+      if (this.isTargetClosedError(error)) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (/\btimeout\s+\d+ms\s+exceeded\b/i.test(message)) {
+        loadStateTimedOut = true;
+        return;
+      }
+      throw error;
     });
     const stableMs = boundedNonNegativeIntegerEnv(
       'BROWSER_WAIT_FOR_PAGE_STABLE_MS',
@@ -4505,14 +4686,17 @@ export class BrowserSession {
     );
     if (stableMs > 0) await this.waitForStableViewport(stableMs);
     const note = await this.manualVerificationNote();
-    return this.completeActionWithSnapshot(`Page wait completed.${note}`, previousGeneration);
+    const status = loadStateTimedOut
+      ? `Page is still loading after ${loadStateTimeoutMs}ms; continuing with the current rendered state.`
+      : 'Page wait completed.';
+    return this.completeActionWithDomChanges(`${status}${note}`, previousGeneration);
   }
 
   // 等待固定时间，给短动画、下拉面板或异步更新留出渲染时间。
   async wait(ms = 800): Promise<BrowserActionResult> {
     const previousGeneration = this.snapshotGeneration;
     await this.waitForStableViewport(Math.min(Math.max(ms, 100), 5000));
-    return this.completeActionWithSnapshot(`Waited ${ms}ms.`, previousGeneration);
+    return this.completeActionWithDomChanges(`Waited ${ms}ms.`, previousGeneration);
   }
 
   // 等待用户手动完成验证码/安全校验，超时后返回阻塞信息。
@@ -6007,11 +6191,14 @@ export class BrowserSession {
     } catch (error) {
       verification = { ok: false, detail: `verification failed: ${unknownErrorMessage(error)}` };
     }
-    const result = await this.completeActionWithSnapshot(
+    const result = await this.completeActionWithDomChanges(
       `${actual} Post-action check: ${verification.detail}`,
       previousGeneration,
     );
-    return verification.ok ? result : { ...result, ok: false };
+    // The page-level listener is diagnostic only. A navigation or a framework-owned
+    // event boundary can replace the document before its counters are read, even when
+    // the preceding Playwright action completed successfully.
+    return result;
   }
 
   private async readScrollPosition(
@@ -6092,13 +6279,12 @@ export class BrowserSession {
     }
   }
 
-  private async completeActionWithSnapshot(
+  private async completeActionWithDomChanges(
     actual: string,
     previousGeneration: SnapshotGeneration | undefined,
     options: { postNavigation?: boolean } = {},
   ): Promise<BrowserActionResult> {
     this.lastScreenshotMetrics = undefined;
-    await this.activePage.waitForTimeout(60).catch(() => undefined);
     try {
       const currentPage = this.activePage;
       const postNavigation = options.postNavigation === true || Boolean(previousGeneration && (
@@ -6112,25 +6298,26 @@ export class BrowserSession {
         : stability.stable
           ? ` Navigation DOM stabilized for ${stability.quietMs}ms after ${stability.waitedMs}ms.`
           : ` Navigation DOM stability wait reached the ${stability.timeoutMs}ms cap; continuing with the current DOM.`;
-      const baselineGeneration = this.snapshotGeneration || previousGeneration;
-      const changed = baselineGeneration
-        ? await this.snapshotMutationChanged(baselineGeneration).catch(() => true)
-        : true;
-      const shouldRefresh = !baselineGeneration || changed;
-      const generation = shouldRefresh
-        ? await this.ensureSnapshotGeneration(true)
-        : baselineGeneration;
-      if (!shouldRefresh) this.snapshotGeneration = baselineGeneration;
+      if (postNavigation) {
+        this.invalidateSnapshotGeneration();
+        this.lastDomNodeReferences.clear();
+        this.domVisiblePublicIdByFrameLocalRef.clear();
+        this.domVisibleSnapshotKey = undefined;
+        return {
+          ok: true,
+          actual: `${actual}${stabilityNote} Navigation changed the document. DOM UID registry was cleared; call takeSnapshot when you need targets in the new document.`,
+        };
+      }
+      const changes = await this.readDomChanges();
       return {
         ok: true,
-        actual: `${actual}${stabilityNote} Semantic DOM snapshot ${generation.id} is current (${shouldRefresh ? 'refreshed' : 'reused; no page-state change detected'}).`,
-        autoSnapshot: { generationId: generation.id, refreshed: shouldRefresh },
+        actual: `${actual}${stabilityNote}`,
+        domChanges: changes.domChanges,
       };
     } catch (error) {
-      this.invalidateSnapshotGeneration();
       return {
         ok: true,
-        actual: `${actual} Automatic semantic DOM snapshot refresh was unavailable: ${unknownErrorMessage(error)}`,
+        actual: `${actual} DOM incremental change read was unavailable: ${unknownErrorMessage(error)}. Call takeSnapshot if fresh page state is required.`,
       };
     }
   }
@@ -6358,23 +6545,6 @@ export class BrowserSession {
   }
 
   private async resolveSnapshotReferencePoint(uid: string, allowNonActionable = false) {
-    const previousGeneration = this.snapshotGeneration;
-    if (previousGeneration && await this.snapshotMutationChanged(previousGeneration).catch(() => true)) {
-      let refreshedGeneration: SnapshotGeneration;
-      try {
-        refreshedGeneration = await this.ensureSnapshotGeneration(true);
-      } catch (error) {
-        return { error: `UID ${uid} could not be refreshed after the page changed: ${unknownErrorMessage(error)}` };
-      }
-      const previousReference = previousGeneration.references.get(String(uid));
-      const refreshedReference = refreshedGeneration.references.get(String(uid));
-      if (!previousReference || !refreshedReference) {
-        return { error: `UID ${uid} is stale because its DOM node no longer exists in the refreshed snapshot. Capture a fresh snapshot and choose the current target.` };
-      }
-      // UIDs follow the backing DOM node, not its mutable accessible metadata. Reactive pages
-      // commonly update a field's name/value in place; the live locator checks below still
-      // reject detached, hidden, disabled, or covered nodes before any action is dispatched.
-    }
     const resolved = this.currentSnapshotReference(uid);
     if (!resolved.reference) return { error: resolved.error };
     const reference = resolved.reference;
@@ -6497,6 +6667,47 @@ export class BrowserSession {
     }
   }
 
+  private async resolveDomObservationReferencePoint(uid: string, allowNonActionable = false) {
+    const reference = this.lastDomNodeReferences.get(uid);
+    if (!reference) {
+      return { error: `UID ${uid} is not present in the current DOM UID registry. It may have been removed; call takeSnapshot to inspect the current page.` };
+    }
+    if (!allowNonActionable && !reference.interactive) {
+      return { error: `UID ${uid} (${reference.tag} "${reference.label}") is structural text, not an actionable control.` };
+    }
+    if (!reference.localRef || !reference.contextId) {
+      return { error: `UID ${uid} has no live DOM reference. Call takeSnapshot and choose a current UID.` };
+    }
+    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
+    if (!frame) return { error: `UID ${uid} belongs to an iframe that no longer exists.` };
+    await this.ensureBrowserPageRuntime(frame);
+    const localPoint = await frame.evaluate((input) => {
+      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+      return runtime?.visibleDomPoint(input.ref, input.viewportClip);
+    }, { ref: reference.localRef, viewportClip: reference.viewportClip }).catch(() => undefined);
+    if (!localPoint) {
+      this.lastDomNodeReferences.delete(uid);
+      return { error: `UID ${uid} is detached, hidden, or covered and was removed from the DOM UID registry.` };
+    }
+    let offsetX = 0;
+    let offsetY = 0;
+    if (frame !== this.activePage.mainFrame()) {
+      const frameBox = await frame.frameElement().then((element) => element.boundingBox()).catch(() => undefined);
+      if (!frameBox) return { error: `UID ${uid} belongs to an iframe that is no longer visible.` };
+      offsetX = frameBox.x;
+      offsetY = frameBox.y;
+    }
+    return {
+      reference,
+      point: {
+        x: Math.round(localPoint.x + offsetX),
+        y: Math.round(localPoint.y + offsetY),
+        descriptor: localPoint.descriptor || reference.descriptor,
+        source: 'dom-observation',
+      },
+    };
+  }
+
   private async resolveScreenshotPoint(xThousandth?: number, yThousandth?: number) {
     const xPart = Number(xThousandth);
     const yPart = Number(yThousandth);
@@ -6546,12 +6757,23 @@ export class BrowserSession {
     const hasUid = typeof input.uid === 'string' && input.uid.trim().length > 0;
     const hasAnyCoordinate = input.xThousandth !== undefined || input.yThousandth !== undefined;
     if (hasUid && hasAnyCoordinate) return { error: 'Use either uid or screenshot coordinates, never both.' };
-    if (hasUid) return this.resolveSnapshotReferencePoint(input.uid!, allowNonActionable);
+    if (hasUid) {
+      return input.uid!.startsWith('dom-')
+        ? this.resolveDomObservationReferencePoint(input.uid!, allowNonActionable)
+        : this.resolveSnapshotReferencePoint(input.uid!, allowNonActionable);
+    }
     if (hasAnyCoordinate) return this.resolveScreenshotPoint(input.xThousandth, input.yThousandth);
     return { error: 'A uid or the latest screenshot x_thousandth/y_thousandth coordinates are required.' };
   }
 
   async mouse(input: BrowserMouseAction): Promise<BrowserActionResult> {
+    const throwIfAborted = () => {
+      if (!input.abortSignal?.aborted) return;
+      throw input.abortSignal.reason instanceof Error
+        ? input.abortSignal.reason
+        : new Error('Browser mouse action was cancelled.');
+    };
+    throwIfAborted();
     const page = this.activePage;
     const previousGeneration = this.snapshotGeneration;
     if (input.action === 'scroll') {
@@ -6559,9 +6781,10 @@ export class BrowserSession {
       let targetLocator: Locator | undefined;
       if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
         const resolved = await this.unifiedActionPoint(input, true);
+        throwIfAborted();
         if (!resolved.point) return { ok: false, actual: resolved.error || 'Unable to resolve scroll target.' };
         point = resolved.point;
-        targetLocator = resolved.reference ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
+        targetLocator = resolved.reference && isSnapshotReference(resolved.reference) ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
         if (targetLocator) await targetLocator.hover();
         else await page.mouse.move(point.x, point.y);
       }
@@ -6593,9 +6816,9 @@ export class BrowserSession {
 
     if (input.action === 'scrollIntoView') {
       if (!input.uid) return { ok: false, actual: 'scrollIntoView requires a current snapshot uid.' };
-      const resolved = await this.resolveSnapshotReferencePoint(input.uid, true);
+      const resolved = await this.unifiedActionPoint({ uid: input.uid }, true);
       if (!resolved.point) return { ok: false, actual: resolved.error || `Unable to scroll UID ${input.uid} into view.` };
-      const targetLocator = resolved.reference ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
+      const targetLocator = resolved.reference && isSnapshotReference(resolved.reference) ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
       return this.completeVerifiedAction(
         `Scrolled UID ${input.uid} (${resolved.point.descriptor}) into view.`,
         previousGeneration,
@@ -6616,8 +6839,10 @@ export class BrowserSession {
     }
 
     const from = await this.unifiedActionPoint(input, input.action === 'move');
+    throwIfAborted();
     if (!from.point) return { ok: false, actual: from.error || 'Unable to resolve mouse target.' };
-    const fromLocator = from.reference ? await this.snapshotReferenceLocator(from.reference) : undefined;
+    const fromLocator = from.reference && isSnapshotReference(from.reference) ? await this.snapshotReferenceLocator(from.reference) : undefined;
+    throwIfAborted();
     if (input.action === 'move') {
       const eventsBefore = await this.readInteractionCounts();
       if (fromLocator) await fromLocator.hover();
@@ -6647,8 +6872,9 @@ export class BrowserSession {
         xThousandth: input.toXThousandth,
         yThousandth: input.toYThousandth,
       }, true);
+      throwIfAborted();
       if (!to.point) return { ok: false, actual: to.error || 'Unable to resolve drag destination.' };
-      const toLocator = to.reference ? await this.snapshotReferenceLocator(to.reference) : undefined;
+      const toLocator = to.reference && isSnapshotReference(to.reference) ? await this.snapshotReferenceLocator(to.reference) : undefined;
       const button = input.button || 'left';
       const eventsBefore = await this.readInteractionCounts();
       const sourceHandle = fromLocator ? undefined : await this.viewportDragTarget(page, from.point.x, from.point.y, true);
@@ -6695,8 +6921,10 @@ export class BrowserSession {
     const eventsBefore = await this.readInteractionCounts();
     const urlBefore = page.url();
     const popup = this.watchForPopup(page);
+    throwIfAborted();
     if (fromLocator) await fromLocator.click({ button, clickCount, noWaitAfter: true });
     else await page.mouse.click(from.point.x, from.point.y, { button, clickCount });
+    throwIfAborted();
     const claimedPopup = await this.settlePopupAfterAction(popup.popup, popup.waitMs);
     void this.showClickMarker(from.point.x, from.point.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
     return this.completeVerifiedAction(
@@ -6727,7 +6955,7 @@ export class BrowserSession {
     if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
       const target = await this.unifiedActionPoint(input);
       if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
-      targetLocator = target.reference ? await this.snapshotReferenceLocator(target.reference) : undefined;
+      targetLocator = target.reference && isSnapshotReference(target.reference) ? await this.snapshotReferenceLocator(target.reference) : undefined;
       if (targetLocator) {
         await targetLocator.click({ noWaitAfter: true });
         await targetLocator.focus();
@@ -6750,6 +6978,8 @@ export class BrowserSession {
       if (!editable) return { ok: false, actual: 'Keyboard type requires an editable focused textbox or contenteditable target.' };
       const valueBefore = await this.editableValue(targetLocator);
       const eventsBefore = await this.readInteractionCounts();
+      const urlBefore = page.url();
+      const navigationSequenceBefore = this.navigationSequenceByPage.get(page) || 0;
       const selectAllKey = process.platform === 'darwin' ? 'Meta+A' : 'Control+A';
       if (input.replace !== false) {
         if (targetLocator) {
@@ -6772,16 +7002,18 @@ export class BrowserSession {
         previousGeneration,
         async () => {
           const eventsAfter = await this.readInteractionCounts();
-          const valueAfter = await this.editableValue(targetLocator);
           const keyEvents = this.interactionDelta(eventsBefore, eventsAfter, 'keydown');
           const inputEvents = this.interactionDelta(eventsBefore, eventsAfter, 'input');
+          const navigated = page.url() !== urlBefore
+            || (this.navigationSequenceByPage.get(page) || 0) !== navigationSequenceBefore;
+          const valueAfter = navigated ? undefined : await this.editableValue(targetLocator);
           const valueChanged = valueBefore !== undefined && valueAfter !== undefined && valueBefore !== valueAfter;
           const delivered = text.length > 0
             ? inputEvents > 0 || valueChanged
             : input.replace !== false ? inputEvents > 0 || valueChanged || valueBefore === '' : true;
           return {
-            ok: keyEvents > 0 && delivered,
-            detail: `${keyEvents} keydown and ${inputEvents} input event(s) observed; valueLength ${valueBefore?.length ?? '?'}→${valueAfter?.length ?? '?'}.`,
+            ok: navigated || (keyEvents > 0 && delivered),
+            detail: `${keyEvents} keydown and ${inputEvents} input event(s) observed; valueLength ${valueBefore?.length ?? '?'}→${valueAfter?.length ?? '?'}; navigation=${navigated}.`,
           };
         },
       );
@@ -6874,10 +7106,11 @@ export class BrowserSession {
 
     const treeLines: string[] = [];
     const actionLines: string[] = [];
+    const actionContextLines: string[] = [];
+    const actionContextIds = new Map<string, string>();
     const textLines: string[] = [];
     const textSeen = new Set<string>();
     let chars = 0;
-    let actionChars = 0;
     let textChars = 0;
     let domNodeCount = 0;
     let interactiveNodeCount = 0;
@@ -6892,14 +7125,29 @@ export class BrowserSession {
       textLines.push(text);
       textChars += lineChars;
     };
+    const formatActionSnapshot = (contexts: string[], actions: string[]) => {
+      if (!actions.length) return '';
+      if (!contexts.length) return actions.join('\n');
+      return [
+        'Contexts:',
+        ...contexts.map((context) => `- ${context}`),
+        '',
+        'Interactive elements:',
+        ...actions,
+      ].join('\n');
+    };
+    const compactActionContextLabel = (value?: string) => {
+      const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+      return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized;
+    };
     const actionContext = (snapshot: BrowserUseVisibleDomSnapshot, item: BrowserUseVisibleDomSnapshot['items'][number], framePath?: string, frameUrl?: string) => {
       const byPath = new Map(snapshot.items.map((entry) => [entry.path, entry]));
       const labels: string[] = [];
-      if (framePath) labels.push(`iframe ${framePath}${frameUrl ? ` ${frameUrl}` : ''}`);
+      if (framePath) labels.push(compactActionContextLabel(`iframe ${framePath}${frameUrl ? ` ${frameUrl}` : ''}`));
       const parts = item.path.split('.');
       for (let length = 1; length < parts.length; length += 1) {
         const ancestor = byPath.get(parts.slice(0, length).join('.'));
-        const label = ancestor?.label?.replace(/\s+/g, ' ').trim();
+        const label = compactActionContextLabel(ancestor?.label);
         if (label && label !== item.label && !labels.includes(label)) labels.push(label);
       }
       return labels.slice(-4).join(' > ').replace(/--/g, '-');
@@ -6934,11 +7182,18 @@ export class BrowserSession {
         if (options.includeText) appendText(item.label);
         if (options.includeActions && item.interactive) {
           const context = actionContext(snapshot, item, framePath, frameUrl);
-          const actionLine = context ? `${line} <!-- context: ${context} -->` : line;
-          const actionLineChars = actionLine.length + (actionLines.length === 0 ? 0 : 1);
-          if (actionChars + actionLineChars <= maxChars && actionLines.length < maxElements) {
+          const existingContextId = context ? actionContextIds.get(context) : undefined;
+          const contextId = existingContextId || (context ? `c${actionContextIds.size + 1}` : undefined);
+          const actionLine = contextId ? `${line} ctx=${contextId}` : line;
+          const nextContextLines = context && contextId && !existingContextId
+            ? [...actionContextLines, `${contextId}: ${context}`]
+            : actionContextLines;
+          if (formatActionSnapshot(nextContextLines, [...actionLines, actionLine]).length <= maxChars && actionLines.length < maxElements) {
+            if (context && contextId && !existingContextId) {
+              actionContextIds.set(context, contextId);
+              actionContextLines.push(`${contextId}: ${context}`);
+            }
             actionLines.push(actionLine);
-            actionChars += actionLineChars;
           }
           if (!actionReferenceIds.has(publicId)) {
             actionReferenceIds.add(publicId);
@@ -6948,10 +7203,15 @@ export class BrowserSession {
         references.push({
           id: publicId,
           interactive: item.interactive,
+          capabilities: item.capabilities,
+          confidence: item.confidence,
+          contextId: snapshot.stateKey,
           label: item.label,
           line,
           localRef: item.ref,
           path: item.path,
+          locatorCandidates: item.locatorCandidates,
+          signals: item.signals,
           framePath,
           frameUrl,
           descriptor: item.descriptor,
@@ -6990,7 +7250,7 @@ export class BrowserSession {
     this.lastDomNodeReferences = new Map(references.map((reference) => [reference.id, reference]));
     addTiming('buildDomNodeReferenceMapMs', referenceMapStartedAt);
     const tree = treeLines.join('\n') || (fullScope ? '[empty full DOM snapshot]' : '[empty visible DOM snapshot]');
-    const actions = actionLines.join('\n') || '[no visible actionable elements]';
+    const actions = formatActionSnapshot(actionContextLines, actionLines) || '[no visible actionable elements]';
     const text = textLines.join('\n') || '[no visible page text]';
     const elements = tree;
     return {
@@ -7076,10 +7336,141 @@ export class BrowserSession {
     const key = `${stateKey}:${localRef}`;
     let id = this.domVisiblePublicIdByFrameLocalRef.get(key);
     if (!id) {
-      id = String(this.domVisibleNextPublicId++);
+      // Keep DOM-observation UIDs in a separate namespace from CDP snapshot UIDs.
+      // The same registry is then updated by incremental MutationObserver deltas.
+      id = `dom-${this.domVisibleNextPublicId++}`;
       this.domVisiblePublicIdByFrameLocalRef.set(key, id);
     }
     return id;
+  }
+
+  private removeDomVisibleReference(stateKey: string, localRef: string) {
+    const key = `${stateKey}:${localRef}`;
+    const uid = this.domVisiblePublicIdByFrameLocalRef.get(key);
+    if (!uid) return undefined;
+    this.domVisiblePublicIdByFrameLocalRef.delete(key);
+    this.lastDomNodeReferences.delete(uid);
+    return uid;
+  }
+
+  private domObservationReference(
+    stateKey: string,
+    item: BrowserUseVisibleDomSnapshot['items'][number],
+    framePath?: string,
+    frameUrl?: string,
+    viewportClip?: BrowserUseViewportClip,
+  ): DomNodeReference {
+    const id = this.publicDomVisibleId(stateKey, item.ref);
+    return {
+      id,
+      interactive: item.interactive,
+      capabilities: item.capabilities,
+      confidence: item.confidence,
+      contextId: stateKey,
+      label: item.label,
+      line: item.line.replace(`node_id=${item.ref}`, `uid=${id}`),
+      locatorCandidates: item.locatorCandidates,
+      localRef: item.ref,
+      path: item.path,
+      signals: item.signals,
+      framePath,
+      frameUrl,
+      descriptor: item.descriptor,
+      state: item.state,
+      tag: item.tag,
+      viewportClip,
+    };
+  }
+
+  /**
+   * Read the lightweight DOM-observation snapshot used as the baseline for
+   * incremental MutationObserver updates. It intentionally avoids CDP
+   * DOMSnapshot/AX collection, which is reserved for explicit legacy search
+   * tools and is never run after every action.
+   */
+  async readDomObservationSnapshot(options: { mode?: 'actionable' | 'full' | 'text' } = {}) {
+    const startedAt = Date.now();
+    const result = await this.readSimplifiedDomTree({ scope: options.mode === 'full' ? 'full' : 'visible' });
+    const source = options.mode === 'text'
+      ? result.observation.text
+      : options.mode === 'full'
+        ? result.observation.tree
+        : result.observation.actions;
+    const content = source.replaceAll(/\bnode_id=/g, 'uid=');
+    // Establish the returned snapshot as the delta baseline without walking
+    // historical page-load mutations. A queue discard is intentionally O(1).
+    await this.discardDomChanges();
+    return {
+      content,
+      contentCharLength: content.length,
+      mode: options.mode || 'actionable',
+      nodeCount: result.observation.domNodeCount,
+      actionableCount: result.observation.interactiveNodeCount,
+      timings: { ...result.observation.timings, readDomObservationMs: Date.now() - startedAt },
+    };
+  }
+
+  /**
+   * Consume only the mutations observed since the previous call. Removed nodes
+   * are deleted from the authoritative UID registry before the result is
+   * returned, so a later UID action cannot silently target a stale element.
+   */
+  async readDomChanges(): Promise<BrowserActionResult> {
+    const mainFrame = this.activePage.mainFrame();
+    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER);
+    const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
+    const added: string[] = [];
+    const updated: string[] = [];
+    const removed: string[] = [];
+    let epoch = 0;
+    let overflow = false;
+
+    const frameDeltas = await Promise.all(frames.map(async (frame) => {
+      const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
+      if (frame !== mainFrame && framePath === undefined) return undefined;
+      await this.ensureBrowserPageRuntime(frame);
+      const delta = await frame.evaluate(() => {
+        const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+        return runtime?.visibleDomDelta();
+      }).catch(() => undefined);
+      return delta ? { delta, frame, framePath } : undefined;
+    }));
+
+    for (const entry of frameDeltas) {
+      if (!entry) continue;
+      const { delta, frame, framePath } = entry;
+      epoch = Math.max(epoch, delta.epoch);
+      overflow ||= delta.overflow;
+      const frameUrl = frame.url() || undefined;
+      for (const localRef of delta.removedRefs) {
+        const uid = this.removeDomVisibleReference(delta.stateKey, localRef);
+        if (uid) removed.push(uid);
+      }
+      for (const item of delta.added) {
+        const reference = this.domObservationReference(delta.stateKey, item, framePath, frameUrl);
+        this.lastDomNodeReferences.set(reference.id, reference);
+        added.push(reference.line);
+      }
+      for (const item of delta.updated) {
+        const reference = this.domObservationReference(delta.stateKey, item, framePath, frameUrl);
+        this.lastDomNodeReferences.set(reference.id, reference);
+        updated.push(reference.line);
+      }
+    }
+
+    return {
+      ok: true,
+      actual: 'DOM incremental changes captured.',
+      domChanges: { epoch, added, updated, removed, overflow },
+    };
+  }
+
+  private async discardDomChanges() {
+    const frames = this.activePage.frames();
+    await Promise.all(frames.map((frame) => frame.evaluate(() => {
+      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+      return runtime?.discardDomChanges();
+    }).catch(() => undefined)));
   }
 
   private intersectViewportClip(left: BrowserUseViewportClip, right: BrowserUseViewportClip) {

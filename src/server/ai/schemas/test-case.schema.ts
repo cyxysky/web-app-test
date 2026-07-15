@@ -260,6 +260,8 @@ export type StepToolCall = {
   recovered?: boolean;
   transient?: boolean;
   result?: string;
+  /** Complete tool result retained for the browser-chat detail dialog. */
+  rawResult?: unknown;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
   visualAfter?: {

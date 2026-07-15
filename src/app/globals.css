@@ -6017,7 +6017,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .group-tree-row {
-  align-items: center;
+  align-items: start;
   display: grid;
   gap: 2px;
   grid-template-columns: minmax(0, 1fr) 28px;
@@ -6025,7 +6025,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .group-tree-button {
-  align-items: center;
+  align-items: flex-start;
   background: transparent;
   border: 0;
   border-radius: 12px;
@@ -6035,10 +6035,11 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   font-size: 13px;
   font-weight: 650;
   gap: 8px;
-  min-height: 34px;
+  line-height: 1.4;
+  min-height: 36px;
   min-width: 0;
-  overflow: hidden;
-  padding: 0 8px;
+  overflow-wrap: anywhere;
+  padding: 7px 8px;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -6775,8 +6776,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-group-binding-list button>span {
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .browser-chat-group-binding-list button>svg:last-child {
@@ -6997,6 +6997,9 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   font-size: 15px;
   font-weight: 760;
   letter-spacing: -0.02em;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .browser-chat-layout.sidebar-collapsed .browser-chat-brand strong {
@@ -7369,9 +7372,9 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: flex;
   gap: 2px 8px;
   justify-items: start;
-  min-height: 34px;
+  min-height: 36px;
   min-width: 0;
-  padding: 0 7px;
+  padding: 7px;
   text-align: left;
   width: 100%;
 }
@@ -7404,10 +7407,14 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   opacity: 0.54;
 }
 
-.browser-chat-recent-list span {
+.browser-chat-recent-list .browser-chat-recent-open > span {
+  display: block;
+  flex: 1 1 auto;
   font-size: 13px;
   font-weight: 650;
+  line-height: 1.4;
   max-width: 100%;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -9508,6 +9515,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   gap: 8px;
   justify-content: flex-end;
   padding: 8px;
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  box-shadow: 0 8px 16px color-mix(in srgb, var(--background) 42%, transparent);
 }
 
 .browser-chat-message-export-bar>span {
