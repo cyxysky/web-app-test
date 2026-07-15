@@ -6323,6 +6323,14 @@ export class BrowserSession {
     }).catch(() => undefined);
   }
 
+  private async hasFocusedNativeSelect() {
+    for (const frame of this.activePage.frames()) {
+      const focused = await frame.evaluate(() => document.activeElement instanceof HTMLSelectElement).catch(() => false);
+      if (focused) return true;
+    }
+    return false;
+  }
+
   private async viewportDragTarget(page: Page, x: number, y: number, source: boolean) {
     const handle = await page.evaluateHandle(({ pointX, pointY, dragSource }) => {
       const hit = document.elementFromPoint(pointX, pointY);
@@ -7057,7 +7065,7 @@ export class BrowserSession {
     throwIfAborted();
     const claimedPopup = await this.settlePopupAfterAction(popup.popup, popup.waitMs);
     void this.showClickMarker(from.point.x, from.point.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
-    return this.completeVerifiedAction(
+    const result = await this.completeVerifiedAction(
       `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${from.point.source}.`,
       previousGeneration,
       async () => {
@@ -7076,6 +7084,31 @@ export class BrowserSession {
         };
       },
     );
+    // A native <select> opens a browser/OS-owned popup. Its options do not
+    // enter the page DOM and therefore cannot be reported by MutationObserver.
+    // Re-emit the select's current semantic line so the post-click delta still
+    // exposes its options and the caller can continue with selectOption.
+    const nativeSelectReference = from.reference
+      && !isSnapshotReference(from.reference)
+      && from.reference.tag === 'select'
+      ? from.reference
+      : undefined;
+    const clickedNativeSelect = (
+      button === 'left'
+      && clickCount === 1
+      && nativeSelectReference
+    );
+    if (clickedNativeSelect) {
+      if (
+        result.domChanges
+        && !result.domChanges.added.includes(nativeSelectReference.line)
+        && !result.domChanges.updated.includes(nativeSelectReference.line)
+      ) {
+        result.domChanges.updated.push(nativeSelectReference.line);
+      }
+      result.actual += ' Native select options are exposed in the updated element above. Use selectOption with this UID and an exact option value or full label; do not choose it with keyboard letters.';
+    }
+    return result;
   }
 
   async selectOption(input: BrowserSelectOptionAction): Promise<BrowserActionResult> {
@@ -7109,6 +7142,14 @@ export class BrowserSession {
       const target = await this.unifiedActionPoint(input, true);
       if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
       targetLocator = target.reference && isSnapshotReference(target.reference) ? await this.snapshotReferenceLocator(target.reference) : undefined;
+      const targetsNativeSelect = Boolean(target.reference && (
+        isSnapshotReference(target.reference)
+          ? await targetLocator?.evaluate((element) => element instanceof HTMLSelectElement).catch(() => false)
+          : target.reference.tag === 'select'
+      ));
+      if (targetsNativeSelect) {
+        return { ok: false, actual: 'Keyboard operation rejected for a native <select>. Use selectOption with this select UID and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
+      }
       if (!targetLocator && target.reference && !isSnapshotReference(target.reference) && !target.reference.interactive) {
         targetLocator = await this.editableIframeLocator(target.reference, target.point);
         if (!targetLocator) {
@@ -7127,6 +7168,9 @@ export class BrowserSession {
         const focused = page.locator(':focus');
         if (await focused.count().catch(() => 0) === 1) targetLocator = focused;
       }
+    }
+    if (await this.hasFocusedNativeSelect()) {
+      return { ok: false, actual: 'Keyboard operation rejected because a native <select> is focused. Use selectOption with the select UID from takeSnapshot and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
     }
     if (input.action === 'type') {
       if (typeof input.text !== 'string') return { ok: false, actual: 'Keyboard type requires text.' };

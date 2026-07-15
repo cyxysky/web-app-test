@@ -16,7 +16,7 @@ export const browserMouseToolShape = {
   deltaY: z.number().optional().describe('Vertical wheel delta for action=scroll.'),
 } satisfies z.ZodRawShape;
 
-export const browserKeyboardToolDescription = 'Unified keyboard tool. action=type can focus a fresh uid or latest viewport screenshot coordinate before entering text. action=press sends one key; action=shortcut sends a key combination.';
+export const browserKeyboardToolDescription = 'Unified keyboard tool. action=type can focus a fresh uid or latest viewport screenshot coordinate before entering text. action=press sends one key; action=shortcut sends a key combination. Never use keyboard letters, ArrowUp/ArrowDown, or Enter to choose an option from a native HTML <select>; use selectOption with the select UID and an exact value or full label.';
 
 export const browserKeyboardToolShape = {
   action: z.enum(['type', 'press', 'shortcut']),

@@ -1056,7 +1056,7 @@ function summarizeStepToolCallForPrompt(toolCall: StepToolCall) {
   const status = toolCall.recovered === true && toolCall.transient === true
     ? ' recovered'
     : toolCall.ok === false ? ' failed' : '';
-  return `${toolCall.name}${status}${reason ? `: ${reason}` : result ? `: ${result}` : ''}`;
+  return `${toolCall.name}${status}${reason ? `: ${reason}` : ''}${result ? ` -> ${result}` : ''}`;
 }
 
 function buildCompactRunContext(steps: StepExecutionResult[], activeMemory?: RuntimeWorkingMemory) {
@@ -1110,17 +1110,43 @@ function buildCompactBrowserChatContext(steps: StepExecutionResult[], activeMemo
     : latestTool
     ? summarizeStepToolCallForPrompt(latestTool)
     : latestStep ? `Step ${latestStep.index}: ${concise(latestStep.observation || latestStep.note || latestStep.action, 140)}` : '[none]';
+  const recentActions = usefulSteps
+    .flatMap((step) => (step.tools || []).map((tool) => `Step ${step.index}: ${summarizeStepToolCallForPrompt(tool)}`))
+    .slice(-8);
   const runState = {
     currentState: currentState || null,
     nextObjective: latestNextGoal || 'Satisfy the latest browser-chat user message.',
     lastActionOrResult: lastAction,
+    recentExecutedActions: recentActions,
     completedSteps: steps.length,
+    stateRule: 'These actions already executed. Do not repeat an action whose successful result already satisfies the request; inspect current state or finish instead.',
   };
 
   return [
     'BrowserChat RunState JSON (compact context):',
     JSON.stringify(runState, null, 2),
   ].join('\n');
+}
+
+function codexExecutedActionMessages(steps: StepExecutionResult[]): RuntimeModelMessage[] {
+  const actions = steps
+    .filter(isUsefulHistoryStep)
+    .flatMap((step) => (step.tools || []).map((tool) => ({ stepIndex: step.index, tool })))
+    .slice(-8);
+  return actions.flatMap(({ stepIndex, tool }) => {
+    const input = tool.input === undefined ? {} : tool.input;
+    const result = textFromUnknown(tool.rawResult ?? tool.result).trim() || '[no execution result recorded]';
+    return [
+      {
+        role: 'assistant' as const,
+        content: `[Previously requested browser action]\nstep=${stepIndex}\ntool=${tool.name}\ninput=${JSON.stringify(input)}`,
+      },
+      {
+        role: 'user' as const,
+        content: `[Browser action execution result]\nstep=${stepIndex}\ntool=${tool.name}\nok=${tool.ok !== false}\nresult=${result}`,
+      },
+    ];
+  });
 }
 
 function formatLedgerDigest(items: TaskLedgerItem[], limit = Number(process.env.AI_LEDGER_DIGEST_LIMIT || 1000)) {
@@ -2151,7 +2177,7 @@ ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : ''
 ${externalAppCandidateContext}` : '',
     visualMarkersWithoutOverlay || visualTextCandidateFallback ? `Visible interactive elements:
 ${candidateContext}` : '',
-    browserChatMode ? '' : compactRunContext,
+    compactRunContext,
     availableScreenshotReferences.length ? `Available previous screenshot references:
 ${formatScreenshotReferences(availableScreenshotReferences)}` : '',
     selectedScreenshotReferences.length ? `Selected reference screenshots:
@@ -2178,6 +2204,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'searchSnapshot',
     'mouse',
     'keyboard',
+    'selectOption',
     'downloadFile',
     'generateMarkdownFile',
     'switchTab',
@@ -2287,8 +2314,11 @@ function sanitizeModelLogValue(
 }
 
 function sanitizeModelMessagesForLog(system: string | undefined, messages: unknown, imagePaths: string[]) {
-  void system;
-  return sanitizeModelLogValue(Array.isArray(messages) ? messages : [], imagePaths, { imageIndex: 0 });
+  const orderedMessages = [
+    ...(system?.trim() ? [{ role: 'system', content: system }] : []),
+    ...(Array.isArray(messages) ? messages : []),
+  ];
+  return sanitizeModelLogValue(orderedMessages, imagePaths, { imageIndex: 0 });
 }
 
 function sanitizeModelInputForStats(system: string | undefined, messages: unknown, imagePaths: string[]) {
@@ -2805,6 +2835,9 @@ async function executeRuntimeStep(input: {
       const initialContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: requestPrompt }];
       for (const image of initialImages) initialContent.push({ type: 'image', image });
       initialMessages = [...historyMessages, { role: 'user' as const, content: initialContent }] as RuntimeModelMessage[];
+    }
+    if (codexMode && input.completedSteps.length) {
+      initialMessages.push(...codexExecutedActionMessages(input.completedSteps));
     }
     if (retryState?.messages.length) {
       initialMessages = [...retryState.messages];

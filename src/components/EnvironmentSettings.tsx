@@ -831,7 +831,7 @@ export function EnvironmentSettings({
           </div>
           <div className="personal-memory-head-actions">
             <button className="ui-button ui-icon-button" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">
-              {loadingPersonalMemory ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
+              <RefreshCw size={15} />
               {t('刷新')}
             </button>
             <button className="ui-button ui-icon-button" onClick={openCreatePersonalMemory} type="button">
@@ -842,12 +842,22 @@ export function EnvironmentSettings({
         </div>
 
         {loadingPersonalMemory ? (
-          <section className="settings-loading-panel compact" role="status" aria-live="polite">
-            <span aria-hidden="true" className="ui-loading-spinner" />
-            <div>
-              <h2>{t('正在读取个性化记忆')}</h2>
-            </div>
-          </section>
+          <div className="settings-list-skeleton personal-memory-skeleton" role="status" aria-label={t('正在读取个性化记忆')}>
+            {[0, 1, 2].map((index) => (
+              <article className="settings-skeleton-row memory-skeleton-row" key={index}>
+                <div className="memory-skeleton-content">
+                  <span className="settings-skeleton-block skeleton-meta" />
+                  <span className="settings-skeleton-block skeleton-heading" />
+                  <span className="settings-skeleton-block skeleton-copy" />
+                </div>
+                <div className="memory-skeleton-actions">
+                  <span className="settings-skeleton-block skeleton-action" />
+                  <span className="settings-skeleton-block skeleton-action" />
+                  <span className="settings-skeleton-block skeleton-action" />
+                </div>
+              </article>
+            ))}
+          </div>
         ) : personalMemoryItems.length ? (
           <div className="personal-memory-list">
             {personalMemoryItems.map((item) => (

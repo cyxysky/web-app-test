@@ -593,6 +593,15 @@ function hasAiOutputView(output: BrowserChatAiOutputView) {
   return Boolean(output.reasoning.length || output.texts.length || output.tools.length);
 }
 
+function isCodexRuntimeObjectEnvelope(value: string) {
+  const parsed = parseJsonObjectText(value);
+  if (!parsed) return false;
+  return typeof parsed.type === 'string'
+    && parsed.params !== null
+    && typeof parsed.params === 'object'
+    && !Array.isArray(parsed.params);
+}
+
 function aiOutputCyclesFromLogs(logs: BrowserChatLogRecord[]): BrowserChatAiOutputCycle[] {
   const cycles: BrowserChatAiOutputCycle[] = [];
   logs.forEach((log, index) => {
@@ -603,6 +612,9 @@ function aiOutputCyclesFromLogs(logs: BrowserChatLogRecord[]): BrowserChatAiOutp
     const output = aiOutputViewFromResponse(aiOutput.response);
     const fallbackText = stringFromUnknown(aiOutput.text);
     if (fallbackText) output.texts.push(fallbackText);
+    if (log.phase === 'ai:runtime:object') {
+      output.texts = output.texts.filter((text) => !isCodexRuntimeObjectEnvelope(text));
+    }
     const compacted = compactAiOutputView(output);
     if (!hasAiOutputView(compacted)) return;
     cycles.push({
@@ -2400,6 +2412,29 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   );
 });
 
+function BrowserChatMessageSkeleton() {
+  return (
+    <div className="browser-chat-message-skeleton" role="status" aria-label="正在加载对话消息">
+      <div className="browser-chat-message-skeleton-user">
+        <span className="browser-chat-skeleton-block skeleton-user-line" />
+        <span className="browser-chat-skeleton-block skeleton-user-meta" />
+      </div>
+      <div className="browser-chat-message-skeleton-assistant">
+        <span className="browser-chat-skeleton-block skeleton-heading" />
+        <span className="browser-chat-skeleton-block skeleton-line wide" />
+        <span className="browser-chat-skeleton-block skeleton-line" />
+        <span className="browser-chat-skeleton-block skeleton-tool" />
+        <span className="browser-chat-skeleton-block skeleton-line medium" />
+        <div className="browser-chat-skeleton-actions">
+          <span className="browser-chat-skeleton-block skeleton-button" />
+          <span className="browser-chat-skeleton-block skeleton-button" />
+          <span className="browser-chat-skeleton-block skeleton-button" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const BrowserChatComposer = memo(function BrowserChatComposer({
   attachments,
   availableSkills,
@@ -4077,7 +4112,8 @@ export function BrowserChatWorkspace({
   const [embeddedChatCollapsed, setEmbeddedChatCollapsed] = useState(false);
   const [, setEmbeddedChatResizing] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
-  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
+  const [deletingSessionIds, setDeletingSessionIds] = useState<Set<string>>(() => new Set());
+  const deletingSessionIdsRef = useRef(new Set<string>());
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
   const [recentSelectionMode, setRecentSelectionMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
@@ -4697,12 +4733,32 @@ export function BrowserChatWorkspace({
     if (!targetId || interrupting) return;
     setInterrupting(true);
     setError('');
+    const interruptedAt = new Date().toISOString();
+    const markInterrupted = (current: BrowserChatSession) => ({
+      ...current,
+      busy: false,
+      status: current.status === 'closed' ? current.status : 'idle' as const,
+      pendingToolConfirmation: undefined,
+      updatedAt: interruptedAt,
+      messages: current.messages.map((message) => message.status === 'running' ? {
+        ...message,
+        activity: undefined,
+        content: '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。',
+        status: 'interrupted' as const,
+        updatedAt: interruptedAt,
+      } : message),
+    });
+    setBusy(false);
+    setPendingMessageSessionId(null);
+    setSessions((current) => current.map((item) => item.id === targetId ? markInterrupted(item) : item));
+    setSession((current) => current?.id === targetId ? markInterrupted(current) : current);
     try {
       const response = await fetch(`/api/browser-chat/${targetId}/interrupt`, { method: 'POST' });
       const data = await readApiJson<Record<string, unknown>>(response, '中断对话失败');
       upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === targetId });
     } catch (interruptError) {
       setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
+      await refreshSession(targetId, { activate: activeSessionIdRef.current === targetId }).catch(() => undefined);
     } finally {
       setInterrupting(false);
     }
@@ -4749,8 +4805,9 @@ export function BrowserChatWorkspace({
   }
 
   async function deleteSessionHistory(sessionId: string) {
-    if (deletingSessionId || deletingSelectedSessions) return;
-    setDeletingSessionId(sessionId);
+    if (deletingSessionIdsRef.current.has(sessionId) || deletingSelectedSessions) return;
+    deletingSessionIdsRef.current.add(sessionId);
+    setDeletingSessionIds((current) => new Set(current).add(sessionId));
     setError('');
     try {
       const response = await fetch(`/api/browser-chat/${sessionId}/delete`, { method: 'POST' });
@@ -4763,7 +4820,12 @@ export function BrowserChatWorkspace({
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '删除历史对话失败');
     } finally {
-      setDeletingSessionId(null);
+      deletingSessionIdsRef.current.delete(sessionId);
+      setDeletingSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(sessionId);
+        return next;
+      });
     }
   }
 
@@ -4918,7 +4980,7 @@ export function BrowserChatWorkspace({
 
   async function startNewConversation() {
     setActiveView('chat');
-    if (busy || loadingSessionId) return;
+    if (loadingSessionId) return;
     setError('');
     setComposerResetToken((current) => current + 1);
     attachmentsRef.current = [];
@@ -5004,7 +5066,7 @@ export function BrowserChatWorkspace({
             <button
               aria-label={t('新建对话')}
               className="ui-icon-button browser-chat-section-create"
-              disabled={busy || Boolean(loadingSessionId)}
+              disabled={Boolean(loadingSessionId)}
               onClick={() => void startNewConversation()}
               title={t('新建对话')}
               type="button"
@@ -5060,7 +5122,7 @@ export function BrowserChatWorkspace({
         <button
           aria-label={t('新建对话')}
           className="ui-button ui-button--neutral browser-chat-new-chat-button"
-          disabled={busy || Boolean(loadingSessionId)}
+          disabled={Boolean(loadingSessionId)}
           onClick={() => void startNewConversation()}
           title={t('新建对话')}
           type="button"
@@ -5100,12 +5162,12 @@ export function BrowserChatWorkspace({
                   </button>
                   <details className="browser-chat-overflow browser-chat-recent-row-menu">
                     <summary aria-label={`${sessionDisplayTitle(item)} 操作`} title="更多操作">
-                      {deletingSessionId === item.id ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
+                      {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
                     </summary>
                     <div className="browser-chat-overflow-menu">
                       <button
                         className="danger"
-                        disabled={item.busy || deletingSessionId === item.id || deletingSelectedSessions}
+                        disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
                         onClick={(event) => {
                           closeSidebarOverflowMenu(event);
                           void deleteSessionHistory(item.id);
@@ -5177,15 +5239,9 @@ export function BrowserChatWorkspace({
 
   const renderChatPane = () => (
     <div className={`${hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`} style={chatPaneStyle}>
-      {loadingSessionId ? (
-        <div className="browser-chat-inline-loading">
-          <span aria-hidden="true" className="ui-loading-spinner ui-loading-spinner--small" />
-          <span>正在加载对话</span>
-        </div>
-      ) : null}
       {renderChatPaneActions()}
 
-      {hasMessages ? (
+      {loadingSessionId ? <BrowserChatMessageSkeleton /> : hasMessages ? (
         <BrowserChatMessageList
           availableSkills={skills}
           exportingMessageId={exportingMessageId}
@@ -5313,7 +5369,6 @@ export function BrowserChatWorkspace({
               <div className="browser-chat-target-model-controls">
                 <CustomSelect
                   className="browser-chat-target-model-select"
-                  disabled={currentBusy}
                   onChange={(value) => changeModelSelection(parseModelSelectionValue(value))}
                   options={modelSelectionOptions}
                   title={modelSelectionDiagnostic}
@@ -5400,15 +5455,9 @@ export function BrowserChatWorkspace({
           </div>
         ) : (
           <div className={hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'} style={chatPaneStyle}>
-            {loadingSessionId ? (
-              <div className="browser-chat-inline-loading">
-                <span aria-hidden="true" className="ui-loading-spinner ui-loading-spinner--small" />
-                <span>正在加载对话</span>
-              </div>
-            ) : null}
             {renderChatPaneActions()}
 
-            {hasMessages ? (
+            {loadingSessionId ? <BrowserChatMessageSkeleton /> : hasMessages ? (
               <BrowserChatMessageList
                 availableSkills={skills}
                 exportingMessageId={exportingMessageId}

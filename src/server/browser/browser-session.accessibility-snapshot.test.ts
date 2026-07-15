@@ -523,6 +523,14 @@ test('native select options and rich-text iframe entry use explicit DOM-baseline
   const actionable = await session.readDomObservationSnapshot({ mode: 'actionable' });
   const selectUid = actionable.content.match(/<select\s+uid=(dom-\S+)[^>]*options="[^"]*15002=新增需求或本身的bug/)?.[1];
   assert.ok(selectUid, actionable.content);
+  const clicked = await session.mouse({ action: 'click', uid: selectUid });
+  assert.equal(clicked.ok, true, clicked.actual);
+  assert.match(clicked.actual, /Use selectOption .* exact option value or full label/);
+  assert.match(clicked.domChanges?.updated.join('\n') || '', /<select\s+uid=dom-\S+[^>]*options="[^"]*15002=/);
+  const rejectedKeyboardSelection = await session.keyboard({ action: 'press', key: 'ArrowDown' });
+  assert.equal(rejectedKeyboardSelection.ok, false, rejectedKeyboardSelection.actual);
+  assert.match(rejectedKeyboardSelection.actual, /Use selectOption/);
+  assert.equal(await page.locator('#category').inputValue(), '');
   const selected = await session.selectOption({ uid: selectUid, value: '15002' });
   assert.equal(selected.ok, true, selected.actual);
   assert.equal(await page.locator('#category').inputValue(), '15002');

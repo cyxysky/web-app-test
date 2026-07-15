@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
 
-const nativeToolNames = ['takeSnapshot', 'mouse', 'keyboard', 'reportState'];
+const nativeToolNames = ['takeSnapshot', 'mouse', 'keyboard', 'selectOption', 'reportState'];
 const observationToolNames = new Set(['takeSnapshot']);
 
 test('runtimeAllowedToolTypes keeps native tools outside Codex mode', () => {
@@ -37,6 +37,6 @@ test('runtimeAllowedToolTypes swaps reportState for answer in Codex browser chat
       nativeToolNames,
       observationToolNames,
     }),
-    ['takeSnapshot', 'mouse', 'keyboard', 'answer'],
+    ['takeSnapshot', 'mouse', 'keyboard', 'selectOption', 'answer'],
   );
 });

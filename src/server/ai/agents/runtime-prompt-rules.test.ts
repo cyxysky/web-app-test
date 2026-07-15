@@ -14,6 +14,14 @@ test('screenshot-capable models receive the screenshot tool guidance', () => {
   assert.match(combinedRules(true), /takeScreenshot/);
 });
 
+test('native selects require selectOption instead of mouse or keyboard selection', () => {
+  const rules = combinedRules(true);
+
+  assert.match(rules, /MUST call selectOption directly/);
+  assert.match(rules, /Never click the select first/);
+  assert.match(rules, /Never use keyboard letters\/ArrowUp\/ArrowDown\/Enter/);
+});
+
 test('models without image input receive snapshot-only guidance', () => {
   const rules = combinedRules(false);
 

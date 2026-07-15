@@ -5671,6 +5671,99 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   padding: 12px 0;
 }
 
+.settings-list-skeleton {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-skeleton-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  min-width: 0;
+}
+
+.settings-skeleton-block {
+  animation: settings-skeleton-pulse 1.35s ease-in-out infinite;
+  background: linear-gradient(90deg, var(--panel-soft) 20%, color-mix(in srgb, var(--border) 72%, var(--panel)) 50%, var(--panel-soft) 80%);
+  background-size: 220% 100%;
+  border-radius: 999px;
+  display: block;
+}
+
+.skills-skeleton-row {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 18px minmax(80px, 1fr) 32px 32px;
+  min-height: 56px;
+  padding: 8px 6px 8px 10px;
+}
+
+.settings-skeleton-block.skeleton-icon {
+  height: 14px;
+  width: 14px;
+}
+
+.settings-skeleton-block.skeleton-title {
+  height: 14px;
+  max-width: 46%;
+}
+
+.settings-skeleton-block.skeleton-action {
+  border-radius: 8px;
+  height: 30px;
+  width: 30px;
+}
+
+.personal-memory-skeleton {
+  gap: 10px;
+}
+
+.memory-skeleton-row {
+  align-items: start;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 116px;
+  padding: 14px;
+}
+
+.memory-skeleton-content {
+  display: grid;
+  gap: 10px;
+}
+
+.memory-skeleton-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.settings-skeleton-block.skeleton-meta {
+  height: 22px;
+  width: 34%;
+}
+
+.settings-skeleton-block.skeleton-heading {
+  height: 15px;
+  width: 48%;
+}
+
+.settings-skeleton-block.skeleton-copy {
+  height: 13px;
+  width: 76%;
+}
+
+@keyframes settings-skeleton-pulse {
+  from {
+    background-position: 100% 0;
+  }
+
+  to {
+    background-position: -120% 0;
+  }
+}
+
 .skills-manager-item {
   border: 1px solid transparent;
   border-radius: 8px;
@@ -8791,7 +8884,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-inline-loading {
   align-items: center;
-  animation: ui-loading-content-in 0.18s ease both;
+  animation: browser-chat-inline-loading-in 0.18s ease both;
   backdrop-filter: blur(8px);
   background: color-mix(in srgb, var(--panel) 88%, transparent);
   border: 0;
@@ -8808,7 +8901,17 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   position: absolute;
   top: 16px;
   transform: translateX(-50%);
-  z-index: 2;
+  z-index: 20;
+}
+
+@keyframes browser-chat-inline-loading-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
 }
 
 .browser-chat-close {
@@ -8887,6 +8990,89 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-message-list-end {
   height: 1px;
+}
+
+.browser-chat-message-skeleton {
+  align-content: start;
+  display: grid;
+  flex: 1;
+  gap: 24px;
+  margin: 0 auto;
+  max-width: 920px;
+  padding: 64px 0 8px;
+  width: min(100%, 920px);
+}
+
+.browser-chat-message-skeleton-user {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  display: grid;
+  gap: 12px;
+  justify-self: end;
+  padding: 18px 20px;
+  width: min(72%, 560px);
+}
+
+.browser-chat-message-skeleton-assistant {
+  display: grid;
+  gap: 13px;
+  justify-self: start;
+  width: min(92%, 760px);
+}
+
+.browser-chat-skeleton-block {
+  animation: settings-skeleton-pulse 1.35s ease-in-out infinite;
+  background: linear-gradient(90deg, var(--panel-soft) 20%, color-mix(in srgb, var(--border) 72%, var(--panel)) 50%, var(--panel-soft) 80%);
+  background-size: 220% 100%;
+  border-radius: 999px;
+  display: block;
+}
+
+.browser-chat-message-skeleton .skeleton-user-line {
+  height: 18px;
+  width: 82%;
+}
+
+.browser-chat-message-skeleton .skeleton-user-meta {
+  height: 12px;
+  width: 28%;
+}
+
+.browser-chat-message-skeleton .skeleton-heading {
+  height: 16px;
+  width: 32%;
+}
+
+.browser-chat-message-skeleton .skeleton-line {
+  height: 15px;
+  width: 72%;
+}
+
+.browser-chat-message-skeleton .skeleton-line.wide {
+  width: 94%;
+}
+
+.browser-chat-message-skeleton .skeleton-line.medium {
+  width: 58%;
+}
+
+.browser-chat-message-skeleton .skeleton-tool {
+  border-radius: 18px;
+  height: 38px;
+  width: min(66%, 420px);
+}
+
+.browser-chat-skeleton-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.browser-chat-message-skeleton .skeleton-button {
+  border-radius: 18px;
+  height: 34px;
+  width: 104px;
 }
 
 .browser-chat-message {

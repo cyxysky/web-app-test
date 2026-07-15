@@ -2695,12 +2695,11 @@ async function runBrowserChatMessage(
         },
         onDebug: (event) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-          const toolLifecycle = event.phase === 'ai:tool' && /(?:started|->)/i.test(event.message);
           appendLog(session, event.phase, event.message, {
             stepIndex: event.stepIndex,
             elapsedMs: elapsedFromDetails(event.details),
             details: event.details,
-            deferPersist: !toolLifecycle,
+            deferPersist: true,
           });
         },
       });

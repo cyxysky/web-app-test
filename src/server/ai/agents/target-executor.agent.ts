@@ -1875,6 +1875,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'searchSnapshot',
     'mouse',
     'keyboard',
+    'selectOption',
     'downloadFile',
     'generateMarkdownFile',
     'switchTab',
@@ -1984,8 +1985,11 @@ function sanitizeModelLogValue(
 }
 
 function sanitizeModelMessagesForLog(system: string | undefined, messages: unknown, imagePaths: string[]) {
-  void system;
-  return sanitizeModelLogValue(Array.isArray(messages) ? messages : [], imagePaths, { imageIndex: 0 });
+  const orderedMessages = [
+    ...(system?.trim() ? [{ role: 'system', content: system }] : []),
+    ...(Array.isArray(messages) ? messages : []),
+  ];
+  return sanitizeModelLogValue(orderedMessages, imagePaths, { imageIndex: 0 });
 }
 
 function sanitizeModelInputForStats(system: string | undefined, messages: unknown, imagePaths: string[]) {

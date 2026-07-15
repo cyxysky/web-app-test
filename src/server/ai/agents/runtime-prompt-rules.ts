@@ -23,7 +23,8 @@ export function snapshotHardRules(screenshotAvailable = true) {
 
 export function browserActionRules(screenshotAvailable = true) {
   return [
-    '- Prefer takeSnapshot -> UID -> mouse/keyboard for buttons, links, forms, tables, menus, and offscreen elements. For a native <select>, use selectOption with its UID and an exact value or label exposed in the snapshot; do not open the platform dropdown to look for DOM changes.',
+    '- Native HTML <select> hard rule: you MUST call selectOption directly with the select UID and an exact option value or full visible label from the snapshot. Never click the select first, never use keyboard letters/ArrowUp/ArrowDown/Enter to choose, and never inspect the platform dropdown for DOM changes.',
+    '- Prefer takeSnapshot -> UID -> mouse/keyboard for buttons, links, forms, tables, menus, and offscreen elements.',
     screenshotAvailable
       ? '- Use takeScreenshot -> thousandth coordinates for canvas, charts, icon-only controls, custom rendered widgets, or ambiguous overlays.'
       : '- Use only fresh semantic-snapshot UIDs for pointer and keyboard actions; do not invent image coordinates.',

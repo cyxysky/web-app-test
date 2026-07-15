@@ -48,6 +48,7 @@ const EMBEDDED_BROWSER_PERSISTENCE_FILE = 'embedded-browser-state.json';
 const EMBEDDED_BROWSER_PERSISTENCE_VERSION = 2;
 const EMBEDDED_BROWSER_HISTORY_LIMIT = 300;
 let startupLogPath;
+let startupScreenReady = Promise.resolve();
 let recentServerOutput = [];
 let lastDownloadDirectory = '';
 let nextDownloadId = 1;
@@ -142,6 +143,11 @@ function appIconPath() {
   const fileName = process.platform === 'win32' ? 'app-icon.ico' : 'app-icon.png';
   if (app.isPackaged) return path.join(process.resourcesPath, fileName);
   return path.join(process.cwd(), 'assets', fileName);
+}
+
+function appPngIconPath() {
+  if (app.isPackaged) return path.join(process.resourcesPath, 'app-icon.png');
+  return path.join(process.cwd(), 'assets', 'app-icon.png');
 }
 
 function preloadPath() {
@@ -2528,7 +2534,7 @@ async function startServer(appDataDir) {
 }
 
 function createWindow() {
-  nativeTheme.themeSource = 'dark';
+  nativeTheme.themeSource = 'system';
   mainWindow = new BrowserWindow({
     width: 1320,
     height: 900,
@@ -2546,6 +2552,19 @@ function createWindow() {
   mainWindow.setMenuBarVisibility(false);
   mainWindow.webContents.on('before-input-event', (event, input) => {
     handleEmbeddedBrowserShortcut(event, input);
+  });
+  mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
+    if (!String(targetUrl).startsWith('webpilot-startup://')) return;
+    event.preventDefault();
+    const action = String(targetUrl).slice('webpilot-startup://'.length).replace(/\/$/, '');
+    if (action === 'retry') {
+      app.relaunch();
+      app.exit(0);
+    } else if (action === 'logs' && startupLogPath) {
+      shell.showItemInFolder(startupLogPath);
+    } else if (action === 'quit') {
+      app.quit();
+    }
   });
   mainWindow.on('close', () => {
     clearEmbeddedBrowserStateChangeTimer();
@@ -2570,79 +2589,205 @@ function createWindow() {
       .catch((error) => appendLog(`App shell link open failed: ${error instanceof Error ? error.message : String(error)}`));
     return { action: 'deny' };
   });
+  let loadingIconDataUrl = '';
+  try {
+    loadingIconDataUrl = `data:image/png;base64,${fs.readFileSync(appPngIconPath()).toString('base64')}`;
+  } catch {
+    // The text fallback keeps the startup screen usable if the icon is unavailable.
+  }
+  const loadingMark = loadingIconDataUrl
+    ? `<img src="${loadingIconDataUrl}" alt="" />`
+    : '<span>W</span>';
   const loadingHtml = `
     <style>
       * { box-sizing: border-box; }
       :root { color-scheme: light; }
       body {
         background:
-          radial-gradient(circle at 18% 12%, rgba(118, 198, 175, 0.18), transparent 30%),
-          radial-gradient(circle at 82% 88%, rgba(104, 150, 224, 0.13), transparent 34%),
-          #f6f8fa;
-        color: #18212d;
+          radial-gradient(circle at 20% 12%, rgba(70, 205, 181, 0.11), transparent 28%),
+          radial-gradient(circle at 78% 88%, rgba(74, 132, 204, 0.09), transparent 32%),
+          linear-gradient(145deg, #f8fafb 0%, #f3f6f8 100%);
+        color: #12202c;
         display: grid;
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         height: 100vh;
         margin: 0;
+        overflow: hidden;
         place-items: center;
+        position: relative;
+        -webkit-font-smoothing: antialiased;
+      }
+      body::before,
+      body::after {
+        border-radius: 50%;
+        content: "";
+        filter: blur(10px);
+        pointer-events: none;
+        position: absolute;
+        will-change: transform, opacity;
+      }
+      body::before {
+        animation: ambient-drift-a 12s ease-in-out infinite alternate;
+        background: radial-gradient(circle, rgba(61, 203, 178, 0.13), rgba(61, 203, 178, 0) 69%);
+        height: min(58vw, 720px);
+        left: -10vw;
+        top: -18vh;
+        width: min(58vw, 720px);
+      }
+      body::after {
+        animation: ambient-drift-b 15s ease-in-out infinite alternate;
+        background: radial-gradient(circle, rgba(69, 127, 205, 0.11), rgba(69, 127, 205, 0) 70%);
+        bottom: -24vh;
+        height: min(54vw, 680px);
+        right: -8vw;
+        width: min(54vw, 680px);
       }
       .shell {
         align-items: center;
-        background: rgba(255, 255, 255, 0.74);
-        border: 1px solid rgba(31, 41, 55, 0.09);
-        border-radius: 22px;
-        box-shadow: 0 24px 72px rgba(35, 52, 72, 0.15);
+        animation: shell-in 0.42s cubic-bezier(.2,.8,.2,1) both;
+        backdrop-filter: blur(24px) saturate(1.15);
+        background: rgba(255, 255, 255, 0.82);
+        border: 1px solid rgba(28, 52, 68, 0.08);
+        border-radius: 24px;
+        box-shadow:
+          0 22px 60px rgba(25, 46, 61, 0.11),
+          0 2px 8px rgba(25, 46, 61, 0.04),
+          inset 0 1px rgba(255, 255, 255, 0.9);
         display: grid;
-        gap: 18px;
-        grid-template-columns: 46px minmax(0, 1fr);
-        max-width: 440px;
-        padding: 25px 27px;
+        gap: 19px;
+        grid-template-columns: 58px minmax(0, 1fr);
+        max-width: 470px;
+        padding: 28px 30px 26px;
+        position: relative;
         width: calc(100vw - 56px);
+        z-index: 1;
+      }
+      .shell::before {
+        background: linear-gradient(90deg, transparent, rgba(255,255,255,.82), transparent);
+        content: "";
+        height: 1px;
+        left: 34px;
+        position: absolute;
+        right: 34px;
+        top: 0;
       }
       .mark {
         align-items: center;
-        background: linear-gradient(145deg, #467bcb, #5fb99e);
-        border-radius: 14px;
-        box-shadow: 0 8px 20px rgba(60, 122, 179, 0.22);
-        color: #fff;
         display: flex;
-        font-size: 18px;
-        font-weight: 780;
-        height: 46px;
+        height: 58px;
         justify-content: center;
-        letter-spacing: -0.08em;
         position: relative;
-        width: 46px;
+        width: 58px;
       }
-      .mark::after {
-        animation: pulse 1.45s ease-out infinite;
-        border: 2px solid rgba(95, 185, 158, 0.5);
-        border-radius: 18px;
-        content: "";
-        inset: -5px;
-        position: absolute;
+      .mark img {
+        border-radius: 14px;
+        box-shadow: 0 9px 22px rgba(15, 44, 57, 0.17);
+        display: block;
+        height: 58px;
+        width: 58px;
       }
-      .eyebrow { color: #718096; font-size: 11px; font-weight: 750; letter-spacing: 0.08em; margin: 0 0 5px; text-transform: uppercase; }
-      h2 { font-size: 20px; letter-spacing: -0.02em; line-height: 1.2; margin: 0 0 7px; }
-      p { color: #687587; font-size: 13px; line-height: 1.55; margin: 0; }
-      .progress { background: #e7edf1; border-radius: 99px; grid-column: 1 / -1; height: 4px; overflow: hidden; }
-      .progress::after { animation: loading 1.35s ease-in-out infinite; background: linear-gradient(90deg, #4d86d6, #69c2a7); border-radius: inherit; content: ""; display: block; height: 100%; width: 42%; }
-      @keyframes loading { from { transform: translateX(-110%); } to { transform: translateX(260%); } }
-      @keyframes pulse { 0% { opacity: 0.8; transform: scale(0.82); } 100% { opacity: 0; transform: scale(1.18); } }
+      .mark span { color: #1aaE98; font-size: 25px; font-weight: 800; }
+      .eyebrow { color: #668090; font-size: 10px; font-weight: 760; letter-spacing: 0.15em; margin: 0 0 6px; text-transform: uppercase; }
+      h2 { font-size: 19px; font-weight: 720; letter-spacing: -0.025em; line-height: 1.25; margin: 0 0 8px; }
+      p { align-items: center; color: #70808d; display: flex; font-size: 12.5px; line-height: 1.55; margin: 0; }
+      .status-dot { animation: status-pulse 1.7s ease-in-out infinite; background: #37c7ad; border-radius: 50%; box-shadow: 0 0 0 4px rgba(55, 199, 173, 0.11); flex: 0 0 auto; height: 6px; margin-right: 9px; width: 6px; }
+      .progress { background: rgba(100, 125, 141, 0.12); border-radius: 99px; grid-column: 1 / -1; height: 3px; margin-top: 3px; overflow: hidden; position: relative; }
+      .progress-value { background: linear-gradient(90deg, #4f91cf, #45cdb5); border-radius: inherit; display: block; height: 100%; transition: width .42s cubic-bezier(.2,.8,.2,1); width: 7%; }
+      .slow-note { color: #81909b; display: none; font-size: 11px; grid-column: 1 / -1; margin-top: -8px; }
+      .slow-note.visible { display: block; }
+      .startup-error { display: none; grid-column: 1 / -1; }
+      .startup-error.visible { display: block; }
+      .startup-error strong { color: #b44747; display: block; font-size: 12px; margin-bottom: 10px; }
+      .startup-actions { display: flex; gap: 8px; }
+      .startup-actions button { background: rgba(255,255,255,.72); border: 1px solid rgba(47,71,85,.13); border-radius: 9px; color: #526673; cursor: pointer; font: inherit; font-size: 11px; padding: 7px 11px; }
+      .startup-actions button:first-child { background: #168e7d; border-color: #168e7d; color: white; }
+      .shell.complete { opacity: 0; transform: translateY(-4px) scale(.99); transition: opacity .22s ease, transform .22s ease; }
+      @keyframes status-pulse { 0%, 100% { opacity: .55; transform: scale(.85); } 50% { opacity: 1; transform: scale(1); } }
+      @keyframes shell-in { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+      @keyframes ambient-drift-a {
+        0% { opacity: .72; transform: translate3d(-3%, -2%, 0) scale(.96); }
+        50% { opacity: 1; transform: translate3d(10%, 7%, 0) scale(1.06); }
+        100% { opacity: .8; transform: translate3d(18%, 1%, 0) scale(1); }
+      }
+      @keyframes ambient-drift-b {
+        0% { opacity: .65; transform: translate3d(3%, 4%, 0) scale(1); }
+        50% { opacity: .92; transform: translate3d(-10%, -8%, 0) scale(1.08); }
+        100% { opacity: .72; transform: translate3d(-17%, 2%, 0) scale(.98); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        body::before, body::after, .shell, .status-dot { animation: none; }
+        .progress-value { transition-duration: .01ms; }
+      }
+      @media (prefers-color-scheme: dark) {
+        :root { color-scheme: dark; }
+        body { background: radial-gradient(circle at 20% 12%, rgba(48,167,146,.12), transparent 28%), radial-gradient(circle at 78% 88%, rgba(67,111,173,.13), transparent 32%), #10151b; color: #eef5f6; }
+        .shell { background: rgba(24,31,39,.84); border-color: rgba(255,255,255,.08); box-shadow: 0 22px 60px rgba(0,0,0,.34), inset 0 1px rgba(255,255,255,.05); }
+        .shell::before { background: linear-gradient(90deg, transparent, rgba(255,255,255,.16), transparent); }
+        .eyebrow { color: #8aa1ae; }
+        p, .slow-note { color: #93a3ad; }
+        .progress { background: rgba(255,255,255,.09); }
+        .startup-actions button { background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.1); color: #bdc8ce; }
+      }
     </style>
     <body>
       <main class="shell">
-        <div class="mark">WP</div>
+        <div class="mark">${loadingMark}</div>
         <div>
           <div class="eyebrow">${APP_NAME}</div>
           <h2>智能浏览器测试工作区</h2>
-          <p>正在连接本地服务，并恢复你的浏览器工作区…</p>
+          <p><span class="status-dot"></span><span id="startup-status">正在初始化工作区…</span></p>
         </div>
-        <div class="progress" aria-label="正在加载"></div>
+        <div class="progress" aria-label="正在加载"><span class="progress-value" id="startup-progress"></span></div>
+        <div class="slow-note" id="startup-slow">首次启动可能需要更长时间，请稍候。</div>
+        <div class="startup-error" id="startup-error">
+          <strong id="startup-error-message">启动失败</strong>
+          <div class="startup-actions">
+            <button onclick="location.href='webpilot-startup://retry'">重新启动</button>
+            <button onclick="location.href='webpilot-startup://logs'">查看日志</button>
+            <button onclick="location.href='webpilot-startup://quit'">退出</button>
+          </div>
+        </div>
       </main>
+      <script>
+        window.__webPilotStartup = {
+          update(input) {
+            if (input.message) document.getElementById('startup-status').textContent = input.message;
+            if (Number.isFinite(input.progress)) document.getElementById('startup-progress').style.width = Math.max(0, Math.min(100, input.progress)) + '%';
+            document.getElementById('startup-slow').classList.toggle('visible', Boolean(input.slow));
+          },
+          fail(message) {
+            document.querySelector('.status-dot').style.background = '#d65c5c';
+            document.getElementById('startup-status').textContent = '未能完成启动';
+            document.getElementById('startup-error-message').textContent = message || '启动失败，请重试或查看日志。';
+            document.getElementById('startup-error').classList.add('visible');
+            document.getElementById('startup-slow').classList.remove('visible');
+          },
+          complete() { document.querySelector('.shell').classList.add('complete'); }
+        };
+      </script>
     </body>`;
-  mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(loadingHtml)}`);
+  startupScreenReady = mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(loadingHtml)}`);
   return mainWindow;
+}
+
+async function updateStartupScreen(input) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    await startupScreenReady;
+    await mainWindow.webContents.executeJavaScript(`window.__webPilotStartup?.update(${JSON.stringify(input)})`);
+  } catch {
+    // Startup progress is cosmetic and must never prevent the app from opening.
+  }
+}
+
+async function failStartupScreen(message) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    await startupScreenReady;
+    await mainWindow.webContents.executeJavaScript(`window.__webPilotStartup?.fail(${JSON.stringify(message)})`);
+  } catch {
+    dialog.showErrorBox(APP_TITLE, message);
+  }
 }
 
 async function boot() {
@@ -2654,22 +2799,34 @@ async function boot() {
   appendLog(`resourcesPath=${process.resourcesPath}`);
   appendLog(`WEBPILOT_ELECTRON_CDP_PORT=${EMBEDDED_BROWSER_CDP_PORT}`);
   createWindow();
+  await updateStartupScreen({ message: '正在恢复浏览器工作区…', progress: 18 });
   if (restoreEmbeddedBrowserPersistence()) appendLog('Embedded browser tabs restored from local cache.');
+  const slowStartupTimer = setTimeout(() => {
+    void updateStartupScreen({ message: '服务仍在启动，请稍候…', progress: 58, slow: true });
+  }, 8_000);
 
   try {
     const externalServerUrl = String(process.env.WEBPILOT_ELECTRON_SERVER_URL || '').trim().replace(/\/+$/, '');
+    await updateStartupScreen({ message: externalServerUrl ? '正在连接本地服务…' : '正在启动本地服务…', progress: 36 });
     const url = externalServerUrl || await startServer(appDataDir);
+    await updateStartupScreen({ message: '服务已就绪，正在加载界面…', progress: 82 });
     if (externalServerUrl) {
       await waitForHttp(`${url}/dashboard`, 60_000, 2);
     }
+    clearTimeout(slowStartupTimer);
+    await updateStartupScreen({ message: '工作区已准备完成', progress: 100 });
+    await mainWindow.webContents.executeJavaScript('window.__webPilotStartup?.complete()').catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 180));
     await mainWindow.loadURL(url);
   } catch (error) {
+    clearTimeout(slowStartupTimer);
     const output = recentServerOutput.length
       ? `\n\nRecent server output:\n${recentServerOutput.slice(-10).join('\n')}`
       : '';
     const logHint = startupLogPath ? `\n\nStartup log: ${startupLogPath}` : '';
-    dialog.showErrorBox(APP_TITLE, `${error instanceof Error ? error.message : String(error)}${output}${logHint}`);
-    app.quit();
+    const message = `${error instanceof Error ? error.message : String(error)}${output}${logHint}`;
+    appendLog(`Startup failed: ${message}`);
+    await failStartupScreen(error instanceof Error ? error.message : String(error));
   }
 }
 

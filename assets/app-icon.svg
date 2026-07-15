@@ -1,6 +1,22 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
-  <title>WebPilot</title>
-  <desc>Minimal WebPilot mark.</desc>
-  <rect width="1024" height="1024" rx="224" fill="#102536"/>
-  <path d="M206 292 348 732 512 430 676 732 818 292" fill="none" stroke="#6CE2CE" stroke-linecap="round" stroke-linejoin="round" stroke-width="92"/>
+  <title id="title">WebPilot</title>
+  <desc id="desc">A refined navigation-inspired W mark.</desc>
+  <defs>
+    <linearGradient id="surface" x1="160" y1="96" x2="864" y2="928" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#142D3D"/>
+      <stop offset="1" stop-color="#081521"/>
+    </linearGradient>
+    <linearGradient id="route" x1="205" y1="286" x2="819" y2="742" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7AECDD"/>
+      <stop offset="1" stop-color="#32C9B2"/>
+    </linearGradient>
+    <filter id="route-shadow" x="100" y="180" width="824" height="680" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#020B12" flood-opacity=".34"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="228" fill="url(#surface)"/>
+  <rect x="18" y="18" width="988" height="988" rx="210" fill="none" stroke="#FFFFFF" stroke-opacity=".055" stroke-width="4"/>
+  <path d="M205 292 345 727 512 430 679 727 819 292" fill="none" stroke="#020B12" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round" stroke-width="86" transform="translate(0 14)"/>
+  <path d="M205 292 345 727 512 430 679 727 819 292" fill="none" stroke="url(#route)" stroke-linecap="round" stroke-linejoin="round" stroke-width="80" filter="url(#route-shadow)"/>
+  <circle cx="512" cy="430" r="21" fill="#D8FFF8"/>
 </svg>

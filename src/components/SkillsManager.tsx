@@ -273,9 +273,15 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
         <div className="settings-card skills-manager-list">
           <div className="skills-manager-list-body">
             {loading ? (
-              <div className="settings-loading-panel compact">
-                <span aria-hidden="true" className="ui-loading-spinner" />
-                <span>{t('正在加载 Skills')}</span>
+              <div className="settings-list-skeleton skills-list-skeleton" role="status" aria-label={t('正在加载 Skills')}>
+                {[0, 1, 2, 3].map((index) => (
+                  <div className="settings-skeleton-row skills-skeleton-row" key={index}>
+                    <span className="settings-skeleton-block skeleton-icon" />
+                    <span className="settings-skeleton-block skeleton-title" />
+                    <span className="settings-skeleton-block skeleton-action" />
+                    <span className="settings-skeleton-block skeleton-action" />
+                  </div>
+                ))}
               </div>
             ) : skills.length ? skills.map((skill) => {
               const expanded = expandedSkillIds.includes(skill.id);
