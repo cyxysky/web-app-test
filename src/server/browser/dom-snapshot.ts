@@ -117,6 +117,7 @@ const textBearingRoles = new Set([
 ]);
 
 const ignoredTags = new Set(['HEAD', 'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'META', 'LINK']);
+const svgInteractionTags = new Set(['circle', 'ellipse', 'g', 'line', 'path', 'polygon', 'polyline', 'rect', 'svg', 'text', 'use']);
 
 function text(value: unknown) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -385,8 +386,17 @@ export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapsho
       });
       for (let index = count - 1; index >= 0; index -= 1) {
         if (nodes.nodeType?.[index] !== 1) continue;
-        const combined = children[index].map((child) => descendantText[child]).filter(Boolean).join(' ');
-        descendantText[index] = text(combined).slice(0, 600);
+        const parts: string[] = [];
+        let remaining = 600;
+        for (const child of children[index]) {
+          const childText = descendantText[child];
+          if (!childText || remaining <= 0) continue;
+          const chunk = childText.slice(0, remaining);
+          parts.push(chunk);
+          remaining -= chunk.length + 1;
+          if (remaining <= 0) break;
+        }
+        descendantText[index] = text(parts.join(' ')).slice(0, 600);
       }
       const labelByTarget = new Map<string, string>();
       for (let index = 0; index < count; index += 1) {
@@ -394,11 +404,16 @@ export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapsho
           labelByTarget.set(attrs[index].for, descendantText[index]);
         }
       }
+      const embeddedSvgIconCache = new Map<number, string>();
       const embeddedSvgIcons = (index: number) => {
+        const cached = embeddedSvgIconCache.get(index);
+        if (cached !== undefined) return cached;
         const result: string[] = [];
         const stack = [...children[index]].reverse();
-        while (stack.length && result.length < 4) {
+        let visited = 0;
+        while (stack.length && result.length < 4 && visited < 256) {
           const current = stack.pop()!;
+          visited += 1;
           const tag = (strings[nodes.nodeName?.[current] || 0] || '').toUpperCase();
           if (tag === 'SVG') {
             const descriptor = classDescriptor(tag, attrs[current]?.class || '');
@@ -406,7 +421,9 @@ export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapsho
           }
           for (const child of [...children[current]].reverse()) stack.push(child);
         }
-        return result.join(', ');
+        const value = result.join(', ');
+        embeddedSvgIconCache.set(index, value);
+        return value;
       };
       const depthCache = new Map<number, number>();
       const depthOf = (index: number): number => {
@@ -524,6 +541,8 @@ export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapsho
         if (!actionable && !semantic) continue;
         const parentBackendId = parents[index] >= 0 ? nodes.backendNodeId?.[parents[index]] : undefined;
         const properties: Record<string, string | number | boolean> = {
+          domTag: tag.toLowerCase(),
+          ownClickSignal: clickable.has(index) || hasClickAttribute(attributes),
           rendered,
           paintOrder: layout?.paintOrder || 0,
         };
@@ -593,6 +612,9 @@ export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapsho
       if (!node.actionable || !node.parentAxNodeId) return true;
       const parent = byAxId.get(`${node.frameId}:${node.parentAxNodeId}`);
       if (!parent?.actionable) return true;
+      const svgInteractionBoundary = svgInteractionTags.has(String(node.properties.domTag || '').toLowerCase())
+        && node.properties.ownClickSignal === true;
+      if (svgInteractionBoundary) return true;
       const sameEntityLink = Boolean(node.url && parent.url === node.url);
       const inheritedPointer = node.properties.cursorPointer === true && parent.properties.cursorPointer === true;
       if (!sameEntityLink && !inheritedPointer) return true;
@@ -602,19 +624,25 @@ export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapsho
     const enrichmentStartedAt = Date.now();
     const candidates = deduplicated
       .filter((node) => node.actionable && node.backendDOMNodeId);
-    const candidateBackendIds = new Set(candidates.map((node) => node.backendDOMNodeId));
-    const candidateFrameIds = [...new Set(candidates.map((node) => node.frameId))];
-    const axNodesByBackendId = new Map<number, CdpAxNode>();
+    const enrichmentCandidates = candidates.filter((node) => (
+      !readableName(node.name)
+      || ['combobox', 'generic', 'textbox'].includes(node.role.toLowerCase())
+      || node.properties.expanded !== undefined
+    ));
+    const candidateBackendIds = new Set(enrichmentCandidates.map((node) => `${node.frameId}:${node.backendDOMNodeId}`));
+    const candidateFrameIds = [...new Set(enrichmentCandidates.map((node) => node.frameId))];
+    const axNodesByBackendId = new Map<string, CdpAxNode>();
     await mapConcurrent(candidateFrameIds, 4, async (frameId) => {
       const result = await client.send('Accessibility.getFullAXTree', { frameId })
         .catch(() => undefined) as { nodes?: CdpAxNode[] } | undefined;
       for (const axNode of result?.nodes || []) {
-        if (axNode.backendDOMNodeId && candidateBackendIds.has(axNode.backendDOMNodeId)) {
-          axNodesByBackendId.set(axNode.backendDOMNodeId, axNode);
+        const key = `${frameId}:${axNode.backendDOMNodeId}`;
+        if (axNode.backendDOMNodeId && candidateBackendIds.has(key)) {
+          axNodesByBackendId.set(key, axNode);
         }
       }
     });
-    const enriched = candidates.map((node) => enrichFromAx(node, axNodesByBackendId.get(node.backendDOMNodeId!)));
+    const enriched = enrichmentCandidates.map((node) => enrichFromAx(node, axNodesByBackendId.get(`${node.frameId}:${node.backendDOMNodeId}`)));
     const enrichedByIdentity = new Map(enriched.map((node) => [node.identity, node]));
     const nodes = deduplicated.map((node) => enrichedByIdentity.get(node.identity) || node);
     const axEnrichmentMs = Date.now() - enrichmentStartedAt;

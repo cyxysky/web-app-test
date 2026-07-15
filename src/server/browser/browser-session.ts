@@ -287,6 +287,8 @@ type DomNodeReference = {
   interactive: boolean;
   capabilities?: DomActionCapability[];
   confidence?: DomActionConfidence;
+  contextText?: string;
+  priority?: number;
   contextId?: string;
   label: string;
   line: string;
@@ -297,10 +299,53 @@ type DomNodeReference = {
   framePath?: string;
   frameUrl?: string;
   descriptor: string;
+  normalizedContext: string;
+  normalizedLabel: string;
+  normalizedLine: string;
+  searchText: string;
+  semanticRoles: string[];
   state: string;
   tag: string;
   viewportClip?: BrowserUseViewportClip;
 };
+
+function normalizeDomSearchText(value: unknown) {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function indexDomNodeReference<T extends Omit<DomNodeReference, 'normalizedContext' | 'normalizedLabel' | 'normalizedLine' | 'searchText' | 'semanticRoles'>>(reference: T): DomNodeReference {
+  const normalizedLabel = normalizeDomSearchText(reference.label);
+  const normalizedContext = normalizeDomSearchText(reference.contextText);
+  const normalizedLine = normalizeDomSearchText(reference.line);
+  const tag = normalizeDomSearchText(reference.tag);
+  const semanticRoles = new Set<string>([tag]);
+  for (const match of normalizedLine.matchAll(/\brole="([^"]+)"/g)) semanticRoles.add(normalizeDomSearchText(match[1]));
+  if (tag === 'input' || tag === 'textarea' || tag === 'contenteditable') semanticRoles.add('textbox');
+  if (tag === 'select') semanticRoles.add('combobox');
+  if (tag === 'a') semanticRoles.add('link');
+  if (tag === 'button') semanticRoles.add('button');
+  if (tag === 'input' && /\btype="checkbox"/.test(normalizedLine)) semanticRoles.add('checkbox');
+  if (tag === 'input' && /\btype="radio"/.test(normalizedLine)) semanticRoles.add('radio');
+  return {
+    ...reference,
+    normalizedContext,
+    normalizedLabel,
+    normalizedLine,
+    searchText: normalizeDomSearchText([
+      reference.label,
+      reference.contextText,
+      reference.line,
+      reference.tag,
+      reference.descriptor,
+      reference.state,
+    ].filter(Boolean).join(' ')),
+    semanticRoles: [...semanticRoles],
+  };
+}
 
 type PageInteractiveCandidate = Omit<InteractiveCandidate, 'framePath' | 'frameUrl'>;
 
@@ -366,7 +411,7 @@ type BrowserUseViewportClip = {
   top: number;
 };
 
-type DomActionCapability = 'click' | 'drag' | 'fill' | 'focus' | 'hover' | 'select';
+type DomActionCapability = 'click' | 'drag' | 'fill' | 'focus' | 'hover' | 'scroll' | 'select';
 type DomActionConfidence = 'high' | 'medium' | 'low';
 
 type BrowserUseVisibleDomSnapshot = {
@@ -386,6 +431,7 @@ type BrowserUseVisibleDomSnapshot = {
     line: string;
     locatorCandidates: string[];
     path: string;
+    priority: number;
     rect?: BrowserUseViewportClip;
     ref: string;
     signals: string[];
@@ -482,6 +528,13 @@ type AiDomRuntime = {
     actual: string;
     value?: string;
     label?: string;
+  } | undefined);
+  scrollVisibleDomVirtualList: (ref: string, input?: { advance?: boolean; top?: number }) => ({
+    after: number;
+    atBottom: boolean;
+    before: number;
+    maxTop: number;
+    moved: boolean;
   } | undefined);
 };
 
@@ -669,6 +722,7 @@ type WindowWithAiDomRuntime = Window & {
   __aiDomMutationState?: AiDomMutationStateSnapshot & {
     observer?: MutationObserver;
     pendingMutations?: MutationRecord[];
+    pendingMutationKeys?: WeakMap<Node, Set<string>>;
     pendingOverflow?: boolean;
   };
   __browserUseVisibleDomState?: {
@@ -942,10 +996,21 @@ function installAiBrowserPageRuntime() {
       });
       if (!meaningful) return;
       mutationState.pendingMutations = mutationState.pendingMutations || [];
+      mutationState.pendingMutationKeys = mutationState.pendingMutationKeys || new WeakMap<Node, Set<string>>();
       for (const mutation of mutations) {
         if (mutationState.pendingMutations.length >= 500) {
           mutationState.pendingOverflow = true;
           break;
+        }
+        if (mutation.type !== 'childList') {
+          const key = mutation.type === 'attributes' ? `attributes:${mutation.attributeName || ''}` : mutation.type;
+          let keys = mutationState.pendingMutationKeys.get(mutation.target);
+          if (!keys) {
+            keys = new Set<string>();
+            mutationState.pendingMutationKeys.set(mutation.target, keys);
+          }
+          if (keys.has(key)) continue;
+          keys.add(key);
         }
         mutationState.pendingMutations.push(mutation);
       }
@@ -960,7 +1025,7 @@ function installAiBrowserPageRuntime() {
     });
   }
 
-  if (win.__aiDomRuntime?.version === 10) return;
+  if (win.__aiDomRuntime?.version === 12) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
@@ -1354,7 +1419,7 @@ function installAiBrowserPageRuntime() {
       || element.hasAttribute('onpointerover');
   }
 
-  function visibleDomHoverSelectors() {
+  function visibleDomHoverElements() {
     const selectors: string[] = [];
     for (const sheet of Array.from(document.styleSheets)) {
       let rules: CSSRuleList | undefined;
@@ -1375,23 +1440,18 @@ function installAiBrowserPageRuntime() {
         }
       }
     }
-    return Array.from(new Set(selectors)).slice(0, 600);
-  }
-
-  function hasVisibleDomCssHoverEffect(element: Element, hoverSelectors: string[]) {
-    const className = typeof element.className === 'string' ? element.className : '';
-    if (/(^|\s)hover[:_-]/.test(className)) return true;
-    for (const selector of hoverSelectors) {
+    const matches = new Set<Element>();
+    for (const selector of Array.from(new Set(selectors)).slice(0, 600)) {
       try {
-        if (element.matches(selector)) return true;
+        for (const element of Array.from(document.querySelectorAll(selector))) matches.add(element);
       } catch {
-        // Ignore selectors that cannot be used with matches().
+        // Ignore selectors that cannot be queried outside their rule context.
       }
     }
-    return false;
+    return matches;
   }
 
-  function visibleDomInteractionSignals(element: Element, hoverSelectors: string[] = []) {
+  function visibleDomInteractionSignals(element: Element, hoverElements: Set<Element> = new Set()) {
     const signals: string[] = [];
     const tag = visibleDomElementName(element);
     if (hasNativeActionSignal(element, tag)) signals.push('native');
@@ -1408,8 +1468,38 @@ function installAiBrowserPageRuntime() {
     if (isContentEditableOwner(element)) signals.push('contenteditable');
     if (hasVisibleDomOwnHoverAttribute(element)) signals.push('hover-attribute');
     const shouldInspectCssHover = signals.some((signal) => !/^listener:(mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/.test(signal));
-    if (shouldInspectCssHover && hoverSelectors.length && hasVisibleDomCssHoverEffect(element, hoverSelectors)) signals.push('hover-css');
+    const className = typeof element.className === 'string' ? element.className : '';
+    if (shouldInspectCssHover && (hoverElements.has(element) || /(^|\s)hover[:_-]/.test(className))) signals.push('hover-css');
+    const style = window.getComputedStyle(element);
+    if (/^(auto|scroll)$/.test(style.overflowY)
+      && element.children.length >= 3
+      && (element as HTMLElement).clientHeight > 0
+      && (element as HTMLElement).scrollHeight > (element as HTMLElement).clientHeight * 1.5) signals.push('virtual-list');
     return Array.from(new Set(signals));
+  }
+
+  function hasVisibleDomOwnClickBoundary(element: Element) {
+    const role = normalizeVisibleDomText(element.getAttribute('role') || '').toLowerCase();
+    return hasNativeActionSignal(element)
+      || element.hasAttribute('onclick')
+      || hasActionAttribute(element)
+      || visibleDomActionRolePattern.test(role)
+      || recordedEventTypes(element).some((type) => visibleDomClickEventPattern.test(type))
+      || (element.hasAttribute('tabindex') && element.getAttribute('tabindex') !== '-1');
+  }
+
+  function visibleDomSvgActionScope(element: Element) {
+    if (element.namespaceURI !== 'http://www.w3.org/2000/svg') return '';
+    if (visibleDomElementName(element) !== 'svg') return hasVisibleDomOwnClickBoundary(element) ? 'own' : 'graphic';
+    const stack = Array.from(element.children).reverse();
+    let visited = 0;
+    while (stack.length && visited < 256) {
+      const current = stack.pop()!;
+      visited += 1;
+      if (hasVisibleDomOwnClickBoundary(current)) return 'container';
+      for (const child of Array.from(current.children).reverse()) stack.push(child);
+    }
+    return 'own';
   }
 
   function visibleDomActionCapabilities(element: Element, signals: string[]) {
@@ -1443,6 +1533,7 @@ function installAiBrowserPageRuntime() {
     if (signals.includes('cursor=pointer')) capabilities.add('click');
     if (signals.includes('tabindex')) capabilities.add('focus');
     if (signals.some((signal) => /^(hover-attribute|hover-css|listener:(mouseenter|mouseover|pointerenter|pointerover))$/.test(signal))) capabilities.add('hover');
+    if (signals.includes('virtual-list')) capabilities.add('scroll');
     const dragSignal = signals.some((signal) => /^listener:(mousedown|pointerdown|touchstart)$/.test(signal));
     if (dragSignal && (
       element.getAttribute('draggable') === 'true'
@@ -1457,6 +1548,7 @@ function installAiBrowserPageRuntime() {
     if (signals.includes('cursor=pointer') || signals.includes('contenteditable')) return 'medium';
     if (capabilities.includes('fill') || capabilities.includes('select')) return 'high';
     if (signals.some((signal) => /^(tabindex|hover-attribute|listener:(mouseenter|pointerenter))$/.test(signal))) return 'medium';
+    if (signals.includes('virtual-list')) return 'medium';
     if (element.getAttribute('draggable') === 'true' || element.hasAttribute('cdkdraghandle') || element.hasAttribute('data-drag-handle')) return 'medium';
     return 'low';
   }
@@ -1841,12 +1933,31 @@ function installAiBrowserPageRuntime() {
     if (signals.length) {
       attrs.push(`signals="${escapeVisibleDomText(Array.from(new Set(signals)).join('|'))}"`);
     }
+    const svgActionScope = visibleDomSvgActionScope(element);
+    if (svgActionScope) attrs.push(`action_scope="${svgActionScope}"`);
     if (tag === 'select') {
       const select = element as HTMLSelectElement;
       const selected = select.selectedOptions[0];
       const options = visibleDomSelectOptions(select);
       if (selected) attrs.push(`selected_value="${escapeVisibleDomText(selected.value)}"`);
       if (options) attrs.push(`options="${escapeVisibleDomText(options)}"`);
+    }
+    if (signals.includes('virtual-list')) {
+      const target = element as HTMLElement;
+      const childHeights = Array.from(element.children).slice(0, 20)
+        .map((child) => child.getBoundingClientRect().height)
+        .filter((height) => height > 1)
+        .sort((left, right) => left - right);
+      const medianHeight = childHeights.length ? childHeights[Math.floor(childHeights.length / 2)] : 0;
+      const estimatedItems = medianHeight > 0 ? Math.max(element.children.length, Math.round(target.scrollHeight / medianHeight)) : element.children.length;
+      const firstVisibleIndex = medianHeight > 0 ? Math.max(0, Math.floor(target.scrollTop / medianHeight)) : 0;
+      attrs.push('virtualized="possible"');
+      attrs.push('actions="scroll,search"');
+      attrs.push(`visible_children="${element.children.length}"`);
+      attrs.push(`estimated_items="${estimatedItems}"`);
+      attrs.push(`visible_range="${firstVisibleIndex + 1}-${Math.min(estimatedItems, firstVisibleIndex + element.children.length)}"`);
+      attrs.push(`scroll_top="${Math.round(target.scrollTop)}"`);
+      attrs.push(`scroll_height="${Math.round(target.scrollHeight)}"`);
     }
     const capabilities = visibleDomActionCapabilities(element, signals);
     const confidence = visibleDomActionConfidence(element, signals, capabilities);
@@ -1864,6 +1975,11 @@ function installAiBrowserPageRuntime() {
         ? visibleDomTextContent(element, 320)
         : '';
     const rect = renderedDomRect(element);
+    const viewport = visualViewportRect();
+    const inModal = Boolean(element.closest('dialog[open], [aria-modal="true"]'));
+    const containsFocus = element === document.activeElement || Boolean(element.contains(document.activeElement));
+    const inViewport = Boolean(rect && rect.right > viewport.left && rect.left < viewport.right && rect.bottom > viewport.top && rect.top < viewport.bottom);
+    const priority = (inModal ? 60 : 0) + (containsFocus ? 35 : 0) + (inViewport ? 20 : 0) + (confidence === 'high' ? 10 : confidence === 'medium' ? 5 : 0);
     const line = text.length === 0
       ? `<${tag} ${attrs.join(' ')} />`
       : `<${tag} ${attrs.join(' ')}>${escapeVisibleDomText(text)}</${tag}>`;
@@ -1875,6 +1991,7 @@ function installAiBrowserPageRuntime() {
       label: visibleDomLabelForElement(element, interactive, text),
       line,
       locatorCandidates: visibleDomLocatorCandidates(element),
+      priority,
       rect,
       signals,
       state: interactive ? visibleDomInteractiveStateForElement(element, signals) : '',
@@ -1895,10 +2012,10 @@ function installAiBrowserPageRuntime() {
     const items: BrowserUseVisibleDomSnapshot['items'] = [];
     let chars = 0;
     let truncated = false;
-    const hoverSelectors = visibleDomHoverSelectors();
+    const hoverElements = visibleDomHoverElements();
 
     const stop = () => truncated || items.length >= maxElements || chars >= maxChars;
-    const pushItem = (element: Element, signals: string[] = []) => {
+    const pushItem = (element: Element, path: string, signals: string[] = []) => {
       if (stop()) return;
       const ref = visibleDomRef(element);
       const item = visibleDomItem(element, ref, signals);
@@ -1912,7 +2029,7 @@ function installAiBrowserPageRuntime() {
       items.push({
         ...item,
         descriptor: descriptor(element),
-        path: pathOf(element) || '',
+        path,
         ref,
       });
       chars += lineChars;
@@ -1933,17 +2050,17 @@ function installAiBrowserPageRuntime() {
         ...(frameElement.src ? { url: frameElement.src } : {}),
       });
     };
-    const visit = (node: Node) => {
+    const visit = (node: Node, path = '0') => {
       if (stop()) return;
       if (node.nodeType === Node.DOCUMENT_NODE) {
         const root = document.documentElement;
-        if (root) visit(root);
+        if (root) visit(root, '0');
         return;
       }
       if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
-        for (const child of Array.from((node as DocumentFragment).children)) {
+        for (const [index, child] of Array.from((node as DocumentFragment).children).entries()) {
           if (stop()) break;
-          visit(child);
+          visit(child, `${path}.${index}`);
         }
         return;
       }
@@ -1952,20 +2069,18 @@ function installAiBrowserPageRuntime() {
       if (isDisplayNone(element)) return;
       const tag = visibleDomElementName(element);
       if (tag === 'frame' || tag === 'iframe') pushFrame(element);
-      const signals = visibleDomInteractionSignals(element, hoverSelectors);
+      const signals = visibleDomInteractionSignals(element, hoverElements);
       if (
         signals.length
         && !isVisibleDomSubtreeHidden(element)
         && hasVisibleDomPointerEvents(element)
         && visibleDomClickablePoint(element, viewportClip)
       ) {
-        pushItem(element, signals);
+        pushItem(element, path, signals);
       }
-      const root = shadowRootOf(element);
-      if (root && !stop()) visit(root);
-      for (const child of Array.from(element.children)) {
+      for (const [index, child] of children(element).entries()) {
         if (stop()) break;
-        visit(child);
+        visit(child, `${path}.${index}`);
       }
     };
 
@@ -1984,7 +2099,7 @@ function installAiBrowserPageRuntime() {
     const items: BrowserUseVisibleDomSnapshot['items'] = [];
     let chars = 0;
     let truncated = false;
-    const hoverSelectors = visibleDomHoverSelectors();
+    const hoverElements = visibleDomHoverElements();
 
     const structuralTextTags = new Set([
       'a', 'button', 'dd', 'details', 'dt', 'figcaption', 'input', 'label', 'legend', 'li',
@@ -1992,11 +2107,16 @@ function installAiBrowserPageRuntime() {
       'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
     ]);
     const directTextContainerTags = new Set(['article', 'aside', 'div', 'fieldset', 'footer', 'form', 'header', 'main', 'nav', 'section', 'span']);
+    const signalCache = new WeakMap<Element, string[]>();
     const stop = () => truncated || items.length >= maxElements || chars >= maxChars;
     const hasMeaningfulAttributes = (element: Element) => visibleDomMeaningfulAttributes.some((name) => Boolean(visibleDomAttributeValue(element, name)));
     const actionableSignals = (element: Element) => {
-      const signals = visibleDomInteractionSignals(element, hoverSelectors);
-      return signals.length && renderedDomRect(element) ? signals : [];
+      const cached = signalCache.get(element);
+      if (cached) return cached;
+      const signals = visibleDomInteractionSignals(element, hoverElements);
+      const actionable = signals.length && renderedDomRect(element) ? signals : [];
+      signalCache.set(element, actionable);
+      return actionable;
     };
     const shouldIncludeElement = (element: Element) => {
       if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
@@ -2006,7 +2126,7 @@ function installAiBrowserPageRuntime() {
       if (directTextContainerTags.has(tag) && visibleDomOwnTextContent(element)) return true;
       return hasMeaningfulAttributes(element);
     };
-    const pushItem = (element: Element, signals: string[] = []) => {
+    const pushItem = (element: Element, path: string, signals: string[] = []) => {
       if (stop()) return;
       const ref = visibleDomRef(element);
       const item = visibleDomItem(element, ref, signals);
@@ -2020,7 +2140,7 @@ function installAiBrowserPageRuntime() {
       items.push({
         ...item,
         descriptor: descriptor(element),
-        path: pathOf(element) || '',
+        path,
         ref,
       });
       chars += lineChars;
@@ -2042,17 +2162,17 @@ function installAiBrowserPageRuntime() {
         ...(frameElement.src ? { url: frameElement.src } : {}),
       });
     };
-    const visit = (node: Node) => {
+    const visit = (node: Node, path = '0') => {
       if (stop()) return;
       if (node.nodeType === Node.DOCUMENT_NODE) {
         const root = document.documentElement;
-        if (root) visit(root);
+        if (root) visit(root, '0');
         return;
       }
       if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
-        for (const child of Array.from((node as DocumentFragment).children)) {
+        for (const [index, child] of Array.from((node as DocumentFragment).children).entries()) {
           if (stop()) break;
-          visit(child);
+          visit(child, `${path}.${index}`);
         }
         return;
       }
@@ -2061,12 +2181,10 @@ function installAiBrowserPageRuntime() {
       if (isDisplayNone(element)) return;
       const tag = visibleDomElementName(element);
       if (tag === 'frame' || tag === 'iframe') pushFrame(element);
-      if (shouldIncludeElement(element)) pushItem(element, actionableSignals(element));
-      const root = shadowRootOf(element);
-      if (root && !stop()) visit(root);
-      for (const child of Array.from(element.children)) {
+      if (shouldIncludeElement(element)) pushItem(element, path, actionableSignals(element));
+      for (const [index, child] of children(element).entries()) {
         if (stop()) break;
-        visit(child);
+        visit(child, `${path}.${index}`);
       }
     };
 
@@ -2078,6 +2196,7 @@ function installAiBrowserPageRuntime() {
     const discardedMutations = mutationState.pendingMutations?.length || 0;
     const overflow = Boolean(mutationState.pendingOverflow);
     mutationState.pendingMutations = [];
+    mutationState.pendingMutationKeys = new WeakMap<Node, Set<string>>();
     mutationState.pendingOverflow = false;
     return { epoch: mutationState.epoch, overflow, discardedMutations };
   }
@@ -2087,6 +2206,7 @@ function installAiBrowserPageRuntime() {
     const pending = [...(mutationState.pendingMutations || [])];
     const overflow = Boolean(mutationState.pendingOverflow);
     mutationState.pendingMutations = [];
+    mutationState.pendingMutationKeys = new WeakMap<Node, Set<string>>();
     mutationState.pendingOverflow = false;
     if (!pending.length) {
       return { epoch: mutationState.epoch, stateKey: state.instanceId, added: [], updated: [], removedRefs: [], overflow };
@@ -2097,13 +2217,23 @@ function installAiBrowserPageRuntime() {
     const maxNodes = 1000;
     let remainingNodes = maxNodes;
     let remainingRemovedNodes = maxNodes;
-    const hoverSelectors = visibleDomHoverSelectors();
+    const hoverElements = visibleDomHoverElements();
     const viewportClip = visualViewportRect();
 
     const asElement = (node: Node | null | undefined) => {
       if (!node) return undefined;
       if (node.nodeType === Node.ELEMENT_NODE) return node as Element;
       return flatParentElement(node);
+    };
+    const semanticMutationRoot = (element: Element | undefined) => {
+      let current = element;
+      for (let guard = 0; current && guard < 128; guard += 1) {
+        const ref = state.elementToRef.get(current);
+        const broadDocumentContainer = current === document.body || current === document.documentElement;
+        if ((ref && state.refToElement.has(ref)) || (!broadDocumentContainer && isActionable(current))) return current;
+        current = flatParentElement(current);
+      }
+      return element;
     };
     const rememberRemoved = (node: Node) => {
       const stack: Node[] = [node];
@@ -2126,8 +2256,9 @@ function installAiBrowserPageRuntime() {
       if (mutation.type === 'childList') {
         // The inserted subtree supplies new UIDs. Only update a small tracked
         // container itself; never rescan a broad parent such as <body>.
-        if (target && !isOverlay(target) && state.refToElement.has(state.elementToRef.get(target) || '') && target.children.length <= 64) {
-          updatedRoots.add(target);
+        const semanticTarget = semanticMutationRoot(target);
+        if (semanticTarget && !isOverlay(semanticTarget) && semanticTarget.children.length <= 64) {
+          updatedRoots.add(semanticTarget);
         }
         for (const node of Array.from(mutation.addedNodes)) {
           const element = asElement(node);
@@ -2135,7 +2266,7 @@ function installAiBrowserPageRuntime() {
         }
         for (const node of Array.from(mutation.removedNodes)) rememberRemoved(node);
       } else if (target && !isOverlay(target)) {
-        updatedRoots.add(target);
+        updatedRoots.add(semanticMutationRoot(target) || target);
       }
     }
 
@@ -2151,7 +2282,7 @@ function installAiBrowserPageRuntime() {
     };
     const inspect = (element: Element, destination: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>) => {
       if (!element.isConnected || isOverlay(element) || isDisplayNone(element)) return;
-      const signals = visibleDomInteractionSignals(element, hoverSelectors);
+      const signals = visibleDomInteractionSignals(element, hoverElements);
       if (signals.length && !isVisibleDomSubtreeHidden(element) && hasVisibleDomPointerEvents(element) && visibleDomClickablePoint(element, viewportClip)) {
         const ref = visibleDomRef(element);
         state.refToElement.set(ref, element);
@@ -2227,6 +2358,21 @@ function installAiBrowserPageRuntime() {
     return point ? { ...point, descriptor: descriptor(element) } : undefined;
   }
 
+  function scrollVisibleDomVirtualList(ref: string, input: { advance?: boolean; top?: number } = {}) {
+    const element = visibleDomState().refToElement.get(ref) as HTMLElement | undefined;
+    if (!element?.isConnected || element.clientHeight <= 0 || element.scrollHeight <= element.clientHeight) return undefined;
+    const before = element.scrollTop;
+    const maxTop = Math.max(0, element.scrollHeight - element.clientHeight);
+    const requested = input.advance === false
+      ? before
+      : Number.isFinite(input.top)
+      ? Number(input.top)
+      : before + Math.max(1, Math.round(element.clientHeight * 0.85));
+    element.scrollTop = Math.max(0, Math.min(maxTop, requested));
+    const after = element.scrollTop;
+    return { after, atBottom: after >= maxTop - 1, before, maxTop, moved: Math.abs(after - before) >= 1 };
+  }
+
   function elementText(pathValue: string, options: { maxChars?: number } = {}) {
     const element = elementFromPath(pathValue);
     if (!element) return undefined;
@@ -2277,7 +2423,7 @@ function installAiBrowserPageRuntime() {
   }
 
   win.__aiDomRuntime = {
-    version: 10,
+    version: 12,
     mutationState: () => ({ epoch: mutationState.epoch, lastMutationAt: mutationState.lastMutationAt }),
     isOverlay,
     isTraversable,
@@ -2306,6 +2452,7 @@ function installAiBrowserPageRuntime() {
     visibleDomPoint,
     visibleDomText,
     selectVisibleDomOption,
+    scrollVisibleDomVirtualList,
   };
 }
 
@@ -6450,14 +6597,9 @@ export class BrowserSession {
   }
 
   async searchSnapshot(input: { query: string; roles?: string[]; limit?: number }): Promise<BrowserActionResult> {
-    const normalizeSearchText = (value: unknown) => String(value || '')
-      .normalize('NFKC')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-    const query = normalizeSearchText(input.query);
+    const query = normalizeDomSearchText(input.query);
     if (!query) return { ok: false, actual: 'Snapshot search requires a non-empty query.' };
-    const roles = new Set((input.roles || []).map(normalizeSearchText));
+    const roles = new Set((input.roles || []).map(normalizeDomSearchText));
     const queryParts = query.split(/\s+/).filter(Boolean);
     const limit = Math.min(100, Math.max(1, Math.floor(Number(input.limit) || 20)));
 
@@ -6473,57 +6615,99 @@ export class BrowserSession {
           domChanges: changes.domChanges,
         };
       }
-      const roleMatches = (reference: DomNodeReference) => {
-        if (!roles.size) return true;
-        const line = normalizeSearchText(reference.line);
-        const tag = normalizeSearchText(reference.tag);
-        const lineTerms = new Set(line.split(/[^a-z0-9_-]+/).filter(Boolean));
-        const semanticRoles = new Set<string>([tag]);
-        for (const match of line.matchAll(/\brole="([^"]+)"/g)) {
-          semanticRoles.add(normalizeSearchText(match[1]));
-        }
-        if (tag === 'input' || tag === 'textarea' || tag === 'contenteditable') semanticRoles.add('textbox');
-        if (tag === 'select') semanticRoles.add('combobox');
-        if (tag === 'a') semanticRoles.add('link');
-        if (tag === 'button') semanticRoles.add('button');
-        if (tag === 'input' && /\btype="checkbox"/.test(line)) semanticRoles.add('checkbox');
-        if (tag === 'input' && /\btype="radio"/.test(line)) semanticRoles.add('radio');
-        return [...roles].some((role) => semanticRoles.has(role) || lineTerms.has(role));
-      };
-      const matches = [...this.lastDomNodeReferences.values()]
+      const collectMatches = () => [...this.lastDomNodeReferences.values()]
         .filter((reference) => {
-          if (!roleMatches(reference)) return false;
-          const searchable = normalizeSearchText([
-            reference.label,
-            reference.line,
-            reference.tag,
-            reference.descriptor,
-            reference.state,
-          ].filter(Boolean).join(' '));
-          return searchable.includes(query) || queryParts.every((part) => searchable.includes(part));
+          if (roles.size && ![...roles].some((role) => reference.semanticRoles.includes(role))) return false;
+          return reference.searchText.includes(query) || queryParts.every((part) => reference.searchText.includes(part));
         })
         .sort((left, right) => {
           const score = (reference: DomNodeReference) => {
-            const label = normalizeSearchText(reference.label);
-            const line = normalizeSearchText(reference.line);
-            let value = 0;
+            const label = reference.normalizedLabel;
+            const context = reference.normalizedContext;
+            const line = reference.normalizedLine;
+            let value = reference.priority || 0;
             if (label === query) value += 140;
             else if (label.startsWith(query)) value += 110;
             else if (label.includes(query)) value += 85;
             else if (queryParts.length > 1 && queryParts.every((part) => label.includes(part))) value += 72;
             else if (line.includes(query)) value += 35;
+            if (context === query) value += 55;
+            else if (context.includes(query)) value += 28;
             if (reference.interactive) value += 30;
+            if (reference.confidence === 'high') value += 15;
+            else if (reference.confidence === 'medium') value += 7;
+            if (reference.locatorCandidates?.some((candidate) => /data-test|data-qa|data-cy|#[\w-]+/.test(candidate))) value += 12;
+            if (roles.has('combobox') && reference.capabilities?.includes('select')) value += 24;
+            if (roles.has('textbox') && reference.capabilities?.includes('fill')) value += 24;
             if (/\b(?:focused|selected|modal)=true\b/.test(line)) value += 12;
             if (/\bdisabled=true\b/.test(line)) value -= 35;
             return value;
           };
-          return score(right) - score(left) || left.id.localeCompare(right.id, undefined, { numeric: true });
+          return score(right) - score(left)
+            || left.path.localeCompare(right.path, undefined, { numeric: true })
+            || left.id.localeCompare(right.id, undefined, { numeric: true });
         })
         .slice(0, limit);
+      let matches = collectMatches();
+      let virtualSearchSteps = 0;
+      if (!matches.length) {
+        const virtualLists = [...this.lastDomNodeReferences.values()]
+          .filter((reference) => reference.localRef && reference.signals?.includes('virtual-list'))
+          .slice(0, 3);
+        const maxSteps = boundedPositiveIntegerEnv('DOM_VIRTUAL_SEARCH_MAX_STEPS', 12, 1, 50);
+        const settleMs = boundedNonNegativeIntegerEnv('DOM_VIRTUAL_SEARCH_SETTLE_MS', 50, 500);
+        for (const virtualList of virtualLists) {
+          const frame = virtualList.framePath ? this.frameFromPath(virtualList.framePath) : this.activePage.mainFrame();
+          if (!frame || !virtualList.localRef) continue;
+          await this.ensureBrowserPageRuntime(frame);
+          const initial = await frame.evaluate((selection) => {
+            const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+            return runtime?.scrollVisibleDomVirtualList(selection.ref, { advance: false });
+          }, { ref: virtualList.localRef }).catch(() => undefined);
+          if (!initial) continue;
+          let found = false;
+          if (initial.before > 1) {
+            await frame.evaluate((selection) => {
+              const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+              return runtime?.scrollVisibleDomVirtualList(selection.ref, { top: 0 });
+            }, { ref: virtualList.localRef }).catch(() => undefined);
+            if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+            await this.readSimplifiedDomTree({ scope: 'visible' });
+            await this.discardDomChanges();
+            matches = collectMatches();
+            found = matches.length > 0;
+          }
+          for (let step = 0; step < maxSteps && !found; step += 1) {
+            const movement = await frame.evaluate((selection) => {
+              const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+              return runtime?.scrollVisibleDomVirtualList(selection.ref);
+            }, { ref: virtualList.localRef }).catch(() => undefined);
+            if (!movement?.moved) break;
+            virtualSearchSteps += 1;
+            if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+            await this.readSimplifiedDomTree({ scope: 'visible' });
+            await this.discardDomChanges();
+            matches = collectMatches();
+            if (matches.length) {
+              found = true;
+              break;
+            }
+            if (movement.atBottom) break;
+          }
+          if (found) break;
+          await frame.evaluate((selection) => {
+            const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+            return runtime?.scrollVisibleDomVirtualList(selection.ref, { top: selection.top });
+          }, { ref: virtualList.localRef, top: initial.before }).catch(() => undefined);
+          if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+          await this.readSimplifiedDomTree({ scope: 'visible' });
+          await this.discardDomChanges();
+        }
+      }
       return {
         ok: true,
         actual: [
-          `DOM baseline search for "${input.query}" returned ${matches.length} result(s). Use only the dom-* UIDs shown below exactly as returned.`,
+          `DOM baseline search for "${input.query}" returned ${matches.length} result(s)${virtualSearchSteps ? ` after ${virtualSearchSteps} bounded virtual-list scroll step(s)` : ''}. Use only the dom-* UIDs shown below exactly as returned.`,
           matches.map((reference) => reference.line).join('\n') || '[no DOM baseline matches]',
         ].join('\n'),
       };
@@ -7317,6 +7501,7 @@ export class BrowserSession {
     const actionLines: string[] = [];
     const actionContextLines: string[] = [];
     const actionContextIds = new Map<string, string>();
+    let actionSnapshotChars = 'Contexts:\n\nInteractive elements:\n'.length;
     const textLines: string[] = [];
     const textSeen = new Set<string>();
     let chars = 0;
@@ -7349,8 +7534,7 @@ export class BrowserSession {
       const normalized = String(value || '').replace(/\s+/g, ' ').trim();
       return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized;
     };
-    const actionContext = (snapshot: BrowserUseVisibleDomSnapshot, item: BrowserUseVisibleDomSnapshot['items'][number], framePath?: string, frameUrl?: string) => {
-      const byPath = new Map(snapshot.items.map((entry) => [entry.path, entry]));
+    const actionContext = (byPath: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>, item: BrowserUseVisibleDomSnapshot['items'][number], framePath?: string, frameUrl?: string) => {
       const labels: string[] = [];
       if (framePath) labels.push(compactActionContextLabel(`iframe ${framePath}${frameUrl ? ` ${frameUrl}` : ''}`));
       const parts = item.path.split('.');
@@ -7368,6 +7552,7 @@ export class BrowserSession {
       viewportClip?: BrowserUseViewportClip,
       options: { includeTree?: boolean; includeActions?: boolean; includeText?: boolean } = { includeTree: true, includeActions: true, includeText: true },
     ) => {
+      const itemByPath = new Map(snapshot.items.map((entry) => [entry.path, entry]));
       if (options.includeTree && framePath && snapshot.items.length) {
         const frameLine = `<!-- iframe ${framePath}${frameUrl ? ` url="${frameUrl}"` : ''} -->`;
         const frameLineChars = frameLine.length + (treeLines.length === 0 ? 0 : 1);
@@ -7390,30 +7575,18 @@ export class BrowserSession {
         }
         if (options.includeText) appendText(item.label);
         if (options.includeActions && item.interactive) {
-          const context = actionContext(snapshot, item, framePath, frameUrl);
-          const existingContextId = context ? actionContextIds.get(context) : undefined;
-          const contextId = existingContextId || (context ? `c${actionContextIds.size + 1}` : undefined);
-          const actionLine = contextId ? `${line} ctx=${contextId}` : line;
-          const nextContextLines = context && contextId && !existingContextId
-            ? [...actionContextLines, `${contextId}: ${context}`]
-            : actionContextLines;
-          if (formatActionSnapshot(nextContextLines, [...actionLines, actionLine]).length <= maxChars && actionLines.length < maxElements) {
-            if (context && contextId && !existingContextId) {
-              actionContextIds.set(context, contextId);
-              actionContextLines.push(`${contextId}: ${context}`);
-            }
-            actionLines.push(actionLine);
-          }
           if (!actionReferenceIds.has(publicId)) {
             actionReferenceIds.add(publicId);
             interactiveNodeCount += 1;
           }
         }
-        references.push({
+        references.push(indexDomNodeReference({
           id: publicId,
           interactive: item.interactive,
           capabilities: item.capabilities,
           confidence: item.confidence,
+          contextText: item.contextText,
+          priority: item.priority,
           contextId: snapshot.stateKey,
           label: item.label,
           line,
@@ -7427,7 +7600,38 @@ export class BrowserSession {
           state: item.state,
           tag: item.tag,
           viewportClip,
-        });
+        }));
+      }
+      if (options.includeActions) {
+        const actionTier = (item: BrowserUseVisibleDomSnapshot['items'][number]) => {
+          if ((item.priority || 0) >= 60) return 0;
+          if ((item.priority || 0) >= 35) return 1;
+          if (item.confidence === 'high') return 2;
+          if (item.confidence === 'medium') return 3;
+          return 4;
+        };
+        const prioritizedActions = snapshot.items
+          .map((item, index) => ({ item, index }))
+          .filter(({ item }) => item.interactive)
+          .sort((left, right) => actionTier(left.item) - actionTier(right.item) || left.index - right.index);
+        for (const { item } of prioritizedActions) {
+          const publicId = this.publicDomVisibleId(snapshot.stateKey, item.ref);
+          const indent = this.domObservationIndent(item.path, framePath);
+          const line = `${indent}${item.line.replace(`node_id=${item.ref}`, `uid=${publicId}`)}`;
+          const context = actionContext(itemByPath, item, framePath, frameUrl);
+          const existingContextId = context ? actionContextIds.get(context) : undefined;
+          const contextId = existingContextId || (context ? `c${actionContextIds.size + 1}` : undefined);
+          const actionLine = contextId ? `${line} ctx=${contextId}` : line;
+          const contextLine = context && contextId && !existingContextId ? `${contextId}: ${context}` : '';
+          const addedChars = actionLine.length + 1 + (contextLine ? contextLine.length + 1 : 0);
+          if (actionSnapshotChars + addedChars > maxChars || actionLines.length >= maxElements) continue;
+          if (contextLine) {
+            actionContextIds.set(context, contextId!);
+            actionContextLines.push(contextLine);
+          }
+          actionLines.push(actionLine);
+          actionSnapshotChars += addedChars;
+        }
       }
     };
 
@@ -7570,11 +7774,13 @@ export class BrowserSession {
     viewportClip?: BrowserUseViewportClip,
   ): DomNodeReference {
     const id = this.publicDomVisibleId(stateKey, item.ref);
-    return {
+    return indexDomNodeReference({
       id,
       interactive: item.interactive,
       capabilities: item.capabilities,
       confidence: item.confidence,
+      contextText: item.contextText,
+      priority: item.priority,
       contextId: stateKey,
       label: item.label,
       line: item.line.replace(`node_id=${item.ref}`, `uid=${id}`),
@@ -7588,7 +7794,7 @@ export class BrowserSession {
       state: item.state,
       tag: item.tag,
       viewportClip,
-    };
+    });
   }
 
   /**

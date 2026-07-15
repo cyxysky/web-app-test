@@ -239,6 +239,120 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.match(replacedTarget.actual, /absent from the current DOM UID registry/);
 });
 
+test('DOM baseline ranks modal duplicates and describes virtual lists', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-ranking-and-virtual-list-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <button data-testid="page-delete" type="button">Delete</button>
+    <dialog open aria-modal="true"><h2>Delete account</h2><button data-testid="modal-delete" type="button">Delete</button></dialog>
+    <div id="virtual-list" aria-label="Results" style="height:100px;overflow-y:auto">
+      ${Array.from({ length: 20 }, (_, index) => `<div style="height:30px">Result ${index + 1}</div>`).join('')}
+    </div>
+  </body></html>`);
+
+  const baseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  assert.match(baseline.content, /virtualized="possible"/);
+  assert.match(baseline.content, /actions="scroll,search"/);
+  assert.match(baseline.content, /visible_range="\d+-\d+"/);
+
+  const modalUid = baseline.content.match(/uid=(dom-\d+)[^\n]*data-testid="modal-delete"/)?.[1];
+  assert.ok(modalUid, baseline.content);
+  assert.ok(
+    baseline.content.indexOf('data-testid="modal-delete"') < baseline.content.indexOf('data-testid="page-delete"'),
+    `modal actions should receive the first budget tier:\n${baseline.content}`,
+  );
+  const indexedReferences = Reflect.get(session, 'lastDomNodeReferences') as Map<string, { searchText?: string; semanticRoles?: string[] }>;
+  assert.ok([...indexedReferences.values()].every((reference) => reference.searchText && reference.semanticRoles?.length), 'DOM references should be indexed when the baseline is created');
+  const ranked = await session.searchSnapshot({ query: 'Delete', roles: ['button'] });
+  assert.equal(ranked.ok, true, ranked.actual);
+  assert.equal(ranked.actual.match(/uid=(dom-\d+)/)?.[1], modalUid, ranked.actual);
+});
+
+test('searchSnapshot progressively scans virtual lists and leaves a found target actionable', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'virtual-list-progressive-search-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <div id="virtual-results" aria-label="Virtual results" style="height:120px;overflow-y:auto;border:1px solid black">
+      ${Array.from({ length: 50 }, (_, index) => `<button type="button" style="display:block;height:30px;width:180px" onclick="this.dataset.clicked='true'">Virtual item ${index + 1}</button>`).join('')}
+    </div>
+  </body></html>`);
+  const baseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  assert.match(baseline.content, /virtualized="possible"/);
+  assert.doesNotMatch(baseline.content, /Virtual item 40/);
+
+  const searched = await session.searchSnapshot({ query: 'Virtual item 40', roles: ['button'] });
+  assert.equal(searched.ok, true, searched.actual);
+  assert.match(searched.actual, /after \d+ bounded virtual-list scroll step/);
+  const targetUid = searched.actual.match(/uid=(dom-\d+)[^\n]*Virtual item 40/)?.[1];
+  assert.ok(targetUid, searched.actual);
+  assert.ok(await page.locator('#virtual-results').evaluate((element) => element.scrollTop) > 0);
+  const clicked = await session.mouse({ action: 'click', uid: targetUid });
+  assert.equal(clicked.ok, true, clicked.actual);
+  assert.equal(await page.getByRole('button', { name: 'Virtual item 40' }).getAttribute('data-clicked'), 'true');
+  const scrollBeforeMissingSearch = await page.locator('#virtual-results').evaluate((element) => element.scrollTop);
+  const missing = await session.searchSnapshot({ query: 'Virtual item 999', roles: ['button'] });
+  assert.equal(missing.ok, true, missing.actual);
+  assert.match(missing.actual, /returned 0 result/);
+  const scrollAfterMissingSearch = await page.locator('#virtual-results').evaluate((element) => element.scrollTop);
+  assert.ok(Math.abs(scrollAfterMissingSearch - scrollBeforeMissingSearch) <= 1, `${scrollBeforeMissingSearch} -> ${scrollAfterMissingSearch}`);
+});
+
+test('DOM mutation deltas coalesce repeated attributes and promote nested text changes to interactive roots', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-mutation-coalescing-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <button data-testid="label-button" type="button"><span>Before label</span></button>
+    <button data-testid="changing" type="button" aria-label="Before">Changing</button>
+  </body></html>`);
+  await session.readDomObservationSnapshot({ mode: 'actionable' });
+
+  await page.evaluate(() => {
+    const changing = document.querySelector('[data-testid="changing"]')!;
+    for (let index = 0; index < 50; index += 1) changing.setAttribute('aria-label', `After ${index}`);
+    document.querySelector('[data-testid="label-button"] span')!.textContent = 'After label';
+  });
+
+  const delta = await session.readDomChanges();
+  const changingUpdates = delta.domChanges?.updated.filter((line) => line.includes('data-testid="changing"')) || [];
+  const labelUpdates = delta.domChanges?.updated.filter((line) => line.includes('data-testid="label-button"')) || [];
+  assert.equal(changingUpdates.length, 1, JSON.stringify(delta.domChanges));
+  assert.match(changingUpdates[0], /aria-label="After 49"/);
+  assert.equal(labelUpdates.length, 1, JSON.stringify(delta.domChanges));
+  assert.match(labelUpdates[0], />After label<\/button>/);
+});
+
+test('SVG parents and children with independent click boundaries remain separate actions', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'svg-action-boundary-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <svg id="chart" role="button" aria-label="Chart action" width="220" height="100" style="cursor:pointer;border:1px solid black">
+      <rect id="bar" role="button" aria-label="Chart action" x="20" y="20" width="80" height="60" fill="teal" style="cursor:pointer" />
+      ${Array.from({ length: 400 }, (_, index) => `<path d="M ${120 + index % 80} ${10 + index % 80} h 1" />`).join('')}
+    </svg>
+    <script>
+      document.getElementById('chart').addEventListener('click', () => document.body.dataset.parentClicked = 'true');
+      document.getElementById('bar').addEventListener('click', event => { event.stopPropagation(); document.body.dataset.childClicked = 'true'; });
+    </script>
+  </body></html>`);
+
+  const baseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  assert.match(baseline.content, /<svg\b[^>]*action_scope="container"/);
+  assert.match(baseline.content, /<rect\b[^>]*action_scope="own"/);
+  const liveUids = baseline.content.match(/uid=dom-\d+/g) || [];
+  assert.equal(liveUids.length >= 2, true, baseline.content);
+
+  const semantic = (await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n');
+  assert.equal((semantic.match(/button\s+"Chart action/g) || []).length, 2, semantic);
+});
+
 test('open waits for a bounded DOM quiet window before capturing the navigation snapshot', async (context) => {
   const previousQuietMs = process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
   const previousTimeoutMs = process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
