@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ChevronDown, Edit3, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
+import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -258,7 +259,7 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
   }
 
   return (
-    <section className="skills-manager">
+    <section className={loading ? 'skills-manager is-loading' : 'skills-manager'}>
       <div className="settings-section-head skills-manager-head">
         <div>
           <h2>{t('Skills 管理')}</h2>
@@ -273,15 +274,11 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
         <div className="settings-card skills-manager-list">
           <div className="skills-manager-list-body">
             {loading ? (
-              <div className="settings-list-skeleton skills-list-skeleton" role="status" aria-label={t('正在加载 Skills')}>
-                {[0, 1, 2, 3].map((index) => (
-                  <div className="settings-skeleton-row skills-skeleton-row" key={index}>
-                    <span className="settings-skeleton-block skeleton-icon" />
-                    <span className="settings-skeleton-block skeleton-title" />
-                    <span className="settings-skeleton-block skeleton-action" />
-                    <span className="settings-skeleton-block skeleton-action" />
-                  </div>
-                ))}
+              <div className="settings-loading-panel compact" role="status" aria-live="polite" aria-label={t('正在加载 Skills')}>
+                <LiquidGlassLoader className="ui-liquid-glass-loader--compact" />
+                <div>
+                  <h2>{t('正在加载 Skills')}</h2>
+                </div>
               </div>
             ) : skills.length ? skills.map((skill) => {
               const expanded = expandedSkillIds.includes(skill.id);

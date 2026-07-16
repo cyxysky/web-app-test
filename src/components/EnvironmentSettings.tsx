@@ -824,7 +824,7 @@ export function EnvironmentSettings({
 
   function renderPersonalMemoryPanel() {
     return (
-      <section className="personal-memory-settings">
+      <section className={loadingPersonalMemory ? 'personal-memory-settings is-loading' : 'personal-memory-settings'}>
         <div className="settings-section-head">
           <div>
             <h2>{t('个性化记忆')}</h2>
@@ -843,21 +843,11 @@ export function EnvironmentSettings({
         </div>
 
         {loadingPersonalMemory ? (
-          <div className="settings-list-skeleton personal-memory-skeleton" role="status" aria-label={t('正在读取个性化记忆')}>
-            {[0, 1, 2].map((index) => (
-              <article className="settings-skeleton-row memory-skeleton-row" key={index}>
-                <div className="memory-skeleton-content">
-                  <span className="settings-skeleton-block skeleton-meta" />
-                  <span className="settings-skeleton-block skeleton-heading" />
-                  <span className="settings-skeleton-block skeleton-copy" />
-                </div>
-                <div className="memory-skeleton-actions">
-                  <span className="settings-skeleton-block skeleton-action" />
-                  <span className="settings-skeleton-block skeleton-action" />
-                  <span className="settings-skeleton-block skeleton-action" />
-                </div>
-              </article>
-            ))}
+          <div className="settings-loading-panel compact" role="status" aria-live="polite" aria-label={t('正在读取个性化记忆')}>
+            <LiquidGlassLoader className="ui-liquid-glass-loader--compact" />
+            <div>
+              <h2>{t('正在读取个性化记忆')}</h2>
+            </div>
           </div>
         ) : personalMemoryItems.length ? (
           <div className="personal-memory-list">

@@ -1049,7 +1049,7 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
       .map((step) => step.index),
   );
   const steps = (session.steps || []).filter((step) => !transientStepIndexes.has(step.index));
-  const messages = (session.messages || []).map((rawMessage) => {
+  const messages = assignAssistantStepIndexesToLatestMessage((session.messages || []).map((rawMessage) => {
     const safeMessage: BrowserChatMessage = {
       ...rawMessage,
       role: rawMessage.role === 'assistant' ? 'assistant' : 'user',
@@ -1077,7 +1077,7 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
       activity: undefined,
       stepIndexes,
     };
-  });
+  }));
   return {
     ...session,
     tabs: session.tabs || [],
@@ -1332,6 +1332,27 @@ function mergeStringLists(first?: string[], second?: string[]) {
   return Array.from(new Set([...(first || []), ...(second || [])].filter(Boolean)));
 }
 
+function assignAssistantStepIndexesToLatestMessage(messages: BrowserChatMessage[]) {
+  // A stale transient step can be removed during recovery and its numeric index
+  // reused by the next turn. Disk merging must not attach that reused step to
+  // both assistant messages; the later turn is the authoritative owner.
+  const claimedStepIndexes = new Set<number>();
+  const normalized = [...messages];
+  for (let index = normalized.length - 1; index >= 0; index -= 1) {
+    const message = normalized[index];
+    if (message.role !== 'assistant' || !message.stepIndexes?.length) continue;
+    const stepIndexes = message.stepIndexes.filter((stepIndex) => {
+      if (claimedStepIndexes.has(stepIndex)) return false;
+      claimedStepIndexes.add(stepIndex);
+      return true;
+    });
+    if (stepIndexes.length !== message.stepIndexes.length) {
+      normalized[index] = { ...message, stepIndexes };
+    }
+  }
+  return normalized;
+}
+
 function mergeMessagesFromFile(existing: BrowserChatMessage[] = [], incoming: BrowserChatMessage[] = []) {
   const byId = new Map<string, BrowserChatMessage>();
   for (const message of existing) byId.set(message.id, message);
@@ -1349,7 +1370,9 @@ function mergeMessagesFromFile(existing: BrowserChatMessage[] = [], incoming: Br
       attachments: incomingPreferred ? message.attachments || previous.attachments : previous.attachments || message.attachments,
     });
   }
-  return [...byId.values()].sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
+  return assignAssistantStepIndexesToLatestMessage(
+    [...byId.values()].sort((a, b) => messageTimestamp(a) - messageTimestamp(b)),
+  );
 }
 
 function stepCompletenessScore(step: StepExecutionResult) {

@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { ClickParticleEffect } from '@/components/ClickParticleEffect';
 import { InterfaceMotion } from '@/components/InterfaceMotion';
 import { NavigationLoading } from '@/components/NavigationLoading';
 import { I18nProvider } from '@/i18n/I18nProvider';
@@ -26,6 +27,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
         <ThemeProvider>
           <I18nProvider>
             <InterfaceMotion />
+            <ClickParticleEffect />
             {children}
             <NavigationLoading />
           </I18nProvider>

@@ -1,12 +1,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  assignBrowserChatStepIndexesToLatestMessage,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
   browserChatAssistantMessageHasVisibleText,
   browserChatLogsForMessage,
 } from './browser-chat-message-model';
+
+test('assigns a reused step index only to the latest assistant message', () => {
+  const messages = assignBrowserChatStepIndexesToLatestMessage([
+    { content: 'first', id: 'a1', role: 'assistant' as const, stepIndexes: [1, 2] },
+    { content: 'retry', id: 'u2', role: 'user' as const },
+    { content: 'second', id: 'a2', role: 'assistant' as const, stepIndexes: [2, 3] },
+  ]);
+
+  assert.deepEqual(messages[0].stepIndexes, [1]);
+  assert.deepEqual(messages[2].stepIndexes, [2, 3]);
+});
 
 test('groups consecutive assistant messages without visible text', () => {
   const messages = [

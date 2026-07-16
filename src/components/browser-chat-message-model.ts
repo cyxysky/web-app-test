@@ -34,6 +34,24 @@ function hasVisibleText(value: unknown) {
   return typeof value === 'string' && Boolean(value.trim());
 }
 
+export function assignBrowserChatStepIndexesToLatestMessage<TMessage extends BrowserChatMessageLike>(messages: TMessage[]) {
+  const claimedStepIndexes = new Set<number>();
+  const normalized = [...messages];
+  for (let index = normalized.length - 1; index >= 0; index -= 1) {
+    const message = normalized[index];
+    if (message.role !== 'assistant' || !message.stepIndexes?.length) continue;
+    const stepIndexes = message.stepIndexes.filter((stepIndex) => {
+      if (claimedStepIndexes.has(stepIndex)) return false;
+      claimedStepIndexes.add(stepIndex);
+      return true;
+    });
+    if (stepIndexes.length !== message.stepIndexes.length) {
+      normalized[index] = { ...message, stepIndexes };
+    }
+  }
+  return normalized;
+}
+
 export function buildBrowserChatLogIndex<TLog extends BrowserChatLogRecordLike>(logs: TLog[]): BrowserChatLogIndex<TLog> {
   const byMessageId = new Map<string, TLog[]>();
   const byStepIndex = new Map<number, TLog[]>();
@@ -127,7 +145,7 @@ export function buildBrowserChatMessageRenderEntries<TMessage extends BrowserCha
     pendingExecutedGroup = [];
   };
 
-  for (const item of messages) {
+  for (const item of assignBrowserChatStepIndexesToLatestMessage(messages)) {
     const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
     const emptyAssistantMessage = item.role === 'assistant' && !assistantMessageHasVisibleText(item, itemLogs);
     if (emptyAssistantMessage) {
