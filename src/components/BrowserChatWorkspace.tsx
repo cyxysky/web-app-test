@@ -4112,6 +4112,8 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const embeddedBrowserSyncRef = useRef({ boundsKey: '', groupId: '', sessionId: '', visible: false });
   const addressFocusedRef = useRef(false);
   const tabDragCommitTargetRef = useRef<EmbeddedBrowserTabDropTarget | null>(null);
+  const tabDragCurrentGroupRef = useRef('');
+  const tabDragSourceGroupRef = useRef('');
   const [bridgeAvailable, setBridgeAvailable] = useState(false);
   const [bridgeError, setBridgeError] = useState('');
   const [browserGroups, setBrowserGroups] = useState<EmbeddedBrowserGroup[]>([]);
@@ -4498,6 +4500,8 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   function clearEmbeddedTabDrag({ keepPreview = false }: { keepPreview?: boolean } = {}) {
     if (typeof document !== 'undefined') document.body.classList.remove('is-dragging-embedded-tab');
     tabDragCommitTargetRef.current = null;
+    tabDragCurrentGroupRef.current = '';
+    tabDragSourceGroupRef.current = '';
     setDraggingTabId('');
     setDragDropGroupId('');
     if (!keepPreview) setTabDragPreview(null);
@@ -4668,6 +4672,8 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     if (!dragData?.tabId) return;
     document.body.classList.add('is-dragging-embedded-tab');
     tabDragCommitTargetRef.current = null;
+    tabDragCurrentGroupRef.current = dragData.groupId;
+    tabDragSourceGroupRef.current = dragData.groupId;
     setDraggingTabId(dragData.tabId);
     setDragDropGroupId(dragData.groupId);
     setTabDragPreview(Object.fromEntries(visibleGroups.map((group) => [group.id, group.tabs.map((tab) => tab.id)])));
@@ -4683,6 +4689,11 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       return;
     }
     tabDragCommitTargetRef.current = target;
+    const sourceGroupId = tabDragSourceGroupRef.current || dragData.groupId;
+    const previewCrossGroupMove = target.groupId !== sourceGroupId
+      || tabDragCurrentGroupRef.current !== sourceGroupId;
+    if (previewCrossGroupMove) previewEmbeddedBrowserTabMove(dragData.tabId, target);
+    tabDragCurrentGroupRef.current = target.groupId;
     setDragDropGroupId(target.groupId);
   }
 
