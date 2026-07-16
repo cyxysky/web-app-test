@@ -2,7 +2,7 @@ import type { ModelMessage } from 'ai';
 import type { BrowserActionResult, BrowserSnapshotView, BrowserSnapshotViews } from '@/server/browser/browser-session';
 
 export const runtimeObservationToolNames = new Set(['takeSnapshot', 'searchSnapshot']);
-export const staleSnapshotText = 'Stale: this old semantic DOM snapshot was replaced or invalidated by a browser action. Call takeSnapshot({mode:"actionable",maxChars:10000}) for fresh UIDs.';
+export const staleSnapshotText = 'Stale: this old semantic DOM snapshot was replaced or invalidated by a browser action. Call takeSnapshot({mode:"actionable"}) for fresh UIDs.';
 export const runtimeObservationInvalidatingToolNames = new Set([
   'openPage',
   'mouse',
@@ -31,8 +31,7 @@ export type RuntimeObservationStore = Map<string, RuntimeObservationRecord>;
 
 export type RuntimeObservationReadOptions = {
   cursor?: string;
-  mode?: 'actionable' | 'full' | 'text';
-  maxChars?: number;
+  mode?: 'actionable' | 'full' | 'text' | 'changes';
 };
 
 export type RuntimeObservationCursorPayload = {
@@ -334,12 +333,12 @@ export function readStoredSnapshot(
 ): BrowserActionResult {
   const record = store?.get(observationStoreKey(runId));
   if (!record) {
-    return { ok: false, actual: 'No current semantic DOM snapshot is available for this run. Call takeSnapshot({mode:"actionable",maxChars:10000}) first.' };
+    return { ok: false, actual: 'No current semantic DOM snapshot is available for this run. Call takeSnapshot({mode:"actionable"}) first.' };
   }
   if (record.stale) {
     return {
       ok: false,
-      actual: `Current snapshot generation ${record.generation} is stale${record.staleReason ? ` after ${record.staleReason}` : ''}${record.invalidatedAt ? ` at ${record.invalidatedAt}` : ''}. Call takeSnapshot({mode:"actionable",maxChars:10000}) before using UIDs.`,
+      actual: `Current snapshot generation ${record.generation} is stale${record.staleReason ? ` after ${record.staleReason}` : ''}${record.invalidatedAt ? ` at ${record.invalidatedAt}` : ''}. Call takeSnapshot({mode:"actionable"}) before using UIDs.`,
     };
   }
   const selectedType = view || record.defaultType || 'actionable';
@@ -403,7 +402,7 @@ function modelToolPartRefreshesObservation(part: unknown) {
   if (name !== 'takeSnapshot') return false;
   const input = modelToolPartInput(part);
   if (input && typeof input === 'object' && !Array.isArray(input)) {
-    return typeof (input as Record<string, unknown>).cursor !== 'string';
+    return typeof (input as Record<string, unknown>).cursor !== 'string' && (input as Record<string, unknown>).mode !== 'changes';
   }
   if (typeof input === 'string') {
     try {

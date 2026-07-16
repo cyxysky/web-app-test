@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useContext, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   AppWindow,
   AlertCircle,
@@ -257,6 +257,11 @@ type BrowserChatToolDetail = {
   step: StepExecutionResult;
   toolIndex: number;
   tool: BrowserChatToolCall;
+};
+
+type BrowserChatTimelineStepEntry = {
+  step: StepExecutionResult;
+  visibleToolIndexes?: readonly number[];
 };
 
 type EmbeddedBrowserBounds = {
@@ -659,7 +664,7 @@ function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: St
     // Each rendered copy must point to the same persisted tool trace; only prevent a
     // duplicate match within this one response cycle.
     const usedStepTools = new Set<string>();
-    const candidateSteps = cycle.stepIndex
+    const candidateSteps = typeof cycle.stepIndex === 'number'
       ? steps.filter((step) => step.index === cycle.stepIndex)
       : steps;
 
@@ -848,6 +853,582 @@ function BrowserChatToolIcon({ name }: { name: string }) {
   if (lower.includes('move')) return <Compass size={13} />;
   return <Workflow size={13} />;
 }
+
+type ToolTailRain = {
+  alpha: number;
+  head: boolean;
+  length: number;
+  phase: number;
+  speed: number;
+  width: number;
+  wobble: number;
+  x: number;
+  y: number;
+};
+
+type ToolTailDust = {
+  alpha: number;
+  blur: number;
+  drift: number;
+  phase: number;
+  radius: number;
+  speed: number;
+  twinkle: number;
+  x: number;
+  y: number;
+};
+
+type ToolTailBeam = {
+  alpha: number;
+  drift: number;
+  height: number;
+  phase: number;
+  y: number;
+};
+
+type ToolTailSourceSpark = {
+  alpha: number;
+  delay: number;
+  distance: number;
+  duration: number;
+  life: number;
+  localY: number;
+  width: number;
+};
+
+type ToolTailFlowParticle = {
+  createdAt: number;
+  distance: number;
+  duration: number;
+  expiresAt: number;
+  id: number;
+  start: number;
+  width: number;
+  y: number;
+};
+
+function toolTailClamp(value: number, minimum: number, maximum: number) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+const BrowserChatToolTailParticles = memo(function BrowserChatToolTailParticles() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [flowParticles, setFlowParticles] = useState<ToolTailFlowParticle[]>([]);
+
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return undefined;
+    const context = canvas.getContext('2d');
+    if (!context) return undefined;
+
+    let beams: ToolTailBeam[] = [];
+    let dust: ToolTailDust[] = [];
+    let frame = 0;
+    let elapsed = 0;
+    let lastTimestamp = 0;
+    let rain: ToolTailRain[] = [];
+    let sourceSparks: ToolTailSourceSpark[] = [];
+    let width = 0;
+    let height = 0;
+    let emitterRadius = 15;
+    let lightTheme = true;
+    let canvasVisible = true;
+    let documentVisible = document.visibilityState !== 'hidden';
+    let pixelRatio = 1;
+    const emitterOverlap = 20;
+    const random = (minimum: number, maximum: number) => minimum + Math.random() * (maximum - minimum);
+
+    const updateTheme = () => {
+      const theme = document.documentElement.dataset.theme;
+      lightTheme = theme ? theme !== 'dark' : !window.matchMedia('(prefers-color-scheme: dark)').matches;
+    };
+    const emitterX = (localY: number) => {
+      const y = Math.min(emitterRadius, Math.abs(localY));
+      return emitterOverlap - emitterRadius + Math.sqrt(Math.max(0, emitterRadius ** 2 - y ** 2));
+    };
+
+    const makeRain = (initial = false): ToolTailRain => ({
+      alpha: random(0.16, 0.72),
+      head: Math.random() < 0.46,
+      length: random(12, 68) * random(0.72, 1.25),
+      phase: random(0, Math.PI * 2),
+      speed: random(52, 170),
+      width: random(0.4, 1.2),
+      wobble: random(0.4, 2),
+      x: initial ? random(-width * 0.25, width) : random(-width * 0.34, -8),
+      y: random(5, Math.max(6, height - 5)),
+    });
+    const makeDust = (initial = false): ToolTailDust => {
+      const depth = Math.random();
+      return {
+        alpha: random(0.16, 0.92) * (0.52 + depth * 0.48),
+        blur: random(0, 5) * (1 - depth),
+        drift: random(-7, 7),
+        phase: random(0, Math.PI * 2),
+        radius: random(0.45, 2.4) * (0.55 + depth),
+        speed: random(8, 31) * (0.55 + depth),
+        twinkle: random(1.1, 4.2),
+        x: initial ? random(-10, width + 10) : random(-20, -2),
+        y: random(3, Math.max(4, height - 3)),
+      };
+    };
+    const makeSourceSpark = (initial = false): ToolTailSourceSpark => ({
+      alpha: random(0.22, 0.9),
+      delay: random(0, 2.2),
+      distance: random(12, Math.max(13, width * 0.28)),
+      duration: random(0.75, 2.8),
+      life: initial ? random(0, 1) : 0,
+      localY: random(-emitterRadius * 0.94, emitterRadius * 0.94),
+      width: random(0.45, 1.5),
+    });
+    const buildScene = () => {
+      const areaScale = Math.sqrt((width * height) / (500 * 280));
+      beams = Array.from({ length: Math.max(7, Math.round(14 * areaScale)) }, () => ({
+        alpha: random(0.018, 0.075),
+        drift: random(-4, 4),
+        height: random(1, 7),
+        phase: random(0, Math.PI * 2),
+        y: random(0, height),
+      }));
+      rain = Array.from({ length: Math.max(32, Math.round(43 * areaScale)) }, () => makeRain(true));
+      dust = Array.from({ length: Math.max(78, Math.round(104 * areaScale)) }, () => makeDust(true));
+      sourceSparks = Array.from({ length: Math.max(14, Math.round(18 * areaScale)) }, () => makeSourceSpark(true));
+    };
+    const resize = () => {
+      const bounds = canvas.getBoundingClientRect();
+      const nextWidth = Math.max(1, bounds.width);
+      const nextHeight = Math.max(1, bounds.height);
+      const nextPixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      const sizeChanged = Math.abs(width - nextWidth) > 0.5
+        || Math.abs(height - nextHeight) > 0.5
+        || pixelRatio !== nextPixelRatio;
+      width = nextWidth;
+      height = nextHeight;
+      pixelRatio = nextPixelRatio;
+      const toolHeight = canvas.parentElement?.getBoundingClientRect().height || 32;
+      emitterRadius = Math.max(8, Math.min(20, (toolHeight - 2) / 2));
+      updateTheme();
+      if (!sizeChanged) return;
+      canvas.width = Math.round(width * pixelRatio);
+      canvas.height = Math.round(height * pixelRatio);
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.imageSmoothingEnabled = true;
+      buildScene();
+    };
+
+    const update = (deltaSeconds: number) => {
+      elapsed += deltaSeconds;
+      for (let index = 0; index < rain.length; index += 1) {
+        const drop = rain[index];
+        drop.x += drop.speed * deltaSeconds;
+        drop.y += Math.sin(elapsed * drop.wobble + drop.phase) * 0.06;
+        if (drop.x - drop.length > width + 10) rain[index] = makeRain(false);
+      }
+      for (let index = 0; index < dust.length; index += 1) {
+        const particle = dust[index];
+        particle.x += particle.speed * deltaSeconds;
+        particle.y += (particle.drift + Math.sin(elapsed * 0.7 + particle.phase) * 4) * deltaSeconds;
+        if (particle.x - particle.radius > width + 12 || particle.y < -24 || particle.y > height + 24) {
+          dust[index] = makeDust(false);
+        }
+      }
+      for (let index = 0; index < sourceSparks.length; index += 1) {
+        const spark = sourceSparks[index];
+        if (spark.delay > 0) spark.delay -= deltaSeconds;
+        else {
+          spark.life += deltaSeconds / spark.duration;
+          if (spark.life >= 1) sourceSparks[index] = makeSourceSpark(false);
+        }
+      }
+    };
+
+    const drawAtmosphere = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.translate(emitterOverlap, height / 2);
+      context.scale(1, 0.56);
+      const haze = context.createRadialGradient(0, 0, 0, 0, 0, width * 0.72);
+      haze.addColorStop(0, lightTheme ? 'rgba(0, 166, 214, 0.08)' : 'rgba(0, 146, 255, 0.13)');
+      haze.addColorStop(0.46, lightTheme ? 'rgba(0, 137, 197, 0.035)' : 'rgba(0, 87, 169, 0.055)');
+      haze.addColorStop(1, 'rgba(0, 105, 255, 0)');
+      context.fillStyle = haze;
+      context.fillRect(-20, -height, width + 40, height * 2);
+      context.restore();
+
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.filter = `blur(${Math.max(2, width / 180)}px)`;
+      for (const beam of beams) {
+        const y = beam.y + Math.sin(elapsed * 0.18 + beam.phase) * beam.drift;
+        const gradient = context.createLinearGradient(0, y, width, y);
+        gradient.addColorStop(0, 'rgba(0, 156, 255, 0)');
+        gradient.addColorStop(0.28, lightTheme
+          ? `rgba(0, 135, 190, ${beam.alpha * 0.28})`
+          : `rgba(0, 156, 255, ${beam.alpha * 0.34})`);
+        gradient.addColorStop(0.74, lightTheme
+          ? `rgba(0, 162, 205, ${beam.alpha * 0.72})`
+          : `rgba(0, 188, 255, ${beam.alpha})`);
+        gradient.addColorStop(1, 'rgba(0, 225, 255, 0)');
+        context.fillStyle = gradient;
+        context.fillRect(0, y - beam.height / 2, width, beam.height);
+      }
+      context.restore();
+    };
+
+    const drawRain = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.lineCap = 'round';
+      context.filter = 'blur(2px)';
+      for (const drop of rain) {
+        const x0 = drop.x - drop.length;
+        const gradient = context.createLinearGradient(x0, drop.y, drop.x, drop.y);
+        gradient.addColorStop(0, 'rgba(0, 118, 255, 0)');
+        gradient.addColorStop(0.7, lightTheme
+          ? `rgba(0, 137, 193, ${drop.alpha * 0.14})`
+          : `rgba(0, 173, 255, ${drop.alpha * 0.22})`);
+        gradient.addColorStop(1, lightTheme
+          ? `rgba(0, 176, 211, ${drop.alpha * 0.34})`
+          : `rgba(74, 235, 255, ${drop.alpha * 0.5})`);
+        context.strokeStyle = gradient;
+        context.lineWidth = drop.width * 3.4;
+        context.beginPath();
+        context.moveTo(x0, drop.y);
+        context.lineTo(drop.x, drop.y);
+        context.stroke();
+      }
+      context.restore();
+
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.lineCap = 'round';
+      for (const drop of rain) {
+        const x0 = drop.x - drop.length;
+        const gradient = context.createLinearGradient(x0, drop.y, drop.x, drop.y);
+        gradient.addColorStop(0, 'rgba(0, 113, 232, 0)');
+        gradient.addColorStop(0.55, lightTheme
+          ? `rgba(0, 117, 174, ${drop.alpha * 0.26})`
+          : `rgba(0, 146, 255, ${drop.alpha * 0.32})`);
+        gradient.addColorStop(1, lightTheme
+          ? `rgba(0, 156, 201, ${drop.alpha * 0.88})`
+          : `rgba(106, 246, 255, ${drop.alpha})`);
+        context.strokeStyle = gradient;
+        context.lineWidth = drop.width;
+        context.beginPath();
+        context.moveTo(x0, drop.y);
+        context.lineTo(drop.x, drop.y);
+        context.stroke();
+        if (drop.head) {
+          context.fillStyle = lightTheme
+            ? `rgba(0, 151, 197, ${drop.alpha * 0.92})`
+            : `rgba(138, 250, 255, ${drop.alpha * 0.92})`;
+          context.beginPath();
+          context.arc(drop.x, drop.y, Math.max(0.55, drop.width * 0.76), 0, Math.PI * 2);
+          context.fill();
+        }
+      }
+      context.restore();
+    };
+
+    const drawDust = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      for (const particle of dust) {
+        const pulse = 0.58 + 0.42 * Math.sin(elapsed * particle.twinkle + particle.phase);
+        const alpha = toolTailClamp(particle.alpha * (0.72 + pulse * 0.42), 0, 1);
+        const radius = particle.radius * (1 + pulse * 0.12);
+        if (particle.blur > 1.6) {
+          context.filter = `blur(${particle.blur}px)`;
+          context.fillStyle = lightTheme
+            ? `rgba(0, 145, 194, ${alpha * 0.18})`
+            : `rgba(0, 176, 255, ${alpha * 0.28})`;
+          context.beginPath();
+          context.arc(particle.x, particle.y, radius * 2.15, 0, Math.PI * 2);
+          context.fill();
+        }
+        context.filter = 'none';
+        const glow = context.createRadialGradient(particle.x, particle.y, 0, particle.x, particle.y, radius * 3.5);
+        glow.addColorStop(0, lightTheme
+          ? `rgba(0, 135, 180, ${alpha * 0.95})`
+          : `rgba(169, 255, 255, ${alpha})`);
+        glow.addColorStop(0.18, lightTheme
+          ? `rgba(0, 177, 210, ${alpha * 0.68})`
+          : `rgba(57, 225, 255, ${alpha * 0.86})`);
+        glow.addColorStop(0.56, lightTheme
+          ? `rgba(0, 139, 202, ${alpha * 0.18})`
+          : `rgba(0, 143, 255, ${alpha * 0.24})`);
+        glow.addColorStop(1, 'rgba(0, 105, 255, 0)');
+        context.fillStyle = glow;
+        context.beginPath();
+        context.arc(particle.x, particle.y, radius * 3.5, 0, Math.PI * 2);
+        context.fill();
+      }
+      context.restore();
+    };
+
+    const drawSourceSparks = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.lineCap = 'round';
+      for (const spark of sourceSparks) {
+        if (spark.delay > 0) continue;
+        const progress = toolTailClamp(spark.life, 0, 1);
+        const travel = 1 - (1 - Math.min(progress * 2.1, 1)) ** 3;
+        const fade = progress < 0.18 ? progress / 0.18 : 1 - (progress - 0.18) / 0.82;
+        const alpha = Math.max(0, fade) * spark.alpha;
+        const sourceX = emitterX(spark.localY) + 1;
+        const y = height / 2 + spark.localY;
+        const headX = sourceX + spark.distance * travel;
+
+        context.filter = 'blur(3px)';
+        const soft = context.createLinearGradient(sourceX, y, headX, y);
+        soft.addColorStop(0, lightTheme
+          ? `rgba(0, 160, 204, ${alpha * 0.42})`
+          : `rgba(0, 229, 255, ${alpha * 0.7})`);
+        soft.addColorStop(0.65, lightTheme
+          ? `rgba(0, 126, 191, ${alpha * 0.12})`
+          : `rgba(0, 156, 255, ${alpha * 0.18})`);
+        soft.addColorStop(1, 'rgba(0, 118, 255, 0)');
+        context.strokeStyle = soft;
+        context.lineWidth = spark.width * 5;
+        context.beginPath();
+        context.moveTo(sourceX, y);
+        context.lineTo(headX, y);
+        context.stroke();
+
+        context.filter = 'none';
+        const core = context.createLinearGradient(sourceX, y, headX, y);
+        core.addColorStop(0, lightTheme
+          ? `rgba(0, 137, 183, ${alpha * 0.9})`
+          : `rgba(181, 255, 255, ${alpha})`);
+        core.addColorStop(0.45, lightTheme
+          ? `rgba(0, 181, 211, ${alpha * 0.64})`
+          : `rgba(29, 223, 255, ${alpha * 0.75})`);
+        core.addColorStop(1, 'rgba(0, 158, 255, 0)');
+        context.strokeStyle = core;
+        context.lineWidth = spark.width;
+        context.beginPath();
+        context.moveTo(sourceX, y);
+        context.lineTo(headX, y);
+        context.stroke();
+
+        const orb = context.createRadialGradient(headX, y, 0, headX, y, 5 + spark.width * 2);
+        orb.addColorStop(0, lightTheme
+          ? `rgba(0, 139, 180, ${alpha * 0.95})`
+          : `rgba(210, 255, 255, ${alpha})`);
+        orb.addColorStop(0.22, lightTheme
+          ? `rgba(0, 185, 213, ${alpha * 0.58})`
+          : `rgba(53, 236, 255, ${alpha * 0.72})`);
+        orb.addColorStop(1, 'rgba(0, 130, 255, 0)');
+        context.fillStyle = orb;
+        context.beginPath();
+        context.arc(headX, y, 5 + spark.width * 2, 0, Math.PI * 2);
+        context.fill();
+      }
+      context.restore();
+    };
+
+    const drawEmitter = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.lineCap = 'round';
+      const traceArc = () => {
+        context.beginPath();
+        let first = true;
+        for (let y = -emitterRadius + 0.5; y <= emitterRadius - 0.5; y += 0.75) {
+          const x = emitterX(y) + 1.5;
+          if (first) {
+            context.moveTo(x, height / 2 + y);
+            first = false;
+          } else context.lineTo(x, height / 2 + y);
+        }
+      };
+      traceArc();
+      context.strokeStyle = lightTheme
+        ? 'rgba(0, 143, 190, 0.07)'
+        : 'rgba(0, 118, 255, 0.2)';
+      context.lineWidth = 14;
+      context.shadowBlur = lightTheme ? 8 : 16;
+      context.shadowColor = lightTheme ? 'rgba(0, 166, 210, 0.3)' : 'rgba(0, 198, 255, 0.82)';
+      context.stroke();
+      traceArc();
+      context.strokeStyle = lightTheme
+        ? 'rgba(0, 154, 197, 0.2)'
+        : 'rgba(0, 218, 255, 0.58)';
+      context.lineWidth = 5.5;
+      context.shadowBlur = lightTheme ? 4 : 7;
+      context.stroke();
+      traceArc();
+      context.strokeStyle = lightTheme
+        ? 'rgba(0, 126, 173, 0.92)'
+        : 'rgba(209, 255, 255, 0.98)';
+      context.lineWidth = 1.4;
+      context.shadowBlur = lightTheme ? 1 : 3;
+      context.stroke();
+      context.restore();
+    };
+
+    const clipParticleFieldOutsideCapsule = () => {
+      context.beginPath();
+      context.moveTo(emitterX(-emitterRadius) + 1, 0);
+      for (let y = -emitterRadius; y <= emitterRadius; y += 0.75) {
+        context.lineTo(emitterX(y) + 1, height / 2 + y);
+      }
+      context.lineTo(width, height);
+      context.lineTo(width, 0);
+      context.closePath();
+      context.clip();
+    };
+
+    const fadeParticleFieldEdges = () => {
+      const fadeStart = Math.max(0, width - 38);
+      const startRatio = fadeStart / Math.max(1, width);
+      context.save();
+      context.globalCompositeOperation = 'destination-in';
+      const rightMask = context.createLinearGradient(0, 0, width, 0);
+      rightMask.addColorStop(0, 'rgba(0, 0, 0, 1)');
+      rightMask.addColorStop(startRatio, 'rgba(0, 0, 0, 1)');
+      rightMask.addColorStop(startRatio + (1 - startRatio) * 0.5, 'rgba(0, 0, 0, 0.72)');
+      rightMask.addColorStop(startRatio + (1 - startRatio) * 0.78, 'rgba(0, 0, 0, 0.3)');
+      rightMask.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      context.fillStyle = rightMask;
+      context.fillRect(0, 0, width, height);
+      const verticalMask = context.createLinearGradient(0, 0, 0, height);
+      verticalMask.addColorStop(0, 'rgba(0, 0, 0, 0)');
+      verticalMask.addColorStop(0.18, 'rgba(0, 0, 0, 0.72)');
+      verticalMask.addColorStop(0.34, 'rgba(0, 0, 0, 1)');
+      verticalMask.addColorStop(0.66, 'rgba(0, 0, 0, 1)');
+      verticalMask.addColorStop(0.82, 'rgba(0, 0, 0, 0.72)');
+      verticalMask.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      context.fillStyle = verticalMask;
+      context.fillRect(0, 0, width, height);
+      context.restore();
+    };
+
+    const draw = (timestamp: number) => {
+      frame = 0;
+      if (!canvasVisible || !documentVisible) return;
+      const deltaSeconds = lastTimestamp ? Math.min((timestamp - lastTimestamp) / 1000, 0.034) : 0;
+      lastTimestamp = timestamp;
+      context.clearRect(0, 0, width, height);
+      update(deltaSeconds);
+      context.save();
+      clipParticleFieldOutsideCapsule();
+      drawAtmosphere();
+      drawRain();
+      drawDust();
+      drawSourceSparks();
+      context.restore();
+      fadeParticleFieldEdges();
+      drawEmitter();
+      frame = window.requestAnimationFrame(draw);
+    };
+
+    const requestDraw = () => {
+      if (!canvasVisible || !documentVisible || frame) return;
+      lastTimestamp = 0;
+      frame = window.requestAnimationFrame(draw);
+    };
+    const setAnimationActive = () => {
+      if (canvasVisible && documentVisible) {
+        requestDraw();
+        return;
+      }
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = 0;
+      lastTimestamp = 0;
+    };
+
+    const resizeObserver = new ResizeObserver(resize);
+    const intersectionObserver = typeof IntersectionObserver === 'function'
+      ? new IntersectionObserver(([entry]) => {
+        canvasVisible = entry?.isIntersecting !== false;
+        setAnimationActive();
+      })
+      : undefined;
+    const themeObserver = new MutationObserver(updateTheme);
+    const handleVisibilityChange = () => {
+      documentVisible = document.visibilityState !== 'hidden';
+      setAnimationActive();
+    };
+    resizeObserver.observe(canvas);
+    intersectionObserver?.observe(canvas);
+    themeObserver.observe(document.documentElement, { attributeFilter: ['data-theme'], attributes: true });
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    resize();
+    // Draw synchronously in the same layout commit that inserts the running
+    // tool card, then continue on RAF. This prevents a visible blank interval.
+    draw(performance.now());
+    return () => {
+      resizeObserver.disconnect();
+      intersectionObserver?.disconnect();
+      themeObserver.disconnect();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.cancelAnimationFrame(frame);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return undefined;
+    const lanes = [2, 5, 8, 11, 14, 17, 20, 23, 26];
+    let nextId = 0;
+    let timeoutId: number | undefined;
+    const random = (minimum: number, maximum: number) => minimum + Math.random() * (maximum - minimum);
+
+    const emit = () => {
+      const timestamp = Date.now();
+      setFlowParticles((current) => {
+        const active = current.filter((particle) => particle.expiresAt > timestamp);
+        const occupiedLanes = new Set(active
+          .filter((particle) => timestamp - particle.createdAt < particle.duration * 0.55)
+          .map((particle) => particle.y));
+        const availableLanes = lanes.filter((lane) => !occupiedLanes.has(lane));
+        const emitted = Array.from({ length: Math.min(availableLanes.length, 1) }, () => {
+          const laneIndex = Math.floor(Math.random() * availableLanes.length);
+          const y = availableLanes.splice(laneIndex, 1)[0];
+          const width = Math.round(random(27, 47));
+          const duration = Math.round(random(2700, 3350));
+          return {
+            createdAt: timestamp,
+            distance: Math.round(random(160, 178)),
+            duration,
+            expiresAt: timestamp + duration,
+            id: nextId++,
+            start: -(width + 5),
+            width,
+            y,
+          };
+        });
+        return [...active, ...emitted];
+      });
+      timeoutId = window.setTimeout(emit, Math.round(random(200, 400)));
+    };
+
+    emit();
+    return () => window.clearTimeout(timeoutId);
+  }, []);
+
+  return (
+    <span
+      aria-hidden="true"
+      className="browser-chat-tool-tail-particles"
+    >
+      {flowParticles.map((particle) => (
+        <i
+          className="browser-chat-tool-tail-comet"
+          key={particle.id}
+          style={{
+            '--distance': `${particle.distance}px`,
+            '--duration': `${particle.duration}ms`,
+            '--start': `${particle.start}px`,
+            '--width': `${particle.width}px`,
+            '--y': `${particle.y}px`,
+          } as CSSProperties}
+        />
+      ))}
+    </span>
+  );
+});
 
 
 function temporaryId(prefix: string) {
@@ -1539,6 +2120,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   resolvingConfirmationId,
   running,
   step,
+  visibleToolIndexes,
 }: {
   logs: BrowserChatLogRecord[];
   onSelectTool: (detail: BrowserChatToolDetail) => void;
@@ -1549,11 +2131,16 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   resolvingConfirmationId?: string | null;
   running: boolean;
   step: StepExecutionResult;
+  visibleToolIndexes?: readonly number[];
 }) {
   const { t } = useI18n();
-  const toolCalls = step.tools || [];
+  const allToolCalls = step.tools || [];
+  const visibleToolIndexSet = visibleToolIndexes ? new Set(visibleToolIndexes) : undefined;
+  const toolCalls = allToolCalls
+    .map((tool, toolIndex) => ({ tool, toolIndex }))
+    .filter(({ toolIndex }) => !visibleToolIndexSet || visibleToolIndexSet.has(toolIndex));
   if (!running && !toolCalls.length) return null;
-  if (onlyPendingConfirmation && !toolCalls.some((tool) => pendingConfirmationForTool({
+  if (onlyPendingConfirmation && !toolCalls.some(({ tool }) => pendingConfirmationForTool({
     pending: pendingToolConfirmation,
     stepIndex: step.index,
     toolName: tool.name,
@@ -1561,6 +2148,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
     toolOk: tool.ok,
   }))) return null;
   if (running && !toolCalls.length) {
+    if (allToolCalls.length) return null;
     if (onlyPendingConfirmation) return null;
     return (
       <div className="browser-chat-tool-card is-waiting">
@@ -1580,12 +2168,13 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
 
   return (
     <>
-      {toolCalls.map((tool, toolIndex) => {
+      {toolCalls.map(({ tool, toolIndex }) => {
         const label = browserChatToolLabel(tool.name, t);
         const meta = compactText(browserChatToolMeta(tool.name, tool.input), 56);
         const status = toolStatusLabel(tool);
         const displayText = `${label}${meta ? `: ${meta}` : ''}`;
-        const stateClass = tool.ok === false && !isRecoveredTransientTool(tool) ? ' is-failed' : tool.ok === undefined ? ' is-running' : '';
+        const isActiveTool = tool.ok === undefined;
+        const stateClass = tool.ok === false && !isRecoveredTransientTool(tool) ? ' is-failed' : isActiveTool ? ' is-running' : '';
         const pendingConfirmation = pendingConfirmationForTool({
           pending: pendingToolConfirmation,
           stepIndex: step.index,
@@ -1594,7 +2183,9 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
           toolOk: tool.ok,
         });
         if (onlyPendingConfirmation && !pendingConfirmation) return null;
-        const userAction = toolUserActionForTool(logs, step.index, tool.name, tool.input);
+        const userAction = pendingConfirmation
+          ? undefined
+          : toolUserActionForTool(logs, step.index, tool.name, tool.input);
         return (
           <div className="browser-chat-tool-call" key={`${step.index}-${toolIndex}-${tool.name}`}>
             {tool.reason ? <p className="browser-chat-tool-reason">{tool.reason}</p> : null}
@@ -1615,6 +2206,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                 </span>
                 {meta ? <small className="browser-chat-tool-meta">{meta}</small> : null}
               </span>
+              {isActiveTool ? <BrowserChatToolTailParticles /> : null}
             </button>
             <BrowserChatToolConfirmationActions
               pending={pendingConfirmation}
@@ -1705,7 +2297,9 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                 toolInput: toolDetail?.tool.input ?? tool.input,
                 toolOk: toolDetail?.tool.ok,
               });
-              const userAction = toolUserActionForTool(logs, toolDetail?.stepIndex ?? cycle.stepIndex, tool.name, toolDetail?.tool.input ?? tool.input);
+              const userAction = pendingConfirmation
+                ? undefined
+                : toolUserActionForTool(logs, toolDetail?.stepIndex ?? cycle.stepIndex, tool.name, toolDetail?.tool.input ?? tool.input);
               const card = (
                 <>
                   <span className="browser-chat-tool-icon" aria-hidden="true">
@@ -1729,6 +2323,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                     type="button"
                   >
                     {card}
+                    {stateClass.includes('is-running') ? <BrowserChatToolTailParticles /> : null}
                   </button>
                   <BrowserChatToolConfirmationActions
                     pending={pendingConfirmation}
@@ -1875,14 +2470,30 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(aiOutputCycles), [aiOutputCycles]);
   const aiOutputTextSet = useMemo(() => aiOutputTextSetFromCycles(aiOutputCycles), [aiOutputCycles]);
   const aiCycleToolDetails = useMemo(() => buildAiCycleToolDetailMap(aiOutputCycles, steps), [aiOutputCycles, steps]);
+  const aiCycleRepresentedToolKeys = new Set([...aiCycleToolDetails.values()].map((detail) => (
+    `${detail.stepIndex}:${detail.toolIndex}`
+  )));
   const seenTexts = new Set<string>();
   const toolCount = steps.reduce((count, step) => count + (step.tools || []).length, 0);
+  const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
+  const timelineSteps = steps.filter((step) => (step.tools || []).length || (running && step.status === 'running'));
+  // An AI output record is appended only after its corresponding tool returns.
+  // Keep the currently running trace visible even when prior output cycles are
+  // already present, otherwise only the first tool of a conversation can show
+  // its active state.
+  const liveTimelineEntries = timelineSteps.flatMap((step): BrowserChatTimelineStepEntry[] => {
+    const visibleToolIndexes = (step.tools || []).flatMap((tool, toolIndex) => (
+      tool.ok === undefined && !aiCycleRepresentedToolKeys.has(`${step.index}:${toolIndex}`) ? [toolIndex] : []
+    ));
+    if (visibleToolIndexes.length) return [{ step, visibleToolIndexes }];
+    if (step.status === 'running' && !(step.tools || []).length) return [{ step }];
+    return [];
+  });
+  const hasPendingConfirmation = Boolean(pendingToolConfirmation);
   const failedToolCount = steps.reduce((count, step) => count + (step.tools || []).filter((tool) => (
     tool.ok === false && !isRecoveredTransientTool(tool)
   )).length, 0);
-  const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
-  const timelineSteps = steps.filter((step) => (step.tools || []).length || (running && step.status === 'running'));
-  const hasPendingConfirmation = Boolean(pendingToolConfirmation);
+  const shouldEmphasizeToolFailure = failedToolCount > 0 && !hasPendingConfirmation;
   const aiCyclesContainPendingConfirmation = hasPendingConfirmation && aiOutputCycles.some((cycle) => (
     cycle.output.tools.some((tool, index) => {
       const toolDetail = aiCycleToolDetails.get(aiCycleToolKey(cycle.id, index));
@@ -1895,36 +2506,41 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       }));
     })
   ));
-  const pendingTimelineSteps = hasPendingConfirmation
+  const pendingTimelineEntries: BrowserChatTimelineStepEntry[] = hasPendingConfirmation
     ? steps.filter((step) => (step.tools || []).some((tool) => pendingConfirmationForTool({
       pending: pendingToolConfirmation,
       stepIndex: step.index,
       toolName: tool.name,
       toolInput: tool.input,
       toolOk: tool.ok,
-    })))
+    }))).map((step) => ({ step }))
     : [];
   const showPendingTimelineFallback = hasPendingConfirmation && !aiCyclesContainPendingConfirmation;
-  const timelineStepsToRender = showPendingTimelineFallback ? pendingTimelineSteps : timelineSteps;
+  const timelineEntriesToRender: BrowserChatTimelineStepEntry[] = showPendingTimelineFallback
+    ? pendingTimelineEntries
+    : aiOutputCycles.length
+      ? liveTimelineEntries
+      : timelineSteps.map((step) => ({ step }));
   const shouldShowStepTimeline = (!aiOutputCycles.length && (toolCount > 0 || waitingForTool))
-    || (showPendingTimelineFallback && pendingTimelineSteps.length > 0);
+    || liveTimelineEntries.length > 0
+    || (showPendingTimelineFallback && pendingTimelineEntries.length > 0);
   const manualVerificationPaused = steps.some((step) => (step.tools || []).some((tool) => tool.name === 'waitForHumanVerification'))
     || aiOutputCycles.some((cycle) => cycle.output.tools.some((tool) => tool.name === 'waitForHumanVerification'));
   const hasFinalText = Boolean(finalText.trim());
   const hideManualVerificationStatusText = manualVerificationPaused && isManualVerificationStatusText(finalText);
-  const toolSummary = failedToolCount
-    ? failedToolCount === 1
+  const toolSummary = hasPendingConfirmation
+    ? '等待用户确认工具调用'
+    : failedToolCount
+      ? failedToolCount === 1
       ? '工具调用失败'
       : `${failedToolCount} 个工具调用失败`
-    : showPendingTimelineFallback
-      ? '等待用户确认工具调用'
       : toolCount
-        ? toolCount === 1
-          ? `${running ? '正在执行' : '执行'}一个工具`
-          : `${running ? '正在执行' : '执行'} ${toolCount} 个工具`
-        : waitingForTool
-          ? '准备工具'
-          : '暂无工具';
+          ? toolCount === 1
+            ? `${running ? '正在执行' : '执行'}一个工具`
+            : `${running ? '正在执行' : '执行'} ${toolCount} 个工具`
+          : waitingForTool
+            ? '准备工具'
+            : '暂无工具';
   const renderText = (text: string, key: string) => {
     const normalized = text;
     if (!normalized || seenTexts.has(normalized)) return null;
@@ -1977,7 +2593,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
         <div className="browser-chat-tool-stack">
           <button
             aria-expanded={toolsExpanded}
-            className={`browser-chat-tool-summary${toolsExpanded ? ' is-expanded' : ''}${failedToolCount ? ' has-failed' : ''}`}
+            className={`browser-chat-tool-summary${toolsExpanded ? ' is-expanded' : ''}${shouldEmphasizeToolFailure ? ' has-failed' : ''}`}
             onClick={() => setToolsExpanded((value) => !value)}
             type="button"
           >
@@ -1985,8 +2601,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
             <span>{toolSummary}</span>
             <ChevronDown className="browser-chat-tool-summary-chevron" size={14} />
           </button>
-          {toolsExpanded ? timelineStepsToRender.map((step) => (
-            <div className="browser-chat-agent-step" key={step.index}>
+          {toolsExpanded ? timelineEntriesToRender.map(({ step, visibleToolIndexes }) => (
+            <div className={`browser-chat-agent-step${running && step.status === 'running' ? ' is-running' : ''}`} key={step.index}>
               <BrowserChatStepToolCards
                 logs={logs}
                 onResolveToolConfirmation={onResolveToolConfirmation}
@@ -1997,6 +2613,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                 resolvingConfirmationId={resolvingConfirmationId}
                 running={running && step.status === 'running'}
                 step={step}
+                visibleToolIndexes={visibleToolIndexes}
               />
             </div>
           )) : null}
@@ -2005,7 +2622,15 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       {manualVerificationPaused ? <BrowserChatManualVerificationCard /> : null}
       {hasFinalText && !hideManualVerificationStatusText && !aiOutputTextSet.has(finalText.replace(/\s+/g, ' ').trim()) ? renderText(finalText, 'final-text') : null}
       {!hasFinalText && !shouldShowStepTimeline ? (
-        <p className="browser-chat-agent-empty">{running ? 'AI 正在处理当前请求。' : 'AI 已完成本轮操作，未返回额外文本。'}</p>
+        running ? (
+          <div aria-live="polite" className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
+            <span aria-hidden="true" className="browser-chat-agent-thinking-mark"><i /><i /><i /></span>
+            <span className="browser-chat-agent-thinking-copy">
+              <strong>AI 正在处理当前请求<span className="browser-chat-agent-thinking-ellipsis">...</span></strong>
+              <small>正在分析页面状态并准备下一步操作</small>
+            </span>
+          </div>
+        ) : <p className="browser-chat-agent-empty">AI 已完成本轮操作，未返回额外文本。</p>
       ) : null}
     </div>
   );
@@ -2073,7 +2698,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   }, [item.skillIds, skillsById]);
 
   return (
-    <article className={`browser-chat-message ${item.role}`}>
+    <article className={`browser-chat-message ${item.role}${operationRunning ? ' is-running' : ''}`}>
       <div>
         {item.role === 'assistant' ? (
           <BrowserChatAssistantTimeline

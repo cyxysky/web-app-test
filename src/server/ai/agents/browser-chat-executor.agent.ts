@@ -150,8 +150,8 @@ const codexRuntimeObjectSchema = z.object({
     actual: z.string().nullable().optional(),
     status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
     done: z.boolean().nullable().optional(),
-    mode: z.enum(['actionable', 'full', 'text']).nullable().optional(),
-    maxChars: z.number().nullable().optional(),
+    mode: z.enum(['actionable', 'full', 'text', 'changes']).nullable().optional(),
+    cursor: z.string().nullable().optional(),
     query: z.string().nullable().optional(),
     roles: z.array(z.string()).nullable().optional(),
     limit: z.number().nullable().optional(),
@@ -1736,6 +1736,13 @@ function makeBrowserTools(
     }).optional(),
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
+  const takeSnapshotInput = browserToolInput({
+    cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by the prior takeSnapshot page. When set, mode is required and must match the prior page.'),
+    mode: z.enum(['actionable', 'full', 'text', 'changes']).optional(),
+  }).refine((input) => !input.cursor || Boolean(input.mode), {
+    path: ['mode'],
+    message: 'mode is required when cursor is provided.',
+  });
   async function record(name: string, input: unknown, action: (abortSignal?: AbortSignal) => Promise<BrowserActionResult>) {
     throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
     if (toolExecutionGate.executed) {
@@ -1873,11 +1880,11 @@ function makeBrowserTools(
       })),
     }),
     waitForPage: tool({
-      description: 'Wait for the page to settle after navigation or UI changes.',
+      description: 'Wait for the page after navigation or UI changes. When ms is provided, wait for that full duration in milliseconds; do not shorten it.',
       inputSchema: browserToolInput({
-        ms: z.number().optional().describe('Optional wait time in milliseconds.'),
+        ms: z.number().int().nonnegative().optional().describe('Optional exact minimum wait duration in milliseconds.'),
       }),
-      execute: (input) => record('waitForPage', input, () => (input.ms ? session.wait(input.ms) : session.waitForPage())),
+      execute: (input) => record('waitForPage', input, () => (typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage())),
     }),
     waitForHumanVerification: tool({
       description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever the page detector or snapshot shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
@@ -1892,16 +1899,15 @@ function makeBrowserTools(
       execute: (input) => record('listTabs', input, () => session.listTabs()),
     }),
     getHttpRequests: tool({
-      description: 'Read-only diagnostic tool: return recent HTTP requests for the current active tab, including method, URL, resource type, status, ok/failed, and error text. Use when a page looks broken, data is missing, an API may have failed, or you need evidence for a network-related issue.',
-      inputSchema: browserToolInput({}),
-      execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
+      description: 'Read HTTP requests for the current tab. Without ids, return recent request summaries. With ids from takeSnapshot({mode:"changes"}), return request body and readable response body for only those requests. Use this when an inter-action change journal lists a request that may explain a delayed UI result.',
+      inputSchema: browserToolInput({
+        ids: z.array(z.string().min(1)).min(1).max(20).optional().describe('Optional request IDs listed by takeSnapshot({mode:"changes"}). Supplying IDs returns their request/response details.'),
+      }),
+      execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests({ ids: input.ids })),
     }),
     takeSnapshot: tool({
-      description: 'Capture a fresh DOM-observation baseline for the current document. mode=actionable is the default interactive control view; full includes visible structure; text returns visible text. It establishes dom-* UIDs that later action deltas update or remove.',
-      inputSchema: browserToolInput({
-        mode: z.enum(['actionable', 'full', 'text']).optional(),
-        maxChars: z.number().int().positive().optional().describe('Requested response budget. The DOM-observation baseline is bounded by the configured runtime limits.'),
-      }),
+      description: 'Capture a paged DOM observation. actionable and text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal: all observed DOM additions, updates, removals, and request summaries since the last browser-changing tool call; it has no actionable UIDs and does not replace the DOM baseline. Use getHttpRequests with its request IDs for details. If nextCursor is returned, call takeSnapshot again with both the same mode and that exact cursor; do not act between pages. Every result states page/current total.',
+      inputSchema: takeSnapshotInput,
       execute: (input) => record('takeSnapshot', input, async () => (
         referenceOptions?.takeSnapshot
           ? referenceOptions.takeSnapshot(input)
@@ -2127,7 +2133,7 @@ function runtimePrompt(input: {
       : screenshotAvailable
         ? '- Browser action reason must cite the current snapshot UID or latest screenshot target used for the action.'
         : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
-    `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"actionable",maxChars:20000}).`,
+    `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"actionable"}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
@@ -2757,8 +2763,8 @@ async function executeRuntimeStep(input: {
       blockers: [],
       pageUnderstanding: '',
       currentState: browserChatMode
-        ? 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable",maxChars:20000}) when browser evidence is needed.'
-        : 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable",maxChars:20000}) before choosing a UID action.',
+        ? 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable"}) when browser evidence is needed.'
+        : 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable"}) before choosing a UID action.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
@@ -2887,14 +2893,20 @@ async function executeRuntimeStep(input: {
 
     async function takeSnapshot(options: RuntimeObservationReadOptions = {}): Promise<BrowserActionResult> {
       ensureActive();
-      if (options.cursor) {
-        return { ok: false, actual: 'DOM-observation snapshots are current-document baselines and do not use cursors. Capture a new takeSnapshot instead.' };
-      }
       const snapshotView = options.mode || 'actionable';
 
       const readStartedAt = Date.now();
-      const snapshot = await session.readDomObservationSnapshot({ mode: snapshotView });
+      const snapshot = await session.readDomObservationSnapshot({
+        cursor: options.cursor,
+        mode: options.cursor ? options.mode : snapshotView,
+      });
       ensureActive();
+      const snapshotActual = [
+        snapshot.pageSummary,
+        snapshot.content,
+        snapshot.nextCursor ? `More pages remain. Continue with takeSnapshot({mode:"${snapshot.mode}",cursor:"${snapshot.nextCursor}"}).` : 'End of this snapshot.',
+      ].join('\n');
+      if (options.cursor || snapshotView === 'changes') return { ok: true, actual: snapshotActual, nextCursor: snapshot.nextCursor };
       const observationViews: BrowserSnapshotViews = {
         defaultType: snapshotView,
         [snapshotView]: snapshot.content,
@@ -2922,7 +2934,8 @@ async function executeRuntimeStep(input: {
         // Returning them leaks unrelated modes into both the model context and
         // the tool-result dialog. A snapshot tool result is exactly its
         // requested mode's content, nothing else.
-        actual: snapshot.content,
+        actual: snapshotActual,
+        nextCursor: snapshot.nextCursor,
       };
     }
 
@@ -3061,7 +3074,7 @@ async function executeRuntimeStep(input: {
           { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
           ...(appendedMessages.length
             ? appendedMessages
-            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"actionable",maxChars:20000}).' }]),
+            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"actionable"}).' }]),
         ];
         attachedImagePaths = appendedImagePaths;
         messageImagePaths = [...attachedImagePaths];
@@ -3993,7 +4006,7 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
     case 'listTabs':
       return session.listTabs();
     case 'getHttpRequests':
-      return session.getCurrentTabHttpRequests();
+      return session.getCurrentTabHttpRequests({ ids: Array.isArray(input.ids) ? input.ids.filter((id): id is string => typeof id === 'string') : undefined });
     case 'downloadFile':
       return downloadFileArtifact({
         runId,

@@ -147,6 +147,68 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
   await unlink(exported.path);
 });
 
+test('DOM-observation takeSnapshot pages actionable, text, and full views with stable DOM UIDs', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-observation-pagination-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  const buttons = Array.from({ length: 200 }, (_, index) => (
+    `<button type="button" data-testid="page-${index}" style="display:inline-block;width:55px;height:10px;font-size:1px;overflow:hidden">${`Pagination item ${index} with descriptive text `.repeat(3)}</button>`
+  )).join('');
+  await page.setContent(`<!doctype html><html><body><main>${buttons}</main></body></html>`);
+
+  for (const mode of ['actionable', 'text', 'full'] as const) {
+    const pages: string[] = [];
+    let result = await session.readDomObservationSnapshot({ mode });
+    pages.push(result.content);
+    assert.ok(result.nextCursor, `${mode} must expose a next cursor`);
+    for (let guard = 0; result.nextCursor && guard < 100; guard += 1) {
+      result = await session.readDomObservationSnapshot({ cursor: result.nextCursor, mode });
+      pages.push(result.content);
+    }
+    assert.equal(result.nextCursor, undefined, `${mode} cursor must reach the end`);
+    assert.match(pages.join('\n'), /Pagination item 199 with descriptive text/, `${mode} must include content from every page`);
+  }
+});
+
+test('inter-action changes retain all DOM mutations and request summaries until the next interaction', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'inter-action-changes-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent('<!doctype html><html><body><main id="root"><span id="gone">temporary node</span></main></body></html>');
+  await session.wait(100);
+  await page.route('https://change-journal.test/inter-action-request', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ message: 'request completed' }),
+  }));
+
+  await page.evaluate(async () => {
+    const root = document.querySelector('#root')!;
+    root.insertAdjacentHTML('beforeend', '<section class="background-result"><span class="detail">Delayed validation detail</span></section>');
+    document.querySelector('#gone')?.remove();
+    await fetch('https://change-journal.test/inter-action-request');
+  });
+  await page.waitForTimeout(20);
+
+  const first = await session.readDomObservationSnapshot({ mode: 'changes' });
+  assert.match(first.content, /background-result/);
+  assert.match(first.content, /Delayed validation detail/);
+  assert.match(first.content, /id="gone"/);
+  assert.match(first.content, /request id=.*change-journal\.test\/inter-action-request/);
+  const requestId = first.content.match(/request id=(\S+)/)?.[1];
+  assert.ok(requestId, 'changes must expose an ID for a later request-detail query');
+  const requestDetail = await session.getCurrentTabHttpRequests({ ids: [requestId] });
+  assert.match(requestDetail.actual, /request completed/);
+
+  const second = await session.readDomObservationSnapshot({ mode: 'changes' });
+  assert.match(second.content, /background-result/, 'reading changes must not clear the active journal');
+
+  await session.wait(100);
+  const afterNextInteraction = await session.readDomObservationSnapshot({ mode: 'changes' });
+  assert.doesNotMatch(afterNextInteraction.content, /background-result/, 'the next interaction must start a new journal window');
+});
+
 test('snapshot lifecycle refreshes on page-state changes, ranks actionable matches, and rejects covered targets', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'snapshot-lifecycle-test' });
   context.after(async () => session.close());
@@ -325,6 +387,42 @@ test('DOM mutation deltas coalesce repeated attributes and promote nested text c
   assert.match(changingUpdates[0], /aria-label="After 49"/);
   assert.equal(labelUpdates.length, 1, JSON.stringify(delta.domChanges));
   assert.match(labelUpdates[0], />After label<\/button>/);
+});
+
+test('DOM mutation deltas expose non-actionable semantic context and page diagnostics under extra', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-mutation-extra-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent('<!doctype html><html><body><button type="button">Open</button></body></html>');
+  await session.readDomObservationSnapshot({ mode: 'actionable' });
+
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<section><p data-testid="notice">Saved successfully</p></section>');
+    console.error('post-action validation failed');
+  });
+
+  const delta = await session.readDomChanges();
+  assert.match(delta.domChanges?.extra.added.join('\n') || '', /data-testid="notice"[^>]*>Saved successfully<\/p>/);
+  assert.doesNotMatch(delta.domChanges?.extra.added.join('\n') || '', /\buid=|\bnode_id=/);
+  assert.ok(delta.domChanges?.extra.errors.some((entry) => entry.includes('[console] post-action validation failed')));
+});
+
+test('post-action form validation errors are elevated instead of remaining only in extra context', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-validation-error-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <button id="submit" type="button" onclick="document.body.insertAdjacentHTML('beforeend', '<div class=&quot;error&quot;>Link is required</div>')">Submit</button>
+  </body></html>`);
+  const baseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  const uid = baseline.content.match(/uid=(dom-\d+)[^\n]*>Submit<\/button>/)?.[1];
+  assert.ok(uid, baseline.content);
+
+  const result = await session.mouse({ action: 'click', uid });
+  assert.match(result.actual, /Post-action form validation failed: Link is required/);
+  assert.deepEqual(result.domChanges?.extra.validationErrors, ['Link is required']);
 });
 
 test('SVG parents and children with independent click boundaries remain separate actions', async (context) => {

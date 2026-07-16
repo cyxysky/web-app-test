@@ -15,6 +15,7 @@ import {
   type SettingsTab,
 } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
+import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { languageOptions } from '@/i18n/translations';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/test-case.schema';
@@ -956,7 +957,7 @@ export function EnvironmentSettings({
         <div className="settings-content">
           {loading ? (
             <section className="settings-loading-panel" role="status" aria-live="polite">
-              <span aria-hidden="true" className="ui-loading-spinner ui-loading-spinner--large" />
+              <LiquidGlassLoader />
               <div>
                 <h2>{t('正在读取环境配置')}</h2>
                 <span>{t('正在加载模型、浏览器、运行控制和调试参数。')}</span>

@@ -2645,32 +2645,21 @@ function createWindow() {
       .shell {
         align-items: center;
         animation: shell-in 0.42s cubic-bezier(.2,.8,.2,1) both;
-        backdrop-filter: blur(24px) saturate(1.15);
-        background: rgba(255, 255, 255, 0.82);
-        border: 1px solid rgba(28, 52, 68, 0.08);
-        border-radius: 24px;
-        box-shadow:
-          0 22px 60px rgba(25, 46, 61, 0.11),
-          0 2px 8px rgba(25, 46, 61, 0.04),
-          inset 0 1px rgba(255, 255, 255, 0.9);
+        backdrop-filter: none;
+        background: transparent;
+        border: 0;
+        border-radius: 0;
+        box-shadow: none;
         display: grid;
         gap: 19px;
-        grid-template-columns: 58px minmax(0, 1fr);
-        max-width: 470px;
-        padding: 28px 30px 26px;
+        grid-template-columns: minmax(0, 1fr);
+        max-width: none;
+        padding: 0;
         position: relative;
-        width: calc(100vw - 56px);
+        width: 100%;
         z-index: 1;
       }
-      .shell::before {
-        background: linear-gradient(90deg, transparent, rgba(255,255,255,.82), transparent);
-        content: "";
-        height: 1px;
-        left: 34px;
-        position: absolute;
-        right: 34px;
-        top: 0;
-      }
+      .shell::before { display: none; }
       .mark {
         align-items: center;
         display: flex;
@@ -2691,9 +2680,19 @@ function createWindow() {
       h2 { font-size: 19px; font-weight: 720; letter-spacing: -0.025em; line-height: 1.25; margin: 0 0 8px; }
       p { align-items: center; color: #70808d; display: flex; font-size: 12.5px; line-height: 1.55; margin: 0; }
       .status-dot { animation: status-pulse 1.7s ease-in-out infinite; background: #37c7ad; border-radius: 50%; box-shadow: 0 0 0 4px rgba(55, 199, 173, 0.11); flex: 0 0 auto; height: 6px; margin-right: 9px; width: 6px; }
-      .progress { background: rgba(100, 125, 141, 0.12); border-radius: 99px; grid-column: 1 / -1; height: 3px; margin-top: 3px; overflow: hidden; position: relative; }
-      .progress-value { background: linear-gradient(90deg, #4f91cf, #45cdb5); border-radius: inherit; display: block; height: 100%; transition: width .42s cubic-bezier(.2,.8,.2,1); width: 7%; }
-      .slow-note { color: #81909b; display: none; font-size: 11px; grid-column: 1 / -1; margin-top: -8px; }
+      .startup-liquid { display: grid; grid-column: 1 / -1; grid-row: 1; height: 154px; margin: -1px 0 -6px; place-items: center; position: relative; width: 154px; justify-self: center; }
+      .startup-liquid + div { align-items: center; display: flex; grid-column: 1 / -1; grid-row: 2; justify-content: center; margin: -2px 0 0; text-align: center; }
+      .startup-liquid + div .eyebrow, .startup-liquid + div h2, .startup-liquid + div .status-dot { display: none; }
+      .startup-liquid + div p { justify-content: center; text-align: center; }
+      .startup-liquid-orb { background: rgba(255,255,255,.74); border: 1px solid rgba(51,44,37,.10); border-radius: 50%; box-shadow: 0 20px 38px rgba(62,51,39,.08), inset 0 1px 0 #fff, inset 0 -10px 28px rgba(122,155,139,.05); height: 132px; overflow: hidden; position: relative; width: 132px; }
+      .startup-liquid-orb::after { border-radius: inherit; box-shadow: inset 8px 9px 20px rgba(255,255,255,.56), inset -9px -12px 22px rgba(55,43,32,.04); content: ""; inset: 0; pointer-events: none; position: absolute; }
+      .startup-liquid-water { animation: startup-liquid-water-breathe 3s cubic-bezier(.22,.8,.28,1) infinite; background: linear-gradient(180deg,rgba(122,155,139,.50),rgba(122,155,139,.88)); bottom: -5%; height: var(--startup-liquid-progress, 12%); left: -18%; position: absolute; right: -18%; transition: height .42s cubic-bezier(.22,.8,.28,1); }
+      .startup-liquid-water::before, .startup-liquid-water::after { animation: startup-liquid-wave 3.4s ease-in-out infinite; background: rgba(255,255,255,.88); border-radius: 45% 55% 48% 52%; content: ""; height: 38px; left: -12%; position: absolute; top: -20px; width: 124%; }
+      .startup-liquid-water::after { animation-direction: reverse; animation-duration: 2.8s; background: rgba(122,155,139,.22); border-radius: 54% 46% 58% 42%; top: -15px; }
+      .startup-liquid-bubble { animation: startup-liquid-bubble-up 2.5s ease-in infinite; animation-delay: var(--delay); background: rgba(255,255,255,.22); border: 1px solid rgba(255,255,255,.75); border-radius: 50%; bottom: 22px; height: 7px; left: var(--x); position: absolute; width: 7px; z-index: 2; }
+      .startup-liquid-bubble.small { height: 5px; width: 5px; }
+      .startup-liquid-bubble.large { height: 9px; width: 9px; }
+      .slow-note { color: #81909b; display: none; font-size: 11px; grid-column: 1 / -1; justify-self: center; margin-top: -8px; text-align: center; }
       .slow-note.visible { display: block; }
       .startup-error { display: none; grid-column: 1 / -1; }
       .startup-error.visible { display: block; }
@@ -2703,6 +2702,9 @@ function createWindow() {
       .startup-actions button:first-child { background: #168e7d; border-color: #168e7d; color: white; }
       .shell.complete { opacity: 0; transform: translateY(-4px) scale(.99); transition: opacity .22s ease, transform .22s ease; }
       @keyframes status-pulse { 0%, 100% { opacity: .55; transform: scale(.85); } 50% { opacity: 1; transform: scale(1); } }
+      @keyframes startup-liquid-water-breathe { 0%,100% { transform: translateY(4px); } 50% { transform: translateY(-3px); } }
+      @keyframes startup-liquid-wave { 0%,100% { transform: translateX(-3%) rotate(-2deg); } 50% { transform: translateX(5%) rotate(2deg); } }
+      @keyframes startup-liquid-bubble-up { 0% { opacity: 0; transform: translateY(12px) scale(.5); } 20% { opacity: .72; } 100% { opacity: 0; transform: translateY(-72px) translateX(7px) scale(1); } }
       @keyframes shell-in { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
       @keyframes ambient-drift-a {
         0% { opacity: .72; transform: translate3d(-3%, -2%, 0) scale(.96); }
@@ -2715,29 +2717,33 @@ function createWindow() {
         100% { opacity: .72; transform: translate3d(-17%, 2%, 0) scale(.98); }
       }
       @media (prefers-reduced-motion: reduce) {
-        body::before, body::after, .shell, .status-dot { animation: none; }
-        .progress-value { transition-duration: .01ms; }
+        body::before, body::after, .shell, .status-dot, .startup-liquid-water, .startup-liquid-water::before, .startup-liquid-water::after, .startup-liquid-bubble { animation: none; }
       }
       @media (prefers-color-scheme: dark) {
         :root { color-scheme: dark; }
         body { background: radial-gradient(circle at 20% 12%, rgba(48,167,146,.12), transparent 28%), radial-gradient(circle at 78% 88%, rgba(67,111,173,.13), transparent 32%), #10151b; color: #eef5f6; }
-        .shell { background: rgba(24,31,39,.84); border-color: rgba(255,255,255,.08); box-shadow: 0 22px 60px rgba(0,0,0,.34), inset 0 1px rgba(255,255,255,.05); }
+        .shell { background: transparent; border: 0; box-shadow: none; }
         .shell::before { background: linear-gradient(90deg, transparent, rgba(255,255,255,.16), transparent); }
         .eyebrow { color: #8aa1ae; }
         p, .slow-note { color: #93a3ad; }
-        .progress { background: rgba(255,255,255,.09); }
         .startup-actions button { background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.1); color: #bdc8ce; }
       }
     </style>
     <body>
       <main class="shell">
-        <div class="mark">${loadingMark}</div>
+        <div class="startup-liquid" aria-hidden="true">
+          <div class="startup-liquid-orb">
+            <div class="startup-liquid-water" id="startup-liquid-water"></div>
+            <i class="startup-liquid-bubble" style="--x:34%;--delay:-.2s"></i>
+            <i class="startup-liquid-bubble small" style="--x:57%;--delay:-1.4s"></i>
+            <i class="startup-liquid-bubble large" style="--x:69%;--delay:-2.1s"></i>
+          </div>
+        </div>
         <div>
           <div class="eyebrow">${APP_NAME}</div>
           <h2>智能浏览器测试工作区</h2>
           <p><span class="status-dot"></span><span id="startup-status">正在初始化工作区…</span></p>
         </div>
-        <div class="progress" aria-label="正在加载"><span class="progress-value" id="startup-progress"></span></div>
         <div class="slow-note" id="startup-slow">首次启动可能需要更长时间，请稍候。</div>
         <div class="startup-error" id="startup-error">
           <strong id="startup-error-message">启动失败</strong>
@@ -2752,7 +2758,10 @@ function createWindow() {
         window.__webPilotStartup = {
           update(input) {
             if (input.message) document.getElementById('startup-status').textContent = input.message;
-            if (Number.isFinite(input.progress)) document.getElementById('startup-progress').style.width = Math.max(0, Math.min(100, input.progress)) + '%';
+            if (Number.isFinite(input.progress)) {
+              const liquid = document.getElementById('startup-liquid-water');
+              if (liquid) liquid.style.setProperty('--startup-liquid-progress', Math.max(8, Math.min(100, input.progress)) + '%');
+            }
             document.getElementById('startup-slow').classList.toggle('visible', Boolean(input.slow));
           },
           fail(message) {

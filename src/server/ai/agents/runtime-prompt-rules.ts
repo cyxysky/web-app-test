@@ -1,9 +1,11 @@
 export function snapshotHardRules(screenshotAvailable = true) {
   return [
     '- takeSnapshot captures a lightweight DOM-observation baseline, not a screenshot.',
-    '- Use mode="actionable" normally, mode="full" for wider DOM structure, and mode="text" for deduplicated rendered copy.',
+    '- Use mode="actionable" normally, mode="full" for wider DOM structure, and mode="text" for deduplicated rendered copy. Use mode="changes" to read the persistent inter-action journal: all observed DOM additions, updates, removals, and request summaries since the last browser-changing tool call. changes has no actionable UIDs and does not replace the current DOM baseline.',
     '- Browser-changing actions return an incremental DOM delta, not a full snapshot. Keep an existing dom-* UID unless that delta lists it as removed; removed UIDs are invalid immediately.',
-    '- Browser-changing actions already return their incremental DOM delta. When the page may have changed outside an action, call takeSnapshot for a fresh baseline; call it again if an action delta reports overflow.',
+    '- Browser-changing actions already return their immediate incremental DOM delta. For delayed toasts, asynchronous UI updates, or requests that happened between tools, call takeSnapshot({mode:"changes"}); use getHttpRequests with the listed request IDs when request details are needed.',
+    '- A takeSnapshot result with nextCursor is only one page. If the needed evidence may be later, call takeSnapshot again with both its same mode and exact cursor before concluding the target is absent. Do not perform a browser action between snapshot pages.',
+    '- If an action result says "Post-action form validation failed" or domChanges.extra.validationErrors is non-empty, the requested operation failed. State the validation error, correct the named field, and do not continue or report success until it is resolved.',
     '- Use searchSnapshot to narrow the current DOM baseline when needed; it returns the same dom-* UID namespace as takeSnapshot. Prefer existing DOM deltas when they already contain the needed target.',
     '- Never conclude that a control or result is absent from one bounded observation. Take a fresh snapshot or screenshot when broader evidence is needed.',
     '- Never invent a room id, entity id, href, or navigation URL. Navigation targets and factual identifiers must come from the user, the current semantic DOM snapshot, a screenshot, or an observed network response.',
@@ -40,8 +42,8 @@ export function browserActionRules(screenshotAvailable = true) {
 
 export function currentSnapshotContextLine(browserChatMode: boolean) {
   return browserChatMode
-    ? 'No live page snapshot is preloaded. Call takeSnapshot({mode:"actionable",maxChars:10000}) when browser evidence is needed.'
-    : 'No initial page snapshot is included. Call takeSnapshot({mode:"actionable",maxChars:10000}) before choosing a browser UID action.';
+    ? 'No live page snapshot is preloaded. Call takeSnapshot({mode:"actionable"}) when browser evidence is needed.'
+    : 'No initial page snapshot is included. Call takeSnapshot({mode:"actionable"}) before choosing a browser UID action.';
 }
 
 export function screenshotObservationRule(screenshotAvailable = true) {

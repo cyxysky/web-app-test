@@ -1,7 +1,7 @@
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Dialog, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
 import { artifactPath } from '@/server/storage/paths';
 import {
   boundedNonNegativeIntegerEnv,
@@ -79,6 +79,10 @@ function unknownErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isAlreadyHandledJavaScriptDialogError(error: unknown) {
+  return /(?:no dialog is showing|dialog which is already handled)/i.test(unknownErrorMessage(error));
+}
+
 function stringifyDiagnosticValue(value: unknown) {
   if (typeof value === 'string') return value;
   try {
@@ -133,6 +137,13 @@ export type BrowserActionResult = {
     added: string[];
     updated: string[];
     removed: string[];
+    /** Non-actionable semantic changes and diagnostics observed with this delta. */
+    extra: {
+      added: string[];
+      updated: string[];
+      errors: string[];
+      validationErrors: string[];
+    };
     overflow: boolean;
   };
   autoSnapshot?: {
@@ -455,7 +466,20 @@ type BrowserUseDomDelta = {
   stateKey: string;
   added: BrowserUseVisibleDomSnapshot['items'];
   updated: BrowserUseVisibleDomSnapshot['items'];
+  extra: {
+    added: BrowserUseVisibleDomSnapshot['items'];
+    updated: BrowserUseVisibleDomSnapshot['items'];
+  };
   removedRefs: string[];
+  overflow: boolean;
+};
+
+type BrowserUseDomJournalDelta = {
+  epoch: number;
+  stateKey: string;
+  added: string[];
+  updated: string[];
+  removed: string[];
   overflow: boolean;
 };
 
@@ -480,6 +504,17 @@ export type BrowserDomObservation = {
 type BrowserSimplifiedDomTreeResult = {
   tree: string;
   observation: BrowserDomObservation;
+};
+
+type DomObservationPagination = {
+  id: string;
+  lines: string[];
+  mode: BrowserSnapshotView;
+  navigationSequence: number;
+  pageMaxChars: number;
+  pageStarts: number[];
+  page: Page;
+  url: string;
 };
 
 type AiDomRuntime = {
@@ -516,7 +551,9 @@ type AiDomRuntime = {
     preserveExistingRefs?: boolean;
   }) => BrowserUseVisibleDomSnapshot;
   visibleDomDelta: () => BrowserUseDomDelta;
+  journalDomDelta: () => BrowserUseDomJournalDelta;
   discardDomChanges: () => { epoch: number; overflow: boolean; discardedMutations: number };
+  discardDomJournal: () => { epoch: number; overflow: boolean; discardedMutations: number };
   elementText: (pathValue: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
   visibleDomPoint: (
     ref: string,
@@ -596,10 +633,13 @@ const aiDomMutationObserverScript = `(() => {
       }
       if (!meaningful) return;
       state.pendingMutations = state.pendingMutations || [];
+      state.journalMutations = state.journalMutations || [];
       for (const mutation of mutations) {
+        if (state.journalMutations.length >= 10000) state.journalOverflow = true;
+        else state.journalMutations.push(mutation);
         if (state.pendingMutations.length >= 500) {
           state.pendingOverflow = true;
-          break;
+          continue;
         }
         state.pendingMutations.push(mutation);
       }
@@ -724,6 +764,8 @@ type WindowWithAiDomRuntime = Window & {
     pendingMutations?: MutationRecord[];
     pendingMutationKeys?: WeakMap<Node, Set<string>>;
     pendingOverflow?: boolean;
+    journalMutations?: MutationRecord[];
+    journalOverflow?: boolean;
   };
   __browserUseVisibleDomState?: {
     elementToRef: WeakMap<Element, string>;
@@ -744,6 +786,7 @@ type ManualVerificationDetails = {
 
 type HttpRequestRecord = {
   id: string;
+  sequence: number;
   startedAt: string;
   method: string;
   url: string;
@@ -753,6 +796,18 @@ type HttpRequestRecord = {
   ok?: boolean;
   failed?: boolean;
   errorText?: string;
+};
+
+type InterActionChangeJournal = {
+  id: string;
+  page: Page;
+  startedAt: string;
+  requestStartSequence: number;
+  added: string[];
+  updated: string[];
+  removed: string[];
+  errors: string[];
+  overflow: boolean;
 };
 
 const manualVerificationUrlPattern = /captcha|security-check|safecheck|abnormal|robot|challenge/i;
@@ -997,10 +1052,13 @@ function installAiBrowserPageRuntime() {
       if (!meaningful) return;
       mutationState.pendingMutations = mutationState.pendingMutations || [];
       mutationState.pendingMutationKeys = mutationState.pendingMutationKeys || new WeakMap<Node, Set<string>>();
+      mutationState.journalMutations = mutationState.journalMutations || [];
       for (const mutation of mutations) {
+        if (mutationState.journalMutations.length >= 10000) mutationState.journalOverflow = true;
+        else mutationState.journalMutations.push(mutation);
         if (mutationState.pendingMutations.length >= 500) {
           mutationState.pendingOverflow = true;
-          break;
+          continue;
         }
         if (mutation.type !== 'childList') {
           const key = mutation.type === 'attributes' ? `attributes:${mutation.attributeName || ''}` : mutation.type;
@@ -1025,7 +1083,7 @@ function installAiBrowserPageRuntime() {
     });
   }
 
-  if (win.__aiDomRuntime?.version === 12) return;
+  if (win.__aiDomRuntime?.version === 14) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
@@ -2000,6 +2058,19 @@ function installAiBrowserPageRuntime() {
     };
   }
 
+  function isVisibleDomExtraElement(element: Element, signals: string[]) {
+    if (isVisibleDomSubtreeHidden(element) || !hasVisibleDomPointerEvents(element)) return false;
+    // `added` and `updated` remain the actionable channel. Extra deliberately
+    // carries only semantic context that is not an action candidate.
+    if (signals.length) return false;
+    const tag = visibleDomElementName(element);
+    if (new Set(['dd', 'details', 'dt', 'figcaption', 'label', 'legend', 'li', 'option', 'p', 'td', 'textarea', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']).has(tag)
+      && visibleDomTextContent(element)) return true;
+    if (new Set(['article', 'aside', 'div', 'fieldset', 'footer', 'form', 'header', 'main', 'nav', 'section', 'span']).has(tag)
+      && visibleDomOwnTextContent(element)) return true;
+    return visibleDomMeaningfulAttributes.some((name) => Boolean(visibleDomAttributeValue(element, name)));
+  }
+
   function visibleDomSnapshot(options: { maxChars: number; maxElements: number; preserveExistingRefs?: boolean; viewportClip?: BrowserUseViewportClip }) {
     const state = visibleDomState();
     if (!options.preserveExistingRefs) state.refToElement.clear();
@@ -2201,6 +2272,77 @@ function installAiBrowserPageRuntime() {
     return { epoch: mutationState.epoch, overflow, discardedMutations };
   }
 
+  function discardDomJournal() {
+    const discardedMutations = mutationState.journalMutations?.length || 0;
+    const overflow = Boolean(mutationState.journalOverflow);
+    mutationState.journalMutations = [];
+    mutationState.journalOverflow = false;
+    return { epoch: mutationState.epoch, overflow, discardedMutations };
+  }
+
+  function journalDomLine(element: Element) {
+    const tag = visibleDomElementName(element) || 'element';
+    const attrs = ['extra=true'];
+    for (const name of visibleDomRenderedAttributes) {
+      const value = visibleDomAttributeValue(element, name);
+      if (value) attrs.push(`${name}="${escapeVisibleDomText(value)}"`);
+    }
+    for (const name of visibleDomBooleanAttributes) {
+      if (element.hasAttribute(name)) attrs.push(`${name}="true"`);
+    }
+    const text = visibleDomTextContent(element, 400);
+    return `<${tag} ${attrs.join(' ')}>${text ? ` ${escapeVisibleDomText(text)}` : ''}`;
+  }
+
+  function journalDomDelta(): BrowserUseDomJournalDelta {
+    const pending = [...(mutationState.journalMutations || [])];
+    const overflow = Boolean(mutationState.journalOverflow);
+    mutationState.journalMutations = [];
+    mutationState.journalOverflow = false;
+    const added = new Set<string>();
+    const updated = new Set<string>();
+    const removed = new Set<string>();
+    let remainingNodes = 10000;
+    const asElement = (node: Node | null | undefined) => {
+      if (!node) return undefined;
+      if (node.nodeType === Node.ELEMENT_NODE) return node as Element;
+      return flatParentElement(node);
+    };
+    const collect = (node: Node, destination: Set<string>) => {
+      const root = asElement(node);
+      if (!root) return;
+      const stack = [root];
+      while (stack.length && remainingNodes > 0) {
+        const element = stack.pop()!;
+        remainingNodes -= 1;
+        if (isOverlay(element)) continue;
+        destination.add(journalDomLine(element));
+        const rootNode = shadowRootOf(element);
+        if (rootNode) for (const child of Array.from(rootNode.children).reverse()) stack.push(child);
+        for (const child of Array.from(element.children).reverse()) stack.push(child);
+      }
+    };
+    for (const mutation of pending) {
+      if (mutation.type === 'childList') {
+        for (const node of Array.from(mutation.addedNodes)) collect(node, added);
+        for (const node of Array.from(mutation.removedNodes)) collect(node, removed);
+        const target = asElement(mutation.target);
+        if (target && !isOverlay(target)) updated.add(journalDomLine(target));
+      } else {
+        const target = asElement(mutation.target);
+        if (target && !isOverlay(target)) updated.add(journalDomLine(target));
+      }
+    }
+    return {
+      epoch: mutationState.epoch,
+      stateKey: visibleDomState().instanceId,
+      added: [...added],
+      updated: [...updated],
+      removed: [...removed],
+      overflow: overflow || remainingNodes <= 0,
+    };
+  }
+
   function visibleDomDelta(): BrowserUseDomDelta {
     const state = visibleDomState();
     const pending = [...(mutationState.pendingMutations || [])];
@@ -2209,7 +2351,15 @@ function installAiBrowserPageRuntime() {
     mutationState.pendingMutationKeys = new WeakMap<Node, Set<string>>();
     mutationState.pendingOverflow = false;
     if (!pending.length) {
-      return { epoch: mutationState.epoch, stateKey: state.instanceId, added: [], updated: [], removedRefs: [], overflow };
+      return {
+        epoch: mutationState.epoch,
+        stateKey: state.instanceId,
+        added: [],
+        updated: [],
+        extra: { added: [], updated: [] },
+        removedRefs: [],
+        overflow,
+      };
     }
     const addedRoots = new Set<Element>();
     const updatedRoots = new Set<Element>();
@@ -2272,6 +2422,8 @@ function installAiBrowserPageRuntime() {
 
     const addedByRef = new Map<string, BrowserUseVisibleDomSnapshot['items'][number]>();
     const updatedByRef = new Map<string, BrowserUseVisibleDomSnapshot['items'][number]>();
+    const extraAddedByRef = new Map<string, BrowserUseVisibleDomSnapshot['items'][number]>();
+    const extraUpdatedByRef = new Map<string, BrowserUseVisibleDomSnapshot['items'][number]>();
     const hasAncestorRoot = (element: Element, roots: Set<Element>) => {
       let parent = flatParentElement(element);
       for (let guard = 0; parent && guard < 128; guard += 1) {
@@ -2280,7 +2432,11 @@ function installAiBrowserPageRuntime() {
       }
       return false;
     };
-    const inspect = (element: Element, destination: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>) => {
+    const inspect = (
+      element: Element,
+      destination: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>,
+      extraDestination: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>,
+    ) => {
       if (!element.isConnected || isOverlay(element) || isDisplayNone(element)) return;
       const signals = visibleDomInteractionSignals(element, hoverElements);
       if (signals.length && !isVisibleDomSubtreeHidden(element) && hasVisibleDomPointerEvents(element) && visibleDomClickablePoint(element, viewportClip)) {
@@ -2293,17 +2449,29 @@ function installAiBrowserPageRuntime() {
           path: pathOf(element) || '',
           ref,
         });
+      } else if (isVisibleDomExtraElement(element, signals)) {
+        const ref = visibleDomRef(element);
+        extraDestination.set(ref, {
+          ...visibleDomItem(element, ref, signals),
+          descriptor: descriptor(element),
+          path: pathOf(element) || '',
+          ref,
+        });
       } else {
         const ref = state.elementToRef.get(element);
         if (ref) removedRefs.add(ref);
       }
     };
-    const collectSubtree = (root: Element, destination: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>) => {
+    const collectSubtree = (
+      root: Element,
+      destination: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>,
+      extraDestination: Map<string, BrowserUseVisibleDomSnapshot['items'][number]>,
+    ) => {
       const stack: Element[] = [root];
       while (stack.length && remainingNodes > 0) {
         const element = stack.pop()!;
         remainingNodes -= 1;
-        inspect(element, destination);
+        inspect(element, destination, extraDestination);
         if (!element.isConnected || isOverlay(element) || isDisplayNone(element)) continue;
         const rootNode = shadowRootOf(element);
         if (rootNode) for (const child of Array.from(rootNode.children).reverse()) stack.push(child);
@@ -2312,14 +2480,14 @@ function installAiBrowserPageRuntime() {
     };
 
     for (const root of addedRoots) {
-      if (!hasAncestorRoot(root, addedRoots)) collectSubtree(root, addedByRef);
+      if (!hasAncestorRoot(root, addedRoots)) collectSubtree(root, addedByRef, extraAddedByRef);
       if (remainingNodes <= 0) break;
     }
     for (const root of updatedRoots) {
       if (hasAncestorRoot(root, addedRoots) || hasAncestorRoot(root, updatedRoots)) continue;
       if (remainingNodes <= 0) break;
       remainingNodes -= 1;
-      inspect(root, updatedByRef);
+      inspect(root, updatedByRef, extraUpdatedByRef);
     }
     for (const ref of addedByRef.keys()) removedRefs.delete(ref);
     for (const ref of removedRefs) state.refToElement.delete(ref);
@@ -2328,6 +2496,10 @@ function installAiBrowserPageRuntime() {
       stateKey: state.instanceId,
       added: [...addedByRef.values()],
       updated: [...updatedByRef.values()].filter((item) => !addedByRef.has(item.ref)),
+      extra: {
+        added: [...extraAddedByRef.values()],
+        updated: [...extraUpdatedByRef.values()].filter((item) => !extraAddedByRef.has(item.ref)),
+      },
       removedRefs: [...removedRefs],
       overflow,
     };
@@ -2423,7 +2595,7 @@ function installAiBrowserPageRuntime() {
   }
 
   win.__aiDomRuntime = {
-    version: 12,
+    version: 14,
     mutationState: () => ({ epoch: mutationState.epoch, lastMutationAt: mutationState.lastMutationAt }),
     isOverlay,
     isTraversable,
@@ -2448,6 +2620,8 @@ function installAiBrowserPageRuntime() {
     fullDomSnapshot,
     visibleDomDelta,
     discardDomChanges,
+    journalDomDelta,
+    discardDomJournal,
     elementText,
     visibleDomPoint,
     visibleDomText,
@@ -3366,9 +3540,12 @@ export class BrowserSession {
   private page?: Page;
   private consoleErrors: string[] = [];
   private networkErrors: string[] = [];
+  private domChangeErrors: string[] = [];
   private attachedPages = new WeakSet<Page>();
   private httpRequestsByPage = new WeakMap<Page, HttpRequestRecord[]>();
   private httpRequestByRequest = new WeakMap<Request, HttpRequestRecord>();
+  private httpRequestById = new Map<string, Request>();
+  private httpRequestSequence = 0;
   private lastScreenshotMetrics?: ScreenshotMetrics;
   private screenshotGenerationSequence = 0;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
@@ -3377,6 +3554,10 @@ export class BrowserSession {
   private domVisiblePublicIdByFrameLocalRef = new Map<string, string>();
   private domVisibleSnapshotKey?: string;
   private domVisibleNextPublicId = 1;
+  private domObservationPagination?: DomObservationPagination;
+  private domObservationPaginationSequence = 0;
+  private interActionChangeJournal?: InterActionChangeJournal;
+  private interActionChangeJournalSequence = 0;
   private lastScrollableAreas: ScrollableArea[] = [];
   private lastCandidateMarkerScreenshotPath?: string;
   private lastOriginalScreenshotPath?: string;
@@ -4147,7 +4328,24 @@ export class BrowserSession {
     });
     page.on('console', (message) => {
       const text = message.text();
-      if (message.type() === 'error' && !shouldIgnoreConsoleError(text)) this.consoleErrors.push(text);
+      if (message.type() === 'error' && !shouldIgnoreConsoleError(text)) {
+        this.consoleErrors.push(text);
+        this.recordDomChangeError('console', text);
+      }
+    });
+    page.on('pageerror', (error) => {
+      this.recordDomChangeError('page', unknownErrorMessage(error));
+    });
+    page.on('dialog', (dialog: Dialog) => {
+      // Playwright's automatic close path leaves a rejected promise behind when
+      // another CDP client has already handled this browser dialog. Handling it
+      // explicitly keeps that normal CDP race out of Next's unhandledRejection.
+      void dialog.dismiss().catch((error) => {
+        if (isAlreadyHandledJavaScriptDialogError(error)) return;
+        const message = `Could not dismiss JavaScript dialog: ${unknownErrorMessage(error)}`;
+        this.consoleErrors.push(message);
+        this.recordDomChangeError('dialog', message);
+      });
     });
     page.on('request', (request) => {
       this.recordHttpRequest(page, request);
@@ -4165,8 +4363,17 @@ export class BrowserSession {
       record.ok = false;
       record.errorText = errorText;
       if (shouldIgnoreNetworkFailure(request.url(), errorText)) return;
-      this.networkErrors.push(`${request.method()} ${request.url()} ${errorText}`);
+      const message = `${request.method()} ${request.url()} ${errorText}`;
+      this.networkErrors.push(message);
+      this.recordDomChangeError('network', message);
     });
+  }
+
+  private recordDomChangeError(source: 'console' | 'page' | 'dialog' | 'network', message: string) {
+    const normalized = String(message || '').trim();
+    if (!normalized) return;
+    this.domChangeErrors.push(`[${source}] ${normalized}`);
+    if (this.domChangeErrors.length > 100) this.domChangeErrors.splice(0, this.domChangeErrors.length - 100);
   }
 
   private recordHttpRequest(page: Page, request: Request) {
@@ -4175,6 +4382,7 @@ export class BrowserSession {
     const records = this.httpRequestsByPage.get(page) || [];
     const record: HttpRequestRecord = {
       id: `${Date.now().toString(36)}-${records.length + 1}`,
+      sequence: ++this.httpRequestSequence,
       startedAt: new Date().toISOString(),
       method: request.method(),
       url: request.url(),
@@ -4183,9 +4391,13 @@ export class BrowserSession {
     records.push(record);
     const rawMaxRecords = Number(process.env.BROWSER_HTTP_REQUEST_HISTORY_LIMIT || 400);
     const maxRecords = Math.max(50, Math.floor(Number.isFinite(rawMaxRecords) ? rawMaxRecords : 400));
-    if (records.length > maxRecords) records.splice(0, records.length - maxRecords);
+    if (records.length > maxRecords) {
+      const removed = records.splice(0, records.length - maxRecords);
+      for (const item of removed) this.httpRequestById.delete(item.id);
+    }
     this.httpRequestsByPage.set(page, records);
     this.httpRequestByRequest.set(request, record);
+    this.httpRequestById.set(record.id, request);
     return record;
   }
 
@@ -4835,16 +5047,97 @@ export class BrowserSession {
   }
 
   // 返回当前活动标签页最近的 HTTP 请求，供 AI 定位接口错误、状态码异常和静态资源问题。
-  async getCurrentTabHttpRequests(): Promise<BrowserActionResult> {
+  private async resetInterActionChangeJournal() {
+    const page = this.activePage;
+    this.interActionChangeJournal = {
+      id: `changes-${++this.interActionChangeJournalSequence}`,
+      page,
+      startedAt: new Date().toISOString(),
+      requestStartSequence: this.httpRequestSequence,
+      added: [],
+      updated: [],
+      removed: [],
+      errors: [],
+      overflow: false,
+    };
+    this.domChangeErrors = [];
+    await Promise.all(page.frames().map(async (frame) => {
+      await this.ensureBrowserPageRuntime(frame);
+      await frame.evaluate(() => {
+        const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+        return runtime?.discardDomJournal();
+      }).catch(() => undefined);
+    }));
+  }
+
+  private async readInterActionChangeJournal() {
+    if (!this.interActionChangeJournal || this.interActionChangeJournal.page !== this.activePage) {
+      await this.resetInterActionChangeJournal();
+    }
+    const journal = this.interActionChangeJournal!;
+    const mainFrame = this.activePage.mainFrame();
+    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER);
+    const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
+    const deltas = await Promise.all(frames.map(async (frame) => {
+      const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
+      if (frame !== mainFrame && framePath === undefined) return undefined;
+      await this.ensureBrowserPageRuntime(frame);
+      const delta = await frame.evaluate(() => {
+        const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+        return runtime?.journalDomDelta();
+      }).catch(() => undefined);
+      return delta ? { delta, framePath } : undefined;
+    }));
+    for (const entry of deltas) {
+      if (!entry) continue;
+      const prefix = entry.framePath ? `[iframe ${entry.framePath}] ` : '';
+      journal.added.push(...entry.delta.added.map((line) => `${prefix}${line}`));
+      journal.updated.push(...entry.delta.updated.map((line) => `${prefix}${line}`));
+      journal.removed.push(...entry.delta.removed.map((line) => `${prefix}${line}`));
+      journal.overflow ||= entry.delta.overflow;
+    }
+    journal.errors.push(...this.domChangeErrors.splice(0));
+    const requests = (this.httpRequestsByPage.get(this.activePage) || [])
+      .filter((record) => record.sequence > journal.requestStartSequence);
+    const requestLines = requests.map((record) => {
+      const outcome = record.failed
+        ? `failed=${record.errorText || 'unknown'}`
+        : record.status === undefined
+          ? 'pending'
+          : `status=${record.status}${record.ok === false ? ' failed' : ''}`;
+      return `request id=${record.id} method=${record.method} type=${record.resourceType} ${outcome} url=${record.url}`;
+    });
+    const lines = [
+      `Inter-action changes ${journal.id}: since ${journal.startedAt}.`,
+      `DOM added (${journal.added.length}):`,
+      ...journal.added.map((line) => `added ${line}`),
+      `DOM updated (${journal.updated.length}):`,
+      ...journal.updated.map((line) => `updated ${line}`),
+      `DOM removed (${journal.removed.length}):`,
+      ...journal.removed.map((line) => `removed ${line}`),
+      `Requests started in this window (${requests.length}); use getHttpRequests with request IDs for details:`,
+      ...requestLines,
+      ...(journal.errors.length ? [`Diagnostics (${journal.errors.length}):`, ...journal.errors] : []),
+      ...(journal.overflow ? ['Change journal overflowed; entries may be incomplete.'] : []),
+    ];
+    return { journal, lines };
+  }
+
+  async getCurrentTabHttpRequests(options: { ids?: string[] } = {}): Promise<BrowserActionResult> {
     const rawLimit = Number(process.env.AI_HTTP_REQUEST_TOOL_LIMIT || 80);
     const limit = Math.max(1, Math.floor(Number.isFinite(rawLimit) ? rawLimit : 80));
-    const records = (this.httpRequestsByPage.get(this.activePage) || []).slice(-limit);
+    const requestedIds = new Set((options.ids || []).filter((id) => typeof id === 'string' && id));
+    const detailed = requestedIds.size > 0;
+    const records = detailed
+      ? (this.httpRequestsByPage.get(this.activePage) || []).filter((record) => requestedIds.has(record.id))
+      : (this.httpRequestsByPage.get(this.activePage) || []).slice(-limit);
     if (!records.length) {
-      return { ok: true, actual: 'Current tab has no captured HTTP requests yet.' };
+      return { ok: true, actual: detailed ? 'None of the requested HTTP request IDs are available in the current tab history.' : 'Current tab has no captured HTTP requests yet.' };
     }
-    return {
-      ok: true,
-      actual: JSON.stringify(records.map((record) => ({
+    const detailLimit = Math.max(1000, Math.floor(Number(process.env.AI_HTTP_REQUEST_DETAIL_MAX_CHARS || 12000)));
+    const output = await Promise.all(records.map(async (record) => {
+      const summary = {
+        id: record.id,
         time: record.startedAt,
         method: record.method,
         url: record.url,
@@ -4854,7 +5147,25 @@ export class BrowserSession {
         ok: record.ok ?? null,
         failed: record.failed || false,
         errorText: record.errorText || null,
-      })), null, 2),
+      } as Record<string, unknown>;
+      if (!detailed) return summary;
+      const request = this.httpRequestById.get(record.id);
+      if (!request) return { ...summary, detailUnavailable: true };
+      const requestBody = request.postData();
+      if (requestBody) summary.requestBody = compactDiagnosticText(requestBody, detailLimit);
+      if (record.status !== undefined) {
+        const response = await request.response().catch(() => null);
+        const contentType = response?.headers()['content-type'] || '';
+        if (response && /(?:json|text|xml|javascript|graphql|urlencoded)/i.test(contentType)) {
+          const responseBody = await response.text().catch(() => '');
+          if (responseBody) summary.responseBody = compactDiagnosticText(responseBody, detailLimit);
+        }
+      }
+      return summary;
+    }));
+    return {
+      ok: true,
+      actual: JSON.stringify(output, null, 2),
     };
   }
 
@@ -4903,8 +5214,9 @@ export class BrowserSession {
   // 等待固定时间，给短动画、下拉面板或异步更新留出渲染时间。
   async wait(ms = 800): Promise<BrowserActionResult> {
     const previousGeneration = this.snapshotGeneration;
-    await this.waitForStableViewport(Math.min(Math.max(ms, 100), 5000));
-    return this.completeActionWithDomChanges(`Waited ${ms}ms.`, previousGeneration);
+    const waitMs = Number.isFinite(ms) ? Math.max(0, Math.ceil(ms)) : 800;
+    await this.waitForStableViewport(waitMs);
+    return this.completeActionWithDomChanges(`Waited ${waitMs}ms.`, previousGeneration);
   }
 
   // 等待用户手动完成验证码/安全校验，超时后返回阻塞信息。
@@ -5060,15 +5372,20 @@ export class BrowserSession {
   }
 
   private async waitForStableViewport(ms: number) {
-    try {
-      await this.activePage.waitForTimeout(ms);
-    } catch (error) {
-      if (!this.isTargetClosedError(error)) throw error;
-      const replacement = this.sessionPages()[0];
-      if (!replacement) throw error;
-      this.page = replacement;
-      this.attachPageListeners(replacement);
-      await this.activePage.waitForTimeout(Math.min(ms, 100)).catch(() => undefined);
+    const waitMs = Math.max(0, Math.ceil(ms));
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      const remainingMs = Math.max(0, deadline - Date.now());
+      try {
+        await this.activePage.waitForTimeout(remainingMs);
+        return;
+      } catch (error) {
+        if (!this.isTargetClosedError(error)) throw error;
+        const replacement = this.sessionPages()[0];
+        if (!replacement) throw error;
+        this.page = replacement;
+        this.attachPageListeners(replacement);
+      }
     }
   }
 
@@ -6511,6 +6828,9 @@ export class BrowserSession {
     options: { postNavigation?: boolean } = {},
   ): Promise<BrowserActionResult> {
     this.lastScreenshotMetrics = undefined;
+    // A cursor represents one immutable pre-action DOM baseline. Even an
+    // action with no observed mutation can change focus, overlays, or state.
+    this.domObservationPagination = undefined;
     try {
       const currentPage = this.activePage;
       const postNavigation = options.postNavigation === true || Boolean(previousGeneration && (
@@ -6529,22 +6849,32 @@ export class BrowserSession {
         this.lastDomNodeReferences.clear();
         this.domVisiblePublicIdByFrameLocalRef.clear();
         this.domVisibleSnapshotKey = undefined;
-        return {
+        const result = {
           ok: true,
           actual: `${actual}${stabilityNote} Navigation changed the document. DOM UID registry was cleared; call takeSnapshot when you need targets in the new document.`,
         };
+        await this.resetInterActionChangeJournal();
+        return result;
       }
       const changes = await this.readDomChanges();
-      return {
+      const validationErrors = changes.domChanges?.extra.validationErrors || [];
+      const validationNote = validationErrors.length
+        ? ` Post-action form validation failed: ${validationErrors.slice(0, 3).join(' | ')}. Treat this operation as failed; fix the stated fields before continuing.`
+        : '';
+      const result = {
         ok: true,
-        actual: `${actual}${stabilityNote}`,
+        actual: `${actual}${stabilityNote}${validationNote}`,
         domChanges: changes.domChanges,
       };
+      await this.resetInterActionChangeJournal();
+      return result;
     } catch (error) {
-      return {
+      const result = {
         ok: true,
         actual: `${actual} DOM incremental change read was unavailable: ${unknownErrorMessage(error)}. Call takeSnapshot if fresh page state is required.`,
       };
+      await this.resetInterActionChangeJournal().catch(() => undefined);
+      return result;
     }
   }
 
@@ -7469,15 +7799,22 @@ export class BrowserSession {
     return '  '.repeat(this.domObservationDepth(pathValue, framePath));
   }
 
-  private async readSimplifiedDomTree(options: { scope?: 'visible' | 'full'; timings?: Record<string, number> } = {}): Promise<BrowserSimplifiedDomTreeResult> {
+  private async readSimplifiedDomTree(options: {
+    scope?: 'visible' | 'full';
+    timings?: Record<string, number>;
+    maxChars?: number;
+    maxElements?: number;
+  } = {}): Promise<BrowserSimplifiedDomTreeResult> {
     const startedAt = Date.now();
     const fullScope = options.scope === 'full';
-    const maxElements = fullScope
+    const defaultMaxElements = fullScope
       ? numericLimitFromEnv('DOM_CUA_FULL_MAX_ELEMENTS', numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 600))
       : numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 200);
-    const maxChars = fullScope
+    const defaultMaxChars = fullScope
       ? numericLimitFromEnv('DOM_CUA_FULL_MAX_CHARS', numericLimitFromEnv('DOM_CUA_MAX_CHARS', 60000))
       : numericLimitFromEnv('DOM_CUA_MAX_CHARS', 20000);
+    const maxElements = Math.max(1, Math.floor(Number(options.maxElements) || defaultMaxElements));
+    const maxChars = Math.max(1, Math.floor(Number(options.maxChars) || defaultMaxChars));
     const addTiming = (name: string, startedAt: number) => {
       if (options.timings) options.timings[name] = (options.timings[name] || 0) + Date.now() - startedAt;
     };
@@ -7797,28 +8134,192 @@ export class BrowserSession {
     });
   }
 
+  private domObservationExtraLine(item: BrowserUseVisibleDomSnapshot['items'][number]) {
+    // Extra nodes are context only. Do not expose their page-local node id as a
+    // uid, because callers must not attempt an action through this channel.
+    return item.line.replace(`node_id=${item.ref}`, 'extra=true');
+  }
+
+  private domObservationValidationError(line: string) {
+    if (!/(?:\bclass="[^"]*\b(?:error|errors|field-error|validation-error|aui-message-error)\b|\brole="alert"|\baria-invalid="true")/i.test(line)) return undefined;
+    const text = line.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    return text || line;
+  }
+
+  private domObservationCursor(record: DomObservationPagination, index: number) {
+    return Buffer.from(JSON.stringify({ id: record.id, index, mode: record.mode }), 'utf8').toString('base64url');
+  }
+
+  private parseDomObservationCursor(cursor: string) {
+    try {
+      const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<{ id: string; index: number; mode: string }>;
+      if (typeof value.id !== 'string' || !value.id || !Number.isFinite(value.index) || !['actionable', 'full', 'text', 'changes'].includes(value.mode || '')) return undefined;
+      return {
+        id: value.id,
+        index: Math.max(0, Math.floor(value.index!)),
+        mode: value.mode as DomObservationPagination['mode'],
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private domObservationPageCharLimit(mode: DomObservationPagination['mode']) {
+    return mode === 'full' ? 40000 : 20000;
+  }
+
+  private domObservationPageStarts(lines: string[], maxChars: number) {
+    const starts = [0];
+    let chars = 0;
+    let entries = 0;
+    for (let index = 0; index < lines.length; index += 1) {
+      const addition = lines[index].length + (entries ? 1 : 0);
+      if (entries && chars + addition > maxChars) {
+        starts.push(index);
+        chars = 0;
+        entries = 0;
+      }
+      chars += lines[index].length + (entries ? 1 : 0);
+      entries += 1;
+    }
+    return starts;
+  }
+
+  private domObservationPage(record: DomObservationPagination, startIndex: number) {
+    const maxChars = record.pageMaxChars;
+    const lines: string[] = [];
+    let chars = 0;
+    let nextIndex = Math.min(startIndex, record.lines.length);
+    for (let index = nextIndex; index < record.lines.length; index += 1) {
+      const line = record.lines[index];
+      const addition = line.length + (lines.length ? 1 : 0);
+      if (lines.length && chars + addition > maxChars) break;
+      lines.push(line);
+      chars += addition;
+      nextIndex = index + 1;
+    }
+    const content = lines.join('\n');
+    return {
+      content,
+      contentCharLength: content.length,
+      hasMore: nextIndex < record.lines.length,
+      nextCursor: nextIndex < record.lines.length ? this.domObservationCursor(record, nextIndex) : undefined,
+      pageNumber: Math.max(1, record.pageStarts.indexOf(startIndex) + 1),
+      returnedEntries: Math.max(0, nextIndex - startIndex),
+      startIndex,
+      totalPages: record.pageStarts.length,
+      totalEntries: record.lines.length,
+    };
+  }
+
   /**
    * Read the lightweight DOM-observation snapshot used as the baseline for
    * incremental MutationObserver updates. It intentionally avoids CDP
    * DOMSnapshot/AX collection, which is reserved for explicit legacy search
    * tools and is never run after every action.
    */
-  async readDomObservationSnapshot(options: { mode?: 'actionable' | 'full' | 'text' } = {}) {
+  async readDomObservationSnapshot(options: { cursor?: string; mode?: BrowserSnapshotView } = {}) {
     const startedAt = Date.now();
-    const result = await this.readSimplifiedDomTree({ scope: options.mode === 'full' ? 'full' : 'visible' });
-    const source = options.mode === 'text'
+    const cursor = options.cursor ? this.parseDomObservationCursor(options.cursor) : undefined;
+    if (options.cursor && !cursor) throw new Error('Invalid DOM-observation snapshot cursor. Capture a fresh takeSnapshot instead.');
+
+    if (cursor) {
+      if (!options.mode) throw new Error('Snapshot continuation requires the same explicit mode together with cursor.');
+      const record = this.domObservationPagination;
+      if (!record || record.id !== cursor.id || record.mode !== cursor.mode) {
+        throw new Error('The DOM-observation snapshot cursor is no longer available. Capture a fresh takeSnapshot instead.');
+      }
+      if (record.mode !== 'changes' && (record.page !== this.activePage || record.url !== this.activePage.url() || record.navigationSequence !== (this.navigationSequenceByPage.get(this.activePage) || 0))) {
+        this.domObservationPagination = undefined;
+        throw new Error('The page changed after the first snapshot page. Capture a fresh takeSnapshot instead.');
+      }
+      if (options.mode && options.mode !== cursor.mode) {
+        throw new Error(`Snapshot cursor mode is ${cursor.mode}; do not change mode while paging.`);
+      }
+      if (record.mode !== 'changes') {
+        const changes = await this.readDomChanges();
+        const changed = Boolean(changes.domChanges && (
+          changes.domChanges.added.length
+          || changes.domChanges.updated.length
+          || changes.domChanges.removed.length
+          || changes.domChanges.extra.added.length
+          || changes.domChanges.extra.updated.length
+        ));
+        if (changed || changes.domChanges?.overflow) {
+          this.domObservationPagination = undefined;
+          throw new Error('The page changed after the first snapshot page. Capture a fresh takeSnapshot instead.');
+        }
+      }
+      const page = this.domObservationPage(record, cursor.index);
+      return {
+        ...page,
+        mode: record.mode,
+        pageSummary: record.mode === 'changes'
+          ? `Inter-action changes: page ${page.pageNumber}/${page.totalPages}, entries ${page.startIndex + 1}-${page.startIndex + page.returnedEntries}/${page.totalEntries}.`
+          : `DOM snapshot ${record.mode}: page ${page.pageNumber}/${page.totalPages}, entries ${page.startIndex + 1}-${page.startIndex + page.returnedEntries}/${page.totalEntries}.`,
+        nodeCount: this.lastDomNodeReferences.size,
+        actionableCount: [...this.lastDomNodeReferences.values()].filter((reference) => reference.interactive).length,
+        timings: { readDomObservationMs: Date.now() - startedAt },
+      };
+    }
+
+    const mode = options.mode || 'actionable';
+    if (mode === 'changes') {
+      const changes = await this.readInterActionChangeJournal();
+      const record: DomObservationPagination = {
+        id: `dom-observation-${++this.domObservationPaginationSequence}`,
+        lines: changes.lines,
+        mode,
+        navigationSequence: this.navigationSequenceByPage.get(this.activePage) || 0,
+        pageMaxChars: this.domObservationPageCharLimit(mode),
+        pageStarts: this.domObservationPageStarts(changes.lines, this.domObservationPageCharLimit(mode)),
+        page: this.activePage,
+        url: this.activePage.url(),
+      };
+      this.domObservationPagination = record;
+      const page = this.domObservationPage(record, 0);
+      return {
+        ...page,
+        mode,
+        pageSummary: `Inter-action changes ${changes.journal.id}: page ${page.pageNumber}/${page.totalPages}, entries ${page.startIndex + 1}-${page.startIndex + page.returnedEntries}/${page.totalEntries}.`,
+        nodeCount: 0,
+        actionableCount: 0,
+        timings: { readDomObservationMs: Date.now() - startedAt },
+      };
+    }
+
+    const maxElements = numericLimitFromEnv('DOM_CUA_PAGED_MAX_ELEMENTS', 10000);
+    const maxChars = numericLimitFromEnv('DOM_CUA_PAGED_MAX_CHARS', 1000000);
+    const result = await this.readSimplifiedDomTree({
+      scope: mode === 'full' ? 'full' : 'visible',
+      maxChars,
+      maxElements,
+    });
+    const source = mode === 'text'
       ? result.observation.text
-      : options.mode === 'full'
+      : mode === 'full'
         ? result.observation.tree
         : result.observation.actions;
-    const content = source.replaceAll(/\bnode_id=/g, 'uid=');
+    const lines = source.replaceAll(/\bnode_id=/g, 'uid=').split('\n');
+    const record: DomObservationPagination = {
+      id: `dom-observation-${++this.domObservationPaginationSequence}`,
+      lines,
+      mode,
+      navigationSequence: this.navigationSequenceByPage.get(this.activePage) || 0,
+      pageMaxChars: this.domObservationPageCharLimit(mode),
+      pageStarts: this.domObservationPageStarts(lines, this.domObservationPageCharLimit(mode)),
+      page: this.activePage,
+      url: this.activePage.url(),
+    };
+    this.domObservationPagination = record;
     // Establish the returned snapshot as the delta baseline without walking
     // historical page-load mutations. A queue discard is intentionally O(1).
     await this.discardDomChanges();
+    const page = this.domObservationPage(record, 0);
     return {
-      content,
-      contentCharLength: content.length,
-      mode: options.mode || 'actionable',
+      ...page,
+      mode,
+      pageSummary: `DOM snapshot ${mode}: page ${page.pageNumber}/${page.totalPages}, entries ${page.startIndex + 1}-${page.startIndex + page.returnedEntries}/${page.totalEntries}.`,
       nodeCount: result.observation.domNodeCount,
       actionableCount: result.observation.interactiveNodeCount,
       timings: { ...result.observation.timings, readDomObservationMs: Date.now() - startedAt },
@@ -7837,6 +8338,9 @@ export class BrowserSession {
     const added: string[] = [];
     const updated: string[] = [];
     const removed: string[] = [];
+    const extraAdded: string[] = [];
+    const extraUpdated: string[] = [];
+    const validationErrors = new Set<string>();
     let epoch = 0;
     let overflow = false;
 
@@ -7865,18 +8369,42 @@ export class BrowserSession {
         const reference = this.domObservationReference(delta.stateKey, item, framePath, frameUrl);
         this.lastDomNodeReferences.set(reference.id, reference);
         added.push(reference.line);
+        const validationError = this.domObservationValidationError(reference.line);
+        if (validationError) validationErrors.add(validationError);
       }
       for (const item of delta.updated) {
         const reference = this.domObservationReference(delta.stateKey, item, framePath, frameUrl);
         this.lastDomNodeReferences.set(reference.id, reference);
         updated.push(reference.line);
+        const validationError = this.domObservationValidationError(reference.line);
+        if (validationError) validationErrors.add(validationError);
+      }
+      for (const item of delta.extra.added) {
+        const line = this.domObservationExtraLine(item);
+        extraAdded.push(line);
+        const validationError = this.domObservationValidationError(line);
+        if (validationError) validationErrors.add(validationError);
+      }
+      for (const item of delta.extra.updated) {
+        const line = this.domObservationExtraLine(item);
+        extraUpdated.push(line);
+        const validationError = this.domObservationValidationError(line);
+        if (validationError) validationErrors.add(validationError);
       }
     }
+    const extraErrors = this.domChangeErrors.splice(0);
 
     return {
       ok: true,
       actual: 'DOM incremental changes captured.',
-      domChanges: { epoch, added, updated, removed, overflow },
+      domChanges: {
+        epoch,
+        added,
+        updated,
+        removed,
+        extra: { added: extraAdded, updated: extraUpdated, errors: extraErrors, validationErrors: [...validationErrors] },
+        overflow,
+      },
     };
   }
 
@@ -7886,6 +8414,7 @@ export class BrowserSession {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
       return runtime?.discardDomChanges();
     }).catch(() => undefined)));
+    this.domChangeErrors = [];
   }
 
   private intersectViewportClip(left: BrowserUseViewportClip, right: BrowserUseViewportClip) {

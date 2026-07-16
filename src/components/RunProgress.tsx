@@ -115,11 +115,10 @@ const toolDefinitions: ToolDefinition[] = [
     name: 'takeSnapshot',
     label: '获取页面快照',
     mode: 'dom',
-    template: { mode: 'actionable', maxChars: 10000 },
+    template: { mode: 'actionable' },
     fields: [
-      { key: 'mode', label: '快照视图', kind: 'select', options: [{ label: '可操作节点', value: 'actionable' }, { label: '完整结构', value: 'full' }, { label: '页面文本', value: 'text' }] },
+      { key: 'mode', label: '快照视图', kind: 'select', options: [{ label: '可操作节点', value: 'actionable' }, { label: '完整结构', value: 'full' }, { label: '页面文本', value: 'text' }, { label: '交互间变更', value: 'changes' }] },
       { key: 'cursor', label: '继续游标', kind: 'text' },
-      { key: 'maxChars', label: '单段最大字符', kind: 'number' },
     ],
   },
   {

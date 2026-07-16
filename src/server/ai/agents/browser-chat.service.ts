@@ -136,6 +136,7 @@ type BrowserChatRuntimeState = {
   toolConfirmations: Map<string, {
     sessionId: string;
     resolve: (decision: BrowserToolConfirmationDecision) => void;
+    promise: Promise<BrowserToolConfirmationDecision>;
   }>;
   pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
   sessionFileCache: Map<string, { mtimeMs: number; size: number; snapshot: BrowserChatSessionSnapshot }>;
@@ -151,6 +152,7 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
   toolConfirmations: new Map<string, {
     sessionId: string;
     resolve: (decision: BrowserToolConfirmationDecision) => void;
+    promise: Promise<BrowserToolConfirmationDecision>;
   }>(),
   pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   sessionFileCache: new Map<string, { mtimeMs: number; size: number; snapshot: BrowserChatSessionSnapshot }>(),
@@ -2505,6 +2507,21 @@ function requestBrowserChatToolConfirmation(
   abortSignal?: AbortSignal,
 ): Promise<BrowserToolConfirmationDecision> {
   if (abortSignal?.aborted) return Promise.resolve('cancelled');
+  const existing = session.pendingToolConfirmation;
+  const existingResolver = existing ? toolConfirmations.get(existing.id) : undefined;
+  const inputSignature = toolConfirmationInputSignature(request.input);
+  if (
+    existing
+    && existingResolver?.sessionId === session.id
+    && existing.messageId === assistantMessageId
+    && existing.toolName === request.toolName
+    && existing.inputSignature === inputSignature
+  ) {
+    // A transient upstream retry can replay the same tool call while the user is
+    // deciding. Reuse that decision instead of converting the original request
+    // into a false "cancelled" tool result and showing a second confirmation.
+    return existingResolver.promise;
+  }
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);
   const confirmationId = id('confirm');
@@ -2514,15 +2531,17 @@ function requestBrowserChatToolConfirmation(
     messageId: assistantMessageId,
     stepIndex: request.stepIndex,
     toolName: request.toolName,
-    inputSignature: toolConfirmationInputSignature(request.input),
+    inputSignature,
     reason: request.reason ? compactText(request.reason, 300) : undefined,
     prompt: compactText(request.prompt || `请确认是否执行工具 ${request.toolName}`, 500),
     requestedAt,
   };
 
-  return new Promise((resolve) => {
+  let finish!: (decision: BrowserToolConfirmationDecision) => void;
+  let onAbort!: () => void;
+  const decisionPromise = new Promise<BrowserToolConfirmationDecision>((resolve) => {
     let settled = false;
-    const finish = (decision: BrowserToolConfirmationDecision) => {
+    finish = (decision: BrowserToolConfirmationDecision) => {
       if (settled) return;
       settled = true;
       toolConfirmations.delete(confirmationId);
@@ -2538,16 +2557,18 @@ function requestBrowserChatToolConfirmation(
       }
       resolve(decision);
     };
-    const onAbort = () => finish('cancelled');
-    toolConfirmations.set(confirmationId, { sessionId: session.id, resolve: finish });
+    onAbort = () => finish('cancelled');
     session.pendingToolConfirmation = pending;
     appendLog(session, 'tool:confirmation:pending', `工具 ${request.toolName} 等待用户确认。`, {
       stepIndex: request.stepIndex,
       messageId: assistantMessageId,
       details: { confirmation: pending, input: request.input },
     });
-    abortSignal?.addEventListener('abort', onAbort, { once: true });
   });
+  toolConfirmations.set(confirmationId, { sessionId: session.id, resolve: finish, promise: decisionPromise });
+  abortSignal?.addEventListener('abort', onAbort, { once: true });
+  if (abortSignal?.aborted) onAbort();
+  return decisionPromise;
 }
 
 export function resolveBrowserChatToolConfirmation(
@@ -2691,7 +2712,14 @@ async function runBrowserChatMessage(
             }));
           }
           session.updatedAt = now();
-          persistAndNotify(session.id, { defer: true });
+          // A tool trace is reported before its browser action begins. This state must
+          // reach the session endpoint synchronously: realtime refreshes hydrate from
+          // the persisted snapshot, so a deferred write makes fast follow-up tools
+          // appear only after they have already completed.
+          const hasRunningTool = (step.tools || []).some((tool) => tool.ok === undefined);
+          persistAndNotify(session.id, hasRunningTool
+            ? { mergeFromDisk: false }
+            : { defer: true });
         },
         onDebug: (event) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
