@@ -1531,19 +1531,6 @@ select {
 .ui-liquid-glass-bubble--small { height: 3.788%; width: 3.788%; }
 .ui-liquid-glass-bubble--large { height: 6.818%; width: 6.818%; }
 
-.ui-liquid-glass-glint {
-  background: rgba(255, 255, 255, .78);
-  border-radius: 50%;
-  filter: blur(.4px);
-  height: 6.061%;
-  left: 31.818%;
-  position: absolute;
-  top: 25%;
-  transform: rotate(-36deg);
-  width: 15.152%;
-  z-index: 3;
-}
-
 @keyframes ui-liquid-glass-water-breathe {
   0%, 100% { transform: translateY(5%); }
   50% { transform: translateY(-3.5%); }
