@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { generateTestCase } from '@/server/ai/agents/test-case-generator.agent';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 import { richTextToPlainText } from '@/lib/rich-text';
 
 export async function POST(request: NextRequest) {

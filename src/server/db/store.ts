@@ -1,25 +1,22 @@
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
-import { join as pathJoin } from 'node:path';
 import { defaultModelByProvider, defaultModelForProvider, modelListForProvider, modelProviderDefinitions, modelProviderDefinition, runtimeEnvDefinitions, runtimeEnvKeys } from '@/config/settings';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RunDebugEvent, RunScheduleRecord, RuntimeEnvRecord, SkillContent, SkillRecord, StepExecutionResult, TaskLedgerItem, TestCaseContent, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
-import { sleepSync, writeJsonFileAtomic } from '@/server/storage/atomic-json';
 import {
-  appConfigFilePath,
-  targetTestCaseFilePath,
-  targetTestCasesDir,
-  targetTestMetadataFilePath,
-  targetTestRunFilePath,
-  targetTestRunsDir,
-} from '@/server/storage/paths';
+  readConfigRecord,
+  readRunSchedules,
+  readRuntimeMeta,
+  readSkills,
+  readTestCases,
+  readTestGroups,
+  readTestRuns,
+  replaceTestCaseRecords,
+  replaceTestRuns,
+  writeConfigRecord,
+  writeRuntimeMeta,
+} from '@/server/storage/sqlite-record-store';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
-const configPath = appConfigFilePath();
-const targetTestMetadataPath = targetTestMetadataFilePath();
-const targetCasesDir = targetTestCasesDir();
-const targetRunsDir = targetTestRunsDir();
-
 function notifyRunUpdate(runId: string, run: TestRunRecord) {
   publishRefreshEvent({ entityType: 'run', id: runId, updatedAt: run.endedAt || run.startedAt || now() });
 }
@@ -333,7 +330,7 @@ function buildMemory(steps: StepExecutionResult[], previous?: NonNullable<NonNul
   };
 }
 
-// 原子写入本地 JSON 数据文件，避免运行中断时写出半截内容。
+// 规范化持久化记录，底层 SQLite 写入由事务保证原子性。
 function taskLedgerKey(item: TaskLedgerItem) {
   return item.id || `${item.dimensionId}:${item.status || ''}:${item.title}`.toLowerCase();
 }
@@ -392,38 +389,6 @@ function normalizeSkillRecord(record: SkillRecord): SkillRecord {
   };
 }
 
-// 读取本地存储数据；文件不存在时初始化默认数据。
-function seedConfigData(): ConfigStoreData {
-  return { runtimeEnv: [] };
-}
-
-function seedTargetTestMetadataData(): TargetTestMetadataStoreData {
-  return { groups: [], skills: [], schedules: [] };
-}
-
-function isObjectRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function readJsonData<T>(filePath: string, seed: () => T, normalize: (data: Partial<T>) => T): T {
-  if (!existsSync(filePath)) {
-    const initial = seed();
-    writeJsonFileAtomic(filePath, initial);
-    return initial;
-  }
-
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      return normalize(JSON.parse(readFileSync(filePath, 'utf8')) as Partial<T>);
-    } catch (error) {
-      lastError = error;
-      sleepSync(25);
-    }
-  }
-  throw lastError;
-}
-
 function normalizeConfigData(data: Partial<ConfigStoreData>): ConfigStoreData {
   return {
     runtimeEnv: data.runtimeEnv || [],
@@ -439,88 +404,39 @@ function normalizeTargetTestMetadataData(data: Partial<TargetTestMetadataStoreDa
   };
 }
 
-function readJsonRecordFile<T>(filePath: string, isRecord: (value: unknown) => value is T): T | undefined {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      const data = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
-      return isRecord(data) ? data : undefined;
-    } catch (error) {
-      lastError = error;
-      sleepSync(25);
-    }
-  }
-  throw lastError;
-}
-
-function readRecordDirectory<T>(directory: string, isRecord: (value: unknown) => value is T) {
-  if (!existsSync(directory)) return [] as T[];
-  return readdirSync(directory, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
-    .map((entry) => readJsonRecordFile(pathJoin(directory, entry.name), isRecord))
-    .filter((item): item is T => Boolean(item));
-}
-
-function syncRecordDirectory<T extends { id: string }>(
-  directory: string,
-  records: T[],
-  filePathForId: (id: string) => string,
-) {
-  const keep = new Set(records.map((record) => record.id));
-  for (const record of records) {
-    writeJsonFileAtomic(filePathForId(record.id), record);
-  }
-  if (!existsSync(directory)) return;
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-    const filePath = pathJoin(directory, entry.name);
-    const record = readJsonRecordFile(filePath, (value): value is T => isObjectRecord(value) && typeof value.id === 'string');
-    if (!record || !keep.has(record.id)) rmSync(filePath, { force: true });
-  }
-}
-
-function isTestCaseRecord(value: unknown): value is TestCaseRecord {
-  return isObjectRecord(value) && typeof value.id === 'string';
-}
-
-function isTestRunRecord(value: unknown): value is TestRunRecord {
-  return isObjectRecord(value) && typeof value.id === 'string';
-}
-
 function readConfigData() {
-  return readJsonData(configPath, seedConfigData, normalizeConfigData);
+  return normalizeConfigData(readConfigRecord() as Partial<ConfigStoreData>);
 }
 
 function writeConfigData(data: Partial<ConfigStoreData>) {
-  writeJsonFileAtomic(configPath, normalizeConfigData(data));
+  writeConfigRecord(normalizeConfigData(data));
 }
 
 function readTargetTestCaseData() {
-  const shouldSeedDefaultCase = !existsSync(targetTestMetadataPath) && !existsSync(targetCasesDir);
-  const metadata = readJsonData(targetTestMetadataPath, seedTargetTestMetadataData, normalizeTargetTestMetadataData);
-  if (shouldSeedDefaultCase) {
-    writeJsonFileAtomic(targetTestCaseFilePath(seedRecord.id), seedRecord);
-  }
-  return {
-    testCases: readRecordDirectory(targetCasesDir, isTestCaseRecord),
-    ...metadata,
+  const data = {
+    testCases: readTestCases(),
+    groups: readTestGroups(),
+    skills: readSkills().map(normalizeSkillRecord),
+    schedules: readRunSchedules(),
   };
+  if (readRuntimeMeta('initial-test-case-seed') === 'complete') return data;
+  const seeded = { ...data, testCases: data.testCases.length ? data.testCases : [seedRecord] };
+  replaceTestCaseRecords(seeded);
+  writeRuntimeMeta('initial-test-case-seed', 'complete');
+  return seeded;
 }
 
 function writeTargetTestCaseData(data: Partial<TargetTestCaseStoreData>) {
   const metadata = normalizeTargetTestMetadataData(data);
-  writeJsonFileAtomic(targetTestMetadataPath, metadata);
-  syncRecordDirectory(targetCasesDir, data.testCases || [], targetTestCaseFilePath);
+  replaceTestCaseRecords({ testCases: data.testCases || [], ...metadata });
 }
 
 function readTargetRunData() {
-  return {
-    runs: readRecordDirectory(targetRunsDir, isTestRunRecord),
-  };
+  return { runs: readTestRuns() };
 }
 
 function writeTargetRunData(data: Partial<TargetRunStoreData>) {
-  syncRecordDirectory(targetRunsDir, data.runs || [], targetTestRunFilePath);
+  replaceTestRuns(data.runs || []);
 }
 
 export const store = {

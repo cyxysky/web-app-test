@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { createBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
 import { startScheduler } from '@/server/ai/agents/test-runner.service';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 import {
   createEmbedToken,
   embedErrorJson,

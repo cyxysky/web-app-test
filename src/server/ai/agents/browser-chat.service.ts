@@ -1,5 +1,4 @@
 ﻿import { randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
@@ -22,17 +21,16 @@ import {
 } from '@/server/ai/personal-memory';
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
 import type { ModelProvider, RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
-import { writeTextFileAtomic } from '@/server/storage/atomic-json';
 import {
-  artifactPath as resolveArtifactPath,
-  browserChatSessionFilePath,
-  browserChatSessionLogFilePath,
-  browserChatSessionSummariesDir,
-  browserChatSessionSummaryFilePath,
-  browserChatSessionsDir,
-} from '@/server/storage/paths';
+  deleteBrowserChatSessionRecord,
+  readBrowserChatLogs,
+  readBrowserChatSessionRecord,
+  readBrowserChatSessionSummaries,
+  writeBrowserChatSessionRecord,
+} from '@/server/storage/sqlite-record-store';
+import { artifactPath as resolveArtifactPath } from '@/server/storage/paths';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 
@@ -139,8 +137,6 @@ type BrowserChatRuntimeState = {
     promise: Promise<BrowserToolConfirmationDecision>;
   }>;
   pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
-  sessionFileCache: Map<string, { mtimeMs: number; size: number; snapshot: BrowserChatSessionSnapshot }>;
-  sessionLogFileCache: Map<string, { mtimeMs: number; size: number; logs: BrowserChatLogRecord[] }>;
   lastPersistWarningAt: number;
 };
 
@@ -155,22 +151,14 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
     promise: Promise<BrowserToolConfirmationDecision>;
   }>(),
   pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
-  sessionFileCache: new Map<string, { mtimeMs: number; size: number; snapshot: BrowserChatSessionSnapshot }>(),
-  sessionLogFileCache: new Map<string, { mtimeMs: number; size: number; logs: BrowserChatLogRecord[] }>(),
   lastPersistWarningAt: 0,
 });
 browserChatRuntimeState.sessions ??= new Map();
 browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
-browserChatRuntimeState.sessionFileCache ??= new Map();
-browserChatRuntimeState.sessionLogFileCache ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
-const sessionsDir = browserChatSessionsDir();
-const sessionSummariesDir = browserChatSessionSummariesDir();
-const sessionFileCache = browserChatRuntimeState.sessionFileCache;
-const sessionLogFileCache = browserChatRuntimeState.sessionLogFileCache;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
@@ -1136,27 +1124,9 @@ function appendLog(
   persistAndNotify(session.id, { defer: input.deferPersist === true });
 }
 
-function readSessionSummariesFromFile(): BrowserChatSessionSnapshot[] {
-  const summaries = new Map<string, BrowserChatSessionSnapshot>();
-  if (existsSync(sessionSummariesDir)) {
-    for (const entry of readdirSync(sessionSummariesDir, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-      const item = readSessionSnapshotFromFilePath(path.join(sessionSummariesDir, entry.name));
-      if (item) summaries.set(item.id, item);
-    }
-  }
-  if (!existsSync(sessionsDir)) return [...summaries.values()];
-  for (const entry of readdirSync(sessionsDir, { withFileTypes: true })) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-    const sessionId = entry.name.slice(0, -'.json'.length);
-    if (summaries.has(sessionId)) continue;
-    const item = readSessionSnapshotFromFilePath(path.join(sessionsDir, entry.name));
-    if (!item) continue;
-    const summary = summaryFromSnapshot(item);
-    writeSessionSummaryToFile(summary);
-    summaries.set(summary.id, summary);
-  }
-  return [...summaries.values()];
+function readSessionSummaries(): BrowserChatSessionSnapshot[] {
+  return readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>()
+    .filter(isBrowserChatSessionSnapshot);
 }
 
 function isBrowserChatSessionSnapshot(value: unknown): value is BrowserChatSessionSnapshot {
@@ -1185,120 +1155,29 @@ function discardInterruptedTurn(session: BrowserChatSessionRecord, assistantMess
   ));
 }
 
-function isBrowserChatLogRecord(value: unknown): value is BrowserChatLogRecord {
-  return Boolean(value)
-    && typeof value === 'object'
-    && !Array.isArray(value)
-    && typeof (value as { id?: unknown }).id === 'string'
-    && typeof (value as { time?: unknown }).time === 'string'
-    && typeof (value as { phase?: unknown }).phase === 'string'
-    && typeof (value as { message?: unknown }).message === 'string';
-}
-
 function readSessionLogRecords(sessionId: string) {
-  const filePath = browserChatSessionLogFilePath(sessionId);
-  if (!existsSync(filePath)) return [] as BrowserChatLogRecord[];
-  const stat = statSync(filePath);
-  const cached = sessionLogFileCache.get(filePath);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.logs;
-  const logs = readFileSync(filePath, 'utf8')
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .flatMap((line) => {
-      try {
-        const item = JSON.parse(line) as unknown;
-        return isBrowserChatLogRecord(item) ? [item] : [];
-      } catch {
-        return [];
-      }
-    });
-  sessionLogFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, logs });
-  return logs;
+  return readBrowserChatLogs<BrowserChatLogRecord>(sessionId);
 }
 
-function logRecordKey(item: BrowserChatLogRecord) {
-  return item.id || [item.time, item.phase, item.message, item.stepIndex || ''].join('|');
+function readSessionSnapshot(sessionId: string) {
+  const item = readBrowserChatSessionRecord<BrowserChatSessionSnapshot>(sessionId);
+  if (!isBrowserChatSessionSnapshot(item)) return undefined;
+  return { ...item, logs: trimBrowserChatLogs(readSessionLogRecords(sessionId)) };
 }
 
-function writeSessionLogRecords(sessionId: string, incoming: BrowserChatLogRecord[]) {
-  const filePath = browserChatSessionLogFilePath(sessionId);
-  const existing = readSessionLogRecords(sessionId);
-  const known = new Set(existing.map(logRecordKey));
-  const additions = incoming.filter((item) => !known.has(logRecordKey(item)));
-  const merged = additions.length
-    ? [...existing, ...additions].sort((a, b) => timestampValue(a.time) - timestampValue(b.time))
-    : existing;
-  const shouldCompact = merged.length > browserChatLogStorageLimit();
-  const next = shouldCompact ? trimBrowserChatLogs(merged) : merged;
-  if (!existsSync(filePath) || shouldCompact) {
-    const content = next.map((item) => stringifyJsonSafe(item)).filter(Boolean).join('\n');
-    writeTextFileAtomic(filePath, content ? `${content}\n` : '');
-  } else if (additions.length) {
-    mkdirSync(path.dirname(filePath), { recursive: true });
-    const content = additions.map((item) => stringifyJsonSafe(item)).filter(Boolean).join('\n');
-    if (content) appendFileSync(filePath, `${content}\n`, 'utf8');
-  }
-  if (existsSync(filePath)) {
-    const stat = statSync(filePath);
-    sessionLogFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, logs: next });
-  }
-  return trimBrowserChatLogs(next);
-}
-
-function withPersistedLogs(snapshot: BrowserChatSessionSnapshot) {
-  const persistedLogs = readSessionLogRecords(snapshot.id);
-  return persistedLogs.length
-    ? { ...snapshot, logs: trimBrowserChatLogs(persistedLogs) }
-    : snapshot;
-}
-
-function readSessionSnapshotFromFilePath(filePath: string) {
-  const stat = statSync(filePath);
-  const cached = sessionFileCache.get(filePath);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return withPersistedLogs(cached.snapshot);
-  const data = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
-  if (!isBrowserChatSessionSnapshot(data)) return undefined;
-  sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, snapshot: data });
-  return withPersistedLogs(data);
-}
-
-function readSessionSnapshotFromFile(sessionId: string) {
-  const filePath = browserChatSessionFilePath(sessionId);
-  if (!existsSync(filePath)) return undefined;
-  return readSessionSnapshotFromFilePath(filePath);
-}
-
-function writeSessionSnapshotToFile(item: BrowserChatSessionSnapshot) {
-  const logs = writeSessionLogRecords(item.id, item.logs);
+function writeSessionSnapshot(item: BrowserChatSessionSnapshot) {
+  const mergedLogs = mergePersistedLogs(readSessionLogRecords(item.id), item.logs);
+  const storedLogs = mergedLogs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(mergedLogs) : mergedLogs;
   const durableSnapshot = { ...item, logs: [] };
-  const payload = stringifyJsonSafe(durableSnapshot, 2);
-  if (!payload) throw new Error(`Browser chat session ${item.id} could not be serialized.`);
-  const filePath = browserChatSessionFilePath(item.id);
-  writeTextFileAtomic(filePath, payload);
-  const stat = statSync(filePath);
-  sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, snapshot: durableSnapshot });
-  writeSessionSummaryToFile(summaryFromSnapshot({ ...item, logs }));
+  writeBrowserChatSessionRecord(
+    durableSnapshot,
+    summaryFromSnapshot({ ...item, logs: trimBrowserChatLogs(storedLogs) }),
+    storedLogs,
+  );
 }
 
-function writeSessionSummaryToFile(item: BrowserChatSessionSnapshot) {
-  const payload = stringifyJsonSafe(item, 2);
-  if (!payload) throw new Error(`Browser chat session summary ${item.id} could not be serialized.`);
-  const filePath = browserChatSessionSummaryFilePath(item.id);
-  writeTextFileAtomic(filePath, payload);
-  const stat = statSync(filePath);
-  sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, snapshot: item });
-}
-
-function deleteSessionSnapshotFile(sessionId: string) {
-  const sessionPath = browserChatSessionFilePath(sessionId);
-  const summaryPath = browserChatSessionSummaryFilePath(sessionId);
-  const logPath = browserChatSessionLogFilePath(sessionId);
-  rmSync(sessionPath, { force: true });
-  rmSync(summaryPath, { force: true });
-  rmSync(logPath, { force: true });
-  sessionFileCache.delete(sessionPath);
-  sessionFileCache.delete(summaryPath);
-  sessionLogFileCache.delete(logPath);
+function deleteSessionSnapshot(sessionId: string) {
+  deleteBrowserChatSessionRecord(sessionId);
 }
 
 function timestampValue(value?: string) {
@@ -1353,7 +1232,7 @@ function assignAssistantStepIndexesToLatestMessage(messages: BrowserChatMessage[
   return normalized;
 }
 
-function mergeMessagesFromFile(existing: BrowserChatMessage[] = [], incoming: BrowserChatMessage[] = []) {
+function mergePersistedMessages(existing: BrowserChatMessage[] = [], incoming: BrowserChatMessage[] = []) {
   const byId = new Map<string, BrowserChatMessage>();
   for (const message of existing) byId.set(message.id, message);
   for (const message of incoming) {
@@ -1388,7 +1267,7 @@ function stepCompletenessScore(step: StepExecutionResult) {
   return score;
 }
 
-function mergeStepFromFile(existing: StepExecutionResult, incoming: StepExecutionResult) {
+function mergePersistedStep(existing: StepExecutionResult, incoming: StepExecutionResult) {
   if (existing.status !== 'running' && incoming.status === 'running') return existing;
   if (incoming.status !== 'running' && existing.status === 'running') return incoming;
   return stepCompletenessScore(incoming) >= stepCompletenessScore(existing)
@@ -1396,17 +1275,17 @@ function mergeStepFromFile(existing: StepExecutionResult, incoming: StepExecutio
     : { ...incoming, ...existing };
 }
 
-function mergeStepsFromFile(existing: StepExecutionResult[] = [], incoming: StepExecutionResult[] = []) {
+function mergePersistedSteps(existing: StepExecutionResult[] = [], incoming: StepExecutionResult[] = []) {
   const byIndex = new Map<number, StepExecutionResult>();
   for (const step of existing) byIndex.set(step.index, step);
   for (const step of incoming) {
     const previous = byIndex.get(step.index);
-    byIndex.set(step.index, previous ? mergeStepFromFile(previous, step) : step);
+    byIndex.set(step.index, previous ? mergePersistedStep(previous, step) : step);
   }
   return [...byIndex.values()].sort((a, b) => a.index - b.index);
 }
 
-function mergeLogsFromFile(existing: BrowserChatLogRecord[] = [], incoming: BrowserChatLogRecord[] = []) {
+function mergePersistedLogs(existing: BrowserChatLogRecord[] = [], incoming: BrowserChatLogRecord[] = []) {
   const byKey = new Map<string, BrowserChatLogRecord>();
   const keyOf = (item: BrowserChatLogRecord) => item.id || [item.time, item.phase, item.message, item.stepIndex || ''].join('|');
   for (const item of existing) byKey.set(keyOf(item), item);
@@ -1416,7 +1295,7 @@ function mergeLogsFromFile(existing: BrowserChatLogRecord[] = [], incoming: Brow
     .slice(-browserChatLogLimit());
 }
 
-function mergeConversationContextFromFile(
+function mergePersistedConversationContext(
   existing?: BrowserChatConversationContext,
   incoming?: BrowserChatConversationContext,
 ) {
@@ -1427,7 +1306,7 @@ function mergeConversationContextFromFile(
     : normalizeConversationContext(existing);
 }
 
-function mergeSessionSnapshotFromFile(
+function mergePersistedSessionSnapshot(
   existing: BrowserChatSessionSnapshot | undefined,
   incoming: BrowserChatSessionSnapshot,
 ): BrowserChatSessionSnapshot {
@@ -1436,12 +1315,12 @@ function mergeSessionSnapshotFromFile(
   const base = incomingNewer ? { ...existing, ...incoming } : { ...incoming, ...existing };
   return {
     ...base,
-    messages: mergeMessagesFromFile(existing.messages, incoming.messages),
-    steps: mergeStepsFromFile(existing.steps, incoming.steps),
+    messages: mergePersistedMessages(existing.messages, incoming.messages),
+    steps: mergePersistedSteps(existing.steps, incoming.steps),
     consoleErrors: mergeStringLists(existing.consoleErrors, incoming.consoleErrors),
     networkErrors: mergeStringLists(existing.networkErrors, incoming.networkErrors),
-    logs: mergeLogsFromFile(existing.logs, incoming.logs),
-    conversationContext: mergeConversationContextFromFile(existing.conversationContext, incoming.conversationContext),
+    logs: mergePersistedLogs(existing.logs, incoming.logs),
+    conversationContext: mergePersistedConversationContext(existing.conversationContext, incoming.conversationContext),
   };
 }
 
@@ -1455,25 +1334,25 @@ function mergeRuntimeSessionState(fromDisk: BrowserChatSessionRecord, existing: 
   if (!hasRuntimeTurn) return fromDisk;
   return {
     ...fromDisk,
-    messages: mergeMessagesFromFile(fromDisk.messages, existing.messages),
-    steps: mergeStepsFromFile(fromDisk.steps, existing.steps),
+    messages: mergePersistedMessages(fromDisk.messages, existing.messages),
+    steps: mergePersistedSteps(fromDisk.steps, existing.steps),
     consoleErrors: mergeStringLists(fromDisk.consoleErrors, existing.consoleErrors),
     networkErrors: mergeStringLists(fromDisk.networkErrors, existing.networkErrors),
-    logs: mergeLogsFromFile(fromDisk.logs, existing.logs),
-    conversationContext: mergeConversationContextFromFile(fromDisk.conversationContext, existing.conversationContext),
+    logs: mergePersistedLogs(fromDisk.logs, existing.logs),
+    conversationContext: mergePersistedConversationContext(fromDisk.conversationContext, existing.conversationContext),
     pendingToolConfirmation: existing.pendingToolConfirmation || fromDisk.pendingToolConfirmation,
   };
 }
 
-function applyFileSnapshotToRuntime(snapshotFromFile: BrowserChatSessionSnapshot) {
-  const existing = sessions.get(snapshotFromFile.id);
+function applyPersistedSnapshotToRuntime(persistedSnapshot: BrowserChatSessionSnapshot) {
+  const existing = sessions.get(persistedSnapshot.id);
   if (!existing) {
-    sessions.set(snapshotFromFile.id, recordFromSnapshot(snapshotFromFile));
+    sessions.set(persistedSnapshot.id, recordFromSnapshot(persistedSnapshot));
     return;
   }
-  const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, snapshotFromFile);
+  const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, persistedSnapshot);
   const fromDisk = mergeRuntimeSessionState(
-    recordFromSnapshot(snapshotFromFile, { preserveRunningState: preserveRuntimeTurn }),
+    recordFromSnapshot(persistedSnapshot, { preserveRunningState: preserveRuntimeTurn }),
     existing,
   );
   const runtimeState = {
@@ -1486,24 +1365,24 @@ function applyFileSnapshotToRuntime(snapshotFromFile: BrowserChatSessionSnapshot
 }
 
 function hydrateSession(sessionId: string) {
-  const fromDisk = readSessionSnapshotFromFile(sessionId);
-  if (fromDisk) applyFileSnapshotToRuntime(fromDisk);
+  const persisted = readSessionSnapshot(sessionId);
+  if (persisted) applyPersistedSnapshotToRuntime(persisted);
   return sessions.get(sessionId);
 }
 
-function persistSessionToFile(sessionId: string, options: { mergeFromDisk?: boolean } = {}) {
+function persistSession(sessionId: string, options: { mergePersisted?: boolean } = {}) {
   try {
     const currentSession = sessions.get(sessionId);
     const incoming = currentSession ? snapshot(currentSession, { fullSteps: true }) : undefined;
     if (!incoming) {
-      deleteSessionSnapshotFile(sessionId);
+      deleteSessionSnapshot(sessionId);
       return true;
     }
-    const writtenSnapshot = options.mergeFromDisk === false
+    const writtenSnapshot = options.mergePersisted === false
       ? incoming
-      : mergeSessionSnapshotFromFile(readSessionSnapshotFromFile(sessionId), incoming);
-    writeSessionSnapshotToFile(writtenSnapshot);
-    if (options.mergeFromDisk !== false) applyFileSnapshotToRuntime(writtenSnapshot);
+      : mergePersistedSessionSnapshot(readSessionSnapshot(sessionId), incoming);
+    writeSessionSnapshot(writtenSnapshot);
+    if (options.mergePersisted !== false) applyPersistedSnapshotToRuntime(writtenSnapshot);
     return true;
   } catch (error) {
     warnPersistFailure(error);
@@ -1522,28 +1401,28 @@ function schedulePersistAndNotify(sessionId: string) {
   if (pendingPersistTimers.has(sessionId)) return;
   const timer = setTimeout(() => {
     pendingPersistTimers.delete(sessionId);
-    persistAndNotify(sessionId, { mergeFromDisk: false });
+    persistAndNotify(sessionId, { mergePersisted: false });
   }, browserChatProgressPersistDelayMs());
   pendingPersistTimers.set(sessionId, timer);
 }
 
-function persistAndNotify(sessionId: string, options: { defer?: boolean; mergeFromDisk?: boolean } = {}) {
+function persistAndNotify(sessionId: string, options: { defer?: boolean; mergePersisted?: boolean } = {}) {
   if (options.defer) {
     schedulePersistAndNotify(sessionId);
     notifySessionUpdate(sessionId);
     return true;
   }
   clearPendingPersist(sessionId);
-  const persisted = persistSessionToFile(sessionId, { mergeFromDisk: options.mergeFromDisk });
+  const persisted = persistSession(sessionId, { mergePersisted: options.mergePersisted });
   if (!persisted) return false;
   notifySessionUpdate(sessionId);
   return true;
 }
 
-function persistDeletedSessionsToFile(sessionIds: string[]) {
+function persistDeletedSessions(sessionIds: string[]) {
   try {
     for (const sessionId of new Set(sessionIds.filter(Boolean))) {
-      deleteSessionSnapshotFile(sessionId);
+      deleteSessionSnapshot(sessionId);
     }
     return true;
   } catch (error) {
@@ -1820,7 +1699,7 @@ export function getBrowserChatSessionLogs(sessionId: string, userId?: string | n
 }
 
 export function listBrowserChatSessions(input: { userId?: string | number } = {}) {
-  const summaries = new Map(readSessionSummariesFromFile().map((session) => [session.id, session]));
+  const summaries = new Map(readSessionSummaries().map((session) => [session.id, session]));
   for (const session of sessions.values()) summaries.set(session.id, summarySnapshot(session));
   return [...summaries.values()]
     .filter((session) => sessionBelongsToUser(session, input.userId))
@@ -1856,7 +1735,7 @@ export async function deleteBrowserChatSession(sessionId: string, userId?: strin
   if (!removed) return undefined;
   if (!persistAndNotify(sessionId)) {
     sessions.set(sessionId, removed.session);
-    throw new Error('Browser chat session was removed from memory, but the session file could not be updated.');
+    throw new Error('Browser chat session was removed from memory, but the database could not be updated.');
   }
   return removed.deleted;
 }
@@ -1947,10 +1826,10 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
     }
   }
   if (removed.length) {
-    const persisted = persistDeletedSessionsToFile(removed.map((item) => item.deleted.id));
+    const persisted = persistDeletedSessions(removed.map((item) => item.deleted.id));
     if (!persisted) {
       for (const item of removed) sessions.set(item.deleted.id, item.session);
-      throw new Error('Browser chat sessions were removed from memory, but the session file could not be updated.');
+      throw new Error('Browser chat sessions were removed from memory, but the database could not be updated.');
     }
     for (const item of removed) notifySessionUpdate(item.deleted.id);
   }
@@ -2741,7 +2620,7 @@ async function runBrowserChatMessage(
           // appear only after they have already completed.
           const hasRunningTool = (step.tools || []).some((tool) => tool.ok === undefined);
           persistAndNotify(session.id, hasRunningTool
-            ? { mergeFromDisk: false }
+            ? { mergePersisted: false }
             : { defer: true });
         },
         onDebug: (event) => {

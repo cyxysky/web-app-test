@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 
 export const runtime = 'nodejs';
 

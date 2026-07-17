@@ -22,11 +22,16 @@ import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEn
 import { useTheme } from '@/theme/ThemeProvider';
 import { readApiJson } from '@/lib/api-client';
 
-type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
+export type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
   updatedAt?: string;
 };
 
-type ModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
+export type ModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
+
+export type EnvironmentSettingsInitialData = {
+  envItems: EnvRow[];
+  modelConfig: ModelConfig;
+};
 
 type PersonalMemoryScope = 'global' | 'domain';
 type PersonalMemoryType = 'alias' | 'preference' | 'workflow' | 'domain_fact';
@@ -220,6 +225,7 @@ function isSecret(item: EnvRow) {
 export function EnvironmentSettings({
   activeTab: controlledActiveTab,
   embedded = false,
+  initialData,
   onActiveTabChange,
   onModelSaved,
   onRuntimeEnvSaved,
@@ -228,6 +234,7 @@ export function EnvironmentSettings({
 }: {
   activeTab?: SettingsTab;
   embedded?: boolean;
+  initialData?: EnvironmentSettingsInitialData;
   onActiveTabChange?: (tab: SettingsTab) => void;
   onModelSaved?: () => void;
   onRuntimeEnvSaved?: () => void;
@@ -237,14 +244,14 @@ export function EnvironmentSettings({
   const { language, setLanguage, t } = useI18n();
   const { color, currentColor, scrollbarColor, setColor, setScrollbarColor } = useTheme();
   const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('general');
-  const [items, setItems] = useState<EnvRow[]>([]);
-  const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig());
-  const [modelDraft, setModelDraft] = useState<ModelConfig>(() => createModelConfig());
+  const [items, setItems] = useState<EnvRow[]>(() => initialData?.envItems || []);
+  const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig(initialData?.modelConfig));
+  const [modelDraft, setModelDraft] = useState<ModelConfig>(() => createModelConfig(initialData?.modelConfig));
   const [personalMemoryItems, setPersonalMemoryItems] = useState<PersonalMemoryItem[]>([]);
   const [personalMemoryDraft, setPersonalMemoryDraft] = useState<PersonalMemoryDraft>(() => createPersonalMemoryDraft());
   const [personalMemoryEditorMode, setPersonalMemoryEditorMode] = useState<PersonalMemoryEditorMode>(null);
   const [portalReady, setPortalReady] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!initialData);
   const [savingEnv, setSavingEnv] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
   const [loadingPersonalMemory, setLoadingPersonalMemory] = useState(false);
@@ -266,7 +273,9 @@ export function EnvironmentSettings({
 
   useEffect(() => {
     setHasDirectoryPicker(typeof window !== 'undefined' && Boolean(window.webPilotSystem?.selectDirectory));
-    void load();
+    if (!initialData) void load();
+  // The server snapshot is immutable for this component instance; saves update local state directly.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -828,7 +837,7 @@ export function EnvironmentSettings({
         <div className="settings-section-head">
           <div>
             <h2>{t('个性化记忆')}</h2>
-            <span>{t('{count} 条记录，文件：.data/personal-memory/items.json', { count: personalMemoryItems.length })}</span>
+            <span>{t('{count} 条记录，存储于本地数据库', { count: personalMemoryItems.length })}</span>
           </div>
           <div className="personal-memory-head-actions">
             <button className="ui-button ui-icon-button" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">

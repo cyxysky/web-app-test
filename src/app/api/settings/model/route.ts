@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { defaultModelByProvider, defaultModelForProvider, modelListForProvider, modelProviderDefinitions, modelProviderValues, modelProviderDefinition } from '@/config/settings';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/test-case.schema';
+import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 
 const providers = new Set<ModelProvider>(modelProviderValues);
 
@@ -12,36 +13,6 @@ function normalizeProvider(value: unknown): ModelProvider {
   if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
   if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
   return providers.has(provider as ModelProvider) ? provider as ModelProvider : 'openrouter';
-}
-
-function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
-  const definition = modelProviderDefinition(provider);
-  const models = modelListForProvider(definition);
-  const model = defaultModelForProvider(definition);
-  return {
-    defaultModel: model,
-    model,
-    models,
-    apiKey: '',
-    baseURL: definition.defaultBaseURL || '',
-  };
-}
-
-function completeProviders(input?: Partial<Record<ModelProvider, ModelProviderSettings>>) {
-  const result: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
-  for (const definition of modelProviderDefinitions) {
-    const current = input?.[definition.value];
-    const models = modelListForProvider(definition, current);
-    const model = defaultModelForProvider(definition, current);
-    result[definition.value] = {
-      ...defaultProviderSettings(definition.value),
-      ...current,
-      defaultModel: model,
-      model,
-      models,
-    };
-  }
-  return result;
 }
 
 function readProviderSettings(value: unknown): Partial<Record<ModelProvider, ModelProviderSettings>> {
@@ -77,16 +48,7 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
 }
 
 export async function GET() {
-  const saved = store.getModelConfig();
-  const provider = saved?.provider || 'openrouter';
-  return NextResponse.json({
-    saved: Boolean(saved),
-    config: {
-      provider,
-      providers: completeProviders(saved?.providers),
-      updatedAt: saved?.updatedAt,
-    },
-  });
+  return NextResponse.json(readModelSettingsState());
 }
 
 export async function POST(request: NextRequest) {

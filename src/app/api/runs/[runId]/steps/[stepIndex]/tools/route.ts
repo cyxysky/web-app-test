@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import type { StepToolCall } from '@/server/ai/schemas/test-case.schema';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 
 type RouteContext = {
   params: Promise<{ runId: string; stepIndex: string }>;

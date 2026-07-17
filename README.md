@@ -27,10 +27,10 @@ Browser execution accepts `http` and `https` target URLs by default. Set `ALLOWE
 
 ## Personal Memory
 
-Browser chat keeps a first-pass local personal memory store at `.data/personal-memory/items.json`.
+Browser chat stores local personal memory in the SQLite runtime database.
 It does not require an embedding model or vector database. After a completed browser-chat turn, the app asks the current chat model to extract only concise durable items such as aliases, preferences, workflows, and domain facts. Future turns recall matching active items by user id, current domain, and keyword/alias match.
 
-You can view, add, edit, disable, and delete memory items in Settings -> Personal Memory. The local JSON file remains the source of truth for backup or bulk cleanup.
+You can view, add, edit, disable, and delete memory items in Settings -> Personal Memory. The local SQLite database remains the source of truth for backup or bulk cleanup.
 
 Runtime controls:
 
@@ -89,11 +89,9 @@ Then open `http://localhost:3000`.
 
 The compose setup keeps runtime data outside the image:
 
-- `.data/app-config.json` stores model and runtime settings.
-- `.data/target-test-cases/`, `.data/target-test-runs/`, and `.data/target-test-metadata.json` store test cases and runs.
-- `.data/browser-chat-sessions/` and `.data/browser-chat-session-summaries/` store browser-chat sessions and their lightweight list summaries.
-- `.data/personal-memory/items.json` stores personal memory.
-- `artifacts/` stores screenshots, traces, uploads, and reports.
+- `.data/webpilot.db` is the SQLite source of truth for model/runtime settings, test cases, runs, browser-chat sessions, personal memory, and Electron workspace state.
+- `artifacts/` keeps screenshots, traces, uploads, reports, and other large generated files outside the database.
+- Chromium profiles and caches remain managed by Chromium in their native file layout.
 
 For unattended packaged regression runs, keep `HEADLESS_BROWSER=true`. For account-based exploratory testing or manual verification, prefer a visible or CDP-connected browser.
 

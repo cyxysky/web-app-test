@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 
 type RouteContext = {
   params: Promise<{ runId: string }>;

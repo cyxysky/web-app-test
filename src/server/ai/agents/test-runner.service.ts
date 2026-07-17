@@ -4,7 +4,7 @@ import { withSkillContext } from '@/server/ai/agents/skill-context';
 import { executeTestCase } from '@/server/ai/agents/target-executor.agent';
 import { withModelSettings, type ModelSettingsOverride } from '@/server/ai/model';
 import type { RecordedFlowStep, StepExecutionResult, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 import { writeAiReport } from '@/server/reports/report-writer.agent';
 import { artifactPath } from '@/server/storage/paths';
 

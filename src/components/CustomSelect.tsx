@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from 'react';
 import { Check, ChevronDown, Search } from 'lucide-react';
 import { useI18n } from '@/i18n/I18nProvider';
 
@@ -13,13 +13,20 @@ export type CustomSelectOption = {
   value: string;
 };
 
+type MenuLayout = {
+  maxHeight: number;
+  placement: 'up' | 'down';
+};
+
+const menuGap = 6;
+const viewportMargin = 8;
+
 export function CustomSelect({
   className,
   disabled = false,
   id,
   onChange,
   options,
-  searchable,
   searchPlaceholder,
   title,
   value,
@@ -37,13 +44,15 @@ export function CustomSelect({
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [menuVisible, setMenuVisible] = useState(false);
+  const [menuLayout, setMenuLayout] = useState<MenuLayout | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const closeTimerRef = useRef<number | undefined>(undefined);
-  const searchEnabled = searchable ?? options.length > 8;
+  const searchEnabled = true;
   const normalizedQuery = searchQuery.trim().toLocaleLowerCase();
   const filteredOptions = useMemo(() => options
     .map((option, index) => ({ option, index }))
@@ -79,6 +88,42 @@ export function CustomSelect({
     if (searchEnabled) requestAnimationFrame(() => searchRef.current?.focus());
   }, [open, searchEnabled, selectedIndex]);
 
+  useLayoutEffect(() => {
+    if (!open || !menuVisible) return undefined;
+
+    function updateMenuLayout() {
+      const button = buttonRef.current;
+      const menu = menuRef.current;
+      if (!button || !menu) return;
+
+      const buttonRect = button.getBoundingClientRect();
+      const viewportHeight = document.documentElement.clientHeight;
+      const spaceAbove = Math.max(0, buttonRect.top - menuGap - viewportMargin);
+      const spaceBelow = Math.max(0, viewportHeight - buttonRect.bottom - menuGap - viewportMargin);
+      const desiredHeight = menu.getBoundingClientRect().height;
+      const placement = desiredHeight <= spaceBelow
+        ? 'down'
+        : desiredHeight <= spaceAbove
+          ? 'up'
+          : spaceAbove > spaceBelow
+            ? 'up'
+            : 'down';
+      const maxHeight = Math.floor(placement === 'up' ? spaceAbove : spaceBelow);
+
+      setMenuLayout((current) => current?.placement === placement && current.maxHeight === maxHeight
+        ? current
+        : { maxHeight, placement });
+    }
+
+    updateMenuLayout();
+    window.addEventListener('resize', updateMenuLayout);
+    window.addEventListener('scroll', updateMenuLayout, true);
+    return () => {
+      window.removeEventListener('resize', updateMenuLayout);
+      window.removeEventListener('scroll', updateMenuLayout, true);
+    };
+  }, [menuVisible, open]);
+
   useEffect(() => {
     if (!open || !enabledOptions.length) return;
     if (enabledOptions.some(({ index }) => index === activeIndex)) return;
@@ -93,6 +138,7 @@ export function CustomSelect({
   function openMenu() {
     if (disabled) return;
     window.clearTimeout(closeTimerRef.current);
+    setMenuLayout(null);
     setMenuVisible(true);
     setOpen(true);
   }
@@ -190,11 +236,13 @@ export function CustomSelect({
       </button>
       {menuVisible ? (
         <div
-          className={open ? 'custom-select-menu open' : 'custom-select-menu closing'}
+          className={`custom-select-menu custom-select-menu--${menuLayout?.placement || 'down'} ${open ? 'open' : 'closing'}`}
           onAnimationEnd={() => {
             if (!open) setMenuVisible(false);
           }}
+          ref={menuRef}
           role="listbox"
+          style={{ '--custom-select-menu-max-height': `${Math.max(0, menuLayout?.maxHeight ?? 360)}px` } as CSSProperties}
           tabIndex={-1}
         >
           {searchEnabled ? (

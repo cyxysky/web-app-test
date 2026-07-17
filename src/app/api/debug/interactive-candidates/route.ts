@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { BrowserSession } from '@/server/browser/browser-session';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 
 type DebugInteractiveCandidateState = {
   session?: BrowserSession;

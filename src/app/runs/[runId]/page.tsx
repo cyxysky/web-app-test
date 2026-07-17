@@ -1,6 +1,6 @@
 import { notFound } from 'next/navigation';
 import { BrowserChatWorkspace } from '@/components/BrowserChatWorkspace';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 
 export const dynamic = 'force-dynamic';
 

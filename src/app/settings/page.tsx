@@ -1,5 +1,6 @@
 import { BrowserChatWorkspace } from '@/components/BrowserChatWorkspace';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
+import { readEnvironmentSettingsSnapshot } from '@/server/settings/settings-snapshot';
 
 export const dynamic = 'force-dynamic';
 
@@ -8,10 +9,17 @@ export default function SettingsPage() {
   const testCases = store.listTestCases();
   const groups = store.listGroups();
   const schedules = store.listSchedules();
+  const initialSettings = readEnvironmentSettingsSnapshot();
 
   return (
     <main className="browser-chat-shell">
-      <BrowserChatWorkspace groups={groups} initialView="settings" schedules={schedules} testCases={testCases} />
+      <BrowserChatWorkspace
+        groups={groups}
+        initialSettings={initialSettings}
+        initialView="settings"
+        schedules={schedules}
+        testCases={testCases}
+      />
     </main>
   );
 }

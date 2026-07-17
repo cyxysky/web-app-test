@@ -1,10 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
 import { generateText } from 'ai';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import type { StepExecutionResult } from '@/server/ai/schemas/test-case.schema';
-import { writeJsonFileAtomic } from '@/server/storage/atomic-json';
-import { personalMemoryFilePath } from '@/server/storage/paths';
+import { readPersonalMemoryRecords, replacePersonalMemoryRecords } from '@/server/storage/sqlite-record-store';
 
 export type PersonalMemoryScope = 'global' | 'domain';
 export type PersonalMemoryType = 'alias' | 'preference' | 'workflow' | 'domain_fact';
@@ -240,24 +238,14 @@ function normalizeStoreItem(value: unknown): PersonalMemoryItem | undefined {
 }
 
 function readStore(): PersonalMemoryStoreFile {
-  const filePath = personalMemoryFilePath();
-  if (!existsSync(filePath)) return { version: 1, items: [] };
-  try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<PersonalMemoryStoreFile>;
-    const items = Array.isArray(parsed.items)
-      ? parsed.items.map(normalizeStoreItem).filter((item): item is PersonalMemoryItem => Boolean(item))
-      : [];
-    return { version: 1, items };
-  } catch {
-    return { version: 1, items: [] };
-  }
+  const items = readPersonalMemoryRecords<PersonalMemoryItem>()
+    .map(normalizeStoreItem)
+    .filter((item): item is PersonalMemoryItem => Boolean(item));
+  return { version: 1, items };
 }
 
 function writeStore(store: PersonalMemoryStoreFile) {
-  writeJsonFileAtomic(personalMemoryFilePath(), {
-    version: 1,
-    items: store.items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
-  });
+  replacePersonalMemoryRecords(store.items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
 }
 
 function memoryIdentity(item: Pick<PersonalMemoryItem, 'userId' | 'scope' | 'domain' | 'type' | 'key'>) {

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/test-case.schema';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 
 type RouteContext = {
   params: Promise<{ skillId: string }>;

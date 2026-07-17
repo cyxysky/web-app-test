@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { generateTaskFrame } from '@/server/ai/agents/task-frame-generator.agent';
 import { withModelSettings, type ModelSettingsOverride } from '@/server/ai/model';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 
 type RouteContext = {
   params: Promise<{ id: string }>;

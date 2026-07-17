@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
 
 const APP_NAME = 'WebPilot';
 const APP_TITLE = APP_NAME;
@@ -38,14 +39,16 @@ const embeddedBrowserRecentlyClosedTabs = [];
 let embeddedBrowserBounds = { x: 0, y: 0, width: 0, height: 0 };
 let embeddedBrowserFitTimer;
 let embeddedBrowserFitAllowZoomIn = false;
-let embeddedBrowserPersistencePath = '';
+let runtimeDatabasePath = '';
+let electronStateDatabase;
 let embeddedBrowserPersistenceTimer;
 let embeddedBrowserPersistenceStopped = false;
 let embeddedBrowserPersistenceRestoring = false;
 let embeddedBrowserStateChangeTimer;
 const EMBEDDED_BROWSER_ROUTE_LOADING_MS = 1200;
-const EMBEDDED_BROWSER_PERSISTENCE_FILE = 'embedded-browser-state.json';
 const EMBEDDED_BROWSER_PERSISTENCE_VERSION = 2;
+const EMBEDDED_BROWSER_STATE_KEY = 'embedded-browser';
+const RUNTIME_DATABASE_FILE = 'webpilot.db';
 const EMBEDDED_BROWSER_HISTORY_LIMIT = 300;
 let startupLogPath;
 let startupScreenReady = Promise.resolve();
@@ -57,6 +60,27 @@ const systemDownloads = new Map();
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function getElectronStateDatabase() {
+  if (electronStateDatabase) return electronStateDatabase;
+  if (!runtimeDatabasePath) throw new Error('Runtime database path is not ready.');
+  ensureDir(path.dirname(runtimeDatabasePath));
+  electronStateDatabase = new DatabaseSync(runtimeDatabasePath, {
+    enableForeignKeyConstraints: true,
+    enableDoubleQuotedStringLiterals: false,
+  });
+  electronStateDatabase.exec(`
+    PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA synchronous = NORMAL;
+    CREATE TABLE IF NOT EXISTS electron_state (
+      key TEXT PRIMARY KEY,
+      value_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  return electronStateDatabase;
 }
 
 function appendLog(message) {
@@ -944,12 +968,16 @@ function embeddedBrowserPersistenceSnapshot() {
 }
 
 function writeEmbeddedBrowserPersistence() {
-  if (!embeddedBrowserPersistencePath || embeddedBrowserPersistenceRestoring || embeddedBrowserPersistenceStopped) return;
+  if (!runtimeDatabasePath || embeddedBrowserPersistenceRestoring || embeddedBrowserPersistenceStopped) return;
   try {
-    ensureDir(path.dirname(embeddedBrowserPersistencePath));
-    const temporaryPath = `${embeddedBrowserPersistencePath}.tmp`;
-    fs.writeFileSync(temporaryPath, `${JSON.stringify(embeddedBrowserPersistenceSnapshot(), null, 2)}\n`, 'utf8');
-    fs.renameSync(temporaryPath, embeddedBrowserPersistencePath);
+    getElectronStateDatabase().prepare(`
+      INSERT INTO electron_state (key, value_json, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+    `).run(
+      EMBEDDED_BROWSER_STATE_KEY,
+      JSON.stringify(embeddedBrowserPersistenceSnapshot()),
+      new Date().toISOString(),
+    );
   } catch (error) {
     appendLog(`Embedded browser state save failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -962,7 +990,7 @@ function clearEmbeddedBrowserPersistenceTimer() {
 }
 
 function scheduleEmbeddedBrowserPersistence() {
-  if (!embeddedBrowserPersistencePath || embeddedBrowserPersistenceStopped) return;
+  if (!runtimeDatabasePath || embeddedBrowserPersistenceStopped) return;
   clearEmbeddedBrowserPersistenceTimer();
   embeddedBrowserPersistenceTimer = setTimeout(() => {
     embeddedBrowserPersistenceTimer = undefined;
@@ -971,12 +999,15 @@ function scheduleEmbeddedBrowserPersistence() {
 }
 
 function restoreEmbeddedBrowserPersistence() {
-  if (!embeddedBrowserPersistencePath || embeddedBrowserTabs.size || embeddedBrowserGroups.size) return false;
+  if (!runtimeDatabasePath || embeddedBrowserTabs.size || embeddedBrowserGroups.size) return false;
 
   let saved;
   try {
-    if (!fs.existsSync(embeddedBrowserPersistencePath)) return false;
-    saved = JSON.parse(fs.readFileSync(embeddedBrowserPersistencePath, 'utf8'));
+    const row = getElectronStateDatabase().prepare(`
+      SELECT value_json FROM electron_state WHERE key = ?
+    `).get(EMBEDDED_BROWSER_STATE_KEY);
+    if (!row?.value_json) return false;
+    saved = JSON.parse(row.value_json);
   } catch (error) {
     appendLog(`Embedded browser state restore failed: ${error instanceof Error ? error.message : String(error)}`);
     return false;
@@ -2801,7 +2832,7 @@ async function failStartupScreen(message) {
 
 async function boot() {
   const appDataDir = ensureDir(path.join(app.getPath('userData'), 'runtime'));
-  embeddedBrowserPersistencePath = path.join(appDataDir, EMBEDDED_BROWSER_PERSISTENCE_FILE);
+  runtimeDatabasePath = path.join(appDataDir, '.data', RUNTIME_DATABASE_FILE);
   startupLogPath = path.join(appDataDir, 'startup.log');
   fs.writeFileSync(startupLogPath, '');
   appendLog(`App starting. packaged=${app.isPackaged}`);
@@ -2860,4 +2891,6 @@ app.on('before-quit', () => {
   detachEmbeddedBrowserView();
   for (const tab of Array.from(embeddedBrowserTabs.values())) destroyEmbeddedBrowserTab(tab);
   if (serverProcess && !serverProcess.killed) serverProcess.kill();
+  electronStateDatabase?.close();
+  electronStateDatabase = undefined;
 });

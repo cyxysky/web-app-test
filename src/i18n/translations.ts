@@ -19,7 +19,7 @@ const en: Record<string, string> = {
   '运行控制': 'Runtime',
   '调试与高级': 'Debug & Advanced',
   '个性化记忆': 'Personal Memory',
-  '{count} 条记录，文件：.data/personal-memory/items.json': '{count} records, file: .data/personal-memory/items.json',
+  '{count} 条记录，存储于本地数据库': '{count} records stored in the local database',
   '刷新': 'Refresh',
   '范围': 'Scope',
   '全局': 'Global',

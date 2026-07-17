@@ -2,7 +2,7 @@ import { notFound } from 'next/navigation';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { remarkSafeBreaks } from '@/lib/markdown';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 import styles from './print.module.css';
 
 export const dynamic = 'force-dynamic';

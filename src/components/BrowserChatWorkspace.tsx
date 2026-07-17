@@ -98,7 +98,7 @@ import {
   type SystemDownloadStatus,
 } from '@/components/browser-chat-download-model';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
-import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
+import { EnvironmentSettings, environmentSettingsTabs, type EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { NewTestCaseModal } from '@/components/NewTestCaseModal';
 import {
@@ -5099,6 +5099,7 @@ export function BrowserChatWorkspace({
   groups,
   schedules,
   initialView = 'chat',
+  initialSettings,
   initialTargetDetailCaseId,
   initialTargetRunId,
 }: {
@@ -5106,6 +5107,7 @@ export function BrowserChatWorkspace({
   groups: TestGroupRecord[];
   schedules: RunScheduleRecord[];
   initialView?: BrowserChatView;
+  initialSettings?: EnvironmentSettingsInitialData;
   initialTargetDetailCaseId?: string;
   initialTargetRunId?: string;
 }) {
@@ -6380,7 +6382,7 @@ export function BrowserChatWorkspace({
             <Folder size={17} />
             <span>目标模式</span>
           </button>
-          <button aria-label="设置" className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => setActiveView('settings')} title="设置" type="button">
+          <button aria-label="设置" className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => router.push('/settings')} title="设置" type="button">
             <Settings size={17} />
             <span>设置</span>
           </button>
@@ -6445,6 +6447,7 @@ export function BrowserChatWorkspace({
             <EnvironmentSettings
               activeTab={settingsTab}
               embedded
+              initialData={initialSettings}
               showTabs={false}
               onActiveTabChange={setSettingsTab}
               onModelSaved={() => void loadModelConfig()}

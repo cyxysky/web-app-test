@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { abortRunStep } from '@/server/ai/run-control.registry';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 
 type RouteContext = {
   params: Promise<{ runId: string }>;

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 import { parseSkillContent } from '@/server/ai/schemas/test-case.schema';
 
 export const dynamic = 'force-dynamic';
