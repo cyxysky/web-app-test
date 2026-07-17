@@ -30,7 +30,11 @@ function resolveArtifactPath(segments: string[]) {
   return filePath;
 }
 
-export async function GET(_request: NextRequest, context: RouteContext) {
+function contentDispositionHeader(filePath: string) {
+  return path.basename(filePath).replace(/["\r\n]/g, '_');
+}
+
+export async function GET(request: NextRequest, context: RouteContext) {
   const { path: pathSegments } = await context.params;
   const filePath = resolveArtifactPath(pathSegments || []);
 
@@ -47,13 +51,18 @@ export async function GET(_request: NextRequest, context: RouteContext) {
     const body = await readFile(filePath);
     const contentType = contentTypes[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
 
-    return new NextResponse(body, {
-      headers: {
-        'Cache-Control': 'no-store',
-        'Content-Length': String(fileStat.size),
-        'Content-Type': contentType,
-      },
-    });
+    const headers: Record<string, string> = {
+      'Cache-Control': 'no-store',
+      'Content-Length': String(fileStat.size),
+      'Content-Type': contentType,
+    };
+    if (request.nextUrl.searchParams.get('download') === '1') {
+      const fileName = contentDispositionHeader(filePath);
+      const asciiName = fileName.replace(/[^\x20-\x7E]/g, '_');
+      headers['Content-Disposition'] = `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+    }
+
+    return new NextResponse(body, { headers });
   } catch {
     return NextResponse.json({ error: 'Artifact not found' }, { status: 404 });
   }

@@ -1,50 +1,60 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { generateObject, generateText, stepCountIs, tool } from 'ai';
+import { generateText, hasToolCall, tool, type ModelMessage } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiDomContextSnapshot, AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildPrepareStepPrompt, buildVerificationPromptLines } from '@/server/ai/prompts/runtime-agent.prompt';
-import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
-import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
-import { appendDesktopEvidenceToResult, captureDesktopBeforeTool, collectDesktopEvidenceAfterTool } from '@/server/desktop/desktop-action-evidence';
-import { normalizeDomNodeIdParam, normalizeDomPathParam } from '@/lib/dom-path';
+import { buildCodexObjectPrompt, buildCompletionPromptLines, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
+import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type BrowserSnapshotViews, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
+import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
+import {
+  browserKeyboardToolDescription,
+  browserKeyboardToolShape,
+  browserMouseToolDescription,
+  browserMouseToolShape,
+  browserSelectOptionToolDescription,
+  browserSelectOptionToolShape,
+} from './browser-input-tool-schema';
+import {
+  invalidateRuntimeObservation,
+  observationPreviewLimit,
+  restoreRuntimeObservationStore,
+  runtimeObservationCount,
+  runtimeObservationInvalidatingToolNames,
+  runtimeObservationToolNames,
+  storeRuntimeObservation,
+  type RuntimeObservationReadOptions,
+  type RuntimeObservationStore,
+} from './runtime-observation';
+import { browserActionRules, currentSnapshotContextLine, screenshotObservationRule, snapshotHardRules } from './runtime-prompt-rules';
+import { summarizeRuntimeLogTimings } from './runtime-log-timings';
+import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
+import { runtimeAllowedToolTypes } from './runtime-tool-selection';
+import {
+  isEffectiveToolTraceFailure,
+  isRecoveredTransientToolTrace,
+  notifyRuntimeToolTrace,
+  runtimeToolTraceId,
+} from './runtime-tool-trace';
 
-type ExecutionProgress = (step: StepExecutionResult) => void | Promise<void>;
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
-type ManualIntervention = { stepIndex: number; reason: string; screenshotPath?: string };
-type ExecutionOptions = {
-  onProgress?: ExecutionProgress;
-  onDebug?: ExecutionDebug;
-  initialSteps?: StepExecutionResult[];
-  shouldSkipStep?: (stepIndex: number) => boolean | Promise<boolean>;
-  shouldPauseRun?: (stepIndex: number) => boolean | Promise<boolean>;
-  shouldResumeStep?: (stepIndex: number) => boolean | Promise<boolean>;
-  onPaused?: (stepIndex: number) => void | Promise<void>;
-  onResumed?: (stepIndex: number) => void | Promise<void>;
-  onManualIntervention?: (manualIntervention: ManualIntervention) => void | Promise<void>;
-  onManualInterventionCleared?: (stepIndex: number) => void | Promise<void>;
-  recordedFlow?: RecordedFlowStep[];
-};
-
-type TestExecutionResult = {
-  status: 'passed' | 'failed' | 'blocked';
-  result: {
-    steps: StepExecutionResult[];
-    consoleErrors: string[];
-    networkErrors: string[];
-    tracePath?: string;
-  };
-};
+type RuntimeModelMessage = ModelMessage;
+type RuntimeRetryState = RuntimeRetryStateBase<RuntimeModelMessage>;
 
 type ToolTrace = {
   id?: string;
   name: string;
   input: unknown;
   result?: BrowserActionResult;
-  desktopEvidence?: DesktopActionEvidence;
+  recovered?: boolean;
+  transient?: boolean;
+  startedAt?: number;
+  completedAt?: number;
+  elapsedMs?: number;
+  actionElapsedMs?: number;
+  postprocessTimings?: Record<string, number>;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
   visualAfter?: VisualAfterPolicy;
@@ -66,7 +76,18 @@ type VisualAfterPolicy = {
   reason?: string;
 };
 
-const BATCH_FILL_FIELD_LIMIT = 80;
+
+type BrowserChatSafetyMode = 'strict' | 'full';
+
+export type BrowserToolConfirmationDecision = 'confirmed' | 'cancelled';
+
+export type BrowserToolConfirmationRequest = {
+  toolName: string;
+  input: unknown;
+  reason?: string;
+  prompt: string;
+  stepIndex?: number;
+};
 
 type RuntimeDecision = {
   action: string;
@@ -97,21 +118,27 @@ type SelectedScreenshotReference = ScreenshotReference & {
 
 const codexRuntimeObjectSchema = z.object({
   type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op status update.'),
-  message: z.string().nullable().optional().describe('Optional short Chinese user-facing progress text that accompanies this tool call.'),
+  message: z.string().nullable().optional().describe('Optional short Chinese progress text that must match the selected tool: takeScreenshot reads pixels; takeSnapshot reads the accessibility tree.'),
   params: z.object({
     reason: z.string().nullable().optional(),
     url: z.string().nullable().optional(),
-    id: z.string().nullable().optional(),
-    areaId: z.string().nullable().optional(),
+    urlOrPath: z.string().nullable().optional(),
+    uid: z.string().nullable().optional(),
     text: z.string().nullable().optional(),
     content: z.string().nullable().optional(),
+    fileName: z.string().nullable().optional(),
+    title: z.string().nullable().optional(),
+    capture: z.enum(['viewport', 'fullPage']).nullable().optional(),
     key: z.string().nullable().optional(),
+    keys: z.array(z.string()).nullable().optional(),
     path: z.string().nullable().optional(),
-    domPath: z.string().nullable().optional(),
-    scopeId: z.string().nullable().optional(),
-    locatorId: z.string().nullable().optional(),
-    fromId: z.string().nullable().optional(),
-    toId: z.string().nullable().optional(),
+    toUid: z.string().nullable().optional(),
+    x_thousandth: z.number().nullable().optional(),
+    y_thousandth: z.number().nullable().optional(),
+    toX_thousandth: z.number().nullable().optional(),
+    toY_thousandth: z.number().nullable().optional(),
+    button: z.enum(['left', 'right', 'middle']).nullable().optional(),
+    clickCount: z.number().nullable().optional(),
     index: z.number().nullable().optional(),
     ms: z.number().nullable().optional(),
     maxMs: z.number().nullable().optional(),
@@ -122,38 +149,23 @@ const codexRuntimeObjectSchema = z.object({
     actual: z.string().nullable().optional(),
     status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
     done: z.boolean().nullable().optional(),
-    targetVisual: z.string().nullable().optional(),
-    targetText: z.string().nullable().optional(),
+    mode: z.enum(['actionable', 'full', 'text', 'changes']).nullable().optional(),
+    cursor: z.string().nullable().optional(),
+    query: z.string().nullable().optional(),
+    roles: z.array(z.string()).nullable().optional(),
+    limit: z.number().nullable().optional(),
+    value: z.string().nullable().optional(),
+    label: z.string().nullable().optional(),
+    replace: z.boolean().nullable().optional(),
+    followByEnter: z.boolean().nullable().optional(),
     ids: z.array(z.string()).nullable().optional(),
-    fields: z.array(z.object({
-      id: z.string().min(1),
-      text: z.string().nullable().optional(),
-      clear: z.boolean().nullable().optional(),
-      targetVisual: z.string().nullable().optional(),
-    })).nullable().optional(),
     selectionReason: z.string().nullable().optional(),
     sameInterfaceGroup: z.string().nullable().optional(),
+    requiresConfirmation: z.boolean().nullable().optional(),
+    confirmationMessage: z.string().nullable().optional(),
   }).describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason.'),
 });
-
-const manualIssuePattern = new RegExp(
-  [
-    '\\u9a8c\\u8bc1\\u7801',
-    '\\u5b89\\u5168\\u6821\\u9a8c',
-    '\\u5b89\\u5168\\u9a8c\\u8bc1',
-    '\\u4eba\\u673a\\u9a8c\\u8bc1',
-    '\\u4eba\\u5de5',
-    '\\u7528\\u6237\\u4ecb\\u5165',
-    'captcha',
-    'verification\\s*code',
-    'security\\s*check',
-    'human\\s*verification',
-    'two[-\\s]?factor',
-    '\\b2fa\\b',
-    '\\botp\\b',
-  ].join('|'),
-  'i',
-);
+type CodexRuntimeObject = z.infer<typeof codexRuntimeObjectSchema>;
 
 // 判断当前模型配置是否支持图片输入；这只是模型能力判断，不代表一定会发送截图。
 function modelSupportsScreenshotInput() {
@@ -166,110 +178,41 @@ function modelSupportsScreenshotInput() {
 }
 
 function browserModeFromEnv(): BrowserSessionMode {
-  const raw = process.env.AI_BROWSER_MODE;
-  return /^(true|1|yes|visual|vision|click|visual-markers)$/i.test(String(raw || ''))
-    ? 'visual-markers'
-    : 'dom';
+  return 'dom';
 }
 
 function browserModeOf(testCase: TestCaseRecord): BrowserSessionMode {
-  const configured = testCase.content.browserMode;
-  if (configured === 'dom' || configured === 'visual-markers') {
-    return configured;
-  }
+  void testCase;
   return browserModeFromEnv();
 }
 
-function isVisualMode(mode: BrowserSessionMode) {
-  return mode !== 'dom';
-}
 
 function runtimePageContextOptions(mode: BrowserSessionMode) {
-  const visualMode = isVisualMode(mode);
+  void mode;
   return {
-    domScope: visualMode ? undefined : 'full' as const,
-    includeDomTree: !visualMode,
-    includeText: !visualMode,
+    domScope: 'full' as const,
+    includeDomTree: false,
+    includeText: false,
     includeManualVerification: false,
-    includeInteractiveCandidates: visualMode,
-    textMaxChars: visualMode ? 0 : domPageTextPromptLimit(),
-    useCachedInteractiveCandidates: visualMode,
-  };
-}
-
-type RuntimePageContext = Awaited<ReturnType<BrowserSession['getPageContext']>>;
-
-function domTreePromptLimit() {
-  const raw = String(process.env.DOM_TREE_PROMPT_MAX_CHARS || '').trim();
-  if (!raw || /^(0|false|none|off|unlimited)$/i.test(raw)) return undefined;
-  const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
-}
-
-function domTreeForPrompt(rawTree: string) {
-  const limit = domTreePromptLimit();
-  return limit ? trimDebugText(rawTree, limit) : rawTree;
-}
-
-function domPageTextPromptLimit() {
-  const raw = String(process.env.DOM_PAGE_TEXT_PROMPT_MAX_CHARS || process.env.PAGE_TEXT_PROMPT_MAX_CHARS || '').trim();
-  if (!raw || /^(0|false|none|off|unlimited)$/i.test(raw)) return 0;
-  const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
-}
-
-function pageTextForPrompt(rawText: string) {
-  const limit = domPageTextPromptLimit();
-  return limit ? trimDebugText(rawText, limit) : rawText;
-}
-
-function createDomContextSnapshot(mode: BrowserSessionMode, pageContext: RuntimePageContext): AiDomContextSnapshot | undefined {
-  if (mode !== 'dom') return undefined;
-  const rawTree = pageContext.domTree || '[empty DOM tree]';
-  const promptCharLimit = domTreePromptLimit();
-  const tree = domTreeForPrompt(rawTree);
-  return {
-    mode: 'dom',
-    source: 'runtime-page-context',
-    generatedAt: new Date().toISOString(),
-    url: pageContext.url,
-    title: pageContext.title,
-    tree,
-    treeCharLength: rawTree.length,
-    promptCharLimit,
-    truncated: Boolean(promptCharLimit && rawTree.length > promptCharLimit),
-    focusedElement: pageContext.focusedElement,
-    pageScrollState: pageContext.pageScrollState,
-    scrollableAreas: pageContext.scrollableAreas,
-    interactiveCandidates: pageContext.interactiveCandidates,
+    includeInteractiveCandidates: false,
+    textMaxChars: 0,
+    useCachedInteractiveCandidates: false,
   };
 }
 
 function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
-  if (!aiRequest?.id && !aiRequest?.domContext) return undefined;
+  if (!aiRequest?.id) return undefined;
   return {
     requestId: aiRequest.id,
     requestCreatedAt: aiRequest.createdAt,
-    domContext: aiRequest.domContext,
   };
 }
 
 // 是否启用视觉候选标识。关闭时仍发送截图，但候选元素只以文本摘要进入 prompt。
-function visualMarkersEnabledFor(testCase: TestCaseRecord) {
-  if (typeof testCase.content.isMarked === 'boolean') return testCase.content.isMarked;
-  if (process.env.VISUAL_MARKERS_IS_MARKED === 'false' || process.env.SCREENSHOT_IS_MARKED === 'false') return false;
-  return true;
-}
 
-// 兼容旧双截图链路；默认 false，标识直接叠加在当前截图里。
-function usesSeparateMarkerMap() {
-  return process.env.VISUAL_MARKER_SEPARATE_MAP === 'true';
-}
+// Default to inline marker labels so visual mode screenshots show interactive targets.
 
 // 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
-function shouldSendScreenshotToAi(mode: BrowserSessionMode) {
-  return isVisualMode(mode) && modelSupportsScreenshotInput();
-}
 
 // 将调试数据转成可安全 JSON 序列化的结构，避免 Buffer/BigInt 破坏持久化。
 function jsonSafe(value: unknown) {
@@ -298,7 +241,7 @@ function jsonSafe(value: unknown) {
 }
 
 function aiScreenshotMaxBytes() {
-  const raw = process.env.AI_SCREENSHOT_MAX_KB || process.env.SCREENSHOT_MAX_KB || '';
+  const raw = process.env.AI_SCREENSHOT_MAX_KB || '';
   const kb = Number(raw);
   if (!Number.isFinite(kb) || kb <= 0) return undefined;
   return Math.max(1, Math.floor(kb * 1024));
@@ -349,21 +292,6 @@ async function readScreenshotForAi(filePath: string) {
 }
 
 // 纯标识图必须跟随原图最终发送尺寸缩放，否则两张图经过压缩后会失去像素对齐关系。
-async function readMarkerScreenshotForAi(filePath: string, referenceScreenshot: Buffer) {
-  const markerBuffer = await readFile(filePath);
-  const [referenceMetadata, markerMetadata] = await Promise.all([
-    sharp(referenceScreenshot, { failOn: 'none' }).metadata(),
-    sharp(markerBuffer, { failOn: 'none' }).metadata(),
-  ]);
-  const width = referenceMetadata.width;
-  const height = referenceMetadata.height;
-  if (!width || !height || (markerMetadata.width === width && markerMetadata.height === height)) return markerBuffer;
-
-  return sharp(markerBuffer, { failOn: 'none' })
-    .resize({ width, height, fit: 'fill' })
-    .png({ compressionLevel: 9 })
-    .toBuffer();
-}
 
 function trimDebugText(value: string, max = 4000) {
   return value.length > max ? `${value.slice(0, max)}...` : value;
@@ -371,18 +299,122 @@ function trimDebugText(value: string, max = 4000) {
 
 function looksLikeDomSnapshot(value?: string) {
   const text = (value || '').trim();
-  if (!text || !/\bnode_id=\d+\b/.test(text)) return false;
-  return /<\s*(?:a|button|input|select|textarea|option|summary|details|label|form|iframe)\b/i.test(text);
+  return Boolean(text && /\buid=\d+\s+(?:RootWebArea|button|link|textbox|combobox|StaticText)\b/.test(text));
 }
 
 function providerToolSchemaError(value?: string) {
   return /Failed to deserialize the JSON body|unknown variant `?custom`?|invalid_request_error|AnthropicException|litellm\.BadRequestError/i.test(value || '');
 }
 
-const untrimmedToolResultNames = new Set(['fillCandidates', 'fillDomNodes']);
+function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
+  const numberValue = typeof value === 'number' ? value : Number(value);
+  const normalized = Number.isFinite(numberValue) ? Math.floor(numberValue) : fallback;
+  return Math.min(Math.max(normalized, min), max);
+}
 
-function userFacingInfrastructureError(value?: string) {
+function runtimeRequestConsecutiveFailureLimit(browserChatMode: boolean) {
+  const retryEnabled = browserChatMode || process.env.AI_RUNTIME_RETRY_ON_PURE_FAILURE === 'true';
+  if (!retryEnabled) return 1;
+  return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, browserChatMode ? 3 : 2, 1, 10);
+}
+
+function upstreamApiDisconnectReason(value?: string) {
   const text = value || '';
+  const apiMatch = text.match(/Cannot connect to API:\s*([^\n]+)/i);
+  if (apiMatch?.[1]) return apiMatch[1].trim();
+  const genericMatch = text.match(/(?:other side closed|socket hang up|ECONNRESET|connection (?:closed|reset|terminated)|fetch failed)/i);
+  return genericMatch?.[0];
+}
+
+function aiRequestFromError(error: unknown) {
+  if (!error || typeof error !== 'object') return undefined;
+  return (error as { aiRequest?: AiRequestSnapshot }).aiRequest;
+}
+
+function runtimeRetryFromError(error: unknown) {
+  if (!error || typeof error !== 'object') return undefined;
+  const retry = (error as { runtimeRetry?: unknown }).runtimeRetry;
+  if (!retry || typeof retry !== 'object' || Array.isArray(retry)) return undefined;
+  const record = retry as Record<string, unknown>;
+  const retryAttempts = Number(record.retryAttempts);
+  const maxRetryAttempts = Number(record.maxRetryAttempts);
+  const consecutiveFailures = Number(record.consecutiveFailures ?? retryAttempts);
+  const consecutiveFailureLimit = Number(record.consecutiveFailureLimit ?? maxRetryAttempts);
+  if (!Number.isFinite(consecutiveFailures) || !Number.isFinite(consecutiveFailureLimit)) return undefined;
+  return {
+    consecutiveFailures: Math.max(0, Math.floor(consecutiveFailures)),
+    consecutiveFailureLimit: Math.max(1, Math.floor(consecutiveFailureLimit)),
+  };
+}
+
+function diagnosticValueText(value: unknown, max = 900) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string') return value.trim() ? trimDebugText(value.trim(), max) : undefined;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return trimDebugText(JSON.stringify(value), max);
+  } catch {
+    return trimDebugText(String(value), max);
+  }
+}
+
+function aiRequestBrief(aiRequest?: AiRequestSnapshot) {
+  if (!aiRequest) return undefined;
+  const agentStepIndex = aiRequest.options?.agentStepIndex;
+  return [
+    aiRequest.id ? `requestId=${aiRequest.id}` : '',
+    aiRequest.provider ? `provider=${aiRequest.provider}` : '',
+    aiRequest.model ? `model=${aiRequest.model}` : '',
+    `stepIndex=${aiRequest.stepIndex}`,
+    typeof agentStepIndex === 'number' ? `agentStep=${agentStepIndex}` : '',
+  ].filter(Boolean).join(', ');
+}
+
+function upstreamDisconnectLines(
+  reason: string,
+  text: string,
+  context?: { error?: unknown; aiRequest?: AiRequestSnapshot },
+) {
+  const error = context?.error;
+  const aiRequest = context?.aiRequest || aiRequestFromError(error);
+  const requestBrief = aiRequestBrief(aiRequest);
+  const retryInfo = runtimeRetryFromError(error);
+  const code = firstErrorString(error, 'code');
+  const status = firstErrorValue(error, 'status') ?? firstErrorValue(error, 'statusCode');
+  const causeMessage = errorCauseMessage(error);
+  const responseBody = firstErrorDisplay(error, 'responseBody', 1200)
+    || firstErrorDisplay(error, 'body', 1200)
+    || firstErrorDisplay(error, 'data', 1200);
+  const technical = [
+    code ? `code=${code}` : '',
+    status !== undefined ? `status=${diagnosticValueText(status, 120)}` : '',
+    causeMessage ? `cause=${trimDebugText(causeMessage, 600)}` : '',
+    responseBody ? `responseBody=${responseBody}` : '',
+  ].filter(Boolean).join('; ');
+  const raw = trimDebugText(text, 1200);
+  const lines = [
+    `网关返回原因：${reason}`,
+    requestBrief ? `请求信息：${requestBrief}` : '',
+    retryInfo ? `重试信息：连续失败 ${retryInfo.consecutiveFailures} 次，达到上限 ${retryInfo.consecutiveFailureLimit} 次；仍然失败。` : '',
+    technical ? `技术细节：${technical}` : '',
+    raw ? `原始错误：${raw}` : '',
+  ].filter(Boolean);
+  if (!code && status === undefined && !causeMessage && !responseBody) {
+    lines.push('补充：上游只返回了连接被对端关闭，未返回 HTTP 状态码或响应体。');
+  }
+  return lines;
+}
+
+function userFacingInfrastructureError(value?: string, context?: { error?: unknown; aiRequest?: AiRequestSnapshot }) {
+  const text = value || '';
+  const upstreamReason = upstreamApiDisconnectReason(text);
+  if (upstreamReason) {
+    return [
+      '上游 AI 服务连接已断开。',
+      ...upstreamDisconnectLines(upstreamReason, text, context),
+      '本轮操作已停止，当前页面状态已保留。',
+    ].join('\n');
+  }
   if (providerToolSchemaError(text)) return 'AI 模型请求失败：当前模型网关不兼容本轮工具调用格式，已保留页面状态并准备继续。';
   if (/Request aborted|operation interrupted/i.test(text)) return '本轮 AI 请求被中断，未继续写入技术错误。';
   if (/timed out|timeout/i.test(text)) return 'AI 请求超时，已保留当前页面状态并准备继续。';
@@ -392,14 +424,56 @@ function userFacingInfrastructureError(value?: string) {
 
 function userFacingToolResult(name: string, result?: BrowserActionResult, max = 360) {
   if (!result) return undefined;
-  const resultMax = untrimmedToolResultNames.has(name) ? Number.MAX_SAFE_INTEGER : max;
+  const resultMax = max;
   if (!result.ok && providerToolSchemaError(result.actual)) return userFacingInfrastructureError(result.actual);
   if (!result.ok) return trimDebugText(result.actual, resultMax);
-  if (looksLikeDomSnapshot(result.actual)) return '已读取当前可见 DOM 快照。';
-  if (name === 'getInteractiveCandidates') return '已读取当前可见可交互元素。';
+  if (name === 'takeSnapshot') return result.actual;
+  if (looksLikeDomSnapshot(result.actual)) return '已读取当前页面语义 DOM 快照。';
   if (name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
   if (name === 'listTabs') return '已读取浏览器标签页列表。';
+  if (name === 'downloadFile' || name === 'generateMarkdownFile') return formatFileArtifactResult(name, result.actual);
   return trimDebugText(result.actual, resultMax);
+}
+
+function modelToolResultLimit(name: string) {
+  const observationTool = name === 'takeSnapshot';
+  const raw = Number(
+    observationTool
+      ? process.env.AI_OBSERVATION_TOOL_RESULT_MAX_CHARS || process.env.AI_TOOL_RESULT_MAX_CHARS || 20000
+      : process.env.AI_TOOL_RESULT_MAX_CHARS || 6000,
+  );
+  const fallback = observationTool ? 20000 : 6000;
+  const min = observationTool ? 20000 : 1200;
+  const value = Math.floor(Number.isFinite(raw) ? raw : fallback);
+  return observationTool ? Math.max(value, min) : Math.min(Math.max(value, min), 30000);
+}
+
+function compactToolResultForModel(
+  name: string,
+  result: BrowserActionResult,
+  observationStore?: RuntimeObservationStore,
+): BrowserActionResult {
+  const modelResult = result;
+  if (!modelResult.actual) return modelResult;
+  const fileResult = modelResult.ok ? formatFileArtifactResult(name, modelResult.actual) : undefined;
+  if (fileResult) return { ...modelResult, actual: fileResult };
+  if (runtimeObservationToolNames.has(name)) return modelResult;
+  const limit = modelToolResultLimit(name);
+  if (modelResult.actual.length <= limit) return modelResult;
+  const previewLimit = observationStore ? Math.min(limit, observationPreviewLimit(name)) : limit;
+  const omitted = modelResult.actual.length - previewLimit;
+  return {
+    ...modelResult,
+    actual: [
+      modelResult.actual.slice(0, previewLimit),
+      '',
+      `[Tool result truncated for model context: ${omitted} characters omitted from ${name}. Use a narrower text query, HTTP filter, or another observation tool call if more detail is required.]`,
+    ].join('\n'),
+  };
+}
+
+function staleUidActionError(value?: string) {
+  return /\bUID\s+\S+.*(?:is stale|could not be refreshed after the page changed|is detached or no longer rendered|no longer has a rendered box)\b/i.test(value || '');
 }
 
 function elapsedSince(startedAt: number) {
@@ -412,12 +486,27 @@ function splitToolInputAndReason(input: unknown) {
   if (!safeInput || typeof safeInput !== 'object' || Array.isArray(safeInput)) {
     return { input: safeInput, reason: undefined };
   }
-  const { reason, ...rest } = safeInput as Record<string, unknown>;
+  const { reason, requiresConfirmation, confirmationMessage, ...rest } = safeInput as Record<string, unknown>;
+  void requiresConfirmation;
+  void confirmationMessage;
   const compactInput = Object.keys(rest).length ? rest : undefined;
   return {
     input: compactInput,
     reason: typeof reason === 'string' && reason.trim() ? trimDebugText(reason.trim(), 300) : undefined,
   };
+}
+
+function toolConfirmationFromInput(toolName: string, input: unknown) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const record = input as Record<string, unknown>;
+  if (record.requiresConfirmation !== true) return undefined;
+  const reason = typeof record.reason === 'string' ? trimDebugText(record.reason.trim(), 300) : undefined;
+  const explicit = typeof record.confirmationMessage === 'string' ? record.confirmationMessage.trim() : '';
+  const prompt = trimDebugText(
+    explicit || `请确认是否执行工具 ${toolName}${reason ? `：${reason}` : ''}`,
+    300,
+  );
+  return { prompt, reason };
 }
 
 function parseJsonObjectText(text?: string) {
@@ -436,10 +525,7 @@ function parseJsonObjectText(text?: string) {
 
 function toolNameLike(value?: string) {
   if (!value) return false;
-  const names = new Set<string>([
-    ...runtimeToolNames('visual-markers'),
-    ...runtimeToolNames('dom'),
-  ]);
+  const names = new Set<string>(runtimeToolNames('dom'));
   return names.has(value);
 }
 
@@ -476,6 +562,39 @@ function readableActionFromTrace(trace?: ToolTrace, options: { reportState?: boo
   return readableTextFromToolRecord(trace.input as Record<string, unknown>, options);
 }
 
+function explicitlyRequestsScreenshot(value?: string) {
+  const text = cleanDisplayText(value);
+  if (!text) return false;
+  if (/(?:不需要|无需|不用|不要).{0,6}(?:截图|截屏)|(?:without|no need to|do not).{0,8}(?:screenshot|screen capture)/i.test(text)) return false;
+  return /(?:让我|我来|先|需要|准备|正在|将|通过).{0,16}(?:截图|截屏)|(?:截图|截屏).{0,16}(?:看看|查看|确认|观察|获取)|(?:take|capture|need|use).{0,12}(?:a )?(?:screenshot|screen capture)|(?:screenshot|screen capture).{0,12}(?:inspect|check|view|understand)/i.test(text);
+}
+
+function toolConsistentAssistantText(value: string | undefined, toolName?: string) {
+  const text = readableActionFromRawText(value) || '';
+  if (toolName === 'takeSnapshot' && explicitlyRequestsScreenshot(text)) {
+    return '我先读取当前页面的语义 DOM 快照，以确认页面结构与可执行目标。';
+  }
+  return text;
+}
+
+function alignCodexRuntimeObjectTool(object: CodexRuntimeObject, allowedTypes: string[]) {
+  if (
+    object.type === 'takeSnapshot'
+    && allowedTypes.includes('takeScreenshot')
+    && explicitlyRequestsScreenshot(object.message || String(object.params.reason || ''))
+  ) {
+    return {
+      ...object,
+      type: 'takeScreenshot',
+      params: {
+        reason: object.params.reason || object.message || '需要查看当前页面实际画面',
+        capture: 'viewport',
+      },
+    } satisfies CodexRuntimeObject;
+  }
+  return object;
+}
+
 function browserChatAbortError(signal?: AbortSignal) {
   const reason = signal?.reason;
   if (reason instanceof Error) return reason;
@@ -498,37 +617,45 @@ function throwIfStopped(signal?: AbortSignal, shouldContinue?: () => boolean) {
 }
 
 // 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
-async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
-  throwIfAborted(options.abortSignal);
-  const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
-  const timeoutController = new AbortController();
-  const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
-  const upstream = options.abortSignal;
-  const abortSignal = upstream ? AbortSignal.any([upstream, timeoutController.signal]) : timeoutController.signal;
-  try {
-    return await generateText({ ...options, abortSignal });
-  } catch (error) {
-    if (isBrowserChatAbortError(error, upstream)) throw browserChatAbortError(upstream);
-    if (timeoutController.signal.aborted && !upstream?.aborted) {
-      const timeoutError = new Error(`AI request timed out after ${timeoutMs}ms`);
-      (timeoutError as { cause?: unknown }).cause = error;
-      throw timeoutError;
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+function generateTextTimeoutMs(options: Parameters<typeof generateText>[0]) {
+  const nativeToolLoop = typeof (options as { prepareStep?: unknown }).prepareStep === 'function';
+  const raw = Number(
+    nativeToolLoop
+      ? process.env.AI_AGENT_LOOP_TIMEOUT_MS || process.env.AI_TEST_REQUEST_TIMEOUT_MS || 120000
+      : process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000,
+  );
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : nativeToolLoop ? 120000 : 30000;
 }
 
-async function generateObjectWithTimeout(options: Parameters<typeof generateObject>[0]) {
+async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
   throwIfAborted(options.abortSignal);
-  const timeoutMs = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
+  const timeoutMs = generateTextTimeoutMs(options);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
   const upstream = options.abortSignal;
   const abortSignal = upstream ? AbortSignal.any([upstream, timeoutController.signal]) : timeoutController.signal;
+  let stopAbortWatch = () => {};
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    const onAbort = () => {
+      if (upstream?.aborted) {
+        reject(browserChatAbortError(upstream));
+        return;
+      }
+      if (timeoutController.signal.aborted) {
+        reject(timeoutController.signal.reason || new Error(`AI request timed out after ${timeoutMs}ms`));
+        return;
+      }
+      reject(browserChatAbortError(upstream));
+    };
+    abortSignal.addEventListener('abort', onAbort, { once: true });
+    stopAbortWatch = () => abortSignal.removeEventListener('abort', onAbort);
+    if (abortSignal.aborted) onAbort();
+  });
   try {
-    return await generateObject({ ...options, abortSignal });
+    return await Promise.race([
+      generateText({ ...options, abortSignal }),
+      abortPromise,
+    ]);
   } catch (error) {
     if (isBrowserChatAbortError(error, upstream)) throw browserChatAbortError(upstream);
     if (timeoutController.signal.aborted && !upstream?.aborted) {
@@ -538,6 +665,7 @@ async function generateObjectWithTimeout(options: Parameters<typeof generateObje
     }
     throw error;
   } finally {
+    stopAbortWatch();
     clearTimeout(timer);
   }
 }
@@ -553,6 +681,39 @@ function extractJson(text: string) {
 }
 
 // 将测试需求富文本转为纯文本，作为执行器理解目标的主输入。
+function recordFromUnknown(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function codexRuntimeObjectFromText(text: string, fallbackType: 'answer' | 'reportState' = 'reportState'): CodexRuntimeObject {
+  let raw: Record<string, unknown> | undefined;
+  try {
+    raw = recordFromUnknown(extractJson(text));
+  } catch {
+    const fallbackText = trimDebugText((text || '').trim() || 'Codex did not return a valid action JSON.', 2000);
+    return {
+      type: fallbackType,
+      message: fallbackText,
+      params: {
+        content: fallbackText,
+        actual: fallbackText,
+        status: fallbackType === 'reportState' ? 'blocked' : undefined,
+        done: fallbackType === 'reportState' ? true : undefined,
+      },
+    };
+  }
+
+  const rawRecord = raw || {};
+  const params = recordFromUnknown(rawRecord.params);
+  const candidate = {
+    type: typeof rawRecord.type === 'string' && rawRecord.type.trim() ? rawRecord.type.trim() : fallbackType,
+    message: typeof rawRecord.message === 'string' && rawRecord.message.trim() ? rawRecord.message.trim() : undefined,
+    params,
+  };
+  const parsed = codexRuntimeObjectSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : candidate as CodexRuntimeObject;
+}
+
 function requirementOf(testCase: TestCaseRecord) {
   return richTextToPlainText(testCase.content.userRequirement || testCase.description) || testCase.description || testCase.title;
 }
@@ -567,6 +728,12 @@ function isBrowserChatTestCase(testCase: TestCaseRecord) {
 }
 
 // 将浏览器工具调用轨迹压缩为步骤证据，保存到运行历史中。
+const browserChatDefaultSystemPrompt = 'This is an interactive browser chat. Do not assume a fixed test-case script; operate from the live page and answer the latest user message in Chinese.';
+
+function browserChatSystemPromptForRuntime(value: string) {
+  return value.replace(browserChatDefaultSystemPrompt, '').trim();
+}
+
 function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   return traces.map((trace) => {
     const { input, reason } = splitToolInputAndReason(trace.input);
@@ -575,8 +742,10 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       input,
       reason,
       ok: trace.result?.ok,
+      recovered: trace.recovered,
+      transient: trace.transient,
       result: userFacingToolResult(trace.name, trace.result, 360),
-      desktopEvidence: trace.desktopEvidence,
+      rawResult: trace.result,
       contextBefore: trace.contextBefore,
       contextAfter: trace.contextAfter,
       visualAfter: trace.visualAfter,
@@ -591,13 +760,6 @@ function upsertToolTrace(traces: ToolTrace[], trace: ToolTrace) {
   else traces.push(trace);
 }
 
-function recentProgressNotes(steps: StepExecutionResult[], limit = 5) {
-  return steps
-    .filter((step) => step.note && step.note.trim())
-    .slice(-limit)
-    .map((step) => `Step ${step.index}: ${step.note}`);
-}
-
 function screenshotPhaseLabel(phase: ScreenshotReference['phase']) {
   if (phase === 'before') return 'before action';
   if (phase === 'after') return 'after action';
@@ -605,12 +767,18 @@ function screenshotPhaseLabel(phase: ScreenshotReference['phase']) {
 }
 
 function screenshotReferenceGroupOf(step: StepExecutionResult) {
-  const scrollTool = (step.tools || []).find((toolCall) => toolCall.name === 'scrollArea' || toolCall.name === 'scrollViewport');
+  const scrollTool = (step.tools || []).find((toolCall) => {
+    if (toolCall.name !== 'mouse') return false;
+    const input = toolCall.input && typeof toolCall.input === 'object' && !Array.isArray(toolCall.input)
+      ? toolCall.input as Record<string, unknown>
+      : {};
+    return input.action === 'scroll';
+  });
   if (!scrollTool) return undefined;
   const input = scrollTool.input && typeof scrollTool.input === 'object' && !Array.isArray(scrollTool.input)
     ? scrollTool.input as Record<string, unknown>
     : {};
-  const area = typeof input.areaId === 'string' ? input.areaId : typeof input.domPath === 'string' ? input.domPath : 'page';
+  const area = typeof input.uid === 'string' ? `uid-${input.uid}` : 'page';
   return `scroll-step-${step.index}-${area}`;
 }
 
@@ -663,15 +831,17 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
   if (!recent.length) return '[none]';
   return recent.map((trace, index) => {
     const { reason } = splitToolInputAndReason(trace.input);
+    const fileResult = trace.result?.ok ? formatFileArtifactResult(trace.name, trace.result.actual) : undefined;
     const status = !trace.result
       ? 'running'
-      : trace.result.ok
-        ? 'ok'
+      : isRecoveredTransientToolTrace(trace)
+        ? 'recovered: a fresh DOM snapshot replaced the stale UID; continue with a current UID'
+        : trace.result.ok
+        ? fileResult ? `ok: ${sanitizeHistoricalToolText(fileResult, 260)}` : 'ok'
         : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
     const shots = trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
-    const desktop = trace.desktopEvidence ? `; desktop=${sanitizeHistoricalToolText(trace.desktopEvidence.summary, 180)}` : '';
     const why = reason ? `; reason=${sanitizeHistoricalToolText(reason, 140)}` : '';
-    return `${index + 1}. ${trace.name}: ${status}${why}${desktop}${shots}`;
+    return `${index + 1}. ${trace.name}: ${status}${why}${shots}`;
   }).join('\n');
 }
 
@@ -687,6 +857,136 @@ function contextCompressionThresholdRatio() {
   return raw > 1 ? Math.min(0.98, raw / 100) : Math.min(0.98, raw);
 }
 
+function agentStepLabel(stepIndex: number) {
+  return String(stepIndex + 1);
+}
+
+function agentLoopSummaryInputCharLimit() {
+  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS || 120000);
+  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 120000;
+}
+
+function agentLoopSummaryOutputCharLimit() {
+  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_OUTPUT_MAX_CHARS || 24000);
+  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 24000;
+}
+
+function compactContinuationText(value: string, max: number) {
+  if (value.length <= max) return value;
+  const headLength = Math.max(1, Math.floor(max * 0.72));
+  const tailLength = Math.max(1, max - headLength);
+  return `${value.slice(0, headLength)}\n...[${value.length - headLength - tailLength} characters omitted; tail retained]...\n${value.slice(-tailLength)}`;
+}
+
+function continuationSummaryMessageExcerpt(modelMessages: unknown, maxChars: number) {
+  const record = modelMessages && typeof modelMessages === 'object' && !Array.isArray(modelMessages)
+    ? modelMessages as Record<string, unknown>
+    : {};
+  const messages = Array.isArray(record.messages) ? record.messages : [];
+  const marker = '[WebPilot continuation summary]';
+  const previousSummary = messages
+    .map((message) => message && typeof message === 'object' && !Array.isArray(message)
+      ? message as Record<string, unknown>
+      : undefined)
+    .filter((message): message is Record<string, unknown> => Boolean(message))
+    .map((message) => typeof message.content === 'string' ? message.content : '')
+    .filter((content) => content.startsWith(marker))
+    .at(-1);
+  const result: {
+    previousContinuationSummary?: string;
+    recentMessages: Array<{ index: number; content: string }>;
+  } = { recentMessages: [] };
+  if (previousSummary) result.previousContinuationSummary = compactContinuationText(previousSummary, Math.min(24000, Math.floor(maxChars * 0.28)));
+
+  let remaining = maxChars - JSON.stringify(result).length - 256;
+  for (let index = messages.length - 1; index >= 0 && result.recentMessages.length < 16 && remaining >= 1200; index -= 1) {
+    const serialized = JSON.stringify(messages[index], null, 2);
+    const excerpt = compactContinuationText(serialized, Math.min(14000, Math.max(1200, remaining)));
+    result.recentMessages.unshift({ index, content: excerpt });
+    remaining -= excerpt.length + 96;
+  }
+  return JSON.stringify(result, null, 2);
+}
+
+function continuationRuntimeState(memory: RuntimeWorkingMemory) {
+  return {
+    completed: memory.completed.slice(-30),
+    findings: memory.findings.slice(-40),
+    blockers: memory.blockers.slice(-20),
+    userConstraints: memory.userConstraints.slice(-20),
+    pageUnderstanding: concise(memory.pageUnderstanding, 1800),
+    currentState: concise(memory.currentState, 2600),
+    lastAction: concise(memory.lastAction, 1400),
+    lastResult: concise(memory.lastResult, 2200),
+    nextStep: concise(memory.nextStep, 1400),
+  };
+}
+
+function buildContinuationSummaryPrompt(input: {
+  goal: string;
+  browserMode: BrowserSessionMode;
+  stepIndex: number;
+  agentStep: number;
+  estimatedTokens: number;
+  thresholdTokens: number;
+  modelMessages: unknown;
+  workingMemory: RuntimeWorkingMemory;
+}) {
+  const serializedMessages = continuationSummaryMessageExcerpt(input.modelMessages, agentLoopSummaryInputCharLimit());
+  return [
+    'You are compressing a WebPilot browser-agent loop so the SAME user request can continue in a fresh model context.',
+    'Return concise JSON only. Do not use markdown.',
+    '',
+    'Required JSON shape:',
+    '{ "goal": string, "completed": string[], "currentPage": string, "confirmedFacts": string[], "negativeResults": string[], "failedAttempts": string[], "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
+    '',
+    'Rules:',
+    '- Preserve current dom-* UIDs and every removed UID from action deltas. A dom-* UID remains actionable until a delta removes it; viewport screenshot coordinates still require the latest viewport screenshot.',
+    '- Preserve tool results that materially affect the next action.',
+    '- Preserve current URL/page state, blockers, manual verification state, and user constraints.',
+    '- Preserve every completed search/query and its observed result. If a query had no result, put the exact query and outcome in negativeResults; do not schedule that same query again unless the user changed it or new evidence contradicts it.',
+    '- Merge the previousContinuationSummary with the newest evidence. The authoritative runtime state below is produced after the latest completed tool call and wins on conflict.',
+    '- Do not include raw screenshots, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON unless essential.',
+    '- Write Chinese for user-facing summaries when possible.',
+    '',
+    `Goal: ${input.goal}`,
+    `Executor step: ${input.stepIndex}`,
+    `Agent step before compression: ${input.agentStep}`,
+    `Browser mode: ${input.browserMode}`,
+    `Estimated model-context tokens: ${input.estimatedTokens}/${input.thresholdTokens}`,
+    '',
+    `Authoritative current runtime state JSON:\n${JSON.stringify(continuationRuntimeState(input.workingMemory), null, 2)}`,
+    '',
+    `Selected message history JSON (previous overview plus newest messages, not a head-only truncation):\n${serializedMessages}`,
+  ].join('\n');
+}
+
+function fallbackContinuationSummary(input: {
+  goal: string;
+  browserMode: BrowserSessionMode;
+  stepIndex: number;
+  agentStep: number;
+  traces: ToolTrace[];
+  workingMemory: RuntimeWorkingMemory;
+}) {
+  return JSON.stringify({
+    goal: input.goal,
+    browserMode: input.browserMode,
+    executorStep: input.stepIndex,
+    agentStepBeforeCompression: input.agentStep,
+    completed: input.workingMemory.completed,
+    currentPage: input.workingMemory.currentState || input.workingMemory.pageUnderstanding || '',
+    importantEvidence: input.workingMemory.findings,
+    confirmedFacts: input.workingMemory.findings,
+    negativeResults: [],
+    failedAttempts: [],
+    openObservations: [],
+    remaining: input.workingMemory.nextStep ? [input.workingMemory.nextStep] : [],
+    nextStep: input.workingMemory.nextStep || 'Continue from the latest live browser state.',
+    recentToolAttempts: formatCurrentToolAttemptSummary(input.traces, 5),
+  }, null, 2);
+}
+
 function estimateTextTokens(text: string) {
   let ascii = 0;
   let nonAscii = 0;
@@ -699,26 +999,6 @@ function estimateTextTokens(text: string) {
 
 function imageTokenEstimatePerImage() {
   return Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
-}
-
-function estimateContextTokens(text: string, imageCount: number) {
-  return estimateTextTokens(text) + imageCount * imageTokenEstimatePerImage();
-}
-
-function compactWorkingMemory(memory: RuntimeWorkingMemory): RuntimeWorkingMemory {
-  return {
-    ...memory,
-    completed: memory.completed.slice(-6),
-    findings: memory.findings.slice(-8),
-    blockers: memory.blockers.slice(-4),
-    lastAction: concise(memory.lastAction, 180),
-    lastResult: concise(memory.lastResult, 180),
-    pageUnderstanding: concise(memory.pageUnderstanding, 260),
-    currentState: concise(memory.currentState, 260),
-    scrollSummary: concise(memory.scrollSummary, 360),
-    userConstraints: memory.userConstraints.slice(-4).map((item) => concise(item, 180)),
-    nextStep: concise(memory.nextStep, 180),
-  };
 }
 
 function isInfrastructureNoise(value?: string) {
@@ -756,15 +1036,13 @@ function sanitizeHistoricalToolText(value: unknown, max = 180) {
   );
 }
 
-function filterRegressiveMemoryItems(items: string[], memory: RuntimeWorkingMemory) {
-  void memory;
-  return items;
-}
-
 function summarizeStepToolCallForPrompt(toolCall: StepToolCall) {
   const reason = sanitizeHistoricalToolText(toolCall.reason, 140);
   const result = sanitizeHistoricalToolText(toolCall.result, 140);
-  return `${toolCall.name}${toolCall.ok === false ? ' failed' : ''}${reason ? `: ${reason}` : result ? `: ${result}` : ''}`;
+  const status = toolCall.recovered === true && toolCall.transient === true
+    ? ' recovered'
+    : toolCall.ok === false ? ' failed' : '';
+  return `${toolCall.name}${status}${reason ? `: ${reason}` : ''}${result ? ` -> ${result}` : ''}`;
 }
 
 function buildCompactRunContext(steps: StepExecutionResult[], activeMemory?: RuntimeWorkingMemory) {
@@ -805,6 +1083,58 @@ function buildCompactRunContext(steps: StepExecutionResult[], activeMemory?: Run
   ].join('\n');
 }
 
+function buildCompactBrowserChatContext(steps: StepExecutionResult[], activeMemory?: RuntimeWorkingMemory) {
+  const usefulSteps = steps.filter(isUsefulHistoryStep);
+  const latestStep = usefulSteps.at(-1);
+  const latestTool = latestStep?.tools?.at(-1);
+  const persistedWorkingMemory = steps.map((step) => step.workingMemory).filter(Boolean).at(-1);
+  const latestWorkingMemory = activeMemory || persistedWorkingMemory;
+  const latestNextGoal = sanitizeNextGoal(activeMemory?.nextStep || persistedWorkingMemory?.nextStep || steps.map((step) => step.workingMemory?.nextStep).filter(Boolean).at(-1));
+  const currentState = sanitizeCurrentState(latestWorkingMemory?.currentState || latestWorkingMemory?.pageUnderstanding || latestStep?.observation || latestStep?.note || '');
+  const lastAction = activeMemory?.lastAction
+    ? concise([activeMemory.lastAction, activeMemory.lastResult].filter(Boolean).join(' -> '), 180)
+    : latestTool
+    ? summarizeStepToolCallForPrompt(latestTool)
+    : latestStep ? `Step ${latestStep.index}: ${concise(latestStep.observation || latestStep.note || latestStep.action, 140)}` : '[none]';
+  const recentActions = usefulSteps
+    .flatMap((step) => (step.tools || []).map((tool) => `Step ${step.index}: ${summarizeStepToolCallForPrompt(tool)}`))
+    .slice(-8);
+  const runState = {
+    currentState: currentState || null,
+    nextObjective: latestNextGoal || 'Satisfy the latest browser-chat user message.',
+    lastActionOrResult: lastAction,
+    recentExecutedActions: recentActions,
+    completedSteps: steps.length,
+    stateRule: 'These actions already executed. Do not repeat an action whose successful result already satisfies the request; inspect current state or finish instead.',
+  };
+
+  return [
+    'BrowserChat RunState JSON (compact context):',
+    JSON.stringify(runState, null, 2),
+  ].join('\n');
+}
+
+function codexExecutedActionMessages(steps: StepExecutionResult[]): RuntimeModelMessage[] {
+  const actions = steps
+    .filter(isUsefulHistoryStep)
+    .flatMap((step) => (step.tools || []).map((tool) => ({ stepIndex: step.index, tool })))
+    .slice(-8);
+  return actions.flatMap(({ stepIndex, tool }) => {
+    const input = tool.input === undefined ? {} : tool.input;
+    const result = textFromUnknown(tool.rawResult ?? tool.result).trim() || '[no execution result recorded]';
+    return [
+      {
+        role: 'assistant' as const,
+        content: `[Previously requested browser action]\nstep=${stepIndex}\ntool=${tool.name}\ninput=${JSON.stringify(input)}`,
+      },
+      {
+        role: 'user' as const,
+        content: `[Browser action execution result]\nstep=${stepIndex}\ntool=${tool.name}\nok=${tool.ok !== false}\nresult=${result}`,
+      },
+    ];
+  });
+}
+
 function formatLedgerDigest(items: TaskLedgerItem[], limit = Number(process.env.AI_LEDGER_DIGEST_LIMIT || 1000)) {
   if (!items.length) return [];
   return items.slice(-Math.max(1, limit)).map((item) => {
@@ -825,59 +1155,9 @@ function hostOf(url: string) {
   }
 }
 
-function formatInteractiveCandidates(candidates: unknown, limit = 50) {
-  if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive candidates]';
-  return JSON.stringify(
-    candidates.slice(0, limit).map((item) => {
-      const candidate = item as Record<string, unknown>;
-      return {
-        id: candidate.id,
-        tag: candidate.tag,
-        role: candidate.role,
-        type: candidate.type,
-        name: candidate.name,
-        text: candidate.text,
-        href: candidate.href,
-        host: candidate.host,
-        rect: candidate.rect,
-        center: candidate.center,
-        input: candidate.input,
-        disabled: candidate.disabled,
-        framePath: candidate.framePath,
-        frameUrl: candidate.frameUrl,
-        nearbyText: candidate.nearbyText,
-      };
-    }),
-    null,
-    2,
-  );
-}
 
-function formatVisualInteractiveElements(candidates: unknown, limit = 80) {
-  if (!Array.isArray(candidates) || !candidates.length) return '[no visible interactive elements detected]';
-  return candidates.slice(0, limit).map((item, index) => {
-    const candidate = item as Record<string, unknown>;
-    const label = [
-      candidate.name,
-      candidate.text,
-      candidate.ariaLabel,
-      candidate.placeholder,
-      candidate.title,
-      candidate.nearbyText,
-    ]
-      .map((value) => (typeof value === 'string' ? value.trim() : ''))
-      .find(Boolean) || '[unlabeled]';
-    const role = [candidate.tag, candidate.role, candidate.type].filter(Boolean).join('/');
-    const rect = candidate.rect ? ` rect=${JSON.stringify(candidate.rect)}` : '';
-    const state = [
-      candidate.input ? 'input' : '',
-      candidate.disabled ? 'disabled' : '',
-      candidate.href ? `href=${candidate.href}` : '',
-      candidate.framePath ? `frame=${candidate.framePath}` : '',
-    ].filter(Boolean).join(', ');
-    return `${index + 1}. id=${candidate.id} ${role || 'element'} "${String(label).slice(0, 120)}"${state ? ` (${state})` : ''}${rect}`;
-  }).join('\n');
-}
+
+
 
 function formatScrollableAreaSummary(areas: unknown, limit = 10) {
   if (!Array.isArray(areas) || !areas.length) return '[no scrollable areas detected]';
@@ -935,9 +1215,14 @@ function formatScrollableAreaSummary(areas: unknown, limit = 10) {
   }).join('\n');
 }
 
+
 function defaultVisualAfterForTool(name: string): VisualAfterPolicy {
   void name;
   return { capture: 'auto', retention: 'replace' };
+}
+
+function browserChatDomScreenshotsEnabled() {
+  return process.env.BROWSER_CHAT_DOM_SCREENSHOTS === 'true';
 }
 
 function sanitizeVisualAfterRetention(retention: unknown, fallback: VisualAfterPolicy['retention']) {
@@ -954,7 +1239,7 @@ function sanitizeNextGoal(value: unknown) {
       .replace(/(?:点击|双击|右键|拖拽|悬停|输入|按下|滚动|选择)\s*[“"']?([^，。；;]*)[”"']?/g, '完成$1')
       .replace(/候选(?:ID|id|编号)\s*[:：]?\s*\d+/gi, '当前截图中的对应候选')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的对应目标')
-      .replace(/\b(?:clickCandidate|fillCandidates|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|fillDomNodes|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '根据当前页面选择合适工具'),
+      .replace(/\b(?:mouse|keyboard)\s*\([^)]*\)/gi, '根据当前页面选择合适工具'),
     220,
   );
 }
@@ -963,86 +1248,13 @@ function sanitizeCurrentState(value: unknown) {
   if (typeof value !== 'string') return '';
   return sanitizeHistoricalToolText(
     value
-      .replace(/\b(?:clickCandidate|fillCandidates|doubleClickCandidate|rightClickCandidate|hoverCandidate|dragCandidate|clickDomNode|fillDomNodes|scrollArea|pressKey|typeText)\s*\([^)]*\)/gi, '已执行页面操作')
+      .replace(/\b(?:mouse|keyboard)\s*\([^)]*\)/gi, '已执行页面操作')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的目标'),
     260,
   );
 }
 
-function hasConcreteTargetVisual(input: unknown) {
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
-  const reason = typeof raw.reason === 'string' ? raw.reason.trim() : '';
-  const combined = `${targetVisual} ${reason}`.trim();
-  if (targetVisual.length < 4) return false;
-  if (!/[A-Za-z\u4e00-\u9fff]/.test(targetVisual)) return false;
-  if (/^(?:候选|编号|id|ID|candidate|#|\d|\s|[:：-])+$/i.test(targetVisual)) return false;
-  if (/^(?:下一张|上一张|确定|确认|关闭|按钮|图标|图片|目标|控件)$/i.test(targetVisual)) return false;
-  if (!reason || /^(?:点击|选择|使用)?\s*(?:候选|编号|id|ID|candidate)?\s*\d+$/i.test(reason)) return false;
-  return /[A-Za-z\u4e00-\u9fff]/.test(combined);
-}
-
-function rejectWeakTargetVisual(name: string, input: unknown): BrowserActionResult | undefined {
-  if (hasConcreteTargetVisual(input)) return undefined;
-  return {
-    ok: false,
-    actual: `${name} rejected before execution: targetVisual/reason must describe the visible target in the CURRENT screenshot, such as text/icon/position/role. Do not provide only a candidate id or a generic label.`,
-  };
-}
-
-function candidateActionId(name: string, input: unknown) {
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  if (name === 'dragCandidate') return `${raw.fromId || ''}->${raw.toId || ''}`;
-  return typeof raw.id === 'string' ? raw.id : '';
-}
-
-function rejectStaleRepeatedCandidateAction(name: string, input: unknown, traces: ToolTrace[]): BrowserActionResult | undefined {
-  const id = candidateActionId(name, input);
-  if (!id) return undefined;
-  const repeated = traces.some((trace) => trace.name === name && candidateActionId(name, trace.input) === id);
-  if (!repeated) return undefined;
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  const reason = typeof raw.reason === 'string' ? raw.reason.trim() : '';
-  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
-  const hasReasonedRepeat = targetVisual.length >= 4 && reason.length >= 10;
-  if (hasReasonedRepeat) return undefined;
-  return {
-    ok: false,
-    actual: `${name} rejected before execution: candidate ${id} was already used in this agent loop. Repeating the same id is allowed, but targetVisual and reason must explain why the current screenshot still supports this same visible target.`,
-  };
-}
-
-function validateCandidateActionBeforeExecution(name: string, input: unknown, traces: ToolTrace[]) {
-  void traces;
-  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-  const targetVisual = typeof raw.targetVisual === 'string' ? raw.targetVisual.trim() : '';
-  if (!targetVisual) {
-    return {
-      ok: false,
-      actual: `${name} rejected before execution: targetVisual is required for candidate actions so the chosen id is tied to visible evidence from the current screenshot.`,
-    };
-  }
-  return undefined;
-}
-
-const candidateActionToolNames = new Set(['clickCandidate', 'hoverCandidate', 'doubleClickCandidate', 'rightClickCandidate', 'dragCandidate']);
-const domNodeIdToolNames = new Set(['clickDomNode', 'focusDomNode', 'getDomNodeText']);
-const noVisualAfterCaptureToolNames = new Set([
-  'reportState',
-  'selectReferenceScreenshots',
-  'manageVisualContext',
-  'listTabs',
-  'getHttpRequests',
-  'getInteractiveCandidates',
-  'getDomNodeText',
-  'findByText',
-  'waitForHumanVerification',
-]);
-const noDomAfterContextToolNames = new Set([
-  ...noVisualAfterCaptureToolNames,
-  'listTabs',
-  'waitForPage',
-]);
+const noVisualAfterCaptureToolNames = new Set<string>();
 
 function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
   const fallback = defaultVisualAfterForTool(name);
@@ -1061,12 +1273,9 @@ function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
 }
 
 function shouldCaptureVisualAfter(name: string, visualAfter: VisualAfterPolicy) {
+  if (!browserChatDomScreenshotsEnabled()) return false;
   if (visualAfter.capture === 'viewport' || visualAfter.capture === 'fullPage') return true;
   return !noVisualAfterCaptureToolNames.has(name);
-}
-
-function shouldCollectDomContextAfter(trace: ToolTrace) {
-  return Boolean(trace.contextBefore?.domContext) && !noDomAfterContextToolNames.has(trace.name);
 }
 
 function screenshotOptionsFromVisualAfter(visualAfter: VisualAfterPolicy): { capture: ScreenshotCaptureMode } {
@@ -1088,6 +1297,8 @@ function summarizeTraceForMemory(trace: ToolTrace) {
   const displayResult = userFacingToolResult(trace.name, trace.result, trace.result?.ok ? 160 : 180);
   const result = !trace.result
     ? 'running'
+    : isRecoveredTransientToolTrace(trace)
+    ? 'recovered: fresh DOM snapshot captured; the old UID is transient and must not be reused'
     : trace.result.ok
     ? sanitizeHistoricalToolText(displayResult, 160) || 'ok'
     : `failed: ${sanitizeHistoricalToolText(displayResult || trace.result.actual, 180)}`;
@@ -1097,19 +1308,34 @@ function summarizeTraceForMemory(trace: ToolTrace) {
   ].join('；');
 }
 
+function toolTraceStatus(trace: ToolTrace) {
+  if (!trace.result) return 'started';
+  if (isRecoveredTransientToolTrace(trace)) return 'recovered';
+  return trace.result.ok ? 'ok' : 'failed';
+}
+
 function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolTrace, sourceStep?: number) {
   void sourceStep;
   const next: RuntimeWorkingMemory = { ...memory };
   const displayResult = userFacingToolResult(trace.name, trace.result, 400);
-  const resultText = sanitizeHistoricalToolText(displayResult || '', 400);
+  const recoveredTransient = isRecoveredTransientToolTrace(trace);
+  const resultText = recoveredTransient
+    ? '旧 UID 已失效，已自动刷新当前 DOM 快照；下一步应从新快照选择当前 UID。'
+    : sanitizeHistoricalToolText(displayResult || '', 400);
   next.lastAction = summarizeTraceForMemory(trace);
-  next.lastResult = concise(displayResult || trace.result?.actual || '工具调用已开始，正在等待页面反馈。', 240);
+  next.lastResult = recoveredTransient
+    ? resultText
+    : concise(displayResult || trace.result?.actual || '工具调用已开始，正在等待页面反馈。', 240);
   if (resultText) {
     next.pageUnderstanding = resultText;
     next.currentState = concise(`${trace.name}: ${resultText}`, 260);
   }
-  if (trace.result && !trace.result.ok) next.blockers = Array.from(new Set([...next.blockers, concise(trace.result.actual, 220)])).slice(-8);
-  if (trace.name === 'scrollArea') {
+  if (recoveredTransient) {
+    next.blockers = next.blockers.filter((blocker) => !staleUidActionError(blocker));
+  } else if (isEffectiveToolTraceFailure(trace)) {
+    next.blockers = Array.from(new Set([...next.blockers, concise(trace.result?.actual || '', 220)])).slice(-8);
+  }
+  if (trace.name === 'mouse' && trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input) && (trace.input as Record<string, unknown>).action === 'scroll') {
     next.phase = '正在查看滚动区域或长页面内容';
     next.scrollSummary = concise([next.scrollSummary, resultText || trace.result?.actual].filter(Boolean).join('；'), 600);
   } else if (trace.name === 'reportState') {
@@ -1119,17 +1345,6 @@ function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolT
   }
   next.nextStep = trace.name === 'reportState' ? '根据报告状态决定是否结束' : '根据当前截图继续完成任务';
   return next;
-}
-
-function formatWorkingMemory(memory: RuntimeWorkingMemory) {
-  const blockers = memory.blockers.slice(-2).map((item) => concise(item, 120));
-  const constraints = memory.userConstraints.slice(-2).map((item) => concise(item, 120));
-  return [
-    'Loop Memory (non-authoritative; durable facts are in RunState.ledgerDigest):',
-    `- Last action/result: ${concise([memory.lastAction, memory.lastResult].filter(Boolean).join(' -> '), 220) || 'none'}`,
-    blockers.length ? `- Recent blockers: ${blockers.join('; ')}` : '',
-    constraints.length ? `- User constraints: ${constraints.join('; ')}` : '',
-  ].join('\n');
 }
 
 class VisualContextManager {
@@ -1288,26 +1503,20 @@ function createToolTrace(input: {
 }) {
   const { traces, name, toolInput, aiRequest, runId, stepIndex, visualContext } = input;
   const screenshots: ToolTrace['screenshots'] = [];
-  pushBeforeFrameScreenshots(screenshots, name, visualContext?.current());
-  const visualAfter = visualAfterFromInput(name, toolInput);
-  const traceId = [
-    runId || 'run',
-    stepIndex || 0,
-    traces.length + 1,
-    Date.now().toString(36),
-  ].join(':');
-  const trace: ToolTrace = { id: traceId, name, input: toolInput, contextBefore: toolContextFromAiRequest(aiRequest), visualAfter, screenshots };
+  if (browserChatDomScreenshotsEnabled()) pushBeforeFrameScreenshots(screenshots, name, visualContext?.current());
+  const visualAfter = browserChatDomScreenshotsEnabled() ? visualAfterFromInput(name, toolInput) : undefined;
+  const traceId = runtimeToolTraceId({ runId, stepIndex, traceIndex: traces.length + 1 });
+  const trace: ToolTrace = {
+    id: traceId,
+    name,
+    input: toolInput,
+    startedAt: Date.now(),
+    contextBefore: toolContextFromAiRequest(aiRequest),
+    visualAfter,
+    screenshots,
+  };
   traces.push(trace);
   return trace;
-}
-
-async function notifyToolTrace(onToolTrace: ((trace: ToolTrace) => void | Promise<void>) | undefined, trace: ToolTrace) {
-  try {
-    await onToolTrace?.(trace);
-  } catch (error) {
-    console.warn('[browser-agent] Tool progress trace callback failed; browser action will continue.', error);
-    // Progress persistence failures must not make a browser action look unexecuted.
-  }
 }
 
 async function finalizeToolTraceVisuals(input: {
@@ -1320,9 +1529,10 @@ async function finalizeToolTraceVisuals(input: {
   visualContext?: VisualContextManager;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
+  onDebug?: ExecutionDebug;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { session, traces, trace, runId, stepIndex, visualContext, abortSignal, shouldContinue, onVisualContextChange } = input;
+  const { session, traces, trace, runId, stepIndex, visualContext, abortSignal, shouldContinue, onDebug, onVisualContextChange } = input;
   throwIfStopped(abortSignal, shouldContinue);
   let result = input.result;
   const screenshots = trace.screenshots || [];
@@ -1331,12 +1541,24 @@ async function finalizeToolTraceVisuals(input: {
   if (result.ok && shouldCaptureVisualAfter(trace.name, visualAfter) && runId && stepIndex !== undefined && visualContext) {
     try {
       throwIfStopped(abortSignal, shouldContinue);
-      await session.waitForPage().catch(() => undefined);
-      throwIfStopped(abortSignal, shouldContinue);
       const visualIndex = traces.filter((item) => item.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
       const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
+      const screenshotStartedAt = Date.now();
       const screenshotPath = await session.takeScreenshot(runId, stepIndex, `visual-${visualIndex}`, screenshotOptions);
       throwIfStopped(abortSignal, shouldContinue);
+      const timingSummary = session.formatLastScreenshotTiming();
+      await onDebug?.({
+        phase: 'browser:screenshot:visual-after',
+        stepIndex,
+        message: `${trace.name} visual-after screenshot captured in ${elapsedSince(screenshotStartedAt)}ms${timingSummary ? ` ${timingSummary}` : ''}`,
+        details: {
+          elapsedMs: elapsedSince(screenshotStartedAt),
+          path: screenshotPath,
+          capture: screenshotOptions.capture,
+          toolName: trace.name,
+          timings: session.getLastScreenshotTiming(),
+        },
+      });
       const markerPath = session.getLastCandidateMarkerScreenshotPath();
       const originalPath = session.getLastOriginalScreenshotPath();
       const frame = visualContext.apply({
@@ -1363,25 +1585,6 @@ async function finalizeToolTraceVisuals(input: {
     pushFailureFrameScreenshots(screenshots, trace.name, visualContext.current());
   }
 
-  if (shouldCollectDomContextAfter(trace)) {
-    throwIfStopped(abortSignal, shouldContinue);
-    const afterPageContext = await session.getPageContext({
-      includeDomTree: true,
-      includeText: false,
-      includeManualVerification: false,
-      includeInteractiveCandidates: false,
-    }).catch(() => undefined);
-    throwIfStopped(abortSignal, shouldContinue);
-    const domContext = afterPageContext ? createDomContextSnapshot('dom', afterPageContext) : undefined;
-    if (domContext) {
-      trace.contextAfter = {
-        requestId: trace.contextBefore?.requestId,
-        requestCreatedAt: trace.contextBefore?.requestCreatedAt,
-        domContext,
-      };
-    }
-  }
-
   trace.result = result;
   trace.screenshots = screenshots;
   return result;
@@ -1392,27 +1595,31 @@ async function executeTracedBrowserAction(input: {
   traces: ToolTrace[];
   name: string;
   toolInput: unknown;
-  action: () => Promise<BrowserActionResult>;
+  action: (abortSignal?: AbortSignal) => Promise<BrowserActionResult>;
   aiRequest?: AiRequestSnapshot;
   runId?: string;
   stepIndex?: number;
   visualContext?: VisualContextManager;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
+  onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { session, traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onToolTrace, onVisualContextChange } = input;
+  const { session, traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onDebug, onToolTrace, onVisualContextChange } = input;
   throwIfStopped(abortSignal, shouldContinue);
   const trace = createToolTrace({ traces, name, toolInput, aiRequest, runId, stepIndex, visualContext });
-  await notifyToolTrace(onToolTrace, trace);
-  throwIfStopped(abortSignal, shouldContinue);
-  const desktopBefore = await captureDesktopBeforeTool(name);
+  const postprocessTimings: Record<string, number> = {};
+  trace.postprocessTimings = postprocessTimings;
+  let postprocessStartedAt = Date.now();
+  await notifyRuntimeToolTrace(onToolTrace, trace);
+  postprocessTimings.notifyStartMs = elapsedSince(postprocessStartedAt);
   throwIfStopped(abortSignal, shouldContinue);
 
   let result: BrowserActionResult;
+  const actionStartedAt = Date.now();
   try {
-    result = await action();
+    result = await action(abortSignal);
     throwIfStopped(abortSignal, shouldContinue);
   } catch (error) {
     if (abortSignal?.aborted || (shouldContinue && !shouldContinue())) throw browserChatAbortError(abortSignal);
@@ -1421,16 +1628,15 @@ async function executeTracedBrowserAction(input: {
       actual: `Tool ${name} threw after execution started: ${infrastructureError(error)}`,
     };
   }
+  trace.actionElapsedMs = elapsedSince(actionStartedAt);
 
-  const desktopEvidence = await collectDesktopEvidenceAfterTool(name, desktopBefore);
-  if (desktopEvidence) {
-    trace.desktopEvidence = desktopEvidence;
-    result = appendDesktopEvidenceToResult(result, desktopEvidence);
-  }
   throwIfStopped(abortSignal, shouldContinue);
   trace.result = result;
-  await notifyToolTrace(onToolTrace, trace);
+  postprocessStartedAt = Date.now();
+  await notifyRuntimeToolTrace(onToolTrace, trace);
+  postprocessTimings.notifyResultMs = elapsedSince(postprocessStartedAt);
   throwIfStopped(abortSignal, shouldContinue);
+  postprocessStartedAt = Date.now();
   result = await finalizeToolTraceVisuals({
     session,
     traces,
@@ -1441,10 +1647,18 @@ async function executeTracedBrowserAction(input: {
     visualContext,
     abortSignal,
     shouldContinue,
+    onDebug,
     onVisualContextChange,
   });
+  postprocessTimings.visualAfterMs = elapsedSince(postprocessStartedAt);
   throwIfStopped(abortSignal, shouldContinue);
-  await notifyToolTrace(onToolTrace, trace);
+  trace.completedAt = Date.now();
+  trace.elapsedMs = trace.startedAt ? trace.completedAt - trace.startedAt : undefined;
+  postprocessStartedAt = Date.now();
+  await notifyRuntimeToolTrace(onToolTrace, trace);
+  postprocessTimings.notifyCompleteMs = elapsedSince(postprocessStartedAt);
+  trace.completedAt = Date.now();
+  trace.elapsedMs = trace.startedAt ? trace.completedAt - trace.startedAt : undefined;
   return result;
 }
 
@@ -1466,21 +1680,30 @@ function makeBrowserTools(
     stepIndex?: number;
     allowedToolTypes?: string[];
     visualContext?: VisualContextManager;
+    observationStore?: RuntimeObservationStore;
+    toolExecutionGate?: { stepNumber: number; executed: boolean };
+    getAiRequest?: () => AiRequestSnapshot | undefined;
     abortSignal?: AbortSignal;
     shouldContinue?: () => boolean;
+    onDebug?: ExecutionDebug;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
+    takeSnapshot?: (input?: RuntimeObservationReadOptions) => Promise<BrowserActionResult>;
+    observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => Promise<BrowserActionResult>;
+    requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   },
 ) {
-  // Enforce a single executed tool per AI request. makeBrowserTools is created fresh for each
-  // request, so this flag guarantees that even if the model emits several tool calls in one
-  // response (parallel/chained), only the first one actually runs. The rest are ignored, which
-  // keeps every browser action paired with a fresh screenshot on the next step and prevents the
-  // duplicate-operation problem seen when a request was retried mid-chain.
-  let toolExecutedThisRequest = false;
+  // Enforce one executed browser tool per model step. The native AI SDK loop may call the model
+  // multiple times inside one user turn, so prepareStep resets this gate before each LLM call.
+  // If a single model response emits several tool calls, only the first one can produce side
+  // effects; the following calls receive an ignored result and the model can continue from the
+  // fresh tool result in the next step.
+  const toolExecutionGate = referenceOptions?.toolExecutionGate || { stepNumber: 0, executed: false };
   const toolTextRule = 'Do not include old tool params, candidate ids as business meaning, coordinates, screenshot ids/file names, or tool input JSON.';
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
   const toolContextShape = {
     reason: toolReasonInput,
+    requiresConfirmation: z.boolean().optional().describe('Browser chat strict safety mode only: set true when this important tool call must pause for user confirm/cancel before execution. Do not use this in full safety mode.'),
+    confirmationMessage: z.string().min(1).max(300).optional().describe('Browser chat strict safety mode only: concise Chinese text shown next to the tool confirm/cancel buttons.'),
     visualAfter: z.object({
       capture: z.enum(['auto', 'viewport', 'fullPage']).optional().describe('Use auto normally. Use viewport/fullPage only when the next model request truly needs that screenshot size.'),
       retention: z.enum(['auto', 'replace', 'append']).optional().describe('Use replace by default. Use append only when the next decision must compare with, continue from, or analyze together with the previous screenshot.'),
@@ -1488,24 +1711,56 @@ function makeBrowserTools(
     }).optional(),
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
-  const batchFillFieldsInput = z.array(z.object({
-    id: z.string().min(1).describe('Fresh DOM node_id or visual candidate id from the CURRENT snapshot.'),
-    text: z.string().optional().describe('Optional text to fill after clicking this field. Omit for click-only actions.'),
-    clear: z.boolean().optional().describe('Defaults to true when text is provided. Set false only when appending is intended.'),
-    targetVisual: z.string().optional().describe('Visible label/placeholder/target description for this field.'),
-  })).min(1).max(BATCH_FILL_FIELD_LIMIT);
-
-  async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
+  const takeSnapshotInput = browserToolInput({
+    cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by the prior takeSnapshot page. When set, mode is required and must match the prior page.'),
+    mode: z.enum(['actionable', 'full', 'text', 'changes']).optional(),
+  }).refine((input) => !input.cursor || Boolean(input.mode), {
+    path: ['mode'],
+    message: 'mode is required when cursor is provided.',
+  });
+  async function record(name: string, input: unknown, action: (abortSignal?: AbortSignal) => Promise<BrowserActionResult>) {
     throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
-    if (toolExecutedThisRequest) {
+    if (toolExecutionGate.executed) {
       // Do not execute or trace extra calls; just tell the model to stop. This keeps the recorded
       // step clean (one real action) and avoids any duplicate side effect.
       return {
         ok: false,
-        actual: 'Ignored: only one tool call is allowed per step. Stop now; you will get a fresh screenshot at the start of the next step and can act again then.',
+        actual: `Ignored: only one browser tool can execute in model step ${toolExecutionGate.stepNumber + 1}. Continue from the executed tool result in the next model step.`,
       } satisfies BrowserActionResult;
     }
-    toolExecutedThisRequest = true;
+    toolExecutionGate.executed = true;
+    const pendingConfirmation = referenceOptions?.requestToolConfirmation ? toolConfirmationFromInput(name, input) : undefined;
+    let browserActionExecuted = false;
+    const actionWithConfirmation = async (actionSignal?: AbortSignal) => {
+      if (pendingConfirmation && referenceOptions?.requestToolConfirmation) {
+        const decision = await referenceOptions.requestToolConfirmation({
+          toolName: name,
+          input,
+          reason: pendingConfirmation.reason,
+          prompt: pendingConfirmation.prompt,
+          stepIndex: referenceOptions.stepIndex,
+        });
+        throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
+        if (decision !== 'confirmed') {
+          return {
+            ok: true,
+            actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
+          } satisfies BrowserActionResult;
+        }
+        browserActionExecuted = true;
+        const result = await action(actionSignal);
+        // This becomes the native tool-result message for the next model step
+        // and is also retained by working-memory/continuation compression.
+        // A confirmation log alone is UI state and is not model context.
+        return {
+          ...result,
+          actual: `用户已确认本次工具调用，现已执行。\n${result.actual}`,
+        } satisfies BrowserActionResult;
+      }
+      browserActionExecuted = true;
+      return action(actionSignal);
+    };
+    const traceVisualContext = referenceOptions?.visualContext;
     return executeTracedBrowserAction({
       session,
       traces,
@@ -1513,17 +1768,41 @@ function makeBrowserTools(
       toolInput: input,
       runId: referenceOptions?.runId,
       stepIndex: referenceOptions?.stepIndex,
-      visualContext: referenceOptions?.visualContext,
+      visualContext: traceVisualContext,
       abortSignal: referenceOptions?.abortSignal,
       shouldContinue: referenceOptions?.shouldContinue,
-      aiRequest,
+      aiRequest: referenceOptions?.getAiRequest?.() || aiRequest,
+      onDebug: referenceOptions?.onDebug,
       onToolTrace,
-      onVisualContextChange: referenceOptions?.onVisualContextChange,
-      action,
+      onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
+      action: actionWithConfirmation,
+    }).then(async (result) => {
+      if (browserActionExecuted && runtimeObservationInvalidatingToolNames.has(name)) {
+        // The action result already carries a bounded DOM delta. Never capture or
+        // inject a full replacement snapshot here; the model decides when it needs
+        // one through takeSnapshot.
+        if (!result.ok || !result.domChanges) {
+          invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
+        }
+      }
+      return compactToolResultForModel(name, result, referenceOptions?.observationStore);
     });
   }
 
   const sharedTools = {
+    ...(modelSupportsScreenshotInput() ? {
+      takeScreenshot: tool({
+        description: 'Capture a visual screenshot and attach it to the next model request. The latest viewport screenshot can be targeted with mouse/keyboard x_thousandth and y_thousandth coordinates; fullPage screenshots are read-only evidence.',
+        inputSchema: browserToolInput({
+          capture: z.enum(['viewport', 'fullPage']).optional().describe('Screenshot size. Defaults to viewport; use fullPage only when the visual evidence is outside the current viewport.'),
+        }),
+        execute: (input) => record('takeScreenshot', input, async () => (
+          referenceOptions?.observeCurrentScreenshot
+            ? referenceOptions.observeCurrentScreenshot({ capture: input.capture })
+            : { ok: false, actual: 'takeScreenshot is unavailable in this runtime.' }
+        )),
+      }),
+    } : {}),
     openPage: tool({
       description: 'Open or navigate to a URL in the browser.',
       inputSchema: browserToolInput({
@@ -1531,38 +1810,57 @@ function makeBrowserTools(
       }),
       execute: (input) => record('openPage', input, () => session.open(input.url || targetUrl)),
     }),
-    scrollArea: tool({
-      description: 'Scroll a visible scrollable area by its current area id. In DOM mode, do not use this to read normal DOM text; use it only for lazy-loaded/virtualized content or viewport-only UI. Check the latest summary/result first: do not scroll down atBottom/remainingDown=0 or up atTop/remainingUp=0. One call should scroll about one visible viewport/container height only. Area ids are volatile per turn; never reuse historical ids.',
-      inputSchema: browserToolInput({
-        areaId: z.string().describe('Scrollable area id from the CURRENT page context, such as S1 or S2. Do not invent or reuse an old id.'),
-        deltaY: z.number().describe('Vertical scroll delta. Positive scrolls down, negative scrolls up. Use roughly one viewport/container height per call; do not request multiple screens of scrolling in one tool call.'),
-        deltaX: z.number().optional().describe('Horizontal scroll delta. Positive scrolls right, negative scrolls left.'),
-      }),
-      execute: (input) => record('scrollArea', input, () => session.scrollArea(input.areaId, input.deltaY, input.deltaX || 0)),
+    mouse: tool({
+      description: browserMouseToolDescription,
+      inputSchema: browserToolInput(browserMouseToolShape),
+      execute: (input) => record('mouse', input, (abortSignal) => session.mouse({
+        action: input.action,
+        abortSignal,
+        uid: input.uid,
+        xThousandth: input.x_thousandth,
+        yThousandth: input.y_thousandth,
+        toUid: input.toUid,
+        toXThousandth: input.toX_thousandth,
+        toYThousandth: input.toY_thousandth,
+        button: input.button,
+        clickCount: input.clickCount,
+        deltaX: input.deltaX,
+        deltaY: input.deltaY,
+      })),
     }),
-    typeText: tool({
-      description: 'Type text into the currently focused element. In DOM mode prefer clickDomNode(id,text) when the target input id is known; use this only after a prior click/focus already focused the field.',
-      inputSchema: browserToolInput({
-        text: z.string().describe('Text to enter.'),
-      }),
-      execute: (input) => record('typeText', input, () => session.typeText(input.text)),
+    keyboard: tool({
+      description: browserKeyboardToolDescription,
+      inputSchema: browserToolInput(browserKeyboardToolShape),
+      execute: (input) => record('keyboard', input, () => session.keyboard({
+        action: input.action,
+        uid: input.uid,
+        xThousandth: input.x_thousandth,
+        yThousandth: input.y_thousandth,
+        text: input.text,
+        key: input.key,
+        keys: input.keys,
+        replace: input.replace,
+        followByEnter: input.followByEnter,
+      })),
     }),
-    pressKey: tool({
-      description: 'Press a keyboard key on the currently focused element or page.',
-      inputSchema: browserToolInput({
-        key: z.string().describe('Keyboard key, for example Enter, Escape, Tab.'),
-      }),
-      execute: (input) => record('pressKey', input, () => session.press(input.key)),
+    selectOption: tool({
+      description: browserSelectOptionToolDescription,
+      inputSchema: browserToolInput(browserSelectOptionToolShape),
+      execute: (input) => record('selectOption', input, () => session.selectOption({
+        uid: input.uid,
+        value: input.value,
+        label: input.label,
+      })),
     }),
     waitForPage: tool({
-      description: 'Wait for the page to settle after navigation or UI changes.',
+      description: 'Wait for the page after navigation or UI changes. When ms is provided, wait for that full duration in milliseconds; do not shorten it.',
       inputSchema: browserToolInput({
-        ms: z.number().optional().describe('Optional wait time in milliseconds.'),
+        ms: z.number().int().nonnegative().optional().describe('Optional exact minimum wait duration in milliseconds.'),
       }),
-      execute: (input) => record('waitForPage', input, () => (input.ms ? session.wait(input.ms) : session.waitForPage())),
+      execute: (input) => record('waitForPage', input, () => (typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage())),
     }),
     waitForHumanVerification: tool({
-      description: 'Wait while the user completes a visible CAPTCHA, login verification, or security check in the non-headless browser.',
+      description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever the page detector or snapshot shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
       inputSchema: browserToolInput({
         maxMs: z.number().optional().describe('Maximum wait time in milliseconds. Defaults to MANUAL_VERIFICATION_TIMEOUT_MS or 180000.'),
       }),
@@ -1574,9 +1872,48 @@ function makeBrowserTools(
       execute: (input) => record('listTabs', input, () => session.listTabs()),
     }),
     getHttpRequests: tool({
-      description: 'Read-only diagnostic tool: return recent HTTP requests for the current active tab, including method, URL, resource type, status, ok/failed, and error text. Use when a page looks broken, data is missing, an API may have failed, or you need evidence for a network-related issue.',
-      inputSchema: browserToolInput({}),
-      execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests()),
+      description: 'Read HTTP requests for the current tab. Without ids, return recent request summaries. With ids from takeSnapshot({mode:"changes"}), return request body and readable response body for only those requests. Use this when an inter-action change journal lists a request that may explain a delayed UI result.',
+      inputSchema: browserToolInput({
+        ids: z.array(z.string().min(1)).min(1).max(20).optional().describe('Optional request IDs listed by takeSnapshot({mode:"changes"}). Supplying IDs returns their request/response details.'),
+      }),
+      execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests({ ids: input.ids })),
+    }),
+    takeSnapshot: tool({
+      description: 'Capture a paged DOM observation. actionable and text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal: all observed DOM additions, updates, removals, and request summaries since the last browser-changing tool call; it has no actionable UIDs and does not replace the DOM baseline. Use getHttpRequests with its request IDs for details. If nextCursor is returned, call takeSnapshot again with both the same mode and that exact cursor; do not act between pages. Every result states page/current total.',
+      inputSchema: takeSnapshotInput,
+      execute: (input) => record('takeSnapshot', input, async () => (
+        referenceOptions?.takeSnapshot
+          ? referenceOptions.takeSnapshot(input)
+          : { ok: false, actual: 'takeSnapshot is unavailable in this runtime.' }
+      )),
+    }),
+    searchSnapshot: tool({
+      description: 'Search the current DOM-observation baseline without paging through it. Call takeSnapshot first; this returns matching dom-* UIDs from that same live registry and never searches a separate CDP snapshot.',
+      inputSchema: browserToolInput({
+        query: z.string().min(1).max(500),
+        roles: z.array(z.string().min(1)).max(20).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+      }),
+      execute: (input) => record('searchSnapshot', input, () => session.searchSnapshot(input)),
+    }),
+    downloadFile: tool({
+      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, an origin-relative path starting with / resolved against the current page origin, or a page-relative path resolved against the current page directory. Use this when the user asks to download/save a file; include the returned download target as a clickable Markdown link in the final answer.',
+      inputSchema: browserToolInput({
+        url: z.string().optional().describe('Absolute download URL. If omitted, path or urlOrPath is used.'),
+        path: z.string().optional().describe('Download path. /files/a.pdf resolves against current page origin; report/a.pdf resolves against current page directory.'),
+        urlOrPath: z.string().optional().describe('Absolute URL, origin-relative path, or page-relative path to download.'),
+        fileName: z.string().optional().describe('Optional saved file name, including extension when known.'),
+      }),
+      execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
+    }),
+    generateMarkdownFile: tool({
+      description: 'Create a Markdown .md file in the configured local output directory or this run artifacts from complete Markdown content written by the AI. Use this when the user asks to generate/export/save a Markdown file, then include the returned Markdown download link exactly as a clickable Markdown link in the final answer.',
+      inputSchema: browserToolInput({
+        fileName: z.string().optional().describe('Optional Markdown file name. The .md extension is added when missing.'),
+        title: z.string().optional().describe('Optional title used as fallback file name.'),
+        content: z.string().min(1).describe('Complete Markdown file content to save.'),
+      }),
+      execute: (input) => record('generateMarkdownFile', input, () => generateMarkdownArtifact({ ...input, runId: referenceOptions?.runId })),
     }),
     switchTab: tool({
       description: 'Switch to a browser tab by index when the workflow opened a new tab.',
@@ -1646,214 +1983,40 @@ function makeBrowserTools(
     }),
   };
 
-  const domTools = {
-    getDomNodeText: tool({
-      description: 'DOM mode: return the full rendered text under a node from the CURRENT full DOM snapshot by numeric node_id, for example "12" or "[12]". This is read-only and does not click, navigate, or scroll.',
-      inputSchema: browserToolInput({
-        id: z.string().describe('The numeric node_id shown in the current full DOM snapshot, such as 12 or [12]. IDs are volatile; use only a fresh id.'),
-      }),
-      execute: (input) => record('getDomNodeText', input, () => session.getDomNodeText(normalizeDomNodeIdParam(input))),
-    }),
-    clickDomNode: tool({
-      description: 'DOM mode: click a node from the CURRENT full DOM snapshot by numeric node_id, for example "12" or "[12]". If text is provided, type it immediately after clicking. IDs are volatile; use only an id from the current DOM snapshot.',
-      inputSchema: browserToolInput({
-        id: z.string().describe('The numeric node_id shown in the full DOM snapshot, such as 12 or [12].'),
-        text: z.string().optional().describe('Optional text to type immediately after clicking/focusing this DOM node.'),
-      }),
-      execute: (input) => record('clickDomNode', input, () => session.clickDomNode(normalizeDomNodeIdParam(input), input.text)),
-    }),
-    fillDomNodes: tool({
-      description: `DOM mode form helper: click and optionally fill up to ${BATCH_FILL_FIELD_LIMIT} fields from the CURRENT full DOM snapshot in one browser action. Use for stable forms where all node_id values are visible in the same fresh DOM snapshot. Do not use across navigation, popups, or dynamic multi-step widgets.`,
-      inputSchema: browserToolInput({
-        fields: batchFillFieldsInput.describe('Ordered fields to click/fill. Each id is a numeric node_id from the current DOM snapshot; text is optional for click-only actions.'),
-      }),
-      execute: (input) => record('fillDomNodes', input, () => session.fillDomNodes(input.fields.map((field) => ({
-        id: normalizeDomNodeIdParam({ id: field.id }),
-        text: field.text,
-        clear: field.clear,
-      })))),
-    }),
-    findByText: tool({
-      description: 'DOM mode recovery, read-only: find visible interactive locators whose text/accessibility label/title/placeholder/href matches targetText. This does not click. Use only when a fresh DOM id is unavailable or unreliable, then choose one returned locatorId in a later clickLocator call.',
-      inputSchema: browserToolInput({
-        targetText: z.string().min(1).max(300).describe('Exact visible or accessible text to search for from the CURRENT DOM/page context. Prefer short unique labels over long surrounding snippets.'),
-        scopeId: z.string().optional().describe('Optional numeric DOM id that scopes the search to a subtree, such as 12 or [12].'),
-      }),
-      execute: (input) => record('findByText', input, () => session.findByText(input.targetText, normalizeDomNodeIdParam({ id: input.scopeId }))),
-    }),
-    clickLocator: tool({
-      description: 'DOM mode recovery click: click one locatorId returned by the immediately preceding findByText result. Do not invent locatorIds and do not use visual candidate ids.',
-      inputSchema: browserToolInput({
-        locatorId: z.string().min(1).max(20).describe('A locatorId such as T1 from the latest findByText result.'),
-        text: z.string().optional().describe('Optional text to type immediately after clicking/focusing this locator.'),
-      }),
-      execute: (input) => record('clickLocator', input, () => session.clickLocator(input.locatorId, input.text)),
-    }),
-  };
-
-  const visualTools = {
-    clickCandidate: tool({
-      description: 'Visual mode: click a visible candidate by its numbered label from the current step screenshot snapshot. Choose the smallest/tightest candidate that directly encloses the intended visible text, icon, or control; avoid larger containing wrapper boxes. A successful tool result only confirms the click was delivered, not that the UI changed. The same visible target may be attempted at most twice because the first click can dismiss an overlay while the second activates the target. If text is provided, type it immediately after the click.',
-      inputSchema: browserToolInput({
-        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current visual labels. Never choose a larger overlapping wrapper when a tighter candidate represents the same visible target.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
-        text: z.string().optional().describe('Optional text to type immediately after clicking, useful when the click focuses an input or editable control.'),
-      }),
-      execute: (input) => record('clickCandidate', input, async () => validateCandidateActionBeforeExecution('clickCandidate', input, traces) || session.clickCandidate(input.id, input.text)),
-    }),
-    fillCandidates: tool({
-      description: `Visual mode form helper: click and optionally fill up to ${BATCH_FILL_FIELD_LIMIT} visible candidates from the CURRENT screenshot candidate map in one browser action. Use for stable forms where all fields are visible at once. Do not use across navigation, popups, hover menus, or dynamic multi-step widgets.`,
-      inputSchema: browserToolInput({
-        fields: batchFillFieldsInput.describe('Ordered visual candidates to click/fill. Each id must come from the current visual labels; targetVisual should name the visible label/placeholder for each field.'),
-      }),
-      execute: (input) => record('fillCandidates', input, async () => session.fillCandidates(input.fields.map((field) => ({
-        id: field.id,
-        text: field.text,
-        clear: field.clear,
-      })))),
-    }),
-    hoverCandidate: tool({
-      description: 'Visual mode: move the mouse over a visible candidate by its numbered label. Use this to reveal hover menus, tooltips, dropdown panels, or controls that only appear on hover.',
-      inputSchema: browserToolInput({
-        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current visual labels.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
-      }),
-      execute: (input) => record('hoverCandidate', input, async () => validateCandidateActionBeforeExecution('hoverCandidate', input, traces) || session.hoverCandidate(input.id)),
-    }),
-    doubleClickCandidate: tool({
-      description: 'Visual mode: double-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
-      inputSchema: browserToolInput({
-        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current screenshot labels or interactive candidate list.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
-      }),
-      execute: (input) => record('doubleClickCandidate', input, async () => validateCandidateActionBeforeExecution('doubleClickCandidate', input, traces) || session.doubleClickCandidate(input.id)),
-    }),
-    rightClickCandidate: tool({
-      description: 'Visual mode: right-click a visible candidate by its numbered label. The backend clicks the candidate visible center.',
-      inputSchema: browserToolInput({
-        id: z.string().describe('Candidate id such as 1 or 12. Must come from the current screenshot labels or interactive candidate list.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
-      }),
-      execute: (input) => record('rightClickCandidate', input, async () => validateCandidateActionBeforeExecution('rightClickCandidate', input, traces) || session.rightClickCandidate(input.id)),
-    }),
-    dragCandidate: tool({
-      description: 'Visual mode: drag from one numbered candidate center to another numbered candidate center.',
-      inputSchema: browserToolInput({
-        fromId: z.string().describe('Start candidate id such as 1.'),
-        toId: z.string().describe('End candidate id such as 2.'),
-        targetVisual: z.string().min(1).max(300).describe('Visible target description from the CURRENT screenshot.'),
-      }),
-      execute: (input) => record('dragCandidate', input, async () => validateCandidateActionBeforeExecution('dragCandidate', input, traces) || session.dragCandidate(input.fromId, input.toId)),
-    }),
-  };
-
-  const tools = mode === 'visual-markers' ? { ...sharedTools, ...visualTools } : { ...sharedTools, ...domTools };
+  const tools = sharedTools;
   const allowedToolTypes = referenceOptions?.allowedToolTypes;
   if (!allowedToolTypes?.length) return tools;
   const allowed = new Set(allowedToolTypes);
   return Object.fromEntries(Object.entries(tools).filter(([name]) => allowed.has(name))) as typeof tools;
 }
 
-// 构造完成判定规则；视觉模式用截图作证据，DOM 模式用文本化页面上下文作证据。
-function completionVerifyEnabled() {
-  const raw = process.env.AI_COMPLETION_VERIFY ?? 'true';
-  return raw.toLowerCase() !== 'false';
-}
+type RuntimeToolDefinitions = ReturnType<typeof makeBrowserTools>;
 
-/** Fix contradictory model output before branching on done/status. */
-function normalizeRuntimeDecision(decision: RuntimeDecision): RuntimeDecision {
-  if (decision.status === 'blocked') {
-    if (decision.done) return { ...decision, done: false };
-    return decision;
-  }
-  if (decision.done && decision.status !== 'passed' && decision.status !== 'failed') {
-    return { ...decision, done: false };
-  }
-  return decision;
-}
-
-type CompletionVerification = {
-  verified: boolean;
-  status: 'passed' | 'failed' | 'blocked';
-  summary: string;
-  remainingWork: string;
-};
-
-// 当执行器声称完成时，用独立校验请求再判断一次，减少“只完成一半就结束”的误判。
-async function verifyRuntimeCompletion(input: {
-  testCase: TestCaseRecord;
-  screenshotPath: string;
-  proposed: RuntimeDecision;
-  completedSteps: StepExecutionResult[];
-  pageContext: Awaited<ReturnType<BrowserSession['getPageContext']>>;
-  abortSignal?: AbortSignal;
-}): Promise<CompletionVerification> {
-  const { testCase, screenshotPath, proposed, completedSteps, pageContext, abortSignal } = input;
-  const requirement = requirementOf(testCase);
-  const attachScreenshot = shouldSendScreenshotToAi(browserModeOf(testCase));
-  const prompt = buildCompletionVerificationPrompt({
-    requirement,
-    attachScreenshot,
-    proposedClaim: { action: proposed.action, expected: proposed.expected, actual: proposed.actual, status: proposed.status },
-    currentUrl: pageContext.url,
-    manualVerification: pageContext.manualVerification ?? null,
-    recentProgressNotes: recentProgressNotes(completedSteps, 5),
-  });
-
-  const screenshot = attachScreenshot ? await readScreenshotForAi(screenshotPath) : undefined;
-  const messageContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [
-    {
-      type: 'text',
-      text: attachScreenshot
-        ? prompt
-        : `${prompt}\n\nScreenshot image input is disabled for this request.`,
-    },
-  ];
-  if (screenshot) messageContent.push({ type: 'image', image: screenshot });
-
-  const result = await generateTextWithTimeout({
-    model: getModel(),
-    messages: [{ role: 'user', content: messageContent }],
-    abortSignal,
-  });
-
+function toolInputJsonSchema(inputSchema: unknown) {
+  if (!inputSchema) return undefined;
   try {
-    const parsed = z
-      .object({
-        verified: z.boolean(),
-        status: z.enum(['passed', 'failed', 'blocked']),
-        summary: z.string().min(1),
-        remainingWork: z.string(),
-      })
-      .parse(extractJson(result.text));
-    return parsed;
-  } catch {
-    return {
-      verified: false,
-      status: 'passed',
-      summary: 'Completion verification response could not be parsed; continue execution.',
-      remainingWork: 'Continue from the latest screenshot until every requirement clause is satisfied.',
-    };
+    return z.toJSONSchema(inputSchema as z.ZodType);
+  } catch (error) {
+    return { unavailable: true, reason: error instanceof Error ? error.message : String(error) };
   }
+}
+
+function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
+  if (!tools) return [];
+  return Object.entries(tools).map(([name, toolDefinition]) => {
+    const record = toolDefinition as Record<string, unknown>;
+    return {
+      type: 'function',
+      function: {
+        name,
+        description: typeof record.description === 'string' ? record.description : '',
+        parameters: toolInputJsonSchema(record.inputSchema),
+      },
+    };
+  });
 }
 
 // 根据当前模式生成验证码/安全校验规则；DOM 模式不要要求 AI 读取截图。
-function domRuntimeSystemPrompt(pageContext: RuntimePageContext) {
-  const domTree = domTreeForPrompt(pageContext.domTree || '[empty DOM tree]');
-  return [
-    'Runtime DOM Context (fresh, authoritative for DOM mode):',
-    '- This system message is refreshed immediately before the AI request.',
-    '- Numeric DOM node_id values are volatile and valid only for this request. Never reuse historical DOM ids.',
-    `Current URL: ${pageContext.url}`,
-    `Current title: ${pageContext.title}`,
-    `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}`,
-    `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}`,
-    `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}`,
-    `Scrollable areas summary:\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}`,
-    `Full DOM snapshot:\n${domTree}`,
-    `Full page text (${pageContext.textLength || 0} chars):\n${pageTextForPrompt(pageContext.text || '')}`,
-  ].filter(Boolean).join('\n');
-}
 
 function runtimePrompt(input: {
   testCase: TestCaseRecord;
@@ -1870,158 +2033,126 @@ function runtimePrompt(input: {
 }) {
   const { testCase, pageContext, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
-  const mode = browserModeOf(testCase);
-  const visualMode = isVisualMode(mode);
-  const attachScreenshot = shouldSendScreenshotToAi(mode);
-  const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
-  const visualMarkersWithoutOverlay = mode === 'visual-markers' && !markerEnabled;
-  const visualTextCandidateFallback = visualMode && !attachScreenshot;
-  const markerOverlayInScreenshot = Boolean(markerEnabled && input.markerOverlayInScreenshot);
-  const separateMarkerScreenshot = Boolean(markerEnabled && input.hasMarkerScreenshot);
-  const caseSystemPrompt = systemPromptOf(testCase);
+  const visualMode = false;
+  const attachScreenshot = false;
+  const visualMarkersWithoutOverlay = false;
+  const visualTextCandidateFallback = false;
+  void input.markerOverlayInScreenshot;
+  void input.hasMarkerScreenshot;
+  const rawCaseSystemPrompt = systemPromptOf(testCase);
   const requirement = requirementOf(testCase);
   const browserChatMode = isBrowserChatTestCase(testCase);
-  const compactRunContext = buildCompactRunContext(completedSteps, input.workingMemory);
+  const caseSystemPrompt = browserChatMode ? browserChatSystemPromptForRuntime(rawCaseSystemPrompt) : rawCaseSystemPrompt;
+  const compactRunContext = browserChatMode
+    ? buildCompactBrowserChatContext(completedSteps, input.workingMemory)
+    : buildCompactRunContext(completedSteps, input.workingMemory);
+  const customPrompt = customRuntimePromptFromEnv();
   const availableScreenshotReferences = input.availableScreenshotReferences || [];
   const selectedScreenshotReferences = input.selectedScreenshotReferences || [];
   const strategyMemory = (testCase.strategyMemory || [])
     .filter((hint) => !isInfrastructureNoise(hint))
     .map((hint) => concise(hint, 220))
     .slice(-4);
-  const candidateLimit = Math.max(10, Number(process.env.SCREENSHOT_ELEMENT_LABEL_LIMIT || process.env.INTERACTIVE_CANDIDATE_LIMIT || 160));
-  const candidateContext = visualMode
-    ? visualMarkersWithoutOverlay || visualTextCandidateFallback
-      ? formatVisualInteractiveElements(pageContext.interactiveCandidates, candidateLimit)
-      : '[disabled because visual mode uses screenshot labels]'
-    : '[disabled because DOM mode uses fresh DOM tree ids; findByText returns separate T locators only when explicitly called]';
-  const evidence = attachScreenshot
-    ? mode === 'visual-markers' && separateMarkerScreenshot
-      ? 'the two attached screenshots'
-      : mode === 'visual-markers' && markerOverlayInScreenshot
-        ? 'the attached viewport screenshot with marker labels overlaid'
-      : visualMarkersWithoutOverlay
-        ? 'the attached clean viewport screenshot plus the visible interactive elements list'
-        : 'the attached clean viewport screenshot'
-    : visualMode
-      ? 'current URL, tabs, scrollable areas, focused element, and the visible interactive elements list generated from the current screenshot'
-      : 'Codex-style full DOM snapshot, full page text, URL, tabs, scroll state, focused element, and read-only DOM text tools';
-  const markerSourceRule = separateMarkerScreenshot
-    ? '- Image 1 is the source of truth for what the page means. Image 2 only maps visible click/scroll positions to candidate IDs.'
-    : markerOverlayInScreenshot
-      ? '- The attached screenshot is the source of truth and contains marker labels overlaid only as click/scroll position IDs.'
-      : '- The attached screenshot is the source of truth for what the page means.';
-  const markerTargetRules = mode === 'visual-markers' && attachScreenshot && markerEnabled
+  const screenshotAvailable = modelSupportsScreenshotInput();
+  const candidateContext = screenshotAvailable
+    ? '[legacy candidate map disabled; use snapshot UIDs or latest screenshot coordinates]'
+    : '[legacy candidate map disabled; use fresh snapshot UIDs]';
+  const externalAppCandidateContext = '';
+  const evidence = screenshotAvailable
+    ? 'the latest semantic DOM snapshot across the main document and all attached iframes, plus an optional latest viewport screenshot'
+    : 'the latest semantic DOM snapshot across the main document and all attached iframes';
+  const markerTargetRules: string[] = [];
+  const modeActionRules = browserActionRules(screenshotAvailable);
+  const manualVerificationBlocker = pageContext.isManualVerification
     ? [
-        '',
-        'Visual target selection and no-progress recovery:',
-        markerSourceRule,
-        '- Marker numbers/labels are NOT page content, image/page numbers, item order, progress, status, priority, or business meaning; they only identify where a tool can click/hover/drag/scroll.',
-        '- A tool result with ok=true only confirms that the browser received the action. It does NOT prove the target was correct or that the page changed.',
-        '- Candidate ids in attached reference screenshots are historical only. For the next action, use only ids that are visible in the current screenshot/marker map.',
-        '- For overlapping boxes, choose the smallest/tightest box that directly encloses the intended visible text/icon/control.',
-        '- Count repeated attempts by visible target + action, not only by id. After two ineffective attempts, choose another evidence-based path.',
-        '- Never issue two separate click tools from one screenshot. Re-inspect the new screenshot before a second attempt, except fillCandidates may fill multiple stable form fields in one tool call.',
-      ]
-    : [];
-  const modeActionRules = visualMode
-    ? [
-        '- Candidate IDs are volatile and valid only for the CURRENT screenshot. Re-read the visible target first, then use its current number.',
-        '- For text entry on a numbered candidate, use clickCandidate(id,text) in one tool call. Use typeText only after a fallback click already focused the field.',
-        `- For stable forms with multiple visible fields in the same screenshot, use fillCandidates(fields[]) once instead of one clickCandidate per field. You may include up to ${BATCH_FILL_FIELD_LIMIT} fields. Do not batch across navigation, hover menus, or dynamic multi-step UI.`,
-        '- For hover-only menus, call hoverCandidate on the visible trigger, then act on the revealed target in the next step.',
-        '- If needed content may be outside the visible area, use scrollArea with the green S label shown on the current screenshot.',
-        '- Green dashed boxes/green S labels mark scrollable regions. Use only a green S id visible in the CURRENT screenshot; never reuse historical S ids.',
-        '- Previous screenshots/references are context only; never use their candidate ids.',
-        '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous screenshot.',
-      ]
-    : [
-        '- DOM mode has no clickCandidate/hoverCandidate/dragCandidate tools. Never choose visual candidate IDs.',
-        '- Use clickDomNode(id,text?) with a numeric node_id copied from the CURRENT full DOM snapshot. The tool accepts the numeric id with or without square brackets. IDs are volatile; never reuse an id from a previous turn.',
-        '- The DOM tree is a full-page DOM snapshot with actionable node_ids beyond the current viewport, including accessible iframe and shadow DOM content, paired with full page text. Prefer this context before deciding to scroll.',
-        '- Use getDomNodeText(id) when a full DOM snapshot line is truncated or you need the complete rendered text under a returned node.',
-        '- Text matching is a recovery path, not the normal click path: call findByText(targetText,scopeId?) first, inspect the returned locatorIds, then call clickLocator(locatorId,text?) in a later turn.',
-        '- Use findByText only when a fresh DOM id is unavailable or unreliable, such as dynamic search results, iframe/shadow/dialog/popover content, or an id that disappeared after refresh.',
-        '- For findByText targetText, use a short unique visible/accessibility label from the CURRENT DOM/page context. Do not pass a long surrounding snippet.',
-        '- For text entry, use clickDomNode(id,text) in one tool call when the input id is present. Use typeText only after a prior action already focused the field.',
-        `- For stable forms with multiple fields in the same fresh DOM snapshot, use fillDomNodes(fields[]) once instead of one clickDomNode per field. You may include up to ${BATCH_FILL_FIELD_LIMIT} fields. Do not batch across navigation, popups, or dynamic multi-step UI.`,
-        '- Use scrollArea only when interaction requires changing the visual viewport or lazy-loaded content is absent from the full DOM/text context. The next AI request automatically includes the refreshed DOM snapshot before any further action.',
-        '- Before scrollArea, check the latest area summary/result: do not scroll down when atBottom or remainingDown=0, and do not scroll up when atTop or remainingUp=0.',
-        '- visualAfter defaults to {capture:"auto", retention:"replace"}. Use retention:"append" only when the next turn must compare with or continue from the previous state.',
-      ];
+        'CURRENT BLOCKER: The page detector found a user-side verification challenge.',
+        `Evidence: ${pageContext.manualVerification?.evidence || 'visible captcha, OTP, login security check, or anti-bot verification'}.`,
+        'Call waitForHumanVerification immediately. Do not attempt to solve, guess, bypass, or submit this verification yourself.',
+      ].join('\n')
+    : '';
   return [
     browserChatMode
-      ? 'You are an AI browser chat agent. Call a browser tool only when live browser action or inspection is needed; otherwise answer directly in Chinese Markdown.'
+      ? 'You are an AI browser chat agent.'
       : 'You are an AI browser testing agent. Call exactly ONE tool. Use reportState only when no browser action is needed.',
     `Requirement: ${requirement}`,
     `Target URL: ${testCase.targetUrl}`,
     `Target host: ${targetHost}`,
     `Current URL: ${pageContext.url}`,
+    manualVerificationBlocker,
     '',
     'Hard rules:',
     browserChatMode
       ? '- Browser chat may either answer with Chinese Markdown and no tool, or call at most one browser tool when action/inspection is needed.'
       : '- One tool only. You may include a short ordinary Chinese progress sentence alongside the tool call.',
     browserChatMode
-      ? '- Keep browser action tool params minimal: reason, exact tool arguments, and optional visualAfter. If no browser action is needed, answer directly in Markdown without calling a tool.'
+      ? '- Keep browser action tool params minimal: reason, exact tool arguments, optional visualAfter, and optional requiresConfirmation/confirmationMessage only when strict safety requires a button confirmation. If no browser action is needed, answer directly in Markdown without calling a tool.'
       : '- Keep tool params minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
     '- Treat RunState JSON and Working Memory as compact context only. Do not copy them into tool params.',
     '- Historical actions are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
     '- In reason/message/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
-    '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
-    '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
-    '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
-    '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
+    '- When a candidate is marked external-app=<protocol>, clicking it is an external application launch attempt. The browser page may remain unchanged, and native app launch success is not server-verifiable.',
+    browserChatMode ? '' : '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
+    browserChatMode ? '' : '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
+    browserChatMode ? '' : '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
+    browserChatMode ? '' : '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
+    '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL.',
+    browserChatMode ? '- Strict safety confirmations must use tool params requiresConfirmation=true and confirmationMessage; never ask the user to type a confirmation message for that purpose.' : '',
+    '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. In the final answer, include the returned Markdown download link exactly as a clickable Markdown link.',
+    ...snapshotHardRules(screenshotAvailable),
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
       ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
-      : '- DOM action reason must cite the current full-DOM id/text, or the findByText locatorId plus matched text when using recovery locators.',
-    `- Use ${evidence} as the current page state.`,
+      : screenshotAvailable
+        ? '- Browser action reason must cite the current snapshot UID or latest screenshot target used for the action.'
+        : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
+    `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"actionable"}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
     '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
     '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
+    '- If login, password, OTP, QR-code scan, payment confirmation, or identity confirmation requires user-owned credentials or a personal device and those credentials were not explicitly supplied, call waitForHumanVerification instead of inventing credentials or only describing the blocker in text.',
     browserChatMode
-      ? '- Finish the chat turn by returning normal Chinese Markdown text with no tool call once the latest user message is satisfied, blocked, or needs clarification.'
+      ? ''
       : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
-    attachScreenshot
-      ? separateMarkerScreenshot
-        ? '- Visual mode: image 1 is the clean viewport screenshot. Image 2 is a pixel-aligned marker map: white labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomNodeText are unavailable.'
-        : markerOverlayInScreenshot
-          ? '- Visual mode: the attached screenshot is the current page with marker labels overlaid. White labels mark clickable targets; green dashed boxes/green S labels mark scrollable regions. getInteractiveCandidates/getDomNodeText are unavailable.'
-        : markerEnabled
-          ? '- Visual mode: use the clean viewport screenshot as the current page state. Candidate marker image is unavailable for this request. getInteractiveCandidates/getDomNodeText are unavailable.'
-          : '- Visual mode without markers: use the clean viewport screenshot as the current page state and use the visible interactive elements list below to choose candidate IDs. getInteractiveCandidates/getDomNodeText are unavailable.'
-      : visualMode
-        ? '- Visual mode: screenshot image is not attached because the configured model does not support image input. Use the visible interactive elements list below as the current screenshot-derived candidate map. clickCandidate IDs are available and valid only for this current step.'
-        : '- DOM mode: no screenshot image/path is attached. Use the current full DOM snapshot, full page text, and DOM node_id tools first; use findByText/clickLocator only as a two-step recovery path. clickCandidate and visual candidate IDs are unavailable.',
+    screenshotObservationRule(screenshotAvailable),
     ...markerTargetRules,
-    caseSystemPrompt ? `Test-case-specific instructions:
+    caseSystemPrompt ? `${browserChatMode ? 'Browser-chat loaded instructions and Skills' : 'Test-case-specific instructions'}:
 ${caseSystemPrompt}` : '',
-    strategyMemory.length ? `Historical failure strategy memory:
+    customPrompt,
+    !browserChatMode && strategyMemory.length ? `Historical failure strategy memory:
 ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : '',
     '',
-    ...buildVerificationPromptLines(pageContext, attachScreenshot),
-    ...buildCompletionPromptLines(attachScreenshot),
+    ...(browserChatMode ? [] : buildVerificationPromptLines(pageContext, attachScreenshot)),
+    ...(browserChatMode ? [] : buildCompletionPromptLines(attachScreenshot)),
     '',
     'Response:',
     browserChatMode
       ? '- Either return normal Chinese Markdown text with no tool, or call one browser tool if action/inspection is needed. Tool params are only for the selected tool.'
       : '- Call one tool. Use ordinary assistant text for progress/explanation, and tool params only for the selected tool.',
-    browserChatMode ? '- Browser chat: when the user can be answered from current evidence, output normal Chinese Markdown text and call no tool.' : '',
     visualMode
       ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
-      : '- DOM action reason must mention the current full-DOM id/text, or the chosen findByText locatorId plus matched text when using clickLocator.',
+      : screenshotAvailable
+        ? '- Browser action reason must mention the current UID or latest screenshot visual target.'
+        : '- Browser action reason must mention the current snapshot UID.',
     browserChatMode
       ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
       : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
+    screenshotAvailable
+      ? '- Progress text and the selected tool must agree. Use takeScreenshot for pixels and takeSnapshot for the accessibility tree.'
+      : '- Progress text must describe takeSnapshot as a semantic DOM snapshot, not as a screenshot.',
+    '- When a file tool succeeds, mention the saved file name and include its returned download target as a clickable Markdown link.',
     '',
     'Current context:',
-    visualMode ? `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}` : 'See the Runtime DOM Context system message for current URL, tabs, focus, scroll state, DOM snapshot, and page text.',
+    browserChatMode
+      ? currentSnapshotContextLine(true)
+      : visualMode ? `Open tabs JSON: ${JSON.stringify(pageContext.tabs)}` : currentSnapshotContextLine(false),
     visualMode ? `Page scroll state JSON: ${JSON.stringify(pageContext.pageScrollState)}` : '',
     visualMode ? `Scrollable areas summary (green S labels in screenshot are authoritative):\n${formatScrollableAreaSummary(pageContext.scrollableAreas)}` : '',
     visualMode && visualTextCandidateFallback ? `Focused element JSON: ${JSON.stringify(pageContext.focusedElement)}` : '',
+    visualMode && externalAppCandidateContext ? `External application candidates in the current candidate map:
+${externalAppCandidateContext}` : '',
     visualMarkersWithoutOverlay || visualTextCandidateFallback ? `Visible interactive elements:
 ${candidateContext}` : '',
     compactRunContext,
@@ -2032,52 +2163,32 @@ ${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
     selectedScreenshotReferences.length
       ? 'Reference screenshot rule: selected reference images help connect scroll continuity or compare earlier page state. They may show the same interface at different scroll offsets when sameInterfaceGroup matches, but their candidate ids are historical and must never be used for the current action.'
       : '',
-    attachScreenshot
-      ? mode === 'visual-markers' && separateMarkerScreenshot
-        ? `Screenshot images are attached in this order: Image 1 current clean viewport, Image 2 current marker map${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
-        : mode === 'visual-markers' && markerOverlayInScreenshot
-          ? `Screenshot images are attached in this order: Image 1 current page with marker labels overlaid${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
-        : `Screenshot images are attached in this order: Image 1 current clean viewport${selectedScreenshotReferences.length ? ', then selected reference screenshots in listed order' : ''}.`
-      : 'Screenshot image/path is not attached.',
+    screenshotAvailable
+      ? 'Screenshot image/path is not attached automatically. takeScreenshot attaches explicit visual evidence to the next model request when available.'
+      : '',
   ].filter(Boolean).join('\n');
-}
-function summarizeToolInput(input: unknown) {
-  if (input && typeof input === 'object') {
-    const entries = Object.entries(input as Record<string, unknown>)
-      .filter(([key, value]) => !['reason', 'taskFrameJson', 'ledgerItemsJson', 'visualAfter'].includes(key) && value !== undefined && value !== null && value !== '')
-      .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
-    return entries.length ? ` (${entries.join(', ')})` : '';
-  }
-  return '';
 }
 
 function runtimeToolNames(mode: BrowserSessionMode) {
-  const sharedTools = [
+  void mode;
+  return [
+    ...(modelSupportsScreenshotInput() ? ['takeScreenshot'] : []),
     'openPage',
-    'openUrl',
     'waitForPage',
     'waitForHumanVerification',
     'listTabs',
     'getHttpRequests',
+    'takeSnapshot',
+    'searchSnapshot',
+    'mouse',
+    'keyboard',
+    'selectOption',
+    'downloadFile',
+    'generateMarkdownFile',
     'switchTab',
-    'typeText',
-    'pressKey',
     'reportState',
-    'scrollArea',
-    'selectReferenceScreenshots',
-    'manageVisualContext',
+    ...(modelSupportsScreenshotInput() ? ['selectReferenceScreenshots', 'manageVisualContext'] : []),
   ];
-  const candidateTools = [
-    ...sharedTools,
-    'clickCandidate',
-    'fillCandidates',
-    'hoverCandidate',
-    'doubleClickCandidate',
-    'rightClickCandidate',
-    'dragCandidate',
-  ];
-  if (mode === 'visual-markers') return candidateTools;
-  return [...sharedTools, 'getDomNodeText', 'clickDomNode', 'fillDomNodes', 'findByText', 'clickLocator'];
 }
 
 function isCodexProvider() {
@@ -2094,7 +2205,6 @@ function createAiRequestSnapshot(input: {
   imageAttached: boolean;
   tools?: string[];
   options?: Record<string, unknown>;
-  domContext?: AiDomContextSnapshot;
   systemPrompt?: string;
 }): AiRequestSnapshot {
   const { provider, model } = getModelSettings();
@@ -2117,16 +2227,12 @@ function createAiRequestSnapshot(input: {
     createdAt: new Date().toISOString(),
     provider,
     model,
+    systemPrompt: input.systemPrompt,
     screenshotPath: input.screenshotPath,
     imageAttached: input.imageAttached,
     tools: input.tools,
     options: input.options,
-    domContext: input.domContext,
     messages: [
-      ...(input.systemPrompt ? [{
-        role: 'system' as const,
-        content: [{ type: 'text' as const, text: input.systemPrompt }],
-      }] : []),
       {
         role: 'user',
         content: [
@@ -2138,26 +2244,110 @@ function createAiRequestSnapshot(input: {
   };
 }
 
-const fullLogDetailsFlag = '__browserChatFullLogDetails';
+const fullLogDetailsFlag = '__browserChatFullLogDetails';function binaryLogDescriptor(value: unknown, imagePath?: string) {
+  const bytes = Buffer.isBuffer(value)
+    ? value.length
+    : ArrayBuffer.isView(value)
+      ? value.byteLength
+      : value instanceof ArrayBuffer
+        ? value.byteLength
+        : typeof value === 'string'
+          ? value.length
+          : undefined;
+  return {
+    type: 'binary',
+    bytes,
+    imagePath,
+    attached: Boolean(imagePath),
+  };
+}
 
-function aiRequestTextAndImageStats(aiRequest?: AiRequestSnapshot) {
-  let text = '';
-  let imageCount = 0;
-  for (const message of aiRequest?.messages || []) {
-    for (const item of message.content || []) {
-      if (item.type === 'text') text += `\n${item.text}`;
-      if (item.type === 'image') imageCount += 1;
+function sanitizeModelLogValue(
+  value: unknown,
+  imagePaths: string[],
+  state: { imageIndex: number },
+  seen = new WeakSet<object>(),
+): unknown {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== 'object') return value;
+  if (Buffer.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    const imagePath = imagePaths[state.imageIndex++];
+    return binaryLogDescriptor(value, imagePath);
+  }
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeModelLogValue(item, imagePaths, state, seen));
+  }
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (key === 'image') {
+      const imagePath = imagePaths[state.imageIndex++];
+      output[key] = binaryLogDescriptor(item, imagePath);
+    } else {
+      output[key] = sanitizeModelLogValue(item, imagePaths, state, seen);
     }
   }
-  const estimatedTextTokens = estimateTextTokens(text);
+  return output;
+}
+
+function sanitizeModelMessagesForLog(system: string | undefined, messages: unknown, imagePaths: string[]) {
+  const orderedMessages = [
+    ...(system?.trim() ? [{ role: 'system', content: system }] : []),
+    ...(Array.isArray(messages) ? messages : []),
+  ];
+  return sanitizeModelLogValue(orderedMessages, imagePaths, { imageIndex: 0 });
+}
+
+function sanitizeModelInputForStats(system: string | undefined, messages: unknown, imagePaths: string[]) {
+  return sanitizeModelLogValue({
+    system: system || '',
+    messages: Array.isArray(messages) ? messages : [],
+  }, imagePaths, { imageIndex: 0 });
+}
+
+function modelMessagesTextAndImageStats(messages: unknown, tools?: RuntimeToolDefinitions) {
+  let text = '';
+  let imageCount = 0;
+  const walk = (value: unknown) => {
+    if (typeof value === 'string') {
+      text += `\n${value}`;
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    if (record.type === 'image' || (record.image && typeof record.image === 'object')) {
+      imageCount += 1;
+      return;
+    }
+    Object.values(record).forEach(walk);
+  };
+  walk(messages);
+  const serialized = JSON.stringify(messages) || '';
+  const estimatedValueTextTokens = estimateTextTokens(text);
+  const estimatedSerializedTextTokens = estimateTextTokens(serialized);
+  const estimatedTextTokens = Math.max(estimatedValueTextTokens, estimatedSerializedTextTokens);
   const estimatedImageTokens = imageCount * imageTokenEstimatePerImage();
+  const toolSchema = toolSchemaEstimateInput(tools);
+  const serializedToolSchema = JSON.stringify(toolSchema) || '';
+  const estimatedToolSchemaTokens = estimateTextTokens(serializedToolSchema);
   return {
     textCharacters: text.length,
+    serializedCharacters: serialized.length,
     imageCount,
+    toolCount: toolSchema.length,
+    toolSchemaCharacters: serializedToolSchema.length,
+    estimatedValueTextTokens,
+    estimatedSerializedTextTokens,
     estimatedTextTokens,
     estimatedImageTokens,
-    estimatedTotalTokens: estimatedTextTokens + estimatedImageTokens,
-    method: 'rough estimate: ASCII chars / 4 + non-ASCII chars + imageCount * AI_IMAGE_CONTEXT_ESTIMATE_TOKENS',
+    estimatedToolSchemaTokens,
+    estimatedTotalTokens: estimatedTextTokens + estimatedImageTokens + estimatedToolSchemaTokens,
+    method: 'rough estimate from sanitized modelMessages plus current browser tool schemas: max(value-text tokens, serialized JSON tokens) + imageCount * AI_IMAGE_CONTEXT_ESTIMATE_TOKENS + serialized current tool definitions',
   };
 }
 
@@ -2168,32 +2358,46 @@ function fullLogDetails(value: unknown) {
   };
 }
 
-function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Record<string, unknown> = {}) {
+function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Record<string, unknown> = {}, modelMessages?: unknown) {
   return fullLogDetails({
-    ...extra,
-    requestTokenEstimate: aiRequestTextAndImageStats(aiRequest),
-    request: aiRequest,
+    aiInput: {
+      provider: aiRequest?.provider || extra.provider,
+      model: aiRequest?.model || extra.model,
+      tools: aiRequest?.tools,
+      options: {
+        ...(aiRequest?.options || {}),
+        ...extra,
+      },
+      system: aiRequest?.systemPrompt,
+      messages: modelMessages || aiRequest?.messages || [],
+    },
   });
 }
 
 function aiResponseLogDetails(input: {
   aiRequest?: AiRequestSnapshot;
+  modelMessages?: unknown;
   response: unknown;
   elapsedMs: number;
+  aiElapsedMs?: number;
+  stepStartedAt?: number;
   traces?: ToolTrace[];
   visualContext?: ReturnType<VisualContextManager['snapshot']>;
   workingMemory?: RuntimeWorkingMemory;
   extra?: Record<string, unknown>;
 }) {
   return fullLogDetails({
-    ...(input.extra || {}),
-    elapsedMs: input.elapsedMs,
-    requestTokenEstimate: aiRequestTextAndImageStats(input.aiRequest),
-    request: input.aiRequest,
-    response: input.response,
-    traces: input.traces,
-    visualContext: input.visualContext,
-    workingMemory: input.workingMemory,
+    aiOutput: sanitizeModelLogValue({
+      ...(input.extra || {}),
+      elapsedMs: input.elapsedMs,
+      timings: summarizeRuntimeLogTimings({
+        aiElapsedMs: input.aiElapsedMs,
+        stepStartedAt: input.stepStartedAt,
+        totalElapsedMs: input.elapsedMs,
+        traces: input.traces,
+      }),
+      response: input.response,
+    }, [], { imageIndex: 0 }),
   });
 }
 
@@ -2205,137 +2409,26 @@ function extractProgressNote(text: string) {
   return readableActionFromRawText(note)?.slice(0, 400);
 }
 
-function parseListLike(text?: string) {
-  if (!text || /^(无|none)$/i.test(text.trim())) return [];
-  return text
-    .split(/(?:[；;]\s*|\n+|\s(?:\d+\.|[-*])\s)/)
-    .map((item) => item.replace(/^[\d.\s、*-]+/, '').trim())
-    .filter((item) => item && !/^(无|none)$/i.test(item))
-    .slice(0, 8);
-}
-
-function parseJsonPayload(value: unknown) {
-  if (value === null || value === undefined) return undefined;
-  if (typeof value !== 'string') return value;
-  const text = value.trim();
-  if (!text || /^(null|none|unchanged|无|暂无)$/i.test(text)) return undefined;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
+function textFromUnknown(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
+        const record = item as Record<string, unknown>;
+        return textFromUnknown(record.text ?? record.content);
+      })
+      .filter(Boolean)
+      .join('\n');
   }
-}
-
-function stringField(value: unknown, max = 240) {
-  return typeof value === 'string' && value.trim() ? concise(value.trim(), max) : undefined;
-}
-
-function arrayOfStrings(value: unknown, maxItems = 12) {
-  if (!Array.isArray(value)) return [];
-  return value.map((item) => stringField(item, 220)).filter((item): item is string => Boolean(item)).slice(0, maxItems);
-}
-
-function normalizeDimension(value: unknown): TaskFrame['dimensions'][number] | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const name = stringField(raw.name, 80);
-  const id = stringField(raw.id, 80) || name?.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/gi, '_').replace(/^_+|_+$/g, '');
-  if (!id || !name) return undefined;
-  const dimension: TaskFrame['dimensions'][number] = {
-    id,
-    name,
-    description: stringField(raw.description, 500),
-  };
-  const focus = arrayOfStrings(raw.focus, 12);
-  const testIdeas = arrayOfStrings(raw.testIdeas, 12);
-  const risks = arrayOfStrings(raw.risks, 8);
-  if (focus.length) dimension.focus = focus;
-  if (testIdeas.length) dimension.testIdeas = testIdeas;
-  if (risks.length) dimension.risks = risks;
-  return dimension;
-}
-
-function fallbackTaskFrame(goal: string): TaskFrame {
-  return {
-    goal: concise(goal, 300) || 'Complete the user task and preserve structured findings.',
-    version: 1,
-    successCriteria: ['满足用户目标', '结构化记录关键过程和结论', '最终输出可由台账追溯'],
-    dimensions: [],
-  };
-}
-
-function normalizeTaskFrame(value: unknown, previous: TaskFrame | undefined, goal: string): TaskFrame | undefined {
-  const parsed = parseJsonPayload(value);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return previous || fallbackTaskFrame(goal);
-  const raw = parsed as Record<string, unknown>;
-  const dimensions = Array.isArray(raw.dimensions)
-    ? raw.dimensions.map(normalizeDimension).filter((item): item is TaskFrame['dimensions'][number] => Boolean(item)).slice(0, 12)
-    : [];
-  if (!dimensions.length && previous) return previous;
-  if (!dimensions.length) return fallbackTaskFrame(goal);
-  const successCriteria = arrayOfStrings(raw.successCriteria, 12);
-  const next: TaskFrame = {
-    goal: stringField(raw.goal, 320) || previous?.goal || concise(goal, 320),
-    version: typeof raw.version === 'number' ? raw.version : previous?.version || 1,
-    successCriteria: successCriteria.length ? successCriteria : previous?.successCriteria || fallbackTaskFrame(goal).successCriteria,
-    dimensions,
-  };
-  const deliverables = arrayOfStrings(raw.deliverables, 12);
-  const analysisGuidance = arrayOfStrings(raw.analysisGuidance, 12);
-  const finalOutputRequirements = arrayOfStrings(raw.finalOutputRequirements, 12);
-  if (deliverables.length) next.deliverables = deliverables;
-  else if (previous?.deliverables?.length) next.deliverables = previous.deliverables;
-  if (analysisGuidance.length) next.analysisGuidance = analysisGuidance;
-  else if (previous?.analysisGuidance?.length) next.analysisGuidance = previous.analysisGuidance;
-  if (finalOutputRequirements.length) next.finalOutputRequirements = finalOutputRequirements;
-  else if (previous?.finalOutputRequirements?.length) next.finalOutputRequirements = previous.finalOutputRequirements;
-  return next;
-}
-
-function normalizeLedgerItem(value: unknown, sourceStep?: number, evidence: string[] = []): TaskLedgerItem | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const title = stringField(raw.title, 180);
-  if (!title) return undefined;
-  const status = ['finding', 'issue', 'covered', 'risk', 'question', 'evidence', 'decision'].includes(String(raw.status))
-    ? raw.status as TaskLedgerItem['status']
-    : 'finding';
-  const severity = ['info', 'minor', 'major', 'critical'].includes(String(raw.severity))
-    ? raw.severity as TaskLedgerItem['severity']
-    : status === 'issue' || status === 'risk' ? 'minor' : 'info';
-  const attributes = Array.isArray(raw.attributes)
-    ? raw.attributes.map((item) => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return undefined;
-      const pair = item as Record<string, unknown>;
-      const key = stringField(pair.key, 80);
-      const valueText = stringField(pair.value, 180);
-      return key && valueText ? { key, value: valueText } : undefined;
-    }).filter((item): item is { key: string; value: string } => Boolean(item)).slice(0, 8)
-    : undefined;
-  const itemEvidence = arrayOfStrings(raw.evidence, 8);
-  return {
-    id: stringField(raw.id, 120),
-    dimensionId: stringField(raw.dimensionId, 80) || 'general',
-    title,
-    summary: stringField(raw.summary, 500),
-    status,
-    severity,
-    expected: stringField(raw.expected, 500),
-    actual: stringField(raw.actual, 500),
-    evidence: Array.from(new Set([...itemEvidence, ...evidence])).slice(0, 8),
-    confidence: typeof raw.confidence === 'number' && Number.isFinite(raw.confidence) ? Math.max(0, Math.min(1, raw.confidence)) : undefined,
-    sourceStep: typeof raw.sourceStep === 'number' ? raw.sourceStep : sourceStep,
-    attributes,
-  };
-}
-
-function parseLedgerItems(value: unknown, sourceStep?: number, evidence: string[] = []) {
-  const parsed = parseJsonPayload(value);
-  const rawItems = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-  return rawItems
-    .map((item) => normalizeLedgerItem(item, sourceStep, evidence))
-    .filter((item): item is TaskLedgerItem => Boolean(item))
-    .slice(0, 12);
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return textFromUnknown(record.text ?? record.content);
+  }
+  return '';
 }
 
 function ledgerMemoryLimit() {
@@ -2364,84 +2457,16 @@ function collectLedgerItemsFromSteps(steps: StepExecutionResult[]) {
   ], ledgerMemoryLimit());
 }
 
-function formatTaskFrameContext(frame?: TaskFrame) {
-  return JSON.stringify({
-    taskFrame: frame || null,
-  }, null, 2);
-}
-
 function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''): Pick<RuntimeDecision, 'taskFrame' | 'ledgerItems'> {
   void traces;
   void goal;
   return {};
 }
 
-function deriveDecision(text: string, traces: ToolTrace[], goal = ''): RuntimeDecision {
-  // When a tool actually executed this step, the step result is derived from the action itself. We
-  // never trust JSON done/status in the same response as a tool call, so the model cannot accidentally
-  // declare the requirement complete before seeing the next screenshot.
-  if (traces.length > 0) {
-    const executed = traces.filter((trace) => trace.name && trace.result);
-    const last = executed.at(-1);
-    const failed = executed.find((trace) => trace.result && !trace.result.ok);
-    const names = executed.map((trace) => summarizeTraceForMemory(trace)).join('; ');
-    const note = extractProgressNote(text);
-    const assistantInfo = extractAssistantStepInfoFromToolInputs(executed, goal);
-    const toolReason = executed.map((trace) => readableActionFromTrace(trace)).find(Boolean);
-
-    if (last?.name === 'reportState' && last.result && last.input && typeof last.input === 'object' && !Array.isArray(last.input)) {
-      const input = last.input as Record<string, unknown>;
-      const status = input.status === 'failed' || input.status === 'blocked' || input.status === 'passed' ? input.status : 'passed';
-      return {
-        action: readableActionFromRawText(typeof input.action === 'string' ? input.action : undefined, { reportState: true })
-          || readableActionFromTrace(last, { reportState: true })
-          || toolReason
-          || 'AI reported current state',
-        expected: typeof input.expected === 'string' ? input.expected : 'AI should report progress or conclusion based on current page state.',
-        actual: typeof input.actual === 'string' ? input.actual : last.result.actual,
-        status,
-        done: typeof input.done === 'boolean' ? input.done : status === 'failed',
-        note,
-        ...assistantInfo,
-      };
-    }
-
-    if (last?.name === 'waitForHumanVerification') {
-      return {
-        action: readableActionFromTrace(last) || toolReason || '等待人工完成验证',
-        expected: '用户在可见浏览器中完成验证码、登录验证或安全校验后，回到运行报告点击“执行完毕”。',
-        actual: `AI 已请求人工介入：${last.result?.actual || '请在浏览器中完成验证后继续。'}`,
-        status: 'blocked',
-        done: false,
-        note,
-        ...assistantInfo,
-      };
-    }
-
-    return {
-      action: note || readableActionFromTrace(last) || toolReason || `AI executed browser action: ${names || last?.name || 'browser action'}`,
-      expected: 'This action should advance the user requirement; the next screenshot will verify the result.',
-      actual: last ? userFacingToolResult(last.name, last.result, 500) || 'Tool call finished; waiting for next screenshot to confirm effect.' : 'Tool call finished; waiting for next screenshot to confirm effect.',
-      status: failed ? 'failed' : 'passed',
-      done: false,
-      note,
-      ...assistantInfo,
-    };
-  }
-
-  return {
-    action: 'Browser chat returned no browser tool',
-    expected: 'Browser chat may answer directly without a tool, or continue until an explicit answer is available.',
-    actual: text || 'Browser chat returned no browser tool result.',
-    status: 'passed',
-    done: false,
-  };
-}
-
 function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal = ''): RuntimeDecision {
   const executed = traces.filter((trace) => trace.name && trace.result);
   const last = executed.at(-1);
-  const failed = executed.find((trace) => trace.result && !trace.result.ok);
+  const failed = executed.find(isEffectiveToolTraceFailure);
   const names = executed.map((trace) => summarizeTraceForMemory(trace)).join('; ');
   const note = extractProgressNote(text);
   const assistantInfo = extractAssistantStepInfoFromToolInputs(executed, goal);
@@ -2480,7 +2505,9 @@ function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal =
     action: note || readableActionFromTrace(last) || toolReason || `AI executed browser-chat action: ${names || last?.name || 'browser action'}`,
     expected: 'This browser-chat action should move the conversation forward; the next turn will decide whether to continue or answer.',
     actual: last
-      ? userFacingToolResult(last.name, last.result, 500) || 'Tool call finished; waiting for the next browser-chat turn.'
+      ? isRecoveredTransientToolTrace(last)
+        ? 'The stale UID was transient. A fresh DOM snapshot is available for the next action.'
+        : userFacingToolResult(last.name, last.result, 500) || 'Tool call finished; waiting for the next browser-chat turn.'
       : text || 'Browser chat returned no browser tool result.',
     status: failed ? 'failed' : 'passed',
     done: false,
@@ -2490,6 +2517,23 @@ function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal =
 }
 
 // 执行单个运行时步骤：采集页面上下文，调用 AI 选择一个动作，并记录请求快照。
+function browserChatReplyFromDecision(decision: RuntimeDecision, lastToolName?: string) {
+  const candidates = [
+    decision.actual,
+    decision.note,
+    decision.observation,
+    decision.action,
+  ].map((item) => String(item || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const text = candidates.find((item) => (
+    item
+    && !/^Tool call finished/i.test(item)
+    && !/^Browser chat returned no browser tool/i.test(item)
+    && !/^AI executed browser-chat action/i.test(item)
+  )) || candidates[0] || '';
+  if (!text) return lastToolName === 'reportState' ? '已完成本轮操作。' : '';
+  return text.length > 900 ? `${text.slice(0, 900)}...` : text;
+}
+
 function progressFieldsFromToolTraces(
   traces: ToolTrace[],
   goal: string,
@@ -2518,7 +2562,10 @@ async function executeRuntimeStep(input: {
   runId: string;
   stepIndex: number;
   beforeScreenshotPath: string;
+  instruction?: string;
+  conversation?: InteractiveBrowserTurnMessage[];
   completedSteps: StepExecutionResult[];
+  runtimeObservationStore?: RuntimeObservationStore;
   selectedScreenshotReferences?: SelectedScreenshotReference[];
   referenceImagePaths?: string[];
   onSelectReferenceScreenshots?: (selection: {
@@ -2531,7 +2578,9 @@ async function executeRuntimeStep(input: {
   shouldContinue?: () => boolean;
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
+  getDynamicSkillContext?: () => string | Promise<string>;
   repairContext?: string;
+  requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
 }) {
   const {
     session,
@@ -2548,14 +2597,11 @@ async function executeRuntimeStep(input: {
   } = input;
   const mode = browserModeOf(testCase);
   const browserChatMode = isBrowserChatTestCase(testCase);
-  const screenshotInputEnabled = shouldSendScreenshotToAi(mode);
-  const markerEnabled = mode === 'visual-markers' && visualMarkersEnabledFor(testCase);
-  const separateMarkerMap = markerEnabled && usesSeparateMarkerMap();
-  const markerOverlayInScreenshot = markerEnabled && !separateMarkerMap;
+  const screenshotInputEnabled = false;
+  const markerEnabled = false;
+  const markerOverlayInScreenshot = false;
   const ensureActive = () => throwIfStopped(abortSignal, input.shouldContinue);
-  const markerScreenshotPath = separateMarkerMap && screenshotInputEnabled
-    ? session.getLastCandidateMarkerScreenshotPath()
-    : undefined;
+  const markerScreenshotPath = undefined;
   const originalScreenshotPath = session.getLastOriginalScreenshotPath();
   ensureActive();
   await onDebug?.({
@@ -2567,14 +2613,11 @@ async function executeRuntimeStep(input: {
   const contextStartedAt = Date.now();
   const pageContext = await session.getPageContext(runtimePageContextOptions(mode));
   ensureActive();
-  let currentDomContext = createDomContextSnapshot(mode, pageContext);
   const contextMs = elapsedSince(contextStartedAt);
   const screenshotReadStartedAt = Date.now();
-  const screenshot = screenshotInputEnabled ? await readScreenshotForAi(beforeScreenshotPath) : undefined;
+  const screenshot = undefined;
   ensureActive();
-  const markerScreenshot = screenshot && markerScreenshotPath
-    ? await readMarkerScreenshotForAi(markerScreenshotPath, screenshot).catch(() => undefined)
-    : undefined;
+  const markerScreenshot = undefined;
   ensureActive();
   const userReferenceImagePaths = Array.from(new Set(referenceImagePaths.filter(Boolean))).slice(0, 4);
   const userReferenceImages = modelSupportsScreenshotInput()
@@ -2584,16 +2627,40 @@ async function executeRuntimeStep(input: {
       })))
     : [];
   ensureActive();
-  const selectedReferenceScreenshots = screenshotInputEnabled
-    ? await Promise.all(selectedScreenshotReferences.map(async (ref) => ({
+  let runtimeSelectedScreenshotReferences = [...selectedScreenshotReferences];
+  const loadSelectedReferenceScreenshots = async () => modelSupportsScreenshotInput()
+    ? Promise.all(runtimeSelectedScreenshotReferences.map(async (ref) => ({
         ref,
         image: await readScreenshotForAi(ref.path).catch(() => undefined),
       })))
     : [];
+  let runtimeSelectedReferenceScreenshots = await loadSelectedReferenceScreenshots();
   ensureActive();
   const screenshotReadMs = elapsedSince(screenshotReadStartedAt);
   const availableScreenshotReferences = buildAvailableScreenshotReferences(completedSteps);
   const availableReferenceIds = new Set(availableScreenshotReferences.map((ref) => ref.id));
+  const applySelectedReferenceScreenshots = async (selection: {
+    ids: string[];
+    selectionReason: string;
+    sameInterfaceGroup?: string;
+  }) => {
+    const validIds = selection.ids.filter((id) => availableReferenceIds.has(id));
+    runtimeSelectedScreenshotReferences = validIds
+      .map((id) => availableScreenshotReferences.find((ref) => ref.id === id))
+      .filter((ref): ref is ScreenshotReference => Boolean(ref))
+      .map((ref) => ({
+        ...ref,
+        selectionReason: selection.selectionReason,
+        sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
+      }));
+    runtimeSelectedReferenceScreenshots = await loadSelectedReferenceScreenshots();
+    await onSelectReferenceScreenshots?.({
+      ...selection,
+      ids: validIds,
+      availableReferences: availableScreenshotReferences,
+    });
+    return validIds;
+  };
   const promptStartedAt = Date.now();
   const userReferenceImagePrompt = userReferenceImagePaths.length
     ? [
@@ -2612,7 +2679,7 @@ async function executeRuntimeStep(input: {
     hasMarkerScreenshot: Boolean(markerScreenshot),
     markerOverlayInScreenshot,
     availableScreenshotReferences,
-    selectedScreenshotReferences,
+    selectedScreenshotReferences: runtimeSelectedScreenshotReferences,
     repairContext: input.repairContext,
   })}${userReferenceImagePrompt}`;
   const promptMs = elapsedSince(promptStartedAt);
@@ -2625,173 +2692,407 @@ async function executeRuntimeStep(input: {
       screenshotReadMs,
       promptMs,
       screenshotInputEnabled,
-      screenshotBytes: screenshot?.length,
-      markerScreenshotBytes: markerScreenshot?.length,
-      selectedReferenceScreenshotCount: selectedReferenceScreenshots.filter((item) => item.image).length,
+      screenshotBytes: undefined,
+      markerScreenshotBytes: undefined,
+      selectedReferenceScreenshotCount: runtimeSelectedReferenceScreenshots.filter((item) => item.image).length,
       userReferenceImageCount: userReferenceImages.filter((item) => item.image).length,
       browserMode: mode,
     },
   });
   let lastAiRequest: AiRequestSnapshot | undefined;
+  let lastRetryState: RuntimeRetryState | undefined;
+  let consecutiveRequestFailures = 0;
 
-  async function runAgent(includeImage: boolean) {
+  function rememberRetryState(state: RuntimeRetryState) {
+    lastRetryState = cloneRuntimeRetryState(state);
+  }
+
+  async function runAgent(includeImage: boolean, retryState?: RuntimeRetryState) {
     const traces: ToolTrace[] = [];
     const codexMode = isCodexProvider();
-    const baseAllowedToolTypes = runtimeToolNames(mode).filter((name) => !(browserChatMode && name === 'reportState'));
-    const allowedToolTypes = browserChatMode && codexMode
-      ? [...baseAllowedToolTypes, 'answer']
-      : baseAllowedToolTypes;
+    const retryAgentStepOffset = retryState?.agentStepOffset || 0;
+    const observationStore: RuntimeObservationStore = input.runtimeObservationStore || new Map();
+    if (retryState?.observationStore) restoreRuntimeObservationStore(observationStore, retryState.observationStore);
+    const allowedToolTypes = runtimeAllowedToolTypes({
+      browserChatMode,
+      codexMode,
+      nativeToolNames: runtimeToolNames(mode),
+      observationToolNames: runtimeObservationToolNames,
+    });
+    const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
-    let requestPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
-    let requestSystemPrompt: string | undefined;
-    async function refreshRequestPromptForTurn() {
-      ensureActive();
-      const currentPageContext = await session.getPageContext(runtimePageContextOptions(mode));
-      ensureActive();
-      currentDomContext = createDomContextSnapshot(mode, currentPageContext);
-      requestSystemPrompt = mode === 'dom' ? domRuntimeSystemPrompt(currentPageContext) : undefined;
-      const currentMarkerPath = visualContext.current()?.markerPath;
-      const basePrompt = `${runtimePrompt({
-        testCase,
-        pageContext: currentPageContext,
-        completedSteps,
-        workingMemory,
-        stepIndex,
-        beforeScreenshotPath,
-        hasMarkerScreenshot: Boolean(separateMarkerMap && currentMarkerPath),
-        markerOverlayInScreenshot,
-        availableScreenshotReferences,
-        selectedScreenshotReferences,
-        repairContext: input.repairContext,
-      })}${userReferenceImagePrompt}`;
-      requestPrompt = codexMode ? buildCodexObjectPrompt(basePrompt, allowedToolTypes) : basePrompt;
-      return requestPrompt;
-    }
+    const initialRequestPrompt = prompt;
+    const requestPrompt = codexMode ? buildCodexObjectPrompt(initialRequestPrompt, allowedToolTypes) : initialRequestPrompt;
+    const requestSystemPrompt: string | undefined = browserChatMode ? requestPrompt : undefined;
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(testCase),
       phase: browserChatMode
         ? 'Browser chat turn; answer directly when current evidence is enough, otherwise use one browser tool.'
-        : mode === 'dom'
-          ? 'Entering DOM Agent Loop; choose one DOM/text tool or report state.'
-          : 'Entering visual Agent Loop; choose one tool from the current visual frame.',
+        : 'Entering the browser Agent Loop; choose one semantic, visual, mouse, keyboard, or reporting tool.',
       completed: [],
       findings: [],
       blockers: [],
       pageUnderstanding: '',
-      currentState: mode === 'dom'
-        ? 'No DOM state summary yet; use the current full DOM snapshot, full page text, URL, focus, tabs, and scroll state.'
-        : 'No visual state summary yet; inspect the current screenshot.',
+      currentState: browserChatMode
+        ? 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable"}) when browser evidence is needed.'
+        : 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable"}) before choosing a UID action.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
-        : mode === 'dom'
-          ? 'Use current full DOM node_ids, full page text, and getDomNodeText for the next missing goal; scroll only when the content is lazy-loaded or viewport-dependent.'
-          : 'Use the current screenshot to complete the next missing goal.',
+        : 'Use the current DOM baseline plus the latest incremental changes for the next missing goal; use mouse scroll only when content is lazy-loaded or virtualized.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
-    let contextCompressionTurns = 0;
-    let aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: requestPrompt, screenshotPath: beforeScreenshotPath, imagePaths: [...(includeImage ? visualContext.imagePaths() : []), ...userReferenceImagePaths], imageAttached: Boolean((includeImage && screenshot) || userReferenceImages.some((item) => item.image)), tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, prepareStep: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: (includeImage ? visualContext.imagePaths().length : 0) + userReferenceImages.filter((item) => item.image).length, markerScreenshotPath, isMarked: markerEnabled, markerOverlayInScreenshot, separateMarkerMap, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled, browserMode: mode, visualClickMode: mode === 'visual-markers', codexObjectMode: codexMode, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length } });
+    const initialVisualPaths: string[] = [];
+    const initialSelectedReferenceImagePaths = browserChatMode ? [] : runtimeSelectedReferenceScreenshots.filter((item) => item.image).map((item) => item.ref.path);
+    const initialUserReferenceImagePaths = userReferenceImages.filter((item) => item.image).map((item) => item.imagePath);
+    type PendingObservationMessage = {
+      text: string;
+      imagePaths: string[];
+    };
+    const pendingObservationMessages: PendingObservationMessage[] = [];
+    const historyMessages = (input.conversation || [])
+      .map((message) => {
+        const content = textFromUnknown(message?.content);
+        if (!content.trim()) return undefined;
+        return {
+          role: message?.role === 'assistant' ? 'assistant' as const : 'user' as const,
+          content,
+        };
+      })
+      .filter((message): message is { role: 'user' | 'assistant'; content: string } => Boolean(message)) as RuntimeModelMessage[];
+    const initialImagePaths = [...initialVisualPaths, ...initialSelectedReferenceImagePaths, ...initialUserReferenceImagePaths];
+    const initialImages: Buffer[] = [];
+    for (const imagePath of initialImagePaths) {
+      const image = await readScreenshotForAi(imagePath).catch(() => undefined);
+      if (image) initialImages.push(image);
+    }
+    let initialMessages = [...historyMessages] as RuntimeModelMessage[];
+    if (browserChatMode) {
+      const latestInstruction = (
+        textFromUnknown(input.instruction)
+        || textFromUnknown(testCase.description)
+        || textFromUnknown(testCase.content?.description)
+      ).trim();
+      const hasLatestUserMessage = Boolean(latestInstruction && initialMessages.some((message) => {
+        if (message.role !== 'user' || typeof message.content !== 'string') return false;
+        const content = textFromUnknown(message.content);
+        return content.trim() === latestInstruction || content.includes(latestInstruction);
+      }));
+      if (latestInstruction && !hasLatestUserMessage) {
+        initialMessages.push({ role: 'user' as const, content: latestInstruction });
+      }
+      if (initialImages.length) {
+        const latestUserIndex = initialMessages.map((message) => message.role).lastIndexOf('user');
+        const fallbackText = latestInstruction || 'User uploaded reference image(s).';
+        if (latestUserIndex >= 0) {
+          const latestUser = initialMessages[latestUserIndex];
+          const text = typeof latestUser.content === 'string' && latestUser.content.trim()
+            ? latestUser.content
+            : fallbackText;
+          initialMessages[latestUserIndex] = {
+            role: 'user' as const,
+            content: [
+              { type: 'text' as const, text },
+              ...initialImages.map((image) => ({ type: 'image' as const, image })),
+            ],
+          };
+        } else {
+          initialMessages.push({
+            role: 'user' as const,
+            content: [
+              { type: 'text' as const, text: fallbackText },
+              ...initialImages.map((image) => ({ type: 'image' as const, image })),
+            ],
+          });
+        }
+      }
+    } else {
+      const initialContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: requestPrompt }];
+      for (const image of initialImages) initialContent.push({ type: 'image', image });
+      initialMessages = [...historyMessages, { role: 'user' as const, content: initialContent }] as RuntimeModelMessage[];
+    }
+    if (codexMode && input.completedSteps.length) {
+      initialMessages.push(...codexExecutedActionMessages(input.completedSteps));
+    }
+    if (retryState?.messages.length) {
+      initialMessages = [...retryState.messages];
+    }
+    let messageImagePaths = retryState?.messages.length ? [...retryState.imagePaths] : [...initialImagePaths];
+    rememberRetryState({
+      messages: initialMessages,
+      imagePaths: messageImagePaths,
+      agentStepOffset: retryAgentStepOffset,
+      observationStore,
+    });
+    let aiRequest = createAiRequestSnapshot({
+      kind: 'runtime',
+      stepIndex,
+      prompt: browserChatMode ? '[system prompt]' : requestPrompt,
+      systemPrompt: requestSystemPrompt,
+      screenshotPath: undefined,
+      imagePaths: messageImagePaths,
+      imageAttached: Boolean(messageImagePaths.length),
+      tools: allowedToolTypes,
+      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, markerScreenshotPath, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled: false, screenshotToolEnabled: modelSupportsScreenshotInput(), browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: initialSelectedReferenceImagePaths.length, userReferenceImageCount: initialUserReferenceImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId) },
+    });
     lastAiRequest = aiRequest;
+    const toolExecutionGate = { stepNumber: 0, executed: false };
+    const stepTraceStarts = new Map<number, number>();
+    const stepStartedAt = new Map<number, number>();
+    const stepModelMessagesForLog = new Map<number, unknown>();
+    let contextSegmentationTurns = 0;
+    let pageStateObservationIndex = 0;
+    const continuationSummaryMarker = '[WebPilot continuation summary]';
+    let compactedModelContext: RuntimeModelMessage[] | undefined;
+    let compactedSourceMessageCount = 0;
 
-    async function prepareStep(turnIndex: number) {
+    function messagesAddedAfterCompactedContext(sourceMessages: RuntimeModelMessage[]) {
+      if (!compactedModelContext?.length) return sourceMessages;
+      const markerIndex = sourceMessages.findIndex((message) => (
+        textFromUnknown(message.content).startsWith(continuationSummaryMarker)
+      ));
+      if (markerIndex >= 0) {
+        return sourceMessages.slice(markerIndex + Math.min(
+          compactedModelContext.length,
+          sourceMessages.length - markerIndex,
+        ));
+      }
+      return sourceMessages.slice(Math.min(compactedSourceMessageCount, sourceMessages.length));
+    }
+
+    async function takeSnapshot(options: RuntimeObservationReadOptions = {}): Promise<BrowserActionResult> {
       ensureActive();
-      const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
-      let visualPaths = includeImage ? visualContext.imagePaths() : [];
-      let traceLimit = 5;
-      let compressionDetails: Record<string, unknown> | undefined;
-      await refreshRequestPromptForTurn();
-      const buildContextText = () => {
-        const compressionNote = compressionDetails
-          ? [
-              'Context budget manager:',
-              `- Estimated context exceeded ${Math.round(Number(compressionDetails.thresholdRatio) * 100)}%; historical visual frames and working memory were compressed.`,
-              '- This request is a single reconstructed prompt built from current visual context, compact memory, and recent tool summaries.',
-            ].join('\n')
-          : '';
-        return buildPrepareStepPrompt({
-          requestPrompt,
-          compressionNote,
-          workingMemoryText: formatWorkingMemory(workingMemory),
-          visualContextText: mode === 'dom'
-            ? [
-                'DOM Context Manager:',
-                '- Current full DOM snapshot, full page text, URL, focus, tabs, and scroll state in Runtime Context are authoritative.',
-                '- No screenshot image is attached for DOM decisions.',
-                '- If needed content/control is absent from the full DOM/text context, scroll the relevant area only for lazy-loaded or viewport-dependent UI; the next AI request will include the refreshed DOM/text context.',
-              ].join('\n')
-            : visualContext.renderText(),
-          currentToolAttemptsText: formatCurrentToolAttemptSummary(traces, traceLimit),
-          turnIndex,
-          maxTurns,
-          traceLimit,
-          allowTextResponse: browserChatMode,
-          browserMode: mode,
-        });
+      const snapshotView = options.mode || 'actionable';
+
+      const readStartedAt = Date.now();
+      const snapshot = await session.readDomObservationSnapshot({
+        cursor: options.cursor,
+        mode: options.cursor ? options.mode : snapshotView,
+      });
+      ensureActive();
+      const snapshotActual = [
+        snapshot.pageSummary,
+        snapshot.content,
+        snapshot.nextCursor ? `More pages remain. Continue with takeSnapshot({mode:"${snapshot.mode}",cursor:"${snapshot.nextCursor}"}).` : 'End of this snapshot.',
+      ].join('\n');
+      if (options.cursor || snapshotView === 'changes') return { ok: true, actual: snapshotActual, nextCursor: snapshot.nextCursor };
+      const observationViews: BrowserSnapshotViews = {
+        defaultType: snapshotView,
+        [snapshotView]: snapshot.content,
       };
-      let contextText = buildContextText();
+      const observation = storeRuntimeObservation(
+        observationStore,
+        input.runId,
+        'takeSnapshot',
+        snapshot.content,
+        observationViews,
+        { includeChanges: false },
+      );
+      if (!observation) {
+        return { ok: false, actual: 'Unable to store the current semantic DOM snapshot. Capture it again.' };
+      }
+      await onDebug?.({
+        phase: 'browser:take-snapshot:dom-timings',
+        stepIndex,
+        message: `DOM-observation takeSnapshot timings: total=${elapsedSince(readStartedAt)}ms, runtime=${snapshot.timings.readDomObservationMs || 0}ms.`,
+        details: { snapshot, totalMs: elapsedSince(readStartedAt) },
+      });
+      return {
+        ok: true,
+        // The observation store and its change view are server-side state.
+        // Returning them leaks unrelated modes into both the model context and
+        // the tool-result dialog. A snapshot tool result is exactly its
+        // requested mode's content, nothing else.
+        actual: snapshotActual,
+        nextCursor: snapshot.nextCursor,
+      };
+    }
+
+    async function observeCurrentScreenshot(options: { capture?: ScreenshotCaptureMode } = {}): Promise<BrowserActionResult> {
+      ensureActive();
+      if (!modelSupportsScreenshotInput()) {
+        return { ok: false, actual: 'takeScreenshot is unavailable because the configured model does not support image input.' };
+      }
+      pageStateObservationIndex += 1;
+      const capture = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
+      const visualIndex = traces.length + pageStateObservationIndex + 1;
+      const screenshotPath = await session.takeCurrentScreenshotOnly(input.runId, stepIndex, `visual-${visualIndex}`, { capture });
+      ensureActive();
+      const observationText = [
+        'Current screenshot observation:',
+        `- ${capture} screenshot captured and attached to the next model request.`,
+        capture === 'viewport'
+          ? '- This is now the only screenshot whose thousandth coordinates may be used by mouse or keyboard.'
+          : '- Full-page screenshots are read-only and cannot be targeted with viewport coordinates.',
+        `Image: ${basenameOfPath(screenshotPath)}`,
+      ].join('\n');
+      pendingObservationMessages.push({
+        text: `[WebPilot explicit screenshot observation]\n${observationText}`,
+        imagePaths: [screenshotPath],
+      });
+      return {
+        ok: true,
+        actual: `${observationText}\n\n[The screenshot image will be attached to the next model request.]`,
+      };
+    }
+
+    const summarizeContinuation = async (modelMessagesForLog: unknown, turnIndex: number, messageStats: ReturnType<typeof modelMessagesTextAndImageStats>, thresholdTokens: number) => {
+      ensureActive();
+      const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
+      try {
+        const result = await generateTextWithTimeout({
+          model: getModel(),
+          messages: [{
+            role: 'user' as const,
+            content: buildContinuationSummaryPrompt({
+              goal: requirementOf(testCase),
+              browserMode: mode,
+              stepIndex,
+              agentStep: agentStepIndex,
+              estimatedTokens: messageStats.estimatedTotalTokens,
+              thresholdTokens,
+              modelMessages: modelMessagesForLog,
+              workingMemory,
+            }),
+          }],
+          temperature: 0.1,
+          maxRetries: 0,
+          abortSignal,
+        });
+        ensureActive();
+        return trimDebugText(result.text || '', agentLoopSummaryOutputCharLimit()) || fallbackContinuationSummary({
+          goal: requirementOf(testCase),
+          browserMode: mode,
+          stepIndex,
+          agentStep: agentStepIndex,
+          traces,
+          workingMemory,
+        });
+      } catch (error) {
+        if (isBrowserChatAbortError(error, abortSignal)) throw browserChatAbortError(abortSignal);
+        return fallbackContinuationSummary({
+          goal: requirementOf(testCase),
+          browserMode: mode,
+          stepIndex,
+          agentStep: agentStepIndex,
+          traces,
+          workingMemory,
+        });
+      }
+    };
+
+    async function prepareStep(turnIndex: number, previousMessages?: RuntimeModelMessage[]) {
+      ensureActive();
+      const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = contextWindowTokens();
       const thresholdRatio = contextCompressionThresholdRatio();
       const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
-      const estimateText = () => [requestSystemPrompt, contextText].filter(Boolean).join('\n');
-      let estimatedTokens = estimateContextTokens(estimateText(), visualPaths.length + userReferenceImages.filter((item) => item.image).length);
-      if (estimatedTokens > thresholdTokens) {
-        const beforeImageCount = visualPaths.length;
-        const removedFrames = visualContext.compressForBudget('Context budget exceeded; compacting historical visual frames.');
-        workingMemory = compactWorkingMemory(workingMemory);
-        contextCompressionTurns += 1;
-        traceLimit = 3;
-        visualPaths = includeImage ? visualContext.imagePaths() : [];
-        compressionDetails = {
-          turn: contextCompressionTurns,
-          estimatedTokensBefore: estimatedTokens,
-          thresholdTokens,
-          thresholdRatio,
-          windowTokens,
-          beforeImageCount,
-          afterImageCount: visualPaths.length,
-          removedFrames,
-        };
-        contextText = buildContextText();
-        estimatedTokens = estimateContextTokens(estimateText(), visualPaths.length + userReferenceImages.filter((item) => item.image).length);
-        if (estimatedTokens > thresholdTokens && visualPaths.length > 1) {
-          visualContext.manage('keepLatestOnly', 'Context budget still exceeded after history compression; keeping only current visual frame for the next dialogue turn.');
-          visualPaths = includeImage ? visualContext.imagePaths() : [];
-          compressionDetails = {
-            ...compressionDetails,
-            secondPass: 'keepLatestOnly',
-            estimatedTokensAfterFirstPass: estimatedTokens,
-            afterImageCount: visualPaths.length,
-          };
-          contextText = buildContextText();
-          estimatedTokens = estimateContextTokens(estimateText(), visualPaths.length + userReferenceImages.filter((item) => item.image).length);
+      const appendedMessages: RuntimeModelMessage[] = [];
+      const appendedImagePaths: string[] = [];
+      if (input.getDynamicSkillContext) {
+        try {
+          const dynamicSkillContext = textFromUnknown(await input.getDynamicSkillContext()).trim();
+          ensureActive();
+          if (dynamicSkillContext) {
+            pendingObservationMessages.push({
+              text: `[WebPilot domain memory recalled for the current page]\n${dynamicSkillContext}`,
+              imagePaths: [],
+            });
+          }
+        } catch (error) {
+          await onDebug?.({
+            phase: 'memory:prompt:domain-refresh:error',
+            stepIndex,
+            message: `Unable to refresh domain memory for the current page: ${infrastructureError(error)}`,
+            details: serializeError(error),
+          });
         }
+      }
+      while (pendingObservationMessages.length) {
+        const observation = pendingObservationMessages.shift();
+        if (!observation) break;
+        const content: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: observation.text }];
+        for (const imagePath of observation.imagePaths) {
+          const image = await readScreenshotForAi(imagePath).catch(() => undefined);
+          if (image) {
+            content.push({ type: 'image', image });
+            appendedImagePaths.push(imagePath);
+          }
+        }
+        appendedMessages.push({ role: 'user' as const, content });
+      }
+
+      const sourceMessages = previousMessages?.length ? [...previousMessages] : [...initialMessages];
+      let messagesToSend = compactedModelContext?.length
+        ? [...compactedModelContext, ...messagesAddedAfterCompactedContext(sourceMessages)]
+        : sourceMessages;
+      if (appendedMessages.length) {
+        messagesToSend = [...messagesToSend, ...appendedMessages];
+        messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
+      }
+
+      let attachedImagePaths = [...messageImagePaths];
+      let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
+      let modelContextSegmentation: Record<string, unknown> | undefined;
+      const modelInputForStats = sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths);
+      const messageStats = modelMessagesTextAndImageStats(modelInputForStats, codexMode ? undefined : nativeToolsRef.current);
+      if ((previousMessages?.length || messagesToSend.length > 1) && messageStats.estimatedTotalTokens > thresholdTokens) {
+        const summary = await summarizeContinuation(modelInputForStats, turnIndex, messageStats, thresholdTokens);
+        contextSegmentationTurns += 1;
+        messagesToSend = [
+          { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
+          ...(appendedMessages.length
+            ? appendedMessages
+            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"actionable"}).' }]),
+        ];
+        attachedImagePaths = appendedImagePaths;
+        messageImagePaths = [...attachedImagePaths];
+        modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
+        const afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current);
+        modelContextSegmentation = {
+          segment: contextSegmentationTurns,
+          reason: 'modelMessages exceeded context threshold',
+          estimatedTokensBefore: messageStats.estimatedTotalTokens,
+          estimatedTokensAfter: afterStats.estimatedTotalTokens,
+          thresholdTokens,
+        };
         await onDebug?.({
-          phase: 'ai:context-compressed',
+          phase: 'ai:context-segmented',
           stepIndex,
-          message: `Context estimate ${estimatedTokens}/${windowTokens} tokens after compression; rebuilt one-shot runtime context ${contextCompressionTurns}.`,
-          details: { ...compressionDetails, estimatedTokensAfter: estimatedTokens, visualContext: visualContext.snapshot(), workingMemory },
+          message: `Model message context exceeded threshold; inserted continuation summary segment ${contextSegmentationTurns}.`,
+          details: modelContextSegmentation,
         });
       }
-      const content: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: contextText }];
-      for (const imagePath of visualPaths) { const image = await readScreenshotForAi(imagePath).catch(() => undefined); if (image) content.push({ type: 'image', image }); }
-      ensureActive();
-      for (const referenceImage of userReferenceImages) { if (referenceImage.image) content.push({ type: 'image', image: referenceImage.image }); }
-      ensureActive();
-      const attachedImagePaths = [...visualPaths, ...userReferenceImages.filter((item) => item.image).map((item) => item.imagePath)];
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: contextText, systemPrompt: requestSystemPrompt, screenshotPath: visualContext.current()?.path || beforeScreenshotPath, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, domContext: currentDomContext, options: { agentLoop: true, turnIndex: turnIndex + 1, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, userReferenceImageCount: userReferenceImages.filter((item) => item.image).length, prepareStep: true, contextCompression: compressionDetails ? { ...compressionDetails, estimatedTokensAfter: estimatedTokens } : undefined } });
+      const finalStats = modelContextSegmentation
+        ? modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current)
+        : messageStats;
+      if (compactedModelContext?.length || modelContextSegmentation) {
+        // The SDK passes its full pre-segmentation history back to every prepareStep.
+        // Retain the compact form locally and append only newly produced SDK messages.
+        compactedModelContext = [...messagesToSend];
+        compactedSourceMessageCount = sourceMessages.length;
+      }
+      rememberRetryState({
+        messages: [...messagesToSend],
+        imagePaths: [...attachedImagePaths],
+        agentStepOffset: agentStepIndex - 1,
+        observationStore,
+      });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId), explicitPageState: true, screenshotToolEnabled: modelSupportsScreenshotInput(), modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
-      return [
-        ...(requestSystemPrompt ? [{ role: 'system' as const, content: requestSystemPrompt }] : []),
-        { role: 'user' as const, content },
-      ];
+      return {
+        system: requestSystemPrompt || undefined,
+        messages: messagesToSend,
+        modelMessagesForLog,
+      };
     }
 
     if (codexMode) {
       const aiStartedAt = Date.now();
-      const messages = await prepareStep(0);
+      const { system, messages, modelMessagesForLog } = await prepareStep(0);
       ensureActive();
       await onDebug?.({
         phase: 'ai:runtime:request',
@@ -2801,16 +3102,21 @@ async function executeRuntimeStep(input: {
           provider: getModelSettings().provider,
           model: getModelSettings().model,
           codexObjectMode: true,
-        }),
+        }, modelMessagesForLog),
       });
-      const result = await generateObjectWithTimeout({ model: getModel(), messages, schema: codexRuntimeObjectSchema, temperature: 0.1, maxRetries: 0, abortSignal });
+      const result = await generateTextWithTimeout({ model: getModel(), system, messages, temperature: 0.1, maxRetries: 0, abortSignal });
+      const aiElapsedMs = elapsedSince(aiStartedAt);
       ensureActive();
-      const object = result.object as z.infer<typeof codexRuntimeObjectSchema>;
+      const object = alignCodexRuntimeObjectTool(
+        codexRuntimeObjectFromText(result.text, allowedToolTypes.includes('answer') ? 'answer' : 'reportState'),
+        allowedToolTypes,
+      );
       const execution = await executeCodexRuntimeObject({
         session,
         targetUrl: testCase.targetUrl,
         runId: input.runId,
         stepIndex,
+        mode,
         type: object.type,
         message: object.message || undefined,
         params: object.params,
@@ -2820,15 +3126,19 @@ async function executeRuntimeStep(input: {
         visualContext,
         abortSignal,
         shouldContinue: input.shouldContinue,
+        requestToolConfirmation: input.requestToolConfirmation,
+        onDebug,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
         onToolTrace: async (trace) => {
           ensureActive();
           workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
           await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
           ensureActive();
-          await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
+          await onDebug?.({ phase: 'ai:tool', stepIndex, message: `${trace.name} -> ${toolTraceStatus(trace)}`, details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
         },
-        onSelectReferenceScreenshots: async (selection) => { ensureActive(); const validIds = selection.ids.filter((id) => availableReferenceIds.has(id)); await onSelectReferenceScreenshots?.({ ...selection, ids: validIds, availableReferences: availableScreenshotReferences }); },
+        onSelectReferenceScreenshots: async (selection) => { ensureActive(); await applySelectedReferenceScreenshots(selection); },
+        observeCurrentScreenshot,
+        takeSnapshot,
       });
       ensureActive();
       await onDebug?.({
@@ -2837,8 +3147,10 @@ async function executeRuntimeStep(input: {
         message: 'Codex object -> ' + object.type + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms',
         details: aiResponseLogDetails({
           aiRequest,
+          modelMessages: modelMessagesForLog,
           response: { result, object, execution },
           elapsedMs: elapsedSince(aiStartedAt),
+          aiElapsedMs,
           traces,
           visualContext: visualContext.snapshot(),
           workingMemory,
@@ -2851,163 +3163,200 @@ async function executeRuntimeStep(input: {
         aiRequest,
         visualContext: visualContext.snapshot(),
         workingMemory,
-        endedWithText: browserChatMode && !execution.executed && Boolean(execution.text.trim()),
+        endedWithText: browserChatMode && !execution.executed && Boolean(textFromUnknown(execution.text).trim()),
       };
     }
 
-    const maxTurns = Math.max(1, Number(process.env.AI_AGENT_LOOP_MAX_TURNS || process.env.AI_TEST_AGENT_MAX_STEPS || 6));
-    for (let turnIndex = 0; turnIndex < maxTurns; turnIndex += 1) {
+    const stopWhen = [hasToolCall('reportState'), hasToolCall('waitForHumanVerification')];
+    nativeToolsRef.current = makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
       ensureActive();
-      const aiStartedAt = Date.now();
-      const traceStart = traces.length;
-      try {
-        const messages = await prepareStep(turnIndex);
+      workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
+      await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+      ensureActive();
+      await onDebug?.({
+        phase: 'ai:tool',
+        stepIndex,
+        message: `${trace.name} -> ${toolTraceStatus(trace)}`,
+        details: { trace, visualContext: visualContext.snapshot(), workingMemory },
+      });
+    }, {
+      availableReferenceIds,
+      allowedToolTypes,
+      runId: input.runId,
+      stepIndex,
+      visualContext,
+      observationStore,
+      toolExecutionGate,
+      getAiRequest: () => aiRequest,
+      abortSignal,
+      shouldContinue: input.shouldContinue,
+      requestToolConfirmation: input.requestToolConfirmation,
+      onDebug,
+      observeCurrentScreenshot,
+      takeSnapshot,
+      onVisualContextChange: async (snapshot) => {
         ensureActive();
-        await onDebug?.({
-          phase: 'ai:runtime:request',
-          stepIndex,
-          message: 'AI request started; waiting for browser action decision. turn ' + (turnIndex + 1) + '/' + maxTurns + '.',
-          details: aiRequestLogDetails(aiRequest, {
-            provider: getModelSettings().provider,
-            model: getModelSettings().model,
-            turnIndex: turnIndex + 1,
-            maxTurns,
-          }),
-        });
-        const result = await generateTextWithTimeout({
-          model: getModel(), messages,
-          tools: makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
-            ensureActive();
-            workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
-            await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
-            ensureActive();
-            await onDebug?.({
-              phase: 'ai:tool',
-              stepIndex,
-              message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'),
-              details: { trace, visualContext: visualContext.snapshot(), workingMemory },
-            });
-          }, { availableReferenceIds, allowedToolTypes, runId: input.runId, stepIndex, visualContext, abortSignal, shouldContinue: input.shouldContinue, onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); }, onSelectReferenceScreenshots: async (selection) => { ensureActive(); await onSelectReferenceScreenshots?.({ ...selection, availableReferences: availableScreenshotReferences }); } }),
-          stopWhen: stepCountIs(1), temperature: 0.1, maxRetries: 0, abortSignal,
-        });
+        await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
+      },
+      onSelectReferenceScreenshots: async (selection) => {
         ensureActive();
-        latestText = result.text || '';
-        const newTraces = traces.slice(traceStart);
-        const lastTrace = newTraces.at(-1);
-        await onDebug?.({
-          phase: 'ai:runtime:response',
-          stepIndex,
-          message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; turn ' + (turnIndex + 1) + '/' + maxTurns + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms',
-          details: aiResponseLogDetails({
-            aiRequest,
-            response: result,
-            elapsedMs: elapsedSince(aiStartedAt),
-            traces: newTraces,
-            visualContext: visualContext.snapshot(),
-            workingMemory,
-            extra: {
-              responseType: 'text',
-              text: latestText,
-              turnIndex: turnIndex + 1,
-              maxTurns,
-            },
-          }),
-        });
-        if (!lastTrace || lastTrace.name === 'reportState' || lastTrace.name === 'waitForHumanVerification') {
-          return {
-            text: latestText,
-            traces,
-            aiRequest,
-            visualContext: visualContext.snapshot(),
-            workingMemory,
-            endedWithText: browserChatMode && !lastTrace && Boolean(latestText.trim()),
-          };
-        }
-      } catch (error) {
-        if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
-        if (traces.length > traceStart && !abortSignal?.aborted) {
-          await onDebug?.({ phase: 'ai:runtime:partial', stepIndex, message: 'AI request stopped after a tool executed; keeping the action and continuing from Visual Context Manager.', details: { error: error instanceof Error ? error.message : String(error), traces: traces.slice(traceStart), visualContext: visualContext.snapshot() } });
-          return {
-            text: latestText,
-            traces,
-            aiRequest,
-            visualContext: visualContext.snapshot(),
-            workingMemory,
-            endedWithText: false,
-          };
-        }
-        if (error && typeof error === 'object') (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
-        throw error;
-      }
+        await applySelectedReferenceScreenshots(selection);
+      },
+    });
+    const toolsForRequest = nativeToolsRef.current;
+    try {
+      const result = await generateTextWithTimeout({
+        model: getModel(),
+        messages: initialMessages,
+        tools: toolsForRequest,
+        stopWhen,
+        prepareStep: async ({ stepNumber, messages }) => {
+          ensureActive();
+          const prepared = await prepareStep(stepNumber, messages as RuntimeModelMessage[]);
+          ensureActive();
+          stepModelMessagesForLog.set(stepNumber, prepared.modelMessagesForLog);
+          toolExecutionGate.stepNumber = stepNumber;
+          toolExecutionGate.executed = false;
+          stepTraceStarts.set(stepNumber, traces.length);
+          stepStartedAt.set(stepNumber, Date.now());
+          await onDebug?.({
+            phase: 'ai:runtime:request',
+            stepIndex,
+            message: 'AI request started; waiting for browser action decision. agent step ' + agentStepLabel(retryAgentStepOffset + stepNumber) + '.',
+            details: aiRequestLogDetails(aiRequest, {
+              provider: getModelSettings().provider,
+              model: getModelSettings().model,
+              agentStepIndex: retryAgentStepOffset + stepNumber + 1,
+              nativeToolLoop: true,
+            }, prepared.modelMessagesForLog),
+          });
+          return { system: prepared.system, messages: prepared.messages };
+        },
+        onStepFinish: async (event) => {
+          ensureActive();
+          consecutiveRequestFailures = 0;
+          latestText = event.text || '';
+          const eventStep = event as { stepNumber?: unknown };
+          const turnIndex = typeof eventStep.stepNumber === 'number' ? eventStep.stepNumber : toolExecutionGate.stepNumber;
+          const traceStart = stepTraceStarts.get(turnIndex) ?? 0;
+          const newTraces = traces.slice(traceStart);
+          const startedAt = stepStartedAt.get(turnIndex) || Date.now();
+          await onDebug?.({
+            phase: 'ai:runtime:response',
+            stepIndex,
+            message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; agent step ' + agentStepLabel(retryAgentStepOffset + turnIndex) + '; AI+tool ' + elapsedSince(startedAt) + 'ms',
+            details: aiResponseLogDetails({
+              aiRequest,
+              modelMessages: stepModelMessagesForLog.get(turnIndex),
+              response: event,
+              elapsedMs: elapsedSince(startedAt),
+              stepStartedAt: startedAt,
+              traces: newTraces,
+              visualContext: visualContext.snapshot(),
+              workingMemory,
+              extra: {
+                responseType: 'text',
+                text: latestText,
+                agentStepIndex: retryAgentStepOffset + turnIndex + 1,
+                nativeToolLoop: true,
+              },
+            }),
+          });
+        },
+        temperature: 0.1,
+        maxRetries: 0,
+        abortSignal,
+      });
+      ensureActive();
+      latestText = toolConsistentAssistantText(result.text || latestText, traces.at(-1)?.name);
+      return {
+        text: latestText,
+        traces,
+        aiRequest,
+        visualContext: visualContext.snapshot(),
+        workingMemory,
+        endedWithText: browserChatMode && Boolean(textFromUnknown(latestText).trim()) && traces.at(-1)?.name !== 'waitForHumanVerification',
+      };
+    } catch (error) {
+      if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
+      if (error && typeof error === 'object') (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
+      throw error;
     }
-    return {
-      text: latestText,
-      traces,
-      aiRequest,
-      visualContext: visualContext.snapshot(),
-      workingMemory,
-      endedWithText: false,
-    };
   }
 
-  // Hidden retries can duplicate browser actions when a provider error happens after a tool
-  // started but before the trace is fully persisted. Keep retry opt-in so one AI request maps
-  // to at most one browser action by default.
-  const retryPureRequestFailure = browserChatMode || process.env.AI_RUNTIME_RETRY_ON_PURE_FAILURE === 'true';
-  const attempts = retryPureRequestFailure ? [Boolean(screenshot), Boolean(screenshot)] : [Boolean(screenshot)];
+  // Keep SDK retries disabled, but allow the runtime loop to retry transient upstream
+  // disconnects with the exact model messages prepared for the failed request. The
+  // limit is consecutive failures; any successful model step resets the counter.
+  const consecutiveFailureLimit = runtimeRequestConsecutiveFailureLimit(browserChatMode);
   let lastError: unknown;
+  let retryingAfterFailure = false;
 
-  for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
+  while (true) {
     ensureActive();
-    const includeImage = attempts[attemptIndex];
+    const includeImage = Boolean(screenshot);
+    const retryState = retryingAfterFailure && lastRetryState?.messages.length ? lastRetryState : undefined;
     try {
-      if (attemptIndex > 0) {
+      if (retryingAfterFailure) {
+        if (!retryState) {
+          await onDebug?.({
+            phase: 'ai:runtime:retry-skipped',
+            stepIndex,
+            message: 'AI request failed, but no preserved model messages exist; not rebuilding messages for retry.',
+            details: {
+              error: infrastructureError(lastError),
+              consecutiveFailures: consecutiveRequestFailures,
+              consecutiveFailureLimit,
+            },
+          });
+          break;
+        }
         ensureActive();
         await onDebug?.({
           phase: 'ai:runtime:retry',
           stepIndex,
-          message: 'AI request failed before any tool executed; retrying once.',
-          details: infrastructureError(lastError),
+          message: `AI request failed; retrying after consecutive failure ${consecutiveRequestFailures}/${consecutiveFailureLimit} with the previously prepared model messages.`,
+          details: {
+            error: infrastructureError(lastError),
+            consecutiveFailures: consecutiveRequestFailures,
+            consecutiveFailureLimit,
+            reusePreparedMessages: Boolean(retryState),
+            messageCount: retryState?.messages.length,
+            imageCount: retryState?.imagePaths.length,
+            agentStepIndex: retryState ? retryState.agentStepOffset + 1 : undefined,
+          },
         });
       }
-      return await runAgent(includeImage);
+      return await runAgent(includeImage, retryState);
     } catch (error) {
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
       lastError = error;
+      consecutiveRequestFailures += 1;
+      if (consecutiveRequestFailures >= consecutiveFailureLimit) break;
+      retryingAfterFailure = true;
     }
   }
 
   if (lastError && typeof lastError === 'object') {
     (lastError as { aiRequest?: AiRequestSnapshot }).aiRequest ??= lastAiRequest;
+    (lastError as { runtimeRetry?: { consecutiveFailures: number; consecutiveFailureLimit: number } }).runtimeRetry ??= {
+      consecutiveFailures: consecutiveRequestFailures,
+      consecutiveFailureLimit,
+    };
     throw lastError;
   }
 
   const wrapped = new Error(String(lastError || 'AI request failed before a response was returned'));
   (wrapped as { aiRequest?: AiRequestSnapshot }).aiRequest = lastAiRequest;
+  (wrapped as { runtimeRetry?: { consecutiveFailures: number; consecutiveFailureLimit: number } }).runtimeRetry = {
+    consecutiveFailures: consecutiveRequestFailures,
+    consecutiveFailureLimit,
+  };
   throw wrapped;
 }
 
 export type InteractiveBrowserTurnMessage = {
   role: 'user' | 'assistant';
   content: string;
-};
-
-export type InteractiveBrowserConversationMemory = {
-  version?: number;
-  updatedAt?: string;
-  coveredMessageIds?: string[];
-  coveredStepIndexes?: number[];
-  latestUserGoal?: string;
-  summary?: string;
-  userConstraints?: string[];
-  completed?: string[];
-  pending?: string[];
-  findings?: string[];
-  blockers?: string[];
-  decisions?: string[];
-  lastAssistantReply?: string;
-  continuationHint?: string;
-  evidenceRefs?: Array<{ type?: string; id?: string; note?: string }>;
 };
 
 export type InteractiveBrowserTurnResult = {
@@ -3019,94 +3368,64 @@ export type InteractiveBrowserTurnResult = {
   networkErrors: string[];
 };
 
-function browserChatMaxBrowserSteps() {
-  const raw = Number(process.env.AI_BROWSER_CHAT_MAX_STEPS || 6);
-  return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 6));
-}
-
 function browserChatMaxConsecutiveAiRequestFailures() {
   const raw = Number(process.env.AI_BROWSER_CHAT_MAX_CONSECUTIVE_REQUEST_FAILURES || 3);
   return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 3));
 }
 
-function manualVerificationMaxPromptsPerStep() {
-  const raw = Number(process.env.AI_MANUAL_VERIFICATION_MAX_PROMPTS_PER_STEP || 3);
-  return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 3));
-}
-
-function manualResumeCount(counts: Map<number, number>, stepIndex: number) {
-  return counts.get(stepIndex) || 0;
-}
-
-function markManualResumed(counts: Map<number, number>, stepIndex: number) {
-  counts.set(stepIndex, manualResumeCount(counts, stepIndex) + 1);
-}
-
-function canPromptManualVerification(counts: Map<number, number>, stepIndex: number, maxPrompts: number) {
-  return manualResumeCount(counts, stepIndex) < maxPrompts;
-}
-
-function formatBrowserChatConversationMemory(memory?: InteractiveBrowserConversationMemory) {
-  if (!memory) return '';
-  try {
-    return JSON.stringify(jsonSafe(memory), null, 2);
-  } catch {
-    return String(memory);
-  }
-}
-
 function browserChatRequirement(input: {
   targetUrl: string;
   instruction: string;
-  conversation: InteractiveBrowserTurnMessage[];
-  conversationMemory?: InteractiveBrowserConversationMemory;
 }) {
-  const memory = formatBrowserChatConversationMemory(input.conversationMemory);
-  const history = input.conversation
-    .slice(-12)
-    .map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${concise(message.content, 900)}`)
-    .join('\n');
   return [
-    'Browser chat mode. This is not a fixed test case.',
-    'The user is having a live conversation with you and expects you to operate the browser from the current page state.',
+    'Browser chat mode: live conversation, not a fixed test case.',
     `Latest user message: ${input.instruction}`,
-    `Target URL if the user did not specify another page: ${input.targetUrl || 'about:blank'}`,
-    memory ? `Conversation Memory JSON (cross-turn compact state; prefer the latest user message and live page evidence if anything conflicts):\n${memory}` : '',
-    history ? `Recent raw conversation window:\n${history}` : '',
+    `Fallback target URL: ${input.targetUrl || 'about:blank'}`,
     '',
-    'Work style:',
-    '- Follow the latest user message first, while preserving useful context from the conversation.',
-    '- If the previous assistant message says the browser-chat browser step limit was reached, treat its progress summary plus RunState/Working Memory as authoritative continuation context; do not restart from the first step.',
-    '- If browser work is needed, take concrete browser actions instead of only describing what to do.',
-    '- If the user asks a question about the current page, inspect the page and answer from evidence.',
-    '- If the user asks you to continue after manual login/captcha/security work, continue from the current browser state.',
+    'Browser-chat behavior:',
+    '- Follow the latest user message first; use earlier model messages only as conversation context.',
+    '- Use browser tools only for live action or page inspection. If current evidence is enough, answer directly.',
     '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
-    '- Keep tester discipline: record visible problems, suspicious network failures, broken UI states, and why they matter.',
-    '',
-    'Final answer style:',
-    '- The final user-visible browser-chat answer is your assistant content. It must be Chinese Markdown, not plain inline text.',
-    '- Use short paragraphs and Markdown bullets or numbered lists with line breaks. Do not cram numbered items into one paragraph.',
-    '- If the latest user message can be answered from current evidence, return the Markdown answer directly and call no tool.',
-    '- Never include JSON, fenced JSON, tool parameters, candidate ids, coordinates, screenshot paths, or status objects in assistant text.',
+    '- Final visible answer must be Chinese Markdown. Do not include JSON, tool parameters, candidate ids, coordinates, or screenshot paths.',
   ].filter(Boolean).join('\n');
+}
+
+function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
+  if (mode === 'full') {
+    return [
+      'Safety mode: full.',
+      '- When the user request is clear, do not ask for extra confirmation only because an operation is important.',
+      '- Do not set requiresConfirmation or confirmationMessage for browser tools in full mode.',
+      '- Still stop or ask for help when the page requires captcha/OTP/security verification, missing credentials, or information only the user can provide.',
+    ].join('\n');
+  }
+  return [
+    'Safety mode: strict.',
+    '- Before executing an operation you judge important, irreversible, externally visible, data-changing, privacy-sensitive, or costly, call the intended browser tool with requiresConfirmation=true and a concise Chinese confirmationMessage.',
+    '- Important operations can include submit/publish/send/delete/modify records, payment/order/authorization, login/security actions, file upload/download/export, or similar actions based on page context.',
+    '- The backend will pause this same browser-chat turn and show Confirm/Cancel buttons on that tool before executing it.',
+    '- Do not ask for this confirmation in plain text and do not end the turn just to ask the user to type confirm.',
+  ].join('\n');
 }
 
 function createInteractiveBrowserTestCase(input: {
   id: string;
-  mode?: BrowserSessionMode | 'default';
+  mode?: BrowserSessionMode;
+  safetyMode?: BrowserChatSafetyMode;
   targetUrl: string;
   instruction: string;
-  conversation: InteractiveBrowserTurnMessage[];
-  conversationMemory?: InteractiveBrowserConversationMemory;
+  skillContext?: string;
 }): TestCaseRecord {
   const now = new Date().toISOString();
   const targetUrl = input.targetUrl || 'about:blank';
   const requirement = browserChatRequirement({
     targetUrl,
     instruction: input.instruction,
-    conversation: input.conversation,
-    conversationMemory: input.conversationMemory,
   });
+  const systemPrompt = [
+    browserChatSafetyInstructions(input.safetyMode),
+    input.skillContext,
+  ].filter(Boolean).join('\n\n');
   return {
     id: input.id,
     title: 'Browser chat operation',
@@ -3119,10 +3438,10 @@ function createInteractiveBrowserTestCase(input: {
       description: input.instruction,
       targetUrl,
       priority: 'medium',
-      browserMode: input.mode || 'default',
-      isMarked: true,
+      browserMode: 'dom',
+      isMarked: false,
       userRequirement: requirement,
-      systemPrompt: 'This is an interactive browser chat. Do not assume a fixed test-case script; operate from the live page and answer the latest user message in Chinese.',
+      systemPrompt,
       preconditions: [],
       testData: {},
       steps: [],
@@ -3147,15 +3466,19 @@ export async function executeInteractiveBrowserTurn(input: {
   runId: string;
   targetUrl: string;
   instruction: string;
+  modelInstruction?: string;
   conversation?: InteractiveBrowserTurnMessage[];
-  conversationMemory?: InteractiveBrowserConversationMemory;
   completedSteps?: StepExecutionResult[];
-  mode?: BrowserSessionMode | 'default';
+  mode?: BrowserSessionMode;
+  safetyMode?: BrowserChatSafetyMode;
   referenceImagePaths?: string[];
+  skillContext?: string;
+  getDynamicSkillContext?: () => string | Promise<string>;
   onProgress?: (step: StepExecutionResult) => void | Promise<void>;
   onDebug?: ExecutionDebug;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
+  requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
 }): Promise<InteractiveBrowserTurnResult> {
   const ensureActive = () => throwIfStopped(input.abortSignal, input.shouldContinue);
   const steps = [...(input.completedSteps || [])];
@@ -3163,23 +3486,54 @@ export async function executeInteractiveBrowserTurn(input: {
   const testCase = createInteractiveBrowserTestCase({
     id: `chat_${input.runId}`,
     mode: input.mode,
+    safetyMode: input.safetyMode,
     targetUrl: input.targetUrl,
     instruction: input.instruction,
-    conversation: input.conversation || [],
-    conversationMemory: input.conversationMemory,
+    skillContext: input.skillContext,
   });
+  const runtimeMode = browserModeOf(testCase);
   let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
+  const runtimeObservationStore: RuntimeObservationStore = new Map();
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
-  const maxSteps = browserChatMaxBrowserSteps();
   const maxConsecutiveAiRequestFailures = browserChatMaxConsecutiveAiRequestFailures();
   let consecutiveAiRequestFailures = 0;
 
-  for (let turnStep = 0; turnStep < maxSteps; turnStep += 1) {
+  async function takeStepScreenshot(phase: 'before' | 'after', stepIndex: number) {
+    if (runtimeMode === 'dom' && !browserChatDomScreenshotsEnabled()) {
+      await input.onDebug?.({
+        phase: `browser:screenshot:${phase}:skipped`,
+        stepIndex,
+        message: `Skipped automatic ${phase} screenshot; explicit takeSnapshot/takeScreenshot evidence remains authoritative.`,
+        details: { browserMode: runtimeMode, enabledBy: 'BROWSER_CHAT_DOM_SCREENSHOTS=true' },
+      });
+      return undefined;
+    }
+    const startedAt = Date.now();
+    try {
+      const screenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, phase);
+      ensureActive();
+      const message = phase === 'before'
+        ? `Current page screenshot captured in ${elapsedSince(startedAt)}ms.`
+        : `Post-action screenshot captured in ${elapsedSince(startedAt)}ms.`;
+      const timingSummary = input.session.formatLastScreenshotTiming();
+      await input.onDebug?.({
+        phase: `browser:screenshot:${phase}`,
+        stepIndex,
+        message: timingSummary ? `${message} ${timingSummary}` : message,
+        details: { elapsedMs: elapsedSince(startedAt), path: screenshotPath, timings: input.session.getLastScreenshotTiming() },
+      });
+      return screenshotPath;
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  while (true) {
     ensureActive();
     const stepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
-    await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `正在准备第 ${stepIndex} 步浏览器操作：读取当前页面状态。` });
+    await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `正在准备第 ${stepIndex} 步浏览器操作。` });
     let runningStep: StepExecutionResult = {
       index: stepIndex,
       action: 'AI is handling the latest browser chat message',
@@ -3188,10 +3542,7 @@ export async function executeInteractiveBrowserTurn(input: {
       status: 'running',
     };
 
-    const beforeScreenshotStartedAt = Date.now();
-    const beforeScreenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, 'before');
-    ensureActive();
-    await input.onDebug?.({ phase: 'browser:screenshot:before', stepIndex, message: `Current page screenshot captured in ${elapsedSince(beforeScreenshotStartedAt)}ms.`, details: { elapsedMs: elapsedSince(beforeScreenshotStartedAt), path: beforeScreenshotPath } });
+    const beforeScreenshotPath = await takeStepScreenshot('before', stepIndex);
     runningStep = {
       ...runningStep,
       actual: 'AI is choosing the next browser action from the current page.',
@@ -3208,10 +3559,14 @@ export async function executeInteractiveBrowserTurn(input: {
         testCase,
         runId: input.runId,
         stepIndex,
-        beforeScreenshotPath,
+        beforeScreenshotPath: beforeScreenshotPath || '',
+        instruction: input.modelInstruction || input.instruction,
+        conversation: input.conversation || [],
         completedSteps: steps.filter((step) => step.index !== stepIndex),
+        runtimeObservationStore,
         selectedScreenshotReferences,
         referenceImagePaths: input.referenceImagePaths,
+        getDynamicSkillContext: input.getDynamicSkillContext,
         onSelectReferenceScreenshots: async (selection) => {
           selectedScreenshotReferences = selection.ids
             .map((id) => selection.availableReferences.find((ref) => ref.id === id))
@@ -3224,6 +3579,7 @@ export async function executeInteractiveBrowserTurn(input: {
         },
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
+        requestToolConfirmation: input.requestToolConfirmation,
         onDebug: input.onDebug,
         onToolTrace: async (trace, progress) => {
           ensureActive();
@@ -3242,7 +3598,8 @@ export async function executeInteractiveBrowserTurn(input: {
     } catch (error) {
       if (isBrowserChatAbortError(error, input.abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(input.abortSignal);
       const errorText = infrastructureError(error);
-      if (!liveToolTraces.length && isInfrastructureNoise(errorText)) {
+      const upstreamDisconnected = isUpstreamAiDisconnectError(error);
+      if (!upstreamDisconnected && !liveToolTraces.length && isInfrastructureNoise(errorText)) {
         consecutiveAiRequestFailures += 1;
         const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
         if (runningIndex >= 0) steps.splice(runningIndex, 1);
@@ -3258,6 +3615,7 @@ export async function executeInteractiveBrowserTurn(input: {
             session: input.session,
             runId: input.runId,
             stepIndex,
+            mode: runtimeMode,
             beforeScreenshotPath,
             error,
             tools: [],
@@ -3283,6 +3641,7 @@ export async function executeInteractiveBrowserTurn(input: {
         session: input.session,
         runId: input.runId,
         stepIndex,
+        mode: runtimeMode,
         beforeScreenshotPath,
         error,
         tools: summarizeToolTraces(liveToolTraces),
@@ -3303,15 +3662,22 @@ export async function executeInteractiveBrowserTurn(input: {
           screenshotPath: errorStep.screenshotPath,
           aiRequest: errorStep.aiRequest,
           tools: errorStep.tools,
+          upstreamDisconnected,
         },
       });
+      if (upstreamDisconnected) {
+        finalStatus = 'failed';
+        reply = userFacingRecoverableRuntimeError(error);
+        endedWithFinalAnswer = true;
+        break;
+      }
       reply = '';
       continue;
     }
 
     ensureActive();
     consecutiveAiRequestFailures = 0;
-    const browserChatReply = actionResult.endedWithText ? actionResult.text.trim() : '';
+    const browserChatReply = actionResult.endedWithText ? textFromUnknown(actionResult.text).trim() : '';
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
       if (runningIndex >= 0) steps.splice(runningIndex, 1);
@@ -3320,7 +3686,7 @@ export async function executeInteractiveBrowserTurn(input: {
         stepIndex,
         message: browserChatReply
           ? 'Browser chat completed with an explicit Markdown answer and no browser tool.'
-          : 'Browser chat returned no browser tool and no explicit final answer; continuing until the AI explicitly answers or the safety step limit is reached.',
+          : 'Browser chat returned no browser tool and no explicit final answer; continuing until the AI explicitly answers, blocks, or is stopped.',
       });
       if (browserChatReply) {
         reply = browserChatReply;
@@ -3331,10 +3697,7 @@ export async function executeInteractiveBrowserTurn(input: {
       continue;
     }
 
-    const afterScreenshotStartedAt = Date.now();
-    const afterScreenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, 'after');
-    ensureActive();
-    await input.onDebug?.({ phase: 'browser:screenshot:after', stepIndex, message: `Post-action screenshot captured in ${elapsedSince(afterScreenshotStartedAt)}ms.`, details: { elapsedMs: elapsedSince(afterScreenshotStartedAt), path: afterScreenshotPath } });
+    const afterScreenshotPath = await takeStepScreenshot('after', stepIndex);
     const decision = deriveBrowserChatStepDecision(actionResult.text, actionResult.traces, requirementOf(testCase));
     const completedStep: StepExecutionResult = {
       index: stepIndex,
@@ -3369,11 +3732,13 @@ export async function executeInteractiveBrowserTurn(input: {
     }
     if (lastToolName === 'waitForHumanVerification') {
       finalStatus = 'blocked';
+      if (!reply) reply = browserChatReplyFromDecision(decision, lastToolName);
       endedWithFinalAnswer = true;
       break;
     }
     if (decision.done || lastToolName === 'reportState') {
       finalStatus = decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed';
+      if (!reply) reply = browserChatReplyFromDecision(decision, lastToolName);
       endedWithFinalAnswer = true;
       break;
     }
@@ -3417,6 +3782,20 @@ function firstErrorString(error: unknown, key: string) {
   return undefined;
 }
 
+function firstErrorValue(error: unknown, key: string) {
+  for (const source of errorRecordSources(error)) {
+    const value = source[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'string' && !value.trim()) continue;
+    return value;
+  }
+  return undefined;
+}
+
+function firstErrorDisplay(error: unknown, key: string, max = 900) {
+  return diagnosticValueText(firstErrorValue(error, key), max);
+}
+
 function firstErrorNumber(error: unknown, key: string) {
   for (const source of errorRecordSources(error)) {
     const value = source[key];
@@ -3425,15 +3804,30 @@ function firstErrorNumber(error: unknown, key: string) {
   return undefined;
 }
 
+function errorCauseMessage(error: unknown) {
+  if (!error || typeof error !== 'object') return undefined;
+  const cause = (error as Record<string, unknown>).cause;
+  if (cause instanceof Error) return cause.message;
+  if (cause && typeof cause === 'object' && !Array.isArray(cause)) {
+    const message = (cause as Record<string, unknown>).message;
+    if (typeof message === 'string' && message.trim()) return message.trim();
+  }
+  return undefined;
+}
+
 function errorDetailText(error: unknown) {
   const exitCode = firstErrorNumber(error, 'exitCode');
   const code = firstErrorString(error, 'code');
+  const status = firstErrorValue(error, 'status') ?? firstErrorValue(error, 'statusCode');
   const stderr = firstErrorString(error, 'stderr');
+  const responseBody = firstErrorDisplay(error, 'responseBody', 1200) || firstErrorDisplay(error, 'body', 1200);
   const promptExcerpt = firstErrorString(error, 'promptExcerpt');
   return [
     typeof exitCode === 'number' ? `exitCode=${exitCode}` : '',
     code ? `code=${code}` : '',
+    status !== undefined ? `status=${diagnosticValueText(status, 120)}` : '',
     stderr ? `stderr=${trimDebugText(stderr, 1200)}` : '',
+    responseBody ? `responseBody=${responseBody}` : '',
     promptExcerpt ? `promptExcerpt=${trimDebugText(promptExcerpt, 600)}` : '',
   ].filter(Boolean).join('\n');
 }
@@ -3444,8 +3838,15 @@ function infrastructureError(error: unknown) {
   return details ? `${message}\n${details}` : message;
 }
 
+function isUpstreamAiDisconnectError(error: unknown) {
+  return Boolean(upstreamApiDisconnectReason(infrastructureError(error)));
+}
+
 function userFacingRecoverableRuntimeError(error: unknown) {
-  return userFacingInfrastructureError(infrastructureError(error));
+  return userFacingInfrastructureError(infrastructureError(error), {
+    error,
+    aiRequest: aiRequestFromError(error),
+  });
 }
 
 function serializeError(error: unknown) {
@@ -3455,31 +3856,14 @@ function serializeError(error: unknown) {
     message: error.message,
     exitCode: firstErrorNumber(error, 'exitCode'),
     code: firstErrorString(error, 'code'),
+    status: firstErrorValue(error, 'status'),
+    statusCode: firstErrorValue(error, 'statusCode'),
     stderr: firstErrorString(error, 'stderr'),
+    responseBody: firstErrorDisplay(error, 'responseBody', 2000),
+    body: firstErrorDisplay(error, 'body', 2000),
+    causeMessage: errorCauseMessage(error),
     promptExcerpt: firstErrorString(error, 'promptExcerpt'),
     stack: error.stack,
-  };
-}
-
-function shouldKeepBrowserOpenAfterError() {
-  if (process.env.KEEP_BROWSER_OPEN_ON_AI_ERROR === 'false') return false;
-  return true;
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function createSkippedStep(stepIndex: number, beforeScreenshotPath?: string, afterScreenshotPath?: string): StepExecutionResult {
-  return {
-    index: stepIndex,
-    action: '用户跳过当前 AI 运行步骤',
-    expected: 'After this skipped step, continue to the next AI decision.',
-    actual: 'User skipped this step manually.',
-    status: 'blocked',
-    beforeScreenshotPath,
-    afterScreenshotPath,
-    screenshotPath: afterScreenshotPath,
   };
 }
 
@@ -3487,19 +3871,29 @@ async function createRecoverableRuntimeErrorStep(input: {
   session: BrowserSession;
   runId: string;
   stepIndex: number;
+  mode?: BrowserSessionMode;
   beforeScreenshotPath?: string;
   error: unknown;
   tools?: StepToolCall[];
   aiRequest?: AiRequestSnapshot;
   recoveredState?: Partial<StepExecutionResult>;
 }): Promise<StepExecutionResult> {
-  const { session, runId, stepIndex, beforeScreenshotPath, error, tools, aiRequest, recoveredState } = input;
-  const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after').catch(() => undefined);
+  const { session, runId, stepIndex, mode, beforeScreenshotPath, error, tools, aiRequest, recoveredState } = input;
+  const afterScreenshotPath = mode === 'dom'
+    ? undefined
+    : await session.takeScreenshot(runId, stepIndex, 'after').catch(() => undefined);
+  const upstreamDisconnected = isUpstreamAiDisconnectError(error);
 
   return {
     index: stepIndex,
-    action: 'AI request or response handling failed; continuing automatically',
-    expected: 'A single AI request/tool/parse failure should not stop the flow; the next round will continue from the latest screenshot.',
+    action: upstreamDisconnected
+      ? 'Upstream AI connection was interrupted; stopping this browser-chat turn'
+      : 'AI request or response handling failed; continuing automatically',
+    expected: upstreamDisconnected
+      ? 'The assistant should stop this turn and show the upstream disconnect reason to the user.'
+      : mode === 'dom'
+        ? 'A single AI request/tool/parse failure should not stop the flow; the next round will continue from the latest page context.'
+        : 'A single AI request/tool/parse failure should not stop the flow; the next round will continue from the latest screenshot.',
     actual: userFacingRecoverableRuntimeError(error),
     status: 'failed',
     beforeScreenshotPath,
@@ -3518,19 +3912,6 @@ function flowInput(input: unknown) {
   return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
 }
 
-function batchFillFieldsFromInput(input: Record<string, unknown>) {
-  const rawFields = Array.isArray(input.fields) ? input.fields : [];
-  return rawFields
-    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
-    .map((item) => ({
-      id: String(item.id || ''),
-      text: typeof item.text === 'string' ? item.text : undefined,
-      clear: typeof item.clear === 'boolean' ? item.clear : undefined,
-    }))
-    .filter((item) => item.id.trim())
-    .slice(0, BATCH_FILL_FIELD_LIMIT);
-}
-
 function normalizeBrowserUrl(url: string) {
   const trimmed = url.trim();
   if (!trimmed) return '';
@@ -3539,99 +3920,57 @@ function normalizeBrowserUrl(url: string) {
   return `https://${trimmed}`;
 }
 
-function recordedStepDelayMs(flow: RecordedFlowStep, isFirstStep: boolean) {
-  if (typeof flow.delayBeforeMs === 'number' && Number.isFinite(flow.delayBeforeMs)) {
-    return Math.max(0, Math.floor(flow.delayBeforeMs));
-  }
-  if (isFirstStep) return 0;
-  const configuredDelay = Number(process.env.REPLAY_STEP_DELAY_MS || 1500);
-  return Math.max(0, Math.floor(Number.isFinite(configuredDelay) ? configuredDelay : 1500));
-}
-
-async function waitBeforeRecordedTool(session: BrowserSession, flow: RecordedFlowStep, isFirstStep: boolean) {
-  const delayMs = recordedStepDelayMs(flow, isFirstStep);
-  if (delayMs > 0) await session.wait(delayMs).catch(() => undefined);
-}
-
-async function waitAfterRecordedTool(session: BrowserSession) {
-  await session.waitForPage().catch(() => undefined);
-  const configuredDelay = Number(process.env.REPLAY_AFTER_ACTION_SETTLE_MS || 0);
-  const delayMs = Number.isFinite(configuredDelay) ? configuredDelay : 0;
-  if (delayMs > 0) await session.wait(delayMs).catch(() => undefined);
-}
-
-function replayAiRepairEnabled() {
-  return process.env.REPLAY_AI_REPAIR !== 'false';
-}
-
-function replayAiRepairMaxSteps() {
-  const raw = Number(process.env.REPLAY_AI_REPAIR_MAX_STEPS || 2);
-  return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 2));
-}
-
-async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep): Promise<BrowserActionResult> {
+async function runRecordedTool(session: BrowserSession, targetUrl: string, flow: RecordedFlowStep, runId?: string): Promise<BrowserActionResult> {
   const input = flowInput(flow.input);
   const text = typeof input.text === 'string' ? input.text : undefined;
-  const domPath = normalizeDomPathParam(input);
-  const domNodeId = normalizeDomNodeIdParam(input);
   const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
 
   switch (flow.name) {
     case 'openPage':
-    case 'openUrl':
       {
         const rawUrl = typeof input.url === 'string' && input.url.trim() ? input.url : targetUrl;
         const url = normalizeBrowserUrl(rawUrl);
-        if (!url) return { ok: false, actual: 'Recorded openPage/openUrl failed because the target URL is empty.' };
+        if (!url) return { ok: false, actual: 'Recorded openPage failed because the target URL is empty.' };
         return session.open(url);
       }
-    case 'scrollViewport':
-      return session.scroll(
-        typeof input.deltaY === 'number' ? input.deltaY : 0,
-        typeof input.deltaX === 'number' ? input.deltaX : 0,
-        { domPath },
-      );
-    case 'scrollArea':
-      {
-        const areaId = typeof input.areaId === 'string' && input.areaId.trim()
-          ? input.areaId.trim()
-          : typeof input.id === 'string' && /^S\d+$/i.test(input.id.trim())
-            ? input.id.trim()
-            : '';
-        return session.scrollArea(
-          areaId,
-          typeof input.deltaY === 'number' ? input.deltaY : 0,
-          typeof input.deltaX === 'number' ? input.deltaX : 0,
-        );
-      }
-    case 'clickCandidate':
-      return session.clickCandidate(String(input.id || ''), text);
-    case 'fillCandidates':
-      return session.fillCandidates(batchFillFieldsFromInput(input));
-    case 'focusCandidate':
-      return session.clickCandidate(String(input.id || ''), text);
-    case 'hoverCandidate':
-      return session.hoverCandidate(String(input.id || ''));
-    case 'doubleClickCandidate':
-      return session.doubleClickCandidate(String(input.id || ''));
-    case 'rightClickCandidate':
-      return session.rightClickCandidate(String(input.id || ''));
-    case 'dragCandidate':
-      return session.dragCandidate(String(input.fromId || ''), String(input.toId || ''));
-    case 'clickDomNode':
-      return session.clickDomNode(domNodeId, text);
-    case 'fillDomNodes':
-      return session.fillDomNodes(batchFillFieldsFromInput(input));
-    case 'focusDomNode':
-      return session.clickDomNode(domNodeId, text);
-    case 'findByText':
-      return session.findByText(String(input.targetText || input.targetVisual || ''), normalizeDomNodeIdParam({ id: input.scopeId }));
-    case 'clickLocator':
-      return session.clickLocator(String(input.locatorId || input.id || ''), text);
-    case 'typeText':
-      return session.typeText(String(input.text || ''));
-    case 'pressKey':
-      return session.press(String(input.key || ''));
+    case 'searchSnapshot':
+      return session.searchSnapshot({
+        query: String(input.query || ''),
+        roles: Array.isArray(input.roles) ? input.roles.filter((role): role is string => typeof role === 'string') : undefined,
+        limit: typeof input.limit === 'number' ? input.limit : undefined,
+      });
+    case 'mouse':
+      return session.mouse({
+        action: String(input.action || 'click') as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
+        uid: typeof input.uid === 'string' ? input.uid : undefined,
+        xThousandth: typeof input.x_thousandth === 'number' ? input.x_thousandth : undefined,
+        yThousandth: typeof input.y_thousandth === 'number' ? input.y_thousandth : undefined,
+        toUid: typeof input.toUid === 'string' ? input.toUid : undefined,
+        toXThousandth: typeof input.toX_thousandth === 'number' ? input.toX_thousandth : undefined,
+        toYThousandth: typeof input.toY_thousandth === 'number' ? input.toY_thousandth : undefined,
+        button: typeof input.button === 'string' ? input.button as 'left' | 'right' | 'middle' : undefined,
+        clickCount: typeof input.clickCount === 'number' ? input.clickCount : undefined,
+        deltaX: typeof input.deltaX === 'number' ? input.deltaX : undefined,
+        deltaY: typeof input.deltaY === 'number' ? input.deltaY : undefined,
+      });
+    case 'keyboard':
+      return session.keyboard({
+        action: String(input.action || 'type') as 'type' | 'press' | 'shortcut',
+        uid: typeof input.uid === 'string' ? input.uid : undefined,
+        xThousandth: typeof input.x_thousandth === 'number' ? input.x_thousandth : undefined,
+        yThousandth: typeof input.y_thousandth === 'number' ? input.y_thousandth : undefined,
+        text,
+        key: typeof input.key === 'string' ? input.key : undefined,
+        keys: Array.isArray(input.keys) ? input.keys.filter((key): key is string => typeof key === 'string') : undefined,
+        replace: typeof input.replace === 'boolean' ? input.replace : undefined,
+        followByEnter: typeof input.followByEnter === 'boolean' ? input.followByEnter : undefined,
+      });
+    case 'selectOption':
+      return session.selectOption({
+        uid: typeof input.uid === 'string' ? input.uid : '',
+        value: typeof input.value === 'string' ? input.value : undefined,
+        label: typeof input.label === 'string' ? input.label : undefined,
+      });
     case 'waitForPage':
       return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
     case 'waitForHumanVerification':
@@ -3639,56 +3978,32 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
     case 'listTabs':
       return session.listTabs();
     case 'getHttpRequests':
-      return session.getCurrentTabHttpRequests();
+      return session.getCurrentTabHttpRequests({ ids: Array.isArray(input.ids) ? input.ids.filter((id): id is string => typeof id === 'string') : undefined });
+    case 'downloadFile':
+      return downloadFileArtifact({
+        runId,
+        url: typeof input.url === 'string' ? input.url : undefined,
+        path: typeof input.path === 'string' ? input.path : undefined,
+        urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
+        sourcePageUrl: session.currentUrl(),
+        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+      });
+    case 'generateMarkdownFile':
+      return generateMarkdownArtifact({
+        runId,
+        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+        title: typeof input.title === 'string' ? input.title : undefined,
+        content: typeof input.content === 'string' ? input.content : typeof input.text === 'string' ? input.text : undefined,
+      });
     case 'switchTab':
       return session.switchTab(typeof input.index === 'number' ? input.index : Number(input.index || 0));
     case 'reportState':
       return { ok: true, actual: `Reported state without browser action: ${String(input.actual || input.reason || '')}` };
     case 'selectReferenceScreenshots':
       return { ok: true, actual: `Selected screenshot references for context only: ${(Array.isArray(input.ids) ? input.ids : []).join(', ') || '[none]'}.` };
-    case 'getInteractiveCandidates':
-      return session.getInteractiveCandidates();
-    case 'getDomNodeText':
-      return session.getDomNodeText(domNodeId);
     default:
       return { ok: false, actual: `Unsupported recorded tool: ${flow.name}.${reason}` };
   }
-}
-
-function recordedToolTraceInput(flow: RecordedFlowStep) {
-  const input = jsonSafe(flow.input);
-  if (!input || typeof input !== 'object' || Array.isArray(input)) {
-    return flow.reason ? { value: input, reason: flow.reason } : input;
-  }
-  const withReason = { ...(input as Record<string, unknown>) };
-  if (flow.reason && typeof withReason.reason !== 'string') withReason.reason = flow.reason;
-  return withReason;
-}
-
-async function runTracedRecordedTool(input: {
-  session: BrowserSession;
-  targetUrl: string;
-  flow: RecordedFlowStep;
-  traces: ToolTrace[];
-  runId: string;
-  stepIndex: number;
-  visualContext: VisualContextManager;
-  onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
-  onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
-}) {
-  const { session, targetUrl, flow, traces, runId, stepIndex, visualContext, onToolTrace, onVisualContextChange } = input;
-  return executeTracedBrowserAction({
-    session,
-    traces,
-    name: flow.name,
-    toolInput: recordedToolTraceInput(flow),
-    runId,
-    stepIndex,
-    visualContext,
-    onToolTrace,
-    onVisualContextChange,
-    action: () => runRecordedTool(session, targetUrl, flow),
-  });
 }
 
 async function executeCodexRuntimeObject(input: {
@@ -3696,6 +4011,7 @@ async function executeCodexRuntimeObject(input: {
   targetUrl: string;
   runId: string;
   stepIndex: number;
+  mode: BrowserSessionMode;
   type: string;
   message?: string;
   params: Record<string, unknown>;
@@ -3705,15 +4021,19 @@ async function executeCodexRuntimeObject(input: {
   visualContext?: VisualContextManager;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
+  requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
+  onDebug?: ExecutionDebug;
   onSelectReferenceScreenshots?: (selection: {
     ids: string[];
     selectionReason: string;
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
+  observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => BrowserActionResult | Promise<BrowserActionResult>;
+  takeSnapshot?: (input?: RuntimeObservationReadOptions) => BrowserActionResult | Promise<BrowserActionResult>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observeCurrentScreenshot, takeSnapshot } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -3745,26 +4065,28 @@ async function executeCodexRuntimeObject(input: {
   }
 
   const normalizedParams = { ...params };
-  if (domNodeIdToolNames.has(type)) {
-    const nodeId = normalizeDomNodeIdParam(normalizedParams);
-    if (nodeId) normalizedParams.id = nodeId;
-  }
-  if (type === 'scrollArea') {
-    const areaId = typeof normalizedParams.areaId === 'string' && normalizedParams.areaId.trim()
-      ? normalizedParams.areaId.trim()
-      : typeof normalizedParams.id === 'string' && /^S\d+$/i.test(normalizedParams.id.trim())
-        ? normalizedParams.id.trim()
-        : '';
-    normalizedParams.areaId = areaId || normalizedParams.areaId;
-  }
   const flow: RecordedFlowStep = {
     index: stepIndex,
     name: type,
     input: normalizedParams,
     reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
   };
+  const pendingConfirmation = requestToolConfirmation ? toolConfirmationFromInput(type, normalizedParams) : undefined;
+  const runTool = async () => {
+    if (type === 'takeScreenshot') {
+      return observeCurrentScreenshot
+        ? observeCurrentScreenshot({ capture: normalizedParams.capture === 'fullPage' ? 'fullPage' : 'viewport' })
+        : { ok: false, actual: 'takeScreenshot is unavailable in this runtime.' };
+    }
+    if (type === 'takeSnapshot') {
+      return takeSnapshot
+        ? takeSnapshot(normalizedParams as RuntimeObservationReadOptions)
+        : { ok: false, actual: 'takeSnapshot is unavailable in this runtime.' };
+    }
+    return runRecordedTool(session, targetUrl, flow, runId);
+  };
 
-  await executeTracedBrowserAction({
+  const result = await executeTracedBrowserAction({
     session,
     traces,
     name: type,
@@ -3775,1041 +4097,34 @@ async function executeCodexRuntimeObject(input: {
     visualContext,
     abortSignal,
     shouldContinue,
+    onDebug,
     onToolTrace,
     onVisualContextChange,
-    action: async () => (
-      candidateActionToolNames.has(type)
-        ? validateCandidateActionBeforeExecution(type, normalizedParams, traces) || await runRecordedTool(session, targetUrl, flow)
-        : await runRecordedTool(session, targetUrl, flow)
-    ),
-  });
-  return { text: readableActionFromRawText(message) || '', executed: true };
-}
-
-async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, recordedFlow: RecordedFlowStep[], options: ExecutionOptions): Promise<TestExecutionResult> {
-  const {
-    onProgress,
-    onDebug,
-    shouldSkipStep,
-    shouldPauseRun,
-    shouldResumeStep,
-    onPaused,
-    onResumed,
-    onManualIntervention,
-    onManualInterventionCleared,
-  } = options;
-  const session = new BrowserSession(browserModeOf(testCase), {
-    isMarked: visualMarkersEnabledFor(testCase),
-    runId,
-    tabGroupTitle: testCase.title,
-  });
-  const steps: StepExecutionResult[] = [];
-  let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
-  let allowBrowserClose = false;
-
-  async function waitWhilePaused(stepIndex: number) {
-    if (!shouldPauseRun) return false;
-    let paused = false;
-    while (await shouldPauseRun(stepIndex)) {
-      if (!paused) {
-        paused = true;
-        await onPaused?.(stepIndex);
-        await onDebug?.({ phase: 'recorded:paused', stepIndex, message: 'Recorded flow paused by user; waiting for resume.' });
-      }
-      await sleep(800);
-    }
-    if (paused) {
-      await onResumed?.(stepIndex);
-      await onDebug?.({ phase: 'recorded:resumed', stepIndex, message: 'Recorded flow resumed.' });
-    }
-    return paused;
-  }
-
-  async function waitForRecordedManualIntervention(input: {
-    stepIndex: number;
-    reason: string;
-    screenshotPath?: string;
-    runningStep: StepExecutionResult;
-  }) {
-    const { stepIndex, reason, screenshotPath, runningStep } = input;
-    if (!shouldResumeStep) return false;
-    await onManualIntervention?.({ stepIndex, reason, screenshotPath });
-    await onDebug?.({
-      phase: 'recorded:manual-required',
-      stepIndex,
-      message: 'Recorded flow is waiting for user-side verification before continuing.',
-      details: { reason, screenshotPath },
-    });
-    await onProgress?.({
-      ...runningStep,
-      actual: `${reason} 完成后请回到运行报告点击“执行完毕”，回放会从当前浏览器状态继续。`,
-    });
-
-    while (true) {
-      if (await shouldSkipStep?.(stepIndex)) {
-        await onManualInterventionCleared?.(stepIndex);
-        return true;
-      }
-      if (await shouldResumeStep(stepIndex)) break;
-      await sleep(800);
-    }
-
-    await onManualInterventionCleared?.(stepIndex);
-    await onDebug?.({ phase: 'recorded:manual-resumed', stepIndex, message: 'User confirmed manual verification; recorded flow is continuing.' });
-    return false;
-  }
-
-  async function runAiRepairForRecordedFailure(
-    failedRecordedStep: StepExecutionResult,
-    flow: RecordedFlowStep,
-    repairAttempt = 1,
-  ): Promise<{ status: 'passed' | 'failed' | 'blocked'; done: boolean }> {
-    const repairStepIndex = steps.length + 1;
-    await waitWhilePaused(repairStepIndex);
-
-    if (await shouldSkipStep?.(repairStepIndex)) {
-      const skippedStep = createSkippedStep(repairStepIndex, failedRecordedStep.afterScreenshotPath || failedRecordedStep.screenshotPath);
-      steps.push(skippedStep);
-      await onProgress?.(skippedStep);
-      return { status: 'blocked', done: true };
-    }
-
-    const beforeScreenshotPath = failedRecordedStep.afterScreenshotPath
-      || failedRecordedStep.screenshotPath
-      || await session.takeScreenshot(runId, repairStepIndex, 'before');
-    const runningStep: StepExecutionResult = {
-      index: repairStepIndex,
-      action: 'AI 接管修复回放失败操作',
-      expected: 'AI 应基于当前页面重新选择可靠操作，修复固定回放中失败或失效的录制动作。',
-      actual: `回放步骤 ${failedRecordedStep.index} 的工具 ${flow.name} 执行失败，AI 正在接管修复。`,
-      status: 'running',
-      beforeScreenshotPath,
-    };
-    await onProgress?.(runningStep);
-    await onDebug?.({
-      phase: 'recorded:repair:start',
-      stepIndex: repairStepIndex,
-      message: `AI repair attempt ${repairAttempt} started after recorded tool ${flow.name} failed.`,
-      details: { failedRecordedStep, flow, repairAttempt },
-    });
-
-    const abortController = registerStepAbortController(runId, repairStepIndex);
-    const liveToolTraces: ToolTrace[] = [];
-    let latestToolProgress: ToolTraceProgress | undefined;
-
-    try {
-      const flowIndex = recordedFlow.indexOf(flow);
-      const nextFlow = flowIndex >= 0 ? recordedFlow[flowIndex + 1] : undefined;
-      const repairContext = [
-        '- A recorded replay operation just failed. This AI step must automatically repair the current browser state so the remaining recorded replay can continue.',
-        '- Perform one concrete corrective browser action from the CURRENT screenshot/context. Do not ask the user unless CAPTCHA/login/security verification is actually required.',
-        '- Do not reuse old recorded candidate ids, DOM ids, coordinates, or scroll area ids. Treat them only as historical clues.',
-        '- Do not mark the full test complete unless every user requirement is already proven. Prefer restoring the page to a state where the next recorded operation can work.',
-        '- When the page is repaired and ready for the remaining replay, call reportState with done=false and status="passed" to say replay can continue. If it is not repaired yet, keep taking corrective tool actions within this agent loop.',
-        `- Failed recorded tool: ${flow.name}.`,
-        flow.reason ? `- Recorded reason: ${sanitizeHistoricalToolText(flow.reason, 240)}.` : '',
-        `- Failure result: ${sanitizeHistoricalToolText(failedRecordedStep.actual, 420)}.`,
-        nextFlow ? `- Next recorded tool after repair: ${nextFlow.name}${nextFlow.reason ? ` (${sanitizeHistoricalToolText(nextFlow.reason, 180)})` : ''}.` : '- There is no next recorded tool; repair should finish only if the requirement is proven.',
-      ].filter(Boolean).join('\n');
-      const actionResult = await executeRuntimeStep({
-        session,
-        testCase,
-        runId,
-        stepIndex: repairStepIndex,
-        beforeScreenshotPath,
-        completedSteps: steps,
-        selectedScreenshotReferences,
-        onSelectReferenceScreenshots: async (selection) => {
-          selectedScreenshotReferences = selection.ids
-            .map((id) => selection.availableReferences.find((ref) => ref.id === id))
-            .filter((ref): ref is ScreenshotReference => Boolean(ref))
-            .map((ref) => ({
-              ...ref,
-              selectionReason: selection.selectionReason,
-              sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
-            }));
-          await onDebug?.({
-            phase: 'recorded:repair:reference-screenshots:selected',
-            stepIndex: repairStepIndex,
-            message: selectedScreenshotReferences.length
-              ? `Selected reference screenshots for AI repair: ${selectedScreenshotReferences.map((ref) => ref.id).join(', ')}`
-              : 'Cleared reference screenshots for AI repair.',
-            details: { selection, selectedScreenshotReferences },
-          });
-        },
-        abortSignal: abortController.signal,
-        onDebug,
-        repairContext,
-        onToolTrace: async (trace, progress) => {
-          upsertToolTrace(liveToolTraces, trace);
-          latestToolProgress = progress || latestToolProgress;
-          const liveFields = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), repairStepIndex, latestToolProgress);
-          await onProgress?.({
-            ...runningStep,
-            actual: 'AI 已调用浏览器工具修复回放失败操作，正在等待页面反馈。',
-            tools: summarizeToolTraces(liveToolTraces),
-            ...liveFields,
-          });
-        },
-      });
-
-      const afterScreenshotPath = await session.takeScreenshot(runId, repairStepIndex, 'after');
-      let decision = normalizeRuntimeDecision(deriveDecision(actionResult.text, actionResult.traces, requirementOf(testCase)));
-
-      if (decision.done && completionVerifyEnabled()) {
-        const verifyPageContext = await session.getPageContext({
-          includeDomTree: false,
-          includeText: false,
-          includeManualVerification: true,
-        });
-        const verification = await verifyRuntimeCompletion({
-          testCase,
-          screenshotPath: afterScreenshotPath,
-          proposed: decision,
-          completedSteps: steps,
-          pageContext: verifyPageContext,
-          abortSignal: abortController.signal,
-        });
-        await onDebug?.({
-          phase: 'recorded:repair:completion-verify',
-          stepIndex: repairStepIndex,
-          message: verification.verified
-            ? 'AI repair completion verification passed.'
-            : `AI repair completion verification failed: ${verification.remainingWork || verification.summary}`,
-          details: { verification, proposed: decision },
-        });
-
-        if (!verification.verified) {
-          const retryInstruction = `[AI 修复完成校验未通过] ${verification.summary}${
-            verification.remainingWork ? ` 待继续：${verification.remainingWork}` : ''
-          }。`;
-          decision = {
-            ...decision,
-            done: false,
-            status: verification.status === 'blocked' ? 'blocked' : 'passed',
-            actual: `${decision.actual}\n\n${retryInstruction}`,
-            note: retryInstruction,
-          };
-        } else {
-          decision = {
-            ...decision,
-            done: true,
-            status: verification.status,
-            actual: verification.summary,
-          };
-        }
-      }
-
-      if (
-        decision.status === 'blocked' &&
-        !decision.done &&
-        manualIssuePattern.test(`${decision.action}\n${decision.expected}\n${decision.actual}`)
-      ) {
-        const skippedForManual = await waitForRecordedManualIntervention({
-          stepIndex: repairStepIndex,
-          reason: decision.actual || 'AI 修复过程中检测到验证码、登录验证或安全校验，需要用户手动处理。',
-          screenshotPath: afterScreenshotPath,
-          runningStep,
-        });
-        if (skippedForManual) {
-          const skippedStep = createSkippedStep(repairStepIndex, beforeScreenshotPath, afterScreenshotPath);
-          steps.push(skippedStep);
-          await onProgress?.(skippedStep);
-          return { status: 'blocked', done: true };
-        }
-
-        const manualStep: StepExecutionResult = {
-          index: repairStepIndex,
-          action: 'AI 修复等待人工校验',
-          expected: '人工校验完成前，AI 修复不应继续执行后续操作。',
-          actual: '用户已确认人工校验完成，AI 将基于最新页面继续修复回放失败操作。',
-          status: 'passed',
-          note: decision.note,
-          taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
-          ledgerItems: mergeLedgerItems(decision.ledgerItems || [], [{
-            dimensionId: 'runtime-replay',
-            title: 'AI 修复等待人工校验',
-            status: 'evidence',
-            severity: 'info',
-            expected: '人工校验完成前暂停自动化修复。',
-            actual: '已等待用户点击“执行完毕”后继续。',
-            sourceStep: repairStepIndex,
-          }], ledgerMemoryLimit()).map((item) => ({ ...item, sourceStep: item.sourceStep ?? repairStepIndex })),
-          aiRequest: actionResult.aiRequest,
-          beforeScreenshotPath,
-          afterScreenshotPath,
-          screenshotPath: afterScreenshotPath,
-          tools: summarizeToolTraces(actionResult.traces),
-          visualContext: actionResult.visualContext,
-          workingMemory: actionResult.workingMemory,
-        };
-        steps.push(manualStep);
-        await onProgress?.(manualStep);
-        clearStepAbortController(runId, repairStepIndex);
-        if (repairAttempt < replayAiRepairMaxSteps()) {
-          return runAiRepairForRecordedFailure(failedRecordedStep, flow, repairAttempt + 1);
-        }
-        return { status: 'blocked', done: true };
-      }
-
-      const completedStep: StepExecutionResult = {
-        index: repairStepIndex,
-        action: `AI 接管修复：${decision.action}`,
-        expected: decision.expected,
-        actual: decision.actual,
-        status: decision.status,
-        note: decision.note,
-        taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
-        ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
-          .map((item) => ({ ...item, sourceStep: item.sourceStep ?? repairStepIndex })),
-        aiRequest: actionResult.aiRequest,
-        beforeScreenshotPath,
-        afterScreenshotPath,
-        screenshotPath: afterScreenshotPath,
-        tools: summarizeToolTraces(actionResult.traces),
-        visualContext: actionResult.visualContext,
-        workingMemory: actionResult.workingMemory,
-      };
-      steps.push(completedStep);
-      await onProgress?.(completedStep);
-      await onDebug?.({
-        phase: 'recorded:repair:done',
-        stepIndex: repairStepIndex,
-        message: `AI repair completed with ${decision.status}${decision.done ? '; requirement marked done' : '; replay can continue'}.`,
-        details: { decision, traces: actionResult.traces },
-      });
-      return { status: decision.status, done: decision.done };
-    } catch (error) {
-      const recoverableStep = await createRecoverableRuntimeErrorStep({
-        session,
-        runId,
-        stepIndex: repairStepIndex,
-        beforeScreenshotPath,
-        error,
-        tools: summarizeToolTraces(liveToolTraces),
-        aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
-        recoveredState: progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), repairStepIndex, latestToolProgress),
-      });
-      steps.push(recoverableStep);
-      await onProgress?.(recoverableStep);
-      await onDebug?.({
-        phase: 'recorded:repair:error',
-        stepIndex: repairStepIndex,
-        message: 'AI repair failed; recorded replay cannot continue automatically.',
-        details: { error: serializeError(error), failedRecordedStep, flow },
-      });
-      return { status: 'failed', done: true };
-    } finally {
-      clearStepAbortController(runId, repairStepIndex);
-    }
-  }
-
-  try {
-    await onDebug?.({ phase: 'recorded:start', message: `Using recorded flow with ${recordedFlow.length} tool calls; AI repair will take over if a recorded operation fails.` });
-    await session.start();
-
-    for (let index = 0; index < recordedFlow.length; index += 1) {
-      const flow = recordedFlow[index];
-      const stepIndex = steps.length + 1;
-      await waitWhilePaused(stepIndex);
-
-      if (await shouldSkipStep?.(stepIndex)) {
-        const skippedStep = createSkippedStep(stepIndex);
-        steps.push(skippedStep);
-        await onProgress?.(skippedStep);
-        continue;
-      }
-
-      await waitBeforeRecordedTool(session, flow, index === 0);
-      let beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
-      const runningStep: StepExecutionResult = {
-        index: stepIndex,
-        action: `回放固定流程工具：${flow.name}`,
-        expected: 'Recorded tool should execute with recorded parameters.',
-        actual: 'Executing recorded tool call.',
-        status: 'running',
-        beforeScreenshotPath,
-        tools: [{ name: flow.name, input: flow.input, reason: flow.reason }],
-      };
-      await onProgress?.(runningStep);
-      const visualContext = new VisualContextManager();
-      visualContext.init({
-        path: beforeScreenshotPath,
-        stepIndex,
-        capture: 'viewport',
-        reason: 'Initial screenshot for recorded replay step',
-      });
-      const liveToolTraces: ToolTrace[] = [];
-      const publishRecordedToolProgress = async (actual: string) => {
-        const liveFields = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex);
-        await onProgress?.({
-          ...runningStep,
-          beforeScreenshotPath,
-          actual,
-          tools: liveToolTraces.length ? summarizeToolTraces(liveToolTraces) : runningStep.tools,
-          ...liveFields,
-          visualContext: liveFields.visualContext || visualContext.snapshot(),
-        });
-      };
-
-      const pageContext = await session.getPageContext({
-        includeDomTree: false,
-        includeText: true,
-        includeManualVerification: true,
-        includeInteractiveCandidates: false,
-      });
-      const explicitManualWait = flow.waitForManual || flow.name === 'waitForHumanVerification';
-      if (explicitManualWait || pageContext.isManualVerification) {
-        const reason = explicitManualWait
-          ? '录制流程在此处需要用户完成验证码、登录验证或安全校验。'
-          : '回放检测到当前页面出现验证码、登录验证或安全校验，需要用户在现有浏览器中手动处理。';
-        const skippedForManual = await waitForRecordedManualIntervention({
+    action: async () => {
+      if (pendingConfirmation && requestToolConfirmation) {
+        const decision = await requestToolConfirmation({
+          toolName: type,
+          input: normalizedParams,
+          reason: pendingConfirmation.reason,
+          prompt: pendingConfirmation.prompt,
           stepIndex,
-          reason,
-          screenshotPath: beforeScreenshotPath,
-          runningStep,
         });
-        if (skippedForManual) {
-          const skippedStep = createSkippedStep(stepIndex, beforeScreenshotPath);
-          steps.push(skippedStep);
-          await onProgress?.(skippedStep);
-          continue;
-        }
-
-        beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
-        await onProgress?.({
-          ...runningStep,
-          beforeScreenshotPath,
-          actual: '用户已确认人工校验完成；回放正在从最新页面状态继续。',
-        });
-
-        if (explicitManualWait) {
-          const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
-          const completedStep: StepExecutionResult = {
-            index: stepIndex,
-            action: `回放固定流程工具：${flow.name}`,
-            expected: 'Recorded manual verification wait should pause until the user confirms completion.',
-            actual: '用户已确认人工校验完成，回放继续执行后续步骤。',
-            status: 'passed',
-            beforeScreenshotPath,
-            afterScreenshotPath,
-            screenshotPath: afterScreenshotPath,
-            tools: [{ name: flow.name, input: flow.input, reason: flow.reason, ok: true, result: 'Manual verification confirmed by user before replay continued.' }],
-            ledgerItems: [{
-              dimensionId: 'runtime-replay',
-              title: '回放等待人工校验',
-              status: 'evidence',
-              severity: 'info',
-              expected: '验证码、登录验证或安全校验完成前，回放不应继续执行后续操作。',
-              actual: '回放已暂停并等待用户点击“执行完毕”后继续。',
-              sourceStep: stepIndex,
-            }],
-          };
-          steps.push(completedStep);
-          await onProgress?.(completedStep);
-          await onDebug?.({
-            phase: 'recorded:manual-step',
-            stepIndex,
-            message: 'Recorded manual verification step completed after user confirmation.',
-            details: { flow },
-          });
-          continue;
-        }
-      }
-
-      const result = await runTracedRecordedTool({
-        session,
-        targetUrl: testCase.targetUrl,
-        flow,
-        traces: liveToolTraces,
-        runId,
-        stepIndex,
-        visualContext,
-        onVisualContextChange: async () => {
-          await publishRecordedToolProgress(`Recorded tool ${flow.name} updated the replay screenshot context.`);
-        },
-        onToolTrace: async (trace) => {
-          upsertToolTrace(liveToolTraces, trace);
-          await publishRecordedToolProgress(trace.result
-            ? `Recorded tool ${trace.name} ${trace.result.ok ? 'completed' : 'failed'}.`
-            : `Recorded tool ${trace.name} started.`);
-        },
-      }).catch((error) => ({
-        ok: false,
-        actual: infrastructureError(error),
-      }));
-      await waitAfterRecordedTool(session);
-      const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
-      const completedStep: StepExecutionResult = {
-        index: stepIndex,
-        action: `回放固定流程工具：${flow.name}`,
-        expected: 'Recorded tool should execute with recorded parameters.',
-        actual: result.actual,
-        status: result.ok ? 'passed' : 'failed',
-        beforeScreenshotPath,
-        afterScreenshotPath,
-        screenshotPath: afterScreenshotPath,
-        tools: liveToolTraces.length ? summarizeToolTraces(liveToolTraces) : [{ name: flow.name, input: flow.input, reason: flow.reason, ok: result.ok, result: result.actual }],
-        visualContext: visualContext.snapshot(),
-        ledgerItems: result.ok ? undefined : [{
-          dimensionId: 'runtime-replay',
-          title: '固定回放操作失败',
-          status: 'issue',
-          severity: 'major',
-          expected: '录制动作应能在当前页面稳定执行。',
-          actual: result.actual,
-          summary: `回放工具 ${flow.name} 失败，可能是页面加载状态、候选编号、DOM 结构或登录/验证状态变化导致。`,
-          sourceStep: stepIndex,
-        }],
-      };
-      steps.push(completedStep);
-      await onProgress?.(completedStep);
-      await onDebug?.({
-        phase: 'recorded:step',
-        stepIndex,
-        message: `${flow.name} -> ${result.ok ? 'ok' : 'failed'}`,
-        details: { flow, result },
-      });
-
-      if (!result.ok) {
-        if (!replayAiRepairEnabled()) {
-          allowBrowserClose = true;
+        throwIfStopped(abortSignal, shouldContinue);
+        if (decision !== 'confirmed') {
           return {
-            status: 'failed' as const,
-            result: {
-              steps,
-              consoleErrors: session.getConsoleErrors(),
-              networkErrors: session.getNetworkErrors(),
-            },
-          };
+            ok: true,
+            actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
+          } satisfies BrowserActionResult;
         }
-
-        const repair = await runAiRepairForRecordedFailure(completedStep, flow);
-        if (repair.status === 'passed' && !repair.done) continue;
-        allowBrowserClose = repair.status !== 'blocked';
+        const result = await runTool();
         return {
-          status: repair.status,
-          result: {
-            steps,
-            consoleErrors: session.getConsoleErrors(),
-            networkErrors: session.getNetworkErrors(),
-          },
-        };
+          ...result,
+          actual: `用户已确认本次工具调用，现已执行。\n${result.actual}`,
+        } satisfies BrowserActionResult;
       }
-    }
-
-    allowBrowserClose = true;
-    return {
-      status: 'passed' as const,
-      result: {
-        steps,
-        consoleErrors: session.getConsoleErrors(),
-        networkErrors: session.getNetworkErrors(),
-      },
-    };
-  } catch (error) {
-    const blockedStep: StepExecutionResult = {
-      index: steps.length + 1,
-      action: '固定流程回放中断',
-      expected: 'Recorded tool flow should replay stably.',
-      actual: infrastructureError(error),
-      status: 'blocked',
-    };
-    steps.push(blockedStep);
-    await onProgress?.(blockedStep);
-    return {
-      status: 'blocked' as const,
-      result: {
-        steps,
-        consoleErrors: session.getConsoleErrors(),
-        networkErrors: session.getNetworkErrors(),
-      },
-    };
-  } finally {
-    await session.close({ keepOpen: !allowBrowserClose });
-  }
-}
-
-async function executeTestCase(testCase: TestCaseRecord, runId: string, options: ExecutionOptions = {}): Promise<TestExecutionResult> {
-  if (!options.initialSteps?.length && options.recordedFlow?.length) {
-    return executeRecordedFlow(testCase, runId, options.recordedFlow, options);
-  }
-
-  const runtimeMode = browserModeOf(testCase);
-
-  const {
-    onProgress,
-    onDebug,
-    initialSteps,
-    shouldSkipStep,
-    shouldPauseRun,
-    shouldResumeStep,
-    onPaused,
-    onResumed,
-    onManualIntervention,
-    onManualInterventionCleared,
-  } = options;
-  const session = new BrowserSession(runtimeMode, {
-    isMarked: visualMarkersEnabledFor(testCase),
-    runId,
-    tabGroupTitle: testCase.title,
+      return runTool();
+    },
   });
-  const steps: StepExecutionResult[] = [...(initialSteps || [])];
-  // Each runtime step now performs a single browser action, so allow more steps overall.
-  const maxRuntimeSteps = Number(process.env.AI_TEST_RUNTIME_MAX_STEPS || 30);
-  const startStepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
-  const finalStepIndex = startStepIndex + maxRuntimeSteps - 1;
-  const manualResumeCounts = new Map<number, number>();
-  const maxManualPromptsPerStep = manualVerificationMaxPromptsPerStep();
-  let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
-  let keepBrowserOpen = false;
-  let allowBrowserClose = false;
-  let tracePath: string | undefined;
-
-  async function waitWhilePaused(stepIndex: number) {
-    if (!shouldPauseRun) return false;
-    let paused = false;
-    while (await shouldPauseRun(stepIndex)) {
-      if (!paused) {
-        paused = true;
-        await onPaused?.(stepIndex);
-        await onDebug?.({ phase: 'run:paused', stepIndex, message: 'Run paused by user; waiting for resume.' });
-      }
-      await sleep(800);
-    }
-    if (paused) {
-      await onResumed?.(stepIndex);
-      await onDebug?.({ phase: 'run:resumed', stepIndex, message: 'Run resumed by user; continuing from the same step.' });
-    }
-    return paused;
-  }
-
-  try {
-    await onDebug?.({ phase: 'browser:start', message: 'Starting visible browser.' });
-    await session.start();
-    await session.startTrace(runId);
-    await onDebug?.({ phase: 'browser:ready', message: 'Browser is ready; AI will decide each next action from the current page.' });
-
-    for (let stepIndex = startStepIndex; stepIndex <= finalStepIndex; stepIndex += 1) {
-      await waitWhilePaused(stepIndex);
-      const abortController = registerStepAbortController(runId, stepIndex);
-      await onDebug?.({ phase: 'step:start', stepIndex, message: `开始执行运行时步骤 ${stepIndex}` });
-
-      if (await shouldSkipStep?.(stepIndex)) {
-        const skippedStep = createSkippedStep(stepIndex);
-        steps.push(skippedStep);
-        await onProgress?.(skippedStep);
-        clearStepAbortController(runId, stepIndex);
-        continue;
-      }
-
-      const beforeScreenshotStartedAt = Date.now();
-      let beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
-      const runningStep: StepExecutionResult = {
-        index: stepIndex,
-                action: 'AI is choosing the next browser action from the current screenshot',
-                expected: 'AI should call a browser tool to advance the requirement or decide the requirement is complete.',
-        actual: 'AI is choosing the next browser action from the current page context.',
-        status: 'running',
-        beforeScreenshotPath,
-      };
-      await onProgress?.(runningStep);
-      await onDebug?.({
-        phase: 'perf:before-screenshot',
-        stepIndex,
-        message: `操作前截图耗时 ${elapsedSince(beforeScreenshotStartedAt)}ms`,
-        details: { elapsedMs: elapsedSince(beforeScreenshotStartedAt), screenshotPath: beforeScreenshotPath },
-      });
-
-      if (await waitWhilePaused(stepIndex)) {
-        clearStepAbortController(runId, stepIndex);
-        stepIndex -= 1;
-        continue;
-      }
-
-      let skippedDuringManualIntervention = false;
-      const pageContext = await session.getPageContext();
-      if (pageContext.isManualVerification && !canPromptManualVerification(manualResumeCounts, stepIndex, maxManualPromptsPerStep)) {
-        await onDebug?.({
-          phase: 'manual:prompt-limit-reached',
-          stepIndex,
-          message: 'Manual verification still detected after repeated resumes; prompt limit reached, so AI will judge the current page state.',
-          details: {
-            url: pageContext.url,
-            title: pageContext.title,
-            screenshotPath: beforeScreenshotPath,
-            resumeCount: manualResumeCount(manualResumeCounts, stepIndex),
-            maxPrompts: maxManualPromptsPerStep,
-          },
-        });
-      } else if (pageContext.isManualVerification) {
-        const reason = '当前页面出现验证码、登录验证或安全校验，需要用户在可见浏览器中手动处理。';
-        await onManualIntervention?.({ stepIndex, reason, screenshotPath: beforeScreenshotPath });
-        await onDebug?.({
-          phase: 'manual:required',
-          stepIndex,
-                    message: 'Manual verification page detected; run paused for user intervention.',
-          details: { url: pageContext.url, title: pageContext.title, screenshotPath: beforeScreenshotPath },
-        });
-        await onProgress?.({
-          ...runningStep,
-          actual: `${reason} 完成后请回到运行报告点击“执行完毕”，AI 会重新观察页面并继续。`,
-        });
-
-        while (true) {
-          if (await shouldSkipStep?.(stepIndex)) {
-            const skippedStep = createSkippedStep(stepIndex, beforeScreenshotPath);
-            steps.push(skippedStep);
-            await onProgress?.(skippedStep);
-            skippedDuringManualIntervention = true;
-            break;
-          }
-          if (await shouldResumeStep?.(stepIndex)) break;
-          await sleep(800);
-        }
-
-        if (skippedDuringManualIntervention) {
-          await onManualInterventionCleared?.(stepIndex);
-          clearStepAbortController(runId, stepIndex);
-          continue;
-        }
-
-        await onManualInterventionCleared?.(stepIndex);
-        await onDebug?.({ phase: 'manual:resumed', stepIndex, message: 'User confirmed verification complete; collecting a fresh screenshot for AI.' });
-        markManualResumed(manualResumeCounts, stepIndex);
-        const manualScreenshotStartedAt = Date.now();
-        beforeScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'before');
-        await onDebug?.({
-          phase: 'perf:manual-resume-screenshot',
-          stepIndex,
-          message: `Manual-resume screenshot took ${elapsedSince(manualScreenshotStartedAt)}ms`,
-          details: { elapsedMs: elapsedSince(manualScreenshotStartedAt), screenshotPath: beforeScreenshotPath },
-        });
-        await onProgress?.({
-          ...runningStep,
-          beforeScreenshotPath,
-                    actual: 'User completed verification; AI is continuing from the latest screenshot.',
-        });
-      }
-
-      const liveToolTraces: ToolTrace[] = [];
-      let latestToolProgress: ToolTraceProgress | undefined;
-      let actionResult: Awaited<ReturnType<typeof executeRuntimeStep>>;
-      try {
-        actionResult = await executeRuntimeStep({
-        session,
-        testCase,
-        runId,
-        stepIndex,
-        beforeScreenshotPath,
-        completedSteps: steps,
-        selectedScreenshotReferences,
-        onSelectReferenceScreenshots: async (selection) => {
-          selectedScreenshotReferences = selection.ids
-            .map((id) => selection.availableReferences.find((ref) => ref.id === id))
-            .filter((ref): ref is ScreenshotReference => Boolean(ref))
-            .map((ref) => ({
-              ...ref,
-              selectionReason: selection.selectionReason,
-              sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
-            }));
-          await onDebug?.({
-            phase: 'ai:reference-screenshots:selected',
-            stepIndex,
-            message: selectedScreenshotReferences.length
-              ? `Selected reference screenshots for next AI request: ${selectedScreenshotReferences.map((ref) => ref.id).join(', ')}`
-              : 'Cleared reference screenshots for next AI request.',
-            details: { selection, selectedScreenshotReferences },
-          });
-        },
-        abortSignal: abortController.signal,
-        onDebug,
-        onToolTrace: async (trace, progress) => {
-          upsertToolTrace(liveToolTraces, trace);
-          latestToolProgress = progress || latestToolProgress;
-          const liveFields = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress);
-          await onProgress?.({
-            ...runningStep,
-            beforeScreenshotPath,
-                          actual: 'AI called a browser tool; waiting for page feedback.',
-            tools: summarizeToolTraces(liveToolTraces),
-            ...liveFields,
-          });
-        },
-        });
-      } catch (error) {
-        if (await shouldPauseRun?.(stepIndex)) {
-          clearStepAbortController(runId, stepIndex);
-          await waitWhilePaused(stepIndex);
-          stepIndex -= 1;
-          continue;
-        }
-        if (await shouldSkipStep?.(stepIndex)) {
-          const skippedStep = createSkippedStep(stepIndex, beforeScreenshotPath);
-          steps.push(skippedStep);
-          await onProgress?.(skippedStep);
-          clearStepAbortController(runId, stepIndex);
-          continue;
-        }
-        const recoverableStep = await createRecoverableRuntimeErrorStep({
-          session,
-          runId,
-          stepIndex,
-          beforeScreenshotPath,
-          error,
-          tools: summarizeToolTraces(liveToolTraces),
-          aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
-          recoveredState: progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress),
-        });
-        steps.push(recoverableStep);
-        await onProgress?.(recoverableStep);
-        await onDebug?.({
-          phase: 'ai:runtime:recoverable-error',
-          stepIndex,
-                    message: 'This AI request or response handling failed; recorded as failed step and continuing.',
-          details: {
-            error: serializeError(error),
-            screenshotPath: recoverableStep.screenshotPath,
-            aiRequest: recoverableStep.aiRequest,
-          },
-        });
-        clearStepAbortController(runId, stepIndex);
-        continue;
-      }
-
-      const afterScreenshotStartedAt = Date.now();
-      const afterScreenshotPath = await session.takeScreenshot(runId, stepIndex, 'after');
-      await onDebug?.({
-        phase: 'perf:after-screenshot',
-        stepIndex,
-        message: `操作后截图耗时 ${elapsedSince(afterScreenshotStartedAt)}ms`,
-        details: { elapsedMs: elapsedSince(afterScreenshotStartedAt), screenshotPath: afterScreenshotPath },
-      });
-
-      if (await shouldSkipStep?.(stepIndex)) {
-        const skippedStep = createSkippedStep(stepIndex, beforeScreenshotPath, afterScreenshotPath);
-        steps.push(skippedStep);
-        await onProgress?.(skippedStep);
-        clearStepAbortController(runId, stepIndex);
-        continue;
-      }
-
-      let decision = normalizeRuntimeDecision(deriveDecision(actionResult.text, actionResult.traces, requirementOf(testCase)));
-      let stopAfterManualPromptLimit = false;
-
-      if (decision.done && completionVerifyEnabled()) {
-        const verifyPageContext = await session.getPageContext({
-          includeDomTree: false,
-          includeText: false,
-          includeManualVerification: true,
-        });
-        const verificationStartedAt = Date.now();
-        const verification = await verifyRuntimeCompletion({
-          testCase,
-          screenshotPath: afterScreenshotPath,
-          proposed: decision,
-          completedSteps: steps,
-          pageContext: verifyPageContext,
-          abortSignal: abortController.signal,
-        });
-        await onDebug?.({
-          phase: 'completion:verify',
-          stepIndex,
-          message: verification.verified
-            ? 'Completion verification passed; ending run.'
-            : `Completion verification failed; continuing: ${verification.remainingWork || verification.summary}`,
-          details: { verification, proposed: decision, elapsedMs: elapsedSince(verificationStartedAt) },
-        });
-
-        if (!verification.verified) {
-          const retryInstruction = `[完成校验未通过] ${verification.summary}${
-            verification.remainingWork ? ` 待继续：${verification.remainingWork}` : ''
-          }。下一步必须基于新截图继续观察，不要直接再次声明完成。`;
-          decision = {
-            ...decision,
-            done: false,
-            status: verification.status === 'blocked' ? 'blocked' : 'passed',
-            actual: `${decision.actual}\n\n${retryInstruction}`,
-            note: retryInstruction,
-          };
-        } else {
-          decision = {
-            ...decision,
-            done: true,
-            status: verification.status,
-            actual: verification.summary,
-          };
-        }
-      }
-
-      if (
-        decision.status === 'blocked' &&
-        !decision.done &&
-        manualIssuePattern.test(`${decision.action}\n${decision.expected}\n${decision.actual}`)
-      ) {
-        if (!canPromptManualVerification(manualResumeCounts, stepIndex, maxManualPromptsPerStep)) {
-          await onDebug?.({
-            phase: 'manual:ai-detected-limit-reached',
-            stepIndex,
-            message: 'AI still detected manual verification after repeated resumes; ending this run as blocked instead of prompting again.',
-            details: {
-              decision,
-              screenshotPath: afterScreenshotPath,
-              resumeCount: manualResumeCount(manualResumeCounts, stepIndex),
-              maxPrompts: maxManualPromptsPerStep,
-            },
-          });
-          decision = {
-            ...decision,
-            status: 'blocked',
-            actual: `${decision.actual}\n\n已多次等待人工验证，但页面仍被识别为验证码、登录验证或安全校验；为避免无限循环，本次运行按阻塞结束。`,
-          };
-          stopAfterManualPromptLimit = true;
-        } else {
-          const reason = decision.actual || 'AI 判断当前截图需要用户完成验证码、登录验证或安全校验。';
-          await onManualIntervention?.({ stepIndex, reason, screenshotPath: afterScreenshotPath });
-          await onDebug?.({
-            phase: 'manual:ai-detected',
-            stepIndex,
-            message: 'AI detected manual verification in the screenshot; run paused.',
-            details: {
-              decision,
-              screenshotPath: afterScreenshotPath,
-              resumeCount: manualResumeCount(manualResumeCounts, stepIndex),
-              maxPrompts: maxManualPromptsPerStep,
-            },
-          });
-          await onProgress?.({
-            ...runningStep,
-            beforeScreenshotPath,
-            afterScreenshotPath,
-            screenshotPath: afterScreenshotPath,
-            actual: `${reason} 完成后请回到运行报告点击“执行完毕”，AI 会重新请求并继续。`,
-          });
-
-          let skippedAfterAiManual = false;
-          while (true) {
-            if (await shouldSkipStep?.(stepIndex)) {
-              const skippedStep = createSkippedStep(stepIndex, beforeScreenshotPath, afterScreenshotPath);
-              steps.push(skippedStep);
-              await onProgress?.(skippedStep);
-              await onManualInterventionCleared?.(stepIndex);
-              clearStepAbortController(runId, stepIndex);
-              skippedAfterAiManual = true;
-              break;
-            }
-            if (await shouldResumeStep?.(stepIndex)) break;
-            await sleep(800);
-          }
-
-          if (skippedAfterAiManual) continue;
-
-          await onManualInterventionCleared?.(stepIndex);
-          await onDebug?.({ phase: 'manual:resumed', stepIndex, message: 'User confirmed verification complete; retrying this AI step.' });
-          markManualResumed(manualResumeCounts, stepIndex);
-          clearStepAbortController(runId, stepIndex);
-          stepIndex -= 1;
-          continue;
-        }
-      }
-
-      const completedStep: StepExecutionResult = {
-        index: stepIndex,
-        action: decision.action,
-        expected: decision.expected,
-        actual: decision.actual,
-        status: decision.status,
-        note: decision.note,
-        taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
-        ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
-          .map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex })),
-        aiRequest: actionResult.aiRequest,
-        beforeScreenshotPath,
-        afterScreenshotPath,
-        screenshotPath: afterScreenshotPath,
-        tools: summarizeToolTraces(actionResult.traces),
-        visualContext: actionResult.visualContext,
-        workingMemory: actionResult.workingMemory,
-      };
-      steps.push(completedStep);
-      await onProgress?.(completedStep);
-      await onDebug?.({
-        phase: 'step:done',
-        stepIndex,
-          message: `Runtime step ${stepIndex} completed: ${decision.status}${decision.done ? '; AI marked requirement finished' : ''}`,
-        details: { decision, traces: actionResult.traces },
-      });
-      clearStepAbortController(runId, stepIndex);
-
-      if (stopAfterManualPromptLimit) {
-        allowBrowserClose = true;
-        return {
-          status: 'blocked',
-          result: {
-            steps,
-            consoleErrors: session.getConsoleErrors(),
-            networkErrors: session.getNetworkErrors(),
-            tracePath,
-          },
-        };
-      }
-
-      if (decision.done) {
-        allowBrowserClose = true;
-        return {
-          status: decision.status,
-          result: {
-            steps,
-            consoleErrors: session.getConsoleErrors(),
-            networkErrors: session.getNetworkErrors(),
-            tracePath,
-          },
-        };
-      }
-    }
-
-    const timeoutStep: StepExecutionResult = {
-      index: steps.length + 1,
-            action: 'Reached maximum AI runtime steps',
-      expected: `AI should complete or clearly block within ${maxRuntimeSteps} runtime steps.`,
-      actual: `Executed ${maxRuntimeSteps} runtime steps, but AI has not marked the requirement complete.`,
-      status: 'failed',
-    };
-    steps.push(timeoutStep);
-    await onProgress?.(timeoutStep);
-    allowBrowserClose = true;
-
-    return {
-      status: 'failed' as const,
-      result: {
-        steps,
-        consoleErrors: session.getConsoleErrors(),
-        networkErrors: session.getNetworkErrors(),
-        tracePath,
-      },
-    };
-  } catch (error) {
-    keepBrowserOpen = shouldKeepBrowserOpenAfterError();
-    const blockedStep: StepExecutionResult = {
-      index: steps.length + 1,
-            action: 'AI browser run interrupted',
-            expected: 'AI should continue operating the browser according to the user requirement.',
-      actual: `${infrastructureError(error)}${keepBrowserOpen ? ' Browser is kept open for investigation.' : ''}`,
-      status: 'blocked',
-    };
-    steps.push(blockedStep);
-    await onProgress?.(blockedStep);
-    return {
-      status: 'blocked' as const,
-      result: {
-        steps,
-        consoleErrors: session.getConsoleErrors(),
-        networkErrors: session.getNetworkErrors(),
-        tracePath,
-      },
-    };
-  } finally {
-    tracePath = await session.stopTrace(runId);
-    await session.close({ keepOpen: keepBrowserOpen || !allowBrowserClose });
-  }
+  const fileResult = result.ok ? formatFileArtifactResult(type, result.actual) : undefined;
+  return { text: fileResult || toolConsistentAssistantText(message, type), executed: true };
 }

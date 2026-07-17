@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { generateTestCase } from '@/server/ai/agents/test-case-generator.agent';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
 import { richTextToPlainText } from '@/lib/rich-text';
 
 export async function POST(request: NextRequest) {
@@ -10,7 +10,7 @@ export async function POST(request: NextRequest) {
   const targetUrl = body.targetUrl ? String(body.targetUrl) : undefined;
   const imageNames = Array.isArray(body.imageNames) ? body.imageNames.map(String) : [];
   const groupId = body.groupId ? String(body.groupId) : undefined;
-  const browserMode = body.browserMode ? String(body.browserMode) : undefined;
+  const browserMode = 'dom';
   const isMarked = typeof body.isMarked === 'boolean' ? body.isMarked : undefined;
 
   if (!richTextToPlainText(prompt)) {
@@ -22,9 +22,7 @@ export async function POST(request: NextRequest) {
     systemPrompt,
     targetUrl,
     imageNames,
-    browserMode: ['default', 'dom', 'visual-markers'].includes(browserMode || '')
-      ? browserMode as 'default' | 'dom' | 'visual-markers'
-      : undefined,
+    browserMode,
     isMarked,
   });
   const testCase = store.createTestCase(content, imageNames, groupId);

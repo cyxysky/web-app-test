@@ -1,9 +1,25 @@
-import { EnvironmentSettings } from '@/components/EnvironmentSettings';
-import { store } from '@/server/db/mock-store';
+import { BrowserChatWorkspace } from '@/components/BrowserChatWorkspace';
+import { store } from '@/server/db/store';
+import { readEnvironmentSettingsSnapshot } from '@/server/settings/settings-snapshot';
 
 export const dynamic = 'force-dynamic';
 
 export default function SettingsPage() {
   store.applyRuntimeEnv();
-  return <EnvironmentSettings />;
+  const testCases = store.listTestCases();
+  const groups = store.listGroups();
+  const schedules = store.listSchedules();
+  const initialSettings = readEnvironmentSettingsSnapshot();
+
+  return (
+    <main className="browser-chat-shell">
+      <BrowserChatWorkspace
+        groups={groups}
+        initialSettings={initialSettings}
+        initialView="settings"
+        schedules={schedules}
+        testCases={testCases}
+      />
+    </main>
+  );
 }

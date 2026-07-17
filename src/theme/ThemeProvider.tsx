@@ -12,7 +12,9 @@ import {
 
 const STORAGE_KEY = 'webpilotqa.themeColor';
 const SCROLLBAR_STORAGE_KEY = 'webpilotqa.scrollbarColor';
+const MODE_STORAGE_KEY = 'webpilotqa.themeMode';
 const DEFAULT_ACCENT = '#10a37f';
+const DEFAULT_MODE: ThemeMode = 'light';
 
 type Rgb = {
   blue: number;
@@ -29,12 +31,17 @@ type ThemeColor = {
   strong: string;
 };
 
+export type ThemeMode = 'dark' | 'light';
+
 type ThemeContextValue = {
   color: string;
   currentColor: ThemeColor;
+  mode: ThemeMode;
   scrollbarColor: string;
+  setMode: (mode: ThemeMode) => void;
   setScrollbarColor: (color: string) => void;
   setColor: (color: string) => void;
+  toggleMode: () => void;
 };
 
 const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
@@ -53,6 +60,10 @@ function normalizeHexColor(value: unknown) {
   if (/^#[0-9a-fA-F]{6}$/.test(trimmed)) return trimmed.toLowerCase();
   if (/^[0-9a-fA-F]{6}$/.test(trimmed)) return `#${trimmed.toLowerCase()}`;
   return DEFAULT_ACCENT;
+}
+
+function normalizeThemeMode(value: unknown): ThemeMode {
+  return value === 'dark' ? 'dark' : DEFAULT_MODE;
 }
 
 function hexToRgb(hex: string): Rgb {
@@ -85,8 +96,18 @@ function rgba(hex: string, opacity: number) {
   return `rgba(${rgb.red}, ${rgb.green}, ${rgb.blue}, ${opacity})`;
 }
 
-function deriveThemeColor(color: string): ThemeColor {
+function deriveThemeColor(color: string, mode: ThemeMode): ThemeColor {
   const accent = normalizeHexColor(color);
+  if (mode === 'dark') {
+    return {
+      accent,
+      hover: mixColors(accent, '#ffffff', 0.12),
+      strong: mixColors(accent, '#ffffff', 0.2),
+      soft: mixColors(accent, '#111827', 0.82),
+      border: mixColors(accent, '#111827', 0.58),
+      focus: rgba(accent, 0.24),
+    };
+  }
   return {
     accent,
     hover: mixColors(accent, '#000000', 0.12),
@@ -95,6 +116,12 @@ function deriveThemeColor(color: string): ThemeColor {
     border: mixColors(accent, '#ffffff', 0.68),
     focus: rgba(accent, 0.18),
   };
+}
+
+function applyThemeMode(mode: ThemeMode) {
+  const root = document.documentElement;
+  root.dataset.theme = mode;
+  root.style.setProperty('color-scheme', mode);
 }
 
 function applyThemeColor(option: ThemeColor) {
@@ -108,31 +135,37 @@ function applyThemeColor(option: ThemeColor) {
   root.style.setProperty('--focus', option.focus);
 }
 
-function applyScrollbarColor(color: string) {
+function applyScrollbarColor(color: string, mode: ThemeMode) {
   const normalized = normalizeHexColor(color);
   const root = document.documentElement;
   root.style.setProperty('--scrollbar-thumb', normalized);
-  root.style.setProperty('--scrollbar-thumb-hover', mixColors(normalized, '#000000', 0.12));
+  root.style.setProperty('--scrollbar-thumb-hover', mixColors(normalized, mode === 'dark' ? '#ffffff' : '#000000', 0.12));
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [color, setColorState] = useState(DEFAULT_ACCENT);
+  const [mode, setModeState] = useState<ThemeMode>(DEFAULT_MODE);
   const [scrollbarColor, setScrollbarColorState] = useState(DEFAULT_ACCENT);
 
   useEffect(() => {
     setColorState(normalizeHexColor(window.localStorage.getItem(STORAGE_KEY)));
+    setModeState(normalizeThemeMode(window.localStorage.getItem(MODE_STORAGE_KEY)));
     setScrollbarColorState(normalizeHexColor(window.localStorage.getItem(SCROLLBAR_STORAGE_KEY)));
   }, []);
 
-  const currentColor = useMemo(() => deriveThemeColor(color), [color]);
+  const currentColor = useMemo(() => deriveThemeColor(color, mode), [color, mode]);
+
+  useEffect(() => {
+    applyThemeMode(mode);
+  }, [mode]);
 
   useEffect(() => {
     applyThemeColor(currentColor);
   }, [currentColor]);
 
   useEffect(() => {
-    applyScrollbarColor(scrollbarColor);
-  }, [scrollbarColor]);
+    applyScrollbarColor(scrollbarColor, mode);
+  }, [mode, scrollbarColor]);
 
   const setColor = useCallback((nextColor: string) => {
     const normalized = normalizeHexColor(nextColor);
@@ -146,13 +179,30 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     window.localStorage.setItem(SCROLLBAR_STORAGE_KEY, normalized);
   }, []);
 
+  const setMode = useCallback((nextMode: ThemeMode) => {
+    const normalized = normalizeThemeMode(nextMode);
+    setModeState(normalized);
+    window.localStorage.setItem(MODE_STORAGE_KEY, normalized);
+  }, []);
+
+  const toggleMode = useCallback(() => {
+    setModeState((current) => {
+      const nextMode = current === 'dark' ? 'light' : 'dark';
+      window.localStorage.setItem(MODE_STORAGE_KEY, nextMode);
+      return nextMode;
+    });
+  }, []);
+
   const value = useMemo<ThemeContextValue>(() => ({
     color,
     currentColor,
+    mode,
     scrollbarColor,
     setColor,
+    setMode,
     setScrollbarColor,
-  }), [color, currentColor, scrollbarColor, setColor, setScrollbarColor]);
+    toggleMode,
+  }), [color, currentColor, mode, scrollbarColor, setColor, setMode, setScrollbarColor, toggleMode]);
 
   return (
     <ThemeContext.Provider value={value}>

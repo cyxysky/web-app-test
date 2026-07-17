@@ -1,0 +1,1079 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light" />
+  <title>精致加载动画 · Elegant Loader Studies</title>
+  <style>
+    :root{
+      --paper:#f3f0ea;
+      --panel:rgba(255,255,255,.72);
+      --panel-strong:rgba(255,255,255,.92);
+      --ink:#2f2b27;
+      --muted:#8a837a;
+      --line:rgba(55,45,35,.10);
+      --accent:#b58b5d;
+      --accent-rgb:181,139,93;
+      --accent-soft:#efe4d7;
+      --progress:0%;
+      --ease:cubic-bezier(.22,.8,.28,1);
+    }
+
+    *{box-sizing:border-box}
+    html{min-height:100%;background:var(--paper)}
+    body{
+      min-height:100vh;
+      margin:0;
+      overflow-x:hidden;
+      color:var(--ink);
+      font-family:Inter,ui-sans-serif,system-ui,-apple-system,"SF Pro Display","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+      background:
+        radial-gradient(circle at 12% 12%,rgba(255,255,255,.95) 0 9%,transparent 32%),
+        radial-gradient(circle at 90% 18%,rgba(226,216,205,.58),transparent 28%),
+        radial-gradient(circle at 78% 88%,rgba(231,224,213,.72),transparent 29%),
+        linear-gradient(135deg,#f7f5f1 0%,#eeeae3 100%);
+    }
+
+    body::before,
+    body::after{
+      content:"";
+      position:fixed;
+      pointer-events:none;
+      border-radius:50%;
+      filter:blur(2px);
+      opacity:.7;
+      z-index:0;
+    }
+    body::before{
+      width:360px;height:360px;
+      left:-160px;top:38%;
+      background:radial-gradient(circle,rgba(var(--accent-rgb),.14),transparent 68%);
+      transition:background .65s ease;
+    }
+    body::after{
+      width:420px;height:420px;
+      right:-180px;bottom:-170px;
+      background:radial-gradient(circle,rgba(var(--accent-rgb),.11),transparent 69%);
+      transition:background .65s ease;
+    }
+
+    button{font:inherit;color:inherit}
+
+    .page{
+      position:relative;
+      z-index:1;
+      min-height:100vh;
+      display:grid;
+      place-items:center;
+      padding:clamp(18px,3.2vw,46px);
+    }
+
+    .shell{
+      width:min(1160px,100%);
+      min-height:min(720px,calc(100vh - 56px));
+      display:grid;
+      grid-template-rows:auto 1fr;
+      gap:24px;
+      padding:clamp(20px,3vw,38px);
+      border:1px solid rgba(255,255,255,.85);
+      border-radius:34px;
+      background:linear-gradient(145deg,rgba(255,255,255,.76),rgba(250,248,244,.62));
+      box-shadow:
+        0 34px 90px rgba(74,61,48,.13),
+        0 4px 18px rgba(74,61,48,.05),
+        inset 0 1px 0 rgba(255,255,255,.95);
+      -webkit-backdrop-filter:blur(26px) saturate(1.1);
+      backdrop-filter:blur(26px) saturate(1.1);
+    }
+
+    .topbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:22px;
+      min-width:0;
+    }
+
+    .brand{
+      display:flex;
+      align-items:center;
+      gap:14px;
+      min-width:0;
+    }
+
+    .brand-mark{
+      position:relative;
+      width:39px;height:39px;
+      flex:0 0 auto;
+      border-radius:50%;
+      border:1px solid rgba(var(--accent-rgb),.32);
+      background:rgba(255,255,255,.68);
+      box-shadow:inset 0 0 0 7px rgba(var(--accent-rgb),.06),0 7px 20px rgba(var(--accent-rgb),.09);
+      transition:border-color .55s ease,box-shadow .55s ease;
+    }
+    .brand-mark::before,
+    .brand-mark::after{
+      content:"";
+      position:absolute;
+      border-radius:50%;
+      inset:9px;
+      border:1px solid var(--accent);
+      transition:border-color .55s ease;
+    }
+    .brand-mark::after{
+      inset:15px;
+      border:0;
+      background:var(--accent);
+      box-shadow:0 0 0 4px rgba(var(--accent-rgb),.10);
+      transition:background .55s ease,box-shadow .55s ease;
+    }
+
+    .brand-copy{min-width:0}
+    .eyebrow{
+      margin:0 0 4px;
+      color:var(--muted);
+      font-size:10px;
+      font-weight:650;
+      letter-spacing:.26em;
+      text-transform:uppercase;
+      white-space:nowrap;
+    }
+    h1{
+      margin:0;
+      font-size:clamp(20px,2.5vw,30px);
+      line-height:1.1;
+      font-weight:620;
+      letter-spacing:-.035em;
+      white-space:nowrap;
+    }
+
+    .meta{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      color:var(--muted);
+      font-size:12px;
+      white-space:nowrap;
+    }
+    .meta-dot{
+      width:6px;height:6px;border-radius:50%;
+      background:var(--accent);
+      box-shadow:0 0 0 5px rgba(var(--accent-rgb),.10);
+      transition:background .55s ease,box-shadow .55s ease;
+    }
+
+    .content{
+      min-height:0;
+      display:grid;
+      grid-template-columns:minmax(0,1fr) 316px;
+      gap:22px;
+    }
+
+    .preview{
+      position:relative;
+      min-height:510px;
+      overflow:hidden;
+      display:grid;
+      grid-template-rows:auto 1fr auto;
+      gap:18px;
+      padding:clamp(20px,3vw,34px);
+      border:1px solid rgba(62,51,39,.075);
+      border-radius:28px;
+      background:
+        radial-gradient(circle at 50% 42%,rgba(var(--accent-rgb),.10),transparent 31%),
+        linear-gradient(145deg,rgba(255,255,255,.92),rgba(248,246,242,.82));
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,.96),
+        0 12px 34px rgba(62,51,39,.06);
+      transition:background .65s ease;
+      isolation:isolate;
+    }
+
+    .preview::before{
+      content:"";
+      position:absolute;
+      width:360px;height:360px;
+      left:50%;top:48%;
+      transform:translate(-50%,-50%);
+      border-radius:50%;
+      background:radial-gradient(circle,rgba(var(--accent-rgb),.09),transparent 66%);
+      filter:blur(6px);
+      z-index:-1;
+      transition:background .65s ease;
+    }
+
+    .preview-head{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:16px;
+    }
+    .section-kicker{
+      margin:0 0 8px;
+      color:var(--accent);
+      font-size:10px;
+      font-weight:700;
+      letter-spacing:.22em;
+      text-transform:uppercase;
+      transition:color .55s ease;
+    }
+    .preview-title{
+      margin:0;
+      font-size:clamp(24px,3.2vw,42px);
+      font-weight:560;
+      line-height:1.06;
+      letter-spacing:-.045em;
+    }
+    .preview-subtitle{
+      margin:9px 0 0;
+      color:var(--muted);
+      font-size:13px;
+      line-height:1.7;
+    }
+    .number{
+      display:grid;
+      place-items:center;
+      width:42px;height:42px;
+      flex:0 0 auto;
+      border-radius:50%;
+      border:1px solid var(--line);
+      background:rgba(255,255,255,.64);
+      color:var(--muted);
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+      font-size:11px;
+      box-shadow:inset 0 1px 0 #fff;
+    }
+
+    .stage{
+      position:relative;
+      min-height:250px;
+      display:grid;
+      place-items:center;
+    }
+
+    .loader-scene{
+      position:absolute;
+      inset:0;
+      display:grid;
+      place-items:center;
+      opacity:0;
+      visibility:hidden;
+      transform:translateY(8px) scale(.985);
+      transition:opacity .35s ease,transform .5s var(--ease),visibility .35s;
+    }
+    .loader-scene.is-active{
+      opacity:1;
+      visibility:visible;
+      transform:none;
+    }
+
+    /* 01 · Pearl orbit */
+    .pearl-loader{
+      position:relative;
+      width:178px;height:178px;
+      display:grid;
+      place-items:center;
+    }
+    .pearl-loader::before{
+      content:"";
+      position:absolute;
+      inset:18px;
+      border-radius:50%;
+      border:1px solid rgba(45,38,31,.08);
+      box-shadow:inset 0 0 40px rgba(255,255,255,.75);
+    }
+    .pearl-orbit{
+      position:absolute;
+      inset:0;
+      animation:slowTurn 9s linear infinite;
+    }
+    .pearl{
+      position:absolute;
+      left:50%;top:50%;
+      width:1px;height:1px;
+      transform:rotate(calc(var(--i) * 30deg)) translateY(-73px);
+    }
+    .pearl::before{
+      content:"";
+      position:absolute;
+      left:-5px;top:-5px;
+      width:10px;height:10px;
+      border-radius:50%;
+      background:linear-gradient(145deg,#fff 12%,var(--accent-soft) 48%,var(--accent) 100%);
+      box-shadow:
+        inset 1px 1px 2px rgba(255,255,255,.9),
+        0 4px 10px rgba(var(--accent-rgb),.16);
+      animation:pearlPulse 1.55s var(--ease) infinite;
+      animation-delay:calc(var(--i) * -0.12s);
+      transition:background .55s ease,box-shadow .55s ease;
+    }
+    .pearl-core{
+      position:relative;
+      width:64px;height:64px;
+      display:grid;
+      place-items:center;
+      border-radius:50%;
+      background:rgba(255,255,255,.76);
+      border:1px solid rgba(var(--accent-rgb),.14);
+      box-shadow:
+        0 14px 34px rgba(var(--accent-rgb),.10),
+        inset 0 1px 0 rgba(255,255,255,.98);
+      transition:border-color .55s ease,box-shadow .55s ease;
+    }
+    .pearl-core::before{
+      content:"";
+      width:16px;height:16px;
+      border-radius:50%;
+      background:var(--accent);
+      box-shadow:0 0 0 8px rgba(var(--accent-rgb),.10),0 0 0 16px rgba(var(--accent-rgb),.04);
+      animation:coreBreathe 1.8s var(--ease) infinite;
+      transition:background .55s ease,box-shadow .55s ease;
+    }
+
+    /* 02 · Silk line */
+    .silk-loader{
+      position:relative;
+      width:min(310px,78%);
+      height:170px;
+      display:grid;
+      place-items:center;
+    }
+    .silk-loader svg{
+      width:100%;height:auto;
+      overflow:visible;
+    }
+    .silk-base{
+      fill:none;
+      stroke:rgba(57,49,42,.09);
+      stroke-width:7;
+      stroke-linecap:round;
+    }
+    .silk-shadow{
+      fill:none;
+      stroke:rgba(var(--accent-rgb),.11);
+      stroke-width:13;
+      stroke-linecap:round;
+      filter:blur(7px);
+    }
+    .silk-runner{
+      fill:none;
+      stroke:url(#silkGradient);
+      stroke-width:7;
+      stroke-linecap:round;
+      stroke-dasharray:52 460;
+      animation:silkTravel 2.45s var(--ease) infinite;
+      filter:drop-shadow(0 4px 8px rgba(var(--accent-rgb),.20));
+    }
+    .silk-runner.second{
+      stroke-width:3;
+      stroke-dasharray:24 488;
+      animation-duration:2.45s;
+      animation-delay:-1.22s;
+      opacity:.72;
+    }
+    .silk-caption{
+      position:absolute;
+      bottom:10px;
+      color:var(--muted);
+      font-size:11px;
+      letter-spacing:.2em;
+      text-transform:uppercase;
+    }
+
+    /* 03 · Petal bloom */
+    .bloom-loader{
+      position:relative;
+      width:180px;height:180px;
+      display:grid;
+      place-items:center;
+    }
+    .bloom-ring{
+      position:absolute;
+      inset:0;
+      animation:slowTurn 13s linear infinite reverse;
+    }
+    .petal-wrap{
+      position:absolute;
+      left:50%;top:50%;
+      width:1px;height:1px;
+      transform:rotate(calc(var(--i) * 45deg)) translateY(-52px);
+    }
+    .petal{
+      position:absolute;
+      width:20px;height:42px;
+      left:-10px;top:-21px;
+      border-radius:70% 70% 55% 55%;
+      transform-origin:50% 100%;
+      background:linear-gradient(180deg,rgba(255,255,255,.96),var(--accent-soft) 48%,rgba(var(--accent-rgb),.72));
+      box-shadow:0 10px 18px rgba(var(--accent-rgb),.10),inset 0 1px 1px rgba(255,255,255,.85);
+      animation:petalBreathe 1.9s var(--ease) infinite;
+      animation-delay:calc(var(--i) * -.22s);
+      transition:background .55s ease,box-shadow .55s ease;
+    }
+    .bloom-center{
+      position:relative;
+      width:45px;height:45px;
+      border-radius:50%;
+      background:linear-gradient(145deg,#fff,var(--accent-soft));
+      border:1px solid rgba(var(--accent-rgb),.18);
+      box-shadow:0 12px 28px rgba(var(--accent-rgb),.12),inset 0 1px 0 #fff;
+      transition:background .55s ease,border-color .55s ease,box-shadow .55s ease;
+    }
+    .bloom-center::after{
+      content:"";
+      position:absolute;
+      inset:16px;
+      border-radius:50%;
+      background:var(--accent);
+      animation:coreBreathe 1.9s var(--ease) infinite;
+      transition:background .55s ease;
+    }
+
+    /* 04 · Liquid glass */
+    .liquid-loader{
+      position:relative;
+      width:154px;height:154px;
+      display:grid;
+      place-items:center;
+    }
+    .liquid-orb{
+      position:relative;
+      width:132px;height:132px;
+      overflow:hidden;
+      border-radius:50%;
+      border:1px solid rgba(51,44,37,.10);
+      background:rgba(255,255,255,.74);
+      box-shadow:
+        0 20px 38px rgba(62,51,39,.08),
+        inset 0 1px 0 #fff,
+        inset 0 -10px 28px rgba(var(--accent-rgb),.05);
+    }
+    .liquid-orb::after{
+      content:"";
+      position:absolute;
+      inset:0;
+      border-radius:inherit;
+      box-shadow:inset 8px 9px 20px rgba(255,255,255,.56),inset -9px -12px 22px rgba(55,43,32,.04);
+      pointer-events:none;
+    }
+    .water{
+      position:absolute;
+      left:-18%;right:-18%;bottom:-5%;
+      height:63%;
+      background:linear-gradient(180deg,rgba(var(--accent-rgb),.50),rgba(var(--accent-rgb),.88));
+      animation:waterBreathe 3s var(--ease) infinite;
+      transition:background .55s ease;
+    }
+    .water::before,
+    .water::after{
+      content:"";
+      position:absolute;
+      left:-12%;
+      width:124%;
+      height:38px;
+      top:-20px;
+      border-radius:45% 55% 48% 52%;
+      background:rgba(255,255,255,.88);
+      animation:wave 3.4s ease-in-out infinite;
+    }
+    .water::after{
+      top:-15px;
+      background:rgba(var(--accent-rgb),.22);
+      border-radius:54% 46% 58% 42%;
+      animation-duration:2.8s;
+      animation-direction:reverse;
+    }
+    .bubble{
+      position:absolute;
+      bottom:22px;
+      width:7px;height:7px;
+      border-radius:50%;
+      border:1px solid rgba(255,255,255,.75);
+      background:rgba(255,255,255,.22);
+      animation:bubbleUp 2.5s ease-in infinite;
+      animation-delay:var(--delay);
+      left:var(--x);
+      z-index:2;
+    }
+    .liquid-glint{
+      position:absolute;
+      width:20px;height:8px;
+      border-radius:50%;
+      left:42px;top:33px;
+      background:rgba(255,255,255,.78);
+      transform:rotate(-36deg);
+      filter:blur(.4px);
+      z-index:3;
+    }
+
+    /* 05 · Breathing halo */
+    .halo-loader{
+      position:relative;
+      width:190px;height:190px;
+      display:grid;
+      place-items:center;
+    }
+    .halo{
+      position:absolute;
+      border-radius:50%;
+      border:1px solid rgba(var(--accent-rgb),.30);
+      animation:haloExpand 2.7s var(--ease) infinite;
+      animation-delay:calc(var(--i) * -.9s);
+      box-shadow:inset 0 0 18px rgba(var(--accent-rgb),.04);
+      transition:border-color .55s ease,box-shadow .55s ease;
+    }
+    .halo-seed{
+      position:relative;
+      width:55px;height:55px;
+      border-radius:50%;
+      background:linear-gradient(145deg,#fff,var(--accent-soft));
+      border:1px solid rgba(var(--accent-rgb),.18);
+      box-shadow:0 14px 30px rgba(var(--accent-rgb),.12),inset 0 1px 0 #fff;
+      transition:background .55s ease,border-color .55s ease,box-shadow .55s ease;
+    }
+    .halo-seed::before,
+    .halo-seed::after{
+      content:"";
+      position:absolute;
+      inset:19px;
+      border-radius:50%;
+      background:var(--accent);
+      transition:background .55s ease;
+    }
+    .halo-seed::after{
+      inset:13px;
+      background:transparent;
+      border:1px solid rgba(var(--accent-rgb),.24);
+      animation:seedRing 1.7s var(--ease) infinite;
+      transition:border-color .55s ease;
+    }
+
+    .progress-area{
+      display:grid;
+      gap:11px;
+    }
+    .progress-meta{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:18px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .progress-copy{
+      min-width:0;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .progress-number{
+      color:var(--ink);
+      font-variant-numeric:tabular-nums;
+      letter-spacing:-.02em;
+    }
+    .progress-track{
+      position:relative;
+      height:3px;
+      overflow:visible;
+      border-radius:999px;
+      background:rgba(46,39,32,.08);
+    }
+    .progress-fill{
+      position:absolute;
+      inset:0 auto 0 0;
+      width:var(--progress);
+      border-radius:inherit;
+      background:linear-gradient(90deg,rgba(var(--accent-rgb),.48),var(--accent));
+      box-shadow:0 3px 12px rgba(var(--accent-rgb),.18);
+      transition:width .14s linear,background .55s ease,box-shadow .55s ease;
+    }
+    .progress-fill::after{
+      content:"";
+      position:absolute;
+      right:-4px;top:50%;
+      width:8px;height:8px;
+      transform:translateY(-50%);
+      border-radius:50%;
+      background:#fff;
+      border:2px solid var(--accent);
+      box-shadow:0 3px 9px rgba(var(--accent-rgb),.23);
+      transition:border-color .55s ease,box-shadow .55s ease;
+    }
+
+    .selector{
+      min-height:0;
+      padding:8px;
+      border:1px solid rgba(62,51,39,.075);
+      border-radius:25px;
+      background:rgba(248,246,242,.56);
+      box-shadow:inset 0 1px 0 rgba(255,255,255,.82);
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .selector-head{
+      padding:13px 13px 10px;
+    }
+    .selector-head h2{
+      margin:0 0 6px;
+      font-size:15px;
+      font-weight:620;
+      letter-spacing:-.02em;
+    }
+    .selector-head p{
+      margin:0;
+      color:var(--muted);
+      font-size:11px;
+      line-height:1.6;
+    }
+
+    .option{
+      position:relative;
+      width:100%;
+      min-height:76px;
+      display:grid;
+      grid-template-columns:46px 1fr auto;
+      align-items:center;
+      gap:12px;
+      padding:10px 12px;
+      border:1px solid transparent;
+      border-radius:18px;
+      background:transparent;
+      text-align:left;
+      cursor:pointer;
+      transition:background .3s ease,border-color .3s ease,box-shadow .3s ease,transform .3s var(--ease);
+    }
+    .option:hover{
+      transform:translateY(-1px);
+      background:rgba(255,255,255,.52);
+    }
+    .option.is-active{
+      background:rgba(255,255,255,.88);
+      border-color:rgba(62,51,39,.075);
+      box-shadow:0 8px 22px rgba(62,51,39,.065),inset 0 1px 0 #fff;
+    }
+    .option:focus-visible{
+      outline:2px solid rgba(var(--accent-rgb),.35);
+      outline-offset:2px;
+    }
+    .mini{
+      position:relative;
+      width:44px;height:44px;
+      display:grid;
+      place-items:center;
+      border-radius:14px;
+      border:1px solid rgba(62,51,39,.075);
+      background:linear-gradient(145deg,#fff,#f4f1ec);
+      box-shadow:inset 0 1px 0 #fff;
+      overflow:hidden;
+    }
+    .mini::before,
+    .mini::after{
+      content:"";
+      position:absolute;
+      border-radius:50%;
+    }
+    .mini-orbit::before{
+      width:21px;height:21px;
+      border:1px solid rgba(181,139,93,.35);
+    }
+    .mini-orbit::after{
+      width:6px;height:6px;
+      background:#b58b5d;
+      box-shadow:0 -12px 0 -1px #b58b5d,10px 6px 0 -1px rgba(181,139,93,.55),-10px 6px 0 -1px rgba(181,139,93,.25);
+    }
+    .mini-silk::before{
+      width:27px;height:13px;
+      border:2px solid #7f9aa8;
+      border-left-color:transparent;
+      border-right-color:transparent;
+      border-radius:50%;
+      transform:rotate(-9deg);
+    }
+    .mini-silk::after{
+      width:27px;height:13px;
+      border:1px solid rgba(127,154,168,.25);
+      border-radius:50%;
+      transform:rotate(9deg);
+    }
+    .mini-bloom::before{
+      width:7px;height:19px;
+      border-radius:50%;
+      background:#c18f91;
+      box-shadow:0 0 0 1px rgba(255,255,255,.45) inset,0 0 10px rgba(193,143,145,.12);
+    }
+    .mini-bloom::after{
+      width:7px;height:19px;
+      border-radius:50%;
+      background:rgba(193,143,145,.52);
+      transform:rotate(60deg);
+      box-shadow:0 0 0 1px rgba(255,255,255,.35) inset;
+    }
+    .mini-liquid::before{
+      width:25px;height:25px;
+      border:1px solid rgba(58,50,42,.13);
+      background:linear-gradient(to top,#7a9b8b 0 48%,rgba(255,255,255,.75) 49% 100%);
+    }
+    .mini-liquid::after{
+      width:7px;height:3px;
+      background:rgba(255,255,255,.8);
+      transform:translate(-5px,-5px) rotate(-30deg);
+    }
+    .mini-halo::before{
+      width:26px;height:26px;
+      border:1px solid rgba(145,133,161,.32);
+      box-shadow:0 0 0 5px rgba(145,133,161,.08);
+    }
+    .mini-halo::after{
+      width:7px;height:7px;
+      background:#9185a1;
+    }
+
+    .option-copy{min-width:0}
+    .option-title{
+      display:block;
+      margin-bottom:4px;
+      font-size:13px;
+      font-weight:620;
+      letter-spacing:-.015em;
+    }
+    .option-note{
+      display:block;
+      overflow:hidden;
+      color:var(--muted);
+      font-size:10px;
+      white-space:nowrap;
+      text-overflow:ellipsis;
+    }
+    .option-index{
+      align-self:start;
+      padding-top:2px;
+      color:#aaa39a;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+      font-size:9px;
+    }
+    .option.is-active .option-index{color:var(--accent)}
+
+    .selector-foot{
+      margin-top:auto;
+      padding:13px 14px 11px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      color:var(--muted);
+      font-size:10px;
+    }
+    .tiny-line{
+      width:35px;height:1px;
+      background:linear-gradient(90deg,var(--accent),transparent);
+      transition:background .55s ease;
+    }
+
+    @keyframes slowTurn{to{transform:rotate(360deg)}}
+    @keyframes pearlPulse{
+      0%,100%{transform:scale(.55);opacity:.26}
+      35%{transform:scale(1);opacity:1}
+      58%{transform:scale(.78);opacity:.58}
+    }
+    @keyframes coreBreathe{
+      0%,100%{transform:scale(.82);opacity:.72}
+      50%{transform:scale(1.08);opacity:1}
+    }
+    @keyframes silkTravel{
+      0%{stroke-dashoffset:0;opacity:.2}
+      18%{opacity:1}
+      82%{opacity:1}
+      100%{stroke-dashoffset:-512;opacity:.2}
+    }
+    @keyframes petalBreathe{
+      0%,100%{transform:scaleY(.72) scaleX(.88);opacity:.38}
+      38%{transform:scaleY(1.05) scaleX(1);opacity:1}
+      64%{transform:scaleY(.88) scaleX(.94);opacity:.66}
+    }
+    @keyframes waterBreathe{
+      0%,100%{transform:translateY(4px)}
+      50%{transform:translateY(-3px)}
+    }
+    @keyframes wave{
+      0%,100%{transform:translateX(-3%) rotate(-2deg)}
+      50%{transform:translateX(5%) rotate(2deg)}
+    }
+    @keyframes bubbleUp{
+      0%{transform:translateY(12px) scale(.5);opacity:0}
+      20%{opacity:.72}
+      100%{transform:translateY(-72px) translateX(7px) scale(1);opacity:0}
+    }
+    @keyframes haloExpand{
+      0%{width:50px;height:50px;opacity:0;transform:scale(.82)}
+      18%{opacity:.62}
+      78%{opacity:.08}
+      100%{width:174px;height:174px;opacity:0;transform:scale(1)}
+    }
+    @keyframes seedRing{
+      0%,100%{transform:scale(.82);opacity:.35}
+      50%{transform:scale(1.28);opacity:1}
+    }
+
+    @media (max-width:900px){
+      .shell{min-height:auto}
+      .content{grid-template-columns:1fr}
+      .preview{min-height:520px}
+      .selector{
+        display:grid;
+        grid-template-columns:repeat(5,minmax(180px,1fr));
+        overflow-x:auto;
+        scroll-snap-type:x proximity;
+        padding:8px;
+      }
+      .selector-head,.selector-foot{display:none}
+      .option{scroll-snap-align:start}
+    }
+
+    @media (max-width:600px){
+      .page{padding:12px}
+      .shell{padding:16px;border-radius:25px;gap:16px}
+      .topbar{align-items:flex-start}
+      .meta{font-size:0;gap:0}
+      .meta .meta-dot{display:block}
+      .eyebrow{letter-spacing:.19em}
+      h1{font-size:20px}
+      .preview{min-height:500px;padding:22px 18px;border-radius:22px}
+      .preview-title{font-size:30px}
+      .preview-subtitle{max-width:250px}
+      .number{width:36px;height:36px}
+      .stage{min-height:245px}
+      .selector{border-radius:21px}
+      .option{min-width:205px}
+    }
+
+    @media (prefers-reduced-motion:reduce){
+      *,*::before,*::after{
+        animation-duration:.001ms !important;
+        animation-iteration-count:1 !important;
+        scroll-behavior:auto !important;
+        transition-duration:.001ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="shell" aria-label="精致加载动画展示">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div class="brand-copy">
+            <p class="eyebrow">Elegant motion studies</p>
+            <h1>精致加载动效</h1>
+          </div>
+        </div>
+        <div class="meta"><span class="meta-dot"></span><span>纯 HTML · CSS · JavaScript</span></div>
+      </header>
+
+      <div class="content">
+        <section class="preview" aria-live="polite">
+          <div class="preview-head">
+            <div>
+              <p class="section-kicker" id="kicker">Soft rhythm</p>
+              <h2 class="preview-title" id="title">珍珠轨迹</h2>
+              <p class="preview-subtitle" id="subtitle">克制的呼吸节奏，适合品牌页、内容骨架与轻量等待状态。</p>
+            </div>
+            <div class="number" id="number">01</div>
+          </div>
+
+          <div class="stage" aria-label="加载动画预览">
+            <div class="loader-scene is-active" data-scene="pearl">
+              <div class="pearl-loader" aria-hidden="true">
+                <div class="pearl-orbit">
+                  <i class="pearl" style="--i:0"></i><i class="pearl" style="--i:1"></i>
+                  <i class="pearl" style="--i:2"></i><i class="pearl" style="--i:3"></i>
+                  <i class="pearl" style="--i:4"></i><i class="pearl" style="--i:5"></i>
+                  <i class="pearl" style="--i:6"></i><i class="pearl" style="--i:7"></i>
+                  <i class="pearl" style="--i:8"></i><i class="pearl" style="--i:9"></i>
+                  <i class="pearl" style="--i:10"></i><i class="pearl" style="--i:11"></i>
+                </div>
+                <div class="pearl-core"></div>
+              </div>
+            </div>
+
+            <div class="loader-scene" data-scene="silk">
+              <div class="silk-loader" aria-hidden="true">
+                <svg viewBox="0 0 320 150" role="presentation">
+                  <defs>
+                    <linearGradient id="silkGradient" x1="0" y1="0" x2="1" y2="1">
+                      <stop offset="0" stop-color="#ffffff" />
+                      <stop offset="0.27" stop-color="var(--accent-soft)" />
+                      <stop offset="0.58" stop-color="var(--accent)" />
+                      <stop offset="1" stop-color="#ffffff" />
+                    </linearGradient>
+                  </defs>
+                  <path class="silk-shadow" pathLength="512" d="M30 78 C72 21 118 21 160 78 C202 135 248 135 290 78 C248 21 202 21 160 78 C118 135 72 135 30 78" />
+                  <path class="silk-base" pathLength="512" d="M30 78 C72 21 118 21 160 78 C202 135 248 135 290 78 C248 21 202 21 160 78 C118 135 72 135 30 78" />
+                  <path class="silk-runner" pathLength="512" d="M30 78 C72 21 118 21 160 78 C202 135 248 135 290 78 C248 21 202 21 160 78 C118 135 72 135 30 78" />
+                  <path class="silk-runner second" pathLength="512" d="M30 78 C72 21 118 21 160 78 C202 135 248 135 290 78 C248 21 202 21 160 78 C118 135 72 135 30 78" />
+                </svg>
+                <span class="silk-caption">flowing gently</span>
+              </div>
+            </div>
+
+            <div class="loader-scene" data-scene="bloom">
+              <div class="bloom-loader" aria-hidden="true">
+                <div class="bloom-ring">
+                  <i class="petal-wrap" style="--i:0"><b class="petal"></b></i>
+                  <i class="petal-wrap" style="--i:1"><b class="petal"></b></i>
+                  <i class="petal-wrap" style="--i:2"><b class="petal"></b></i>
+                  <i class="petal-wrap" style="--i:3"><b class="petal"></b></i>
+                  <i class="petal-wrap" style="--i:4"><b class="petal"></b></i>
+                  <i class="petal-wrap" style="--i:5"><b class="petal"></b></i>
+                  <i class="petal-wrap" style="--i:6"><b class="petal"></b></i>
+                  <i class="petal-wrap" style="--i:7"><b class="petal"></b></i>
+                </div>
+                <div class="bloom-center"></div>
+              </div>
+            </div>
+
+            <div class="loader-scene" data-scene="liquid">
+              <div class="liquid-loader" aria-hidden="true">
+                <div class="liquid-orb">
+                  <div class="water"></div>
+                  <i class="bubble" style="--x:34%;--delay:-.2s"></i>
+                  <i class="bubble" style="--x:57%;--delay:-1.4s;width:5px;height:5px"></i>
+                  <i class="bubble" style="--x:69%;--delay:-2.1s;width:9px;height:9px"></i>
+                  <span class="liquid-glint"></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="loader-scene" data-scene="halo">
+              <div class="halo-loader" aria-hidden="true">
+                <i class="halo" style="--i:0"></i>
+                <i class="halo" style="--i:1"></i>
+                <i class="halo" style="--i:2"></i>
+                <div class="halo-seed"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="progress-area">
+            <div class="progress-meta">
+              <span class="progress-copy" id="status">正在整理细节，请稍候</span>
+              <span class="progress-number" id="progressNumber">0%</span>
+            </div>
+            <div class="progress-track" aria-hidden="true"><span class="progress-fill"></span></div>
+          </div>
+        </section>
+
+        <aside class="selector" aria-label="选择加载动画">
+          <div class="selector-head">
+            <h2>动效样式</h2>
+            <p>低饱和配色、细腻缓动与克制的层次感。</p>
+          </div>
+
+          <button class="option is-active" type="button" data-id="pearl" data-number="01" data-kicker="Soft rhythm" data-title="珍珠轨迹" data-subtitle="克制的呼吸节奏，适合品牌页、内容骨架与轻量等待状态。" data-accent="#b58b5d" data-rgb="181,139,93" data-soft="#efe4d7" aria-pressed="true">
+            <span class="mini mini-orbit" aria-hidden="true"></span>
+            <span class="option-copy"><span class="option-title">珍珠轨迹</span><span class="option-note">柔和 · 品牌感</span></span>
+            <span class="option-index">01</span>
+          </button>
+
+          <button class="option" type="button" data-id="silk" data-number="02" data-kicker="Continuous flow" data-title="丝带流线" data-subtitle="一笔不断的流动轨迹，适合上传、同步与内容生成过程。" data-accent="#7f9aa8" data-rgb="127,154,168" data-soft="#dfe8eb" aria-pressed="false">
+            <span class="mini mini-silk" aria-hidden="true"></span>
+            <span class="option-copy"><span class="option-title">丝带流线</span><span class="option-note">顺滑 · 连续感</span></span>
+            <span class="option-index">02</span>
+          </button>
+
+          <button class="option" type="button" data-id="bloom" data-number="03" data-kicker="Quiet bloom" data-title="花瓣呼吸" data-subtitle="花瓣依次舒展又收拢，细腻但不喧闹，适合生活方式与女性向产品。" data-accent="#c18f91" data-rgb="193,143,145" data-soft="#f0dddd" aria-pressed="false">
+            <span class="mini mini-bloom" aria-hidden="true"></span>
+            <span class="option-copy"><span class="option-title">花瓣呼吸</span><span class="option-note">优雅 · 有温度</span></span>
+            <span class="option-index">03</span>
+          </button>
+
+          <button class="option" type="button" data-id="liquid" data-number="04" data-kicker="Liquid balance" data-title="液态玻璃" data-subtitle="透明球体与柔软液面结合，适合文件处理、下载与阶段性进度展示。" data-accent="#7a9b8b" data-rgb="122,155,139" data-soft="#dde8e2" aria-pressed="false">
+            <span class="mini mini-liquid" aria-hidden="true"></span>
+            <span class="option-copy"><span class="option-title">液态玻璃</span><span class="option-note">通透 · 进度感</span></span>
+            <span class="option-index">04</span>
+          </button>
+
+          <button class="option" type="button" data-id="halo" data-number="05" data-kicker="Calm presence" data-title="呼吸光晕" data-subtitle="以缓慢扩散的圆环传达持续状态，适合冥想、音频与高级服务场景。" data-accent="#9185a1" data-rgb="145,133,161" data-soft="#e6e1eb" aria-pressed="false">
+            <span class="mini mini-halo" aria-hidden="true"></span>
+            <span class="option-copy"><span class="option-title">呼吸光晕</span><span class="option-note">安静 · 松弛感</span></span>
+            <span class="option-index">05</span>
+          </button>
+
+          <div class="selector-foot"><span>点击切换预览</span><i class="tiny-line"></i></div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      const root = document.documentElement;
+      const options = [...document.querySelectorAll('.option')];
+      const scenes = [...document.querySelectorAll('.loader-scene')];
+      const title = document.getElementById('title');
+      const subtitle = document.getElementById('subtitle');
+      const kicker = document.getElementById('kicker');
+      const number = document.getElementById('number');
+      const progressNumber = document.getElementById('progressNumber');
+      const status = document.getElementById('status');
+
+      const statusCopy = [
+        '正在整理细节，请稍候',
+        '正在完成最后的润色',
+        '内容即将准备完成'
+      ];
+
+      function select(option) {
+        const id = option.dataset.id;
+        options.forEach(item => {
+          const active = item === option;
+          item.classList.toggle('is-active', active);
+          item.setAttribute('aria-pressed', String(active));
+        });
+        scenes.forEach(scene => scene.classList.toggle('is-active', scene.dataset.scene === id));
+
+        root.style.setProperty('--accent', option.dataset.accent);
+        root.style.setProperty('--accent-rgb', option.dataset.rgb);
+        root.style.setProperty('--accent-soft', option.dataset.soft);
+        kicker.textContent = option.dataset.kicker;
+        title.textContent = option.dataset.title;
+        subtitle.textContent = option.dataset.subtitle;
+        number.textContent = option.dataset.number;
+      }
+
+      options.forEach(option => option.addEventListener('click', () => select(option)));
+
+      const start = performance.now();
+      const fillDuration = 6300;
+      const finishDuration = 450;
+      const holdDuration = 900;
+      const cycleDuration = fillDuration + finishDuration + holdDuration;
+
+      function tick(now) {
+        const elapsed = (now - start) % cycleDuration;
+        let value;
+
+        if (elapsed < fillDuration) {
+          const raw = elapsed / fillDuration;
+          const eased = 1 - Math.pow(1 - raw, 2.15);
+          value = Math.min(98, Math.round(eased * 98));
+        } else if (elapsed < fillDuration + finishDuration) {
+          const finish = (elapsed - fillDuration) / finishDuration;
+          value = Math.round(98 + finish * 2);
+        } else {
+          value = 100;
+        }
+
+        root.style.setProperty('--progress', value + '%');
+        progressNumber.textContent = value + '%';
+        status.textContent = statusCopy[value < 66 ? 0 : value < 96 ? 1 : 2];
+        requestAnimationFrame(tick);
+      }
+
+      requestAnimationFrame(tick);
+    })();
+  </script>
+</body>
+</html>

@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { defaultModelByProvider, modelProviderDefinitions, modelProviderValues, modelProviderDefinition } from '@/config/settings';
-import { store } from '@/server/db/mock-store';
+import { defaultModelByProvider, defaultModelForProvider, modelListForProvider, modelProviderDefinitions, modelProviderValues, modelProviderDefinition } from '@/config/settings';
+import { store } from '@/server/db/store';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/test-case.schema';
+import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 
 const providers = new Set<ModelProvider>(modelProviderValues);
 
@@ -9,30 +10,9 @@ function normalizeProvider(value: unknown): ModelProvider {
   const provider = String(value || 'openrouter').trim().toLowerCase();
   if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
   if (provider === 'codex' || provider === 'codex-cli') return 'codex';
-  if (provider === 'gemini' || provider === 'gemini-cli') return 'gemini';
+  if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
   if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
   return providers.has(provider as ModelProvider) ? provider as ModelProvider : 'openrouter';
-}
-
-function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
-  return {
-    model: defaultModelByProvider[provider],
-    apiKey: '',
-    baseURL: modelProviderDefinition(provider).defaultBaseURL || '',
-  };
-}
-
-function completeProviders(input?: Partial<Record<ModelProvider, ModelProviderSettings>>) {
-  const result: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
-  for (const definition of modelProviderDefinitions) {
-    const current = input?.[definition.value];
-    result[definition.value] = {
-      ...defaultProviderSettings(definition.value),
-      ...current,
-      model: current?.model?.trim() || definition.defaultModel,
-    };
-  }
-  return result;
 }
 
 function readProviderSettings(value: unknown): Partial<Record<ModelProvider, ModelProviderSettings>> {
@@ -43,8 +23,23 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
     const raw = input[definition.value];
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
     const item = raw as Record<string, unknown>;
+    const rawModels = Array.isArray(item.models)
+      ? item.models.map((model) => typeof model === 'string' ? model : '').filter(Boolean)
+      : [];
+    const models = modelListForProvider(definition, {
+      models: rawModels,
+      defaultModel: typeof item.defaultModel === 'string' ? item.defaultModel : undefined,
+      model: typeof item.model === 'string' ? item.model : undefined,
+    });
+    const model = defaultModelForProvider(definition, {
+      models,
+      defaultModel: typeof item.defaultModel === 'string' ? item.defaultModel : undefined,
+      model: typeof item.model === 'string' ? item.model : undefined,
+    });
     result[definition.value] = {
-      model: typeof item.model === 'string' && item.model.trim() ? item.model.trim() : definition.defaultModel,
+      defaultModel: model,
+      model,
+      models,
       apiKey: typeof item.apiKey === 'string' ? item.apiKey : '',
       baseURL: typeof item.baseURL === 'string' ? item.baseURL : definition.defaultBaseURL || '',
     };
@@ -53,17 +48,7 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
 }
 
 export async function GET() {
-  store.applyRuntimeEnv();
-  const saved = store.getModelConfig();
-  const provider = saved?.provider || 'openrouter';
-  return NextResponse.json({
-    saved: Boolean(saved),
-    config: {
-      provider,
-      providers: completeProviders(saved?.providers),
-      updatedAt: saved?.updatedAt,
-    },
-  });
+  return NextResponse.json(readModelSettingsState());
 }
 
 export async function POST(request: NextRequest) {
@@ -72,8 +57,14 @@ export async function POST(request: NextRequest) {
     const provider = normalizeProvider(body.provider);
     const providersInput = readProviderSettings(body.providers);
     if (!Object.keys(providersInput).length) {
+      const definition = modelProviderDefinition(provider);
+      const bodyModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultModelByProvider[provider];
+      const models = modelListForProvider(definition, { model: bodyModel });
+      const model = defaultModelForProvider(definition, { models, model: bodyModel });
       providersInput[provider] = {
-        model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultModelByProvider[provider],
+        defaultModel: model,
+        model,
+        models,
         apiKey: typeof body.apiKey === 'string' ? body.apiKey : '',
         baseURL: typeof body.baseURL === 'string' ? body.baseURL : modelProviderDefinition(provider).defaultBaseURL || '',
       };

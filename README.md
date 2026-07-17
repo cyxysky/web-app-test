@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:3000`. Create a `.env.local` file for local development; for Docker, create `.env` in the project root.
 
 The app uses DeepSeek by default:
 
@@ -24,6 +24,27 @@ You can override `AI_PROVIDER`, `AI_MODEL`, `DEEPSEEK_API_KEY`, `OPENAI_BASE_URL
 If the model call fails, generation falls back to a local structured test case and records the failure reason in the test case risks.
 
 Browser execution accepts `http` and `https` target URLs by default. Set `ALLOWED_TEST_DOMAINS=localhost,127.0.0.1,example.com` to restrict runs to a domain allowlist.
+
+## Personal Memory
+
+Browser chat stores local personal memory in the SQLite runtime database.
+It does not require an embedding model or vector database. After a completed browser-chat turn, the app asks the current chat model to extract only concise durable items such as aliases, preferences, workflows, and domain facts. Future turns recall matching active items by user id, current domain, and keyword/alias match.
+
+You can view, add, edit, disable, and delete memory items in Settings -> Personal Memory. The local SQLite database remains the source of truth for backup or bulk cleanup.
+
+Runtime controls:
+
+- `AI_PERSONAL_MEMORY_ENABLED=false` disables recall and extraction.
+- `AI_PERSONAL_MEMORY_EXTRACT_ENABLED=false` disables post-turn extraction while keeping manual memory recall available.
+- `AI_PERSONAL_MEMORY_PROMPT_LIMIT=6` controls how many memory items are injected into one turn.
+- `AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS=30000` controls the extraction request timeout.
+
+Minimal management API:
+
+- `GET /api/personal-memory?userId=...&domain=...&includeDisabled=true`
+- `POST /api/personal-memory`
+- `PATCH /api/personal-memory/{id}`
+- `DELETE /api/personal-memory/{id}`
 
 Each test case can choose a browser operation mode:
 
@@ -57,7 +78,7 @@ During AI execution, `getHttpRequests` is available as a read-only diagnostic to
 
 Docker is available for packaged runs because the app depends on Playwright and a Chromium runtime.
 
-1. Copy `.env.example` to `.env` and fill the provider key you want to use.
+1. Create `.env` and fill the provider key you want to use.
 2. Build and start:
 
 ```bash
@@ -68,7 +89,17 @@ Then open `http://localhost:3000`.
 
 The compose setup keeps runtime data outside the image:
 
-- `.data/store.json` stores test cases and runs.
-- `artifacts/` stores screenshots and reports.
+- `.data/webpilot.db` is the SQLite source of truth for model/runtime settings, test cases, runs, browser-chat sessions, personal memory, and Electron workspace state.
+- `artifacts/` keeps screenshots, traces, uploads, reports, and other large generated files outside the database.
+- Chromium profiles and caches remain managed by Chromium in their native file layout.
 
 For unattended packaged regression runs, keep `HEADLESS_BROWSER=true`. For account-based exploratory testing or manual verification, prefer a visible or CDP-connected browser.
+
+## Desktop development
+
+Start the Next.js server first, then launch Electron in another PowerShell window:
+
+```powershell
+$env:WEBPILOT_ELECTRON_SERVER_URL="http://127.0.0.1:3000"
+npx electron .
+```

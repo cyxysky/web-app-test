@@ -1,25 +1,33 @@
 import type { ModelProvider } from '@/server/ai/schemas/test-case.schema';
 
-export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'debug';
+export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'memory' | 'dom-test' | 'debug';
 
 export type ModelProviderDefinition = {
   value: ModelProvider;
   label: string;
   defaultModel: string;
+  defaultModels?: string[];
   keyLabel: string;
   baseUrlLabel?: string;
   defaultBaseURL?: string;
   localAuth?: boolean;
 };
 
+export type ModelSettingsLike = {
+  defaultModel?: string;
+  model?: string;
+  models?: string[];
+};
+
 export type RuntimeEnvDefinition = {
   key: string;
   label: string;
   description: string;
-  tab: Exclude<SettingsTab, 'general' | 'model'>;
+  tab: Exclude<SettingsTab, 'general' | 'model' | 'skills' | 'memory' | 'dom-test'>;
   defaultValue: string;
-  control: 'boolean' | 'number' | 'select' | 'text' | 'secret';
+  control: 'boolean' | 'number' | 'select' | 'text' | 'secret' | 'textarea';
   options?: Array<{ label: string; value: string }>;
+  picker?: 'directory';
   secret?: boolean;
 };
 
@@ -37,7 +45,6 @@ export const modelProviderDefinitions: ModelProviderDefinition[] = [
     defaultBaseURL: 'http://localhost:1234/v1',
   },
   { value: 'google', label: 'Google Gemini API', defaultModel: 'gemini-3-flash-preview', keyLabel: 'Google 访问密钥' },
-  { value: 'gemini', label: 'Gemini CLI', defaultModel: 'gemini-3-flash-preview', keyLabel: 'Gemini CLI 使用本地登录，无需 Key', localAuth: true },
   { value: 'codex', label: 'Codex CLI', defaultModel: 'gpt-5.5', keyLabel: 'Codex CLI 使用本地登录，无需 Key', localAuth: true },
   { value: 'anthropic', label: 'Anthropic', defaultModel: 'claude-sonnet-4-5', keyLabel: 'Anthropic 访问密钥', baseUrlLabel: 'Anthropic 服务地址' },
   { value: 'deepseek', label: 'DeepSeek', defaultModel: 'deepseek-v4-flash', keyLabel: 'DeepSeek 访问密钥' },
@@ -77,45 +84,68 @@ export function modelProviderDefinition(provider: ModelProvider) {
   return modelProviderDefinitions.find((item) => item.value === provider) || modelProviderDefinitions[0];
 }
 
+export function uniqueModelIds(values: Array<string | undefined | null>) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const model = String(value || '').trim();
+    if (!model || seen.has(model)) continue;
+    seen.add(model);
+    result.push(model);
+  }
+  return result;
+}
+
+export function modelListForProvider(definition: ModelProviderDefinition, settings?: ModelSettingsLike) {
+  const models = uniqueModelIds([
+    ...(settings?.models || []),
+    settings?.defaultModel,
+    settings?.model,
+    ...(definition.defaultModels || []),
+    definition.defaultModel,
+  ]);
+  return models.length ? models : [definition.defaultModel];
+}
+
+export function defaultModelForProvider(definition: ModelProviderDefinition, settings?: ModelSettingsLike) {
+  const models = modelListForProvider(definition, settings);
+  const requested = String(settings?.defaultModel || settings?.model || definition.defaultModel).trim();
+  return requested && models.includes(requested) ? requested : models[0];
+}
+
 const boolOptions = [
   { label: '开启', value: 'true' },
   { label: '关闭', value: 'false' },
 ];
 
 export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
-  { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: 'visual-markers 使用截图编号，dom 使用 DOM 定位。', tab: 'browser', defaultValue: 'visual-markers', control: 'select', options: [{ label: '视觉标记', value: 'visual-markers' }, { label: 'DOM 定位', value: 'dom' }] },
+  { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
+  { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: '使用 DOMSnapshot 与局部无障碍语义生成 UID；视觉信息通过 takeScreenshot 按需获取。', tab: 'browser', defaultValue: 'dom', control: 'select', options: [{ label: '语义快照', value: 'dom' }] },
   { key: 'BROWSER_CDP_ENDPOINT', label: '现有浏览器 CDP 地址', description: '连接已开启远程调试的 Chrome/Edge，例如 http://127.0.0.1:9222；可复用登录态。留空则启动新浏览器。', tab: 'browser', defaultValue: '', control: 'text' },
   { key: 'BROWSER_USER_DATA_DIR', label: '浏览器用户数据目录', description: '未配置 CDP 时使用指定 profile 启动持久浏览器，适合保存登录态。留空使用临时上下文。', tab: 'browser', defaultValue: '', control: 'text' },
   { key: 'BROWSER_CHANNEL', label: '浏览器通道', description: '可选 chrome、msedge 等本机浏览器通道；留空使用 Playwright Chromium。', tab: 'browser', defaultValue: '', control: 'text' },
   { key: 'HEADLESS_BROWSER', label: '无头浏览器', description: '是否隐藏浏览器窗口运行。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'BROWSER_FULLSCREEN', label: '浏览器全屏', description: '启动浏览器时是否尽量使用全屏窗口。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'BROWSER_VIEWPORT_WIDTH', label: '视口宽度', description: '浏览器视口宽度。', tab: 'browser', defaultValue: '1920', control: 'number' },
-  { key: 'BROWSER_VIEWPORT_HEIGHT', label: '视口高度', description: '浏览器视口高度。', tab: 'browser', defaultValue: '1080', control: 'number' },
+  { key: 'BROWSER_VIEWPORT_MODE', label: '视口模式', description: '自动时跟随真实浏览器窗口；固定时使用下方视口宽高。', tab: 'browser', defaultValue: 'auto', control: 'select', options: [{ label: '自动跟随窗口', value: 'auto' }, { label: '固定宽高', value: 'fixed' }] },
+  { key: 'BROWSER_VIEWPORT_WIDTH', label: '视口宽度', description: '固定模式下的浏览器视口宽度；留空则自动跟随窗口。', tab: 'browser', defaultValue: '', control: 'number' },
+  { key: 'BROWSER_VIEWPORT_HEIGHT', label: '视口高度', description: '固定模式下的浏览器视口高度；留空则自动跟随窗口。', tab: 'browser', defaultValue: '', control: 'number' },
   { key: 'BROWSER_SLOW_MO_MS', label: '浏览器动作延迟', description: 'Playwright 每个动作的慢速延迟，单位毫秒。', tab: 'browser', defaultValue: '250', control: 'number' },
   { key: 'BROWSER_ACTION_SETTLE_MS', label: '动作后等待', description: '每次动作后额外等待页面稳定的时间。', tab: 'browser', defaultValue: '0', control: 'number' },
+  { key: 'BROWSER_NAVIGATION_DOM_QUIET_MS', label: '导航后 DOM 静默窗口', description: '导航提交后 DOM 连续保持不变达到该时长即生成语义快照，单位毫秒；0 表示关闭。', tab: 'browser', defaultValue: '250', control: 'number' },
+  { key: 'BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS', label: '导航后 DOM 稳定上限', description: '等待导航后 DOM 稳定的最长时间，达到上限后继续生成当前快照，单位毫秒；0 表示关闭。', tab: 'browser', defaultValue: '1000', control: 'number' },
   { key: 'BROWSER_POPUP_WAIT_MS', label: '弹窗等待时间', description: '点击后等待新标签页或弹窗出现的时间。', tab: 'browser', defaultValue: '600', control: 'number' },
   { key: 'BROWSER_IGNORE_HTTPS_ERRORS', label: '忽略 HTTPS 错误', description: '测试环境证书异常时允许继续打开页面。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'BROWSER_HTTP_REQUEST_HISTORY_LIMIT', label: 'HTTP 请求历史上限', description: '每个标签页保留多少条 HTTP 请求记录，供 AI 诊断接口和资源加载问题。', tab: 'browser', defaultValue: '400', control: 'number' },
   { key: 'AI_HTTP_REQUEST_TOOL_LIMIT', label: 'HTTP 请求工具返回条数', description: 'AI 调用 getHttpRequests 时最多返回当前标签页最近多少条请求。', tab: 'browser', defaultValue: '80', control: 'number' },
-  { key: 'SCREENSHOT_ELEMENT_LABELS', label: '截图元素编号', description: '在截图上绘制可点击元素编号。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'SCREENSHOT_SCROLL_AREA_LABELS', label: '滚动区域标记', description: '在截图上绘制可滚动区域标记。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'SCREENSHOT_ELEMENT_LABEL_LIMIT', label: '元素编号上限', description: '单张截图最多标记多少个候选元素。', tab: 'browser', defaultValue: '160', control: 'number' },
-  { key: 'SCREENSHOT_SCROLL_AREA_LABEL_LIMIT', label: '滚动区域上限', description: '单张截图最多标记多少个滚动区域。', tab: 'browser', defaultValue: '12', control: 'number' },
   { key: 'SCREENSHOT_STABILIZE_MS', label: '截图前稳定等待', description: '截图前等待页面稳定的时间。', tab: 'browser', defaultValue: '1000', control: 'number' },
-  { key: 'SCREENSHOT_MAX_KB', label: '截图压缩上限', description: '发送给模型前的截图大小上限，留空表示不压缩。', tab: 'browser', defaultValue: '', control: 'number' },
-  { key: 'AI_SCREENSHOT_MAX_KB', label: 'AI 截图压缩上限', description: '发送给 AI 的截图大小上限，留空表示沿用截图压缩上限。', tab: 'browser', defaultValue: '', control: 'number' },
-  { key: 'VISUAL_MARKERS_IS_MARKED', label: '启用视觉标记', description: '是否在截图上叠加候选编号。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'VISUAL_MARKER_SEPARATE_MAP', label: '单独标记图', description: '把标记图和原截图分开发给模型，运行证据链展示不带标识的原图。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
+  { key: 'SCREENSHOT_TIMEOUT_MS', label: '截图超时', description: 'Playwright 截图等待上限，单位毫秒；默认 15000。', tab: 'browser', defaultValue: '15000', control: 'number' },
+  { key: 'BROWSER_CHAT_DOM_SCREENSHOTS', label: 'DOM 模式保存截图', description: '对话 DOM 模式是否保存步骤截图；关闭时不会因截图超时阻塞执行。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
+  { key: 'AI_SCREENSHOT_MAX_KB', label: 'AI 截图压缩上限', description: '发送给 AI 的截图大小上限，留空表示不压缩。', tab: 'browser', defaultValue: '', control: 'number' },
   { key: 'SEND_SCREENSHOT_TO_AI', label: '强制发送截图', description: '覆盖模型能力判断，留空表示自动判断。', tab: 'browser', defaultValue: '', control: 'select', options: [{ label: '自动', value: '' }, ...boolOptions] },
-  { key: 'INTERACTIVE_CANDIDATE_LIMIT', label: '交互候选上限', description: '页面上下文最多采集多少个候选元素。', tab: 'browser', defaultValue: '160', control: 'number' },
-  { key: 'DOM_TREE_MAX_NODES', label: 'DOM 节点上限', description: 'DOM 模式下最多读取多少个简化节点。', tab: 'browser', defaultValue: '320', control: 'number' },
-  { key: 'DOM_TREE_MAX_DEPTH', label: 'DOM 深度上限', description: 'DOM 模式下读取 DOM 树的最大深度。', tab: 'browser', defaultValue: '14', control: 'number' },
 
   { key: 'KEEP_BROWSER_OPEN_AFTER_RUN', label: '运行后保留浏览器', description: '运行结束后是否保持浏览器打开。', tab: 'runtime', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'KEEP_BROWSER_OPEN_ON_AI_ERROR', label: 'AI 错误时保留浏览器', description: 'AI 调用异常时是否保留浏览器用于排查。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'AI_TEST_RUNTIME_MAX_STEPS', label: '最大运行步骤数', description: '单次测试最多允许 AI 执行多少个运行步骤。', tab: 'runtime', defaultValue: '30', control: 'number' },
-  { key: 'AI_BROWSER_CHAT_MAX_STEPS', label: '对话模式浏览器步骤上限', description: '对话模式中，单轮用户消息最多允许执行多少个浏览器步骤；达到后会保存进度并暂停，发送“继续”可接着执行。', tab: 'runtime', defaultValue: '6', control: 'number' },
-  { key: 'AI_AGENT_LOOP_MAX_TURNS', label: 'Agent Loop 最大轮次', description: '单个步骤内部最多允许多少轮工具调用。', tab: 'runtime', defaultValue: '6', control: 'number' },
+  { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。对话模式和目标模式都会生效。', tab: 'runtime', defaultValue: '', control: 'textarea' },
   { key: 'RUN_WORKER_CONCURRENCY', label: '运行并发数', description: '同时执行多少个测试运行。', tab: 'runtime', defaultValue: '1', control: 'number' },
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
   { key: 'REPLAY_STEP_DELAY_MS', label: '回放步骤间隔', description: '固定流程回放时每个录制动作前的等待时间，用于模拟 AI 每轮观察和页面加载间隔。', tab: 'runtime', defaultValue: '1500', control: 'number' },
@@ -123,8 +153,19 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'REPLAY_AI_REPAIR', label: '回放失败 AI 修复', description: '固定流程回放工具失败时，是否让 AI 接管当前页面自动修复操作。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'REPLAY_AI_REPAIR_MAX_STEPS', label: 'AI 修复重试步数', description: '回放失败后 AI 修复最多允许连续接管多少个步骤，通常 1-2 即可。', tab: 'runtime', defaultValue: '2', control: 'number' },
   { key: 'AI_TEST_REQUEST_TIMEOUT_MS', label: 'AI 请求超时', description: '单次模型请求最长等待时间。', tab: 'runtime', defaultValue: '30000', control: 'number' },
+  { key: 'AI_AGENT_LOOP_TIMEOUT_MS', label: 'Agent Loop 请求超时', description: '带工具循环的单个用户请求最长等待时间；留空时默认 120000。', tab: 'runtime', defaultValue: '120000', control: 'number' },
+  { key: 'AI_RUNTIME_REQUEST_RETRY_ATTEMPTS', label: 'AI 请求连续失败上限', description: 'Agent Loop 中上游连接或请求级错误连续失败达到该次数后停止；成功一次会清零。', tab: 'runtime', defaultValue: '3', control: 'number' },
+  { key: 'BROWSER_CHAT_KEEP_BROWSER_OPEN_AFTER_TURN', label: '对话完成保留浏览器', description: '浏览器对话每轮完成后是否保留浏览器，便于同一用户后续对话复用。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
+  { key: 'BROWSER_CHAT_SHOW_REASONING', label: '对话展示思维链', description: '是否在对话模式中展示模型返回的推理内容；关闭后仍会保留工具调用与最终回复。', tab: 'runtime', defaultValue: 'false', control: 'boolean', options: boolOptions },
+  { key: 'BROWSER_CHAT_LOG_LIMIT', label: '对话日志保留上限', description: '每个浏览器对话最多保留多少条执行日志；前端日志弹窗使用虚拟滚动。', tab: 'runtime', defaultValue: '2000', control: 'number' },
+  { key: 'AI_PERSONAL_MEMORY_ENABLED', label: '个性化记忆召回', description: '是否在浏览器对话提示词中召回简洁的用户记忆和域名记忆。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
+  { key: 'AI_PERSONAL_MEMORY_EXTRACT_ENABLED', label: '个性化记忆提炼', description: '每轮浏览器对话完成后，是否提炼可长期复用的别名、偏好、工作流和域名事实。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
+  { key: 'AI_PERSONAL_MEMORY_PROMPT_LIMIT', label: '个性化记忆注入上限', description: '单轮浏览器对话最多注入多少条个性化记忆。', tab: 'runtime', defaultValue: '6', control: 'number' },
+  { key: 'AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS', label: '个性化记忆提炼超时', description: '对话结束后，记忆提炼模型请求允许的最长时间，单位毫秒。', tab: 'runtime', defaultValue: '30000', control: 'number' },
   { key: 'AI_CONTEXT_WINDOW_TOKENS', label: '上下文窗口大小', description: '估算模型上下文窗口大小。', tab: 'runtime', defaultValue: '32000', control: 'number' },
   { key: 'AI_CONTEXT_COMPRESSION_THRESHOLD', label: '上下文压缩阈值', description: '超过上下文窗口多少比例后压缩历史。', tab: 'runtime', defaultValue: '0.7', control: 'number' },
+  { key: 'AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS', label: '压缩摘要输入上限', description: 'Agent Loop 生成续接摘要时保留的历史字符上限；会优先保留上一摘要和最新工具结果。', tab: 'runtime', defaultValue: '120000', control: 'number' },
+  { key: 'AI_AGENT_LOOP_SUMMARY_OUTPUT_MAX_CHARS', label: '压缩摘要输出上限', description: 'Agent Loop 续接摘要允许的最大字符数。', tab: 'runtime', defaultValue: '24000', control: 'number' },
   { key: 'AI_IMAGE_CONTEXT_ESTIMATE_TOKENS', label: '单张图片估算 Token', description: '估算每张截图占用的上下文 token。', tab: 'runtime', defaultValue: '1200', control: 'number' },
   { key: 'AI_VISUAL_HISTORY_LIMIT', label: '视觉历史上限', description: 'Visual Context Manager 保留多少张历史图。', tab: 'runtime', defaultValue: '6', control: 'number' },
   { key: 'AI_VISUAL_COMPRESSED_HISTORY_LIMIT', label: '压缩后历史图上限', description: '上下文压缩后保留多少张历史图。', tab: 'runtime', defaultValue: '2', control: 'number' },

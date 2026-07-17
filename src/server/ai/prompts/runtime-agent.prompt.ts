@@ -14,19 +14,6 @@ type CompletionVerificationPromptInput = {
   recentProgressNotes: string[];
 };
 
-type PrepareStepPromptInput = {
-  requestPrompt: string;
-  compressionNote?: string;
-  workingMemoryText: string;
-  visualContextText: string;
-  currentToolAttemptsText: string;
-  turnIndex: number;
-  maxTurns: number;
-  traceLimit: number;
-  allowTextResponse?: boolean;
-  browserMode?: 'dom' | 'visual-markers';
-};
-
 export function buildCompletionPromptLines(usesScreenshot: boolean) {
   const evidence = usesScreenshot ? 'screenshot' : 'textual page context / candidates / DOM / URL / focus';
   return [
@@ -84,8 +71,8 @@ export function buildCompletionVerificationPrompt(input: CompletionVerificationP
 
 export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
   const answerAllowed = allowedTypes.includes('answer');
-  const visualMode = allowedTypes.includes('clickCandidate');
-  const domMode = allowedTypes.includes('clickDomNode') || allowedTypes.includes('getDomNodeText');
+  const snapshotMode = allowedTypes.includes('takeSnapshot');
+  const screenshotMode = allowedTypes.includes('takeScreenshot');
   return [
     prompt,
     '',
@@ -96,12 +83,16 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- All user-facing strings such as message/reason/action/expected/actual must be Chinese.',
     `- type must be one of: ${allowedTypes.join(', ')}.`,
     '- params should include only keys required by that tool plus a concise reason.',
+    answerAllowed ? '- In browser chat strict safety mode, important actions must still return the intended tool object; add params.requiresConfirmation=true and a concise Chinese params.confirmationMessage so the UI can pause with Confirm/Cancel buttons before execution. Do not ask the user to type confirmation text.' : '',
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
-    '- In message/reason/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot ids/file names, or tool input JSON.',
-    visualMode ? '- For candidate actions, include targetVisual and make reason describe the current screenshot visible target text/icon/position/role before choosing id.' : '',
-    domMode ? '- DOM mode: use the current Codex-style full DOM snapshot plus full page text, including accessible iframe and shadow DOM content. Use getDomNodeText(id) for complete text under a returned DOM node; use clickDomNode(id,text?) with a fresh numeric node_id. Use findByText(targetText,scopeId?) only as a read-only recovery step, then clickLocator(locatorId,text?) using a returned locatorId in a later turn.' : '',
-    '- For scrollArea, put the scrollable area id in params.areaId, not params.id. Do not scroll in a direction whose latest state says atBottom/atTop/atLeft/atRight or remaining distance is 0.',
-    '- For getDomNodeText/clickDomNode, put the fresh DOM numeric node_id in params.id. The numeric id may be copied with or without square brackets.',
+    '- In message/reason/action/expected/actual, do not output UIDs, coordinates, deltas, screenshot ids/file names, or tool input JSON as business meaning.',
+    snapshotMode ? '- Use takeSnapshot with params={mode:"actionable"} for a fresh DOM-observation baseline. action/text pages are fixed at 20,000 characters and full pages at 40,000 characters. Use params={mode:"changes"} only to read all DOM mutations and request summaries accumulated since the last browser-changing tool call; it has no UIDs and does not replace the baseline. Query its request IDs with getHttpRequests for details. When nextCursor is returned, continue with both the same mode and cursor; each response states its page number and total pages.' : '',
+    snapshotMode ? '- Use searchSnapshot to search the complete latest snapshot. Use only UIDs from the latest snapshot. Browser-changing actions return a refreshed snapshot when available; continue with its current UIDs, or call takeSnapshot when the refresh is absent or insufficient.' : '',
+    snapshotMode ? '- Use mouse for every pointer operation and keyboard for every keyboard operation. A UID action scrolls an offscreen target into view automatically.' : '',
+    screenshotMode ? '- takeScreenshot is the visual tool. Only coordinates derived from its latest viewport capture may be used in mouse/keyboard; fullPage captures are read-only evidence.' : '',
+    screenshotMode ? '- If accessibility evidence is missing or visual layering is ambiguous, call takeScreenshot before choosing coordinates.' : '',
+    allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
+    allowedTypes.includes('generateMarkdownFile') ? '- For generateMarkdownFile, put the complete Markdown document in params.content and the desired file name in params.fileName. The final visible answer must include the returned download link as a clickable Markdown link.' : '',
     '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
     answerAllowed
       ? '- For browser chat completion, clarification, blocked state, failure, or pure text response, set type="answer" and put the complete Chinese Markdown answer in message. Do not use reportState.'
@@ -109,26 +100,14 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
   ].join('\n');
 }
 
-export function buildPrepareStepPrompt(input: PrepareStepPromptInput) {
-  const domMode = input.browserMode === 'dom';
+export function customRuntimePromptFromEnv() {
+  const rules = String(process.env.AI_CUSTOM_SYSTEM_PROMPT || '').trim();
+  if (!rules) return '';
   return [
-    input.requestPrompt,
-    '',
-    'Agent Loop / prepareStep context:',
-    domMode
-      ? '- Current turn delta: use Runtime DOM Context for fresh node_ids/text; RunState.nextObjective guides the goal only.'
-      : '- Current turn delta: use only the current screenshot/marker map for actionable ids; RunState.nextObjective guides the goal only.',
-    domMode
-      ? '- DOM Context Manager below is the current actionable DOM/page state; scroll only if the full DOM/text context lacks lazy-loaded or viewport-dependent content.'
-      : '- Visual Context Manager below is the current actionable visual state; historical screenshot ids remain context only.',
-    '- Current step tool attempts below are authoritative recent tool feedback; desktop=... means a local process/window change was detected outside the browser.',
-    input.compressionNote,
-    '',
-    input.workingMemoryText,
-    '',
-    input.visualContextText,
-    '',
-    `Current step tool attempts (last ${input.traceLimit}):\n${input.currentToolAttemptsText}`,
-    `Loop turn: ${input.turnIndex + 1}/${input.maxTurns}`,
-  ].filter(Boolean).join('\n');
+    'Additional user-configured rules (append-only):',
+    '- These rules supplement the built-in Agent Loop prompt; they do not replace it.',
+    '- They must not override, weaken, or bypass built-in rules, safety rules, tool contracts, test-case instructions, or the current user requirement.',
+    '- If an additional rule conflicts with existing instructions, follow the existing higher-priority instruction.',
+    rules,
+  ].join('\n');
 }

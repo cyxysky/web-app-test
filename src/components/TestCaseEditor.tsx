@@ -1,24 +1,49 @@
 'use client';
 
-import { useState } from 'react';
-import { Loader2, Save, Sparkles } from 'lucide-react';
+import { forwardRef, useEffect, useImperativeHandle, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { CustomSelect } from '@/components/CustomSelect';
 import { RichTextEditor } from '@/components/RichTextEditor';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
-import type { TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import type { ModelProvider, SkillRecord, TaskFrame, TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import { readApiJson } from '@/lib/api-client';
 
-export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
+export type TestCaseEditorActionState = {
+  generatingFrame: boolean;
+  saving: boolean;
+};
+
+export type TestCaseEditorHandle = {
+  generateFrame: () => Promise<void>;
+  save: () => Promise<void>;
+};
+
+export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
+  model?: string;
+  modelProvider?: ModelProvider;
+  onActionStateChange?: (state: TestCaseEditorActionState) => void;
+  onSaved?: (testCase: TestCaseRecord) => void;
+  showSectionActions?: boolean;
+  skills: SkillRecord[];
+  testCase: TestCaseRecord;
+}>(function TestCaseEditor({
+  model,
+  modelProvider,
+  onActionStateChange,
+  onSaved,
+  skills,
+  testCase,
+}, ref) {
   const { t } = useI18n();
   const router = useRouter();
   const [draft, setDraft] = useState<TestCaseContent>({
     ...testCase.content,
-    browserMode: testCase.content.browserMode || 'default',
-    isMarked: testCase.content.isMarked ?? true,
+    browserMode: 'dom',
+    isMarked: false,
     userRequirement: testCase.content.userRequirement || testCase.description,
     systemPrompt: testCase.content.systemPrompt || '',
+    skillIds: testCase.content.skillIds || [],
     steps: [],
   });
   const [saving, setSaving] = useState(false);
@@ -28,8 +53,21 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
   ));
   const [error, setError] = useState('');
 
+  useEffect(() => {
+    onActionStateChange?.({ generatingFrame, saving });
+  }, [generatingFrame, onActionStateChange, saving]);
+
   function update(patch: Partial<TestCaseContent>) {
     setDraft((current) => ({ ...current, ...patch }));
+  }
+
+  function toggleSkill(skillId: string) {
+    setDraft((current) => {
+      const selected = new Set(current.skillIds || []);
+      if (selected.has(skillId)) selected.delete(skillId);
+      else selected.add(skillId);
+      return { ...current, skillIds: [...selected] };
+    });
   }
 
   async function save() {
@@ -67,8 +105,8 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('保存失败'));
+      const data = await readApiJson<TestCaseRecord>(response, t('保存失败'));
+      onSaved?.(data);
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : t('保存失败'));
@@ -92,13 +130,14 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          model,
+          modelProvider,
           userRequirement: draft.userRequirement || draft.description,
           systemPrompt: draft.systemPrompt || '',
           targetUrl: draft.targetUrl,
         }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || t('生成内容框架失败'));
+      const data = await readApiJson<{ taskFrame: TaskFrame }>(response, t('生成内容框架失败'));
       setFrameText(JSON.stringify(data.taskFrame, null, 2));
       update({ taskFrame: data.taskFrame });
     } catch (err) {
@@ -109,24 +148,13 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
     }
   }
 
+  useImperativeHandle(ref, () => ({
+    generateFrame,
+    save,
+  }));
+
   return (
     <section className="content-band test-goal-list">
-      <div className="section-head">
-        <div>
-          <h2>{t('测试需求')}</h2>
-        </div>
-        <div className="case-editor-actions">
-          <button className="icon-text-button" disabled={generatingFrame || saving} onClick={generateFrame} type="button">
-            {generatingFrame ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-            {generatingFrame ? t('生成中') : t('生成内容框架')}
-          </button>
-          <button className="icon-text-button" disabled={saving} onClick={save} type="button">
-            {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-            {saving ? t('保存中') : t('保存需求')}
-          </button>
-        </div>
-      </div>
-
       <div className="runtime-case-form">
         <label>
           {t('用例标题')}
@@ -136,32 +164,24 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
           {t('目标地址')}
           <input className="input" value={draft.targetUrl} onChange={(event) => update({ targetUrl: event.target.value })} />
         </label>
-        <label>
-          {t('浏览器操作模式')}
-          <CustomSelect
-            value={draft.browserMode || 'default'}
-            onChange={(nextValue) => update({ browserMode: nextValue as TestCaseContent['browserMode'] })}
-            options={[
-              { label: t('默认配置'), value: 'default' },
-              { label: t('DOM 交互'), value: 'dom' },
-              { label: t('视觉标识'), value: 'visual-markers' },
-            ]}
-          />
+        <label className="wide">
+          Skills
+          <div className="skill-picker">
+            {skills.length ? skills.map((skill) => (
+              <label className="skill-picker-item" key={skill.id} title={skill.description}>
+                <input
+                  type="checkbox"
+                  checked={(draft.skillIds || []).includes(skill.id)}
+                  onChange={() => toggleSkill(skill.id)}
+                />
+                <span>
+                  <b>{skill.title}</b>
+                  <small>{skill.description}</small>
+                </span>
+              </label>
+            )) : <span className="hint">No skills yet. Generate one from a run record first.</span>}
+          </div>
         </label>
-        {draft.browserMode === 'visual-markers' ? (
-          <label>
-            {t('视觉标记截图')}
-            <span className="inline-check">
-              <input
-                type="checkbox"
-                checked={draft.isMarked ?? true}
-                onChange={(event) => update({ isMarked: event.target.checked })}
-              />
-              {t('启用截图 marker')}
-            </span>
-            <span className="hint">{t('关闭后只发送原始截图，并在提示词中加入可交互元素摘要。')}</span>
-          </label>
-        ) : null}
         <label className="wide">
           {t('用户需求')}
           <RichTextEditor
@@ -196,4 +216,4 @@ export function TestCaseEditor({ testCase }: { testCase: TestCaseRecord }) {
       {error ? <div className="error">{error}</div> : null}
     </section>
   );
-}
+});

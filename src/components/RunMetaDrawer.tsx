@@ -11,7 +11,7 @@ export function RunMetaDrawer({ run, testCaseTitle }: { run: TestRunRecord; test
 
   return (
     <>
-      <button className="icon-text-button" onClick={() => setOpen(true)} type="button">
+      <button className="link-button run-meta-trigger" onClick={() => setOpen(true)} type="button">
         <Info size={16} />
         {t('运行信息')}
       </button>
@@ -22,7 +22,7 @@ export function RunMetaDrawer({ run, testCaseTitle }: { run: TestRunRecord; test
               <div>
                 <h2>{t('运行信息')}</h2>
               </div>
-              <button className="icon-button" onClick={() => setOpen(false)} type="button" aria-label={t('关闭')}>
+              <button className="ui-icon-button" onClick={() => setOpen(false)} type="button" aria-label={t('关闭')}>
                 <X size={18} />
               </button>
             </header>

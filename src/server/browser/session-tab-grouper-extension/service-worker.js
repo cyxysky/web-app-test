@@ -138,8 +138,25 @@ async function findSessionGroupTabs(input) {
   return { found: groups.length > 0, tabs };
 }
 
+async function activateSessionGroupTab(input) {
+  const lookup = await findSessionGroupTabs(input);
+  const requestedTabId = Number(input?.tabId || 0);
+  const target = requestedTabId
+    ? lookup.tabs.find((tab) => tab.tabId === requestedTabId)
+    : lookup.tabs.find((tab) => tab.active && tab.url)
+      || lookup.tabs.find((tab) => tab.url && !/^chrome:\/\/new-tab-page|^about:blank|^about:newtab/i.test(tab.url))
+      || lookup.tabs.at(-1);
+  if (!target?.tabId) return { ok: false, lookup };
+
+  await chrome.windows.update(target.windowId, { focused: true }).catch(() => undefined);
+  const tab = await chrome.tabs.update(target.tabId, { active: true }).catch(() => undefined);
+  if (tab) await applySessionMarkerToTab(tab, cleanText(input?.sessionId, ''));
+  return { ok: Boolean(tab), tab: tab ? tabSnapshot(tab) : target, lookup };
+}
+
 globalThis.aiWebTestSessionTabGrouper = {
   findSessionGroupTabs,
+  activateSessionGroupTab,
 };
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

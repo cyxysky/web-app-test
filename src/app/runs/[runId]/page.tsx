@@ -1,8 +1,6 @@
-import Link from 'next/link';
 import { notFound } from 'next/navigation';
-import { ArrowLeft } from 'lucide-react';
-import { RunProgress } from '@/components/RunProgress';
-import { store } from '@/server/db/mock-store';
+import { BrowserChatWorkspace } from '@/components/BrowserChatWorkspace';
+import { store } from '@/server/db/store';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,18 +14,20 @@ export default async function RunReportPage({ params }: PageProps) {
   if (!run) notFound();
 
   const testCase = store.getTestCase(run.testCaseId);
+  const testCases = store.listTestCases();
+  const groups = store.listGroups();
+  const schedules = store.listSchedules();
 
   return (
-    <main className="run-workspace">
-      <header className="run-inline-header">
-        <Link className="ghost-link" href={testCase ? `/test-cases/${testCase.id}` : '/dashboard'}>
-          <ArrowLeft size={15} />
-          返回用例
-        </Link>
-        <div className="run-inline-actions" />
-      </header>
-
-      <RunProgress initialRun={run} testCaseTitle={testCase?.title || '未知用例'} />
+    <main className="browser-chat-shell">
+      <BrowserChatWorkspace
+        groups={groups}
+        initialTargetDetailCaseId={testCase?.id || run.testCaseId}
+        initialTargetRunId={run.id}
+        initialView="target"
+        schedules={schedules}
+        testCases={testCases}
+      />
     </main>
   );
 }

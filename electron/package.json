@@ -1,6 +1,8 @@
 {
   "name": "webpilot-qa-electron",
   "version": "0.1.0",
+  "description": "WebPilot desktop application",
+  "author": "WebPilot",
   "private": true,
   "main": "main.js"
 }

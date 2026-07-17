@@ -2,6 +2,9 @@
   "name": "webpilot-qa",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22.13"
+  },
   "main": "electron/main.js",
   "scripts": {
     "dev": "next dev",
@@ -14,8 +17,7 @@
     "docker:build": "docker build -t webpilot-qa:latest .",
     "docker:up": "docker compose up -d --build",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit",
-    "prisma:generate": "prisma generate"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@ai-sdk/alibaba": "^1.0.28",
@@ -39,14 +41,15 @@
     "@ai-sdk/togetherai": "^2.0.55",
     "@ai-sdk/vercel": "^2.0.52",
     "@ai-sdk/xai": "^3.0.95",
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
     "@openrouter/ai-sdk-provider": "^2.9.0",
-    "@prisma/client": "^6.8.2",
+    "@tanstack/react-virtual": "^3.14.3",
     "@tinymce/tinymce-react": "^6.3.0",
     "ai": "^6.0.193",
-    "ai-sdk-provider-codex-app-server": "^1.1.7",
     "ai-sdk-provider-codex-cli": "^1.2.1",
-    "ai-sdk-provider-gemini-cli": "^2.0.1",
-    "clsx": "^2.1.1",
+    "animejs": "^4.5.0",
     "lucide-react": "^0.511.0",
     "next": "^15.3.3",
     "playwright": "^1.60.0",
@@ -68,13 +71,12 @@
     "electron-builder": "^26.15.0",
     "eslint": "^9.27.0",
     "eslint-config-next": "^15.3.3",
-    "prisma": "^6.8.2",
     "tailwindcss": "^4.1.8",
     "typescript": "^5.8.3"
   },
   "build": {
     "appId": "com.webpilotqa.desktop",
-    "productName": "WebPilot QA",
+    "productName": "WebPilot",
     "asar": true,
     "npmRebuild": true,
     "beforeBuild": "scripts/electron-before-build.js",
@@ -98,6 +100,10 @@
       {
         "from": "assets/app-icon.png",
         "to": "app-icon.png"
+      },
+      {
+        "from": "assets/app-icon.ico",
+        "to": "app-icon.ico"
       }
     ],
     "win": {
@@ -109,7 +115,7 @@
           ]
         }
       ],
-      "artifactName": "WebPilot-QA-Setup-${version}-${arch}.${ext}",
+      "artifactName": "WebPilot-Setup-${version}-${arch}.${ext}",
       "icon": "assets/app-icon.ico"
     },
     "nsis": {
@@ -118,7 +124,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "WebPilot QA",
+      "shortcutName": "WebPilot",
       "runAfterFinish": true
     }
   }

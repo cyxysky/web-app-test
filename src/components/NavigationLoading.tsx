@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
+import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 
 function isInternalNavigationLink(anchor: HTMLAnchorElement) {
   if (anchor.target && anchor.target !== '_self') return false;
@@ -17,10 +18,10 @@ function isInternalNavigationLink(anchor: HTMLAnchorElement) {
 function LoadingOverlay({ label }: { label: string }) {
   return (
     <div className="navigation-loading-overlay" role="status" aria-live="polite" aria-label={label}>
-      <div className="navigation-loading-mark">
-        <span />
+      <div className="navigation-loading-content">
+        <LiquidGlassLoader />
+        <p>{label}</p>
       </div>
-      <p>{label}</p>
     </div>
   );
 }

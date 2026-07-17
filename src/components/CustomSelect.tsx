@@ -1,13 +1,25 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
-import { Check, ChevronDown } from 'lucide-react';
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from 'react';
+import { Check, ChevronDown, Search } from 'lucide-react';
+import { useI18n } from '@/i18n/I18nProvider';
 
 export type CustomSelectOption = {
+  description?: string;
   disabled?: boolean;
+  group?: string;
   label: string;
+  selectedLabel?: string;
   value: string;
 };
+
+type MenuLayout = {
+  maxHeight: number;
+  placement: 'up' | 'down';
+};
+
+const menuGap = 6;
+const viewportMargin = 8;
 
 export function CustomSelect({
   className,
@@ -15,6 +27,8 @@ export function CustomSelect({
   id,
   onChange,
   options,
+  searchPlaceholder,
+  title,
   value,
 }: {
   className?: string;
@@ -22,15 +36,35 @@ export function CustomSelect({
   id?: string;
   onChange: (value: string) => void;
   options: CustomSelectOption[];
+  searchable?: boolean;
+  searchPlaceholder?: string;
+  title?: string;
   value: string;
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [menuVisible, setMenuVisible] = useState(false);
+  const [menuLayout, setMenuLayout] = useState<MenuLayout | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
   const closeTimerRef = useRef<number | undefined>(undefined);
-  const enabledOptions = useMemo(() => options.filter((option) => !option.disabled), [options]);
+  const searchEnabled = true;
+  const normalizedQuery = searchQuery.trim().toLocaleLowerCase();
+  const filteredOptions = useMemo(() => options
+    .map((option, index) => ({ option, index }))
+    .filter(({ option }) => {
+      if (!normalizedQuery) return true;
+      return [option.label, option.selectedLabel, option.description, option.group, option.value]
+        .filter(Boolean)
+        .join('\n')
+        .toLocaleLowerCase()
+        .includes(normalizedQuery);
+    }), [normalizedQuery, options]);
+  const enabledOptions = useMemo(() => filteredOptions.filter(({ option }) => !option.disabled), [filteredOptions]);
   const selectedOption = options.find((option) => option.value === value) || options[0];
   const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value));
 
@@ -48,9 +82,54 @@ export function CustomSelect({
 
   useEffect(() => {
     if (!open) return;
+    setSearchQuery('');
     setActiveIndex(selectedIndex);
     setMenuVisible(true);
-  }, [open, selectedIndex]);
+    if (searchEnabled) requestAnimationFrame(() => searchRef.current?.focus());
+  }, [open, searchEnabled, selectedIndex]);
+
+  useLayoutEffect(() => {
+    if (!open || !menuVisible) return undefined;
+
+    function updateMenuLayout() {
+      const button = buttonRef.current;
+      const menu = menuRef.current;
+      if (!button || !menu) return;
+
+      const buttonRect = button.getBoundingClientRect();
+      const viewportHeight = document.documentElement.clientHeight;
+      const spaceAbove = Math.max(0, buttonRect.top - menuGap - viewportMargin);
+      const spaceBelow = Math.max(0, viewportHeight - buttonRect.bottom - menuGap - viewportMargin);
+      const desiredHeight = menu.getBoundingClientRect().height;
+      const placement = desiredHeight <= spaceBelow
+        ? 'down'
+        : desiredHeight <= spaceAbove
+          ? 'up'
+          : spaceAbove > spaceBelow
+            ? 'up'
+            : 'down';
+      const maxHeight = Math.floor(placement === 'up' ? spaceAbove : spaceBelow);
+
+      setMenuLayout((current) => current?.placement === placement && current.maxHeight === maxHeight
+        ? current
+        : { maxHeight, placement });
+    }
+
+    updateMenuLayout();
+    window.addEventListener('resize', updateMenuLayout);
+    window.addEventListener('scroll', updateMenuLayout, true);
+    return () => {
+      window.removeEventListener('resize', updateMenuLayout);
+      window.removeEventListener('scroll', updateMenuLayout, true);
+    };
+  }, [menuVisible, open]);
+
+  useEffect(() => {
+    if (!open || !enabledOptions.length) return;
+    if (enabledOptions.some(({ index }) => index === activeIndex)) return;
+    const selected = enabledOptions.find(({ index }) => index === selectedIndex);
+    setActiveIndex((selected || enabledOptions[0]).index);
+  }, [activeIndex, enabledOptions, open, selectedIndex]);
 
   useEffect(() => {
     if (disabled) closeMenu();
@@ -59,6 +138,7 @@ export function CustomSelect({
   function openMenu() {
     if (disabled) return;
     window.clearTimeout(closeTimerRef.current);
+    setMenuLayout(null);
     setMenuVisible(true);
     setOpen(true);
   }
@@ -76,10 +156,11 @@ export function CustomSelect({
 
   function moveActive(direction: 1 | -1) {
     if (!enabledOptions.length) return;
-    const currentValue = options[activeIndex]?.value;
-    const enabledIndex = Math.max(0, enabledOptions.findIndex((option) => option.value === currentValue));
-    const nextOption = enabledOptions[(enabledIndex + direction + enabledOptions.length) % enabledOptions.length];
-    setActiveIndex(options.findIndex((option) => option.value === nextOption.value));
+    const enabledIndex = enabledOptions.findIndex(({ index }) => index === activeIndex);
+    const nextIndex = enabledIndex < 0
+      ? (direction === 1 ? 0 : enabledOptions.length - 1)
+      : (enabledIndex + direction + enabledOptions.length) % enabledOptions.length;
+    setActiveIndex(enabledOptions[nextIndex].index);
   }
 
   function selectOption(option: CustomSelectOption) {
@@ -105,12 +186,34 @@ export function CustomSelect({
         openMenu();
         return;
       }
-      const option = options[activeIndex];
+      const option = filteredOptions.find((item) => item.index === activeIndex)?.option;
       if (option) selectOption(option);
     }
     if (event.key === 'Escape') {
       event.preventDefault();
       closeMenu();
+    }
+  }
+
+  function handleSearchKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveActive(event.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const option = filteredOptions.find((item) => item.index === activeIndex)?.option;
+      if (option) selectOption(option);
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      if (searchQuery) setSearchQuery('');
+      else {
+        closeMenu();
+        buttonRef.current?.focus();
+      }
     }
   }
 
@@ -125,35 +228,66 @@ export function CustomSelect({
         onClick={toggleMenu}
         onKeyDown={handleKeyDown}
         ref={buttonRef}
+        title={title}
         type="button"
       >
-        <span>{selectedOption?.label || value}</span>
+        <div>{selectedOption?.selectedLabel || selectedOption?.label || value}</div>
         <ChevronDown className={open ? 'open' : undefined} size={16} />
       </button>
       {menuVisible ? (
         <div
-          className={open ? 'custom-select-menu open' : 'custom-select-menu closing'}
+          className={`custom-select-menu custom-select-menu--${menuLayout?.placement || 'down'} ${open ? 'open' : 'closing'}`}
           onAnimationEnd={() => {
             if (!open) setMenuVisible(false);
           }}
+          ref={menuRef}
           role="listbox"
+          style={{ '--custom-select-menu-max-height': `${Math.max(0, menuLayout?.maxHeight ?? 360)}px` } as CSSProperties}
           tabIndex={-1}
         >
-          {options.map((option, index) => (
-            <button
-              aria-selected={option.value === value}
-              className={index === activeIndex ? 'active' : undefined}
-              disabled={option.disabled}
-              key={option.value}
-              onClick={() => selectOption(option)}
-              onMouseEnter={() => setActiveIndex(index)}
-              role="option"
-              type="button"
-            >
-              <span>{option.label}</span>
-              {option.value === value ? <Check size={15} /> : null}
-            </button>
-          ))}
+          {searchEnabled ? (
+            <div className="custom-select-search">
+              <Search aria-hidden="true" size={15} />
+              <input
+                aria-label={t('搜索选项')}
+                autoComplete="off"
+                onChange={(event) => setSearchQuery(event.currentTarget.value)}
+                onKeyDown={handleSearchKeyDown}
+                placeholder={searchPlaceholder || t('搜索选项')}
+                ref={searchRef}
+                spellCheck={false}
+                type="search"
+                value={searchQuery}
+              />
+            </div>
+          ) : null}
+          <div className="custom-select-options">
+            {filteredOptions.map(({ option, index }, filteredIndex) => {
+              const previous = filteredOptions[filteredIndex - 1]?.option;
+              const showGroup = Boolean(option.group && option.group !== previous?.group);
+              return (
+                <Fragment key={option.value}>
+                  {showGroup ? <div className="custom-select-group">{option.group}</div> : null}
+                  <button
+                    aria-selected={option.value === value}
+                    className={`custom-select-option${index === activeIndex ? ' active' : ''}`}
+                    disabled={option.disabled}
+                    onClick={() => selectOption(option)}
+                    onMouseEnter={() => setActiveIndex(index)}
+                    role="option"
+                    type="button"
+                  >
+                    <span>
+                      <b>{option.label}</b>
+                      {option.description ? <small>{option.description}</small> : null}
+                    </span>
+                    {option.value === value ? <Check size={15} /> : null}
+                  </button>
+                </Fragment>
+              );
+            })}
+            {!filteredOptions.length ? <p className="custom-select-empty">{t('未找到匹配选项')}</p> : null}
+          </div>
         </div>
       ) : null}
     </div>

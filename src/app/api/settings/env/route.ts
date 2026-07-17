@@ -1,35 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { runtimeEnvDefinitions } from '@/config/settings';
-import { store } from '@/server/db/mock-store';
+import { store } from '@/server/db/store';
+import { readRuntimeSettingsItems } from '@/server/settings/settings-snapshot';
 
 const allowedKeys = new Set(runtimeEnvDefinitions.map((item) => item.key));
 
-function defaultRuntimeItems() {
-  return runtimeEnvDefinitions.map((definition) => ({
-    key: definition.key,
-    value: definition.defaultValue,
-    enabled: true,
-    secret: Boolean(definition.secret),
-  }));
-}
-
-function mergedRuntimeItems() {
-  const savedByKey = new Map(store.listRuntimeEnv().map((item) => [item.key, item]));
-  return defaultRuntimeItems().map((item) => {
-    const saved = savedByKey.get(item.key);
-    return {
-      ...item,
-      value: saved?.value ?? item.value,
-      enabled: true,
-      secret: saved?.secret ?? item.secret,
-      updatedAt: saved?.updatedAt,
-    };
-  });
-}
-
 export async function GET() {
-  store.applyRuntimeEnv();
-  return NextResponse.json({ saved: mergedRuntimeItems() });
+  return NextResponse.json({ saved: readRuntimeSettingsItems() });
 }
 
 export async function POST(request: NextRequest) {

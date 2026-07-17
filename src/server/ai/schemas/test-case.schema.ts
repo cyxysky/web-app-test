@@ -41,12 +41,28 @@ export const taskFrameSchema = z.object({
   version: z.number().optional(),
 });
 
+export const skillContentSchema = z.object({
+  workflow: z.array(z.string()).default([]),
+  recovery: z.array(z.string()).default([]),
+  verification: z.array(z.string()).default([]),
+});
+
+export function parseSkillContent(value: unknown) {
+  const record = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  return skillContentSchema.parse({
+    ...record,
+    recovery: record.recovery ?? record.cautions ?? [],
+  });
+}
+
 export const testCaseContentSchema = z.object({
   title: z.string(),
   description: z.string(),
   targetUrl: z.string(),
   priority: z.enum(['low', 'medium', 'high', 'critical']),
-  browserMode: z.enum(['default', 'dom', 'visual-markers']).default('default'),
+  browserMode: z.literal('dom').default('dom'),
   isMarked: z.boolean().default(true),
   userRequirement: z.string().optional(),
   systemPrompt: z.string().optional(),
@@ -56,12 +72,15 @@ export const testCaseContentSchema = z.object({
   expectedResults: z.array(z.string()),
   risks: z.array(z.string()),
   recordedFlow: z.array(recordedFlowStepSchema).optional(),
+  defaultRecordedRunId: z.string().optional(),
   taskFrame: taskFrameSchema.optional(),
+  skillIds: z.array(z.string()).optional(),
 });
 
 export type TestStep = z.infer<typeof testStepSchema>;
 export type RecordedFlowStep = z.infer<typeof recordedFlowStepSchema>;
 export type TestCaseContent = z.infer<typeof testCaseContentSchema>;
+export type SkillContent = z.infer<typeof skillContentSchema>;
 
 export type TestCaseRecord = {
   id: string;
@@ -78,7 +97,21 @@ export type TestCaseRecord = {
   updatedAt: string;
 };
 
-export type TaskFrameDimension = z.infer<typeof taskFrameDimensionSchema>;
+export type SkillRecord = {
+  id: string;
+  title: string;
+  description: string;
+  tags: string[];
+  triggerPhrases: string[];
+  content: SkillContent;
+  sourceRunId?: string;
+  sourceTestCaseId?: string;
+  sourceSessionId?: string;
+  status: 'draft' | 'ready' | 'disabled';
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+};
 
 export type TaskFrame = z.infer<typeof taskFrameSchema>;
 
@@ -159,26 +192,9 @@ export type RuntimeWorkingMemory = {
   ledgerItems?: TaskLedgerItem[];
 };
 
-export type AiDomContextSnapshot = {
-  mode: 'dom';
-  source: 'runtime-page-context';
-  generatedAt: string;
-  url?: string;
-  title?: string;
-  tree: string;
-  treeCharLength: number;
-  promptCharLimit?: number;
-  truncated: boolean;
-  focusedElement?: unknown;
-  pageScrollState?: unknown;
-  scrollableAreas?: unknown;
-  interactiveCandidates?: unknown;
-};
-
 export type AiToolContextSnapshot = {
   requestId?: string;
   requestCreatedAt?: string;
-  domContext?: AiDomContextSnapshot;
 };
 
 export type AiRequestSnapshot = {
@@ -188,11 +204,11 @@ export type AiRequestSnapshot = {
   createdAt: string;
   provider: string;
   model: string;
+  systemPrompt?: string;
   screenshotPath?: string;
   imageAttached: boolean;
   tools?: string[];
   options?: Record<string, unknown>;
-  domContext?: AiDomContextSnapshot;
   messages: Array<{
     role: 'user' | 'system' | 'assistant';
     content: Array<
@@ -202,46 +218,16 @@ export type AiRequestSnapshot = {
   }>;
 };
 
-export type DesktopEvidenceProcess = {
-  pid: number;
-  parentPid?: number;
-  name: string;
-  executablePath?: string;
-  startedAt?: string;
-  mainWindowTitle?: string;
-  hasMainWindow: boolean;
-};
-
-export type DesktopEvidenceWindow = {
-  pid?: number;
-  processName?: string;
-  title?: string;
-};
-
-export type DesktopActionEvidence = {
-  observed: boolean;
-  changed: boolean;
-  summary: string;
-  capturedAt?: {
-    before: string;
-    after: string;
-  };
-  addedProcesses?: DesktopEvidenceProcess[];
-  removedProcesses?: DesktopEvidenceProcess[];
-  changedWindows?: DesktopEvidenceProcess[];
-  foregroundChanged?: {
-    before?: DesktopEvidenceWindow;
-    after?: DesktopEvidenceWindow;
-  };
-  errors?: string[];
-};
-
 export type StepToolCall = {
   name: string;
   input?: unknown;
   reason?: string;
   ok?: boolean;
+  recovered?: boolean;
+  transient?: boolean;
   result?: string;
+  /** Complete tool result retained for the browser-chat detail dialog. */
+  rawResult?: unknown;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
   visualAfter?: {
@@ -249,7 +235,6 @@ export type StepToolCall = {
     retention?: 'auto' | 'replace' | 'append';
     reason?: string;
   };
-  desktopEvidence?: DesktopActionEvidence;
   screenshots?: Array<{
     title: string;
     path: string;
@@ -366,7 +351,6 @@ export type ModelProvider =
   | 'deepinfra'
   | 'deepseek'
   | 'fireworks'
-  | 'gemini'
   | 'google'
   | 'google-vertex'
   | 'groq'
@@ -383,7 +367,9 @@ export type ModelProvider =
   | 'xai';
 
 export type ModelProviderSettings = {
+  defaultModel?: string;
   model: string;
+  models?: string[];
   apiKey?: string;
   baseURL?: string;
   updatedAt?: string;

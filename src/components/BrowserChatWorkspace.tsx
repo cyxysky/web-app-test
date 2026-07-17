@@ -1,59 +1,136 @@
 'use client';
 
-import { memo, type RefObject, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition } from 'react';
+import {
+  closestCenter,
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  PointerSensor,
+  pointerWithin,
+  useDroppable,
+  useSensor,
+  useSensors,
+  type CollisionDetection,
+  type DragEndEvent,
+  type DragOverEvent,
+  type DragStartEvent,
+  type Modifier,
+} from '@dnd-kit/core';
+import {
+  horizontalListSortingStrategy,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from '@dnd-kit/sortable';
+import { CSS as DndCss } from '@dnd-kit/utilities';
+import { createPortal } from 'react-dom';
 import {
   AppWindow,
+  AlertCircle,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   BadgeCheck,
   Bot,
+  Brain,
   Braces,
   Bug,
   ChevronDown,
   ClipboardCheck,
   Compass,
   CornerDownLeft,
+  CheckCircle2,
+  Download,
   FileSearch,
   Folder,
+  FolderOpen,
   GalleryHorizontalEnd,
   Gauge,
+  Globe,
+  History,
   ImageUp,
   Loader2,
-  Maximize2,
+  Lock,
   MessageSquare,
+  MoreHorizontal,
+  Moon,
   MousePointer2,
   Network,
   PanelLeft,
+  PanelRight,
   PencilLine,
+  Pin,
+  Plus,
   Power,
+  RefreshCw,
   Route,
   ScanSearch,
   ScrollText,
-  Send,
   SendHorizontal,
   Settings,
   SlidersHorizontal,
+  Sparkles,
   FilePlus2,
   SquareArrowOutUpRight,
   SquareTerminal,
   Square,
+  Star,
+  Sun,
   Trash2,
+  Volume2,
+  VolumeX,
   Waypoints,
   Workflow,
-  User,
   X,
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { CustomSelect } from '@/components/CustomSelect';
+import { BrowserChatLogDialog } from '@/components/BrowserChatLogDialog';
+import { BrowserChatToolDialog } from '@/components/BrowserChatToolDialog';
+import {
+  browserChatDownloadPercent,
+  browserChatDownloadStatusLabel,
+  formatDownloadBytes,
+  type SystemDownloadItem,
+  type SystemDownloadStatus,
+} from '@/components/browser-chat-download-model';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
-import { EnvironmentSettings, environmentSettingsTabs } from '@/components/EnvironmentSettings';
-import type { SettingsTab } from '@/config/settings';
+import { EnvironmentSettings, environmentSettingsTabs, type EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
+import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
+import { NewTestCaseModal } from '@/components/NewTestCaseModal';
+import {
+  buildBrowserChatAiCycleRenderEntries,
+  buildBrowserChatLogIndex,
+  buildBrowserChatMessageRenderEntries,
+  browserChatAssistantMessageHasVisibleText as modelBrowserChatAssistantMessageHasVisibleText,
+  browserChatLogsForMessage,
+  type BrowserChatLogIndex as BrowserChatLogIndexModel,
+} from '@/components/browser-chat-message-model';
+import {
+  visibleBrowserChatExecutionLogs,
+} from '@/components/browser-chat-log-model';
+import { type SettingsTab } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
-import { domTreeFromToolCall } from '@/lib/ai-request-inspection';
-import { artifactApiUrl as artifactUrl } from '@/lib/artifacts';
+import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import {
+  modelSelectionDiagnosticLabel,
+  modelSelectionOptionsForConfig,
+  modelSelectionValueForConfig,
+  normalizeRuntimeModelConfig,
+  parseModelSelectionValue,
+  resolveRuntimeModelSelection,
+  type RuntimeModelConfig,
+} from '@/lib/model-selection';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
+import { useTheme } from '@/theme/ThemeProvider';
 import type {
+  ModelProvider,
   RunScheduleRecord,
+  SkillRecord,
   StepExecutionResult,
   TestCaseRecord,
   TestGroupRecord,
@@ -67,6 +144,7 @@ type BrowserChatMessage = {
   updatedAt?: string;
   clientMessageId?: string;
   attachments?: BrowserChatAttachment[];
+  skillIds?: string[];
   stepIndexes?: number[];
   activity?: {
     phase: string;
@@ -83,7 +161,35 @@ type BrowserChatAttachment = {
   size?: number;
   path: string;
   url: string;
+  kind?: BrowserChatAttachmentKind;
+  sourceUrl?: string;
 };
+
+type BrowserChatAttachmentKind = 'image' | 'file' | 'tab';
+
+type EmbeddedBrowserTabDragPayload = {
+  groupId?: string;
+  id?: string;
+  sessionId?: string;
+  title?: string;
+  url?: string;
+};
+
+const BROWSER_CHAT_MAX_REFERENCES = 8;
+const WEBPILOT_TAB_DRAG_MIME = 'application/x-webpilot-tab';
+const BROWSER_CHAT_INLINE_TOKEN_RE = /\[\[(skill|ref):([^\]]+)\]\]/g;
+
+function inlineTokenId(value: string) {
+  return encodeURIComponent(value);
+}
+
+function readInlineTokenId(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
 
 type BrowserChatLogRecord = {
   id: string;
@@ -96,11 +202,30 @@ type BrowserChatLogRecord = {
   elapsedMs?: number;
 };
 
+type BrowserChatLogIndex = BrowserChatLogIndexModel<BrowserChatLogRecord>;
+
+type BrowserChatToolConfirmation = {
+  id: string;
+  messageId: string;
+  stepIndex?: number;
+  toolName: string;
+  inputSignature: string;
+  reason?: string;
+  prompt: string;
+  requestedAt: string;
+};
+
+type BrowserChatToolConfirmationAction = 'confirm' | 'cancel';
+
 type BrowserChatSession = {
   id: string;
   title: string;
+  browserGroupId: string;
   targetUrl: string;
   mode: BrowserChatMode;
+  safetyMode: BrowserChatSafetyMode;
+  modelProvider: ModelProvider;
+  model: string;
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
   createdAt: string;
@@ -111,12 +236,47 @@ type BrowserChatSession = {
   consoleErrors: string[];
   networkErrors: string[];
   logs: BrowserChatLogRecord[];
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
   error?: string;
 };
 
 type BrowserChatView = 'chat' | 'target' | 'settings';
-type BrowserChatMode = 'dom' | 'visual-markers';
+type BrowserChatMode = 'dom';
+type BrowserChatSafetyMode = 'strict' | 'full';
+type BrowserChatModelConfig = RuntimeModelConfig;
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
+
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'webpilotqa.sidebarCollapsed';
+const EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY = 'webpilotqa.embeddedChatCollapsed';
+
+function readStoredSidebarCollapsed() {
+  if (typeof window === 'undefined') return false;
+  return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true';
+}
+
+function writeStoredSidebarCollapsed(collapsed: boolean) {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, collapsed ? 'true' : 'false');
+}
+
+function readStoredEmbeddedChatCollapsed() {
+  if (typeof window === 'undefined') return false;
+  return window.localStorage.getItem(EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY) === 'true';
+}
+
+function writeStoredEmbeddedChatCollapsed(collapsed: boolean) {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY, collapsed ? 'true' : 'false');
+}
+
+function hasRunningAssistantMessage(session?: Pick<BrowserChatSession, 'messages'> | null) {
+  return Boolean(session?.messages?.some((message) => message.role === 'assistant' && message.status === 'running'));
+}
+
+function isBrowserChatSessionRunning(session?: BrowserChatSession | null) {
+  return Boolean(session && (session.busy || session.status === 'running' || hasRunningAssistantMessage(session)));
+}
+
 type BrowserChatToolDetail = {
   stepIndex: number;
   step: StepExecutionResult;
@@ -124,35 +284,234 @@ type BrowserChatToolDetail = {
   tool: BrowserChatToolCall;
 };
 
-type BrowserChatLogIndex = {
-  byMessageId: Map<string, BrowserChatLogRecord[]>;
-  byStepIndex: Map<number, BrowserChatLogRecord[]>;
+type BrowserChatTimelineStepEntry = {
+  step: StepExecutionResult;
+  visibleToolIndexes?: readonly number[];
 };
 
-function statusLabel(status: string) {
-  return ({
-    blocked: '阻塞',
-    closed: '已结束',
-    error: '异常',
-    failed: '失败',
-    idle: '空闲',
-    interrupted: '已中断',
-    passed: '完成',
-    running: '执行中',
-  } as Record<string, string>)[status] || status;
+type EmbeddedBrowserBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type EmbeddedBrowserBridgeResult = {
+  ok: boolean;
+  error?: string;
+};
+
+type EmbeddedBrowserTab = {
+  audioMuted?: boolean;
+  bookmarked?: boolean;
+  faviconUrl?: string;
+  groupId?: string;
+  id: string;
+  pinned?: boolean;
+  sessionId?: string;
+  title: string;
+  url: string;
+  loading?: boolean;
+};
+
+type EmbeddedBrowserGroup = {
+  active?: boolean;
+  activeTabId?: string;
+  collapsed?: boolean;
+  id: string;
+  label?: string;
+  sessionId?: string;
+  tabs: EmbeddedBrowserTab[];
+};
+
+type EmbeddedBrowserTabDndData = {
+  groupId: string;
+  tabId: string;
+  type: 'embedded-browser-tab';
+};
+
+type EmbeddedBrowserGroupDndData = {
+  groupId: string;
+  type: 'embedded-browser-group';
+};
+
+type EmbeddedBrowserTabDragPreview = Record<string, string[]>;
+
+type EmbeddedBrowserTabDropTarget =
+  | { groupId: string; type: 'embedded-browser-group' }
+  | { groupId: string; position: 'before' | 'after'; tabId: string; type: 'embedded-browser-tab' };
+
+const EMBEDDED_BROWSER_TAB_DND_PREFIX = 'embedded-browser-tab:';
+const EMBEDDED_BROWSER_GROUP_DND_PREFIX = 'embedded-browser-group:';
+const EMBEDDED_BROWSER_TAB_COLLISION_Y_TOLERANCE = 36;
+const EMBEDDED_BROWSER_TAB_VERTICAL_DAMPING_RANGE = 36;
+const EMBEDDED_BROWSER_TAB_VERTICAL_DAMPING = 0.22;
+const embeddedBrowserTabTrackModifier: Modifier = ({ transform }) => {
+  const verticalDistance = Math.abs(transform.y);
+  const dampedDistance = Math.min(verticalDistance, EMBEDDED_BROWSER_TAB_VERTICAL_DAMPING_RANGE)
+    * EMBEDDED_BROWSER_TAB_VERTICAL_DAMPING;
+  return {
+    ...transform,
+    y: Math.sign(transform.y) * (
+      dampedDistance + Math.max(0, verticalDistance - EMBEDDED_BROWSER_TAB_VERTICAL_DAMPING_RANGE)
+    ),
+  };
+};
+const embeddedBrowserTabModifiers = [embeddedBrowserTabTrackModifier];
+
+function embeddedBrowserTabDndId(tabId: string) {
+  return `${EMBEDDED_BROWSER_TAB_DND_PREFIX}${tabId}`;
 }
+
+function embeddedBrowserGroupDndId(groupId: string) {
+  return `${EMBEDDED_BROWSER_GROUP_DND_PREFIX}${groupId}`;
+}
+
+function embeddedBrowserGroupEndDndId(groupId: string) {
+  return `${embeddedBrowserGroupDndId(groupId)}:end`;
+}
+
+const embeddedBrowserTabCollisionDetection: CollisionDetection = (input) => {
+  const collisions = pointerWithin(input);
+  if (!collisions.length) {
+    if (!input.pointerCoordinates) return closestCenter(input);
+    const tabContainers = input.droppableContainers.filter((container) => {
+      const data = container.data.current as EmbeddedBrowserTabDndData | undefined;
+      return data?.type === 'embedded-browser-tab' && container.rect.current;
+    });
+    const tabRects = tabContainers.flatMap((container) => container.rect.current ? [container.rect.current] : []);
+    const tabTrackTop = tabRects.length ? Math.min(...tabRects.map((rect) => rect.top)) : 0;
+    const tabTrackBottom = tabRects.length ? Math.max(...tabRects.map((rect) => rect.bottom)) : 0;
+    const pointerNearTabTrack = tabRects.length > 0
+      && input.pointerCoordinates.y >= tabTrackTop - EMBEDDED_BROWSER_TAB_COLLISION_Y_TOLERANCE
+      && input.pointerCoordinates.y <= tabTrackBottom + EMBEDDED_BROWSER_TAB_COLLISION_Y_TOLERANCE;
+    return pointerNearTabTrack
+      ? closestCenter({ ...input, droppableContainers: tabContainers })
+      : [];
+  }
+  const tabCollisions = collisions.filter((collision) => (
+    collision.id !== input.active.id
+    && String(collision.id).startsWith(EMBEDDED_BROWSER_TAB_DND_PREFIX)
+  ));
+  if (tabCollisions.length) return tabCollisions;
+  const activeCollision = collisions.find((collision) => collision.id === input.active.id);
+  if (activeCollision) return [activeCollision];
+  const groupCollision = collisions.find((collision) => String(collision.id).startsWith(EMBEDDED_BROWSER_GROUP_DND_PREFIX));
+  const groupData = groupCollision?.data?.droppableContainer.data.current as EmbeddedBrowserGroupDndData | undefined;
+  if (!groupData) return collisions;
+  const groupTabs = input.droppableContainers.filter((container) => {
+    const data = container.data.current as EmbeddedBrowserTabDndData | undefined;
+    return data?.type === 'embedded-browser-tab' && data.groupId === groupData.groupId;
+  });
+  return groupTabs.length ? closestCenter({ ...input, droppableContainers: groupTabs }) : groupCollision ? [groupCollision] : collisions;
+};
+
+type EmbeddedBrowserState = EmbeddedBrowserBridgeResult & {
+  activeGroupId?: string;
+  activeIndex?: number;
+  activeTabId?: string;
+  canGoBack?: boolean;
+  canGoForward?: boolean;
+  groups?: EmbeddedBrowserGroup[];
+  libraryPanel?: 'bookmarks' | 'history';
+  tabs?: EmbeddedBrowserTab[];
+  zoomFactor?: number;
+};
+
+type EmbeddedBrowserBridge = {
+  activateTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
+  closeActiveTab: () => Promise<EmbeddedBrowserBridgeResult>;
+  closeGroup: (input: { id: string }) => Promise<EmbeddedBrowserState>;
+  discardGroup?: (input: { id: string }) => Promise<EmbeddedBrowserState>;
+  closeTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
+  createGroup: (input: { label?: string }) => Promise<EmbeddedBrowserState>;
+  createTab: (input: { groupId?: string; sessionId?: string; url?: string }) => Promise<EmbeddedBrowserState>;
+  getState: () => Promise<EmbeddedBrowserState>;
+  goBack: () => Promise<EmbeddedBrowserState>;
+  goForward: () => Promise<EmbeddedBrowserState>;
+  moveTab: (input: { id: string; position?: 'before' | 'after' | 'end'; targetGroupId?: string; targetId?: string; targetSessionId?: string }) => Promise<EmbeddedBrowserState>;
+  navigate: (input: { groupId?: string; id?: string; sessionId?: string; url: string }) => Promise<EmbeddedBrowserBridgeResult>;
+  onFocusAddress: (listener: () => void) => () => void;
+  onStateChange: (listener: (state: EmbeddedBrowserState) => void) => () => void;
+  reload: () => Promise<EmbeddedBrowserState>;
+  reset: () => Promise<EmbeddedBrowserBridgeResult>;
+  setBounds: (bounds: EmbeddedBrowserBounds) => Promise<EmbeddedBrowserBridgeResult>;
+  setGroupCollapsed: (input: { collapsed: boolean; id: string }) => Promise<EmbeddedBrowserState>;
+  setLibraryPanel: (input: { panel: 'bookmarks' | 'history' | null }) => Promise<EmbeddedBrowserState>;
+  setTabMuted: (input: { id: string; muted?: boolean }) => Promise<EmbeddedBrowserState>;
+  showTabContextMenu: (input: { groups: Array<{ id: string; label: string }>; id: string }) => Promise<EmbeddedBrowserBridgeResult>;
+  setVisible: (input: {
+    bounds?: EmbeddedBrowserBounds;
+    createIfMissing?: boolean;
+    groupId?: string;
+    id?: string;
+    sessionId?: string;
+    url?: string;
+    visible: boolean;
+  }) => Promise<EmbeddedBrowserState>;
+  stop?: () => Promise<EmbeddedBrowserState>;
+  toggleBookmark: () => Promise<EmbeddedBrowserState>;
+};
+
+declare global {
+  interface Window {
+    webPilotEmbeddedBrowser?: EmbeddedBrowserBridge;
+  }
+}
+
 
 function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'model') return <Bot size={15} />;
   if (tab === 'browser') return <PanelLeft size={15} />;
   if (tab === 'runtime') return <SquareTerminal size={15} />;
+  if (tab === 'skills') return <Braces size={15} />;
+  if (tab === 'memory') return <Brain size={15} />;
+  if (tab === 'dom-test') return <ScanSearch size={15} />;
   if (tab === 'debug') return <Bug size={15} />;
   return <SlidersHorizontal size={15} />;
 }
 
-function compactText(value?: string, max = 160) {
-  const text = (value || '').replace(/\s+/g, ' ').trim();
+function compactText(value?: unknown, max = 160) {
+  const text = stringFromUnknown(value).replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function embeddedSessionGroupLabel(sessionId?: string) {
+  const normalized = (sessionId || 'browser-session')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  const parts = normalized.split('_');
+  const shortId = (parts.at(-1) || normalized || 'session').slice(-6).toLowerCase();
+  return `ai-${shortId}`;
+}
+
+const EMBEDDED_BROWSER_GROUP_ICON_COLORS = ['#10a37f', '#4f8cff', '#9b6fe8', '#e38b2d', '#d85b7d', '#27a9b2', '#7aa83e', '#c65ed0', '#e05b45', '#3978c5'];
+
+function embeddedBrowserGroupIconColorIndex(groupId: string) {
+  let hash = 0;
+  for (const character of groupId) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
+  return Math.abs(hash) % EMBEDDED_BROWSER_GROUP_ICON_COLORS.length;
+}
+
+function embeddedBrowserGroupIconColor(groupId?: string) {
+  return EMBEDDED_BROWSER_GROUP_ICON_COLORS[embeddedBrowserGroupIconColorIndex(groupId || 'default')];
+}
+
+function embeddedGroupIdForSession(sessionId?: string) {
+  const normalized = (sessionId || '').trim();
+  return normalized ? `session:${normalized}` : 'default';
+}
+
+function embeddedSessionIdFromGroupId(groupId?: string) {
+  const normalized = (groupId || '').trim();
+  return normalized.startsWith('session:') ? normalized.slice('session:'.length) : '';
+}
+
+function embeddedGroupIdForTab(tab: EmbeddedBrowserTab, fallbackGroupId: string) {
+  if (tab.groupId) return tab.groupId;
+  if (tab.sessionId) return embeddedGroupIdForSession(tab.sessionId);
+  return fallbackGroupId;
 }
 
 function parseJsonObjectText(value?: string) {
@@ -168,13 +527,17 @@ function parseJsonObjectText(value?: string) {
   }
 }
 
+function stripAnsiControlCodes(value: string) {
+  return value.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+}
+
 function formatToolPayload(value: unknown) {
   if (value === undefined || value === null || value === '') return '无';
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return stripAnsiControlCodes(value);
   try {
-    return JSON.stringify(value, null, 2);
+    return stripAnsiControlCodes(JSON.stringify(value, null, 2));
   } catch {
-    return String(value);
+    return stripAnsiControlCodes(String(value));
   }
 }
 
@@ -184,87 +547,299 @@ function asRecord(value: unknown) {
     : undefined;
 }
 
-function aiLogTokenEstimate(details?: Record<string, unknown>) {
-  const estimate = asRecord(details?.requestTokenEstimate);
-  return estimate ? formatToolPayload(estimate) : '';
+type BrowserChatAiOutputTool = {
+  id: string;
+  input?: unknown;
+  name: string;
+  reason?: string;
+};
+
+type BrowserChatAiOutputView = {
+  reasoning: string[];
+  texts: string[];
+  tools: BrowserChatAiOutputTool[];
+};
+
+type BrowserChatAiOutputCycle = {
+  id: string;
+  output: BrowserChatAiOutputView;
+  stepIndex?: number;
+};
+
+const BrowserChatReasoningVisibilityContext = createContext(false);
+
+function stringFromUnknown(value: unknown): string {
+  if (typeof value === 'string') return stripAnsiControlCodes(value).trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => stringFromUnknown(item))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return stringFromUnknown(record.text ?? record.content ?? record.reasoning);
+  }
+  return '';
 }
 
-function aiLogRequestPayload(details?: Record<string, unknown>) {
-  const request = asRecord(details?.request);
-  if (!request) return '';
-  return formatToolPayload({
-    provider: request.provider,
-    model: request.model,
-    tools: request.tools,
-    options: request.options,
-    messages: request.messages,
+function arrayFromUnknown(value: unknown) {
+  return Array.isArray(value) ? value : [];
+}
+
+function textFromAiContentPart(part: Record<string, unknown>) {
+  return stringFromUnknown(part.text)
+    || stringFromUnknown(part.content)
+    || stringFromUnknown(part.reasoning);
+}
+
+function toolReasonFromInput(input: unknown) {
+  const record = asRecord(input);
+  return stringFromUnknown(record?.reason)
+    || stringFromUnknown(record?.targetVisual)
+    || stringFromUnknown(record?.url)
+    || stringFromUnknown(record?.text)
+    || stringFromUnknown(record?.action);
+}
+
+function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
+  const record = asRecord(part);
+  if (!record) return { reasoning: [], texts: [], tools: [] };
+  const type = String(record.type || '').toLowerCase();
+  if (type === 'reasoning') {
+    const text = textFromAiContentPart(record);
+    return { reasoning: text ? [text] : [], texts: [], tools: [] };
+  }
+  if (type === 'text') {
+    const text = textFromAiContentPart(record);
+    return { reasoning: [], texts: text ? [text] : [], tools: [] };
+  }
+  if (type === 'tool-call' || type === 'tool_call') {
+    const name = stringFromUnknown(record.toolName) || stringFromUnknown(record.name) || stringFromUnknown(record.tool);
+    if (!name) return { reasoning: [], texts: [], tools: [] };
+    const input = record.input ?? record.args ?? record.arguments;
+    return {
+      reasoning: [],
+      texts: [],
+      tools: [{
+        id: stringFromUnknown(record.toolCallId) || stringFromUnknown(record.id) || name,
+        input,
+        name,
+        reason: toolReasonFromInput(input),
+      }],
+    };
+  }
+  return { reasoning: [], texts: [], tools: [] };
+}
+
+function mergeAiOutputView(target: BrowserChatAiOutputView, source: BrowserChatAiOutputView) {
+  target.reasoning.push(...source.reasoning);
+  target.texts.push(...source.texts);
+  target.tools.push(...source.tools);
+}
+
+function aiOutputViewFromContentParts(parts: unknown[]) {
+  const output: BrowserChatAiOutputView = { reasoning: [], texts: [], tools: [] };
+  for (const part of parts) {
+    mergeAiOutputView(output, normalizeAiContentPart(part));
+  }
+  return output;
+}
+
+function aiOutputViewFromResponse(response: unknown) {
+  const record = asRecord(response);
+  if (!record) return { reasoning: [], texts: [], tools: [] };
+  const output: BrowserChatAiOutputView = { reasoning: [], texts: [], tools: [] };
+  mergeAiOutputView(output, aiOutputViewFromContentParts(arrayFromUnknown(record.content)));
+  if (!output.reasoning.length && !output.texts.length) {
+    const reasoningText = stringFromUnknown(record.reasoningText);
+    if (reasoningText) output.reasoning.push(reasoningText);
+    const text = stringFromUnknown(record.text);
+    if (text) output.texts.push(text);
+  }
+  for (const toolCall of arrayFromUnknown(record.toolCalls)) {
+    mergeAiOutputView(output, normalizeAiContentPart({ ...asRecord(toolCall), type: 'tool-call' }));
+  }
+  const steps = arrayFromUnknown(record.steps);
+  if (steps.length && !output.reasoning.length && !output.tools.length) {
+    mergeAiOutputView(output, aiOutputViewFromResponse(steps.at(-1)));
+  }
+  const result = asRecord(record.result);
+  if (result && !output.reasoning.length && !output.tools.length && !output.texts.length) {
+    mergeAiOutputView(output, aiOutputViewFromResponse(result));
+  }
+  return output;
+}
+
+function dedupeStrings(values: string[]) {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
   });
 }
 
-function aiLogResponsePayload(details?: Record<string, unknown>) {
-  const response = asRecord(details?.response);
-  const blocks: Array<{ label: string; value: unknown }> = [];
-  const directText = typeof details?.text === 'string' ? details.text.trim() : '';
-  if (directText) blocks.push({ label: 'text', value: directText });
-  if (response) {
-    const responseText = typeof response.text === 'string' ? response.text.trim() : '';
-    if (responseText && responseText !== directText) blocks.push({ label: 'response.text', value: responseText });
-    if (response.object !== undefined) blocks.push({ label: 'response.object', value: response.object });
-    if (response.toolCalls !== undefined) blocks.push({ label: 'response.toolCalls', value: response.toolCalls });
-    const providerResponse = asRecord(response.response);
-    if (providerResponse?.messages !== undefined) {
-      blocks.push({ label: 'response.response.messages', value: providerResponse.messages });
-    }
-  }
-  if (!blocks.length && details?.response !== undefined) {
-    blocks.push({ label: 'response', value: details.response });
-  }
-  if (!blocks.length) return '';
-  return blocks.map((block) => `${block.label}:\n${formatToolPayload(block.value)}`).join('\n\n');
+function dedupeAiOutputTools(tools: BrowserChatAiOutputTool[]) {
+  const seen = new Set<string>();
+  return tools.filter((tool) => {
+    const key = `${tool.name}:${formatToolPayload(tool.input)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
-function BrowserChatLogDetails({ log }: { log: BrowserChatLogRecord }) {
-  if (!log.details) return null;
-  const parsed = parseJsonObjectText(log.details);
-  const isAiRequestLog = log.phase === 'ai:runtime:request';
-  const isAiResponseLog = log.phase === 'ai:runtime:response' || log.phase === 'ai:runtime:object';
-  if (!parsed || (!isAiRequestLog && !isAiResponseLog)) {
-    return <pre>{log.details}</pre>;
+function compactAiOutputView(output: BrowserChatAiOutputView): BrowserChatAiOutputView {
+  return {
+    reasoning: dedupeStrings(output.reasoning),
+    texts: dedupeStrings(output.texts),
+    tools: dedupeAiOutputTools(output.tools),
+  };
+}
+
+function hasAiOutputView(output: BrowserChatAiOutputView) {
+  return Boolean(output.reasoning.length || output.texts.length || output.tools.length);
+}
+
+function isCodexRuntimeObjectEnvelope(value: string) {
+  const parsed = parseJsonObjectText(value);
+  if (!parsed) return false;
+  return typeof parsed.type === 'string'
+    && parsed.params !== null
+    && typeof parsed.params === 'object'
+    && !Array.isArray(parsed.params);
+}
+
+function aiOutputCyclesFromLogs(logs: BrowserChatLogRecord[]): BrowserChatAiOutputCycle[] {
+  const cycles: BrowserChatAiOutputCycle[] = [];
+  logs.forEach((log, index) => {
+    if (log.phase !== 'ai:runtime:response' && log.phase !== 'ai:runtime:object') return;
+    const parsed = parseJsonObjectText(log.details);
+    const aiOutput = asRecord(parsed?.aiOutput);
+    if (!aiOutput) return;
+    const output = aiOutputViewFromResponse(aiOutput.response);
+    const fallbackText = stringFromUnknown(aiOutput.text);
+    if (fallbackText) output.texts.push(fallbackText);
+    if (log.phase === 'ai:runtime:object') {
+      output.texts = output.texts.filter((text) => !isCodexRuntimeObjectEnvelope(text));
+    }
+    const compacted = compactAiOutputView(output);
+    if (!hasAiOutputView(compacted)) return;
+    cycles.push({
+      id: log.id || `${log.phase}-${log.stepIndex || 0}-${index}`,
+      output: compacted,
+      stepIndex: log.stepIndex,
+    });
+  });
+  return cycles;
+}
+
+function aiOutputTextSetFromCycles(cycles: BrowserChatAiOutputCycle[]) {
+  return new Set(cycles.flatMap((cycle) => cycle.output.texts).map((text) => text.replace(/\s+/g, ' ').trim()));
+}
+
+function aiCycleToolKey(cycleId: string, toolIndex: number) {
+  return `${cycleId}:${toolIndex}`;
+}
+
+function toolInputSignature(value: unknown) {
+  const canonicalize = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(canonicalize);
+    if (!input || typeof input !== 'object') return input;
+    const record = input as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(record)
+      .filter((key) => key !== 'reason' && key !== 'requiresConfirmation' && key !== 'confirmationMessage')
+      .sort()
+      .map((key) => [key, canonicalize(record[key])]));
+  };
+  try {
+    return JSON.stringify(canonicalize(value)) || '';
+  } catch {
+    return '';
   }
-  const tokenEstimate = aiLogTokenEstimate(parsed);
-  const requestPayload = isAiRequestLog ? aiLogRequestPayload(parsed) : '';
-  const responsePayload = isAiResponseLog ? aiLogResponsePayload(parsed) : '';
-  return (
-    <div className="browser-chat-log-details">
-      {tokenEstimate ? (
-        <section className="browser-chat-log-detail-block">
-          <strong>粗略 token 估算</strong>
-          <pre>{tokenEstimate}</pre>
-        </section>
-      ) : null}
-      {requestPayload ? (
-        <section className="browser-chat-log-detail-block">
-          <strong>发送给 AI 的请求</strong>
-          <pre>{requestPayload}</pre>
-        </section>
-      ) : null}
-      {responsePayload ? (
-        <section className="browser-chat-log-detail-block is-response">
-          <strong>AI 返回内容</strong>
-          <pre>{responsePayload}</pre>
-        </section>
-      ) : null}
-      <details className="browser-chat-log-raw">
-        <summary>完整日志 JSON</summary>
-        <pre>{log.details}</pre>
-      </details>
-    </div>
-  );
+}
+
+function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[]) {
+  const details = new Map<string, BrowserChatToolDetail>();
+
+  cycles.forEach((cycle) => {
+    // An AI response can be present in several log records (request/response/retry).
+    // Each rendered copy must point to the same persisted tool trace; only prevent a
+    // duplicate match within this one response cycle.
+    const usedStepTools = new Set<string>();
+    const candidateSteps = typeof cycle.stepIndex === 'number'
+      ? steps.filter((step) => step.index === cycle.stepIndex)
+      : steps;
+
+    cycle.output.tools.forEach((aiTool, aiToolIndex) => {
+      const exactInput = toolInputSignature(aiTool.input);
+      const sameNameCandidates: BrowserChatToolDetail[] = [];
+
+      for (const step of candidateSteps) {
+        const toolCalls = step.tools || [];
+        for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex += 1) {
+          const tool = toolCalls[toolIndex];
+          if (!tool) continue;
+          const usedKey = `${step.index}:${toolIndex}`;
+          if (usedStepTools.has(usedKey) || tool.name !== aiTool.name) continue;
+
+          const detail = { stepIndex: step.index, step, toolIndex, tool };
+          sameNameCandidates.push(detail);
+          if (!exactInput || toolInputSignature(tool.input) === exactInput) {
+            details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
+            usedStepTools.add(usedKey);
+            return;
+          }
+        }
+      }
+
+      // A same-name fallback is valid only when it is unambiguous. Showing a
+      // real result from another takeSnapshot is worse than showing the raw
+      // model request without a result: it makes debugging impossible.
+      if (sameNameCandidates.length === 1) {
+        const [detail] = sameNameCandidates;
+        details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
+        usedStepTools.add(`${detail.step.index}:${detail.toolIndex}`);
+      }
+    });
+  });
+
+  return details;
+}
+
+function fallbackAiCycleToolDetail(cycle: BrowserChatAiOutputCycle, tool: BrowserChatAiOutputTool, toolIndex: number): BrowserChatToolDetail {
+  const fallbackTool: BrowserChatToolCall = {
+    name: tool.name,
+    input: tool.input,
+    reason: tool.reason,
+  };
+  return {
+    stepIndex: cycle.stepIndex || 0,
+    step: {
+      index: cycle.stepIndex || 0,
+      action: tool.reason || tool.name,
+      actual: '',
+      expected: '',
+      status: 'running',
+      tools: [fallbackTool],
+    },
+    toolIndex,
+    tool: fallbackTool,
+  };
+}
+
+function isRecoveredTransientTool(tool: BrowserChatToolCall | undefined) {
+  return tool?.recovered === true && tool.transient === true;
 }
 
 function toolStatusLabel(tool: BrowserChatToolCall) {
-  if (tool.ok === false) return '失败';
+  if (isRecoveredTransientTool(tool)) return '已恢复';
   if (tool.ok === true) return '完成';
+  if (tool.ok === false) return '失败';
   return '运行中';
 }
 
@@ -292,46 +867,39 @@ function summarizeToolFields(fields: unknown) {
   return `${fields.length} 项${textValues[0] ? `，${textValues[0]}` : ''}`;
 }
 
-function browserChatToolLabel(name: string) {
+function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
-    clickCandidate: '点选目标',
-    clickDomNode: '点选节点',
-    clickLocator: '点选定位器',
-    doubleClickCandidate: '双击目标',
-    dragCandidate: '拖拽元素',
-    fillCandidates: '填写表单',
-    fillDomNodes: '填写节点',
-    findByText: '定位文本',
-    getDomNodeText: '读取节点',
     getHttpRequests: '检查请求',
+    keyboard: '键盘操作',
     listTabs: '扫描标签页',
     manageVisualContext: '整理视觉上下文',
+    mouse: '鼠标操作',
     openPage: '导航页面',
-    pressKey: '发送按键',
     reportState: '确认状态',
-    rightClickCandidate: '右键目标',
-    scrollArea: '移动视窗',
+    searchSnapshot: '搜索页面快照',
+    selectOption: '选择下拉选项',
     selectReferenceScreenshots: '引用截图',
     switchTab: '切换标签',
-    typeText: '键入内容',
+    takeScreenshot: '截屏取证',
+    takeSnapshot: '读取页面快照',
     waitForHumanVerification: '等待人工验证',
     waitForPage: '等待页面稳定',
   };
-  if (labels[name]) return labels[name];
+  if (labels[name]) return t(labels[name]);
 
   const lower = name.toLowerCase();
-  if (lower.includes('screenshot') || lower.includes('capture')) return '截屏取证';
-  if (lower.includes('snapshot') || lower.includes('context')) return '读取页面状态';
-  if (lower.includes('clickat') || lower.includes('coordinate')) return '点选坐标';
-  if (lower.includes('click')) return '点选目标';
-  if (lower.includes('fill') || lower.includes('type')) return '键入内容';
-  if (lower.includes('hover')) return '悬停元素';
-  if (lower.includes('drag')) return '拖拽元素';
-  if (lower.includes('scroll')) return '移动视窗';
-  if (lower.includes('wait')) return '等待页面稳定';
-  if (lower.includes('open') || lower.includes('page')) return '导航页面';
-  if (lower.includes('request')) return '检查请求';
-  if (lower.includes('report') || lower.includes('state')) return '确认状态';
+  if (lower.includes('screenshot') || lower.includes('capture')) return t('截屏取证');
+  if (lower.includes('snapshot') || lower.includes('context')) return t('读取页面状态');
+  if (lower.includes('clickat') || lower.includes('coordinate')) return t('点选坐标');
+  if (lower.includes('click')) return t('点选目标');
+  if (lower.includes('fill') || lower.includes('type')) return t('键入内容');
+  if (lower.includes('hover')) return t('悬停元素');
+  if (lower.includes('drag')) return t('拖拽元素');
+  if (lower.includes('scroll')) return t('移动视窗');
+  if (lower.includes('wait')) return t('等待页面稳定');
+  if (lower.includes('open') || lower.includes('page')) return t('导航页面');
+  if (lower.includes('request')) return t('检查请求');
+  if (lower.includes('report') || lower.includes('state')) return t('确认状态');
   return name;
 }
 
@@ -340,17 +908,21 @@ function browserChatToolMeta(name: string, input: unknown) {
   if (!record) return toolStringValue(input);
 
   const lower = name.toLowerCase();
-  if (name === 'typeText') return toolInputValue(record, ['text', 'content', 'value']);
-  if (name === 'pressKey') return toolInputValue(record, ['key']);
+  if (name === 'keyboard') return [toolInputValue(record, ['action']), toolInputValue(record, ['text', 'key', 'uid'])].filter(Boolean).join(' · ');
+  if (name === 'selectOption') return [toolInputValue(record, ['uid']), toolInputValue(record, ['value', 'label'])].filter(Boolean).join(' · ');
   if (name === 'openPage') return toolInputValue(record, ['url']);
   if (name === 'switchTab') return toolInputValue(record, ['index']);
   if (name === 'waitForPage') return toolInputValue(record, ['ms']);
   if (name === 'waitForHumanVerification') return toolInputValue(record, ['maxMs']);
-  if (name === 'scrollArea') {
-    const area = toolInputValue(record, ['areaId']);
+  if (name === 'mouse') {
+    const action = toolInputValue(record, ['action']);
+    const target = toolInputValue(record, ['uid', 'x_thousandth']);
     const deltaY = toolInputValue(record, ['deltaY']);
-    return [area, deltaY ? `Y ${deltaY}` : ''].filter(Boolean).join(' · ');
+    return [action, target, deltaY ? `Y ${deltaY}` : ''].filter(Boolean).join(' · ');
   }
+  if (name === 'takeSnapshot') return toolInputValue(record, ['mode', 'cursor']);
+  if (name === 'searchSnapshot') return toolInputValue(record, ['query']);
+  if (name === 'takeScreenshot') return toolInputValue(record, ['capture']);
   if (name === 'selectReferenceScreenshots') {
     const ids = Array.isArray(record.ids) ? record.ids : [];
     return ids.length ? `${ids.length} 张` : '';
@@ -359,11 +931,11 @@ function browserChatToolMeta(name: string, input: unknown) {
   if (name === 'reportState') return toolInputValue(record, ['action', 'actual', 'status']);
   if (lower.includes('fill')) return summarizeToolFields(record.fields) || toolInputValue(record, ['text', 'content', 'value']);
   if (lower.includes('click') || lower.includes('hover') || lower.includes('drag')) {
-    return toolInputValue(record, ['text', 'targetVisual', 'targetText', 'id', 'locatorId', 'fromId']);
+    return toolInputValue(record, ['text', 'targetVisual', 'targetText', 'id', 'fromId']);
   }
   if (lower.includes('find')) return toolInputValue(record, ['targetText', 'scopeId']);
   if (lower.includes('text')) return toolInputValue(record, ['text', 'targetText', 'id']);
-  return toolInputValue(record, ['url', 'text', 'targetVisual', 'targetText', 'id', 'areaId', 'action', 'status']);
+  return toolInputValue(record, ['url', 'text', 'uid', 'query', 'action', 'status']);
 }
 
 function BrowserChatToolIcon({ name }: { name: string }) {
@@ -389,30 +961,635 @@ function BrowserChatToolIcon({ name }: { name: string }) {
   return <Workflow size={13} />;
 }
 
-function screenshotKindLabel(kind?: string) {
-  if (kind === 'original') return '原始图';
-  if (kind === 'marker') return '标识图';
-  if (kind === 'current' || kind === 'pinned' || kind === 'after') return '操作后';
-  if (kind === 'history') return '操作前';
-  return '截图';
+type ToolTailRain = {
+  alpha: number;
+  head: boolean;
+  length: number;
+  phase: number;
+  speed: number;
+  width: number;
+  wobble: number;
+  x: number;
+  y: number;
+};
+
+type ToolTailDust = {
+  alpha: number;
+  blur: number;
+  drift: number;
+  phase: number;
+  radius: number;
+  speed: number;
+  twinkle: number;
+  x: number;
+  y: number;
+};
+
+type ToolTailBeam = {
+  alpha: number;
+  drift: number;
+  height: number;
+  phase: number;
+  y: number;
+};
+
+type ToolTailSourceSpark = {
+  alpha: number;
+  delay: number;
+  distance: number;
+  duration: number;
+  life: number;
+  localY: number;
+  width: number;
+};
+
+type ToolTailFlowParticle = {
+  createdAt: number;
+  distance: number;
+  duration: number;
+  expiresAt: number;
+  id: number;
+  start: number;
+  width: number;
+  y: number;
+};
+
+function toolTailClamp(value: number, minimum: number, maximum: number) {
+  return Math.max(minimum, Math.min(maximum, value));
 }
+
+const BrowserChatToolTailParticles = memo(function BrowserChatToolTailParticles() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [flowParticles, setFlowParticles] = useState<ToolTailFlowParticle[]>([]);
+
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return undefined;
+    const context = canvas.getContext('2d');
+    if (!context) return undefined;
+
+    let beams: ToolTailBeam[] = [];
+    let dust: ToolTailDust[] = [];
+    let frame = 0;
+    let elapsed = 0;
+    let lastTimestamp = 0;
+    let rain: ToolTailRain[] = [];
+    let sourceSparks: ToolTailSourceSpark[] = [];
+    let width = 0;
+    let height = 0;
+    let emitterRadius = 15;
+    let lightTheme = true;
+    let canvasVisible = true;
+    let documentVisible = document.visibilityState !== 'hidden';
+    let pixelRatio = 1;
+    const emitterOverlap = 20;
+    const random = (minimum: number, maximum: number) => minimum + Math.random() * (maximum - minimum);
+
+    const updateTheme = () => {
+      const theme = document.documentElement.dataset.theme;
+      lightTheme = theme ? theme !== 'dark' : !window.matchMedia('(prefers-color-scheme: dark)').matches;
+    };
+    const emitterX = (localY: number) => {
+      const y = Math.min(emitterRadius, Math.abs(localY));
+      return emitterOverlap - emitterRadius + Math.sqrt(Math.max(0, emitterRadius ** 2 - y ** 2));
+    };
+
+    const makeRain = (initial = false): ToolTailRain => ({
+      alpha: random(0.16, 0.72),
+      head: Math.random() < 0.46,
+      length: random(12, 68) * random(0.72, 1.25),
+      phase: random(0, Math.PI * 2),
+      speed: random(52, 170),
+      width: random(0.4, 1.2),
+      wobble: random(0.4, 2),
+      x: initial ? random(-width * 0.25, width) : random(-width * 0.34, -8),
+      y: random(5, Math.max(6, height - 5)),
+    });
+    const makeDust = (initial = false): ToolTailDust => {
+      const depth = Math.random();
+      return {
+        alpha: random(0.16, 0.92) * (0.52 + depth * 0.48),
+        blur: random(0, 5) * (1 - depth),
+        drift: random(-7, 7),
+        phase: random(0, Math.PI * 2),
+        radius: random(0.45, 2.4) * (0.55 + depth),
+        speed: random(8, 31) * (0.55 + depth),
+        twinkle: random(1.1, 4.2),
+        x: initial ? random(-10, width + 10) : random(-20, -2),
+        y: random(3, Math.max(4, height - 3)),
+      };
+    };
+    const makeSourceSpark = (initial = false): ToolTailSourceSpark => ({
+      alpha: random(0.22, 0.9),
+      delay: random(0, 2.2),
+      distance: random(12, Math.max(13, width * 0.28)),
+      duration: random(0.75, 2.8),
+      life: initial ? random(0, 1) : 0,
+      localY: random(-emitterRadius * 0.94, emitterRadius * 0.94),
+      width: random(0.45, 1.5),
+    });
+    const buildScene = () => {
+      const areaScale = Math.sqrt((width * height) / (500 * 280));
+      beams = Array.from({ length: Math.max(7, Math.round(14 * areaScale)) }, () => ({
+        alpha: random(0.018, 0.075),
+        drift: random(-4, 4),
+        height: random(1, 7),
+        phase: random(0, Math.PI * 2),
+        y: random(0, height),
+      }));
+      rain = Array.from({ length: Math.max(32, Math.round(43 * areaScale)) }, () => makeRain(true));
+      dust = Array.from({ length: Math.max(78, Math.round(104 * areaScale)) }, () => makeDust(true));
+      sourceSparks = Array.from({ length: Math.max(14, Math.round(18 * areaScale)) }, () => makeSourceSpark(true));
+    };
+    const resize = () => {
+      const bounds = canvas.getBoundingClientRect();
+      const nextWidth = Math.max(1, bounds.width);
+      const nextHeight = Math.max(1, bounds.height);
+      const nextPixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      const sizeChanged = Math.abs(width - nextWidth) > 0.5
+        || Math.abs(height - nextHeight) > 0.5
+        || pixelRatio !== nextPixelRatio;
+      width = nextWidth;
+      height = nextHeight;
+      pixelRatio = nextPixelRatio;
+      const toolHeight = canvas.parentElement?.getBoundingClientRect().height || 32;
+      emitterRadius = Math.max(8, Math.min(20, (toolHeight - 2) / 2));
+      updateTheme();
+      if (!sizeChanged) return;
+      canvas.width = Math.round(width * pixelRatio);
+      canvas.height = Math.round(height * pixelRatio);
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.imageSmoothingEnabled = true;
+      buildScene();
+    };
+
+    const update = (deltaSeconds: number) => {
+      elapsed += deltaSeconds;
+      for (let index = 0; index < rain.length; index += 1) {
+        const drop = rain[index];
+        drop.x += drop.speed * deltaSeconds;
+        drop.y += Math.sin(elapsed * drop.wobble + drop.phase) * 0.06;
+        if (drop.x - drop.length > width + 10) rain[index] = makeRain(false);
+      }
+      for (let index = 0; index < dust.length; index += 1) {
+        const particle = dust[index];
+        particle.x += particle.speed * deltaSeconds;
+        particle.y += (particle.drift + Math.sin(elapsed * 0.7 + particle.phase) * 4) * deltaSeconds;
+        if (particle.x - particle.radius > width + 12 || particle.y < -24 || particle.y > height + 24) {
+          dust[index] = makeDust(false);
+        }
+      }
+      for (let index = 0; index < sourceSparks.length; index += 1) {
+        const spark = sourceSparks[index];
+        if (spark.delay > 0) spark.delay -= deltaSeconds;
+        else {
+          spark.life += deltaSeconds / spark.duration;
+          if (spark.life >= 1) sourceSparks[index] = makeSourceSpark(false);
+        }
+      }
+    };
+
+    const drawAtmosphere = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.translate(emitterOverlap, height / 2);
+      context.scale(1, 0.56);
+      const haze = context.createRadialGradient(0, 0, 0, 0, 0, width * 0.72);
+      haze.addColorStop(0, lightTheme ? 'rgba(0, 166, 214, 0.08)' : 'rgba(0, 146, 255, 0.13)');
+      haze.addColorStop(0.46, lightTheme ? 'rgba(0, 137, 197, 0.035)' : 'rgba(0, 87, 169, 0.055)');
+      haze.addColorStop(1, 'rgba(0, 105, 255, 0)');
+      context.fillStyle = haze;
+      context.fillRect(-20, -height, width + 40, height * 2);
+      context.restore();
+
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.filter = `blur(${Math.max(2, width / 180)}px)`;
+      for (const beam of beams) {
+        const y = beam.y + Math.sin(elapsed * 0.18 + beam.phase) * beam.drift;
+        const gradient = context.createLinearGradient(0, y, width, y);
+        gradient.addColorStop(0, 'rgba(0, 156, 255, 0)');
+        gradient.addColorStop(0.28, lightTheme
+          ? `rgba(0, 135, 190, ${beam.alpha * 0.28})`
+          : `rgba(0, 156, 255, ${beam.alpha * 0.34})`);
+        gradient.addColorStop(0.74, lightTheme
+          ? `rgba(0, 162, 205, ${beam.alpha * 0.72})`
+          : `rgba(0, 188, 255, ${beam.alpha})`);
+        gradient.addColorStop(1, 'rgba(0, 225, 255, 0)');
+        context.fillStyle = gradient;
+        context.fillRect(0, y - beam.height / 2, width, beam.height);
+      }
+      context.restore();
+    };
+
+    const drawRain = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.lineCap = 'round';
+      context.filter = 'blur(2px)';
+      for (const drop of rain) {
+        const x0 = drop.x - drop.length;
+        const gradient = context.createLinearGradient(x0, drop.y, drop.x, drop.y);
+        gradient.addColorStop(0, 'rgba(0, 118, 255, 0)');
+        gradient.addColorStop(0.7, lightTheme
+          ? `rgba(0, 137, 193, ${drop.alpha * 0.14})`
+          : `rgba(0, 173, 255, ${drop.alpha * 0.22})`);
+        gradient.addColorStop(1, lightTheme
+          ? `rgba(0, 176, 211, ${drop.alpha * 0.34})`
+          : `rgba(74, 235, 255, ${drop.alpha * 0.5})`);
+        context.strokeStyle = gradient;
+        context.lineWidth = drop.width * 3.4;
+        context.beginPath();
+        context.moveTo(x0, drop.y);
+        context.lineTo(drop.x, drop.y);
+        context.stroke();
+      }
+      context.restore();
+
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.lineCap = 'round';
+      for (const drop of rain) {
+        const x0 = drop.x - drop.length;
+        const gradient = context.createLinearGradient(x0, drop.y, drop.x, drop.y);
+        gradient.addColorStop(0, 'rgba(0, 113, 232, 0)');
+        gradient.addColorStop(0.55, lightTheme
+          ? `rgba(0, 117, 174, ${drop.alpha * 0.26})`
+          : `rgba(0, 146, 255, ${drop.alpha * 0.32})`);
+        gradient.addColorStop(1, lightTheme
+          ? `rgba(0, 156, 201, ${drop.alpha * 0.88})`
+          : `rgba(106, 246, 255, ${drop.alpha})`);
+        context.strokeStyle = gradient;
+        context.lineWidth = drop.width;
+        context.beginPath();
+        context.moveTo(x0, drop.y);
+        context.lineTo(drop.x, drop.y);
+        context.stroke();
+        if (drop.head) {
+          context.fillStyle = lightTheme
+            ? `rgba(0, 151, 197, ${drop.alpha * 0.92})`
+            : `rgba(138, 250, 255, ${drop.alpha * 0.92})`;
+          context.beginPath();
+          context.arc(drop.x, drop.y, Math.max(0.55, drop.width * 0.76), 0, Math.PI * 2);
+          context.fill();
+        }
+      }
+      context.restore();
+    };
+
+    const drawDust = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      for (const particle of dust) {
+        const pulse = 0.58 + 0.42 * Math.sin(elapsed * particle.twinkle + particle.phase);
+        const alpha = toolTailClamp(particle.alpha * (0.72 + pulse * 0.42), 0, 1);
+        const radius = particle.radius * (1 + pulse * 0.12);
+        if (particle.blur > 1.6) {
+          context.filter = `blur(${particle.blur}px)`;
+          context.fillStyle = lightTheme
+            ? `rgba(0, 145, 194, ${alpha * 0.18})`
+            : `rgba(0, 176, 255, ${alpha * 0.28})`;
+          context.beginPath();
+          context.arc(particle.x, particle.y, radius * 2.15, 0, Math.PI * 2);
+          context.fill();
+        }
+        context.filter = 'none';
+        const glow = context.createRadialGradient(particle.x, particle.y, 0, particle.x, particle.y, radius * 3.5);
+        glow.addColorStop(0, lightTheme
+          ? `rgba(0, 135, 180, ${alpha * 0.95})`
+          : `rgba(169, 255, 255, ${alpha})`);
+        glow.addColorStop(0.18, lightTheme
+          ? `rgba(0, 177, 210, ${alpha * 0.68})`
+          : `rgba(57, 225, 255, ${alpha * 0.86})`);
+        glow.addColorStop(0.56, lightTheme
+          ? `rgba(0, 139, 202, ${alpha * 0.18})`
+          : `rgba(0, 143, 255, ${alpha * 0.24})`);
+        glow.addColorStop(1, 'rgba(0, 105, 255, 0)');
+        context.fillStyle = glow;
+        context.beginPath();
+        context.arc(particle.x, particle.y, radius * 3.5, 0, Math.PI * 2);
+        context.fill();
+      }
+      context.restore();
+    };
+
+    const drawSourceSparks = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.lineCap = 'round';
+      for (const spark of sourceSparks) {
+        if (spark.delay > 0) continue;
+        const progress = toolTailClamp(spark.life, 0, 1);
+        const travel = 1 - (1 - Math.min(progress * 2.1, 1)) ** 3;
+        const fade = progress < 0.18 ? progress / 0.18 : 1 - (progress - 0.18) / 0.82;
+        const alpha = Math.max(0, fade) * spark.alpha;
+        const sourceX = emitterX(spark.localY) + 1;
+        const y = height / 2 + spark.localY;
+        const headX = sourceX + spark.distance * travel;
+
+        context.filter = 'blur(3px)';
+        const soft = context.createLinearGradient(sourceX, y, headX, y);
+        soft.addColorStop(0, lightTheme
+          ? `rgba(0, 160, 204, ${alpha * 0.42})`
+          : `rgba(0, 229, 255, ${alpha * 0.7})`);
+        soft.addColorStop(0.65, lightTheme
+          ? `rgba(0, 126, 191, ${alpha * 0.12})`
+          : `rgba(0, 156, 255, ${alpha * 0.18})`);
+        soft.addColorStop(1, 'rgba(0, 118, 255, 0)');
+        context.strokeStyle = soft;
+        context.lineWidth = spark.width * 5;
+        context.beginPath();
+        context.moveTo(sourceX, y);
+        context.lineTo(headX, y);
+        context.stroke();
+
+        context.filter = 'none';
+        const core = context.createLinearGradient(sourceX, y, headX, y);
+        core.addColorStop(0, lightTheme
+          ? `rgba(0, 137, 183, ${alpha * 0.9})`
+          : `rgba(181, 255, 255, ${alpha})`);
+        core.addColorStop(0.45, lightTheme
+          ? `rgba(0, 181, 211, ${alpha * 0.64})`
+          : `rgba(29, 223, 255, ${alpha * 0.75})`);
+        core.addColorStop(1, 'rgba(0, 158, 255, 0)');
+        context.strokeStyle = core;
+        context.lineWidth = spark.width;
+        context.beginPath();
+        context.moveTo(sourceX, y);
+        context.lineTo(headX, y);
+        context.stroke();
+
+        const orb = context.createRadialGradient(headX, y, 0, headX, y, 5 + spark.width * 2);
+        orb.addColorStop(0, lightTheme
+          ? `rgba(0, 139, 180, ${alpha * 0.95})`
+          : `rgba(210, 255, 255, ${alpha})`);
+        orb.addColorStop(0.22, lightTheme
+          ? `rgba(0, 185, 213, ${alpha * 0.58})`
+          : `rgba(53, 236, 255, ${alpha * 0.72})`);
+        orb.addColorStop(1, 'rgba(0, 130, 255, 0)');
+        context.fillStyle = orb;
+        context.beginPath();
+        context.arc(headX, y, 5 + spark.width * 2, 0, Math.PI * 2);
+        context.fill();
+      }
+      context.restore();
+    };
+
+    const drawEmitter = () => {
+      context.save();
+      context.globalCompositeOperation = lightTheme ? 'source-over' : 'lighter';
+      context.lineCap = 'round';
+      const traceArc = () => {
+        context.beginPath();
+        let first = true;
+        for (let y = -emitterRadius + 0.5; y <= emitterRadius - 0.5; y += 0.75) {
+          const x = emitterX(y) + 1.5;
+          if (first) {
+            context.moveTo(x, height / 2 + y);
+            first = false;
+          } else context.lineTo(x, height / 2 + y);
+        }
+      };
+      traceArc();
+      context.strokeStyle = lightTheme
+        ? 'rgba(0, 143, 190, 0.07)'
+        : 'rgba(0, 118, 255, 0.2)';
+      context.lineWidth = 14;
+      context.shadowBlur = lightTheme ? 8 : 16;
+      context.shadowColor = lightTheme ? 'rgba(0, 166, 210, 0.3)' : 'rgba(0, 198, 255, 0.82)';
+      context.stroke();
+      traceArc();
+      context.strokeStyle = lightTheme
+        ? 'rgba(0, 154, 197, 0.2)'
+        : 'rgba(0, 218, 255, 0.58)';
+      context.lineWidth = 5.5;
+      context.shadowBlur = lightTheme ? 4 : 7;
+      context.stroke();
+      traceArc();
+      context.strokeStyle = lightTheme
+        ? 'rgba(0, 126, 173, 0.92)'
+        : 'rgba(209, 255, 255, 0.98)';
+      context.lineWidth = 1.4;
+      context.shadowBlur = lightTheme ? 1 : 3;
+      context.stroke();
+      context.restore();
+    };
+
+    const clipParticleFieldOutsideCapsule = () => {
+      context.beginPath();
+      context.moveTo(emitterX(-emitterRadius) + 1, 0);
+      for (let y = -emitterRadius; y <= emitterRadius; y += 0.75) {
+        context.lineTo(emitterX(y) + 1, height / 2 + y);
+      }
+      context.lineTo(width, height);
+      context.lineTo(width, 0);
+      context.closePath();
+      context.clip();
+    };
+
+    const fadeParticleFieldEdges = () => {
+      const fadeStart = Math.max(0, width - 38);
+      const startRatio = fadeStart / Math.max(1, width);
+      context.save();
+      context.globalCompositeOperation = 'destination-in';
+      const rightMask = context.createLinearGradient(0, 0, width, 0);
+      rightMask.addColorStop(0, 'rgba(0, 0, 0, 1)');
+      rightMask.addColorStop(startRatio, 'rgba(0, 0, 0, 1)');
+      rightMask.addColorStop(startRatio + (1 - startRatio) * 0.5, 'rgba(0, 0, 0, 0.72)');
+      rightMask.addColorStop(startRatio + (1 - startRatio) * 0.78, 'rgba(0, 0, 0, 0.3)');
+      rightMask.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      context.fillStyle = rightMask;
+      context.fillRect(0, 0, width, height);
+      const verticalMask = context.createLinearGradient(0, 0, 0, height);
+      verticalMask.addColorStop(0, 'rgba(0, 0, 0, 0)');
+      verticalMask.addColorStop(0.18, 'rgba(0, 0, 0, 0.72)');
+      verticalMask.addColorStop(0.34, 'rgba(0, 0, 0, 1)');
+      verticalMask.addColorStop(0.66, 'rgba(0, 0, 0, 1)');
+      verticalMask.addColorStop(0.82, 'rgba(0, 0, 0, 0.72)');
+      verticalMask.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      context.fillStyle = verticalMask;
+      context.fillRect(0, 0, width, height);
+      context.restore();
+    };
+
+    const draw = (timestamp: number) => {
+      frame = 0;
+      if (!canvasVisible || !documentVisible) return;
+      const deltaSeconds = lastTimestamp ? Math.min((timestamp - lastTimestamp) / 1000, 0.034) : 0;
+      lastTimestamp = timestamp;
+      context.clearRect(0, 0, width, height);
+      update(deltaSeconds);
+      context.save();
+      clipParticleFieldOutsideCapsule();
+      drawAtmosphere();
+      drawRain();
+      drawDust();
+      drawSourceSparks();
+      context.restore();
+      fadeParticleFieldEdges();
+      drawEmitter();
+      frame = window.requestAnimationFrame(draw);
+    };
+
+    const requestDraw = () => {
+      if (!canvasVisible || !documentVisible || frame) return;
+      lastTimestamp = 0;
+      frame = window.requestAnimationFrame(draw);
+    };
+    const setAnimationActive = () => {
+      if (canvasVisible && documentVisible) {
+        requestDraw();
+        return;
+      }
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = 0;
+      lastTimestamp = 0;
+    };
+
+    const resizeObserver = new ResizeObserver(resize);
+    const intersectionObserver = typeof IntersectionObserver === 'function'
+      ? new IntersectionObserver(([entry]) => {
+        canvasVisible = entry?.isIntersecting !== false;
+        setAnimationActive();
+      })
+      : undefined;
+    const themeObserver = new MutationObserver(updateTheme);
+    const handleVisibilityChange = () => {
+      documentVisible = document.visibilityState !== 'hidden';
+      setAnimationActive();
+    };
+    resizeObserver.observe(canvas);
+    intersectionObserver?.observe(canvas);
+    themeObserver.observe(document.documentElement, { attributeFilter: ['data-theme'], attributes: true });
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    resize();
+    // Draw synchronously in the same layout commit that inserts the running
+    // tool card, then continue on RAF. This prevents a visible blank interval.
+    draw(performance.now());
+    return () => {
+      resizeObserver.disconnect();
+      intersectionObserver?.disconnect();
+      themeObserver.disconnect();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.cancelAnimationFrame(frame);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return undefined;
+    const lanes = [2, 5, 8, 11, 14, 17, 20, 23, 26];
+    let nextId = 0;
+    let timeoutId: number | undefined;
+    const random = (minimum: number, maximum: number) => minimum + Math.random() * (maximum - minimum);
+
+    const emit = () => {
+      const timestamp = Date.now();
+      setFlowParticles((current) => {
+        const active = current.filter((particle) => particle.expiresAt > timestamp);
+        const occupiedLanes = new Set(active
+          .filter((particle) => timestamp - particle.createdAt < particle.duration * 0.55)
+          .map((particle) => particle.y));
+        const availableLanes = lanes.filter((lane) => !occupiedLanes.has(lane));
+        const emitted = Array.from({ length: Math.min(availableLanes.length, 1) }, () => {
+          const laneIndex = Math.floor(Math.random() * availableLanes.length);
+          const y = availableLanes.splice(laneIndex, 1)[0];
+          const width = Math.round(random(27, 47));
+          const duration = Math.round(random(2700, 3350));
+          return {
+            createdAt: timestamp,
+            distance: Math.round(random(160, 178)),
+            duration,
+            expiresAt: timestamp + duration,
+            id: nextId++,
+            start: -(width + 5),
+            width,
+            y,
+          };
+        });
+        return [...active, ...emitted];
+      });
+      timeoutId = window.setTimeout(emit, Math.round(random(200, 400)));
+    };
+
+    emit();
+    return () => window.clearTimeout(timeoutId);
+  }, []);
+
+  return (
+    <span
+      aria-hidden="true"
+      className="browser-chat-tool-tail-particles"
+    >
+      {flowParticles.map((particle) => (
+        <i
+          className="browser-chat-tool-tail-comet"
+          key={particle.id}
+          style={{
+            '--distance': `${particle.distance}px`,
+            '--duration': `${particle.duration}ms`,
+            '--start': `${particle.start}px`,
+            '--width': `${particle.width}px`,
+            '--y': `${particle.y}px`,
+          } as CSSProperties}
+        />
+      ))}
+    </span>
+  );
+});
+
 
 function temporaryId(prefix: string) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function normalizeMode(value?: string): BrowserChatMode {
-  return value === 'dom' ? 'dom' : 'visual-markers';
+  void value;
+  return 'dom';
+}
+
+function normalizeSafetyMode(value?: string): BrowserChatSafetyMode {
+  return value === 'full' ? 'full' : 'strict';
+}
+
+function normalizeToolConfirmation(value?: BrowserChatToolConfirmation): BrowserChatToolConfirmation | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const id = typeof value.id === 'string' ? value.id.trim() : '';
+  const messageId = typeof value.messageId === 'string' ? value.messageId.trim() : '';
+  const toolName = typeof value.toolName === 'string' ? value.toolName.trim() : '';
+  const inputSignature = typeof value.inputSignature === 'string' ? value.inputSignature : '';
+  const prompt = typeof value.prompt === 'string' ? value.prompt.trim() : '';
+  if (!id || !messageId || !toolName || !prompt) return undefined;
+  return {
+    id,
+    messageId,
+    stepIndex: typeof value.stepIndex === 'number' && Number.isFinite(value.stepIndex) ? Math.floor(value.stepIndex) : undefined,
+    toolName,
+    inputSignature,
+    reason: typeof value.reason === 'string' && value.reason.trim() ? compactText(value.reason, 300) : undefined,
+    prompt: compactText(prompt, 500),
+    requestedAt: typeof value.requestedAt === 'string' ? value.requestedAt : '',
+  };
 }
 
 function normalizeSession(session: BrowserChatSession): BrowserChatSession {
+  const modelSelection = resolveRuntimeModelSelection(null, { model: session.model, provider: session.modelProvider });
   return {
     ...session,
     consoleErrors: session.consoleErrors || [],
     logs: session.logs || [],
-    messages: (session.messages || []).map((message) => ({ ...message, attachments: message.attachments || [] })),
+    messages: (session.messages || []).map((message) => ({
+      ...message,
+      attachments: message.attachments || [],
+      content: stringFromUnknown(message.content),
+      role: message.role === 'assistant' ? 'assistant' : 'user',
+      stepIndexes: Array.isArray(message.stepIndexes) ? message.stepIndexes : [],
+    })),
     mode: normalizeMode(session.mode),
+    safetyMode: normalizeSafetyMode(session.safetyMode),
+    modelProvider: modelSelection.provider,
+    model: modelSelection.model,
     networkErrors: session.networkErrors || [],
+    pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
     steps: session.steps || [],
   };
 }
@@ -448,44 +1625,10 @@ function formatLogTime(value: string) {
   return date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-function buildBrowserChatLogIndex(logs: BrowserChatLogRecord[]): BrowserChatLogIndex {
-  const byMessageId = new Map<string, BrowserChatLogRecord[]>();
-  const byStepIndex = new Map<number, BrowserChatLogRecord[]>();
-
-  for (const log of logs) {
-    if (log.messageId) {
-      const entries = byMessageId.get(log.messageId) || [];
-      entries.push(log);
-      byMessageId.set(log.messageId, entries);
-      continue;
-    }
-    if (typeof log.stepIndex === 'number') {
-      const entries = byStepIndex.get(log.stepIndex) || [];
-      entries.push(log);
-      byStepIndex.set(log.stepIndex, entries);
-    }
-  }
-
-  return { byMessageId, byStepIndex };
-}
-
-function browserChatLogsForMessage(message: BrowserChatMessage, logIndex: BrowserChatLogIndex) {
-  const directLogs = logIndex.byMessageId.get(message.id) || [];
-  const stepLogs = (message.stepIndexes || []).flatMap((stepIndex) => logIndex.byStepIndex.get(stepIndex) || []);
-  return directLogs.length || stepLogs.length ? [...directLogs, ...stepLogs] : [];
-}
-
 function messageUpdateTime(message: BrowserChatMessage) {
   return message.updatedAt || message.createdAt;
 }
 
-function phaseLabel(phase: string) {
-  if (phase.startsWith('browser:')) return '浏览器';
-  if (phase.startsWith('ai:')) return 'AI';
-  if (phase.startsWith('chat:')) return '对话';
-  if (phase.startsWith('perf:')) return '性能';
-  return phase;
-}
 
 function normalizeMarkdownSegment(value: string) {
   return value
@@ -503,13 +1646,296 @@ function normalizeChatMarkdown(markdown: string) {
     .trim();
 }
 
+const BROWSER_CHAT_DOWNLOAD_EXTENSIONS = new Set([
+  '.7z',
+  '.apk',
+  '.bin',
+  '.bz2',
+  '.csv',
+  '.deb',
+  '.dmg',
+  '.doc',
+  '.docx',
+  '.exe',
+  '.gz',
+  '.ipa',
+  '.msi',
+  '.pkg',
+  '.ppt',
+  '.pptx',
+  '.rar',
+  '.rpm',
+  '.tar',
+  '.tgz',
+  '.xls',
+  '.xlsx',
+  '.xz',
+  '.zip',
+]);
+
+function normalizeBrowserChatMarkdownHref(href: string) {
+  const trimmed = href.trim();
+  if (!trimmed) return '';
+  if (/^[./?#/]/.test(trimmed)) {
+    try {
+      return new URL(trimmed, typeof window === 'undefined' ? 'http://127.0.0.1/' : window.location.href).toString();
+    } catch {
+      return '';
+    }
+  }
+  return normalizeEmbeddedBrowserAddress(trimmed);
+}
+
+function isBrowserChatDownloadHref(href: string) {
+  const normalizedHref = normalizeBrowserChatMarkdownHref(href);
+  if (!normalizedHref) return false;
+  try {
+    const parsed = new URL(normalizedHref);
+    const downloadValue = parsed.searchParams.get('download');
+    if (downloadValue !== null && !/^(0|false|no)$/i.test(downloadValue)) return true;
+    const attachmentValue = [
+      parsed.searchParams.get('content-disposition'),
+      parsed.searchParams.get('response-content-disposition'),
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (attachmentValue.includes('attachment')) return true;
+    const pathname = decodeURIComponent(parsed.pathname || '').toLowerCase();
+    const extension = pathname.match(/\.([a-z0-9]{1,8})$/)?.[0] || '';
+    return BROWSER_CHAT_DOWNLOAD_EXTENSIONS.has(extension);
+  } catch {
+    return false;
+  }
+}
+
+function handleBrowserChatMarkdownLinkClick(event: ReactMouseEvent<HTMLAnchorElement>, href?: string) {
+  const rawHref = String(href || '').trim();
+  if (!rawHref || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (rawHref.startsWith('#') || /^(javascript|mailto|tel):/i.test(rawHref)) return;
+  const url = normalizeBrowserChatMarkdownHref(rawHref);
+  if (!url) return;
+  if (isBrowserChatDownloadHref(rawHref)) {
+    const systemBridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
+    if (!systemBridge?.downloadUrl) return;
+    event.preventDefault();
+    systemBridge.downloadUrl({ url }).catch(() => undefined);
+    return;
+  }
+  const bridge = typeof window === 'undefined' ? undefined : window.webPilotEmbeddedBrowser;
+  if (!bridge) return;
+  event.preventDefault();
+  bridge.createTab({ url }).catch(() => undefined);
+}
+
 const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { markdown: string }) {
   const normalizedMarkdown = useMemo(() => normalizeChatMarkdown(markdown), [markdown]);
   return (
     <div className="browser-chat-agent-markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, onClick, ...props }) => (
+            <a
+              {...props}
+              href={href}
+              onClick={(event) => {
+                onClick?.(event);
+                handleBrowserChatMarkdownLinkClick(event, href);
+              }}
+              target="_blank"
+              rel="noopener noreferrer"
+            />
+          ),
+        }}
+      >
         {normalizedMarkdown}
       </ReactMarkdown>
+    </div>
+  );
+});
+
+function BrowserChatDownloadStatusIcon({ status }: { status?: SystemDownloadStatus }) {
+  if (status === 'completed') return <CheckCircle2 size={15} />;
+  if (status === 'failed') return <AlertCircle size={15} />;
+  if (status === 'downloading' || status === 'pending' || status === 'selecting') return <Loader2 className="spin" size={15} />;
+  return <Download size={15} />;
+}
+
+const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
+  downloads,
+  open,
+  onClose,
+  onToggle,
+}: {
+  downloads: SystemDownloadItem[];
+  open: boolean;
+  onClose: () => void;
+  onToggle: () => void;
+}) {
+  const activeCount = downloads.filter((download) => download.status === 'selecting' || download.status === 'pending' || download.status === 'downloading').length;
+  const recentDownloads = downloads.slice(0, 12);
+  return (
+    <div className="browser-chat-download-center">
+      <button
+        aria-expanded={open}
+        aria-label="下载"
+        className={activeCount ? 'ui-icon-button browser-chat-download-button active' : 'ui-icon-button browser-chat-download-button'}
+        onClick={onToggle}
+        title="下载"
+        type="button"
+      >
+        <Download size={17} />
+        {activeCount ? <span className="browser-chat-download-badge">{activeCount}</span> : null}
+      </button>
+      {open ? (
+        <div className="browser-chat-download-popover" role="dialog" aria-label="下载进度">
+          <header>
+            <strong>下载</strong>
+            <button className="ui-icon-button" onClick={onClose} type="button" aria-label="关闭下载面板">
+              <X size={15} />
+            </button>
+          </header>
+          {recentDownloads.length ? (
+            <ol className="browser-chat-download-list">
+              {recentDownloads.map((download) => {
+                const percent = browserChatDownloadPercent(download);
+                const received = formatDownloadBytes(download.receivedBytes);
+                const total = formatDownloadBytes(download.totalBytes);
+                const progressWidth = percent === undefined ? (download.status === 'downloading' ? 18 : 0) : percent;
+                return (
+                  <li className={`browser-chat-download-item ${download.status || 'pending'}`} key={download.id}>
+                    <div className="browser-chat-download-item-head">
+                      <span className="browser-chat-download-status-icon">
+                        <BrowserChatDownloadStatusIcon status={download.status} />
+                      </span>
+                      <div>
+                        <strong>{download.fileName || 'download'}</strong>
+                        <span>{browserChatDownloadStatusLabel(download.status)}{percent !== undefined ? ` · ${percent}%` : ''}</span>
+                      </div>
+                    </div>
+                    <div className="browser-chat-download-progress" aria-hidden="true">
+                      <span style={{ width: `${progressWidth}%` }} />
+                    </div>
+                    <div className="browser-chat-download-meta">
+                      <span>{total ? `${received || '0 B'} / ${total}` : (received || '')}</span>
+                      {download.error ? <span className="error">{download.error}</span> : null}
+                      {download.path ? <span title={download.path}>{download.path}</span> : null}
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+          ) : (
+            <div className="browser-chat-download-empty">暂无下载</div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+});
+
+const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCenter({
+  disabled,
+  groupId,
+  onClose,
+  onSelect,
+  onToggle,
+  open,
+}: {
+  disabled?: boolean;
+  groupId?: string;
+  onClose: () => void;
+  onSelect: (groupId: string) => void | Promise<void>;
+  onToggle: () => void;
+  open: boolean;
+}) {
+  const [groups, setGroups] = useState<EmbeddedBrowserGroup[]>([]);
+  const [error, setError] = useState('');
+  const [pendingGroupId, setPendingGroupId] = useState('');
+
+  const loadGroups = useCallback(async () => {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) {
+      setGroups([]);
+      return;
+    }
+    const state = await bridge.getState();
+    if (!state.ok) throw new Error(state.error || '无法读取浏览器标签组');
+    setGroups(Array.isArray(state.groups) ? state.groups : []);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    void loadGroups().catch((loadError) => setError(loadError instanceof Error ? loadError.message : '无法读取浏览器标签组'));
+    return window.webPilotEmbeddedBrowser?.onStateChange?.((state) => {
+      if (state.ok) setGroups(Array.isArray(state.groups) ? state.groups : []);
+    }) || undefined;
+  }, [loadGroups, open]);
+
+  async function selectGroup(nextGroupId: string) {
+    if (pendingGroupId || nextGroupId === groupId) return;
+    setError('');
+    setPendingGroupId(nextGroupId);
+    try {
+      await onSelect(nextGroupId);
+    } catch (selectError) {
+      setError(selectError instanceof Error ? selectError.message : '切换标签组失败');
+    } finally {
+      setPendingGroupId('');
+    }
+  }
+
+  const displayedGroupId = pendingGroupId || groupId;
+
+  return (
+    <div className="browser-chat-group-binding-center">
+      <button
+        aria-expanded={open}
+        aria-label="绑定浏览器标签组"
+        className="ui-icon-button browser-chat-group-binding-button"
+        disabled={disabled}
+        onClick={onToggle}
+        style={{ '--browser-chat-bound-group-color': embeddedBrowserGroupIconColor(displayedGroupId) } as CSSProperties}
+        title="绑定浏览器标签组"
+        type="button"
+      >
+        {pendingGroupId ? <Loader2 className="spin" size={17} /> : <Folder size={17} />}
+      </button>
+      {open ? (
+        <div className="browser-chat-group-binding-popover" role="dialog" aria-label="选择浏览器标签组">
+          <header>
+            <strong>绑定标签组</strong>
+            <button className="ui-icon-button" onClick={onClose} type="button" aria-label="关闭标签组面板">
+              <X size={15} />
+            </button>
+          </header>
+          {error ? <p className="browser-chat-group-binding-error">{error}</p> : null}
+          {groups.length ? (
+            <ol className="browser-chat-group-binding-list">
+              {groups.map((group) => {
+                const label = group.label || embeddedSessionGroupLabel(group.sessionId || embeddedSessionIdFromGroupId(group.id));
+                const selected = group.id === groupId;
+                const switching = group.id === pendingGroupId;
+                return (
+                  <li key={group.id}>
+                    <button
+                      aria-pressed={selected}
+                      className={selected ? 'selected' : ''}
+                      disabled={Boolean(pendingGroupId)}
+                      onClick={() => void selectGroup(group.id)}
+                      type="button"
+                    >
+                      <Folder size={16} style={{ color: embeddedBrowserGroupIconColor(group.id) }} />
+                      <span>{label}</span>
+                      {switching ? <Loader2 className="spin" size={16} /> : selected ? <CheckCircle2 size={16} /> : null}
+                    </button>
+                  </li>
+                );
+              })}
+            </ol>
+          ) : (
+            <div className="browser-chat-group-binding-empty">暂无可绑定的标签组</div>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 });
@@ -521,63 +1947,319 @@ function formatAttachmentSize(size?: number) {
   return `${Math.round(size / 1024 / 102.4) / 10} MB`;
 }
 
-const BrowserChatImageGrid = memo(function BrowserChatImageGrid({
-  attachments,
-  editable = false,
+function browserChatAttachmentKind(attachment: BrowserChatAttachment): BrowserChatAttachmentKind {
+  if (attachment.kind === 'tab' || attachment.type === WEBPILOT_TAB_DRAG_MIME) return 'tab';
+  if (attachment.kind === 'image' || attachment.type.startsWith('image/')) return 'image';
+  return 'file';
+}
+
+function browserChatReferenceLabel(kind: BrowserChatAttachmentKind) {
+  if (kind === 'image') return '图片';
+  if (kind === 'tab') return '标签页';
+  return '文件';
+}
+
+function browserChatReferenceMeta(attachment: BrowserChatAttachment, kind: BrowserChatAttachmentKind) {
+  if (kind === 'tab') return compactText(attachment.sourceUrl || attachment.url || '标签页', 58);
+  return formatAttachmentSize(attachment.size) || browserChatReferenceLabel(kind);
+}
+
+function BrowserChatReferenceIcon({ kind }: { kind: BrowserChatAttachmentKind }) {
+  if (kind === 'image') return <ImageUp size={14} />;
+  if (kind === 'tab') return <AppWindow size={14} />;
+  return <FileSearch size={14} />;
+}
+
+function inlineTokenSvg(paths: string) {
+  return `<svg aria-hidden="true" focusable="false" viewBox="0 0 24 24">${paths}</svg>`;
+}
+
+function inlineSkillIconSvg() {
+  return inlineTokenSvg('<path d="M8 3 4 7l4 4"/><path d="m16 3 4 4-4 4"/><path d="M14 21l4-18"/><path d="M10 21 6 3"/>');
+}
+
+function inlineReferenceIconSvg(kind: BrowserChatAttachmentKind) {
+  if (kind === 'image') {
+    return inlineTokenSvg('<rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/>');
+  }
+  if (kind === 'tab') {
+    return inlineTokenSvg('<rect width="18" height="14" x="3" y="5" rx="2"/><path d="M3 9h18"/><path d="M8 5v4"/>');
+  }
+  return inlineTokenSvg('<rect x="3.5" y="4" width="17" height="16" rx="3"/><circle cx="9" cy="9.5" r="1.25"/><path d="m5.5 17 4.2-4.2 3.1 3 2.2-2.2 3.5 3.4"/>');
+}
+
+function browserChatReferenceKey(attachment: BrowserChatAttachment) {
+  const kind = browserChatAttachmentKind(attachment);
+  if (kind === 'tab') return `tab:${attachment.sourceUrl || attachment.url || attachment.id}`;
+  if (attachment.path) return `path:${attachment.path}`;
+  return `${kind}:${attachment.name}:${attachment.url}`;
+}
+
+function parseEmbeddedBrowserTabDragPayload(value: string): EmbeddedBrowserTabDragPayload | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as EmbeddedBrowserTabDragPayload;
+    if (parsed && typeof parsed === 'object') return parsed;
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function browserChatTabReferenceFromPayload(payload?: EmbeddedBrowserTabDragPayload) {
+  if (!payload?.id && !payload?.url && !payload?.title) return undefined;
+  const rawUrl = String(payload.url || '').trim();
+  const sourceUrl = rawUrl && !/^data:text\/html/i.test(rawUrl) ? rawUrl : '';
+  const title = String(payload.title || '').trim();
+  const name = title && !/^WebPilot Embedded Browser$/i.test(title) ? title : (sourceUrl || '新建标签页');
+  return {
+    id: temporaryId('tab_ref'),
+    kind: 'tab' as const,
+    name: compactText(name, 120),
+    path: '',
+    sourceUrl,
+    type: WEBPILOT_TAB_DRAG_MIME,
+    url: sourceUrl,
+  };
+}
+
+function browserChatTabReferenceFromDataTransfer(dataTransfer: DataTransfer) {
+  return browserChatTabReferenceFromPayload(parseEmbeddedBrowserTabDragPayload(dataTransfer.getData(WEBPILOT_TAB_DRAG_MIME)));
+}
+
+function dataTransferHasBrowserChatReferences(dataTransfer: DataTransfer) {
+  const types = Array.from(dataTransfer.types || []);
+  return types.includes(WEBPILOT_TAB_DRAG_MIME) || Array.from(dataTransfer.items || []).some((item) => item.kind === 'file');
+}
+
+const BrowserChatReferenceChip = memo(function BrowserChatReferenceChip({
+  attachment,
+  className = '',
   onPreview,
-  onRemove,
+}: {
+  attachment: BrowserChatAttachment;
+  className?: string;
+  onPreview: (attachment: BrowserChatAttachment) => void;
+}) {
+  const kind = browserChatAttachmentKind(attachment);
+  const label = browserChatReferenceLabel(kind);
+  const children = (
+    <>
+      <span className={`browser-chat-reference-icon ${kind}`}>
+        <BrowserChatReferenceIcon kind={kind} />
+      </span>
+      <span className="browser-chat-reference-name">{attachment.name || label}</span>
+    </>
+  );
+  return (
+    <span className={`browser-chat-reference-chip ${kind}${className ? ` ${className}` : ''}`} title={browserChatReferenceMeta(attachment, kind)}>
+      {kind === 'image' ? (
+        <button
+          aria-label={`放大查看 ${attachment.name}`}
+          className="browser-chat-reference-main"
+          onClick={() => onPreview(attachment)}
+          type="button"
+        >
+          {children}
+        </button>
+      ) : attachment.url ? (
+        <a
+          className="browser-chat-reference-main"
+          href={attachment.url}
+          onClick={(event) => handleBrowserChatMarkdownLinkClick(event, attachment.url)}
+          rel="noopener noreferrer"
+          target="_blank"
+          title={attachment.sourceUrl || attachment.url}
+        >
+          {children}
+        </a>
+      ) : (
+        <span className="browser-chat-reference-main">{children}</span>
+      )}
+    </span>
+  );
+});
+
+function BrowserChatSkillChip({ skill }: { skill: { description: string; id: string; title: string } }) {
+  return (
+    <span className="browser-chat-message-skill" title={skill.description}>
+      <Braces size={13} />
+      <span>{skill.title}</span>
+    </span>
+  );
+}
+
+function BrowserChatInlineMessageContent({
+  attachments,
+  content,
+  onPreviewImage,
+  skills,
 }: {
   attachments?: BrowserChatAttachment[];
-  editable?: boolean;
-  onPreview: (attachment: BrowserChatAttachment) => void;
-  onRemove?: (id: string) => void;
+  content: string;
+  onPreviewImage: (attachment: BrowserChatAttachment) => void;
+  skills: Array<{ description: string; id: string; title: string }>;
 }) {
-  if (!attachments?.length) return null;
+  const attachmentsById = useMemo(() => new Map((attachments || []).map((attachment) => [attachment.id, attachment])), [attachments]);
+  const skillsById = useMemo(() => new Map(skills.map((skill) => [skill.id, skill])), [skills]);
+  const usedAttachmentIds = new Set<string>();
+  const usedSkillIds = new Set<string>();
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  let matchIndex = 0;
+  BROWSER_CHAT_INLINE_TOKEN_RE.lastIndex = 0;
+  for (const match of content.matchAll(BROWSER_CHAT_INLINE_TOKEN_RE)) {
+    const start = match.index ?? 0;
+    if (start > lastIndex) nodes.push(content.slice(lastIndex, start));
+    const type = match[1];
+    const id = readInlineTokenId(match[2] || '');
+    if (type === 'ref') {
+      const attachment = attachmentsById.get(id);
+      if (attachment) {
+        usedAttachmentIds.add(id);
+        nodes.push(<BrowserChatReferenceChip attachment={attachment} className="inline" key={`ref-${id}-${matchIndex}`} onPreview={onPreviewImage} />);
+      }
+    } else {
+      const skill = skillsById.get(id);
+      if (skill) {
+        usedSkillIds.add(id);
+        nodes.push(<BrowserChatSkillChip key={`skill-${id}-${matchIndex}`} skill={skill} />);
+      }
+    }
+    lastIndex = start + match[0].length;
+    matchIndex += 1;
+  }
+  if (lastIndex < content.length) nodes.push(content.slice(lastIndex));
+  for (const skill of skills) {
+    if (!usedSkillIds.has(skill.id)) nodes.push(' ', <BrowserChatSkillChip key={`skill-fallback-${skill.id}`} skill={skill} />);
+  }
+  for (const attachment of attachments || []) {
+    if (!usedAttachmentIds.has(attachment.id)) nodes.push(' ', <BrowserChatReferenceChip attachment={attachment} className="inline" key={`ref-fallback-${attachment.id}`} onPreview={onPreviewImage} />);
+  }
+  if (!nodes.length) return null;
+  return <p className="browser-chat-message-inline-content">{nodes}</p>;
+}
+
+function pendingConfirmationForTool(input: {
+  pending?: BrowserChatToolConfirmation;
+  stepIndex?: number;
+  toolName: string;
+  toolInput: unknown;
+  toolOk?: boolean;
+}) {
+  const { pending, stepIndex, toolName, toolInput, toolOk } = input;
+  if (!pending || toolOk !== undefined) return undefined;
+  if (pending.toolName !== toolName) return undefined;
+  if (pending.stepIndex !== undefined && stepIndex !== pending.stepIndex) return undefined;
+  if (!pending.inputSignature || pending.inputSignature !== toolInputSignature(toolInput)) return undefined;
+  return pending;
+}
+
+function toolUserActionForTool(logs: BrowserChatLogRecord[], stepIndex: number | undefined, toolName: string, toolInput: unknown) {
+  if (stepIndex === undefined) return undefined;
+  const inputSignature = toolInputSignature(toolInput);
+  for (const log of [...logs].reverse()) {
+    if (log.stepIndex !== stepIndex) continue;
+    if (log.phase !== 'tool:confirmation:confirmed' && log.phase !== 'tool:confirmation:cancelled') continue;
+    const details = parseJsonObjectText(log.details);
+    const loggedToolName = typeof details?.toolName === 'string' ? details.toolName : '';
+    if (loggedToolName && loggedToolName !== toolName) continue;
+    const loggedInputSignature = typeof details?.inputSignature === 'string' ? details.inputSignature : '';
+    if (!loggedInputSignature || loggedInputSignature !== inputSignature) continue;
+    return log.phase === 'tool:confirmation:confirmed'
+      ? { className: 'is-confirmed', label: '用户已确认' }
+      : { className: 'is-cancelled', label: '用户已取消' };
+  }
+  return undefined;
+}
+
+function BrowserChatToolUserActionTag({ action }: { action?: ReturnType<typeof toolUserActionForTool> }) {
+  if (!action) return null;
+  return <span className={`browser-chat-tool-user-action-tag ${action.className}`}>{action.label}</span>;
+}
+
+const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirmationActions({
+  pending,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+  onResolveToolConfirmation,
+}: {
+  pending?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
+}) {
+  if (!pending || !onResolveToolConfirmation) return null;
+  const resolving = resolvingConfirmationId === pending.id;
+  const resolvingConfirm = resolving && resolvingConfirmationAction === 'confirm';
+  const resolvingCancel = resolving && resolvingConfirmationAction === 'cancel';
   return (
-    <div className={editable ? 'browser-chat-image-grid editable' : 'browser-chat-image-grid'}>
-      {attachments.map((attachment) => (
-        <figure className="browser-chat-image-thumb" key={attachment.id}>
-          <button
-            aria-label={`放大查看 ${attachment.name}`}
-            className="browser-chat-image-preview-button"
-            onClick={() => onPreview(attachment)}
-            type="button"
-          >
-            <img alt={attachment.name} src={attachment.url} />
-            <span><Maximize2 size={13} /></span>
-          </button>
-          <figcaption>
-            <span>{compactText(attachment.name, 34)}</span>
-            {formatAttachmentSize(attachment.size) ? <small>{formatAttachmentSize(attachment.size)}</small> : null}
-          </figcaption>
-          {editable && onRemove ? (
-            <button
-              aria-label={`删除 ${attachment.name}`}
-              className="browser-chat-image-remove"
-              onClick={() => onRemove(attachment.id)}
-              type="button"
-            >
-              <X size={13} />
-            </button>
-          ) : null}
-        </figure>
-      ))}
+    <div className="browser-chat-tool-confirmation" role="group" aria-label="工具调用确认">
+      <span>{pending.prompt}</span>
+      <div className="browser-chat-tool-confirmation-actions">
+        <button
+          className="browser-chat-tool-confirm"
+          disabled={resolving}
+          onClick={() => void onResolveToolConfirmation(pending.id, 'confirm')}
+          type="button"
+        >
+          {resolvingConfirm ? <Loader2 className="spin" size={13} /> : <BadgeCheck size={13} />}
+          {resolvingConfirm ? '确认中' : '确认'}
+        </button>
+        <button
+          className="browser-chat-tool-cancel"
+          disabled={resolving}
+          onClick={() => void onResolveToolConfirmation(pending.id, 'cancel')}
+          type="button"
+        >
+          {resolvingCancel ? <Loader2 className="spin" size={13} /> : <X size={13} />}
+          {resolvingCancel ? '取消中' : '取消'}
+        </button>
+      </div>
     </div>
   );
 });
 
 const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
+  logs,
   onSelectTool,
+  onResolveToolConfirmation,
+  onlyPendingConfirmation = false,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
   running,
   step,
+  visibleToolIndexes,
 }: {
+  logs: BrowserChatLogRecord[];
   onSelectTool: (detail: BrowserChatToolDetail) => void;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
+  onlyPendingConfirmation?: boolean;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
   running: boolean;
   step: StepExecutionResult;
+  visibleToolIndexes?: readonly number[];
 }) {
-  const toolCalls = step.tools || [];
+  const { t } = useI18n();
+  const allToolCalls = step.tools || [];
+  const visibleToolIndexSet = visibleToolIndexes ? new Set(visibleToolIndexes) : undefined;
+  const toolCalls = allToolCalls
+    .map((tool, toolIndex) => ({ tool, toolIndex }))
+    .filter(({ toolIndex }) => !visibleToolIndexSet || visibleToolIndexSet.has(toolIndex));
   if (!running && !toolCalls.length) return null;
+  if (onlyPendingConfirmation && !toolCalls.some(({ tool }) => pendingConfirmationForTool({
+    pending: pendingToolConfirmation,
+    stepIndex: step.index,
+    toolName: tool.name,
+    toolInput: tool.input,
+    toolOk: tool.ok,
+  }))) return null;
   if (running && !toolCalls.length) {
+    if (allToolCalls.length) return null;
+    if (onlyPendingConfirmation) return null;
     return (
       <div className="browser-chat-tool-card is-waiting">
         <span className="browser-chat-tool-icon" aria-hidden="true">
@@ -596,18 +2278,30 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
 
   return (
     <>
-      {toolCalls.map((tool, toolIndex) => {
-        const label = browserChatToolLabel(tool.name);
+      {toolCalls.map(({ tool, toolIndex }) => {
+        const label = browserChatToolLabel(tool.name, t);
         const meta = compactText(browserChatToolMeta(tool.name, tool.input), 56);
         const status = toolStatusLabel(tool);
-        const showState = tool.ok !== true;
         const displayText = `${label}${meta ? `: ${meta}` : ''}`;
+        const isActiveTool = tool.ok === undefined;
+        const stateClass = tool.ok === false && !isRecoveredTransientTool(tool) ? ' is-failed' : isActiveTool ? ' is-running' : '';
+        const pendingConfirmation = pendingConfirmationForTool({
+          pending: pendingToolConfirmation,
+          stepIndex: step.index,
+          toolName: tool.name,
+          toolInput: tool.input,
+          toolOk: tool.ok,
+        });
+        if (onlyPendingConfirmation && !pendingConfirmation) return null;
+        const userAction = pendingConfirmation
+          ? undefined
+          : toolUserActionForTool(logs, step.index, tool.name, tool.input);
         return (
           <div className="browser-chat-tool-call" key={`${step.index}-${toolIndex}-${tool.name}`}>
             {tool.reason ? <p className="browser-chat-tool-reason">{tool.reason}</p> : null}
             <button
               aria-label={`${displayText}，${status}`}
-              className={`browser-chat-tool-card${tool.ok === false ? ' is-failed' : ''}${tool.ok === undefined ? ' is-running' : ''}`}
+              className={`browser-chat-tool-card${stateClass}`}
               onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
               title={`${displayText} · ${status}`}
               type="button"
@@ -618,11 +2312,18 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
               <span className="browser-chat-tool-content">
                 <span className="browser-chat-tool-label">
                   <span className="browser-chat-tool-name">{label}</span>
-                  {showState ? <span className="browser-chat-tool-state">{status}</span> : null}
+                  <BrowserChatToolUserActionTag action={userAction} />
                 </span>
                 {meta ? <small className="browser-chat-tool-meta">{meta}</small> : null}
               </span>
+              {isActiveTool ? <BrowserChatToolTailParticles /> : null}
             </button>
+            <BrowserChatToolConfirmationActions
+              pending={pendingConfirmation}
+              resolvingConfirmationAction={resolvingConfirmationAction}
+              resolvingConfirmationId={resolvingConfirmationId}
+              onResolveToolConfirmation={onResolveToolConfirmation}
+            />
           </div>
         );
       })}
@@ -630,31 +2331,326 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   );
 });
 
-const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
-  message,
+const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
+  cycle,
+  logs,
+  onResolveToolConfirmation,
   onSelectTool,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+  toolDetails,
+}: {
+  cycle: BrowserChatAiOutputCycle;
+  logs: BrowserChatLogRecord[];
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+  toolDetails: Map<string, BrowserChatToolDetail>;
+}) {
+  const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
+  const { output } = cycle;
+  if (!output.tools.length && !output.texts.length && (!showReasoning || !output.reasoning.length)) return null;
+  const firstTool = output.tools[0];
+  const firstToolLabel = firstTool ? browserChatToolLabel(firstTool.name, (value) => value) : '';
+  const firstToolMeta = firstTool ? browserChatToolMeta(firstTool.name, firstTool.input) || firstTool.reason : '';
+  const toolTitle = compactText([firstToolLabel, firstToolMeta].filter(Boolean).join(': '), 160);
+  const toolSummary = output.tools.length === 1 ? '执行一个工具' : `执行 ${output.tools.length} 个工具`;
+  const hasPendingConfirmation = output.tools.some((tool, index) => {
+    const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+    return Boolean(pendingConfirmationForTool({
+      pending: pendingToolConfirmation,
+      stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+      toolName: tool.name,
+      toolInput: toolDetail?.tool.input ?? tool.input,
+      toolOk: toolDetail?.tool.ok,
+    }));
+  });
+  return (
+    <div className="browser-chat-ai-cycle">
+      {showReasoning && output.reasoning.length ? (
+        <details className="browser-chat-ai-line-collapse">
+          <summary className="browser-chat-ai-collapse-summary">
+            <Sparkles size={14} />
+            <span>思维链</span>
+            <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
+          </summary>
+          <div className="browser-chat-ai-reasoning-text">
+            {output.reasoning.map((item, index) => (
+              <p key={`${index}-${item.slice(0, 16)}`}>{item}</p>
+            ))}
+          </div>
+        </details>
+      ) : null}
+      {output.tools.length ? (
+        <details className="browser-chat-ai-line-collapse" open={hasPendingConfirmation || undefined}>
+          <summary className="browser-chat-ai-collapse-summary" title={toolTitle}>
+            <SquareTerminal size={14} />
+            <span>{toolSummary}</span>
+            <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
+          </summary>
+          <div className="browser-chat-ai-cycle-tools">
+            {output.tools.map((tool, index) => {
+              const label = browserChatToolLabel(tool.name, (value) => value);
+              const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
+              const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+              const selectableToolDetail = toolDetail || fallbackAiCycleToolDetail(cycle, tool, index);
+              const stateClass = toolDetail?.tool.ok === false && !isRecoveredTransientTool(toolDetail.tool)
+                ? ' is-failed'
+                : toolDetail?.tool.ok === undefined ? ' is-running' : '';
+              const pendingConfirmation = pendingConfirmationForTool({
+                pending: pendingToolConfirmation,
+                stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+                toolName: tool.name,
+                toolInput: toolDetail?.tool.input ?? tool.input,
+                toolOk: toolDetail?.tool.ok,
+              });
+              const userAction = pendingConfirmation
+                ? undefined
+                : toolUserActionForTool(logs, toolDetail?.stepIndex ?? cycle.stepIndex, tool.name, toolDetail?.tool.input ?? tool.input);
+              const card = (
+                <>
+                  <span className="browser-chat-tool-icon" aria-hidden="true">
+                    <BrowserChatToolIcon name={tool.name} />
+                  </span>
+                  <span className="browser-chat-tool-content">
+                    <span className="browser-chat-tool-label">
+                      <span className="browser-chat-tool-name">{label}</span>
+                      <BrowserChatToolUserActionTag action={userAction} />
+                    </span>
+                    {meta ? <small className="browser-chat-tool-meta">{compactText(meta, 150)}</small> : null}
+                  </span>
+                </>
+              );
+              return (
+                <div className="browser-chat-tool-call" key={`${tool.id}-${index}`}>
+                  <button
+                    className={`browser-chat-tool-card browser-chat-ai-call-card${stateClass}`}
+                    onClick={() => onSelectTool(selectableToolDetail)}
+                    title={`${label}${meta ? ` - ${meta}` : ''}`}
+                    type="button"
+                  >
+                    {card}
+                    {stateClass.includes('is-running') ? <BrowserChatToolTailParticles /> : null}
+                  </button>
+                  <BrowserChatToolConfirmationActions
+                    pending={pendingConfirmation}
+                    resolvingConfirmationAction={resolvingConfirmationAction}
+                    resolvingConfirmationId={resolvingConfirmationId}
+                    onResolveToolConfirmation={onResolveToolConfirmation}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      ) : null}
+      {output.texts.length ? (
+        <div className="browser-chat-ai-cycle-text">
+          {output.texts.map((text, index) => (
+            <BrowserChatMarkdown key={`${index}-${text.slice(0, 16)}`} markdown={text} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+});
+
+const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGroup({
+  cycles,
+  logs,
+  onResolveToolConfirmation,
+  onSelectTool,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+  toolDetails,
+}: {
+  cycles: BrowserChatAiOutputCycle[];
+  logs: BrowserChatLogRecord[];
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+  toolDetails: Map<string, BrowserChatToolDetail>;
+}) {
+  const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
+  const toolCount = cycles.reduce((count, cycle) => count + cycle.output.tools.length, 0);
+  const reasoningCount = showReasoning ? cycles.reduce((count, cycle) => count + cycle.output.reasoning.length, 0) : 0;
+  const hasPendingConfirmation = cycles.some((cycle) => (
+    cycle.output.tools.some((tool, index) => {
+      const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+      return Boolean(pendingConfirmationForTool({
+        pending: pendingToolConfirmation,
+        stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+        toolName: tool.name,
+        toolInput: toolDetail?.tool.input ?? tool.input,
+        toolOk: toolDetail?.tool.ok,
+      }));
+    })
+  ));
+  const meta = [
+    toolCount ? `${toolCount} 个工具` : '',
+    reasoningCount ? `${reasoningCount} 条思维链` : '',
+  ].filter(Boolean).join(' · ');
+
+  return (
+    <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={hasPendingConfirmation || undefined}>
+      <summary className="browser-chat-ai-collapse-summary" title={meta || undefined}>
+        <SquareTerminal size={14} />
+        <span>已执行</span>
+        {meta ? <small>{meta}</small> : null}
+        <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
+      </summary>
+      <div className="browser-chat-executed-body">
+        {cycles.map((cycle) => (
+          <div className="browser-chat-executed-entry" key={cycle.id}>
+            <BrowserChatAiCycleLine
+              cycle={cycle}
+              logs={logs}
+              onResolveToolConfirmation={onResolveToolConfirmation}
+              onSelectTool={onSelectTool}
+              pendingToolConfirmation={pendingToolConfirmation}
+              resolvingConfirmationAction={resolvingConfirmationAction}
+              resolvingConfirmationId={resolvingConfirmationId}
+              toolDetails={toolDetails}
+            />
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+});
+
+function isManualVerificationStatusText(text: string) {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return /^AI requested a manual verification pause\. Ask the user to inspect the browser and continue after completing any required verification\.$/i.test(normalized)
+    || /^Manual verification is visible \(.+\)\. The run UI should pause and wait for the user to complete it\.$/i.test(normalized)
+    || /^已暂停自动操作[：:]/.test(normalized)
+    || /^已暂停，等待您检查浏览器/.test(normalized);
+}
+
+const BrowserChatManualVerificationCard = memo(function BrowserChatManualVerificationCard() {
+  return (
+    <section className="browser-chat-manual-verification" role="status">
+      <span aria-hidden="true" className="browser-chat-manual-verification-icon"><Lock size={18} /></span>
+      <div>
+        <strong>需要人工完成验证</strong>
+        <p>请在浏览器中完成验证码、登录/安全验证或其他需要本人确认的步骤。</p>
+        <small>完成后发送“验证已完成”，我会重新读取当前页面并继续。</small>
+      </div>
+    </section>
+  );
+});
+
+const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
+  logs,
+  message,
+  onResolveToolConfirmation,
+  onSelectTool,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
   running,
   steps,
 }: {
+  logs: BrowserChatLogRecord[];
   message: BrowserChatMessage;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
   running: boolean;
   steps: StepExecutionResult[];
 }) {
-  const [toolsExpanded, setToolsExpanded] = useState(false);
-  const finalText = message.content;
+  const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
+  const autoExpandedToolsRef = useRef(false);
+  const [toolsExpanded, setToolsExpanded] = useState(() => running);
+  const finalText = stringFromUnknown(message.content);
+  const aiOutputCycles = useMemo(() => aiOutputCyclesFromLogs(logs)
+    .map((cycle) => (showReasoning ? cycle : {
+      ...cycle,
+      output: { ...cycle.output, reasoning: [] },
+    }))
+    .filter((cycle) => hasAiOutputView(cycle.output)), [logs, showReasoning]);
+  const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(aiOutputCycles), [aiOutputCycles]);
+  const aiOutputTextSet = useMemo(() => aiOutputTextSetFromCycles(aiOutputCycles), [aiOutputCycles]);
+  const aiCycleToolDetails = useMemo(() => buildAiCycleToolDetailMap(aiOutputCycles, steps), [aiOutputCycles, steps]);
+  const aiCycleRepresentedToolKeys = new Set([...aiCycleToolDetails.values()].map((detail) => (
+    `${detail.stepIndex}:${detail.toolIndex}`
+  )));
   const seenTexts = new Set<string>();
   const toolCount = steps.reduce((count, step) => count + (step.tools || []).length, 0);
-  const failedToolCount = steps.reduce((count, step) => (
-    count + (step.tools || []).filter((tool) => tool.ok === false).length
-  ), 0);
   const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
-  const shouldShowStepTimeline = running || toolCount > 0;
-  const toolSummary = toolCount
-    ? `${running ? '已运行' : '已运行'} ${toolCount} 个工具${failedToolCount ? `，${failedToolCount} 条失败` : ''}`
-    : waitingForTool
-      ? '正在准备工具'
-      : '暂无工具';
+  const timelineSteps = steps.filter((step) => (step.tools || []).length || (running && step.status === 'running'));
+  // An AI output record is appended only after its corresponding tool returns.
+  // Keep the currently running trace visible even when prior output cycles are
+  // already present, otherwise only the first tool of a conversation can show
+  // its active state.
+  const liveTimelineEntries = timelineSteps.flatMap((step): BrowserChatTimelineStepEntry[] => {
+    const visibleToolIndexes = (step.tools || []).flatMap((tool, toolIndex) => (
+      tool.ok === undefined && !aiCycleRepresentedToolKeys.has(`${step.index}:${toolIndex}`) ? [toolIndex] : []
+    ));
+    if (visibleToolIndexes.length) return [{ step, visibleToolIndexes }];
+    if (step.status === 'running' && !(step.tools || []).length) return [{ step }];
+    return [];
+  });
+  const hasPendingConfirmation = Boolean(pendingToolConfirmation);
+  const failedToolCount = steps.reduce((count, step) => count + (step.tools || []).filter((tool) => (
+    tool.ok === false && !isRecoveredTransientTool(tool)
+  )).length, 0);
+  const shouldEmphasizeToolFailure = failedToolCount > 0 && !hasPendingConfirmation;
+  const aiCyclesContainPendingConfirmation = hasPendingConfirmation && aiOutputCycles.some((cycle) => (
+    cycle.output.tools.some((tool, index) => {
+      const toolDetail = aiCycleToolDetails.get(aiCycleToolKey(cycle.id, index));
+      return Boolean(pendingConfirmationForTool({
+        pending: pendingToolConfirmation,
+        stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+        toolName: tool.name,
+        toolInput: toolDetail?.tool.input ?? tool.input,
+        toolOk: toolDetail?.tool.ok,
+      }));
+    })
+  ));
+  const pendingTimelineEntries: BrowserChatTimelineStepEntry[] = hasPendingConfirmation
+    ? steps.filter((step) => (step.tools || []).some((tool) => pendingConfirmationForTool({
+      pending: pendingToolConfirmation,
+      stepIndex: step.index,
+      toolName: tool.name,
+      toolInput: tool.input,
+      toolOk: tool.ok,
+    }))).map((step) => ({ step }))
+    : [];
+  const showPendingTimelineFallback = hasPendingConfirmation && !aiCyclesContainPendingConfirmation;
+  const timelineEntriesToRender: BrowserChatTimelineStepEntry[] = showPendingTimelineFallback
+    ? pendingTimelineEntries
+    : aiOutputCycles.length
+      ? liveTimelineEntries
+      : timelineSteps.map((step) => ({ step }));
+  const shouldShowStepTimeline = (!aiOutputCycles.length && (toolCount > 0 || waitingForTool))
+    || liveTimelineEntries.length > 0
+    || (showPendingTimelineFallback && pendingTimelineEntries.length > 0);
+  const manualVerificationPaused = steps.some((step) => (step.tools || []).some((tool) => tool.name === 'waitForHumanVerification'))
+    || aiOutputCycles.some((cycle) => cycle.output.tools.some((tool) => tool.name === 'waitForHumanVerification'));
+  const hasFinalText = Boolean(finalText.trim());
+  const hideManualVerificationStatusText = manualVerificationPaused && isManualVerificationStatusText(finalText);
+  const toolSummary = hasPendingConfirmation
+    ? '等待用户确认工具调用'
+    : failedToolCount
+      ? failedToolCount === 1
+      ? '工具调用失败'
+      : `${failedToolCount} 个工具调用失败`
+      : toolCount
+          ? toolCount === 1
+            ? `${running ? '正在执行' : '执行'}一个工具`
+            : `${running ? '正在执行' : '执行'} ${toolCount} 个工具`
+          : waitingForTool
+            ? '准备工具'
+            : '暂无工具';
   const renderText = (text: string, key: string) => {
     const normalized = text;
     if (!normalized || seenTexts.has(normalized)) return null;
@@ -664,13 +2660,50 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     );
   };
 
+  useEffect(() => {
+    if (showPendingTimelineFallback) {
+      setToolsExpanded(true);
+      return;
+    }
+    if (!running || !shouldShowStepTimeline || autoExpandedToolsRef.current) return;
+    autoExpandedToolsRef.current = true;
+    setToolsExpanded(true);
+  }, [running, shouldShowStepTimeline, showPendingTimelineFallback]);
+
   return (
     <div className="browser-chat-agent-timeline">
+      {aiOutputCycleEntries.map((entry) => (
+        entry.kind === 'executed' ? (
+          <BrowserChatExecutedCycleGroup
+            cycles={entry.cycles}
+            key={entry.id}
+            logs={logs}
+            onResolveToolConfirmation={onResolveToolConfirmation}
+            onSelectTool={onSelectTool}
+            pendingToolConfirmation={pendingToolConfirmation}
+            resolvingConfirmationAction={resolvingConfirmationAction}
+            resolvingConfirmationId={resolvingConfirmationId}
+            toolDetails={aiCycleToolDetails}
+          />
+        ) : (
+          <BrowserChatAiCycleLine
+            cycle={entry.cycle}
+            key={entry.cycle.id}
+            logs={logs}
+            onResolveToolConfirmation={onResolveToolConfirmation}
+            onSelectTool={onSelectTool}
+            pendingToolConfirmation={pendingToolConfirmation}
+            resolvingConfirmationAction={resolvingConfirmationAction}
+            resolvingConfirmationId={resolvingConfirmationId}
+            toolDetails={aiCycleToolDetails}
+          />
+        )
+      ))}
       {shouldShowStepTimeline ? (
         <div className="browser-chat-tool-stack">
           <button
             aria-expanded={toolsExpanded}
-            className={`browser-chat-tool-summary${toolsExpanded ? ' is-expanded' : ''}${failedToolCount ? ' has-failed' : ''}`}
+            className={`browser-chat-tool-summary${toolsExpanded ? ' is-expanded' : ''}${shouldEmphasizeToolFailure ? ' has-failed' : ''}`}
             onClick={() => setToolsExpanded((value) => !value)}
             type="button"
           >
@@ -678,65 +2711,125 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
             <span>{toolSummary}</span>
             <ChevronDown className="browser-chat-tool-summary-chevron" size={14} />
           </button>
-          {toolsExpanded ? steps.map((step) => (
-            <div className="browser-chat-agent-step" key={step.index}>
-              <BrowserChatStepToolCards onSelectTool={onSelectTool} running={running && step.status === 'running'} step={step} />
+          {toolsExpanded ? timelineEntriesToRender.map(({ step, visibleToolIndexes }) => (
+            <div className={`browser-chat-agent-step${running && step.status === 'running' ? ' is-running' : ''}`} key={step.index}>
+              <BrowserChatStepToolCards
+                logs={logs}
+                onResolveToolConfirmation={onResolveToolConfirmation}
+                onSelectTool={onSelectTool}
+                onlyPendingConfirmation={showPendingTimelineFallback}
+                pendingToolConfirmation={pendingToolConfirmation}
+                resolvingConfirmationAction={resolvingConfirmationAction}
+                resolvingConfirmationId={resolvingConfirmationId}
+                running={running && step.status === 'running'}
+                step={step}
+                visibleToolIndexes={visibleToolIndexes}
+              />
             </div>
           )) : null}
         </div>
       ) : null}
-      {renderText(finalText, 'final-text')}
+      {manualVerificationPaused ? <BrowserChatManualVerificationCard /> : null}
+      {hasFinalText && !hideManualVerificationStatusText && !aiOutputTextSet.has(finalText.replace(/\s+/g, ' ').trim()) ? renderText(finalText, 'final-text') : null}
+      {!hasFinalText && !shouldShowStepTimeline ? (
+        running ? (
+          <div aria-live="polite" className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
+            <span aria-hidden="true" className="browser-chat-agent-thinking-mark"><i /><i /><i /></span>
+            <span className="browser-chat-agent-thinking-copy">
+              <strong>AI 正在处理当前请求<span className="browser-chat-agent-thinking-ellipsis">...</span></strong>
+              <small>正在分析页面状态并准备下一步操作</small>
+            </span>
+          </div>
+        ) : <p className="browser-chat-agent-empty">AI 已完成本轮操作，未返回额外文本。</p>
+      ) : null}
     </div>
   );
 });
 
 const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
+  skillsById,
   exportingMessageId,
+  exportingSelectedMessages,
+  generatingSkillMessageId,
+  generatingSkillSelectedMessages,
   item,
   itemLogs,
   itemSteps,
   lastAssistantMessageId,
   onExportMessage,
+  onGenerateSkill,
   onPreviewImage,
+  onResolveToolConfirmation,
   onSelectTool,
   onShowLogs,
+  onToggleExportSelection,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+  selectedForExport,
   sessionBusy,
   totalStepCount,
 }: {
   exportingMessageId: string | null;
+  exportingSelectedMessages: boolean;
+  generatingSkillMessageId: string | null;
+  generatingSkillSelectedMessages: boolean;
   item: BrowserChatMessage;
   itemLogs: BrowserChatLogRecord[];
   itemSteps: StepExecutionResult[];
   lastAssistantMessageId?: string;
   onExportMessage: (messageId: string) => void | Promise<void>;
+  onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
+  onToggleExportSelection: (messageId: string, selected: boolean) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+  selectedForExport: boolean;
   sessionBusy: boolean;
+  skillsById: Map<string, SkillRecord>;
   totalStepCount: number;
 }) {
   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
-  const operationLabel = operationRunning ? (item.activity?.label || '处理中') : statusLabel(item.status || 'passed');
   const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
+  const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
+  const messageSkills = useMemo(() => {
+    return Array.from(new Set(item.skillIds || [])).map((skillId) => {
+      const skill = skillsById.get(skillId);
+      return {
+        id: skillId,
+        title: skill?.title || skillId,
+        description: skill?.description || 'Skill',
+      };
+    });
+  }, [item.skillIds, skillsById]);
 
   return (
-    <article className={`browser-chat-message ${item.role}`}>
-      {/* <div className="browser-chat-avatar">
-        {item.role === 'user' ? <User size={15} /> : <Bot size={15} />}
-      </div> */}
+    <article className={`browser-chat-message ${item.role}${operationRunning ? ' is-running' : ''}`}>
       <div>
         {item.role === 'assistant' ? (
-          <>
-            <div className="browser-chat-agent-meta">
-              <span>{operationLabel}</span>
-              <time dateTime={messageUpdateTime(item)}>最后更新 {formatLogTime(messageUpdateTime(item))}</time>
-            </div>
-            <BrowserChatAssistantTimeline message={item} onSelectTool={onSelectTool} running={operationRunning} steps={itemSteps} />
-          </>
+          <BrowserChatAssistantTimeline
+            logs={itemLogs}
+            message={item}
+            onResolveToolConfirmation={onResolveToolConfirmation}
+            onSelectTool={onSelectTool}
+            pendingToolConfirmation={pendingToolConfirmation?.messageId === item.id ? pendingToolConfirmation : undefined}
+            resolvingConfirmationAction={resolvingConfirmationAction}
+            resolvingConfirmationId={resolvingConfirmationId}
+            running={operationRunning}
+            steps={itemSteps}
+          />
         ) : (
           <>
-            {item.content ? <p>{item.content}</p> : null}
-            <BrowserChatImageGrid attachments={item.attachments} onPreview={onPreviewImage} />
+            <BrowserChatInlineMessageContent
+              attachments={item.attachments}
+              content={item.content}
+              onPreviewImage={onPreviewImage}
+              skills={messageSkills}
+            />
             <time className="browser-chat-message-time" dateTime={messageUpdateTime(item)}>
               最后更新 {formatLogTime(messageUpdateTime(item))}
             </time>
@@ -744,6 +2837,17 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
         )}
         {item.role === 'assistant' ? (
           <div className="browser-chat-message-actions">
+            {canExportMessage ? (
+              <label className="browser-chat-message-select">
+                <input
+                  checked={selectedForExport}
+                  disabled={actionDisabled}
+                  onChange={(event) => onToggleExportSelection(item.id, event.currentTarget.checked)}
+                  type="checkbox"
+                />
+                <span>选择</span>
+              </label>
+            ) : null}
             {itemLogs.length ? (
               <button className="browser-chat-log-button" onClick={() => onShowLogs(item.id)} type="button">
                 <ScrollText size={14} />
@@ -753,7 +2857,18 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
             {canExportMessage ? (
               <button
                 className="browser-chat-log-button"
-                disabled={Boolean(exportingMessageId)}
+                disabled={actionDisabled}
+                onClick={() => void onGenerateSkill(item.id)}
+                type="button"
+              >
+                {generatingSkillMessageId === item.id ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
+                生成 Skill
+              </button>
+            ) : null}
+            {canExportMessage ? (
+              <button
+                className="browser-chat-log-button"
+                disabled={actionDisabled}
                 onClick={() => void onExportMessage(item.id)}
                 type="button"
               >
@@ -768,34 +2883,233 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   );
 });
 
+function browserChatAssistantMessageHasVisibleText(message: BrowserChatMessage, logs: BrowserChatLogRecord[]) {
+  return modelBrowserChatAssistantMessageHasVisibleText(
+    message,
+    logs,
+    (sourceLogs) => aiOutputCyclesFromLogs(sourceLogs).flatMap((cycle) => cycle.output.texts),
+  );
+}
+
+const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
+  items,
+  lastAssistantMessageId,
+  logIndex,
+  onResolveToolConfirmation,
+  onSelectTool,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+  sessionBusy,
+  stepsByIndex,
+}: {
+  items: BrowserChatMessage[];
+  lastAssistantMessageId?: string;
+  logIndex: BrowserChatLogIndex;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+  sessionBusy: boolean;
+  stepsByIndex: Map<number, StepExecutionResult>;
+}) {
+  const itemViews = items.map((item) => {
+    const steps = (item.stepIndexes || [])
+      .map((stepIndex) => stepsByIndex.get(stepIndex))
+      .filter((step): step is StepExecutionResult => Boolean(step));
+    return {
+      item,
+      logs: browserChatLogsForMessage(item, logIndex),
+      running: item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId),
+      steps,
+    };
+  });
+  const groupRunning = itemViews.some((item) => item.running);
+  const groupHasPendingConfirmation = Boolean(pendingToolConfirmation && items.some((item) => item.id === pendingToolConfirmation.messageId));
+  const toolCount = itemViews.reduce((count, item) => (
+    count + item.steps.reduce((stepCount, step) => stepCount + (step.tools || []).length, 0)
+  ), 0);
+  const summaryMeta = toolCount ? `${toolCount} 个工具` : `${items.length} 轮`;
+
+  return (
+    <article className="browser-chat-message assistant browser-chat-executed-message">
+      <div>
+        <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={groupRunning || groupHasPendingConfirmation || undefined}>
+          <summary className="browser-chat-ai-collapse-summary">
+            <SquareTerminal size={14} />
+            <span>已执行</span>
+            <small>{summaryMeta}</small>
+            <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
+          </summary>
+          <div className="browser-chat-executed-body">
+            {itemViews.map(({ item, logs, running, steps }) => (
+              <div className="browser-chat-executed-entry" key={item.id}>
+                <BrowserChatAssistantTimeline
+                  logs={logs}
+                  message={item}
+                  onResolveToolConfirmation={onResolveToolConfirmation}
+                  onSelectTool={onSelectTool}
+                  pendingToolConfirmation={pendingToolConfirmation?.messageId === item.id ? pendingToolConfirmation : undefined}
+                  resolvingConfirmationAction={resolvingConfirmationAction}
+                  resolvingConfirmationId={resolvingConfirmationId}
+                  running={running}
+                  steps={steps}
+                />
+              </div>
+            ))}
+          </div>
+        </details>
+      </div>
+    </article>
+  );
+});
+
 const BrowserChatMessageList = memo(function BrowserChatMessageList({
+  availableSkills,
   exportingMessageId,
+  exportingSelectedMessages,
+  generatingSkillMessageId,
+  generatingSkillSelectedMessages,
   lastAssistantMessageId,
   logIndex,
   messages,
+  onBulkExportMessages,
+  onBulkGenerateSkillMessages,
+  onClearExportSelection,
   onExportMessage,
+  onGenerateSkill,
   onPreviewImage,
+  onResolveToolConfirmation,
   onSelectTool,
   onShowLogs,
+  onToggleExportSelection,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+  selectedExportMessageIdSet,
+  selectedExportMessageIds,
+  sessionId,
   sessionBusy,
   stepsByIndex,
   totalStepCount,
 }: {
+  availableSkills: SkillRecord[];
   exportingMessageId: string | null;
+  exportingSelectedMessages: boolean;
+  generatingSkillMessageId: string | null;
+  generatingSkillSelectedMessages: boolean;
   lastAssistantMessageId?: string;
   logIndex: BrowserChatLogIndex;
   messages: BrowserChatMessage[];
+  onBulkExportMessages: () => void | Promise<void>;
+  onBulkGenerateSkillMessages: () => void | Promise<void>;
+  onClearExportSelection: () => void;
   onExportMessage: (messageId: string) => void | Promise<void>;
+  onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
+  onToggleExportSelection: (messageId: string, selected: boolean) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+  selectedExportMessageIdSet: Set<string>;
+  selectedExportMessageIds: string[];
+  sessionId?: string;
   sessionBusy: boolean;
   stepsByIndex: Map<number, StepExecutionResult>;
   totalStepCount: number;
 }) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
+  const lastMessage = messages[messages.length - 1];
+  const skillsById = useMemo(() => new Map(availableSkills.map((skill) => [skill.id, skill])), [availableSkills]);
+  const renderEntries = useMemo(
+    () => buildBrowserChatMessageRenderEntries(messages, logIndex, browserChatAssistantMessageHasVisibleText),
+    [logIndex, messages],
+  );
+  const scrollKey = [
+    sessionId || '',
+    messages.length,
+    lastMessage?.id || '',
+    lastMessage?.updatedAt || '',
+    pendingToolConfirmation?.id || '',
+    sessionBusy ? 'busy' : 'idle',
+  ].join(':');
+
+  useEffect(() => {
+    let frame = 0;
+    let nextFrame = 0;
+    const scrollToBottom = () => {
+      const container = scrollRef.current;
+      if (!container) return;
+      container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    };
+    frame = requestAnimationFrame(() => {
+      scrollToBottom();
+      nextFrame = requestAnimationFrame(scrollToBottom);
+    });
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      if (nextFrame) cancelAnimationFrame(nextFrame);
+    };
+  }, [scrollKey]);
+
   return (
-    <div className="browser-chat-message-list">
-      {messages.map((item) => {
+    <div className="browser-chat-message-list" ref={scrollRef}>
+      {selectedExportMessageIds.length ? (
+        <div className="browser-chat-message-export-bar">
+          <span>已选 {selectedExportMessageIds.length} 轮</span>
+          <button
+            className="browser-chat-log-button"
+            disabled={actionDisabled}
+            onClick={() => void onBulkExportMessages()}
+            type="button"
+          >
+            {exportingSelectedMessages ? <Loader2 className="spin" size={14} /> : <FilePlus2 size={14} />}
+            导出为用例
+          </button>
+          <button
+            className="browser-chat-log-button"
+            disabled={actionDisabled}
+            onClick={() => void onBulkGenerateSkillMessages()}
+            type="button"
+          >
+            {generatingSkillSelectedMessages ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
+            生成 Skill
+          </button>
+          <button
+            className="browser-chat-log-button"
+            disabled={actionDisabled}
+            onClick={onClearExportSelection}
+            type="button"
+          >
+            <X size={14} />
+            清空
+          </button>
+        </div>
+      ) : null}
+      {renderEntries.map((entry) => {
+        if (entry.kind === 'executed-group') {
+          return (
+            <BrowserChatExecutedGroup
+              items={entry.items}
+              key={entry.id}
+              lastAssistantMessageId={lastAssistantMessageId}
+              logIndex={logIndex}
+              onResolveToolConfirmation={onResolveToolConfirmation}
+              onSelectTool={onSelectTool}
+              pendingToolConfirmation={pendingToolConfirmation}
+              resolvingConfirmationAction={resolvingConfirmationAction}
+              resolvingConfirmationId={resolvingConfirmationId}
+              sessionBusy={sessionBusy}
+              stepsByIndex={stepsByIndex}
+            />
+          );
+        }
+        const item = entry.item;
         const itemSteps = (item.stepIndexes || [])
           .map((stepIndex) => stepsByIndex.get(stepIndex))
           .filter((step): step is StepExecutionResult => Boolean(step));
@@ -803,26 +3117,48 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         return (
           <BrowserChatMessageItem
             exportingMessageId={exportingMessageId}
+            exportingSelectedMessages={exportingSelectedMessages}
+            generatingSkillMessageId={generatingSkillMessageId}
+            generatingSkillSelectedMessages={generatingSkillSelectedMessages}
             item={item}
             itemLogs={itemLogs}
             itemSteps={itemSteps}
             key={item.id}
             lastAssistantMessageId={lastAssistantMessageId}
             onExportMessage={onExportMessage}
+            onGenerateSkill={onGenerateSkill}
             onPreviewImage={onPreviewImage}
+            onResolveToolConfirmation={onResolveToolConfirmation}
             onSelectTool={onSelectTool}
             onShowLogs={onShowLogs}
+            onToggleExportSelection={onToggleExportSelection}
+            pendingToolConfirmation={pendingToolConfirmation}
+            resolvingConfirmationAction={resolvingConfirmationAction}
+            resolvingConfirmationId={resolvingConfirmationId}
+            selectedForExport={selectedExportMessageIdSet.has(item.id)}
             sessionBusy={sessionBusy}
+            skillsById={skillsById}
             totalStepCount={totalStepCount}
           />
         );
       })}
+      <div aria-hidden="true" className="browser-chat-message-list-end" />
     </div>
   );
 });
 
+function BrowserChatSessionLoading({ label }: { label: string }) {
+  return (
+    <div className="browser-chat-session-loading" role="status" aria-live="polite" aria-label={label}>
+      <LiquidGlassLoader />
+      <span>{label}</span>
+    </div>
+  );
+}
+
 const BrowserChatComposer = memo(function BrowserChatComposer({
   attachments,
+  availableSkills,
   busy,
   currentBusy,
   imageInputRef,
@@ -830,17 +3166,24 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading,
   mode,
   modeLocked,
+  modelSelection,
+  modelSelectionTitle,
+  modelSelectionOptions,
+  safetyMode,
   onInterrupt,
+  onModelSelectionChange,
   onModeChange,
-  onPreviewAttachment,
   onRemoveAttachment,
   onSubmitMessage,
-  onUploadImages,
+  onSafetyModeChange,
+  onAddReferences,
+  onUploadFiles,
   resetToken,
   showStop,
   uploadingImage,
 }: {
   attachments: BrowserChatAttachment[];
+  availableSkills: SkillRecord[];
   busy: boolean;
   currentBusy: boolean;
   imageInputRef: RefObject<HTMLInputElement | null>;
@@ -848,40 +3191,494 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading: boolean;
   mode: BrowserChatMode;
   modeLocked: boolean;
+  modelSelection: string;
+  modelSelectionTitle: string;
+  modelSelectionOptions: Array<{ description?: string; group?: string; label: string; selectedLabel?: string; value: string }>;
+  safetyMode: BrowserChatSafetyMode;
   onInterrupt: () => void | Promise<void>;
+  onModelSelectionChange: (selection: { provider: ModelProvider; model: string }) => void;
   onModeChange: (mode: BrowserChatMode) => void;
-  onPreviewAttachment: (attachment: BrowserChatAttachment) => void;
   onRemoveAttachment: (id: string) => void;
-  onSubmitMessage: (content: string) => Promise<boolean>;
-  onUploadImages: (files: File[]) => void | Promise<void>;
+  onSubmitMessage: (content: string, skillIds: string[], attachments: BrowserChatAttachment[]) => Promise<boolean>;
+  onSafetyModeChange: (mode: BrowserChatSafetyMode) => void;
+  onAddReferences: (attachments: BrowserChatAttachment[]) => BrowserChatAttachment[];
+  onUploadFiles: (files: File[]) => Promise<BrowserChatAttachment[]>;
   resetToken: number;
   showStop: boolean;
   uploadingImage: boolean;
 }) {
+  void mode;
+  void modeLocked;
+  void onModeChange;
   const { t } = useI18n();
+  const editorRef = useRef<HTMLDivElement | null>(null);
   const [draft, setDraft] = useState('');
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [dismissedSlashDraft, setDismissedSlashDraft] = useState('');
+  const [activeSkillIndex, setActiveSkillIndex] = useState(0);
+  const attachmentsById = useMemo(() => new Map(attachments.map((attachment) => [attachment.id, attachment])), [attachments]);
 
   useEffect(() => {
     setDraft('');
+    setSelectedSkillIds([]);
+    setDismissedSlashDraft('');
+    setActiveSkillIndex(0);
+    if (editorRef.current) editorRef.current.innerHTML = '';
   }, [resetToken]);
 
+  const editorPlainText = useCallback((root: HTMLElement | null) => {
+    if (!root) return '';
+    const walk = (node: Node): string => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
+      if (!(node instanceof HTMLElement)) return '';
+      if (node.dataset.skillId || node.dataset.attachmentId) return ' ';
+      if (node.tagName === 'BR') return '\n';
+      return Array.from(node.childNodes).map(walk).join('');
+    };
+    return Array.from(root.childNodes).map(walk).join('').replace(/\u00A0/g, ' ');
+  }, []);
+
+  const attachmentFromToken = useCallback((node: HTMLElement) => {
+    const attachmentId = node.dataset.attachmentId || '';
+    if (!attachmentId) return undefined;
+    const existing = attachmentsById.get(attachmentId);
+    if (existing) return existing;
+    const raw = node.dataset.attachmentJson;
+    if (!raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw) as BrowserChatAttachment;
+      return parsed?.id ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }, [attachmentsById]);
+
+  const editorContentForSubmit = useCallback((root: HTMLElement | null) => {
+    if (!root) return '';
+    const walk = (node: Node): string => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
+      if (!(node instanceof HTMLElement)) return '';
+      if (node.dataset.skillId) return ` [[skill:${inlineTokenId(node.dataset.skillId)}]] `;
+      if (node.dataset.attachmentId) return ` [[ref:${inlineTokenId(node.dataset.attachmentId)}]] `;
+      if (node.tagName === 'BR') return '\n';
+      return Array.from(node.childNodes).map(walk).join('');
+    };
+    return Array.from(root.childNodes).map(walk).join('').replace(/\u00A0/g, ' ');
+  }, []);
+
+  const editorAttachmentsForSubmit = useCallback(() => {
+    const editor = editorRef.current;
+    if (!editor) return [];
+    const seen = new Set<string>();
+    const next: BrowserChatAttachment[] = [];
+    editor.querySelectorAll<HTMLElement>('[data-attachment-id]').forEach((node) => {
+      const attachment = attachmentFromToken(node);
+      if (!attachment || seen.has(attachment.id)) return;
+      seen.add(attachment.id);
+      next.push(attachment);
+    });
+    return next;
+  }, [attachmentFromToken]);
+
+  const syncEditorState = useCallback((options: { scrollToBottom?: boolean } = {}) => {
+    const editor = editorRef.current;
+    const skillIds = editor
+      ? Array.from(editor.querySelectorAll<HTMLElement>('[data-skill-id]')).map((node) => node.dataset.skillId || '').filter(Boolean)
+      : [];
+    setDraft(editorPlainText(editor));
+    setSelectedSkillIds(Array.from(new Set(skillIds)));
+    if (options.scrollToBottom && editor) {
+      requestAnimationFrame(() => {
+        editor.scrollTop = editor.scrollHeight;
+      });
+    }
+  }, [editorPlainText]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || typeof MutationObserver === 'undefined') return undefined;
+    let frame = 0;
+    const observer = new MutationObserver(() => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        syncEditorState();
+      });
+    });
+    observer.observe(editor, { childList: true, characterData: true, subtree: true });
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [syncEditorState]);
+
+  useEffect(() => {
+    const readySkillIds = new Set(availableSkills.filter((skill) => skill.status === 'ready').map((skill) => skill.id));
+    let removed = false;
+    editorRef.current?.querySelectorAll<HTMLElement>('[data-skill-id]').forEach((node) => {
+      if (!readySkillIds.has(node.dataset.skillId || '')) {
+        node.remove();
+        removed = true;
+      }
+    });
+    if (removed) syncEditorState();
+    setSelectedSkillIds((current) => current.filter((skillId) => readySkillIds.has(skillId)));
+  }, [availableSkills, syncEditorState]);
+
+  const selectedSkills = useMemo(() => (
+    selectedSkillIds
+      .map((skillId) => availableSkills.find((skill) => skill.id === skillId))
+      .filter((skill): skill is SkillRecord => Boolean(skill))
+  ), [availableSkills, selectedSkillIds]);
+  const composerText = useMemo(() => draft.replace(/\s+/g, ' ').trim(), [draft]);
+  const slashMatch = draft.match(/(?:^|\s)\/([^\s/]*)$/);
+  const skillQuery = slashMatch?.[1]?.toLowerCase() || '';
+  const skillMenuOpen = Boolean(slashMatch && dismissedSlashDraft !== draft);
+  const skillSuggestions = useMemo(() => {
+    if (!skillMenuOpen) return [];
+    const selected = new Set(selectedSkillIds);
+    return availableSkills
+      .filter((skill) => skill.status === 'ready' && !selected.has(skill.id))
+      .filter((skill) => {
+        if (!skillQuery) return true;
+        return [
+          skill.title,
+          skill.description,
+          ...skill.tags,
+          ...skill.triggerPhrases,
+        ].some((value) => value.toLowerCase().includes(skillQuery));
+      })
+      .slice(0, 8);
+  }, [availableSkills, selectedSkillIds, skillMenuOpen, skillQuery]);
+
+  useEffect(() => {
+    setActiveSkillIndex(0);
+  }, [skillMenuOpen, skillQuery, selectedSkillIds.length]);
+
+  useEffect(() => {
+    if (activeSkillIndex >= skillSuggestions.length) setActiveSkillIndex(Math.max(0, skillSuggestions.length - 1));
+  }, [activeSkillIndex, skillSuggestions.length]);
+
   const submitDraft = useCallback(async () => {
-    const content = draft.trim();
-    if ((!content && !attachments.length) || currentBusy || loading || uploadingImage) return;
-    const sent = await onSubmitMessage(content);
-    if (sent) setDraft('');
-  }, [attachments.length, currentBusy, draft, loading, onSubmitMessage, uploadingImage]);
+    const content = editorContentForSubmit(editorRef.current).trim();
+    const nextAttachments = editorAttachmentsForSubmit();
+    if ((!content && !nextAttachments.length && !selectedSkillIds.length) || currentBusy || loading || uploadingImage) return;
+    const sent = await onSubmitMessage(content, selectedSkillIds, nextAttachments);
+    if (sent) {
+      setDraft('');
+      setSelectedSkillIds([]);
+      if (editorRef.current) editorRef.current.innerHTML = '';
+    }
+  }, [currentBusy, editorAttachmentsForSubmit, editorContentForSubmit, loading, onSubmitMessage, selectedSkillIds, uploadingImage]);
+
+  function handleReferenceDragOver(event: ReactDragEvent<HTMLElement>) {
+    if (!dataTransferHasBrowserChatReferences(event.dataTransfer) || currentBusy || loading || uploadingImage || attachments.length >= BROWSER_CHAT_MAX_REFERENCES) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  }
+
+  function handleReferenceDrop(event: ReactDragEvent<HTMLElement>) {
+    if (!dataTransferHasBrowserChatReferences(event.dataTransfer) || currentBusy || loading || uploadingImage || attachments.length >= BROWSER_CHAT_MAX_REFERENCES) return;
+    event.preventDefault();
+    event.stopPropagation();
+    placeEditorCaretFromPoint(event.clientX, event.clientY);
+    const tabReference = browserChatTabReferenceFromDataTransfer(event.dataTransfer);
+    if (tabReference) onAddReferences([tabReference]).forEach(insertReferenceToken);
+    const files = Array.from(event.dataTransfer.files || []);
+    if (files.length) void onUploadFiles(files).then((uploaded) => uploaded.forEach(insertReferenceToken));
+  }
+
+  function chooseSkill(skill: SkillRecord) {
+    insertSkillToken(skill);
+    setSelectedSkillIds((current) => current.includes(skill.id) ? current : [...current, skill.id]);
+    setDismissedSlashDraft('');
+    requestAnimationFrame(() => editorRef.current?.focus());
+  }
+
+  function removeSkill(skillId: string) {
+    editorRef.current?.querySelectorAll<HTMLElement>(`[data-skill-id="${CSS.escape(skillId)}"]`).forEach((node) => node.remove());
+    setSelectedSkillIds((current) => current.filter((id) => id !== skillId));
+    syncEditorState();
+  }
+
+  function isInlineToken(node: Node | null): node is HTMLElement {
+    return node instanceof HTMLElement && Boolean(node.dataset.skillId || node.dataset.attachmentId);
+  }
+
+  function isBlankText(value: string) {
+    return value.replace(/\u00A0/g, ' ').trim() === '';
+  }
+
+  function setEditorSelection(container: Node, offset: number) {
+    const selection = window.getSelection();
+    if (!selection) return;
+    const maxOffset = container.nodeType === Node.TEXT_NODE
+      ? (container as Text).data.length
+      : container.childNodes.length;
+    const range = document.createRange();
+    range.setStart(container, Math.max(0, Math.min(offset, maxOffset)));
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  function clearEditorIfBlank() {
+    const editor = editorRef.current;
+    if (!editor || editor.querySelector('[data-skill-id],[data-attachment-id]') || !isBlankText(editorPlainText(editor))) return false;
+    editor.innerHTML = '';
+    setEditorSelection(editor, 0);
+    return true;
+  }
+
+  function removeInlineTokenNode(token: HTMLElement, selectionTarget?: { container: Node; offset: number }) {
+    const editor = editorRef.current;
+    const attachmentId = token.dataset.attachmentId || '';
+    const skillId = token.dataset.skillId || '';
+    token.remove();
+    if (attachmentId) onRemoveAttachment(attachmentId);
+    if (skillId) setSelectedSkillIds((current) => current.filter((id) => id !== skillId));
+    if (!clearEditorIfBlank()) {
+      if (selectionTarget?.container.isConnected && editor?.contains(selectionTarget.container)) {
+        setEditorSelection(selectionTarget.container, selectionTarget.offset);
+      } else if (editor) {
+        setEditorSelection(editor, editor.childNodes.length);
+      }
+    }
+    setDismissedSlashDraft('');
+    syncEditorState();
+  }
+
+  function removeAdjacentTokenByKeyboard(key: string) {
+    const editor = editorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection?.rangeCount) return false;
+    const range = selection.getRangeAt(0);
+    if (!editor.contains(range.commonAncestorContainer)) return false;
+
+    if (!range.collapsed) {
+      const fragment = range.cloneContents();
+      const removedAttachmentIds = Array.from(fragment.querySelectorAll<HTMLElement>('[data-attachment-id]'))
+        .map((node) => node.dataset.attachmentId || '')
+        .filter(Boolean);
+      if (!fragment.querySelector('[data-skill-id],[data-attachment-id]')) return false;
+      range.deleteContents();
+      removedAttachmentIds.forEach(onRemoveAttachment);
+      setEditorSelection(range.startContainer, range.startOffset);
+      clearEditorIfBlank();
+      setDismissedSlashDraft('');
+      syncEditorState();
+      return true;
+    }
+
+    const container = range.startContainer;
+    const offset = range.startOffset;
+
+    if (key === 'Backspace') {
+      if (container.nodeType === Node.TEXT_NODE) {
+        const textNode = container as Text;
+        const beforeCaret = textNode.data.slice(0, offset);
+        const previous = textNode.previousSibling;
+        if (isInlineToken(previous) && isBlankText(beforeCaret)) {
+          textNode.data = textNode.data.slice(offset);
+          removeInlineTokenNode(previous, { container: textNode, offset: 0 });
+          return true;
+        }
+      } else {
+        const before = container.childNodes[offset - 1];
+        if (isInlineToken(before)) {
+          removeInlineTokenNode(before, { container, offset: offset - 1 });
+          return true;
+        }
+        if (before?.nodeType === Node.TEXT_NODE && isBlankText(before.textContent || '') && isInlineToken(before.previousSibling)) {
+          const token = before.previousSibling;
+          before.remove();
+          removeInlineTokenNode(token, { container, offset: offset - 2 });
+          return true;
+        }
+      }
+    }
+
+    if (key === 'Delete') {
+      if (container.nodeType === Node.TEXT_NODE) {
+        const textNode = container as Text;
+        const afterCaret = textNode.data.slice(offset);
+        const next = textNode.nextSibling;
+        if (isInlineToken(next) && isBlankText(afterCaret)) {
+          textNode.data = textNode.data.slice(0, offset);
+          removeInlineTokenNode(next, { container: textNode, offset });
+          return true;
+        }
+      } else {
+        const after = container.childNodes[offset];
+        if (isInlineToken(after)) {
+          removeInlineTokenNode(after, { container, offset });
+          return true;
+        }
+        if (after?.nodeType === Node.TEXT_NODE && isBlankText(after.textContent || '') && isInlineToken(after.nextSibling)) {
+          const token = after.nextSibling;
+          after.remove();
+          removeInlineTokenNode(token, { container, offset });
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  function editorRange() {
+    const editor = editorRef.current;
+    if (!editor) return undefined;
+    editor.focus();
+    const selection = window.getSelection();
+    if (selection?.rangeCount) {
+      const range = selection.getRangeAt(0);
+      if (editor.contains(range.commonAncestorContainer)) return range;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    return range;
+  }
+
+  function placeEditorCaretFromPoint(clientX: number, clientY: number) {
+    const editor = editorRef.current;
+    if (!editor || typeof document === 'undefined') return;
+    const doc = document as Document & {
+      caretPositionFromPoint?: (x: number, y: number) => { offset: number; offsetNode: Node } | null;
+      caretRangeFromPoint?: (x: number, y: number) => Range | null;
+    };
+    const range = doc.caretRangeFromPoint?.(clientX, clientY) || (() => {
+      const position = doc.caretPositionFromPoint?.(clientX, clientY);
+      if (!position) return null;
+      const nextRange = document.createRange();
+      nextRange.setStart(position.offsetNode, position.offset);
+      return nextRange;
+    })();
+    if (!range || !editor.contains(range.commonAncestorContainer)) return;
+    range.collapse(true);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  }
+
+  function removeSlashTrigger(range: Range) {
+    if (!range.collapsed || range.startContainer.nodeType !== Node.TEXT_NODE) return range;
+    const node = range.startContainer as Text;
+    const before = node.data.slice(0, range.startOffset);
+    const match = before.match(/(^|\s)\/[^\s/]*$/);
+    if (!match) return range;
+    const deleteFrom = before.length - match[0].length + match[1].length;
+    node.data = `${node.data.slice(0, deleteFrom)}${node.data.slice(range.startOffset)}`;
+    const nextRange = document.createRange();
+    nextRange.setStart(node, deleteFrom);
+    nextRange.collapse(true);
+    return nextRange;
+  }
+
+  function insertSkillToken(skill: SkillRecord) {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const range = removeSlashTrigger(editorRange() || document.createRange());
+    range.deleteContents();
+
+    const token = document.createElement('span');
+    token.className = 'browser-chat-inline-skill';
+    token.contentEditable = 'false';
+    token.dataset.skillId = skill.id;
+    token.title = skill.description;
+    token.innerHTML = `<span class="browser-chat-inline-skill-icon">${inlineSkillIconSvg()}</span><span class="browser-chat-inline-skill-title"></span>`;
+    token.querySelector('.browser-chat-inline-skill-title')!.textContent = skill.title;
+
+    range.insertNode(token);
+    const trailingText = document.createTextNode('\u00A0');
+    token.after(trailingText);
+    const nextRange = document.createRange();
+    nextRange.setStart(trailingText, trailingText.data.length);
+    nextRange.collapse(true);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(nextRange);
+    syncEditorState();
+  }
+
+  function insertReferenceToken(attachment: BrowserChatAttachment) {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const kind = browserChatAttachmentKind(attachment);
+    const range = editorRange() || document.createRange();
+    range.deleteContents();
+
+    const token = document.createElement('span');
+    token.className = `browser-chat-inline-reference ${kind}`;
+    token.contentEditable = 'false';
+    token.dataset.attachmentId = attachment.id;
+    token.dataset.attachmentJson = JSON.stringify(attachment);
+    token.dataset.attachmentKind = kind;
+    token.title = `${browserChatReferenceLabel(kind)}: ${attachment.name}`;
+    token.innerHTML = `<span class="browser-chat-inline-reference-icon">${inlineReferenceIconSvg(kind)}</span><span class="browser-chat-inline-reference-title"></span>`;
+    token.querySelector('.browser-chat-inline-reference-title')!.textContent = attachment.name || browserChatReferenceLabel(kind);
+
+    range.insertNode(token);
+    const trailingText = document.createTextNode('\u00A0');
+    token.after(trailingText);
+    const nextRange = document.createRange();
+    nextRange.setStart(trailingText, trailingText.data.length);
+    nextRange.collapse(true);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(nextRange);
+    syncEditorState({ scrollToBottom: true });
+  }
 
   return (
     <>
-      <BrowserChatImageGrid
-        attachments={attachments}
-        editable
-        onPreview={onPreviewAttachment}
-        onRemove={onRemoveAttachment}
-      />
+      {selectedSkills.length ? (
+        <div className="browser-chat-skill-chips">
+          {selectedSkills.map((skill) => (
+            <button key={skill.id} onClick={() => removeSkill(skill.id)} title={skill.description} type="button">
+              <Braces size={14} />
+              <span>{skill.title}</span>
+              <X size={13} />
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {skillMenuOpen ? (
+        <div className="browser-chat-skill-menu" role="listbox" aria-label="Skills">
+          <div className="browser-chat-skill-menu-head">
+            <b>Skills</b>
+            {skillQuery ? <span>/{skillQuery}</span> : null}
+          </div>
+          {skillSuggestions.length ? skillSuggestions.map((skill, index) => (
+            <button
+              aria-selected={activeSkillIndex === index}
+              className={activeSkillIndex === index ? 'active' : undefined}
+              key={skill.id}
+              onClick={() => chooseSkill(skill)}
+              onMouseDown={(event) => event.preventDefault()}
+              role="option"
+              type="button"
+            >
+              <Braces size={15} />
+              <span>
+                <b>{skill.title}</b>
+                <small>{skill.description}</small>
+              </span>
+            </button>
+          )) : (
+            <div className="browser-chat-skill-empty">
+              {availableSkills.some((skill) => skill.status === 'ready') ? '没有匹配的 Skills' : '暂无可用 Skills'}
+            </div>
+          )}
+        </div>
+      ) : null}
       <form
-        className="browser-chat-compose"
+        className="browser-chat-compose browser-chat-compose--reference"
+        onDragOver={handleReferenceDragOver}
+        onDrop={handleReferenceDrop}
         onSubmit={(event) => {
           event.preventDefault();
           void submitDraft();
@@ -891,77 +3688,1408 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           ref={imageInputRef}
           className="browser-chat-image-input"
           type="file"
-          accept="image/*"
           multiple
           onChange={(event) => {
             const files = event.currentTarget.files;
-            if (files?.length) void onUploadImages(Array.from(files));
+            if (files?.length) void onUploadFiles(Array.from(files)).then((uploaded) => uploaded.forEach(insertReferenceToken));
           }}
         />
-        <textarea
-          disabled={currentBusy || loading}
-          placeholder={t('有问题，尽管问')}
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
+        {(selectedSkills.length || skillMenuOpen) ? (
+          <div className="browser-chat-compose-context">
+            {selectedSkills.length ? (
+              <div className="browser-chat-skill-chips">
+                {selectedSkills.map((skill) => (
+                  <button key={skill.id} onClick={() => removeSkill(skill.id)} title={skill.description} type="button">
+                    <Braces size={14} />
+                    <span>{skill.title}</span>
+                    <X size={13} />
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {skillMenuOpen ? (
+              <div className="browser-chat-skill-menu" role="listbox" aria-label="Skills">
+                <div className="browser-chat-skill-menu-head">
+                  <b>Skills</b>
+                  {skillQuery ? <span>/{skillQuery}</span> : <span>/</span>}
+                </div>
+                {skillSuggestions.length ? skillSuggestions.map((skill, index) => (
+                  <button
+                    aria-selected={activeSkillIndex === index}
+                    className={activeSkillIndex === index ? 'active' : undefined}
+                    key={skill.id}
+                    onClick={() => chooseSkill(skill)}
+                    onMouseDown={(event) => event.preventDefault()}
+                    role="option"
+                    type="button"
+                  >
+                    <Braces size={15} />
+                    <span>
+                      <b>{skill.title}</b>
+                      <small>{skill.description}</small>
+                    </span>
+                  </button>
+                )) : (
+                  <div className="browser-chat-skill-empty">
+                    {availableSkills.some((skill) => skill.status === 'ready') ? '没有匹配的 Skills' : '暂无可用 Skills'}
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        <div
+          ref={editorRef}
+          className="browser-chat-inline-editor"
+          contentEditable={!currentBusy && !loading}
+          data-placeholder={t('有问题，尽管问')}
+          onInput={() => syncEditorState({ scrollToBottom: true })}
           onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === 'Backspace' || event.key === 'Delete') {
+              if (removeAdjacentTokenByKeyboard(event.key)) {
+                event.preventDefault();
+                return;
+              }
+              requestAnimationFrame(() => syncEditorState({ scrollToBottom: true }));
+            }
+            if (skillMenuOpen && event.key === 'ArrowDown') {
+              event.preventDefault();
+              setActiveSkillIndex((current) => skillSuggestions.length ? (current + 1) % skillSuggestions.length : 0);
+              return;
+            }
+            if (skillMenuOpen && event.key === 'ArrowUp') {
+              event.preventDefault();
+              setActiveSkillIndex((current) => skillSuggestions.length ? (current - 1 + skillSuggestions.length) % skillSuggestions.length : 0);
+              return;
+            }
+            if (skillMenuOpen && event.key === 'Escape') {
+              event.preventDefault();
+              setDismissedSlashDraft(draft);
+              return;
+            }
+            if (skillMenuOpen && (event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
+              event.preventDefault();
+              const skill = skillSuggestions[activeSkillIndex];
+              if (skill) chooseSkill(skill);
+              return;
+            }
+            if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault();
               void submitDraft();
             }
           }}
+          onKeyUp={(event) => {
+            if (event.key === 'Backspace' || event.key === 'Delete') syncEditorState({ scrollToBottom: true });
+          }}
+          onPaste={(event) => {
+            event.preventDefault();
+            const text = event.clipboardData.getData('text/plain');
+            if (!text) return;
+            const range = editorRange();
+            range?.deleteContents();
+            range?.insertNode(document.createTextNode(text));
+            range?.collapse(false);
+            syncEditorState({ scrollToBottom: true });
+          }}
+          role="textbox"
+          suppressContentEditableWarning
         />
-        <button
-          aria-label={t('上传图片')}
-          className="browser-chat-attach"
-          disabled={currentBusy || uploadingImage || attachments.length >= 8}
-          onClick={() => imageInputRef.current?.click()}
-          title={t('上传图片')}
-          type="button"
-        >
-          {uploadingImage ? <Loader2 className="spin" size={17} /> : <ImageUp size={17} />}
-        </button>
-        <div className="browser-chat-mode-toggle" role="radiogroup" aria-label={t('操作模式')}>
+        <div className="browser-chat-compose-actions">
+          <div className="browser-chat-compose-tools">
+            <button
+              aria-label="上传文件"
+              className="browser-chat-attach"
+              disabled={currentBusy || uploadingImage || attachments.length >= BROWSER_CHAT_MAX_REFERENCES}
+              onClick={() => imageInputRef.current?.click()}
+              title="上传文件"
+              type="button"
+            >
+              {uploadingImage ? <Loader2 className="spin" size={17} /> : <Plus size={19} />}
+            </button>
+            <div className="browser-chat-safety-toggle" role="radiogroup" aria-label={t('安全性')}>
+              <button
+                aria-pressed={safetyMode === 'strict'}
+                className={safetyMode === 'strict' ? 'active' : undefined}
+                disabled={currentBusy || loading}
+                onClick={() => onSafetyModeChange('strict')}
+                title={t('严谨模式下，一些模型认为重要的操作需要用户手动确认执行')}
+                type="button"
+              >
+                {t('严谨')}
+              </button>
+              <button
+                aria-pressed={safetyMode === 'full'}
+                className={safetyMode === 'full' ? 'active' : undefined}
+                disabled={currentBusy || loading}
+                onClick={() => onSafetyModeChange('full')}
+                title={t('完全模式下，模型不需要征求用户手动确认执行')}
+                type="button"
+              >
+                {t('完全')}
+              </button>
+            </div>
+          </div>
+          <div className="browser-chat-compose-submit">
+            <div className="browser-chat-model-control">
+              <CustomSelect
+                className="browser-chat-provider-select"
+                disabled={currentBusy || loading}
+                onChange={(value) => onModelSelectionChange(parseModelSelectionValue(value))}
+                options={modelSelectionOptions}
+                searchable
+                searchPlaceholder={t('搜索模型')}
+                title={modelSelectionTitle}
+                value={modelSelection}
+              />
+            </div>
+            {showStop ? (
+              <button
+                className="browser-chat-stop"
+                disabled={interrupting}
+                onClick={() => void onInterrupt()}
+                type="button"
+                aria-label={t('中断本轮对话')}
+                title={t('中断本轮对话')}
+              >
+                {interrupting ? <Loader2 className="spin" size={18} /> : <Square size={16} />}
+              </button>
+            ) : (
+              <button
+                className="browser-chat-send"
+                disabled={(!composerText && !attachments.length && !selectedSkillIds.length) || currentBusy || loading || uploadingImage}
+                type="submit"
+                aria-label={t('发送')}
+              >
+                {busy ? <Loader2 className="spin" size={18} /> : <ArrowUp size={20} strokeWidth={2.2} />}
+              </button>
+            )}
+          </div>
+        </div>
+      </form>
+    </>
+  );
+});
+
+function embeddedBoundsFromElement(element: HTMLElement, options: { leftInset?: number } = {}): EmbeddedBrowserBounds {
+  const rect = element.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
+  const leftInset = Math.max(0, Math.min(Math.round(options.leftInset || 0), width - 1));
+  return {
+    x: Math.max(0, Math.round(rect.left) + leftInset),
+    y: Math.max(0, Math.round(rect.top)),
+    width: Math.max(1, width - leftInset),
+    height,
+  };
+}
+
+function EmbeddedBrowserFavoritesIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg aria-hidden="true" fill="none" height={size} viewBox="0 0 24 24" width={size}>
+      <path d="m7.1 3.2 1.45 2.95 3.25.47-2.35 2.3.56 3.23-2.91-1.53-2.91 1.53.56-3.23-2.35-2.3 3.25-.47L7.1 3.2Z" />
+      <path d="M13.4 6.25h7.1M13.8 10.7h6.7M12.2 15.15h8.3" />
+    </svg>
+  );
+}
+
+function embeddedBoundsKey(bounds?: EmbeddedBrowserBounds) {
+  return bounds ? `${bounds.x}:${bounds.y}:${bounds.width}:${bounds.height}` : '';
+}
+
+function embeddedBrowserDisplayUrl(tab?: EmbeddedBrowserTab) {
+  const url = tab?.url || '';
+  if (!url || /^data:text\/html/i.test(url)) return '';
+  return url;
+}
+
+function normalizeEmbeddedBrowserAddress(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) || /^(about|data|file|blob):/i.test(trimmed)) return trimmed;
+  if (/^(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(trimmed)) return `http://${trimmed}`;
+  return `https://${trimmed}`;
+}
+
+function EmbeddedBrowserTabFavicon({ faviconUrl }: { faviconUrl?: string }) {
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [faviconUrl]);
+
+  if (!faviconUrl || failed) return <AppWindow aria-hidden="true" size={14} />;
+  return (
+    <img
+      alt=""
+      decoding="async"
+      draggable={false}
+      onError={() => setFailed(true)}
+      referrerPolicy="no-referrer"
+      src={faviconUrl}
+    />
+  );
+}
+
+function EmbeddedBrowserTabContent({ tab }: { tab: EmbeddedBrowserTab }) {
+  return (
+    <>
+      <span className="browser-chat-embedded-tab-icon">
+        <EmbeddedBrowserTabFavicon faviconUrl={tab.faviconUrl} />
+      </span>
+      {tab.pinned ? <Pin aria-label="已固定" className="browser-chat-embedded-tab-pin" size={11} /> : null}
+      <span className="browser-chat-embedded-tab-text">
+        <strong>{compactText(tab.title || tab.url || '新建标签页', 56)}</strong>
+      </span>
+      {tab.loading ? (
+        <span className="browser-chat-embedded-tab-loading" aria-label="页面加载中">
+          <Loader2 className="spin" size={12} />
+        </span>
+      ) : null}
+    </>
+  );
+}
+
+function EmbeddedBrowserSortableTab({
+  active,
+  dragging,
+  groupId,
+  onActivate,
+  onClose,
+  onContextMenu,
+  onToggleMute,
+  tab,
+}: {
+  active: boolean;
+  dragging: boolean;
+  groupId: string;
+  onActivate: () => void;
+  onClose: () => void;
+  onContextMenu: (event: ReactMouseEvent<HTMLElement>) => void;
+  onToggleMute: () => void;
+  tab: EmbeddedBrowserTab;
+}) {
+  const {
+    attributes,
+    isDragging,
+    isSorting,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+  } = useSortable({
+    data: {
+      groupId,
+      tabId: tab.id,
+      type: 'embedded-browser-tab',
+    } satisfies EmbeddedBrowserTabDndData,
+    id: embeddedBrowserTabDndId(tab.id),
+    transition: {
+      duration: 160,
+      easing: 'cubic-bezier(0.2, 0, 0, 1)',
+    },
+  });
+  const sortableStyle = {
+    transform: DndCss.Transform.toString(transform),
+    transition: [
+      transition,
+      'background-color 160ms ease',
+      'border-color 160ms ease',
+      'box-shadow 160ms ease',
+      'color 160ms ease',
+    ].filter(Boolean).join(', '),
+    visibility: dragging || isDragging ? 'hidden' : undefined,
+  } satisfies CSSProperties;
+
+  return (
+    <div
+      {...attributes}
+      {...listeners}
+      aria-selected={active}
+      className={[
+        'browser-chat-embedded-tab',
+        active ? 'active' : '',
+        tab.pinned ? 'pinned' : '',
+        tab.loading ? 'loading' : '',
+        dragging || isDragging ? 'dragging' : '',
+        isSorting ? 'sorting' : '',
+      ].filter(Boolean).join(' ')}
+      onClick={onActivate}
+      onContextMenu={onContextMenu}
+      ref={setNodeRef}
+      role="tab"
+      style={sortableStyle}
+      title={tab.url || tab.title}
+    >
+      <EmbeddedBrowserTabContent tab={tab} />
+      <button
+        aria-label={tab.audioMuted ? '取消静音标签页' : '静音标签页'}
+        className={tab.audioMuted ? 'browser-chat-embedded-tab-mute is-muted' : 'browser-chat-embedded-tab-mute'}
+        onClick={(event) => {
+          event.stopPropagation();
+          onToggleMute();
+        }}
+        onPointerDown={(event) => event.stopPropagation()}
+        title={tab.audioMuted ? '取消静音' : '静音'}
+        type="button"
+      >
+        {tab.audioMuted ? <VolumeX size={13} /> : <Volume2 size={13} />}
+      </button>
+      <button
+        aria-label="关闭当前标签页"
+        className="browser-chat-embedded-tab-close"
+        onClick={(event) => {
+          event.stopPropagation();
+          onClose();
+        }}
+        onPointerDown={(event) => event.stopPropagation()}
+        title="关闭当前标签页"
+        type="button"
+      >
+        <X size={13} />
+      </button>
+    </div>
+  );
+}
+
+function EmbeddedBrowserTabGroupDropZone({
+  children,
+  className,
+  endDropActive,
+  groupId,
+  style,
+}: {
+  children: ReactNode;
+  className: string;
+  endDropActive: boolean;
+  groupId: string;
+  style?: CSSProperties;
+}) {
+  const { setNodeRef } = useDroppable({
+    data: {
+      groupId,
+      type: 'embedded-browser-group',
+    } satisfies EmbeddedBrowserGroupDndData,
+    id: embeddedBrowserGroupDndId(groupId),
+  });
+  const { setNodeRef: setEndDropNodeRef } = useDroppable({
+    data: {
+      groupId,
+      type: 'embedded-browser-group',
+    } satisfies EmbeddedBrowserGroupDndData,
+    disabled: !endDropActive,
+    id: embeddedBrowserGroupEndDndId(groupId),
+  });
+
+  return (
+    <div className={className} ref={setNodeRef} style={style}>
+      {children}
+      <span aria-hidden="true" className="browser-chat-embedded-tab-group-end-drop-zone" ref={setEndDropNodeRef} />
+    </div>
+  );
+}
+
+const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
+  active,
+  browserGroupId,
+  enabled,
+  leftOverlayInset = 0,
+  onAddTabReference,
+  onDialogOpenChange,
+  onSelectSession,
+  sessionId,
+}: {
+  active: boolean;
+  browserGroupId?: string;
+  enabled: boolean;
+  leftOverlayInset?: number;
+  onAddTabReference?: (reference: BrowserChatAttachment) => void;
+  onDialogOpenChange?: (open: boolean) => void;
+  onSelectSession?: (sessionId: string) => void;
+  sessionId?: string;
+}) {
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const addressInputRef = useRef<HTMLInputElement | null>(null);
+  const requestedSessionIdRef = useRef('');
+  const embeddedBrowserSyncRef = useRef({ boundsKey: '', groupId: '', sessionId: '', visible: false });
+  const addressFocusedRef = useRef(false);
+  const tabDragCommitTargetRef = useRef<EmbeddedBrowserTabDropTarget | null>(null);
+  const tabDragCurrentGroupRef = useRef('');
+  const tabDragSourceGroupRef = useRef('');
+  const [bridgeAvailable, setBridgeAvailable] = useState(false);
+  const [bridgeError, setBridgeError] = useState('');
+  const [browserGroups, setBrowserGroups] = useState<EmbeddedBrowserGroup[]>([]);
+  const [browserTabs, setBrowserTabs] = useState<EmbeddedBrowserTab[]>([]);
+  const [activeGroupId, setActiveGroupId] = useState('');
+  const [activeTabIndex, setActiveTabIndex] = useState(0);
+  const [activeTabId, setActiveTabId] = useState('');
+  const [addressValue, setAddressValue] = useState('');
+  const [canGoBack, setCanGoBack] = useState(false);
+  const [canGoForward, setCanGoForward] = useState(false);
+  const [closedGroupIds, setClosedGroupIds] = useState<string[]>([]);
+  const [draggingTabId, setDraggingTabId] = useState('');
+  const [dragDropGroupId, setDragDropGroupId] = useState('');
+  const [tabDragPreview, setTabDragPreview] = useState<EmbeddedBrowserTabDragPreview | null>(null);
+  const [tabDragPortalTarget, setTabDragPortalTarget] = useState<HTMLElement | null>(null);
+  const [libraryPanel, setLibraryPanel] = useState<'bookmarks' | 'history' | null>(null);
+  const [newGroupDialogOpen, setNewGroupDialogOpen] = useState(false);
+  const [newGroupName, setNewGroupName] = useState('新建标签组');
+  const [creatingNewGroup, setCreatingNewGroup] = useState(false);
+  const embeddedTabSensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 3 },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  const applyEmbeddedBrowserState = useCallback((result: EmbeddedBrowserState) => {
+    if (!result.ok) {
+      setBridgeError(result.error || '嵌入浏览器状态不可用');
+      return;
+    }
+    setBridgeError('');
+    setBrowserGroups(Array.isArray(result.groups) ? result.groups : []);
+    setBrowserTabs(Array.isArray(result.tabs) ? result.tabs : []);
+    setLibraryPanel(result.libraryPanel === 'bookmarks' || result.libraryPanel === 'history' ? result.libraryPanel : null);
+    setActiveGroupId(result.activeGroupId || '');
+    setActiveTabIndex(typeof result.activeIndex === 'number' && result.activeIndex >= 0 ? result.activeIndex : 0);
+    setActiveTabId(result.activeTabId || '');
+    setCanGoBack(Boolean(result.canGoBack));
+    setCanGoForward(Boolean(result.canGoForward));
+  }, []);
+
+  const loadEmbeddedBrowserState = useCallback(async () => {
+    const bridge = window.webPilotEmbeddedBrowser;
+    setBridgeAvailable(Boolean(bridge));
+    if (!bridge) {
+      setBrowserGroups([]);
+      setBrowserTabs([]);
+      setActiveGroupId('');
+      setActiveTabIndex(0);
+      setActiveTabId('');
+      setAddressValue('');
+      setCanGoBack(false);
+      setCanGoForward(false);
+      setLibraryPanel(null);
+      return;
+    }
+
+    try {
+      const result = await bridge.getState();
+      applyEmbeddedBrowserState(result);
+    } catch (error) {
+      setBridgeError(error instanceof Error ? error.message : '嵌入浏览器状态不可用');
+    }
+  }, [applyEmbeddedBrowserState]);
+
+  const syncEmbeddedBrowser = useCallback(async () => {
+    const bridge = window.webPilotEmbeddedBrowser;
+    const viewport = viewportRef.current;
+    const visible = enabled && active && Boolean(viewport);
+    const groupId = browserGroupId || embeddedGroupIdForSession(sessionId);
+    const bounds = visible && viewport
+      ? embeddedBoundsFromElement(viewport, { leftInset: leftOverlayInset })
+      : undefined;
+    const boundsKey = embeddedBoundsKey(bounds);
+    const previous = embeddedBrowserSyncRef.current;
+    setBridgeAvailable(Boolean(bridge));
+    if (!bridge) return;
+    try {
+      if (!visible) {
+        if (!previous.visible) return;
+        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
+        const result = await bridge.setVisible({ visible: false });
+        setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
+        if (result.ok) applyEmbeddedBrowserState(result);
+        return;
+      }
+
+      if (!previous.visible || previous.groupId !== groupId || previous.sessionId !== (sessionId || '')) {
+        embeddedBrowserSyncRef.current = { boundsKey, groupId, sessionId: sessionId || '', visible: true };
+        const result = await bridge.setVisible({
+          bounds,
+          createIfMissing: Boolean(sessionId),
+          groupId,
+          sessionId,
+          visible: true,
+        });
+        setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
+        if (result.ok) applyEmbeddedBrowserState(result);
+        return;
+      }
+
+      if (bounds && previous.boundsKey !== boundsKey) {
+        embeddedBrowserSyncRef.current = { boundsKey, groupId, sessionId: sessionId || '', visible: true };
+        const result = await bridge.setBounds(bounds);
+        setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
+      }
+    } catch (error) {
+      setBridgeError(error instanceof Error ? error.message : '嵌入浏览器不可用');
+    }
+  }, [active, applyEmbeddedBrowserState, browserGroupId, enabled, leftOverlayInset, sessionId]);
+
+  useEffect(() => {
+    void syncEmbeddedBrowser();
+    const viewport = viewportRef.current;
+    if (!enabled || !active || !viewport) {
+      return () => {
+        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
+        void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
+      };
+    }
+
+    const update = () => {
+      void syncEmbeddedBrowser();
+    };
+    const resizeObserver = new ResizeObserver(update);
+    resizeObserver.observe(viewport);
+    window.addEventListener('resize', update);
+    window.addEventListener('scroll', update, true);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', update);
+      window.removeEventListener('scroll', update, true);
+      embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
+      void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
+    };
+  }, [active, enabled, syncEmbeddedBrowser]);
+
+  useEffect(() => {
+    if (!enabled || !active) return undefined;
+    void loadEmbeddedBrowserState();
+    const bridge = window.webPilotEmbeddedBrowser;
+    return bridge?.onStateChange?.((result) => applyEmbeddedBrowserState(result)) || undefined;
+  }, [active, applyEmbeddedBrowserState, enabled, loadEmbeddedBrowserState]);
+
+  useEffect(() => {
+    if (!enabled || !active) return undefined;
+    return window.webPilotEmbeddedBrowser?.onFocusAddress?.(() => {
+      window.requestAnimationFrame(() => {
+        addressInputRef.current?.focus();
+        addressInputRef.current?.select();
+      });
+    }) || undefined;
+  }, [active, enabled]);
+
+  async function goEmbeddedBrowserBack() {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge || !canGoBack) return;
+    const result = await bridge.goBack().catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Browser back failed',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function goEmbeddedBrowserForward() {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge || !canGoForward) return;
+    const result = await bridge.goForward().catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Browser forward failed',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function reloadEmbeddedBrowser() {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.reload().catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Browser reload failed',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function stopEmbeddedBrowserLoading() {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge?.stop) return;
+    const result = await bridge.stop().catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '停止页面加载失败',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function toggleEmbeddedBrowserBookmark() {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.toggleBookmark().catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '收藏操作失败',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function setEmbeddedBrowserTabMuted(tab: EmbeddedBrowserTab) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.setTabMuted({ id: tab.id, muted: !tab.audioMuted }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '标签静音操作失败',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function toggleEmbeddedBrowserLibraryPanel(panel: 'bookmarks' | 'history') {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.setLibraryPanel({ panel: libraryPanel === panel ? null : panel }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '打开收藏与历史记录失败',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function activateEmbeddedBrowserTab(tab: EmbeddedBrowserTab) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.activateTab({ id: tab.id }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '切换嵌入浏览器标签失败',
+    }));
+    applyEmbeddedBrowserState(result);
+    if (result.ok && tab.sessionId && tab.sessionId !== sessionId) {
+      requestedSessionIdRef.current = tab.sessionId;
+      onSelectSession?.(tab.sessionId);
+    }
+  }
+
+  async function closeEmbeddedBrowserTab(tab: EmbeddedBrowserTab) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.closeTab({ id: tab.id }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '关闭嵌入浏览器标签失败',
+    }));
+    applyEmbeddedBrowserState(result);
+    void syncEmbeddedBrowser();
+  }
+
+  async function closeEmbeddedBrowserGroup(group: EmbeddedBrowserGroup) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.closeGroup({ id: group.id }).catch((error: unknown): EmbeddedBrowserState => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '关闭嵌入浏览器标签组失败',
+    }));
+    applyEmbeddedBrowserState(result);
+    if (result.ok) {
+      setClosedGroupIds((current) => (current.includes(group.id) ? current : [...current, group.id]));
+      const nextActiveGroup = result.groups?.find((item) => item.active) || result.groups?.find((item) => item.tabs.length);
+      const nextSessionId = nextActiveGroup?.sessionId || nextActiveGroup?.tabs.find((tab) => tab.sessionId)?.sessionId;
+      if (nextSessionId && nextSessionId !== sessionId) {
+        requestedSessionIdRef.current = nextSessionId;
+        onSelectSession?.(nextSessionId);
+      }
+      void syncEmbeddedBrowser();
+    }
+  }
+
+  async function createEmbeddedBrowserTab(group: EmbeddedBrowserGroup) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const groupSessionId = embeddedSessionIdFromGroupId(group.id)
+      || (group.id.startsWith('session:') ? group.sessionId : sessionId)
+      || sessionId;
+    const result = await bridge.createTab({ groupId: group.id, sessionId: groupSessionId }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '创建嵌入浏览器标签失败',
+    }));
+    applyEmbeddedBrowserState(result);
+    if (result.ok) {
+      setClosedGroupIds((current) => current.filter((item) => item !== group.id));
+      if (groupSessionId && groupSessionId !== sessionId) {
+        requestedSessionIdRef.current = groupSessionId;
+        onSelectSession?.(groupSessionId);
+      }
+    }
+  }
+
+  async function createEmbeddedBrowserGroup() {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const label = newGroupName.trim() || '新建标签组';
+    if (!label) return;
+    setCreatingNewGroup(true);
+    try {
+      const result = await bridge.createGroup({ label }).catch((error: unknown) => ({
+        ok: false,
+        error: error instanceof Error ? error.message : '创建嵌入浏览器标签组失败',
+      }));
+      applyEmbeddedBrowserState(result);
+      if (!result.ok) return;
+      setNewGroupDialogOpen(false);
+      onDialogOpenChange?.(false);
+      setNewGroupName('新建标签组');
+    } finally {
+      setCreatingNewGroup(false);
+    }
+  }
+
+  async function toggleEmbeddedBrowserGroupCollapsed(group: EmbeddedBrowserGroup) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const result = await bridge.setGroupCollapsed({ collapsed: !group.collapsed, id: group.id }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '更新标签组状态失败',
+    }));
+    applyEmbeddedBrowserState(result);
+  }
+
+  async function moveEmbeddedBrowserTab(tabId: string, options: { position?: 'before' | 'after' | 'end'; targetGroupId?: string; targetId?: string; targetSessionId?: string }) {
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge || !tabId || (options.targetId && tabId === options.targetId)) return;
+    const result = await bridge.moveTab({ id: tabId, ...options }).catch((error: unknown): EmbeddedBrowserState => ({
+      ok: false,
+      error: error instanceof Error ? error.message : '移动嵌入浏览器标签失败',
+    }));
+    applyEmbeddedBrowserState(result);
+    if (result.ok && result.activeTabId === tabId) {
+      const movedTab = result.tabs?.find((item) => item.id === tabId);
+      if (movedTab?.sessionId && movedTab.sessionId !== sessionId) {
+        requestedSessionIdRef.current = movedTab.sessionId;
+        onSelectSession?.(movedTab.sessionId);
+      }
+    }
+  }
+
+  function showEmbeddedBrowserTabContextMenu(event: ReactMouseEvent<HTMLElement>, tab: EmbeddedBrowserTab) {
+    event.preventDefault();
+    event.stopPropagation();
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    void bridge.showTabContextMenu({
+      groups: visibleGroups.map((group) => ({
+        id: group.id,
+        label: embeddedSessionGroupLabel(group.sessionId || embeddedSessionIdFromGroupId(group.id)),
+      })),
+      id: tab.id,
+    }).catch(() => undefined);
+  }
+
+  async function navigateEmbeddedBrowserAddress(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const bridge = window.webPilotEmbeddedBrowser;
+    const url = normalizeEmbeddedBrowserAddress(addressValue);
+    if (!bridge || !url) return;
+    const groupId = activeEmbeddedTab?.groupId || activeGroupId || browserGroupId || undefined;
+    const targetSessionId = activeEmbeddedTab?.sessionId
+      || (groupId?.startsWith('session:') ? embeddedSessionIdFromGroupId(groupId) : undefined)
+      || (groupId === browserGroupId ? sessionId : undefined);
+    const result = await bridge.navigate({
+      groupId,
+      id: activeEmbeddedTab?.id,
+      sessionId: targetSessionId,
+      url,
+    }).catch((error: unknown) => ({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Browser navigation failed',
+    }));
+    if (!result.ok) {
+      setBridgeError(result.error || 'Browser navigation failed');
+      return;
+    }
+    setBridgeError('');
+    addressFocusedRef.current = false;
+    setAddressValue(url);
+    void loadEmbeddedBrowserState();
+  }
+
+  function clearEmbeddedTabDrag({ keepPreview = false }: { keepPreview?: boolean } = {}) {
+    if (typeof document !== 'undefined') document.body.classList.remove('is-dragging-embedded-tab');
+    tabDragCommitTargetRef.current = null;
+    tabDragCurrentGroupRef.current = '';
+    tabDragSourceGroupRef.current = '';
+    setDraggingTabId('');
+    setDragDropGroupId('');
+    if (!keepPreview) setTabDragPreview(null);
+  }
+
+  const selectedGroupId = browserGroupId || embeddedGroupIdForSession(sessionId);
+  const visibleGroups = useMemo<EmbeddedBrowserGroup[]>(() => {
+    const groupsById = new Map<string, EmbeddedBrowserGroup>();
+    const orderedIds: string[] = [];
+    const resolvedActiveGroupId = activeGroupId || browserGroups.find((group) => group.active)?.id || selectedGroupId;
+
+    function ensureGroup(id: string, input: Partial<EmbeddedBrowserGroup> = {}) {
+      const normalizedId = id || selectedGroupId;
+      let group = groupsById.get(normalizedId);
+      if (!group) {
+        group = {
+          active: normalizedId === resolvedActiveGroupId,
+          activeTabId: input.activeTabId,
+          collapsed: Boolean(input.collapsed),
+          id: normalizedId,
+          label: input.label,
+          sessionId: input.sessionId,
+          tabs: [],
+        };
+        groupsById.set(normalizedId, group);
+        orderedIds.push(normalizedId);
+      }
+      group.active = Boolean(group.active || input.active || normalizedId === resolvedActiveGroupId);
+      group.activeTabId = group.activeTabId || input.activeTabId;
+      group.label = group.label || input.label;
+      group.sessionId = group.sessionId || input.sessionId;
+      return group;
+    }
+
+    for (const group of browserGroups) {
+      const hydrated = ensureGroup(group.id, group);
+      for (const tab of Array.isArray(group.tabs) ? group.tabs : []) {
+        if (!hydrated.tabs.some((item) => item.id === tab.id)) hydrated.tabs.push(tab);
+      }
+    }
+
+    for (const tab of browserTabs) {
+      const groupId = embeddedGroupIdForTab(tab, resolvedActiveGroupId || selectedGroupId);
+      const hydrated = ensureGroup(groupId, {
+        active: groupId === resolvedActiveGroupId || tab.id === activeTabId,
+        sessionId: tab.sessionId || (groupId.startsWith('session:') ? groupId.slice('session:'.length) : undefined),
+      });
+      if (!hydrated.tabs.some((item) => item.id === tab.id)) hydrated.tabs.push(tab);
+    }
+
+    if (sessionId && (!groupsById.size || !groupsById.has(selectedGroupId)) && !closedGroupIds.includes(selectedGroupId)) {
+      ensureGroup(selectedGroupId, { active: true, sessionId });
+    }
+
+    return orderedIds.map((id) => groupsById.get(id)!).filter(Boolean);
+  }, [activeGroupId, activeTabId, browserGroups, browserTabs, closedGroupIds, selectedGroupId, sessionId]);
+
+  const visibleGroupIconColors = useMemo(() => {
+    return new Map(visibleGroups.map((group) => [group.id, embeddedBrowserGroupIconColor(group.id)]));
+  }, [visibleGroups]);
+  const renderedVisibleGroups = useMemo(() => {
+    if (!tabDragPreview) return visibleGroups;
+    const tabsById = new Map(visibleGroups.flatMap((group) => group.tabs).map((tab) => [tab.id, tab]));
+    return visibleGroups.map((group) => ({
+      ...group,
+      tabs: (tabDragPreview[group.id] || group.tabs.map((tab) => tab.id))
+        .map((tabId) => tabsById.get(tabId))
+        .filter((tab): tab is EmbeddedBrowserTab => Boolean(tab)),
+    }));
+  }, [tabDragPreview, visibleGroups]);
+
+  const activeEmbeddedTab = useMemo(() => {
+    const groupedTabs = visibleGroups.flatMap((group) => group.tabs);
+    const activeGroup = visibleGroups.find((group) => group.id === activeGroupId)
+      || visibleGroups.find((group) => group.active);
+    const activeGroupTabs = activeGroup?.tabs || [];
+    if (activeTabId) {
+      return activeGroupTabs.find((tab) => tab.id === activeTabId)
+        || groupedTabs.find((tab) => tab.id === activeTabId);
+    }
+    if (activeGroup) return activeGroupTabs[0];
+    return browserTabs[activeTabIndex] || groupedTabs[activeTabIndex] || groupedTabs[0];
+  }, [activeGroupId, activeTabId, activeTabIndex, browserTabs, visibleGroups]);
+  const isEmbeddedBrowserLoading = Boolean(activeEmbeddedTab?.loading);
+  const draggedEmbeddedTab = useMemo(() => (
+    draggingTabId
+      ? visibleGroups.flatMap((group) => group.tabs).find((tab) => tab.id === draggingTabId)
+      : undefined
+  ), [draggingTabId, visibleGroups]);
+
+  function embeddedBrowserDropTarget(event: DragOverEvent | DragEndEvent): EmbeddedBrowserTabDropTarget | undefined {
+    const over = event.over;
+    if (!over) return undefined;
+    const overData = over.data.current as EmbeddedBrowserTabDndData | EmbeddedBrowserGroupDndData | undefined;
+    if (!overData) return undefined;
+    if (overData.type === 'embedded-browser-group') {
+      return { groupId: overData.groupId, type: overData.type } as const;
+    }
+
+    const dragData = event.active.data.current as EmbeddedBrowserTabDndData | undefined;
+    if (dragData?.type === 'embedded-browser-tab' && dragData.groupId === overData.groupId) {
+      const sourceGroup = visibleGroups.find((group) => group.id === dragData.groupId);
+      const sourceIndex = sourceGroup?.tabs.findIndex((tab) => tab.id === dragData.tabId) ?? -1;
+      const targetIndex = sourceGroup?.tabs.findIndex((tab) => tab.id === overData.tabId) ?? -1;
+      if (sourceIndex >= 0 && targetIndex >= 0 && sourceIndex !== targetIndex) {
+        // horizontalListSortingStrategy moves the active item to the over item's
+        // index. Use that exact index relationship when committing so the final
+        // order cannot disagree with the animation shown while dragging.
+        return {
+          groupId: overData.groupId,
+          position: sourceIndex < targetIndex ? 'after' : 'before',
+          tabId: overData.tabId,
+          type: overData.type,
+        } as const;
+      }
+    }
+
+    const activatorEvent = event.activatorEvent;
+    const pointerX = activatorEvent instanceof MouseEvent ? activatorEvent.clientX + event.delta.x : undefined;
+    const activeRect = event.active.rect.current.translated;
+    const activeCenter = activeRect ? activeRect.left + activeRect.width / 2 : pointerX;
+    const overThreshold = over.rect.left + over.rect.width / 2;
+    const position = activeCenter === undefined
+      ? (event.delta.x > 0 ? 'after' : 'before')
+      : (activeCenter > overThreshold ? 'after' : 'before');
+    return { groupId: overData.groupId, position, tabId: overData.tabId, type: overData.type } as const;
+  }
+
+  function previewEmbeddedBrowserTabMove(
+    tabId: string,
+    target: EmbeddedBrowserTabDropTarget | undefined,
+  ) {
+    if (!target || (target.type === 'embedded-browser-tab' && target.tabId === tabId)) return;
+    setTabDragPreview((current) => {
+      const next = Object.fromEntries(visibleGroups.map((group) => [
+        group.id,
+        [...(current?.[group.id] || group.tabs.map((tab) => tab.id))],
+      ])) as EmbeddedBrowserTabDragPreview;
+      for (const tabIds of Object.values(next)) {
+        const sourceIndex = tabIds.indexOf(tabId);
+        if (sourceIndex >= 0) tabIds.splice(sourceIndex, 1);
+      }
+
+      const destination = next[target.groupId];
+      if (!destination) return current;
+      if (target.type === 'embedded-browser-group') {
+        destination.push(tabId);
+      } else {
+        const targetIndex = destination.indexOf(target.tabId);
+        destination.splice(targetIndex < 0 ? destination.length : targetIndex + (target.position === 'after' ? 1 : 0), 0, tabId);
+      }
+      const tabsById = new Map(visibleGroups.flatMap((group) => group.tabs).map((tab) => [tab.id, tab]));
+      next[target.groupId] = [
+        ...destination.filter((id) => tabsById.get(id)?.pinned),
+        ...destination.filter((id) => !tabsById.get(id)?.pinned),
+      ];
+
+      if (current && Object.keys(next).every((groupId) => (
+        current[groupId]?.length === next[groupId].length
+        && current[groupId].every((id, index) => id === next[groupId][index])
+      ))) return current;
+      return next;
+    });
+  }
+
+  function handleEmbeddedTabDragStart(event: DragStartEvent) {
+    const dragData = event.active.data.current as EmbeddedBrowserTabDndData | undefined;
+    if (!dragData?.tabId) return;
+    document.body.classList.add('is-dragging-embedded-tab');
+    tabDragCommitTargetRef.current = null;
+    tabDragCurrentGroupRef.current = dragData.groupId;
+    tabDragSourceGroupRef.current = dragData.groupId;
+    setDraggingTabId(dragData.tabId);
+    setDragDropGroupId(dragData.groupId);
+    setTabDragPreview(Object.fromEntries(visibleGroups.map((group) => [group.id, group.tabs.map((tab) => tab.id)])));
+  }
+
+  function handleEmbeddedTabDragOver(event: DragOverEvent) {
+    const dragData = event.active.data.current as EmbeddedBrowserTabDndData | undefined;
+    const target = embeddedBrowserDropTarget(event);
+    if (!dragData?.tabId || !target) {
+      return;
+    }
+    if (target.type === 'embedded-browser-tab' && target.tabId === dragData.tabId) {
+      return;
+    }
+    tabDragCommitTargetRef.current = target;
+    const sourceGroupId = tabDragSourceGroupRef.current || dragData.groupId;
+    const previewCrossGroupMove = target.groupId !== sourceGroupId
+      || tabDragCurrentGroupRef.current !== sourceGroupId;
+    if (previewCrossGroupMove) previewEmbeddedBrowserTabMove(dragData.tabId, target);
+    tabDragCurrentGroupRef.current = target.groupId;
+    setDragDropGroupId(target.groupId);
+  }
+
+  function handleEmbeddedTabDragEnd(event: DragEndEvent) {
+    const dragData = event.active.data.current as EmbeddedBrowserTabDndData | undefined;
+    const detectedTarget = embeddedBrowserDropTarget(event);
+    const activatorEvent = event.activatorEvent;
+    const point = activatorEvent instanceof MouseEvent
+      ? { x: activatorEvent.clientX + event.delta.x, y: activatorEvent.clientY + event.delta.y }
+      : undefined;
+    const droppedOnTabStrip = point
+      ? document.elementsFromPoint(point.x, point.y).some((element) => element.closest('.browser-chat-embedded-tab-strip'))
+      : false;
+    const target = event.over == null
+      ? droppedOnTabStrip ? tabDragCommitTargetRef.current || undefined : undefined
+      : detectedTarget?.type === 'embedded-browser-tab' && detectedTarget.tabId === dragData?.tabId
+        ? tabDragCommitTargetRef.current || undefined
+        : detectedTarget;
+    if (!dragData?.tabId) return;
+    if (!target) {
+      clearEmbeddedTabDrag();
+      const droppedOnComposer = point
+        ? document.elementsFromPoint(point.x, point.y).some((element) => element.closest('.browser-chat-compose--reference'))
+        : false;
+      const draggedTab = visibleGroups.flatMap((group) => group.tabs).find((tab) => tab.id === dragData.tabId);
+      const reference = droppedOnComposer && draggedTab ? browserChatTabReferenceFromPayload({
+        groupId: dragData.groupId,
+        id: draggedTab.id,
+        sessionId: draggedTab.sessionId,
+        title: draggedTab.title,
+        url: embeddedBrowserDisplayUrl(draggedTab) || draggedTab.url,
+      }) : undefined;
+      if (reference) onAddTabReference?.(reference);
+      return;
+    }
+
+    if (target.type === 'embedded-browser-tab') {
+      if (target.tabId === dragData.tabId) {
+        clearEmbeddedTabDrag();
+        return;
+      }
+      previewEmbeddedBrowserTabMove(dragData.tabId, target);
+      clearEmbeddedTabDrag({ keepPreview: true });
+      void moveEmbeddedBrowserTab(dragData.tabId, { position: target.position, targetId: target.tabId })
+        .finally(() => setTabDragPreview(null));
+      return;
+    }
+
+    previewEmbeddedBrowserTabMove(dragData.tabId, target);
+    clearEmbeddedTabDrag({ keepPreview: true });
+    const targetGroup = visibleGroups.find((group) => group.id === target.groupId);
+    const targetSessionId = targetGroup?.sessionId
+      || targetGroup?.tabs.find((tab) => tab.sessionId)?.sessionId
+      || (target.groupId.startsWith('session:') ? embeddedSessionIdFromGroupId(target.groupId) : undefined);
+    void moveEmbeddedBrowserTab(dragData.tabId, {
+      position: 'end',
+      targetGroupId: target.groupId,
+      targetSessionId,
+    }).finally(() => setTabDragPreview(null));
+  }
+
+  useEffect(() => {
+    if (!addressFocusedRef.current) setAddressValue(embeddedBrowserDisplayUrl(activeEmbeddedTab));
+  }, [activeEmbeddedTab]);
+
+  useEffect(() => {
+    setTabDragPortalTarget(document.body);
+    return () => {
+      document.body.classList.remove('is-dragging-embedded-tab');
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!draggingTabId) return undefined;
+    const cancelDrag = () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'Escape',
+        key: 'Escape',
+      }));
+    };
+    const cancelWhenHidden = () => {
+      if (document.visibilityState !== 'visible') cancelDrag();
+    };
+    window.addEventListener('blur', cancelDrag);
+    document.addEventListener('lostpointercapture', cancelDrag, true);
+    document.addEventListener('visibilitychange', cancelWhenHidden);
+    document.documentElement.addEventListener('pointerleave', cancelDrag);
+    return () => {
+      window.removeEventListener('blur', cancelDrag);
+      document.removeEventListener('lostpointercapture', cancelDrag, true);
+      document.removeEventListener('visibilitychange', cancelWhenHidden);
+      document.documentElement.removeEventListener('pointerleave', cancelDrag);
+    };
+  }, [draggingTabId]);
+
+  useEffect(() => {
+    if (!active || !activeEmbeddedTab?.sessionId || activeEmbeddedTab.sessionId === sessionId) {
+      requestedSessionIdRef.current = '';
+      return;
+    }
+    if (requestedSessionIdRef.current === activeEmbeddedTab.sessionId) return;
+    requestedSessionIdRef.current = activeEmbeddedTab.sessionId;
+    onSelectSession?.(activeEmbeddedTab.sessionId);
+  }, [active, activeEmbeddedTab, onSelectSession, sessionId]);
+
+  return (
+    <>
+    <section
+      className={[
+        'browser-chat-embedded-browser',
+        isEmbeddedBrowserLoading ? 'loading' : '',
+      ].filter(Boolean).join(' ')}
+      aria-label="嵌入浏览器"
+    >
+      <header className="browser-chat-embedded-chrome">
+        <div className="browser-chat-embedded-tab-strip">
+          <DndContext
+            collisionDetection={embeddedBrowserTabCollisionDetection}
+            modifiers={embeddedBrowserTabModifiers}
+            onDragCancel={() => clearEmbeddedTabDrag()}
+            onDragEnd={handleEmbeddedTabDragEnd}
+            onDragOver={handleEmbeddedTabDragOver}
+            onDragStart={handleEmbeddedTabDragStart}
+            sensors={embeddedTabSensors}
+          >
+            <div className="browser-chat-embedded-tab-list" role="tablist" aria-label="Embedded browser tabs">
+              {renderedVisibleGroups.map((group) => {
+                const groupSessionId = group.sessionId
+                  || group.tabs.find((tab) => tab.sessionId)?.sessionId
+                  || (group.id.startsWith('session:') ? group.id.slice('session:'.length) : sessionId);
+                const groupLabel = group.label || embeddedSessionGroupLabel(groupSessionId);
+                const isActiveGroup = Boolean(group.active || group.id === selectedGroupId);
+                const isCollapsedGroup = Boolean(group.collapsed);
+                return (
+                  <EmbeddedBrowserTabGroupDropZone
+                    className={[
+                      'browser-chat-embedded-tab-group-shell',
+                      isActiveGroup ? 'active' : '',
+                      isCollapsedGroup ? 'collapsed' : '',
+                      group.tabs.length ? '' : 'empty',
+                      dragDropGroupId === group.id ? 'drop-target' : '',
+                    ].filter(Boolean).join(' ')}
+                    endDropActive={Boolean(draggingTabId && dragDropGroupId === group.id)}
+                    groupId={group.id}
+                    key={group.id}
+                    style={{ '--embedded-group-icon-color': visibleGroupIconColors.get(group.id) } as CSSProperties}
+                  >
+                    <div className="browser-chat-embedded-tab-group-tag">
+                      <button
+                        aria-expanded={!isCollapsedGroup}
+                        className="browser-chat-embedded-tab-group-label"
+                        onClick={() => void toggleEmbeddedBrowserGroupCollapsed(group)}
+                        title={`${isCollapsedGroup ? '展开' : '收起'} ${groupLabel} 标签组`}
+                        type="button"
+                      >
+                        {isCollapsedGroup ? <Folder size={16} /> : <FolderOpen size={16} />}
+                      </button>
+                      <button
+                        aria-label={`关闭 ${groupLabel} 标签组`}
+                        className="browser-chat-embedded-tab-group-action browser-chat-embedded-tab-group-close"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void closeEmbeddedBrowserGroup(group);
+                        }}
+                        title={`关闭 ${groupLabel} 标签组`}
+                        type="button"
+                      >
+                        <X size={13} />
+                      </button>
+                      <button
+                        aria-label={`在 ${groupLabel} 中新建标签页`}
+                        className="browser-chat-embedded-tab-group-action browser-chat-embedded-tab-group-add"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void createEmbeddedBrowserTab(group);
+                        }}
+                        title={`在 ${groupLabel} 中新建标签页`}
+                        type="button"
+                      >
+                        <Plus size={14} />
+                      </button>
+                    </div>
+                    <SortableContext
+                      items={group.tabs.map((tab) => embeddedBrowserTabDndId(tab.id))}
+                      strategy={horizontalListSortingStrategy}
+                    >
+                      <div className="browser-chat-embedded-tab-stack">
+                        {group.tabs.map((tab) => {
+                          const tabIndex = browserTabs.findIndex((item) => item.id === tab.id);
+                          const isActiveTab = activeTabId ? tab.id === activeTabId : tabIndex === activeTabIndex;
+                          return (
+                            <EmbeddedBrowserSortableTab
+                              active={isActiveTab}
+                              dragging={draggingTabId === tab.id}
+                              groupId={group.id}
+                              key={tab.id || `${tab.url}-${tabIndex}`}
+                              onActivate={() => void activateEmbeddedBrowserTab(tab)}
+                              onClose={() => void closeEmbeddedBrowserTab(tab)}
+                              onContextMenu={(event) => showEmbeddedBrowserTabContextMenu(event, tab)}
+                              onToggleMute={() => void setEmbeddedBrowserTabMuted(tab)}
+                              tab={tab}
+                            />
+                          );
+                        })}
+                      </div>
+                    </SortableContext>
+                  </EmbeddedBrowserTabGroupDropZone>
+                );
+              })}
+            </div>
+            {tabDragPortalTarget ? createPortal(
+              <DragOverlay
+                adjustScale={false}
+                dropAnimation={null}
+                modifiers={embeddedBrowserTabModifiers}
+                zIndex={1200}
+              >
+                {draggedEmbeddedTab ? (
+                  <div
+                    aria-hidden="true"
+                    className={[
+                      'browser-chat-embedded-tab',
+                      'browser-chat-embedded-tab-drag-overlay',
+                      draggedEmbeddedTab.id === activeTabId ? 'active' : '',
+                      draggedEmbeddedTab.pinned ? 'pinned' : '',
+                      draggedEmbeddedTab.loading ? 'loading' : '',
+                    ].filter(Boolean).join(' ')}
+                  >
+                    <EmbeddedBrowserTabContent tab={draggedEmbeddedTab} />
+                  </div>
+                ) : null}
+              </DragOverlay>,
+              tabDragPortalTarget,
+            ) : null}
+          </DndContext>
           <button
-            aria-pressed={mode === 'visual-markers'}
-            className={mode === 'visual-markers' ? 'active' : undefined}
-            disabled={currentBusy || loading || modeLocked}
-            onClick={() => onModeChange('visual-markers')}
+            aria-label="新建标签组"
+            className="browser-chat-embedded-new-group"
+            onClick={() => {
+              setNewGroupDialogOpen(true);
+              onDialogOpenChange?.(true);
+            }}
+            title="新建标签组"
             type="button"
           >
-            {t('视觉')}
-          </button>
-          <button
-            aria-pressed={mode === 'dom'}
-            className={mode === 'dom' ? 'active' : undefined}
-            disabled={currentBusy || loading || modeLocked}
-            onClick={() => onModeChange('dom')}
-            type="button"
-          >
-            {t('DOM')}
+            <Plus size={15} />
           </button>
         </div>
-        {showStop ? (
-          <button
-            className="browser-chat-stop"
-            disabled={interrupting}
-            onClick={() => void onInterrupt()}
-            type="button"
-            aria-label={t('中断本轮对话')}
-            title={t('中断本轮对话')}
-          >
-            {interrupting ? <Loader2 className="spin" size={18} /> : <Square size={16} />}
-          </button>
-        ) : (
-          <button
-            className="browser-chat-send"
-            disabled={(!draft.trim() && !attachments.length) || currentBusy || loading || uploadingImage}
-            type="submit"
-            aria-label={t('发送')}
-          >
-            {busy ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
-          </button>
-        )}
-      </form>
+        <div className="browser-chat-embedded-toolbar">
+          <div className="browser-chat-embedded-nav-controls">
+            <button className="browser-chat-embedded-tool-button" disabled={!canGoBack} onClick={() => void goEmbeddedBrowserBack()} title="Back" type="button" aria-label="Back">
+              <ArrowLeft size={16} />
+            </button>
+            <button className="browser-chat-embedded-tool-button" disabled={!canGoForward} onClick={() => void goEmbeddedBrowserForward()} title="Forward" type="button" aria-label="Forward">
+              <ArrowRight size={16} />
+            </button>
+            <button
+              aria-label={isEmbeddedBrowserLoading ? '停止加载' : '重新加载'}
+              className={isEmbeddedBrowserLoading ? 'browser-chat-embedded-tool-button is-stop' : 'browser-chat-embedded-tool-button'}
+              disabled={!activeEmbeddedTab}
+              onClick={() => void (isEmbeddedBrowserLoading ? stopEmbeddedBrowserLoading() : reloadEmbeddedBrowser())}
+              title={isEmbeddedBrowserLoading ? '停止加载' : '重新加载'}
+              type="button"
+            >
+              {isEmbeddedBrowserLoading ? <X size={16} /> : <RefreshCw size={15} />}
+            </button>
+          </div>
+          <form className="browser-chat-embedded-address-bar" onSubmit={navigateEmbeddedBrowserAddress}>
+            <span className="browser-chat-embedded-address-icon" aria-hidden="true">
+              {addressValue.startsWith('https://') ? <Lock size={14} /> : <Globe size={14} />}
+            </span>
+            <input
+              ref={addressInputRef}
+              aria-label="Address"
+              disabled={!bridgeAvailable}
+              onBlur={() => {
+                addressFocusedRef.current = false;
+                setAddressValue(embeddedBrowserDisplayUrl(activeEmbeddedTab));
+              }}
+              onChange={(event) => setAddressValue(event.currentTarget.value)}
+              onFocus={() => {
+                addressFocusedRef.current = true;
+              }}
+              spellCheck={false}
+              value={addressValue}
+            />
+            <button
+              aria-label={activeEmbeddedTab?.bookmarked ? '取消收藏当前页面' : '收藏当前页面'}
+              className={activeEmbeddedTab?.bookmarked ? 'browser-chat-embedded-address-action active' : 'browser-chat-embedded-address-action'}
+              disabled={!activeEmbeddedTab}
+              onClick={() => void toggleEmbeddedBrowserBookmark()}
+              title={activeEmbeddedTab?.bookmarked ? '取消收藏' : '收藏此页面'}
+              type="button"
+            >
+              <Star fill={activeEmbeddedTab?.bookmarked ? 'currentColor' : 'none'} size={18} />
+            </button>
+          </form>
+          <div className="browser-chat-embedded-library-actions">
+            <button
+              aria-expanded={libraryPanel === 'bookmarks'}
+              aria-label="收藏夹"
+              className={libraryPanel === 'bookmarks' ? 'browser-chat-embedded-tool-button active' : 'browser-chat-embedded-tool-button'}
+              onClick={() => void toggleEmbeddedBrowserLibraryPanel('bookmarks')}
+              title="收藏夹"
+              type="button"
+            >
+              <EmbeddedBrowserFavoritesIcon size={19} />
+            </button>
+            <button
+              aria-expanded={libraryPanel === 'history'}
+              aria-label="历史记录"
+              className={libraryPanel === 'history' ? 'browser-chat-embedded-tool-button active' : 'browser-chat-embedded-tool-button'}
+              onClick={() => void toggleEmbeddedBrowserLibraryPanel('history')}
+              title="历史记录"
+              type="button"
+            >
+              <History size={18} />
+            </button>
+          </div>
+        </div>
+      </header>
+      <div className="browser-chat-embedded-viewport" ref={viewportRef}>
+        {!bridgeAvailable ? (
+          <div className="browser-chat-embedded-state">
+            <AppWindow size={24} />
+            <strong>仅桌面端可用</strong>
+            <span>请使用 Electron 开发壳或桌面版打开。</span>
+          </div>
+        ) : bridgeError ? (
+          <div className="browser-chat-embedded-state">
+            <Bug size={24} />
+            <strong>嵌入浏览器未就绪</strong>
+            <span>{bridgeError}</span>
+          </div>
+        ) : null}
+      </div>
+    </section>
+    {newGroupDialogOpen ? (
+      <div className="ui-modal-overlay" onClick={() => {
+        if (creatingNewGroup) return;
+        setNewGroupDialogOpen(false);
+        onDialogOpenChange?.(false);
+      }} role="presentation">
+        <form
+          className="ui-modal ui-modal--compact"
+          onClick={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void createEmbeddedBrowserGroup();
+          }}
+          role="dialog"
+          aria-label="新建浏览器标签组"
+        >
+          <header className="ui-modal-header">
+            <div className="ui-modal-heading">
+              <h2 className="ui-modal-title">新建标签组</h2>
+              <p className="ui-modal-subtitle">标签组可在对话工具栏中单独绑定。</p>
+            </div>
+            <button
+              aria-label="关闭"
+              className="ui-icon-button ui-modal-close"
+              disabled={creatingNewGroup}
+              onClick={() => {
+                setNewGroupDialogOpen(false);
+                onDialogOpenChange?.(false);
+              }}
+              type="button"
+            >
+              <X size={18} />
+            </button>
+          </header>
+          <div className="ui-modal-body">
+            <label className="modal-field">
+              标签组名称
+              <input
+                autoFocus
+                className="input"
+                disabled={creatingNewGroup}
+                onChange={(event) => setNewGroupName(event.target.value)}
+                value={newGroupName}
+              />
+            </label>
+          </div>
+          <footer className="ui-modal-footer">
+            <button className="ui-button ui-button--primary" disabled={creatingNewGroup} type="submit">
+              {creatingNewGroup ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
+              {creatingNewGroup ? '创建中…' : '创建并绑定'}
+            </button>
+          </footer>
+        </form>
+      </div>
+    ) : null}
     </>
   );
 });
@@ -971,17 +5099,27 @@ export function BrowserChatWorkspace({
   groups,
   schedules,
   initialView = 'chat',
+  initialSettings,
+  initialTargetDetailCaseId,
+  initialTargetRunId,
 }: {
   testCases: TestCaseRecord[];
   groups: TestGroupRecord[];
   schedules: RunScheduleRecord[];
   initialView?: BrowserChatView;
+  initialSettings?: EnvironmentSettingsInitialData;
+  initialTargetDetailCaseId?: string;
+  initialTargetRunId?: string;
 }) {
   const router = useRouter();
+  const { t } = useI18n();
+  const { mode: themeMode, toggleMode } = useTheme();
   const [, startTransition] = useTransition();
+  const initialModelSelection = resolveRuntimeModelSelection(null);
   const sendingRef = useRef(false);
   const loadingSessionRef = useRef<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const embeddedWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
   const sessionVersionsRef = useRef(new Map<string, number>());
   const sessionRefreshTimersRef = useRef(new Map<string, number>());
@@ -990,31 +5128,60 @@ export function BrowserChatWorkspace({
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
-  const [mode, setMode] = useState<BrowserChatMode>('visual-markers');
+  const [skills, setSkills] = useState<SkillRecord[]>([]);
+  const [mode, setMode] = useState<BrowserChatMode>('dom');
+  const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
+  const [modelProvider, setModelProvider] = useState<ModelProvider>(() => initialModelSelection.provider);
+  const [modelId, setModelId] = useState(() => initialModelSelection.model);
+  const [modelConfig, setModelConfig] = useState<BrowserChatModelConfig | null>(null);
   const [targetGroupId, setTargetGroupId] = useState<string | undefined>();
+  const [targetDetailCaseId, setTargetDetailCaseId] = useState<string | null>(initialTargetDetailCaseId || null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [groupName, setGroupName] = useState('');
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
+  const [deletingTargetGroupId, setDeletingTargetGroupId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
+  const attachmentsRef = useRef<BrowserChatAttachment[]>([]);
   const [composerResetToken, setComposerResetToken] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [pendingMessageSessionId, setPendingMessageSessionId] = useState<string | null>(null);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [realtimeConnected, setRealtimeConnected] = useState(false);
+  const [embeddedBrowserEnabled, setEmbeddedBrowserEnabled] = useState(false);
+  const [showReasoning, setShowReasoning] = useState(false);
+  const [embeddedChatWidth, setEmbeddedChatWidth] = useState(420);
+  const [embeddedChatCollapsed, setEmbeddedChatCollapsed] = useState(false);
+  const [, setEmbeddedChatResizing] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
-  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
+  const [deletingSessionIds, setDeletingSessionIds] = useState<Set<string>>(() => new Set());
+  const deletingSessionIdsRef = useRef(new Set<string>());
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
+  const [recentSelectionMode, setRecentSelectionMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
   const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
+  const [exportingSelectedMessages, setExportingSelectedMessages] = useState(false);
+  const [generatingSkillMessageId, setGeneratingSkillMessageId] = useState<string | null>(null);
+  const [generatingSkillSelectedMessages, setGeneratingSkillSelectedMessages] = useState(false);
+  const [selectedExportMessageIds, setSelectedExportMessageIds] = useState<string[]>([]);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
+  const fullLogSessionIdsRef = useRef(new Set<string>());
   const [toolDialog, setToolDialog] = useState<BrowserChatToolDetail | null>(null);
+  const [resolvingConfirmationId, setResolvingConfirmationId] = useState<string | null>(null);
+  const [resolvingConfirmationAction, setResolvingConfirmationAction] = useState<BrowserChatToolConfirmationAction | null>(null);
   const [imagePreview, setImagePreview] = useState<BrowserChatAttachment | null>(null);
   const [error, setError] = useState('');
-  const selectedRunningSession = session?.busy ? session : undefined;
-  const selectedSessionBusy = Boolean(session?.busy);
-  const currentBusy = busy || selectedSessionBusy;
-  const modeLocked = Boolean(session && session.status !== 'closed' && (session.messages.length || session.steps.length || session.busy));
+  const [downloads, setDownloads] = useState<SystemDownloadItem[]>([]);
+  const [downloadCenterOpen, setDownloadCenterOpen] = useState(false);
+  const [browserGroupPickerOpen, setBrowserGroupPickerOpen] = useState(false);
+  const [embeddedBrowserDialogOpen, setEmbeddedBrowserDialogOpen] = useState(false);
+  const selectedSessionRunning = isBrowserChatSessionRunning(session);
+  const selectedRunningSession = selectedSessionRunning ? session : undefined;
+  const currentBusy = busy || selectedSessionRunning;
+  const interruptSessionId = selectedRunningSession?.id || (busy ? pendingMessageSessionId || session?.id : undefined);
+  const canInterruptConversation = Boolean(interruptSessionId && (busy || selectedSessionRunning));
+  const modeLocked = Boolean(session && session.status !== 'closed' && (session.messages.length || session.steps.length || selectedSessionRunning));
   const messages = useMemo(() => session?.messages || [], [session?.messages]);
   const steps = useMemo(() => session?.steps || [], [session?.steps]);
   const logs = useMemo(() => session?.logs || [], [session?.logs]);
@@ -1024,7 +5191,69 @@ export function BrowserChatWorkspace({
     [visibleMessages],
   );
   const hasMessages = visibleMessages.length > 0;
+  const toggleSidebarCollapsed = useCallback(() => {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      writeStoredSidebarCollapsed(next);
+      return next;
+    });
+  }, []);
+  const toggleEmbeddedChatCollapsed = useCallback(() => {
+    setEmbeddedChatCollapsed((current) => {
+      const next = !current;
+      writeStoredEmbeddedChatCollapsed(next);
+      if (next) setDownloadCenterOpen(false);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    setSidebarCollapsed(readStoredSidebarCollapsed());
+    setEmbeddedChatCollapsed(readStoredEmbeddedChatCollapsed());
+  }, []);
+
+  useEffect(() => {
+    function closeSidebarMenus(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      document.querySelectorAll<HTMLDetailsElement>('.browser-chat-overflow[open]').forEach((menu) => {
+        if (!menu.contains(target)) menu.removeAttribute('open');
+      });
+    }
+    document.addEventListener('pointerdown', closeSidebarMenus);
+    return () => document.removeEventListener('pointerdown', closeSidebarMenus);
+  }, []);
+
+  useEffect(() => {
+    const bridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
+    if (!bridge) return undefined;
+    let mounted = true;
+    const applyDownload = (download: SystemDownloadItem) => {
+      if (!download?.id) return;
+      setDownloads((current) => {
+        const next = [download, ...current.filter((item) => item.id !== download.id)];
+        return next.sort((left, right) => Number(right.startedAt || right.updatedAt || 0) - Number(left.startedAt || left.updatedAt || 0));
+      });
+    };
+    bridge.getDownloads?.()
+      .then((result) => {
+        if (!mounted || !result?.ok || !Array.isArray(result.downloads)) return;
+        setDownloads(result.downloads);
+      })
+      .catch(() => undefined);
+    const unsubscribe = bridge.onDownloadProgress?.(applyDownload);
+    return () => {
+      mounted = false;
+      unsubscribe?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    attachmentsRef.current = attachments;
+  }, [attachments]);
+
   const stepsByIndex = useMemo(() => new Map(steps.map((step) => [step.index, step])), [steps]);
+  const selectedExportMessageIdSet = useMemo(() => new Set(selectedExportMessageIds), [selectedExportMessageIds]);
   const logIndex = useMemo(() => buildBrowserChatLogIndex(logs), [logs]);
   const logDialogMessage = useMemo(
     () => messages.find((item) => item.id === logDialogMessageId),
@@ -1032,16 +5261,70 @@ export function BrowserChatWorkspace({
   );
   const logDialogEntries = useMemo(() => {
     if (!logDialogMessage) return [];
-    return browserChatLogsForMessage(logDialogMessage, logIndex);
+    return visibleBrowserChatExecutionLogs(browserChatLogsForMessage(logDialogMessage, logIndex));
   }, [logDialogMessage, logIndex]);
   const previewAttachment = useCallback((attachment: BrowserChatAttachment) => {
     setImagePreview(attachment);
   }, []);
   const removeAttachment = useCallback((id: string) => {
-    setAttachments((current) => current.filter((attachment) => attachment.id !== id));
+    setAttachments((current) => {
+      const next = current.filter((attachment) => attachment.id !== id);
+      attachmentsRef.current = next;
+      return next;
+    });
   }, []);
+  const addReferenceAttachments = useCallback((nextReferences: BrowserChatAttachment[]) => {
+    const current = attachmentsRef.current;
+    const keys = new Set(current.map(browserChatReferenceKey));
+    const next = [...current];
+    const added: BrowserChatAttachment[] = [];
+    for (const reference of nextReferences) {
+      if (next.length >= BROWSER_CHAT_MAX_REFERENCES) break;
+      const normalized: BrowserChatAttachment = {
+        ...reference,
+        id: reference.id || temporaryId('ref'),
+        kind: reference.kind || browserChatAttachmentKind(reference),
+      };
+      const key = browserChatReferenceKey(normalized);
+      if (keys.has(key)) continue;
+      keys.add(key);
+      next.push(normalized);
+      added.push(normalized);
+    }
+    if (added.length) {
+      attachmentsRef.current = next;
+      setAttachments(next);
+    }
+    return added;
+  }, []);
+  const addTabReference = useCallback((reference: BrowserChatAttachment) => {
+    addReferenceAttachments([reference]);
+  }, [addReferenceAttachments]);
   const showMessageLogs = useCallback((messageId: string) => {
     setLogDialogMessageId(messageId);
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId || fullLogSessionIdsRef.current.has(sessionId)) return;
+    fullLogSessionIdsRef.current.add(sessionId);
+    void fetch(`/api/browser-chat/${sessionId}/logs`, { cache: 'no-store' })
+      .then((response) => readApiJson<{ logs?: BrowserChatLogRecord[] }>(response, '加载对话日志失败'))
+      .then((data) => {
+        if (!Array.isArray(data.logs)) return;
+        setSession((current) => current?.id === sessionId ? { ...current, logs: data.logs || [] } : current);
+      })
+      .catch(() => {
+        fullLogSessionIdsRef.current.delete(sessionId);
+      });
+  }, []);
+  const toggleExportMessageSelection = useCallback((messageId: string, selected: boolean) => {
+    setSelectedExportMessageIds((current) => {
+      const next = new Set(current);
+      if (selected) next.add(messageId);
+      else next.delete(messageId);
+      return [...next];
+    });
+  }, []);
+  const clearExportMessageSelection = useCallback(() => {
+    setSelectedExportMessageIds([]);
   }, []);
   const recentSessions = useMemo(() => {
     const merged = new Map<string, BrowserChatSession>();
@@ -1064,13 +5347,124 @@ export function BrowserChatWorkspace({
   );
   const allSelectableRecentSessionsSelected = selectableRecentSessionIds.length > 0
     && selectableRecentSessionIds.every((id) => selectedSessionIdSet.has(id));
-  const toolDialogDomTree = useMemo(
-    () => domTreeFromToolCall(toolDialog?.tool, toolDialog?.step.aiRequest),
-    [toolDialog],
-  );
+  const embeddedBrowserActive = embeddedBrowserEnabled && activeView === 'chat';
+  const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || imagePreview || groupDialogOpen || embeddedBrowserDialogOpen);
+  const embeddedBrowserViewActive = embeddedBrowserActive && !embeddedBrowserCovered;
+  const modelSelection = modelSelectionValueForConfig(modelConfig, { model: modelId, provider: modelProvider });
+  const modelSelectionDiagnostic = modelSelectionDiagnosticLabel(modelConfig, { model: modelId, provider: modelProvider });
+  const modelSelectionOptions = useMemo(() => modelSelectionOptionsForConfig(modelConfig), [modelConfig]);
+  const downloadPanelWidth = embeddedBrowserActive
+    ? Math.max(260, Math.min(360, embeddedChatWidth - 36))
+    : 380;
+  const chatPaneStyle = useMemo(() => ({
+    '--browser-chat-download-panel-width': `${downloadPanelWidth}px`,
+  }) as CSSProperties, [downloadPanelWidth]);
+  const toggleDownloadCenter = useCallback(() => {
+    setBrowserGroupPickerOpen(false);
+    setDownloadCenterOpen((current) => !current);
+  }, []);
+
+  const toggleBrowserGroupPicker = useCallback(() => {
+    setDownloadCenterOpen(false);
+    setBrowserGroupPickerOpen((current) => !current);
+  }, []);
+
+  const changeModelSelection = useCallback((selection: { provider: ModelProvider; model: string }) => {
+    const next = resolveRuntimeModelSelection(modelConfig, selection);
+    setModelProvider(next.provider);
+    setModelId(next.model);
+
+    const providerConfig = modelConfig?.providers[next.provider];
+    if (!modelConfig || !providerConfig) return;
+    const nextConfig: BrowserChatModelConfig = {
+      ...modelConfig,
+      provider: next.provider,
+      providers: {
+        ...modelConfig.providers,
+        [next.provider]: {
+          ...providerConfig,
+          defaultModel: next.model,
+          model: next.model,
+          models: Array.from(new Set([...(providerConfig.models || []), next.model])),
+        },
+      },
+    };
+    setModelConfig(nextConfig);
+    void fetch('/api/settings/model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: nextConfig.provider, providers: nextConfig.providers }),
+    })
+      .then(async (response) => {
+        const data = await readApiJson<Record<string, unknown>>(response, '保存模型选择失败');
+        const persisted = normalizeRuntimeModelConfig(data.config as Partial<BrowserChatModelConfig> | undefined);
+        if (persisted) setModelConfig(persisted);
+      })
+      .catch(() => undefined);
+  }, [modelConfig]);
+
+  const loadBrowserRuntimeSettings = useCallback(async () => {
+    const response = await fetch('/api/settings/env', { cache: 'no-store' });
+    const data = await readApiJson<Record<string, unknown>>(response, '加载浏览器配置失败');
+    const saved = Array.isArray(data.saved) ? data.saved as Array<{ key?: string; value?: string }> : [];
+    const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
+    const reasoningSetting = saved.find((item) => item.key === 'BROWSER_CHAT_SHOW_REASONING');
+    setEmbeddedBrowserEnabled(embeddedSetting?.value === 'true');
+    setShowReasoning(reasoningSetting?.value === 'true');
+  }, []);
+
+  const loadSkills = useCallback(async () => {
+    const response = await fetch('/api/skills', { cache: 'no-store' });
+    const data = await readApiJson<Record<string, unknown>>(response, '加载 Skills 失败');
+    setSkills(Array.isArray(data.skills) ? data.skills : []);
+  }, []);
+
+  const loadModelConfig = useCallback(async () => {
+    const response = await fetch('/api/settings/model', { cache: 'no-store' });
+    const data = await readApiJson<Record<string, unknown>>(response, '加载模型配置失败');
+    const config = normalizeRuntimeModelConfig(data.config as Partial<BrowserChatModelConfig> | undefined);
+    if (config) setModelConfig(config);
+  }, []);
+
+  const beginEmbeddedChatResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const workspace = embeddedWorkspaceRef.current;
+    if (!workspace) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    const rect = workspace.getBoundingClientRect();
+    const minChatWidth = 320;
+    const minBrowserWidth = 380;
+    const maxChatWidth = Math.max(minChatWidth, Math.min(760, rect.width - minBrowserWidth - 8));
+    setEmbeddedChatResizing(true);
+
+    function nextWidth(clientX: number) {
+      return Math.round(Math.max(minChatWidth, Math.min(maxChatWidth, rect.right - clientX)));
+    }
+
+    setEmbeddedChatWidth(nextWidth(event.clientX));
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      moveEvent.preventDefault();
+      setEmbeddedChatWidth(nextWidth(moveEvent.clientX));
+    };
+    const onPointerUp = () => {
+      setEmbeddedChatResizing(false);
+      document.body.classList.remove('browser-chat-resizing');
+      document.removeEventListener('pointermove', onPointerMove, true);
+      document.removeEventListener('pointerup', onPointerUp, true);
+      document.removeEventListener('pointercancel', onPointerUp, true);
+    };
+    document.body.classList.add('browser-chat-resizing');
+    document.addEventListener('pointermove', onPointerMove, true);
+    document.addEventListener('pointerup', onPointerUp, true);
+    document.addEventListener('pointercancel', onPointerUp, true);
+  }, []);
 
   useEffect(() => {
     activeSessionIdRef.current = session?.id || null;
+  }, [session?.id]);
+
+  useEffect(() => {
+    setSelectedExportMessageIds([]);
   }, [session?.id]);
 
   const upsertSession = useCallback((nextSession: BrowserChatSession, options: { activate?: boolean; version?: number } = {}) => {
@@ -1095,21 +5489,28 @@ export function BrowserChatWorkspace({
 
   const loadSessions = useCallback(async () => {
     const response = await fetch('/api/browser-chat', { cache: 'no-store' });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '加载对话历史失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '加载对话历史失败');
     const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => normalizeSession(item)) : [];
     setSessions(nextSessions);
   }, []);
 
   const refreshSession = useCallback(async (sessionId: string, options: { activate?: boolean } = {}) => {
     const response = await fetch(`/api/browser-chat/${sessionId}`, { cache: 'no-store' });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '加载对话失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '加载对话失败');
     const shouldActivate = options.activate ?? activeSessionIdRef.current === sessionId;
     const loadedSession = upsertSession(data.session as BrowserChatSession, { activate: shouldActivate });
-    if (shouldActivate) setMode(normalizeMode(loadedSession.mode));
+    if (shouldActivate) {
+      setMode(normalizeMode(loadedSession.mode));
+      setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
+      const nextModel = resolveRuntimeModelSelection(modelConfig, {
+        model: loadedSession.model,
+        provider: loadedSession.modelProvider,
+      });
+      setModelProvider(nextModel.provider);
+      setModelId(nextModel.model);
+    }
     return loadedSession;
-  }, [upsertSession]);
+  }, [modelConfig, upsertSession]);
 
   const scheduleLoadSessions = useCallback((delay = 80) => {
     if (sessionListRefreshTimerRef.current) window.clearTimeout(sessionListRefreshTimerRef.current);
@@ -1143,6 +5544,29 @@ export function BrowserChatWorkspace({
   }, [loadSessions]);
 
   useEffect(() => {
+    void loadSkills().catch(() => undefined);
+  }, [loadSkills]);
+
+  useEffect(() => {
+    void loadModelConfig().catch(() => undefined);
+  }, [loadModelConfig]);
+
+  useEffect(() => {
+    if (session?.id || !modelConfig?.provider) return;
+    const nextModel = resolveRuntimeModelSelection(modelConfig);
+    setModelProvider(nextModel.provider);
+    setModelId(nextModel.model);
+  }, [modelConfig, session?.id]);
+
+  useEffect(() => {
+    setModelId((current) => resolveRuntimeModelSelection(modelConfig, { model: current, provider: modelProvider }).model);
+  }, [modelConfig, modelProvider]);
+
+  useEffect(() => {
+    void loadBrowserRuntimeSettings().catch(() => undefined);
+  }, [loadBrowserRuntimeSettings]);
+
+  useEffect(() => {
     return subscribeRealtimeRefresh((event) => {
       if (event.entityType !== 'browserChatSession') return;
       const lastVersion = sessionVersionsRef.current.get(event.id) || 0;
@@ -1155,7 +5579,7 @@ export function BrowserChatWorkspace({
         return;
       }
       if (activeSessionIdRef.current === event.id) scheduleSessionRefresh(event.id);
-      scheduleLoadSessions();
+      else scheduleLoadSessions();
     }, { onStatus: setRealtimeConnected });
   }, [scheduleLoadSessions, scheduleSessionRefresh]);
 
@@ -1168,13 +5592,13 @@ export function BrowserChatWorkspace({
   }, []);
 
   useEffect(() => {
-    if (!session?.id || !session.busy || realtimeConnected) return undefined;
+    if (!session?.id || !selectedSessionRunning || realtimeConnected) return undefined;
     const sessionId = session.id;
     const timer = window.setInterval(() => {
       void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch(() => undefined);
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [realtimeConnected, refreshSession, session?.busy, session?.id]);
+  }, [realtimeConnected, refreshSession, selectedSessionRunning, session?.id]);
 
   async function createGroup(parentId?: string) {
     const name = groupName.trim();
@@ -1196,14 +5620,44 @@ export function BrowserChatWorkspace({
     }
   }
 
+  async function deleteTargetGroup(group: TestGroupRecord) {
+    if (deletingTargetGroupId) return;
+    const descendantIds = new Set<string>([group.id]);
+    const collect = (groupId: string) => {
+      groups.filter((item) => item.parentId === groupId).forEach((child) => {
+        if (descendantIds.has(child.id)) return;
+        descendantIds.add(child.id);
+        collect(child.id);
+      });
+    };
+    collect(group.id);
+    const childCount = descendantIds.size - 1;
+    const message = childCount
+      ? `确定删除分组“${group.name}”及其 ${childCount} 个子分组吗？这些分组下的测试用例会移回未分组。`
+      : `确定删除分组“${group.name}”吗？这个分组下的测试用例会移回未分组。`;
+    if (!window.confirm(message)) return;
+    setDeletingTargetGroupId(group.id);
+    startGlobalLoading('正在删除分组');
+    try {
+      const response = await fetch(`/api/groups/${group.id}`, { method: 'DELETE' });
+      await readApiJson<Record<string, unknown>>(response, '删除分组失败');
+      if (targetGroupId && descendantIds.has(targetGroupId)) setTargetGroupId(undefined);
+      startTransition(() => router.refresh());
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '删除分组失败');
+    } finally {
+      setDeletingTargetGroupId(null);
+      stopGlobalLoading();
+    }
+  }
+
   async function createSession() {
     const response = await fetch('/api/browser-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ safetyMode, modelProvider, model: modelId }),
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '创建对话会话失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '创建对话会话失败');
     return upsertSession(data.session as BrowserChatSession, { activate: true });
   }
 
@@ -1212,21 +5666,41 @@ export function BrowserChatWorkspace({
     return createSession();
   }
 
-  async function postMessageToSession(sessionId: string, content: string, clientMessageId: string, nextAttachments: BrowserChatAttachment[]) {
+  async function postMessageToSession(sessionId: string, content: string, clientMessageId: string, nextAttachments: BrowserChatAttachment[], skillIds: string[]) {
     const response = await fetch(`/api/browser-chat/${sessionId}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds }),
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '发送消息失败');
+    const data = await readApiJson<Record<string, unknown>>(response, '发送消息失败');
     return data.session as BrowserChatSession;
   }
 
-  async function uploadChatImages(files: FileList | File[]) {
-    const selectedFiles = Array.from(files).filter((file) => file.type.startsWith('image/'));
-    const remainingSlots = Math.max(0, 8 - attachments.length);
-    if (!selectedFiles.length || !remainingSlots || uploadingImage || currentBusy) return;
+  async function ensureEmbeddedBrowserSessionTab(sessionId: string) {
+    if (!embeddedBrowserEnabled || typeof window === 'undefined') return;
+    const bridge = window.webPilotEmbeddedBrowser;
+    if (!bridge) return;
+    const groupId = embeddedGroupIdForSession(sessionId);
+    const result = await bridge.setVisible({
+      createIfMissing: true,
+      groupId,
+      sessionId,
+      visible: true,
+    });
+    if (!result.ok) throw new Error(result.error || '嵌入浏览器标签创建失败');
+    const groupTabs = [
+      ...(result.groups?.find((group) => group.id === groupId)?.tabs || []),
+      ...(result.tabs || []).filter((tab) => tab.groupId === groupId),
+    ];
+    if (groupTabs.length) return;
+    const created = await bridge.createTab({ groupId, sessionId });
+    if (!created.ok) throw new Error(created.error || '嵌入浏览器标签创建失败');
+  }
+
+  async function uploadChatFiles(files: FileList | File[]) {
+    const selectedFiles = Array.from(files);
+    const remainingSlots = Math.max(0, BROWSER_CHAT_MAX_REFERENCES - attachmentsRef.current.length);
+    if (!selectedFiles.length || !remainingSlots || uploadingImage || currentBusy) return [];
     setUploadingImage(true);
     setError('');
     try {
@@ -1235,30 +5709,33 @@ export function BrowserChatWorkspace({
         const form = new FormData();
         form.append('file', file);
         const response = await fetch('/api/uploads', { method: 'POST', body: form });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || '图片上传失败');
+        const data = await readApiJson<Record<string, unknown>>(response, '文件上传失败');
+        const fileId = String(data.fileId || data.imageId || temporaryId(file.type.startsWith('image/') ? 'image' : 'file'));
+        const kind: BrowserChatAttachmentKind = String(data.type || file.type || '').startsWith('image/') ? 'image' : 'file';
         uploaded.push({
-          id: String(data.imageId || temporaryId('image')),
+          id: fileId,
+          kind,
           name: String(data.name || file.name),
-          type: String(data.type || file.type || 'image/*'),
+          type: String(data.type || file.type || 'application/octet-stream'),
           size: typeof data.size === 'number' ? data.size : file.size,
-          path: String(data.path || `uploads/${data.imageId}`),
-          url: String(data.url || `/api/artifacts/uploads/${encodeURIComponent(String(data.imageId))}`),
+          path: String(data.path || `uploads/${fileId}`),
+          url: String(data.url || `/api/artifacts/uploads/${encodeURIComponent(fileId)}`),
         });
       }
-      if (uploaded.length) setAttachments((current) => [...current, ...uploaded].slice(0, 8));
+      return uploaded.length ? addReferenceAttachments(uploaded) : [];
     } catch (uploadError) {
-      setError(uploadError instanceof Error ? uploadError.message : '图片上传失败');
+      setError(uploadError instanceof Error ? uploadError.message : '文件上传失败');
+      return [];
     } finally {
       setUploadingImage(false);
       if (imageInputRef.current) imageInputRef.current.value = '';
     }
   }
 
-  async function sendMessage(content: string) {
+  async function sendMessage(content: string, skillIds: string[] = [], messageAttachments?: BrowserChatAttachment[]) {
     const trimmedContent = content.trim();
-    const nextAttachments = attachments;
-    if ((!trimmedContent && !nextAttachments.length) || currentBusy || loadingSessionId || sendingRef.current || uploadingImage) return false;
+    const nextAttachments = messageAttachments ?? attachments;
+    if ((!trimmedContent && !nextAttachments.length && !skillIds.length) || currentBusy || loadingSessionId || sendingRef.current || uploadingImage) return false;
     sendingRef.current = true;
     const clientMessageId = temporaryId('client_msg');
     setError('');
@@ -1266,43 +5743,92 @@ export function BrowserChatWorkspace({
     setActiveView('chat');
     try {
       let active = await ensureSession();
+      setPendingMessageSessionId(active.id);
+      await ensureEmbeddedBrowserSessionTab(active.id);
       let posted: BrowserChatSession;
       try {
-        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments);
+        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments, skillIds);
       } catch (firstError) {
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
         active = await createSession();
-        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments);
+        setPendingMessageSessionId(active.id);
+        await ensureEmbeddedBrowserSessionTab(active.id);
+        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments, skillIds);
       }
       upsertSession(posted, { activate: true });
+      attachmentsRef.current = [];
       setAttachments([]);
       return true;
     } catch (sendError) {
       const sendMessageText = sendError instanceof Error ? sendError.message : '发送消息失败';
       setError(sendMessageText);
+      attachmentsRef.current = nextAttachments;
       setAttachments(nextAttachments);
       return false;
     } finally {
       sendingRef.current = false;
+      setPendingMessageSessionId(null);
       setBusy(false);
     }
   }
 
   async function interruptConversation() {
-    const target = selectedRunningSession;
-    if (!target?.id || interrupting || !target.busy) return;
+    const targetId = interruptSessionId;
+    if (!targetId || interrupting) return;
     setInterrupting(true);
     setError('');
+    const interruptedAt = new Date().toISOString();
+    const markInterrupted = (current: BrowserChatSession) => ({
+      ...current,
+      busy: false,
+      status: current.status === 'closed' ? current.status : 'idle' as const,
+      pendingToolConfirmation: undefined,
+      updatedAt: interruptedAt,
+      messages: current.messages.map((message) => message.status === 'running' ? {
+        ...message,
+        activity: undefined,
+        content: '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。',
+        status: 'interrupted' as const,
+        updatedAt: interruptedAt,
+      } : message),
+    });
+    setBusy(false);
+    setPendingMessageSessionId(null);
+    setSessions((current) => current.map((item) => item.id === targetId ? markInterrupted(item) : item));
+    setSession((current) => current?.id === targetId ? markInterrupted(current) : current);
     try {
-      const response = await fetch(`/api/browser-chat/${target.id}/interrupt`, { method: 'POST' });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '中断对话失败');
-      upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === target.id });
+      const response = await fetch(`/api/browser-chat/${targetId}/interrupt`, { method: 'POST' });
+      const data = await readApiJson<Record<string, unknown>>(response, '中断对话失败');
+      upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === targetId });
     } catch (interruptError) {
       setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
+      await refreshSession(targetId, { activate: activeSessionIdRef.current === targetId }).catch(() => undefined);
     } finally {
       setInterrupting(false);
+    }
+  }
+
+  async function resolveToolConfirmation(confirmationId: string, action: BrowserChatToolConfirmationAction) {
+    const sessionId = session?.id;
+    if (!sessionId || resolvingConfirmationId) return;
+    setResolvingConfirmationId(confirmationId);
+    setResolvingConfirmationAction(action);
+    setError('');
+    try {
+      const response = await fetch(`/api/browser-chat/${sessionId}/tool-confirmation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, confirmationId }),
+      });
+      const data = await readApiJson<Record<string, unknown>>(response, '工具确认失败');
+      upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === sessionId });
+      scheduleSessionRefresh(sessionId, 120);
+    } catch (resolveError) {
+      setError(resolveError instanceof Error ? resolveError.message : '工具确认失败');
+    } finally {
+      setResolvingConfirmationId(null);
+      setResolvingConfirmationAction(null);
     }
   }
 
@@ -1312,8 +5838,8 @@ export function BrowserChatWorkspace({
     startGlobalLoading('正在结束浏览器对话');
     try {
       const response = await fetch(`/api/browser-chat/${session.id}`, { method: 'DELETE' });
-      const data = await response.json();
       if (response.ok) {
+        const data = await readApiJson<{ session: BrowserChatSession }>(response, '结束浏览器对话失败');
         upsertSession(data.session, { activate: true });
         await loadSessions().catch(() => undefined);
       }
@@ -1324,21 +5850,27 @@ export function BrowserChatWorkspace({
   }
 
   async function deleteSessionHistory(sessionId: string) {
-    if (deletingSessionId || deletingSelectedSessions) return;
-    setDeletingSessionId(sessionId);
+    if (deletingSessionIdsRef.current.has(sessionId) || deletingSelectedSessions) return;
+    deletingSessionIdsRef.current.add(sessionId);
+    setDeletingSessionIds((current) => new Set(current).add(sessionId));
     setError('');
     try {
       const response = await fetch(`/api/browser-chat/${sessionId}/delete`, { method: 'POST' });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '删除历史对话失败');
+      await readApiJson<Record<string, unknown>>(response, '删除历史对话失败');
       setSessions((current) => current.filter((item) => item.id !== sessionId));
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
       if (session?.id === sessionId) setSession(null);
+      await window.webPilotEmbeddedBrowser?.discardGroup?.({ id: embeddedGroupIdForSession(sessionId) }).catch(() => undefined);
       await loadSessions().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '删除历史对话失败');
     } finally {
-      setDeletingSessionId(null);
+      deletingSessionIdsRef.current.delete(sessionId);
+      setDeletingSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(sessionId);
+        return next;
+      });
     }
   }
 
@@ -1375,22 +5907,59 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: deletingIds }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '批量删除历史对话失败');
+      await readApiJson<Record<string, unknown>>(response, '批量删除历史对话失败');
       setSessions((current) => current.filter((item) => !deletingIdSet.has(item.id)));
       setSelectedSessionIds((current) => current.filter((id) => !deletingIdSet.has(id)));
       if (session?.id && deletingIdSet.has(session.id)) setSession(null);
+      for (const sessionId of deletingIds) {
+        await window.webPilotEmbeddedBrowser?.discardGroup?.({ id: embeddedGroupIdForSession(sessionId) }).catch(() => undefined);
+      }
       await loadSessions().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '批量删除历史对话失败');
     } finally {
       setDeletingSelectedSessions(false);
+      setRecentSelectionMode(false);
     }
   }
 
+  function closeSidebarOverflowMenu(event: ReactMouseEvent<HTMLButtonElement>) {
+    event.currentTarget.closest('details')?.removeAttribute('open');
+  }
+
+  const openTargetCaseDetail = useCallback((testCaseId: string) => {
+    setActiveView('target');
+    setTargetDetailCaseId(testCaseId);
+    startTransition(() => router.refresh());
+  }, [router, startTransition]);
+
+  const exportSelectedMessagesToTestCase = useCallback(async () => {
+    const sessionId = session?.id;
+    if (!sessionId || !selectedExportMessageIds.length || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
+    const messageIds = selectedExportMessageIds;
+    setExportingSelectedMessages(true);
+    setError('');
+    startGlobalLoading('正在导出选中对话轮次');
+    try {
+      const response = await fetch(`/api/browser-chat/${sessionId}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageIds }),
+      });
+      const data = await readApiJson<Record<string, unknown>>(response, '导出测试用例失败');
+      setSelectedExportMessageIds([]);
+      if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : '导出测试用例失败');
+    } finally {
+      setExportingSelectedMessages(false);
+      stopGlobalLoading();
+    }
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, selectedExportMessageIds, session?.id]);
+
   const exportMessageToTestCase = useCallback(async (messageId: string) => {
     const sessionId = session?.id;
-    if (!sessionId || exportingMessageId) return;
+    if (!sessionId || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
     setExportingMessageId(messageId);
     setError('');
     try {
@@ -1399,21 +5968,67 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageId }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '导出测试用例失败');
-      startTransition(() => router.push(`/test-cases/${data.testCaseId}`));
+      const data = await readApiJson<Record<string, unknown>>(response, '导出测试用例失败');
+      if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
     } catch (exportError) {
       setError(exportError instanceof Error ? exportError.message : '导出测试用例失败');
     } finally {
       setExportingMessageId(null);
     }
-  }, [exportingMessageId, router, session?.id, startTransition]);
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, session?.id]);
+
+  const generateSelectedMessagesSkill = useCallback(async () => {
+    const sessionId = session?.id;
+    if (!sessionId || !selectedExportMessageIds.length || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
+    const messageIds = selectedExportMessageIds;
+    setGeneratingSkillSelectedMessages(true);
+    setError('');
+    startGlobalLoading('正在生成 Skill');
+    try {
+      const response = await fetch(`/api/browser-chat/${sessionId}/skills`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageIds }),
+      });
+      await readApiJson<Record<string, unknown>>(response, '生成 Skill 失败');
+      setSelectedExportMessageIds([]);
+      await loadSkills();
+    } catch (skillError) {
+      setError(skillError instanceof Error ? skillError.message : '生成 Skill 失败');
+    } finally {
+      setGeneratingSkillSelectedMessages(false);
+      stopGlobalLoading();
+    }
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, selectedExportMessageIds, session?.id]);
+
+  const generateMessageSkill = useCallback(async (messageId: string) => {
+    const sessionId = session?.id;
+    if (!sessionId || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
+    setGeneratingSkillMessageId(messageId);
+    setError('');
+    startGlobalLoading('正在生成 Skill');
+    try {
+      const response = await fetch(`/api/browser-chat/${sessionId}/skills`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageId }),
+      });
+      await readApiJson<Record<string, unknown>>(response, '生成 Skill 失败');
+      await loadSkills();
+    } catch (skillError) {
+      setError(skillError instanceof Error ? skillError.message : '生成 Skill 失败');
+    } finally {
+      setGeneratingSkillMessageId(null);
+      stopGlobalLoading();
+    }
+  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, session?.id]);
 
   async function startNewConversation() {
     setActiveView('chat');
-    if (busy) return;
+    if (loadingSessionId) return;
     setError('');
     setComposerResetToken((current) => current + 1);
+    attachmentsRef.current = [];
     setAttachments([]);
     setSession(null);
   }
@@ -1425,11 +6040,18 @@ export function BrowserChatWorkspace({
     setActiveView('chat');
     setError('');
     setComposerResetToken((current) => current + 1);
+    attachmentsRef.current = [];
     setAttachments([]);
     try {
       const loadedSession = await refreshSession(sessionId, { activate: true });
       setMode(normalizeMode(loadedSession.mode));
-      void loadSessions().catch(() => undefined);
+      setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
+      const nextModel = resolveRuntimeModelSelection(modelConfig, {
+        model: loadedSession.model,
+        provider: loadedSession.modelProvider,
+      });
+      setModelProvider(nextModel.provider);
+      setModelId(nextModel.model);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');
       void loadSessions().catch(() => undefined);
@@ -1441,17 +6063,24 @@ export function BrowserChatWorkspace({
     }
   }
 
-  async function openChatEntry() {
-    await startNewConversation();
-  }
-
   function renderSidebarDetail() {
     if (activeView === 'target') {
       return (
         <DashboardGroupSidebar
           className="browser-chat-sub-sidebar"
+          deletingGroupId={deletingTargetGroupId}
           groups={groups}
+          headerAction={(
+            <NewTestCaseModal
+              groupId={targetGroupId}
+              icon={<Plus size={16} />}
+              iconOnly
+              onCreated={openTargetCaseDetail}
+            />
+          )}
+          headerLabel="目标"
           selectedGroupId={targetGroupId}
+          onDeleteGroup={deleteTargetGroup}
           onCreateGroup={() => setGroupDialogOpen(true)}
           onSelect={setTargetGroupId}
         />
@@ -1464,7 +6093,7 @@ export function BrowserChatWorkspace({
           <h2>设置</h2>
           <nav className="browser-chat-subnav" aria-label="环境配置分类">
             {environmentSettingsTabs.map((tab) => (
-              <button className={settingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={tab.label} type="button">
+              <button aria-label={tab.label} className={settingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={tab.label} type="button">
                 <SettingsTabIcon tab={tab.id} />
                 <span>{tab.label}</span>
               </button>
@@ -1477,90 +6106,260 @@ export function BrowserChatWorkspace({
     return (
       <section className="browser-chat-sidebar-section browser-chat-recent-section">
         <div className="browser-chat-recent-header">
-          <h2>最近</h2>
-          {recentSessions.length ? (
-            <div>
-              <label className="browser-chat-recent-select-all">
-                <input
-                  aria-label="选择全部历史对话"
-                  checked={allSelectableRecentSessionsSelected}
-                  disabled={!selectableRecentSessionIds.length || deletingSelectedSessions}
-                  onChange={() => toggleAllRecentSelections()}
-                  type="checkbox"
-                />
-                <span>全选</span>
-              </label>
+          <h2>对话</h2>
+          <div className="browser-chat-recent-header-actions">
+            <button
+              aria-label={t('新建对话')}
+              className="ui-icon-button browser-chat-section-create"
+              disabled={Boolean(loadingSessionId)}
+              onClick={() => void startNewConversation()}
+              title={t('新建对话')}
+              type="button"
+            >
+              <Plus size={16} />
+            </button>
+            {recentSelectionMode ? (
               <button
-                aria-label="批量删除历史对话"
-                className="browser-chat-recent-bulk-delete"
+                aria-label={`删除已选对话（${selectedDeletableSessionIds.length}）`}
+                className="ui-icon-button ui-icon-button--danger browser-chat-section-create"
                 disabled={!selectedDeletableSessionIds.length || deletingSelectedSessions}
                 onClick={() => void deleteSelectedSessionHistory()}
-                title="批量删除历史对话"
+                title={selectedDeletableSessionIds.length ? `删除已选对话（${selectedDeletableSessionIds.length}）` : '请选择要删除的对话'}
                 type="button"
               >
-                {deletingSelectedSessions ? <Loader2 className="spin" size={13} /> : <Trash2 size={14} />}
+                {deletingSelectedSessions ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
               </button>
-            </div>
-          ) : null}
+            ) : null}
+            <details className="browser-chat-overflow browser-chat-recent-actions">
+              <summary aria-label="对话操作" title="对话操作">
+                <MoreHorizontal size={16} />
+              </summary>
+              <div className="browser-chat-overflow-menu">
+                {recentSessions.length ? (
+                  <button
+                    onClick={(event) => {
+                      closeSidebarOverflowMenu(event);
+                      setRecentSelectionMode((current) => !current);
+                      if (recentSelectionMode) setSelectedSessionIds([]);
+                    }}
+                    type="button"
+                  >
+                    <Square size={14} />
+                    <span>{recentSelectionMode ? '退出选择' : '选择对话'}</span>
+                  </button>
+                ) : null}
+                {recentSelectionMode ? (
+                  <button
+                    onClick={(event) => {
+                      closeSidebarOverflowMenu(event);
+                      toggleAllRecentSelections();
+                    }}
+                    type="button"
+                  >
+                    <CheckCircle2 size={15} />
+                    <span>{allSelectableRecentSessionsSelected ? '取消全选' : '全选'}</span>
+                  </button>
+                ) : null}
+              </div>
+            </details>
+          </div>
         </div>
+        <button
+          aria-label={t('新建对话')}
+          className="ui-button ui-button--neutral browser-chat-new-chat-button"
+          disabled={Boolean(loadingSessionId)}
+          onClick={() => void startNewConversation()}
+          title={t('新建对话')}
+          type="button"
+        >
+          <Plus size={16} />
+          <span>{t('新建对话')}</span>
+        </button>
         {recentSessions.length ? (
           <ol className="browser-chat-recent-list">
             {recentSessions.map((item) => (
               <li key={item.id}>
-                <div className={session?.id === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}>
-                  <input
-                    aria-label={`选择 ${sessionDisplayTitle(item)}`}
-                    checked={selectedSessionIdSet.has(item.id)}
-                    className="browser-chat-recent-check"
-                    disabled={item.busy || deletingSelectedSessions}
-                    onChange={(event) => toggleSessionSelection(item.id, event.currentTarget.checked)}
-                    type="checkbox"
-                  />
+                <div
+                  className={`${session?.id === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}${recentSelectionMode ? ' selecting' : ''}`}
+                >
+                  {recentSelectionMode ? (
+                    <input
+                      aria-label={`选择 ${sessionDisplayTitle(item)}`}
+                      checked={selectedSessionIdSet.has(item.id)}
+                      className="browser-chat-recent-check"
+                      disabled={item.busy || deletingSelectedSessions}
+                      onChange={(event) => toggleSessionSelection(item.id, event.currentTarget.checked)}
+                      type="checkbox"
+                    />
+                  ) : null}
                   <button
+                    aria-label={sessionDisplayTitle(item)}
                     className="browser-chat-recent-open"
-                    data-title={sessionDisplayTitle(item)}
                     disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
-                    onClick={() => void loadSession(item.id)}
+                    onClick={() => {
+                      void loadSession(item.id);
+                    }}
                     title={sessionDisplayTitle(item)}
                     type="button"
                   >
-                    <MessageSquare className="browser-chat-recent-icon" size={15} />
+                    {sidebarCollapsed ? <MessageSquare className="browser-chat-recent-icon" size={17} /> : null}
                     <span>{sessionDisplayTitle(item)}</span>
-                    <small>
-                      {loadingSessionId === item.id ? <Loader2 className="spin" size={11} /> : null}
-                      <span>{loadingSessionId === item.id ? '加载中' : statusLabel(item.status)}</span>
-                      {sessionSortTime(item) ? <time dateTime={sessionSortTime(item)}>{formatLogTime(sessionSortTime(item))}</time> : null}
-                    </small>
                   </button>
-                  <button
-                    aria-label="删除历史对话"
-                    className="browser-chat-recent-delete"
-                    disabled={item.busy || deletingSessionId === item.id || deletingSelectedSessions}
-                    onClick={() => void deleteSessionHistory(item.id)}
-                    title={item.busy ? '执行中不能删除' : '删除历史对话'}
-                    type="button"
-                  >
-                    {deletingSessionId === item.id ? <Loader2 className="spin" size={13} /> : <Trash2 size={14} />}
-                  </button>
+                  <details className="browser-chat-overflow browser-chat-recent-row-menu">
+                    <summary aria-label={`${sessionDisplayTitle(item)} 操作`} title="更多操作">
+                      {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
+                    </summary>
+                    <div className="browser-chat-overflow-menu">
+                      <button
+                        className="danger"
+                        disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
+                        onClick={(event) => {
+                          closeSidebarOverflowMenu(event);
+                          void deleteSessionHistory(item.id);
+                        }}
+                        type="button"
+                      >
+                        <Trash2 size={15} />
+                        <span>{item.busy ? '执行中，无法删除' : '删除对话'}</span>
+                      </button>
+                    </div>
+                  </details>
                 </div>
               </li>
             ))}
           </ol>
         ) : (
-          <p>暂无记录</p>
+          <p>{t('暂无记录')}</p>
         )}
       </section>
     );
   }
 
+  async function assignBrowserGroup(browserGroupId: string) {
+    if (!session?.id) return;
+    if (session.browserGroupId === browserGroupId) {
+      setBrowserGroupPickerOpen(false);
+      return;
+    }
+    const previous = session;
+    upsertSession({ ...session, browserGroupId }, { activate: true });
+    try {
+      const response = await fetch(`/api/browser-chat/${session.id}/group`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ groupId: browserGroupId }),
+      });
+      const data = await readApiJson<Record<string, unknown>>(response, '设置对话标签组失败');
+      upsertSession(data.session as BrowserChatSession, { activate: true });
+      setBrowserGroupPickerOpen(false);
+    } catch (assignError) {
+      upsertSession(previous, { activate: true });
+      throw assignError;
+    }
+  }
+
+  const renderChatPaneActions = () => (
+    <div className="browser-chat-pane-actions">
+      {session ? (
+        <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title="结束会话" type="button">
+          <Power size={17} />
+        </button>
+      ) : null}
+      <BrowserChatGroupBindingCenter
+        disabled={!session?.id}
+        groupId={session?.browserGroupId}
+        onClose={() => setBrowserGroupPickerOpen(false)}
+        onSelect={assignBrowserGroup}
+        onToggle={toggleBrowserGroupPicker}
+        open={browserGroupPickerOpen}
+      />
+      <BrowserChatDownloadCenter
+        downloads={downloads}
+        open={downloadCenterOpen}
+        onClose={() => setDownloadCenterOpen(false)}
+        onToggle={toggleDownloadCenter}
+      />
+    </div>
+  );
+
+  const renderChatPane = () => (
+    <div className={`${hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`} style={chatPaneStyle}>
+      {renderChatPaneActions()}
+
+      {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages ? (
+        <BrowserChatMessageList
+          availableSkills={skills}
+          exportingMessageId={exportingMessageId}
+          exportingSelectedMessages={exportingSelectedMessages}
+          generatingSkillMessageId={generatingSkillMessageId}
+          generatingSkillSelectedMessages={generatingSkillSelectedMessages}
+          lastAssistantMessageId={lastAssistantMessageId}
+          logIndex={logIndex}
+          messages={visibleMessages}
+          onBulkExportMessages={exportSelectedMessagesToTestCase}
+          onBulkGenerateSkillMessages={generateSelectedMessagesSkill}
+          onClearExportSelection={clearExportMessageSelection}
+          onExportMessage={exportMessageToTestCase}
+          onGenerateSkill={generateMessageSkill}
+          onPreviewImage={previewAttachment}
+          onResolveToolConfirmation={resolveToolConfirmation}
+          onSelectTool={setToolDialog}
+          onShowLogs={showMessageLogs}
+          onToggleExportSelection={toggleExportMessageSelection}
+          pendingToolConfirmation={session?.pendingToolConfirmation}
+          resolvingConfirmationAction={resolvingConfirmationAction}
+          resolvingConfirmationId={resolvingConfirmationId}
+          selectedExportMessageIdSet={selectedExportMessageIdSet}
+          selectedExportMessageIds={selectedExportMessageIds}
+          sessionId={session?.id}
+          sessionBusy={selectedSessionRunning}
+          stepsByIndex={stepsByIndex}
+          totalStepCount={steps.length}
+        />
+      ) : null}
+
+      <div className="browser-chat-composer-shell">
+        {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
+        <BrowserChatComposer
+          attachments={attachments}
+          availableSkills={skills}
+          busy={busy}
+          currentBusy={currentBusy}
+          imageInputRef={imageInputRef}
+          interrupting={interrupting}
+          loading={Boolean(loadingSessionId)}
+          mode={mode}
+          modeLocked={modeLocked}
+          modelSelection={modelSelection}
+          modelSelectionTitle={modelSelectionDiagnostic}
+          modelSelectionOptions={modelSelectionOptions}
+          safetyMode={safetyMode}
+          onInterrupt={interruptConversation}
+          onModelSelectionChange={changeModelSelection}
+          onModeChange={setMode}
+          onRemoveAttachment={removeAttachment}
+          onSubmitMessage={sendMessage}
+          onSafetyModeChange={setSafetyMode}
+          onAddReferences={addReferenceAttachments}
+          onUploadFiles={uploadChatFiles}
+          resetToken={composerResetToken}
+          showStop={canInterruptConversation}
+          uploadingImage={uploadingImage}
+        />
+      </div>
+    </div>
+  );
+
   return (
+    <BrowserChatReasoningVisibilityContext.Provider value={showReasoning}>
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed' : 'browser-chat-layout'}>
       <aside className="browser-chat-sidebar">
         <div className="browser-chat-brand">
-          <strong>WebPilot QA</strong>
+          <strong>WebPilot</strong>
           <button
-            className="icon-button"
-            onClick={() => setSidebarCollapsed((current) => !current)}
+            className="ui-icon-button"
+            onClick={toggleSidebarCollapsed}
+            title={sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'}
             type="button"
             aria-label={sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'}
           >
@@ -1570,20 +6369,20 @@ export function BrowserChatWorkspace({
 
         <nav className="browser-chat-nav" aria-label="工作模式">
           <button
-            aria-label="新对话"
+            aria-label={t('对话模式')}
             className={activeView === 'chat' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'}
-            onClick={() => void openChatEntry()}
-            title="新对话"
+            onClick={() => setActiveView('chat')}
+            title={t('对话模式')}
             type="button"
           >
             <MessageSquare size={17} />
-            <span>新对话</span>
+            <span>{t('对话模式')}</span>
           </button>
-          <button className={activeView === 'target' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => setActiveView('target')} type="button">
+          <button aria-label="目标模式" className={activeView === 'target' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => setActiveView('target')} title="目标模式" type="button">
             <Folder size={17} />
             <span>目标模式</span>
           </button>
-          <button className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => setActiveView('settings')} type="button">
+          <button aria-label="设置" className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => router.push('/settings')} title="设置" type="button">
             <Settings size={17} />
             <span>设置</span>
           </button>
@@ -1591,13 +6390,49 @@ export function BrowserChatWorkspace({
 
         {renderSidebarDetail()}
 
+        <div className="browser-chat-sidebar-footer">
+          <button
+            aria-label={themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式'}
+            className="browser-chat-theme-toggle"
+            onClick={toggleMode}
+            title={themeMode === 'dark' ? '浅色模式' : '深色模式'}
+            type="button"
+          >
+            {themeMode === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
+          </button>
+        </div>
       </aside>
 
       <main className="browser-chat-main">
         {activeView === 'target' ? (
           <div className="browser-chat-cases-pane">
+            <div className="browser-chat-target-model-bar">
+              <div className="browser-chat-target-copy">
+                <strong>{t('目标模式模型')}</strong>
+                <span>{t('当前目标模式运行将使用这个模型。')}</span>
+              </div>
+              <div className="browser-chat-target-model-controls">
+                <CustomSelect
+                  className="browser-chat-target-model-select"
+                  onChange={(value) => changeModelSelection(parseModelSelectionValue(value))}
+                  options={modelSelectionOptions}
+                  searchable
+                  searchPlaceholder={t('搜索模型')}
+                  title={modelSelectionDiagnostic}
+                  value={modelSelection}
+                />
+                <div className="browser-chat-target-actions" id="browser-chat-target-actions" />
+              </div>
+            </div>
             <DashboardWorkspace
+              actionsPortalId="browser-chat-target-actions"
+              activeDetailCaseId={targetDetailCaseId}
               groups={groups}
+              hideListHeader
+              initialActiveRunId={initialTargetRunId}
+              model={modelId}
+              modelProvider={modelProvider}
+              onActiveDetailCaseIdChange={setTargetDetailCaseId}
               schedules={schedules}
               selectedGroupId={targetGroupId}
               showBrowserChatAction={false}
@@ -1609,46 +6444,105 @@ export function BrowserChatWorkspace({
           </div>
         ) : activeView === 'settings' ? (
           <div className="browser-chat-settings-pane">
-            <EnvironmentSettings activeTab={settingsTab} embedded showTabs={false} onActiveTabChange={setSettingsTab} />
+            <EnvironmentSettings
+              activeTab={settingsTab}
+              embedded
+              initialData={initialSettings}
+              showTabs={false}
+              onActiveTabChange={setSettingsTab}
+              onModelSaved={() => void loadModelConfig()}
+              onRuntimeEnvSaved={() => void loadBrowserRuntimeSettings()}
+              onSkillsChanged={() => void loadSkills()}
+            />
+          </div>
+        ) : embeddedBrowserActive ? (
+          <div
+            className={embeddedChatCollapsed ? 'browser-chat-embedded-workspace chat-collapsed' : 'browser-chat-embedded-workspace'}
+            ref={embeddedWorkspaceRef}
+            style={{ '--embedded-chat-width': `${embeddedChatWidth}px` } as CSSProperties}
+          >
+            <BrowserChatEmbeddedBrowser
+              active={embeddedBrowserViewActive}
+              browserGroupId={session?.browserGroupId}
+              enabled={embeddedBrowserEnabled}
+              onAddTabReference={addTabReference}
+              onDialogOpenChange={setEmbeddedBrowserDialogOpen}
+              onSelectSession={(nextSessionId) => {
+                if (nextSessionId !== activeSessionIdRef.current) void loadSession(nextSessionId);
+              }}
+              sessionId={session?.id}
+            />
+            {embeddedChatCollapsed ? null : (
+              <div
+                aria-label={t('调整对话栏宽度')}
+                aria-orientation="vertical"
+                aria-valuemax={760}
+                aria-valuemin={320}
+                aria-valuenow={embeddedChatWidth}
+                className="browser-chat-embedded-resizer"
+                onPointerDown={beginEmbeddedChatResize}
+                role="separator"
+                title={t('拖拽调整对话栏宽度')}
+              >
+                <span />
+              </div>
+            )}
+            <aside className="browser-chat-embedded-chat-column">
+              <button
+                aria-label={embeddedChatCollapsed ? t('展开对话栏') : t('折叠对话栏')}
+                className="ui-icon-button browser-chat-embedded-chat-toggle"
+                onClick={toggleEmbeddedChatCollapsed}
+                title={embeddedChatCollapsed ? t('展开对话栏') : t('折叠对话栏')}
+                type="button"
+              >
+                <PanelRight size={17} />
+              </button>
+              <div className="browser-chat-embedded-chat-content">
+                {renderChatPane()}
+              </div>
+            </aside>
           </div>
         ) : (
-          <div className={hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}>
-            {loadingSessionId ? (
-              <div className="browser-chat-inline-loading">
-                <Loader2 className="spin" size={15} />
-                <span>正在加载对话</span>
-              </div>
-            ) : null}
-            {session ? (
-              <button className="browser-chat-close" disabled={session.status === 'closed' || busy} onClick={closeSession} title="结束会话" type="button">
-                <Power size={17} />
-              </button>
-            ) : null}
+          <div className={hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'} style={chatPaneStyle}>
+            {renderChatPaneActions()}
 
-            {hasMessages ? (
+            {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages ? (
               <BrowserChatMessageList
+                availableSkills={skills}
                 exportingMessageId={exportingMessageId}
+                exportingSelectedMessages={exportingSelectedMessages}
+                generatingSkillMessageId={generatingSkillMessageId}
+                generatingSkillSelectedMessages={generatingSkillSelectedMessages}
                 lastAssistantMessageId={lastAssistantMessageId}
                 logIndex={logIndex}
                 messages={visibleMessages}
+                onBulkExportMessages={exportSelectedMessagesToTestCase}
+                onBulkGenerateSkillMessages={generateSelectedMessagesSkill}
+                onClearExportSelection={clearExportMessageSelection}
                 onExportMessage={exportMessageToTestCase}
+                onGenerateSkill={generateMessageSkill}
                 onPreviewImage={previewAttachment}
+                onResolveToolConfirmation={resolveToolConfirmation}
                 onSelectTool={setToolDialog}
                 onShowLogs={showMessageLogs}
-                sessionBusy={Boolean(session?.busy)}
+                onToggleExportSelection={toggleExportMessageSelection}
+                pendingToolConfirmation={session?.pendingToolConfirmation}
+                resolvingConfirmationAction={resolvingConfirmationAction}
+                resolvingConfirmationId={resolvingConfirmationId}
+                selectedExportMessageIdSet={selectedExportMessageIdSet}
+                selectedExportMessageIds={selectedExportMessageIds}
+                sessionId={session?.id}
+                sessionBusy={selectedSessionRunning}
                 stepsByIndex={stepsByIndex}
                 totalStepCount={steps.length}
               />
-            ) : (
-              <div className="browser-chat-hero">
-                <h1>今天要做什么？</h1>
-              </div>
-            )}
+            ) : null}
 
             <div className="browser-chat-composer-shell">
-              {error || session?.error ? <div className="error">{error || session?.error}</div> : null}
+              {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
               <BrowserChatComposer
                 attachments={attachments}
+                availableSkills={skills}
                 busy={busy}
                 currentBusy={currentBusy}
                 imageInputRef={imageInputRef}
@@ -1656,14 +6550,20 @@ export function BrowserChatWorkspace({
                 loading={Boolean(loadingSessionId)}
                 mode={mode}
                 modeLocked={modeLocked}
+                modelSelection={modelSelection}
+                modelSelectionTitle={modelSelectionDiagnostic}
+                modelSelectionOptions={modelSelectionOptions}
+                safetyMode={safetyMode}
                 onInterrupt={interruptConversation}
+                onModelSelectionChange={changeModelSelection}
                 onModeChange={setMode}
-                onPreviewAttachment={previewAttachment}
                 onRemoveAttachment={removeAttachment}
                 onSubmitMessage={sendMessage}
-                onUploadImages={uploadChatImages}
+                onSafetyModeChange={setSafetyMode}
+                onAddReferences={addReferenceAttachments}
+                onUploadFiles={uploadChatFiles}
                 resetToken={composerResetToken}
-                showStop={Boolean(selectedRunningSession)}
+                showStop={canInterruptConversation}
                 uploadingImage={uploadingImage}
               />
             </div>
@@ -1672,134 +6572,26 @@ export function BrowserChatWorkspace({
       </main>
 
       {toolDialog ? (
-        <div className="modal-overlay" onClick={() => setToolDialog(null)} role="presentation">
-          <section className="browser-chat-tool-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="工具调用详情">
-            <header>
-              <div>
-                <h2>{toolDialog.tool.name}</h2>
-                <p>步骤 {toolDialog.stepIndex} · 工具调用 {toolDialog.toolIndex + 1}</p>
-              </div>
-              <button className="icon-button" onClick={() => setToolDialog(null)} type="button" aria-label="关闭">
-                <X size={18} />
-              </button>
-            </header>
-            <div className="browser-chat-tool-detail-grid">
-              <div>
-                <span>状态</span>
-                <strong>{toolStatusLabel(toolDialog.tool)}</strong>
-              </div>
-              <div>
-                <span>工具名</span>
-                <strong>{toolDialog.tool.name}</strong>
-              </div>
-            </div>
-            {toolDialog.tool.reason ? (
-              <section className="browser-chat-tool-detail-section">
-                <h3>调用理由</h3>
-                <p>{toolDialog.tool.reason}</p>
-              </section>
-            ) : null}
-            <section className="browser-chat-tool-detail-section">
-              <h3>输入参数</h3>
-              <pre>{formatToolPayload(toolDialog.tool.input)}</pre>
-            </section>
-            <section className="browser-chat-tool-detail-section">
-              <h3>输出结果</h3>
-              <pre>{formatToolPayload(toolDialog.tool.result)}</pre>
-            </section>
-            {toolDialogDomTree ? (
-              <section className="browser-chat-tool-detail-section">
-                <h3>模型看到的 DOM 树</h3>
-                <pre>{toolDialogDomTree}</pre>
-              </section>
-            ) : null}
-            {toolDialog.tool.visualAfter ? (
-              <section className="browser-chat-tool-detail-section">
-                <h3>视觉截图参数</h3>
-                <pre>{formatToolPayload(toolDialog.tool.visualAfter)}</pre>
-              </section>
-            ) : null}
-            {toolDialog.tool.screenshots?.length ? (
-              <section className="browser-chat-tool-detail-section">
-                <h3>截图记录</h3>
-                <div className="browser-chat-tool-shot-grid">
-                  {toolDialog.tool.screenshots.map((shot, index) => {
-                    const url = artifactUrl(shot.path);
-                    return (
-                      <a
-                        className="browser-chat-tool-shot-card"
-                        href={url || '#'}
-                        key={`${shot.path}-${index}-preview`}
-                        onClick={(event) => {
-                          if (!url) event.preventDefault();
-                        }}
-                        rel="noreferrer"
-                        target="_blank"
-                      >
-                        {url ? <img alt={shot.title || screenshotKindLabel(shot.kind)} src={url} /> : null}
-                        <span>
-                          <strong>{screenshotKindLabel(shot.kind)} · {shot.title || `截图 ${index + 1}`}</strong>
-                          <code>{shot.path}</code>
-                        </span>
-                      </a>
-                    );
-                  })}
-                </div>
-                <ol className="browser-chat-tool-shot-list">
-                  {toolDialog.tool.screenshots.map((shot, index) => (
-                    <li key={`${shot.path}-${index}`}>
-                      <strong>{shot.title || shot.kind || `截图 ${index + 1}`}</strong>
-                      <code>{shot.path}</code>
-                    </li>
-                  ))}
-                </ol>
-              </section>
-            ) : null}
-          </section>
-        </div>
+        <BrowserChatToolDialog
+          detail={toolDialog}
+          onClose={() => setToolDialog(null)}
+          toolLabel={(name) => browserChatToolLabel(name, t)}
+        />
       ) : null}
 
       {logDialogMessageId ? (
-        <div className="modal-overlay" onClick={() => setLogDialogMessageId(null)} role="presentation">
-          <section className="browser-chat-log-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="执行日志">
-            <header>
-              <div>
-                <h2>执行日志</h2>
-                <p>{logDialogMessage ? compactText(logDialogMessage.content, 80) : '当前 AI 消息'}</p>
-              </div>
-              <button className="icon-button" onClick={() => setLogDialogMessageId(null)} type="button" aria-label="关闭">
-                <X size={18} />
-              </button>
-            </header>
-            {logDialogEntries.length ? (
-              <ol className="browser-chat-log-modal-list">
-                {logDialogEntries.map((log) => (
-                  <li key={log.id}>
-                    <span>{phaseLabel(log.phase)}</span>
-                    <div>
-                      <strong>{log.message}</strong>
-                      <small>
-                        {formatLogTime(log.time)}
-                        {log.stepIndex ? ` · 步骤 ${log.stepIndex}` : ''}
-                        {typeof log.elapsedMs === 'number' ? ` · ${log.elapsedMs}ms` : ''}
-                      </small>
-                      <BrowserChatLogDetails log={log} />
-                    </div>
-                  </li>
-                ))}
-              </ol>
-            ) : (
-              <p className="browser-chat-log-empty">暂无日志</p>
-            )}
-          </section>
-        </div>
+        <BrowserChatLogDialog
+          entries={logDialogEntries}
+          messageContent={logDialogMessage ? compactText(logDialogMessage.content, 80) : undefined}
+          onClose={() => setLogDialogMessageId(null)}
+        />
       ) : null}
 
       {imagePreview ? (
         <div className="fullscreen-image-viewer" onClick={() => setImagePreview(null)} role="presentation">
           <div className="image-viewer-toolbar" onClick={(event) => event.stopPropagation()}>
             <strong>{imagePreview.name}</strong>
-            <button className="icon-button" onClick={() => setImagePreview(null)} type="button" aria-label="关闭">
+            <button className="ui-icon-button" onClick={() => setImagePreview(null)} type="button" aria-label="关闭">
               <X size={18} />
             </button>
           </div>
@@ -1810,28 +6602,33 @@ export function BrowserChatWorkspace({
       ) : null}
 
       {groupDialogOpen ? (
-        <div className="modal-overlay" onClick={() => setGroupDialogOpen(false)} role="presentation">
-          <section className="group-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="创建分组">
-            <header>
-              <div>
-                <h2>{targetGroupId ? '创建子组' : '创建组'}</h2>
-                <p>{targetGroupId ? `父级：${groupPath(groups, targetGroupId)}` : '创建根分组'}</p>
+        <div className="ui-modal-overlay" onClick={() => setGroupDialogOpen(false)} role="presentation">
+          <section className="ui-modal ui-modal--compact" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="创建分组">
+            <header className="ui-modal-header">
+              <div className="ui-modal-heading">
+                <h2 className="ui-modal-title">{targetGroupId ? '创建子组' : '创建组'}</h2>
+                <p className="ui-modal-subtitle">{targetGroupId ? `父级：${groupPath(groups, targetGroupId)}` : '创建根分组'}</p>
               </div>
-              <button className="icon-button" onClick={() => setGroupDialogOpen(false)} type="button" aria-label="关闭">
+              <button className="ui-icon-button ui-modal-close" onClick={() => setGroupDialogOpen(false)} type="button" aria-label="关闭">
                 <X size={18} />
               </button>
             </header>
-            <label className="modal-field">
-              分组名称
-              <input autoFocus className="input" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
-            </label>
-            <button className="button full-width" disabled={creatingGroup} onClick={() => createGroup(targetGroupId)} type="button">
-              {creatingGroup ? <Loader2 className="spin" size={16} /> : null}
-              {creatingGroup ? '创建中' : '创建'}
-            </button>
+            <div className="ui-modal-body">
+              <label className="modal-field">
+                分组名称
+                <input autoFocus className="input" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
+              </label>
+            </div>
+            <footer className="ui-modal-footer">
+              <button className="ui-button ui-button--primary" disabled={creatingGroup} onClick={() => createGroup(targetGroupId)} type="button">
+                {creatingGroup ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
+                {creatingGroup ? '创建中' : '创建'}
+              </button>
+            </footer>
           </section>
         </div>
       ) : null}
     </section>
+    </BrowserChatReasoningVisibilityContext.Provider>
   );
 }

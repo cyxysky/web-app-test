@@ -8,10 +8,15 @@ type RouteContext = {
   params: Promise<{ sessionId: string }>;
 };
 
-export async function POST(_request: Request, context: RouteContext) {
+function requestUserId(request: Request) {
+  const url = new URL(request.url);
+  return (url.searchParams.get('userId') || url.searchParams.get('qzUserId') || '').trim();
+}
+
+export async function POST(request: Request, context: RouteContext) {
   try {
     const { sessionId } = await context.params;
-    const deleted = await deleteBrowserChatSession(sessionId);
+    const deleted = await deleteBrowserChatSession(sessionId, requestUserId(request));
     if (!deleted) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
     return noStoreJson({ ok: true, deleted });
   } catch (error) {
