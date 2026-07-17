@@ -10,10 +10,12 @@ export function MarkdownReport({ markdown, onImageClick }: { markdown: string; o
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkSafeBreaks]}
         components={{
-          a: ({ node: _node, ...props }) => (
-            <a {...props} rel="noopener noreferrer" target="_blank" />
-          ),
+          a: ({ node, ...props }) => {
+            void node;
+            return <a {...props} rel="noopener noreferrer" target="_blank" />;
+          },
           img: ({ node: _node, alt = '', src, ...props }) => {
+            void _node;
             const imageUrl = typeof src === 'string' ? src : '';
             if (!imageUrl) return null;
             return (
@@ -26,11 +28,14 @@ export function MarkdownReport({ markdown, onImageClick }: { markdown: string; o
               />
             );
           },
-          table: ({ node: _node, ...props }) => (
-            <div className="markdown-table-wrap">
-              <table {...props} />
-            </div>
-          ),
+          table: ({ node, ...props }) => {
+            void node;
+            return (
+              <div className="markdown-table-wrap">
+                <table {...props} />
+              </div>
+            );
+          },
         }}
       >
         {markdown}

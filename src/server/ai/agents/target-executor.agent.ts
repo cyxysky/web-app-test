@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { generateText, hasToolCall, tool, type ModelMessage } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
@@ -75,7 +75,6 @@ type ToolTrace = {
   elapsedMs?: number;
   actionElapsedMs?: number;
   postprocessTimings?: Record<string, number>;
-  desktopEvidence?: DesktopActionEvidence;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
   visualAfter?: VisualAfterPolicy;
@@ -388,7 +387,6 @@ function compactToolResultForModel(
   name: string,
   result: BrowserActionResult,
   observationStore?: RuntimeObservationStore,
-  runId?: string,
 ): BrowserActionResult {
   const modelResult = result;
   if (!modelResult.actual) return modelResult;
@@ -577,7 +575,6 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       reason,
       ok: trace.result?.ok,
       result: userFacingToolResult(trace.name, trace.result, 360),
-      desktopEvidence: trace.desktopEvidence,
       contextBefore: trace.contextBefore,
       contextAfter: trace.contextAfter,
       visualAfter: trace.visualAfter,
@@ -677,9 +674,8 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
         ? fileResult ? `ok: ${sanitizeHistoricalToolText(fileResult, 260)}` : 'ok'
         : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
     const shots = trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
-    const desktop = trace.desktopEvidence ? `; desktop=${sanitizeHistoricalToolText(trace.desktopEvidence.summary, 180)}` : '';
     const why = reason ? `; reason=${sanitizeHistoricalToolText(reason, 140)}` : '';
-    return `${index + 1}. ${trace.name}: ${status}${why}${desktop}${shots}`;
+    return `${index + 1}. ${trace.name}: ${status}${why}${shots}`;
   }).join('\n');
 }
 
@@ -1056,17 +1052,6 @@ function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolT
   return next;
 }
 
-function formatWorkingMemory(memory: RuntimeWorkingMemory) {
-  const blockers = memory.blockers.slice(-2).map((item) => concise(item, 120));
-  const constraints = memory.userConstraints.slice(-2).map((item) => concise(item, 120));
-  return [
-    'Loop Memory (non-authoritative; durable facts are in RunState.ledgerDigest):',
-    `- Last action/result: ${concise([memory.lastAction, memory.lastResult].filter(Boolean).join(' -> '), 220) || 'none'}`,
-    blockers.length ? `- Recent blockers: ${blockers.join('; ')}` : '',
-    constraints.length ? `- User constraints: ${constraints.join('; ')}` : '',
-  ].join('\n');
-}
-
 class VisualContextManager {
   private frames: VisualFrameRecord[] = [];
   private currentId?: string;
@@ -1431,7 +1416,7 @@ function makeBrowserTools(
           invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
         }
       }
-      return compactToolResultForModel(name, result, referenceOptions?.observationStore, referenceOptions?.runId);
+      return compactToolResultForModel(name, result, referenceOptions?.observationStore);
     });
   }
 
@@ -1761,7 +1746,6 @@ function runtimePrompt(input: {
 }) {
   const { testCase, pageContext, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
-  const mode = browserModeOf(testCase);
   const visualMode = false;
   const attachScreenshot = false;
   void input.markerOverlayInScreenshot;

@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { generateText, hasToolCall, tool, type ModelMessage } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiRequestSnapshot, AiToolContextSnapshot, DesktopActionEvidence, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type BrowserSnapshotViews, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
@@ -55,7 +55,6 @@ type ToolTrace = {
   elapsedMs?: number;
   actionElapsedMs?: number;
   postprocessTimings?: Record<string, number>;
-  desktopEvidence?: DesktopActionEvidence;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
   visualAfter?: VisualAfterPolicy;
@@ -200,16 +199,6 @@ function runtimePageContextOptions(mode: BrowserSessionMode) {
     useCachedInteractiveCandidates: false,
   };
 }
-
-type RuntimePageContext = Awaited<ReturnType<BrowserSession['getPageContext']>>;
-
-function domPageTextPromptLimit() {
-  const raw = String(process.env.DOM_PAGE_TEXT_PROMPT_MAX_CHARS || process.env.PAGE_TEXT_PROMPT_MAX_CHARS || '').trim();
-  if (!raw || /^(0|false|none|off|unlimited)$/i.test(raw)) return 0;
-  const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
-}
-
 
 function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
   if (!aiRequest?.id) return undefined;
@@ -463,7 +452,6 @@ function compactToolResultForModel(
   name: string,
   result: BrowserActionResult,
   observationStore?: RuntimeObservationStore,
-  runId?: string,
 ): BrowserActionResult {
   const modelResult = result;
   if (!modelResult.actual) return modelResult;
@@ -758,7 +746,6 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       transient: trace.transient,
       result: userFacingToolResult(trace.name, trace.result, 360),
       rawResult: trace.result,
-      desktopEvidence: trace.desktopEvidence,
       contextBefore: trace.contextBefore,
       contextAfter: trace.contextAfter,
       visualAfter: trace.visualAfter,
@@ -853,9 +840,8 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
         ? fileResult ? `ok: ${sanitizeHistoricalToolText(fileResult, 260)}` : 'ok'
         : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
     const shots = trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
-    const desktop = trace.desktopEvidence ? `; desktop=${sanitizeHistoricalToolText(trace.desktopEvidence.summary, 180)}` : '';
     const why = reason ? `; reason=${sanitizeHistoricalToolText(reason, 140)}` : '';
-    return `${index + 1}. ${trace.name}: ${status}${why}${desktop}${shots}`;
+    return `${index + 1}. ${trace.name}: ${status}${why}${shots}`;
   }).join('\n');
 }
 
@@ -1361,17 +1347,6 @@ function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolT
   return next;
 }
 
-function formatWorkingMemory(memory: RuntimeWorkingMemory) {
-  const blockers = memory.blockers.slice(-2).map((item) => concise(item, 120));
-  const constraints = memory.userConstraints.slice(-2).map((item) => concise(item, 120));
-  return [
-    'Loop Memory (non-authoritative; durable facts are in RunState.ledgerDigest):',
-    `- Last action/result: ${concise([memory.lastAction, memory.lastResult].filter(Boolean).join(' -> '), 220) || 'none'}`,
-    blockers.length ? `- Recent blockers: ${blockers.join('; ')}` : '',
-    constraints.length ? `- User constraints: ${constraints.join('; ')}` : '',
-  ].join('\n');
-}
-
 class VisualContextManager {
   private frames: VisualFrameRecord[] = [];
   private currentId?: string;
@@ -1786,7 +1761,6 @@ function makeBrowserTools(
       return action(actionSignal);
     };
     const traceVisualContext = referenceOptions?.visualContext;
-    const traceIndex = traces.length;
     return executeTracedBrowserAction({
       session,
       traces,
@@ -1803,7 +1777,6 @@ function makeBrowserTools(
       onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
       action: actionWithConfirmation,
     }).then(async (result) => {
-      const actionTrace = traces[traceIndex];
       if (browserActionExecuted && runtimeObservationInvalidatingToolNames.has(name)) {
         // The action result already carries a bounded DOM delta. Never capture or
         // inject a full replacement snapshot here; the model decides when it needs
@@ -1812,7 +1785,7 @@ function makeBrowserTools(
           invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
         }
       }
-      return compactToolResultForModel(name, result, referenceOptions?.observationStore, referenceOptions?.runId);
+      return compactToolResultForModel(name, result, referenceOptions?.observationStore);
     });
   }
 
@@ -2060,7 +2033,6 @@ function runtimePrompt(input: {
 }) {
   const { testCase, pageContext, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
-  const mode = browserModeOf(testCase);
   const visualMode = false;
   const attachScreenshot = false;
   const visualMarkersWithoutOverlay = false;

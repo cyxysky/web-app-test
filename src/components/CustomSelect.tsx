@@ -202,10 +202,13 @@ export function CustomSelect({
               <Search aria-hidden="true" size={15} />
               <input
                 aria-label={t('搜索选项')}
+                autoComplete="off"
                 onChange={(event) => setSearchQuery(event.currentTarget.value)}
                 onKeyDown={handleSearchKeyDown}
                 placeholder={searchPlaceholder || t('搜索选项')}
                 ref={searchRef}
+                spellCheck={false}
+                type="search"
                 value={searchQuery}
               />
             </div>
@@ -219,7 +222,7 @@ export function CustomSelect({
                   {showGroup ? <div className="custom-select-group">{option.group}</div> : null}
                   <button
                     aria-selected={option.value === value}
-                    className={`${index === activeIndex ? 'active' : ''}${option.group ? ' grouped' : ''}`.trim() || undefined}
+                    className={`custom-select-option${index === activeIndex ? ' active' : ''}`}
                     disabled={option.disabled}
                     onClick={() => selectOption(option)}
                     onMouseEnter={() => setActiveIndex(index)}

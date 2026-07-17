@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, FileJson2, FolderOpen, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
@@ -274,11 +274,6 @@ export function EnvironmentSettings({
   }, []);
 
   useEffect(() => {
-    if (activeTab !== 'memory') return;
-    void loadPersonalMemoryItems().catch(() => undefined);
-  }, [activeTab]);
-
-  useEffect(() => {
     if (activeTab !== 'dom-test') return undefined;
     let active = true;
     const refresh = async () => {
@@ -509,7 +504,7 @@ export function EnvironmentSettings({
     setPersonalMemoryItems((current) => sortPersonalMemoryItems([item, ...current.filter((entry) => entry.id !== item.id)]));
   }
 
-  async function loadPersonalMemoryItems() {
+  const loadPersonalMemoryItems = useCallback(async () => {
     setLoadingPersonalMemory(true);
     try {
       const response = await fetch('/api/personal-memory?includeDisabled=true', { cache: 'no-store' });
@@ -518,7 +513,12 @@ export function EnvironmentSettings({
     } finally {
       setLoadingPersonalMemory(false);
     }
-  }
+  }, [t]);
+
+  useEffect(() => {
+    if (activeTab !== 'memory') return;
+    void loadPersonalMemoryItems().catch(() => undefined);
+  }, [activeTab, loadPersonalMemoryItems]);
 
   function personalMemoryPayload() {
     return {
@@ -1060,6 +1060,8 @@ export function EnvironmentSettings({
                       label: model,
                       value: model,
                     }))}
+                    searchable
+                    searchPlaceholder={t('搜索模型')}
                   />
                 </div>
                 <div className="settings-row settings-model-list-row">

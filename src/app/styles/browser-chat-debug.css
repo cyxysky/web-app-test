@@ -3,14 +3,12 @@
   gap: 14px;
 }
 
-.browser-chat-tool-detail-grid div,
 .browser-chat-tool-detail-section {
   background: #ffffff;
   padding: 10px;
   width: 100%;
 }
 
-.browser-chat-tool-detail-grid span,
 .browser-chat-tool-detail-section h3 {
   color: var(--muted);
   display: block;
@@ -19,7 +17,6 @@
   margin: 0 0 6px;
 }
 
-.browser-chat-tool-detail-grid strong,
 .browser-chat-tool-detail-section p {
   color: var(--foreground);
   font-size: 13px;
@@ -93,11 +90,6 @@
 
 .browser-chat-tool-detail-payload pre {
   margin-top: 8px;
-}
-
-.browser-chat-tool-detail-section.is-full-dom pre {
-  max-height: min(900px, 70vh);
-  white-space: pre;
 }
 
 .browser-chat-tool-shot-grid {
@@ -335,20 +327,8 @@
   color: var(--foreground);
 }
 
-.browser-chat-log-detail-block pre,
-.browser-chat-log-raw pre {
+.browser-chat-log-detail-block pre {
   max-height: 360px;
-}
-
-.browser-chat-log-raw {
-  margin-top: 2px;
-}
-
-.browser-chat-log-raw summary {
-  color: var(--muted-strong);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 850;
 }
 
 :root[data-theme="dark"] .browser-chat-log-modal-list {
@@ -372,8 +352,7 @@
 }
 
 :root[data-theme="dark"] .browser-chat-log-modal-list small,
-:root[data-theme="dark"] .browser-chat-log-empty,
-:root[data-theme="dark"] .browser-chat-log-raw summary {
+:root[data-theme="dark"] .browser-chat-log-empty {
   color: var(--muted);
 }
 
@@ -403,7 +382,6 @@
   border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
 }
 
-:root[data-theme="dark"] .browser-chat-tool-detail-grid div,
 :root[data-theme="dark"] .browser-chat-tool-detail-summary div,
 :root[data-theme="dark"] .browser-chat-tool-detail-section {
   background: color-mix(in srgb, var(--panel-soft) 88%, #000000);
@@ -411,13 +389,11 @@
   color: var(--foreground);
 }
 
-:root[data-theme="dark"] .browser-chat-tool-detail-grid span,
 :root[data-theme="dark"] .browser-chat-tool-detail-summary span,
 :root[data-theme="dark"] .browser-chat-tool-detail-section h3 {
   color: var(--muted);
 }
 
-:root[data-theme="dark"] .browser-chat-tool-detail-grid strong,
 :root[data-theme="dark"] .browser-chat-tool-detail-summary strong,
 :root[data-theme="dark"] .browser-chat-tool-detail-section p {
   color: var(--foreground);

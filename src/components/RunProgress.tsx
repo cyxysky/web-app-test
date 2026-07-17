@@ -1444,7 +1444,6 @@ export function RunProgress({
         contextBefore: tool.contextBefore,
         contextAfter: tool.contextAfter,
         visualAfter: tool.visualAfter,
-        desktopEvidence: tool.desktopEvidence,
         screenshots: tool.screenshots,
       };
     });

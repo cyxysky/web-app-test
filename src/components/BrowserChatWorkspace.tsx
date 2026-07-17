@@ -1985,7 +1985,7 @@ function inlineReferenceIconSvg(kind: BrowserChatAttachmentKind) {
   if (kind === 'tab') {
     return inlineTokenSvg('<rect width="18" height="14" x="3" y="5" rx="2"/><path d="M3 9h18"/><path d="M8 5v4"/>');
   }
-  return inlineTokenSvg('<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><path d="M14 2v6h6"/><path d="m9 15 2 2 4-4"/>');
+  return inlineTokenSvg('<rect x="3.5" y="4" width="17" height="16" rx="3"/><circle cx="9" cy="9.5" r="1.25"/><path d="m5.5 17 4.2-4.2 3.1 3 2.2-2.2 3.5 3.4"/>');
 }
 
 function browserChatReferenceKey(attachment: BrowserChatAttachment) {
@@ -3813,10 +3813,10 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                 className={safetyMode === 'strict' ? 'active' : undefined}
                 disabled={currentBusy || loading}
                 onClick={() => onSafetyModeChange('strict')}
-                title={t('严格模式下，一些模型认为重要的操作需要用户手动确认执行')}
+                title={t('严谨模式下，一些模型认为重要的操作需要用户手动确认执行')}
                 type="button"
               >
-                {t('严格')}
+                {t('严谨')}
               </button>
               <button
                 aria-pressed={safetyMode === 'full'}
@@ -3837,6 +3837,8 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                 disabled={currentBusy || loading}
                 onChange={(value) => onModelSelectionChange(parseModelSelectionValue(value))}
                 options={modelSelectionOptions}
+                searchable
+                searchPlaceholder={t('搜索模型')}
                 title={modelSelectionTitle}
                 value={modelSelection}
               />
@@ -6412,6 +6414,8 @@ export function BrowserChatWorkspace({
                   className="browser-chat-target-model-select"
                   onChange={(value) => changeModelSelection(parseModelSelectionValue(value))}
                   options={modelSelectionOptions}
+                  searchable
+                  searchPlaceholder={t('搜索模型')}
                   title={modelSelectionDiagnostic}
                   value={modelSelection}
                 />

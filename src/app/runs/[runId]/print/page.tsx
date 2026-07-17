@@ -28,18 +28,25 @@ function localArtifactUrl(value: string | undefined) {
 }
 
 const markdownComponents: Components = {
-  a: ({ node: _node, ...props }) => <a {...props} rel="noopener noreferrer" />,
+  a: ({ node, ...props }) => {
+    void node;
+    return <a {...props} rel="noopener noreferrer" />;
+  },
   img: ({ node: _node, alt = '', src }) => {
+    void _node;
     const safeUrl = localArtifactUrl(typeof src === 'string' ? src : undefined);
     return safeUrl
       ? <img alt={alt} src={safeUrl} />
       : <span className={styles.imageOmitted}>{alt ? `图片已省略：${alt}` : '外部图片已省略'}</span>;
   },
-  table: ({ node: _node, ...props }) => (
-    <div className={styles.tableWrap}>
-      <table {...props} />
-    </div>
-  ),
+  table: ({ node, ...props }) => {
+    void node;
+    return (
+      <div className={styles.tableWrap}>
+        <table {...props} />
+      </div>
+    );
+  },
 };
 
 export default async function RunReportPrintPage({ params }: PageProps) {

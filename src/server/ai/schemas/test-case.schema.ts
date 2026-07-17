@@ -218,40 +218,6 @@ export type AiRequestSnapshot = {
   }>;
 };
 
-export type DesktopEvidenceProcess = {
-  pid: number;
-  parentPid?: number;
-  name: string;
-  executablePath?: string;
-  startedAt?: string;
-  mainWindowTitle?: string;
-  hasMainWindow: boolean;
-};
-
-export type DesktopEvidenceWindow = {
-  pid?: number;
-  processName?: string;
-  title?: string;
-};
-
-export type DesktopActionEvidence = {
-  observed: boolean;
-  changed: boolean;
-  summary: string;
-  capturedAt?: {
-    before: string;
-    after: string;
-  };
-  addedProcesses?: DesktopEvidenceProcess[];
-  removedProcesses?: DesktopEvidenceProcess[];
-  changedWindows?: DesktopEvidenceProcess[];
-  foregroundChanged?: {
-    before?: DesktopEvidenceWindow;
-    after?: DesktopEvidenceWindow;
-  };
-  errors?: string[];
-};
-
 export type StepToolCall = {
   name: string;
   input?: unknown;
@@ -269,7 +235,6 @@ export type StepToolCall = {
     retention?: 'auto' | 'replace' | 'append';
     reason?: string;
   };
-  desktopEvidence?: DesktopActionEvidence;
   screenshots?: Array<{
     title: string;
     path: string;

@@ -144,6 +144,8 @@ export function TestCaseDetailWorkspace({
             className="case-model-select"
             onChange={changeModelSelection}
             options={modelSelectionOptions}
+            searchable
+            searchPlaceholder={t('搜索模型')}
             title={modelSelectionDiagnostic}
             value={modelSelection}
           />

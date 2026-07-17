@@ -55,7 +55,6 @@ function cleanTool(input: unknown, index: number, sourceTools: StepToolCall[]): 
     contextBefore: sourceTool.contextBefore,
     contextAfter: sourceTool.contextAfter,
     visualAfter: sourceTool.visualAfter,
-    desktopEvidence: sourceTool.desktopEvidence,
     screenshots: sourceTool.screenshots,
   };
 }

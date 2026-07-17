@@ -21,6 +21,8 @@ const CLICK_PARTICLE_COLORS = [
   [208, 107, 255],
   [255, 255, 255],
 ] as const;
+const CLICK_PARTICLE_LIMIT = 31;
+const CLICK_BURST_MIN_INTERVAL_MS = 200;
 
 function randomBetween(min: number, max: number) {
   return min + Math.random() * (max - min);
@@ -39,6 +41,7 @@ export function ClickParticleEffect() {
     const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
     let particles: ClickParticle[] = [];
     let animationFrame = 0;
+    let lastBurstAt = 0;
     let lastFrameAt = performance.now();
     let width = window.innerWidth;
     let height = window.innerHeight;
@@ -60,7 +63,10 @@ export function ClickParticleEffect() {
     };
 
     const createBurst = (x: number, y: number) => {
-      const amount = reducedMotionQuery.matches ? 16 : 42;
+      const now = performance.now();
+      if (now - lastBurstAt < CLICK_BURST_MIN_INTERVAL_MS) return;
+      lastBurstAt = now;
+      const amount = reducedMotionQuery.matches ? 4 : 10;
       const nextParticles = Array.from({ length: amount }, (_, index): ClickParticle => {
         const angle = Math.random() * Math.PI * 2;
         const speed = randomBetween(0.8, 4.2);
@@ -77,8 +83,8 @@ export function ClickParticleEffect() {
           y,
         };
       });
-      particles = [...particles.slice(-126), ...nextParticles];
-      lastFrameAt = performance.now();
+      particles = [...particles, ...nextParticles].slice(-CLICK_PARTICLE_LIMIT);
+      lastFrameAt = now;
       scheduleFrame();
     };
 
