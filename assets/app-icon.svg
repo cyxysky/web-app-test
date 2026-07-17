@@ -1,22 +1,22 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
   <title id="title">WebPilot</title>
-  <desc id="desc">A refined navigation-inspired W mark.</desc>
+  <desc id="desc">A minimal two-part navigation needle.</desc>
   <defs>
-    <linearGradient id="surface" x1="160" y1="96" x2="864" y2="928" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#142D3D"/>
-      <stop offset="1" stop-color="#081521"/>
+    <linearGradient id="surface" x1="174" y1="108" x2="850" y2="930" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#071A3B"/>
+      <stop offset="1" stop-color="#020D24"/>
     </linearGradient>
-    <linearGradient id="route" x1="205" y1="286" x2="819" y2="742" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#7AECDD"/>
-      <stop offset="1" stop-color="#32C9B2"/>
+    <linearGradient id="forward" x1="512" y1="512" x2="770" y2="270" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#18BCEB"/>
+      <stop offset="1" stop-color="#55D9F7"/>
     </linearGradient>
-    <filter id="route-shadow" x="100" y="180" width="824" height="680" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#020B12" flood-opacity=".34"/>
-    </filter>
+    <linearGradient id="back" x1="512" y1="512" x2="270" y2="770" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B8D9F8"/>
+      <stop offset="1" stop-color="#E4F1FF"/>
+    </linearGradient>
   </defs>
-  <rect width="1024" height="1024" rx="228" fill="url(#surface)"/>
-  <rect x="18" y="18" width="988" height="988" rx="210" fill="none" stroke="#FFFFFF" stroke-opacity=".055" stroke-width="4"/>
-  <path d="M205 292 345 727 512 430 679 727 819 292" fill="none" stroke="#020B12" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round" stroke-width="86" transform="translate(0 14)"/>
-  <path d="M205 292 345 727 512 430 679 727 819 292" fill="none" stroke="url(#route)" stroke-linecap="round" stroke-linejoin="round" stroke-width="80" filter="url(#route-shadow)"/>
-  <circle cx="512" cy="430" r="21" fill="#D8FFF8"/>
+  <rect x="60" y="60" width="904" height="904" rx="196" fill="url(#surface)"/>
+  <path d="M494 442Q485 451 495 462L542 509Q552 519 560 507L770 270Z" fill="url(#forward)"/>
+  <path d="M530 582Q539 573 529 562L482 515Q472 505 464 517L270 770Z" fill="url(#back)"/>
+  <circle cx="512" cy="512" r="42" fill="#03122E"/>
 </svg>
