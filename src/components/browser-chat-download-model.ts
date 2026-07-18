@@ -1,4 +1,4 @@
-export type SystemDownloadStatus = 'selecting' | 'pending' | 'downloading' | 'completed' | 'cancelled' | 'failed' | string;
+export type SystemDownloadStatus = 'selecting' | 'pending' | 'downloading' | 'paused' | 'interrupted' | 'completed' | 'cancelled' | 'failed' | string;
 
 export type SystemDownloadItem = {
   completedAt?: number;
@@ -28,6 +28,8 @@ export function browserChatDownloadStatusLabel(status?: SystemDownloadStatus) {
   if (status === 'selecting') return '选择保存目录';
   if (status === 'pending') return '准备下载';
   if (status === 'downloading') return '下载中';
+  if (status === 'paused') return '已暂停';
+  if (status === 'interrupted') return '等待恢复';
   if (status === 'completed') return '已完成';
   if (status === 'cancelled') return '已取消';
   if (status === 'failed') return '下载失败';

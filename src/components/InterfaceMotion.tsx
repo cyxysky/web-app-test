@@ -87,6 +87,9 @@ export function InterfaceMotion() {
 
       const run = (elements: HTMLElement[], type: 'list' | 'nav' | 'page' | 'panel') => {
         const fresh = elements.filter((element) => {
+          // The workspace sidebar persists while its URL-controlled content view changes.
+          // Replaying entrance motion here makes the stable navigation look like it reloaded.
+          if (element.closest('.browser-chat-sidebar')) return false;
           if (animated.has(element)) return false;
           animated.add(element);
           return element.getClientRects().length > 0;

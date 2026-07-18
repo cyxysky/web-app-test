@@ -86,10 +86,15 @@ type AccessibilitySnapshotBrowserStatus = {
 };
 
 type SystemBridge = {
+  cancelDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
+  chooseDownloadDirectory?: (input?: { defaultPath?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
   downloadUrl?: (input: { defaultPath?: string; fileName?: string; url: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
-  getDownloads?: () => Promise<{ ok: boolean; downloads?: Array<{ completedAt?: number; error?: string; fileName?: string; id: string; path?: string; progress?: number; receivedBytes?: number; startedAt?: number; status?: string; totalBytes?: number; updatedAt?: number; url?: string }>; error?: string }>;
+  getDownloads?: () => Promise<{ ok: boolean; directory?: string; downloads?: Array<{ completedAt?: number; error?: string; fileName?: string; id: string; path?: string; progress?: number; receivedBytes?: number; startedAt?: number; status?: string; totalBytes?: number; updatedAt?: number; url?: string }>; error?: string }>;
   onDownloadProgress?: (listener: (payload: { completedAt?: number; error?: string; fileName?: string; id: string; path?: string; progress?: number; receivedBytes?: number; startedAt?: number; status?: string; totalBytes?: number; updatedAt?: number; url?: string }) => void) => () => void;
+  openDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
+  removeDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
   selectDirectory: (input?: { defaultPath?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
+  showDownloadInFolder?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
 };
 
 declare global {

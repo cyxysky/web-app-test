@@ -8,6 +8,7 @@ import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, buildCompletionPromptLines, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type BrowserSnapshotViews, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
+import { browserChatReplyClaimsBrowserAction, browserChatToolRequirement, type BrowserChatToolRequirement } from './browser-chat-intent';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 import {
   browserKeyboardToolDescription,
@@ -3377,6 +3378,7 @@ function browserChatRequirement(input: {
   targetUrl: string;
   instruction: string;
 }) {
+  const toolRequirement = browserChatToolRequirement(input.instruction);
   return [
     'Browser chat mode: live conversation, not a fixed test case.',
     `Latest user message: ${input.instruction}`,
@@ -3384,10 +3386,41 @@ function browserChatRequirement(input: {
     '',
     'Browser-chat behavior:',
     '- Follow the latest user message first; use earlier model messages only as conversation context.',
+    toolRequirement === 'action'
+      ? '- HARD REQUIREMENT: This latest message requests a browser-changing action. Execute a relevant browser-changing tool before claiming completion; snapshots, prior turns, and text-only claims do not satisfy it.'
+      : toolRequirement === 'inspection'
+        ? '- HARD REQUIREMENT: This latest message requests live page inspection. Execute a relevant browser observation tool before answering from page state.'
+        : '',
+    '- Every new user action message is a new occurrence. Even when it repeats the previous wording, a previous tool call never satisfies the new message.',
     '- Use browser tools only for live action or page inspection. If current evidence is enough, answer directly.',
     '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
     '- Final visible answer must be Chinese Markdown. Do not include JSON, tool parameters, candidate ids, coordinates, or screenshot paths.',
   ].filter(Boolean).join('\n');
+}
+
+const browserChatNonActionToolNames = new Set([
+  'getHttpRequests',
+  'listTabs',
+  'reportState',
+  'searchSnapshot',
+  'selectReferenceScreenshots',
+  'takeScreenshot',
+  'takeSnapshot',
+  'waitForHumanVerification',
+  'waitForPage',
+]);
+
+const browserChatNonEvidenceToolNames = new Set([
+  'reportState',
+  'selectReferenceScreenshots',
+  'waitForHumanVerification',
+  'waitForPage',
+]);
+
+function browserChatTurnHasToolEvidence(steps: StepExecutionResult[], requirement: BrowserChatToolRequirement) {
+  const toolNames = steps.flatMap((step) => (step.tools || []).filter((toolCall) => toolCall.ok !== false).map((toolCall) => toolCall.name));
+  if (requirement === 'action') return toolNames.some((name) => !browserChatNonActionToolNames.has(name));
+  return toolNames.some((name) => !browserChatNonEvidenceToolNames.has(name));
 }
 
 function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
@@ -3497,6 +3530,8 @@ export async function executeInteractiveBrowserTurn(input: {
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
+  const requiredTool = browserChatToolRequirement(input.instruction);
+  let rejectedDirectAnswerCount = 0;
   const maxConsecutiveAiRequestFailures = browserChatMaxConsecutiveAiRequestFailures();
   let consecutiveAiRequestFailures = 0;
 
@@ -3560,7 +3595,9 @@ export async function executeInteractiveBrowserTurn(input: {
         runId: input.runId,
         stepIndex,
         beforeScreenshotPath: beforeScreenshotPath || '',
-        instruction: input.modelInstruction || input.instruction,
+        instruction: rejectedDirectAnswerCount
+          ? `${input.modelInstruction || input.instruction}\n\n[Backend correction] Your previous text-only completion claim was rejected because this user message requires a real browser tool. Execute the requested action or inspection now. Do not claim success without a successful tool result from this turn.`
+          : input.modelInstruction || input.instruction,
         conversation: input.conversation || [],
         completedSteps: steps.filter((step) => step.index !== stepIndex),
         runtimeObservationStore,
@@ -3681,6 +3718,31 @@ export async function executeInteractiveBrowserTurn(input: {
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
       if (runningIndex >= 0) steps.splice(runningIndex, 1);
+      const hasRequiredToolEvidence = requiredTool ? browserChatTurnHasToolEvidence(newSteps, requiredTool) : false;
+      const unsupportedActionClaim = browserChatReplyClaimsBrowserAction(browserChatReply)
+        && !browserChatTurnHasToolEvidence(newSteps, 'action');
+      const rejectDirectAnswer = Boolean(browserChatReply && (
+        (requiredTool && !hasRequiredToolEvidence)
+        || unsupportedActionClaim
+      ));
+      if (rejectDirectAnswer) {
+        rejectedDirectAnswerCount += 1;
+        await input.onDebug?.({
+          phase: 'chat:direct-answer-rejected',
+          stepIndex,
+          message: `Rejected text-only browser completion claim ${rejectedDirectAnswerCount}; required tool evidence was missing.`,
+          details: {
+            requiredTool,
+            unsupportedActionClaim,
+            reply: browserChatReply,
+          },
+        });
+        if (rejectedDirectAnswerCount <= 2) continue;
+        reply = '本轮没有执行所请求的浏览器操作：模型连续返回了缺少工具证据的完成声明，系统已拒绝将其记为成功。请重试本条指令。';
+        finalStatus = 'failed';
+        endedWithFinalAnswer = true;
+        break;
+      }
       await input.onDebug?.({
         phase: browserChatReply ? 'chat:direct-answer' : 'chat:no-tool-response',
         stepIndex,
@@ -3722,6 +3784,35 @@ export async function executeInteractiveBrowserTurn(input: {
     ensureActive();
     await input.onProgress?.(completedStep);
     ensureActive();
+    const completedTurnHasRequiredTool = requiredTool ? browserChatTurnHasToolEvidence(newSteps, requiredTool) : false;
+    const completedTurnUnsupportedActionClaim = browserChatReplyClaimsBrowserAction(browserChatReply)
+      && !browserChatTurnHasToolEvidence(newSteps, 'action');
+    const rejectCompletedTurnReply = Boolean(browserChatReply && (
+      (requiredTool && !completedTurnHasRequiredTool)
+      || completedTurnUnsupportedActionClaim
+    ));
+    if (rejectCompletedTurnReply) {
+      rejectedDirectAnswerCount += 1;
+      await input.onDebug?.({
+        phase: 'chat:direct-answer-rejected',
+        stepIndex,
+        message: `Rejected browser completion claim ${rejectedDirectAnswerCount}; the executed tools did not satisfy the required ${requiredTool || 'action'} evidence.`,
+        details: {
+          requiredTool,
+          unsupportedActionClaim: completedTurnUnsupportedActionClaim,
+          reply: browserChatReply,
+          tools: completedStep.tools,
+        },
+      });
+      if (rejectedDirectAnswerCount <= 2) {
+        reply = '';
+        continue;
+      }
+      reply = '本轮没有执行所请求的浏览器操作：模型连续返回了与工具证据不一致的完成声明，系统已拒绝将其记为成功。请重试本条指令。';
+      finalStatus = 'failed';
+      endedWithFinalAnswer = true;
+      break;
+    }
     if (browserChatReply) reply = browserChatReply;
 
     const lastToolName = actionResult.traces.at(-1)?.name;

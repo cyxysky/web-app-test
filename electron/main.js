@@ -1,6 +1,5 @@
 const { app, BrowserWindow, Menu, WebContentsView, dialog, ipcMain, nativeTheme, shell } = require('electron');
 const { spawn } = require('node:child_process');
-const { once } = require('node:events');
 const fs = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
@@ -24,8 +23,6 @@ let embeddedBrowserLibraryView;
 let embeddedBrowserLibraryPanel = '';
 let embeddedBrowserLibraryAttached = false;
 let embeddedBrowserLibraryVisible = false;
-let embeddedBrowserLibraryOpenSequence = 0;
-let embeddedBrowserLibraryPendingSequence = 0;
 let embeddedBrowserActiveGroupId = '';
 let embeddedBrowserActiveTabId = '';
 let embeddedBrowserNextTabId = 1;
@@ -48,6 +45,7 @@ let embeddedBrowserStateChangeTimer;
 const EMBEDDED_BROWSER_ROUTE_LOADING_MS = 1200;
 const EMBEDDED_BROWSER_PERSISTENCE_VERSION = 2;
 const EMBEDDED_BROWSER_STATE_KEY = 'embedded-browser';
+const DOWNLOAD_SETTINGS_STATE_KEY = 'download-settings';
 const RUNTIME_DATABASE_FILE = 'webpilot.db';
 const EMBEDDED_BROWSER_HISTORY_LIMIT = 300;
 let startupLogPath;
@@ -56,6 +54,8 @@ let recentServerOutput = [];
 let lastDownloadDirectory = '';
 let nextDownloadId = 1;
 const systemDownloads = new Map();
+const nativeDownloadItems = new Map();
+const nativeDownloadSessions = new WeakSet();
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -294,7 +294,6 @@ function ensureEmbeddedBrowserLibraryView() {
     if (embeddedBrowserLibraryView === view) {
       embeddedBrowserLibraryPanel = '';
       embeddedBrowserLibraryVisible = false;
-      embeddedBrowserLibraryPendingSequence = 0;
       view.setVisible(false);
       notifyEmbeddedBrowserStateChange();
     }
@@ -305,7 +304,6 @@ function ensureEmbeddedBrowserLibraryView() {
       embeddedBrowserLibraryPanel = '';
       embeddedBrowserLibraryAttached = false;
       embeddedBrowserLibraryVisible = false;
-      embeddedBrowserLibraryPendingSequence = 0;
       notifyEmbeddedBrowserStateChange();
     }
   });
@@ -317,7 +315,6 @@ function ensureEmbeddedBrowserLibraryView() {
     if (embeddedBrowserLibraryView === view) {
       embeddedBrowserLibraryPanel = '';
       embeddedBrowserLibraryVisible = false;
-      embeddedBrowserLibraryPendingSequence = 0;
       view.setVisible(false);
       notifyEmbeddedBrowserStateChange();
     }
@@ -332,13 +329,12 @@ function attachEmbeddedBrowserLibraryView() {
     return;
   }
   const view = ensureEmbeddedBrowserLibraryView();
-  if (!embeddedBrowserLibraryAttached) {
-    mainWindow.contentView.addChildView(view);
-    embeddedBrowserLibraryAttached = true;
-  }
+  // Re-adding an existing child moves it to the top of the native View stack.
+  // Active browser tabs are also WebContentsViews and may otherwise cover this panel.
+  mainWindow.contentView.addChildView(view);
+  embeddedBrowserLibraryAttached = true;
   view.setBounds(embeddedBrowserLibraryViewBounds());
-  const canShow = embeddedBrowserLibraryPendingSequence === 0;
-  if (canShow && !embeddedBrowserLibraryVisible) {
+  if (!embeddedBrowserLibraryVisible) {
     view.setVisible(true);
     embeddedBrowserLibraryVisible = true;
     view.webContents.focus();
@@ -346,23 +342,19 @@ function attachEmbeddedBrowserLibraryView() {
 }
 
 function setEmbeddedBrowserLibraryPanel(value) {
-  const nextPanel = value === 'bookmarks' || value === 'history' ? value : '';
-  embeddedBrowserLibraryPanel = nextPanel;
-  if (nextPanel) {
-    embeddedBrowserLibraryOpenSequence += 1;
-    embeddedBrowserLibraryPendingSequence = embeddedBrowserLibraryOpenSequence;
-    if (embeddedBrowserLibraryVisible) {
-      embeddedBrowserLibraryView?.setVisible(false);
-      embeddedBrowserLibraryVisible = false;
-    }
-    attachEmbeddedBrowserLibraryView();
-    notifyEmbeddedBrowserLibraryStateChange();
-  }
-  else {
-    embeddedBrowserLibraryPendingSequence = 0;
+  const nextPanel = value === 'library' ? value : '';
+  if (!nextPanel) {
+    embeddedBrowserLibraryPanel = '';
     if (embeddedBrowserLibraryVisible) embeddedBrowserLibraryView?.setVisible(false);
     embeddedBrowserLibraryVisible = false;
+    notifyEmbeddedBrowserStateChange();
+    return embeddedBrowserState();
   }
+
+  // Reuse the preloaded combined view so opening is immediate.
+  embeddedBrowserLibraryPanel = nextPanel;
+  attachEmbeddedBrowserLibraryView();
+  notifyEmbeddedBrowserLibraryStateChange();
   notifyEmbeddedBrowserStateChange();
   return embeddedBrowserState();
 }
@@ -370,7 +362,6 @@ function setEmbeddedBrowserLibraryPanel(value) {
 function destroyEmbeddedBrowserLibraryView() {
   const view = embeddedBrowserLibraryView;
   embeddedBrowserLibraryPanel = '';
-  embeddedBrowserLibraryPendingSequence = 0;
   embeddedBrowserLibraryView = undefined;
   embeddedBrowserLibraryVisible = false;
   const wasAttached = embeddedBrowserLibraryAttached;
@@ -525,21 +516,6 @@ function uniqueDownloadPath(directory, fileName) {
   return candidate;
 }
 
-function parseDownloadFileNameFromContentDisposition(value) {
-  const header = String(value || '');
-  const encoded = header.match(/filename\*\s*=\s*(?:UTF-8''|)([^;]+)/i)?.[1];
-  if (encoded) {
-    try {
-      return decodeURIComponent(encoded.trim().replace(/^"|"$/g, ''));
-    } catch {
-      return encoded.trim().replace(/^"|"$/g, '');
-    }
-  }
-  return header.match(/filename\s*=\s*"([^"]+)"/i)?.[1]
-    || header.match(/filename\s*=\s*([^;]+)/i)?.[1]?.trim()
-    || '';
-}
-
 function downloadProgressPayload(download) {
   const totalBytes = Number(download.totalBytes || 0);
   const receivedBytes = Number(download.receivedBytes || 0);
@@ -561,7 +537,7 @@ function downloadProgressPayload(download) {
 
 function emitDownloadProgress(download) {
   const payload = downloadProgressPayload(download);
-  if (mainWindow && !mainWindow.isDestroyed()) {
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
     mainWindow.webContents.send('webpilot:system:download-progress', payload);
   }
   return payload;
@@ -575,6 +551,7 @@ function updateSystemDownload(download, patch = {}) {
 
 function systemDownloadState() {
   return {
+    directory: downloadDirectory(),
     downloads: Array.from(systemDownloads.values())
       .sort((left, right) => Number(right.startedAt || 0) - Number(left.startedAt || 0))
       .map(downloadProgressPayload),
@@ -582,141 +559,135 @@ function systemDownloadState() {
   };
 }
 
+function downloadDirectory() {
+  return lastDownloadDirectory || app.getPath('downloads');
+}
+
+function writeDownloadSettings() {
+  if (!runtimeDatabasePath || !lastDownloadDirectory) return;
+  try {
+    getElectronStateDatabase().prepare(`
+      INSERT INTO electron_state (key, value_json, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+    `).run(
+      DOWNLOAD_SETTINGS_STATE_KEY,
+      JSON.stringify({ directory: lastDownloadDirectory }),
+      new Date().toISOString(),
+    );
+  } catch (error) {
+    appendLog(`Download settings save failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function restoreDownloadSettings() {
+  if (!runtimeDatabasePath) return false;
+  try {
+    const row = getElectronStateDatabase().prepare(`
+      SELECT value_json FROM electron_state WHERE key = ?
+    `).get(DOWNLOAD_SETTINGS_STATE_KEY);
+    if (!row?.value_json) return false;
+    const saved = JSON.parse(row.value_json);
+    const directory = typeof saved?.directory === 'string' ? saved.directory.trim() : '';
+    if (!directory || !path.isAbsolute(directory)) return false;
+    lastDownloadDirectory = directory;
+    return true;
+  } catch (error) {
+    appendLog(`Download settings restore failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
 async function chooseDownloadDirectory(input = {}) {
   const defaultPath = typeof input.defaultPath === 'string' && input.defaultPath.trim()
     ? input.defaultPath.trim()
-    : (lastDownloadDirectory || undefined);
+    : downloadDirectory();
   const result = await dialog.showOpenDialog(mainWindow, {
     defaultPath,
     properties: ['openDirectory', 'createDirectory'],
-    title: 'Select download directory',
+    title: '选择下载位置',
   });
   if (result.canceled || !result.filePaths?.[0]) return { ok: true, canceled: true };
   lastDownloadDirectory = result.filePaths[0];
+  writeDownloadSettings();
   return { ok: true, path: result.filePaths[0] };
 }
 
-async function downloadCookieHeader(webContents, url) {
-  try {
-    const cookies = await webContents?.session?.cookies?.get?.({ url });
-    if (!Array.isArray(cookies) || !cookies.length) return '';
-    return cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
-  } catch {
-    return '';
-  }
+function installNativeDownloadHandler(electronSession) {
+  if (!electronSession || nativeDownloadSessions.has(electronSession)) return;
+  nativeDownloadSessions.add(electronSession);
+  electronSession.on('will-download', (event, item) => {
+    const startedAt = Date.now();
+    const url = item.getURL() || '';
+    const fileName = sanitizeDownloadFileName(item.getFilename() || downloadFileNameFromUrl(url));
+    const download = {
+      error: '',
+      fileName,
+      id: `download:${startedAt}:${nextDownloadId++}`,
+      path: '',
+      receivedBytes: Number(item.getReceivedBytes() || 0),
+      startedAt,
+      status: 'pending',
+      totalBytes: Number(item.getTotalBytes() || 0),
+      updatedAt: startedAt,
+      url,
+    };
+    systemDownloads.set(download.id, download);
+    emitDownloadProgress(download);
+
+    try {
+      const directory = ensureDir(downloadDirectory());
+      const savePath = uniqueDownloadPath(directory, fileName);
+      item.setSavePath(savePath);
+      nativeDownloadItems.set(download.id, item);
+      updateSystemDownload(download, { path: savePath, status: 'downloading' });
+    } catch (error) {
+      event.preventDefault();
+      const message = error instanceof Error ? error.message : String(error);
+      updateSystemDownload(download, { completedAt: Date.now(), error: message, status: 'failed' });
+      appendLog(`Native download setup failed: ${message}`);
+      return;
+    }
+
+    let lastProgressAt = 0;
+    item.on('updated', (_updatedEvent, state) => {
+      const now = Date.now();
+      const receivedBytes = Number(item.getReceivedBytes() || 0);
+      const totalBytes = Number(item.getTotalBytes() || 0);
+      if (state === 'progressing' && now - lastProgressAt < 160 && receivedBytes !== totalBytes) return;
+      lastProgressAt = now;
+      updateSystemDownload(download, {
+        error: state === 'interrupted' ? '下载已中断，正在等待恢复' : '',
+        receivedBytes,
+        status: state === 'interrupted' ? 'interrupted' : item.isPaused() ? 'paused' : 'downloading',
+        totalBytes,
+      });
+    });
+
+    item.once('done', (_doneEvent, state) => {
+      nativeDownloadItems.delete(download.id);
+      const completed = state === 'completed';
+      updateSystemDownload(download, {
+        completedAt: Date.now(),
+        error: completed || state === 'cancelled' ? '' : '下载已中断',
+        receivedBytes: Number(item.getReceivedBytes() || 0),
+        status: completed ? 'completed' : state === 'cancelled' ? 'cancelled' : 'failed',
+        totalBytes: Number(item.getTotalBytes() || 0),
+      });
+    });
+  });
 }
 
-async function startElectronDownload(webContents, url, context, options = {}) {
+function startNativeDownload(webContents, url) {
   const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url, mainWindow?.webContents?.getURL?.() || '');
   if (!normalizedUrl) return { ok: false, error: 'Download URL is invalid.' };
-  const download = {
-    error: '',
-    fileName: sanitizeDownloadFileName(options.fileName || downloadFileNameFromUrl(normalizedUrl)),
-    id: `download:${Date.now()}:${nextDownloadId++}`,
-    path: '',
-    receivedBytes: 0,
-    startedAt: Date.now(),
-    status: 'selecting',
-    totalBytes: 0,
-    updatedAt: Date.now(),
-    url: normalizedUrl,
-  };
-  systemDownloads.set(download.id, download);
-  emitDownloadProgress(download);
-  let directory = String(options.directory || '').trim();
-  if (options.promptForDirectory || !directory) {
-    const selected = await chooseDownloadDirectory({ defaultPath: options.defaultPath });
-    if (!selected.ok || selected.canceled) {
-      updateSystemDownload(download, { completedAt: Date.now(), status: selected.canceled ? 'cancelled' : 'failed', error: selected.error || '' });
-      return selected;
-    }
-    directory = selected.path;
-  }
-  await fs.promises.mkdir(directory, { recursive: true });
-  updateSystemDownload(download, { status: 'pending' });
-  let savePath = '';
-  let fileStream;
   try {
-    const headers = {};
-    const cookieHeader = await downloadCookieHeader(webContents, normalizedUrl);
-    if (cookieHeader) headers.Cookie = cookieHeader;
-    const userAgent = typeof webContents?.getUserAgent === 'function' ? webContents.getUserAgent() : '';
-    if (userAgent) headers['User-Agent'] = userAgent;
-    headers.Accept = '*/*';
-    const response = await fetch(normalizedUrl, {
-      headers,
-      redirect: 'follow',
-    });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText}`);
-    }
-    const responseUrl = response.url || normalizedUrl;
-    const fileName = sanitizeDownloadFileName(
-      options.fileName
-      || parseDownloadFileNameFromContentDisposition(response.headers.get('content-disposition'))
-      || downloadFileNameFromUrl(responseUrl)
-      || download.fileName,
-    );
-    const totalBytes = Number(response.headers.get('content-length') || 0);
-    savePath = uniqueDownloadPath(directory, fileName);
-    fileStream = fs.createWriteStream(savePath);
-    const fileStreamError = new Promise((_, reject) => {
-      fileStream.once('error', reject);
-    });
-    updateSystemDownload(download, {
-      fileName,
-      path: savePath,
-      status: 'downloading',
-      totalBytes: Number.isFinite(totalBytes) && totalBytes > 0 ? totalBytes : 0,
-    });
-
-    let receivedBytes = 0;
-    let lastEmitAt = 0;
-    const emitChunkProgress = () => {
-      const now = Date.now();
-      if (now - lastEmitAt < 160 && receivedBytes !== totalBytes) return;
-      lastEmitAt = now;
-      updateSystemDownload(download, { receivedBytes });
-    };
-
-    if (response.body?.getReader) {
-      const reader = response.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const buffer = Buffer.from(value);
-        receivedBytes += buffer.byteLength;
-        if (!fileStream.write(buffer)) await Promise.race([once(fileStream, 'drain'), fileStreamError]);
-        emitChunkProgress();
-      }
-    } else {
-      const buffer = Buffer.from(await response.arrayBuffer());
-      receivedBytes = buffer.byteLength;
-      if (!fileStream.write(buffer)) await Promise.race([once(fileStream, 'drain'), fileStreamError]);
-      emitChunkProgress();
-    }
-
-    await Promise.race([
-      new Promise((resolve) => fileStream.end(resolve)),
-      fileStreamError,
-    ]);
-    updateSystemDownload(download, {
-      completedAt: Date.now(),
-      receivedBytes,
-      status: 'completed',
-      totalBytes: download.totalBytes || receivedBytes,
-    });
-    return { ok: true, path: savePath };
+    if (!webContents || webContents.isDestroyed()) throw new Error('Download page is not available.');
+    installNativeDownloadHandler(webContents.session);
+    webContents.downloadURL(normalizedUrl);
+    return { ok: true };
   } catch (error) {
-    try {
-      if (fileStream) fileStream.destroy();
-      if (savePath && fs.existsSync(savePath)) fs.unlinkSync(savePath);
-    } catch {
-      // Best-effort cleanup of incomplete downloads.
-    }
-    appendLog(`${context} failed: ${error instanceof Error ? error.message : String(error)}`);
     const message = error instanceof Error ? error.message : String(error);
-    updateSystemDownload(download, { completedAt: Date.now(), error: message, status: 'failed' });
+    appendLog(`Native download start failed: ${message}`);
     return { ok: false, error: message };
   }
 }
@@ -1359,11 +1330,8 @@ function installEmbeddedBrowserTabHandlers(tab) {
     const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url, view.webContents.getURL() || '');
     if (!normalizedUrl || isBlankPageUrl(normalizedUrl)) return { action: 'deny' };
     if (isDownloadLikeUrl(normalizedUrl, details)) {
-      startElectronDownload(view.webContents, normalizedUrl, 'Embedded browser popup download', { promptForDirectory: true })
-        .then((result) => {
-          if (result?.ok === false) appendLog(`Embedded browser popup download failed: ${result.error || 'unknown error'}`);
-        })
-        .catch((error) => appendLog(`Embedded browser popup download failed: ${error instanceof Error ? error.message : String(error)}`));
+      const result = startNativeDownload(view.webContents, normalizedUrl);
+      if (result.ok === false) appendLog(`Embedded browser popup download failed: ${result.error || 'unknown error'}`);
       return { action: 'deny' };
     }
     let popupTab;
@@ -1506,6 +1474,7 @@ function createEmbeddedBrowserTab(input = {}) {
       sandbox: false,
     },
   });
+  installNativeDownloadHandler(view.webContents.session);
   const tab = {
     audioMuted: Boolean(input.audioMuted),
     attached: false,
@@ -1621,6 +1590,11 @@ function attachEmbeddedBrowserView(input = {}) {
   }
   setActiveEmbeddedBrowserTab(tab);
   tab.view.setBounds(embeddedBrowserBounds);
+  try {
+    ensureEmbeddedBrowserLibraryView();
+  } catch (error) {
+    appendLog(`Embedded browser library preload failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   attachEmbeddedBrowserLibraryView();
   void markEmbeddedBrowserSession(tab);
   scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
@@ -1632,10 +1606,7 @@ function detachEmbeddedBrowserView() {
   applyEmbeddedBrowserAudioPolicy();
   for (const tab of embeddedBrowserTabs.values()) detachEmbeddedBrowserTab(tab);
   embeddedBrowserAttached = false;
-  embeddedBrowserLibraryPanel = '';
-  embeddedBrowserLibraryPendingSequence = 0;
-  if (embeddedBrowserLibraryVisible) embeddedBrowserLibraryView?.setVisible(false);
-  embeddedBrowserLibraryVisible = false;
+  destroyEmbeddedBrowserLibraryView();
   notifyEmbeddedBrowserStateChange();
 }
 
@@ -1881,7 +1852,6 @@ function embeddedBrowserState() {
     groups,
     history: embeddedBrowserHistory,
     libraryPanel: embeddedBrowserLibraryPanel || undefined,
-    libraryPanelSequence: embeddedBrowserLibraryPanel ? embeddedBrowserLibraryOpenSequence : undefined,
     zoomFactor: active?.view.webContents.isDestroyed() ? undefined : active?.view.webContents.getZoomFactor(),
     tabs,
   };
@@ -2239,20 +2209,12 @@ function registerEmbeddedBrowserIpc() {
 
   ipcMain.handle('webpilot:embedded-browser:set-library-panel', async (_event, input = {}) => {
     try {
-      return setEmbeddedBrowserLibraryPanel(input.panel);
+      const requestedPanel = input.panel === 'library' ? input.panel : '';
+      const nextPanel = input.toggle && embeddedBrowserLibraryPanel === requestedPanel ? '' : requestedPanel;
+      return setEmbeddedBrowserLibraryPanel(nextPanel);
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:library-panel-ready', async (_event, input = {}) => {
-    const panel = input.panel === 'bookmarks' || input.panel === 'history' ? input.panel : '';
-    const sequence = Number(input.sequence);
-    if (panel && panel === embeddedBrowserLibraryPanel && sequence === embeddedBrowserLibraryOpenSequence) {
-      embeddedBrowserLibraryPendingSequence = 0;
-      attachEmbeddedBrowserLibraryView();
-    }
-    return embeddedBrowserState();
   });
 
   ipcMain.handle('webpilot:embedded-browser:clear-history', async () => {
@@ -2484,11 +2446,7 @@ function registerSystemIpc() {
       const url = String(input.url || '').trim();
       if (!url) throw new Error('Download URL is required.');
       const webContents = preferredDownloadWebContents();
-      return await startElectronDownload(webContents, url, 'Selected directory download', {
-        defaultPath: typeof input.defaultPath === 'string' ? input.defaultPath : undefined,
-        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
-        promptForDirectory: true,
-      });
+      return startNativeDownload(webContents, url);
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
@@ -2497,6 +2455,66 @@ function registerSystemIpc() {
   ipcMain.handle('webpilot:system:get-downloads', async () => {
     try {
       return systemDownloadState();
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:system:remove-download', async (_event, input = {}) => {
+    try {
+      const id = String(input.id || '');
+      const download = systemDownloads.get(id);
+      if (!id || !download) throw new Error('下载记录不存在。');
+      if (nativeDownloadItems.has(id)) throw new Error('下载进行中，暂时不能删除记录。');
+      if (download.path && fs.existsSync(download.path)) {
+        const filePath = path.resolve(download.path);
+        if (!fs.statSync(filePath).isFile()) throw new Error('下载路径不是文件，无法删除。');
+        await shell.trashItem(filePath);
+      }
+      systemDownloads.delete(id);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:system:choose-download-directory', async (_event, input = {}) => {
+    try {
+      return await chooseDownloadDirectory(input);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:system:open-download', async (_event, input = {}) => {
+    try {
+      const download = systemDownloads.get(String(input.id || ''));
+      if (!download?.path || !fs.existsSync(download.path)) throw new Error('下载文件不存在或已被移动。');
+      const error = await shell.openPath(download.path);
+      return error ? { ok: false, error } : { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:system:show-download-in-folder', async (_event, input = {}) => {
+    try {
+      const download = systemDownloads.get(String(input.id || ''));
+      if (!download?.path || !fs.existsSync(download.path)) throw new Error('下载文件不存在或已被移动。');
+      shell.showItemInFolder(download.path);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('webpilot:system:cancel-download', async (_event, input = {}) => {
+    try {
+      const id = String(input.id || '');
+      const item = nativeDownloadItems.get(id);
+      if (!item) throw new Error('该下载已结束。');
+      item.cancel();
+      return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
@@ -2580,6 +2598,7 @@ function createWindow() {
       preload: preloadPath(),
     },
   });
+  installNativeDownloadHandler(mainWindow.webContents.session);
   mainWindow.setMenuBarVisibility(false);
   mainWindow.webContents.on('before-input-event', (event, input) => {
     handleEmbeddedBrowserShortcut(event, input);
@@ -2609,11 +2628,8 @@ function createWindow() {
     const normalizedUrl = normalizeEmbeddedBrowserOpenUrl(url, mainWindow.webContents.getURL() || '');
     if (!normalizedUrl || isBlankPageUrl(normalizedUrl)) return { action: 'deny' };
     if (isDownloadLikeUrl(normalizedUrl, details)) {
-      startElectronDownload(preferredDownloadWebContents(), normalizedUrl, 'App shell download', { promptForDirectory: true })
-        .then((result) => {
-          if (result?.ok === false) appendLog(`App shell download failed: ${result.error || 'unknown error'}`);
-        })
-        .catch((error) => appendLog(`App shell download failed: ${error instanceof Error ? error.message : String(error)}`));
+      const result = startNativeDownload(preferredDownloadWebContents(), normalizedUrl);
+      if (result.ok === false) appendLog(`App shell download failed: ${result.error || 'unknown error'}`);
       return { action: 'deny' };
     }
     openAppShellUrlInEmbeddedBrowser(normalizedUrl)
@@ -2838,6 +2854,7 @@ async function boot() {
   appendLog(`App starting. packaged=${app.isPackaged}`);
   appendLog(`resourcesPath=${process.resourcesPath}`);
   appendLog(`WEBPILOT_ELECTRON_CDP_PORT=${EMBEDDED_BROWSER_CDP_PORT}`);
+  if (restoreDownloadSettings()) appendLog(`Download directory restored: ${lastDownloadDirectory}`);
   createWindow();
   await updateStartupScreen({ message: '正在恢复浏览器工作区…', progress: 18 });
   if (restoreEmbeddedBrowserPersistence()) appendLog('Embedded browser tabs restored from local cache.');

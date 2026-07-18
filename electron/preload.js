@@ -98,6 +98,9 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
   setLibraryPanel(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:set-library-panel', input);
   },
+  toggleLibraryPanel(input) {
+    return ipcRenderer.invoke('webpilot:embedded-browser:set-library-panel', { ...(input || {}), toggle: true });
+  },
   setTabMuted(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:set-tab-muted', input);
   },
@@ -113,6 +116,12 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
 });
 
 contextBridge.exposeInMainWorld('webPilotSystem', {
+  cancelDownload(input) {
+    return ipcRenderer.invoke('webpilot:system:cancel-download', input || {});
+  },
+  chooseDownloadDirectory(input) {
+    return ipcRenderer.invoke('webpilot:system:choose-download-directory', input || {});
+  },
   downloadUrl(input) {
     return ipcRenderer.invoke('webpilot:system:download-url', input || {});
   },
@@ -125,7 +134,16 @@ contextBridge.exposeInMainWorld('webPilotSystem', {
     ipcRenderer.on('webpilot:system:download-progress', handler);
     return () => ipcRenderer.removeListener('webpilot:system:download-progress', handler);
   },
+  openDownload(input) {
+    return ipcRenderer.invoke('webpilot:system:open-download', input || {});
+  },
+  removeDownload(input) {
+    return ipcRenderer.invoke('webpilot:system:remove-download', input || {});
+  },
   selectDirectory(input) {
     return ipcRenderer.invoke('webpilot:system:select-directory', input || {});
+  },
+  showDownloadInFolder(input) {
+    return ipcRenderer.invoke('webpilot:system:show-download-in-folder', input || {});
   },
 });

@@ -27,7 +27,6 @@ import { CSS as DndCss } from '@dnd-kit/utilities';
 import { createPortal } from 'react-dom';
 import {
   AppWindow,
-  AlertCircle,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
@@ -50,6 +49,7 @@ import {
   Globe,
   History,
   ImageUp,
+  Library,
   Loader2,
   Lock,
   MessageSquare,
@@ -84,7 +84,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { useRouter } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -95,7 +95,6 @@ import {
   browserChatDownloadStatusLabel,
   formatDownloadBytes,
   type SystemDownloadItem,
-  type SystemDownloadStatus,
 } from '@/components/browser-chat-download-model';
 import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
 import { EnvironmentSettings, environmentSettingsTabs, type EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
@@ -248,6 +247,18 @@ type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'webpilotqa.sidebarCollapsed';
 const EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY = 'webpilotqa.embeddedChatCollapsed';
+
+function browserChatViewForPathname(pathname: string, fallback: BrowserChatView): BrowserChatView {
+  if (pathname === '/settings' || pathname.startsWith('/settings/')) return 'settings';
+  if (pathname === '/dashboard' || pathname.startsWith('/runs/')) return 'target';
+  if (pathname === '/browser-chat' || pathname.startsWith('/browser-chat/')) return 'chat';
+  return fallback;
+}
+
+function navigateBrowserChatView(href: string) {
+  if (window.location.pathname === href) return;
+  window.history.pushState(null, '', href);
+}
 
 function readStoredSidebarCollapsed() {
   if (typeof window === 'undefined') return false;
@@ -413,7 +424,7 @@ type EmbeddedBrowserState = EmbeddedBrowserBridgeResult & {
   canGoBack?: boolean;
   canGoForward?: boolean;
   groups?: EmbeddedBrowserGroup[];
-  libraryPanel?: 'bookmarks' | 'history';
+  libraryPanel?: 'library';
   tabs?: EmbeddedBrowserTab[];
   zoomFactor?: number;
 };
@@ -437,7 +448,8 @@ type EmbeddedBrowserBridge = {
   reset: () => Promise<EmbeddedBrowserBridgeResult>;
   setBounds: (bounds: EmbeddedBrowserBounds) => Promise<EmbeddedBrowserBridgeResult>;
   setGroupCollapsed: (input: { collapsed: boolean; id: string }) => Promise<EmbeddedBrowserState>;
-  setLibraryPanel: (input: { panel: 'bookmarks' | 'history' | null }) => Promise<EmbeddedBrowserState>;
+  setLibraryPanel: (input: { panel: 'library' | null }) => Promise<EmbeddedBrowserState>;
+  toggleLibraryPanel?: (input: { panel: 'library' }) => Promise<EmbeddedBrowserState>;
   setTabMuted: (input: { id: string; muted?: boolean }) => Promise<EmbeddedBrowserState>;
   showTabContextMenu: (input: { groups: Array<{ id: string; label: string }>; id: string }) => Promise<EmbeddedBrowserBridgeResult>;
   setVisible: (input: {
@@ -708,10 +720,12 @@ function hasAiOutputView(output: BrowserChatAiOutputView) {
 function isCodexRuntimeObjectEnvelope(value: string) {
   const parsed = parseJsonObjectText(value);
   if (!parsed) return false;
-  return typeof parsed.type === 'string'
-    && parsed.params !== null
+  if (typeof parsed.type !== 'string' || !parsed.type.trim()) return false;
+  const hasMessage = typeof parsed.message === 'string';
+  const hasParams = parsed.params !== null
     && typeof parsed.params === 'object'
     && !Array.isArray(parsed.params);
+  return hasMessage || hasParams;
 }
 
 function aiOutputCyclesFromLogs(logs: BrowserChatLogRecord[]): BrowserChatAiOutputCycle[] {
@@ -1752,26 +1766,101 @@ const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { ma
   );
 });
 
-function BrowserChatDownloadStatusIcon({ status }: { status?: SystemDownloadStatus }) {
-  if (status === 'completed') return <CheckCircle2 size={15} />;
-  if (status === 'failed') return <AlertCircle size={15} />;
-  if (status === 'downloading' || status === 'pending' || status === 'selecting') return <Loader2 className="spin" size={15} />;
-  return <Download size={15} />;
-}
-
 const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
   downloads,
   open,
   onClose,
+  onRemove,
   onToggle,
 }: {
   downloads: SystemDownloadItem[];
   open: boolean;
   onClose: () => void;
+  onRemove: (id: string) => void;
   onToggle: () => void;
 }) {
   const activeCount = downloads.filter((download) => download.status === 'selecting' || download.status === 'pending' || download.status === 'downloading').length;
   const recentDownloads = downloads.slice(0, 12);
+  const [downloadDirectory, setDownloadDirectory] = useState('');
+  const [downloadDirectoryError, setDownloadDirectoryError] = useState('');
+  const [downloadActionError, setDownloadActionError] = useState('');
+  const [removingDownloadIds, setRemovingDownloadIds] = useState<Set<string>>(() => new Set());
+  const [selectingDownloadDirectory, setSelectingDownloadDirectory] = useState(false);
+
+  useEffect(() => {
+    const bridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
+    if (!bridge?.getDownloads) return undefined;
+    let mounted = true;
+    bridge.getDownloads()
+      .then((result) => {
+        if (!mounted) return;
+        if (!result.ok) {
+          setDownloadDirectoryError(result.error || '读取下载位置失败');
+          return;
+        }
+        setDownloadDirectory(result.directory || '');
+      })
+      .catch((reason: unknown) => {
+        if (mounted) setDownloadDirectoryError(reason instanceof Error ? reason.message : '读取下载位置失败');
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  async function chooseDownloadLocation() {
+    const bridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
+    if (!bridge?.chooseDownloadDirectory || selectingDownloadDirectory) return;
+    setSelectingDownloadDirectory(true);
+    setDownloadDirectoryError('');
+    try {
+      const result = await bridge.chooseDownloadDirectory({ defaultPath: downloadDirectory || undefined });
+      if (!result.ok) setDownloadDirectoryError(result.error || '修改下载位置失败');
+      else if (result.path) setDownloadDirectory(result.path);
+    } catch (reason) {
+      setDownloadDirectoryError(reason instanceof Error ? reason.message : '修改下载位置失败');
+    } finally {
+      setSelectingDownloadDirectory(false);
+    }
+  }
+
+  async function removeDownload(id: string) {
+    const bridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
+    if (!bridge?.removeDownload || removingDownloadIds.has(id)) return;
+    const download = downloads.find((item) => item.id === id);
+    if (!window.confirm(`确定删除“${download?.fileName || '该文件'}”吗？文件将移入回收站。`)) return;
+    setDownloadActionError('');
+    setRemovingDownloadIds((current) => new Set(current).add(id));
+    try {
+      const result = await bridge.removeDownload({ id });
+      if (!result.ok) {
+        setDownloadActionError(result.error || '删除文件失败');
+        return;
+      }
+      onRemove(id);
+    } catch (reason) {
+      setDownloadActionError(reason instanceof Error ? reason.message : '删除文件失败');
+    } finally {
+      setRemovingDownloadIds((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
+
+  async function showDownloadInFolder(id: string) {
+    const bridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
+    if (!bridge?.showDownloadInFolder) return;
+    setDownloadActionError('');
+    try {
+      const result = await bridge.showDownloadInFolder({ id });
+      if (!result.ok) setDownloadActionError(result.error || '打开文件所在位置失败');
+    } catch (reason) {
+      setDownloadActionError(reason instanceof Error ? reason.message : '打开文件所在位置失败');
+    }
+  }
+
   return (
     <div className="browser-chat-download-center">
       <button
@@ -1789,10 +1878,24 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
         <div className="browser-chat-download-popover" role="dialog" aria-label="下载进度">
           <header>
             <strong>下载</strong>
-            <button className="ui-icon-button" onClick={onClose} type="button" aria-label="关闭下载面板">
-              <X size={15} />
-            </button>
+            <div className="browser-chat-download-header-actions">
+              <button
+                aria-label="设置下载位置"
+                className="ui-icon-button"
+                disabled={selectingDownloadDirectory}
+                onClick={() => void chooseDownloadLocation()}
+                title={downloadDirectory ? `下载位置：${downloadDirectory}` : '设置下载位置'}
+                type="button"
+              >
+                {selectingDownloadDirectory ? <Loader2 className="spin" size={15} /> : <Settings size={15} />}
+              </button>
+              <button className="ui-icon-button" onClick={onClose} type="button" aria-label="关闭下载面板" title="关闭">
+                <X size={15} />
+              </button>
+            </div>
           </header>
+          {downloadDirectoryError ? <div className="browser-chat-download-location-error">{downloadDirectoryError}</div> : null}
+          {downloadActionError ? <div className="browser-chat-download-location-error">{downloadActionError}</div> : null}
           {recentDownloads.length ? (
             <ol className="browser-chat-download-list">
               {recentDownloads.map((download) => {
@@ -1800,25 +1903,53 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
                 const received = formatDownloadBytes(download.receivedBytes);
                 const total = formatDownloadBytes(download.totalBytes);
                 const progressWidth = percent === undefined ? (download.status === 'downloading' ? 18 : 0) : percent;
+                const sizeLabel = total ? `${received || '0 B'} / ${total}` : received;
+                const statusLine = [
+                  browserChatDownloadStatusLabel(download.status),
+                  percent !== undefined ? `${percent}%` : '',
+                  sizeLabel,
+                ].filter(Boolean).join(' · ');
+                const removable = !['selecting', 'pending', 'downloading', 'paused', 'interrupted'].includes(download.status || '');
+                const revealable = download.status === 'completed' && Boolean(download.path);
                 return (
                   <li className={`browser-chat-download-item ${download.status || 'pending'}`} key={download.id}>
                     <div className="browser-chat-download-item-head">
-                      <span className="browser-chat-download-status-icon">
-                        <BrowserChatDownloadStatusIcon status={download.status} />
-                      </span>
-                      <div>
+                      <div className="browser-chat-download-copy">
                         <strong>{download.fileName || 'download'}</strong>
-                        <span>{browserChatDownloadStatusLabel(download.status)}{percent !== undefined ? ` · ${percent}%` : ''}</span>
+                        <span>{statusLine}</span>
                       </div>
+                      {revealable || removable ? (
+                        <div className="browser-chat-download-actions">
+                          {revealable ? (
+                            <button
+                              aria-label="在文件夹中显示"
+                              className="browser-chat-download-item-action browser-chat-download-reveal"
+                              onClick={() => void showDownloadInFolder(download.id)}
+                              title="在文件夹中显示"
+                              type="button"
+                            >
+                              <FolderOpen size={14} />
+                            </button>
+                          ) : null}
+                          {removable ? (
+                            <button
+                              aria-label="删除下载文件"
+                              className="browser-chat-download-item-action browser-chat-download-remove"
+                              disabled={removingDownloadIds.has(download.id)}
+                              onClick={() => void removeDownload(download.id)}
+                              title="删除文件"
+                              type="button"
+                            >
+                              {removingDownloadIds.has(download.id) ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : null}
                     </div>
                     <div className="browser-chat-download-progress" aria-hidden="true">
                       <span style={{ width: `${progressWidth}%` }} />
                     </div>
-                    <div className="browser-chat-download-meta">
-                      <span>{total ? `${received || '0 B'} / ${total}` : (received || '')}</span>
-                      {download.error ? <span className="error">{download.error}</span> : null}
-                      {download.path ? <span title={download.path}>{download.path}</span> : null}
-                    </div>
+                    {download.error ? <div className="browser-chat-download-error">{download.error}</div> : null}
                   </li>
                 );
               })}
@@ -3783,6 +3914,26 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             if (event.key === 'Backspace' || event.key === 'Delete') syncEditorState({ scrollToBottom: true });
           }}
           onPaste={(event) => {
+            const itemFiles = Array.from(event.clipboardData.items || [])
+              .filter((item) => item.kind === 'file')
+              .map((item) => item.getAsFile())
+              .filter((file): file is File => Boolean(file));
+            const pastedFiles = itemFiles.length ? itemFiles : Array.from(event.clipboardData.files || []);
+            if (pastedFiles.length) {
+              event.preventDefault();
+              if (currentBusy || loading || uploadingImage || attachments.length >= BROWSER_CHAT_MAX_REFERENCES) return;
+              const pastedAt = editorRange()?.cloneRange();
+              void onUploadFiles(pastedFiles).then((uploaded) => {
+                const editor = editorRef.current;
+                if (editor && pastedAt && editor.contains(pastedAt.commonAncestorContainer)) {
+                  const selection = window.getSelection();
+                  selection?.removeAllRanges();
+                  selection?.addRange(pastedAt);
+                }
+                uploaded.forEach(insertReferenceToken);
+              });
+              return;
+            }
             event.preventDefault();
             const text = event.clipboardData.getData('text/plain');
             if (!text) return;
@@ -3882,15 +4033,6 @@ function embeddedBoundsFromElement(element: HTMLElement, options: { leftInset?: 
     width: Math.max(1, width - leftInset),
     height,
   };
-}
-
-function EmbeddedBrowserFavoritesIcon({ size = 18 }: { size?: number }) {
-  return (
-    <svg aria-hidden="true" fill="none" height={size} viewBox="0 0 24 24" width={size}>
-      <path d="m7.1 3.2 1.45 2.95 3.25.47-2.35 2.3.56 3.23-2.91-1.53-2.91 1.53.56-3.23-2.35-2.3 3.25-.47L7.1 3.2Z" />
-      <path d="M13.4 6.25h7.1M13.8 10.7h6.7M12.2 15.15h8.3" />
-    </svg>
-  );
 }
 
 function embeddedBoundsKey(bounds?: EmbeddedBrowserBounds) {
@@ -4131,7 +4273,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [dragDropGroupId, setDragDropGroupId] = useState('');
   const [tabDragPreview, setTabDragPreview] = useState<EmbeddedBrowserTabDragPreview | null>(null);
   const [tabDragPortalTarget, setTabDragPortalTarget] = useState<HTMLElement | null>(null);
-  const [libraryPanel, setLibraryPanel] = useState<'bookmarks' | 'history' | null>(null);
+  const [libraryPanel, setLibraryPanel] = useState<'library' | null>(null);
   const [newGroupDialogOpen, setNewGroupDialogOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState('新建标签组');
   const [creatingNewGroup, setCreatingNewGroup] = useState(false);
@@ -4152,7 +4294,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     setBridgeError('');
     setBrowserGroups(Array.isArray(result.groups) ? result.groups : []);
     setBrowserTabs(Array.isArray(result.tabs) ? result.tabs : []);
-    setLibraryPanel(result.libraryPanel === 'bookmarks' || result.libraryPanel === 'history' ? result.libraryPanel : null);
+    setLibraryPanel(result.libraryPanel === 'library' ? result.libraryPanel : null);
     setActiveGroupId(result.activeGroupId || '');
     setActiveTabIndex(typeof result.activeIndex === 'number' && result.activeIndex >= 0 ? result.activeIndex : 0);
     setActiveTabId(result.activeTabId || '');
@@ -4334,10 +4476,13 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     applyEmbeddedBrowserState(result);
   }
 
-  async function toggleEmbeddedBrowserLibraryPanel(panel: 'bookmarks' | 'history') {
+  async function toggleEmbeddedBrowserLibraryPanel() {
     const bridge = window.webPilotEmbeddedBrowser;
     if (!bridge) return;
-    const result = await bridge.setLibraryPanel({ panel: libraryPanel === panel ? null : panel }).catch((error: unknown) => ({
+    const request = bridge.toggleLibraryPanel
+      ? bridge.toggleLibraryPanel({ panel: 'library' })
+      : bridge.setLibraryPanel({ panel: libraryPanel === 'library' ? null : 'library' });
+    const result = await request.catch((error: unknown) => ({
       ok: false,
       error: error instanceof Error ? error.message : '打开收藏与历史记录失败',
     }));
@@ -4997,24 +5142,14 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
           </form>
           <div className="browser-chat-embedded-library-actions">
             <button
-              aria-expanded={libraryPanel === 'bookmarks'}
-              aria-label="收藏夹"
-              className={libraryPanel === 'bookmarks' ? 'browser-chat-embedded-tool-button active' : 'browser-chat-embedded-tool-button'}
-              onClick={() => void toggleEmbeddedBrowserLibraryPanel('bookmarks')}
-              title="收藏夹"
+              aria-expanded={libraryPanel === 'library'}
+              aria-label="收藏与历史记录"
+              className={libraryPanel === 'library' ? 'browser-chat-embedded-tool-button active' : 'browser-chat-embedded-tool-button'}
+              onClick={() => void toggleEmbeddedBrowserLibraryPanel()}
+              title="收藏与历史记录"
               type="button"
             >
-              <EmbeddedBrowserFavoritesIcon size={19} />
-            </button>
-            <button
-              aria-expanded={libraryPanel === 'history'}
-              aria-label="历史记录"
-              className={libraryPanel === 'history' ? 'browser-chat-embedded-tool-button active' : 'browser-chat-embedded-tool-button'}
-              onClick={() => void toggleEmbeddedBrowserLibraryPanel('history')}
-              title="历史记录"
-              type="button"
-            >
-              <History size={18} />
+              <Library size={18} />
             </button>
           </div>
         </div>
@@ -5112,6 +5247,7 @@ export function BrowserChatWorkspace({
   initialTargetRunId?: string;
 }) {
   const router = useRouter();
+  const pathname = usePathname();
   const { t } = useI18n();
   const { mode: themeMode, toggleMode } = useTheme();
   const [, startTransition] = useTransition();
@@ -5124,7 +5260,7 @@ export function BrowserChatWorkspace({
   const sessionVersionsRef = useRef(new Map<string, number>());
   const sessionRefreshTimersRef = useRef(new Map<string, number>());
   const sessionListRefreshTimerRef = useRef<number | undefined>(undefined);
-  const [activeView, setActiveView] = useState<BrowserChatView>(initialView);
+  const activeView = browserChatViewForPathname(pathname, initialView);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
@@ -5740,7 +5876,6 @@ export function BrowserChatWorkspace({
     const clientMessageId = temporaryId('client_msg');
     setError('');
     setBusy(true);
-    setActiveView('chat');
     try {
       let active = await ensureSession();
       setPendingMessageSessionId(active.id);
@@ -5928,10 +6063,13 @@ export function BrowserChatWorkspace({
   }
 
   const openTargetCaseDetail = useCallback((testCaseId: string) => {
-    setActiveView('target');
     setTargetDetailCaseId(testCaseId);
-    startTransition(() => router.refresh());
-  }, [router, startTransition]);
+    if (activeView === 'target') {
+      startTransition(() => router.refresh());
+      return;
+    }
+    router.push(`/dashboard?caseId=${encodeURIComponent(testCaseId)}`);
+  }, [activeView, router, startTransition]);
 
   const exportSelectedMessagesToTestCase = useCallback(async () => {
     const sessionId = session?.id;
@@ -6024,7 +6162,6 @@ export function BrowserChatWorkspace({
   }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, session?.id]);
 
   async function startNewConversation() {
-    setActiveView('chat');
     if (loadingSessionId) return;
     setError('');
     setComposerResetToken((current) => current + 1);
@@ -6037,7 +6174,6 @@ export function BrowserChatWorkspace({
     if (loadingSessionRef.current === sessionId) return;
     loadingSessionRef.current = sessionId;
     setLoadingSessionId(sessionId);
-    setActiveView('chat');
     setError('');
     setComposerResetToken((current) => current + 1);
     attachmentsRef.current = [];
@@ -6277,6 +6413,7 @@ export function BrowserChatWorkspace({
         downloads={downloads}
         open={downloadCenterOpen}
         onClose={() => setDownloadCenterOpen(false)}
+        onRemove={(id) => setDownloads((current) => current.filter((download) => download.id !== id))}
         onToggle={toggleDownloadCenter}
       />
     </div>
@@ -6369,20 +6506,21 @@ export function BrowserChatWorkspace({
 
         <nav className="browser-chat-nav" aria-label="工作模式">
           <button
+            aria-current={activeView === 'chat' ? 'page' : undefined}
             aria-label={t('对话模式')}
             className={activeView === 'chat' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'}
-            onClick={() => setActiveView('chat')}
+            onClick={() => navigateBrowserChatView('/browser-chat')}
             title={t('对话模式')}
             type="button"
           >
             <MessageSquare size={17} />
             <span>{t('对话模式')}</span>
           </button>
-          <button aria-label="目标模式" className={activeView === 'target' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => setActiveView('target')} title="目标模式" type="button">
+          <button aria-current={activeView === 'target' ? 'page' : undefined} aria-label="目标模式" className={activeView === 'target' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => navigateBrowserChatView('/dashboard')} title="目标模式" type="button">
             <Folder size={17} />
             <span>目标模式</span>
           </button>
-          <button aria-label="设置" className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => router.push('/settings')} title="设置" type="button">
+          <button aria-current={activeView === 'settings' ? 'page' : undefined} aria-label="设置" className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => navigateBrowserChatView('/settings')} title="设置" type="button">
             <Settings size={17} />
             <span>设置</span>
           </button>

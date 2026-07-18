@@ -10,7 +10,6 @@
 }
 
 .card {
-  animation: library-card-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1) both;
   background: color-mix(in srgb, var(--panel) 97%, #f4f7fb);
   border-radius: 16px;
   box-shadow:
@@ -22,18 +21,6 @@
   height: min(680px, 100%);
   overflow: hidden;
   width: min(520px, 100%);
-}
-
-@keyframes library-card-in {
-  from {
-    opacity: 0;
-    transform: translateY(-8px) scale(0.985);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
 }
 
 .header {
@@ -129,6 +116,23 @@
   flex: 1 1 auto;
   min-height: 0;
   padding: 10px 10px 12px;
+}
+
+.combinedContent {
+  display: block;
+  overflow-y: auto;
+  scrollbar-color: color-mix(in srgb, var(--muted) 65%, transparent) transparent;
+  scrollbar-width: thin;
+}
+
+.librarySection {
+  min-width: 0;
+}
+
+.librarySection + .librarySection {
+  border-top: 1px solid color-mix(in srgb, var(--border) 64%, transparent);
+  margin-top: 8px;
+  padding-top: 8px;
 }
 
 .sectionHeading {
@@ -269,6 +273,11 @@
   opacity: 1;
 }
 
+.combinedContent .list {
+  flex: 0 0 auto;
+  overflow: visible;
+}
+
 .removeItem:hover {
   color: var(--danger) !important;
 }
@@ -307,6 +316,23 @@
   line-height: 1.6;
   margin: 0;
   max-width: 220px;
+}
+
+.sectionEmpty {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  gap: 7px;
+  justify-content: center;
+  min-height: 88px;
+  padding: 16px;
+  text-align: center;
+}
+
+.sectionEmpty svg {
+  color: var(--muted-strong);
 }
 
 .error {

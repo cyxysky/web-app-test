@@ -4,7 +4,12 @@ import { store } from '@/server/db/store';
 
 export const dynamic = 'force-dynamic';
 
-export default function DashboardPage() {
+type PageProps = {
+  searchParams: Promise<{ caseId?: string | string[] }>;
+};
+
+export default async function DashboardPage({ searchParams }: PageProps) {
+  const { caseId } = await searchParams;
   store.applyRuntimeEnv();
   startScheduler();
   const testCases = store.listTestCases();
@@ -13,7 +18,13 @@ export default function DashboardPage() {
 
   return (
     <main className="browser-chat-shell">
-      <BrowserChatWorkspace groups={groups} schedules={schedules} testCases={testCases} />
+      <BrowserChatWorkspace
+        groups={groups}
+        initialTargetDetailCaseId={typeof caseId === 'string' ? caseId : undefined}
+        initialView="target"
+        schedules={schedules}
+        testCases={testCases}
+      />
     </main>
   );
 }

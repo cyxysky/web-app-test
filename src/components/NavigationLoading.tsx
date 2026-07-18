@@ -15,6 +15,10 @@ function isInternalNavigationLink(anchor: HTMLAnchorElement) {
   return `${url.pathname}${url.search}${url.hash}` !== `${window.location.pathname}${window.location.search}${window.location.hash}`;
 }
 
+function isWorkspaceViewPathname(pathname: string) {
+  return pathname === '/browser-chat' || pathname === '/dashboard' || pathname === '/settings';
+}
+
 function LoadingOverlay({ label }: { label: string }) {
   return (
     <div className="navigation-loading-overlay" role="status" aria-live="polite" aria-label={label}>
@@ -59,6 +63,7 @@ export function NavigationLoading() {
     }
 
     function onPopState() {
+      if (isWorkspaceViewPathname(window.location.pathname)) return;
       start('正在切换界面');
     }
 
