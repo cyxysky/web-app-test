@@ -1,7 +1,8 @@
-﻿import { randomUUID } from 'node:crypto';
+﻿import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
+import { electronEmbeddedBrowserEnabled } from '@/server/browser/browser-session-runtime';
 import {
   executeInteractiveBrowserTurn,
   type BrowserToolConfirmationDecision,
@@ -11,6 +12,8 @@ import {
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
 import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
+import { executeTargetWorkflow } from '@/server/ai/agents/target-workflow-executor.service';
+import { generateTargetWorkflowPlan, targetWorkflowPlanningReply } from '@/server/ai/agents/target-workflow-planner.agent';
 import {
   extractPersonalMemoryFromTurn,
   formatPersonalMemoryForPrompt,
@@ -21,6 +24,15 @@ import {
 } from '@/server/ai/personal-memory';
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
 import type { ModelProvider, RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import {
+  targetPlanIsReady,
+  targetWorkflowRunSchema,
+  validateTargetPlanStructure,
+  type TargetActor,
+  type TargetLeafNode,
+  type TargetPlan,
+  type TargetWorkflowRun,
+} from '@/server/ai/schemas/target-workflow.schema';
 import { store } from '@/server/db/store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import {
@@ -61,6 +73,24 @@ export type BrowserChatMessage = {
     updatedAt: string;
   };
   status?: 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
+};
+
+export type BrowserChatWorkflowMode = 'chat' | 'target';
+
+export type TargetWorkflowRequirementResponse = {
+  requirementId: string;
+  value: string;
+};
+
+export type TargetWorkflowActorCredentials = {
+  actorId: string;
+  username: string;
+  password: string;
+};
+
+export type ContinueTargetWorkflowInput = {
+  responses?: TargetWorkflowRequirementResponse[];
+  actorCredentials?: TargetWorkflowActorCredentials[];
 };
 
 export type BrowserChatLogRecord = {
@@ -105,6 +135,8 @@ export type BrowserChatSessionSnapshot = {
   safetyMode: BrowserChatSafetyMode;
   modelProvider: ModelProvider;
   model: string;
+  workflowMode: BrowserChatWorkflowMode;
+  targetRun?: TargetWorkflowRun;
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
   tabs: BrowserTabSnapshot[];
@@ -140,6 +172,26 @@ type BrowserChatRuntimeState = {
   lastPersistWarningAt: number;
 };
 
+type TargetActorBrowserBinding = {
+  browser: BrowserSession;
+  browserSessionId: string;
+  identityFingerprint: string;
+};
+
+type TargetWorkflowRuntimeState = {
+  // BrowserSession remains in the union for hot-reload compatibility with the
+  // pre-binding runtime shape. Legacy values are discarded on their next use.
+  actorBrowsers: Map<string, TargetActorBrowserBinding | BrowserSession>;
+  actorLoginControllers: Map<string, AbortController>;
+  credentials: Map<string, {
+    actorId: string;
+    attemptId: string;
+    expiresAt: number;
+    sessionId: string;
+    value: string;
+  }>;
+};
+
 const browserChatRuntimeState = ((globalThis as typeof globalThis & {
   __browserChatRuntimeState?: BrowserChatRuntimeState;
 }).__browserChatRuntimeState ??= {
@@ -162,6 +214,16 @@ const sessions = browserChatRuntimeState.sessions;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
+const targetWorkflowRuntimeState = ((globalThis as typeof globalThis & {
+  __targetWorkflowRuntimeState?: TargetWorkflowRuntimeState;
+}).__targetWorkflowRuntimeState ??= {
+  actorBrowsers: new Map(),
+  actorLoginControllers: new Map<string, AbortController>(),
+  credentials: new Map(),
+});
+targetWorkflowRuntimeState.actorBrowsers ??= new Map();
+targetWorkflowRuntimeState.actorLoginControllers ??= new Map();
+targetWorkflowRuntimeState.credentials ??= new Map();
 const browserStartPromises = new Map<string, Promise<BrowserSession>>();
 const runningHydrationGraceMs = 2 * 60 * 1000;
 const fullLogDetailsFlag = '__browserChatFullLogDetails';
@@ -180,7 +242,7 @@ function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'u
 
 function browserChatBrowserProfileKey(session: Pick<BrowserChatSessionSnapshot, 'id' | 'userId'>) {
   const userId = normalizeUserId(session.userId);
-  return `user_${userId || 'default'}`;
+  return `user_${userId || 'default'}_${session.id}`;
 }
 
 function fullLogDetails(value: unknown) {
@@ -320,6 +382,135 @@ function queuePersonalMemoryExtraction(input: {
 
 function normalizeSafetyMode(value: unknown): BrowserChatSafetyMode {
   return value === 'full' ? 'full' : 'strict';
+}
+
+function normalizeWorkflowMode(value: unknown): BrowserChatWorkflowMode {
+  return value === 'target' ? 'target' : 'chat';
+}
+
+function normalizeTargetRun(value: unknown) {
+  const parsed = targetWorkflowRunSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+function recoverOrphanedTargetRun(value: unknown) {
+  const run = normalizeTargetRun(value);
+  if (!run) return undefined;
+  const timestamp = now();
+  const executionInterrupted = run.status === 'running'
+    || run.status === 'summarizing'
+    || (run.status === 'ready' && Boolean(run.confirmedAt));
+  const planningInterrupted = run.status === 'analyzing';
+  const plan = run.plan ? {
+    ...run.plan,
+    actors: run.plan.actors.map((actor) => actor.auth.status === 'verifying' ? {
+      ...actor,
+      auth: {
+        ...actor.auth,
+        status: 'failed' as const,
+        credentialsAvailable: false,
+        message: '上一次登录验证因服务运行态丢失而中断，请重新登录或再次检查。',
+      },
+    } : actor),
+  } : undefined;
+  const hadInterruptedAuthentication = Boolean(run.plan?.actors.some((actor) => actor.auth.status === 'verifying'));
+  if (!executionInterrupted && !planningInterrupted && !hadInterruptedAuthentication) return run;
+  const results = { ...run.results };
+  if (executionInterrupted && plan) {
+    for (const node of plan.nodes) {
+      if (node.type !== 'target') continue;
+      const previous = results[node.id];
+      if (previous && !['pending', 'running'].includes(previous.status)) continue;
+      results[node.id] = {
+        targetId: node.id,
+        actorId: node.actorId,
+        status: 'cancelled',
+        startedAt: previous?.startedAt,
+        endedAt: timestamp,
+        summary: '执行进程已中断，未继续后台操作。',
+        failureReason: '服务重启或运行态丢失。',
+        criteria: node.successCriteria.map((criterion) => ({
+          criterionId: criterion.id,
+          status: 'inconclusive',
+          observation: '执行已中断，证据不完整。',
+          evidence: [],
+        })),
+        evidence: previous?.evidence || [],
+        outputs: previous?.outputs || {},
+        stepIndexes: previous?.stepIndexes,
+      };
+    }
+  }
+  const unresolved = plan?.requirements.some((item) => item.required && item.status === 'missing');
+  const pendingAuth = plan?.actors.some((actor) => actor.auth.required && actor.auth.status !== 'ready');
+  return {
+    ...run,
+    plan,
+    results,
+    status: executionInterrupted
+      ? 'cancelled' as const
+      : planningInterrupted
+        ? 'failed' as const
+        : unresolved
+          ? 'collecting_requirements' as const
+          : pendingAuth
+            ? 'preparing_authentication' as const
+            : 'awaiting_confirmation' as const,
+    error: executionInterrupted
+      ? '目标执行因服务重启或运行态丢失而中断。'
+      : planningInterrupted
+        ? '目标分析因服务重启或运行态丢失而中断，请重新发送需求。'
+        : run.error,
+    endedAt: executionInterrupted ? timestamp : run.endedAt,
+    updatedAt: timestamp,
+  };
+}
+
+function cancelActiveTargetWorkflowRun(run: TargetWorkflowRun | undefined, reason: string, timestamp = now()) {
+  if (!run) return run;
+  if (run.status === 'analyzing') {
+    return {
+      ...run,
+      status: run.plan ? targetPlanPreparationStatus(run.plan) : 'failed',
+      error: reason,
+      updatedAt: timestamp,
+    };
+  }
+  if (!run.plan || !['ready', 'running', 'summarizing'].includes(run.status)) return run;
+  const results = { ...run.results };
+  for (const node of run.plan.nodes) {
+    if (node.type !== 'target') continue;
+    const previous = results[node.id];
+    if (previous && !['pending', 'running'].includes(previous.status)) continue;
+    results[node.id] = {
+      targetId: node.id,
+      actorId: node.actorId,
+      status: 'cancelled',
+      startedAt: previous?.startedAt,
+      endedAt: timestamp,
+      summary: '目标执行已中断，未继续后台操作。',
+      failureReason: reason,
+      criteria: node.successCriteria.map((criterion) => (
+        previous?.criteria.find((item) => item.criterionId === criterion.id) || {
+          criterionId: criterion.id,
+          status: 'inconclusive' as const,
+          observation: '执行已中断，证据不完整。',
+          evidence: [],
+        }
+      )),
+      evidence: previous?.evidence || [],
+      outputs: previous?.outputs || {},
+      stepIndexes: previous?.stepIndexes,
+    };
+  }
+  return {
+    ...run,
+    status: 'cancelled' as const,
+    error: reason,
+    endedAt: timestamp,
+    updatedAt: timestamp,
+    results,
+  };
 }
 
 function browserChatModelSettings(providerInput?: unknown, modelInput?: unknown) {
@@ -865,6 +1056,8 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: normalizeModelProvider(session.modelProvider),
     model: browserChatModelSettings(session.modelProvider, session.model).model,
+    workflowMode: normalizeWorkflowMode(session.workflowMode),
+    targetRun: normalizeTargetRun(session.targetRun),
     status: session.status,
     busy: session.busy,
     tabs: browserChatTabs(session),
@@ -895,6 +1088,8 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: normalizeModelProvider(session.modelProvider),
     model: browserChatModelSettings(session.modelProvider, session.model).model,
+    workflowMode: normalizeWorkflowMode(session.workflowMode),
+    targetRun: normalizeTargetRun(session.targetRun),
     status: session.status,
     busy: session.busy,
     tabs: browserChatTabs(session),
@@ -1026,9 +1221,20 @@ function shouldPreserveRuntimeTurn(existing: BrowserChatSessionRecord, fromDisk:
   return hasRunningAssistantMessage(fromDisk, assistantMessageId);
 }
 
-function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { preserveRunningState?: boolean } = {}): BrowserChatSessionRecord {
+function recordFromSnapshot(
+  session: BrowserChatSessionSnapshot,
+  options: { preserveRunningState?: boolean; recoverOrphanedTargetRun?: boolean } = {},
+): BrowserChatSessionRecord {
   const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
-  const preserveRecentRunningState = (session.busy || session.status === 'running' || options.preserveRunningState)
+  const persistedTargetRun = normalizeTargetRun(session.targetRun);
+  const orphanedTargetActivity = options.recoverOrphanedTargetRun && Boolean(
+    persistedTargetRun && (
+      ['analyzing', 'running', 'summarizing'].includes(persistedTargetRun.status)
+      || (persistedTargetRun.status === 'ready' && persistedTargetRun.confirmedAt)
+    ),
+  );
+  const preserveRecentRunningState = !orphanedTargetActivity
+    && (session.busy || session.status === 'running' || options.preserveRunningState)
     && (options.preserveRunningState || isRecentTimestamp(session.updatedAt));
   const status = preserveRecentRunningState ? session.status : (session.status === 'running' ? 'idle' : session.status);
   const transientStepIndexes = new Set(
@@ -1071,6 +1277,10 @@ function recordFromSnapshot(session: BrowserChatSessionSnapshot, options: { pres
     tabs: session.tabs || [],
     targetUrl: exportableTargetUrl(session.targetUrl),
     safetyMode: normalizeSafetyMode(session.safetyMode),
+    workflowMode: normalizeWorkflowMode(session.workflowMode),
+    targetRun: options.recoverOrphanedTargetRun
+      ? recoverOrphanedTargetRun(persistedTargetRun)
+      : persistedTargetRun,
     modelProvider: modelSettings.provider,
     model: modelSettings.model,
     messages,
@@ -1306,6 +1516,35 @@ function mergePersistedConversationContext(
     : normalizeConversationContext(existing);
 }
 
+function mergeTargetWorkflowRun(existing?: TargetWorkflowRun, incoming?: TargetWorkflowRun) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  if (existing.id !== incoming.id) {
+    return timestampValue(incoming.updatedAt) >= timestampValue(existing.updatedAt) ? incoming : existing;
+  }
+  const existingPlanVersion = existing.plan?.version || 0;
+  const incomingPlanVersion = incoming.plan?.version || 0;
+  const planChanged = existing.plan?.id !== incoming.plan?.id || existingPlanVersion !== incomingPlanVersion;
+  if (planChanged) {
+    if (incomingPlanVersion !== existingPlanVersion) return incomingPlanVersion > existingPlanVersion ? incoming : existing;
+    return timestampValue(incoming.updatedAt) >= timestampValue(existing.updatedAt) ? incoming : existing;
+  }
+  const incomingNewer = timestampValue(incoming.updatedAt) >= timestampValue(existing.updatedAt);
+  const base = incomingNewer ? { ...existing, ...incoming } : { ...incoming, ...existing };
+  const results = { ...existing.results };
+  for (const [targetId, result] of Object.entries(incoming.results)) {
+    const previous = results[targetId];
+    const previousTime = Math.max(timestampValue(previous?.endedAt), timestampValue(previous?.startedAt));
+    const incomingTime = Math.max(timestampValue(result.endedAt), timestampValue(result.startedAt));
+    const previousFinal = previous && !['pending', 'running'].includes(previous.status);
+    const incomingFinal = !['pending', 'running'].includes(result.status);
+    if (!previous || incomingTime > previousTime || (incomingTime === previousTime && incomingFinal && !previousFinal)) {
+      results[targetId] = result;
+    }
+  }
+  return { ...base, results };
+}
+
 function mergePersistedSessionSnapshot(
   existing: BrowserChatSessionSnapshot | undefined,
   incoming: BrowserChatSessionSnapshot,
@@ -1321,6 +1560,7 @@ function mergePersistedSessionSnapshot(
     networkErrors: mergeStringLists(existing.networkErrors, incoming.networkErrors),
     logs: mergePersistedLogs(existing.logs, incoming.logs),
     conversationContext: mergePersistedConversationContext(existing.conversationContext, incoming.conversationContext),
+    targetRun: mergeTargetWorkflowRun(existing.targetRun, incoming.targetRun),
   };
 }
 
@@ -1340,6 +1580,7 @@ function mergeRuntimeSessionState(fromDisk: BrowserChatSessionRecord, existing: 
     networkErrors: mergeStringLists(fromDisk.networkErrors, existing.networkErrors),
     logs: mergePersistedLogs(fromDisk.logs, existing.logs),
     conversationContext: mergePersistedConversationContext(fromDisk.conversationContext, existing.conversationContext),
+    targetRun: mergeTargetWorkflowRun(fromDisk.targetRun, existing.targetRun),
     pendingToolConfirmation: existing.pendingToolConfirmation || fromDisk.pendingToolConfirmation,
   };
 }
@@ -1347,12 +1588,18 @@ function mergeRuntimeSessionState(fromDisk: BrowserChatSessionRecord, existing: 
 function applyPersistedSnapshotToRuntime(persistedSnapshot: BrowserChatSessionSnapshot) {
   const existing = sessions.get(persistedSnapshot.id);
   if (!existing) {
-    sessions.set(persistedSnapshot.id, recordFromSnapshot(persistedSnapshot));
+    sessions.set(persistedSnapshot.id, recordFromSnapshot(persistedSnapshot, { recoverOrphanedTargetRun: true }));
     return;
   }
   const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, persistedSnapshot);
+  const targetRuntimePrefix = `${persistedSnapshot.id}:`;
+  const hasActorLoginRuntime = Array.from(targetWorkflowRuntimeState.actorLoginControllers.keys())
+    .some((key) => key.startsWith(targetRuntimePrefix));
   const fromDisk = mergeRuntimeSessionState(
-    recordFromSnapshot(persistedSnapshot, { preserveRunningState: preserveRuntimeTurn }),
+    recordFromSnapshot(persistedSnapshot, {
+      preserveRunningState: preserveRuntimeTurn,
+      recoverOrphanedTargetRun: !preserveRuntimeTurn && !hasActorLoginRuntime,
+    }),
     existing,
   );
   const runtimeState = {
@@ -1636,6 +1883,7 @@ function warmBrowserChatSession(session: BrowserChatSessionRecord) {
 export function createBrowserChatSession(input: {
   targetUrl?: string;
   mode?: BrowserSessionMode;
+  workflowMode?: BrowserChatWorkflowMode;
   safetyMode?: BrowserChatSafetyMode;
   modelProvider?: unknown;
   model?: unknown;
@@ -1655,6 +1903,7 @@ export function createBrowserChatSession(input: {
     safetyMode: normalizeSafetyMode(input.safetyMode),
     modelProvider: modelSettings.provider,
     model: modelSettings.model,
+    workflowMode: normalizeWorkflowMode(input.workflowMode),
     status: 'idle',
     busy: false,
     tabs: [],
@@ -1670,15 +1919,923 @@ export function createBrowserChatSession(input: {
   session.browserGroupId = `session:${session.id}`;
   sessions.set(session.id, session);
   persistAndNotify(session.id);
-  warmBrowserChatSession(session);
+  if (session.workflowMode === 'chat') warmBrowserChatSession(session);
   return snapshot(session);
 }
 
 export function getBrowserChatSession(sessionId: string, userId?: string | number) {
   const session = hydrateSession(sessionId);
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
-  if (session) warmBrowserChatSession(session);
+  if (session?.workflowMode === 'chat') warmBrowserChatSession(session);
   return session ? snapshot(session) : undefined;
+}
+
+function targetActorRuntimeKey(sessionId: string, actorId: string) {
+  return `${sessionId}:${actorId}`;
+}
+
+function isTargetActorBrowserBinding(
+  value: TargetActorBrowserBinding | BrowserSession,
+): value is TargetActorBrowserBinding {
+  const candidate = value as Partial<TargetActorBrowserBinding>;
+  return typeof candidate.browserSessionId === 'string'
+    && typeof candidate.identityFingerprint === 'string'
+    && Boolean(candidate.browser)
+    && typeof candidate.browser?.close === 'function';
+}
+
+function targetActorIdentityFingerprint(actor: TargetActor) {
+  return createHash('sha256')
+    .update(JSON.stringify([
+      actor.id,
+      actor.name,
+      actor.role,
+      actor.auth.required,
+      actor.auth.loginUrl || '',
+    ]), 'utf8')
+    .digest('hex')
+    .slice(0, 32);
+}
+
+function targetActorSessionId(runId: string, actor: TargetActor) {
+  return `actor_${runId}_${targetActorIdentityFingerprint(actor)}`.slice(0, 180);
+}
+
+function targetActorOf(session: BrowserChatSessionRecord, actorId: string) {
+  const actor = session.targetRun?.plan?.actors.find((item) => item.id === actorId);
+  if (!actor) throw new Error(`目标测试参与者不存在：${actorId}`);
+  return actor;
+}
+
+function updateTargetActor(session: BrowserChatSessionRecord, actorId: string, updater: (actor: TargetActor) => TargetActor) {
+  if (!session.targetRun?.plan) throw new Error('目标测试计划不存在');
+  if (!session.targetRun.plan.actors.some((actor) => actor.id === actorId)) {
+    throw new Error(`目标测试参与者不存在：${actorId}`);
+  }
+  session.targetRun.plan = {
+    ...session.targetRun.plan,
+    actors: session.targetRun.plan.actors.map((actor) => actor.id === actorId ? updater(actor) : actor),
+  };
+  session.targetRun.updatedAt = now();
+}
+
+function targetActorIdentityMatches(session: BrowserChatSessionRecord, expected: TargetActor) {
+  const current = session.targetRun?.plan?.actors.find((actor) => actor.id === expected.id);
+  return Boolean(current
+    && current.name === expected.name
+    && current.role === expected.role
+    && current.auth.required === expected.auth.required
+    && (current.auth.loginUrl || '') === (expected.auth.loginUrl || ''));
+}
+
+function mergeLatestTargetActorAuth(plan: TargetPlan, latestPlan?: TargetPlan): TargetPlan {
+  if (!latestPlan) return plan;
+  return {
+    ...plan,
+    actors: plan.actors.map((actor) => {
+      const latest = latestPlan.actors.find((item) => item.id === actor.id);
+      const sameIdentity = latest
+        && latest.name === actor.name
+        && latest.role === actor.role
+        && latest.auth.required === actor.auth.required
+        && (latest.auth.loginUrl || '') === (actor.auth.loginUrl || '');
+      return sameIdentity ? { ...actor, auth: { ...actor.auth, ...latest.auth } } : actor;
+    }),
+  };
+}
+
+function targetPlanPreparationStatus(plan: TargetPlan): TargetWorkflowRun['status'] {
+  const unresolved = plan.requirements.some((item) => item.required && item.status === 'missing');
+  if (unresolved) return 'collecting_requirements';
+  const pendingAuth = plan.actors.some((actor) => actor.auth.required && actor.auth.status !== 'ready');
+  return pendingAuth ? 'preparing_authentication' : 'awaiting_confirmation';
+}
+
+function pendingTargetResults(plan: TargetPlan): TargetWorkflowRun['results'] {
+  return Object.fromEntries(plan.nodes
+    .filter((node): node is TargetLeafNode => node.type === 'target')
+    .map((target) => [target.id, {
+      targetId: target.id,
+      actorId: target.actorId,
+      status: 'pending' as const,
+      criteria: [],
+      evidence: [],
+      outputs: {},
+    }]));
+}
+
+function applyTargetRequirementResponses(
+  plan: TargetPlan,
+  responses: TargetWorkflowRequirementResponse[],
+) {
+  const byId = new Map(responses.map((item) => [item.requirementId, item.value]));
+  return {
+    ...plan,
+    requirements: plan.requirements.map((requirement) => {
+      const response = byId.get(requirement.id);
+      return response === undefined ? requirement : {
+        ...requirement,
+        status: 'resolved' as const,
+        resolution: response,
+      };
+    }),
+  };
+}
+
+function targetRequirementResponseMessage(
+  plan: TargetPlan,
+  responses: TargetWorkflowRequirementResponse[],
+) {
+  const requirements = new Map(plan.requirements.map((requirement) => [requirement.id, requirement]));
+  return [
+    '我补充以下目标测试执行资料：',
+    ...responses.map((item) => {
+      const requirement = requirements.get(item.requirementId);
+      return `- ${requirement?.title || item.requirementId}：${item.value}`;
+    }),
+  ].join('\n');
+}
+
+function refreshTargetPreparationStatus(session: BrowserChatSessionRecord) {
+  const run = session.targetRun;
+  const plan = run?.plan;
+  if (!run || !plan || ['running', 'summarizing', 'completed', 'cancelled'].includes(run.status)) return;
+  run.status = targetPlanPreparationStatus(plan);
+  run.updatedAt = now();
+}
+
+async function ensureTargetActorBrowser(session: BrowserChatSessionRecord, actor: TargetActor) {
+  const run = session.targetRun;
+  if (!run?.plan) throw new Error('目标测试计划不存在');
+  const identityFingerprint = targetActorIdentityFingerprint(actor);
+  const browserSessionId = actor.auth.browserSessionId || targetActorSessionId(run.id, actor);
+  const key = targetActorRuntimeKey(session.id, actor.id);
+  const existing = targetWorkflowRuntimeState.actorBrowsers.get(key);
+  const existingBinding = existing && isTargetActorBrowserBinding(existing) ? existing : undefined;
+  const existingBrowser = existingBinding?.browser || existing;
+  const sameBinding = existingBinding?.browserSessionId === browserSessionId
+    && existingBinding.identityFingerprint === identityFingerprint;
+  if (sameBinding && existingBinding.browser.isUsable()) return existingBinding.browser;
+  if (existing) {
+    targetWorkflowRuntimeState.actorBrowsers.delete(key);
+    await existingBrowser?.close({ keepOpen: sameBinding }).catch(() => undefined);
+  }
+  const browser = new BrowserSession('dom', {
+    browserSurface: 'electron-embedded',
+    browserProfileKey: `target_${run.id}_${identityFingerprint}`,
+    isMarked: true,
+    preferExistingPage: false,
+    runId: browserSessionId,
+  });
+  await browser.start();
+  if (run.plan.targetUrl && !browser.hasNonBlankActivePage()) await browser.open(run.plan.targetUrl);
+  targetWorkflowRuntimeState.actorBrowsers.set(key, {
+    browser,
+    browserSessionId,
+    identityFingerprint,
+  });
+  return browser;
+}
+
+function mergeTargetSteps(session: BrowserChatSessionRecord, steps: StepExecutionResult[]) {
+  session.steps = mergePersistedSteps(session.steps, steps);
+  if (session.activeAssistantMessageId
+    && steps.length
+    && session.targetRun
+    && ['running', 'summarizing'].includes(session.targetRun.status)) {
+    const stepIndexes = steps.map((step) => step.index);
+    updateAssistantMessage(session, session.activeAssistantMessageId, (message) => ({
+      ...message,
+      stepIndexes: Array.from(new Set([...(message.stepIndexes || []), ...stepIndexes])).sort((left, right) => left - right),
+    }));
+  }
+  session.updatedAt = now();
+  persistAndNotify(session.id, { mergePersisted: false });
+}
+
+function targetCredentialRef(sessionId: string, actorId: string, field: 'username' | 'password') {
+  return `credential:${sessionId}:${actorId}:${field}`;
+}
+
+function resolveTargetCredential(reference: string, attemptId?: string) {
+  const item = targetWorkflowRuntimeState.credentials.get(reference);
+  if (!item) return undefined;
+  if (attemptId && item.attemptId !== attemptId) return undefined;
+  if (item.expiresAt <= Date.now()) {
+    targetWorkflowRuntimeState.credentials.delete(reference);
+    return undefined;
+  }
+  return item.value;
+}
+
+function clearTargetActorCredentials(sessionId: string, actorId: string, attemptId?: string) {
+  for (const [reference, item] of targetWorkflowRuntimeState.credentials) {
+    if (item.sessionId === sessionId
+      && item.actorId === actorId
+      && (!attemptId || item.attemptId === attemptId)) {
+      targetWorkflowRuntimeState.credentials.delete(reference);
+    }
+  }
+}
+
+function targetActorCredentialLoginUrl(session: BrowserChatSessionRecord, actor: TargetActor) {
+  const value = actor.auth.loginUrl || session.targetRun?.plan?.targetUrl || '';
+  try {
+    const url = new URL(value);
+    if (!/^https?:$/.test(url.protocol)) throw new Error('unsupported protocol');
+    return url.toString();
+  } catch {
+    throw new Error('凭据登录需要计划中提供明确的 http(s) 登录地址；请补充登录地址或改用手动登录');
+  }
+}
+
+export function prepareTargetActorLogin(
+  sessionId: string,
+  actorId: string,
+  mode: 'manual' | 'credentials' | 'existing_session',
+  userId?: string | number,
+) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
+  const actor = targetActorOf(session, actorId);
+  if (!actor.auth.required) throw new Error('该参与者不需要登录');
+  const browserSessionId = actor.auth.browserSessionId || targetActorSessionId(session.targetRun!.id, actor);
+  updateTargetActor(session, actorId, (current) => ({
+    ...current,
+    auth: {
+      ...current.auth,
+      mode,
+      status: 'awaiting_user',
+      browserSessionId,
+      credentialsAvailable: false,
+      message: mode === 'manual'
+        ? '请在该账号的独立浏览器中完成登录，然后点击“完成登录”。'
+        : mode === 'credentials'
+          ? '独立登录环境已准备好，提交凭据后将开始安全登录。'
+          : undefined,
+    },
+  }));
+  refreshTargetPreparationStatus(session);
+  session.updatedAt = now();
+  persistAndNotify(session.id);
+  return snapshot(session);
+}
+
+async function verifyTargetActorLogin(
+  session: BrowserChatSessionRecord,
+  actorId: string,
+  abortController: AbortController,
+) {
+  const actor = targetActorOf(session, actorId);
+  const runtimeKey = targetActorRuntimeKey(session.id, actorId);
+  const isCurrentRuntime = () => (
+    sessions.get(session.id) === session
+    && session.status !== 'closed'
+    && targetWorkflowRuntimeState.actorLoginControllers.get(runtimeKey) === abortController
+    && targetActorIdentityMatches(session, actor)
+  );
+  updateTargetActor(session, actorId, (current) => ({
+    ...current,
+    auth: { ...current.auth, status: 'verifying', message: 'AI 正在检查当前账号是否已经登录。' },
+  }));
+  persistAndNotify(session.id);
+  try {
+    const browser = await ensureTargetActorBrowser(session, actor);
+    const actorIndex = session.targetRun!.plan!.actors.findIndex((item) => item.id === actorId);
+    const authStepBase = 10_000_000 + Math.max(0, actorIndex) * 10_000;
+    const initialStepIndex = Math.max(authStepBase, ...session.steps
+      .map((step) => step.index)
+      .filter((stepIndex) => stepIndex >= authStepBase && stepIndex < authStepBase + 10_000));
+    const result = await executeInteractiveBrowserTurn({
+      session: browser,
+      runId: `${session.targetRun!.id}_auth_${actor.id}`,
+      initialStepIndex,
+      targetUrl: actor.auth.loginUrl || session.targetRun!.plan!.targetUrl || browser.currentUrl() || 'about:blank',
+      instruction: `请只检查当前浏览器是否已经成功登录为“${actor.name}（${actor.role}）”。必须读取当前页面证据，不要修改业务数据。如果能够确认已登录，明确报告 passed；仍在登录页、身份不符或证据不足时报告 blocked。`,
+      mode: 'dom',
+      safetyMode: 'full',
+      completedSteps: [],
+      abortSignal: abortController.signal,
+      shouldContinue: isCurrentRuntime,
+      onProgress: (step) => {
+        if (isCurrentRuntime()) mergeTargetSteps(session, [step]);
+      },
+    });
+    if (!isCurrentRuntime()) return;
+    mergeTargetSteps(session, result.newSteps);
+    const ready = result.status === 'passed';
+    updateTargetActor(session, actorId, (current) => ({
+      ...current,
+      auth: {
+        ...current.auth,
+        status: ready ? 'ready' : 'awaiting_user',
+        credentialsAvailable: false,
+        message: ready ? '登录状态已由 AI 检查通过。' : result.reply || '尚未确认登录成功，请继续完成登录。',
+      },
+    }));
+  } catch (error) {
+    if (isCurrentRuntime()) {
+      updateTargetActor(session, actorId, (current) => ({
+        ...current,
+        auth: {
+          ...current.auth,
+          status: 'failed',
+          credentialsAvailable: false,
+          message: error instanceof Error ? error.message : String(error),
+        },
+      }));
+    }
+  }
+  if (isCurrentRuntime()) {
+    refreshTargetPreparationStatus(session);
+    session.updatedAt = now();
+    persistAndNotify(session.id);
+  }
+}
+
+export async function completeTargetActorLogin(sessionId: string, actorId: string, userId?: string | number) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
+  const runtimeKey = targetActorRuntimeKey(session.id, actorId);
+  targetWorkflowRuntimeState.actorLoginControllers.get(runtimeKey)?.abort(new Error('新的登录检查已替换上一次请求'));
+  const abortController = new AbortController();
+  targetWorkflowRuntimeState.actorLoginControllers.set(runtimeKey, abortController);
+  try {
+    await verifyTargetActorLogin(session, actorId, abortController);
+  } finally {
+    if (targetWorkflowRuntimeState.actorLoginControllers.get(runtimeKey) === abortController) {
+      targetWorkflowRuntimeState.actorLoginControllers.delete(runtimeKey);
+    }
+  }
+  return snapshot(session);
+}
+
+async function runTargetCredentialLogin(
+  session: BrowserChatSessionRecord,
+  actorId: string,
+  abortController: AbortController,
+  attemptId: string,
+) {
+  const actor = targetActorOf(session, actorId);
+  const runtimeKey = targetActorRuntimeKey(session.id, actorId);
+  const isCurrentRuntime = () => (
+    sessions.get(session.id) === session
+    && session.status !== 'closed'
+    && targetWorkflowRuntimeState.actorLoginControllers.get(runtimeKey) === abortController
+    && targetActorIdentityMatches(session, actor)
+  );
+  const usernameRef = targetCredentialRef(session.id, actorId, 'username');
+  const passwordRef = targetCredentialRef(session.id, actorId, 'password');
+  const allowedCredentialRefs = new Set([usernameRef, passwordRef]);
+  try {
+    const loginUrl = targetActorCredentialLoginUrl(session, actor);
+    const browser = await ensureTargetActorBrowser(session, actor);
+    const loginOrigin = new URL(loginUrl).origin;
+    let currentOrigin = '';
+    try {
+      currentOrigin = new URL(browser.currentUrl()).origin;
+    } catch {
+      // The browser can still be on about:blank before the first login attempt.
+    }
+    if (currentOrigin !== loginOrigin) await browser.open(loginUrl);
+    const actorIndex = session.targetRun!.plan!.actors.findIndex((item) => item.id === actorId);
+    const authStepBase = 20_000_000 + Math.max(0, actorIndex) * 10_000;
+    const initialStepIndex = Math.max(authStepBase, ...session.steps
+      .map((step) => step.index)
+      .filter((stepIndex) => stepIndex >= authStepBase && stepIndex < authStepBase + 10_000));
+    const result = await executeInteractiveBrowserTurn({
+      session: browser,
+      runId: `${session.targetRun!.id}_credential_auth_${actor.id}`,
+      initialStepIndex,
+      targetUrl: loginUrl,
+      instruction: [
+        `请登录为“${actor.name}（${actor.role}）”。`,
+        `用户名只能通过 keyboard.credentialRef="${usernameRef}" 输入。`,
+        `密码只能通过 keyboard.credentialRef="${passwordRef}" 输入。`,
+        '绝对不要要求、复述或猜测凭据明文。遇到验证码、OTP、扫码或二次认证时调用 waitForHumanVerification。登录成功后检查页面并报告 passed。',
+      ].join('\n'),
+      mode: 'dom',
+      safetyMode: 'full',
+      completedSteps: [],
+      resolveCredential: (reference) => allowedCredentialRefs.has(reference) ? resolveTargetCredential(reference, attemptId) : undefined,
+      credentialAllowedOrigins: [loginOrigin],
+      allowedToolTypes: [
+        'openPage',
+        'mouse',
+        'keyboard',
+        'selectOption',
+        'waitForPage',
+        'waitForHumanVerification',
+        'listTabs',
+        'switchTab',
+        'takeSnapshot',
+        'searchSnapshot',
+        'reportState',
+      ],
+      abortSignal: abortController.signal,
+      shouldContinue: isCurrentRuntime,
+      onProgress: (step) => {
+        if (isCurrentRuntime()) mergeTargetSteps(session, [step]);
+      },
+    });
+    if (!isCurrentRuntime()) return;
+    mergeTargetSteps(session, result.newSteps);
+    const ready = result.status === 'passed';
+    updateTargetActor(session, actorId, (current) => ({
+      ...current,
+      auth: {
+        ...current.auth,
+        status: ready ? 'ready' : 'awaiting_user',
+        credentialsAvailable: false,
+        message: ready ? '账号凭据登录完成，AI 已检查登录状态。' : result.reply || '需要你在独立浏览器中继续完成人工验证。',
+      },
+    }));
+  } catch (error) {
+    if (isCurrentRuntime()) {
+      updateTargetActor(session, actorId, (current) => ({
+        ...current,
+        auth: {
+          ...current.auth,
+          status: 'failed',
+          credentialsAvailable: false,
+          message: error instanceof Error ? error.message : String(error),
+        },
+      }));
+    }
+  } finally {
+    clearTargetActorCredentials(session.id, actorId, attemptId);
+    if (targetWorkflowRuntimeState.actorLoginControllers.get(runtimeKey) === abortController) {
+      targetWorkflowRuntimeState.actorLoginControllers.delete(runtimeKey);
+    }
+    if (sessions.get(session.id) === session && session.status !== 'closed') {
+      refreshTargetPreparationStatus(session);
+      session.updatedAt = now();
+      persistAndNotify(session.id);
+    }
+  }
+}
+
+function startTargetActorCredentialLogin(
+  session: BrowserChatSessionRecord,
+  actorId: string,
+  credentials: { username: string; password: string },
+  parentAbortSignal?: AbortSignal,
+) {
+  if (!credentials.username.trim() || !credentials.password) throw new Error('账号和密码不能为空');
+  const actor = targetActorOf(session, actorId);
+  if (!actor.auth.required) throw new Error('该参与者不需要登录');
+  const browserSessionId = actor.auth.browserSessionId || targetActorSessionId(session.targetRun!.id, actor);
+  updateTargetActor(session, actorId, (current) => ({
+    ...current,
+    auth: {
+      ...current.auth,
+      mode: 'credentials',
+      status: 'awaiting_user',
+      browserSessionId,
+      credentialsAvailable: false,
+      message: '独立登录环境已准备好，正在通过安全引用使用本次凭据。',
+    },
+  }));
+  const runtimeKey = targetActorRuntimeKey(session.id, actorId);
+  targetWorkflowRuntimeState.actorLoginControllers.get(runtimeKey)?.abort(new Error('新的登录请求已替换上一次请求'));
+  const abortController = new AbortController();
+  targetWorkflowRuntimeState.actorLoginControllers.set(runtimeKey, abortController);
+  const forwardParentAbort = () => abortController.abort(parentAbortSignal?.reason);
+  if (parentAbortSignal?.aborted) forwardParentAbort();
+  else parentAbortSignal?.addEventListener('abort', forwardParentAbort, { once: true });
+  const expiresAt = Date.now() + 15 * 60 * 1000;
+  const attemptId = id('credential_attempt');
+  targetWorkflowRuntimeState.credentials.set(targetCredentialRef(session.id, actorId, 'username'), {
+    actorId,
+    attemptId,
+    expiresAt,
+    sessionId: session.id,
+    value: credentials.username,
+  });
+  targetWorkflowRuntimeState.credentials.set(targetCredentialRef(session.id, actorId, 'password'), {
+    actorId,
+    attemptId,
+    expiresAt,
+    sessionId: session.id,
+    value: credentials.password,
+  });
+  updateTargetActor(session, actorId, (current) => ({
+    ...current,
+    auth: { ...current.auth, credentialsAvailable: true, status: 'verifying', message: '凭据仅保存在内存中，AI 正在使用安全引用登录。' },
+  }));
+  persistAndNotify(session.id);
+  return withModelSettings(
+    browserChatModelSettings(session.modelProvider, session.model),
+    () => runTargetCredentialLogin(session, actorId, abortController, attemptId),
+  ).finally(() => parentAbortSignal?.removeEventListener('abort', forwardParentAbort));
+}
+
+export function provideTargetActorCredentials(
+  sessionId: string,
+  actorId: string,
+  credentials: { username: string; password: string },
+  userId?: string | number,
+) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
+  void startTargetActorCredentialLogin(session, actorId, credentials);
+  return snapshot(session);
+}
+
+async function runConfirmedTargetWorkflow(session: BrowserChatSessionRecord, assistantMessageId: string, abortController: AbortController) {
+  const run = session.targetRun;
+  if (!run?.plan) return;
+  const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
+  const anonymousBrowsers = new Map<string, BrowserSession>();
+  const transientActorBrowsers = new Map<string, BrowserSession>();
+  try {
+    await executeTargetWorkflow(run, {
+      safetyMode: normalizeSafetyMode(session.safetyMode),
+      abortSignal: abortController.signal,
+      shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
+      requestToolConfirmation: session.safetyMode === 'strict'
+        ? (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal)
+        : undefined,
+      getBrowser: async ({ actor, laneId }) => {
+        if (!ownsTurn()) throw abortController.signal.reason || new Error('目标测试执行已失效。');
+        if (actor?.auth.required) return ensureTargetActorBrowser(session, actor);
+        const key = actor ? targetActorRuntimeKey(session.id, actor.id) : `anonymous:${session.id}:${laneId}`;
+        const existing = actor
+          ? transientActorBrowsers.get(key)
+          : anonymousBrowsers.get(key);
+        if (existing?.isUsable()) return existing;
+        const browser = new BrowserSession('dom', {
+          isolated: true,
+          isMarked: true,
+          runId: `${run.id}_${actor?.id || laneId}`,
+        });
+        await browser.start();
+        if (run.plan?.targetUrl) await browser.open(run.plan.targetUrl);
+        if (actor) {
+          transientActorBrowsers.set(key, browser);
+        }
+        else anonymousBrowsers.set(key, browser);
+        return browser;
+      },
+      onSteps: (steps) => {
+        if (ownsTurn()) mergeTargetSteps(session, steps);
+      },
+      onRunChange: (nextRun) => {
+        if (!ownsTurn()) return;
+        session.targetRun = mergeTargetWorkflowRun(session.targetRun, nextRun);
+        session.updatedAt = now();
+        persistAndNotify(session.id, { mergePersisted: false });
+      },
+      onDebug: (event) => {
+        if (!ownsTurn()) return;
+        appendLog(session, event.phase, event.message, {
+          stepIndex: event.stepIndex,
+          details: event.details,
+          deferPersist: true,
+        });
+      },
+    });
+    if (!ownsTurn()) return;
+    const results = Object.values(session.targetRun?.results || {});
+    const failed = results.some((result) => result.status === 'failed');
+    const blocked = results.some((result) => result.status === 'blocked' || result.status === 'inconclusive');
+    updateAssistantMessage(session, assistantMessageId, (message) => ({
+      ...message,
+      content: session.targetRun?.summary || '目标测试已经完成。',
+      status: failed ? 'failed' : blocked ? 'blocked' : 'passed',
+      activity: undefined,
+      updatedAt: now(),
+    }));
+  } catch (error) {
+    if (!ownsTurn()) return;
+    updateAssistantMessage(session, assistantMessageId, (message) => ({
+      ...message,
+      content: session.targetRun?.status === 'cancelled' ? '目标测试已中断。' : `目标测试执行异常：${error instanceof Error ? error.message : String(error)}`,
+      status: session.targetRun?.status === 'cancelled' ? 'interrupted' : 'failed',
+      activity: undefined,
+      updatedAt: now(),
+    }));
+  } finally {
+    for (const browser of anonymousBrowsers.values()) await browser.close().catch(() => undefined);
+    for (const browser of transientActorBrowsers.values()) await browser.close().catch(() => undefined);
+    if (session.activeAssistantMessageId !== assistantMessageId || session.activeAbortController !== abortController) return;
+    session.activeAssistantMessageId = undefined;
+    session.activeAbortController = undefined;
+    session.busy = false;
+    session.status = 'idle';
+    session.updatedAt = now();
+    persistAndNotify(session.id);
+  }
+}
+
+function replaceTargetRunPlan(
+  session: BrowserChatSessionRecord,
+  assistantMessageId: string,
+  plan: TargetPlan,
+) {
+  const previousRun = session.targetRun;
+  const timestamp = now();
+  session.targetRun = {
+    id: previousRun?.id || id('target'),
+    ownerMessageId: assistantMessageId,
+    status: targetPlanPreparationStatus(plan),
+    plan,
+    results: pendingTargetResults(plan),
+    createdAt: previousRun?.createdAt || timestamp,
+    updatedAt: timestamp,
+  };
+  session.updatedAt = timestamp;
+}
+
+async function runTargetWorkflowContinuation(
+  session: BrowserChatSessionRecord,
+  assistantMessageId: string,
+  abortController: AbortController,
+  actorCredentials: TargetWorkflowActorCredentials[],
+) {
+  const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
+  try {
+    appendLog(session, 'target:continue:plan:start', 'AI 正在重新核对执行资料；此阶段不会操作业务页面', {
+      messageId: assistantMessageId,
+    });
+    let plan = await generateSessionTargetPlan({
+      session,
+      assistantMessageId,
+      abortController,
+      phase: 'continue_before_auth',
+    });
+    if (!ownsTurn()) return;
+    replaceTargetRunPlan(session, assistantMessageId, plan);
+    persistAndNotify(session.id);
+
+    if (actorCredentials.length) {
+      appendLog(session, 'target:continue:auth:start', `正在安全准备 ${actorCredentials.length} 个独立账号会话`, {
+        messageId: assistantMessageId,
+      });
+      const loginTasks = actorCredentials.map(async (credential) => {
+        if (!ownsTurn()) return;
+        const actor = session.targetRun?.plan?.actors.find((item) => item.id === credential.actorId);
+        if (!actor?.auth.required) {
+          appendLog(session, 'target:continue:auth:skipped', `参与者 ${credential.actorId} 在新版资料分析中不存在或不需要登录，未使用其凭据`, {
+            messageId: assistantMessageId,
+          });
+          return;
+        }
+        appendLog(session, 'target:continue:auth:actor', `正在登录独立账号会话：${actor.name}（${actor.role}）`, {
+          messageId: assistantMessageId,
+        });
+        await startTargetActorCredentialLogin(
+          session,
+          actor.id,
+          { username: credential.username, password: credential.password },
+          abortController.signal,
+        );
+      });
+      // Actor browsers, credential references and step-index ranges are all
+      // isolated, so independent account preparation can run concurrently.
+      // allSettled ensures one failed login never prevents the remaining actors
+      // from being checked; the final planning pass turns failures back into
+      // actor-bound missing account requirements.
+      await Promise.allSettled(loginTasks);
+      if (!ownsTurn()) return;
+      appendLog(session, 'target:continue:plan:recheck', '账号登录处理结束，AI 正在无条件重新核对全部资料并生成最终计划', {
+        messageId: assistantMessageId,
+      });
+      plan = await generateSessionTargetPlan({
+        session,
+        assistantMessageId,
+        abortController,
+        phase: 'continue_after_auth',
+      });
+      if (!ownsTurn()) return;
+      replaceTargetRunPlan(session, assistantMessageId, plan);
+      persistAndNotify(session.id);
+    }
+
+    if (!targetPlanIsReady(plan)) {
+      const timestamp = now();
+      updateAssistantMessage(session, assistantMessageId, (message) => ({
+        ...message,
+        content: targetWorkflowPlanningReply(plan),
+        status: 'passed',
+        activity: undefined,
+        updatedAt: timestamp,
+      }));
+      session.activeAssistantMessageId = undefined;
+      session.activeAbortController = undefined;
+      session.busy = false;
+      session.status = 'idle';
+      session.error = undefined;
+      session.updatedAt = timestamp;
+      appendLog(session, 'target:continue:collecting', '资料复核完成，仍有内容需要补充；未启动目标执行', {
+        messageId: assistantMessageId,
+      });
+      persistAndNotify(session.id);
+      return;
+    }
+
+    const structuralErrors = validateTargetPlanStructure(plan);
+    if (structuralErrors.length) throw new Error(`目标测试计划结构无效：${structuralErrors.join('；')}`);
+    const timestamp = now();
+    session.targetRun = {
+      ...session.targetRun!,
+      ownerMessageId: assistantMessageId,
+      status: 'ready',
+      confirmedAt: timestamp,
+      startedAt: undefined,
+      endedAt: undefined,
+      summary: undefined,
+      error: undefined,
+      results: pendingTargetResults(plan),
+      updatedAt: timestamp,
+    };
+    updateAssistantMessage(session, assistantMessageId, (message) => ({
+      ...message,
+      content: '所需资料与账号会话已经复核齐全，正在按最终串并联流程树执行目标测试。',
+      status: 'running',
+      activity: { phase: 'target:execute', label: '正在执行目标测试', updatedAt: timestamp },
+      updatedAt: timestamp,
+    }));
+    session.updatedAt = timestamp;
+    appendLog(session, 'target:continue:execute', `目标计划第 ${plan.version} 版已确认，开始执行`, {
+      messageId: assistantMessageId,
+    });
+    persistAndNotify(session.id);
+    await runConfirmedTargetWorkflow(session, assistantMessageId, abortController);
+  } catch (error) {
+    if (!ownsTurn()) return;
+    const timestamp = now();
+    const message = userFacingErrorMessage(error);
+    if (session.targetRun) {
+      session.targetRun.status = 'failed';
+      session.targetRun.error = message;
+      session.targetRun.updatedAt = timestamp;
+    }
+    updateAssistantMessage(session, assistantMessageId, (item) => ({
+      ...item,
+      content: `目标资料复核失败：${message}`,
+      status: 'failed',
+      activity: undefined,
+      updatedAt: timestamp,
+    }));
+    session.activeAssistantMessageId = undefined;
+    session.activeAbortController = undefined;
+    session.busy = false;
+    session.status = 'error';
+    session.error = message;
+    session.updatedAt = timestamp;
+    appendLog(session, 'target:continue:error', `目标资料复核失败：${message}`, {
+      details: errorLogDetails(error),
+      messageId: assistantMessageId,
+    });
+    persistAndNotify(session.id);
+  }
+}
+
+export function continueTargetWorkflow(
+  sessionId: string,
+  input: ContinueTargetWorkflowInput = {},
+  userId?: string | number,
+) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
+  if (session.workflowMode !== 'target') throw new Error('当前对话不是目标模式');
+  if (session.busy || ['analyzing', 'ready', 'running', 'summarizing'].includes(session.targetRun?.status || '')) {
+    throw new Error('目标资料正在复核或目标测试已经在执行');
+  }
+  const currentPlan = session.targetRun?.plan;
+  if (!currentPlan) throw new Error('目标测试计划不存在');
+
+  const responseById = new Map<string, TargetWorkflowRequirementResponse>();
+  for (const raw of input.responses || []) {
+    const requirementId = raw.requirementId.trim();
+    const value = raw.value.trim();
+    if (!requirementId || !value) throw new Error('补充资料不能为空');
+    const requirement = currentPlan.requirements.find((item) => item.id === requirementId);
+    if (!requirement) throw new Error(`待补充资料不存在或已经更新：${requirementId}`);
+    if (requirement.category === 'account') throw new Error(`账号资料必须通过“${requirement.title}”的安全凭据输入提交`);
+    responseById.set(requirementId, { requirementId, value: value.slice(0, 2_000) });
+  }
+  const responses = Array.from(responseById.values());
+
+  const credentialsByActor = new Map<string, TargetWorkflowActorCredentials>();
+  for (const raw of input.actorCredentials || []) {
+    const actorId = raw.actorId.trim();
+    const actor = currentPlan.actors.find((item) => item.id === actorId);
+    if (!actor?.auth.required) throw new Error(`需要登录的参与者不存在或已经更新：${actorId}`);
+    if (!raw.username.trim() || !raw.password) throw new Error(`参与者 ${actor.name} 的账号和密码不能为空`);
+    credentialsByActor.set(actorId, { actorId, username: raw.username, password: raw.password });
+  }
+  const actorCredentials = Array.from(credentialsByActor.values());
+  if (!responses.length && !actorCredentials.length && session.targetRun?.status === 'collecting_requirements') {
+    throw new Error('请先补充当前缺失的资料或账号凭据');
+  }
+
+  const timestamp = now();
+  let plan = currentPlan;
+  if (responses.length) {
+    const userMessage: BrowserChatMessage = {
+      id: id('msg'),
+      role: 'user',
+      content: targetRequirementResponseMessage(plan, responses),
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    session.messages.push(userMessage);
+    plan = applyTargetRequirementResponses(plan, responses);
+  }
+  const assistantMessage: BrowserChatMessage = {
+    id: id('msg'),
+    role: 'assistant',
+    content: '正在重新核对执行资料与账号状态。',
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    status: 'running',
+    stepIndexes: [],
+    activity: { phase: 'target:continue', label: '正在复核目标资料', updatedAt: timestamp },
+  };
+  session.messages.push(assistantMessage);
+  session.targetRun = {
+    ...session.targetRun!,
+    ownerMessageId: assistantMessage.id,
+    status: 'analyzing',
+    plan,
+    results: {},
+    summary: undefined,
+    error: undefined,
+    confirmedAt: undefined,
+    startedAt: undefined,
+    endedAt: undefined,
+    updatedAt: timestamp,
+  };
+  const abortController = new AbortController();
+  session.activeAssistantMessageId = assistantMessage.id;
+  session.activeAbortController = abortController;
+  session.busy = true;
+  session.status = 'running';
+  session.error = undefined;
+  session.updatedAt = timestamp;
+  appendLog(session, 'target:continue:queued', `已收到目标继续请求：普通资料 ${responses.length} 项，安全账号 ${actorCredentials.length} 个`, {
+    messageId: assistantMessage.id,
+  });
+  persistAndNotify(session.id);
+  void withModelSettings(
+    browserChatModelSettings(session.modelProvider, session.model),
+    () => runTargetWorkflowContinuation(session, assistantMessage.id, abortController, actorCredentials),
+  );
+  return snapshot(session);
+}
+
+export function startTargetWorkflowExecution(sessionId: string, userId?: string | number) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
+  const run = session.targetRun;
+  if (!run?.plan) throw new Error('目标测试计划不存在');
+  if (session.busy || ['running', 'summarizing'].includes(run.status)) throw new Error('目标测试已经在执行');
+  if (run.status !== 'awaiting_confirmation') throw new Error('当前目标计划不在可确认执行状态，请先在对话中完成或更新计划');
+  const structuralErrors = validateTargetPlanStructure(run.plan);
+  if (structuralErrors.length) throw new Error(`目标测试计划结构无效：${structuralErrors.join('；')}`);
+  if (!targetPlanIsReady(run.plan)) throw new Error('仍有必填信息或账号登录尚未准备完成');
+  const timestamp = now();
+  const assistantMessage: BrowserChatMessage = {
+    id: id('msg'),
+    role: 'assistant',
+    content: '计划已经确认，正在按串并联流程树执行目标测试。',
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    status: 'running',
+    stepIndexes: [],
+  };
+  session.messages.push(assistantMessage);
+  session.targetRun = {
+    ...run,
+    ownerMessageId: assistantMessage.id,
+    status: 'ready',
+    confirmedAt: timestamp,
+    summary: undefined,
+    error: undefined,
+    endedAt: undefined,
+    results: Object.fromEntries(run.plan.nodes
+      .filter((node): node is TargetLeafNode => node.type === 'target')
+      .map((target) => [target.id, {
+        targetId: target.id,
+        actorId: target.actorId,
+        status: 'pending' as const,
+        criteria: [],
+        evidence: [],
+        outputs: {},
+      }])),
+    updatedAt: timestamp,
+  };
+  const abortController = new AbortController();
+  session.activeAssistantMessageId = assistantMessage.id;
+  session.activeAbortController = abortController;
+  session.busy = true;
+  session.status = 'running';
+  session.updatedAt = timestamp;
+  persistAndNotify(session.id);
+  void withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => runConfirmedTargetWorkflow(session, assistantMessage.id, abortController));
+  return snapshot(session);
 }
 
 export function setBrowserChatSessionGroup(sessionId: string, groupId: string, userId?: string | number) {
@@ -1706,6 +2863,54 @@ export function listBrowserChatSessions(input: { userId?: string | number } = {}
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
+async function closeTargetWorkflowBrowsers(sessionId: string, targetRun?: TargetWorkflowRun) {
+  const prefix = `${sessionId}:`;
+  const closedBrowserSessionIds = new Set<string>();
+  for (const [key, controller] of targetWorkflowRuntimeState.actorLoginControllers) {
+    if (!key.startsWith(prefix)) continue;
+    targetWorkflowRuntimeState.actorLoginControllers.delete(key);
+    if (!controller.signal.aborted) controller.abort(new Error('目标账号登录已随会话关闭而中断'));
+  }
+  for (const [key, actorBrowser] of targetWorkflowRuntimeState.actorBrowsers) {
+    if (!key.startsWith(prefix)) continue;
+    targetWorkflowRuntimeState.actorBrowsers.delete(key);
+    const binding = isTargetActorBrowserBinding(actorBrowser) ? actorBrowser : undefined;
+    const browser = binding?.browser || actorBrowser;
+    try {
+      await browser.close();
+      if (binding) closedBrowserSessionIds.add(binding.browserSessionId);
+    } catch {
+      // Reconnect below when Electron still owns the actor tab.
+    }
+  }
+  if (electronEmbeddedBrowserEnabled()) {
+    const orphanedActorSessions = Array.from(new Set((targetRun?.plan?.actors || [])
+      .map((actor) => actor.auth.browserSessionId)
+      .filter((browserSessionId): browserSessionId is string => (
+        typeof browserSessionId === 'string'
+        && Boolean(browserSessionId)
+        && !closedBrowserSessionIds.has(browserSessionId)
+      ))));
+    await Promise.all(orphanedActorSessions.map(async (browserSessionId) => {
+      const browser = new BrowserSession('dom', {
+        browserSurface: 'electron-embedded',
+        isMarked: true,
+        preferExistingPage: true,
+        runId: browserSessionId,
+      });
+      try {
+        await browser.start();
+        await browser.close();
+      } catch {
+        await browser.close().catch(() => undefined);
+      }
+    }));
+  }
+  for (const [reference, credential] of targetWorkflowRuntimeState.credentials) {
+    if (credential.sessionId === sessionId) targetWorkflowRuntimeState.credentials.delete(reference);
+  }
+}
+
 export async function closeBrowserChatSession(sessionId: string, userId?: string | number) {
   const session = hydrateSession(sessionId);
   if (!session) return undefined;
@@ -1715,6 +2920,7 @@ export async function closeBrowserChatSession(sessionId: string, userId?: string
   }
   cancelPendingToolConfirmation(session);
   await session.browser?.close({ keepOpen: true }).catch(() => undefined);
+  await closeTargetWorkflowBrowsers(sessionId, session.targetRun);
   session.browser = undefined;
   session.started = false;
   session.activeAbortController = undefined;
@@ -1803,6 +3009,7 @@ async function deleteBrowserChatSessionFromMemory(sessionId: string) {
   }
   cancelPendingToolConfirmation(session);
   await session.browser?.close({ keepOpen: true }).catch(() => undefined);
+  await closeTargetWorkflowBrowsers(sessionId, session.targetRun);
   session.browser = undefined;
   session.started = false;
   session.activeAbortController = undefined;
@@ -2234,10 +3441,33 @@ export async function sendBrowserChatMessage(
   session.status = 'running';
   session.error = undefined;
   session.updatedAt = timestamp;
+  if (session.workflowMode === 'target') {
+    session.targetRun = session.targetRun || {
+      id: id('target'),
+      ownerMessageId: assistantMessage.id,
+      status: 'analyzing',
+      results: {},
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    session.targetRun.ownerMessageId = assistantMessage.id;
+    session.targetRun.status = 'analyzing';
+    session.targetRun.error = undefined;
+    session.targetRun.updatedAt = timestamp;
+  }
   persistAndNotify(session.id);
-  appendLog(session, 'chat:queued', '已收到消息，准备执行浏览器操作');
+  appendLog(
+    session,
+    session.workflowMode === 'target' ? 'target:plan:queued' : 'chat:queued',
+    session.workflowMode === 'target' ? '已收到目标需求，准备分析流程、账号和前置条件' : '已收到消息，准备执行浏览器操作',
+    { messageId: assistantMessage.id },
+  );
 
-  void runBrowserChatMessage(session, messageText, modelMessageText, userMessage.id, assistantMessage.id, fromStepIndex, abortController, attachments, selectedSkills);
+  if (session.workflowMode === 'target') {
+    void runTargetPlanningMessage(session, modelMessageText, userMessage.id, assistantMessage.id, abortController);
+  } else {
+    void runBrowserChatMessage(session, messageText, modelMessageText, userMessage.id, assistantMessage.id, fromStepIndex, abortController, attachments, selectedSkills);
+  }
   return snapshot(session);
 }
 
@@ -2516,6 +3746,7 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
   if (abortController && !abortController.signal.aborted) {
     abortController.abort(new Error('Browser chat operation interrupted by user.'));
   }
+  session.targetRun = cancelActiveTargetWorkflowRun(session.targetRun, '用户主动中断了目标测试。', timestamp);
   cancelPendingToolConfirmation(session);
   discardInterruptedTurn(session, assistantMessageId);
   session.activeAbortController = undefined;
@@ -2529,6 +3760,133 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
     throw new Error('Browser chat interrupt state could not be persisted.');
   }
   return snapshot(session);
+}
+
+function targetPlanningMessages(
+  session: BrowserChatSessionRecord,
+  assistantMessageId: string,
+  latest?: { userMessageId: string; modelText: string },
+) {
+  return session.messages
+    .filter((message) => message.id !== assistantMessageId && message.content.trim())
+    .map((message) => ({
+      role: message.role,
+      content: latest && message.id === latest.userMessageId
+        ? latest.modelText
+        : messageContentForPrompt(message),
+    }));
+}
+
+async function generateSessionTargetPlan(input: {
+  session: BrowserChatSessionRecord;
+  assistantMessageId: string;
+  abortController: AbortController;
+  phase: 'message' | 'continue_before_auth' | 'continue_after_auth';
+  latest?: { userMessageId: string; modelText: string };
+}) {
+  const { session, assistantMessageId, abortController, phase } = input;
+  const generatedPlan = await generateTargetWorkflowPlan({
+    messages: targetPlanningMessages(session, assistantMessageId, input.latest),
+    currentPlan: session.targetRun?.plan,
+    targetUrl: session.targetUrl,
+    onValidation: ({ attempt, errors }) => {
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      const repaired = attempt === 'repair';
+      appendLog(
+        session,
+        errors.length ? (repaired ? 'target:plan:validation:error' : 'target:plan:validation:retry') : 'target:plan:validation:passed',
+        errors.length
+          ? `${repaired ? '修复后的' : '初次'}目标流程仍有 ${errors.length} 项结构问题${repaired ? '' : '，正在自动修复'}`
+          : `${repaired ? '修复后的' : '初次'}目标流程结构校验通过`,
+        {
+          details: errors.length ? { attempt, errors, phase } : { attempt, phase },
+          messageId: assistantMessageId,
+        },
+      );
+    },
+  });
+  return mergeLatestTargetActorAuth(generatedPlan, session.targetRun?.plan);
+}
+
+async function runTargetPlanningMessage(
+  session: BrowserChatSessionRecord,
+  latestModelText: string,
+  userMessageId: string,
+  assistantMessageId: string,
+  abortController: AbortController,
+) {
+  const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
+  return withModelSettings(modelSettings, async () => {
+    try {
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      appendLog(session, 'target:plan:start', 'AI 正在完整分析需求、参与者、权限和目标关系', {
+        messageId: assistantMessageId,
+      });
+      const plan = await generateSessionTargetPlan({
+        session,
+        assistantMessageId,
+        abortController,
+        phase: 'message',
+        latest: { userMessageId, modelText: latestModelText },
+      });
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      const timestamp = now();
+      const previousRun = session.targetRun;
+      session.targetRun = {
+        id: previousRun?.id || id('target'),
+        ownerMessageId: assistantMessageId,
+        status: targetPlanPreparationStatus(plan),
+        plan,
+        results: pendingTargetResults(plan),
+        createdAt: previousRun?.createdAt || timestamp,
+        updatedAt: timestamp,
+      };
+      updateAssistantMessage(session, assistantMessageId, (message) => ({
+        ...message,
+        content: targetWorkflowPlanningReply(plan),
+        status: 'passed',
+        activity: undefined,
+        updatedAt: timestamp,
+      }));
+      session.activeAssistantMessageId = undefined;
+      session.activeAbortController = undefined;
+      session.busy = false;
+      session.status = 'idle';
+      session.error = undefined;
+      session.updatedAt = timestamp;
+      appendLog(session, 'target:plan:done', `目标计划第 ${plan.version} 版已生成，全程未启动浏览器`, {
+        messageId: assistantMessageId,
+      });
+      persistAndNotify(session.id);
+    } catch (error) {
+      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      const timestamp = now();
+      const message = userFacingErrorMessage(error);
+      if (session.targetRun) {
+        session.targetRun.status = 'failed';
+        session.targetRun.error = message;
+        session.targetRun.updatedAt = timestamp;
+      }
+      updateAssistantMessage(session, assistantMessageId, (item) => ({
+        ...item,
+        content: `目标分析失败：${message}`,
+        status: 'failed',
+        activity: undefined,
+        updatedAt: timestamp,
+      }));
+      session.activeAssistantMessageId = undefined;
+      session.activeAbortController = undefined;
+      session.busy = false;
+      session.status = 'error';
+      session.error = message;
+      session.updatedAt = timestamp;
+      appendLog(session, 'target:plan:error', `目标分析失败：${message}`, {
+        details: errorLogDetails(error),
+        messageId: assistantMessageId,
+      });
+      persistAndNotify(session.id);
+    }
+  });
 }
 
 async function runBrowserChatMessage(

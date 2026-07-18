@@ -35,6 +35,7 @@ export function phaseLabel(phase: string) {
   if (phase.startsWith('browser:')) return 'Browser';
   if (phase.startsWith('ai:')) return 'AI';
   if (phase.startsWith('chat:')) return 'Chat';
+  if (phase.startsWith('target:')) return 'Target';
   if (phase.startsWith('perf:')) return 'Perf';
   return phase;
 }

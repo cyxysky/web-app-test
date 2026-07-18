@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   closestCenter,
   DndContext,
@@ -47,7 +47,6 @@ import {
   GalleryHorizontalEnd,
   Gauge,
   Globe,
-  History,
   ImageUp,
   Library,
   Loader2,
@@ -90,16 +89,15 @@ import remarkGfm from 'remark-gfm';
 import { CustomSelect } from '@/components/CustomSelect';
 import { BrowserChatLogDialog } from '@/components/BrowserChatLogDialog';
 import { BrowserChatToolDialog } from '@/components/BrowserChatToolDialog';
+import { BrowserChatTargetRunCard, type TargetContinuePayload } from '@/components/BrowserChatTargetRunCard';
 import {
   browserChatDownloadPercent,
   browserChatDownloadStatusLabel,
   formatDownloadBytes,
   type SystemDownloadItem,
 } from '@/components/browser-chat-download-model';
-import { DashboardGroupSidebar, DashboardWorkspace, groupPath } from '@/components/DashboardWorkspace';
 import { EnvironmentSettings, environmentSettingsTabs, type EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
-import { NewTestCaseModal } from '@/components/NewTestCaseModal';
 import {
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
@@ -128,12 +126,10 @@ import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import { useTheme } from '@/theme/ThemeProvider';
 import type {
   ModelProvider,
-  RunScheduleRecord,
   SkillRecord,
   StepExecutionResult,
-  TestCaseRecord,
-  TestGroupRecord,
 } from '@/server/ai/schemas/test-case.schema';
+import type { TargetWorkflowRun } from '@/server/ai/schemas/target-workflow.schema';
 
 type BrowserChatMessage = {
   id: string;
@@ -225,6 +221,8 @@ type BrowserChatSession = {
   safetyMode: BrowserChatSafetyMode;
   modelProvider: ModelProvider;
   model: string;
+  workflowMode: BrowserChatWorkflowMode;
+  targetRun?: TargetWorkflowRun;
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
   createdAt: string;
@@ -239,8 +237,9 @@ type BrowserChatSession = {
   error?: string;
 };
 
-type BrowserChatView = 'chat' | 'target' | 'settings';
+type BrowserChatView = 'chat' | 'settings';
 type BrowserChatMode = 'dom';
+type BrowserChatWorkflowMode = 'chat' | 'target';
 type BrowserChatSafetyMode = 'strict' | 'full';
 type BrowserChatModelConfig = RuntimeModelConfig;
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
@@ -250,7 +249,7 @@ const EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY = 'webpilotqa.embeddedChatCollapsed';
 
 function browserChatViewForPathname(pathname: string, fallback: BrowserChatView): BrowserChatView {
   if (pathname === '/settings' || pathname.startsWith('/settings/')) return 'settings';
-  if (pathname === '/dashboard' || pathname.startsWith('/runs/')) return 'target';
+  if (pathname === '/dashboard' || pathname.startsWith('/runs/')) return 'chat';
   if (pathname === '/browser-chat' || pathname.startsWith('/browser-chat/')) return 'chat';
   return fallback;
 }
@@ -433,7 +432,7 @@ type EmbeddedBrowserBridge = {
   activateTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   closeActiveTab: () => Promise<EmbeddedBrowserBridgeResult>;
   closeGroup: (input: { id: string }) => Promise<EmbeddedBrowserState>;
-  discardGroup?: (input: { id: string }) => Promise<EmbeddedBrowserState>;
+  discardGroup?: (input: { clearStorage?: boolean; id: string }) => Promise<EmbeddedBrowserState>;
   closeTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   createGroup: (input: { label?: string }) => Promise<EmbeddedBrowserState>;
   createTab: (input: { groupId?: string; sessionId?: string; url?: string }) => Promise<EmbeddedBrowserState>;
@@ -726,6 +725,42 @@ function isCodexRuntimeObjectEnvelope(value: string) {
     && typeof parsed.params === 'object'
     && !Array.isArray(parsed.params);
   return hasMessage || hasParams;
+}
+
+function embeddedGroupIdsForChatSession(session?: BrowserChatSession, includeSessionGroup = true) {
+  if (!session) return [];
+  return Array.from(new Set([
+    ...(includeSessionGroup ? [embeddedGroupIdForSession(session.id)] : []),
+    ...(session.targetRun?.plan?.actors || [])
+      .map((actor) => actor.auth.browserSessionId)
+      .filter((sessionId): sessionId is string => Boolean(sessionId))
+      .map(embeddedGroupIdForSession),
+  ]));
+}
+
+async function discardEmbeddedBrowserDataForSessions(
+  targetSessions: BrowserChatSession[],
+  options: { includeSessionGroups?: boolean } = {},
+) {
+  const bridge = typeof window === 'undefined' ? undefined : window.webPilotEmbeddedBrowser;
+  if (!bridge?.discardGroup) return;
+  const groupIds = new Set(targetSessions.flatMap((session) => (
+    embeddedGroupIdsForChatSession(session, options.includeSessionGroups !== false)
+  )));
+  const actorSessionPrefixes = targetSessions
+    .map((session) => session.targetRun?.id ? `actor_${session.targetRun.id}_` : '')
+    .filter(Boolean);
+  if (actorSessionPrefixes.length) {
+    const state = await bridge.getState().catch(() => undefined);
+    for (const group of state?.groups || []) {
+      if (group.sessionId && actorSessionPrefixes.some((prefix) => group.sessionId!.startsWith(prefix))) {
+        groupIds.add(group.id);
+      }
+    }
+  }
+  for (const groupId of groupIds) {
+    await bridge.discardGroup({ clearStorage: true, id: groupId }).catch(() => undefined);
+  }
 }
 
 function aiOutputCyclesFromLogs(logs: BrowserChatLogRecord[]): BrowserChatAiOutputCycle[] {
@@ -1599,6 +1634,7 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
       stepIndexes: Array.isArray(message.stepIndexes) ? message.stepIndexes : [],
     })),
     mode: normalizeMode(session.mode),
+    workflowMode: session.workflowMode === 'target' ? 'target' : 'chat',
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: modelSelection.provider,
     model: modelSelection.model,
@@ -2887,18 +2923,16 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   itemLogs,
   itemSteps,
   lastAssistantMessageId,
-  onExportMessage,
   onGenerateSkill,
   onPreviewImage,
   onResolveToolConfirmation,
   onSelectTool,
   onShowLogs,
-  onToggleExportSelection,
   pendingToolConfirmation,
   resolvingConfirmationAction,
   resolvingConfirmationId,
-  selectedForExport,
   sessionBusy,
+  targetRunContent,
   totalStepCount,
 }: {
   exportingMessageId: string | null;
@@ -2922,6 +2956,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   selectedForExport: boolean;
   sessionBusy: boolean;
   skillsById: Map<string, SkillRecord>;
+  targetRunContent?: ReactNode;
   totalStepCount: number;
 }) {
   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
@@ -2966,19 +3001,9 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
             </time>
           </>
         )}
+        {item.role === 'assistant' ? targetRunContent : null}
         {item.role === 'assistant' ? (
           <div className="browser-chat-message-actions">
-            {canExportMessage ? (
-              <label className="browser-chat-message-select">
-                <input
-                  checked={selectedForExport}
-                  disabled={actionDisabled}
-                  onChange={(event) => onToggleExportSelection(item.id, event.currentTarget.checked)}
-                  type="checkbox"
-                />
-                <span>选择</span>
-              </label>
-            ) : null}
             {itemLogs.length ? (
               <button className="browser-chat-log-button" onClick={() => onShowLogs(item.id)} type="button">
                 <ScrollText size={14} />
@@ -2994,17 +3019,6 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
               >
                 {generatingSkillMessageId === item.id ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
                 生成 Skill
-              </button>
-            ) : null}
-            {canExportMessage ? (
-              <button
-                className="browser-chat-log-button"
-                disabled={actionDisabled}
-                onClick={() => void onExportMessage(item.id)}
-                type="button"
-              >
-                {exportingMessageId === item.id ? <Loader2 className="spin" size={14} /> : <FilePlus2 size={14} />}
-                导出用例
               </button>
             ) : null}
           </div>
@@ -3033,6 +3047,8 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   resolvingConfirmationId,
   sessionBusy,
   stepsByIndex,
+  targetRunContent,
+  targetRunMessageId,
 }: {
   items: BrowserChatMessage[];
   lastAssistantMessageId?: string;
@@ -3044,6 +3060,8 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   resolvingConfirmationId?: string | null;
   sessionBusy: boolean;
   stepsByIndex: Map<number, StepExecutionResult>;
+  targetRunContent?: ReactNode;
+  targetRunMessageId?: string;
 }) {
   const itemViews = items.map((item) => {
     const steps = (item.stepIndexes || [])
@@ -3087,6 +3105,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
                   running={running}
                   steps={steps}
                 />
+                {targetRunMessageId === item.id ? targetRunContent : null}
               </div>
             ))}
           </div>
@@ -3123,7 +3142,10 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   sessionId,
   sessionBusy,
   stepsByIndex,
+  targetRunContent,
+  targetRunMessageId,
   totalStepCount,
+  supplementalScrollKey,
 }: {
   availableSkills: SkillRecord[];
   exportingMessageId: string | null;
@@ -3151,9 +3173,14 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   sessionId?: string;
   sessionBusy: boolean;
   stepsByIndex: Map<number, StepExecutionResult>;
+  targetRunContent?: ReactNode;
+  targetRunMessageId?: string;
   totalStepCount: number;
+  supplementalScrollKey?: string;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const followLatestRef = useRef(true);
+  const previousSessionIdRef = useRef(sessionId);
   const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
   const lastMessage = messages[messages.length - 1];
   const skillsById = useMemo(() => new Map(availableSkills.map((skill) => [skill.id, skill])), [availableSkills]);
@@ -3168,15 +3195,20 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     lastMessage?.updatedAt || '',
     pendingToolConfirmation?.id || '',
     sessionBusy ? 'busy' : 'idle',
+    supplementalScrollKey || '',
   ].join(':');
 
   useEffect(() => {
+    const sessionChanged = previousSessionIdRef.current !== sessionId;
+    previousSessionIdRef.current = sessionId;
+    if (!sessionChanged && !followLatestRef.current) return undefined;
     let frame = 0;
     let nextFrame = 0;
     const scrollToBottom = () => {
       const container = scrollRef.current;
       if (!container) return;
       container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      followLatestRef.current = true;
     };
     frame = requestAnimationFrame(() => {
       scrollToBottom();
@@ -3186,10 +3218,17 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       if (frame) cancelAnimationFrame(frame);
       if (nextFrame) cancelAnimationFrame(nextFrame);
     };
-  }, [scrollKey]);
+  }, [scrollKey, sessionId]);
+
+  const trackScrollPosition = useCallback(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    followLatestRef.current = distanceFromBottom <= 96;
+  }, []);
 
   return (
-    <div className="browser-chat-message-list" ref={scrollRef}>
+    <div className="browser-chat-message-list" onScroll={trackScrollPosition} ref={scrollRef}>
       {selectedExportMessageIds.length ? (
         <div className="browser-chat-message-export-bar">
           <span>已选 {selectedExportMessageIds.length} 轮</span>
@@ -3237,6 +3276,8 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
               resolvingConfirmationId={resolvingConfirmationId}
               sessionBusy={sessionBusy}
               stepsByIndex={stepsByIndex}
+              targetRunContent={targetRunContent}
+              targetRunMessageId={targetRunMessageId}
             />
           );
         }
@@ -3269,6 +3310,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             selectedForExport={selectedExportMessageIdSet.has(item.id)}
             sessionBusy={sessionBusy}
             skillsById={skillsById}
+            targetRunContent={targetRunMessageId === item.id ? targetRunContent : undefined}
             totalStepCount={totalStepCount}
           />
         );
@@ -3297,6 +3339,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading,
   mode,
   modeLocked,
+  workflowMode,
   modelSelection,
   modelSelectionTitle,
   modelSelectionOptions,
@@ -3304,6 +3347,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   onInterrupt,
   onModelSelectionChange,
   onModeChange,
+  onWorkflowModeChange,
   onRemoveAttachment,
   onSubmitMessage,
   onSafetyModeChange,
@@ -3322,6 +3366,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading: boolean;
   mode: BrowserChatMode;
   modeLocked: boolean;
+  workflowMode: BrowserChatWorkflowMode;
   modelSelection: string;
   modelSelectionTitle: string;
   modelSelectionOptions: Array<{ description?: string; group?: string; label: string; selectedLabel?: string; value: string }>;
@@ -3329,6 +3374,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   onInterrupt: () => void | Promise<void>;
   onModelSelectionChange: (selection: { provider: ModelProvider; model: string }) => void;
   onModeChange: (mode: BrowserChatMode) => void;
+  onWorkflowModeChange: (mode: BrowserChatWorkflowMode) => void;
   onRemoveAttachment: (id: string) => void;
   onSubmitMessage: (content: string, skillIds: string[], attachments: BrowserChatAttachment[]) => Promise<boolean>;
   onSafetyModeChange: (mode: BrowserChatSafetyMode) => void;
@@ -3339,7 +3385,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   uploadingImage: boolean;
 }) {
   void mode;
-  void modeLocked;
   void onModeChange;
   const { t } = useI18n();
   const editorRef = useRef<HTMLDivElement | null>(null);
@@ -3873,7 +3918,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           ref={editorRef}
           className="browser-chat-inline-editor"
           contentEditable={!currentBusy && !loading}
-          data-placeholder={t('有问题，尽管问')}
+          data-placeholder={workflowMode === 'target' ? '描述完整需求，AI 会先分析目标、账号、权限与前置条件' : t('有问题，尽管问')}
           onInput={() => syncEditorState({ scrollToBottom: true })}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
@@ -3978,6 +4023,28 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                 type="button"
               >
                 {t('完全')}
+              </button>
+            </div>
+            <div className="browser-chat-workflow-toggle" role="radiogroup" aria-label="对话类型">
+              <button
+                aria-checked={workflowMode === 'chat'}
+                className={workflowMode === 'chat' ? 'active' : undefined}
+                disabled={modeLocked || currentBusy || loading}
+                onClick={() => onWorkflowModeChange('chat')}
+                role="radio"
+                type="button"
+              >
+                普通对话
+              </button>
+              <button
+                aria-checked={workflowMode === 'target'}
+                className={workflowMode === 'target' ? 'active' : undefined}
+                disabled={modeLocked || currentBusy || loading}
+                onClick={() => onWorkflowModeChange('target')}
+                role="radio"
+                type="button"
+              >
+                目标模式
               </button>
             </div>
           </div>
@@ -5230,27 +5297,16 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
 });
 
 export function BrowserChatWorkspace({
-  testCases,
-  groups,
-  schedules,
   initialView = 'chat',
   initialSettings,
-  initialTargetDetailCaseId,
-  initialTargetRunId,
 }: {
-  testCases: TestCaseRecord[];
-  groups: TestGroupRecord[];
-  schedules: RunScheduleRecord[];
   initialView?: BrowserChatView;
   initialSettings?: EnvironmentSettingsInitialData;
-  initialTargetDetailCaseId?: string;
-  initialTargetRunId?: string;
 }) {
   const router = useRouter();
   const pathname = usePathname();
   const { t } = useI18n();
   const { mode: themeMode, toggleMode } = useTheme();
-  const [, startTransition] = useTransition();
   const initialModelSelection = resolveRuntimeModelSelection(null);
   const sendingRef = useRef(false);
   const loadingSessionRef = useRef<string | null>(null);
@@ -5266,17 +5322,12 @@ export function BrowserChatWorkspace({
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [mode, setMode] = useState<BrowserChatMode>('dom');
+  const [workflowMode, setWorkflowMode] = useState<BrowserChatWorkflowMode>('chat');
   const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
   const [modelProvider, setModelProvider] = useState<ModelProvider>(() => initialModelSelection.provider);
   const [modelId, setModelId] = useState(() => initialModelSelection.model);
   const [modelConfig, setModelConfig] = useState<BrowserChatModelConfig | null>(null);
-  const [targetGroupId, setTargetGroupId] = useState<string | undefined>();
-  const [targetDetailCaseId, setTargetDetailCaseId] = useState<string | null>(initialTargetDetailCaseId || null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
-  const [groupName, setGroupName] = useState('');
-  const [groupDialogOpen, setGroupDialogOpen] = useState(false);
-  const [creatingGroup, setCreatingGroup] = useState(false);
-  const [deletingTargetGroupId, setDeletingTargetGroupId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
   const attachmentsRef = useRef<BrowserChatAttachment[]>([]);
   const [composerResetToken, setComposerResetToken] = useState(0);
@@ -5313,6 +5364,13 @@ export function BrowserChatWorkspace({
   const [browserGroupPickerOpen, setBrowserGroupPickerOpen] = useState(false);
   const [embeddedBrowserDialogOpen, setEmbeddedBrowserDialogOpen] = useState(false);
   const selectedSessionRunning = isBrowserChatSessionRunning(session);
+  const targetBackgroundActive = Boolean(
+    session?.targetRun
+    && (
+      ['analyzing', 'ready', 'running', 'summarizing'].includes(session.targetRun.status)
+      || session.targetRun.plan?.actors.some((actor) => actor.auth.status === 'verifying')
+    ),
+  );
   const selectedRunningSession = selectedSessionRunning ? session : undefined;
   const currentBusy = busy || selectedSessionRunning;
   const interruptSessionId = selectedRunningSession?.id || (busy ? pendingMessageSessionId || session?.id : undefined);
@@ -5326,7 +5384,23 @@ export function BrowserChatWorkspace({
     () => [...visibleMessages].reverse().find((item) => item.role === 'assistant')?.id,
     [visibleMessages],
   );
+  const targetRunMessageId = useMemo(() => {
+    if (!session?.targetRun) return undefined;
+    const assistantMessageIds = new Set(visibleMessages
+      .filter((message) => message.role === 'assistant')
+      .map((message) => message.id));
+    if (session.targetRun.ownerMessageId && assistantMessageIds.has(session.targetRun.ownerMessageId)) {
+      return session.targetRun.ownerMessageId;
+    }
+    const targetLogMessageId = [...logs].reverse().find((log) => (
+      log.phase.startsWith('target:')
+      && Boolean(log.messageId)
+      && assistantMessageIds.has(log.messageId || '')
+    ))?.messageId;
+    return targetLogMessageId || lastAssistantMessageId;
+  }, [lastAssistantMessageId, logs, session?.targetRun, visibleMessages]);
   const hasMessages = visibleMessages.length > 0;
+  const hasChatContent = hasMessages || Boolean(session?.targetRun);
   const toggleSidebarCollapsed = useCallback(() => {
     setSidebarCollapsed((current) => {
       const next = !current;
@@ -5484,7 +5558,7 @@ export function BrowserChatWorkspace({
   const allSelectableRecentSessionsSelected = selectableRecentSessionIds.length > 0
     && selectableRecentSessionIds.every((id) => selectedSessionIdSet.has(id));
   const embeddedBrowserActive = embeddedBrowserEnabled && activeView === 'chat';
-  const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || imagePreview || groupDialogOpen || embeddedBrowserDialogOpen);
+  const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || imagePreview || embeddedBrowserDialogOpen);
   const embeddedBrowserViewActive = embeddedBrowserActive && !embeddedBrowserCovered;
   const modelSelection = modelSelectionValueForConfig(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionDiagnostic = modelSelectionDiagnosticLabel(modelConfig, { model: modelId, provider: modelProvider });
@@ -5637,6 +5711,7 @@ export function BrowserChatWorkspace({
     const loadedSession = upsertSession(data.session as BrowserChatSession, { activate: shouldActivate });
     if (shouldActivate) {
       setMode(normalizeMode(loadedSession.mode));
+      setWorkflowMode(loadedSession.workflowMode === 'target' ? 'target' : 'chat');
       setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
       const nextModel = resolveRuntimeModelSelection(modelConfig, {
         model: loadedSession.model,
@@ -5728,77 +5803,26 @@ export function BrowserChatWorkspace({
   }, []);
 
   useEffect(() => {
-    if (!session?.id || !selectedSessionRunning || realtimeConnected) return undefined;
+    if (!session?.id || (!selectedSessionRunning && !targetBackgroundActive) || realtimeConnected) return undefined;
     const sessionId = session.id;
     const timer = window.setInterval(() => {
       void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch(() => undefined);
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [realtimeConnected, refreshSession, selectedSessionRunning, session?.id]);
-
-  async function createGroup(parentId?: string) {
-    const name = groupName.trim();
-    if (!name || creatingGroup) return;
-    setCreatingGroup(true);
-    startGlobalLoading('正在创建分组');
-    try {
-      await fetch('/api/groups', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, parentId }),
-      });
-      setGroupName('');
-      setGroupDialogOpen(false);
-      startTransition(() => router.refresh());
-    } finally {
-      setCreatingGroup(false);
-      stopGlobalLoading();
-    }
-  }
-
-  async function deleteTargetGroup(group: TestGroupRecord) {
-    if (deletingTargetGroupId) return;
-    const descendantIds = new Set<string>([group.id]);
-    const collect = (groupId: string) => {
-      groups.filter((item) => item.parentId === groupId).forEach((child) => {
-        if (descendantIds.has(child.id)) return;
-        descendantIds.add(child.id);
-        collect(child.id);
-      });
-    };
-    collect(group.id);
-    const childCount = descendantIds.size - 1;
-    const message = childCount
-      ? `确定删除分组“${group.name}”及其 ${childCount} 个子分组吗？这些分组下的测试用例会移回未分组。`
-      : `确定删除分组“${group.name}”吗？这个分组下的测试用例会移回未分组。`;
-    if (!window.confirm(message)) return;
-    setDeletingTargetGroupId(group.id);
-    startGlobalLoading('正在删除分组');
-    try {
-      const response = await fetch(`/api/groups/${group.id}`, { method: 'DELETE' });
-      await readApiJson<Record<string, unknown>>(response, '删除分组失败');
-      if (targetGroupId && descendantIds.has(targetGroupId)) setTargetGroupId(undefined);
-      startTransition(() => router.refresh());
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : '删除分组失败');
-    } finally {
-      setDeletingTargetGroupId(null);
-      stopGlobalLoading();
-    }
-  }
+  }, [realtimeConnected, refreshSession, selectedSessionRunning, session?.id, targetBackgroundActive]);
 
   async function createSession() {
     const response = await fetch('/api/browser-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ safetyMode, modelProvider, model: modelId }),
+      body: JSON.stringify({ safetyMode, modelProvider, model: modelId, workflowMode }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '创建对话会话失败');
     return upsertSession(data.session as BrowserChatSession, { activate: true });
   }
 
   async function ensureSession() {
-    if (session && session.status !== 'closed') return session;
+    if (session && session.status !== 'closed' && session.workflowMode === workflowMode) return session;
     return createSession();
   }
 
@@ -5879,7 +5903,7 @@ export function BrowserChatWorkspace({
     try {
       let active = await ensureSession();
       setPendingMessageSessionId(active.id);
-      await ensureEmbeddedBrowserSessionTab(active.id);
+      if (active.workflowMode !== 'target') await ensureEmbeddedBrowserSessionTab(active.id);
       let posted: BrowserChatSession;
       try {
         posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments, skillIds);
@@ -5888,7 +5912,7 @@ export function BrowserChatWorkspace({
         if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
         active = await createSession();
         setPendingMessageSessionId(active.id);
-        await ensureEmbeddedBrowserSessionTab(active.id);
+        if (active.workflowMode !== 'target') await ensureEmbeddedBrowserSessionTab(active.id);
         posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments, skillIds);
       }
       upsertSession(posted, { activate: true });
@@ -5904,6 +5928,29 @@ export function BrowserChatWorkspace({
     } finally {
       sendingRef.current = false;
       setPendingMessageSessionId(null);
+      setBusy(false);
+    }
+  }
+
+  async function continueTargetWorkflow(payload: TargetContinuePayload) {
+    const sessionId = session?.id;
+    if (!sessionId || currentBusy) throw new Error('目标计划正在处理中，请稍候。');
+    setBusy(true);
+    setError('');
+    try {
+      const response = await fetch(`/api/browser-chat/${sessionId}/target/continue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await readApiJson<{ session: BrowserChatSession }>(response, '提交目标测试资料失败');
+      upsertSession(data.session, { activate: true });
+      scheduleSessionRefresh(sessionId, 120);
+    } catch (continueError) {
+      const message = continueError instanceof Error ? continueError.message : '提交目标测试资料失败';
+      setError(message);
+      throw continueError;
+    } finally {
       setBusy(false);
     }
   }
@@ -5976,6 +6023,7 @@ export function BrowserChatWorkspace({
       if (response.ok) {
         const data = await readApiJson<{ session: BrowserChatSession }>(response, '结束浏览器对话失败');
         upsertSession(data.session, { activate: true });
+        await discardEmbeddedBrowserDataForSessions([session], { includeSessionGroups: false });
         await loadSessions().catch(() => undefined);
       }
     } finally {
@@ -5989,13 +6037,15 @@ export function BrowserChatWorkspace({
     deletingSessionIdsRef.current.add(sessionId);
     setDeletingSessionIds((current) => new Set(current).add(sessionId));
     setError('');
+    const deletedSession = sessions.find((item) => item.id === sessionId)
+      || (session?.id === sessionId ? session : undefined);
     try {
       const response = await fetch(`/api/browser-chat/${sessionId}/delete`, { method: 'POST' });
       await readApiJson<Record<string, unknown>>(response, '删除历史对话失败');
       setSessions((current) => current.filter((item) => item.id !== sessionId));
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
       if (session?.id === sessionId) setSession(null);
-      await window.webPilotEmbeddedBrowser?.discardGroup?.({ id: embeddedGroupIdForSession(sessionId) }).catch(() => undefined);
+      if (deletedSession) await discardEmbeddedBrowserDataForSessions([deletedSession]);
       await loadSessions().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '删除历史对话失败');
@@ -6034,6 +6084,7 @@ export function BrowserChatWorkspace({
     if (!selectedDeletableSessionIds.length || deletingSelectedSessions) return;
     const deletingIds = selectedDeletableSessionIds;
     const deletingIdSet = new Set(deletingIds);
+    const deletedSessions = sessions.filter((item) => deletingIdSet.has(item.id));
     setDeletingSelectedSessions(true);
     setError('');
     try {
@@ -6046,9 +6097,7 @@ export function BrowserChatWorkspace({
       setSessions((current) => current.filter((item) => !deletingIdSet.has(item.id)));
       setSelectedSessionIds((current) => current.filter((id) => !deletingIdSet.has(id)));
       if (session?.id && deletingIdSet.has(session.id)) setSession(null);
-      for (const sessionId of deletingIds) {
-        await window.webPilotEmbeddedBrowser?.discardGroup?.({ id: embeddedGroupIdForSession(sessionId) }).catch(() => undefined);
-      }
+      await discardEmbeddedBrowserDataForSessions(deletedSessions);
       await loadSessions().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '批量删除历史对话失败');
@@ -6063,13 +6112,8 @@ export function BrowserChatWorkspace({
   }
 
   const openTargetCaseDetail = useCallback((testCaseId: string) => {
-    setTargetDetailCaseId(testCaseId);
-    if (activeView === 'target') {
-      startTransition(() => router.refresh());
-      return;
-    }
     router.push(`/dashboard?caseId=${encodeURIComponent(testCaseId)}`);
-  }, [activeView, router, startTransition]);
+  }, [router]);
 
   const exportSelectedMessagesToTestCase = useCallback(async () => {
     const sessionId = session?.id;
@@ -6181,6 +6225,7 @@ export function BrowserChatWorkspace({
     try {
       const loadedSession = await refreshSession(sessionId, { activate: true });
       setMode(normalizeMode(loadedSession.mode));
+      setWorkflowMode(loadedSession.workflowMode === 'target' ? 'target' : 'chat');
       setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
       const nextModel = resolveRuntimeModelSelection(modelConfig, {
         model: loadedSession.model,
@@ -6200,29 +6245,6 @@ export function BrowserChatWorkspace({
   }
 
   function renderSidebarDetail() {
-    if (activeView === 'target') {
-      return (
-        <DashboardGroupSidebar
-          className="browser-chat-sub-sidebar"
-          deletingGroupId={deletingTargetGroupId}
-          groups={groups}
-          headerAction={(
-            <NewTestCaseModal
-              groupId={targetGroupId}
-              icon={<Plus size={16} />}
-              iconOnly
-              onCreated={openTargetCaseDetail}
-            />
-          )}
-          headerLabel="目标"
-          selectedGroupId={targetGroupId}
-          onDeleteGroup={deleteTargetGroup}
-          onCreateGroup={() => setGroupDialogOpen(true)}
-          onSelect={setTargetGroupId}
-        />
-      );
-    }
-
     if (activeView === 'settings') {
       return (
         <section className="browser-chat-sidebar-section browser-chat-settings-section">
@@ -6419,11 +6441,19 @@ export function BrowserChatWorkspace({
     </div>
   );
 
+  const renderTargetRunCard = () => session?.workflowMode === 'target' && session.targetRun ? (
+    <BrowserChatTargetRunCard
+      busy={currentBusy}
+      onContinue={continueTargetWorkflow}
+      run={session.targetRun}
+    />
+  ) : null;
+
   const renderChatPane = () => (
-    <div className={`${hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`} style={chatPaneStyle}>
+    <div className={`${hasChatContent ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`} style={chatPaneStyle}>
       {renderChatPaneActions()}
 
-      {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages ? (
+      {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages || session?.targetRun ? (
         <BrowserChatMessageList
           availableSkills={skills}
           exportingMessageId={exportingMessageId}
@@ -6451,7 +6481,10 @@ export function BrowserChatWorkspace({
           sessionId={session?.id}
           sessionBusy={selectedSessionRunning}
           stepsByIndex={stepsByIndex}
+          targetRunContent={renderTargetRunCard()}
+          targetRunMessageId={targetRunMessageId}
           totalStepCount={steps.length}
+          supplementalScrollKey={session?.targetRun?.updatedAt}
         />
       ) : null}
 
@@ -6467,6 +6500,7 @@ export function BrowserChatWorkspace({
           loading={Boolean(loadingSessionId)}
           mode={mode}
           modeLocked={modeLocked}
+          workflowMode={workflowMode}
           modelSelection={modelSelection}
           modelSelectionTitle={modelSelectionDiagnostic}
           modelSelectionOptions={modelSelectionOptions}
@@ -6474,6 +6508,7 @@ export function BrowserChatWorkspace({
           onInterrupt={interruptConversation}
           onModelSelectionChange={changeModelSelection}
           onModeChange={setMode}
+          onWorkflowModeChange={setWorkflowMode}
           onRemoveAttachment={removeAttachment}
           onSubmitMessage={sendMessage}
           onSafetyModeChange={setSafetyMode}
@@ -6516,10 +6551,6 @@ export function BrowserChatWorkspace({
             <MessageSquare size={17} />
             <span>{t('对话模式')}</span>
           </button>
-          <button aria-current={activeView === 'target' ? 'page' : undefined} aria-label="目标模式" className={activeView === 'target' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => navigateBrowserChatView('/dashboard')} title="目标模式" type="button">
-            <Folder size={17} />
-            <span>目标模式</span>
-          </button>
           <button aria-current={activeView === 'settings' ? 'page' : undefined} aria-label="设置" className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => navigateBrowserChatView('/settings')} title="设置" type="button">
             <Settings size={17} />
             <span>设置</span>
@@ -6542,45 +6573,7 @@ export function BrowserChatWorkspace({
       </aside>
 
       <main className="browser-chat-main">
-        {activeView === 'target' ? (
-          <div className="browser-chat-cases-pane">
-            <div className="browser-chat-target-model-bar">
-              <div className="browser-chat-target-copy">
-                <strong>{t('目标模式模型')}</strong>
-                <span>{t('当前目标模式运行将使用这个模型。')}</span>
-              </div>
-              <div className="browser-chat-target-model-controls">
-                <CustomSelect
-                  className="browser-chat-target-model-select"
-                  onChange={(value) => changeModelSelection(parseModelSelectionValue(value))}
-                  options={modelSelectionOptions}
-                  searchable
-                  searchPlaceholder={t('搜索模型')}
-                  title={modelSelectionDiagnostic}
-                  value={modelSelection}
-                />
-                <div className="browser-chat-target-actions" id="browser-chat-target-actions" />
-              </div>
-            </div>
-            <DashboardWorkspace
-              actionsPortalId="browser-chat-target-actions"
-              activeDetailCaseId={targetDetailCaseId}
-              groups={groups}
-              hideListHeader
-              initialActiveRunId={initialTargetRunId}
-              model={modelId}
-              modelProvider={modelProvider}
-              onActiveDetailCaseIdChange={setTargetDetailCaseId}
-              schedules={schedules}
-              selectedGroupId={targetGroupId}
-              showBrowserChatAction={false}
-              showGroupSidebar={false}
-              showSettingsAction={false}
-              onSelectedGroupIdChange={setTargetGroupId}
-              testCases={testCases}
-            />
-          </div>
-        ) : activeView === 'settings' ? (
+        {activeView === 'settings' ? (
           <div className="browser-chat-settings-pane">
             <EnvironmentSettings
               activeTab={settingsTab}
@@ -6606,7 +6599,12 @@ export function BrowserChatWorkspace({
               onAddTabReference={addTabReference}
               onDialogOpenChange={setEmbeddedBrowserDialogOpen}
               onSelectSession={(nextSessionId) => {
-                if (nextSessionId !== activeSessionIdRef.current) void loadSession(nextSessionId);
+                const owner = sessions.find((item) => (
+                  item.id === nextSessionId
+                  || item.targetRun?.plan?.actors.some((actor) => actor.auth.browserSessionId === nextSessionId)
+                ));
+                const ownerSessionId = owner?.id || (nextSessionId.startsWith('actor_') ? activeSessionIdRef.current : nextSessionId);
+                if (ownerSessionId && ownerSessionId !== activeSessionIdRef.current) void loadSession(ownerSessionId);
               }}
               sessionId={session?.id}
             />
@@ -6641,10 +6639,10 @@ export function BrowserChatWorkspace({
             </aside>
           </div>
         ) : (
-          <div className={hasMessages ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'} style={chatPaneStyle}>
+          <div className={hasChatContent ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'} style={chatPaneStyle}>
             {renderChatPaneActions()}
 
-            {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages ? (
+            {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages || session?.targetRun ? (
               <BrowserChatMessageList
                 availableSkills={skills}
                 exportingMessageId={exportingMessageId}
@@ -6672,7 +6670,10 @@ export function BrowserChatWorkspace({
                 sessionId={session?.id}
                 sessionBusy={selectedSessionRunning}
                 stepsByIndex={stepsByIndex}
+                targetRunContent={renderTargetRunCard()}
+                targetRunMessageId={targetRunMessageId}
                 totalStepCount={steps.length}
+                supplementalScrollKey={session?.targetRun?.updatedAt}
               />
             ) : null}
 
@@ -6688,6 +6689,7 @@ export function BrowserChatWorkspace({
                 loading={Boolean(loadingSessionId)}
                 mode={mode}
                 modeLocked={modeLocked}
+                workflowMode={workflowMode}
                 modelSelection={modelSelection}
                 modelSelectionTitle={modelSelectionDiagnostic}
                 modelSelectionOptions={modelSelectionOptions}
@@ -6695,6 +6697,7 @@ export function BrowserChatWorkspace({
                 onInterrupt={interruptConversation}
                 onModelSelectionChange={changeModelSelection}
                 onModeChange={setMode}
+                onWorkflowModeChange={setWorkflowMode}
                 onRemoveAttachment={removeAttachment}
                 onSubmitMessage={sendMessage}
                 onSafetyModeChange={setSafetyMode}
@@ -6739,33 +6742,6 @@ export function BrowserChatWorkspace({
         </div>
       ) : null}
 
-      {groupDialogOpen ? (
-        <div className="ui-modal-overlay" onClick={() => setGroupDialogOpen(false)} role="presentation">
-          <section className="ui-modal ui-modal--compact" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="创建分组">
-            <header className="ui-modal-header">
-              <div className="ui-modal-heading">
-                <h2 className="ui-modal-title">{targetGroupId ? '创建子组' : '创建组'}</h2>
-                <p className="ui-modal-subtitle">{targetGroupId ? `父级：${groupPath(groups, targetGroupId)}` : '创建根分组'}</p>
-              </div>
-              <button className="ui-icon-button ui-modal-close" onClick={() => setGroupDialogOpen(false)} type="button" aria-label="关闭">
-                <X size={18} />
-              </button>
-            </header>
-            <div className="ui-modal-body">
-              <label className="modal-field">
-                分组名称
-                <input autoFocus className="input" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
-              </label>
-            </div>
-            <footer className="ui-modal-footer">
-              <button className="ui-button ui-button--primary" disabled={creatingGroup} onClick={() => createGroup(targetGroupId)} type="button">
-                {creatingGroup ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
-                {creatingGroup ? '创建中' : '创建'}
-              </button>
-            </footer>
-          </section>
-        </div>
-      ) : null}
     </section>
     </BrowserChatReasoningVisibilityContext.Provider>
   );

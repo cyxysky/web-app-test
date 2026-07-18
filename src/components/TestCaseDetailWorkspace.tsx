@@ -5,7 +5,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Loader2, Save, Sparkles, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { DeleteTestCaseButton } from '@/components/DeleteTestCaseButton';
-import { RunDefaultRecordedRunButton } from '@/components/RunDefaultRecordedRunButton';
 import { RunHistoryList } from '@/components/RunHistoryList';
 import { RunTestButton } from '@/components/RunTestButton';
 import {
@@ -169,14 +168,6 @@ export function TestCaseDetailWorkspace({
           >
             {editorActions.saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
           </button>
-          <RunDefaultRecordedRunButton
-            defaultRecordedRunId={currentTestCase.content.defaultRecordedRunId}
-            iconOnly
-            model={modelId}
-            modelProvider={modelProvider}
-            onStarted={onOpenRun ? handleOpenRun : undefined}
-            testCaseId={currentTestCase.id}
-          />
           <RunTestButton iconOnly model={modelId} modelProvider={modelProvider} onStarted={onOpenRun ? handleOpenRun : undefined} testCaseId={currentTestCase.id} />
           <DeleteTestCaseButton
             className="ui-icon-button ui-icon-button--danger case-detail-icon-button"
@@ -206,7 +197,7 @@ export function TestCaseDetailWorkspace({
       />
 
       <section className="content-band run-history-panel">
-        <RunHistoryList defaultRecordedRunId={currentTestCase.content.defaultRecordedRunId} onOpenRun={onOpenRun ? handleOpenRun : undefined} runs={runs} testCaseId={currentTestCase.id} />
+        <RunHistoryList onOpenRun={onOpenRun ? handleOpenRun : undefined} runs={runs} />
       </section>
     </>
   );

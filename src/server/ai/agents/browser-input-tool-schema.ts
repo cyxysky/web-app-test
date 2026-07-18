@@ -16,7 +16,7 @@ export const browserMouseToolShape = {
   deltaY: z.number().optional().describe('Vertical wheel delta for action=scroll.'),
 } satisfies z.ZodRawShape;
 
-export const browserKeyboardToolDescription = 'Unified keyboard tool. action=type can focus a fresh uid or latest viewport screenshot coordinate before entering text. action=press sends one key; action=shortcut sends a key combination. Never use keyboard letters, ArrowUp/ArrowDown, or Enter to choose an option from a native HTML <select>; use selectOption with the select UID and an exact value or full label.';
+export const browserKeyboardToolDescription = 'Unified keyboard tool. action=type can focus a fresh uid or latest viewport screenshot coordinate before entering text. When the runtime provides a credential reference, use credentialRef instead of putting the secret in text. action=press sends one key; action=shortcut sends a key combination. Never use keyboard letters, ArrowUp/ArrowDown, or Enter to choose an option from a native HTML <select>; use selectOption with the select UID and an exact value or full label.';
 
 export const browserKeyboardToolShape = {
   action: z.enum(['type', 'press', 'shortcut']),
@@ -24,6 +24,7 @@ export const browserKeyboardToolShape = {
   x_thousandth: z.number().int().min(1).max(999).optional().describe('Horizontal position in the latest viewport screenshot, from 1 to 999.'),
   y_thousandth: z.number().int().min(1).max(999).optional().describe('Vertical position in the latest viewport screenshot, from 1 to 999.'),
   text: z.string().optional(),
+  credentialRef: z.string().min(1).max(200).optional().describe('Opaque runtime credential reference. For secret input use this instead of text; the model never receives the underlying value.'),
   key: z.string().optional(),
   keys: z.array(z.string().min(1)).max(6).optional(),
   replace: z.boolean().optional().describe('For action=type, replace existing content unless false.'),

@@ -732,6 +732,7 @@ export type BrowserKeyboardAction = {
   keys?: string[];
   replace?: boolean;
   followByEnter?: boolean;
+  allowedOrigins?: string[];
 };
 
 export type BrowserSelectOptionAction = {
@@ -3577,6 +3578,7 @@ export class BrowserSession {
   private snapshotPageIds = new WeakMap<Page, string>();
   private accessibilitySnapshotExportControlInstalled = false;
   private accessibilitySnapshotExporter?: () => Promise<AccessibilitySnapshotExportControlResult>;
+  private visitedOrigins = new Set<string>();
   private readonly pageGroupId: string;
   private browserSurface: BrowserSessionSurface = 'external';
 
@@ -3717,21 +3719,26 @@ export class BrowserSession {
     if (cdpEndpoint) {
       this.browserOwnership = 'connected';
       this.browser = await chromium.connectOverCDP(cdpEndpoint);
-      const existingContext = this.browser.contexts()[0];
-      const context = existingContext || await this.browser.newContext(contextOptions);
-      this.context = context;
       if (useElectronEmbeddedBrowser) {
-        await this.prepareContext(context, { claimPages: false });
-        this.installElectronEmbeddedBrowserPageDiscovery(context);
-        const embeddedPages = await this.findInitialElectronEmbeddedBrowserPages(context);
-        const embeddedPage = this.chooseInitialPage(embeddedPages);
-        if (embeddedPage) {
-          this.page = embeddedPage;
-          await embeddedPage.bringToFront().catch(() => undefined);
-          return;
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          for (const context of this.browser.contexts()) {
+            await this.prepareContext(context, { claimPages: false });
+            const embeddedPages = await this.findElectronEmbeddedBrowserSessionPages(context);
+            const embeddedPage = this.chooseInitialPage(embeddedPages);
+            if (!embeddedPage) continue;
+            this.context = context;
+            this.installElectronEmbeddedBrowserPageDiscovery(context);
+            this.page = embeddedPage;
+            await embeddedPage.bringToFront().catch(() => undefined);
+            return;
+          }
+          if (attempt < 11) await sleep(160);
         }
         throw new Error('Electron embedded browser tab for this session is not ready.');
       }
+      const existingContext = this.browser.contexts()[0];
+      const context = existingContext || await this.browser.newContext(contextOptions);
+      this.context = context;
       if (useSessionGroupPageSelection) {
         await this.selectInitialSessionGroupPage(context);
       } else {
@@ -3909,17 +3916,22 @@ export class BrowserSession {
   private async findInitialElectronEmbeddedBrowserPages(context: BrowserContext) {
     if (this.browserSurface !== 'electron-embedded') return [];
     for (let attempt = 0; attempt < 12; attempt += 1) {
-      const pages: Page[] = [];
-      for (const page of [...context.pages()].reverse()) {
-        if (page.isClosed()) continue;
-        if (await this.isElectronEmbeddedBrowserSessionPage(page) && this.claimPage(page, { allowSteal: true, makeActive: false })) {
-          pages.push(page);
-        }
-      }
+      const pages = await this.findElectronEmbeddedBrowserSessionPages(context);
       if (pages.length) return pages.reverse();
       if (attempt < 11) await sleep(160);
     }
     return [];
+  }
+
+  private async findElectronEmbeddedBrowserSessionPages(context: BrowserContext) {
+    const pages: Page[] = [];
+    for (const page of [...context.pages()].reverse()) {
+      if (page.isClosed()) continue;
+      if (await this.isElectronEmbeddedBrowserSessionPage(page) && this.claimPage(page, { allowSteal: true, makeActive: false })) {
+        pages.push(page);
+      }
+    }
+    return pages;
   }
 
   private async reclaimSessionPagesByMarker(context: BrowserContext) {
@@ -4316,13 +4328,59 @@ export class BrowserSession {
     this.page = undefined;
   }
 
+  private async clearElectronEmbeddedSessionData() {
+    const pages = this.sessionPages();
+    const origins = new Set(this.visitedOrigins);
+    for (const value of pages.flatMap((page) => page.frames().map((frame) => frame.url()))) {
+      try {
+        const url = new URL(value);
+        if (/^https?:$/.test(url.protocol)) origins.add(url.origin);
+      } catch {
+        // Ignore blank, data, and transient frame URLs.
+      }
+    }
+    for (const worker of this.context?.serviceWorkers() || []) {
+      try {
+        const url = new URL(worker.url());
+        if (/^https?:$/.test(url.protocol)) origins.add(url.origin);
+      } catch {
+        // Ignore workers without a web origin.
+      }
+    }
+    const storageState = await this.context?.storageState().catch(() => undefined);
+    for (const item of storageState?.origins || []) {
+      try {
+        const url = new URL(item.origin);
+        if (/^https?:$/.test(url.protocol)) origins.add(url.origin);
+      } catch {
+        // Ignore malformed persisted origins.
+      }
+    }
+    await this.context?.clearCookies().catch(() => undefined);
+    await this.context?.clearPermissions().catch(() => undefined);
+    await Promise.all(pages.map(async (page) => {
+      const client = await page.context().newCDPSession(page).catch(() => undefined);
+      if (!client) return;
+      try {
+        for (const origin of origins) {
+          await client.send('Storage.clearDataForOrigin', { origin, storageTypes: 'all' }).catch(() => undefined);
+        }
+        await client.send('Network.clearBrowserCache').catch(() => undefined);
+      } finally {
+        await client.detach().catch(() => undefined);
+      }
+    }));
+  }
+
   // 绑定 console 和网络失败监听，只记录会影响测试判断的关键异常。
   private attachPageListeners(page: Page) {
     if (this.attachedPages.has(page)) return;
     this.attachedPages.add(page);
     this.navigationSequenceByPage.set(page, this.navigationSequenceByPage.get(page) || 0);
+    for (const frame of page.frames()) this.rememberVisitedOrigin(frame.url());
     page.setDefaultTimeout(8000);
     page.on('framenavigated', (frame) => {
+      this.rememberVisitedOrigin(frame.url());
       if (frame !== page.mainFrame()) return;
       this.navigationSequenceByPage.set(page, (this.navigationSequenceByPage.get(page) || 0) + 1);
     });
@@ -4367,6 +4425,15 @@ export class BrowserSession {
       this.networkErrors.push(message);
       this.recordDomChangeError('network', message);
     });
+  }
+
+  private rememberVisitedOrigin(value: string) {
+    try {
+      const url = new URL(value);
+      if (/^https?:$/.test(url.protocol)) this.visitedOrigins.add(url.origin);
+    } catch {
+      // Blank and transient URLs do not own persistent web storage.
+    }
   }
 
   private recordDomChangeError(source: 'console' | 'page' | 'dialog' | 'network', message: string) {
@@ -5258,7 +5325,11 @@ export class BrowserSession {
       }
       if (options.keepOpen || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true') return;
       if (this.browserOwnership === 'connected') {
-        if (this.browserSurface === 'electron-embedded') return;
+        if (this.browserSurface === 'electron-embedded') {
+          await this.clearElectronEmbeddedSessionData();
+          await this.closeOwnedPages();
+          return;
+        }
         await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
         return;
       }
@@ -6365,7 +6436,13 @@ export class BrowserSession {
           }
           const description = name ? '' : unnamedActionContext(element, role);
           const field = element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
-          const value = ['input', 'select', 'textarea'].includes(tag) ? normalize(field.value).slice(0, 300) : '';
+          const rawValue = ['input', 'select', 'textarea'].includes(tag) ? normalize(field.value).slice(0, 300) : '';
+          const sensitiveInput = ['input', 'textarea'].includes(tag) && (
+            inputType === 'password'
+            || /(?:^|\s)(?:current-password|new-password|one-time-code)(?:\s|$)/i.test(element.getAttribute('autocomplete') || '')
+            || element.getAttribute('data-webpilot-sensitive-input') === 'true'
+          );
+          const value = sensitiveInput && rawValue ? '[redacted]' : rawValue;
           const url = tag === 'a' ? String((element as HTMLAnchorElement).href || '') : '';
           if (!name && !actionable) continue;
           results.push({
@@ -6779,12 +6856,14 @@ export class BrowserSession {
     }, point || { x: 1, y: 1 }).catch(() => undefined);
   }
 
-  private async editableValue(locator: Locator | undefined) {
-    if (!locator) return undefined;
-    return locator.evaluate((element) => {
+  private async editableValue(locator?: Locator, handle?: ElementHandle<Element>) {
+    const read = (element: Element) => {
       const field = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
       return 'value' in field ? String(field.value) : String(element.textContent || '');
-    }).catch(() => undefined);
+    };
+    if (handle) return handle.evaluate(read).catch(() => undefined);
+    if (locator) return locator.evaluate(read).catch(() => undefined);
+    return undefined;
   }
 
   private async hasFocusedNativeSelect() {
@@ -7652,10 +7731,23 @@ export class BrowserSession {
     const page = this.activePage;
     const previousGeneration = this.snapshotGeneration;
     let targetLocator: Locator | undefined;
+    let targetHandle: ElementHandle<Element> | undefined;
     if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
       const target = await this.unifiedActionPoint(input, true);
       if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
       targetLocator = target.reference && isSnapshotReference(target.reference) ? await this.snapshotReferenceLocator(target.reference) : undefined;
+      if (!targetLocator && target.reference && !isSnapshotReference(target.reference) && target.reference.interactive) {
+        const frame = target.reference.framePath ? this.frameFromPath(target.reference.framePath) : page.mainFrame();
+        if (!frame) return { ok: false, actual: `UID ${input.uid} belongs to an iframe that no longer exists.` };
+        targetHandle = await this.elementHandleForDomPath(
+          frame,
+          target.reference.path,
+          target.reference.locatorCandidates || [],
+        ) as ElementHandle<Element> | undefined;
+        if (!targetHandle) {
+          return { ok: false, actual: `UID ${input.uid} no longer resolves to a live editable element. Call takeSnapshot again.` };
+        }
+      }
       const targetsNativeSelect = Boolean(target.reference && (
         isSnapshotReference(target.reference)
           ? await targetLocator?.evaluate((element) => element instanceof HTMLSelectElement).catch(() => false)
@@ -7664,18 +7756,53 @@ export class BrowserSession {
       if (targetsNativeSelect) {
         return { ok: false, actual: 'Keyboard operation rejected for a native <select>. Use selectOption with this select UID and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
       }
-      if (!targetLocator && target.reference && !isSnapshotReference(target.reference) && !target.reference.interactive) {
+      if (!targetLocator && !targetHandle && target.reference && !isSnapshotReference(target.reference) && !target.reference.interactive) {
         targetLocator = await this.editableIframeLocator(target.reference, target.point);
         if (!targetLocator) {
           return { ok: false, actual: `UID ${input.uid} (${target.reference.tag} "${target.reference.label}") is structural text, not an editable target.` };
         }
       }
-      if (targetLocator) {
-        await targetLocator.click({ noWaitAfter: true });
-        await targetLocator.focus();
-        const focused = await targetLocator.evaluate((element) => (
+      if (input.allowedOrigins?.length) {
+        if (!targetLocator && !targetHandle) {
+          return { ok: false, actual: 'Credential entry requires a resolvable element target in the confirmed login page.' };
+        }
+        if (targetLocator) {
+          const boundHandle = await targetLocator.elementHandle().catch(() => null);
+          if (!boundHandle) return { ok: false, actual: 'Credential entry target is no longer attached. Call takeSnapshot again.' };
+          targetHandle = boundHandle as ElementHandle<Element>;
+          targetLocator = undefined;
+        }
+        const allowedOrigins = new Set(input.allowedOrigins.flatMap((value) => {
+          try {
+            const origin = new URL(value).origin;
+            return origin === 'null' ? [] : [origin];
+          } catch {
+            return [];
+          }
+        }));
+        const targetOrigin = await targetHandle!.evaluate(() => window.location.origin).catch(() => '');
+        if (!targetOrigin || !allowedOrigins.has(targetOrigin)) {
+          return { ok: false, actual: 'Credential entry was blocked because the target field belongs to a different frame origin.' };
+        }
+        const markedSensitive = await targetHandle!.evaluate((element) => {
+          if (!(element instanceof HTMLInputElement) && !(element instanceof HTMLTextAreaElement)) return false;
+          element.setAttribute('data-webpilot-sensitive-input', 'true');
+          return true;
+        }).catch(() => false);
+        if (!markedSensitive) {
+          return { ok: false, actual: 'Credential entry is limited to a concrete input or textarea field.' };
+        }
+      }
+      if (targetLocator || targetHandle) {
+        if (targetHandle) await targetHandle.click({ noWaitAfter: true });
+        else await targetLocator!.click({ noWaitAfter: true });
+        if (targetHandle) await targetHandle.focus();
+        else await targetLocator!.focus();
+        const focused = await (targetHandle
+          ? targetHandle.evaluate((element) => element === document.activeElement || element.contains(document.activeElement))
+          : targetLocator!.evaluate((element) => (
           element === document.activeElement || element.contains(document.activeElement)
-        )).catch(() => false);
+          ))).catch(() => false);
         if (!focused) return { ok: false, actual: 'The keyboard target did not receive focus after Playwright click and focus.' };
       } else {
         await page.mouse.click(target.point.x, target.point.y);
@@ -7688,33 +7815,63 @@ export class BrowserSession {
     }
     if (input.action === 'type') {
       if (typeof input.text !== 'string') return { ok: false, actual: 'Keyboard type requires text.' };
+      if (input.allowedOrigins?.length) {
+        const allowedOrigins = new Set(input.allowedOrigins.flatMap((value) => {
+          try {
+            const origin = new URL(value).origin;
+            return origin === 'null' ? [] : [origin];
+          } catch {
+            return [];
+          }
+        }));
+        const currentTarget = targetHandle
+          ? await targetHandle.evaluate((element) => ({
+              focused: element === document.activeElement || element.contains(document.activeElement),
+              origin: window.location.origin,
+            })).catch(() => undefined)
+          : targetLocator
+            ? await targetLocator.evaluate((element) => ({
+                focused: element === document.activeElement || element.contains(document.activeElement),
+                origin: window.location.origin,
+              })).catch(() => undefined)
+            : undefined;
+        if (!currentTarget?.focused || !allowedOrigins.has(currentTarget.origin)) {
+          return { ok: false, actual: 'Credential entry was blocked because the target navigated, detached, lost focus, or changed frame origin.' };
+        }
+      }
       const text = input.text;
-      const editable = targetLocator
-        ? await targetLocator.isEditable().catch(() => false)
+      const editable = targetHandle
+        ? await targetHandle.isEditable().catch(() => false)
+        : targetLocator
+          ? await targetLocator.isEditable().catch(() => false)
         : await page.locator(':focus').isEditable().catch(() => false);
       if (!editable) return { ok: false, actual: 'Keyboard type requires an editable focused textbox or contenteditable target.' };
-      const valueBefore = await this.editableValue(targetLocator);
+      const valueBefore = await this.editableValue(targetLocator, targetHandle);
       const eventsBefore = await this.readInteractionCounts();
       const urlBefore = page.url();
       const navigationSequenceBefore = this.navigationSequenceByPage.get(page) || 0;
       const selectAllKey = process.platform === 'darwin' ? 'Meta+A' : 'Control+A';
       if (input.replace !== false) {
-        if (targetLocator) {
-          await targetLocator.press(selectAllKey);
-          await targetLocator.press('Backspace');
+        if (targetHandle || targetLocator) {
+          if (targetHandle) await targetHandle.press(selectAllKey);
+          else await targetLocator!.press(selectAllKey);
+          if (targetHandle) await targetHandle.press('Backspace');
+          else await targetLocator!.press('Backspace');
         } else {
           await page.keyboard.press(selectAllKey);
           await page.keyboard.press('Backspace');
         }
       }
       const delay = boundedNonNegativeIntegerEnv('BROWSER_KEYBOARD_TYPE_DELAY_MS', 0, 200);
-      const fastInserted = await this.insertFocusedTextFast(text);
+      const fastInserted = input.allowedOrigins?.length ? false : await this.insertFocusedTextFast(text);
       if (!fastInserted) {
-        if (targetLocator) await targetLocator.pressSequentially(text, { delay });
+        if (targetHandle) await targetHandle.type(text, { delay });
+        else if (targetLocator) await targetLocator.pressSequentially(text, { delay });
         else await page.keyboard.type(text, { delay });
       }
       if (input.followByEnter) {
-        if (targetLocator) await targetLocator.press('Enter');
+        if (targetHandle) await targetHandle.press('Enter');
+        else if (targetLocator) await targetLocator.press('Enter');
         else await page.keyboard.press('Enter');
       }
       return this.completeVerifiedAction(
@@ -7726,7 +7883,7 @@ export class BrowserSession {
           const inputEvents = this.interactionDelta(eventsBefore, eventsAfter, 'input');
           const navigated = page.url() !== urlBefore
             || (this.navigationSequenceByPage.get(page) || 0) !== navigationSequenceBefore;
-          const valueAfter = navigated ? undefined : await this.editableValue(targetLocator);
+          const valueAfter = navigated ? undefined : await this.editableValue(targetLocator, targetHandle);
           const valueChanged = valueBefore !== undefined && valueAfter !== undefined && valueBefore !== valueAfter;
           const delivered = text.length > 0
             ? inputEvents > 0 || valueChanged

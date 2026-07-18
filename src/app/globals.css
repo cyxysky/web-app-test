@@ -9244,15 +9244,24 @@ body.is-dragging-embedded-tab * {
 
 .browser-chat-message-list {
   align-content: start;
+  box-sizing: border-box;
   display: grid;
   flex: 1;
   gap: 18px;
   margin: 0 auto;
   max-width: 920px;
+  min-width: 0;
   min-height: 0;
-  overflow: auto;
-  padding: 52px 0 8px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 52px 4px 8px;
+  scrollbar-gutter: stable;
   width: min(100%, 920px);
+}
+
+.browser-chat-message-list > * {
+  min-width: 0;
+  max-width: 100%;
 }
 
 .browser-chat-message-list-end {
@@ -9278,9 +9287,11 @@ body.is-dragging-embedded-tab * {
 }
 
 .browser-chat-message {
+  box-sizing: border-box;
   content-visibility: auto;
   contain-intrinsic-size: 180px;
   max-width: 790px;
+  min-width: 0;
 }
 
 .browser-chat-message.is-running {
@@ -9300,8 +9311,31 @@ body.is-dragging-embedded-tab * {
 }
 
 .browser-chat-message.assistant>div:last-child {
+  box-sizing: border-box;
   max-width: min(790px, 100%);
+  min-width: 0;
   width: fit-content;
+}
+
+.browser-chat-message.assistant:has([aria-label="目标测试计划"]),
+.browser-chat-message.assistant:has([aria-label="目标测试计划"]) > div:last-child {
+  max-width: 100%;
+  width: 100%;
+}
+
+.browser-chat-message.assistant:has([aria-label="目标测试计划"]) :where(
+  .browser-chat-ai-line-collapse,
+  .browser-chat-executed-body,
+  .browser-chat-executed-entry
+) {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+}
+
+.browser-chat-message.assistant:has([aria-label="目标测试计划"]) .browser-chat-ai-line-collapse {
+  justify-items: stretch;
 }
 
 .browser-chat-message.user .browser-chat-avatar {
@@ -10805,7 +10839,8 @@ body.is-dragging-embedded-tab * {
 }
 
 .browser-chat-mode-toggle,
-.browser-chat-safety-toggle {
+.browser-chat-safety-toggle,
+.browser-chat-workflow-toggle {
   align-items: center;
   background: var(--panel-soft);
   border: 1px solid var(--border);
@@ -10819,12 +10854,14 @@ body.is-dragging-embedded-tab * {
 }
 
 .browser-chat-mode-toggle svg,
-.browser-chat-safety-toggle svg {
+.browser-chat-safety-toggle svg,
+.browser-chat-workflow-toggle svg {
   margin-left: 6px;
 }
 
 .browser-chat-mode-toggle button,
-.browser-chat-safety-toggle button {
+.browser-chat-safety-toggle button,
+.browser-chat-workflow-toggle button {
   background: transparent;
   border: 0;
   border-radius: 999px;
@@ -10839,12 +10876,14 @@ body.is-dragging-embedded-tab * {
 }
 
 .browser-chat-mode-toggle button.active,
-.browser-chat-safety-toggle button.active {
+.browser-chat-safety-toggle button.active,
+.browser-chat-workflow-toggle button.active {
   background: var(--accent-strong);
   color: #ffffff;
 }
 
-.browser-chat-safety-toggle {
+.browser-chat-safety-toggle,
+.browser-chat-workflow-toggle {
   display: inline-grid;
   gap: 0;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -10852,7 +10891,8 @@ body.is-dragging-embedded-tab * {
   position: relative;
 }
 
-.browser-chat-safety-toggle::before {
+.browser-chat-safety-toggle::before,
+.browser-chat-workflow-toggle::before {
   background: var(--accent-strong);
   border-radius: 999px;
   bottom: 3px;
@@ -10866,18 +10906,21 @@ body.is-dragging-embedded-tab * {
   z-index: 0;
 }
 
-.browser-chat-safety-toggle:has(button:nth-child(2).active)::before {
+.browser-chat-safety-toggle:has(button:nth-child(2).active)::before,
+.browser-chat-workflow-toggle:has(button:nth-child(2).active)::before {
   transform: translateX(100%);
 }
 
-.browser-chat-safety-toggle button {
+.browser-chat-safety-toggle button,
+.browser-chat-workflow-toggle button {
   min-width: 44px;
   position: relative;
   transition: color 0.18s ease;
   z-index: 1;
 }
 
-.browser-chat-safety-toggle button.active {
+.browser-chat-safety-toggle button.active,
+.browser-chat-workflow-toggle button.active {
   background: transparent;
 }
 
@@ -10933,7 +10976,8 @@ body.is-dragging-embedded-tab * {
 }
 
 .browser-chat-mode-toggle button:disabled,
-.browser-chat-safety-toggle button:disabled {
+.browser-chat-safety-toggle button:disabled,
+.browser-chat-workflow-toggle button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
@@ -11114,6 +11158,7 @@ body.is-dragging-embedded-tab * {
   .browser-chat-close,
   .browser-chat-mode-toggle button,
   .browser-chat-safety-toggle button,
+  .browser-chat-workflow-toggle button,
   .browser-chat-nav-item,
   .browser-chat-subnav button,
   .browser-chat-recent-open,
@@ -11141,6 +11186,7 @@ body.is-dragging-embedded-tab * {
   .browser-chat-close,
   .browser-chat-mode-toggle button,
   .browser-chat-safety-toggle button,
+  .browser-chat-workflow-toggle button,
   .browser-chat-nav-item,
   .browser-chat-subnav button,
   .browser-chat-recent-open,
@@ -11734,7 +11780,8 @@ body.is-dragging-embedded-tab * {
 }
 
 :root[data-theme="dark"] .browser-chat-mode-toggle,
-:root[data-theme="dark"] .browser-chat-safety-toggle {
+:root[data-theme="dark"] .browser-chat-safety-toggle,
+:root[data-theme="dark"] .browser-chat-workflow-toggle {
   background: color-mix(in srgb, var(--panel) 86%, var(--foreground));
   border-color: var(--border);
 }
@@ -11810,11 +11857,13 @@ body.is-dragging-embedded-tab * {
   color: #ffffff;
 }
 
-:root[data-theme="dark"] .browser-chat-safety-toggle::before {
+:root[data-theme="dark"] .browser-chat-safety-toggle::before,
+:root[data-theme="dark"] .browser-chat-workflow-toggle::before {
   background: var(--accent);
 }
 
-:root[data-theme="dark"] .browser-chat-safety-toggle button.active {
+:root[data-theme="dark"] .browser-chat-safety-toggle button.active,
+:root[data-theme="dark"] .browser-chat-workflow-toggle button.active {
   background: transparent;
   color: #ffffff;
 }
@@ -12794,17 +12843,24 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
   opacity: 1;
 }
 
-.browser-chat-compose--reference .browser-chat-safety-toggle {
+.browser-chat-compose--reference .browser-chat-safety-toggle,
+.browser-chat-compose--reference .browser-chat-workflow-toggle {
+  --browser-chat-segment-width: 43px;
   background: #f1f1ef;
   border: 0;
   border-radius: 10px;
   height: 34px;
   min-height: 34px;
   padding: 3px;
-  width: 92px;
+  width: calc(var(--browser-chat-segment-width) * 2 + 6px);
 }
 
-.browser-chat-compose--reference .browser-chat-safety-toggle::before {
+.browser-chat-compose--reference .browser-chat-workflow-toggle {
+  --browser-chat-segment-width: 62px;
+}
+
+.browser-chat-compose--reference .browser-chat-safety-toggle::before,
+.browser-chat-compose--reference .browser-chat-workflow-toggle::before {
   background: #ffffff;
   border: 0;
   border-radius: 8px;
@@ -12816,14 +12872,16 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
   left: 3px;
   top: 3px;
   transform: translateX(0);
-  width: 43px;
+  width: var(--browser-chat-segment-width);
 }
 
-.browser-chat-compose--reference .browser-chat-safety-toggle:has(button:nth-child(2).active)::before {
-  transform: translateX(43px);
+.browser-chat-compose--reference .browser-chat-safety-toggle:has(button:nth-child(2).active)::before,
+.browser-chat-compose--reference .browser-chat-workflow-toggle:has(button:nth-child(2).active)::before {
+  transform: translateX(var(--browser-chat-segment-width));
 }
 
-.browser-chat-compose--reference .browser-chat-safety-toggle button {
+.browser-chat-compose--reference .browser-chat-safety-toggle button,
+.browser-chat-compose--reference .browser-chat-workflow-toggle button {
   border-radius: 8px;
   color: #6d7179;
   font-size: 12px;
@@ -12831,11 +12889,12 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
   height: 28px;
   line-height: 28px;
   min-height: 28px;
-  min-width: 43px;
+  min-width: var(--browser-chat-segment-width);
   padding: 0;
 }
 
-.browser-chat-compose--reference .browser-chat-safety-toggle button.active {
+.browser-chat-compose--reference .browser-chat-safety-toggle button.active,
+.browser-chat-compose--reference .browser-chat-workflow-toggle button.active {
   color: #315f98;
 }
 
@@ -12864,6 +12923,11 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
 .browser-chat-composer-shell:has(.browser-chat-compose--reference) .browser-chat-composer-mode button:not(:disabled):hover {
   background: color-mix(in srgb, var(--foreground) 6%, transparent);
   color: var(--foreground);
+}
+
+.browser-chat-composer-shell:has(.browser-chat-compose--reference) .browser-chat-composer-mode button.active {
+  background: color-mix(in srgb, var(--accent) 11%, transparent);
+  color: var(--accent);
 }
 
 .browser-chat-composer-shell:has(.browser-chat-compose--reference) .browser-chat-composer-mode button:disabled {
@@ -13262,6 +13326,7 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
 .settings-toggle,
 .settings-toggle span,
 .browser-chat-safety-toggle::before,
+.browser-chat-workflow-toggle::before,
 .browser-chat-embedded-chat-toggle svg,
 .custom-select-button svg {
   transition:

@@ -273,7 +273,11 @@ async function concurrentMap<T, R>(values: T[], concurrency: number, mapper: (va
   return results;
 }
 
-function normalizeFrameNodes(frame: CapturedSnapshotFrame, rawNodes: CdpAxNode[]) {
+function normalizeFrameNodes(
+  frame: CapturedSnapshotFrame,
+  rawNodes: CdpAxNode[],
+  sensitiveBackendNodeIds: ReadonlySet<number> = new Set(),
+) {
   const rawById = new Map(rawNodes.map((node) => [String(node.nodeId || ''), node]));
   const depthById = new Map<string, number>();
   const depthOf = (nodeId: string, visiting = new Set<string>()): number => {
@@ -293,6 +297,12 @@ function normalizeFrameNodes(frame: CapturedSnapshotFrame, rawNodes: CdpAxNode[]
     const properties = propertyRecord(node.properties);
     const role = roleOf(node);
     const urlProperty = properties.url;
+    const sensitive = Boolean(
+      (node.backendDOMNodeId && sensitiveBackendNodeIds.has(node.backendDOMNodeId))
+      || properties.protected === true
+      || properties.protected === 'true',
+    );
+    if (sensitive) properties.sensitiveInput = true;
     return {
       identity: `${frame.documentId}:${frame.frameId}:${node.backendDOMNodeId || axNodeId}`,
       frameId: frame.frameId,
@@ -308,12 +318,52 @@ function normalizeFrameNodes(frame: CapturedSnapshotFrame, rawNodes: CdpAxNode[]
       role,
       name: normalizeWhitespace(stringValue(node.name)),
       description: normalizeWhitespace(stringValue(node.description)),
-      value: normalizeWhitespace(stringValue(node.value)),
+      value: sensitive && stringValue(node.value) ? '[redacted]' : normalizeWhitespace(stringValue(node.value)),
       url: typeof urlProperty === 'string' ? urlProperty : '',
       properties,
       actionable: isActionable(role, properties),
     };
   });
+}
+
+async function sensitiveBackendNodes(client: CDPSession, nodes: CdpAxNode[]) {
+  const candidates = nodes.filter((node) => {
+    if (!node.backendDOMNodeId) return false;
+    const role = roleOf(node).toLowerCase();
+    return ['textbox', 'searchbox', 'combobox', 'spinbutton'].includes(role);
+  });
+  const sensitive = new Set<number>();
+  await concurrentMap(candidates, 8, async (node) => {
+    const backendNodeId = node.backendDOMNodeId;
+    if (!backendNodeId) return;
+    let objectId = '';
+    try {
+      const resolved = await client.send('DOM.resolveNode', { backendNodeId }) as {
+        object?: { objectId?: string };
+      };
+      objectId = resolved.object?.objectId || '';
+      if (!objectId) return;
+      const checked = await client.send('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function () {
+          if (!(this instanceof HTMLInputElement) && !(this instanceof HTMLTextAreaElement)) return false;
+          const type = this instanceof HTMLInputElement ? String(this.type || '').toLowerCase() : '';
+          const autocomplete = String(this.autocomplete || this.getAttribute('autocomplete') || '');
+          return type === 'password'
+            || /(?:^|\\s)(?:current-password|new-password|one-time-code)(?:\\s|$)/i.test(autocomplete)
+            || this.getAttribute('data-webpilot-sensitive-input') === 'true';
+        }`,
+        returnByValue: true,
+        silent: true,
+      }) as { result?: { value?: unknown } };
+      if (checked.result?.value === true) sensitive.add(backendNodeId);
+    } catch {
+      // A detached node is safe to ignore; the snapshot will be discarded on navigation/mutation.
+    } finally {
+      if (objectId) await client.send('Runtime.releaseObject', { objectId }).catch(() => undefined);
+    }
+  });
+  return sensitive;
 }
 
 export async function captureAxSnapshot(page: Page, allowedFrameIds?: ReadonlySet<string>): Promise<CapturedAxSnapshot> {
@@ -329,7 +379,9 @@ export async function captureAxSnapshot(page: Page, allowedFrameIds?: ReadonlySe
     const perFrame = await concurrentMap(frames, 4, async (frame) => {
       try {
         const result = await client.send('Accessibility.getFullAXTree', { frameId: frame.frameId }) as { nodes?: CdpAxNode[] };
-        return { frame, nodes: normalizeFrameNodes(frame, result.nodes || []) };
+        const rawNodes = result.nodes || [];
+        const sensitiveNodeIds = await sensitiveBackendNodes(client, rawNodes);
+        return { frame, nodes: normalizeFrameNodes(frame, rawNodes, sensitiveNodeIds) };
       } catch (error) {
         return { frame: { ...frame, error: errorText(error) }, nodes: [] as CapturedSnapshotNode[] };
       }

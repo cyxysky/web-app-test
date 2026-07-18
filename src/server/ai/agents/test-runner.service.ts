@@ -349,7 +349,7 @@ async function executeRun(testCaseId: string, runId: string, options: ExecuteRun
 
     const execution = await executeTestCase(runnableTestCase, runId, {
       initialSteps,
-      recordedFlow: options.recordedFlow || (options.continueExisting ? undefined : testCase.content.recordedFlow),
+      recordedFlow: options.source === 'replay' ? options.recordedFlow : undefined,
       onProgress: (step) => {
         store.updateRunStep(runId, step);
       },

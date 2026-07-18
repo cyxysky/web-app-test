@@ -2,9 +2,8 @@
 
 import { useRouter } from 'next/navigation';
 import { useMemo, useState } from 'react';
-import { BadgeCheck, Clock3, ExternalLink, Loader2, Sparkles, Star, Trash2 } from 'lucide-react';
+import { Clock3, ExternalLink, Loader2, Sparkles, Trash2 } from 'lucide-react';
 import { DeleteRunButton } from '@/components/DeleteRunButton';
-import { RecordedFlowToCaseButton } from '@/components/RecordedFlowToCaseButton';
 import { RunScreenshotChainButton } from '@/components/RunScreenshotChain';
 import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -41,21 +40,16 @@ function formatRunTime(value?: string, language: 'zh' | 'en' = 'zh') {
 }
 
 export function RunHistoryList({
-  defaultRecordedRunId,
   onOpenRun,
   runs,
-  testCaseId,
 }: {
-  defaultRecordedRunId?: string;
   onOpenRun?: (runId: string) => void;
   runs: TestRunRecord[];
-  testCaseId: string;
 }) {
   const { language, t } = useI18n();
   const router = useRouter();
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deleting, setDeleting] = useState(false);
-  const [settingDefaultRunId, setSettingDefaultRunId] = useState<string | null>(null);
   const [generatingSkillRunId, setGeneratingSkillRunId] = useState<string | null>(null);
   const latestRun = runs[0];
   const finishedRuns = runs.filter((run) => finishedRunStatuses.includes(run.status)).length;
@@ -90,26 +84,6 @@ export function RunHistoryList({
       window.alert(error instanceof Error ? error.message : t('批量删除失败'));
     } finally {
       setDeleting(false);
-      stopGlobalLoading();
-    }
-  }
-
-  async function setDefaultRecordedRun(runId: string) {
-    if (settingDefaultRunId) return;
-    setSettingDefaultRunId(runId);
-    startGlobalLoading(t('正在设置默认记录'));
-    try {
-      const response = await fetch(`/api/test-cases/${testCaseId}/default-recorded-run`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ runId }),
-      });
-      await readApiJson<Record<string, unknown>>(response, t('设置默认记录失败'));
-      router.refresh();
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : t('设置默认记录失败'));
-    } finally {
-      setSettingDefaultRunId(null);
       stopGlobalLoading();
     }
   }
@@ -158,12 +132,10 @@ export function RunHistoryList({
             <span title={deletableIds.length ? t('全选执行记录') : t('暂无执行记录')}>{deletableIds.length ? t('全选执行记录') : t('暂无执行记录')}</span>
           </label>
           {runs.map((run) => {
-            const replayable = Boolean(run.result?.steps.some((step) => step.tools?.some((tool) => tool.name && tool.ok !== false)));
             const startedAt = formatRunTime(run.startedAt || run.createdAt, language);
             const endedAt = run.endedAt ? formatRunTime(run.endedAt, language) : undefined;
             const active = isActiveRun(run);
             const selected = selectedSet.has(run.id);
-            const isDefaultRecordedRun = run.id === defaultRecordedRunId;
             const skillable = !active && Boolean(run.result?.steps?.length);
             return (
               <div className={selected ? 'run-history-row selected' : 'run-history-row'} key={run.id}>
@@ -183,18 +155,7 @@ export function RunHistoryList({
                   {endedAt ? <span>{t('至')} {endedAt}</span> : <span>{t('未结束')}</span>}
                 </span>
                 <span className="run-history-actions">
-                  <button
-                    aria-label={isDefaultRecordedRun ? t('当前默认记录') : t('设为默认记录')}
-                    className={isDefaultRecordedRun ? 'run-history-replay default-record selected' : 'run-history-replay default-record'}
-                    disabled={!replayable || active || isDefaultRecordedRun || Boolean(settingDefaultRunId)}
-                    onClick={() => setDefaultRecordedRun(run.id)}
-                    title={isDefaultRecordedRun ? t('当前默认记录') : t('设为默认记录')}
-                    type="button"
-                  >
-                    {settingDefaultRunId === run.id ? <Loader2 className="spin" size={14} /> : isDefaultRecordedRun ? <BadgeCheck size={14} /> : <Star size={14} />}
-                  </button>
                   <RunScreenshotChainButton className="run-history-replay" run={run} />
-                  <RecordedFlowToCaseButton disabled={!replayable || active} runId={run.id} />
                   <button
                     aria-label={t('从这条执行记录生成 Skill')}
                     className="run-history-replay"

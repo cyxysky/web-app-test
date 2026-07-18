@@ -1,5 +1,6 @@
-const { app, BrowserWindow, Menu, WebContentsView, dialog, ipcMain, nativeTheme, shell } = require('electron');
+const { app, BrowserWindow, Menu, WebContentsView, dialog, ipcMain, nativeTheme, session: electronSession, shell } = require('electron');
 const { spawn } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
@@ -733,6 +734,25 @@ function normalizeEmbeddedBrowserSessionId(value) {
   return String(value || '').trim();
 }
 
+function embeddedBrowserPartition(sessionId) {
+  const sessionKey = normalizeEmbeddedBrowserSessionId(sessionId) || 'default';
+  const normalized = sessionKey
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  const digest = createHash('sha256').update(sessionKey, 'utf8').digest('hex').slice(0, 24);
+  return `persist:webpilot-${normalized || 'session'}-${digest}`;
+}
+
+async function clearEmbeddedBrowserPartition(sessionId) {
+  const normalized = normalizeEmbeddedBrowserSessionId(sessionId);
+  if (!normalized) return;
+  const partitionSession = electronSession.fromPartition(embeddedBrowserPartition(normalized));
+  await partitionSession.clearStorageData();
+  await partitionSession.clearCache();
+  if (typeof partitionSession.clearAuthCache === 'function') await partitionSession.clearAuthCache();
+}
+
 function embeddedBrowserGroupIdForSession(sessionId) {
   const normalized = normalizeEmbeddedBrowserSessionId(sessionId);
   return normalized ? `session:${normalized}` : 'default';
@@ -1445,6 +1465,14 @@ function installEmbeddedBrowserTabHandlers(tab) {
     embeddedBrowserTabs.delete(tab.id);
     const group = embeddedBrowserGroups.get(tab.groupId);
     if (group?.activeTabId === tab.id) group.activeTabId = embeddedBrowserTabsForGroup(tab.groupId)[0]?.id || '';
+    if (group && String(group.sessionId || '').startsWith('actor_') && !embeddedBrowserTabsForGroup(tab.groupId).length) {
+      const actorSessionId = group.sessionId;
+      closeEmbeddedBrowserGroup(tab.groupId, { rememberClosed: false });
+      void clearEmbeddedBrowserPartition(actorSessionId).catch((error) => {
+        appendLog(`Actor browser partition cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      return;
+    }
     if (embeddedBrowserActiveTabId === tab.id) {
       embeddedBrowserActiveTabId = '';
       embeddedBrowserView = undefined;
@@ -1470,6 +1498,7 @@ function createEmbeddedBrowserTab(input = {}) {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
+      partition: embeddedBrowserPartition(sessionId),
       preload: embeddedBrowserPreloadPath(),
       sandbox: false,
     },
@@ -2386,7 +2415,14 @@ function registerEmbeddedBrowserIpc() {
 
   ipcMain.handle('webpilot:embedded-browser:discard-group', async (_event, input = {}) => {
     try {
-      return closeEmbeddedBrowserGroup(typeof input.id === 'string' ? input.id : '', { rememberClosed: false });
+      const groupId = typeof input.id === 'string' ? input.id : '';
+      const sessionId = embeddedBrowserSessionIdFromGroupId(groupId)
+        || normalizeEmbeddedBrowserSessionId(embeddedBrowserGroups.get(groupId)?.sessionId);
+      const state = closeEmbeddedBrowserGroup(groupId, { rememberClosed: false });
+      if (input.clearStorage === true && sessionId) {
+        await clearEmbeddedBrowserPartition(sessionId);
+      }
+      return state;
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }

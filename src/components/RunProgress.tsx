@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowDown, ArrowUp, Bug, CheckCircle2, ChevronRight, CircleAlert, Eye, Loader2, Maximize2, Minus, PlayCircle, Plus, Radar, RotateCcw, Save, SkipForward, Trash2, Wrench, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Bug, CheckCircle2, ChevronRight, CircleAlert, Eye, Loader2, Maximize2, Minus, PlayCircle, Plus, Radar, Save, SkipForward, Trash2, Wrench, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -285,9 +285,9 @@ function toolOptionLabel(name: string, t: TranslateFn) {
 }
 
 const toolStatusOptions = [
-  { label: '成功 / 参与重放', value: 'success' },
-  { label: '失败 / 不参与重放', value: 'failed' },
-  { label: '未定 / 参与重放', value: 'pending' },
+  { label: '成功', value: 'success' },
+  { label: '失败', value: 'failed' },
+  { label: '未定', value: 'pending' },
 ];
 
 function traceUrl(run: TestRunRecord) {
@@ -1231,7 +1231,6 @@ export function RunProgress({
   const [toolDrafts, setToolDrafts] = useState<ToolDraft[]>([]);
   const [toolEditError, setToolEditError] = useState('');
   const [savingTools, setSavingTools] = useState(false);
-  const [replayingRecord, setReplayingRecord] = useState(false);
   const steps = useMemo(() => run.result?.steps || [], [run.result?.steps]);
   const allImages = useMemo(() => collectStepImages(steps, t), [steps, t]);
   const taskFrame = useMemo(() => collectRunTaskFrame(run), [run]);
@@ -1246,7 +1245,6 @@ export function RunProgress({
   const manualInterventionScreenshotUrl = artifactUrl(visibleManualIntervention?.screenshotPath);
   const canContinueBlockedRun = run.status === 'blocked';
   const canEditToolRecord = selectedStep && run.status !== 'running' && run.status !== 'queued' && run.status !== 'paused';
-  const canRunByRecord = isFinished(run.status) && steps.some((step) => step.tools?.some((tool) => tool.ok !== false));
 
   useEffect(() => {
     let active = true;
@@ -1480,22 +1478,6 @@ export function RunProgress({
     }
   }
 
-  async function runByCurrentRecord() {
-    if (!canRunByRecord || replayingRecord) return;
-    setReplayingRecord(true);
-    startGlobalLoading(t('正在按记录执行'));
-    try {
-      const response = await fetch(`/api/runs/${run.id}/replay`, { method: 'POST' });
-      const data = await readApiJson<Record<string, unknown>>(response, t('按记录执行失败'));
-      if (!data.runId) throw new Error(t('按记录执行失败'));
-      window.location.href = `/runs/${data.runId}`;
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : t('按记录执行失败'));
-      setReplayingRecord(false);
-      stopGlobalLoading();
-    }
-  }
-
   async function skipSelectedStep() {
     if (!selectedStep) return;
     startGlobalLoading(t('正在跳过步骤'));
@@ -1562,17 +1544,6 @@ export function RunProgress({
             <a className="link-button" href={traceUrl(run)} target="_blank" rel="noopener noreferrer">
               {t('下载 Trace')}
             </a>
-          ) : null}
-          {isFinished(run.status) && steps.some((step) => step.tools?.some((tool) => tool.ok !== false)) ? (
-            <a className="link-button" href={`/api/runs/${run.id}/recorded-flow`} target="_blank" rel="noopener noreferrer">
-              {t('导出录制流')}
-            </a>
-          ) : null}
-          {canRunByRecord ? (
-            <button className="link-button" disabled={replayingRecord} onClick={runByCurrentRecord} type="button">
-              {replayingRecord ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />}
-              {t('按记录执行')}
-            </button>
           ) : null}
           {debugEnabled ? (
             <span className="debug-phase">

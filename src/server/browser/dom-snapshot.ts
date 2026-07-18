@@ -299,7 +299,9 @@ function enrichFromAx(node: CapturedDomSnapshotNode, axNode: CdpAxNode | undefin
     role,
     name,
     description: text(axValue(axNode.description)) || node.description,
-    value: text(axValue(axNode.value)) || node.value,
+    value: node.properties.sensitiveInput === true
+      ? node.value
+      : text(axValue(axNode.value)) || node.value,
     properties: { ...properties, axIgnored: axNode.ignored === true },
     actions: [...actions],
     actionable: actions.size > 0 && properties.disabled !== true && properties.disabled !== 'true',
@@ -523,7 +525,13 @@ export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapsho
           .join(' '));
         const ownText = descendantText[index];
         const inputType = (attributes.type || '').toLowerCase();
-        const value = text(inputValues.get(index) || textValues.get(index) || attributes.value || '');
+        const rawValue = text(inputValues.get(index) || textValues.get(index) || attributes.value || '');
+        const sensitiveInput = ['INPUT', 'TEXTAREA'].includes(tag) && (
+          inputType === 'password'
+          || /(?:^|\s)(?:current-password|new-password|one-time-code)(?:\s|$)/i.test(attributes.autocomplete || '')
+          || attributes['data-webpilot-sensitive-input'] === 'true'
+        );
+        const value = sensitiveInput && rawValue ? '[redacted]' : rawValue;
         const semanticText = actionable || textBearingRoles.has(role) ? ownText : '';
         const contextualDescription = actionable ? contextualActionName(index, tag, attributes) : '';
         const name = text(
@@ -546,6 +554,7 @@ export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapsho
           rendered,
           paintOrder: layout?.paintOrder || 0,
         };
+        if (sensitiveInput) properties.sensitiveInput = true;
         if (
           rendered
           && bounds[0] < (document.scrollOffsetX || 0) + viewport.width

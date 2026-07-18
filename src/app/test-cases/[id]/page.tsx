@@ -8,5 +8,5 @@ type PageProps = {
 
 export default async function TestCaseDetailPage({ params }: PageProps) {
   await params;
-  redirect('/dashboard');
+  redirect('/browser-chat');
 }

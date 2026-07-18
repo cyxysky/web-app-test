@@ -21,11 +21,20 @@ export function isBrowserChatAiFailureLog(log: BrowserChatLogRecordLike) {
   return log.phase === 'ai:runtime:retry'
     || log.phase === 'ai:runtime:retry-skipped'
     || log.phase === 'ai:runtime:recoverable-error'
-    || log.phase === 'chat:runtime:request-aborted';
+    || log.phase === 'chat:runtime:request-aborted'
+    || log.phase === 'target:plan:validation:retry'
+    || log.phase === 'target:plan:validation:error'
+    || log.phase === 'target:plan:error';
+}
+
+export function isBrowserChatTargetPlanningLog(log: BrowserChatLogRecordLike) {
+  return log.phase.startsWith('target:plan:');
 }
 
 export function isBrowserChatAiLog(log: BrowserChatLogRecordLike) {
-  return isBrowserChatAiInputOutputLog(log) || isBrowserChatAiFailureLog(log);
+  return isBrowserChatAiInputOutputLog(log)
+    || isBrowserChatAiFailureLog(log)
+    || isBrowserChatTargetPlanningLog(log);
 }
 
 export function isBrowserChatContextCompressionLog(log: BrowserChatLogRecordLike) {

@@ -126,6 +126,7 @@ const codexRuntimeObjectSchema = z.object({
     urlOrPath: z.string().nullable().optional(),
     uid: z.string().nullable().optional(),
     text: z.string().nullable().optional(),
+    credentialRef: z.string().nullable().optional(),
     content: z.string().nullable().optional(),
     fileName: z.string().nullable().optional(),
     title: z.string().nullable().optional(),
@@ -1691,6 +1692,8 @@ function makeBrowserTools(
     takeSnapshot?: (input?: RuntimeObservationReadOptions) => Promise<BrowserActionResult>;
     observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => Promise<BrowserActionResult>;
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
+    resolveCredential?: (credentialRef: string) => string | undefined;
+    credentialAllowedOrigins?: string[];
   },
 ) {
   // Enforce one executed browser tool per model step. The native AI SDK loop may call the model
@@ -1699,6 +1702,25 @@ function makeBrowserTools(
   // effects; the following calls receive an ignored result and the model can continue from the
   // fresh tool result in the next step.
   const toolExecutionGate = referenceOptions?.toolExecutionGate || { stepNumber: 0, executed: false };
+  const credentialAllowedOrigins = new Set((referenceOptions?.credentialAllowedOrigins || []).flatMap((value) => {
+    try {
+      const url = new URL(value);
+      return /^https?:$/.test(url.protocol) ? [url.origin] : [];
+    } catch {
+      return [];
+    }
+  }));
+  const credentialRestricted = typeof referenceOptions?.resolveCredential === 'function';
+  const credentialOriginAllowed = (value: string) => {
+    if (!credentialRestricted) return true;
+    if (!credentialAllowedOrigins.size) return false;
+    try {
+      const url = new URL(value, session.currentUrl() || targetUrl);
+      return credentialAllowedOrigins.has(url.origin);
+    } catch {
+      return false;
+    }
+  };
   const toolTextRule = 'Do not include old tool params, candidate ids as business meaning, coordinates, screenshot ids/file names, or tool input JSON.';
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
   const toolContextShape = {
@@ -1809,7 +1831,13 @@ function makeBrowserTools(
       inputSchema: browserToolInput({
         url: z.string().optional().describe('The URL to open. Defaults to the test target URL.'),
       }),
-      execute: (input) => record('openPage', input, () => session.open(input.url || targetUrl)),
+      execute: (input) => record('openPage', input, () => {
+        const url = input.url || targetUrl;
+        if (!credentialOriginAllowed(url)) {
+          return Promise.resolve({ ok: false, actual: 'Navigation was blocked because credential entry is restricted to the confirmed login origin.' });
+        }
+        return session.open(url);
+      }),
     }),
     mouse: tool({
       description: browserMouseToolDescription,
@@ -1832,17 +1860,32 @@ function makeBrowserTools(
     keyboard: tool({
       description: browserKeyboardToolDescription,
       inputSchema: browserToolInput(browserKeyboardToolShape),
-      execute: (input) => record('keyboard', input, () => session.keyboard({
-        action: input.action,
-        uid: input.uid,
-        xThousandth: input.x_thousandth,
-        yThousandth: input.y_thousandth,
-        text: input.text,
-        key: input.key,
-        keys: input.keys,
-        replace: input.replace,
-        followByEnter: input.followByEnter,
-      })),
+      execute: (input) => record('keyboard', input, async () => {
+        if (input.credentialRef && (input.action !== 'type' || !input.uid)) {
+          return { ok: false, actual: 'Credential entry requires keyboard type with a fresh element UID; screenshot coordinates and implicit focus are not allowed.' };
+        }
+        if (input.credentialRef && !credentialOriginAllowed(session.currentUrl())) {
+          return { ok: false, actual: 'Credential entry was blocked because the current page is outside the confirmed login origin.' };
+        }
+        const credentialText = input.credentialRef
+          ? referenceOptions?.resolveCredential?.(input.credentialRef)
+          : undefined;
+        if (input.credentialRef && credentialText === undefined) {
+          return { ok: false, actual: `Credential reference ${input.credentialRef} is unavailable or expired.` };
+        }
+        return session.keyboard({
+          action: input.action,
+          uid: input.uid,
+          xThousandth: input.x_thousandth,
+          yThousandth: input.y_thousandth,
+          text: input.credentialRef ? credentialText : input.text,
+          key: input.key,
+          keys: input.keys,
+          replace: input.replace,
+          followByEnter: input.followByEnter,
+          allowedOrigins: input.credentialRef ? [...credentialAllowedOrigins] : undefined,
+        });
+      }),
     }),
     selectOption: tool({
       description: browserSelectOptionToolDescription,
@@ -2582,6 +2625,9 @@ async function executeRuntimeStep(input: {
   getDynamicSkillContext?: () => string | Promise<string>;
   repairContext?: string;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
+  resolveCredential?: (credentialRef: string) => string | undefined;
+  credentialAllowedOrigins?: string[];
+  allowedToolTypes?: string[];
 }) {
   const {
     session,
@@ -2714,12 +2760,16 @@ async function executeRuntimeStep(input: {
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
     const observationStore: RuntimeObservationStore = input.runtimeObservationStore || new Map();
     if (retryState?.observationStore) restoreRuntimeObservationStore(observationStore, retryState.observationStore);
-    const allowedToolTypes = runtimeAllowedToolTypes({
+    const runtimeTools = runtimeAllowedToolTypes({
       browserChatMode,
       codexMode,
       nativeToolNames: runtimeToolNames(mode),
       observationToolNames: runtimeObservationToolNames,
     });
+    const requestedToolTypes = input.allowedToolTypes?.length ? new Set(input.allowedToolTypes) : undefined;
+    const allowedToolTypes = requestedToolTypes
+      ? runtimeTools.filter((toolType) => requestedToolTypes.has(toolType))
+      : runtimeTools;
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
@@ -3192,6 +3242,8 @@ async function executeRuntimeStep(input: {
       abortSignal,
       shouldContinue: input.shouldContinue,
       requestToolConfirmation: input.requestToolConfirmation,
+      resolveCredential: input.resolveCredential,
+      credentialAllowedOrigins: input.credentialAllowedOrigins,
       onDebug,
       observeCurrentScreenshot,
       takeSnapshot,
@@ -3497,6 +3549,7 @@ function upsertStep(steps: StepExecutionResult[], step: StepExecutionResult) {
 export async function executeInteractiveBrowserTurn(input: {
   session: BrowserSession;
   runId: string;
+  initialStepIndex?: number;
   targetUrl: string;
   instruction: string;
   modelInstruction?: string;
@@ -3512,6 +3565,9 @@ export async function executeInteractiveBrowserTurn(input: {
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
+  resolveCredential?: (credentialRef: string) => string | undefined;
+  credentialAllowedOrigins?: string[];
+  allowedToolTypes?: string[];
 }): Promise<InteractiveBrowserTurnResult> {
   const ensureActive = () => throwIfStopped(input.abortSignal, input.shouldContinue);
   const steps = [...(input.completedSteps || [])];
@@ -3567,7 +3623,7 @@ export async function executeInteractiveBrowserTurn(input: {
 
   while (true) {
     ensureActive();
-    const stepIndex = Math.max(0, ...steps.map((step) => step.index)) + 1;
+    const stepIndex = Math.max(input.initialStepIndex || 0, ...steps.map((step) => step.index)) + 1;
     await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `正在准备第 ${stepIndex} 步浏览器操作。` });
     let runningStep: StepExecutionResult = {
       index: stepIndex,
@@ -3617,6 +3673,9 @@ export async function executeInteractiveBrowserTurn(input: {
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
+        resolveCredential: input.resolveCredential,
+        credentialAllowedOrigins: input.credentialAllowedOrigins,
+        allowedToolTypes: input.allowedToolTypes,
         onDebug: input.onDebug,
         onToolTrace: async (trace, progress) => {
           ensureActive();
