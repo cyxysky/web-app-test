@@ -12,10 +12,9 @@ const bodySchema = z.object({
     requirementId: z.string().trim().min(1).max(120),
     value: z.string().trim().min(1).max(2_000),
   }).strict()).max(40).default([]),
-  actorCredentials: z.array(z.object({
+  actorCredentialIds: z.array(z.object({
     actorId: z.string().trim().min(1).max(120),
-    username: z.string().min(1).max(500),
-    password: z.string().min(1).max(2_000),
+    credentialId: z.string().trim().min(1).max(200),
   }).strict()).max(20).default([]),
   userId: z.union([z.string(), z.number()]).optional(),
   qzUserId: z.union([z.string(), z.number()]).optional(),
@@ -33,7 +32,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     return noStoreJson({
       session: continueTargetWorkflow(sessionId, {
         responses: body.responses,
-        actorCredentials: body.actorCredentials,
+        actorCredentialIds: body.actorCredentialIds,
       }, userId),
     });
   } catch (error) {

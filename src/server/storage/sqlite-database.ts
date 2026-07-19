@@ -8,7 +8,10 @@ const databaseFileName = 'webpilot.db';
 type DatabaseRuntimeState = {
   database?: DatabaseSync;
   databasePath?: string;
+  schemaVersion?: number;
 };
+
+const currentSchemaVersion = 2;
 
 const runtimeState = ((globalThis as typeof globalThis & {
   __webPilotDatabaseRuntimeState?: DatabaseRuntimeState;
@@ -139,6 +142,26 @@ function initializeSchema(database: DatabaseSync) {
       ON personal_memory_item(user_id, scope, domain, type, memory_key);
     CREATE INDEX IF NOT EXISTS personal_memory_updated_at_idx ON personal_memory_item(updated_at DESC);
 
+    CREATE TABLE IF NOT EXISTS login_account (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      username TEXT NOT NULL,
+      label TEXT NOT NULL,
+      login_url TEXT NOT NULL,
+      status TEXT NOT NULL,
+      password_envelope TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_used_at TEXT,
+      use_count INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(user_id, domain, username)
+    );
+    CREATE INDEX IF NOT EXISTS login_account_user_domain_idx
+      ON login_account(user_id, domain);
+    CREATE INDEX IF NOT EXISTS login_account_updated_at_idx
+      ON login_account(updated_at DESC);
+
     CREATE TABLE IF NOT EXISTS electron_state (
       key TEXT PRIMARY KEY,
       value_json TEXT NOT NULL,
@@ -150,11 +173,21 @@ function initializeSchema(database: DatabaseSync) {
     INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
     VALUES (1, 'sqlite-runtime', ?)
   `).run(new Date().toISOString());
+  database.prepare(`
+    INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
+    VALUES (2, 'login-account-vault', ?)
+  `).run(new Date().toISOString());
 }
 
 export function getSqliteDatabase() {
   const databasePath = sqliteDatabasePath();
-  if (runtimeState.database && runtimeState.databasePath === databasePath) return runtimeState.database;
+  if (runtimeState.database && runtimeState.databasePath === databasePath) {
+    if (runtimeState.schemaVersion !== currentSchemaVersion) {
+      initializeSchema(runtimeState.database);
+      runtimeState.schemaVersion = currentSchemaVersion;
+    }
+    return runtimeState.database;
+  }
   runtimeState.database?.close();
   mkdirSync(path.dirname(databasePath), { recursive: true });
   const database = new DatabaseSync(databasePath, {
@@ -164,6 +197,7 @@ export function getSqliteDatabase() {
   initializeSchema(database);
   runtimeState.database = database;
   runtimeState.databasePath = databasePath;
+  runtimeState.schemaVersion = currentSchemaVersion;
   return database;
 }
 

@@ -611,7 +611,7 @@ select {
   gap: 0;
   left: 0;
   line-height: 20px;
-  max-height: var(--custom-select-menu-max-height, 360px);
+  max-height: min(360px, var(--custom-select-menu-max-height, 360px));
   overflow: hidden;
   padding: 4px;
   position: absolute;
@@ -5793,6 +5793,152 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   border-radius: 8px;
   color: var(--danger);
   padding: 10px 12px;
+}
+
+.login-account-modal {
+  width: min(92vw, 620px);
+}
+
+.login-account-modal-header {
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+}
+
+.login-account-modal-icon {
+  align-items: center;
+  align-self: start;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-radius: 10px;
+  color: var(--accent-strong);
+  display: inline-flex;
+  height: 32px;
+  justify-content: center;
+  width: 32px;
+}
+
+.login-account-form {
+  display: grid;
+  gap: 13px 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.login-account-form > label {
+  color: var(--muted-strong);
+  display: grid;
+  font-size: 11px;
+  font-weight: 720;
+  gap: 6px;
+  min-width: 0;
+}
+
+.login-account-form > label.wide,
+.login-account-form > .wide {
+  grid-column: 1 / -1;
+}
+
+.login-account-form label > span {
+  align-items: baseline;
+  display: flex;
+  gap: 5px;
+}
+
+.login-account-form label small {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 560;
+}
+
+.login-account-form .input {
+  min-width: 0;
+  width: 100%;
+}
+
+.login-account-security-note {
+  align-items: flex-start;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  display: flex;
+  font-size: 10px;
+  gap: 7px;
+  line-height: 1.5;
+  padding-top: 12px;
+}
+
+.login-account-security-note svg {
+  color: var(--accent-strong);
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.login-account-modal-error {
+  border-left: 2px solid var(--danger);
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.45;
+  margin: 0;
+  padding: 4px 0 4px 9px;
+}
+
+.login-account-settings {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.login-account-list {
+  border-top: 1px solid var(--border);
+  display: grid;
+  min-width: 0;
+}
+
+.login-account-item {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  min-width: 0;
+  padding: 13px 2px;
+}
+
+.login-account-item-icon {
+  align-items: center;
+  color: var(--accent-strong);
+  display: inline-flex;
+  height: 32px;
+  justify-content: center;
+  width: 32px;
+}
+
+.login-account-item-main {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.login-account-item-main > strong {
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.login-account-item-main > span,
+.login-account-item-main > small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.login-account-item-actions {
+  display: flex;
+  gap: 5px;
+}
+
+@media (max-width: 620px) {
+  .login-account-form { grid-template-columns: 1fr; }
+  .login-account-form > label.wide,
+  .login-account-form > .wide { grid-column: auto; }
 }
 
 .skills-manager {
@@ -12791,6 +12937,168 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
 .browser-chat-compose--reference .browser-chat-attach:not(:disabled):hover {
   background: color-mix(in srgb, var(--foreground) 6%, transparent);
   color: var(--foreground);
+}
+
+.browser-chat-mode-selector {
+  position: relative;
+  z-index: 3;
+  flex: 0 0 auto;
+}
+
+.browser-chat-mode-selector-trigger {
+  align-items: center;
+  display: inline-flex;
+  gap: 5px;
+  height: 30px;
+  padding: 0 3px;
+  border: 0;
+  border-radius: 6px;
+  outline: 0;
+  background: transparent;
+  color: var(--muted-strong);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1;
+  white-space: nowrap;
+  transition: color 140ms ease;
+}
+
+.browser-chat-mode-selector-trigger:hover:not(:disabled),
+.browser-chat-mode-selector-trigger[aria-expanded="true"] {
+  background: transparent;
+  color: var(--foreground);
+}
+
+.browser-chat-mode-selector-trigger:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.browser-chat-mode-selector-trigger:disabled {
+  cursor: not-allowed;
+  opacity: .5;
+}
+
+.browser-chat-mode-selector-separator { color: #b6b8bc; }
+
+.browser-chat-mode-selector-trigger > svg {
+  margin-left: 1px;
+  color: #8a8d93;
+  transition: transform var(--motion-fast) var(--ease-standard);
+}
+
+.browser-chat-mode-selector-trigger > svg.is-open { transform: rotate(180deg); }
+
+.browser-chat-mode-selector-menu {
+  position: absolute;
+  bottom: calc(100% + 7px);
+  left: 0;
+  z-index: 70;
+  box-sizing: border-box;
+  width: 226px;
+  max-width: calc(100vw - 28px);
+  padding: 4px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: 0 14px 34px rgba(15, 23, 42, .12), 0 2px 7px rgba(15, 23, 42, .05);
+  transform-origin: left bottom;
+  animation: ui-disclosure-in var(--motion-fast) var(--ease-emphasized) both;
+}
+
+.browser-chat-mode-selector-section { padding: 8px; }
+
+.browser-chat-mode-selector-section + .browser-chat-mode-selector-section {
+  border-top: 1px solid var(--border);
+}
+
+.browser-chat-mode-selector-section > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.browser-chat-mode-selector-section > header strong {
+  color: var(--foreground);
+  font-size: 10px;
+  font-weight: 740;
+  line-height: 1.35;
+}
+
+.browser-chat-mode-selector-section > header span {
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.4;
+}
+
+.browser-chat-mode-selector-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  margin-top: 5px;
+}
+
+.browser-chat-mode-selector-options button {
+  align-items: center;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 14px;
+  gap: 5px;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 7px;
+  outline: 0;
+  background: transparent;
+  color: var(--muted-strong);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 620;
+  text-align: left;
+}
+
+.browser-chat-mode-selector-options button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--foreground) 4.5%, transparent);
+  color: var(--foreground);
+}
+
+.browser-chat-mode-selector-options button.active {
+  background: transparent;
+  color: var(--accent-strong);
+}
+
+.browser-chat-mode-selector-options button:focus-visible { box-shadow: 0 0 0 2px var(--focus); }
+
+.browser-chat-mode-selector-options button:disabled {
+  cursor: not-allowed;
+  opacity: .4;
+}
+
+.browser-chat-mode-selector-options button > svg { justify-self: end; }
+
+:root[data-theme="dark"] .browser-chat-mode-selector-trigger {
+  background: transparent;
+  color: #b6b9bd;
+}
+
+:root[data-theme="dark"] .browser-chat-mode-selector-trigger:hover:not(:disabled),
+:root[data-theme="dark"] .browser-chat-mode-selector-trigger[aria-expanded="true"] {
+  background: transparent;
+  color: #d7e8ff;
+}
+
+:root[data-theme="dark"] .browser-chat-mode-selector-separator { color: #565a5d; }
+
+:root[data-theme="dark"] .browser-chat-mode-selector-menu {
+  border-color: #3b3f41;
+  background: #1d1f20;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, .34), 0 2px 8px rgba(0, 0, 0, .2);
 }
 
 .browser-chat-compose--reference .browser-chat-model-control {

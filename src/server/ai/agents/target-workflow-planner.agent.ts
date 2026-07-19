@@ -15,9 +15,19 @@ export type TargetPlanningMessage = {
   content: string;
 };
 
+export type TargetPlanningAccount = {
+  id: string;
+  domain: string;
+  username: string;
+  label?: string;
+  loginUrl?: string;
+};
+
 type GenerateTargetPlanInput = {
+  availableAccounts?: TargetPlanningAccount[];
   messages: TargetPlanningMessage[];
   currentPlan?: TargetPlan;
+  preferredLocale?: 'zh' | 'en';
   targetUrl?: string;
   onValidation?: (event: {
     attempt: 'initial' | 'repair';
@@ -33,17 +43,39 @@ function boundedText(value: string, maxLength: number) {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
 }
 
+function planningLocale(input: GenerateTargetPlanInput): 'zh' | 'en' {
+  if (input.currentPlan?.locale) return input.currentPlan.locale;
+  if (input.preferredLocale) return input.preferredLocale;
+  const userText = input.messages
+    .filter((message) => message.role === 'user')
+    .map((message) => message.content)
+    .join('\n');
+  return /[\u3400-\u9fff]/u.test(userText) ? 'zh' : 'en';
+}
+
+function localeName(locale: 'zh' | 'en') {
+  return locale === 'zh' ? '简体中文' : 'English';
+}
+
 function planningPrompt(input: GenerateTargetPlanInput, validationErrors: string[] = []) {
+  const locale = planningLocale(input);
   const previousPlan = input.currentPlan ? JSON.stringify(input.currentPlan, null, 2) : '[none]';
   const conversation = input.messages
     .filter((message) => message.content.trim())
     .map((message) => `${message.role === 'user' ? '用户' : 'AI'}：${message.content.trim()}`)
     .join('\n\n');
+  const availableAccounts = (input.availableAccounts || []).map((account) => ({
+    domain: account.domain,
+    username: account.username,
+    label: account.label || undefined,
+    loginUrl: account.loginUrl || undefined,
+  }));
   return [
     '你是 WebPilot 的目标测试规划 Agent。当前阶段只能分析和规划，绝对不能操作浏览器。',
     '请先阅读完整对话并判断执行资料是否齐全。资料收集阶段只输出参与者和待补充清单；全部齐全后，才生成一棵由 sequence、parallel 和 target 组成的串并联流程树。流程树 JSON 使用扁平 nodes 数组，父节点的 children 保存子节点 id。',
     '',
     '规划规则：',
+    `- 输出语言固定为 ${localeName(locale)}。所有用户可见的自然语言字段必须使用该语言，包括 title、requirementSummary、actor name/role/purpose、requirement title/question/resolution、assumptions、risks、node title/description/relationReason/objective、successCriteria 及 evidenceRequirement。JSON key、id、enum、URL、用户名和用户原文值保持原样；currentPlan、schema 与校验错误的语言都不能改变这一要求。`,
     '- 串联或并联的业务语义由你判断。不要依靠固定业务规则，也不要为了提高并发而强行并联。',
     '- sequence 表示严格的先后关系；parallel 表示各分支在业务状态、账号会话和输入输出上可以独立推进。relationReason 必须解释判断依据。',
     '- 并联的每个 child 是一个完整分支；分支内部可以继续是 sequence、parallel 或 target。',
@@ -59,7 +91,8 @@ function planningPrompt(input: GenerateTargetPlanInput, validationErrors: string
     '- 缺少会阻止目标定位或判定的网址、账号角色、权限预期、测试数据、文件、约束或副作用授权时，建立 required=true、status=missing 的 requirement。',
     '- 用户在后续对话已经明确补充的内容，应写入 resolution 并设为 resolved。不要反复询问已经回答的问题。',
     '- 每个 account requirement 必须填写对应的 actorId；多个账号必须拆成多个 requirement，绝不能用一个未绑定参与者的“请提供所有账号”笼统代替。',
-    '- 当前资料收集界面通过目标卡片为每个 actor 提供账号和密码，不要求用户选择登录方式，也不要引导用户打开手动登录；密码只经安全通道使用，绝不能进入计划内容。',
+    '- 账号密码由后台按域名与用户名保存，目标卡片不直接填写密码。已有账号时只引用 domain + username；没有匹配账号时，account requirement 应引导用户点击目标卡片中的“新增账号”按钮。密码绝不能进入计划、对话或日志。',
+    '- “后台已保存账号”只包含安全元数据。只有 domain 与 username 能唯一精确匹配时，才把它们分别写入 actor.auth.credentialDomain 与 actor.auth.username；不要输出或猜测 credentialId。匹配账号的 loginUrl 可作为 actor.auth.loginUrl。',
     '- 登录只是业务测试的前置条件时，通过 actor.auth 表达，不要创建“登录成功”测试目标；只有用户明确要测试登录功能时，登录才是 target。',
     '- 需要登录的 actor 应尽量给出明确的 http(s) loginUrl。登录地址未知且用户可能选择提供凭据时，建立必填 environment/account requirement 让用户补充；不能猜测登录域名。',
     '- actor.auth.status 只允许根据 currentPlan 中已有的运行时状态继承；不能因为用户说有账号就虚构 ready。新 actor 需要登录时使用 missing。',
@@ -74,6 +107,8 @@ function planningPrompt(input: GenerateTargetPlanInput, validationErrors: string
     '- 可选字段没有信息时直接省略；即使输出为 null，系统也会按“未提供”处理。',
     '',
     `当前目标地址：${input.targetUrl || '[未提供]'}`,
+    '',
+    `后台已保存账号（仅域名、用户名与标签，不含密码）：\n${availableAccounts.length ? JSON.stringify(availableAccounts, null, 2) : '[none]'}`,
     '',
     `当前计划（如有）：\n${previousPlan}`,
     '',
@@ -126,6 +161,16 @@ function readableGenerationError(error: unknown) {
   return wrapped;
 }
 
+function normalizedCredentialDomain(value?: string) {
+  const text = (value || '').trim();
+  if (!text) return '';
+  try {
+    return new URL(/^[a-z][a-z\d+.-]*:\/\//i.test(text) ? text : `https://${text}`).hostname.toLowerCase();
+  } catch {
+    return text.toLowerCase().replace(/^https?:\/\//, '').split(/[/:?#]/)[0];
+  }
+}
+
 function preservedActorAuth(actor: TargetActor, currentPlan?: TargetPlan) {
   if (!actor.auth.required) {
     return {
@@ -137,33 +182,79 @@ function preservedActorAuth(actor: TargetActor, currentPlan?: TargetPlan) {
     };
   }
   const previous = currentPlan?.actors.find((item) => item.id === actor.id);
+  const credentialDomain = normalizedCredentialDomain(actor.auth.credentialDomain || previous?.auth.credentialDomain || actor.auth.loginUrl);
+  const username = actor.auth.username || previous?.auth.username;
+  const nextAuth = {
+    ...actor.auth,
+    credentialDomain: credentialDomain || undefined,
+    username: username || undefined,
+  };
   const sameIdentity = previous
     && previous.name === actor.name
     && previous.role === actor.role
-    && (previous.auth.loginUrl || '') === (actor.auth.loginUrl || '');
+    && (previous.auth.loginUrl || '') === (actor.auth.loginUrl || previous.auth.loginUrl || '')
+    && normalizedCredentialDomain(previous.auth.credentialDomain || previous.auth.loginUrl) === credentialDomain
+    && (previous.auth.username || '') === (username || '');
   if (sameIdentity && (previous?.auth.status === 'ready'
     || previous?.auth.status === 'awaiting_user'
     || previous?.auth.status === 'verifying'
     || previous?.auth.status === 'failed')) {
     return {
-      ...actor.auth,
+      ...nextAuth,
       mode: previous.auth.status !== 'ready' && previous.auth.mode === 'manual'
         ? 'credentials' as const
         : previous.auth.mode,
       status: previous.auth.status,
       browserSessionId: previous.auth.browserSessionId,
+      credentialId: previous.auth.credentialId,
       credentialsAvailable: previous.auth.credentialsAvailable,
       message: previous.auth.message,
     };
   }
   return {
-    ...actor.auth,
+    ...nextAuth,
     mode: actor.auth.mode === 'none' || actor.auth.mode === 'manual'
       ? 'credentials' as const
       : actor.auth.mode,
     status: 'missing' as const,
     browserSessionId: undefined,
     credentialsAvailable: false,
+  };
+}
+
+function attachAvailableAccount(actor: TargetActor, input: GenerateTargetPlanInput): TargetActor {
+  if (!actor.auth.required || actor.auth.status === 'ready') return actor;
+  const domain = normalizedCredentialDomain(actor.auth.credentialDomain || actor.auth.loginUrl || input.targetUrl);
+  if (!domain) return actor;
+  const domainAccounts = (input.availableAccounts || []).filter((account) => (
+    normalizedCredentialDomain(account.domain) === domain
+  ));
+  const requestedUsername = (actor.auth.username || '').trim().toLocaleLowerCase();
+  const account = requestedUsername
+    ? domainAccounts.find((item) => item.username.trim().toLocaleLowerCase() === requestedUsername)
+    : domainAccounts.length === 1 ? domainAccounts[0] : undefined;
+  if (!account) {
+    return {
+      ...actor,
+      auth: {
+        ...actor.auth,
+        credentialDomain: domain,
+        credentialId: undefined,
+        credentialsAvailable: false,
+      },
+    };
+  }
+  return {
+    ...actor,
+    auth: {
+      ...actor.auth,
+      credentialDomain: account.domain,
+      credentialId: account.id,
+      credentialsAvailable: true,
+      loginUrl: actor.auth.loginUrl || account.loginUrl,
+      message: actor.auth.message || `已匹配后台保存的账号 ${account.username}。`,
+      username: account.username,
+    },
   };
 }
 
@@ -191,6 +282,7 @@ function actorMentionedByRequirement(requirement: TargetPlanningRequirement, act
  * before structural validation. Credential values are never placed in the plan.
  */
 function normalizeAccountRequirements(plan: TargetPlan) {
+  const zh = plan.locale !== 'en';
   const authActors = plan.actors.filter((actor) => actor.auth.required);
   const nonAccount = plan.requirements.filter((requirement) => requirement.category !== 'account');
   const boundAccount: TargetPlanningRequirement[] = [];
@@ -234,14 +326,24 @@ function normalizeAccountRequirements(plan: TargetPlan) {
         requirements[index] = actor.auth.status === 'ready'
           ? {
               ...requirement,
+              title: zh ? `${actor.name}的账号登录` : `${actor.name} account login`,
               required: true,
               status: 'resolved',
-              resolution: `${actor.name}（${actor.role}）的账号会话已通过安全登录验证。`,
+              resolution: zh
+                ? `${actor.name}（${actor.role}）的账号会话已通过安全登录验证。`
+                : `The account session for ${actor.name} (${actor.role}) passed secure login verification.`,
             }
           : {
               ...requirement,
+              title: zh ? `${actor.name}的账号登录` : `${actor.name} account login`,
               required: true,
-              question: `请在目标卡片中输入“${actor.name}（${actor.role}）”的账号和密码；密码仅用于安全登录，不会进入对话、日志或持久化存储。`,
+              question: actor.auth.credentialsAvailable
+                ? zh
+                  ? `已为“${actor.name}（${actor.role}）”匹配后台账号 ${actor.auth.username || ''}（${actor.auth.credentialDomain || ''}），开始执行时会通过安全引用登录。`
+                  : `Saved account ${actor.auth.username || ''} (${actor.auth.credentialDomain || ''}) is matched for ${actor.name} (${actor.role}) and will be used through secure references.`
+                : zh
+                  ? `请在目标卡片中为“${actor.name}（${actor.role}）”选择已按域名保存的账号；若尚未保存，请点击“新增账号”。`
+                  : `Choose a saved domain account for ${actor.name} (${actor.role}) in the target card, or click "Add account" if it has not been saved yet.`,
               status: 'missing',
               resolution: undefined,
             };
@@ -251,13 +353,21 @@ function normalizeAccountRequirements(plan: TargetPlan) {
     const requirement: TargetPlanningRequirement = {
       id: uniqueRequirementId(requirements, `requirement_account_${actor.id}`),
       category: 'account',
-      title: `${actor.name}的账号登录`,
-      question: `请在目标卡片中输入“${actor.name}（${actor.role}）”的账号和密码；密码仅用于安全登录，不会进入对话、日志或持久化存储。`,
+      title: zh ? `${actor.name}的账号登录` : `${actor.name} account login`,
+      question: actor.auth.credentialsAvailable
+        ? zh
+          ? `已为“${actor.name}（${actor.role}）”匹配后台账号 ${actor.auth.username || ''}（${actor.auth.credentialDomain || ''}），开始执行时会通过安全引用登录。`
+          : `Saved account ${actor.auth.username || ''} (${actor.auth.credentialDomain || ''}) is matched for ${actor.name} (${actor.role}) and will be used through secure references.`
+        : zh
+          ? `请在目标卡片中为“${actor.name}（${actor.role}）”选择已按域名保存的账号；若尚未保存，请点击“新增账号”。`
+          : `Choose a saved domain account for ${actor.name} (${actor.role}) in the target card, or click "Add account" if it has not been saved yet.`,
       required: true,
       actorId: actor.id,
       status: actor.auth.status === 'ready' ? 'resolved' : 'missing',
       resolution: actor.auth.status === 'ready'
-        ? `${actor.name}（${actor.role}）的账号会话已通过安全登录验证。`
+        ? zh
+          ? `${actor.name}（${actor.role}）的账号会话已通过安全登录验证。`
+          : `The account session for ${actor.name} (${actor.role}) passed secure login verification.`
         : undefined,
     };
     if (requirements.length < maxPlanningRequirements) requirements.push(requirement);
@@ -270,6 +380,7 @@ function normalizeAccountRequirements(plan: TargetPlan) {
 }
 
 function unknownPermissionRequirement(plan: TargetPlan) {
+  const zh = plan.locale !== 'en';
   const actorsNeedingConfirmation = plan.actors.filter((actor) => (
     actor.permissions.some((permission) => permission.expected === 'unknown')
     && !plan.requirements.some((requirement) => (
@@ -284,14 +395,18 @@ function unknownPermissionRequirement(plan: TargetPlan) {
   const permissionLines = actorsNeedingConfirmation.flatMap((actor) => (
     actor.permissions
       .filter((permission) => permission.expected === 'unknown')
-      .map((permission) => `- ${actor.name}（${actor.role}）：${permission.resource} / ${permission.action}`)
+      .map((permission) => zh
+        ? `- ${actor.name}（${actor.role}）：${permission.resource} / ${permission.action}`
+        : `- ${actor.name} (${actor.role}): ${permission.resource} / ${permission.action}`)
   ));
   const requirement: TargetPlanningRequirement = {
     id: uniqueRequirementId(plan.requirements),
     category: 'permission',
-    title: '确认待定的账号权限',
+    title: zh ? '确认待定的账号权限' : 'Confirm unresolved account permissions',
     question: boundedText(
-      `以下权限预期尚不明确，请确认应当允许、禁止还是有限允许：\n${permissionLines.join('\n')}`,
+      zh
+        ? `以下权限预期尚不明确，请确认应当允许、禁止还是有限允许：\n${permissionLines.join('\n')}`
+        : `The following permission expectations are unclear. Confirm whether each should be allowed, denied, or limited:\n${permissionLines.join('\n')}`,
       maxRequirementQuestionLength,
     ),
     required: true,
@@ -311,9 +426,11 @@ function unknownPermissionRequirement(plan: TargetPlan) {
       ? {
           ...requirement,
           id: previous.id,
-          title: boundedText(`${previous.title}及待定权限确认`, maxRequirementTitleLength),
+          title: boundedText(zh ? `${previous.title}及待定权限确认` : `${previous.title} and unresolved permissions`, maxRequirementTitleLength),
           question: boundedText(
-            `${requirement.question}\n\n其他待补充信息：${previous.question}`,
+            zh
+              ? `${requirement.question}\n\n其他待补充信息：${previous.question}`
+              : `${requirement.question}\n\nOther missing information: ${previous.question}`,
             maxRequirementQuestionLength,
           ),
         }
@@ -327,15 +444,17 @@ function unknownPermissionRequirement(plan: TargetPlan) {
 }
 
 function normalizePlan(plan: TargetPlan, input: GenerateTargetPlanInput): TargetPlan {
+  const locale = planningLocale(input);
   const normalizedAccounts = normalizeAccountRequirements({
     ...plan,
     id: input.currentPlan?.id || plan.id || `plan_${randomUUID()}`,
     version: (input.currentPlan?.version || 0) + 1,
+    locale,
     targetUrl: plan.targetUrl || input.targetUrl || undefined,
-    actors: plan.actors.map((actor) => ({
+    actors: plan.actors.map((actor) => attachAvailableAccount({
       ...actor,
       auth: preservedActorAuth(actor, input.currentPlan),
-    })),
+    }, input)),
     requirements: plan.requirements.map((requirement) => ({
       ...requirement,
       actorId: requirement.actorId || undefined,
@@ -361,13 +480,28 @@ function normalizePlan(plan: TargetPlan, input: GenerateTargetPlanInput): Target
     : normalizedRequirements;
 }
 
+function validateTargetPlanLocale(plan: TargetPlan, locale: 'zh' | 'en') {
+  if (locale !== 'zh') return [];
+  const errors: string[] = [];
+  if (!/[\u3400-\u9fff]/u.test(plan.requirementSummary)) {
+    errors.push('requirementSummary must use Simplified Chinese because the user is speaking Chinese.');
+  }
+  for (const requirement of plan.requirements) {
+    if (requirement.status !== 'missing') continue;
+    if (!/[\u3400-\u9fff]/u.test(`${requirement.title}\n${requirement.question}`)) {
+      errors.push(`Missing requirement ${requirement.id} title and question must use Simplified Chinese.`);
+    }
+  }
+  return errors;
+}
+
 async function generate(input: GenerateTargetPlanInput, validationErrors: string[] = []) {
   try {
     const result = await generateObject({
       model: getModel(),
       schema: targetPlanSchema,
       schemaName: 'target_workflow_plan',
-      schemaDescription: '目标测试的参与者、前置需求与串并联流程树。可选字段允许省略或为 null。',
+      schemaDescription: `目标测试的参与者、前置需求与串并联流程树。所有用户可见自然语言字段必须使用 ${localeName(planningLocale(input))}；可选字段允许省略或为 null。`,
       experimental_repairText: async ({ text }) => repairNullableTargetPlanText(text),
       temperature: 0.15,
       prompt: planningPrompt(input, validationErrors),
@@ -380,11 +514,12 @@ async function generate(input: GenerateTargetPlanInput, validationErrors: string
 
 export async function generateTargetWorkflowPlan(input: GenerateTargetPlanInput): Promise<TargetPlan> {
   const first = await generate(input);
-  const firstErrors = validateTargetPlanStructure(first);
+  const locale = planningLocale(input);
+  const firstErrors = [...validateTargetPlanStructure(first), ...validateTargetPlanLocale(first, locale)];
   input.onValidation?.({ attempt: 'initial', errors: firstErrors });
   if (!firstErrors.length) return first;
   const repaired = await generate({ ...input, currentPlan: first }, firstErrors);
-  const repairedErrors = validateTargetPlanStructure(repaired);
+  const repairedErrors = [...validateTargetPlanStructure(repaired), ...validateTargetPlanLocale(repaired, locale)];
   input.onValidation?.({ attempt: 'repair', errors: repairedErrors });
   if (repairedErrors.length) throw new Error(`AI 生成的目标流程树结构无效：${repairedErrors.join('；')}`);
   return repaired;
@@ -396,11 +531,21 @@ export function targetWorkflowPlanningReply(plan: TargetPlan) {
   const parallelCount = plan.nodes.filter((node) => node.type === 'parallel').length;
   const unresolved = plan.requirements.filter((item) => item.required && item.status === 'missing');
   const pendingActors = plan.actors.filter((actor) => actor.auth.required && actor.auth.status !== 'ready');
+  if (plan.locale === 'en') {
+    const lines = [plan.analysisComplete
+      ? `Target analysis version ${plan.version} is ready: ${targetCount} test targets, ${sequenceCount} sequence nodes, and ${parallelCount} parallel nodes.`
+      : `Execution-data analysis version ${plan.version} is ready. The flow tree will be generated after all required information and account sessions are available.`,
+    ];
+    if (unresolved.length) lines.push(`${unresolved.length} required items are still missing. Review the checklist in the target plan and reply directly in the conversation.`);
+    if (pendingActors.length) lines.push(`${pendingActors.length} account sessions still need preparation; each account uses an isolated browser identity.`);
+    if (!unresolved.length && !pendingActors.length) lines.push('All information and account sessions are ready. Review the flow tree and confirm execution.');
+    return lines.join('\n\n');
+  }
   const lines = [plan.analysisComplete
     ? `已完成第 ${plan.version} 版目标分析：共 ${targetCount} 个测试目标，包含 ${sequenceCount} 个串联节点和 ${parallelCount} 个并联节点。`
     : `已完成第 ${plan.version} 版执行资料分析；流程树会在所需资料和账号会话全部齐全后生成。`,
   ];
-  if (unresolved.length) lines.push(`开始执行前还需要补充 ${unresolved.length} 项需求信息，请在下方计划卡中查看并直接回复。`);
+  if (unresolved.length) lines.push(`开始执行前还需要补充 ${unresolved.length} 项需求信息，请查看目标计划中的缺失清单，并直接在对话中回复。`);
   if (pendingActors.length) lines.push(`还需要准备 ${pendingActors.length} 个账号会话；每个账号会使用独立浏览器身份。`);
   if (!unresolved.length && !pendingActors.length) lines.push('所需信息与账号会话已经齐全，请检查流程树并确认开始执行。');
   return lines.join('\n\n');

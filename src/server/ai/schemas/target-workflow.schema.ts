@@ -28,6 +28,9 @@ export const targetActorAuthSchema = z.object({
   status: z.enum(['not_required', 'missing', 'awaiting_user', 'verifying', 'ready', 'failed']),
   loginUrl: z.string().trim().max(4_000).optional(),
   browserSessionId: z.string().trim().max(200).optional(),
+  credentialDomain: z.string().trim().max(500).optional(),
+  credentialId: z.string().trim().max(200).optional(),
+  username: z.string().trim().max(500).optional(),
   credentialsAvailable: z.boolean().optional(),
   message: z.string().trim().max(1_000).optional(),
 });
@@ -100,6 +103,7 @@ export const targetFlowNodeSchema = z.discriminatedUnion('type', [
 export const targetPlanSchema = z.object({
   id: identifierSchema,
   version: z.number().int().min(1),
+  locale: z.enum(['zh', 'en']).optional(),
   title: conciseTextSchema,
   requirementSummary: z.string().trim().min(1).max(4_000),
   targetUrl: z.string().trim().max(4_000).optional(),
@@ -236,6 +240,7 @@ export function validateTargetPlanStructure(plan: TargetPlan) {
   const errors: string[] = [];
   if (nodes.size !== plan.nodes.length) errors.push('Flow node ids must be unique.');
   const actorIds = new Set(plan.actors.map((actor) => actor.id));
+  const actorsById = new Map(plan.actors.map((actor) => [actor.id, actor]));
   if (actorIds.size !== plan.actors.length) errors.push('Actor ids must be unique.');
   const requirementIds = new Set(plan.requirements.map((requirement) => requirement.id));
   if (requirementIds.size !== plan.requirements.length) errors.push('Planning requirement ids must be unique.');
@@ -351,6 +356,21 @@ export function validateTargetPlanStructure(plan: TargetPlan) {
         const sharedActor = right.find((target) => target.actorId && leftActors.has(target.actorId));
         if (sharedActor?.actorId) {
           errors.push(`Parallel node ${node.id} reuses actor ${sharedActor.actorId} across branches; use sequence or separate actors.`);
+        }
+        const leftCredentialIdentities = new Set(left.flatMap((target) => {
+          const actor = target.actorId ? actorsById.get(target.actorId) : undefined;
+          const domain = actor?.auth.credentialDomain?.trim().toLowerCase();
+          const username = actor?.auth.username?.trim().toLowerCase();
+          return domain && username ? [`${domain}\u0000${username}`] : [];
+        }));
+        const sharedCredentialTarget = right.find((target) => {
+          const actor = target.actorId ? actorsById.get(target.actorId) : undefined;
+          const domain = actor?.auth.credentialDomain?.trim().toLowerCase();
+          const username = actor?.auth.username?.trim().toLowerCase();
+          return Boolean(domain && username && leftCredentialIdentities.has(`${domain}\u0000${username}`));
+        });
+        if (sharedCredentialTarget?.actorId) {
+          errors.push(`Parallel node ${node.id} reuses the same saved domain account across branches; use sequence or separate accounts.`);
         }
         const leftResources = new Map<string, 'read' | 'write'>();
         for (const target of left) {

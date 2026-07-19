@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { createPortal } from 'react-dom';
-import { ArrowLeft, FileJson2, FolderOpen, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
+import { ArrowLeft, FileJson2, FolderOpen, KeyRound, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { SkillsManager } from '@/components/SkillsManager';
 import {
@@ -21,6 +21,7 @@ import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/test-case.schema';
 import { useTheme } from '@/theme/ThemeProvider';
 import { readApiJson } from '@/lib/api-client';
+import { LoginAccountModal, type LoginAccountMetadata } from '@/components/LoginAccountModal';
 
 export type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
   updatedAt?: string;
@@ -110,6 +111,7 @@ export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> 
   { id: 'browser', label: '浏览器与截图' },
   { id: 'runtime', label: '运行控制' },
   { id: 'memory', label: '个性化记忆' },
+  { id: 'accounts', label: '登录账号' },
   { id: 'dom-test', label: '页面快照测试' },
   { id: 'debug', label: '调试与高级' },
 ];
@@ -255,6 +257,10 @@ export function EnvironmentSettings({
   const [personalMemoryItems, setPersonalMemoryItems] = useState<PersonalMemoryItem[]>([]);
   const [personalMemoryDraft, setPersonalMemoryDraft] = useState<PersonalMemoryDraft>(() => createPersonalMemoryDraft());
   const [personalMemoryEditorMode, setPersonalMemoryEditorMode] = useState<PersonalMemoryEditorMode>(null);
+  const [loginAccounts, setLoginAccounts] = useState<LoginAccountMetadata[]>([]);
+  const [loginAccountEditor, setLoginAccountEditor] = useState<LoginAccountMetadata | 'create' | null>(null);
+  const [loadingLoginAccounts, setLoadingLoginAccounts] = useState(false);
+  const [deletingLoginAccountId, setDeletingLoginAccountId] = useState('');
   const [portalReady, setPortalReady] = useState(false);
   const [loading, setLoading] = useState(!initialData);
   const [savingEnv, setSavingEnv] = useState(false);
@@ -533,6 +539,40 @@ export function EnvironmentSettings({
     if (activeTab !== 'memory') return;
     void loadPersonalMemoryItems().catch(() => undefined);
   }, [activeTab, loadPersonalMemoryItems]);
+
+  const loadLoginAccounts = useCallback(async () => {
+    setLoadingLoginAccounts(true);
+    try {
+      const response = await fetch('/api/login-accounts', { cache: 'no-store' });
+      const data = await readApiJson<{ accounts?: LoginAccountMetadata[] }>(response, '读取登录账号失败');
+      setLoginAccounts(Array.isArray(data.accounts) ? data.accounts : []);
+    } finally {
+      setLoadingLoginAccounts(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'accounts') return;
+    void loadLoginAccounts().catch(() => undefined);
+  }, [activeTab, loadLoginAccounts]);
+
+  function replaceLoginAccount(account: LoginAccountMetadata) {
+    setLoginAccounts((current) => [account, ...current.filter((item) => item.id !== account.id)]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)));
+  }
+
+  async function deleteLoginAccount(account: LoginAccountMetadata) {
+    if (!window.confirm(`确认删除“${account.label || account.username}”吗？`)) return;
+    setDeletingLoginAccountId(account.id);
+    try {
+      const query = account.userId ? `?userId=${encodeURIComponent(account.userId)}` : '';
+      const response = await fetch(`/api/login-accounts/${encodeURIComponent(account.id)}${query}`, { method: 'DELETE' });
+      await readApiJson(response, '删除登录账号失败');
+      setLoginAccounts((current) => current.filter((item) => item.id !== account.id));
+    } finally {
+      setDeletingLoginAccountId('');
+    }
+  }
 
   function personalMemoryPayload() {
     return {
@@ -922,6 +962,73 @@ export function EnvironmentSettings({
     );
   }
 
+  function renderLoginAccountsPanel() {
+    return (
+      <section className="login-account-settings">
+        <div className="settings-section-head">
+          <div>
+            <h2>登录账号</h2>
+            <span>{loginAccounts.length} 个按域名保存的账号；密码只在后台解密并通过短期安全引用使用</span>
+          </div>
+          <div className="personal-memory-head-actions">
+            <button className="ui-button ui-icon-button" disabled={loadingLoginAccounts} onClick={() => void loadLoginAccounts()} type="button">
+              <RefreshCw size={15} />
+              刷新
+            </button>
+            <button className="ui-button ui-icon-button" onClick={() => setLoginAccountEditor('create')} type="button">
+              <Plus size={15} />
+              新增账号
+            </button>
+          </div>
+        </div>
+
+        {loadingLoginAccounts ? (
+          <div className="settings-loading-panel compact" role="status" aria-live="polite">
+            <LiquidGlassLoader className="ui-liquid-glass-loader--compact" />
+            <div><h2>正在读取登录账号</h2></div>
+          </div>
+        ) : loginAccounts.length ? (
+          <div className="login-account-list">
+            {loginAccounts.map((account) => (
+              <article className="login-account-item" key={account.id}>
+                <span className="login-account-item-icon" aria-hidden="true"><KeyRound size={17} /></span>
+                <div className="login-account-item-main">
+                  <strong>{account.label || account.username}</strong>
+                  <span>{account.username} · {account.domain}</span>
+                  <small>{account.status === 'active' ? '可用于目标测试' : '已停用'}{account.useCount ? ` · 已使用 ${account.useCount} 次` : ''}</small>
+                </div>
+                <div className="login-account-item-actions">
+                  <button aria-label="编辑登录账号" className="settings-model-row-button" onClick={() => setLoginAccountEditor(account)} title="编辑登录账号" type="button">
+                    <PencilLine size={15} />
+                  </button>
+                  <button
+                    aria-label="删除登录账号"
+                    className="settings-model-row-button danger"
+                    disabled={deletingLoginAccountId === account.id}
+                    onClick={() => void deleteLoginAccount(account)}
+                    title="删除登录账号"
+                    type="button"
+                  >
+                    {deletingLoginAccountId === account.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state">尚未保存登录账号。目标测试需要新账号时，也可以直接在目标卡片中创建。</div>
+        )}
+
+        <LoginAccountModal
+          account={loginAccountEditor && loginAccountEditor !== 'create' ? loginAccountEditor : undefined}
+          onClose={() => setLoginAccountEditor(null)}
+          onSaved={replaceLoginAccount}
+          open={Boolean(loginAccountEditor)}
+        />
+      </section>
+    );
+  }
+
   const editingModelConfig = modelDraft || modelConfig;
   const activeProvider = editingModelConfig.provider;
   const activeProviderOption = modelProviderDefinition(activeProvider);
@@ -930,7 +1037,7 @@ export function EnvironmentSettings({
   const activeProviderDefaultModel = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
-    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'dom-test' && definition?.tab === activeTab);
+    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && activeTab !== 'dom-test' && definition?.tab === activeTab);
 
   return (
     <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
@@ -1141,6 +1248,8 @@ export function EnvironmentSettings({
 
           {activeTab === 'memory' ? renderPersonalMemoryPanel() : null}
 
+          {activeTab === 'accounts' ? renderLoginAccountsPanel() : null}
+
           {activeTab === 'dom-test' ? (
             <section>
               <div className="settings-section-head">
@@ -1187,7 +1296,7 @@ export function EnvironmentSettings({
             </section>
           ) : null}
 
-          {activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'dom-test' ? (
+          {activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && activeTab !== 'dom-test' ? (
             <section>
               <div className="settings-section-head">
                 <div>

@@ -19,6 +19,7 @@ type MenuLayout = {
 };
 
 const menuGap = 6;
+const menuMaxHeight = 360;
 const viewportMargin = 8;
 
 export function CustomSelect({
@@ -108,7 +109,10 @@ export function CustomSelect({
           : spaceAbove > spaceBelow
             ? 'up'
             : 'down';
-      const maxHeight = Math.floor(placement === 'up' ? spaceAbove : spaceBelow);
+      const maxHeight = Math.min(
+        menuMaxHeight,
+        Math.floor(placement === 'up' ? spaceAbove : spaceBelow),
+      );
 
       setMenuLayout((current) => current?.placement === placement && current.maxHeight === maxHeight
         ? current
@@ -242,7 +246,7 @@ export function CustomSelect({
           }}
           ref={menuRef}
           role="listbox"
-          style={{ '--custom-select-menu-max-height': `${Math.max(0, menuLayout?.maxHeight ?? 360)}px` } as CSSProperties}
+          style={{ '--custom-select-menu-max-height': `${Math.max(0, menuLayout?.maxHeight ?? menuMaxHeight)}px` } as CSSProperties}
           tabIndex={-1}
         >
           {searchEnabled ? (

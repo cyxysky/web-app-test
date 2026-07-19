@@ -35,6 +35,7 @@ import {
   Brain,
   Braces,
   Bug,
+  Check,
   ChevronDown,
   ClipboardCheck,
   Compass,
@@ -49,6 +50,7 @@ import {
   Globe,
   ImageUp,
   Library,
+  KeyRound,
   Loader2,
   Lock,
   MessageSquare,
@@ -214,6 +216,7 @@ type BrowserChatToolConfirmationAction = 'confirm' | 'cancel';
 
 type BrowserChatSession = {
   id: string;
+  userId?: string;
   title: string;
   browserGroupId: string;
   targetUrl: string;
@@ -477,6 +480,7 @@ function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'runtime') return <SquareTerminal size={15} />;
   if (tab === 'skills') return <Braces size={15} />;
   if (tab === 'memory') return <Brain size={15} />;
+  if (tab === 'accounts') return <KeyRound size={15} />;
   if (tab === 'dom-test') return <ScanSearch size={15} />;
   if (tab === 'debug') return <Bug size={15} />;
   return <SlidersHorizontal size={15} />;
@@ -2913,6 +2917,51 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   );
 });
 
+type BrowserChatTargetStageTimelineEntry = {
+  id: string;
+  logs: BrowserChatLogRecord[];
+  message: BrowserChatMessage;
+  running: boolean;
+  steps: StepExecutionResult[];
+};
+
+const BrowserChatTargetStageTimeline = memo(function BrowserChatTargetStageTimeline({
+  entries,
+  onResolveToolConfirmation,
+  onSelectTool,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+}: {
+  entries: BrowserChatTargetStageTimelineEntry[];
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+}) {
+  if (!entries.length) return null;
+  return (
+    <div className="browser-chat-target-stage-timeline">
+      {entries.map((entry) => (
+        <div className="browser-chat-target-stage-entry" key={entry.id}>
+          <BrowserChatAssistantTimeline
+            logs={entry.logs}
+            message={entry.message}
+            onResolveToolConfirmation={onResolveToolConfirmation}
+            onSelectTool={onSelectTool}
+            pendingToolConfirmation={pendingToolConfirmation?.messageId === entry.message.id ? pendingToolConfirmation : undefined}
+            resolvingConfirmationAction={resolvingConfirmationAction}
+            resolvingConfirmationId={resolvingConfirmationId}
+            running={entry.running}
+            steps={entry.steps}
+          />
+        </div>
+      ))}
+    </div>
+  );
+});
+
 const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   skillsById,
   exportingMessageId,
@@ -3315,6 +3364,9 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
           />
         );
       })}
+      {targetRunContent && !targetRunMessageId ? (
+        <div className="browser-chat-target-run-host">{targetRunContent}</div>
+      ) : null}
       <div aria-hidden="true" className="browser-chat-message-list-end" />
     </div>
   );
@@ -3325,6 +3377,133 @@ function BrowserChatSessionLoading({ label }: { label: string }) {
     <div className="browser-chat-session-loading" role="status" aria-live="polite" aria-label={label}>
       <LiquidGlassLoader />
       <span>{label}</span>
+    </div>
+  );
+}
+
+function BrowserChatModeSelector({
+  disabled,
+  onSafetyModeChange,
+  onWorkflowModeChange,
+  safetyMode,
+  workflowLocked,
+  workflowMode,
+}: {
+  disabled: boolean;
+  onSafetyModeChange: (mode: BrowserChatSafetyMode) => void;
+  onWorkflowModeChange: (mode: BrowserChatWorkflowMode) => void;
+  safetyMode: BrowserChatSafetyMode;
+  workflowLocked: boolean;
+  workflowMode: BrowserChatWorkflowMode;
+}) {
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const safetyLabel = safetyMode === 'full' ? t('完全') : t('严谨');
+  const workflowLabel = workflowMode === 'target' ? '目标模式' : '普通对话';
+
+  useEffect(() => {
+    if (!disabled) return;
+    setOpen(false);
+  }, [disabled]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Node && !rootRef.current?.contains(event.target)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('pointerdown', closeOnPointerDown);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [open]);
+
+  return (
+    <div className="browser-chat-mode-selector" ref={rootRef}>
+      <button
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-label={`${safetyLabel}，${workflowLabel}`}
+        className="browser-chat-mode-selector-trigger"
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+        type="button"
+      >
+        <span>{safetyLabel}</span>
+        <span aria-hidden="true" className="browser-chat-mode-selector-separator">|</span>
+        <span>{workflowLabel}</span>
+        <ChevronDown aria-hidden="true" className={open ? 'is-open' : undefined} size={14} />
+      </button>
+
+      {open ? (
+        <div aria-label="对话运行方式" className="browser-chat-mode-selector-menu" role="dialog">
+          <section className="browser-chat-mode-selector-section">
+            <header>
+              <strong>执行权限</strong>
+            </header>
+            <div aria-label={t('安全性')} className="browser-chat-mode-selector-options" role="radiogroup">
+              <button
+                aria-checked={safetyMode === 'strict'}
+                className={safetyMode === 'strict' ? 'active' : undefined}
+                onClick={() => onSafetyModeChange('strict')}
+                role="radio"
+                title={t('严谨模式下，一些模型认为重要的操作需要用户手动确认执行')}
+                type="button"
+              >
+                <span>{t('严谨')}</span>
+                {safetyMode === 'strict' ? <Check aria-hidden="true" size={14} /> : null}
+              </button>
+              <button
+                aria-checked={safetyMode === 'full'}
+                className={safetyMode === 'full' ? 'active' : undefined}
+                onClick={() => onSafetyModeChange('full')}
+                role="radio"
+                title={t('完全模式下，模型不需要征求用户手动确认执行')}
+                type="button"
+              >
+                <span>{t('完全')}</span>
+                {safetyMode === 'full' ? <Check aria-hidden="true" size={14} /> : null}
+              </button>
+            </div>
+          </section>
+
+          <section className="browser-chat-mode-selector-section">
+            <header>
+              <strong>对话类型</strong>
+              {workflowLocked ? <span>当前会话已锁定</span> : null}
+            </header>
+            <div aria-label="对话类型" className="browser-chat-mode-selector-options" role="radiogroup">
+              <button
+                aria-checked={workflowMode === 'chat'}
+                className={workflowMode === 'chat' ? 'active' : undefined}
+                disabled={workflowLocked}
+                onClick={() => onWorkflowModeChange('chat')}
+                role="radio"
+                type="button"
+              >
+                <span>普通对话</span>
+                {workflowMode === 'chat' ? <Check aria-hidden="true" size={14} /> : null}
+              </button>
+              <button
+                aria-checked={workflowMode === 'target'}
+                className={workflowMode === 'target' ? 'active' : undefined}
+                disabled={workflowLocked}
+                onClick={() => onWorkflowModeChange('target')}
+                role="radio"
+                type="button"
+              >
+                <span>目标模式</span>
+                {workflowMode === 'target' ? <Check aria-hidden="true" size={14} /> : null}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -4003,50 +4182,14 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             >
               {uploadingImage ? <Loader2 className="spin" size={17} /> : <Plus size={19} />}
             </button>
-            <div className="browser-chat-safety-toggle" role="radiogroup" aria-label={t('安全性')}>
-              <button
-                aria-pressed={safetyMode === 'strict'}
-                className={safetyMode === 'strict' ? 'active' : undefined}
-                disabled={currentBusy || loading}
-                onClick={() => onSafetyModeChange('strict')}
-                title={t('严谨模式下，一些模型认为重要的操作需要用户手动确认执行')}
-                type="button"
-              >
-                {t('严谨')}
-              </button>
-              <button
-                aria-pressed={safetyMode === 'full'}
-                className={safetyMode === 'full' ? 'active' : undefined}
-                disabled={currentBusy || loading}
-                onClick={() => onSafetyModeChange('full')}
-                title={t('完全模式下，模型不需要征求用户手动确认执行')}
-                type="button"
-              >
-                {t('完全')}
-              </button>
-            </div>
-            <div className="browser-chat-workflow-toggle" role="radiogroup" aria-label="对话类型">
-              <button
-                aria-checked={workflowMode === 'chat'}
-                className={workflowMode === 'chat' ? 'active' : undefined}
-                disabled={modeLocked || currentBusy || loading}
-                onClick={() => onWorkflowModeChange('chat')}
-                role="radio"
-                type="button"
-              >
-                普通对话
-              </button>
-              <button
-                aria-checked={workflowMode === 'target'}
-                className={workflowMode === 'target' ? 'active' : undefined}
-                disabled={modeLocked || currentBusy || loading}
-                onClick={() => onWorkflowModeChange('target')}
-                role="radio"
-                type="button"
-              >
-                目标模式
-              </button>
-            </div>
+            <BrowserChatModeSelector
+              disabled={currentBusy || loading}
+              onSafetyModeChange={onSafetyModeChange}
+              onWorkflowModeChange={onWorkflowModeChange}
+              safetyMode={safetyMode}
+              workflowLocked={modeLocked}
+              workflowMode={workflowMode}
+            />
           </div>
           <div className="browser-chat-compose-submit">
             <div className="browser-chat-model-control">
@@ -5379,26 +5522,28 @@ export function BrowserChatWorkspace({
   const messages = useMemo(() => session?.messages || [], [session?.messages]);
   const steps = useMemo(() => session?.steps || [], [session?.steps]);
   const logs = useMemo(() => session?.logs || [], [session?.logs]);
-  const visibleMessages = messages;
+  const targetStageMessageIds = useMemo(() => {
+    if (session?.workflowMode !== 'target' || !session.targetRun) return new Set<string>();
+    const ids = new Set<string>();
+    for (const message of messages) {
+      if (message.role === 'assistant') ids.add(message.id);
+    }
+    if (session.targetRun.ownerMessageId) ids.add(session.targetRun.ownerMessageId);
+    for (const log of logs) {
+      if (log.phase.startsWith('target:') && log.messageId) ids.add(log.messageId);
+    }
+    return ids;
+  }, [logs, messages, session?.targetRun, session?.workflowMode]);
+  // Target-mode assistant output is rendered inside the analysis/target/summary
+  // stages of the workflow card. User messages stay in the normal transcript,
+  // while ordinary chat mode keeps the original message layout unchanged.
+  const visibleMessages = useMemo(() => messages.filter((message) => (
+    message.role !== 'assistant' || !targetStageMessageIds.has(message.id)
+  )), [messages, targetStageMessageIds]);
   const lastAssistantMessageId = useMemo(
     () => [...visibleMessages].reverse().find((item) => item.role === 'assistant')?.id,
     [visibleMessages],
   );
-  const targetRunMessageId = useMemo(() => {
-    if (!session?.targetRun) return undefined;
-    const assistantMessageIds = new Set(visibleMessages
-      .filter((message) => message.role === 'assistant')
-      .map((message) => message.id));
-    if (session.targetRun.ownerMessageId && assistantMessageIds.has(session.targetRun.ownerMessageId)) {
-      return session.targetRun.ownerMessageId;
-    }
-    const targetLogMessageId = [...logs].reverse().find((log) => (
-      log.phase.startsWith('target:')
-      && Boolean(log.messageId)
-      && assistantMessageIds.has(log.messageId || '')
-    ))?.messageId;
-    return targetLogMessageId || lastAssistantMessageId;
-  }, [lastAssistantMessageId, logs, session?.targetRun, visibleMessages]);
   const hasMessages = visibleMessages.length > 0;
   const hasChatContent = hasMessages || Boolean(session?.targetRun);
   const toggleSidebarCollapsed = useCallback(() => {
@@ -5465,6 +5610,78 @@ export function BrowserChatWorkspace({
   const stepsByIndex = useMemo(() => new Map(steps.map((step) => [step.index, step])), [steps]);
   const selectedExportMessageIdSet = useMemo(() => new Set(selectedExportMessageIds), [selectedExportMessageIds]);
   const logIndex = useMemo(() => buildBrowserChatLogIndex(logs), [logs]);
+  const targetStageTimeline = useMemo(() => {
+    const run = session?.workflowMode === 'target' ? session.targetRun : undefined;
+    const plan = run?.plan;
+    if (!run) return { analysis: [] as BrowserChatTargetStageTimelineEntry[], targets: new Map<string, BrowserChatTargetStageTimelineEntry[]>() };
+
+    const targetMessages = messages.filter((message) => (
+      message.role === 'assistant' && targetStageMessageIds.has(message.id)
+    ));
+    const targetStepIndexes = new Map<string, number[]>();
+    const allTargetStepIndexes = new Set<number>();
+    for (const [targetId, result] of Object.entries(run.results)) {
+      const indexes = new Set(result.stepIndexes || []);
+      const nodeIndex = plan?.nodes.findIndex((node) => node.id === targetId) ?? -1;
+      if (nodeIndex >= 0) {
+        const rangeStart = (nodeIndex + 1) * 10_000;
+        for (const step of steps) {
+          if (step.index >= rangeStart && step.index < rangeStart + 10_000) indexes.add(step.index);
+        }
+      }
+      const sorted = [...indexes].sort((left, right) => left - right);
+      targetStepIndexes.set(targetId, sorted);
+      sorted.forEach((stepIndex) => allTargetStepIndexes.add(stepIndex));
+    }
+
+    const analysis: BrowserChatTargetStageTimelineEntry[] = [];
+    for (const message of targetMessages) {
+      const messageIndexes = message.stepIndexes || [];
+      const analysisIndexes = messageIndexes.filter((stepIndex) => !allTargetStepIndexes.has(stepIndex));
+      const ownsTargetExecution = messageIndexes.some((stepIndex) => allTargetStepIndexes.has(stepIndex));
+      const entryLogs = browserChatLogsForMessage(message, logIndex).filter((log) => (
+        log.stepIndex === undefined ? !ownsTargetExecution : analysisIndexes.includes(log.stepIndex)
+      ));
+      const content = ownsTargetExecution ? '' : message.content;
+      const entrySteps = analysisIndexes
+        .map((stepIndex) => stepsByIndex.get(stepIndex))
+        .filter((step): step is StepExecutionResult => Boolean(step));
+      if (!content.trim() && !entrySteps.length && !aiOutputCyclesFromLogs(entryLogs).some((cycle) => hasAiOutputView(cycle.output))) continue;
+      analysis.push({
+        id: `analysis:${message.id}`,
+        logs: entryLogs,
+        message: { ...message, content, stepIndexes: analysisIndexes },
+        running: Boolean(message.status === 'running' && !ownsTargetExecution),
+        steps: entrySteps,
+      });
+    }
+
+    const targets = new Map<string, BrowserChatTargetStageTimelineEntry[]>();
+    for (const [targetId, indexes] of targetStepIndexes) {
+      if (!indexes.length) continue;
+      const indexSet = new Set(indexes);
+      const targetSteps = indexes
+        .map((stepIndex) => stepsByIndex.get(stepIndex))
+        .filter((step): step is StepExecutionResult => Boolean(step));
+      const result = run.results[targetId];
+      const entries = targetMessages.flatMap((message): BrowserChatTargetStageTimelineEntry[] => {
+        const entryLogs = browserChatLogsForMessage(message, logIndex).filter((log) => (
+          log.stepIndex !== undefined && indexSet.has(log.stepIndex)
+        ));
+        const messageOwnsSteps = (message.stepIndexes || []).some((stepIndex) => indexSet.has(stepIndex));
+        if (!messageOwnsSteps && !entryLogs.length) return [];
+        return [{
+          id: `target:${targetId}:${message.id}`,
+          logs: entryLogs,
+          message: { ...message, content: '', stepIndexes: indexes },
+          running: result?.status === 'running',
+          steps: targetSteps,
+        }];
+      });
+      if (entries.length) targets.set(targetId, entries);
+    }
+    return { analysis, targets };
+  }, [logIndex, messages, session?.targetRun, session?.workflowMode, steps, stepsByIndex, targetStageMessageIds]);
   const logDialogMessage = useMemo(
     () => messages.find((item) => item.id === logDialogMessageId),
     [logDialogMessageId, messages],
@@ -6441,11 +6658,27 @@ export function BrowserChatWorkspace({
     </div>
   );
 
+  const renderTargetStageTimeline = (entries: BrowserChatTargetStageTimelineEntry[]) => entries.length ? (
+    <BrowserChatTargetStageTimeline
+      entries={entries}
+      onResolveToolConfirmation={resolveToolConfirmation}
+      onSelectTool={setToolDialog}
+      pendingToolConfirmation={session?.pendingToolConfirmation}
+      resolvingConfirmationAction={resolvingConfirmationAction}
+      resolvingConfirmationId={resolvingConfirmationId}
+    />
+  ) : undefined;
+
   const renderTargetRunCard = () => session?.workflowMode === 'target' && session.targetRun ? (
     <BrowserChatTargetRunCard
+      analysisStageContent={renderTargetStageTimeline(targetStageTimeline.analysis)}
       busy={currentBusy}
       onContinue={continueTargetWorkflow}
       run={session.targetRun}
+      userId={session.userId}
+      targetStageContent={Object.fromEntries(
+        [...targetStageTimeline.targets].map(([targetId, entries]) => [targetId, renderTargetStageTimeline(entries)]),
+      )}
     />
   ) : null;
 
@@ -6482,7 +6715,7 @@ export function BrowserChatWorkspace({
           sessionBusy={selectedSessionRunning}
           stepsByIndex={stepsByIndex}
           targetRunContent={renderTargetRunCard()}
-          targetRunMessageId={targetRunMessageId}
+          targetRunMessageId={undefined}
           totalStepCount={steps.length}
           supplementalScrollKey={session?.targetRun?.updatedAt}
         />
@@ -6671,7 +6904,7 @@ export function BrowserChatWorkspace({
                 sessionBusy={selectedSessionRunning}
                 stepsByIndex={stepsByIndex}
                 targetRunContent={renderTargetRunCard()}
-                targetRunMessageId={targetRunMessageId}
+                targetRunMessageId={undefined}
                 totalStepCount={steps.length}
                 supplementalScrollKey={session?.targetRun?.updatedAt}
               />

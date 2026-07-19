@@ -1,11 +1,11 @@
-import { generateObject } from 'ai';
+import { generateObject, NoObjectGeneratedError } from 'ai';
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { getModel } from '@/server/ai/model';
 import type { InteractiveBrowserTurnResult } from '@/server/ai/agents/browser-chat-executor.agent';
 import type { TargetLeafNode, TargetResult } from '@/server/ai/schemas/target-workflow.schema';
 
-const verificationSchema = z.object({
+export const targetVerificationSchema = z.object({
   status: z.enum(['passed', 'failed', 'inconclusive', 'blocked']),
   summary: z.string().min(1).max(4_000),
   failureReason: z.string().max(4_000).optional(),
@@ -13,10 +13,120 @@ const verificationSchema = z.object({
     criterionId: z.string().min(1).max(120),
     status: z.enum(['passed', 'failed', 'inconclusive']),
     observation: z.string().min(1).max(4_000),
-    evidence: z.array(z.string().min(1).max(4_000)).max(20),
-  })).max(30),
-  outputs: z.record(z.string(), z.unknown()),
+    evidence: z.array(z.string().min(1).max(4_000)).max(20).default([]),
+  })).max(30).default([]),
+  outputs: z.record(z.string(), z.unknown()).default({}),
 });
+
+type VerificationVerdict = z.infer<typeof targetVerificationSchema>;
+
+function jsonObjectFromText(text: string) {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  const extracted = firstBrace >= 0 && lastBrace > firstBrace
+    ? trimmed.slice(firstBrace, lastBrace + 1)
+    : undefined;
+  for (const candidate of [trimmed, fenced, extracted]) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate) as unknown;
+    } catch {
+      // Try the next representation. The original SDK error is retained if
+      // none of the deterministic repairs can be parsed.
+    }
+  }
+  return undefined;
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function nonEmptyString(...values: unknown[]) {
+  return values.find((value): value is string => typeof value === 'string' && Boolean(value.trim()))?.trim();
+}
+
+function normalizedStatus(value: unknown, fallback: VerificationVerdict['status'] = 'inconclusive') {
+  if (typeof value !== 'string') return fallback;
+  const status = value.trim().toLowerCase();
+  if (['passed', 'pass', 'success', 'successful', 'ok', '通过', '成功'].includes(status)) return 'passed' as const;
+  if (['failed', 'fail', 'failure', 'error', '失败', '不通过'].includes(status)) return 'failed' as const;
+  if (['blocked', 'block', '阻塞', '被阻断'].includes(status)) return 'blocked' as const;
+  if (['inconclusive', 'unknown', 'uncertain', '无法判断', '不确定'].includes(status)) return 'inconclusive' as const;
+  return fallback;
+}
+
+function normalizedEvidence(value: unknown) {
+  const values = Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
+  return values
+    .filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+    .map((item) => item.trim())
+    .slice(0, 20);
+}
+
+function normalizedCriterionStatus(value: unknown) {
+  const status = normalizedStatus(value, 'inconclusive');
+  return status === 'blocked' ? 'inconclusive' as const : status;
+}
+
+/**
+ * Repair common provider deviations without another model call. This covers
+ * fenced JSON, nullable optional fields, omitted containers and the common
+ * aliases emitted by models that do not follow the response schema exactly.
+ */
+export function repairTargetVerificationText(text: string) {
+  const parsed = jsonObjectFromText(text);
+  const parsedRecord = recordOf(parsed);
+  const root = recordOf(parsedRecord?.result) || recordOf(parsedRecord?.verdict) || parsedRecord;
+  if (!root) return null;
+  const criteriaRecord = recordOf(root.criteria);
+  const rawCriteria = Array.isArray(root.criteria)
+    ? root.criteria
+    : Array.isArray(root.successCriteria)
+      ? root.successCriteria
+      : criteriaRecord
+        ? Object.entries(criteriaRecord).map(([criterionId, value]) => ({
+            ...recordOf(value),
+            criterionId: nonEmptyString(recordOf(value)?.criterionId, recordOf(value)?.id, criterionId),
+          }))
+        : [];
+  const criteria = rawCriteria.flatMap((item) => {
+    const criterion = recordOf(item);
+    if (!criterion) return [];
+    const criterionId = nonEmptyString(criterion.criterionId, criterion.criterion_id, criterion.id, criterion.key);
+    const observation = nonEmptyString(
+      criterion.observation,
+      criterion.actual,
+      criterion.summary,
+      criterion.reason,
+      criterion.message,
+    );
+    if (!criterionId || !observation) return [];
+    return [{
+      criterionId,
+      status: normalizedCriterionStatus(criterion.status),
+      observation,
+      evidence: normalizedEvidence(criterion.evidence ?? criterion.evidences ?? criterion.references),
+    }];
+  });
+  const status = normalizedStatus(root.status ?? root.result ?? root.verdict, 'inconclusive');
+  const summary = nonEmptyString(root.summary, root.observation, root.message, root.reason)
+    || `验证结果：${status}`;
+  const failureReason = nonEmptyString(root.failureReason, root.failure_reason, root.error);
+  const outputs = recordOf(root.outputs) || recordOf(root.output) || {};
+  const normalized = {
+    status,
+    summary,
+    ...(failureReason ? { failureReason } : {}),
+    criteria,
+    outputs,
+  };
+  return JSON.stringify(normalized);
+}
 
 function toolEvidence(result: InteractiveBrowserTurnResult) {
   return result.newSteps.map((step) => ({
@@ -45,17 +155,80 @@ function executionScreenshotPaths(result: InteractiveBrowserTurnResult) {
   ))));
 }
 
-function groundedCriterionEvidence(
+export function groundedCriterionEvidence(
   evidence: string[],
   validStepIndexes: Set<number>,
   validScreenshotPaths: Set<string>,
 ) {
-  return evidence.filter((item) => {
-    const stepMatch = item.match(/^\[step:(\d+)\]/i);
-    if (stepMatch) return validStepIndexes.has(Number(stepMatch[1]));
-    const screenshotMatch = item.match(/^\[screenshot:(.+?)\]/i);
-    return Boolean(screenshotMatch && validScreenshotPaths.has(screenshotMatch[1]));
+  return evidence.flatMap((item) => {
+    const stepMatch = item.match(/(?:^|\[|\b)(?:step|stepIndex|step_id|\u6b65\u9aa4)\s*[:#=]?\s*(\d+)/i);
+    if (stepMatch && validStepIndexes.has(Number(stepMatch[1]))) {
+      const detailStart = (stepMatch.index || 0) + stepMatch[0].length;
+      const detail = item.slice(detailStart).replace(/^[\]\s:;,.\-—]+/, '').trim();
+      return [`[step:${Number(stepMatch[1])}]${detail ? ` ${detail}` : ''}`];
+    }
+    const screenshotMatch = item.match(/^\s*\[screenshot\s*:\s*(.+?)\s*\]/i);
+    if (!screenshotMatch) return [];
+    const path = screenshotMatch[1].trim();
+    return validScreenshotPaths.has(path)
+      ? [`[screenshot:${path}] ${item.slice(screenshotMatch[0].length).trim()}`.trim()]
+      : [];
   });
+}
+
+function reportStateStep(execution: InteractiveBrowserTurnResult) {
+  return [...execution.newSteps].reverse().find((step) => (
+    step.tools?.some((tool) => tool.name === 'reportState' && tool.ok !== false)
+  ));
+}
+
+export function fallbackGroundedEvidence(execution: InteractiveBrowserTurnResult) {
+  const concludingStep = reportStateStep(execution);
+  const observableStep = [...execution.newSteps].reverse().find((step) => (
+    step.status === 'passed'
+    && Boolean(step.actual?.trim() || step.observation?.trim() || step.findings?.length)
+  ));
+  const step = concludingStep || observableStep;
+  const evidence = step
+    ? [`[step:${step.index}] ${step.actual || step.observation || step.action}`]
+    : [];
+  const screenshot = executionScreenshotPaths(execution).at(-1);
+  if (screenshot) evidence.push(`[screenshot:${screenshot}] 执行后页面截图`);
+  return evidence;
+}
+
+export function fallbackVerificationVerdict(
+  target: TargetLeafNode,
+  execution: InteractiveBrowserTurnResult,
+): VerificationVerdict {
+  const concludingStep = reportStateStep(execution);
+  const hasGroundedConclusion = Boolean(concludingStep);
+  const criterionStatus: 'passed' | 'failed' | 'inconclusive' = execution.status === 'failed'
+    ? 'failed'
+    : execution.status === 'passed' && hasGroundedConclusion
+      ? 'passed'
+      : 'inconclusive';
+  const evidence = criterionStatus === 'inconclusive' ? [] : fallbackGroundedEvidence(execution);
+  return {
+    status: execution.status === 'blocked'
+      ? 'blocked'
+      : criterionStatus,
+    summary: execution.reply || '结构化验证输出无法解析，已根据执行器的明确结论和真实证据生成保守结果。',
+    ...(criterionStatus === 'passed' ? {} : {
+      failureReason: execution.reply || '结构化验证输出无法解析，且缺少可以确定结论的执行证据。',
+    }),
+    criteria: target.successCriteria.map((criterion) => ({
+      criterionId: criterion.id,
+      status: criterionStatus,
+      observation: execution.reply || concludingStep?.actual || (
+        criterionStatus === 'inconclusive'
+          ? '缺少可以确定该标准的执行结论。'
+          : `执行器明确报告目标${criterionStatus === 'passed' ? '通过' : '失败'}。`
+      ),
+      evidence,
+    })),
+    outputs: {},
+  };
 }
 
 export async function verifyTargetExecution(input: {
@@ -116,26 +289,50 @@ export async function verifyTargetExecution(input: {
     content.push({ type: 'text', text: `下面图片对应证据路径：${screenshotPath}` });
     content.push({ type: 'image', image });
   }
-  const result = await generateObject({
-    model: getModel(),
-    schema: verificationSchema,
-    temperature: 0,
-    abortSignal: input.abortSignal,
-    messages: [{ role: 'user', content }],
-  });
-  const verdict = result.object;
+  let verdict: VerificationVerdict;
+  try {
+    const result = await generateObject({
+      model: getModel(),
+      schema: targetVerificationSchema,
+      schemaName: 'target_execution_verification',
+      schemaDescription: '基于真实浏览器步骤和截图的目标验证结果。',
+      experimental_repairText: async ({ text }) => repairTargetVerificationText(text),
+      temperature: 0,
+      abortSignal: input.abortSignal,
+      messages: [{ role: 'user', content }],
+    });
+    verdict = result.object;
+  } catch (error) {
+    if (!NoObjectGeneratedError.isInstance(error)) throw error;
+    // A formatting error must not turn a successfully observed browser target
+    // into an execution failure. Fall back only to explicit reportState or
+    // captured page evidence; otherwise the result remains inconclusive.
+    verdict = fallbackVerificationVerdict(target, execution);
+  }
+  if (!verdict.criteria.length) {
+    const fallback = fallbackVerificationVerdict(target, execution);
+    verdict = {
+      ...verdict,
+      criteria: fallback.criteria,
+      outputs: Object.keys(verdict.outputs).length ? verdict.outputs : fallback.outputs,
+    };
+  }
   const byCriterion = new Map(verdict.criteria.map((item) => [item.criterionId, item]));
   const validStepIndexes = new Set(execution.newSteps.map((step) => step.index));
   const validScreenshotPaths = new Set(screenshotPaths);
-  const criteria = target.successCriteria.map((criterion) => {
-    const returned = byCriterion.get(criterion.id);
+  const criteria = target.successCriteria.map((criterion, criterionIndex) => {
+    const returned = byCriterion.get(criterion.id)
+      || (verdict.criteria.length === target.successCriteria.length ? verdict.criteria[criterionIndex] : undefined);
     if (!returned) return {
       criterionId: criterion.id,
       status: 'inconclusive' as const,
       observation: '验证 Agent 未返回该标准的判断。',
       evidence: [],
     };
-    const evidence = groundedCriterionEvidence(returned.evidence, validStepIndexes, validScreenshotPaths);
+    let evidence = groundedCriterionEvidence(returned.evidence, validStepIndexes, validScreenshotPaths);
+    if (returned.status !== 'inconclusive' && !evidence.length) {
+      evidence = fallbackGroundedEvidence(execution);
+    }
     if (returned.status !== 'inconclusive' && !evidence.length) {
       return {
         ...returned,

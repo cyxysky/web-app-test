@@ -45,6 +45,12 @@ import {
 import { artifactPath as resolveArtifactPath } from '@/server/storage/paths';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
+import {
+  getLoginAccountById,
+  listLoginAccounts,
+  normalizeLoginAccountDomain,
+  resolveLoginAccountCredentialById,
+} from '@/server/credentials/login-account-vault';
 
 export type BrowserChatAttachment = {
   id: string;
@@ -82,15 +88,14 @@ export type TargetWorkflowRequirementResponse = {
   value: string;
 };
 
-export type TargetWorkflowActorCredentials = {
+export type TargetWorkflowActorCredentialReference = {
   actorId: string;
-  username: string;
-  password: string;
+  credentialId: string;
 };
 
 export type ContinueTargetWorkflowInput = {
   responses?: TargetWorkflowRequirementResponse[];
-  actorCredentials?: TargetWorkflowActorCredentials[];
+  actorCredentialIds?: TargetWorkflowActorCredentialReference[];
 };
 
 export type BrowserChatLogRecord = {
@@ -1952,6 +1957,8 @@ function targetActorIdentityFingerprint(actor: TargetActor) {
       actor.role,
       actor.auth.required,
       actor.auth.loginUrl || '',
+      actor.auth.credentialDomain || '',
+      actor.auth.username || '',
     ]), 'utf8')
     .digest('hex')
     .slice(0, 32);
@@ -1985,7 +1992,9 @@ function targetActorIdentityMatches(session: BrowserChatSessionRecord, expected:
     && current.name === expected.name
     && current.role === expected.role
     && current.auth.required === expected.auth.required
-    && (current.auth.loginUrl || '') === (expected.auth.loginUrl || ''));
+    && (current.auth.loginUrl || '') === (expected.auth.loginUrl || '')
+    && (current.auth.credentialDomain || '') === (expected.auth.credentialDomain || '')
+    && (current.auth.username || '') === (expected.auth.username || ''));
 }
 
 function mergeLatestTargetActorAuth(plan: TargetPlan, latestPlan?: TargetPlan): TargetPlan {
@@ -1998,8 +2007,23 @@ function mergeLatestTargetActorAuth(plan: TargetPlan, latestPlan?: TargetPlan): 
         && latest.name === actor.name
         && latest.role === actor.role
         && latest.auth.required === actor.auth.required
-        && (latest.auth.loginUrl || '') === (actor.auth.loginUrl || '');
-      return sameIdentity ? { ...actor, auth: { ...actor.auth, ...latest.auth } } : actor;
+        && (latest.auth.loginUrl || '') === (actor.auth.loginUrl || '')
+        && (latest.auth.credentialDomain || '') === (actor.auth.credentialDomain || '')
+        && (latest.auth.username || '') === (actor.auth.username || '');
+      return sameIdentity ? {
+        ...actor,
+        auth: {
+          ...actor.auth,
+          browserSessionId: latest.auth.browserSessionId,
+          credentialId: actor.auth.credentialId || latest.auth.credentialId,
+          credentialsAvailable: Boolean(actor.auth.credentialsAvailable || latest.auth.credentialsAvailable),
+          message: ['ready', 'verifying', 'failed'].includes(latest.auth.status)
+            ? latest.auth.message
+            : actor.auth.message || latest.auth.message,
+          mode: latest.auth.mode,
+          status: latest.auth.status,
+        },
+      } : actor;
     }),
   };
 }
@@ -2393,7 +2417,7 @@ function startTargetActorCredentialLogin(
       status: 'awaiting_user',
       browserSessionId,
       credentialsAvailable: false,
-      message: '独立登录环境已准备好，正在通过安全引用使用本次凭据。',
+      message: '独立登录环境已准备好，正在通过安全引用使用后台账号。',
     },
   }));
   const runtimeKey = targetActorRuntimeKey(session.id, actorId);
@@ -2421,7 +2445,7 @@ function startTargetActorCredentialLogin(
   });
   updateTargetActor(session, actorId, (current) => ({
     ...current,
-    auth: { ...current.auth, credentialsAvailable: true, status: 'verifying', message: '凭据仅保存在内存中，AI 正在使用安全引用登录。' },
+    auth: { ...current.auth, credentialsAvailable: true, status: 'verifying', message: '密码已从本机加密凭据库读取，AI 正在通过短期安全引用登录。' },
   }));
   persistAndNotify(session.id);
   return withModelSettings(
@@ -2551,7 +2575,7 @@ async function runTargetWorkflowContinuation(
   session: BrowserChatSessionRecord,
   assistantMessageId: string,
   abortController: AbortController,
-  actorCredentials: TargetWorkflowActorCredentials[],
+  actorCredentialIds: TargetWorkflowActorCredentialReference[],
 ) {
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
   try {
@@ -2568,26 +2592,44 @@ async function runTargetWorkflowContinuation(
     replaceTargetRunPlan(session, assistantMessageId, plan);
     persistAndNotify(session.id);
 
-    if (actorCredentials.length) {
-      appendLog(session, 'target:continue:auth:start', `正在安全准备 ${actorCredentials.length} 个独立账号会话`, {
+    if (actorCredentialIds.length) {
+      appendLog(session, 'target:continue:auth:start', `正在安全准备 ${actorCredentialIds.length} 个独立账号会话`, {
         messageId: assistantMessageId,
       });
-      const loginTasks = actorCredentials.map(async (credential) => {
+      const loginTasks = actorCredentialIds.map(async (reference) => {
         if (!ownsTurn()) return;
-        const actor = session.targetRun?.plan?.actors.find((item) => item.id === credential.actorId);
+        const actor = session.targetRun?.plan?.actors.find((item) => item.id === reference.actorId);
         if (!actor?.auth.required) {
-          appendLog(session, 'target:continue:auth:skipped', `参与者 ${credential.actorId} 在新版资料分析中不存在或不需要登录，未使用其凭据`, {
+          appendLog(session, 'target:continue:auth:skipped', `参与者 ${reference.actorId} 在新版资料分析中不存在或不需要登录，未使用其凭据`, {
             messageId: assistantMessageId,
           });
           return;
         }
+        const account = getLoginAccountById(reference.credentialId, session.userId);
+        if (!account || account.status !== 'active') throw new Error(`参与者 ${actor.name} 对应的后台账号不存在或已停用`);
+        const plannedDomainValue = actor.auth.credentialDomain || actor.auth.loginUrl || plan.targetUrl;
+        const plannedDomain = plannedDomainValue ? normalizeLoginAccountDomain(plannedDomainValue) : account.domain;
+        if (plannedDomain !== account.domain) throw new Error(`参与者 ${actor.name} 的计划域名与后台账号域名不一致`);
+        const credential = resolveLoginAccountCredentialById(reference.credentialId, session.userId);
+        if (!credential) throw new Error(`参与者 ${actor.name} 的后台账号无法解密或已停用`);
+        updateTargetActor(session, actor.id, (current) => ({
+          ...current,
+          auth: {
+            ...current.auth,
+            credentialDomain: account.domain,
+            credentialId: account.id,
+            credentialsAvailable: true,
+            loginUrl: account.loginUrl,
+            username: account.username,
+          },
+        }));
         appendLog(session, 'target:continue:auth:actor', `正在登录独立账号会话：${actor.name}（${actor.role}）`, {
           messageId: assistantMessageId,
         });
         await startTargetActorCredentialLogin(
           session,
           actor.id,
-          { username: credential.username, password: credential.password },
+          { username: account.username, password: credential.password },
           abortController.signal,
         );
       });
@@ -2713,22 +2755,28 @@ export function continueTargetWorkflow(
     if (!requirementId || !value) throw new Error('补充资料不能为空');
     const requirement = currentPlan.requirements.find((item) => item.id === requirementId);
     if (!requirement) throw new Error(`待补充资料不存在或已经更新：${requirementId}`);
-    if (requirement.category === 'account') throw new Error(`账号资料必须通过“${requirement.title}”的安全凭据输入提交`);
+    if (requirement.category === 'account') throw new Error(`账号资料必须通过“${requirement.title}”关联后台保存的登录账号`);
     responseById.set(requirementId, { requirementId, value: value.slice(0, 2_000) });
   }
   const responses = Array.from(responseById.values());
 
-  const credentialsByActor = new Map<string, TargetWorkflowActorCredentials>();
-  for (const raw of input.actorCredentials || []) {
+  const credentialsByActor = new Map<string, TargetWorkflowActorCredentialReference>();
+  for (const raw of input.actorCredentialIds || []) {
     const actorId = raw.actorId.trim();
     const actor = currentPlan.actors.find((item) => item.id === actorId);
     if (!actor?.auth.required) throw new Error(`需要登录的参与者不存在或已经更新：${actorId}`);
-    if (!raw.username.trim() || !raw.password) throw new Error(`参与者 ${actor.name} 的账号和密码不能为空`);
-    credentialsByActor.set(actorId, { actorId, username: raw.username, password: raw.password });
+    const credentialId = raw.credentialId.trim();
+    const account = getLoginAccountById(credentialId, session.userId);
+    if (!account || account.status !== 'active') throw new Error(`参与者 ${actor.name} 对应的后台账号不存在或已停用`);
+    const plannedDomainValue = actor.auth.credentialDomain || actor.auth.loginUrl || currentPlan.targetUrl;
+    if (plannedDomainValue && normalizeLoginAccountDomain(plannedDomainValue) !== account.domain) {
+      throw new Error(`参与者 ${actor.name} 只能选择 ${normalizeLoginAccountDomain(plannedDomainValue)} 域名下的账号`);
+    }
+    credentialsByActor.set(actorId, { actorId, credentialId });
   }
-  const actorCredentials = Array.from(credentialsByActor.values());
-  if (!responses.length && !actorCredentials.length && session.targetRun?.status === 'collecting_requirements') {
-    throw new Error('请先补充当前缺失的资料或账号凭据');
+  const actorCredentialIds = Array.from(credentialsByActor.values());
+  if (!responses.length && !actorCredentialIds.length && session.targetRun?.status === 'collecting_requirements') {
+    throw new Error('请先补充当前缺失的资料或关联后台登录账号');
   }
 
   const timestamp = now();
@@ -2775,13 +2823,13 @@ export function continueTargetWorkflow(
   session.status = 'running';
   session.error = undefined;
   session.updatedAt = timestamp;
-  appendLog(session, 'target:continue:queued', `已收到目标继续请求：普通资料 ${responses.length} 项，安全账号 ${actorCredentials.length} 个`, {
+  appendLog(session, 'target:continue:queued', `已收到目标继续请求：普通资料 ${responses.length} 项，后台账号 ${actorCredentialIds.length} 个`, {
     messageId: assistantMessage.id,
   });
   persistAndNotify(session.id);
   void withModelSettings(
     browserChatModelSettings(session.modelProvider, session.model),
-    () => runTargetWorkflowContinuation(session, assistantMessage.id, abortController, actorCredentials),
+    () => runTargetWorkflowContinuation(session, assistantMessage.id, abortController, actorCredentialIds),
   );
   return snapshot(session);
 }
@@ -3785,7 +3833,18 @@ async function generateSessionTargetPlan(input: {
   latest?: { userMessageId: string; modelText: string };
 }) {
   const { session, assistantMessageId, abortController, phase } = input;
+  const availableAccounts = listLoginAccounts({ userId: session.userId })
+    .filter((account) => account.status === 'active')
+    .slice(0, 80)
+    .map((account) => ({
+      id: account.id,
+      domain: account.domain,
+      username: account.username,
+      label: account.label,
+      loginUrl: account.loginUrl,
+    }));
   const generatedPlan = await generateTargetWorkflowPlan({
+    availableAccounts,
     messages: targetPlanningMessages(session, assistantMessageId, input.latest),
     currentPlan: session.targetRun?.plan,
     targetUrl: session.targetUrl,
@@ -3796,8 +3855,8 @@ async function generateSessionTargetPlan(input: {
         session,
         errors.length ? (repaired ? 'target:plan:validation:error' : 'target:plan:validation:retry') : 'target:plan:validation:passed',
         errors.length
-          ? `${repaired ? '修复后的' : '初次'}目标流程仍有 ${errors.length} 项结构问题${repaired ? '' : '，正在自动修复'}`
-          : `${repaired ? '修复后的' : '初次'}目标流程结构校验通过`,
+          ? `${repaired ? '修复后的' : '初次'}目标流程仍有 ${errors.length} 项结构或语言问题${repaired ? '' : '，正在自动修复'}`
+          : `${repaired ? '修复后的' : '初次'}目标流程结构与语言校验通过`,
         {
           details: errors.length ? { attempt, errors, phase } : { attempt, phase },
           messageId: assistantMessageId,
