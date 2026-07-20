@@ -1602,10 +1602,12 @@ function attachEmbeddedBrowserView(input = {}) {
   if (shouldCreateTab || existingGroup) {
     tab = ensureEmbeddedBrowserTab({ ...input, createIfMissing: shouldCreateTab });
   }
-  if (!tab && !shouldCreateTab && restoredTab && !restoredTab.view.webContents.isDestroyed()) {
+  if (!tab && !shouldCreateTab && restoredTab?.groupId === groupId && !restoredTab.view.webContents.isDestroyed()) {
     tab = restoredTab;
   }
   if (!tab) {
+    embeddedBrowserVisible = false;
+    applyEmbeddedBrowserAudioPolicy();
     setActiveEmbeddedBrowserGroup(groupId);
     for (const item of embeddedBrowserTabs.values()) detachEmbeddedBrowserTab(item);
     return undefined;

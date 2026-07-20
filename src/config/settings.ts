@@ -150,6 +150,8 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
   { key: 'AI_TEST_REQUEST_TIMEOUT_MS', label: 'AI 请求超时', description: '单次模型请求最长等待时间。', tab: 'runtime', defaultValue: '30000', control: 'number' },
   { key: 'AI_AGENT_LOOP_TIMEOUT_MS', label: 'Agent Loop 请求超时', description: '带工具循环的单个用户请求最长等待时间；留空时默认 120000。', tab: 'runtime', defaultValue: '120000', control: 'number' },
+  { key: 'AI_SUBAGENT_LOOP_TIMEOUT_MS', label: '子 Agent 执行超时', description: '单个并行子 Agent 的完整工具循环最长时间；默认 600000 毫秒，不限制工具回合数。', tab: 'runtime', defaultValue: '600000', control: 'number' },
+  { key: 'AI_SUBAGENT_RESULT_MAX_CHARS', label: '子 Agent 回传上限', description: '并行子 Agent 向主 Agent 回传总结和有效证据的最大字符数。', tab: 'runtime', defaultValue: '60000', control: 'number' },
   { key: 'AI_RUNTIME_REQUEST_RETRY_ATTEMPTS', label: 'AI 请求连续失败上限', description: 'Agent Loop 中上游连接或请求级错误连续失败达到该次数后停止；成功一次会清零。', tab: 'runtime', defaultValue: '3', control: 'number' },
   { key: 'BROWSER_CHAT_KEEP_BROWSER_OPEN_AFTER_TURN', label: '对话完成保留浏览器', description: '浏览器对话每轮完成后是否保留浏览器，便于同一用户后续对话复用。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'BROWSER_CHAT_SHOW_REASONING', label: '对话展示思维链', description: '是否在对话模式中展示模型返回的推理内容；关闭后仍会保留工具调用与最终回复。', tab: 'runtime', defaultValue: 'false', control: 'boolean', options: boolOptions },

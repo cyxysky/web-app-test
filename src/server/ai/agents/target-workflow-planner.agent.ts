@@ -8,6 +8,7 @@ import {
   type TargetActor,
   type TargetPlan,
   type TargetPlanningRequirement,
+  type TargetResearchBundle,
 } from '@/server/ai/schemas/target-workflow.schema';
 
 export type TargetPlanningMessage = {
@@ -27,6 +28,7 @@ type GenerateTargetPlanInput = {
   availableAccounts?: TargetPlanningAccount[];
   messages: TargetPlanningMessage[];
   currentPlan?: TargetPlan;
+  research?: TargetResearchBundle;
   preferredLocale?: 'zh' | 'en';
   targetUrl?: string;
   onValidation?: (event: {
@@ -70,6 +72,9 @@ function planningPrompt(input: GenerateTargetPlanInput, validationErrors: string
     label: account.label || undefined,
     loginUrl: account.loginUrl || undefined,
   }));
+  const research = input.research
+    ? boundedText(JSON.stringify(input.research, null, 2), 80_000)
+    : '[none]';
   return [
     '你是 WebPilot 的目标测试规划 Agent。当前阶段只能分析和规划，绝对不能操作浏览器。',
     '请先阅读完整对话并判断执行资料是否齐全。资料收集阶段只输出参与者和待补充清单；全部齐全后，才生成一棵由 sequence、parallel 和 target 组成的串并联流程树。流程树 JSON 使用扁平 nodes 数组，父节点的 children 保存子节点 id。',
@@ -103,6 +108,9 @@ function planningPrompt(input: GenerateTargetPlanInput, validationErrors: string
     '- 三个使用者操作只有在确有三个独立 actor、三个独立登录会话，并且测试数据与写资源互不冲突时才能放入 parallel；账号或共享写数据不足时必须串行，或建立缺失的账号/测试数据 requirement。',
     '- 整个运行的最终结论由系统汇总 Agent 自动生成，不要创建只负责复述其他目标结果的“总结” target；只有确实需要再次操作浏览器核验业务状态时才创建最终核验 target。',
     '- 不生成重放步骤，也不把工具调用成功当作目标成功。',
+    '- 需求调研证据是规划事实的首要来源。已经在 research.facts 中确认的内容不得再次询问用户；research.unresolved、blocked 或 failed 来源中确实阻塞执行判断的内容才转为 missing requirement。',
+    '- Axure 原型属于 PRD 证据来源。规划必须结合调研 Agent 实际读取到的页面树、页面说明、交互状态、图片和关联页面，不能仅根据 Axure 链接文字猜测需求。',
+    '- 每条 successCriteria 的 sourceIds 必须引用支撑该标准的 research.sources[].id；如果该标准只来自用户明确补充，则 sourceIds 可以为空，并在 evidenceRequirement 中说明需要保存用户确认。',
     '- 仅在 analysisComplete=true 时 rootNodeId 才必须存在；完整树中除根节点外每个节点只能有一个父节点，不得有环或游离节点。资料收集阶段必须省略 rootNodeId。',
     '- 可选字段没有信息时直接省略；即使输出为 null，系统也会按“未提供”处理。',
     '',
@@ -111,6 +119,8 @@ function planningPrompt(input: GenerateTargetPlanInput, validationErrors: string
     `后台已保存账号（仅域名、用户名与标签，不含密码）：\n${availableAccounts.length ? JSON.stringify(availableAccounts, null, 2) : '[none]'}`,
     '',
     `当前计划（如有）：\n${previousPlan}`,
+    '',
+    `需求调研证据（由完整浏览器 Agent 实际读取）：\n${research}`,
     '',
     `完整需求对话：\n${conversation || '[空]'}`,
     validationErrors.length ? `\n上一次结构校验错误，请全部修复：\n- ${validationErrors.join('\n- ')}` : '',
@@ -445,6 +455,7 @@ function unknownPermissionRequirement(plan: TargetPlan) {
 
 function normalizePlan(plan: TargetPlan, input: GenerateTargetPlanInput): TargetPlan {
   const locale = planningLocale(input);
+  const researchSourceIds = new Set((input.research?.sources || []).map((source) => source.id));
   const normalizedAccounts = normalizeAccountRequirements({
     ...plan,
     id: input.currentPlan?.id || plan.id || `plan_${randomUUID()}`,
@@ -462,7 +473,14 @@ function normalizePlan(plan: TargetPlan, input: GenerateTargetPlanInput): Target
     rootNodeId: plan.rootNodeId || '',
     nodes: plan.nodes.map((node) => (
       node.type === 'target'
-        ? { ...node, actorId: node.actorId || undefined }
+        ? {
+            ...node,
+            actorId: node.actorId || undefined,
+            successCriteria: node.successCriteria.map((criterion) => ({
+              ...criterion,
+              sourceIds: (criterion.sourceIds || []).filter((sourceId) => researchSourceIds.has(sourceId)),
+            })),
+          }
         : node
     )),
   });
@@ -478,6 +496,16 @@ function normalizePlan(plan: TargetPlan, input: GenerateTargetPlanInput): Target
         nodes: [],
       }
     : normalizedRequirements;
+}
+
+function validateTargetPlanResearchCitations(plan: TargetPlan, research?: TargetResearchBundle) {
+  if (!research?.sources.length) return [];
+  const sourceIds = new Set(research.sources.map((source) => source.id));
+  return plan.nodes.flatMap((node) => node.type === 'target'
+    ? node.successCriteria.flatMap((criterion) => (criterion.sourceIds || [])
+      .filter((sourceId) => !sourceIds.has(sourceId))
+      .map((sourceId) => `Success criterion ${criterion.id} references missing research source ${sourceId}.`))
+    : []);
 }
 
 function validateTargetPlanLocale(plan: TargetPlan, locale: 'zh' | 'en') {
@@ -515,11 +543,19 @@ async function generate(input: GenerateTargetPlanInput, validationErrors: string
 export async function generateTargetWorkflowPlan(input: GenerateTargetPlanInput): Promise<TargetPlan> {
   const first = await generate(input);
   const locale = planningLocale(input);
-  const firstErrors = [...validateTargetPlanStructure(first), ...validateTargetPlanLocale(first, locale)];
+  const firstErrors = [
+    ...validateTargetPlanStructure(first),
+    ...validateTargetPlanLocale(first, locale),
+    ...validateTargetPlanResearchCitations(first, input.research),
+  ];
   input.onValidation?.({ attempt: 'initial', errors: firstErrors });
   if (!firstErrors.length) return first;
   const repaired = await generate({ ...input, currentPlan: first }, firstErrors);
-  const repairedErrors = [...validateTargetPlanStructure(repaired), ...validateTargetPlanLocale(repaired, locale)];
+  const repairedErrors = [
+    ...validateTargetPlanStructure(repaired),
+    ...validateTargetPlanLocale(repaired, locale),
+    ...validateTargetPlanResearchCitations(repaired, input.research),
+  ];
   input.onValidation?.({ attempt: 'repair', errors: repairedErrors });
   if (repairedErrors.length) throw new Error(`AI 生成的目标流程树结构无效：${repairedErrors.join('；')}`);
   return repaired;

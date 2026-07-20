@@ -180,7 +180,7 @@ const codexRuntimeObjectSchema = z.object({
     actual: z.string().nullable().optional(),
     status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
     done: z.boolean().nullable().optional(),
-    mode: z.enum(['actionable', 'full', 'text', 'changes']).nullable().optional(),
+    mode: z.enum(['full', 'text', 'changes']).nullable().optional(),
     cursor: z.string().nullable().optional(),
     query: z.string().nullable().optional(),
     roles: z.array(z.string()).nullable().optional(),
@@ -775,7 +775,7 @@ function buildContinuationSummaryPrompt(input: {
     '{ "goal": string, "completed": string[], "currentPage": string, "confirmedFacts": string[], "negativeResults": string[], "failedAttempts": string[], "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
     '',
     'Rules:',
-    '- Preserve that only UIDs from the latest takeSnapshot and coordinates from the latest viewport takeScreenshot are actionable.',
+    '- Preserve that only UIDs from the latest takeSnapshot and coordinates from the latest viewport takeScreenshot are valid for interaction.',
     '- Preserve tool results that materially affect the next action.',
     '- Preserve current URL/page state, blockers, manual verification state, and user constraints.',
     '- Preserve every completed search/query and its observed result. If a query had no result, put the exact query and outcome in negativeResults; do not schedule that same query again unless the user changed it or new evidence contradicts it.',
@@ -1377,11 +1377,8 @@ function makeBrowserTools(
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
   const takeSnapshotInput = browserToolInput({
-    cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by the prior takeSnapshot page. When set, mode is required and must match the prior page.'),
-    mode: z.enum(['actionable', 'full', 'text', 'changes']).optional(),
-  }).refine((input) => !input.cursor || Boolean(input.mode), {
-    path: ['mode'],
-    message: 'mode is required when cursor is provided.',
+    cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by the prior takeSnapshot page. When set, mode must match the prior page.'),
+    mode: z.enum(['full', 'text', 'changes']).default('full').describe('full reads the complete semantic DOM, text reads deduplicated rendered copy, and changes reads the inter-action journal.'),
   });
 
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
@@ -1509,7 +1506,7 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests({ ids: input.ids })),
     }),
     takeSnapshot: tool({
-      description: 'Capture a paged DOM observation. actionable and text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal: all observed DOM additions, updates, removals, and request summaries since the last browser-changing tool call; it has no actionable UIDs and does not replace the DOM baseline. Use getHttpRequests with its request IDs for details. If nextCursor is returned, call takeSnapshot with both the same mode and exact cursor; do not act between pages. Every result states page/current total.',
+      description: 'Capture a paged DOM observation. text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal: all observed DOM additions, updates, removals, and request summaries since the last browser-changing tool call; it has no interactive UIDs and does not replace the DOM baseline. Use getHttpRequests with its request IDs for details. Default to mode=full. If nextCursor is returned, call takeSnapshot with both the same mode and exact cursor; do not act between pages. Every result states page/current total.',
       inputSchema: takeSnapshotInput,
       execute: (input) => record('takeSnapshot', input, async () => (
         referenceOptions?.takeSnapshot
@@ -1800,7 +1797,7 @@ function runtimePrompt(input: {
       : screenshotAvailable
         ? '- Browser action reason must cite the current snapshot UID or latest screenshot target.'
         : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
-    `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"actionable"}).`,
+    `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"full"}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
@@ -2371,13 +2368,13 @@ async function executeRuntimeStep(input: {
       blockers: [],
       pageUnderstanding: '',
       currentState: browserChatMode
-        ? 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable"}) when browser evidence is needed.'
-        : 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable"}) before choosing a UID action.',
+        ? 'No page snapshot is preloaded; call takeSnapshot({mode:"full"}) when browser evidence is needed.'
+        : 'No page snapshot is preloaded; call takeSnapshot({mode:"full"}) before choosing a UID action.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
-        : 'Use the latest takeSnapshot actionable view for the next missing goal; scroll only when content is lazy-loaded or virtualized.',
+        : 'Use the latest complete takeSnapshot view for the next missing goal; scroll only when content is lazy-loaded or virtualized.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
@@ -2448,7 +2445,7 @@ async function executeRuntimeStep(input: {
     }
 
     async function takeSnapshot(options: RuntimeObservationReadOptions = {}): Promise<BrowserActionResult> {
-      const snapshotView = options.mode || 'actionable';
+      const snapshotView = options.mode === 'text' || options.mode === 'changes' ? options.mode : 'full';
 
       const readStartedAt = Date.now();
       const snapshot = await session.readDomObservationSnapshot({
@@ -2593,7 +2590,7 @@ async function executeRuntimeStep(input: {
           { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
           ...(appendedMessages.length
             ? appendedMessages
-            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"actionable"}).' }]),
+            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"full"}).' }]),
         ];
         attachedImagePaths = appendedImagePaths;
         messageImagePaths = [...attachedImagePaths];
@@ -3183,7 +3180,7 @@ async function runRecordedTool(
         return session.open(url);
     }
     case 'takeSnapshot': {
-      const mode = input.mode === 'actionable' || input.mode === 'full' || input.mode === 'text' || input.mode === 'changes' ? input.mode : undefined;
+      const mode = input.mode === 'full' || input.mode === 'text' || input.mode === 'changes' ? input.mode : undefined;
       const snapshot = await session.readDomObservationSnapshot({
         cursor: typeof input.cursor === 'string' ? input.cursor : undefined,
         mode,

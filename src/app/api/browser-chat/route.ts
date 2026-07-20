@@ -21,7 +21,6 @@ export async function POST(request: NextRequest) {
     const session = createBrowserChatSession({
       targetUrl: body.targetUrl,
       mode: 'dom',
-      workflowMode: body.workflowMode,
       safetyMode: body.safetyMode,
       modelProvider: body.modelProvider,
       model: body.model,

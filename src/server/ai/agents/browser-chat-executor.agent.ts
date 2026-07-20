@@ -90,6 +90,18 @@ export type BrowserToolConfirmationRequest = {
   stepIndex?: number;
 };
 
+export type BrowserChatSubagentTask = {
+  title: string;
+  instruction: string;
+  url?: string;
+};
+
+export type BrowserChatSubagentRunner = (
+  tasks: BrowserChatSubagentTask[],
+  abortSignal?: AbortSignal,
+  toolCallId?: string,
+) => Promise<BrowserActionResult>;
+
 type RuntimeDecision = {
   action: string;
   expected: string;
@@ -151,7 +163,7 @@ const codexRuntimeObjectSchema = z.object({
     actual: z.string().nullable().optional(),
     status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
     done: z.boolean().nullable().optional(),
-    mode: z.enum(['actionable', 'full', 'text', 'changes']).nullable().optional(),
+    mode: z.enum(['full', 'text', 'changes']).nullable().optional(),
     cursor: z.string().nullable().optional(),
     query: z.string().nullable().optional(),
     roles: z.array(z.string()).nullable().optional(),
@@ -200,6 +212,29 @@ function runtimePageContextOptions(mode: BrowserSessionMode) {
     textMaxChars: 0,
     useCachedInteractiveCandidates: false,
   };
+}
+
+function unopenedBrowserPageContext(targetUrl: string): Awaited<ReturnType<BrowserSession['getPageContext']>> {
+  return {
+    url: targetUrl || 'about:blank',
+    title: '',
+    text: '',
+    textLength: 0,
+    structuredText: '',
+    structuredTextLength: 0,
+    viewport: { width: 0, height: 0 },
+    viewportMetrics: { width: 0, height: 0, devicePixelRatio: 1 },
+    tabs: [],
+    focusedElement: { hasFocus: false, summary: '' },
+    domTree: undefined,
+    domObservation: undefined,
+    interactiveCandidates: [],
+    scrollableAreas: [],
+    pageScrollState: undefined,
+    manualVerification: { detected: false },
+    isManualVerification: false,
+    timings: {},
+  } as Awaited<ReturnType<BrowserSession['getPageContext']>>;
 }
 
 function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
@@ -439,15 +474,19 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, max = 
 
 function modelToolResultLimit(name: string) {
   const observationTool = name === 'takeSnapshot';
+  const subagentTool = name === 'spawnSubagents';
   const raw = Number(
     observationTool
       ? process.env.AI_OBSERVATION_TOOL_RESULT_MAX_CHARS || process.env.AI_TOOL_RESULT_MAX_CHARS || 20000
+      : subagentTool
+        ? process.env.AI_SUBAGENT_RESULT_MAX_CHARS || 60000
       : process.env.AI_TOOL_RESULT_MAX_CHARS || 6000,
   );
-  const fallback = observationTool ? 20000 : 6000;
-  const min = observationTool ? 20000 : 1200;
+  const fallback = observationTool ? 20000 : subagentTool ? 60000 : 6000;
+  const min = observationTool ? 20000 : subagentTool ? 6000 : 1200;
   const value = Math.floor(Number.isFinite(raw) ? raw : fallback);
-  return observationTool ? Math.max(value, min) : Math.min(Math.max(value, min), 30000);
+  if (observationTool) return Math.max(value, min);
+  return Math.min(Math.max(value, min), subagentTool ? 120000 : 30000);
 }
 
 function compactToolResultForModel(
@@ -623,15 +662,17 @@ function generateTextTimeoutMs(options: Parameters<typeof generateText>[0]) {
   const nativeToolLoop = typeof (options as { prepareStep?: unknown }).prepareStep === 'function';
   const raw = Number(
     nativeToolLoop
-      ? process.env.AI_AGENT_LOOP_TIMEOUT_MS || process.env.AI_TEST_REQUEST_TIMEOUT_MS || 120000
+      ? process.env.AI_AGENT_LOOP_TIMEOUT_MS || 30 * 60 * 1000
       : process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000,
   );
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : nativeToolLoop ? 120000 : 30000;
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : nativeToolLoop ? 30 * 60 * 1000 : 30000;
 }
 
-async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
+async function generateTextWithTimeout(options: Parameters<typeof generateText>[0], timeoutOverrideMs?: number) {
   throwIfAborted(options.abortSignal);
-  const timeoutMs = generateTextTimeoutMs(options);
+  const timeoutMs = Number.isFinite(timeoutOverrideMs) && Number(timeoutOverrideMs) > 0
+    ? Math.floor(Number(timeoutOverrideMs))
+    : generateTextTimeoutMs(options);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
   const upstream = options.abortSignal;
@@ -740,6 +781,7 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   return traces.map((trace) => {
     const { input, reason } = splitToolInputAndReason(trace.input);
     return {
+      id: trace.id,
       name: trace.name,
       input,
       reason,
@@ -943,7 +985,7 @@ function buildContinuationSummaryPrompt(input: {
     '{ "goal": string, "completed": string[], "currentPage": string, "confirmedFacts": string[], "negativeResults": string[], "failedAttempts": string[], "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
     '',
     'Rules:',
-    '- Preserve current dom-* UIDs and every removed UID from action deltas. A dom-* UID remains actionable until a delta removes it; viewport screenshot coordinates still require the latest viewport screenshot.',
+    '- Preserve current dom-* UIDs and every removed UID from action deltas. A dom-* UID remains valid until a delta removes it; viewport screenshot coordinates still require the latest viewport screenshot.',
     '- Preserve tool results that materially affect the next action.',
     '- Preserve current URL/page state, blockers, manual verification state, and user constraints.',
     '- Preserve every completed search/query and its observed result. If a query had no result, put the exact query and outcome in negativeResults; do not schedule that same query again unless the user changed it or new evidence contradicts it.',
@@ -1597,7 +1639,7 @@ async function executeTracedBrowserAction(input: {
   traces: ToolTrace[];
   name: string;
   toolInput: unknown;
-  action: (abortSignal?: AbortSignal) => Promise<BrowserActionResult>;
+  action: (abortSignal?: AbortSignal, trace?: ToolTrace) => Promise<BrowserActionResult>;
   aiRequest?: AiRequestSnapshot;
   runId?: string;
   stepIndex?: number;
@@ -1621,7 +1663,7 @@ async function executeTracedBrowserAction(input: {
   let result: BrowserActionResult;
   const actionStartedAt = Date.now();
   try {
-    result = await action(abortSignal);
+    result = await action(abortSignal, trace);
     throwIfStopped(abortSignal, shouldContinue);
   } catch (error) {
     if (abortSignal?.aborted || (shouldContinue && !shouldContinue())) throw browserChatAbortError(abortSignal);
@@ -1694,6 +1736,8 @@ function makeBrowserTools(
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
     resolveCredential?: (credentialRef: string) => string | undefined;
     credentialAllowedOrigins?: string[];
+    runSubagents?: BrowserChatSubagentRunner;
+    ensureBrowserStarted?: () => Promise<void>;
   },
 ) {
   // Enforce one executed browser tool per model step. The native AI SDK loop may call the model
@@ -1735,13 +1779,10 @@ function makeBrowserTools(
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
   const takeSnapshotInput = browserToolInput({
-    cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by the prior takeSnapshot page. When set, mode is required and must match the prior page.'),
-    mode: z.enum(['actionable', 'full', 'text', 'changes']).optional(),
-  }).refine((input) => !input.cursor || Boolean(input.mode), {
-    path: ['mode'],
-    message: 'mode is required when cursor is provided.',
+    cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by the prior takeSnapshot page. When set, mode must match the prior page.'),
+    mode: z.enum(['full', 'text', 'changes']).default('full').describe('full reads the complete semantic DOM, text reads deduplicated rendered copy, and changes reads the inter-action journal.'),
   });
-  async function record(name: string, input: unknown, action: (abortSignal?: AbortSignal) => Promise<BrowserActionResult>) {
+  async function record(name: string, input: unknown, action: (abortSignal?: AbortSignal, trace?: ToolTrace) => Promise<BrowserActionResult>) {
     throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
     if (toolExecutionGate.executed) {
       // Do not execute or trace extra calls; just tell the model to stop. This keeps the recorded
@@ -1754,7 +1795,7 @@ function makeBrowserTools(
     toolExecutionGate.executed = true;
     const pendingConfirmation = referenceOptions?.requestToolConfirmation ? toolConfirmationFromInput(name, input) : undefined;
     let browserActionExecuted = false;
-    const actionWithConfirmation = async (actionSignal?: AbortSignal) => {
+    const actionWithConfirmation = async (actionSignal?: AbortSignal, trace?: ToolTrace) => {
       if (pendingConfirmation && referenceOptions?.requestToolConfirmation) {
         const decision = await referenceOptions.requestToolConfirmation({
           toolName: name,
@@ -1770,8 +1811,9 @@ function makeBrowserTools(
             actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
           } satisfies BrowserActionResult;
         }
+        if (toolRequiresBrowserSession(name)) await referenceOptions?.ensureBrowserStarted?.();
         browserActionExecuted = true;
-        const result = await action(actionSignal);
+        const result = await action(actionSignal, trace);
         // This becomes the native tool-result message for the next model step
         // and is also retained by working-memory/continuation compression.
         // A confirmation log alone is UI state and is not model context.
@@ -1780,8 +1822,9 @@ function makeBrowserTools(
           actual: `用户已确认本次工具调用，现已执行。\n${result.actual}`,
         } satisfies BrowserActionResult;
       }
+      if (toolRequiresBrowserSession(name)) await referenceOptions?.ensureBrowserStarted?.();
       browserActionExecuted = true;
-      return action(actionSignal);
+      return action(actionSignal, trace);
     };
     const traceVisualContext = referenceOptions?.visualContext;
     return executeTracedBrowserAction({
@@ -1833,9 +1876,9 @@ function makeBrowserTools(
       }),
       execute: (input) => record('openPage', input, () => {
         const url = input.url || targetUrl;
-        if (!credentialOriginAllowed(url)) {
-          return Promise.resolve({ ok: false, actual: 'Navigation was blocked because credential entry is restricted to the confirmed login origin.' });
-        }
+        // Navigation itself may cross origins after login (for example a DOMP
+        // requirement linking to an Axure PRD). Secret entry remains protected
+        // below by credentialOriginAllowed(session.currentUrl()).
         return session.open(url);
       }),
     }),
@@ -1910,6 +1953,32 @@ function makeBrowserTools(
       }),
       execute: (input) => record('waitForHumanVerification', input, () => session.waitForManualVerification(input.maxMs)),
     }),
+    ...(referenceOptions?.runSubagents ? {
+      spawnSubagents: tool({
+        description: 'Run several independent research or testing tasks concurrently with full browser-agent tools, then return every successful and failed branch result. Use this for independent links, PRD projects, pages, roles, or test branches. One child failure does not cancel its siblings.',
+        inputSchema: browserToolInput({
+          tasks: z.array(z.object({
+            title: z.string().min(1).max(160).describe('Short Chinese display name for this child Agent.'),
+            instruction: z.string().min(1).max(4_000).describe('Self-contained task and expected evidence for this child Agent.'),
+            url: z.string().url().max(4_000).optional().describe('Optional independent page or PRD entry URL.'),
+          })).min(1).max(6),
+        }),
+        execute: (input) => record('spawnSubagents', input, (abortSignal, trace) => referenceOptions.runSubagents!(input.tasks, abortSignal, trace?.id)),
+      }),
+    } : {}),
+    listPageLinks: tool({
+      description: 'List the real HTTP(S) links currently present in the page and its frames. Use this after inspecting a requirement root page so linked PRDs, Axure projects, documents, or independent pages can be delegated with spawnSubagents using exact URLs.',
+      inputSchema: browserToolInput({}),
+      execute: (input) => record('listPageLinks', input, async () => {
+        const links = await session.readPageLinks();
+        return {
+          ok: true,
+          actual: links.length
+            ? JSON.stringify({ count: links.length, links: links.slice(0, 300) })
+            : 'No HTTP(S) links were found in the current page or its frames.',
+        };
+      }),
+    }),
     listTabs: tool({
       description: 'List all currently open browser tabs with their index and URL.',
       inputSchema: browserToolInput({}),
@@ -1923,7 +1992,7 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests({ ids: input.ids })),
     }),
     takeSnapshot: tool({
-      description: 'Capture a paged DOM observation. actionable and text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal: all observed DOM additions, updates, removals, and request summaries since the last browser-changing tool call; it has no actionable UIDs and does not replace the DOM baseline. Use getHttpRequests with its request IDs for details. If nextCursor is returned, call takeSnapshot again with both the same mode and that exact cursor; do not act between pages. Every result states page/current total.',
+      description: 'Capture a paged DOM observation. text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal: all observed DOM additions, updates, removals, and request summaries since the last browser-changing tool call; it has no interactive UIDs and does not replace the DOM baseline. Use getHttpRequests with its request IDs for details. Default to mode=full. If nextCursor is returned, call takeSnapshot again with both the same mode and that exact cursor; do not act between pages. Every result states page/current total.',
       inputSchema: takeSnapshotInput,
       execute: (input) => record('takeSnapshot', input, async () => (
         referenceOptions?.takeSnapshot
@@ -2149,7 +2218,7 @@ function runtimePrompt(input: {
       : screenshotAvailable
         ? '- Browser action reason must cite the current snapshot UID or latest screenshot target used for the action.'
         : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
-    `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"actionable"}).`,
+    `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"full"}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
     '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
@@ -2220,6 +2289,8 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'openPage',
     'waitForPage',
     'waitForHumanVerification',
+    'spawnSubagents',
+    'listPageLinks',
     'listTabs',
     'getHttpRequests',
     'takeSnapshot',
@@ -2233,6 +2304,27 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'reportState',
     ...(modelSupportsScreenshotInput() ? ['selectReferenceScreenshots', 'manageVisualContext'] : []),
   ];
+}
+
+const browserSessionToolNames = new Set([
+  'takeScreenshot',
+  'openPage',
+  'waitForPage',
+  'waitForHumanVerification',
+  'spawnSubagents',
+  'listPageLinks',
+  'listTabs',
+  'getHttpRequests',
+  'takeSnapshot',
+  'searchSnapshot',
+  'mouse',
+  'keyboard',
+  'selectOption',
+  'switchTab',
+]);
+
+function toolRequiresBrowserSession(name: string) {
+  return browserSessionToolNames.has(name);
 }
 
 function isCodexProvider() {
@@ -2510,7 +2602,9 @@ function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''):
 function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal = ''): RuntimeDecision {
   const executed = traces.filter((trace) => trace.name && trace.result);
   const last = executed.at(-1);
-  const failed = executed.find(isEffectiveToolTraceFailure);
+  // Earlier failed attempts are diagnostic history, not the terminal outcome.
+  // A later successful tool or final report means the branch recovered.
+  const failed = last ? isEffectiveToolTraceFailure(last) : false;
   const names = executed.map((trace) => summarizeTraceForMemory(trace)).join('; ');
   const note = extractProgressNote(text);
   const assistantInfo = extractAssistantStepInfoFromToolInputs(executed, goal);
@@ -2628,6 +2722,10 @@ async function executeRuntimeStep(input: {
   resolveCredential?: (credentialRef: string) => string | undefined;
   credentialAllowedOrigins?: string[];
   allowedToolTypes?: string[];
+  runSubagents?: BrowserChatSubagentRunner;
+  ensureBrowserStarted?: () => Promise<void>;
+  isBrowserStarted?: () => boolean;
+  agentLoopTimeoutMs?: number;
 }) {
   const {
     session,
@@ -2658,7 +2756,9 @@ async function executeRuntimeStep(input: {
     details: { browserMode: mode, screenshotInputEnabled, markerEnabled },
   });
   const contextStartedAt = Date.now();
-  const pageContext = await session.getPageContext(runtimePageContextOptions(mode));
+  const pageContext = input.isBrowserStarted?.() === false
+    ? unopenedBrowserPageContext(testCase.targetUrl)
+    : await session.getPageContext(runtimePageContextOptions(mode));
   ensureActive();
   const contextMs = elapsedSince(contextStartedAt);
   const screenshotReadStartedAt = Date.now();
@@ -2749,13 +2849,14 @@ async function executeRuntimeStep(input: {
   let lastAiRequest: AiRequestSnapshot | undefined;
   let lastRetryState: RuntimeRetryState | undefined;
   let consecutiveRequestFailures = 0;
+  const durableTraces: ToolTrace[] = [];
 
   function rememberRetryState(state: RuntimeRetryState) {
     lastRetryState = cloneRuntimeRetryState(state);
   }
 
   async function runAgent(includeImage: boolean, retryState?: RuntimeRetryState) {
-    const traces: ToolTrace[] = [];
+    const traces: ToolTrace[] = [...durableTraces];
     const codexMode = isCodexProvider();
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
     const observationStore: RuntimeObservationStore = input.runtimeObservationStore || new Map();
@@ -2786,8 +2887,8 @@ async function executeRuntimeStep(input: {
       blockers: [],
       pageUnderstanding: '',
       currentState: browserChatMode
-        ? 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable"}) when browser evidence is needed.'
-        : 'No page snapshot is preloaded; call takeSnapshot({mode:"actionable"}) before choosing a UID action.',
+        ? 'No page snapshot is preloaded; call takeSnapshot({mode:"full"}) when browser evidence is needed.'
+        : 'No page snapshot is preloaded; call takeSnapshot({mode:"full"}) before choosing a UID action.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
@@ -2916,7 +3017,7 @@ async function executeRuntimeStep(input: {
 
     async function takeSnapshot(options: RuntimeObservationReadOptions = {}): Promise<BrowserActionResult> {
       ensureActive();
-      const snapshotView = options.mode || 'actionable';
+      const snapshotView = options.mode === 'text' || options.mode === 'changes' ? options.mode : 'full';
 
       const readStartedAt = Date.now();
       const snapshot = await session.readDomObservationSnapshot({
@@ -3097,7 +3198,7 @@ async function executeRuntimeStep(input: {
           { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
           ...(appendedMessages.length
             ? appendedMessages
-            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"actionable"}).' }]),
+            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"full"}).' }]),
         ];
         attachedImagePaths = appendedImagePaths;
         messageImagePaths = [...attachedImagePaths];
@@ -3178,10 +3279,13 @@ async function executeRuntimeStep(input: {
         abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
+        runSubagents: input.runSubagents,
+        ensureBrowserStarted: input.ensureBrowserStarted,
         onDebug,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
         onToolTrace: async (trace) => {
           ensureActive();
+          upsertToolTrace(durableTraces, trace);
           workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
           await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
           ensureActive();
@@ -3221,6 +3325,7 @@ async function executeRuntimeStep(input: {
     const stopWhen = [hasToolCall('reportState'), hasToolCall('waitForHumanVerification')];
     nativeToolsRef.current = makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
       ensureActive();
+      upsertToolTrace(durableTraces, trace);
       workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
       await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
       ensureActive();
@@ -3244,6 +3349,8 @@ async function executeRuntimeStep(input: {
       requestToolConfirmation: input.requestToolConfirmation,
       resolveCredential: input.resolveCredential,
       credentialAllowedOrigins: input.credentialAllowedOrigins,
+      runSubagents: input.runSubagents,
+      ensureBrowserStarted: input.ensureBrowserStarted,
       onDebug,
       observeCurrentScreenshot,
       takeSnapshot,
@@ -3319,7 +3426,7 @@ async function executeRuntimeStep(input: {
         temperature: 0.1,
         maxRetries: 0,
         abortSignal,
-      });
+      }, input.agentLoopTimeoutMs);
       ensureActive();
       latestText = toolConsistentAssistantText(result.text || latestText, traces.at(-1)?.name);
       return {
@@ -3445,6 +3552,9 @@ function browserChatRequirement(input: {
         : '',
     '- Every new user action message is a new occurrence. Even when it repeats the previous wording, a previous tool call never satisfies the new message.',
     '- Use browser tools only for live action or page inspection. If current evidence is enough, answer directly.',
+    '- Requirement-link delegation rule: when the user asks to analyze a requirement together with its PRD, Axure, Wiki, images, or linked documents, you MUST call listPageLinks after the first useful requirement-page snapshot. Delegate every independently readable PRD/document URL to spawnSubagents with its exact URL and a self-contained evidence request; keep the requirement root and dependent end-to-end test flow in the main Agent. For other tasks, delegate only when independent resources or test branches make parallel work useful. This is an in-conversation tool decision, never a pre-classification step or separate goal mode.',
+    '- Parallel-first rule: whenever you discover two or more independent URLs, documents, roles, environments, or test branches that can be investigated without depending on each other, prefer one spawnSubagents call immediately instead of opening and analyzing them serially in the main Agent.',
+    '- Do not skip spawnSubagents merely because each branch looks simple or the main Agent could complete them one by one. Let child Agents gather branch evidence concurrently, then have the main Agent compare, synthesize, and continue dependent work.',
     '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
     '- Final visible answer must be Chinese Markdown. Do not include JSON, tool parameters, candidate ids, coordinates, or screenshot paths.',
   ].filter(Boolean).join('\n');
@@ -3565,6 +3675,10 @@ export async function executeInteractiveBrowserTurn(input: {
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
+  runSubagents?: BrowserChatSubagentRunner;
+  ensureBrowserStarted?: () => Promise<void>;
+  isBrowserStarted?: () => boolean;
+  agentLoopTimeoutMs?: number;
   resolveCredential?: (credentialRef: string) => string | undefined;
   credentialAllowedOrigins?: string[];
   allowedToolTypes?: string[];
@@ -3592,6 +3706,15 @@ export async function executeInteractiveBrowserTurn(input: {
   let consecutiveAiRequestFailures = 0;
 
   async function takeStepScreenshot(phase: 'before' | 'after', stepIndex: number) {
+    if (input.isBrowserStarted?.() === false) {
+      await input.onDebug?.({
+        phase: `browser:screenshot:${phase}:skipped`,
+        stepIndex,
+        message: `Skipped automatic ${phase} screenshot because no browser tool has started this session yet.`,
+        details: { browserMode: runtimeMode, browserStarted: false },
+      });
+      return undefined;
+    }
     if (runtimeMode === 'dom' && !browserChatDomScreenshotsEnabled()) {
       await input.onDebug?.({
         phase: `browser:screenshot:${phase}:skipped`,
@@ -3676,6 +3799,10 @@ export async function executeInteractiveBrowserTurn(input: {
         resolveCredential: input.resolveCredential,
         credentialAllowedOrigins: input.credentialAllowedOrigins,
         allowedToolTypes: input.allowedToolTypes,
+        runSubagents: input.runSubagents,
+        ensureBrowserStarted: input.ensureBrowserStarted,
+        isBrowserStarted: input.isBrowserStarted,
+        agentLoopTimeoutMs: input.agentLoopTimeoutMs,
         onDebug: input.onDebug,
         onToolTrace: async (trace, progress) => {
           ensureActive();
@@ -4127,6 +4254,16 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
     case 'listTabs':
       return session.listTabs();
+    case 'listPageLinks':
+      {
+        const links = await session.readPageLinks();
+        return {
+          ok: true,
+          actual: links.length
+            ? JSON.stringify({ count: links.length, links: links.slice(0, 300) })
+            : 'No HTTP(S) links were found in the current page or its frames.',
+        };
+      }
     case 'getHttpRequests':
       return session.getCurrentTabHttpRequests({ ids: Array.isArray(input.ids) ? input.ids.filter((id): id is string => typeof id === 'string') : undefined });
     case 'downloadFile':
@@ -4172,6 +4309,8 @@ async function executeCodexRuntimeObject(input: {
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
+  runSubagents?: BrowserChatSubagentRunner;
+  ensureBrowserStarted?: () => Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onDebug?: ExecutionDebug;
@@ -4183,7 +4322,7 @@ async function executeCodexRuntimeObject(input: {
   observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => BrowserActionResult | Promise<BrowserActionResult>;
   takeSnapshot?: (input?: RuntimeObservationReadOptions) => BrowserActionResult | Promise<BrowserActionResult>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observeCurrentScreenshot, takeSnapshot } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, ensureBrowserStarted, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observeCurrentScreenshot, takeSnapshot } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -4222,7 +4361,7 @@ async function executeCodexRuntimeObject(input: {
     reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
   };
   const pendingConfirmation = requestToolConfirmation ? toolConfirmationFromInput(type, normalizedParams) : undefined;
-  const runTool = async () => {
+  const runTool = async (toolCallId?: string) => {
     if (type === 'takeScreenshot') {
       return observeCurrentScreenshot
         ? observeCurrentScreenshot({ capture: normalizedParams.capture === 'fullPage' ? 'fullPage' : 'viewport' })
@@ -4232,6 +4371,19 @@ async function executeCodexRuntimeObject(input: {
       return takeSnapshot
         ? takeSnapshot(normalizedParams as RuntimeObservationReadOptions)
         : { ok: false, actual: 'takeSnapshot is unavailable in this runtime.' };
+    }
+    if (type === 'spawnSubagents') {
+      if (!runSubagents) return { ok: false, actual: 'spawnSubagents is unavailable in this runtime.' };
+      const tasks = Array.isArray(normalizedParams.tasks) ? normalizedParams.tasks.flatMap((raw): BrowserChatSubagentTask[] => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+        const item = raw as Record<string, unknown>;
+        const title = typeof item.title === 'string' ? item.title.trim() : '';
+        const instruction = typeof item.instruction === 'string' ? item.instruction.trim() : '';
+        if (!title || !instruction) return [];
+        return [{ title, instruction, url: typeof item.url === 'string' ? item.url : undefined }];
+      }).slice(0, 6) : [];
+      if (!tasks.length) return { ok: false, actual: 'spawnSubagents requires at least one valid task.' };
+      return runSubagents(tasks, abortSignal, toolCallId);
     }
     return runRecordedTool(session, targetUrl, flow, runId);
   };
@@ -4250,7 +4402,7 @@ async function executeCodexRuntimeObject(input: {
     onDebug,
     onToolTrace,
     onVisualContextChange,
-    action: async () => {
+    action: async (_actionSignal, trace) => {
       if (pendingConfirmation && requestToolConfirmation) {
         const decision = await requestToolConfirmation({
           toolName: type,
@@ -4266,13 +4418,15 @@ async function executeCodexRuntimeObject(input: {
             actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
           } satisfies BrowserActionResult;
         }
-        const result = await runTool();
+        if (toolRequiresBrowserSession(type)) await ensureBrowserStarted?.();
+        const result = await runTool(trace?.id);
         return {
           ...result,
           actual: `用户已确认本次工具调用，现已执行。\n${result.actual}`,
         } satisfies BrowserActionResult;
       }
-      return runTool();
+      if (toolRequiresBrowserSession(type)) await ensureBrowserStarted?.();
+      return runTool(trace?.id);
     },
   });
   const fileResult = result.ok ? formatFileArtifactResult(type, result.actual) : undefined;

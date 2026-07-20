@@ -9685,7 +9685,6 @@ body.is-dragging-embedded-tab * {
 
 .browser-chat-executed-entry {
   display: grid;
-  gap: 8px;
 }
 
 .browser-chat-ai-tool-summary-card {
@@ -10028,6 +10027,11 @@ body.is-dragging-embedded-tab * {
   line-height: 1.45;
 }
 
+.browser-chat-verification-resume {
+  justify-self: start;
+  margin-top: 8px;
+}
+
 .browser-chat-tool-summary {
   align-items: center;
   background: transparent;
@@ -10262,10 +10266,9 @@ body.is-dragging-embedded-tab * {
   border-radius: 999px;
   color: var(--accent-strong);
   cursor: pointer;
-  display: inline-grid;
+  display: flex;
   font: inherit;
   gap: 4px;
-  grid-template-columns: 28px minmax(0, 1fr);
   justify-content: start;
   line-height: 1.2;
   margin: 0;
@@ -10285,6 +10288,11 @@ body.is-dragging-embedded-tab * {
   gap: 7px;
   min-width: 0;
   max-width: 100%;
+}
+
+.browser-chat-tool-call.has-subagents {
+  align-self: stretch;
+  width: 100%;
 }
 
 .browser-chat-tool-reason {

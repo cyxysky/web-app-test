@@ -103,6 +103,7 @@ export type BrowserSessionOptions = {
   debugDevtools?: boolean;
   headless?: boolean;
   isolated?: boolean;
+  storageState?: BrowserContextOptions['storageState'];
 };
 
 export type AccessibilitySnapshotExportControlResult = {
@@ -363,6 +364,7 @@ type PageInteractiveCandidate = Omit<InteractiveCandidate, 'framePath' | 'frameU
 type PageDomObservationPayload = {
   structuredText: string;
   interactiveCandidates: PageInteractiveCandidate[];
+  links: Array<{ url: string; title: string }>;
 };
 
 type ScrollableArea = {
@@ -2636,12 +2638,13 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     debugger;
   }
   const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-  if (!runtime) return { structuredText: '', interactiveCandidates: [] };
+  if (!runtime) return { structuredText: '', interactiveCandidates: [], links: [] };
 
   const includeInteractiveCandidates = input.includeInteractiveCandidates !== false;
   const requirePointerEvents = input.requirePointerEvents === true;
   const maxStructuredTextChars = Math.max(0, Math.floor(Number(input.structuredTextMaxChars) || 0));
   const structuredLines: string[] = [];
+  const pageLinks = new Map<string, { url: string; title: string }>();
   let structuredChars = 0;
   const normalizeText = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
   const candidateTextQuery = normalizeText(input.candidateTextQuery).toLowerCase();
@@ -3259,6 +3262,14 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
     visitedElements += 1;
     if (visitedElements > 50000 || depth > 128) return;
     if (window.getComputedStyle(element).display === 'none') return;
+    if (element instanceof HTMLAnchorElement && element.href && /^https?:\/\//i.test(element.href)) {
+      const title = normalizeText(element.textContent)
+        || normalizeText(element.getAttribute('title'))
+        || normalizeText(element.getAttribute('aria-label'))
+        || normalizeText(element.querySelector('img')?.getAttribute('alt'))
+        || element.href;
+      pageLinks.set(element.href.toLowerCase(), { url: element.href, title });
+    }
     const structured = maxStructuredTextChars ? structuredTextLine(element) : undefined;
     const nextTextDepth = structured?.shown ? textDepth + 1 : textDepth;
     if (structured?.text) appendStructuredText(textDepth, structured.text);
@@ -3276,6 +3287,7 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   return {
     structuredText: structuredLines.join('\n'),
     interactiveCandidates: candidates.map((candidate, index) => ({ ...candidate, id: `${index + 1}` })),
+    links: Array.from(pageLinks.values()).slice(0, 300),
   };
 }
 
@@ -3579,6 +3591,7 @@ export class BrowserSession {
   private accessibilitySnapshotExportControlInstalled = false;
   private accessibilitySnapshotExporter?: () => Promise<AccessibilitySnapshotExportControlResult>;
   private visitedOrigins = new Set<string>();
+  private observedPageLinks = new Map<string, { url: string; title: string }>();
   private readonly pageGroupId: string;
   private browserSurface: BrowserSessionSurface = 'external';
 
@@ -3613,6 +3626,10 @@ export class BrowserSession {
     } catch {
       return false;
     }
+  }
+
+  async exportStorageState() {
+    return this.context?.storageState({ indexedDB: true });
   }
 
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
@@ -3704,6 +3721,7 @@ export class BrowserSession {
       viewport: contextViewport,
       ignoreHTTPSErrors,
       ...(contextViewport ? { deviceScaleFactor: 1 } : {}),
+      ...(this.options.storageState ? { storageState: this.options.storageState } : {}),
     };
 
     if (useSharedBrowserTabs) {
@@ -3720,7 +3738,10 @@ export class BrowserSession {
       this.browserOwnership = 'connected';
       this.browser = await chromium.connectOverCDP(cdpEndpoint);
       if (useElectronEmbeddedBrowser) {
-        for (let attempt = 0; attempt < 12; attempt += 1) {
+        // The renderer creates the exact session tab only after it receives the
+        // backend browser:start event. Allow the realtime activation handshake
+        // enough time instead of requiring a tab during conversation selection.
+        for (let attempt = 0; attempt < 50; attempt += 1) {
           for (const context of this.browser.contexts()) {
             await this.prepareContext(context, { claimPages: false });
             const embeddedPages = await this.findElectronEmbeddedBrowserSessionPages(context);
@@ -3732,7 +3753,7 @@ export class BrowserSession {
             await embeddedPage.bringToFront().catch(() => undefined);
             return;
           }
-          if (attempt < 11) await sleep(160);
+          if (attempt < 49) await sleep(200);
         }
         throw new Error('Electron embedded browser tab for this session is not ready.');
       }
@@ -4510,6 +4531,42 @@ export class BrowserSession {
     return (await this.readDomObservation({ includeInteractiveCandidates: false })).structuredText;
   }
 
+  /** Read-only link inventory across the current page and its frames. */
+  async readPageLinks() {
+    const links: Array<{ url: string; title: string }> = Array.from(this.observedPageLinks.values());
+    const seen = new Set(links.map((link) => link.url.toLowerCase()));
+    for (const frame of this.activePage.frames()) {
+      const frameLinks = await frame.evaluate(() => Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))
+        .map((anchor) => {
+          const rawUrl = anchor.href || anchor.getAttribute('href') || '';
+          let url = '';
+          try {
+            url = new URL(rawUrl, document.baseURI).href;
+          } catch {
+            return undefined;
+          }
+          if (!/^https?:\/\//i.test(url)) return undefined;
+          const title = [
+            anchor.textContent,
+            anchor.getAttribute('title'),
+            anchor.getAttribute('aria-label'),
+            anchor.querySelector('img')?.getAttribute('alt'),
+          ].map((value) => value?.replace(/\s+/g, ' ').trim()).find(Boolean) || url;
+          return { url, title };
+        })
+        .filter((item): item is { url: string; title: string } => Boolean(item)))
+        .catch(() => [] as Array<{ url: string; title: string }>);
+      for (const link of frameLinks) {
+        const key = link.url.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        links.push({ url: link.url.slice(0, 4_000), title: link.title.slice(0, 500) });
+        if (links.length >= 300) return links;
+      }
+    }
+    return links;
+  }
+
   private async readDomObservation(options: {
     includeInteractiveCandidates: boolean;
     maxChars?: number;
@@ -4556,9 +4613,12 @@ export class BrowserSession {
             includeInteractiveCandidates: options.includeInteractiveCandidates,
             requirePointerEvents: true,
             structuredTextMaxChars: Math.max(0, maxChars - chars),
-          }).catch(() => ({ structuredText: '', interactiveCandidates: [] as PageInteractiveCandidate[] }));
+          }).catch(() => ({ structuredText: '', interactiveCandidates: [] as PageInteractiveCandidate[], links: [] as Array<{ url: string; title: string }> }));
         },
       );
+      for (const link of observation.links) {
+        this.observedPageLinks.set(link.url.toLowerCase(), link);
+      }
       const label = framePath ? `[iframe ${framePath}${frame.url() ? ` ${frame.url()}` : ''}]` : '';
       append(label, observation.structuredText);
       if (!options.includeInteractiveCandidates || !observation.interactiveCandidates.length) continue;
@@ -5293,8 +5353,8 @@ export class BrowserSession {
     return {
       ok: true,
       actual: note
-        ? '已暂停自动操作：页面需要人工完成验证。请在浏览器中完成验证码、登录/安全验证或其他需要本人确认的步骤；完成后在对话中发送“验证已完成”，我会重新读取当前页面并继续。'
-        : '已暂停自动操作，等待您检查浏览器并完成可能需要的人工验证；完成后请发送“验证已完成”继续。',
+        ? '已暂停自动操作：页面需要人工完成验证。请在浏览器中完成验证码、登录/安全验证或其他需要本人确认的步骤；完成后点击对话中的“校验完成，继续执行”。'
+        : '已暂停自动操作，等待您检查浏览器并完成可能需要的人工验证；完成后点击对话中的“校验完成，继续执行”。',
     };
   }
 

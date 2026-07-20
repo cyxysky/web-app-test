@@ -1,18 +1,26 @@
 ﻿import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { generateText } from 'ai';
-import { BrowserSession, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import { electronEmbeddedBrowserEnabled } from '@/server/browser/browser-session-runtime';
 import {
   executeInteractiveBrowserTurn,
   type BrowserToolConfirmationDecision,
   type BrowserToolConfirmationRequest,
+  type BrowserChatSubagentTask,
   type InteractiveBrowserTurnMessage,
   type InteractiveBrowserTurnResult,
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
+import { settleBrowserChatSubagents } from '@/server/ai/agents/browser-chat-subagents';
 import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
 import { executeTargetWorkflow } from '@/server/ai/agents/target-workflow-executor.service';
+import {
+  mergeTargetResearchBundles,
+  researchTargetRequirement,
+  targetResearchDelegationSeeds,
+  type TargetResearchSeed,
+} from '@/server/ai/agents/target-requirement-researcher.agent';
 import { generateTargetWorkflowPlan, targetWorkflowPlanningReply } from '@/server/ai/agents/target-workflow-planner.agent';
 import {
   extractPersonalMemoryFromTurn,
@@ -81,8 +89,6 @@ export type BrowserChatMessage = {
   status?: 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
 };
 
-export type BrowserChatWorkflowMode = 'chat' | 'target';
-
 export type TargetWorkflowRequirementResponse = {
   requirementId: string;
   value: string;
@@ -140,7 +146,6 @@ export type BrowserChatSessionSnapshot = {
   safetyMode: BrowserChatSafetyMode;
   modelProvider: ModelProvider;
   model: string;
-  workflowMode: BrowserChatWorkflowMode;
   targetRun?: TargetWorkflowRun;
   status: 'idle' | 'running' | 'closed' | 'error';
   busy: boolean;
@@ -165,8 +170,19 @@ type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
   started: boolean;
 };
 
+type BrowserChatBlockedSubagentRuntime = {
+  id: string;
+  sessionId: string;
+  assistantMessageId: string;
+  title: string;
+  task: BrowserChatSubagentTask;
+  browser: BrowserSession;
+  steps: StepExecutionResult[];
+};
+
 type BrowserChatRuntimeState = {
   sessions: Map<string, BrowserChatSessionRecord>;
+  blockedSubagents: Map<string, BrowserChatBlockedSubagentRuntime>;
   interruptedAssistantMessageIds: Set<string>;
   toolConfirmations: Map<string, {
     sessionId: string;
@@ -201,6 +217,7 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
   __browserChatRuntimeState?: BrowserChatRuntimeState;
 }).__browserChatRuntimeState ??= {
   sessions: new Map<string, BrowserChatSessionRecord>(),
+  blockedSubagents: new Map(),
   interruptedAssistantMessageIds: new Set<string>(),
   toolConfirmations: new Map<string, {
     sessionId: string;
@@ -211,11 +228,13 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
   lastPersistWarningAt: 0,
 });
 browserChatRuntimeState.sessions ??= new Map();
+browserChatRuntimeState.blockedSubagents ??= new Map();
 browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
+const blockedSubagents = browserChatRuntimeState.blockedSubagents;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
@@ -389,14 +408,19 @@ function normalizeSafetyMode(value: unknown): BrowserChatSafetyMode {
   return value === 'full' ? 'full' : 'strict';
 }
 
-function normalizeWorkflowMode(value: unknown): BrowserChatWorkflowMode {
-  return value === 'target' ? 'target' : 'chat';
-}
-
 function normalizeTargetRun(value: unknown) {
   const parsed = targetWorkflowRunSchema.safeParse(value);
   return parsed.success ? parsed.data : undefined;
 }
+
+const targetPlanningActiveStatuses: TargetWorkflowRun['status'][] = [
+  'discovering_sources',
+  'researching_sources',
+  'awaiting_research_access',
+  'synthesizing_requirements',
+];
+const targetResearchStepBase = 2_000_000;
+const targetResearchStepLimit = targetResearchStepBase + 100_000;
 
 function recoverOrphanedTargetRun(value: unknown) {
   const run = normalizeTargetRun(value);
@@ -405,7 +429,7 @@ function recoverOrphanedTargetRun(value: unknown) {
   const executionInterrupted = run.status === 'running'
     || run.status === 'summarizing'
     || (run.status === 'ready' && Boolean(run.confirmedAt));
-  const planningInterrupted = run.status === 'analyzing';
+  const planningInterrupted = targetPlanningActiveStatuses.includes(run.status);
   const plan = run.plan ? {
     ...run.plan,
     actors: run.plan.actors.map((actor) => actor.auth.status === 'verifying' ? {
@@ -473,7 +497,7 @@ function recoverOrphanedTargetRun(value: unknown) {
 
 function cancelActiveTargetWorkflowRun(run: TargetWorkflowRun | undefined, reason: string, timestamp = now()) {
   if (!run) return run;
-  if (run.status === 'analyzing') {
+  if (targetPlanningActiveStatuses.includes(run.status)) {
     return {
       ...run,
       status: run.plan ? targetPlanPreparationStatus(run.plan) : 'failed',
@@ -833,6 +857,137 @@ function attachmentAbsolutePath(attachment: BrowserChatAttachment) {
   return resolveArtifactPath(...relativePath.split('/'));
 }
 
+function targetResearchUrls(text: string) {
+  const matches = text.match(/https?:\/\/[^\s<>"'\]\[(){}，。；、]+/gi) || [];
+  return Array.from(new Set(matches.map((value) => value.replace(/[),.;!?]+$/g, '')))).slice(0, 40);
+}
+
+function targetResearchSourceKind(title: string, url?: string): TargetResearchSeed['kind'] {
+  const value = `${title}\n${url || ''}`.toLowerCase();
+  if (value.includes('axure') || value.includes('axshare.com') || /\/start\.html(?:$|[?#])/i.test(value)) return 'axure';
+  if (/\.(?:png|jpe?g|gif|webp|bmp|svg)(?:$|[?#])/i.test(value)) return 'image';
+  return url ? 'url' : 'other';
+}
+
+function targetResearchSeeds(session: BrowserChatSessionRecord, latestModelText = '') {
+  const seeds: TargetResearchSeed[] = [];
+  const add = (seed: TargetResearchSeed) => {
+    const key = `${seed.kind}\u0000${seed.url || seed.title}`.toLowerCase();
+    if (seeds.some((item) => `${item.kind}\u0000${item.url || item.title}`.toLowerCase() === key)) return;
+    seeds.push(seed);
+  };
+  for (const url of targetResearchUrls(latestModelText)) {
+    add({ kind: targetResearchSourceKind(url, url), title: url, url });
+  }
+  if (session.targetUrl) {
+    add({ kind: targetResearchSourceKind(session.targetUrl, session.targetUrl), title: '目标地址', url: session.targetUrl });
+  }
+  for (const message of session.messages) {
+    for (const url of targetResearchUrls(textFromUnknown(message.content))) {
+      add({ kind: targetResearchSourceKind(url, url), title: url, url });
+    }
+    for (const attachment of message.attachments || []) {
+      const url = attachment.kind === 'tab' ? attachment.sourceUrl || attachment.url : attachment.url || undefined;
+      add({
+        kind: attachment.kind === 'tab'
+          ? targetResearchSourceKind(attachment.name, url) === 'axure' ? 'axure' : 'tab'
+          : attachment.kind || targetResearchSourceKind(attachment.name, url),
+        title: attachment.name,
+        url,
+      });
+    }
+  }
+  return seeds.slice(0, 80);
+}
+
+function targetResearchCredentialContext(
+  session: BrowserChatSessionRecord,
+  seeds: TargetResearchSeed[],
+  instruction: string,
+) {
+  const values = new Map<string, string>();
+  const credentials: Array<{
+    origin: string;
+    username: string;
+    usernameRef: string;
+    passwordRef: string;
+  }> = [];
+  const allowedOrigins = new Set<string>();
+  for (const seed of seeds) {
+    if (!seed.url) continue;
+    let url: URL;
+    try {
+      url = new URL(seed.url);
+    } catch {
+      continue;
+    }
+    if (!['http:', 'https:'].includes(url.protocol)) continue;
+    const accounts = listLoginAccounts({ userId: session.userId, domain: url.hostname })
+      .filter((account) => account.status === 'active');
+    const mentioned = accounts.filter((account) => new RegExp(`(^|[^a-z0-9])${account.username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(instruction));
+    const account = mentioned.length === 1 ? mentioned[0] : accounts.length === 1 ? accounts[0] : undefined;
+    if (!account || credentials.some((item) => item.origin === url.origin && item.username === account.username)) continue;
+    const secret = resolveLoginAccountCredentialById(account.id, session.userId);
+    if (!secret) continue;
+    const token = randomUUID();
+    const usernameRef = `research_credential_${token}_username`;
+    const passwordRef = `research_credential_${token}_password`;
+    values.set(usernameRef, account.username);
+    values.set(passwordRef, secret.password);
+    allowedOrigins.add(url.origin);
+    if (account.loginUrl) {
+      try {
+        allowedOrigins.add(new URL(account.loginUrl).origin);
+      } catch {
+        // The saved account remains usable for the exact seed origin.
+      }
+    }
+    credentials.push({ origin: url.origin, username: account.username, usernameRef, passwordRef });
+  }
+  for (const account of listLoginAccounts({ userId: session.userId }).filter((item) => item.status === 'active')) {
+    const usernamePattern = new RegExp(`(^|[^a-z0-9])${account.username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i');
+    const domainPattern = new RegExp(`(^|[^0-9])${account.domain.split('.').at(-1)?.replace(/\D/g, '') || account.domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^0-9]|$)`);
+    if (!usernamePattern.test(instruction) && !instruction.includes(account.domain) && !domainPattern.test(instruction)) continue;
+    let origin = '';
+    try {
+      origin = new URL(account.loginUrl || `https://${account.domain}`).origin;
+    } catch {
+      continue;
+    }
+    if (credentials.some((item) => item.origin === origin && item.username === account.username)) continue;
+    const secret = resolveLoginAccountCredentialById(account.id, session.userId);
+    if (!secret) continue;
+    const token = randomUUID();
+    const usernameRef = `chat_credential_${token}_username`;
+    const passwordRef = `chat_credential_${token}_password`;
+    values.set(usernameRef, account.username);
+    values.set(passwordRef, secret.password);
+    allowedOrigins.add(origin);
+    credentials.push({ origin, username: account.username, usernameRef, passwordRef });
+  }
+  return {
+    credentials,
+    credentialAllowedOrigins: Array.from(allowedOrigins),
+    resolveCredential: (credentialRef: string) => values.get(credentialRef),
+  };
+}
+
+function browserChatCredentialPrompt(credentials: ReturnType<typeof targetResearchCredentialContext>['credentials']) {
+  if (!credentials.length) return '';
+  return [
+    '[后台已匹配的安全账号引用]',
+    ...credentials.map((item) => `- ${item.origin} / ${item.username}：用户名使用 keyboard.credentialRef="${item.usernameRef}"，密码使用 keyboard.credentialRef="${item.passwordRef}"。`),
+    '账号明文密码不会提供给模型。只能在当前页面 origin 与上述 origin 完全一致时使用 credentialRef；不得把凭据写入 text、日志或最终回复。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
+  ].join('\n');
+}
+
+function targetResearchImagePaths(session: BrowserChatSessionRecord) {
+  return Array.from(new Set(session.messages
+    .flatMap((message) => message.attachments || [])
+    .map(attachmentAbsolutePath)
+    .filter((item): item is string => Boolean(item))));
+}
+
 function attachmentKindLabel(attachment: BrowserChatAttachment) {
   if (attachment.kind === 'tab' || attachment.type === 'application/x-webpilot-tab') return '标签页';
   if (attachment.kind === 'image' || attachment.type.startsWith('image/')) return '图片';
@@ -1061,7 +1216,6 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: normalizeModelProvider(session.modelProvider),
     model: browserChatModelSettings(session.modelProvider, session.model).model,
-    workflowMode: normalizeWorkflowMode(session.workflowMode),
     targetRun: normalizeTargetRun(session.targetRun),
     status: session.status,
     busy: session.busy,
@@ -1093,7 +1247,6 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: normalizeModelProvider(session.modelProvider),
     model: browserChatModelSettings(session.modelProvider, session.model).model,
-    workflowMode: normalizeWorkflowMode(session.workflowMode),
     targetRun: normalizeTargetRun(session.targetRun),
     status: session.status,
     busy: session.busy,
@@ -1234,7 +1387,7 @@ function recordFromSnapshot(
   const persistedTargetRun = normalizeTargetRun(session.targetRun);
   const orphanedTargetActivity = options.recoverOrphanedTargetRun && Boolean(
     persistedTargetRun && (
-      ['analyzing', 'running', 'summarizing'].includes(persistedTargetRun.status)
+      [...targetPlanningActiveStatuses, 'running', 'summarizing'].includes(persistedTargetRun.status)
       || (persistedTargetRun.status === 'ready' && persistedTargetRun.confirmedAt)
     ),
   );
@@ -1282,7 +1435,6 @@ function recordFromSnapshot(
     tabs: session.tabs || [],
     targetUrl: exportableTargetUrl(session.targetUrl),
     safetyMode: normalizeSafetyMode(session.safetyMode),
-    workflowMode: normalizeWorkflowMode(session.workflowMode),
     targetRun: options.recoverOrphanedTargetRun
       ? recoverOrphanedTargetRun(persistedTargetRun)
       : persistedTargetRun,
@@ -1804,12 +1956,18 @@ async function ensureStarted(session: BrowserChatSessionRecord) {
   }
 }
 
-async function ensureStartedNow(session: BrowserChatSessionRecord) {
-  if (session.started && session.browser) {
-    if (session.browser.isUsable()) {
-      appendLog(session, 'browser:reuse', '复用当前会话已有浏览器标签');
-      return session.browser;
-    }
+function createBrowserChatBrowser(session: BrowserChatSessionRecord) {
+  return new BrowserSession(session.mode, {
+    browserSurface: 'electron-embedded',
+    browserProfileKey: browserChatBrowserProfileKey(session),
+    isMarked: true,
+    preferExistingPage: false,
+    runId: session.id,
+  });
+}
+
+async function browserForTurnDecision(session: BrowserChatSessionRecord) {
+  if (session.browser && session.started && !session.browser.isUsable()) {
     appendLog(session, 'browser:stale', '历史对话的浏览器已关闭或页面已失效，正在重新接管本会话。');
     await session.browser.close({ keepOpen: true }).catch(() => undefined);
     session.browser = undefined;
@@ -1817,18 +1975,21 @@ async function ensureStartedNow(session: BrowserChatSessionRecord) {
     session.updatedAt = now();
     persistAndNotify(session.id);
   }
+  if (!session.browser) session.browser = createBrowserChatBrowser(session);
+  return session.browser;
+}
+
+async function ensureStartedNow(session: BrowserChatSessionRecord) {
+  const browser = await browserForTurnDecision(session);
+  if (session.started && browser.isUsable()) {
+    appendLog(session, 'browser:reuse', '复用当前会话已有浏览器标签');
+    return browser;
+  }
   store.applyRuntimeEnv();
   const startedAt = Date.now();
   appendLog(session, 'browser:start', '正在启动或连接浏览器');
   const hasPriorConversation = session.steps.length > 0
     || session.messages.some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
-  const browser = new BrowserSession(session.mode, {
-    browserSurface: 'electron-embedded',
-    browserProfileKey: browserChatBrowserProfileKey(session),
-    isMarked: true,
-    preferExistingPage: false,
-    runId: session.id,
-  });
   session.browser = browser;
   session.status = 'running';
   session.updatedAt = now();
@@ -1871,24 +2032,9 @@ async function ensureStartedNow(session: BrowserChatSessionRecord) {
   return browser;
 }
 
-function warmBrowserChatSession(session: BrowserChatSessionRecord) {
-  if (session.status === 'closed' || (session.started && session.browser?.isUsable())) return;
-  void ensureStarted(session).catch((error) => {
-    if (session.status === 'closed' || session.busy) return;
-    session.status = 'idle';
-    session.error = undefined;
-    session.updatedAt = now();
-    appendLog(session, 'browser:warm:error', '常驻测试浏览器预热失败；发送消息时将自动重试。', {
-      details: errorLogDetails(error),
-    });
-    persistAndNotify(session.id);
-  });
-}
-
 export function createBrowserChatSession(input: {
   targetUrl?: string;
   mode?: BrowserSessionMode;
-  workflowMode?: BrowserChatWorkflowMode;
   safetyMode?: BrowserChatSafetyMode;
   modelProvider?: unknown;
   model?: unknown;
@@ -1908,7 +2054,6 @@ export function createBrowserChatSession(input: {
     safetyMode: normalizeSafetyMode(input.safetyMode),
     modelProvider: modelSettings.provider,
     model: modelSettings.model,
-    workflowMode: normalizeWorkflowMode(input.workflowMode),
     status: 'idle',
     busy: false,
     tabs: [],
@@ -1924,14 +2069,12 @@ export function createBrowserChatSession(input: {
   session.browserGroupId = `session:${session.id}`;
   sessions.set(session.id, session);
   persistAndNotify(session.id);
-  if (session.workflowMode === 'chat') warmBrowserChatSession(session);
   return snapshot(session);
 }
 
 export function getBrowserChatSession(sessionId: string, userId?: string | number) {
   const session = hydrateSession(sessionId);
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
-  if (session?.workflowMode === 'chat') warmBrowserChatSession(session);
   return session ? snapshot(session) : undefined;
 }
 
@@ -2126,7 +2269,7 @@ function mergeTargetSteps(session: BrowserChatSessionRecord, steps: StepExecutio
   if (session.activeAssistantMessageId
     && steps.length
     && session.targetRun
-    && ['running', 'summarizing'].includes(session.targetRun.status)) {
+    && ['discovering_sources', 'researching_sources', 'synthesizing_requirements', 'running', 'summarizing'].includes(session.targetRun.status)) {
     const stepIndexes = steps.map((step) => step.index);
     updateAssistantMessage(session, session.activeAssistantMessageId, (message) => ({
       ...message,
@@ -2563,6 +2706,7 @@ function replaceTargetRunPlan(
     id: previousRun?.id || id('target'),
     ownerMessageId: assistantMessageId,
     status: targetPlanPreparationStatus(plan),
+    research: previousRun?.research,
     plan,
     results: pendingTargetResults(plan),
     createdAt: previousRun?.createdAt || timestamp,
@@ -2580,6 +2724,15 @@ async function runTargetWorkflowContinuation(
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
   try {
     appendLog(session, 'target:continue:plan:start', 'AI 正在重新核对执行资料；此阶段不会操作业务页面', {
+      messageId: assistantMessageId,
+    });
+    await researchSessionTargetRequirement({
+      session,
+      assistantMessageId,
+      abortController,
+    });
+    if (!ownsTurn()) return;
+    appendLog(session, 'target:continue:plan:start', 'AI 正在根据最新调研证据重新核对执行资料', {
       messageId: assistantMessageId,
     });
     let plan = await generateSessionTargetPlan({
@@ -2741,8 +2894,7 @@ export function continueTargetWorkflow(
 ) {
   const session = hydrateSession(sessionId);
   if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
-  if (session.workflowMode !== 'target') throw new Error('当前对话不是目标模式');
-  if (session.busy || ['analyzing', 'ready', 'running', 'summarizing'].includes(session.targetRun?.status || '')) {
+  if (session.busy || [...targetPlanningActiveStatuses, 'ready', 'running', 'summarizing'].includes(session.targetRun?.status || '')) {
     throw new Error('目标资料正在复核或目标测试已经在执行');
   }
   const currentPlan = session.targetRun?.plan;
@@ -2806,7 +2958,7 @@ export function continueTargetWorkflow(
   session.targetRun = {
     ...session.targetRun!,
     ownerMessageId: assistantMessage.id,
-    status: 'analyzing',
+    status: 'discovering_sources',
     plan,
     results: {},
     summary: undefined,
@@ -2911,6 +3063,15 @@ export function listBrowserChatSessions(input: { userId?: string | number } = {}
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
+async function closeBlockedBrowserChatSubagents(sessionId: string, assistantMessageId?: string) {
+  const matches = [...blockedSubagents.entries()].filter(([, binding]) => (
+    binding.sessionId === sessionId
+    && (!assistantMessageId || binding.assistantMessageId === assistantMessageId)
+  ));
+  for (const [id] of matches) blockedSubagents.delete(id);
+  await Promise.all(matches.map(([, binding]) => binding.browser.close().catch(() => undefined)));
+}
+
 async function closeTargetWorkflowBrowsers(sessionId: string, targetRun?: TargetWorkflowRun) {
   const prefix = `${sessionId}:`;
   const closedBrowserSessionIds = new Set<string>();
@@ -2968,6 +3129,7 @@ export async function closeBrowserChatSession(sessionId: string, userId?: string
   }
   cancelPendingToolConfirmation(session);
   await session.browser?.close({ keepOpen: true }).catch(() => undefined);
+  await closeBlockedBrowserChatSubagents(sessionId);
   await closeTargetWorkflowBrowsers(sessionId, session.targetRun);
   session.browser = undefined;
   session.started = false;
@@ -3057,6 +3219,7 @@ async function deleteBrowserChatSessionFromMemory(sessionId: string) {
   }
   cancelPendingToolConfirmation(session);
   await session.browser?.close({ keepOpen: true }).catch(() => undefined);
+  await closeBlockedBrowserChatSubagents(sessionId);
   await closeTargetWorkflowBrowsers(sessionId, session.targetRun);
   session.browser = undefined;
   session.started = false;
@@ -3489,32 +3652,109 @@ export async function sendBrowserChatMessage(
   session.status = 'running';
   session.error = undefined;
   session.updatedAt = timestamp;
-  if (session.workflowMode === 'target') {
-    session.targetRun = session.targetRun || {
-      id: id('target'),
-      ownerMessageId: assistantMessage.id,
-      status: 'analyzing',
-      results: {},
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-    session.targetRun.ownerMessageId = assistantMessage.id;
-    session.targetRun.status = 'analyzing';
-    session.targetRun.error = undefined;
-    session.targetRun.updatedAt = timestamp;
-  }
+  assistantMessage.activity = {
+    phase: 'chat:queued',
+    label: '已收到消息，准备执行对话与浏览器操作',
+    updatedAt: timestamp,
+  };
   persistAndNotify(session.id);
-  appendLog(
+  appendLog(session, 'chat:queued', '已收到消息，统一对话 Agent 正在处理', { messageId: assistantMessage.id });
+  void runBrowserChatMessage(
     session,
-    session.workflowMode === 'target' ? 'target:plan:queued' : 'chat:queued',
-    session.workflowMode === 'target' ? '已收到目标需求，准备分析流程、账号和前置条件' : '已收到消息，准备执行浏览器操作',
-    { messageId: assistantMessage.id },
+    messageText,
+    modelMessageText,
+    userMessage.id,
+    assistantMessage.id,
+    fromStepIndex,
+    abortController,
+    attachments,
+    selectedSkills,
   );
+  return snapshot(session);
+}
 
-  if (session.workflowMode === 'target') {
-    void runTargetPlanningMessage(session, modelMessageText, userMessage.id, assistantMessage.id, abortController);
+function latestManualVerificationAssistant(session: BrowserChatSessionRecord) {
+  for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+    const message = session.messages[index];
+    if (message.role !== 'assistant' || message.status !== 'blocked') continue;
+    const stepIndexes = new Set(message.stepIndexes || []);
+    const waiting = session.steps.some((step) => stepIndexes.has(step.index) && (step.tools || []).some((tool) => tool.name === 'waitForHumanVerification'));
+    if (waiting) return { message, messageIndex: index };
+  }
+  for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+    const message = session.messages[index];
+    if (message.role !== 'assistant') continue;
+    const subagent = [...blockedSubagents.values()].find((item) => (
+      item.sessionId === session.id && item.assistantMessageId === message.id
+    ));
+    if (subagent) return { message, messageIndex: index, subagent };
+  }
+  return undefined;
+}
+
+export function resumeBrowserChatHumanVerification(sessionId: string, userId?: string | number) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
+  if (session.status === 'closed') throw new Error('Browser chat session is closed');
+  if (session.busy) throw new Error('Browser chat session is already running');
+  const paused = latestManualVerificationAssistant(session);
+  if (!paused) throw new Error('当前对话没有等待人工校验的 AI 回合');
+  let userMessage: BrowserChatMessage | undefined;
+  for (let index = paused.messageIndex - 1; index >= 0; index -= 1) {
+    if (session.messages[index].role === 'user') {
+      userMessage = session.messages[index];
+      break;
+    }
+  }
+  if (!userMessage) throw new Error('无法找到当前 AI 回合对应的用户请求');
+
+  const timestamp = now();
+  const abortController = new AbortController();
+  interruptedAssistantMessageIds.delete(paused.message.id);
+  session.activeAssistantMessageId = paused.message.id;
+  session.activeAbortController = abortController;
+  session.busy = true;
+  session.status = 'running';
+  session.error = undefined;
+  updateAssistantMessage(session, paused.message.id, (message) => ({
+    ...message,
+    content: '',
+    status: 'running',
+    activity: { phase: 'chat:verification:resume', label: '校验已完成，正在从当前页面继续执行', updatedAt: timestamp },
+    updatedAt: timestamp,
+  }));
+  appendLog(session, 'chat:verification:resume', '用户点击“校验完成”，继续当前 AI 执行回合', {
+    messageId: paused.message.id,
+  });
+  session.updatedAt = timestamp;
+  persistAndNotify(session.id);
+
+  const instruction = [
+    userMessage.content,
+    '[系统续跑] 用户已在可见浏览器中完成人工校验。立即读取当前页面的最新状态，从暂停点继续原任务；不要要求用户再发送文字。',
+  ].join('\n\n');
+  const fromStepIndex = Math.max(0, ...session.steps.map((step) => step.index)) + 1;
+  if (paused.subagent) {
+    void resumeBlockedBrowserChatSubagent({
+      session,
+      binding: paused.subagent,
+      userMessage,
+      assistantMessageId: paused.message.id,
+      fromStepIndex,
+      abortController,
+    });
   } else {
-    void runBrowserChatMessage(session, messageText, modelMessageText, userMessage.id, assistantMessage.id, fromStepIndex, abortController, attachments, selectedSkills);
+    void runBrowserChatMessage(
+      session,
+      instruction,
+      instruction,
+      userMessage.id,
+      paused.message.id,
+      fromStepIndex,
+      abortController,
+      [],
+      [],
+    );
   }
   return snapshot(session);
 }
@@ -3794,6 +4034,7 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
   if (abortController && !abortController.signal.aborted) {
     abortController.abort(new Error('Browser chat operation interrupted by user.'));
   }
+  void closeBlockedBrowserChatSubagents(session.id, assistantMessageId);
   session.targetRun = cancelActiveTargetWorkflowRun(session.targetRun, '用户主动中断了目标测试。', timestamp);
   cancelPendingToolConfirmation(session);
   discardInterruptedTurn(session, assistantMessageId);
@@ -3825,6 +4066,231 @@ function targetPlanningMessages(
     }));
 }
 
+async function researchSessionTargetRequirement(input: {
+  session: BrowserChatSessionRecord;
+  assistantMessageId: string;
+  abortController: AbortController;
+  latestModelText?: string;
+}) {
+  const { session, assistantMessageId, abortController } = input;
+  const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
+  if (!session.targetRun) throw new Error('目标调研运行不存在');
+  session.targetRun.status = 'discovering_sources';
+  session.targetRun.updatedAt = now();
+  updateAssistantMessage(session, assistantMessageId, (message) => ({
+    ...message,
+    status: 'running',
+    activity: { phase: 'target:research:discover', label: '正在发现需求地址、Axure 与关联资料', updatedAt: now() },
+  }));
+  appendLog(session, 'target:research:discover', '正在从对话、标签页和附件中发现需求资料入口', {
+    messageId: assistantMessageId,
+  });
+  persistAndNotify(session.id);
+
+  const browser = await ensureStarted(session);
+  if (!ownsTurn()) throw abortController.signal.reason || new Error('目标调研已中断');
+  const seeds = targetResearchSeeds(session, input.latestModelText);
+  session.targetRun.status = 'researching_sources';
+  session.targetRun.updatedAt = now();
+  updateAssistantMessage(session, assistantMessageId, (message) => ({
+    ...message,
+    activity: { phase: 'target:research', label: '正在读取需求页面、Axure、图片和关联文档', updatedAt: now() },
+  }));
+  appendLog(session, 'target:research:start', `需求调研 Agent 已启动，发现 ${seeds.length} 个资料入口；使用完整浏览器工具集`, {
+    details: { seeds },
+    messageId: assistantMessageId,
+  });
+  persistAndNotify(session.id);
+
+  const latestResearchStepIndex = Math.max(
+    targetResearchStepBase,
+    ...session.steps
+      .filter((step) => step.index > targetResearchStepBase && step.index < targetResearchStepLimit)
+      .map((step) => step.index),
+  );
+  if (latestResearchStepIndex >= targetResearchStepLimit - 1) throw new Error('当前目标会话的需求调研步骤已达到上限，请新建目标会话后继续');
+
+  const result = await researchTargetRequirement({
+    session: browser,
+    runId: session.targetRun.id,
+    initialStepIndex: latestResearchStepIndex,
+    targetUrl: seeds.find((seed) => seed.url)?.url || session.targetUrl || browser.currentUrl() || 'about:blank',
+    instruction: input.latestModelText || targetPlanningMessages(session, assistantMessageId).filter((message) => message.role === 'user').at(-1)?.content || '请调研当前需求资料。',
+    conversation: targetPlanningMessages(session, assistantMessageId),
+    seeds,
+    previous: session.targetRun.research,
+    mode: session.mode,
+    safetyMode: session.safetyMode,
+    referenceImagePaths: targetResearchImagePaths(session),
+    ...targetResearchCredentialContext(session, seeds, input.latestModelText || ''),
+    delegateDiscoveredSources: true,
+    abortSignal: abortController.signal,
+    shouldContinue: ownsTurn,
+    requestToolConfirmation: session.safetyMode === 'strict'
+      ? (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal)
+      : undefined,
+    onProgress: (step) => {
+      if (!ownsTurn()) return;
+      mergeTargetSteps(session, [step]);
+      updateAssistantMessage(session, assistantMessageId, (message) => ({
+        ...message,
+        status: 'running',
+        activity: { phase: 'target:research', label: step.action || '正在深入读取需求资料', updatedAt: now() },
+      }));
+    },
+    onDebug: (event) => {
+      if (!ownsTurn()) return;
+      appendLog(session, event.phase, event.message, {
+        stepIndex: event.stepIndex,
+        elapsedMs: elapsedFromDetails(event.details),
+        details: event.details,
+        messageId: assistantMessageId,
+        deferPersist: true,
+      });
+    },
+  });
+  if (!ownsTurn()) throw abortController.signal.reason || new Error('目标调研已中断');
+  mergeTargetSteps(session, result.execution.newSteps);
+  session.consoleErrors = mergeStringLists(session.consoleErrors, result.execution.consoleErrors);
+  session.networkErrors = mergeStringLists(session.networkErrors, result.execution.networkErrors);
+  let research = result.bundle;
+  for (let wave = 0; wave < 3; wave += 1) {
+    const delegatedSeeds = targetResearchDelegationSeeds(research, targetResearchSubagentConcurrency());
+    if (!delegatedSeeds.length) break;
+    const children = await runDelegatedTargetResearch({
+        session,
+        assistantMessageId,
+        abortController,
+        instruction: input.latestModelText || '请调研当前需求资料。',
+        conversation: targetPlanningMessages(session, assistantMessageId),
+        seeds: delegatedSeeds,
+        initialStepIndex: latestResearchStepIndex + (wave * 30_000),
+        wave: wave + 1,
+      });
+    research = mergeTargetResearchBundles(research, children);
+  }
+  if (!ownsTurn()) throw abortController.signal.reason || new Error('目标调研已中断');
+  session.targetRun.research = research;
+  session.targetRun.status = research.status === 'blocked' ? 'awaiting_research_access' : 'synthesizing_requirements';
+  session.targetRun.updatedAt = now();
+  appendLog(
+    session,
+    research.status === 'blocked' ? 'target:research:blocked' : 'target:research:done',
+    research.status === 'blocked'
+      ? `需求调研存在访问阻塞，已记录 ${research.unresolved.length} 个未解决问题`
+      : `需求调研完成：读取 ${research.sources.filter((source) => source.status === 'inspected').length} 个来源，提取 ${research.facts.length} 条事实`,
+    { details: { research }, messageId: assistantMessageId },
+  );
+  updateAssistantMessage(session, assistantMessageId, (message) => ({
+    ...message,
+    activity: { phase: 'target:synthesize', label: '正在基于调研证据综合需求并生成计划', updatedAt: now() },
+  }));
+  persistAndNotify(session.id);
+  return research;
+}
+
+function targetResearchSubagentConcurrency() {
+  const configured = Number(process.env.AI_TARGET_RESEARCH_MAX_SUBAGENTS || 3);
+  return Math.min(Math.max(Number.isFinite(configured) ? Math.floor(configured) : 3, 1), 6);
+}
+
+async function runDelegatedTargetResearch(input: {
+  session: BrowserChatSessionRecord;
+  assistantMessageId: string;
+  abortController: AbortController;
+  instruction: string;
+  conversation: InteractiveBrowserTurnMessage[];
+  seeds: TargetResearchSeed[];
+  initialStepIndex: number;
+  wave: number;
+}) {
+  const { session, assistantMessageId, abortController } = input;
+  const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
+  appendLog(session, 'target:research:delegate', `第 ${input.wave} 批正在并行委派 ${input.seeds.length} 个只读需求调研子 Agent；单个分支失败不会中止其他分支`, {
+    details: { seeds: input.seeds, wave: input.wave },
+    messageId: assistantMessageId,
+  });
+  updateAssistantMessage(session, assistantMessageId, (message) => ({
+    ...message,
+    activity: { phase: 'target:research:delegate', label: `第 ${input.wave} 批正在并行读取 ${input.seeds.length} 个关联资料`, updatedAt: now() },
+  }));
+  persistAndNotify(session.id);
+
+  const settled = await Promise.allSettled(input.seeds.map(async (seed, index) => {
+    if (!ownsTurn()) throw abortController.signal.reason || new Error('目标调研已中断');
+    const child = new BrowserSession(session.mode, {
+      browserSurface: 'electron-embedded',
+      browserProfileKey: `${browserChatBrowserProfileKey(session)}_research_${input.wave}_${index + 1}`,
+      isMarked: true,
+      preferExistingPage: false,
+      runId: `${session.targetRun?.id || session.id}_research_wave_${input.wave}_child_${index + 1}`,
+    });
+    const childStepBase = input.initialStepIndex + ((index + 1) * 10_000);
+    try {
+      await child.start();
+      if (seed.url) await child.open(seed.url);
+      const result = await researchTargetRequirement({
+        session: child,
+        runId: `${session.targetRun?.id || session.id}_wave_${input.wave}_child_${index + 1}`,
+        initialStepIndex: childStepBase,
+        targetUrl: seed.url || child.currentUrl() || 'about:blank',
+        instruction: `这是并行调研分支 ${index + 1}。只深入读取这个来源并提取可追溯证据：${input.instruction}`,
+        conversation: input.conversation,
+        seeds: [seed],
+        mode: session.mode,
+        safetyMode: 'strict',
+        referenceImagePaths: targetResearchImagePaths(session),
+        ...targetResearchCredentialContext(session, [seed], input.instruction),
+        delegateDiscoveredSources: false,
+        abortSignal: abortController.signal,
+        shouldContinue: ownsTurn,
+        requestToolConfirmation: (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal),
+        onProgress: (step) => {
+          if (!ownsTurn()) return;
+          mergeTargetSteps(session, [step]);
+          updateAssistantMessage(session, assistantMessageId, (message) => ({
+            ...message,
+            status: 'running',
+            activity: { phase: 'target:research:child', label: `子 Agent ${index + 1}：${step.action || seed.title}`, updatedAt: now() },
+          }));
+        },
+        onDebug: (event) => {
+          if (!ownsTurn()) return;
+          appendLog(session, `target:research:child:${index + 1}:${event.phase}`, event.message, {
+            stepIndex: event.stepIndex,
+            elapsedMs: elapsedFromDetails(event.details),
+            details: event.details,
+            messageId: assistantMessageId,
+            deferPersist: true,
+          });
+        },
+      });
+      if (!ownsTurn()) throw abortController.signal.reason || new Error('目标调研已中断');
+      mergeTargetSteps(session, result.execution.newSteps);
+      session.consoleErrors = mergeStringLists(session.consoleErrors, result.execution.consoleErrors);
+      session.networkErrors = mergeStringLists(session.networkErrors, result.execution.networkErrors);
+      appendLog(session, 'target:research:child:done', `调研子 Agent ${index + 1} 已完成：${seed.title}`, {
+        details: { seed, status: result.bundle.status },
+        messageId: assistantMessageId,
+      });
+      return { bundle: result.bundle };
+    } finally {
+      await child.close().catch(() => undefined);
+    }
+  }));
+
+  if (!ownsTurn()) throw abortController.signal.reason || new Error('目标调研已中断');
+  return settled.map((result, index) => {
+    if (result.status === 'fulfilled') return result.value;
+    const error = userFacingErrorMessage(result.reason);
+    appendLog(session, 'target:research:child:failed', `调研子 Agent ${index + 1} 失败，其他分支继续：${error}`, {
+      details: errorLogDetails(result.reason),
+      messageId: assistantMessageId,
+    });
+    return { error };
+  });
+}
+
 async function generateSessionTargetPlan(input: {
   session: BrowserChatSessionRecord;
   assistantMessageId: string;
@@ -3847,6 +4313,7 @@ async function generateSessionTargetPlan(input: {
     availableAccounts,
     messages: targetPlanningMessages(session, assistantMessageId, input.latest),
     currentPlan: session.targetRun?.plan,
+    research: session.targetRun?.research,
     targetUrl: session.targetUrl,
     onValidation: ({ attempt, errors }) => {
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
@@ -3867,85 +4334,409 @@ async function generateSessionTargetPlan(input: {
   return mergeLatestTargetActorAuth(generatedPlan, session.targetRun?.plan);
 }
 
-async function runTargetPlanningMessage(
-  session: BrowserChatSessionRecord,
-  latestModelText: string,
-  userMessageId: string,
-  assistantMessageId: string,
-  abortController: AbortController,
-) {
-  const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
-  return withModelSettings(modelSettings, async () => {
+function browserChatSubagentLoopTimeoutMs() {
+  const raw = Number(process.env.AI_SUBAGENT_LOOP_TIMEOUT_MS || 10 * 60 * 1000);
+  return Number.isFinite(raw) && raw >= 30_000 ? Math.floor(raw) : 10 * 60 * 1000;
+}
+
+async function runBrowserChatSubagents(input: {
+  session: BrowserChatSessionRecord;
+  assistantMessageId: string;
+  abortController: AbortController;
+  tasks: BrowserChatSubagentTask[];
+  toolCallId?: string;
+}): Promise<BrowserActionResult> {
+  const { session, assistantMessageId, abortController } = input;
+  const batchId = input.toolCallId || id('subagent_batch');
+  const requestedTasks = input.tasks.slice(0, 6);
+  const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
+  const taskKey = (task: Pick<BrowserChatSubagentTask, 'title' | 'instruction' | 'url'>) => (
+    task.url?.trim().toLowerCase()
+    || `${task.title}\n${task.instruction}`.replace(/\s+/g, ' ').trim().toLowerCase()
+  );
+  const existingTaskKeys = new Set(session.logs.flatMap((log) => {
+    if (log.messageId !== assistantMessageId || !/^subagent:[^:]+:start$/.test(log.phase)) return [];
+    const details = parseLogDetails(log.details);
+    if (!details || typeof details !== 'object' || Array.isArray(details)) return [];
+    const record = details as Record<string, unknown>;
+    return [taskKey({
+      title: textFromUnknown(record.title),
+      instruction: textFromUnknown(record.instruction),
+      url: textFromUnknown(record.url) || undefined,
+    })];
+  }).filter(Boolean));
+  const tasks = requestedTasks.flatMap((task) => {
+    const key = taskKey(task);
+    if (!key || existingTaskKeys.has(key)) return [];
+    existingTaskKeys.add(key);
+    return [{ ...task, id: id('subagent') }];
+  });
+  if (!tasks.length) {
+    return {
+      ok: true,
+      actual: JSON.stringify({
+        batchId,
+        requestedTasks,
+        tasks: [],
+        results: [],
+        summary: '这些资源已在当前回合委托过；请复用已有子 Agent 结果，不要重复创建任务。',
+      }),
+    };
+  }
+  appendLog(session, 'subagents:start', `正在并行执行 ${tasks.length} 个子 Agent；单个分支失败不会中止其他分支`, {
+    details: fullLogDetails({ batchId, requestedTasks, tasks }),
+    messageId: assistantMessageId,
+  });
+  persistAndNotify(session.id);
+  let confirmationQueue = Promise.resolve();
+  const requestSerialConfirmation = async (request: BrowserToolConfirmationRequest) => {
+    const previous = confirmationQueue;
+    let release!: () => void;
+    confirmationQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
     try {
-      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      appendLog(session, 'target:plan:start', 'AI 正在完整分析需求、参与者、权限和目标关系', {
-        messageId: assistantMessageId,
-      });
-      const plan = await generateSessionTargetPlan({
+      return await requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal);
+    } finally {
+      release();
+    }
+  };
+
+  const inheritedStorageState = session.browser?.isUsable()
+    ? await session.browser.exportStorageState().catch(() => undefined)
+    : undefined;
+
+  const settled = await settleBrowserChatSubagents(tasks, async (task, index) => {
+    if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
+    appendLog(session, `subagent:${task.id}:start`, `子 Agent ${index + 1} 已启动：${task.title}`, {
+      details: { batchId, id: task.id, index, title: task.title, instruction: task.instruction, url: task.url, status: 'running' },
+      messageId: assistantMessageId,
+    });
+    persistAndNotify(session.id);
+    const child = new BrowserSession(session.mode, {
+      browserSurface: 'external',
+      headless: true,
+      isolated: true,
+      storageState: inheritedStorageState,
+      isMarked: true,
+      preferExistingPage: false,
+      runId: `${session.id}_${task.id}`,
+    });
+    const childSteps = new Map<number, StepExecutionResult>();
+    let latestChildText = '';
+    try {
+      await child.start();
+      if (task.url) await child.open(task.url);
+      const credentialContext = targetResearchCredentialContext(
         session,
-        assistantMessageId,
-        abortController,
-        phase: 'message',
-        latest: { userMessageId, modelText: latestModelText },
+        task.url ? [{ kind: 'url', title: task.title, url: task.url }] : [],
+        task.instruction,
+      );
+      const result = await executeInteractiveBrowserTurn({
+        session: child,
+        runId: `${session.id}_${task.id}`,
+        targetUrl: task.url || child.currentUrl() || session.targetUrl || 'about:blank',
+        instruction: task.instruction,
+        modelInstruction: [
+          `你是并行子 Agent“${task.title}”。只完成这个独立分支，并返回可追溯事实、来源地址、页面证据、失败原因和未解决问题。`,
+          '你拥有完整浏览器工具集。不要等待其他子 Agent，也不要因为其他分支失败而停止。',
+          inheritedStorageState
+            ? '无头浏览器已经复制主会话当前的 Cookie、localStorage 和 IndexedDB 登录态。请先直接访问目标地址验证登录态，不要重新登录。'
+            : '主会话当前没有可复制的浏览器登录态；如果目标页面要求登录，请明确返回登录阻塞，不要猜测页面内容。',
+          '你运行在无头浏览器中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要等待用户操作隐藏页面；请明确报告阻塞证据并把该步骤交回主 Agent。',
+          task.instruction,
+          browserChatCredentialPrompt(credentialContext.credentials),
+        ].join('\n\n'),
+        conversation: [],
+        completedSteps: [],
+        mode: session.mode,
+        safetyMode: session.safetyMode,
+        resolveCredential: credentialContext.resolveCredential,
+        credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
+        abortSignal: abortController.signal,
+        agentLoopTimeoutMs: browserChatSubagentLoopTimeoutMs(),
+        shouldContinue: ownsTurn,
+        requestToolConfirmation: session.safetyMode === 'strict'
+          ? requestSerialConfirmation
+          : undefined,
+        onProgress: (step) => {
+          if (!ownsTurn()) return;
+          childSteps.set(step.index, step);
+          appendLog(session, `subagent:${task.id}:progress`, `${task.title}：${step.action || '正在执行'}`, {
+            details: { batchId, id: task.id, index, title: task.title, status: step.status, step },
+            messageId: assistantMessageId,
+            deferPersist: true,
+          });
+        },
+        onDebug: (event) => {
+          if (!ownsTurn()) return;
+          const eventDetails = unwrapLogDetails(event.details).value;
+          if (event.phase === 'ai:runtime:response' || event.phase === 'ai:runtime:object') {
+            const eventRecord = eventDetails && typeof eventDetails === 'object' && !Array.isArray(eventDetails)
+              ? eventDetails as Record<string, unknown>
+              : undefined;
+            const aiOutput = eventRecord?.aiOutput && typeof eventRecord.aiOutput === 'object' && !Array.isArray(eventRecord.aiOutput)
+              ? eventRecord.aiOutput as Record<string, unknown>
+              : undefined;
+            const responseText = textFromUnknown(aiOutput?.response ?? aiOutput?.text).trim();
+            if (responseText) latestChildText = responseText;
+          }
+          appendLog(session, `subagent:${task.id}:${event.phase}`, event.message, {
+            stepIndex: event.stepIndex,
+            elapsedMs: elapsedFromDetails(eventDetails),
+            details: event.phase === 'ai:runtime:response' || event.phase === 'ai:runtime:object'
+              ? fullLogDetails({ batchId, id: task.id, index, title: task.title, event: eventDetails })
+              : { batchId, id: task.id, index, title: task.title, event: eventDetails },
+            messageId: assistantMessageId,
+            deferPersist: true,
+          });
+        },
       });
-      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      const timestamp = now();
-      const previousRun = session.targetRun;
-      session.targetRun = {
-        id: previousRun?.id || id('target'),
-        ownerMessageId: assistantMessageId,
-        status: targetPlanPreparationStatus(plan),
-        plan,
-        results: pendingTargetResults(plan),
-        createdAt: previousRun?.createdAt || timestamp,
-        updatedAt: timestamp,
-      };
-      updateAssistantMessage(session, assistantMessageId, (message) => ({
-        ...message,
-        content: targetWorkflowPlanningReply(plan),
-        status: 'passed',
-        activity: undefined,
-        updatedAt: timestamp,
+      if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
+      const summary = textFromUnknown(result.reply || result.newSteps.at(-1)?.actual || '子 Agent 已完成，但没有返回额外文本。').trim();
+      const evidence = result.newSteps.map((step) => ({
+        index: step.index,
+        status: step.status,
+        action: step.action,
+        expected: step.expected,
+        actual: step.actual,
+        note: step.note,
+        tools: (step.tools || []).map((tool) => ({
+          name: tool.name,
+          input: tool.input,
+          reason: tool.reason,
+          ok: tool.ok,
+          recovered: tool.recovered,
+          transient: tool.transient,
+          result: tool.result,
+        })),
       }));
-      session.activeAssistantMessageId = undefined;
-      session.activeAbortController = undefined;
-      session.busy = false;
-      session.status = 'idle';
-      session.error = undefined;
-      session.updatedAt = timestamp;
-      appendLog(session, 'target:plan:done', `目标计划第 ${plan.version} 版已生成，全程未启动浏览器`, {
+      appendLog(session, `subagent:${task.id}:done`, `子 Agent ${index + 1} 已完成：${task.title}`, {
+        details: fullLogDetails({
+          batchId,
+          id: task.id,
+          index,
+          title: task.title,
+          status: result.status,
+          summary,
+          resumable: false,
+          steps: result.newSteps,
+          stepCount: result.newSteps.length,
+        }),
         messageId: assistantMessageId,
       });
       persistAndNotify(session.id);
+      return { id: task.id, title: task.title, task, status: result.status, summary, content: summary, evidence };
     } catch (error) {
-      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      const timestamp = now();
+      if (!ownsTurn()) throw error;
       const message = userFacingErrorMessage(error);
-      if (session.targetRun) {
-        session.targetRun.status = 'failed';
-        session.targetRun.error = message;
-        session.targetRun.updatedAt = timestamp;
-      }
-      updateAssistantMessage(session, assistantMessageId, (item) => ({
-        ...item,
-        content: `目标分析失败：${message}`,
-        status: 'failed',
-        activity: undefined,
-        updatedAt: timestamp,
+      const steps = [...childSteps.values()].sort((left, right) => left.index - right.index);
+      const partialContent = latestChildText || steps.map((step) => step.actual).filter(Boolean).join('\n\n');
+      const evidence = steps.map((step) => ({
+        index: step.index,
+        status: step.status,
+        action: step.action,
+        expected: step.expected,
+        actual: step.actual,
+        note: step.note,
+        tools: (step.tools || []).map((tool) => ({
+          name: tool.name,
+          input: tool.input,
+          reason: tool.reason,
+          ok: tool.ok,
+          recovered: tool.recovered,
+          transient: tool.transient,
+          result: tool.result,
+        })),
       }));
-      session.activeAssistantMessageId = undefined;
-      session.activeAbortController = undefined;
-      session.busy = false;
-      session.status = 'error';
-      session.error = message;
-      session.updatedAt = timestamp;
-      appendLog(session, 'target:plan:error', `目标分析失败：${message}`, {
-        details: errorLogDetails(error),
+      appendLog(session, `subagent:${task.id}:failed`, `子 Agent ${index + 1} 失败，其他分支继续：${task.title}`, {
+        details: fullLogDetails({
+          batchId,
+          id: task.id,
+          index,
+          title: task.title,
+          status: 'failed',
+          error: message,
+          summary: partialContent,
+          partial: Boolean(partialContent || evidence.length),
+          steps,
+        }),
         messageId: assistantMessageId,
       });
       persistAndNotify(session.id);
+      return {
+        id: task.id,
+        title: task.title,
+        task,
+        status: 'failed' as const,
+        error: message,
+        partial: Boolean(partialContent || evidence.length),
+        summary: partialContent,
+        content: partialContent,
+        evidence,
+      };
+    } finally {
+      await child.close().catch(() => undefined);
     }
   });
+
+  if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
+  const results = settled.map((settledResult, index) => {
+    const task = settledResult.task;
+    if (settledResult.result) return settledResult.result;
+    const error = userFacingErrorMessage(settledResult.error);
+    void index;
+    return { id: task.id, title: task.title, task, status: 'failed' as const, error };
+  });
+  persistAndNotify(session.id);
+  const completedCount = results.filter((item) => item.status !== 'failed').length;
+  const partialCount = results.filter((item) => item.status === 'failed' && 'partial' in item && item.partial === true).length;
+  return {
+    ok: true,
+    actual: JSON.stringify({
+      results,
+      summary: `${completedCount}/${results.length} 个子 Agent 完成，${partialCount} 个失败分支保留了部分有效内容；任一失败均未中止其他分支。`,
+      batchId,
+      requestedTasks,
+      tasks,
+    }),
+  };
+}
+
+async function resumeBlockedBrowserChatSubagent(input: {
+  session: BrowserChatSessionRecord;
+  binding: BrowserChatBlockedSubagentRuntime;
+  userMessage: BrowserChatMessage;
+  assistantMessageId: string;
+  fromStepIndex: number;
+  abortController: AbortController;
+}) {
+  const { session, binding, userMessage, assistantMessageId, fromStepIndex, abortController } = input;
+  const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
+  const credentialContext = targetResearchCredentialContext(
+    session,
+    binding.task.url ? [{ kind: 'url', title: binding.title, url: binding.task.url }] : [],
+    binding.task.instruction,
+  );
+  try {
+    const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
+      session: binding.browser,
+      runId: `${session.id}_${binding.id}_verification_resume`,
+      targetUrl: binding.task.url || binding.browser.currentUrl() || session.targetUrl || 'about:blank',
+      instruction: `${binding.task.instruction}\n\n[系统续跑] 用户已完成当前可见页面的人工校验，请立即读取最新页面并从暂停点继续。`,
+      modelInstruction: [
+        `你是并行子 Agent“${binding.title}”，正在继续同一个已暂停的分支。`,
+        '用户已点击“校验完成，继续执行”。不要要求用户再发送文字；先读取当前页面状态，再继续原任务。',
+        binding.task.instruction,
+        browserChatCredentialPrompt(credentialContext.credentials),
+      ].filter(Boolean).join('\n\n'),
+      conversation: [],
+      completedSteps: binding.steps,
+      mode: session.mode,
+      safetyMode: session.safetyMode,
+      resolveCredential: credentialContext.resolveCredential,
+      credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
+      abortSignal: abortController.signal,
+      agentLoopTimeoutMs: browserChatSubagentLoopTimeoutMs(),
+      shouldContinue: ownsTurn,
+      requestToolConfirmation: session.safetyMode === 'strict'
+        ? (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal)
+        : undefined,
+      onProgress: (step) => {
+        if (!ownsTurn()) return;
+        appendLog(session, `subagent:${binding.id}:progress`, `${binding.title}：${step.action || '正在继续'}`, {
+          details: { id: binding.id, title: binding.title, status: step.status, step },
+          messageId: assistantMessageId,
+          deferPersist: true,
+        });
+      },
+      onDebug: (event) => {
+        if (!ownsTurn()) return;
+        const eventDetails = unwrapLogDetails(event.details).value;
+        appendLog(session, `subagent:${binding.id}:${event.phase}`, event.message, {
+          stepIndex: event.stepIndex,
+          elapsedMs: elapsedFromDetails(eventDetails),
+          details: event.phase === 'ai:runtime:response' || event.phase === 'ai:runtime:object'
+            ? fullLogDetails({ id: binding.id, title: binding.title, event: eventDetails })
+            : { id: binding.id, title: binding.title, event: eventDetails },
+          messageId: assistantMessageId,
+          deferPersist: true,
+        });
+      },
+    }));
+    if (!ownsTurn()) return;
+    const summary = textFromUnknown(result.reply || result.newSteps.at(-1)?.actual || '子 Agent 续跑完成。').trim();
+    appendLog(session, `subagent:${binding.id}:done`, `子 Agent 续跑完成：${binding.title}`, {
+      details: fullLogDetails({
+        id: binding.id,
+        title: binding.title,
+        status: result.status,
+        summary,
+        steps: result.newSteps,
+        stepCount: result.newSteps.length,
+      }),
+      messageId: assistantMessageId,
+    });
+    binding.steps = result.steps;
+    if (result.status === 'blocked') {
+      const timestamp = now();
+      updateAssistantMessage(session, assistantMessageId, (message) => ({
+        ...message,
+        content: summary,
+        status: 'blocked',
+        activity: undefined,
+        updatedAt: timestamp,
+      }));
+      session.status = 'idle';
+      session.busy = false;
+      session.activeAssistantMessageId = undefined;
+      session.activeAbortController = undefined;
+      session.updatedAt = timestamp;
+      persistAndNotify(session.id);
+      return;
+    }
+    blockedSubagents.delete(binding.id);
+    await binding.browser.close().catch(() => undefined);
+    const continuation = [
+      userMessage.content,
+      `[系统续跑] 人工校验后，子 Agent“${binding.title}”已返回：\n${summary}`,
+      '请在同一个对话回合中继续主任务，不要要求用户再发送文字。',
+    ].join('\n\n');
+    await runBrowserChatMessage(
+      session,
+      continuation,
+      continuation,
+      userMessage.id,
+      assistantMessageId,
+      fromStepIndex,
+      abortController,
+      [],
+      [],
+    );
+  } catch (error) {
+    if (!ownsTurn()) return;
+    blockedSubagents.delete(binding.id);
+    await binding.browser.close().catch(() => undefined);
+    const timestamp = now();
+    const message = userFacingErrorMessage(error);
+    appendLog(session, `subagent:${binding.id}:failed`, `子 Agent 续跑失败：${binding.title}`, {
+      details: { id: binding.id, title: binding.title, status: 'failed', error: message },
+      messageId: assistantMessageId,
+    });
+    updateAssistantMessage(session, assistantMessageId, (assistant) => ({
+      ...assistant,
+      content: `人工校验后继续执行失败：${message}`,
+      status: 'failed',
+      activity: undefined,
+      updatedAt: timestamp,
+    }));
+    session.error = message;
+    session.status = 'error';
+    session.busy = false;
+    session.activeAssistantMessageId = undefined;
+    session.activeAbortController = undefined;
+    session.updatedAt = timestamp;
+    persistAndNotify(session.id);
+  }
 }
 
 async function runBrowserChatMessage(
@@ -3964,7 +4755,7 @@ async function runBrowserChatMessage(
     try {
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       appendLog(session, 'chat:run:start', '开始处理本轮对话操作');
-      const browser = await ensureStarted(session);
+      const browser = await browserForTurnDecision(session);
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
@@ -3977,20 +4768,23 @@ async function runBrowserChatMessage(
         initialPersonalMemory.context,
         formatSkillsForPrompt(skills),
       ].filter(Boolean).join('\n\n');
-      appendLog(session, 'ai:prepare', '浏览器已准备好，正在请求 AI 决策');
+      appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
       const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
+      const credentialContext = targetResearchCredentialContext(session, targetResearchSeeds(session, modelText), modelText);
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
         targetUrl: session.targetUrl || 'about:blank',
         instruction: text,
-        modelInstruction: modelText,
+        modelInstruction: [modelText, browserChatCredentialPrompt(credentialContext.credentials)].filter(Boolean).join('\n\n'),
         conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId),
         completedSteps: session.steps,
         mode: session.mode,
         safetyMode: session.safetyMode,
         referenceImagePaths,
         skillContext,
+        resolveCredential: credentialContext.resolveCredential,
+        credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
         getDynamicSkillContext: () => {
           const currentUrl = browserChatMemoryUrl(browser, session);
           const currentDomain = normalizePersonalMemoryDomain(currentUrl || session.targetUrl);
@@ -4014,6 +4808,12 @@ async function runBrowserChatMessage(
         requestToolConfirmation: session.safetyMode === 'strict'
           ? (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal)
           : undefined,
+        ensureBrowserStarted: async () => {
+          const startedBrowser = await ensureStarted(session);
+          if (startedBrowser !== browser) throw new Error('Browser session changed while the AI was deciding; retry this browser tool on the active session.');
+        },
+        isBrowserStarted: () => session.started && session.browser === browser && browser.isUsable(),
+        runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
         onProgress: (step) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           const index = session.steps.findIndex((item) => item.index === step.index);
@@ -4070,12 +4870,15 @@ async function runBrowserChatMessage(
       }));
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       const completedAt = now();
-      const keepCompletedBrowser = browserChatKeepBrowserOpenAfterTurn() && Boolean(session.browser?.isUsable());
-      const shouldCloseCompletedBrowser = Boolean(session.browser || session.started) && !keepCompletedBrowser;
+      const browserWasStarted = session.started || browser.isUsable();
+      const keepCompletedBrowser = browserWasStarted && browserChatKeepBrowserOpenAfterTurn() && Boolean(session.browser?.isUsable());
+      const shouldCloseCompletedBrowser = browserWasStarted && !keepCompletedBrowser;
       if (shouldCloseCompletedBrowser) {
         await session.browser?.close({ keepOpen: true }).catch(() => undefined);
         session.browser = undefined;
         session.started = false;
+      } else if (!browserWasStarted && session.browser === browser) {
+        session.browser = undefined;
       }
       session.status = 'idle';
       session.busy = false;
@@ -4093,7 +4896,9 @@ async function runBrowserChatMessage(
             ? '本轮对话操作已完成，最终结果已写入，浏览器已自动关闭。'
             : keepCompletedBrowser
               ? '本轮对话操作已完成，最终结果已写入，浏览器已保留供后续对话复用。'
-              : '本轮对话操作已完成，最终结果已写入。',
+              : browserWasStarted
+                ? '本轮对话操作已完成，最终结果已写入。'
+                : '本轮对话已直接完成，没有创建浏览器标签。',
           messageId: assistantMessageId,
         },
       ]);

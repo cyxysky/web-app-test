@@ -11,6 +11,35 @@ export const targetCriterionSchema = z.object({
   id: identifierSchema,
   description: z.string().trim().min(1).max(1_200),
   evidenceRequirement: z.string().trim().min(1).max(1_200),
+  sourceIds: z.array(identifierSchema).max(20).default([]),
+});
+
+export const targetResearchSourceSchema = z.object({
+  id: identifierSchema,
+  kind: z.enum(['url', 'axure', 'tab', 'file', 'image', 'other']),
+  title: conciseTextSchema,
+  url: z.string().trim().max(4_000).optional(),
+  status: z.enum(['discovered', 'inspected', 'blocked', 'failed']),
+  summary: z.string().trim().max(4_000).optional(),
+  evidence: z.array(z.string().trim().min(1).max(4_000)).max(40),
+});
+
+export const targetResearchFactSchema = z.object({
+  id: identifierSchema,
+  statement: z.string().trim().min(1).max(4_000),
+  sourceIds: z.array(identifierSchema).min(1).max(20),
+  confidence: z.number().min(0).max(1),
+});
+
+export const targetResearchBundleSchema = z.object({
+  version: z.number().int().min(1),
+  status: z.enum(['complete', 'partial', 'blocked']),
+  summary: z.string().trim().min(1).max(20_000),
+  sources: z.array(targetResearchSourceSchema).max(80),
+  facts: z.array(targetResearchFactSchema).max(120),
+  unresolved: z.array(z.string().trim().min(1).max(2_000)).max(40),
+  stepIndexes: z.array(z.number().int().nonnegative()).max(500),
+  updatedAt: z.string(),
 });
 
 export const targetPermissionExpectationSchema = z.object({
@@ -152,7 +181,16 @@ function omitNullObjectProperties(value: unknown): { changed: boolean; value: un
 export function repairNullableTargetPlanText(text: string) {
   try {
     const normalized = omitNullObjectProperties(JSON.parse(text));
-    return normalized.changed ? JSON.stringify(normalized.value) : null;
+    const value = normalized.value;
+    let changed = normalized.changed;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      if (typeof record.id !== 'string' || !record.id.trim()) {
+        record.id = 'plan_repaired';
+        changed = true;
+      }
+    }
+    return changed ? JSON.stringify(value) : null;
   } catch {
     return null;
   }
@@ -184,7 +222,10 @@ export const targetWorkflowRunSchema = z.object({
   id: identifierSchema,
   ownerMessageId: optionalIdentifierSchema,
   status: z.enum([
-    'analyzing',
+    'discovering_sources',
+    'researching_sources',
+    'awaiting_research_access',
+    'synthesizing_requirements',
     'collecting_requirements',
     'preparing_authentication',
     'awaiting_confirmation',
@@ -195,6 +236,7 @@ export const targetWorkflowRunSchema = z.object({
     'failed',
     'cancelled',
   ]),
+  research: targetResearchBundleSchema.optional(),
   plan: targetPlanSchema.optional(),
   results: z.record(z.string(), targetResultSchema),
   createdAt: z.string(),
@@ -207,6 +249,8 @@ export const targetWorkflowRunSchema = z.object({
 });
 
 export type TargetActor = z.infer<typeof targetActorSchema>;
+export type TargetResearchBundle = z.infer<typeof targetResearchBundleSchema>;
+export type TargetResearchSource = z.infer<typeof targetResearchSourceSchema>;
 export type TargetFlowNode = z.infer<typeof targetFlowNodeSchema>;
 export type TargetLeafNode = z.infer<typeof targetLeafNodeSchema>;
 export type TargetParallelNode = z.infer<typeof targetParallelNodeSchema>;

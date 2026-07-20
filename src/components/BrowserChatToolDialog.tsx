@@ -16,10 +16,13 @@ export type BrowserChatToolDialogDetail = {
   tool: BrowserChatToolCall;
 };
 
-function toolStatusLabel(tool: BrowserChatToolCall) {
+function toolStatusLabel(tool: BrowserChatToolCall, step: StepExecutionResult) {
   if (tool.recovered === true && tool.transient === true) return '已恢复';
   if (tool.ok === true) return '完成';
   if (tool.ok === false) return '失败';
+  if (step.status === 'failed') return '失败';
+  if (step.status === 'blocked') return '已暂停';
+  if (step.status === 'passed') return '完成';
   return '运行中';
 }
 
@@ -48,7 +51,7 @@ export function BrowserChatToolDialog({
 }) {
   const { t } = useI18n();
   const toolName = toolLabel(detail.tool.name);
-  const status = toolStatusLabel(detail.tool);
+  const status = toolStatusLabel(detail.tool, detail.step);
   const inputPreview = compactPayloadPreview(detail.tool.input);
   const completeResult = detail.tool.rawResult ?? detail.tool.result;
   const hasActualResult = completeResult !== undefined && completeResult !== null && completeResult !== '';

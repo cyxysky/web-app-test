@@ -219,6 +219,7 @@ export type AiRequestSnapshot = {
 };
 
 export type StepToolCall = {
+  id?: string;
   name: string;
   input?: unknown;
   reason?: string;

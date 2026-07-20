@@ -24,7 +24,6 @@ const browserChatSettingsSchema = z.object({
 export const createBrowserChatSessionRequestSchema = browserChatSettingsSchema.extend({
   targetUrl: text(4_000).default(''),
   title: optionalText(240),
-  workflowMode: z.enum(['chat', 'target']).default('chat'),
   userId,
   qzUserId: userId,
 }).strict();

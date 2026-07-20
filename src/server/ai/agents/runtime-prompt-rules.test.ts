@@ -19,7 +19,7 @@ test('native selects require selectOption instead of mouse or keyboard selection
 
   assert.match(rules, /MUST call selectOption directly/);
   assert.match(rules, /Never click the select first/);
-  assert.match(rules, /Never use keyboard letters\/ArrowUp\/ArrowDown\/Enter/);
+  assert.match(rules, /never use keyboard letters\/ArrowUp\/ArrowDown\/Enter/i);
 });
 
 test('models without image input receive snapshot-only guidance', () => {
@@ -29,5 +29,9 @@ test('models without image input receive snapshot-only guidance', () => {
   assert.match(rules, /takeSnapshot/);
   assert.match(rules, /fresh UID/);
   assert.match(rules, /Never invent a room id/);
-  assert.match(rules, /Never conclude.*absent.*truncated snapshot slice/);
+  assert.match(rules, /mode="full"/);
+  assert.match(rules, /mode="text"/);
+  assert.match(rules, /mode="changes"/);
+  assert.match(rules, /nextCursor/);
+  assert.doesNotMatch(rules, /mode="actionable"/);
 });
