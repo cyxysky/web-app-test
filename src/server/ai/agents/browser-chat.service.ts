@@ -7,12 +7,13 @@ import {
   executeInteractiveBrowserTurn,
   type BrowserToolConfirmationDecision,
   type BrowserToolConfirmationRequest,
+  type BrowserChatSubagentReader,
   type BrowserChatSubagentTask,
   type InteractiveBrowserTurnMessage,
   type InteractiveBrowserTurnResult,
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
-import { settleBrowserChatSubagents } from '@/server/ai/agents/browser-chat-subagents';
+import { runOrReuseBrowserChatSubagentBatch, settleBrowserChatSubagents } from '@/server/ai/agents/browser-chat-subagents';
 import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
 import { executeTargetWorkflow } from '@/server/ai/agents/target-workflow-executor.service';
 import {
@@ -180,9 +181,27 @@ type BrowserChatBlockedSubagentRuntime = {
   steps: StepExecutionResult[];
 };
 
+type BrowserChatStoredSubagent = {
+  uuid: string;
+  batchId: string;
+  sessionId: string;
+  assistantMessageId: string;
+  index: number;
+  title: string;
+  task: BrowserChatSubagentTask;
+  status: 'running' | 'passed' | 'failed' | 'blocked';
+  summary: string;
+  steps: StepExecutionResult[];
+  events: unknown[];
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type BrowserChatRuntimeState = {
   sessions: Map<string, BrowserChatSessionRecord>;
   blockedSubagents: Map<string, BrowserChatBlockedSubagentRuntime>;
+  subagentResults: Map<string, Map<string, BrowserChatStoredSubagent>>;
   interruptedAssistantMessageIds: Set<string>;
   toolConfirmations: Map<string, {
     sessionId: string;
@@ -218,6 +237,7 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
 }).__browserChatRuntimeState ??= {
   sessions: new Map<string, BrowserChatSessionRecord>(),
   blockedSubagents: new Map(),
+  subagentResults: new Map(),
   interruptedAssistantMessageIds: new Set<string>(),
   toolConfirmations: new Map<string, {
     sessionId: string;
@@ -229,12 +249,14 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
 });
 browserChatRuntimeState.sessions ??= new Map();
 browserChatRuntimeState.blockedSubagents ??= new Map();
+browserChatRuntimeState.subagentResults ??= new Map();
 browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
 const blockedSubagents = browserChatRuntimeState.blockedSubagents;
+const subagentResults = browserChatRuntimeState.subagentResults;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
@@ -725,7 +747,7 @@ function firstExportableTargetUrl(candidates: Array<string | undefined>) {
 function exportedTargetUrl(session: BrowserChatSessionRecord, steps: StepExecutionResult[]) {
   const browserCurrentUrl = session.browser?.currentUrl();
   const urlsFromOpenTools = steps.flatMap((step) => (step.tools || []).flatMap((tool) => (
-    /^openPage$/i.test(tool.name) ? [inputUrl(tool.input)] : []
+    (/^openPage$/i.test(tool.name) || (tool.name === 'page' && flowInputRecord(tool.input).action === 'open')) ? [inputUrl(tool.input)] : []
   )));
   return firstExportableTargetUrl([
     session.targetUrl,
@@ -735,7 +757,7 @@ function exportedTargetUrl(session: BrowserChatSessionRecord, steps: StepExecuti
 }
 
 function exportedRecordedToolInput(toolName: string, input: unknown, targetUrl: string) {
-  if (!/^openPage$/i.test(toolName)) return input;
+  if (!/^openPage$/i.test(toolName) && !(toolName === 'page' && flowInputRecord(input).action === 'open')) return input;
   const url = exportableTargetUrl(inputUrl(input));
   if (url) return input;
   if (!input || typeof input !== 'object' || Array.isArray(input)) return targetUrl ? { url: targetUrl } : input;
@@ -1092,11 +1114,6 @@ function browserChatConversationTokenEstimate(messages: InteractiveBrowserTurnMe
   return estimateTextTokens(messages.map((message) => `${message.role}: ${message.content}`).join('\n\n'));
 }
 
-function browserChatConversationSummaryInputCharLimit() {
-  const raw = Number(process.env.AI_BROWSER_CHAT_SUMMARY_INPUT_MAX_CHARS || 60000);
-  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 60000;
-}
-
 function buildConversationSummaryPrompt(input: {
   previousContext?: BrowserChatConversationContext;
   messages: BrowserChatMessage[];
@@ -1128,14 +1145,14 @@ function buildConversationSummaryPrompt(input: {
     '',
     `Estimated historical context tokens before compression: ${input.estimatedTokens}/${input.thresholdTokens}`,
     '',
-    `Input JSON:\n${trimLogText(stringifyJsonSafe(source, 2) || '', browserChatConversationSummaryInputCharLimit())}`,
+    `Input JSON:\n${stringifyJsonSafe(source, 2) || ''}`,
   ].join('\n');
 }
 
 function fallbackConversationSummary(input: { previousContext?: BrowserChatConversationContext; messages: BrowserChatMessage[] }) {
   return [
     input.previousContext?.summary ? `此前摘要：${input.previousContext.summary}` : '',
-    ...input.messages.slice(-12).map((message) => `${message.role === 'user' ? '用户' : 'AI'}：${compactText(messageContentForPrompt(message), 700)}`),
+    ...input.messages.map((message) => `${message.role === 'user' ? '用户' : 'AI'}：${messageContentForPrompt(message)}`),
   ].filter(Boolean).join('\n');
 }
 
@@ -1147,7 +1164,8 @@ function safeJson(value: unknown) {
   }
 }
 
-function testOperationFromToolName(name?: string): NonNullable<TestCaseContent['steps'][number]['operation']> {
+function testOperationFromToolName(name?: string, input?: unknown): NonNullable<TestCaseContent['steps'][number]['operation']> {
+  if (name === 'page') return flowInputRecord(input).action === 'wait' ? 'wait' : 'open';
   if (/open|url|navigate/i.test(name || '')) return 'open';
   if (/click|hover|drag/i.test(name || '')) return 'click';
   if (/type|fill|input/i.test(name || '')) return 'fill';
@@ -2487,14 +2505,12 @@ async function runTargetCredentialLogin(
       resolveCredential: (reference) => allowedCredentialRefs.has(reference) ? resolveTargetCredential(reference, attemptId) : undefined,
       credentialAllowedOrigins: [loginOrigin],
       allowedToolTypes: [
-        'openPage',
+        'page',
         'mouse',
         'keyboard',
         'selectOption',
-        'waitForPage',
         'waitForHumanVerification',
-        'listTabs',
-        'switchTab',
+        'tab',
         'takeSnapshot',
         'searchSnapshot',
         'reportState',
@@ -3227,7 +3243,14 @@ async function deleteBrowserChatSessionFromMemory(sessionId: string) {
   session.activeAssistantMessageId = undefined;
   session.pendingToolConfirmation = undefined;
   sessions.delete(sessionId);
+  subagentResults.delete(sessionId);
   return { deleted: { id: sessionId }, session };
+}
+
+function flowInputRecord(input: unknown) {
+  return input && typeof input === 'object' && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : {};
 }
 
 export async function deleteBrowserChatSessions(sessionIds: string[], userId?: string | number) {
@@ -3310,7 +3333,7 @@ export function exportBrowserChatMessageToTestCase(sessionId: string, messageId:
       const firstTool = firstPersistentStepTool(step);
       return {
         index: index + 1,
-        operation: testOperationFromToolName(firstTool?.name),
+        operation: testOperationFromToolName(firstTool?.name, firstTool?.input),
         action: compactText(step.action || firstTool?.name || `执行步骤 ${step.index}`, 240),
         input: firstTool?.input ? safeJson(firstTool.input) : undefined,
         expected: compactText(step.expected || step.actual || '该步骤应按对话中的已执行结果完成。', 320),
@@ -4334,12 +4357,76 @@ async function generateSessionTargetPlan(input: {
   return mergeLatestTargetActorAuth(generatedPlan, session.targetRun?.plan);
 }
 
-function browserChatSubagentLoopTimeoutMs() {
-  const raw = Number(process.env.AI_SUBAGENT_LOOP_TIMEOUT_MS || 10 * 60 * 1000);
-  return Number.isFinite(raw) && raw >= 30_000 ? Math.floor(raw) : 10 * 60 * 1000;
+async function runBrowserChatSubagents(input: {
+  session: BrowserChatSessionRecord;
+  assistantMessageId: string;
+  abortController: AbortController;
+  tasks: BrowserChatSubagentTask[];
+  toolCallId?: string;
+}): Promise<BrowserActionResult> {
+  const requestedTasks = input.tasks.slice(0, 6);
+  const normalizedTasks = requestedTasks.map((task) => ({
+    title: task.title.replace(/\s+/g, ' ').trim(),
+    instruction: task.instruction.replace(/\s+/g, ' ').trim(),
+    url: task.url?.trim().toLowerCase() || '',
+  }));
+  const key = `${input.session.id}:${input.assistantMessageId}:${JSON.stringify(normalizedTasks)}`;
+  return runOrReuseBrowserChatSubagentBatch(key, () => executeBrowserChatSubagentBatch({
+    ...input,
+    tasks: requestedTasks,
+  }));
 }
 
-async function runBrowserChatSubagents(input: {
+function browserChatSubagentSessionRegistry(sessionId: string) {
+  let registry = subagentResults.get(sessionId);
+  if (!registry) {
+    registry = new Map<string, BrowserChatStoredSubagent>();
+    subagentResults.set(sessionId, registry);
+  }
+  return registry;
+}
+
+function updateBrowserChatStoredSubagent(
+  sessionId: string,
+  uuid: string,
+  update: Partial<Pick<BrowserChatStoredSubagent, 'status' | 'summary' | 'steps' | 'events' | 'error'>>,
+) {
+  const record = browserChatSubagentSessionRegistry(sessionId).get(uuid);
+  if (!record) return;
+  Object.assign(record, update, { updatedAt: now() });
+}
+
+function readBrowserChatSubagent(sessionId: string): BrowserChatSubagentReader {
+  return async (uuid) => {
+    const record = subagentResults.get(sessionId)?.get(uuid);
+    if (record) {
+    if (record.status === 'running') {
+      return {
+        ok: false,
+        actual: JSON.stringify({
+          uuid: record.uuid,
+          title: record.title,
+          status: record.status,
+          error: '该子 Agent 仍在执行中。请等待 spawnSubagents 完成后，使用同一 UUID 再次读取。',
+        }),
+      };
+    }
+    return {
+      ok: true,
+      actual: JSON.stringify({
+        uuid: record.uuid,
+        title: record.title,
+        status: record.status,
+        summary: record.summary,
+        error: record.error,
+      }),
+    };
+    }
+    return { ok: false, actual: `未找到 UUID 为 ${uuid} 的子 Agent；它可能不属于当前对话，或所属对话已被删除。` };
+  };
+}
+
+async function executeBrowserChatSubagentBatch(input: {
   session: BrowserChatSessionRecord;
   assistantMessageId: string;
   abortController: AbortController;
@@ -4350,39 +4437,26 @@ async function runBrowserChatSubagents(input: {
   const batchId = input.toolCallId || id('subagent_batch');
   const requestedTasks = input.tasks.slice(0, 6);
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
-  const taskKey = (task: Pick<BrowserChatSubagentTask, 'title' | 'instruction' | 'url'>) => (
-    task.url?.trim().toLowerCase()
-    || `${task.title}\n${task.instruction}`.replace(/\s+/g, ' ').trim().toLowerCase()
-  );
-  const existingTaskKeys = new Set(session.logs.flatMap((log) => {
-    if (log.messageId !== assistantMessageId || !/^subagent:[^:]+:start$/.test(log.phase)) return [];
-    const details = parseLogDetails(log.details);
-    if (!details || typeof details !== 'object' || Array.isArray(details)) return [];
-    const record = details as Record<string, unknown>;
-    return [taskKey({
-      title: textFromUnknown(record.title),
-      instruction: textFromUnknown(record.instruction),
-      url: textFromUnknown(record.url) || undefined,
-    })];
-  }).filter(Boolean));
-  const tasks = requestedTasks.flatMap((task) => {
-    const key = taskKey(task);
-    if (!key || existingTaskKeys.has(key)) return [];
-    existingTaskKeys.add(key);
-    return [{ ...task, id: id('subagent') }];
+  const tasks = requestedTasks.map((task) => ({ ...task, id: randomUUID() }));
+  const registry = browserChatSubagentSessionRegistry(session.id);
+  const createdAt = now();
+  tasks.forEach((task, index) => {
+    registry.set(task.id, {
+      uuid: task.id,
+      batchId,
+      sessionId: session.id,
+      assistantMessageId,
+      index,
+      title: task.title,
+      task: { title: task.title, instruction: task.instruction, url: task.url },
+      status: 'running',
+      summary: '',
+      steps: [],
+      events: [],
+      createdAt,
+      updatedAt: createdAt,
+    });
   });
-  if (!tasks.length) {
-    return {
-      ok: true,
-      actual: JSON.stringify({
-        batchId,
-        requestedTasks,
-        tasks: [],
-        results: [],
-        summary: '这些资源已在当前回合委托过；请复用已有子 Agent 结果，不要重复创建任务。',
-      }),
-    };
-  }
   appendLog(session, 'subagents:start', `正在并行执行 ${tasks.length} 个子 Agent；单个分支失败不会中止其他分支`, {
     details: fullLogDetails({ batchId, requestedTasks, tasks }),
     messageId: assistantMessageId,
@@ -4434,7 +4508,7 @@ async function runBrowserChatSubagents(input: {
       const result = await executeInteractiveBrowserTurn({
         session: child,
         runId: `${session.id}_${task.id}`,
-        targetUrl: task.url || child.currentUrl() || session.targetUrl || 'about:blank',
+        targetUrl: task.url || session.targetUrl || child.currentUrl() || 'about:blank',
         instruction: task.instruction,
         modelInstruction: [
           `你是并行子 Agent“${task.title}”。只完成这个独立分支，并返回可追溯事实、来源地址、页面证据、失败原因和未解决问题。`,
@@ -4443,6 +4517,9 @@ async function runBrowserChatSubagents(input: {
             ? '无头浏览器已经复制主会话当前的 Cookie、localStorage 和 IndexedDB 登录态。请先直接访问目标地址验证登录态，不要重新登录。'
             : '主会话当前没有可复制的浏览器登录态；如果目标页面要求登录，请明确返回登录阻塞，不要猜测页面内容。',
           '你运行在无头浏览器中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要等待用户操作隐藏页面；请明确报告阻塞证据并把该步骤交回主 Agent。',
+          'domChanges.overflow 只表示 MutationObserver 变更队列容量溢出，绝不表示页面下方还有内容。不得因此滚动页面，也不得把“滚动到底部”写入任何任务。只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容不在 full/text 完整 DOM 中时，才允许滚动。',
+          'takeSnapshot 的 full 与 text 都读取已加载页面的完整 DOM；text 是 full 中全部文本的去重阅读视图，不是当前视窗。nextCursor 只是冻结结果的字符分页，不得为分页而滚动。',
+          '完成工具执行后，直接在你自己的最终回复中写出约 20000 个中文字符的完整执行总结，包含过程、事实、证据、URL、失败、限制和未解决项；不得省略或截断。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。',
           task.instruction,
           browserChatCredentialPrompt(credentialContext.credentials),
         ].join('\n\n'),
@@ -4453,7 +4530,6 @@ async function runBrowserChatSubagents(input: {
         resolveCredential: credentialContext.resolveCredential,
         credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
         abortSignal: abortController.signal,
-        agentLoopTimeoutMs: browserChatSubagentLoopTimeoutMs(),
         shouldContinue: ownsTurn,
         requestToolConfirmation: session.safetyMode === 'strict'
           ? requestSerialConfirmation
@@ -4461,10 +4537,13 @@ async function runBrowserChatSubagents(input: {
         onProgress: (step) => {
           if (!ownsTurn()) return;
           childSteps.set(step.index, step);
+          updateBrowserChatStoredSubagent(session.id, task.id, {
+            status: step.status === 'queued' ? 'running' : step.status,
+            steps: [...childSteps.values()].sort((left, right) => left.index - right.index),
+          });
           appendLog(session, `subagent:${task.id}:progress`, `${task.title}：${step.action || '正在执行'}`, {
-            details: { batchId, id: task.id, index, title: task.title, status: step.status, step },
+            details: fullLogDetails({ batchId, id: task.id, index, title: task.title, status: step.status, step }),
             messageId: assistantMessageId,
-            deferPersist: true,
           });
         },
         onDebug: (event) => {
@@ -4479,6 +4558,11 @@ async function runBrowserChatSubagents(input: {
               : undefined;
             const responseText = textFromUnknown(aiOutput?.response ?? aiOutput?.text).trim();
             if (responseText) latestChildText = responseText;
+          }
+          const stored = registry.get(task.id);
+          if (stored) {
+            stored.events.push({ phase: event.phase, message: event.message, stepIndex: event.stepIndex, details: eventDetails });
+            stored.updatedAt = now();
           }
           appendLog(session, `subagent:${task.id}:${event.phase}`, event.message, {
             stepIndex: event.stepIndex,
@@ -4524,6 +4608,11 @@ async function runBrowserChatSubagents(input: {
         }),
         messageId: assistantMessageId,
       });
+      updateBrowserChatStoredSubagent(session.id, task.id, {
+        status: result.status,
+        summary,
+        steps: result.newSteps,
+      });
       persistAndNotify(session.id);
       return { id: task.id, title: task.title, task, status: result.status, summary, content: summary, evidence };
     } catch (error) {
@@ -4562,6 +4651,12 @@ async function runBrowserChatSubagents(input: {
         }),
         messageId: assistantMessageId,
       });
+      updateBrowserChatStoredSubagent(session.id, task.id, {
+        status: 'failed',
+        summary: partialContent,
+        steps,
+        error: message,
+      });
       persistAndNotify(session.id);
       return {
         id: task.id,
@@ -4585,6 +4680,7 @@ async function runBrowserChatSubagents(input: {
     if (settledResult.result) return settledResult.result;
     const error = userFacingErrorMessage(settledResult.error);
     void index;
+    updateBrowserChatStoredSubagent(session.id, task.id, { status: 'failed', error });
     return { id: task.id, title: task.title, task, status: 'failed' as const, error };
   });
   persistAndNotify(session.id);
@@ -4593,11 +4689,15 @@ async function runBrowserChatSubagents(input: {
   return {
     ok: true,
     actual: JSON.stringify({
-      results,
+      subagents: results.map((result, index) => ({
+        uuid: result.id,
+        index,
+        title: result.title,
+        status: result.status,
+      })),
       summary: `${completedCount}/${results.length} 个子 Agent 完成，${partialCount} 个失败分支保留了部分有效内容；任一失败均未中止其他分支。`,
       batchId,
-      requestedTasks,
-      tasks,
+      next: '逐个调用 readSubagent({ uuid }) 读取需要进入主 Agent 上下文的子 Agent 总结。',
     }),
   };
 }
@@ -4636,7 +4736,6 @@ async function resumeBlockedBrowserChatSubagent(input: {
       resolveCredential: credentialContext.resolveCredential,
       credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
       abortSignal: abortController.signal,
-      agentLoopTimeoutMs: browserChatSubagentLoopTimeoutMs(),
       shouldContinue: ownsTurn,
       requestToolConfirmation: session.safetyMode === 'strict'
         ? (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal)
@@ -4814,6 +4913,7 @@ async function runBrowserChatMessage(
         },
         isBrowserStarted: () => session.started && session.browser === browser && browser.isUsable(),
         runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
+        readSubagent: readBrowserChatSubagent(session.id),
         onProgress: (step) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           const index = session.steps.findIndex((item) => item.index === step.index);
@@ -4831,14 +4931,10 @@ async function runBrowserChatMessage(
             }));
           }
           session.updatedAt = now();
-          // A tool trace is reported before its browser action begins. This state must
-          // reach the session endpoint synchronously: realtime refreshes hydrate from
-          // the persisted snapshot, so a deferred write makes fast follow-up tools
-          // appear only after they have already completed.
-          const hasRunningTool = (step.tools || []).some((tool) => tool.ok === undefined);
-          persistAndNotify(session.id, hasRunningTool
-            ? { mergePersisted: false }
-            : { defer: true });
+          // Tool traces arrive once before execution and again with the result.
+          // Persist both edges synchronously so the UI first renders a running
+          // card, then updates that same card to its completed/failed state.
+          persistAndNotify(session.id, { mergePersisted: false });
         },
         onDebug: (event) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;

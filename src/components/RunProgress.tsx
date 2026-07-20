@@ -103,7 +103,7 @@ const outputFormatOptions = [
   { label: 'JSON', value: 'json' },
 ];
 
-const toolDefinitions: ToolDefinition[] = [
+const legacyToolDefinitions: ToolDefinition[] = [
   {
     name: 'openPage',
     label: '打开页面',
@@ -272,6 +272,54 @@ const toolDefinitions: ToolDefinition[] = [
   },
 ];
 
+const toolStatusOptions = [
+  { label: '成功', value: 'success' },
+  { label: '失败', value: 'failed' },
+  { label: '未定', value: 'pending' },
+];
+
+const toolDefinitions: ToolDefinition[] = legacyToolDefinitions.flatMap((definition) => {
+  if (definition.name === 'waitForPage' || definition.name === 'switchTab') return [];
+  if (definition.name === 'openPage') {
+    return [{
+      ...definition,
+      name: 'page',
+      label: '页面操作',
+      template: { action: 'open', target: 'current', url: '' },
+      fields: [
+        { key: 'action', label: '操作', kind: 'select', options: [{ label: '打开页面', value: 'open' }, { label: '等待页面', value: 'wait' }] },
+        { key: 'url', label: '目标地址', kind: 'text', placeholder: 'https://example.com' },
+        { key: 'target', label: '打开位置', kind: 'select', options: [{ label: '当前标签页', value: 'current' }, { label: '新标签页', value: 'new' }] },
+        { key: 'ms', label: '等待毫秒', kind: 'number' },
+      ],
+    }];
+  }
+  if (definition.name === 'listTabs') {
+    return [{
+      ...definition,
+      name: 'tab',
+      label: '标签页操作',
+      template: { action: 'list', index: 0 },
+      fields: [
+        { key: 'action', label: '操作', kind: 'select', options: [{ label: '列出标签页', value: 'list' }, { label: '切换标签页', value: 'switch' }] },
+        { key: 'index', label: '标签页序号', kind: 'number' },
+      ],
+    }];
+  }
+  if (definition.name === 'searchSnapshot') {
+    return [{
+      ...definition,
+      template: { ...definition.template, tag: '' },
+      fields: [
+        ...definition.fields.slice(0, 1),
+        { key: 'tag', label: 'HTML 标签', kind: 'text', helper: '填写后从冻结的 full DOM 返回该标签的全部节点。' },
+        ...definition.fields.slice(1),
+      ],
+    }];
+  }
+  return [definition];
+});
+
 const toolDefinitionsByName = Object.fromEntries(toolDefinitions.map((definition) => [definition.name, definition])) as Record<string, ToolDefinition>;
 const toolDisplayLabels: Record<string, string> = Object.fromEntries(toolDefinitions.map((definition) => [definition.name, definition.label]));
 
@@ -283,12 +331,6 @@ function toolOptionLabel(name: string, t: TranslateFn) {
   const label = toolDisplayName(name, t);
   return label === name ? name : `${label} (${name})`;
 }
-
-const toolStatusOptions = [
-  { label: '成功', value: 'success' },
-  { label: '失败', value: 'failed' },
-  { label: '未定', value: 'pending' },
-];
 
 function traceUrl(run: TestRunRecord) {
   return artifactUrl(run.result?.tracePath);
@@ -663,7 +705,7 @@ function toolDraftFromCall(tool: StepToolCallItem, index: number): ToolDraft {
   };
 }
 
-function newToolDraft(name = 'waitForPage'): ToolDraft {
+function newToolDraft(name = 'page'): ToolDraft {
   return {
     draftId: `tool-manual-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     name,
@@ -1397,7 +1439,7 @@ export function RunProgress({
   }
 
   function addToolDraft() {
-    const defaultName = editableToolNames.includes('waitForPage') ? 'waitForPage' : editableToolNames[0] || 'waitForPage';
+    const defaultName = editableToolNames.includes('page') ? 'page' : editableToolNames[0] || 'page';
     setToolDrafts((current) => [...current, newToolDraft(defaultName)]);
   }
 

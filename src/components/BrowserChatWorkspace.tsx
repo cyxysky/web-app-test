@@ -870,9 +870,9 @@ function isRecoveredTransientTool(tool: BrowserChatToolCall | undefined) {
 
 function toolStatusLabel(tool: BrowserChatToolCall) {
   if (isRecoveredTransientTool(tool)) return '已恢复';
-  if (tool.ok === true) return '完成';
+  if (tool.ok === true) return '已完成';
   if (tool.ok === false) return '失败';
-  return '运行中';
+  return '执行中';
 }
 
 function browserChatToolPresentation(
@@ -889,7 +889,7 @@ function browserChatToolPresentation(
     stateClass: failed ? ' is-failed' : isActive ? ' is-running' : '',
     status: tool.ok !== undefined
       ? toolStatusLabel(tool)
-      : isActive ? '运行中' : inferredFailed ? '失败' : step.status === 'blocked' ? '已暂停' : '完成',
+      : isActive ? '执行中' : inferredFailed ? '失败' : step.status === 'blocked' ? '已暂停' : '已完成',
   };
 }
 
@@ -921,17 +921,19 @@ function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
     getHttpRequests: '检查请求',
     keyboard: '键盘操作',
-    listPageLinks: '读取页面链接',
     listTabs: '扫描标签页',
     manageVisualContext: '整理视觉上下文',
     mouse: '鼠标操作',
     openPage: '导航页面',
+    page: '页面操作',
+    readSubagent: '读取子 Agent',
     reportState: '确认状态',
     searchSnapshot: '搜索页面快照',
     selectOption: '选择下拉选项',
     selectReferenceScreenshots: '引用截图',
     spawnSubagents: '并行子 Agent',
     switchTab: '切换标签',
+    tab: '标签页操作',
     takeScreenshot: '截屏取证',
     takeSnapshot: '读取页面快照',
     waitForHumanVerification: '等待人工验证',
@@ -963,8 +965,14 @@ function browserChatToolMeta(name: string, input: unknown) {
   if (name === 'keyboard') return [toolInputValue(record, ['action']), toolInputValue(record, ['text', 'key', 'uid'])].filter(Boolean).join(' · ');
   if (name === 'selectOption') return [toolInputValue(record, ['uid']), toolInputValue(record, ['value', 'label'])].filter(Boolean).join(' · ');
   if (name === 'openPage') return toolInputValue(record, ['url']);
-  if (name === 'listPageLinks') return '当前页面与子框架';
+  if (name === 'page') {
+    if (record.action === 'wait') return toolInputValue(record, ['ms']) || '等待页面稳定';
+    const target = record.target === 'new' ? '新标签页' : '当前标签页';
+    return [target, toolInputValue(record, ['url'])].filter(Boolean).join(' · ');
+  }
+  if (name === 'readSubagent') return toolInputValue(record, ['uuid']);
   if (name === 'switchTab') return toolInputValue(record, ['index']);
+  if (name === 'tab') return record.action === 'switch' ? toolInputValue(record, ['index']) : '列出全部标签页';
   if (name === 'waitForPage') return toolInputValue(record, ['ms']);
   if (name === 'waitForHumanVerification') return toolInputValue(record, ['maxMs']);
   if (name === 'mouse') {
@@ -974,7 +982,7 @@ function browserChatToolMeta(name: string, input: unknown) {
     return [action, target, deltaY ? `Y ${deltaY}` : ''].filter(Boolean).join(' · ');
   }
   if (name === 'takeSnapshot') return toolInputValue(record, ['mode', 'cursor']);
-  if (name === 'searchSnapshot') return toolInputValue(record, ['query']);
+  if (name === 'searchSnapshot') return toolInputValue(record, ['tag', 'query']);
   if (name === 'takeScreenshot') return toolInputValue(record, ['capture']);
   if (name === 'selectReferenceScreenshots') {
     const ids = Array.isArray(record.ids) ? record.ids : [];
@@ -2491,7 +2499,6 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
         <span className="browser-chat-tool-content">
           <span className="browser-chat-tool-label">
             <span className="browser-chat-tool-name">准备工具</span>
-            <span className="browser-chat-tool-state">运行中</span>
           </span>
           <small className="browser-chat-tool-meta">正在选择下一步浏览器动作</small>
         </span>
@@ -3003,13 +3010,14 @@ function browserChatSubagentsFromLogs(logs: BrowserChatLogRecord[], toolInput: u
       (taskKeys.indexOf(left.taskKey) >= 0 ? taskKeys.indexOf(left.taskKey) : left.taskIndex ?? Number.MAX_SAFE_INTEGER)
       - (taskKeys.indexOf(right.taskKey) >= 0 ? taskKeys.indexOf(right.taskKey) : right.taskIndex ?? Number.MAX_SAFE_INTEGER)
     ));
-  const resultItems = browserChatSubagentToolResultRecord(toolResult)?.results;
+  const toolResultRecord = browserChatSubagentToolResultRecord(toolResult);
+  const resultItems = Array.isArray(toolResultRecord?.results) ? toolResultRecord.results : toolResultRecord?.subagents;
   if (!Array.isArray(resultItems)) return loggedViews;
   const merged = new Map<string, BrowserChatSubagentView>(loggedViews.map((item) => [item.id, item]));
   resultItems.forEach((value, index) => {
     const result = asRecord(value);
     if (!result) return;
-    const id = stringFromUnknown(result.id).trim() || `result-${batchId || 'subagent'}-${index}`;
+    const id = stringFromUnknown(result.uuid || result.id).trim() || `result-${batchId || 'subagent'}-${index}`;
     const statusValue = stringFromUnknown(result.status);
     const status: BrowserChatSubagentView['status'] = statusValue === 'failed' || statusValue === 'blocked'
       ? statusValue
@@ -3188,11 +3196,11 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
   const timelineSteps = steps.filter((step) => (step.tools || []).length || (running && step.status === 'running'));
   // Persisted step traces are the source of truth. Keep every trace that could not
-  // be matched to an AI output cycle, including completed and failed tools, so a
-  // temporary log/result mismatch never makes a tool or child-Agent card vanish.
+  // be matched to an AI output cycle, including tools that have only just started,
+  // so the card is rendered before execution finishes.
   const unrepresentedTimelineEntries = timelineSteps.flatMap((step): BrowserChatTimelineStepEntry[] => {
     const visibleToolIndexes = (step.tools || []).flatMap((tool, toolIndex) => (
-      tool.ok !== undefined && !aiCycleRepresentedToolKeys.has(`${step.index}:${toolIndex}`) ? [toolIndex] : []
+      !aiCycleRepresentedToolKeys.has(`${step.index}:${toolIndex}`) ? [toolIndex] : []
     ));
     if (visibleToolIndexes.length) return [{ step, visibleToolIndexes }];
     return [];

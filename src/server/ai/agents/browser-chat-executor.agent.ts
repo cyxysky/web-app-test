@@ -20,7 +20,6 @@ import {
 } from './browser-input-tool-schema';
 import {
   invalidateRuntimeObservation,
-  observationPreviewLimit,
   restoreRuntimeObservationStore,
   runtimeObservationCount,
   runtimeObservationInvalidatingToolNames,
@@ -100,6 +99,10 @@ export type BrowserChatSubagentRunner = (
   tasks: BrowserChatSubagentTask[],
   abortSignal?: AbortSignal,
   toolCallId?: string,
+) => Promise<BrowserActionResult>;
+
+export type BrowserChatSubagentReader = (
+  uuid: string,
 ) => Promise<BrowserActionResult>;
 
 type RuntimeDecision = {
@@ -459,58 +462,25 @@ function userFacingInfrastructureError(value?: string, context?: { error?: unkno
   return 'AI 请求或响应处理失败，已保留当前页面状态并准备继续。';
 }
 
-function userFacingToolResult(name: string, result?: BrowserActionResult, max = 360) {
+function userFacingToolResult(name: string, result?: BrowserActionResult, _max = 360) {
+  void _max;
   if (!result) return undefined;
-  const resultMax = max;
   if (!result.ok && providerToolSchemaError(result.actual)) return userFacingInfrastructureError(result.actual);
-  if (!result.ok) return trimDebugText(result.actual, resultMax);
-  if (name === 'takeSnapshot') return result.actual;
-  if (looksLikeDomSnapshot(result.actual)) return '已读取当前页面语义 DOM 快照。';
-  if (name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
-  if (name === 'listTabs') return '已读取浏览器标签页列表。';
   if (name === 'downloadFile' || name === 'generateMarkdownFile') return formatFileArtifactResult(name, result.actual);
-  return trimDebugText(result.actual, resultMax);
-}
-
-function modelToolResultLimit(name: string) {
-  const observationTool = name === 'takeSnapshot';
-  const subagentTool = name === 'spawnSubagents';
-  const raw = Number(
-    observationTool
-      ? process.env.AI_OBSERVATION_TOOL_RESULT_MAX_CHARS || process.env.AI_TOOL_RESULT_MAX_CHARS || 20000
-      : subagentTool
-        ? process.env.AI_SUBAGENT_RESULT_MAX_CHARS || 60000
-      : process.env.AI_TOOL_RESULT_MAX_CHARS || 6000,
-  );
-  const fallback = observationTool ? 20000 : subagentTool ? 60000 : 6000;
-  const min = observationTool ? 20000 : subagentTool ? 6000 : 1200;
-  const value = Math.floor(Number.isFinite(raw) ? raw : fallback);
-  if (observationTool) return Math.max(value, min);
-  return Math.min(Math.max(value, min), subagentTool ? 120000 : 30000);
+  return result.actual;
 }
 
 function compactToolResultForModel(
   name: string,
   result: BrowserActionResult,
-  observationStore?: RuntimeObservationStore,
+  _observationStore?: RuntimeObservationStore,
 ): BrowserActionResult {
+  void _observationStore;
   const modelResult = result;
   if (!modelResult.actual) return modelResult;
   const fileResult = modelResult.ok ? formatFileArtifactResult(name, modelResult.actual) : undefined;
   if (fileResult) return { ...modelResult, actual: fileResult };
-  if (runtimeObservationToolNames.has(name)) return modelResult;
-  const limit = modelToolResultLimit(name);
-  if (modelResult.actual.length <= limit) return modelResult;
-  const previewLimit = observationStore ? Math.min(limit, observationPreviewLimit(name)) : limit;
-  const omitted = modelResult.actual.length - previewLimit;
-  return {
-    ...modelResult,
-    actual: [
-      modelResult.actual.slice(0, previewLimit),
-      '',
-      `[Tool result truncated for model context: ${omitted} characters omitted from ${name}. Use a narrower text query, HTTP filter, or another observation tool call if more detail is required.]`,
-    ].join('\n'),
-  };
+  return modelResult;
 }
 
 function staleUidActionError(value?: string) {
@@ -659,17 +629,19 @@ function throwIfStopped(signal?: AbortSignal, shouldContinue?: () => boolean) {
 
 // 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
 function generateTextTimeoutMs(options: Parameters<typeof generateText>[0]) {
-  const nativeToolLoop = typeof (options as { prepareStep?: unknown }).prepareStep === 'function';
-  const raw = Number(
-    nativeToolLoop
-      ? process.env.AI_AGENT_LOOP_TIMEOUT_MS || 30 * 60 * 1000
-      : process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000,
-  );
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : nativeToolLoop ? 30 * 60 * 1000 : 30000;
+  void options;
+  const raw = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 30000;
 }
 
 async function generateTextWithTimeout(options: Parameters<typeof generateText>[0], timeoutOverrideMs?: number) {
   throwIfAborted(options.abortSignal);
+  // A native Agent Loop includes tool execution time. In particular,
+  // spawnSubagents must remain awaited until every child finishes, so an
+  // elapsed wall-clock timeout must never start a second main-Agent attempt.
+  if (typeof (options as { prepareStep?: unknown }).prepareStep === 'function') {
+    return generateText(options);
+  }
   const timeoutMs = Number.isFinite(timeoutOverrideMs) && Number(timeoutOverrideMs) > 0
     ? Math.floor(Number(timeoutOverrideMs))
     : generateTextTimeoutMs(options);
@@ -905,64 +877,25 @@ function agentStepLabel(stepIndex: number) {
   return String(stepIndex + 1);
 }
 
-function agentLoopSummaryInputCharLimit() {
-  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS || 120000);
-  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 120000;
-}
-
-function agentLoopSummaryOutputCharLimit() {
-  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_OUTPUT_MAX_CHARS || 24000);
-  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 24000;
-}
-
-function compactContinuationText(value: string, max: number) {
-  if (value.length <= max) return value;
-  const headLength = Math.max(1, Math.floor(max * 0.72));
-  const tailLength = Math.max(1, max - headLength);
-  return `${value.slice(0, headLength)}\n...[${value.length - headLength - tailLength} characters omitted; tail retained]...\n${value.slice(-tailLength)}`;
-}
-
-function continuationSummaryMessageExcerpt(modelMessages: unknown, maxChars: number) {
+function continuationSummaryMessageHistory(modelMessages: unknown) {
   const record = modelMessages && typeof modelMessages === 'object' && !Array.isArray(modelMessages)
     ? modelMessages as Record<string, unknown>
     : {};
   const messages = Array.isArray(record.messages) ? record.messages : [];
-  const marker = '[WebPilot continuation summary]';
-  const previousSummary = messages
-    .map((message) => message && typeof message === 'object' && !Array.isArray(message)
-      ? message as Record<string, unknown>
-      : undefined)
-    .filter((message): message is Record<string, unknown> => Boolean(message))
-    .map((message) => typeof message.content === 'string' ? message.content : '')
-    .filter((content) => content.startsWith(marker))
-    .at(-1);
-  const result: {
-    previousContinuationSummary?: string;
-    recentMessages: Array<{ index: number; content: string }>;
-  } = { recentMessages: [] };
-  if (previousSummary) result.previousContinuationSummary = compactContinuationText(previousSummary, Math.min(24000, Math.floor(maxChars * 0.28)));
-
-  let remaining = maxChars - JSON.stringify(result).length - 256;
-  for (let index = messages.length - 1; index >= 0 && result.recentMessages.length < 16 && remaining >= 1200; index -= 1) {
-    const serialized = JSON.stringify(messages[index], null, 2);
-    const excerpt = compactContinuationText(serialized, Math.min(14000, Math.max(1200, remaining)));
-    result.recentMessages.unshift({ index, content: excerpt });
-    remaining -= excerpt.length + 96;
-  }
-  return JSON.stringify(result, null, 2);
+  return JSON.stringify({ messages }, null, 2);
 }
 
 function continuationRuntimeState(memory: RuntimeWorkingMemory) {
   return {
-    completed: memory.completed.slice(-30),
-    findings: memory.findings.slice(-40),
-    blockers: memory.blockers.slice(-20),
-    userConstraints: memory.userConstraints.slice(-20),
-    pageUnderstanding: concise(memory.pageUnderstanding, 1800),
-    currentState: concise(memory.currentState, 2600),
-    lastAction: concise(memory.lastAction, 1400),
-    lastResult: concise(memory.lastResult, 2200),
-    nextStep: concise(memory.nextStep, 1400),
+    completed: memory.completed,
+    findings: memory.findings,
+    blockers: memory.blockers,
+    userConstraints: memory.userConstraints,
+    pageUnderstanding: memory.pageUnderstanding,
+    currentState: memory.currentState,
+    lastAction: memory.lastAction,
+    lastResult: memory.lastResult,
+    nextStep: memory.nextStep,
   };
 }
 
@@ -976,7 +909,7 @@ function buildContinuationSummaryPrompt(input: {
   modelMessages: unknown;
   workingMemory: RuntimeWorkingMemory;
 }) {
-  const serializedMessages = continuationSummaryMessageExcerpt(input.modelMessages, agentLoopSummaryInputCharLimit());
+  const serializedMessages = continuationSummaryMessageHistory(input.modelMessages);
   return [
     'You are compressing a WebPilot browser-agent loop so the SAME user request can continue in a fresh model context.',
     'Return concise JSON only. Do not use markdown.',
@@ -1001,7 +934,7 @@ function buildContinuationSummaryPrompt(input: {
     '',
     `Authoritative current runtime state JSON:\n${JSON.stringify(continuationRuntimeState(input.workingMemory), null, 2)}`,
     '',
-    `Selected message history JSON (previous overview plus newest messages, not a head-only truncation):\n${serializedMessages}`,
+    `Complete message history JSON (backend did not truncate or select excerpts):\n${serializedMessages}`,
   ].join('\n');
 }
 
@@ -1737,6 +1670,7 @@ function makeBrowserTools(
     resolveCredential?: (credentialRef: string) => string | undefined;
     credentialAllowedOrigins?: string[];
     runSubagents?: BrowserChatSubagentRunner;
+    readSubagent?: BrowserChatSubagentReader;
     ensureBrowserStarted?: () => Promise<void>;
   },
 ) {
@@ -1780,7 +1714,7 @@ function makeBrowserTools(
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
   const takeSnapshotInput = browserToolInput({
     cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by the prior takeSnapshot page. When set, mode must match the prior page.'),
-    mode: z.enum(['full', 'text', 'changes']).default('full').describe('full reads the complete semantic DOM, text reads deduplicated rendered copy, and changes reads the inter-action journal.'),
+    mode: z.enum(['full', 'text', 'changes']).default('full').describe('full reads the complete loaded semantic DOM; text reads all text from that same complete full DOM, including offscreen content; changes reads the inter-action journal.'),
   });
   async function record(name: string, input: unknown, action: (abortSignal?: AbortSignal, trace?: ToolTrace) => Promise<BrowserActionResult>) {
     throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
@@ -1843,7 +1777,10 @@ function makeBrowserTools(
       onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
       action: actionWithConfirmation,
     }).then(async (result) => {
-      if (browserActionExecuted && runtimeObservationInvalidatingToolNames.has(name)) {
+      const inputRecord = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+      const readOnlyMergedAction = (name === 'page' && inputRecord.action === 'wait')
+        || (name === 'tab' && inputRecord.action === 'list');
+      if (browserActionExecuted && runtimeObservationInvalidatingToolNames.has(name) && !readOnlyMergedAction) {
         // The action result already carries a bounded DOM delta. Never capture or
         // inject a full replacement snapshot here; the model decides when it needs
         // one through takeSnapshot.
@@ -1869,17 +1806,20 @@ function makeBrowserTools(
         )),
       }),
     } : {}),
-    openPage: tool({
-      description: 'Open or navigate to a URL in the browser.',
+    page: tool({
+      description: 'Open a URL or wait for the current page. action=open supports the current tab or a new tab; action=wait waits for page load/stability or for the exact ms supplied.',
       inputSchema: browserToolInput({
-        url: z.string().optional().describe('The URL to open. Defaults to the test target URL.'),
+        action: z.enum(['open', 'wait']),
+        url: z.string().optional().describe('For action=open, the URL to open. Defaults to the test target URL.'),
+        target: z.enum(['current', 'new']).optional().describe('For action=open, open in the current tab or a new active tab. Defaults to current.'),
+        ms: z.number().int().nonnegative().optional().describe('For action=wait, optional exact minimum wait duration in milliseconds.'),
       }),
-      execute: (input) => record('openPage', input, () => {
+      execute: (input) => record('page', input, () => {
+        if (input.action === 'wait') {
+          return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
+        }
         const url = input.url || targetUrl;
-        // Navigation itself may cross origins after login (for example a DOMP
-        // requirement linking to an Axure PRD). Secret entry remains protected
-        // below by credentialOriginAllowed(session.currentUrl()).
-        return session.open(url);
+        return input.target === 'new' ? session.openInNewTab(url) : session.open(url);
       }),
     }),
     mouse: tool({
@@ -1939,13 +1879,6 @@ function makeBrowserTools(
         label: input.label,
       })),
     }),
-    waitForPage: tool({
-      description: 'Wait for the page after navigation or UI changes. When ms is provided, wait for that full duration in milliseconds; do not shorten it.',
-      inputSchema: browserToolInput({
-        ms: z.number().int().nonnegative().optional().describe('Optional exact minimum wait duration in milliseconds.'),
-      }),
-      execute: (input) => record('waitForPage', input, () => (typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage())),
-    }),
     waitForHumanVerification: tool({
       description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever the page detector or snapshot shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
       inputSchema: browserToolInput({
@@ -1955,7 +1888,7 @@ function makeBrowserTools(
     }),
     ...(referenceOptions?.runSubagents ? {
       spawnSubagents: tool({
-        description: 'Run several independent research or testing tasks concurrently with full browser-agent tools, then return every successful and failed branch result. Use this for independent links, PRD projects, pages, roles, or test branches. One child failure does not cancel its siblings.',
+        description: 'Run several independent research or testing tasks concurrently with full browser-agent tools. The main Agent strictly waits for the original batch barrier, including retries. This returns one backend-maintained UUID per child, never the child content. Call readSubagent with each UUID to load that child model\'s complete summary into the main-Agent context. One child failure does not cancel its siblings.',
         inputSchema: browserToolInput({
           tasks: z.array(z.object({
             title: z.string().min(1).max(160).describe('Short Chinese display name for this child Agent.'),
@@ -1966,23 +1899,26 @@ function makeBrowserTools(
         execute: (input) => record('spawnSubagents', input, (abortSignal, trace) => referenceOptions.runSubagents!(input.tasks, abortSignal, trace?.id)),
       }),
     } : {}),
-    listPageLinks: tool({
-      description: 'List the real HTTP(S) links currently present in the page and its frames. Use this after inspecting a requirement root page so linked PRDs, Axure projects, documents, or independent pages can be delegated with spawnSubagents using exact URLs.',
-      inputSchema: browserToolInput({}),
-      execute: (input) => record('listPageLinks', input, async () => {
-        const links = await session.readPageLinks();
-        return {
-          ok: true,
-          actual: links.length
-            ? JSON.stringify({ count: links.length, links: links.slice(0, 300) })
-            : 'No HTTP(S) links were found in the current page or its frames.',
-        };
+    ...(referenceOptions?.readSubagent ? {
+      readSubagent: tool({
+        description: 'Read one completed child Agent result by the exact UUID returned from spawnSubagents. The backend keeps complete child execution details for the conversation, while this tool returns the child model-authored summary without backend truncation.',
+        inputSchema: browserToolInput({
+          uuid: z.string().uuid().describe('Exact child Agent UUID returned by spawnSubagents.'),
+        }),
+        execute: (input) => record('readSubagent', input, () => referenceOptions.readSubagent!(input.uuid)),
       }),
-    }),
-    listTabs: tool({
-      description: 'List all currently open browser tabs with their index and URL.',
-      inputSchema: browserToolInput({}),
-      execute: (input) => record('listTabs', input, () => session.listTabs()),
+    } : {}),
+    tab: tool({
+      description: 'List browser tabs or switch the active tab. action=list returns every tab and index; action=switch activates the supplied index.',
+      inputSchema: browserToolInput({
+        action: z.enum(['list', 'switch']),
+        index: z.number().int().nonnegative().optional().describe('Required for action=switch; use an index returned by action=list.'),
+      }),
+      execute: (input) => record('tab', input, () => {
+        if (input.action === 'list') return session.listTabs();
+        if (typeof input.index !== 'number') return Promise.resolve({ ok: false, actual: 'tab action=switch requires index.' });
+        return session.switchTab(input.index);
+      }),
     }),
     getHttpRequests: tool({
       description: 'Read HTTP requests for the current tab. Without ids, return recent request summaries. With ids from takeSnapshot({mode:"changes"}), return request body and readable response body for only those requests. Use this when an inter-action change journal lists a request that may explain a delayed UI result.',
@@ -1992,7 +1928,7 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests({ ids: input.ids })),
     }),
     takeSnapshot: tool({
-      description: 'Capture a paged DOM observation. text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal: all observed DOM additions, updates, removals, and request summaries since the last browser-changing tool call; it has no interactive UIDs and does not replace the DOM baseline. Use getHttpRequests with its request IDs for details. Default to mode=full. If nextCursor is returned, call takeSnapshot again with both the same mode and that exact cursor; do not act between pages. Every result states page/current total.',
+      description: 'Capture a paged DOM observation. full covers the complete loaded DOM; text contains all text from that same full DOM, including offscreen content, not only the viewport. text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal and has no interactive UIDs. Default to mode=full. nextCursor pages one frozen result: call takeSnapshot again with the same mode and exact cursor, and never scroll for pagination. searchSnapshot, waiting, and asynchronous DOM mutations do not invalidate it; UI-affecting interactions and an explicit fresh takeSnapshot do.',
       inputSchema: takeSnapshotInput,
       execute: (input) => record('takeSnapshot', input, async () => (
         referenceOptions?.takeSnapshot
@@ -2001,12 +1937,13 @@ function makeBrowserTools(
       )),
     }),
     searchSnapshot: tool({
-      description: 'Search the current DOM-observation baseline without paging through it. Call takeSnapshot first; this returns matching dom-* UIDs from that same live registry and never searches a separate CDP snapshot.',
+      description: 'Purely search or read tags from the current frozen full DOM baseline without paging through it. Call takeSnapshot first. query returns ranked matches; tag returns every element of that HTML tag from the full baseline. It never scrolls, consumes mutations, or invalidates pagination.',
       inputSchema: browserToolInput({
-        query: z.string().min(1).max(500),
+        query: z.string().min(1).max(500).optional(),
+        tag: z.string().min(1).max(80).optional().describe('Optional HTML tag. When supplied, return every matching tag from the complete full DOM baseline.'),
         roles: z.array(z.string().min(1)).max(20).optional(),
         limit: z.number().int().min(1).max(100).optional(),
-      }),
+      }).refine((input) => Boolean(input.query || input.tag), { message: 'query or tag is required' }),
       execute: (input) => record('searchSnapshot', input, () => session.searchSnapshot(input)),
     }),
     downloadFile: tool({
@@ -2027,13 +1964,6 @@ function makeBrowserTools(
         content: z.string().min(1).describe('Complete Markdown file content to save.'),
       }),
       execute: (input) => record('generateMarkdownFile', input, () => generateMarkdownArtifact({ ...input, runId: referenceOptions?.runId })),
-    }),
-    switchTab: tool({
-      description: 'Switch to a browser tab by index when the workflow opened a new tab.',
-      inputSchema: browserToolInput({
-        index: z.number().describe('The tab index from listTabs.'),
-      }),
-      execute: (input) => record('switchTab', input, () => session.switchTab(input.index)),
     }),
     reportState: tool({
       description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or a short textual status update is enough. This tool does not change the browser.',
@@ -2220,9 +2150,9 @@ function runtimePrompt(input: {
         : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
     `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"full"}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
-    '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
+    '- If loading/transitioning, call page with action="wait" once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
-    '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
+    '- After a click may open a tab/window, call tab with action="list"; use action="switch" if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
     '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
     '- If login, password, OTP, QR-code scan, payment confirmation, or identity confirmation requires user-owned credentials or a personal device and those credentials were not explicitly supplied, call waitForHumanVerification instead of inventing credentials or only describing the blocker in text.',
@@ -2286,12 +2216,11 @@ function runtimeToolNames(mode: BrowserSessionMode) {
   void mode;
   return [
     ...(modelSupportsScreenshotInput() ? ['takeScreenshot'] : []),
-    'openPage',
-    'waitForPage',
+    'page',
     'waitForHumanVerification',
     'spawnSubagents',
-    'listPageLinks',
-    'listTabs',
+    'readSubagent',
+    'tab',
     'getHttpRequests',
     'takeSnapshot',
     'searchSnapshot',
@@ -2300,7 +2229,6 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'selectOption',
     'downloadFile',
     'generateMarkdownFile',
-    'switchTab',
     'reportState',
     ...(modelSupportsScreenshotInput() ? ['selectReferenceScreenshots', 'manageVisualContext'] : []),
   ];
@@ -2308,19 +2236,16 @@ function runtimeToolNames(mode: BrowserSessionMode) {
 
 const browserSessionToolNames = new Set([
   'takeScreenshot',
-  'openPage',
-  'waitForPage',
+  'page',
   'waitForHumanVerification',
   'spawnSubagents',
-  'listPageLinks',
-  'listTabs',
+  'tab',
   'getHttpRequests',
   'takeSnapshot',
   'searchSnapshot',
   'mouse',
   'keyboard',
   'selectOption',
-  'switchTab',
 ]);
 
 function toolRequiresBrowserSession(name: string) {
@@ -2495,6 +2420,7 @@ function fullLogDetails(value: unknown) {
 }
 
 function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Record<string, unknown> = {}, modelMessages?: unknown) {
+  const messages = modelMessages || aiRequest?.messages || [];
   return fullLogDetails({
     aiInput: {
       provider: aiRequest?.provider || extra.provider,
@@ -2505,8 +2431,9 @@ function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Re
         ...extra,
       },
       system: aiRequest?.systemPrompt,
-      messages: modelMessages || aiRequest?.messages || [],
+      messages,
     },
+    aiInputTokens: modelMessagesTextAndImageStats(messages),
   });
 }
 
@@ -2723,6 +2650,7 @@ async function executeRuntimeStep(input: {
   credentialAllowedOrigins?: string[];
   allowedToolTypes?: string[];
   runSubagents?: BrowserChatSubagentRunner;
+  readSubagent?: BrowserChatSubagentReader;
   ensureBrowserStarted?: () => Promise<void>;
   isBrowserStarted?: () => boolean;
   agentLoopTimeoutMs?: number;
@@ -2861,10 +2789,14 @@ async function executeRuntimeStep(input: {
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
     const observationStore: RuntimeObservationStore = input.runtimeObservationStore || new Map();
     if (retryState?.observationStore) restoreRuntimeObservationStore(observationStore, retryState.observationStore);
+    const availableRuntimeToolNames = runtimeToolNames(mode).filter((name) => (
+      (name !== 'spawnSubagents' || Boolean(input.runSubagents))
+      && (name !== 'readSubagent' || Boolean(input.readSubagent))
+    ));
     const runtimeTools = runtimeAllowedToolTypes({
       browserChatMode,
       codexMode,
-      nativeToolNames: runtimeToolNames(mode),
+      nativeToolNames: availableRuntimeToolNames,
       observationToolNames: runtimeObservationToolNames,
     });
     const requestedToolTypes = input.allowedToolTypes?.length ? new Set(input.allowedToolTypes) : undefined;
@@ -3115,7 +3047,7 @@ async function executeRuntimeStep(input: {
           abortSignal,
         });
         ensureActive();
-        return trimDebugText(result.text || '', agentLoopSummaryOutputCharLimit()) || fallbackContinuationSummary({
+        return (result.text || '').trim() || fallbackContinuationSummary({
           goal: requirementOf(testCase),
           browserMode: mode,
           stepIndex,
@@ -3280,6 +3212,7 @@ async function executeRuntimeStep(input: {
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
         runSubagents: input.runSubagents,
+        readSubagent: input.readSubagent,
         ensureBrowserStarted: input.ensureBrowserStarted,
         onDebug,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
@@ -3350,6 +3283,7 @@ async function executeRuntimeStep(input: {
       resolveCredential: input.resolveCredential,
       credentialAllowedOrigins: input.credentialAllowedOrigins,
       runSubagents: input.runSubagents,
+      readSubagent: input.readSubagent,
       ensureBrowserStarted: input.ensureBrowserStarted,
       onDebug,
       observeCurrentScreenshot,
@@ -3552,9 +3486,9 @@ function browserChatRequirement(input: {
         : '',
     '- Every new user action message is a new occurrence. Even when it repeats the previous wording, a previous tool call never satisfies the new message.',
     '- Use browser tools only for live action or page inspection. If current evidence is enough, answer directly.',
-    '- Requirement-link delegation rule: when the user asks to analyze a requirement together with its PRD, Axure, Wiki, images, or linked documents, you MUST call listPageLinks after the first useful requirement-page snapshot. Delegate every independently readable PRD/document URL to spawnSubagents with its exact URL and a self-contained evidence request; keep the requirement root and dependent end-to-end test flow in the main Agent. For other tasks, delegate only when independent resources or test branches make parallel work useful. This is an in-conversation tool decision, never a pre-classification step or separate goal mode.',
+    '- Requirement-link delegation rule: after the first useful full requirement-page snapshot, use searchSnapshot with tag="a" to read every anchor from that frozen full DOM. Delegate every independently readable PRD/document URL to spawnSubagents with its exact URL and a self-contained evidence request; keep the requirement root and dependent end-to-end flow in the main Agent.',
     '- Parallel-first rule: whenever you discover two or more independent URLs, documents, roles, environments, or test branches that can be investigated without depending on each other, prefer one spawnSubagents call immediately instead of opening and analyzing them serially in the main Agent.',
-    '- Do not skip spawnSubagents merely because each branch looks simple or the main Agent could complete them one by one. Let child Agents gather branch evidence concurrently, then have the main Agent compare, synthesize, and continue dependent work.',
+    '- spawnSubagents returns only child UUIDs after every child reaches a terminal state. Call readSubagent once for each UUID whose result you need; child content is never embedded directly in spawnSubagents.',
     '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
     '- Final visible answer must be Chinese Markdown. Do not include JSON, tool parameters, candidate ids, coordinates, or screenshot paths.',
   ].filter(Boolean).join('\n');
@@ -3562,27 +3496,34 @@ function browserChatRequirement(input: {
 
 const browserChatNonActionToolNames = new Set([
   'getHttpRequests',
-  'listTabs',
+  'readSubagent',
+  'tab',
   'reportState',
   'searchSnapshot',
   'selectReferenceScreenshots',
   'takeScreenshot',
   'takeSnapshot',
   'waitForHumanVerification',
-  'waitForPage',
 ]);
 
 const browserChatNonEvidenceToolNames = new Set([
   'reportState',
   'selectReferenceScreenshots',
   'waitForHumanVerification',
-  'waitForPage',
+  'readSubagent',
+  'tab',
 ]);
 
 function browserChatTurnHasToolEvidence(steps: StepExecutionResult[], requirement: BrowserChatToolRequirement) {
-  const toolNames = steps.flatMap((step) => (step.tools || []).filter((toolCall) => toolCall.ok !== false).map((toolCall) => toolCall.name));
-  if (requirement === 'action') return toolNames.some((name) => !browserChatNonActionToolNames.has(name));
-  return toolNames.some((name) => !browserChatNonEvidenceToolNames.has(name));
+  const toolCalls = steps.flatMap((step) => (step.tools || []).filter((toolCall) => toolCall.ok !== false));
+  if (requirement === 'action') return toolCalls.some((toolCall) => (
+    !browserChatNonActionToolNames.has(toolCall.name)
+    && !(toolCall.name === 'page' && flowInput(toolCall.input).action === 'wait')
+  ));
+  return toolCalls.some((toolCall) => (
+    !browserChatNonEvidenceToolNames.has(toolCall.name)
+    && !(toolCall.name === 'page' && flowInput(toolCall.input).action === 'wait')
+  ));
 }
 
 function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
@@ -3676,6 +3617,7 @@ export async function executeInteractiveBrowserTurn(input: {
   shouldContinue?: () => boolean;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
+  readSubagent?: BrowserChatSubagentReader;
   ensureBrowserStarted?: () => Promise<void>;
   isBrowserStarted?: () => boolean;
   agentLoopTimeoutMs?: number;
@@ -3800,6 +3742,7 @@ export async function executeInteractiveBrowserTurn(input: {
         credentialAllowedOrigins: input.credentialAllowedOrigins,
         allowedToolTypes: input.allowedToolTypes,
         runSubagents: input.runSubagents,
+        readSubagent: input.readSubagent,
         ensureBrowserStarted: input.ensureBrowserStarted,
         isBrowserStarted: input.isBrowserStarted,
         agentLoopTimeoutMs: input.agentLoopTimeoutMs,
@@ -4203,6 +4146,14 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
   const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
 
   switch (flow.name) {
+    case 'page':
+      if (input.action === 'wait') return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
+      {
+        const rawUrl = typeof input.url === 'string' && input.url.trim() ? input.url : targetUrl;
+        const url = normalizeBrowserUrl(rawUrl);
+        if (!url) return { ok: false, actual: 'Recorded page open failed because the target URL is empty.' };
+        return input.target === 'new' ? session.openInNewTab(url) : session.open(url);
+      }
     case 'openPage':
       {
         const rawUrl = typeof input.url === 'string' && input.url.trim() ? input.url : targetUrl;
@@ -4212,7 +4163,8 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       }
     case 'searchSnapshot':
       return session.searchSnapshot({
-        query: String(input.query || ''),
+        query: typeof input.query === 'string' ? input.query : undefined,
+        tag: typeof input.tag === 'string' ? input.tag : undefined,
         roles: Array.isArray(input.roles) ? input.roles.filter((role): role is string => typeof role === 'string') : undefined,
         limit: typeof input.limit === 'number' ? input.limit : undefined,
       });
@@ -4254,16 +4206,10 @@ async function runRecordedTool(session: BrowserSession, targetUrl: string, flow:
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
     case 'listTabs':
       return session.listTabs();
-    case 'listPageLinks':
-      {
-        const links = await session.readPageLinks();
-        return {
-          ok: true,
-          actual: links.length
-            ? JSON.stringify({ count: links.length, links: links.slice(0, 300) })
-            : 'No HTTP(S) links were found in the current page or its frames.',
-        };
-      }
+    case 'tab':
+      return input.action === 'switch'
+        ? session.switchTab(typeof input.index === 'number' ? input.index : Number(input.index || 0))
+        : session.listTabs();
     case 'getHttpRequests':
       return session.getCurrentTabHttpRequests({ ids: Array.isArray(input.ids) ? input.ids.filter((id): id is string => typeof id === 'string') : undefined });
     case 'downloadFile':
@@ -4310,6 +4256,7 @@ async function executeCodexRuntimeObject(input: {
   shouldContinue?: () => boolean;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
+  readSubagent?: BrowserChatSubagentReader;
   ensureBrowserStarted?: () => Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
@@ -4322,7 +4269,7 @@ async function executeCodexRuntimeObject(input: {
   observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => BrowserActionResult | Promise<BrowserActionResult>;
   takeSnapshot?: (input?: RuntimeObservationReadOptions) => BrowserActionResult | Promise<BrowserActionResult>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, ensureBrowserStarted, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observeCurrentScreenshot, takeSnapshot } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, ensureBrowserStarted, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observeCurrentScreenshot, takeSnapshot } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -4384,6 +4331,12 @@ async function executeCodexRuntimeObject(input: {
       }).slice(0, 6) : [];
       if (!tasks.length) return { ok: false, actual: 'spawnSubagents requires at least one valid task.' };
       return runSubagents(tasks, abortSignal, toolCallId);
+    }
+    if (type === 'readSubagent') {
+      if (!readSubagent) return { ok: false, actual: 'readSubagent is unavailable in this runtime.' };
+      const uuid = typeof normalizedParams.uuid === 'string' ? normalizedParams.uuid.trim() : '';
+      if (!uuid) return { ok: false, actual: 'readSubagent requires a UUID.' };
+      return readSubagent(uuid);
     }
     return runRecordedTool(session, targetUrl, flow, runId);
   };

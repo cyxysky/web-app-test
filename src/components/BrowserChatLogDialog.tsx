@@ -49,6 +49,13 @@ function aiLogResponsePayload(details?: Record<string, unknown>) {
   return details?.aiOutput !== undefined ? formatToolPayload(details.aiOutput) : '';
 }
 
+function aiLogInputTokenCount(log: BrowserChatLogDialogRecord) {
+  if (!log.phase.endsWith('ai:runtime:request')) return undefined;
+  const details = parseJsonObjectText(log.details);
+  const payloadDetails = asRecord(details?.event) || details;
+  return finiteNumber(asRecord(payloadDetails?.aiInputTokens)?.estimatedTextTokens);
+}
+
 function aiLogTimings(details?: Record<string, unknown>) {
   return asRecord(asRecord(details?.aiOutput)?.timings);
 }
@@ -188,17 +195,18 @@ function screenshotPerformancePayload(details: Record<string, unknown>) {
   return lines.join('\n');
 }
 
-function BrowserChatLogDetails({ log }: { log: BrowserChatLogDialogRecord }) {
+function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLogDialogRecord; nextAiInputTokens?: number }) {
   if (!log.details) return null;
   const parsed = parseJsonObjectText(log.details);
-  const isAiRequestLog = log.phase === 'ai:runtime:request';
-  const isAiResponseLog = log.phase === 'ai:runtime:response' || log.phase === 'ai:runtime:object';
+  const isAiRequestLog = log.phase.endsWith('ai:runtime:request');
+  const isAiResponseLog = log.phase.endsWith('ai:runtime:response') || log.phase.endsWith('ai:runtime:object');
   const isAiFailureLog = isBrowserChatAiFailureLog(log);
   const isConversationSummaryRequest = log.phase === 'conversation:context:request';
   const isConversationSummaryResponse = log.phase === 'conversation:context:response';
   if (!parsed) return null;
+  const payloadDetails = asRecord(parsed.event) || parsed;
   const requestPayload = isAiRequestLog
-    ? aiLogRequestPayload(parsed)
+    ? aiLogRequestPayload(payloadDetails)
     : isConversationSummaryRequest
       ? formatToolPayload({
           provider: parsed.provider,
@@ -209,7 +217,7 @@ function BrowserChatLogDetails({ log }: { log: BrowserChatLogDialogRecord }) {
         })
       : '';
   const responsePayload = isAiResponseLog
-    ? aiLogResponsePayload(parsed)
+    ? aiLogResponsePayload(payloadDetails)
     : isConversationSummaryResponse
       ? formatToolPayload({
           provider: parsed.provider,
@@ -220,15 +228,22 @@ function BrowserChatLogDetails({ log }: { log: BrowserChatLogDialogRecord }) {
           context: parsed.context,
         })
       : '';
-  const timingPayload = isAiResponseLog ? aiLogTimingPayload(parsed) : '';
+  const timingPayload = isAiResponseLog ? aiLogTimingPayload(payloadDetails) : '';
   const errorPayload = isAiFailureLog ? formatToolPayload(parsed) : '';
   const performancePayload = isBrowserChatScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
+  const requestTokens = isAiRequestLog ? finiteNumber(asRecord(payloadDetails.aiInputTokens)?.estimatedTextTokens) : undefined;
   if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload) return null;
   return (
     <div className="browser-chat-log-details">
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" payload={timingPayload} title="耗时明细" />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block" payload={requestPayload} title="AI input JSON" />
+      {isAiRequestLog ? (
+        <p className="browser-chat-log-token-count">此次发送给 AI 的文本：{requestTokens === undefined ? '无法估算' : `约 ${Math.round(requestTokens).toLocaleString()} tokens`}</p>
+      ) : null}
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-response" payload={responsePayload} title="AI output JSON" />
+      {isAiResponseLog ? (
+        <p className="browser-chat-log-token-count">下次发送给 AI 的内容：{nextAiInputTokens === undefined ? '尚未生成' : `约 ${Math.round(nextAiInputTokens).toLocaleString()} tokens`}</p>
+      ) : null}
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-error" payload={errorPayload} title="错误详情" />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-performance" payload={performancePayload} title="Screenshot performance" />
     </div>
@@ -242,11 +257,13 @@ function BrowserChatLogEntry({
   measureRef,
   style,
   virtualIndex,
+  nextAiInputTokens,
 }: {
   log: BrowserChatLogDialogRecord;
   measureRef?: (node: HTMLLIElement | null) => void;
   style?: CSSProperties;
   virtualIndex?: number;
+  nextAiInputTokens?: number;
 }) {
   const compressionLabel = contextCompressionLabel(log);
   const timingLabel = aiLogTimingInline(log);
@@ -272,7 +289,7 @@ function BrowserChatLogEntry({
           {log.stepIndex ? ` · 步骤 ${log.stepIndex}` : ''}
           {timingLabel ? ` ? ${timingLabel}` : typeof log.elapsedMs === 'number' ? ` ? ${log.elapsedMs}ms` : ''}
         </small>
-        <BrowserChatLogDetails log={log} />
+        <BrowserChatLogDetails log={log} nextAiInputTokens={nextAiInputTokens} />
       </div>
     </li>
   );
@@ -287,6 +304,17 @@ function BrowserChatVirtualLogList({ entries }: { entries: BrowserChatLogDialogR
     overscan: 8,
   });
   const virtualItems = rowVirtualizer.getVirtualItems();
+  const nextInputTokensByIndex = new Map<number, number>();
+  let nextInputTokens: number | undefined;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const log = entries[index];
+    if (!log) continue;
+    if (log.phase.endsWith('ai:runtime:response') || log.phase.endsWith('ai:runtime:object')) {
+      if (nextInputTokens !== undefined) nextInputTokensByIndex.set(index, nextInputTokens);
+    }
+    const currentInputTokens = aiLogInputTokenCount(log);
+    if (currentInputTokens !== undefined) nextInputTokens = currentInputTokens;
+  }
 
   return (
     <div className="browser-chat-log-modal-list" ref={scrollRef}>
@@ -308,6 +336,7 @@ function BrowserChatVirtualLogList({ entries }: { entries: BrowserChatLogDialogR
                 width: '100%',
               }}
               virtualIndex={virtualRow.index}
+              nextAiInputTokens={nextInputTokensByIndex.get(virtualRow.index)}
             />
           );
         })}

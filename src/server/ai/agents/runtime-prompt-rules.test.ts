@@ -35,3 +35,15 @@ test('models without image input receive snapshot-only guidance', () => {
   assert.match(rules, /nextCursor/);
   assert.doesNotMatch(rules, /mode="actionable"/);
 });
+
+test('snapshot rules distinguish frozen pagination from page scrolling and overflow', () => {
+  const rules = combinedRules(true);
+
+  assert.match(rules, /ALL text.*complete full DOM/i);
+  assert.match(rules, /including offscreen text/i);
+  assert.match(rules, /never scroll for snapshot pagination/i);
+  assert.match(rules, /pure read that never scrolls, consumes the mutation queue, or changes snapshot pagination/i);
+  assert.match(rules, /domChanges\.overflow.*MutationObserver/i);
+  assert.match(rules, /NEVER means there is more page content below/i);
+  assert.match(rules, /child-Agent tasks/i);
+});

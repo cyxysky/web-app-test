@@ -21,7 +21,6 @@ import {
 import {
   compactStaleSnapshotMessages,
   invalidateRuntimeObservation,
-  observationPreviewLimit,
   restoreRuntimeObservationStore,
   runtimeObservationCount,
   runtimeObservationInvalidatingToolNames,
@@ -359,52 +358,24 @@ function runtimeRequestConsecutiveFailureLimit(browserChatMode: boolean) {
   return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, browserChatMode ? 3 : 2, 1, 10);
 }
 
-function userFacingToolResult(name: string, result?: BrowserActionResult, max = 360) {
+function userFacingToolResult(name: string, result?: BrowserActionResult, _max = 360) {
+  void _max;
   if (!result) return undefined;
-  if (!result.ok) return trimDebugText(result.actual, max);
-  if (name === 'takeSnapshot') return trimDebugText(result.actual, 10000);
-  if (looksLikeDomSnapshot(result.actual)) return '已读取当前页面语义 DOM 快照。';
-  if (name === 'getHttpRequests') return '已读取当前标签页的网络请求记录。';
-  if (name === 'listTabs') return '已读取浏览器标签页列表。';
   if (name === 'downloadFile' || name === 'generateMarkdownFile') return formatFileArtifactResult(name, result.actual);
-  return trimDebugText(result.actual, max);
-}
-
-function modelToolResultLimit(name: string) {
-  const observationTool = name === 'takeSnapshot';
-  const raw = Number(
-    observationTool
-      ? process.env.AI_OBSERVATION_TOOL_RESULT_MAX_CHARS || process.env.AI_TOOL_RESULT_MAX_CHARS || 10000
-      : process.env.AI_TOOL_RESULT_MAX_CHARS || 6000,
-  );
-  const fallback = observationTool ? 10000 : 6000;
-  const min = observationTool ? 10000 : 1200;
-  const value = Math.floor(Number.isFinite(raw) ? raw : fallback);
-  return Math.min(Math.max(value, min), 30000);
+  return result.actual;
 }
 
 function compactToolResultForModel(
   name: string,
   result: BrowserActionResult,
-  observationStore?: RuntimeObservationStore,
+  _observationStore?: RuntimeObservationStore,
 ): BrowserActionResult {
+  void _observationStore;
   const modelResult = result;
   if (!modelResult.actual) return modelResult;
   const fileResult = modelResult.ok ? formatFileArtifactResult(name, modelResult.actual) : undefined;
   if (fileResult) return { ...modelResult, actual: fileResult };
-  if (runtimeObservationToolNames.has(name)) return modelResult;
-  const limit = modelToolResultLimit(name);
-  if (modelResult.actual.length <= limit) return modelResult;
-  const previewLimit = observationStore ? Math.min(limit, observationPreviewLimit(name)) : limit;
-  const omitted = modelResult.actual.length - previewLimit;
-  return {
-    ...modelResult,
-    actual: [
-      modelResult.actual.slice(0, previewLimit),
-      '',
-      `[Tool result truncated for model context: ${omitted} characters omitted from ${name}. Use a narrower text query, HTTP filter, or another observation tool call if more detail is required.]`,
-    ].join('\n'),
-  };
+  return modelResult;
 }
 
 function elapsedSince(startedAt: number) {
@@ -480,16 +451,15 @@ function readableActionFromTrace(trace?: ToolTrace, options: { reportState?: boo
 
 // 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
 function generateTextTimeoutMs(options: Parameters<typeof generateText>[0]) {
-  const nativeToolLoop = typeof (options as { prepareStep?: unknown }).prepareStep === 'function';
-  const raw = Number(
-    nativeToolLoop
-      ? process.env.AI_AGENT_LOOP_TIMEOUT_MS || process.env.AI_TEST_REQUEST_TIMEOUT_MS || 120000
-      : process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000,
-  );
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : nativeToolLoop ? 120000 : 30000;
+  void options;
+  const raw = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 30000;
 }
 
 async function generateTextWithTimeout(options: Parameters<typeof generateText>[0]) {
+  if (typeof (options as { prepareStep?: unknown }).prepareStep === 'function') {
+    return generateText(options);
+  }
   const timeoutMs = generateTextTimeoutMs(options);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
@@ -695,64 +665,25 @@ function agentStepLabel(stepIndex: number) {
   return String(stepIndex + 1);
 }
 
-function agentLoopSummaryInputCharLimit() {
-  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS || 120000);
-  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 120000;
-}
-
-function agentLoopSummaryOutputCharLimit() {
-  const raw = Number(process.env.AI_AGENT_LOOP_SUMMARY_OUTPUT_MAX_CHARS || 24000);
-  return Number.isFinite(raw) && raw > 1000 ? Math.floor(raw) : 24000;
-}
-
-function compactContinuationText(value: string, max: number) {
-  if (value.length <= max) return value;
-  const headLength = Math.max(1, Math.floor(max * 0.72));
-  const tailLength = Math.max(1, max - headLength);
-  return `${value.slice(0, headLength)}\n...[${value.length - headLength - tailLength} characters omitted; tail retained]...\n${value.slice(-tailLength)}`;
-}
-
-function continuationSummaryMessageExcerpt(modelMessages: unknown, maxChars: number) {
+function continuationSummaryMessageHistory(modelMessages: unknown) {
   const record = modelMessages && typeof modelMessages === 'object' && !Array.isArray(modelMessages)
     ? modelMessages as Record<string, unknown>
     : {};
   const messages = Array.isArray(record.messages) ? record.messages : [];
-  const marker = '[WebPilot continuation summary]';
-  const previousSummary = messages
-    .map((message) => message && typeof message === 'object' && !Array.isArray(message)
-      ? message as Record<string, unknown>
-      : undefined)
-    .filter((message): message is Record<string, unknown> => Boolean(message))
-    .map((message) => typeof message.content === 'string' ? message.content : '')
-    .filter((content) => content.startsWith(marker))
-    .at(-1);
-  const result: {
-    previousContinuationSummary?: string;
-    recentMessages: Array<{ index: number; content: string }>;
-  } = { recentMessages: [] };
-  if (previousSummary) result.previousContinuationSummary = compactContinuationText(previousSummary, Math.min(24000, Math.floor(maxChars * 0.28)));
-
-  let remaining = maxChars - JSON.stringify(result).length - 256;
-  for (let index = messages.length - 1; index >= 0 && result.recentMessages.length < 16 && remaining >= 1200; index -= 1) {
-    const serialized = JSON.stringify(messages[index], null, 2);
-    const excerpt = compactContinuationText(serialized, Math.min(14000, Math.max(1200, remaining)));
-    result.recentMessages.unshift({ index, content: excerpt });
-    remaining -= excerpt.length + 96;
-  }
-  return JSON.stringify(result, null, 2);
+  return JSON.stringify({ messages }, null, 2);
 }
 
 function continuationRuntimeState(memory: RuntimeWorkingMemory) {
   return {
-    completed: memory.completed.slice(-30),
-    findings: memory.findings.slice(-40),
-    blockers: memory.blockers.slice(-20),
-    userConstraints: memory.userConstraints.slice(-20),
-    pageUnderstanding: concise(memory.pageUnderstanding, 1800),
-    currentState: concise(memory.currentState, 2600),
-    lastAction: concise(memory.lastAction, 1400),
-    lastResult: concise(memory.lastResult, 2200),
-    nextStep: concise(memory.nextStep, 1400),
+    completed: memory.completed,
+    findings: memory.findings,
+    blockers: memory.blockers,
+    userConstraints: memory.userConstraints,
+    pageUnderstanding: memory.pageUnderstanding,
+    currentState: memory.currentState,
+    lastAction: memory.lastAction,
+    lastResult: memory.lastResult,
+    nextStep: memory.nextStep,
   };
 }
 
@@ -766,7 +697,7 @@ function buildContinuationSummaryPrompt(input: {
   modelMessages: unknown;
   workingMemory: RuntimeWorkingMemory;
 }) {
-  const serializedMessages = continuationSummaryMessageExcerpt(input.modelMessages, agentLoopSummaryInputCharLimit());
+  const serializedMessages = continuationSummaryMessageHistory(input.modelMessages);
   return [
     'You are compressing a WebPilot browser-agent loop so the SAME user request can continue in a fresh model context.',
     'Return concise JSON only. Do not use markdown.',
@@ -791,7 +722,7 @@ function buildContinuationSummaryPrompt(input: {
     '',
     `Authoritative current runtime state JSON:\n${JSON.stringify(continuationRuntimeState(input.workingMemory), null, 2)}`,
     '',
-    `Selected message history JSON (previous overview plus newest messages, not a head-only truncation):\n${serializedMessages}`,
+    `Complete message history JSON (backend did not truncate or select excerpts):\n${serializedMessages}`,
   ].join('\n');
 }
 
@@ -1378,7 +1309,7 @@ function makeBrowserTools(
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
   const takeSnapshotInput = browserToolInput({
     cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by the prior takeSnapshot page. When set, mode must match the prior page.'),
-    mode: z.enum(['full', 'text', 'changes']).default('full').describe('full reads the complete semantic DOM, text reads deduplicated rendered copy, and changes reads the inter-action journal.'),
+    mode: z.enum(['full', 'text', 'changes']).default('full').describe('full reads the complete loaded semantic DOM; text reads all text from that same complete full DOM, including offscreen content; changes reads the inter-action journal.'),
   });
 
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
@@ -1405,7 +1336,10 @@ function makeBrowserTools(
       onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
       action,
     }).then((result) => {
-      if (runtimeObservationInvalidatingToolNames.has(name)) {
+      const inputRecord = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+      const readOnlyMergedAction = (name === 'page' && inputRecord.action === 'wait')
+        || (name === 'tab' && inputRecord.action === 'list');
+      if (runtimeObservationInvalidatingToolNames.has(name) && !readOnlyMergedAction) {
         // Action results carry their authoritative incremental delta in
         // domChanges. Snapshots remain explicit, server-side observations;
         // never append or return a second text representation after an action.
@@ -1431,12 +1365,17 @@ function makeBrowserTools(
         )),
       }),
     } : {}),
-    openPage: tool({
-      description: 'Open or navigate to a URL in the browser.',
+    page: tool({
+      description: 'Open a URL or wait for the current page. action=open supports the current tab or a new active tab; action=wait waits for page stability or the exact ms supplied.',
       inputSchema: browserToolInput({
-        url: z.string().optional().describe('The URL to open. Defaults to the test target URL.'),
+        action: z.enum(['open', 'wait']),
+        url: z.string().optional().describe('For action=open, the URL to open. Defaults to the test target URL.'),
+        target: z.enum(['current', 'new']).optional().describe('For action=open, open in the current or a new tab. Defaults to current.'),
+        ms: z.number().int().nonnegative().optional().describe('For action=wait, optional exact minimum wait duration.'),
       }),
-      execute: (input) => record('openPage', input, () => session.open(input.url || targetUrl)),
+      execute: (input) => record('page', input, () => input.action === 'wait'
+        ? (typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage())
+        : (input.target === 'new' ? session.openInNewTab(input.url || targetUrl) : session.open(input.url || targetUrl))),
     }),
     mouse: tool({
       description: browserMouseToolDescription,
@@ -1479,13 +1418,6 @@ function makeBrowserTools(
         label: input.label,
       })),
     }),
-    waitForPage: tool({
-      description: 'Wait for the page after navigation or UI changes. When ms is provided, wait for that full duration in milliseconds; do not shorten it.',
-      inputSchema: browserToolInput({
-        ms: z.number().int().nonnegative().optional().describe('Optional exact minimum wait duration in milliseconds.'),
-      }),
-      execute: (input) => record('waitForPage', input, () => (typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage())),
-    }),
     waitForHumanVerification: tool({
       description: 'Wait while the user completes a visible CAPTCHA, login verification, or security check in the non-headless browser.',
       inputSchema: browserToolInput({
@@ -1493,10 +1425,17 @@ function makeBrowserTools(
       }),
       execute: (input) => record('waitForHumanVerification', input, () => session.waitForManualVerification(input.maxMs)),
     }),
-    listTabs: tool({
-      description: 'List all currently open browser tabs with their index and URL.',
-      inputSchema: browserToolInput({}),
-      execute: (input) => record('listTabs', input, () => session.listTabs()),
+    tab: tool({
+      description: 'List browser tabs or switch the active tab.',
+      inputSchema: browserToolInput({
+        action: z.enum(['list', 'switch']),
+        index: z.number().int().nonnegative().optional().describe('Required for action=switch.'),
+      }),
+      execute: (input) => record('tab', input, () => input.action === 'list'
+        ? session.listTabs()
+        : typeof input.index === 'number'
+          ? session.switchTab(input.index)
+          : Promise.resolve({ ok: false, actual: 'tab action=switch requires index.' })),
     }),
     getHttpRequests: tool({
       description: 'Read HTTP requests for the current tab. Without ids, return recent request summaries. With ids from takeSnapshot({mode:"changes"}), return request body and readable response body for only those requests. Use this when an inter-action change journal lists a request that may explain a delayed UI result.',
@@ -1506,7 +1445,7 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests({ ids: input.ids })),
     }),
     takeSnapshot: tool({
-      description: 'Capture a paged DOM observation. text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal: all observed DOM additions, updates, removals, and request summaries since the last browser-changing tool call; it has no interactive UIDs and does not replace the DOM baseline. Use getHttpRequests with its request IDs for details. Default to mode=full. If nextCursor is returned, call takeSnapshot with both the same mode and exact cursor; do not act between pages. Every result states page/current total.',
+      description: 'Capture a paged DOM observation. full covers the complete loaded DOM; text contains all text from that same full DOM, including offscreen content, not only the viewport. text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal and has no interactive UIDs. Default to mode=full. nextCursor pages one frozen result: continue with the same mode and exact cursor and never scroll for pagination. searchSnapshot, waiting, and asynchronous DOM mutations do not invalidate it; UI-affecting interactions and an explicit fresh takeSnapshot do.',
       inputSchema: takeSnapshotInput,
       execute: (input) => record('takeSnapshot', input, async () => (
         referenceOptions?.takeSnapshot
@@ -1515,12 +1454,13 @@ function makeBrowserTools(
       )),
     }),
     searchSnapshot: tool({
-      description: 'Search the current DOM-observation baseline and return matching dom-* UIDs. Call takeSnapshot first; no separate CDP UID namespace exists.',
+      description: 'Purely search or read tags from the frozen full DOM baseline. query returns ranked matches; tag returns every element of that HTML tag. It never scrolls, consumes mutations, or invalidates pagination.',
       inputSchema: browserToolInput({
-        query: z.string().min(1).max(500),
+        query: z.string().min(1).max(500).optional(),
+        tag: z.string().min(1).max(80).optional(),
         roles: z.array(z.string().min(1)).max(20).optional(),
         limit: z.number().int().min(1).max(100).optional(),
-      }),
+      }).refine((input) => Boolean(input.query || input.tag), { message: 'query or tag is required' }),
       execute: (input) => record('searchSnapshot', input, () => session.searchSnapshot(input)),
     }),
     downloadFile: tool({
@@ -1541,13 +1481,6 @@ function makeBrowserTools(
         content: z.string().min(1).describe('Complete Markdown file content to save.'),
       }),
       execute: (input) => record('generateMarkdownFile', input, () => generateMarkdownArtifact({ ...input, runId: referenceOptions?.runId })),
-    }),
-    switchTab: tool({
-      description: 'Switch to a browser tab by index when the workflow opened a new tab.',
-      inputSchema: browserToolInput({
-        index: z.number().describe('The tab index from listTabs.'),
-      }),
-      execute: (input) => record('switchTab', input, () => session.switchTab(input.index)),
     }),
     reportState: tool({
       description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or a short textual status update is enough. This tool does not change the browser.',
@@ -1799,9 +1732,9 @@ function runtimePrompt(input: {
         : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
     `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"full"}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
-    '- If loading/transitioning, call waitForPage once. Block only for manual captcha/OTP/security/user input.',
+    '- If loading/transitioning, call page with action="wait" once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
-    '- After a click may open a tab/window, call listTabs; switchTab if the relevant page is in another tab.',
+    '- After a click may open a tab/window, call tab with action="list"; use action="switch" if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
     '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
     browserChatMode
@@ -1853,10 +1786,9 @@ function runtimeToolNames(mode: BrowserSessionMode) {
   void mode;
   return [
     ...(modelSupportsScreenshotInput() ? ['takeScreenshot'] : []),
-    'openPage',
-    'waitForPage',
+    'page',
     'waitForHumanVerification',
-    'listTabs',
+    'tab',
     'getHttpRequests',
     'takeSnapshot',
     'searchSnapshot',
@@ -1865,7 +1797,6 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'selectOption',
     'downloadFile',
     'generateMarkdownFile',
-    'switchTab',
     'reportState',
     ...(modelSupportsScreenshotInput() ? ['selectReferenceScreenshots', 'manageVisualContext'] : []),
   ];
@@ -2032,6 +1963,7 @@ function modelMessagesTextAndImageStats(messages: unknown, tools?: RuntimeToolDe
 }
 
 function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Record<string, unknown> = {}, modelMessages?: unknown) {
+  const messages = modelMessages || aiRequest?.messages || [];
   return jsonSafe({
     aiInput: {
       provider: aiRequest?.provider || extra.provider,
@@ -2042,8 +1974,9 @@ function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Re
         ...extra,
       },
       system: aiRequest?.systemPrompt,
-      messages: modelMessages || aiRequest?.messages || [],
+      messages,
     },
+    aiInputTokens: modelMessagesTextAndImageStats(messages),
   });
 }
 
@@ -2526,7 +2459,7 @@ async function executeRuntimeStep(input: {
           maxRetries: 0,
           abortSignal,
         });
-        return trimDebugText(result.text || '', agentLoopSummaryOutputCharLimit()) || fallbackContinuationSummary({
+        return (result.text || '').trim() || fallbackContinuationSummary({
           goal: requirementOf(testCase),
           browserMode: mode,
           stepIndex,
@@ -3172,6 +3105,14 @@ async function runRecordedTool(
   const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
 
   switch (flow.name) {
+    case 'page':
+      if (input.action === 'wait') return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
+      {
+        const rawUrl = typeof input.url === 'string' && input.url.trim() ? input.url : targetUrl;
+        const url = normalizeBrowserUrl(rawUrl);
+        if (!url) return { ok: false, actual: 'Recorded page open failed because the target URL is empty.' };
+        return input.target === 'new' ? session.openInNewTab(url) : session.open(url);
+      }
     case 'openPage':
       {
         const rawUrl = typeof input.url === 'string' && input.url.trim() ? input.url : targetUrl;
@@ -3208,7 +3149,8 @@ async function runRecordedTool(
     }
     case 'searchSnapshot':
       return session.searchSnapshot({
-        query: String(input.query || ''),
+        query: typeof input.query === 'string' ? input.query : undefined,
+        tag: typeof input.tag === 'string' ? input.tag : undefined,
         roles: Array.isArray(input.roles) ? input.roles.filter((role): role is string => typeof role === 'string') : undefined,
         limit: typeof input.limit === 'number' ? input.limit : undefined,
       });
@@ -3250,6 +3192,10 @@ async function runRecordedTool(
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
     case 'listTabs':
       return session.listTabs();
+    case 'tab':
+      return input.action === 'switch'
+        ? session.switchTab(typeof input.index === 'number' ? input.index : Number(input.index || 0))
+        : session.listTabs();
     case 'getHttpRequests':
       return session.getCurrentTabHttpRequests({ ids: Array.isArray(input.ids) ? input.ids.filter((id): id is string => typeof id === 'string') : undefined });
     case 'downloadFile':

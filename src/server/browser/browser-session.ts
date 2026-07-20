@@ -4527,6 +4527,14 @@ export class BrowserSession {
     );
   }
 
+  async openInNewTab(url: string): Promise<BrowserActionResult> {
+    if (!this.context) return { ok: false, actual: 'Browser context is unavailable.' };
+    const page = await this.context.newPage();
+    this.claimPage(page);
+    await page.bringToFront().catch(() => undefined);
+    return this.open(url);
+  }
+
   async readStructuredPageText() {
     return (await this.readDomObservation({ includeInteractiveCandidates: false })).structuredText;
   }
@@ -5335,7 +5343,7 @@ export class BrowserSession {
     const status = loadStateTimedOut
       ? `Page is still loading after ${loadStateTimeoutMs}ms; continuing with the current rendered state.`
       : 'Page wait completed.';
-    return this.completeActionWithDomChanges(`${status}${note}`, previousGeneration);
+    return this.completeActionWithDomChanges(`${status}${note}`, previousGeneration, { invalidateSnapshotCursor: false });
   }
 
   // 等待固定时间，给短动画、下拉面板或异步更新留出渲染时间。
@@ -5343,7 +5351,7 @@ export class BrowserSession {
     const previousGeneration = this.snapshotGeneration;
     const waitMs = Number.isFinite(ms) ? Math.max(0, Math.ceil(ms)) : 800;
     await this.waitForStableViewport(waitMs);
-    return this.completeActionWithDomChanges(`Waited ${waitMs}ms.`, previousGeneration);
+    return this.completeActionWithDomChanges(`Waited ${waitMs}ms.`, previousGeneration, { invalidateSnapshotCursor: false });
   }
 
   // 等待用户手动完成验证码/安全校验，超时后返回阻塞信息。
@@ -6964,12 +6972,12 @@ export class BrowserSession {
   private async completeActionWithDomChanges(
     actual: string,
     previousGeneration: SnapshotGeneration | undefined,
-    options: { postNavigation?: boolean } = {},
+    options: { postNavigation?: boolean; invalidateSnapshotCursor?: boolean } = {},
   ): Promise<BrowserActionResult> {
     this.lastScreenshotMetrics = undefined;
     // A cursor represents one immutable pre-action DOM baseline. Even an
     // action with no observed mutation can change focus, overlays, or state.
-    this.domObservationPagination = undefined;
+    if (options.invalidateSnapshotCursor !== false) this.domObservationPagination = undefined;
     try {
       const currentPage = this.activePage;
       const postNavigation = options.postNavigation === true || Boolean(previousGeneration && (
@@ -7065,31 +7073,29 @@ export class BrowserSession {
     };
   }
 
-  async searchSnapshot(input: { query: string; roles?: string[]; limit?: number }): Promise<BrowserActionResult> {
+  async searchSnapshot(input: { query?: string; tag?: string; roles?: string[]; limit?: number }): Promise<BrowserActionResult> {
     const query = normalizeDomSearchText(input.query);
-    if (!query) return { ok: false, actual: 'Snapshot search requires a non-empty query.' };
+    const tag = normalizeDomSearchText(input.tag);
+    if (!query && !tag) return { ok: false, actual: 'Snapshot search requires a non-empty query or tag.' };
     const roles = new Set((input.roles || []).map(normalizeDomSearchText));
     const queryParts = query.split(/\s+/).filter(Boolean);
     const limit = Math.min(100, Math.max(1, Math.floor(Number(input.limit) || 20)));
 
-    // takeSnapshot establishes the only actionable UID namespace. Search that
-    // same registry after first consuming its pending MutationObserver delta;
-    // never create a second CDP UID namespace for the model to mix with dom-*.
+    // Search is a pure read of the frozen baseline. It must not consume the
+    // MutationObserver queue, refresh the UID registry, scroll, or invalidate
+    // an in-progress snapshot cursor.
     if (this.domVisibleSnapshotKey && this.lastDomNodeReferences.size > 0) {
-      const changes = await this.readDomChanges();
-      if (changes.domChanges?.overflow) {
-        return {
-          ok: false,
-          actual: 'DOM changes overflowed while preparing the snapshot search. Call takeSnapshot to establish a fresh DOM baseline before choosing a UID.',
-          domChanges: changes.domChanges,
-        };
-      }
       const collectMatches = () => [...this.lastDomNodeReferences.values()]
         .filter((reference) => {
+          if (tag && reference.tag !== tag) return false;
           if (roles.size && ![...roles].some((role) => reference.semanticRoles.includes(role))) return false;
-          return reference.searchText.includes(query) || queryParts.every((part) => reference.searchText.includes(part));
+          return !query || reference.searchText.includes(query) || queryParts.every((part) => reference.searchText.includes(part));
         })
         .sort((left, right) => {
+          if (tag && !query) {
+            return left.path.localeCompare(right.path, undefined, { numeric: true })
+              || left.id.localeCompare(right.id, undefined, { numeric: true });
+          }
           const score = (reference: DomNodeReference) => {
             const label = reference.normalizedLabel;
             const context = reference.normalizedContext;
@@ -7115,68 +7121,13 @@ export class BrowserSession {
           return score(right) - score(left)
             || left.path.localeCompare(right.path, undefined, { numeric: true })
             || left.id.localeCompare(right.id, undefined, { numeric: true });
-        })
-        .slice(0, limit);
-      let matches = collectMatches();
-      let virtualSearchSteps = 0;
-      if (!matches.length) {
-        const virtualLists = [...this.lastDomNodeReferences.values()]
-          .filter((reference) => reference.localRef && reference.signals?.includes('virtual-list'))
-          .slice(0, 3);
-        const maxSteps = boundedPositiveIntegerEnv('DOM_VIRTUAL_SEARCH_MAX_STEPS', 12, 1, 50);
-        const settleMs = boundedNonNegativeIntegerEnv('DOM_VIRTUAL_SEARCH_SETTLE_MS', 50, 500);
-        for (const virtualList of virtualLists) {
-          const frame = virtualList.framePath ? this.frameFromPath(virtualList.framePath) : this.activePage.mainFrame();
-          if (!frame || !virtualList.localRef) continue;
-          await this.ensureBrowserPageRuntime(frame);
-          const initial = await frame.evaluate((selection) => {
-            const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
-            return runtime?.scrollVisibleDomVirtualList(selection.ref, { advance: false });
-          }, { ref: virtualList.localRef }).catch(() => undefined);
-          if (!initial) continue;
-          let found = false;
-          if (initial.before > 1) {
-            await frame.evaluate((selection) => {
-              const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
-              return runtime?.scrollVisibleDomVirtualList(selection.ref, { top: 0 });
-            }, { ref: virtualList.localRef }).catch(() => undefined);
-            if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
-            await this.readSimplifiedDomTree({ scope: 'visible' });
-            await this.discardDomChanges();
-            matches = collectMatches();
-            found = matches.length > 0;
-          }
-          for (let step = 0; step < maxSteps && !found; step += 1) {
-            const movement = await frame.evaluate((selection) => {
-              const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
-              return runtime?.scrollVisibleDomVirtualList(selection.ref);
-            }, { ref: virtualList.localRef }).catch(() => undefined);
-            if (!movement?.moved) break;
-            virtualSearchSteps += 1;
-            if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
-            await this.readSimplifiedDomTree({ scope: 'visible' });
-            await this.discardDomChanges();
-            matches = collectMatches();
-            if (matches.length) {
-              found = true;
-              break;
-            }
-            if (movement.atBottom) break;
-          }
-          if (found) break;
-          await frame.evaluate((selection) => {
-            const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
-            return runtime?.scrollVisibleDomVirtualList(selection.ref, { top: selection.top });
-          }, { ref: virtualList.localRef, top: initial.before }).catch(() => undefined);
-          if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
-          await this.readSimplifiedDomTree({ scope: 'visible' });
-          await this.discardDomChanges();
-        }
-      }
+        });
+      const allMatches = collectMatches();
+      const matches = tag ? allMatches : allMatches.slice(0, limit);
       return {
         ok: true,
         actual: [
-          `DOM baseline search for "${input.query}" returned ${matches.length} result(s)${virtualSearchSteps ? ` after ${virtualSearchSteps} bounded virtual-list scroll step(s)` : ''}. Use only the dom-* UIDs shown below exactly as returned.`,
+          `Frozen DOM baseline ${tag ? `tag read for <${tag}>` : `search for "${input.query}"`} returned ${matches.length} result(s). The search did not scroll, consume DOM changes, or alter snapshot pagination. Use only the dom-* UIDs shown below exactly as returned.`,
           matches.map((reference) => reference.line).join('\n') || '[no DOM baseline matches]',
         ].join('\n'),
       };
@@ -8446,26 +8397,8 @@ export class BrowserSession {
       if (!record || record.id !== cursor.id || record.mode !== cursor.mode) {
         throw new Error('The DOM-observation snapshot cursor is no longer available. Capture a fresh takeSnapshot instead.');
       }
-      if (record.mode !== 'changes' && (record.page !== this.activePage || record.url !== this.activePage.url() || record.navigationSequence !== (this.navigationSequenceByPage.get(this.activePage) || 0))) {
-        this.domObservationPagination = undefined;
-        throw new Error('The page changed after the first snapshot page. Capture a fresh takeSnapshot instead.');
-      }
       if (options.mode && options.mode !== cursor.mode) {
         throw new Error(`Snapshot cursor mode is ${cursor.mode}; do not change mode while paging.`);
-      }
-      if (record.mode !== 'changes') {
-        const changes = await this.readDomChanges();
-        const changed = Boolean(changes.domChanges && (
-          changes.domChanges.added.length
-          || changes.domChanges.updated.length
-          || changes.domChanges.removed.length
-          || changes.domChanges.extra.added.length
-          || changes.domChanges.extra.updated.length
-        ));
-        if (changed || changes.domChanges?.overflow) {
-          this.domObservationPagination = undefined;
-          throw new Error('The page changed after the first snapshot page. Capture a fresh takeSnapshot instead.');
-        }
       }
       const page = this.domObservationPage(record, cursor.index);
       return {
@@ -8508,7 +8441,7 @@ export class BrowserSession {
     const maxElements = numericLimitFromEnv('DOM_CUA_PAGED_MAX_ELEMENTS', 10000);
     const maxChars = numericLimitFromEnv('DOM_CUA_PAGED_MAX_CHARS', 1000000);
     const result = await this.readSimplifiedDomTree({
-      scope: mode === 'full' ? 'full' : 'visible',
+      scope: mode === 'full' || mode === 'text' ? 'full' : 'visible',
       maxChars,
       maxElements,
     });

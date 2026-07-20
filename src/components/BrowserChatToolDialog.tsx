@@ -18,12 +18,12 @@ export type BrowserChatToolDialogDetail = {
 
 function toolStatusLabel(tool: BrowserChatToolCall, step: StepExecutionResult) {
   if (tool.recovered === true && tool.transient === true) return '已恢复';
-  if (tool.ok === true) return '完成';
+  if (tool.ok === true) return '已完成';
   if (tool.ok === false) return '失败';
   if (step.status === 'failed') return '失败';
   if (step.status === 'blocked') return '已暂停';
-  if (step.status === 'passed') return '完成';
-  return '运行中';
+  if (step.status === 'passed') return '已完成';
+  return '执行中';
 }
 
 function screenshotKindLabel(kind?: string) {

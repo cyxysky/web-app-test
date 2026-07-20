@@ -171,6 +171,48 @@ test('DOM-observation takeSnapshot pages actionable, text, and full views with s
   }
 });
 
+test('frozen snapshot cursors survive search, waiting, and asynchronous DOM changes', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'frozen-dom-pagination-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  const rows = Array.from({ length: 240 }, (_, index) => (
+    `<button type="button">${`Frozen row ${index} `.repeat(12)}</button>`
+  )).join('');
+  await page.setContent(`<!doctype html><html><body>${rows}</body></html>`);
+
+  const first = await session.readDomObservationSnapshot({ mode: 'full' });
+  assert.ok(first.nextCursor, 'the test requires a paginated frozen result');
+  await page.locator('body').evaluate((body) => body.insertAdjacentHTML('beforeend', '<button>Async addition</button>'));
+  await page.waitForTimeout(20);
+  const originalReadDomChanges = session.readDomChanges.bind(session);
+  let readDomChangesCalls = 0;
+  Reflect.set(session, 'readDomChanges', async () => {
+    readDomChangesCalls += 1;
+    return originalReadDomChanges();
+  });
+
+  const searched = await session.searchSnapshot({ query: 'Frozen row 1', roles: ['button'] });
+  assert.equal(searched.ok, true, searched.actual);
+  assert.match(searched.actual, /did not scroll, consume DOM changes, or alter snapshot pagination/);
+  assert.equal(readDomChangesCalls, 0, 'searchSnapshot must not read or consume the mutation queue');
+  await session.wait(0);
+  const second = await session.readDomObservationSnapshot({ mode: 'full', cursor: first.nextCursor });
+  assert.equal(second.pageNumber, 2);
+
+  const refreshed = await session.readDomObservationSnapshot({ mode: 'full' });
+  assert.ok(refreshed.nextCursor);
+  const buttonUid = refreshed.content.match(/uid=(dom-\d+)[^\n]*Frozen row/)?.[1];
+  assert.ok(buttonUid, refreshed.content);
+  const clicked = await session.mouse({ action: 'click', uid: buttonUid });
+  assert.equal(clicked.ok, true, clicked.actual);
+  await assert.rejects(
+    session.readDomObservationSnapshot({ mode: 'full', cursor: refreshed.nextCursor }),
+    /cursor is no longer available/,
+    'a UI-affecting interaction must invalidate the frozen cursor',
+  );
+});
+
 test('inter-action changes retain all DOM mutations and request summaries until the next interaction', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'inter-action-changes-test' });
   context.after(async () => session.close());
@@ -332,7 +374,7 @@ test('DOM baseline ranks modal duplicates and describes virtual lists', async (c
   assert.equal(ranked.actual.match(/uid=(dom-\d+)/)?.[1], modalUid, ranked.actual);
 });
 
-test('searchSnapshot progressively scans virtual lists and leaves a found target actionable', async (context) => {
+test('searchSnapshot is a pure frozen-baseline read and never scrolls virtual lists', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'virtual-list-progressive-search-test' });
   context.after(async () => session.close());
   await session.start();
@@ -348,19 +390,34 @@ test('searchSnapshot progressively scans virtual lists and leaves a found target
 
   const searched = await session.searchSnapshot({ query: 'Virtual item 40', roles: ['button'] });
   assert.equal(searched.ok, true, searched.actual);
-  assert.match(searched.actual, /after \d+ bounded virtual-list scroll step/);
-  const targetUid = searched.actual.match(/uid=(dom-\d+)[^\n]*Virtual item 40/)?.[1];
-  assert.ok(targetUid, searched.actual);
-  assert.ok(await page.locator('#virtual-results').evaluate((element) => element.scrollTop) > 0);
-  const clicked = await session.mouse({ action: 'click', uid: targetUid });
-  assert.equal(clicked.ok, true, clicked.actual);
-  assert.equal(await page.getByRole('button', { name: 'Virtual item 40' }).getAttribute('data-clicked'), 'true');
+  assert.match(searched.actual, /returned 0 result/);
+  assert.equal(await page.locator('#virtual-results').evaluate((element) => element.scrollTop), 0);
   const scrollBeforeMissingSearch = await page.locator('#virtual-results').evaluate((element) => element.scrollTop);
   const missing = await session.searchSnapshot({ query: 'Virtual item 999', roles: ['button'] });
   assert.equal(missing.ok, true, missing.actual);
   assert.match(missing.actual, /returned 0 result/);
   const scrollAfterMissingSearch = await page.locator('#virtual-results').evaluate((element) => element.scrollTop);
   assert.ok(Math.abs(scrollAfterMissingSearch - scrollBeforeMissingSearch) <= 1, `${scrollBeforeMissingSearch} -> ${scrollAfterMissingSearch}`);
+});
+
+test('searchSnapshot tag returns every matching element from the frozen full DOM', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'snapshot-tag-search-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <a href="/one">First link</a>
+    <main style="margin-top:2000px"><a href="/two">Offscreen link</a></main>
+    <button type="button">Not a link</button>
+  </body></html>`);
+  await session.readDomObservationSnapshot({ mode: 'full' });
+
+  const result = await session.searchSnapshot({ tag: 'a', limit: 1 });
+  assert.equal(result.ok, true, result.actual);
+  assert.match(result.actual, /returned 2 result/);
+  assert.match(result.actual, /First link/);
+  assert.match(result.actual, /Offscreen link/);
+  assert.doesNotMatch(result.actual, /Not a link/);
 });
 
 test('DOM mutation deltas coalesce repeated attributes and promote nested text changes to interactive roots', async (context) => {

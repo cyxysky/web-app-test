@@ -209,7 +209,9 @@ function collectTaskLedgerItems(steps: StepExecutionResult[]) {
 }
 
 function isInitialReplayNavigation(step?: RecordedFlowStep) {
-  return step?.name === 'openPage';
+  if (step?.name === 'openPage') return true;
+  if (step?.name !== 'page' || !step.input || typeof step.input !== 'object' || Array.isArray(step.input)) return false;
+  return (step.input as Record<string, unknown>).action === 'open';
 }
 
 function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUrl: string): RecordedFlowStep[] {
@@ -222,8 +224,8 @@ function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUr
   return [
     {
       index: 1,
-      name: 'openPage',
-      input: { url: targetUrl },
+      name: 'page',
+      input: { action: 'open', target: 'current', url: targetUrl },
       delayBeforeMs: 0,
       reason: 'Replay starts from the test case target URL so recorded candidate actions run on the expected page.',
       sourceStepIndex: initialNavigation?.sourceStepIndex,

@@ -4,13 +4,12 @@ import type { BrowserActionResult, BrowserSnapshotView, BrowserSnapshotViews } f
 export const runtimeObservationToolNames = new Set(['takeSnapshot', 'searchSnapshot']);
 export const staleSnapshotText = 'Stale: this old semantic DOM snapshot was replaced or invalidated by a browser action. Call takeSnapshot({mode:"full"}) for fresh UIDs.';
 export const runtimeObservationInvalidatingToolNames = new Set([
-  'openPage',
+  'page',
   'mouse',
   'keyboard',
   'selectOption',
-  'waitForPage',
   'waitForHumanVerification',
-  'switchTab',
+  'tab',
 ]);
 
 export type RuntimeObservationRecord = {
