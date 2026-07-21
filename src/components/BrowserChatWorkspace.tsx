@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type WheelEvent as ReactWheelEvent, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   closestCenter,
   DndContext,
@@ -4765,6 +4765,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   userId?: string;
 }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const tabListRef = useRef<HTMLDivElement | null>(null);
   const addressInputRef = useRef<HTMLInputElement | null>(null);
   const embeddedBrowserSyncRef = useRef({ boundsKey: '', groupId: '', sessionId: '', visible: false });
   const addressFocusedRef = useRef(false);
@@ -4786,6 +4787,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [dragDropGroupId, setDragDropGroupId] = useState('');
   const [tabDragPreview, setTabDragPreview] = useState<EmbeddedBrowserTabDragPreview | null>(null);
   const [tabDragPortalTarget, setTabDragPortalTarget] = useState<HTMLElement | null>(null);
+  const [tabListWidth, setTabListWidth] = useState(0);
   const [libraryPanel, setLibraryPanel] = useState<'library' | null>(null);
   const [newGroupDialogOpen, setNewGroupDialogOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState('新建标签组');
@@ -4860,7 +4862,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     }
   }, [applyEmbeddedBrowserState]);
 
-  const syncEmbeddedBrowser = useCallback(async () => {
+  const syncEmbeddedBrowser = useCallback(async (options: { forceAttach?: boolean } = {}) => {
     const bridge = window.webPilotEmbeddedBrowser;
     const viewport = viewportRef.current;
     const canCreateRequestedGroup = Boolean(activationRequestId && runtimeAuthorized);
@@ -4884,7 +4886,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         return;
       }
 
-      if (!previous.visible || previous.groupId !== groupId || previous.sessionId !== (sessionId || '')) {
+      if (options.forceAttach || !previous.visible || previous.groupId !== groupId || previous.sessionId !== (sessionId || '')) {
         embeddedBrowserSyncRef.current = { boundsKey, groupId, sessionId: sessionId || '', visible: true };
         const result = await bridge.setVisible({
           bounds,
@@ -4912,12 +4914,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   useEffect(() => {
     void syncEmbeddedBrowser();
     const viewport = viewportRef.current;
-    if (!enabled || !active || !viewport) {
-      return () => {
-        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
-        void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
-      };
-    }
+    if (!enabled || !active || !viewport) return undefined;
 
     const update = () => {
       void syncEmbeddedBrowser();
@@ -4927,14 +4924,33 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     window.addEventListener('resize', update);
     window.addEventListener('scroll', update, true);
 
+    const restoreNativeView = () => {
+      if (document.visibilityState === 'hidden') return;
+      void syncEmbeddedBrowser({ forceAttach: true });
+    };
+    // The native WebContentsView can be removed by Electron while the React
+    // shell remains mounted. Reconfirm it after mount and whenever this window
+    // becomes visible again, rather than trusting the renderer-side cache.
+    const restoreTimer = window.setTimeout(restoreNativeView, 250);
+    window.addEventListener('focus', restoreNativeView);
+    window.addEventListener('pageshow', restoreNativeView);
+    document.addEventListener('visibilitychange', restoreNativeView);
+
     return () => {
       resizeObserver.disconnect();
       window.removeEventListener('resize', update);
       window.removeEventListener('scroll', update, true);
-      embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
-      void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
+      window.clearTimeout(restoreTimer);
+      window.removeEventListener('focus', restoreNativeView);
+      window.removeEventListener('pageshow', restoreNativeView);
+      document.removeEventListener('visibilitychange', restoreNativeView);
     };
   }, [active, enabled, syncEmbeddedBrowser]);
+
+  useEffect(() => () => {
+    embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
+    void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     if (!enabled || !active) return undefined;
@@ -4942,6 +4958,40 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const bridge = window.webPilotEmbeddedBrowser;
     return bridge?.onStateChange?.((result) => applyEmbeddedBrowserState(result)) || undefined;
   }, [active, applyEmbeddedBrowserState, enabled, loadEmbeddedBrowserState]);
+
+  useEffect(() => {
+    const tabList = tabListRef.current;
+    if (!tabList) return undefined;
+    const updateWidth = () => {
+      const nextWidth = Math.round(tabList.getBoundingClientRect().width);
+      setTabListWidth((current) => current === nextWidth ? current : nextWidth);
+    };
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(tabList);
+    return () => observer.disconnect();
+  }, []);
+
+  const handleEmbeddedTabListWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
+    const tabList = event.currentTarget;
+    if (tabList.scrollWidth <= tabList.clientWidth) return;
+
+    const rawDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+      ? event.deltaX
+      : event.deltaY;
+    if (!rawDelta) return;
+
+    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? tabList.clientWidth : 1;
+    const maximumScrollLeft = tabList.scrollWidth - tabList.clientWidth;
+    const nextScrollLeft = Math.min(
+      maximumScrollLeft,
+      Math.max(0, tabList.scrollLeft + rawDelta * unit),
+    );
+    if (nextScrollLeft === tabList.scrollLeft) return;
+
+    tabList.scrollLeft = nextScrollLeft;
+    event.preventDefault();
+  }, []);
 
   useEffect(() => {
     if (!enabled || !active) return undefined;
@@ -5252,6 +5302,23 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         .filter((tab): tab is EmbeddedBrowserTab => Boolean(tab)),
     }));
   }, [tabDragPreview, visibleGroups]);
+  const embeddedTabLayoutStyle = useMemo(() => {
+    const expandedGroups = renderedVisibleGroups.filter((group) => !group.collapsed);
+    const tabCount = expandedGroups.reduce((total, group) => total + group.tabs.length, 0);
+    const groupCount = renderedVisibleGroups.length;
+    const groupGapWidth = Math.max(0, groupCount - 1) * 4;
+    const tagToTabGapWidth = expandedGroups.length * 4;
+    const tabGapWidth = expandedGroups.reduce((total, group) => total + Math.max(0, group.tabs.length - 1) * 6, 0);
+    const fixedWidth = groupCount * 36
+      + groupGapWidth
+      + tagToTabGapWidth
+      + tabGapWidth;
+    const requestedWidth = tabListWidth > 0 && tabCount > 0
+      ? Math.floor((tabListWidth - fixedWidth) / tabCount)
+      : 210;
+    const tabWidth = Math.min(210, Math.max(0, requestedWidth));
+    return { '--embedded-tab-width': `${tabWidth}px` } as CSSProperties;
+  }, [renderedVisibleGroups, tabListWidth]);
 
   const activeEmbeddedTab = useMemo(() => {
     const groupedTabs = visibleGroups.flatMap((group) => group.tabs);
@@ -5491,7 +5558,14 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
             onDragStart={handleEmbeddedTabDragStart}
             sensors={embeddedTabSensors}
           >
-            <div className="browser-chat-embedded-tab-list" role="tablist" aria-label="Embedded browser tabs">
+            <div
+              className="browser-chat-embedded-tab-list"
+              onWheel={handleEmbeddedTabListWheel}
+              ref={tabListRef}
+              role="tablist"
+              aria-label="Embedded browser tabs"
+              style={embeddedTabLayoutStyle}
+            >
               {renderedVisibleGroups.map((group) => {
                 const groupSessionId = group.sessionId
                   || group.tabs.find((tab) => tab.sessionId)?.sessionId

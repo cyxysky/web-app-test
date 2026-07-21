@@ -1611,6 +1611,24 @@ function destroyEmbeddedBrowserTab(tab) {
   notifyEmbeddedBrowserStateChange();
 }
 
+// A renderer reload can leave a WebContentsView marked as attached even though
+// Electron has removed it from the window's content view. Re-adding it is
+// idempotent and moves the native view back to the front when needed.
+function ensureEmbeddedBrowserTabAttached(tab) {
+  if (!mainWindow || mainWindow.isDestroyed() || !tab || tab.view.webContents.isDestroyed()) return false;
+  try {
+    mainWindow.contentView.addChildView(tab.view);
+    tab.attached = true;
+    embeddedBrowserAttached = true;
+    tab.view.setVisible(true);
+    return true;
+  } catch (error) {
+    tab.attached = false;
+    appendLog(`Embedded browser attach failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
 function attachEmbeddedBrowserView(input = {}) {
   const restoredTab = embeddedBrowserVisible ? undefined : activeEmbeddedBrowserTab();
   embeddedBrowserVisible = true;
@@ -1635,10 +1653,7 @@ function attachEmbeddedBrowserView(input = {}) {
   for (const item of embeddedBrowserTabs.values()) {
     if (item.id !== tab.id) detachEmbeddedBrowserTab(item);
   }
-  if (!tab.attached) {
-    mainWindow.contentView.addChildView(tab.view);
-    tab.attached = true;
-  }
+  ensureEmbeddedBrowserTabAttached(tab);
   setActiveEmbeddedBrowserTab(tab);
   tab.view.setBounds(embeddedBrowserBounds);
   try {
@@ -1669,7 +1684,7 @@ function setEmbeddedBrowserBounds(bounds) {
     || previousBounds.width !== embeddedBrowserBounds.width
     || previousBounds.height !== embeddedBrowserBounds.height;
   const tab = activeEmbeddedBrowserTab();
-  if (tab?.attached) {
+  if (embeddedBrowserVisible && tab && ensureEmbeddedBrowserTabAttached(tab)) {
     tab.view.setBounds(embeddedBrowserBounds);
     if (boundsChanged) scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   }

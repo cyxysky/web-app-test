@@ -266,6 +266,20 @@ function browserChatKeepBrowserOpenAfterTurn() {
   return process.env.BROWSER_CHAT_KEEP_BROWSER_OPEN_AFTER_TURN !== 'false';
 }
 
+function browserChatBoundedNonNegativeEnv(key: string, fallback: number, max: number) {
+  const raw = Number(process.env[key]);
+  if (!Number.isFinite(raw) || raw < 0) return fallback;
+  return Math.min(Math.floor(raw), max);
+}
+
+function browserChatBrowserExecutionOptions() {
+  return {
+    slowMoMs: browserChatBoundedNonNegativeEnv('BROWSER_CHAT_SLOW_MO_MS', 0, 2000),
+    popupWaitMs: browserChatBoundedNonNegativeEnv('BROWSER_CHAT_POPUP_WAIT_MS', 0, 3000),
+    actionFrameLimit: Math.max(1, browserChatBoundedNonNegativeEnv('BROWSER_CHAT_ACTION_FRAME_LIMIT', 24, 200)),
+  };
+}
+
 function browserChatMemoryUrl(browser: BrowserSession | undefined, session: Pick<BrowserChatSessionSnapshot, 'targetUrl'>) {
   const currentUrl = browser?.currentUrl() || '';
   return currentUrl || session.targetUrl || '';
@@ -1825,6 +1839,7 @@ function createBrowserChatBrowser(session: BrowserChatSessionRecord) {
   return new BrowserSession(session.mode, {
     browserSurface: 'electron-embedded',
     browserProfileKey: browserChatBrowserProfileKey(session),
+    ...browserChatBrowserExecutionOptions(),
     isMarked: true,
     preferExistingPage: false,
     runId: session.id,
@@ -3096,6 +3111,7 @@ async function executeBrowserChatSubagentBatch(input: {
       headless: true,
       sharedBrowserRuntimeKey: applicationUserRuntimeKey(session.userId),
       storageState: inheritedStorageState,
+      ...browserChatBrowserExecutionOptions(),
       isMarked: true,
       preferExistingPage: false,
       runId: `${session.id}_${task.id}`,

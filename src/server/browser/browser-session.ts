@@ -106,6 +106,12 @@ export type BrowserSessionOptions = {
   /** Shares one browser/context with other sessions in the same application-user runtime. */
   sharedBrowserRuntimeKey?: string;
   storageState?: BrowserContextOptions['storageState'];
+  /** Overrides Playwright's artificial action delay for latency-sensitive sessions. */
+  slowMoMs?: number;
+  /** Limits the optional post-click popup wait without changing global browser settings. */
+  popupWaitMs?: number;
+  /** Caps post-action frame bookkeeping; target resolution still uses the original frame. */
+  actionFrameLimit?: number;
 };
 
 export type AccessibilitySnapshotExportControlResult = {
@@ -133,6 +139,8 @@ export type BrowserSnapshotViews = Partial<Record<BrowserSnapshotView, string>> 
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** Click-specific timing breakdown for diagnosing browser action latency. */
+  clickTimings?: BrowserClickTiming;
   /** A user-provided or generated image that should be attached to the next model request. */
   referenceImagePath?: string;
   /** A compact continuation cursor for paged snapshot readers. */
@@ -156,6 +164,37 @@ export type BrowserActionResult = {
     refreshed: boolean;
   };
 };
+
+export type BrowserClickTiming = {
+  targetResolutionMs: number;
+  preClickInteractionReadMs: number;
+  waitForClickableMs: number;
+  clickDispatchMs: number;
+  popupListenerSetupMs: number;
+  popupWaitMs: number;
+  postActionSettleMs: number;
+  verificationMs: number;
+  navigationDomStabilityMs: number;
+  domChangesMs: number;
+  journalResetMs: number;
+  resultAssemblyMs: number;
+  totalMs: number;
+};
+
+type BrowserClickTimingStage = Exclude<keyof BrowserClickTiming, 'totalMs'>;
+
+async function timeBrowserClickStage<T>(
+  timings: BrowserClickTiming,
+  stage: BrowserClickTimingStage,
+  action: () => Promise<T>,
+) {
+  const startedAt = Date.now();
+  try {
+    return await action();
+  } finally {
+    timings[stage] = Date.now() - startedAt;
+  }
+}
 
 type FocusedElementSummary = {
   hasFocus: boolean;
@@ -3596,6 +3635,8 @@ export class BrowserSession {
   private pageDiscoveryListener?: (page: Page) => void;
   private pageGroupInitScriptPages = new WeakSet<Page>();
   private navigationSequenceByPage = new WeakMap<Page, number>();
+  private browserRuntimeRevisionByFrame = new WeakMap<Frame, number>();
+  private browserRuntimeInstalledRevisionByFrame = new WeakMap<Frame, number>();
   private snapshotGeneration?: SnapshotGeneration;
   private snapshotGenerationPromise?: Promise<SnapshotGeneration>;
   private snapshotGenerationSequence = 0;
@@ -3719,7 +3760,7 @@ export class BrowserSession {
     if (userDataDir) await mkdir(userDataDir, { recursive: true });
     const launchOptions: LaunchOptions = {
       headless,
-      slowMo: Number(process.env.BROWSER_SLOW_MO_MS || 0),
+      slowMo: this.browserSlowMoMs(),
       ...(channel ? { channel } : {}),
       ...(executablePath && !channel ? { executablePath } : {}),
       ...(tabGrouperEnabled ? { ignoreDefaultArgs: ['--disable-extensions'] } : {}),
@@ -4190,6 +4231,21 @@ export class BrowserSession {
     return Array.from(this.ownedPages).filter((page) => !page.isClosed());
   }
 
+  private browserSlowMoMs() {
+    const configured = this.options.slowMoMs ?? Number(process.env.BROWSER_SLOW_MO_MS || 0);
+    if (!Number.isFinite(configured) || configured < 0) return 0;
+    return Math.min(Math.floor(configured), 2000);
+  }
+
+  private actionFrames() {
+    const configured = this.options.actionFrameLimit;
+    const frameLimit = typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+      ? Math.min(200, Math.floor(configured))
+      : numericLimitFromEnv('BROWSER_ACTION_FRAME_LIMIT', 24);
+    const page = this.activePage;
+    return [page.mainFrame(), ...page.frames().filter((frame) => frame !== page.mainFrame()).slice(0, frameLimit)];
+  }
+
   private async selectInitialPage(context: BrowserContext) {
     const pages = this.sessionPages();
     const preferred = this.options.preferExistingPage
@@ -4241,8 +4297,17 @@ export class BrowserSession {
   }
 
   private async ensureBrowserPageRuntime(target: Page | Frame = this.activePage) {
-    await target.evaluate(aiDomMutationObserverScript).catch(() => undefined);
-    await target.evaluate(installAiBrowserPageRuntime).catch(() => undefined);
+    const frame = 'mainFrame' in target ? target.mainFrame() : target;
+    const revision = this.browserRuntimeRevisionByFrame.get(frame) || 0;
+    if (this.browserRuntimeInstalledRevisionByFrame.get(frame) === revision) return;
+    try {
+      await target.evaluate(aiDomMutationObserverScript);
+      await target.evaluate(installAiBrowserPageRuntime);
+      this.browserRuntimeInstalledRevisionByFrame.set(frame, revision);
+    } catch {
+      // Frames can disappear between discovery and script injection. The next
+      // operation will retry when the frame is still available.
+    }
   }
 
   async currentTitle() {
@@ -4428,6 +4493,7 @@ export class BrowserSession {
     for (const frame of page.frames()) this.rememberVisitedOrigin(frame.url());
     page.setDefaultTimeout(8000);
     page.on('framenavigated', (frame) => {
+      this.browserRuntimeRevisionByFrame.set(frame, (this.browserRuntimeRevisionByFrame.get(frame) || 0) + 1);
       this.rememberVisitedOrigin(frame.url());
       if (frame !== page.mainFrame()) return;
       this.navigationSequenceByPage.set(page, (this.navigationSequenceByPage.get(page) || 0) + 1);
@@ -5223,7 +5289,7 @@ export class BrowserSession {
       overflow: false,
     };
     this.domChangeErrors = [];
-    await Promise.all(page.frames().map(async (frame) => {
+    await Promise.all(this.actionFrames().map(async (frame) => {
       await this.ensureBrowserPageRuntime(frame);
       await frame.evaluate(() => {
         const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
@@ -6009,7 +6075,10 @@ export class BrowserSession {
   }
 
   private watchForPopup(page: Page) {
-    const waitMs = boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
+    const configuredWaitMs = this.options.popupWaitMs;
+    const waitMs = typeof configuredWaitMs === 'number' && Number.isFinite(configuredWaitMs) && configuredWaitMs >= 0
+      ? Math.min(3000, Math.floor(configuredWaitMs))
+      : boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
     return {
       waitMs,
       popup: waitMs > 0
@@ -6866,7 +6935,7 @@ export class BrowserSession {
   }
 
   private async readInteractionCounts(): Promise<BrowserInteractionCounts> {
-    const frames = [...new Set(this.sessionPages().flatMap((page) => page.frames()))];
+    const frames = this.actionFrames();
     const records = await Promise.all(frames.map((frame) => frame.evaluate(() => {
       const state = (window as Window & {
         __aiDomMutationState?: { interactionCounts?: Record<string, number> };
@@ -6890,17 +6959,25 @@ export class BrowserSession {
     actual: string,
     previousGeneration: SnapshotGeneration | undefined,
     verify: () => Promise<BrowserActionVerification>,
+    clickTimings?: BrowserClickTiming,
   ): Promise<BrowserActionResult> {
-    await this.activePage.waitForTimeout(40).catch(() => undefined);
+    if (clickTimings) {
+      await timeBrowserClickStage(clickTimings, 'postActionSettleMs', () => this.activePage.waitForTimeout(40).catch(() => undefined));
+    } else {
+      await this.activePage.waitForTimeout(40).catch(() => undefined);
+    }
     let verification: BrowserActionVerification;
     try {
-      verification = await verify();
+      verification = clickTimings
+        ? await timeBrowserClickStage(clickTimings, 'verificationMs', verify)
+        : await verify();
     } catch (error) {
       verification = { ok: false, detail: `verification failed: ${unknownErrorMessage(error)}` };
     }
     const result = await this.completeActionWithDomChanges(
       `${actual} Post-action check: ${verification.detail}`,
       previousGeneration,
+      { clickTimings },
     );
     // The page-level listener is diagnostic only. A navigation or a framework-owned
     // event boundary can replace the document before its counters are read, even when
@@ -6999,7 +7076,7 @@ export class BrowserSession {
   private async completeActionWithDomChanges(
     actual: string,
     previousGeneration: SnapshotGeneration | undefined,
-    options: { postNavigation?: boolean; invalidateSnapshotCursor?: boolean } = {},
+    options: { postNavigation?: boolean; invalidateSnapshotCursor?: boolean; clickTimings?: BrowserClickTiming } = {},
   ): Promise<BrowserActionResult> {
     this.lastScreenshotMetrics = undefined;
     // A cursor represents one immutable pre-action DOM baseline. Even an
@@ -7012,7 +7089,11 @@ export class BrowserSession {
         || snapshotFrameUrl(previousGeneration.url) !== snapshotFrameUrl(currentPage.url())
         || previousGeneration.navigationSequence !== (this.navigationSequenceByPage.get(currentPage) || 0)
       ));
-      const stability = postNavigation ? await this.waitForNavigationDomStability() : undefined;
+      const stability = postNavigation
+        ? options.clickTimings
+          ? await timeBrowserClickStage(options.clickTimings, 'navigationDomStabilityMs', () => this.waitForNavigationDomStability())
+          : await this.waitForNavigationDomStability()
+        : undefined;
       const stabilityNote = !stability
         ? ''
         : stability.stable
@@ -7027,10 +7108,17 @@ export class BrowserSession {
           ok: true,
           actual: `${actual}${stabilityNote} Navigation changed the document. DOM UID registry was cleared; call takeSnapshot when you need targets in the new document.`,
         };
-        await this.resetInterActionChangeJournal();
+        if (options.clickTimings) {
+          options.clickTimings.domChangesMs = 0;
+          await timeBrowserClickStage(options.clickTimings, 'journalResetMs', () => this.resetInterActionChangeJournal());
+        } else {
+          await this.resetInterActionChangeJournal();
+        }
         return result;
       }
-      const changes = await this.readDomChanges();
+      const changes = options.clickTimings
+        ? await timeBrowserClickStage(options.clickTimings, 'domChangesMs', () => this.readDomChanges())
+        : await this.readDomChanges();
       const validationErrors = changes.domChanges?.extra.validationErrors || [];
       const validationNote = validationErrors.length
         ? ` Post-action form validation failed: ${validationErrors.slice(0, 3).join(' | ')}. Treat this operation as failed; fix the stated fields before continuing.`
@@ -7040,7 +7128,11 @@ export class BrowserSession {
         actual: `${actual}${stabilityNote}${validationNote}`,
         domChanges: changes.domChanges,
       };
-      await this.resetInterActionChangeJournal();
+      if (options.clickTimings) {
+        await timeBrowserClickStage(options.clickTimings, 'journalResetMs', () => this.resetInterActionChangeJournal());
+      } else {
+        await this.resetInterActionChangeJournal();
+      }
       return result;
     } catch (error) {
       const result = {
@@ -7607,10 +7699,12 @@ export class BrowserSession {
       );
     }
 
+    const targetResolutionStartedAt = Date.now();
     const from = await this.unifiedActionPoint(input, input.action === 'move');
     throwIfAborted();
     if (!from.point) return { ok: false, actual: from.error || 'Unable to resolve mouse target.' };
     const fromLocator = from.reference && isSnapshotReference(from.reference) ? await this.snapshotReferenceLocator(from.reference) : undefined;
+    const targetResolutionMs = Date.now() - targetResolutionStartedAt;
     throwIfAborted();
     if (input.action === 'move') {
       const eventsBefore = await this.readInteractionCounts();
@@ -7687,14 +7781,42 @@ export class BrowserSession {
 
     const button = input.button || 'left';
     const clickCount = Math.min(3, Math.max(1, Math.floor(Number(input.clickCount) || 1)));
-    const eventsBefore = await this.readInteractionCounts();
+    const clickTimings: BrowserClickTiming = {
+      targetResolutionMs,
+      preClickInteractionReadMs: 0,
+      waitForClickableMs: 0,
+      clickDispatchMs: 0,
+      popupListenerSetupMs: 0,
+      popupWaitMs: 0,
+      postActionSettleMs: 0,
+      verificationMs: 0,
+      navigationDomStabilityMs: 0,
+      domChangesMs: 0,
+      journalResetMs: 0,
+      resultAssemblyMs: 0,
+      totalMs: 0,
+    };
+    if (fromLocator) {
+      await timeBrowserClickStage(clickTimings, 'waitForClickableMs', () => fromLocator.click({
+        button,
+        clickCount,
+        noWaitAfter: true,
+        trial: true,
+      }));
+    }
+    const eventsBefore = await timeBrowserClickStage(clickTimings, 'preClickInteractionReadMs', () => this.readInteractionCounts());
     const urlBefore = page.url();
+    const popupSetupStartedAt = Date.now();
     const popup = this.watchForPopup(page);
+    clickTimings.popupListenerSetupMs = Date.now() - popupSetupStartedAt;
     throwIfAborted();
-    if (fromLocator) await fromLocator.click({ button, clickCount, noWaitAfter: true });
-    else await page.mouse.click(from.point.x, from.point.y, { button, clickCount });
+    await timeBrowserClickStage(clickTimings, 'clickDispatchMs', () => (
+      fromLocator
+        ? fromLocator.click({ button, clickCount, noWaitAfter: true })
+        : page.mouse.click(from.point.x, from.point.y, { button, clickCount })
+    ));
     throwIfAborted();
-    const claimedPopup = await this.settlePopupAfterAction(popup.popup, popup.waitMs);
+    const claimedPopup = await timeBrowserClickStage(clickTimings, 'popupWaitMs', () => this.settlePopupAfterAction(popup.popup, popup.waitMs));
     void this.showClickMarker(from.point.x, from.point.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
     const result = await this.completeVerifiedAction(
       `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${from.point.source}.`,
@@ -7714,6 +7836,7 @@ export class BrowserSession {
           detail: `${delivered} ${expectedEvent} event(s) observed; navigation=${navigated}; ${focus.summary}`,
         };
       },
+      clickTimings,
     );
     // A native <select> opens a browser/OS-owned popup. Its options do not
     // enter the page DOM and therefore cannot be reported by MutationObserver.
@@ -7729,6 +7852,7 @@ export class BrowserSession {
       && clickCount === 1
       && nativeSelectReference
     );
+    const resultAssemblyStartedAt = Date.now();
     if (clickedNativeSelect) {
       if (
         result.domChanges
@@ -7739,7 +7863,9 @@ export class BrowserSession {
       }
       result.actual += ' Native select options are exposed in the updated element above. Use selectOption with this UID and an exact option value or full label; do not choose it with keyboard letters.';
     }
-    return result;
+    clickTimings.resultAssemblyMs = Date.now() - resultAssemblyStartedAt;
+    clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
+    return { ...result, clickTimings };
   }
 
   async selectOption(input: BrowserSelectOptionAction): Promise<BrowserActionResult> {
@@ -8510,8 +8636,7 @@ export class BrowserSession {
    */
   async readDomChanges(): Promise<BrowserActionResult> {
     const mainFrame = this.activePage.mainFrame();
-    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER);
-    const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
+    const frames = this.actionFrames();
     const added: string[] = [];
     const updated: string[] = [];
     const removed: string[] = [];
