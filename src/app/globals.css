@@ -9637,10 +9637,14 @@ body.is-dragging-embedded-tab * {
 .browser-chat-agent-timeline {
   display: grid;
   gap: 1px;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .browser-chat-ai-cycle {
   display: grid;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .browser-chat-ai-cycle-detail {
@@ -9761,6 +9765,8 @@ body.is-dragging-embedded-tab * {
 .browser-chat-ai-cycle-text {
   display: grid;
   gap: 8px;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .browser-chat-ai-reasoning-body {
@@ -10113,6 +10119,8 @@ body.is-dragging-embedded-tab * {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .browser-chat-agent-markdown :where(h1, h2, h3, p, ul, ol, pre, blockquote) {
@@ -10174,6 +10182,12 @@ body.is-dragging-embedded-tab * {
   color: var(--foreground);
   font-size: 0.92em;
   padding: 1px 5px;
+}
+
+.browser-chat-agent-markdown :not(pre)>code {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .browser-chat-agent-markdown pre {
@@ -10512,10 +10526,13 @@ body.is-dragging-embedded-tab * {
   background: var(--panel);
   border: 1px solid var(--accent-border);
   border-radius: 999px;
+  box-sizing: border-box;
   color: var(--accent-strong);
   display: inline-flex;
+  flex: 0 0 24px;
   height: 24px;
   justify-content: center;
+  min-width: 24px;
   width: 24px;
 }
 

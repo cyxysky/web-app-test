@@ -3,7 +3,6 @@ import path from 'node:path';
 import * as CFB from 'cfb';
 import JSZip from 'jszip';
 import mammoth from 'mammoth';
-import { PDFParse } from 'pdf-parse';
 import * as XLSX from 'xlsx';
 
 export type BrowserChatReadableAttachment = {
@@ -101,6 +100,10 @@ export function browserChatAttachmentMetadata(attachment: BrowserChatReadableAtt
 }
 
 async function extractPdf(buffer: Buffer) {
+  // pdf-parse pulls in pdfjs, which cannot be evaluated by the Next server
+  // webpack runtime used by lightweight routes such as the session list.
+  // Load it only when a PDF attachment is actually read.
+  const { PDFParse } = await import('pdf-parse');
   const parser = new PDFParse({ data: buffer });
   try {
     return (await parser.getText()).text.trim();

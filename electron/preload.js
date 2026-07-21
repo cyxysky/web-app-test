@@ -134,6 +134,12 @@ contextBridge.exposeInMainWorld('webPilotSystem', {
     ipcRenderer.on('webpilot:system:download-progress', handler);
     return () => ipcRenderer.removeListener('webpilot:system:download-progress', handler);
   },
+  onDownloadRemoved(listener) {
+    if (typeof listener !== 'function') return () => {};
+    const handler = (_event, payload) => listener(payload);
+    ipcRenderer.on('webpilot:system:download-removed', handler);
+    return () => ipcRenderer.removeListener('webpilot:system:download-removed', handler);
+  },
   openDownload(input) {
     return ipcRenderer.invoke('webpilot:system:open-download', input || {});
   },

@@ -544,6 +544,12 @@ function emitDownloadProgress(download) {
   return payload;
 }
 
+function emitDownloadRemoved(id) {
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send('webpilot:system:download-removed', { id });
+  }
+}
+
 function updateSystemDownload(download, patch = {}) {
   Object.assign(download, patch, { updatedAt: Date.now() });
   systemDownloads.set(download.id, download);
@@ -2553,10 +2559,13 @@ function registerSystemIpc() {
         const filePath = path.resolve(download.path);
         if (!fs.statSync(filePath).isFile()) throw new Error('下载路径不是文件，无法删除。');
         await shell.trashItem(filePath);
+        if (fs.existsSync(filePath)) throw new Error('文件未能移入回收站。');
       }
       systemDownloads.delete(id);
+      emitDownloadRemoved(id);
       return { ok: true };
     } catch (error) {
+      appendLog(`Download remove failed: ${error instanceof Error ? error.message : String(error)}`);
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
@@ -2948,7 +2957,6 @@ async function boot() {
   if (restoreDownloadSettings()) appendLog(`Download directory restored: ${lastDownloadDirectory}`);
   createWindow();
   await updateStartupScreen({ message: '正在恢复浏览器工作区…', progress: 18 });
-  if (restoreEmbeddedBrowserPersistence()) appendLog('Embedded browser tabs restored from local cache.');
   const slowStartupTimer = setTimeout(() => {
     void updateStartupScreen({ message: '服务仍在启动，请稍候…', progress: 58, slow: true });
   }, 8_000);
@@ -2966,6 +2974,9 @@ async function boot() {
     await mainWindow.webContents.executeJavaScript('window.__webPilotStartup?.complete()').catch(() => undefined);
     await new Promise((resolve) => setTimeout(resolve, 180));
     await mainWindow.loadURL(url);
+    // Restoring WebContentsViews before this navigation makes Electron destroy
+    // them when the startup document is replaced by the application shell.
+    if (restoreEmbeddedBrowserPersistence()) appendLog('Embedded browser tabs restored from local cache.');
   } catch (error) {
     clearTimeout(slowStartupTimer);
     const output = recentServerOutput.length

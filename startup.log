@@ -1,5 +1,6 @@
-[2026-07-21T13:43:36.856Z] App starting. packaged=false
-[2026-07-21T13:43:36.856Z] APP_DATA_DIR=C:\Users\18367\Desktop\test\web-app-test
-[2026-07-21T13:43:36.856Z] resourcesPath=C:\Users\18367\Desktop\test\web-app-test\node_modules\electron\dist\resources
-[2026-07-21T13:43:36.856Z] WEBPILOT_ELECTRON_CDP_PORT=19333
-[2026-07-21T13:43:36.970Z] Embedded browser tabs restored from local cache.
+[2026-07-21T14:17:40.795Z] App starting. packaged=false
+[2026-07-21T14:17:40.795Z] APP_DATA_DIR=C:\Users\18367\Desktop\test\web-app-test
+[2026-07-21T14:17:40.795Z] resourcesPath=C:\Users\18367\Desktop\test\web-app-test\node_modules\electron\dist\resources
+[2026-07-21T14:17:40.796Z] WEBPILOT_ELECTRON_CDP_PORT=19333
+[2026-07-21T14:17:44.321Z] Embedded browser detach failed: Object has been destroyed
+[2026-07-21T14:17:45.594Z] Embedded browser tabs restored from local cache.

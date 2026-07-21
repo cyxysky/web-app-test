@@ -4793,7 +4793,9 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [newGroupName, setNewGroupName] = useState('新建标签组');
   const [creatingNewGroup, setCreatingNewGroup] = useState(false);
   const [runtimeActivatedSessionId, setRuntimeActivatedSessionId] = useState('');
-  const requestedGroupId = browserGroupId || embeddedGroupIdForSession(sessionId);
+  const requestedGroupId = browserGroupId
+    || (!sessionId && activeGroupId)
+    || embeddedGroupIdForSession(sessionId);
   const requestedGroupAvailable = useMemo(() => (
     browserGroups.some((group) => group.id === requestedGroupId && group.tabs.length > 0)
     || browserTabs.some((tab) => (
@@ -4802,7 +4804,14 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       || (!tab.groupId && !tab.sessionId && requestedGroupId === 'default')
     ))
   ), [browserGroups, browserTabs, requestedGroupId]);
-  const runtimeAuthorized = Boolean(sessionId && runtimeActivatedSessionId === sessionId);
+  // Historical conversations do not have a fresh browser:start/browser:reuse
+  // log entry, but their persisted tab group is still safe to reattach. Keep
+  // the runtime gate only for creating a missing group; otherwise selecting a
+  // historical conversation detaches the native WebContentsView and leaves the
+  // React-rendered tab strip above an empty browser surface.
+  const runtimeAuthorized = !sessionId
+    || requestedGroupAvailable
+    || runtimeActivatedSessionId === sessionId;
 
   useEffect(() => {
     if (!sessionId) {
@@ -5895,6 +5904,7 @@ export function BrowserChatWorkspace({
   const [imagePreview, setImagePreview] = useState<BrowserChatAttachment | null>(null);
   const [error, setError] = useState('');
   const [downloads, setDownloads] = useState<SystemDownloadItem[]>([]);
+  const removedDownloadIdsRef = useRef(new Set<string>());
   const [downloadCenterOpen, setDownloadCenterOpen] = useState(false);
   const [browserGroupPickerOpen, setBrowserGroupPickerOpen] = useState(false);
   const [embeddedBrowserDialogOpen, setEmbeddedBrowserDialogOpen] = useState(false);
@@ -5978,7 +5988,7 @@ export function BrowserChatWorkspace({
     if (!bridge) return undefined;
     let mounted = true;
     const applyDownload = (download: SystemDownloadItem) => {
-      if (!download?.id) return;
+      if (!download?.id || removedDownloadIdsRef.current.has(download.id)) return;
       setDownloads((current) => {
         const next = [download, ...current.filter((item) => item.id !== download.id)];
         return next.sort((left, right) => Number(right.startedAt || right.updatedAt || 0) - Number(left.startedAt || left.updatedAt || 0));
@@ -5987,13 +5997,19 @@ export function BrowserChatWorkspace({
     bridge.getDownloads?.()
       .then((result) => {
         if (!mounted || !result?.ok || !Array.isArray(result.downloads)) return;
-        setDownloads(result.downloads);
+        setDownloads(result.downloads.filter((download) => !removedDownloadIdsRef.current.has(download.id)));
       })
       .catch(() => undefined);
-    const unsubscribe = bridge.onDownloadProgress?.(applyDownload);
+    const unsubscribeProgress = bridge.onDownloadProgress?.(applyDownload);
+    const unsubscribeRemoved = bridge.onDownloadRemoved?.(({ id }) => {
+      if (!id) return;
+      removedDownloadIdsRef.current.add(id);
+      setDownloads((current) => current.filter((download) => download.id !== id));
+    });
     return () => {
       mounted = false;
-      unsubscribe?.();
+      unsubscribeProgress?.();
+      unsubscribeRemoved?.();
     };
   }, []);
 
@@ -6926,7 +6942,10 @@ export function BrowserChatWorkspace({
         downloads={downloads}
         open={downloadCenterOpen}
         onClose={() => setDownloadCenterOpen(false)}
-        onRemove={(id) => setDownloads((current) => current.filter((download) => download.id !== id))}
+        onRemove={(id) => {
+          removedDownloadIdsRef.current.add(id);
+          setDownloads((current) => current.filter((download) => download.id !== id));
+        }}
         onToggle={toggleDownloadCenter}
       />
     </div>
