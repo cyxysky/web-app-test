@@ -1,10 +1,27 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  browserChatSubagentSuggestedSummaryChars,
   clearBrowserChatSubagentBatchRegistryForTests,
+  preserveBrowserChatSubagentSummary,
   runOrReuseBrowserChatSubagentBatch,
   settleBrowserChatSubagents,
 } from './browser-chat-subagents';
+
+test('child Agent summary length is prompt guidance from configuration and never a backend truncation limit', () => {
+  const previous = process.env.AI_SUBAGENT_RESULT_MAX_CHARS;
+  process.env.AI_SUBAGENT_RESULT_MAX_CHARS = '12345';
+  assert.equal(browserChatSubagentSuggestedSummaryChars(), 12_345);
+  if (previous === undefined) delete process.env.AI_SUBAGENT_RESULT_MAX_CHARS;
+  else process.env.AI_SUBAGENT_RESULT_MAX_CHARS = previous;
+
+  const source = `  ${'a'.repeat(50_001)}\n`;
+  const complete = preserveBrowserChatSubagentSummary(source);
+  assert.equal(complete.summary, source);
+  assert.equal(complete.summary.length, 50_004);
+  assert.equal(complete.summaryOriginalChars, 50_004);
+  assert.equal(complete.summaryTruncated, false);
+});
 
 test('a failed child Agent does not cancel successful siblings', async () => {
   const results = await settleBrowserChatSubagents(['prd-a', 'prd-b', 'prd-c'], async (task) => {

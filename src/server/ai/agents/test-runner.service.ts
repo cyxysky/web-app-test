@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import sharp from 'sharp';
 import { withSkillContext } from '@/server/ai/agents/skill-context';
-import { executeTestCase } from '@/server/ai/agents/target-executor.agent';
+import { executeTestCase } from '@/server/ai/agents/test-case-executor.agent';
 import { withModelSettings, type ModelSettingsOverride } from '@/server/ai/model';
 import type { RecordedFlowStep, StepExecutionResult, TaskLedgerItem, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { store } from '@/server/db/store';

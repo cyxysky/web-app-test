@@ -6,8 +6,18 @@ import {
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
   browserChatAssistantMessageHasVisibleText,
+  browserChatExecutedAiToolEntries,
   browserChatLogsForMessage,
 } from './browser-chat-message-model';
+
+test('renders only AI tool requests backed by a real execution detail', () => {
+  const tools = ['read-1', 'read-2', 'read-3', 'read-4'];
+  const entries = browserChatExecutedAiToolEntries(tools, (_tool, index) => (
+    index === 0 ? { traceId: 'trace-1' } : undefined
+  ));
+
+  assert.deepEqual(entries, [{ tool: 'read-1', index: 0, detail: { traceId: 'trace-1' } }]);
+});
 
 test('assigns a reused step index only to the latest assistant message', () => {
   const messages = assignBrowserChatStepIndexesToLatestMessage([

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { generateText } from 'ai';
+import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import type { StepExecutionResult } from '@/server/ai/schemas/test-case.schema';
 import { readPersonalMemoryRecords, replacePersonalMemoryRecords } from '@/server/storage/sqlite-record-store';
@@ -84,8 +85,7 @@ function compactText(value: unknown, max = 180) {
 }
 
 export function normalizePersonalMemoryUserId(value: unknown) {
-  const userId = textFromUnknown(value).trim();
-  return userId || 'default';
+  return normalizeApplicationUserId(value);
 }
 
 export function personalMemoryEnabled() {

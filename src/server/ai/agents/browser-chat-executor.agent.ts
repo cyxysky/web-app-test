@@ -1671,6 +1671,7 @@ function makeBrowserTools(
     credentialAllowedOrigins?: string[];
     runSubagents?: BrowserChatSubagentRunner;
     readSubagent?: BrowserChatSubagentReader;
+    readUploadedFile?: (input: { attachmentId: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
     ensureBrowserStarted?: () => Promise<void>;
   },
 ) {
@@ -1888,7 +1889,7 @@ function makeBrowserTools(
     }),
     ...(referenceOptions?.runSubagents ? {
       spawnSubagents: tool({
-        description: 'Run several independent research or testing tasks concurrently with full browser-agent tools. The main Agent strictly waits for the original batch barrier, including retries. This returns one backend-maintained UUID per child, never the child content. Call readSubagent with each UUID to load that child model\'s complete summary into the main-Agent context. One child failure does not cancel its siblings.',
+        description: 'Run several independent research or testing tasks concurrently with full browser-agent tools. The main Agent strictly waits for the original batch barrier, including retries. This returns one backend-maintained UUID per child, never the child content. Read child results one at a time in later model steps with readSubagent. One child failure does not cancel its siblings.',
         inputSchema: browserToolInput({
           tasks: z.array(z.object({
             title: z.string().min(1).max(160).describe('Short Chinese display name for this child Agent.'),
@@ -1901,11 +1902,26 @@ function makeBrowserTools(
     } : {}),
     ...(referenceOptions?.readSubagent ? {
       readSubagent: tool({
-        description: 'Read one completed child Agent result by the exact UUID returned from spawnSubagents. The backend keeps complete child execution details for the conversation, while this tool returns the child model-authored summary without backend truncation.',
+        description: 'Read exactly one completed child Agent result. Call this once per child UUID in separate model steps. Failed children still return any partial summary they produced.',
         inputSchema: browserToolInput({
-          uuid: z.string().uuid().describe('Exact child Agent UUID returned by spawnSubagents.'),
+          uuid: z.string().uuid().describe('One child Agent UUID returned by spawnSubagents.'),
         }),
         execute: (input) => record('readSubagent', input, () => referenceOptions.readSubagent!(input.uuid)),
+      }),
+    } : {}),
+    ...(referenceOptions?.readUploadedFile ? {
+      readUploadedFile: tool({
+        description: 'Read one user-uploaded file on demand. The conversation only provides file metadata initially, so call this whenever the task needs file contents. attachmentId must be an ID listed in the user-provided file metadata. Read a focused range first; use the returned next offset to continue only when more content is needed. Supports text, PDF, Word, Excel, PowerPoint, OpenDocument, ZIP listings, images metadata, and extensible format detection.',
+        inputSchema: browserToolInput({
+          attachmentId: z.string().min(1).max(160).describe('Required uploaded-file ID listed in the conversation metadata.'),
+          offset: z.number().int().min(0).optional().describe('Zero-based character offset. Omit for the first segment.'),
+          limit: z.number().int().min(1).max(40_000).optional().describe('Maximum returned characters. Start with a focused segment, then continue with the returned next offset when needed.'),
+        }),
+        execute: (input) => record('readUploadedFile', input, () => referenceOptions.readUploadedFile!({
+          attachmentId: input.attachmentId,
+          limit: input.limit,
+          offset: input.offset,
+        })),
       }),
     } : {}),
     tab: tool({
@@ -2220,6 +2236,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'waitForHumanVerification',
     'spawnSubagents',
     'readSubagent',
+    'readUploadedFile',
     'tab',
     'getHttpRequests',
     'takeSnapshot',
@@ -2651,6 +2668,7 @@ async function executeRuntimeStep(input: {
   allowedToolTypes?: string[];
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
+  readUploadedFile?: (input: { attachmentId: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   ensureBrowserStarted?: () => Promise<void>;
   isBrowserStarted?: () => boolean;
   agentLoopTimeoutMs?: number;
@@ -2792,6 +2810,7 @@ async function executeRuntimeStep(input: {
     const availableRuntimeToolNames = runtimeToolNames(mode).filter((name) => (
       (name !== 'spawnSubagents' || Boolean(input.runSubagents))
       && (name !== 'readSubagent' || Boolean(input.readSubagent))
+      && (name !== 'readUploadedFile' || Boolean(input.readUploadedFile))
     ));
     const runtimeTools = runtimeAllowedToolTypes({
       browserChatMode,
@@ -3213,6 +3232,7 @@ async function executeRuntimeStep(input: {
         requestToolConfirmation: input.requestToolConfirmation,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
+        readUploadedFile: input.readUploadedFile,
         ensureBrowserStarted: input.ensureBrowserStarted,
         onDebug,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
@@ -3284,6 +3304,7 @@ async function executeRuntimeStep(input: {
       credentialAllowedOrigins: input.credentialAllowedOrigins,
       runSubagents: input.runSubagents,
       readSubagent: input.readSubagent,
+      readUploadedFile: input.readUploadedFile,
       ensureBrowserStarted: input.ensureBrowserStarted,
       onDebug,
       observeCurrentScreenshot,
@@ -3488,7 +3509,7 @@ function browserChatRequirement(input: {
     '- Use browser tools only for live action or page inspection. If current evidence is enough, answer directly.',
     '- Requirement-link delegation rule: after the first useful full requirement-page snapshot, use searchSnapshot with tag="a" to read every anchor from that frozen full DOM. Delegate every independently readable PRD/document URL to spawnSubagents with its exact URL and a self-contained evidence request; keep the requirement root and dependent end-to-end flow in the main Agent.',
     '- Parallel-first rule: whenever you discover two or more independent URLs, documents, roles, environments, or test branches that can be investigated without depending on each other, prefer one spawnSubagents call immediately instead of opening and analyzing them serially in the main Agent.',
-    '- spawnSubagents returns only child UUIDs after every child reaches a terminal state. Call readSubagent once for each UUID whose result you need; child content is never embedded directly in spawnSubagents.',
+    '- spawnSubagents returns child UUIDs after every child reaches a terminal state. Read at most one result in each model step with readSubagent({ uuid }). If more results are needed, continue with another readSubagent call in the next model step.',
     '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
     '- Final visible answer must be Chinese Markdown. Do not include JSON, tool parameters, candidate ids, coordinates, or screenshot paths.',
   ].filter(Boolean).join('\n');
@@ -3618,6 +3639,7 @@ export async function executeInteractiveBrowserTurn(input: {
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
+  readUploadedFile?: (input: { attachmentId: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   ensureBrowserStarted?: () => Promise<void>;
   isBrowserStarted?: () => boolean;
   agentLoopTimeoutMs?: number;
@@ -3743,6 +3765,7 @@ export async function executeInteractiveBrowserTurn(input: {
         allowedToolTypes: input.allowedToolTypes,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
+        readUploadedFile: input.readUploadedFile,
         ensureBrowserStarted: input.ensureBrowserStarted,
         isBrowserStarted: input.isBrowserStarted,
         agentLoopTimeoutMs: input.agentLoopTimeoutMs,
@@ -4257,6 +4280,7 @@ async function executeCodexRuntimeObject(input: {
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
+  readUploadedFile?: (input: { attachmentId: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   ensureBrowserStarted?: () => Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
@@ -4269,7 +4293,7 @@ async function executeCodexRuntimeObject(input: {
   observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => BrowserActionResult | Promise<BrowserActionResult>;
   takeSnapshot?: (input?: RuntimeObservationReadOptions) => BrowserActionResult | Promise<BrowserActionResult>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, ensureBrowserStarted, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observeCurrentScreenshot, takeSnapshot } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readUploadedFile, ensureBrowserStarted, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observeCurrentScreenshot, takeSnapshot } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -4335,8 +4359,18 @@ async function executeCodexRuntimeObject(input: {
     if (type === 'readSubagent') {
       if (!readSubagent) return { ok: false, actual: 'readSubagent is unavailable in this runtime.' };
       const uuid = typeof normalizedParams.uuid === 'string' ? normalizedParams.uuid.trim() : '';
-      if (!uuid) return { ok: false, actual: 'readSubagent requires a UUID.' };
+      if (!uuid) return { ok: false, actual: 'readSubagent requires one UUID.' };
       return readSubagent(uuid);
+    }
+    if (type === 'readUploadedFile') {
+      if (!readUploadedFile) return { ok: false, actual: 'readUploadedFile is unavailable in this runtime.' };
+      const attachmentId = typeof normalizedParams.attachmentId === 'string' ? normalizedParams.attachmentId.trim() : '';
+      if (!attachmentId) return { ok: false, actual: 'readUploadedFile requires one attachmentId.' };
+      return readUploadedFile({
+        attachmentId,
+        limit: typeof normalizedParams.limit === 'number' ? normalizedParams.limit : undefined,
+        offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
+      });
     }
     return runRecordedTool(session, targetUrl, flow, runId);
   };

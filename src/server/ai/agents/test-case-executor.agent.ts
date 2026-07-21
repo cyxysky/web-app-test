@@ -3978,7 +3978,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       await onDebug?.({
         phase: `browser:screenshot:${phase}:skipped`,
         stepIndex,
-        message: `DOM target mode skipped ${phase} screenshot; using DOM page context instead.`,
+        message: `DOM test execution skipped ${phase} screenshot; using DOM page context instead.`,
         details: { browserMode: runtimeMode, enabledBy: 'TARGET_DOM_SCREENSHOTS=true' },
       });
       return undefined;
@@ -4002,7 +4002,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       await onDebug?.({
         phase: `browser:screenshot:${phase}:error`,
         stepIndex,
-        message: `DOM target mode screenshot ${phase} failed after ${elapsedSince(startedAt)}ms; continuing with DOM page context.`,
+        message: `DOM test execution screenshot ${phase} failed after ${elapsedSince(startedAt)}ms; continuing with DOM page context.`,
         details: serializeError(error),
       });
       return undefined;

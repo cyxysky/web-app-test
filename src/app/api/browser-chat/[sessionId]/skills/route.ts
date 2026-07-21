@@ -13,13 +13,17 @@ export async function POST(request: NextRequest, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
     const body = await request.json().catch(() => ({}));
+    const userId = body.userId
+      ?? body.qzUserId
+      ?? request.nextUrl.searchParams.get('userId')
+      ?? request.nextUrl.searchParams.get('qzUserId');
     const messageIds = Array.isArray(body.messageIds)
       ? body.messageIds.filter((item: unknown): item is string => typeof item === 'string')
       : [];
     const messageId = typeof body.messageId === 'string' ? body.messageId : '';
     const generated = messageIds.length
-      ? await generateBrowserChatMessagesSkill(sessionId, messageIds)
-      : await generateBrowserChatMessageSkill(sessionId, messageId);
+      ? await generateBrowserChatMessagesSkill(sessionId, messageIds, userId)
+      : await generateBrowserChatMessageSkill(sessionId, messageId, userId);
     return noStoreJson({
       ok: true,
       skill: generated.skill,

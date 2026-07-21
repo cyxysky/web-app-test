@@ -12,7 +12,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
-import { getSqliteDatabase, runSqliteTransaction } from '@/server/storage/sqlite-database';
+import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { getSqliteDatabase, runSqliteTransaction, sqliteDatabasePath } from '@/server/storage/sqlite-database';
 import { appDataRoot } from '@/server/storage/paths';
 
 export type LoginAccountStatus = 'active' | 'disabled';
@@ -88,16 +89,14 @@ const metadataColumns = `
 `;
 const keyFileName = 'credential-master.key';
 let cachedMasterKey: Buffer | undefined;
+const migratedDatabasePaths = new Set<string>();
 
 function now() {
   return new Date().toISOString();
 }
 
 export function normalizeLoginAccountUserId(value: unknown) {
-  const normalized = typeof value === 'string' || typeof value === 'number'
-    ? String(value).trim()
-    : '';
-  return normalized || 'default';
+  return normalizeApplicationUserId(value);
 }
 
 export function normalizeLoginAccountDomain(value: unknown) {
@@ -281,6 +280,47 @@ function decryptPassword(row: LoginAccountRow) {
   }
 }
 
+function ensureLoginAccountUserMigration() {
+  const databasePath = sqliteDatabasePath();
+  if (migratedDatabasePaths.has(databasePath)) return;
+  runSqliteTransaction((database) => {
+    const migrationKey = 'login-account-default-user-migrated';
+    const applied = database.prepare('SELECT 1 FROM runtime_meta WHERE key = ?').get(migrationKey);
+    if (applied) return;
+    const legacyRows = database.prepare(`
+      SELECT * FROM login_account WHERE user_id = 'default' OR TRIM(user_id) = ''
+    `).all() as LoginAccountRow[];
+    for (const row of legacyRows) {
+      const password = decryptPassword(row);
+      const existing = database.prepare(`
+        SELECT * FROM login_account
+        WHERE user_id = '0' AND domain = ? AND username = ?
+      `).get(row.domain, row.username) as LoginAccountRow | undefined;
+      if (existing && existing.updated_at >= row.updated_at) {
+        database.prepare('DELETE FROM login_account WHERE id = ?').run(row.id);
+        continue;
+      }
+      if (existing) database.prepare('DELETE FROM login_account WHERE id = ?').run(existing.id);
+      const migratedIdentity = {
+        id: row.id,
+        user_id: '0',
+        domain: row.domain,
+        username: row.username,
+      };
+      database.prepare(`
+        UPDATE login_account
+        SET user_id = '0', password_envelope = ?
+        WHERE id = ?
+      `).run(encryptPassword(password, migratedIdentity), row.id);
+    }
+    database.prepare(`
+      INSERT INTO runtime_meta (key, value, updated_at)
+      VALUES (?, 'complete', ?)
+    `).run(migrationKey, now());
+  });
+  migratedDatabasePaths.add(databasePath);
+}
+
 function metadataFromRow(row: LoginAccountRow): LoginAccountMetadata {
   return {
     id: row.id,
@@ -299,6 +339,7 @@ function metadataFromRow(row: LoginAccountRow): LoginAccountMetadata {
 }
 
 function metadataById(id: string, userId: string) {
+  ensureLoginAccountUserMigration();
   return getSqliteDatabase().prepare(`
     SELECT ${metadataColumns}
     FROM login_account
@@ -307,12 +348,14 @@ function metadataById(id: string, userId: string) {
 }
 
 function fullRowById(id: string, userId: string) {
+  ensureLoginAccountUserMigration();
   return getSqliteDatabase().prepare(`
     SELECT * FROM login_account WHERE id = ? AND user_id = ?
   `).get(id, userId) as LoginAccountRow | undefined;
 }
 
 export function listLoginAccounts(input: { userId?: unknown; domain?: unknown } = {}) {
+  ensureLoginAccountUserMigration();
   const userId = normalizeLoginAccountUserId(input.userId);
   const domain = typeof input.domain === 'string' && input.domain.trim()
     ? normalizeLoginAccountDomain(input.domain)
@@ -344,6 +387,7 @@ export function findLoginAccountByDomainUsername(input: {
   domain: unknown;
   username: unknown;
 }) {
+  ensureLoginAccountUserMigration();
   const userId = normalizeLoginAccountUserId(input.userId);
   const domain = normalizeLoginAccountDomain(input.domain);
   const username = normalizeUsername(input.username);
@@ -356,6 +400,7 @@ export function findLoginAccountByDomainUsername(input: {
 }
 
 export function createLoginAccount(input: CreateLoginAccountInput) {
+  ensureLoginAccountUserMigration();
   const userId = normalizeLoginAccountUserId(input.userId);
   const domain = normalizeLoginAccountDomain(input.domain);
   const username = normalizeUsername(input.username);
@@ -399,6 +444,7 @@ export function createLoginAccount(input: CreateLoginAccountInput) {
 }
 
 export function updateLoginAccount(id: string, input: UpdateLoginAccountInput, userId?: unknown) {
+  ensureLoginAccountUserMigration();
   const normalizedUserId = normalizeLoginAccountUserId(userId);
   return runSqliteTransaction((database) => {
     const previous = database.prepare(`
@@ -459,6 +505,7 @@ export function updateLoginAccount(id: string, input: UpdateLoginAccountInput, u
 }
 
 export function deleteLoginAccount(id: string, userId?: unknown) {
+  ensureLoginAccountUserMigration();
   const normalizedUserId = normalizeLoginAccountUserId(userId);
   const result = getSqliteDatabase().prepare(`
     DELETE FROM login_account WHERE id = ? AND user_id = ?
@@ -497,6 +544,7 @@ export function resolveLoginAccountCredential(input: {
   domain: unknown;
   username: unknown;
 }) {
+  ensureLoginAccountUserMigration();
   const userId = normalizeLoginAccountUserId(input.userId);
   const domain = normalizeLoginAccountDomain(input.domain);
   const username = normalizeUsername(input.username);

@@ -17,6 +17,8 @@
 7. `text` 只读取与顶层视窗相交的 iframe；视窗外 iframe 内容不会进入结果。
 8. 模型把 `domChanges.overflow` 误解成“页面下方还有内容”，继而滚动普通长页面，并把“滚动到底部”继续写进子 Agent 指令。
 9. 快照预采集上限没有明确返回 `truncated` 等覆盖信息，模型可能把不完整内容报告为“已完整读取”。
+10. 模型可以在同一个输出步骤中生成多个 `readSubagent` 调用，但当前通用 `toolExecutionGate` 只允许第一个工具真正执行；前端随后又通过 fallback 把其余没有 trace 和真实结果的模型请求渲染成正常工具卡片，因此出现“实际只读取一个，界面却展示四个读取工具”的假象。
+11. 当前每个子 Agent 使用 `isolated: true` 启动独立无头 Chromium。并发会话和并发子任务叠加后，浏览器进程数按任务数增长；同时 `BrowserSession` 仍围绕“活动页面”组织，缺少可在后台稳定操作指定页面的页面租约。
 
 ## 2. 修复目标
 
@@ -25,7 +27,10 @@
 - 主 Agent 调用 `spawnSubagents` 后，必须等待当前批次所有子 Agent 进入终态，才能进入下一次模型推理或调用其他工具。
 - 单个子 Agent 失败不得取消兄弟分支；失败分支已经获得的部分内容必须返回主 Agent。
 - 同一回合的重复委托必须等待并复用原批次，不能返回空结果，也不能创建第二批重复任务。
-- 所有子 Agent 的状态和最终总结都必须进入同一个工具结果；不能因从头截断而遗漏后面的分支。
+- `spawnSubagents` 返回每个子 Agent 的 UUID；主 Agent 必须使用单结果工具逐个读取，不能一次把多个总结注入上下文。
+- 每个模型步骤最多真实执行一次 `readSubagent`；前端不得把未执行、被闸门忽略或没有真实结果的模型请求渲染成已执行工具。
+- 子 Agent 总结建议长度来自 `AI_SUBAGENT_RESULT_MAX_CHARS` 配置，只用于提示模型控制篇幅；后端必须完整保存和返回模型结果，不得按该配置截断。
+- 子 Agent 的浏览器并发必须受进程池和页面租约控制；后台任务绑定自己的 `Page`，不得依赖用户当前可见或当前激活的标签页。
 - `text` 和 `full` 都覆盖当前已经加载的整页 DOM 及所有可读取 iframe；二者只在输出格式上不同。
 - 快照分页是对一次冻结采集结果的字符分页，不是视窗分页，不应通过滚动获取下一页。
 - 页面后台异步变化不能阻止继续读取冻结快照的后续文本页；UID 是否仍可操作必须独立判断。
@@ -100,23 +105,20 @@ type SubagentBatchRegistryEntry = {
 - 回合结束或用户中断后清理注册表。
 - 子 Agent 自身不得再次派生子 Agent，除非后续明确设计嵌套批次和总并发限制。
 
-### 3.4 子 Agent 结果协议
+### 3.4 子 Agent 结果与单结果读取协议
 
-`spawnSubagents` 返回面向主模型的稳定结构：
+`spawnSubagents` 只返回批次状态和子 Agent 引用，不直接把全部总结塞进该工具结果：
 
 ```ts
 type SubagentBatchResult = {
   batchId: string;
   status: 'completed';
   results: Array<{
-    id: string;
+    uuid: string;
     title: string;
     status: 'passed' | 'failed' | 'blocked';
-    summary: string;
     partial: boolean;
     error?: string;
-    evidenceCount: number;
-    fullResultId: string;
   }>;
   totals: {
     passed: number;
@@ -127,30 +129,73 @@ type SubagentBatchResult = {
 };
 ```
 
-上下文规则：
+只保留每次读取一个结果的工具：
 
-- 工具结果必须包含每个分支的 `status + summary`，并保持任务原始顺序。
+```ts
+readSubagent({
+  uuid: z.string().uuid(),
+})
+```
+
+一次调用返回稳定顺序的完整结果数组：
+
+```ts
+type ReadSubagentsResult = {
+  results: Array<{
+    uuid: string;
+    title: string;
+    status: 'passed' | 'failed' | 'blocked';
+    summary: string;
+    summaryChars: number;
+    summaryTruncated: boolean;
+    partial: boolean;
+    error?: string;
+    evidenceCount: number;
+    fullResultId: string;
+  }>;
+};
+```
+
+执行与上下文规则：
+
+- `spawnSubagents` 完成后，主 Agent 使用 `readSubagent({ uuid })` 每次读取一个结果；需要更多结果时进入后续模型步骤继续读取。
+- `readSubagent` 重新纳入通用“一模型步骤一个工具”闸门；同一步中额外生成的读取请求不执行，也不产生正常工具卡片。
+- UUID 不存在、尚未终态或读取失败时返回该 UUID 的结构化错误，不影响后续读取其他结果。
+- `AI_SUBAGENT_RESULT_MAX_CHARS` 是模型总结建议长度，不是后端上限。提示词应要求优先覆盖来源地址、已验证事实、表格/字段、图片与 iframe 信息、失败步骤、未读取区域和剩余风险。
+- 后端不根据建议长度执行 `slice`、截断或丢弃；`summaryChars` 反映真实文本长度，`summaryTruncated` 始终为 `false`。
 - 不把每个子 Agent 的全部工具日志、完整快照和调试对象直接塞入聚合结果。
 - 完整内容与证据保存在服务端结果存储中，通过 `fullResultId` 分页读取。
-- 如主 Agent 需要原始内容，新增 `readSubagentResult({ id, cursor })`；不得依赖通用字符串截断。
-- 如果必须限制总结长度，应按分支公平分配预算并显式返回 `summaryTruncated`，不能只截取整个 JSON 的前部。
 - 失败分支的 `summary` 使用其最后有效模型文本或已完成步骤内容，不能因为最终状态是 `failed` 就丢弃已获取信息。
 
-### 3.5 需要修改的文件
+### 3.5 工具执行事实与前端渲染
+
+前端必须区分“模型提出了工具调用”和“后端真实执行了工具”：
+
+- 正常工具胶囊只能由持久化的 tool trace/tool result 驱动；`toolDetail` 不存在时不得通过 `fallbackAiCycleToolDetail()` 伪造 `running` 工具。
+- `spawnSubagents` 与每一次 `readSubagent` 都以真实 `toolCallId/traceId` 归属到模型输出中的准确位置，不能按工具名猜测，也不能在消息尾部补挂一份。
+- 每次真实读取只渲染一个对应 UUID 的工具胶囊；没有 trace/result 的模型请求不渲染。
+- 被执行闸门拒绝、参数校验失败或模型重复生成但未进入执行器的调用，只能进入调试日志；不得显示成普通“执行中/已完成”工具。
+- 会话结束、刷新或切换后，工具状态完全从持久化 trace/result 恢复，不能根据主消息是否结束推断。
+
+### 3.6 需要修改的文件
 
 - `src/server/ai/agents/browser-chat-executor.agent.ts`
   - 分离模型请求超时与工具等待。
   - 将 attempt signal 传入所有工具执行路径。
   - 为 `spawnSubagents` 使用专用结果压缩逻辑，不再走通用前缀截断。
-  - 注册 `readSubagentResult`，如采用结果引用方案。
+  - 注册单结果 `readSubagent`，并纳入一步一个工具的执行闸门。
 - `src/server/ai/agents/browser-chat.service.ts`
   - 增加 attempt 级所有权校验。
   - 不再忽略 `runSubagents` 收到的 abort signal。
   - 增加批次注册表，重复任务等待或复用原 Promise。
   - 回合中断时取消并清理对应批次。
+  - 实现单 UUID 读取，并完整保存和返回子 Agent 总结。
 - `src/server/ai/agents/browser-chat-subagents.ts`
   - 保留 `Promise.allSettled` 语义。
   - 明确批次结果顺序、失败分支和部分结果规则。
+- `src/components/BrowserChatWorkspace.tsx`
+  - 移除无真实 trace/result 工具的 fallback 正常渲染。
+  - 将每条真实单结果读取 trace 渲染为对应位置的可展开胶囊。
 - 浏览器聊天会话类型文件
   - 增加 `attemptId`、批次注册和完整结果引用类型。
 
@@ -323,7 +368,114 @@ type SnapshotCoverage = {
 - `src/server/ai/agents/target-executor.agent.ts`
 - `src/server/ai/agents/browser-chat.service.ts` 中的子 Agent 固定指令模板
 
-## 7. 前端与持久化要求
+## 7. 浏览器进程池与后台页面执行
+
+### 7.1 当前实现为什么会卡
+
+当前子 Agent 在 `browser-chat.service.ts` 中使用 `headless: true, isolated: true` 创建 `BrowserSession`。其中 `isolated: true` 会绕过现有的 `sharedBrowserState/acquireSharedBrowser`，强制每个子 Agent 启动独立 Playwright Chromium。四个会话各自并发四个子 Agent 时，理论上会额外出现十六个无头浏览器进程；即使每个任务只开一页，也会重复承担浏览器主进程、网络进程和基础渲染进程的成本。
+
+Playwright 的 DOM、locator、`page.evaluate`、网络监听和截图并不要求页面是操作系统前台标签。当前限制来自应用把目标组织成 `activePage`，以及初始化、弹窗认领、切换标签等路径频繁调用 `bringToFront()`，不是浏览器自动化本身必须前台执行。
+
+### 7.2 目标架构
+
+采用“少量浏览器进程 + 会话 Context + 子 Agent Page 租约”，不再采用“一个子 Agent 一个浏览器进程”：
+
+```text
+BrowserProcessPool（按标准化 userId 分区，缺省 userId="0"）
+  ├─ foreground process / Electron CDP
+  │    ├─ conversation A visible page
+  │    └─ conversation B visible page
+  └─ background Chromium process（默认 1 个，可配置最多 2 个）
+       ├─ context A（由会话 A 的 storageState 初始化）
+       │    ├─ page lease A-1 -> child Agent 1
+       │    ├─ page lease A-2 -> child Agent 2
+       │    └─ page lease A-3 -> child Agent 3
+       └─ context B（由会话 B 的 storageState 初始化）
+            └─ page lease B-1 -> child Agent 1
+```
+
+核心对象：
+
+```ts
+type BrowserContextLease = {
+  contextId: string;
+  conversationId: string;
+  context: BrowserContext;
+  authRevision: string;
+  release(): Promise<void>;
+};
+
+type BrowserPageGroupLease = {
+  leaseId: string;
+  userId: string;
+  conversationId: string;
+  subagentUuid: string;
+  pages: Set<Page>;
+  activePage: Page;
+  visibility: 'background' | 'foreground';
+  release(): Promise<void>;
+};
+```
+
+同一 `userId` 共享浏览器进程与登录 Context，不同 `userId` 使用不同 runtime/partition；缺失、空字符串和数字 `0` 统一归一化为字符串 `"0"`，会话归属必须严格比较，不得把缺失 ID 当成跨用户通配符。
+
+`BrowserSession` 的权威目标改为注入的 `BrowserPageGroupLease`，一个 Agent 可以在自己的页面组中扩展多个标签页；所有 `takeSnapshot`、`mouse`、`keyboard`、`openPage`、`tab` 和弹窗认领都只在该租约拥有的页面集合中工作。Agent 默认不得操作其他 Agent 的页面组；用户切换可见会话或前台标签时，不得改变子 Agent 的目标页面。
+
+### 7.3 Context 与登录态策略
+
+推荐使用混合隔离，而不是所有任务无条件共享同一个 Context：
+
+- 只读需求调研、PRD/Axure/Wiki 分析：同一会话的子 Agent 共享一个后台 Context，每个子 Agent 独享 Page。这样 cookies、localStorage 和登录状态可直接共享，资源开销最低。
+- 会写数据、会退出登录、会切换账号或可能相互污染的测试：在同一个后台 Chromium 进程中创建独立 Context，并使用主会话导出的 `storageState` 初始化。隔离的是 Context，不再额外启动浏览器进程。
+- 主会话登录态变化后，为其生成新的 `authRevision`。新租约使用新的 storage state；旧任务继续使用启动时的 revision，不在任务中途替换 Context。
+- `storageState` 能复制 cookie、localStorage 和 IndexedDB，但不能复制内存变量、页面 JS 状态、已建立的 WebSocket 或临时设备验证。遇到这类登录依赖时，应把任务留在同会话共享 Context，或明确转入一次人工校验流程。
+
+同 Context 的并发副作用必须明确：登出、刷新 token、修改同源 localStorage、服务工作线程和单会话互踢都会影响兄弟页面。因此任务创建时增加：
+
+```ts
+isolation: 'shared-readonly-context' | 'isolated-context'
+```
+
+默认由调度器根据工具权限选择；只要子任务允许写操作，就使用 `isolated-context`。
+
+### 7.4 后台页面规则
+
+- 后台 Page 创建、导航、点击、输入、截图和弹窗处理均不得调用 `bringToFront()`。
+- `activePage` 只表示该 Agent 页面组内部的当前页，不表示用户可见标签；建议重命名为 `ownedActivePage` 或直接由 `pageLease` 解析，避免继续混淆。
+- 新窗口和 `target=_blank` 页面只有 opener 属于当前租约时才能被认领，并加入同一子 Agent 的页面组。
+- `tab(action=list/switch)` 只列出和切换该租约拥有的页面，不扫描其他会话或其他子 Agent 的标签。
+- 只有“等待人工校验”“用户主动查看子 Agent 页面”或需要可见调试时，才调用 `promotePageLease(leaseId)` 把后台页临时挂到可见 BrowserView；该操作只改变展示层，不改变所有权。
+- 子 Agent 完成或取消后立即关闭其 Page；Context 没有活动租约时进入短暂空闲期，超时后关闭。后台 Chromium 在整个应用无租约时再关闭。
+
+### 7.5 并发与背压
+
+并行 Agent 数量和浏览器并发数分开控制。模型仍可一次委托多个独立任务，但浏览器调度器必须设置资源上限：
+
+```text
+AI_SUBAGENT_MAX_CONCURRENCY = 6
+BROWSER_WORKER_PROCESS_LIMIT = 1
+BROWSER_WORKER_CONTEXT_LIMIT = 4
+BROWSER_WORKER_PAGE_LIMIT = 6
+BROWSER_WORKER_PAGES_PER_ORIGIN = 3
+```
+
+超过上限的任务保持 `queued`，不提前创建浏览器。队列按会话轮转，避免一个复杂会话占满全部页面；取消会话时同时移除尚未获取租约的任务。前端要区分 `queued / running / completed / failed`，不能把排队显示为正在操作浏览器。
+
+### 7.6 落地边界
+
+- 复用现有共享浏览器能力的进程复用思想，但不要直接让所有子 Agent 共享当前单例 `sharedBrowserState.context`。进程池必须允许在同一 Browser 中创建多个 Context。
+- 移除子 Agent 路径的 `isolated: true`；改为显式向池申请 Context/Page 租约。
+- 主对话可见浏览器与后台 Worker 可以先保持两个进程：一个负责 Electron 可见页面，一个负责全部子 Agent。这样已经能把进程数从“随子任务线性增长”降到常数，同时不让后台操作抢占用户前台标签。
+- 后续如 Electron CDP 允许稳定创建不可见 BrowserContext，再评估合并为一个进程；第一阶段不应为了少一个进程牺牲会话隔离和可见页面稳定性。
+
+需要修改：
+
+- `src/server/browser/browser-session.ts`：支持外部 Page/Context 租约、后台可见性策略、按租约认领 popup，并移除后台路径的 `bringToFront()`。
+- 新增 `src/server/browser/browser-process-pool.ts`：管理进程、Context、Page、并发信号量、空闲回收和会话公平队列。
+- `src/server/ai/agents/browser-chat.service.ts`：子 Agent 从池申请租约，按任务权限选择共享只读 Context或独立 Context，并在终态释放。
+- 会话/子 Agent 类型：持久化 `leaseId` 仅用于运行期追踪；恢复历史会话时不得尝试恢复已经失效的内存租约。
+
+## 8. 前端与持久化要求
 
 本次后端修复不能依赖前端临时状态：
 
@@ -341,11 +493,11 @@ type SnapshotCoverage = {
 - 工具详情弹窗；
 - 会话恢复时的日志到视图模型转换。
 
-## 8. 测试方案
+## 9. 测试方案
 
 不运行 `dev` 或 `build`。实现后使用定向单元测试、类型检查和静态检查。
 
-### 8.1 子 Agent
+### 9.1 子 Agent
 
 1. 两个 deferred 子任务：任一未结束时，主 Agent不能进入下一模型步骤。
 2. 一个通过、一个失败：兄弟任务继续，聚合结果同时包含通过总结和失败部分内容。
@@ -354,8 +506,23 @@ type SnapshotCoverage = {
 5. 先完成的第二个任务与后完成的第一个任务：最终结果仍按原任务顺序排列。
 6. 聚合内容超过上下文预算：每个分支仍有状态和总结，不允许尾部分支完全消失。
 7. 用户中断：所有子 Agent 收到 abort，批次进入终态，旧事件不再写入会话。
+8. 连续读取四个 UUID：必须经过四个模型步骤，每一步只产生一条真实 `readSubagent` trace 和一个对应胶囊。
+9. 模型在一步中生成多个读取调用：只有第一个真实执行，没有 trace/result 的调用不进入正常工具渲染。
+10. 配置建议长度为 40,000，而子 Agent 返回 50,001 字符：后端完整保存并返回 50,001 字符，`summaryTruncated=false`。
+11. 一个失败子 Agent 已产生部分总结：单结果读取仍返回其完整有效部分、`status=failed` 和错误信息。
 
-### 8.2 快照分页
+### 9.2 浏览器进程池与后台页面
+
+1. 同时启动六个只读子 Agent：只创建一个后台 Chromium 进程、一个会话 Context 和六个 Page，不出现六个浏览器进程。
+2. 同时启动两个写任务：在同一后台 Chromium 中创建两个独立 Context，cookie/localStorage 修改互不影响。
+3. 子 Agent 在后台导航和点击时切换主界面会话、前台标签：子 Agent 始终操作原 `pageLease`，不得跳到用户当前可见页。
+4. 后台页面打开 popup：只由 opener 对应的租约认领，其他 Agent 的 `tab(list)` 不可见。
+5. 页面数达到上限后新任务进入 `queued`；任一 Page 释放后按会话公平策略启动下一个任务。
+6. 取消排队任务：不创建 Page；取消运行中任务：关闭 Page 并释放计数，不影响同进程其他 Context。
+7. 同 Context 只读任务共享登录态；独立 Context 任务使用同一 `authRevision` 初始化，但运行期状态互不污染。
+8. 触发人工校验时仅目标 Page 被临时提升为可见；校验完成后可回到后台，Agent 所有权不变。
+
+### 9.3 快照分页
 
 1. 读取 page 1 后触发无关异步 DOM mutation：page 2 仍可读取冻结内容。
 2. 读取 page 1 后发生导航：后续文本仍可读取，但 `uidsUsable=false`。
@@ -364,7 +531,7 @@ type SnapshotCoverage = {
 5. 达到元素/字符上限：返回 `truncated=true` 和明确原因。
 6. 所有分页结束后：`nextCursor` 为空，页数和总条目一致。
 
-### 8.3 text/full/iframe
+### 9.4 text/full/iframe
 
 1. 视窗外普通文本必须出现在 `text`。
 2. 视窗外 iframe 文本必须出现在 `text` 和 `full`。
@@ -374,7 +541,7 @@ type SnapshotCoverage = {
 6. `text` 和 `full` 来自同一 snapshot id，文本范围一致。
 7. 虚拟列表未创建内容不得伪装成已读取；覆盖信息或页面信号要能提示模型可能需要滚动。
 
-### 8.4 提示词
+### 9.5 提示词
 
 1. 快照工具描述明确 text/full 都是整页已加载 DOM。
 2. 提示词明确 cursor 分页与滚动无关。
@@ -382,10 +549,12 @@ type SnapshotCoverage = {
 4. 默认子任务模板不包含“滚动到底部”。
 5. 只有提供虚拟列表或懒加载证据时，模型才允许生成 scroll 调用。
 
-## 9. 验收标准
+## 10. 验收标准
 
 - 子 Agent 运行期间，数据库日志中不存在主 Agent 的后续工具调用。
 - 所有子 Agent 终态产生后，恰好生成一次聚合工具结果，并进入发起委托的同一 attempt。
+- 四个子 Agent 的结果通过四个后续模型步骤逐个读取；界面不存在“只执行一个却显示四个已读取/执行中卡片”的情况。
+- 子 Agent 总结建议长度来自配置，后端不会截断超过建议长度的有效内容。
 - 任一分支失败不影响兄弟分支，失败分支的部分结果可被主 Agent读取。
 - 重复委托不会得到空结果，也不会创建重复批次。
 - 主模型上下文中每个子 Agent 至少保留标题、状态、总结和错误/部分结果标记。
@@ -395,15 +564,17 @@ type SnapshotCoverage = {
 - 模型不会再因为 `mutationQueueOverflow` 或存在下一字符页而滚动页面。
 - 未消费完 cursor、发生截断或跳过 frame 时，最终回答明确说明内容不完整。
 - 需求/PRD 分析只有在页面、关联文档、iframe、图片证据和所有分页均处理完成后，才允许报告“分析完成”。
+- 并发子 Agent 数量增加时，后台 Chromium 进程数保持在配置上限；切换会话或可见标签不会改变任何运行中子 Agent 的 Page 目标。
 
-## 10. 实施顺序
+## 11. 实施顺序
 
 1. 修复 attempt 生命周期、abort 传播和重复批次复用，先消除主/子 Agent 真并发。
-2. 修复子 Agent 聚合结果协议和模型上下文截断，保证结果真正返回主 Agent。
-3. 分离冻结快照内容与实时 UID generation，修复 cursor 和 `searchSnapshot`。
-4. 统一 `text/full` 整页及 iframe 语义，增加覆盖元数据。
-5. 修改工具描述、系统提示词和子任务模板，移除错误滚动策略。
-6. 修复前端事件归属和会话恢复渲染。
-7. 补齐定向测试，并同步更新快照架构文档。
+2. 实现单条 `readSubagent` 逐个读取、配置驱动的模型篇幅建议和完整结果回传，保证结果真正返回主 Agent。
+3. 修复前端工具事实渲染和事件归属，禁止 fallback 伪造执行状态，并保证会话恢复后位置不变。
+4. 建立后台浏览器进程池、Context/Page 租约和并发背压，再把子 Agent 从 `isolated: true` 迁移到租约路径。
+5. 分离冻结快照内容与实时 UID generation，修复 cursor 和 `searchSnapshot`。
+6. 统一 `text/full` 整页及 iframe 语义，增加覆盖元数据。
+7. 修改工具描述、系统提示词和子任务模板，移除错误滚动策略。
+8. 补齐定向测试，并同步更新快照架构文档。
 
-上述步骤必须按顺序实施。第一、二步完成前，不应继续依赖当前子 Agent 结果做自动化测试结论；第三、四步完成前，不应把快照输出称为完整页面内容。
+上述步骤必须按顺序实施。第一、二步完成前，不应继续依赖当前子 Agent 结果做自动化测试结论；第五、六步完成前，不应把快照输出称为完整页面内容。

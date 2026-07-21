@@ -103,6 +103,8 @@ export type BrowserSessionOptions = {
   debugDevtools?: boolean;
   headless?: boolean;
   isolated?: boolean;
+  /** Shares one browser/context with other sessions in the same application-user runtime. */
+  sharedBrowserRuntimeKey?: string;
   storageState?: BrowserContextOptions['storageState'];
 };
 
@@ -886,16 +888,24 @@ type SharedBrowserLease = {
 
 const preparedContextInitScripts = new WeakSet<BrowserContext>();
 const sharedPageOwners = new WeakMap<Page, string>();
-const sharedBrowserState: {
+type SharedBrowserState = {
   key?: string;
   browser?: Browser;
   context?: BrowserContext;
   ownership?: SharedBrowserOwnership;
   refCount: number;
   initPromise?: Promise<{ browser?: Browser; context: BrowserContext; ownership: SharedBrowserOwnership }>;
-} = {
-  refCount: 0,
 };
+const sharedBrowserStates = new Map<string, SharedBrowserState>();
+
+function sharedBrowserStateFor(runtimeKey: string) {
+  let state = sharedBrowserStates.get(runtimeKey);
+  if (!state) {
+    state = { refCount: 0 };
+    sharedBrowserStates.set(runtimeKey, state);
+  }
+  return state;
+}
 
 
 
@@ -3440,7 +3450,7 @@ function isPersistentProfileAlreadyOpenError(error: unknown) {
   return /Target page, context or browser has been closed|browser session|user data directory|profile.*in use|already.*open/i.test(message);
 }
 
-async function closeIdleSharedBrowser(force = false) {
+async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: SharedBrowserState, force = false) {
   if (sharedBrowserState.refCount > 0) return;
   const shouldClose = force || process.env.BROWSER_CLOSE_SHARED_WHEN_IDLE === 'true';
   if (!shouldClose) return;
@@ -3461,6 +3471,7 @@ async function closeIdleSharedBrowser(force = false) {
 }
 
 async function acquireSharedBrowser(input: {
+  runtimeKey?: string;
   chromium: BrowserType;
   cdpEndpoint: string;
   reconnectCdpEndpoint?: string;
@@ -3468,12 +3479,14 @@ async function acquireSharedBrowser(input: {
   launchOptions: LaunchOptions;
   contextOptions: BrowserContextOptions;
 }): Promise<SharedBrowserLease> {
-  const key = sharedBrowserKey(input);
+  const runtimeKey = input.runtimeKey?.trim() || 'global';
+  const sharedBrowserState = sharedBrowserStateFor(runtimeKey);
+  const key = input.runtimeKey ? `runtime:${runtimeKey}` : sharedBrowserKey(input);
   if (sharedBrowserState.key && sharedBrowserState.key !== key && sharedBrowserState.refCount > 0) {
     throw new Error('A shared browser is already running with different launch settings. Stop active runs or set BROWSER_SHARED_TABS=false.');
   }
   if (sharedBrowserState.key && sharedBrowserState.key !== key && sharedBrowserState.refCount === 0) {
-    await closeIdleSharedBrowser(true);
+    await closeIdleSharedBrowser(runtimeKey, sharedBrowserState, true);
   }
 
   const browserStillConnected = !sharedBrowserState.browser || sharedBrowserState.browser.isConnected();
@@ -3542,7 +3555,7 @@ async function acquireSharedBrowser(input: {
       if (released) return;
       released = true;
       sharedBrowserState.refCount = Math.max(0, sharedBrowserState.refCount - 1);
-      await closeIdleSharedBrowser();
+      await closeIdleSharedBrowser(runtimeKey, sharedBrowserState);
     },
   };
 }
@@ -3661,6 +3674,7 @@ export class BrowserSession {
     const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
     const executablePath = process.env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
     const browserProfileKey = this.options.browserProfileKey ? normalizePageGroupId(this.options.browserProfileKey) : '';
+    const sharedBrowserRuntimeKey = this.options.sharedBrowserRuntimeKey?.trim() || '';
     const rawCdpEndpoint = forceBundledBrowser
       ? ''
       : useElectronEmbeddedBrowser
@@ -3685,7 +3699,10 @@ export class BrowserSession {
       ? path.join(configuredUserDataDir, browserProfileKey)
       : configuredUserDataDir;
     const tabGrouperEnabled = !isolated && sessionTabGrouperEnabled(headless);
-    const useSharedBrowserTabs = !isolated && sharedBrowserTabsEnabled() && !useElectronEmbeddedBrowser && !browserProfileKey;
+    const useSharedBrowserTabs = !isolated && (
+      Boolean(sharedBrowserRuntimeKey)
+      || (sharedBrowserTabsEnabled() && !useElectronEmbeddedBrowser && !browserProfileKey)
+    );
     const useSessionGroupPageSelection = tabGrouperEnabled || Boolean(browserProfileKey);
     const restoreLastSession = tabGrouperEnabled && process.env.BROWSER_RESTORE_LAST_SESSION !== 'false';
     const autoTabGroupProfileKey = browserProfileKey || (useSharedBrowserTabs ? 'shared' : this.pageGroupId);
@@ -3725,7 +3742,15 @@ export class BrowserSession {
     };
 
     if (useSharedBrowserTabs) {
-      const lease = await acquireSharedBrowser({ chromium, cdpEndpoint, reconnectCdpEndpoint: autoTabGroupCdpEndpoint, userDataDir, launchOptions, contextOptions });
+      const lease = await acquireSharedBrowser({
+        runtimeKey: sharedBrowserRuntimeKey || undefined,
+        chromium,
+        cdpEndpoint,
+        reconnectCdpEndpoint: autoTabGroupCdpEndpoint,
+        userDataDir,
+        launchOptions,
+        contextOptions,
+      });
       this.browserOwnership = 'shared';
       this.browser = lease.browser;
       this.context = lease.context;

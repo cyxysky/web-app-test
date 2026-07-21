@@ -86,7 +86,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -105,6 +105,7 @@ import {
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
   browserChatAssistantMessageHasVisibleText as modelBrowserChatAssistantMessageHasVisibleText,
+  browserChatExecutedAiToolEntries,
   browserChatLogsForMessage,
   type BrowserChatLogIndex as BrowserChatLogIndexModel,
 } from '@/components/browser-chat-message-model';
@@ -434,7 +435,7 @@ type EmbeddedBrowserBridge = {
   discardGroup?: (input: { clearStorage?: boolean; id: string }) => Promise<EmbeddedBrowserState>;
   closeTab: (input: { id: string }) => Promise<EmbeddedBrowserState>;
   createGroup: (input: { label?: string }) => Promise<EmbeddedBrowserState>;
-  createTab: (input: { groupId?: string; sessionId?: string; url?: string }) => Promise<EmbeddedBrowserState>;
+  createTab: (input: { groupId?: string; sessionId?: string; userId?: string; url?: string }) => Promise<EmbeddedBrowserState>;
   getState: () => Promise<EmbeddedBrowserState>;
   goBack: () => Promise<EmbeddedBrowserState>;
   goForward: () => Promise<EmbeddedBrowserState>;
@@ -456,6 +457,7 @@ type EmbeddedBrowserBridge = {
     groupId?: string;
     id?: string;
     sessionId?: string;
+    userId?: string;
     url?: string;
     visible: boolean;
   }) => Promise<EmbeddedBrowserState>;
@@ -841,27 +843,6 @@ function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: St
   });
 
   return details;
-}
-
-function fallbackAiCycleToolDetail(cycle: BrowserChatAiOutputCycle, tool: BrowserChatAiOutputTool, toolIndex: number): BrowserChatToolDetail {
-  const fallbackTool: BrowserChatToolCall = {
-    name: tool.name,
-    input: tool.input,
-    reason: tool.reason,
-  };
-  return {
-    stepIndex: cycle.stepIndex || 0,
-    step: {
-      index: cycle.stepIndex || 0,
-      action: tool.reason || tool.name,
-      actual: '',
-      expected: '',
-      status: 'running',
-      tools: [fallbackTool],
-    },
-    toolIndex,
-    tool: fallbackTool,
-  };
 }
 
 function isRecoveredTransientTool(tool: BrowserChatToolCall | undefined) {
@@ -2619,20 +2600,23 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
   const { output } = cycle;
-  if (!output.tools.length && !output.texts.length && (!showReasoning || !output.reasoning.length)) return null;
-  const firstTool = output.tools[0];
+  const executedTools = browserChatExecutedAiToolEntries(
+    output.tools,
+    (_tool, index) => toolDetails.get(aiCycleToolKey(cycle.id, index)),
+  ).map(({ tool, index, detail }) => ({ tool, index, toolDetail: detail }));
+  if (!executedTools.length && !output.texts.length && (!showReasoning || !output.reasoning.length)) return null;
+  const firstTool = executedTools[0]?.tool;
   const firstToolLabel = firstTool ? browserChatToolLabel(firstTool.name, (value) => value) : '';
   const firstToolMeta = firstTool ? browserChatToolMeta(firstTool.name, firstTool.input) || firstTool.reason : '';
   const toolTitle = compactText([firstToolLabel, firstToolMeta].filter(Boolean).join(': '), 160);
-  const toolSummary = output.tools.length === 1 ? '执行一个工具' : `执行 ${output.tools.length} 个工具`;
-  const hasPendingConfirmation = output.tools.some((tool, index) => {
-    const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+  const toolSummary = executedTools.length === 1 ? '执行一个工具' : `执行 ${executedTools.length} 个工具`;
+  const hasPendingConfirmation = executedTools.some(({ tool, toolDetail }) => {
     return Boolean(pendingConfirmationForTool({
       pending: pendingToolConfirmation,
-      stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+      stepIndex: toolDetail.stepIndex,
       toolName: tool.name,
-      toolInput: toolDetail?.tool.input ?? tool.input,
-      toolOk: toolDetail?.tool.ok,
+      toolInput: toolDetail.tool.input,
+      toolOk: toolDetail.tool.ok,
     }));
   });
   return (
@@ -2658,7 +2642,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
           ))}
         </div>
       ) : null}
-      {output.tools.length ? (
+      {executedTools.length ? (
         <details className="browser-chat-ai-line-collapse" open={hasPendingConfirmation || undefined}>
           <summary className="browser-chat-ai-collapse-summary" title={toolTitle}>
             <SquareTerminal size={14} />
@@ -2666,24 +2650,21 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
             <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
           </summary>
           <div className="browser-chat-ai-cycle-tools">
-            {output.tools.map((tool, index) => {
+            {executedTools.map(({ tool, index, toolDetail }) => {
               const label = browserChatToolLabel(tool.name, (value) => value);
               const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
-              const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
-              if (tool.name === 'spawnSubagents' && !toolDetail) return null;
-              const selectableToolDetail = toolDetail || fallbackAiCycleToolDetail(cycle, tool, index);
-              const presentation = browserChatToolPresentation(toolDetail?.tool, toolDetail?.step, running);
+              const presentation = browserChatToolPresentation(toolDetail.tool, toolDetail.step, running);
               const { isActive, stateClass } = presentation;
               const pendingConfirmation = pendingConfirmationForTool({
                 pending: pendingToolConfirmation,
-                stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+                stepIndex: toolDetail.stepIndex,
                 toolName: tool.name,
-                toolInput: toolDetail?.tool.input ?? tool.input,
-                toolOk: toolDetail?.tool.ok,
+                toolInput: toolDetail.tool.input,
+                toolOk: toolDetail.tool.ok,
               });
               const userAction = pendingConfirmation
                 ? undefined
-                : toolUserActionForTool(logs, toolDetail?.stepIndex ?? cycle.stepIndex, tool.name, toolDetail?.tool.input ?? tool.input);
+                : toolUserActionForTool(logs, toolDetail.stepIndex, tool.name, toolDetail.tool.input);
               const card = (
                 <>
                   <span className="browser-chat-tool-icon" aria-hidden="true">
@@ -2714,13 +2695,13 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                       resuming={resumingHumanVerification}
                       running={running}
                       title={`${label}${meta ? ` - ${meta}` : ''}`}
-                      toolInput={toolDetail?.tool.input ?? tool.input}
-                      toolResult={toolDetail?.tool.rawResult ?? toolDetail?.tool.result}
+                      toolInput={toolDetail.tool.input}
+                      toolResult={toolDetail.tool.rawResult ?? toolDetail.tool.result}
                     />
                   ) : (
                     <button
                       className={`browser-chat-tool-card browser-chat-ai-call-card${stateClass}`}
-                      onClick={() => onSelectTool(selectableToolDetail)}
+                      onClick={() => onSelectTool(toolDetail)}
                       title={`${label}${meta ? ` - ${meta}` : ''}`}
                       type="button"
                     >
@@ -4770,6 +4751,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   onDialogOpenChange,
   onSelectSession,
   sessionId,
+  userId,
 }: {
   active: boolean;
   activationRequestId?: string;
@@ -4780,6 +4762,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   onDialogOpenChange?: (open: boolean) => void;
   onSelectSession?: (sessionId: string) => void;
   sessionId?: string;
+  userId?: string;
 }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const addressInputRef = useRef<HTMLInputElement | null>(null);
@@ -4908,6 +4891,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
           createIfMissing: canCreateRequestedGroup && !requestedGroupAvailable,
           groupId,
           sessionId,
+          userId,
           visible: true,
         });
         setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
@@ -4923,7 +4907,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     } catch (error) {
       setBridgeError(error instanceof Error ? error.message : '嵌入浏览器不可用');
     }
-  }, [activationRequestId, active, applyEmbeddedBrowserState, enabled, leftOverlayInset, requestedGroupAvailable, requestedGroupId, runtimeAuthorized, sessionId]);
+  }, [activationRequestId, active, applyEmbeddedBrowserState, enabled, leftOverlayInset, requestedGroupAvailable, requestedGroupId, runtimeAuthorized, sessionId, userId]);
 
   useEffect(() => {
     void syncEmbeddedBrowser();
@@ -5091,7 +5075,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const groupSessionId = embeddedSessionIdFromGroupId(group.id)
       || (group.id.startsWith('session:') ? group.sessionId : sessionId)
       || sessionId;
-    const result = await bridge.createTab({ groupId: group.id, sessionId: groupSessionId }).catch((error: unknown) => ({
+    const result = await bridge.createTab({ groupId: group.id, sessionId: groupSessionId, userId }).catch((error: unknown) => ({
       ok: false,
       error: error instanceof Error ? error.message : '创建嵌入浏览器标签失败',
     }));
@@ -5777,6 +5761,11 @@ export function BrowserChatWorkspace({
 }) {
   const router = useRouter();
   const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const requestUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || '0';
+  const browserChatApiUrl = useCallback((path: string) => (
+    `${path}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(requestUserId)}`
+  ), [requestUserId]);
   const { t } = useI18n();
   const { mode: themeMode, toggleMode } = useTheme();
   const initialModelSelection = resolveRuntimeModelSelection(null);
@@ -5837,7 +5826,7 @@ export function BrowserChatWorkspace({
   const [embeddedBrowserDialogOpen, setEmbeddedBrowserDialogOpen] = useState(false);
   const selectedSessionRunning = isBrowserChatSessionRunning(session);
   const selectedRunningSession = selectedSessionRunning ? session : undefined;
-  const currentBusy = busy || selectedSessionRunning;
+  const currentBusy = busy || selectedSessionRunning || interrupting;
   const interruptSessionId = selectedRunningSession?.id || (busy ? pendingMessageSessionId || session?.id : undefined);
   const canInterruptConversation = Boolean(interruptSessionId && (busy || selectedSessionRunning));
   const modeLocked = Boolean(session && session.status !== 'closed' && (session.messages.length || session.steps.length || selectedSessionRunning));
@@ -5991,7 +5980,7 @@ export function BrowserChatWorkspace({
     const sessionId = activeSessionIdRef.current;
     if (!sessionId || fullLogSessionIdsRef.current.has(sessionId)) return;
     fullLogSessionIdsRef.current.add(sessionId);
-    void fetch(`/api/browser-chat/${sessionId}/logs`, { cache: 'no-store' })
+    void fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/logs`), { cache: 'no-store' })
       .then((response) => readApiJson<{ logs?: BrowserChatLogRecord[] }>(response, '加载对话日志失败'))
       .then((data) => {
         if (!Array.isArray(data.logs)) return;
@@ -6000,7 +5989,7 @@ export function BrowserChatWorkspace({
       .catch(() => {
         fullLogSessionIdsRef.current.delete(sessionId);
       });
-  }, []);
+  }, [browserChatApiUrl]);
   const toggleExportMessageSelection = useCallback((messageId: string, selected: boolean) => {
     setSelectedExportMessageIds((current) => {
       const next = new Set(current);
@@ -6174,14 +6163,14 @@ export function BrowserChatWorkspace({
   }, []);
 
   const loadSessions = useCallback(async () => {
-    const response = await fetch('/api/browser-chat', { cache: 'no-store' });
+    const response = await fetch(browserChatApiUrl('/api/browser-chat'), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载对话历史失败');
     const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => normalizeSession(item)) : [];
     setSessions(nextSessions);
-  }, []);
+  }, [browserChatApiUrl]);
 
   const refreshSession = useCallback(async (sessionId: string, options: { activate?: boolean } = {}) => {
-    const response = await fetch(`/api/browser-chat/${sessionId}`, { cache: 'no-store' });
+    const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}`), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载对话失败');
     const shouldActivate = options.activate ?? activeSessionIdRef.current === sessionId;
     const loadedSession = upsertSession(data.session as BrowserChatSession, { activate: shouldActivate });
@@ -6196,7 +6185,7 @@ export function BrowserChatWorkspace({
       setModelId(nextModel.model);
     }
     return loadedSession;
-  }, [modelConfig, upsertSession]);
+  }, [browserChatApiUrl, modelConfig, upsertSession]);
 
   const scheduleLoadSessions = useCallback((delay = 80) => {
     if (sessionListRefreshTimerRef.current) window.clearTimeout(sessionListRefreshTimerRef.current);
@@ -6287,10 +6276,10 @@ export function BrowserChatWorkspace({
   }, [realtimeConnected, refreshSession, selectedSessionRunning, session?.id]);
 
   async function createSession() {
-    const response = await fetch('/api/browser-chat', {
+    const response = await fetch(browserChatApiUrl('/api/browser-chat'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ safetyMode, modelProvider, model: modelId }),
+      body: JSON.stringify({ safetyMode, modelProvider, model: modelId, userId: requestUserId }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '创建对话会话失败');
     return upsertSession(data.session as BrowserChatSession, { activate: true });
@@ -6302,10 +6291,10 @@ export function BrowserChatWorkspace({
   }
 
   async function postMessageToSession(sessionId: string, content: string, clientMessageId: string, nextAttachments: BrowserChatAttachment[], skillIds: string[]) {
-    const response = await fetch(`/api/browser-chat/${sessionId}/message`, {
+    const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/message`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds, userId: requestUserId }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '发送消息失败');
     return data.session as BrowserChatSession;
@@ -6389,29 +6378,12 @@ export function BrowserChatWorkspace({
     if (!targetId || interrupting) return;
     setInterrupting(true);
     setError('');
-    const interruptedAt = new Date().toISOString();
-    const markInterrupted = (current: BrowserChatSession) => ({
-      ...current,
-      busy: false,
-      status: current.status === 'closed' ? current.status : 'idle' as const,
-      pendingToolConfirmation: undefined,
-      updatedAt: interruptedAt,
-      messages: current.messages.map((message) => message.status === 'running' ? {
-        ...message,
-        activity: undefined,
-        content: '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。',
-        status: 'interrupted' as const,
-        updatedAt: interruptedAt,
-      } : message),
-    });
-    setBusy(false);
-    setPendingMessageSessionId(null);
-    setSessions((current) => current.map((item) => item.id === targetId ? markInterrupted(item) : item));
-    setSession((current) => current?.id === targetId ? markInterrupted(current) : current);
     try {
-      const response = await fetch(`/api/browser-chat/${targetId}/interrupt`, { method: 'POST' });
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${targetId}/interrupt`), { method: 'POST' });
       const data = await readApiJson<Record<string, unknown>>(response, '中断对话失败');
       upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === targetId });
+      setBusy(false);
+      setPendingMessageSessionId((current) => current === targetId ? null : current);
     } catch (interruptError) {
       setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
       await refreshSession(targetId, { activate: activeSessionIdRef.current === targetId }).catch(() => undefined);
@@ -6427,10 +6399,10 @@ export function BrowserChatWorkspace({
     setResolvingConfirmationAction(action);
     setError('');
     try {
-      const response = await fetch(`/api/browser-chat/${sessionId}/tool-confirmation`, {
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/tool-confirmation`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, confirmationId }),
+        body: JSON.stringify({ action, confirmationId, userId: requestUserId }),
       });
       const data = await readApiJson<Record<string, unknown>>(response, '工具确认失败');
       upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === sessionId });
@@ -6449,8 +6421,7 @@ export function BrowserChatWorkspace({
     setResumingHumanVerification(true);
     setError('');
     try {
-      const query = active.userId ? `?userId=${encodeURIComponent(active.userId)}` : '';
-      const response = await fetch(`/api/browser-chat/${active.id}/resume-verification${query}`, { method: 'POST' });
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${active.id}/resume-verification`), { method: 'POST' });
       const data = await readApiJson<{ session: BrowserChatSession }>(response, '继续人工校验回合失败');
       upsertSession(data.session, { activate: true });
       scheduleSessionRefresh(active.id, 120);
@@ -6466,7 +6437,7 @@ export function BrowserChatWorkspace({
     setBusy(true);
     startGlobalLoading('正在结束浏览器对话');
     try {
-      const response = await fetch(`/api/browser-chat/${session.id}`, { method: 'DELETE' });
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${session.id}`), { method: 'DELETE' });
       if (response.ok) {
         const data = await readApiJson<{ session: BrowserChatSession }>(response, '结束浏览器对话失败');
         upsertSession(data.session, { activate: true });
@@ -6487,7 +6458,7 @@ export function BrowserChatWorkspace({
     const deletedSession = sessions.find((item) => item.id === sessionId)
       || (session?.id === sessionId ? session : undefined);
     try {
-      const response = await fetch(`/api/browser-chat/${sessionId}/delete`, { method: 'POST' });
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/delete`), { method: 'POST' });
       await readApiJson<Record<string, unknown>>(response, '删除历史对话失败');
       setSessions((current) => current.filter((item) => item.id !== sessionId));
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
@@ -6535,10 +6506,10 @@ export function BrowserChatWorkspace({
     setDeletingSelectedSessions(true);
     setError('');
     try {
-      const response = await fetch('/api/browser-chat/delete', {
+      const response = await fetch(browserChatApiUrl('/api/browser-chat/delete'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: deletingIds }),
+        body: JSON.stringify({ ids: deletingIds, userId: requestUserId }),
       });
       await readApiJson<Record<string, unknown>>(response, '批量删除历史对话失败');
       setSessions((current) => current.filter((item) => !deletingIdSet.has(item.id)));
@@ -6570,7 +6541,7 @@ export function BrowserChatWorkspace({
     setError('');
     startGlobalLoading('正在导出选中对话轮次');
     try {
-      const response = await fetch(`/api/browser-chat/${sessionId}/export`, {
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/export`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageIds }),
@@ -6584,7 +6555,7 @@ export function BrowserChatWorkspace({
       setExportingSelectedMessages(false);
       stopGlobalLoading();
     }
-  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, selectedExportMessageIds, session?.id]);
+  }, [browserChatApiUrl, exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, selectedExportMessageIds, session?.id]);
 
   const exportMessageToTestCase = useCallback(async (messageId: string) => {
     const sessionId = session?.id;
@@ -6592,7 +6563,7 @@ export function BrowserChatWorkspace({
     setExportingMessageId(messageId);
     setError('');
     try {
-      const response = await fetch(`/api/browser-chat/${sessionId}/export`, {
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/export`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageId }),
@@ -6604,7 +6575,7 @@ export function BrowserChatWorkspace({
     } finally {
       setExportingMessageId(null);
     }
-  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, session?.id]);
+  }, [browserChatApiUrl, exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, session?.id]);
 
   const generateSelectedMessagesSkill = useCallback(async () => {
     const sessionId = session?.id;
@@ -6614,7 +6585,7 @@ export function BrowserChatWorkspace({
     setError('');
     startGlobalLoading('正在生成 Skill');
     try {
-      const response = await fetch(`/api/browser-chat/${sessionId}/skills`, {
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/skills`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageIds }),
@@ -6628,7 +6599,7 @@ export function BrowserChatWorkspace({
       setGeneratingSkillSelectedMessages(false);
       stopGlobalLoading();
     }
-  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, selectedExportMessageIds, session?.id]);
+  }, [browserChatApiUrl, exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, selectedExportMessageIds, session?.id]);
 
   const generateMessageSkill = useCallback(async (messageId: string) => {
     const sessionId = session?.id;
@@ -6637,7 +6608,7 @@ export function BrowserChatWorkspace({
     setError('');
     startGlobalLoading('正在生成 Skill');
     try {
-      const response = await fetch(`/api/browser-chat/${sessionId}/skills`, {
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/skills`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageId }),
@@ -6650,7 +6621,7 @@ export function BrowserChatWorkspace({
       setGeneratingSkillMessageId(null);
       stopGlobalLoading();
     }
-  }, [exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, session?.id]);
+  }, [browserChatApiUrl, exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, session?.id]);
 
   async function startNewConversation() {
     if (loadingSessionId) return;
@@ -6848,7 +6819,7 @@ export function BrowserChatWorkspace({
     const previous = session;
     upsertSession({ ...session, browserGroupId }, { activate: true });
     try {
-      const response = await fetch(`/api/browser-chat/${session.id}/group`, {
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${session.id}/group`), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ groupId: browserGroupId }),
@@ -7042,6 +7013,7 @@ export function BrowserChatWorkspace({
                 if (ownerSessionId && ownerSessionId !== activeSessionIdRef.current) void loadSession(ownerSessionId);
               }}
               sessionId={session?.id}
+              userId={session?.userId || '0'}
             />
             {embeddedChatCollapsed ? null : (
               <div

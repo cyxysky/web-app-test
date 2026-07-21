@@ -30,6 +30,16 @@ export type BrowserChatMessageRenderEntry<TMessage extends BrowserChatMessageLik
   | { item: TMessage; kind: 'message' }
   | { id: string; items: TMessage[]; kind: 'executed-group' };
 
+export function browserChatExecutedAiToolEntries<TTool, TDetail>(
+  tools: TTool[],
+  resolveDetail: (tool: TTool, index: number) => TDetail | undefined,
+) {
+  return tools.flatMap((tool, index) => {
+    const detail = resolveDetail(tool, index);
+    return detail === undefined ? [] : [{ tool, index, detail }];
+  });
+}
+
 function hasVisibleText(value: unknown) {
   return typeof value === 'string' && Boolean(value.trim());
 }

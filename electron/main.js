@@ -734,6 +734,10 @@ function normalizeEmbeddedBrowserSessionId(value) {
   return String(value || '').trim();
 }
 
+function normalizeEmbeddedBrowserUserId(value) {
+  return String(value ?? '').trim();
+}
+
 function embeddedBrowserPartition(sessionId) {
   const sessionKey = normalizeEmbeddedBrowserSessionId(sessionId) || 'default';
   const normalized = sessionKey
@@ -744,10 +748,13 @@ function embeddedBrowserPartition(sessionId) {
   return `persist:webpilot-${normalized || 'session'}-${digest}`;
 }
 
-async function clearEmbeddedBrowserPartition(sessionId) {
+async function clearEmbeddedBrowserPartition(sessionId, userId) {
   const normalized = normalizeEmbeddedBrowserSessionId(sessionId);
-  if (!normalized) return;
-  const partitionSession = electronSession.fromPartition(embeddedBrowserPartition(normalized));
+  const normalizedUserId = normalizeEmbeddedBrowserUserId(userId);
+  if (!normalized && !normalizedUserId) return;
+  const partitionSession = electronSession.fromPartition(embeddedBrowserPartition(
+    normalizedUserId ? `user:${normalizedUserId}` : `session:${normalized}`,
+  ));
   await partitionSession.clearStorageData();
   await partitionSession.clearCache();
   if (typeof partitionSession.clearAuthCache === 'function') await partitionSession.clearAuthCache();
@@ -928,6 +935,7 @@ function embeddedBrowserPersistenceSnapshot() {
       id: tab.id,
       pinned: Boolean(tab.pinned),
       sessionId: tab.sessionId || undefined,
+      userId: tab.userId || undefined,
       title: embeddedBrowserRecordTitle(tab.lastKnownTitle),
       url,
     });
@@ -941,6 +949,7 @@ function embeddedBrowserPersistenceSnapshot() {
       id: group.id,
       label: embeddedBrowserRecordTitle(group.label),
       sessionId: embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || undefined,
+      userId: group.userId || undefined,
     }));
 
   return {
@@ -1060,6 +1069,7 @@ function restoreEmbeddedBrowserPersistence() {
         id,
         label: embeddedBrowserRecordTitle(item?.label),
         sessionId,
+        userId: normalizeEmbeddedBrowserUserId(item?.userId),
       });
       savedGroupActiveTabIds.set(id, persistedEmbeddedBrowserId(item?.activeTabId));
     }
@@ -1077,6 +1087,7 @@ function restoreEmbeddedBrowserPersistence() {
           createdAt: Date.now(),
           id: groupId,
           sessionId: embeddedBrowserSessionIdFromGroupId(groupId) || normalizeEmbeddedBrowserSessionId(item?.sessionId),
+          userId: normalizeEmbeddedBrowserUserId(item?.userId),
         });
       }
       try {
@@ -1087,6 +1098,7 @@ function restoreEmbeddedBrowserPersistence() {
           id,
           pinned: Boolean(item?.pinned),
           sessionId: embeddedBrowserSessionIdFromGroupId(groupId) || normalizeEmbeddedBrowserSessionId(item?.sessionId),
+          userId: normalizeEmbeddedBrowserUserId(item?.userId),
           restore: true,
           title: embeddedBrowserRecordTitle(item?.title),
           url: embeddedBrowserPersistableUrl(item?.url),
@@ -1258,6 +1270,7 @@ function embeddedBrowserTabsForGroup(groupId) {
 function ensureEmbeddedBrowserGroup(input = {}) {
   const groupId = embeddedBrowserGroupId(input);
   const sessionId = embeddedBrowserSessionIdForGroup(input, groupId);
+  const userId = normalizeEmbeddedBrowserUserId(input.userId);
   let group = embeddedBrowserGroups.get(groupId);
   if (!group) {
     group = {
@@ -1267,12 +1280,17 @@ function ensureEmbeddedBrowserGroup(input = {}) {
       id: groupId,
       label: embeddedBrowserRecordTitle(input.label),
       sessionId,
+      userId,
     };
     embeddedBrowserGroups.set(group.id, group);
     scheduleEmbeddedBrowserPersistence();
     notifyEmbeddedBrowserStateChange();
-  } else if (sessionId && group.id.startsWith('session:') && group.sessionId !== sessionId) {
-    group.sessionId = sessionId;
+  } else if (
+    (sessionId && group.id.startsWith('session:') && group.sessionId !== sessionId)
+    || (userId && group.userId !== userId)
+  ) {
+    if (sessionId) group.sessionId = sessionId;
+    if (userId) group.userId = userId;
     scheduleEmbeddedBrowserPersistence();
     notifyEmbeddedBrowserStateChange();
   }
@@ -1356,7 +1374,7 @@ function installEmbeddedBrowserTabHandlers(tab) {
     }
     let popupTab;
     try {
-      popupTab = createEmbeddedBrowserTab({ groupId: tab.groupId, sessionId: tab.sessionId, url: normalizedUrl });
+      popupTab = createEmbeddedBrowserTab({ groupId: tab.groupId, sessionId: tab.sessionId, userId: tab.userId, url: normalizedUrl });
     } catch (error) {
       appendLog(`Embedded browser popup tab create failed: ${error instanceof Error ? error.message : String(error)}`);
       return { action: 'deny' };
@@ -1488,6 +1506,7 @@ function createEmbeddedBrowserTab(input = {}) {
   if (!WebContentsView) throw new Error('Electron WebContentsView is not available.');
   const group = ensureEmbeddedBrowserGroup(input);
   const sessionId = normalizeEmbeddedBrowserSessionId(input.sessionId) || embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId;
+  const userId = normalizeEmbeddedBrowserUserId(input.userId) || normalizeEmbeddedBrowserUserId(group.userId);
   const tabId = input.id || `tab:${embeddedBrowserNextTabId++}`;
   const rawInitialUrl = String(input.url || '').trim();
   const initialUrl = rawInitialUrl
@@ -1498,7 +1517,7 @@ function createEmbeddedBrowserTab(input = {}) {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
-      partition: embeddedBrowserPartition(sessionId),
+      partition: embeddedBrowserPartition(userId ? `user:${userId}` : `session:${sessionId}`),
       preload: embeddedBrowserPreloadPath(),
       sandbox: false,
     },
@@ -1517,6 +1536,7 @@ function createEmbeddedBrowserTab(input = {}) {
     readyPromise: undefined,
     restorePending: Boolean(input.restore),
     sessionId,
+    userId,
     view,
   };
   view.webContents.setZoomFactor(1);
@@ -1554,7 +1574,7 @@ function ensureEmbeddedBrowserTab(input = {}) {
 
   if (!tab && input.createIfMissing !== false) {
     const sessionId = normalizeEmbeddedBrowserSessionId(input.sessionId) || embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId;
-    tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId });
+    tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId, userId: input.userId || group.userId });
   }
   return tab;
 }
@@ -1825,6 +1845,7 @@ function embeddedBrowserState() {
       createdAt: tab.createdAt || Date.now(),
       id: tab.groupId,
       sessionId: tab.sessionId || '',
+      userId: tab.userId || '',
     });
   }
 
@@ -1854,6 +1875,7 @@ function embeddedBrowserState() {
         loading: webContents.isLoading(),
         pinned: Boolean(tab.pinned),
         sessionId: tab.sessionId || undefined,
+        userId: tab.userId || undefined,
         title,
         url,
       };
@@ -1869,6 +1891,7 @@ function embeddedBrowserState() {
       id: group.id,
       label: group.label || undefined,
       sessionId: group.sessionId || undefined,
+      userId: group.userId || undefined,
       tabs: groupTabs,
     });
   }
@@ -1896,6 +1919,7 @@ function rememberClosedEmbeddedBrowserTab(tab) {
     groupId: tab.groupId,
     pinned: Boolean(tab.pinned),
     sessionId: tab.sessionId || undefined,
+    userId: tab.userId || undefined,
     title: embeddedBrowserRecordTitle(tab.lastKnownTitle),
     url: embeddedBrowserPersistableUrl(tab.lastKnownUrl || tab.view.webContents.getURL() || ''),
   });
@@ -1906,6 +1930,7 @@ function openEmbeddedBrowserTabFromRecord(record = {}, options = {}) {
   const group = ensureEmbeddedBrowserGroup({
     groupId: record.groupId || embeddedBrowserActiveGroupId || 'default',
     sessionId: record.sessionId,
+    userId: record.userId,
   });
   const tab = createEmbeddedBrowserTab({
     audioMuted: Boolean(record.audioMuted),
@@ -1913,6 +1938,7 @@ function openEmbeddedBrowserTabFromRecord(record = {}, options = {}) {
     groupId: group.id,
     pinned: Boolean(options.pinned ?? record.pinned),
     sessionId: embeddedBrowserSessionIdFromGroupId(group.id) || group.sessionId || normalizeEmbeddedBrowserSessionId(record.sessionId),
+    userId: normalizeEmbeddedBrowserUserId(record.userId) || group.userId,
     title: embeddedBrowserRecordTitle(record.title),
     url: embeddedBrowserPersistableUrl(record.url),
   });
@@ -2134,7 +2160,7 @@ async function createManualEmbeddedBrowserTab(input = {}) {
   const rawUrl = String(input.url || '').trim();
   const url = rawUrl ? normalizeEmbeddedBrowserOpenUrl(rawUrl, mainWindow?.webContents?.getURL?.() || '') : '';
   if (rawUrl && !url) throw new Error(`Invalid embedded browser URL: ${rawUrl}`);
-  const tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId, url });
+  const tab = createEmbeddedBrowserTab({ groupId: group.id, sessionId, userId: input.userId || group.userId, url });
   if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id: tab.id });
   else setActiveEmbeddedBrowserTab(tab);
   ensureEmbeddedBrowserTabReady(tab)
@@ -2321,6 +2347,7 @@ function registerEmbeddedBrowserIpc() {
           groupId: input.groupId,
           id: input.id,
           sessionId: input.sessionId,
+          userId: input.userId,
         });
         const tab = activeEmbeddedBrowserTab();
         if (typeof input.url === 'string' && input.url.trim()) {
@@ -2420,9 +2447,12 @@ function registerEmbeddedBrowserIpc() {
       const groupId = typeof input.id === 'string' ? input.id : '';
       const sessionId = embeddedBrowserSessionIdFromGroupId(groupId)
         || normalizeEmbeddedBrowserSessionId(embeddedBrowserGroups.get(groupId)?.sessionId);
+      const userId = normalizeEmbeddedBrowserUserId(embeddedBrowserGroups.get(groupId)?.userId);
       const state = closeEmbeddedBrowserGroup(groupId, { rememberClosed: false });
-      if (input.clearStorage === true && sessionId) {
-        await clearEmbeddedBrowserPartition(sessionId);
+      const userPartitionStillInUse = Boolean(userId) && Array.from(embeddedBrowserGroups.values())
+        .some((group) => normalizeEmbeddedBrowserUserId(group.userId) === userId);
+      if (input.clearStorage === true && (sessionId || userId) && !userPartitionStillInUse) {
+        await clearEmbeddedBrowserPartition(sessionId, userId);
       }
       return state;
     } catch (error) {
@@ -2884,12 +2914,20 @@ async function failStartupScreen(message) {
   }
 }
 
+function runtimeAppDataDirectory() {
+  const configured = String(process.env.APP_DATA_DIR || '').trim();
+  if (configured) return path.resolve(configured);
+  if (!app.isPackaged) return process.cwd();
+  return path.join(app.getPath('userData'), 'runtime');
+}
+
 async function boot() {
-  const appDataDir = ensureDir(path.join(app.getPath('userData'), 'runtime'));
+  const appDataDir = ensureDir(runtimeAppDataDirectory());
   runtimeDatabasePath = path.join(appDataDir, '.data', RUNTIME_DATABASE_FILE);
   startupLogPath = path.join(appDataDir, 'startup.log');
   fs.writeFileSync(startupLogPath, '');
   appendLog(`App starting. packaged=${app.isPackaged}`);
+  appendLog(`APP_DATA_DIR=${appDataDir}`);
   appendLog(`resourcesPath=${process.resourcesPath}`);
   appendLog(`WEBPILOT_ELECTRON_CDP_PORT=${EMBEDDED_BROWSER_CDP_PORT}`);
   if (restoreDownloadSettings()) appendLog(`Download directory restored: ${lastDownloadDirectory}`);

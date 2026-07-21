@@ -13,13 +13,17 @@ export async function POST(request: NextRequest, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
     const body = await request.json().catch(() => ({}));
+    const userId = body.userId
+      ?? body.qzUserId
+      ?? request.nextUrl.searchParams.get('userId')
+      ?? request.nextUrl.searchParams.get('qzUserId');
     const messageIds = Array.isArray(body.messageIds)
       ? body.messageIds.filter((item: unknown): item is string => typeof item === 'string')
       : [];
     const messageId = typeof body.messageId === 'string' ? body.messageId : '';
     const exported = messageIds.length
-      ? exportBrowserChatMessagesToTestCase(sessionId, messageIds)
-      : exportBrowserChatMessageToTestCase(sessionId, messageId);
+      ? exportBrowserChatMessagesToTestCase(sessionId, messageIds, userId)
+      : exportBrowserChatMessageToTestCase(sessionId, messageId, userId);
     return noStoreJson({
       testCaseId: exported.testCase.id,
       runId: exported.run.id,

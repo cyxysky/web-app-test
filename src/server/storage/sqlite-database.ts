@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { appDataRoot } from '@/server/storage/paths';
@@ -11,11 +11,237 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 2;
+const currentSchemaVersion = 4;
+const defaultApplicationUserId = '0';
+const obsoleteRuntimeEnvKeys = new Set([
+  'AI_PROMPT_INCLUDE_FULL_TIMELINE',
+  'RUN_MEMORY_TIMELINE_LIMIT',
+  'RUN_MEMORY_SUMMARY_MAX_CHARS',
+  'DATABASE_URL',
+  'AI_TARGET_MODE_CUSTOM_PROMPT',
+  'AI_TARGET_MODE_CUSTOM_PROMPT_ENABLED',
+]);
 
 const runtimeState = ((globalThis as typeof globalThis & {
   __webPilotDatabaseRuntimeState?: DatabaseRuntimeState;
 }).__webPilotDatabaseRuntimeState ??= {});
+
+function normalizedMigratedUserId(value: unknown) {
+  const userId = typeof value === 'string' || typeof value === 'number'
+    ? String(value).trim()
+    : '';
+  return !userId || userId === 'default' ? defaultApplicationUserId : userId;
+}
+
+function jsonRecord(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {} as Record<string, unknown>;
+  return value as Record<string, unknown>;
+}
+
+function textValue(value: unknown) {
+  return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+}
+
+type PersonalMemoryMigrationRow = {
+  id: string;
+  user_id: string;
+  scope: string;
+  domain: string;
+  type: string;
+  memory_key: string;
+  status: string;
+  record_json: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function normalizePersonalMemoryMigrationItem(value: unknown, fallback: Partial<PersonalMemoryMigrationRow> = {}) {
+  const record = jsonRecord(value);
+  const id = textValue(record.id) || textValue(fallback.id);
+  const key = textValue(record.key) || textValue(fallback.memory_key);
+  if (!id || !key) return undefined;
+  const timestamp = new Date().toISOString();
+  const normalizedRecord = {
+    ...record,
+    id,
+    userId: normalizedMigratedUserId(record.userId ?? fallback.user_id),
+  };
+  return {
+    id,
+    user_id: normalizedRecord.userId,
+    scope: textValue(record.scope) || textValue(fallback.scope) || 'global',
+    domain: textValue(record.domain) || textValue(fallback.domain),
+    type: textValue(record.type) || textValue(fallback.type) || 'domain_fact',
+    memory_key: key,
+    status: textValue(record.status) || textValue(fallback.status) || 'active',
+    record_json: JSON.stringify(normalizedRecord),
+    created_at: textValue(record.createdAt) || textValue(fallback.created_at) || timestamp,
+    updated_at: textValue(record.updatedAt) || textValue(fallback.updated_at) || timestamp,
+  } satisfies PersonalMemoryMigrationRow;
+}
+
+function migratePersonalMemory(database: DatabaseSync) {
+  const byIdentity = new Map<string, PersonalMemoryMigrationRow>();
+  const remember = (item: PersonalMemoryMigrationRow | undefined) => {
+    if (!item) return;
+    const identity = [item.user_id, item.scope, item.domain, item.type, item.memory_key.toLowerCase()].join('\u0001');
+    const previous = byIdentity.get(identity);
+    if (!previous || item.updated_at >= previous.updated_at) byIdentity.set(identity, item);
+  };
+
+  const rows = database.prepare(`
+    SELECT id, user_id, scope, domain, type, memory_key, status, record_json, created_at, updated_at
+    FROM personal_memory_item
+  `).all() as PersonalMemoryMigrationRow[];
+  for (const row of rows) {
+    let record: unknown;
+    try {
+      record = JSON.parse(row.record_json);
+    } catch {
+      record = {};
+    }
+    remember(normalizePersonalMemoryMigrationItem(record, row));
+  }
+
+  const legacyPath = path.join(appDataRoot(), '.data', 'personal-memory', 'items.json');
+  if (existsSync(legacyPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(legacyPath, 'utf8')) as { items?: unknown[] };
+      for (const item of Array.isArray(parsed.items) ? parsed.items : []) {
+        remember(normalizePersonalMemoryMigrationItem(item));
+      }
+    } catch {
+      // Leave an unreadable legacy file in place for manual recovery.
+      return false;
+    }
+  }
+
+  database.exec('DELETE FROM personal_memory_item');
+  const insert = database.prepare(`
+    INSERT INTO personal_memory_item (
+      id, user_id, scope, domain, type, memory_key, status, record_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const item of byIdentity.values()) {
+    insert.run(
+      item.id,
+      item.user_id,
+      item.scope,
+      item.domain,
+      item.type,
+      item.memory_key,
+      item.status,
+      item.record_json,
+      item.created_at,
+      item.updated_at,
+    );
+  }
+  return legacyPath;
+}
+
+function migrateBrowserChatUsers(database: DatabaseSync) {
+  const rows = database.prepare(`
+    SELECT id, user_id, snapshot_json, summary_json
+    FROM browser_chat_session
+    WHERE user_id IS NULL OR TRIM(user_id) = '' OR user_id = 'default'
+  `).all() as Array<{ id: string; user_id?: string | null; snapshot_json: string; summary_json: string }>;
+  const update = database.prepare(`
+    UPDATE browser_chat_session
+    SET user_id = ?, snapshot_json = ?, summary_json = ?
+    WHERE id = ?
+  `);
+  for (const row of rows) {
+    const updateJson = (raw: string) => {
+      try {
+        return JSON.stringify({ ...jsonRecord(JSON.parse(raw)), userId: defaultApplicationUserId });
+      } catch {
+        return raw;
+      }
+    };
+    update.run(defaultApplicationUserId, updateJson(row.snapshot_json), updateJson(row.summary_json), row.id);
+  }
+}
+
+function removeObsoleteRuntimeSettings(database: DatabaseSync) {
+  const row = database.prepare('SELECT runtime_env_json FROM app_config WHERE id = 1').get() as { runtime_env_json?: string } | undefined;
+  if (!row?.runtime_env_json) return;
+  try {
+    const items = JSON.parse(row.runtime_env_json) as Array<{ key?: unknown }>;
+    if (!Array.isArray(items)) return;
+    const filtered = items.filter((item) => !obsoleteRuntimeEnvKeys.has(textValue(item?.key)));
+    if (filtered.length === items.length) return;
+    database.prepare('UPDATE app_config SET runtime_env_json = ?, updated_at = ? WHERE id = 1')
+      .run(JSON.stringify(filtered), new Date().toISOString());
+  } catch {
+    // Preserve malformed settings for explicit recovery instead of overwriting them.
+  }
+}
+
+function applyVersionThreeMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 3').get();
+  const cleanupLegacyFiles = () => {
+    const legacyMemoryPath = path.join(appDataRoot(), '.data', 'personal-memory', 'items.json');
+    if (existsSync(legacyMemoryPath)) unlinkSync(legacyMemoryPath);
+    const legacyConfigPath = path.join(appDataRoot(), '.data', 'app-config.json');
+    if (existsSync(legacyConfigPath)) unlinkSync(legacyConfigPath);
+  };
+  if (applied) {
+    cleanupLegacyFiles();
+    return;
+  }
+  let legacyMemoryPath: string | false | undefined;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    legacyMemoryPath = migratePersonalMemory(database);
+    if (legacyMemoryPath === false) throw new Error('Legacy personal memory file is not valid JSON.');
+    migrateBrowserChatUsers(database);
+    removeObsoleteRuntimeSettings(database);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (3, 'default-user-and-settings-cleanup', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+  cleanupLegacyFiles();
+}
+
+function applyVersionFourMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 4').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const rows = database.prepare(`
+      SELECT id, snapshot_json, summary_json FROM browser_chat_session
+    `).all() as Array<{ id: string; snapshot_json: string; summary_json: string }>;
+    const stripTargetRun = (raw: string) => {
+      try {
+        const record = jsonRecord(JSON.parse(raw));
+        delete record.targetRun;
+        return JSON.stringify(record);
+      } catch {
+        return raw;
+      }
+    };
+    const update = database.prepare(`
+      UPDATE browser_chat_session SET snapshot_json = ?, summary_json = ? WHERE id = ?
+    `);
+    for (const row of rows) {
+      update.run(stripTargetRun(row.snapshot_json), stripTargetRun(row.summary_json), row.id);
+    }
+    removeObsoleteRuntimeSettings(database);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (4, 'remove-target-workflow-state', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
 
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
@@ -177,6 +403,8 @@ function initializeSchema(database: DatabaseSync) {
     INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
     VALUES (2, 'login-account-vault', ?)
   `).run(new Date().toISOString());
+  applyVersionThreeMigration(database);
+  applyVersionFourMigration(database);
 }
 
 export function getSqliteDatabase() {

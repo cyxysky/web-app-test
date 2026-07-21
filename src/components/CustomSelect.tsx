@@ -22,6 +22,31 @@ const menuGap = 6;
 const menuMaxHeight = 360;
 const viewportMargin = 8;
 
+function clipsVerticalOverflow(element: HTMLElement) {
+  const overflowY = window.getComputedStyle(element).overflowY;
+  return overflowY === 'auto' || overflowY === 'clip' || overflowY === 'hidden' || overflowY === 'scroll';
+}
+
+function getMenuVerticalBounds(root: HTMLElement) {
+  let top = viewportMargin;
+  let bottom = document.documentElement.clientHeight - viewportMargin;
+  let ancestor = root.parentElement;
+
+  // An absolutely-positioned popup is clipped by every scrolling ancestor, not
+  // only by the browser viewport. This matters in modal bodies with fixed
+  // headers/footers: viewport-only placement can put a menu behind the footer.
+  while (ancestor && ancestor !== document.body) {
+    if (clipsVerticalOverflow(ancestor)) {
+      const rect = ancestor.getBoundingClientRect();
+      top = Math.max(top, rect.top);
+      bottom = Math.min(bottom, rect.bottom);
+    }
+    ancestor = ancestor.parentElement;
+  }
+
+  return { bottom, top };
+}
+
 export function CustomSelect({
   className,
   disabled = false,
@@ -98,9 +123,9 @@ export function CustomSelect({
       if (!button || !menu) return;
 
       const buttonRect = button.getBoundingClientRect();
-      const viewportHeight = document.documentElement.clientHeight;
-      const spaceAbove = Math.max(0, buttonRect.top - menuGap - viewportMargin);
-      const spaceBelow = Math.max(0, viewportHeight - buttonRect.bottom - menuGap - viewportMargin);
+      const bounds = getMenuVerticalBounds(rootRef.current || button);
+      const spaceAbove = Math.max(0, buttonRect.top - menuGap - bounds.top);
+      const spaceBelow = Math.max(0, bounds.bottom - buttonRect.bottom - menuGap);
       const desiredHeight = menu.getBoundingClientRect().height;
       const placement = desiredHeight <= spaceBelow
         ? 'down'

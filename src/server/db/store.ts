@@ -588,14 +588,10 @@ export const store = {
     const items = data.runtimeEnv;
     const itemByKey = new Map(items.map((item) => [item.key, item]));
     const savedByKey = new Map(items.filter((item) => allowedKeys.has(item.key)).map((item) => [item.key, item]));
-    const legacyTargetPrompt = itemByKey.get('AI_TARGET_MODE_CUSTOM_PROMPT')?.value?.trim();
     const legacyBrowserPrompt = itemByKey.get('AI_BROWSER_CHAT_CUSTOM_PROMPT')?.value?.trim();
-    const legacyCustomSystemPrompt =
-      itemByKey.get('AI_TARGET_MODE_CUSTOM_PROMPT_ENABLED')?.value === 'true' && legacyTargetPrompt
-        ? legacyTargetPrompt
-        : itemByKey.get('AI_BROWSER_CHAT_CUSTOM_PROMPT_ENABLED')?.value === 'true' && legacyBrowserPrompt
-          ? legacyBrowserPrompt
-          : '';
+    const legacyCustomSystemPrompt = itemByKey.get('AI_BROWSER_CHAT_CUSTOM_PROMPT_ENABLED')?.value === 'true' && legacyBrowserPrompt
+      ? legacyBrowserPrompt
+      : '';
     for (const definition of runtimeEnvDefinitions) {
       const item = savedByKey.get(definition.key);
       if (item?.enabled === false) continue;

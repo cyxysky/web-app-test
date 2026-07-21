@@ -4,6 +4,21 @@ export type BrowserChatSubagentSettled<TTask, TResult> = {
   error?: unknown;
 };
 
+export function browserChatSubagentSuggestedSummaryChars() {
+  const configured = Number(process.env.AI_SUBAGENT_RESULT_MAX_CHARS);
+  return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : undefined;
+}
+
+export function preserveBrowserChatSubagentSummary(value: unknown) {
+  const summary = typeof value === 'string' ? value : String(value || '');
+  return {
+    summary,
+    summaryChars: summary.length,
+    summaryOriginalChars: summary.length,
+    summaryTruncated: false,
+  };
+}
+
 const inFlightBatches = new Map<string, Promise<unknown>>();
 const completedBatches = new Map<string, unknown>();
 
