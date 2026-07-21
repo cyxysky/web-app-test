@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import * as CFB from 'cfb';
 import JSZip from 'jszip';
@@ -32,6 +32,7 @@ const spreadsheetExtensions = new Set(['.xls', '.xlsx', '.xlsb', '.xlsm', '.ods'
 const wordExtensions = new Set(['.doc', '.docx', '.odt']);
 const presentationExtensions = new Set(['.ppt', '.pptx', '.pps', '.ppsx', '.pot', '.potx', '.odp']);
 const archiveExtensions = new Set(['.zip', '.jar', '.epub']);
+const imageExtensions = new Set(['.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.png', '.svg', '.tif', '.tiff', '.webp']);
 const maxSourceBytes = 64 * 1024 * 1024;
 const defaultReadChars = 12_000;
 const maxReadChars = 40_000;
@@ -80,7 +81,7 @@ function officeXmlText(value: string) {
 
 function attachmentKind(attachment: BrowserChatReadableAttachment) {
   const extension = extensionOf(attachment);
-  if (attachment.kind === 'image' || attachment.type.startsWith('image/')) return 'image';
+  if (attachment.kind === 'image' || attachment.type.startsWith('image/') || imageExtensions.has(extension)) return 'image';
   if (attachment.kind === 'tab') return 'tab';
   if (attachment.type === 'application/pdf' || extension === '.pdf') return 'pdf';
   if (wordExtensions.has(extension)) return 'word';
@@ -91,8 +92,12 @@ function attachmentKind(attachment: BrowserChatReadableAttachment) {
   return 'unknown';
 }
 
+export function isBrowserChatImageAttachment(attachment: BrowserChatReadableAttachment) {
+  return attachmentKind(attachment) === 'image';
+}
+
 export function browserChatAttachmentMetadata(attachment: BrowserChatReadableAttachment) {
-  return `[文件] ${attachment.name} | ID: ${attachment.id} | 类型: ${attachment.type || 'unknown'} | 大小: ${formatSize(attachment.size)} | 读取方式: 调用 readUploadedFile，按需传入 attachmentId、offset、limit。`;
+  return `[文件] ${attachment.name} | ID: ${attachment.id} | 类型: ${attachment.type || 'unknown'} | 大小: ${formatSize(attachment.size)} | 读取方式: 调用 readFile，传入 attachmentId、offset、limit。`;
 }
 
 async function extractPdf(buffer: Buffer) {
@@ -207,9 +212,11 @@ export async function readBrowserChatAttachment(input: {
     return { ok: false, actual: `无法定位上传文件：${attachment.name}` };
   }
   try {
+    const size = attachment.size ?? (input.absolutePath ? (await stat(input.absolutePath)).size : undefined);
+    const resolvedAttachment = size === attachment.size ? attachment : { ...attachment, size };
     const content = attachment.kind === 'tab'
-      ? await extractAttachmentText(attachment, '')
-      : await extractAttachmentText(attachment, input.absolutePath!);
+      ? await extractAttachmentText(resolvedAttachment, '')
+      : await extractAttachmentText(resolvedAttachment, input.absolutePath!);
     const offset = normalizedOffset(input.offset);
     const limit = normalizedLimit(input.limit);
     const slice = content.slice(offset, offset + limit);
@@ -217,8 +224,8 @@ export async function readBrowserChatAttachment(input: {
     return {
       ok: true,
       actual: [
-        `文件：${attachment.name}`,
-        `类型：${attachment.type || 'unknown'}；大小：${formatSize(attachment.size)}；解析器：${attachmentKind(attachment)}`,
+        `文件：${resolvedAttachment.name}`,
+        `类型：${resolvedAttachment.type || 'unknown'}；大小：${formatSize(resolvedAttachment.size)}；解析器：${attachmentKind(resolvedAttachment)}`,
         `字符区间：${offset}-${nextOffset} / ${content.length}${nextOffset < content.length ? `；仍有内容，下一次 offset=${nextOffset}` : '；已到末尾'}`,
         '',
         slice || '[该区间没有可读文本]',

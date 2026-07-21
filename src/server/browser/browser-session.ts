@@ -133,6 +133,8 @@ export type BrowserSnapshotViews = Partial<Record<BrowserSnapshotView, string>> 
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** A user-provided or generated image that should be attached to the next model request. */
+  referenceImagePath?: string;
   /** A compact continuation cursor for paged snapshot readers. */
   nextCursor?: string;
   domChanges?: {

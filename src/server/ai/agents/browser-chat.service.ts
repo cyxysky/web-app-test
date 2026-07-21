@@ -13,7 +13,7 @@ import {
   type InteractiveBrowserTurnResult,
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
-import { browserChatAttachmentMetadata, readBrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachment-reader';
+import { browserChatAttachmentMetadata, isBrowserChatImageAttachment, readBrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachment-reader';
 import {
   browserChatSubagentSuggestedSummaryChars,
   preserveBrowserChatSubagentSummary,
@@ -692,26 +692,56 @@ function attachmentAbsolutePath(attachment: BrowserChatAttachment) {
 function uploadedAttachmentAbsolutePath(attachment: BrowserChatAttachment) {
   if (attachment.kind === 'tab') return undefined;
   const relativePath = normalizeAttachmentPath(attachment.path);
-  return relativePath ? resolveArtifactPath(...relativePath.split('/')) : undefined;
+  if (relativePath) return resolveArtifactPath(...relativePath.split('/'));
+  if (!attachment.id.startsWith('artifact:')) return undefined;
+  const artifactSegments = attachment.path.replace(/\\/g, '/').split('/').filter(Boolean);
+  if (!artifactSegments.length || artifactSegments.some((segment) => segment === '.' || segment === '..')) return undefined;
+  return resolveArtifactPath(...artifactSegments);
 }
 
-function readUploadedFileForSession(
+function artifactAttachmentForSession(session: BrowserChatSessionRecord, artifactId: string): BrowserChatAttachment | undefined {
+  const segments = artifactId.replace(/\\/g, '/').split('/').filter(Boolean);
+  if (segments.some((segment) => segment === '.' || segment === '..')) return undefined;
+  if (segments.length < 3 || segments[0] !== session.id || !['downloads', 'markdown'].includes(segments[1])) return undefined;
+  const name = segments.at(-1) || 'artifact';
+  return {
+    id: `artifact:${segments.join('/')}`,
+    kind: 'file',
+    name,
+    path: segments.join('/'),
+    size: undefined,
+    type: 'application/octet-stream',
+    url: artifactApiUrlFromRelative(segments.join('/')),
+  };
+}
+
+async function readFileForSession(
   session: BrowserChatSessionRecord,
-  input: { attachmentId: string; limit?: number; offset?: number },
+  input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number },
 ) {
-  const attachment = [...session.messages]
-    .reverse()
-    .flatMap((message) => message.attachments || [])
-    .find((item) => item.id === input.attachmentId);
+  const attachment = input.attachmentId
+    ? [...session.messages]
+      .reverse()
+      .flatMap((message) => message.attachments || [])
+      .find((item) => item.id === input.attachmentId)
+    : input.artifactId
+      ? artifactAttachmentForSession(session, input.artifactId)
+      : undefined;
   if (!attachment) {
-    return Promise.resolve({ ok: false, actual: `未找到 ID 为 ${input.attachmentId} 的上传文件。请只使用对话中列出的文件 ID。` });
+    return {
+      ok: false,
+      actual: '未找到可读取文件。请使用对话附件的 attachmentId，或 downloadFile/generateMarkdownFile 返回的 Artifact ID。',
+    };
   }
-  return readBrowserChatAttachment({
+  const result = await readBrowserChatAttachment({
     attachment,
     absolutePath: uploadedAttachmentAbsolutePath(attachment),
     limit: input.limit,
     offset: input.offset,
   });
+  return isBrowserChatImageAttachment(attachment) && result.ok
+    ? { ...result, referenceImagePath: uploadedAttachmentAbsolutePath(attachment) }
+    : result;
 }
 
 type BrowserChatResourceSeed = {
@@ -3503,7 +3533,7 @@ async function runBrowserChatMessage(
         isBrowserStarted: () => session.started && session.browser === browser && browser.isUsable(),
         runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
         readSubagent: readBrowserChatSubagent(session.id),
-        readUploadedFile: (input) => readUploadedFileForSession(session, input),
+        readFile: (input) => readFileForSession(session, input),
         onProgress: (step) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           const index = session.steps.findIndex((item) => item.index === step.index);

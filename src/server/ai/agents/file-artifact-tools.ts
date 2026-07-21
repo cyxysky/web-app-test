@@ -25,6 +25,7 @@ type MarkdownArtifactInput = {
 };
 
 type ArtifactToolPayload = {
+  artifactId?: string;
   kind?: string;
   fileName?: string;
   path?: string;
@@ -88,6 +89,7 @@ function artifactResultPayload(input: {
     ? artifactApiUrlFromRelative(relative)
     : artifactApiUrl(input.filePath, { artifactsRoot: root });
   return {
+    artifactId: relative,
     kind: input.kind,
     fileName: input.fileName,
     path: input.filePath,
@@ -110,9 +112,9 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
       : `Path: ${payload.path || fileName}`;
     return [
       `${label}: ${fileName}`,
+      payload.artifactId ? `Artifact ID: ${payload.artifactId}` : '',
       targetLine,
       payload.url && payload.url !== target ? `Open: ${payload.url}` : '',
-      payload.path ? `Local path: ${payload.path}` : '',
       typeof payload.bytes === 'number' ? `size=${payload.bytes} bytes` : '',
     ].filter(Boolean).join('; ');
   } catch {

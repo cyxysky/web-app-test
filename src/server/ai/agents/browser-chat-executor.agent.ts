@@ -1671,7 +1671,8 @@ function makeBrowserTools(
     credentialAllowedOrigins?: string[];
     runSubagents?: BrowserChatSubagentRunner;
     readSubagent?: BrowserChatSubagentReader;
-    readUploadedFile?: (input: { attachmentId: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
+    readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
+    onReadFileImage?: (input: { path: string }) => void;
     ensureBrowserStarted?: () => Promise<void>;
   },
 ) {
@@ -1789,7 +1790,8 @@ function makeBrowserTools(
           invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
         }
       }
-      return compactToolResultForModel(name, result, referenceOptions?.observationStore);
+    if (result.referenceImagePath) referenceOptions?.onReadFileImage?.({ path: result.referenceImagePath });
+    return compactToolResultForModel(name, result, referenceOptions?.observationStore);
     });
   }
 
@@ -1909,16 +1911,18 @@ function makeBrowserTools(
         execute: (input) => record('readSubagent', input, () => referenceOptions.readSubagent!(input.uuid)),
       }),
     } : {}),
-    ...(referenceOptions?.readUploadedFile ? {
-      readUploadedFile: tool({
-        description: 'Read one user-uploaded file on demand. The conversation only provides file metadata initially, so call this whenever the task needs file contents. attachmentId must be an ID listed in the user-provided file metadata. Read a focused range first; use the returned next offset to continue only when more content is needed. Supports text, PDF, Word, Excel, PowerPoint, OpenDocument, ZIP listings, images metadata, and extensible format detection.',
+    ...(referenceOptions?.readFile ? {
+      readFile: tool({
+        description: 'Read one registered file on demand. User attachments are listed with attachmentId; downloaded/generated artifacts return an Artifact ID. Use exactly one of attachmentId or artifactId. Read a focused range first; use the returned next offset to continue only when more content is needed. Supports text, PDF, Word, Excel, PowerPoint, OpenDocument, ZIP listings, images, and extensible format detection. For an image, the tool attaches it to the next model request for visual understanding instead of returning image bytes as text.',
         inputSchema: browserToolInput({
-          attachmentId: z.string().min(1).max(160).describe('Required uploaded-file ID listed in the conversation metadata.'),
+          attachmentId: z.string().min(1).max(160).optional().describe('One uploaded-file ID listed in the conversation metadata.'),
+          artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by downloadFile or generateMarkdownFile.'),
           offset: z.number().int().min(0).optional().describe('Zero-based character offset. Omit for the first segment.'),
           limit: z.number().int().min(1).max(40_000).optional().describe('Maximum returned characters. Start with a focused segment, then continue with the returned next offset when needed.'),
-        }),
-        execute: (input) => record('readUploadedFile', input, () => referenceOptions.readUploadedFile!({
+        }).refine((input) => Boolean(input.attachmentId) !== Boolean(input.artifactId), { message: 'Provide exactly one of attachmentId or artifactId.' }),
+        execute: (input) => record('readFile', input, () => referenceOptions.readFile!({
           attachmentId: input.attachmentId,
+          artifactId: input.artifactId,
           limit: input.limit,
           offset: input.offset,
         })),
@@ -2236,7 +2240,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'waitForHumanVerification',
     'spawnSubagents',
     'readSubagent',
-    'readUploadedFile',
+    'readFile',
     'tab',
     'getHttpRequests',
     'takeSnapshot',
@@ -2668,7 +2672,7 @@ async function executeRuntimeStep(input: {
   allowedToolTypes?: string[];
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
-  readUploadedFile?: (input: { attachmentId: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
+  readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   ensureBrowserStarted?: () => Promise<void>;
   isBrowserStarted?: () => boolean;
   agentLoopTimeoutMs?: number;
@@ -2810,7 +2814,7 @@ async function executeRuntimeStep(input: {
     const availableRuntimeToolNames = runtimeToolNames(mode).filter((name) => (
       (name !== 'spawnSubagents' || Boolean(input.runSubagents))
       && (name !== 'readSubagent' || Boolean(input.readSubagent))
-      && (name !== 'readUploadedFile' || Boolean(input.readUploadedFile))
+      && (name !== 'readFile' || Boolean(input.readFile))
     ));
     const runtimeTools = runtimeAllowedToolTypes({
       browserChatMode,
@@ -3232,7 +3236,7 @@ async function executeRuntimeStep(input: {
         requestToolConfirmation: input.requestToolConfirmation,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
-        readUploadedFile: input.readUploadedFile,
+        readFile: input.readFile,
         ensureBrowserStarted: input.ensureBrowserStarted,
         onDebug,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
@@ -3304,7 +3308,14 @@ async function executeRuntimeStep(input: {
       credentialAllowedOrigins: input.credentialAllowedOrigins,
       runSubagents: input.runSubagents,
       readSubagent: input.readSubagent,
-      readUploadedFile: input.readUploadedFile,
+      readFile: input.readFile,
+      onReadFileImage: ({ path }) => {
+        if (!modelSupportsScreenshotInput()) return;
+        pendingObservationMessages.push({
+          text: '[文件视觉内容]\n已读取图片文件；该图片已附加到本次工具调用后的下一轮模型请求。请直接基于图片内容进行分析。',
+          imagePaths: [path],
+        });
+      },
       ensureBrowserStarted: input.ensureBrowserStarted,
       onDebug,
       observeCurrentScreenshot,
@@ -3639,7 +3650,7 @@ export async function executeInteractiveBrowserTurn(input: {
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
-  readUploadedFile?: (input: { attachmentId: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
+  readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   ensureBrowserStarted?: () => Promise<void>;
   isBrowserStarted?: () => boolean;
   agentLoopTimeoutMs?: number;
@@ -3765,7 +3776,7 @@ export async function executeInteractiveBrowserTurn(input: {
         allowedToolTypes: input.allowedToolTypes,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
-        readUploadedFile: input.readUploadedFile,
+        readFile: input.readFile,
         ensureBrowserStarted: input.ensureBrowserStarted,
         isBrowserStarted: input.isBrowserStarted,
         agentLoopTimeoutMs: input.agentLoopTimeoutMs,
@@ -4280,7 +4291,7 @@ async function executeCodexRuntimeObject(input: {
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
-  readUploadedFile?: (input: { attachmentId: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
+  readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   ensureBrowserStarted?: () => Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
@@ -4293,7 +4304,7 @@ async function executeCodexRuntimeObject(input: {
   observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => BrowserActionResult | Promise<BrowserActionResult>;
   takeSnapshot?: (input?: RuntimeObservationReadOptions) => BrowserActionResult | Promise<BrowserActionResult>;
 }) {
-  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readUploadedFile, ensureBrowserStarted, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observeCurrentScreenshot, takeSnapshot } = input;
+  const { session, targetUrl, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readFile, ensureBrowserStarted, onVisualContextChange, onToolTrace, onDebug, onSelectReferenceScreenshots, observeCurrentScreenshot, takeSnapshot } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -4362,12 +4373,14 @@ async function executeCodexRuntimeObject(input: {
       if (!uuid) return { ok: false, actual: 'readSubagent requires one UUID.' };
       return readSubagent(uuid);
     }
-    if (type === 'readUploadedFile') {
-      if (!readUploadedFile) return { ok: false, actual: 'readUploadedFile is unavailable in this runtime.' };
-      const attachmentId = typeof normalizedParams.attachmentId === 'string' ? normalizedParams.attachmentId.trim() : '';
-      if (!attachmentId) return { ok: false, actual: 'readUploadedFile requires one attachmentId.' };
-      return readUploadedFile({
+    if (type === 'readFile') {
+      if (!readFile) return { ok: false, actual: 'readFile is unavailable in this runtime.' };
+      const attachmentId = typeof normalizedParams.attachmentId === 'string' ? normalizedParams.attachmentId.trim() : undefined;
+      const artifactId = typeof normalizedParams.artifactId === 'string' ? normalizedParams.artifactId.trim() : undefined;
+      if (Boolean(attachmentId) === Boolean(artifactId)) return { ok: false, actual: 'readFile requires exactly one attachmentId or artifactId.' };
+      return readFile({
         attachmentId,
+        artifactId,
         limit: typeof normalizedParams.limit === 'number' ? normalizedParams.limit : undefined,
         offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
       });
