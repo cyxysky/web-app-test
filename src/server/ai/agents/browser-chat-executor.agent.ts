@@ -9,6 +9,11 @@ import { buildCodexObjectPrompt, buildCompletionPromptLines, buildVerificationPr
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type BrowserSnapshotViews, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { browserChatReplyClaimsBrowserAction, browserChatToolRequirement, type BrowserChatToolRequirement } from './browser-chat-intent';
+import {
+  BROWSER_CHAT_FILE_READ_MAX_CHARS,
+  BROWSER_CHAT_FILE_READ_MIN_CHARS,
+  normalizeBrowserChatFileReadLimit,
+} from './browser-chat-file-read';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 import {
   browserInteractToolDescription,
@@ -1914,18 +1919,23 @@ function makeBrowserTools(
         attachmentId: z.string().min(1).max(160).optional().describe('For action=read, one uploaded-file ID.'),
         artifactId: z.string().min(1).max(4_000).optional().describe('For action=read, one artifact ID returned by this tool.'),
         offset: z.number().int().min(0).optional().describe('For action=read, zero-based character offset.'),
-        limit: z.number().int().min(1).max(40_000).optional().describe('For action=read, maximum returned characters.'),
+        limit: z.number().int().min(BROWSER_CHAT_FILE_READ_MIN_CHARS).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional().describe('For action=read, returned character count. Omit to read the first 20000 characters.'),
       }).superRefine((input, context) => {
         if (input.action === 'download' && !input.url && !input.path && !input.urlOrPath) context.addIssue({ code: z.ZodIssueCode.custom, message: 'action=download requires url, path, or urlOrPath.' });
         if (input.action === 'writeMarkdown' && !input.content?.trim()) context.addIssue({ code: z.ZodIssueCode.custom, message: 'action=writeMarkdown requires content.' });
         if (input.action === 'read' && Boolean(input.attachmentId) === Boolean(input.artifactId)) context.addIssue({ code: z.ZodIssueCode.custom, message: 'action=read requires exactly one attachmentId or artifactId.' });
       }),
-      execute: (input) => record('file', input, () => {
-        if (input.action === 'download') return downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() });
-        if (input.action === 'writeMarkdown') return generateMarkdownArtifact({ ...input, runId: referenceOptions?.runId });
+      execute: (input) => {
+        const normalizedInput = input.action === 'read'
+          ? { ...input, limit: normalizeBrowserChatFileReadLimit(input.limit) }
+          : input;
+        return record('file', normalizedInput, () => {
+        if (normalizedInput.action === 'download') return downloadFileArtifact({ ...normalizedInput, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() });
+        if (normalizedInput.action === 'writeMarkdown') return generateMarkdownArtifact({ ...normalizedInput, runId: referenceOptions?.runId });
         if (!referenceOptions?.readFile) return Promise.resolve({ ok: false, actual: 'file action=read is unavailable in this runtime.' });
-        return referenceOptions.readFile({ attachmentId: input.attachmentId, artifactId: input.artifactId, limit: input.limit, offset: input.offset });
-      }),
+        return referenceOptions.readFile({ attachmentId: normalizedInput.attachmentId, artifactId: normalizedInput.artifactId, limit: normalizedInput.limit, offset: normalizedInput.offset });
+        });
+      },
     }),
     inspect: tool({
       description: 'Inspect the current browser state. action=capture creates a paged semantic DOM snapshot; action=search queries its frozen full baseline; action=httpRequests lists recent HTTP requests or returns details for IDs from capture mode=changes. Capture a baseline before searching.',
@@ -4237,6 +4247,9 @@ async function executeCodexRuntimeObject(input: {
   }
 
   const normalizedParams = { ...params };
+  if (type === 'file' && normalizedParams.action === 'read') {
+    normalizedParams.limit = normalizeBrowserChatFileReadLimit(normalizedParams.limit);
+  }
   const flow: RecordedFlowStep = {
     index: stepIndex,
     name: type,

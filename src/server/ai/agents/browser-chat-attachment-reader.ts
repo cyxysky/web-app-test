@@ -4,6 +4,7 @@ import * as CFB from 'cfb';
 import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
+import { normalizeBrowserChatFileReadLimit } from './browser-chat-file-read';
 
 export type BrowserChatReadableAttachment = {
   id: string;
@@ -33,17 +34,10 @@ const presentationExtensions = new Set(['.ppt', '.pptx', '.pps', '.ppsx', '.pot'
 const archiveExtensions = new Set(['.zip', '.jar', '.epub']);
 const imageExtensions = new Set(['.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.png', '.svg', '.tif', '.tiff', '.webp']);
 const maxSourceBytes = 64 * 1024 * 1024;
-const defaultReadChars = 12_000;
-const maxReadChars = 40_000;
 
 function normalizedOffset(value: unknown) {
   const number = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0;
-}
-
-function normalizedLimit(value: unknown) {
-  const number = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(number) ? Math.min(maxReadChars, Math.max(1, Math.floor(number))) : defaultReadChars;
 }
 
 function extensionOf(attachment: BrowserChatReadableAttachment) {
@@ -96,13 +90,13 @@ export function isBrowserChatImageAttachment(attachment: BrowserChatReadableAtta
 }
 
 export function browserChatAttachmentMetadata(attachment: BrowserChatReadableAttachment) {
-  return `[文件] ${attachment.name} | ID: ${attachment.id} | 类型: ${attachment.type || 'unknown'} | 大小: ${formatSize(attachment.size)} | 读取方式: 调用 readFile，传入 attachmentId、offset、limit。`;
+  return `[文件] ${attachment.name} | ID: ${attachment.id} | 类型: ${attachment.type || 'unknown'} | 大小: ${formatSize(attachment.size)} | 读取方式: 调用 readFile，首次只传 attachmentId；每次至少返回 20000 字符，续读时使用上次返回的 next offset。`;
 }
 
 async function extractPdf(buffer: Buffer) {
-  // pdf-parse pulls in pdfjs, which cannot be evaluated by the Next server
-  // webpack runtime used by lightweight routes such as the session list.
-  // Load it only when a PDF attachment is actually read.
+  // Keep pdf-parse external in next.config.ts: its pdfjs runtime must execute as
+  // the original Node package instead of being rewritten by Next server webpack.
+  // The dynamic import also avoids loading it before a PDF is actually read.
   const { PDFParse } = await import('pdf-parse');
   const parser = new PDFParse({ data: buffer });
   try {
@@ -221,7 +215,7 @@ export async function readBrowserChatAttachment(input: {
       ? await extractAttachmentText(resolvedAttachment, '')
       : await extractAttachmentText(resolvedAttachment, input.absolutePath!);
     const offset = normalizedOffset(input.offset);
-    const limit = normalizedLimit(input.limit);
+    const limit = normalizeBrowserChatFileReadLimit(input.limit);
     const slice = content.slice(offset, offset + limit);
     const nextOffset = offset + slice.length;
     return {

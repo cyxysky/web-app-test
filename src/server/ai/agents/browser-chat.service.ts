@@ -14,6 +14,7 @@ import {
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
 import { browserChatAttachmentMetadata, isBrowserChatImageAttachment, readBrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachment-reader';
+import { browserChatFirstMessageTitle } from '@/server/ai/agents/browser-chat-message-title';
 import {
   browserChatSubagentSuggestedSummaryChars,
   preserveBrowserChatSubagentSummary,
@@ -863,12 +864,6 @@ function attachmentPromptText(attachment: BrowserChatAttachment, index?: number)
     return `${prefix}[${attachmentKindLabel(attachment)}] ${attachment.name} (${location})`;
   }
   return `${prefix}${browserChatAttachmentMetadata(attachment)}`;
-}
-
-function firstMessageTitle(content: string, attachments: BrowserChatAttachment[]) {
-  const userText = content.replace(inlineReferenceTokenPattern, ' ').replace(/\s+/g, ' ').trim();
-  const attachmentNames = attachments.map((attachment) => attachment.name.trim()).filter(Boolean).join('、');
-  return compactText(userText || attachmentNames || content || '新建对话', 42);
 }
 
 function inlineReferencedIds(text: string, type: 'ref' | 'skill') {
@@ -2470,7 +2465,7 @@ export async function sendBrowserChatMessage(
   session.modelProvider = modelSettings.provider;
   session.model = modelSettings.model;
   const firstUserMessage = !session.messages.some((message) => message.role === 'user');
-  if (firstUserMessage) session.title = firstMessageTitle(messageText, attachments);
+  if (firstUserMessage) session.title = browserChatFirstMessageTitle(messageText, attachments);
 
   const timestamp = now();
   const fromStepIndex = Math.max(0, ...session.steps.map((step) => step.index)) + 1;
