@@ -9,11 +9,14 @@ import {
   readTestCases,
   readTestGroups,
   readTestRuns,
+  deleteSkillRecord,
   replaceTestCaseRecords,
   replaceTestRuns,
+  writeSkillRecord,
   writeConfigRecord,
   writeRuntimeMeta,
 } from '@/server/storage/sqlite-record-store';
+import { normalizeApplicationUserId } from '@/server/auth/user-context';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -186,7 +189,7 @@ function modelBaseUrlEnv(provider: ModelProvider) {
     codex: '',
     cohere: 'COHERE_BASE_URL',
     deepinfra: 'DEEPINFRA_BASE_URL',
-    deepseek: '',
+    deepseek: 'DEEPSEEK_BASE_URL',
     fireworks: 'FIREWORKS_BASE_URL',
     google: '',
     'google-vertex': 'GOOGLE_VERTEX_BASE_URL',
@@ -448,9 +451,9 @@ export const store = {
   listGroups() {
     return readTargetTestCaseData().groups;
   },
-  listSkills(query?: string) {
+  listSkills(query?: string, userId?: string | number) {
     const normalizedQuery = (query || '').trim().toLowerCase();
-    const skills = readTargetTestCaseData().skills
+    const skills = readSkills(normalizeApplicationUserId(userId))
       .map(normalizeSkillRecord)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     if (!normalizedQuery) return skills;
@@ -461,12 +464,12 @@ export const store = {
       ...skill.triggerPhrases,
     ].some((value) => value.toLowerCase().includes(normalizedQuery)));
   },
-  getSkill(skillId: string) {
-    const skill = readTargetTestCaseData().skills.find((item) => item.id === skillId);
+  getSkill(skillId: string, userId?: string | number) {
+    const skill = readSkills(normalizeApplicationUserId(userId)).find((item) => item.id === skillId);
     return skill ? normalizeSkillRecord(skill) : undefined;
   },
-  getSkills(skillIds: string[] = []) {
-    const byId = new Map(readTargetTestCaseData().skills.map((skill) => [skill.id, normalizeSkillRecord(skill)]));
+  getSkills(skillIds: string[] = [], userId?: string | number) {
+    const byId = new Map(readSkills(normalizeApplicationUserId(userId)).map((skill) => [skill.id, normalizeSkillRecord(skill)]));
     return skillIds.map((skillId) => byId.get(skillId)).filter((item): item is SkillRecord => Boolean(item));
   },
   upsertSkill(input: {
@@ -480,10 +483,11 @@ export const store = {
     sourceTestCaseId?: string;
     sourceSessionId?: string;
     status?: SkillRecord['status'];
+    userId?: string | number;
   }) {
-    const data = readTargetTestCaseData();
+    const userId = normalizeApplicationUserId(input.userId);
     const timestamp = now();
-    const existing = input.id ? (data.skills || []).find((item) => item.id === input.id) : undefined;
+    const existing = input.id ? this.getSkill(input.id, userId) : undefined;
     const skill = normalizeSkillRecord({
       id: existing?.id || id('skl'),
       title: input.title.trim() || existing?.title || 'Runtime Skill',
@@ -499,23 +503,20 @@ export const store = {
       createdAt: existing?.createdAt || timestamp,
       updatedAt: timestamp,
     });
-    data.skills = existing
-      ? (data.skills || []).map((item) => (item.id === skill.id ? skill : item))
-      : [skill, ...(data.skills || [])];
-    writeTargetTestCaseData(data);
+    writeSkillRecord(skill, userId);
     return skill;
   },
-  deleteSkill(skillId: string) {
+  deleteSkill(skillId: string, userId?: string | number) {
+    const normalizedUserId = normalizeApplicationUserId(userId);
+    if (!deleteSkillRecord(skillId, normalizedUserId)) return false;
     const data = readTargetTestCaseData();
-    const before = (data.skills || []).length;
-    data.skills = (data.skills || []).filter((skill) => skill.id !== skillId);
     data.testCases = data.testCases.map((record) => (
       record.content.skillIds?.includes(skillId)
         ? { ...record, content: { ...record.content, skillIds: record.content.skillIds.filter((id) => id !== skillId) }, updatedAt: now() }
         : record
     ));
     writeTargetTestCaseData(data);
-    return before !== data.skills.length;
+    return true;
   },
   // 列出保存到网页配置里的运行时环境变量。
   listRuntimeEnv() {

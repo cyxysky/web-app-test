@@ -94,6 +94,7 @@ export function getModel(): GenerateTextModel {
   if (provider === 'codex') return getCodexModel(model);
   if (provider === 'deepseek') return createDeepSeek({
     apiKey: process.env.DEEPSEEK_API_KEY || '',
+    baseURL: process.env.DEEPSEEK_BASE_URL || undefined,
   })(model) as unknown as GenerateTextModel;
   if (provider === 'deepinfra') return createDeepInfra({
     apiKey: process.env.DEEPINFRA_API_KEY || '',

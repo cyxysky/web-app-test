@@ -1,24 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  assignBrowserChatStepIndexesToLatestMessage,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
   browserChatAssistantMessageHasVisibleText,
   browserChatLogsForMessage,
 } from './browser-chat-message-model';
-
-test('assigns a reused step index only to the latest assistant message', () => {
-  const messages = assignBrowserChatStepIndexesToLatestMessage([
-    { content: 'first', id: 'a1', role: 'assistant' as const, stepIndexes: [1, 2] },
-    { content: 'retry', id: 'u2', role: 'user' as const },
-    { content: 'second', id: 'a2', role: 'assistant' as const, stepIndexes: [2, 3] },
-  ]);
-
-  assert.deepEqual(messages[0].stepIndexes, [1]);
-  assert.deepEqual(messages[2].stepIndexes, [2, 3]);
-});
 
 test('groups consecutive assistant messages without visible text', () => {
   const messages = [
@@ -32,6 +20,7 @@ test('groups consecutive assistant messages without visible text', () => {
     messages,
     logIndex,
     (message, logs) => browserChatAssistantMessageHasVisibleText(message, logs, () => []),
+    (message) => Boolean(message.stepIndexes?.length),
   );
 
   assert.equal(entries.length, 3);
@@ -40,7 +29,7 @@ test('groups consecutive assistant messages without visible text', () => {
   assert.deepEqual(entries[1].items.map((item) => item.id), ['a1', 'a2']);
 });
 
-test('keeps a single empty assistant message as a normal message', () => {
+test('drops an empty assistant message when it has no executed tool', () => {
   const messages = [
     { content: '', id: 'a1', role: 'assistant' as const },
     { content: 'done', id: 'a2', role: 'assistant' as const },
@@ -49,13 +38,16 @@ test('keeps a single empty assistant message as a normal message', () => {
     messages,
     buildBrowserChatLogIndex([]),
     (message, logs) => browserChatAssistantMessageHasVisibleText(message, logs, () => []),
+    () => false,
   );
 
+  assert.equal(entries.length, 1);
   assert.equal(entries[0]?.kind, 'message');
-  assert.equal(entries[1]?.kind, 'message');
+  if (entries[0]?.kind !== 'message') return;
+  assert.equal(entries[0].item.id, 'a2');
 });
 
-test('reads message logs from direct message id and step index', () => {
+test('reads message logs only from the direct message id', () => {
   const logIndex = buildBrowserChatLogIndex([
     { id: 'step', stepIndex: 2 },
     { id: 'direct', messageId: 'a1' },
@@ -63,7 +55,7 @@ test('reads message logs from direct message id and step index', () => {
 
   const logs = browserChatLogsForMessage({ content: '', id: 'a1', role: 'assistant', stepIndexes: [2] }, logIndex);
 
-  assert.deepEqual(logs.map((log) => log.id), ['step', 'direct']);
+  assert.deepEqual(logs.map((log) => log.id), ['direct']);
 });
 
 test('groups ai cycles without text into executed entries', () => {

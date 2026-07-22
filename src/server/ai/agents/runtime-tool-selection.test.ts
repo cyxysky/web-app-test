@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
 
-const nativeToolNames = ['takeSnapshot', 'mouse', 'keyboard', 'selectOption', 'reportState'];
-const observationToolNames = new Set(['takeSnapshot']);
+const nativeToolNames = ['browserCode', 'reportState'];
+const observationToolNames = new Set<string>();
 
 test('runtimeAllowedToolTypes keeps native tools outside Codex mode', () => {
   assert.deepEqual(
@@ -17,7 +17,7 @@ test('runtimeAllowedToolTypes keeps native tools outside Codex mode', () => {
   );
 });
 
-test('runtimeAllowedToolTypes keeps snapshot and unified input tools in Codex object mode', () => {
+test('runtimeAllowedToolTypes keeps browserCode in Codex object mode', () => {
   assert.deepEqual(
     runtimeAllowedToolTypes({
       browserChatMode: false,
@@ -37,6 +37,6 @@ test('runtimeAllowedToolTypes swaps reportState for answer in Codex browser chat
       nativeToolNames,
       observationToolNames,
     }),
-    ['takeSnapshot', 'mouse', 'keyboard', 'selectOption', 'answer'],
+    ['browserCode', 'answer'],
   );
 });

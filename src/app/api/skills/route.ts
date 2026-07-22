@@ -5,9 +5,19 @@ import { parseSkillContent } from '@/server/ai/schemas/test-case.schema';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
+function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
+  return String(
+    body?.userId
+    ?? body?.qzUserId
+    ?? request.nextUrl.searchParams.get('userId')
+    ?? request.nextUrl.searchParams.get('qzUserId')
+    ?? '',
+  ).trim();
+}
+
 export async function GET(request: NextRequest) {
   const query = request.nextUrl.searchParams.get('q') || undefined;
-  const skills = store.listSkills(query);
+  const skills = store.listSkills(query, requestUserId(request));
   return NextResponse.json({ skills });
 }
 
@@ -26,6 +36,7 @@ export async function POST(request: NextRequest) {
       sourceTestCaseId: typeof body.sourceTestCaseId === 'string' ? body.sourceTestCaseId : undefined,
       sourceSessionId: typeof body.sourceSessionId === 'string' ? body.sourceSessionId : undefined,
       status: ['draft', 'ready', 'disabled'].includes(String(body.status)) ? body.status : 'ready',
+      userId: requestUserId(request, body),
     });
     return NextResponse.json({ skill });
   } catch (error) {

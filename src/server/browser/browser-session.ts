@@ -1,7 +1,9 @@
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Dialog, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
+import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:net';
+import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, Dialog, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
 import { artifactPath } from '@/server/storage/paths';
 import {
   boundedNonNegativeIntegerEnv,
@@ -30,6 +32,11 @@ import {
   type SnapshotView,
 } from './ax-snapshot';
 import { captureDomSnapshot } from './dom-snapshot';
+import {
+  BrowserCodeKernel,
+  type BrowserCodeConnection,
+  type BrowserCodeCredentialBinding,
+} from './browser-code-runner';
 import { resolveBrowserSessionSurface, type BrowserSessionSurface } from './browser-session-surface';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
@@ -143,6 +150,8 @@ export type BrowserActionResult = {
   clickTimings?: BrowserClickTiming;
   /** A user-provided or generated image that should be attached to the next model request. */
   referenceImagePath?: string;
+  /** Images emitted by browserCode that should be attached to the next model request in order. */
+  referenceImagePaths?: string[];
   /** A compact continuation cursor for paged snapshot readers. */
   nextCursor?: string;
   domChanges?: {
@@ -671,7 +680,7 @@ const aiDomMutationObserverScript = `(() => {
       let meaningful = false;
       for (const mutation of mutations) {
         const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-        if (!target || !target.closest || !target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) {
+        if (!target || !target.closest || !target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) {
           meaningful = true;
           break;
         }
@@ -697,7 +706,7 @@ const aiDomMutationObserverScript = `(() => {
     state.interactionListenersInstalled = true;
     const markInteraction = (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      if (target && target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) return;
+      if (target && target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) return;
       state.interactionSequence += 1;
       state.interactionCounts[event.type] = (state.interactionCounts[event.type] || 0) + 1;
       state.lastInteractionType = event.type;
@@ -803,6 +812,7 @@ function isSnapshotReference(reference: SnapshotReference | DomNodeReference): r
 
 type WindowWithAiDomRuntime = Window & {
   __aiBrowserPageRuntimeInstalled?: boolean;
+  __aiMoveMouseCursor?: (x: number, y: number, options?: { immediate?: boolean; kind?: string }) => Promise<void>;
   __aiGetEventListenerTypes?: (target: EventTarget) => string[];
   __aiDomRuntime?: AiDomRuntime;
   __aiDomMutationState?: AiDomMutationStateSnapshot & {
@@ -922,6 +932,8 @@ type NativeTabGroupActivation = {
 
 type SharedBrowserLease = {
   browser?: Browser;
+  browserServer?: BrowserServer;
+  browserCodeConnection: BrowserCodeConnection;
   context: BrowserContext;
   ownership: SharedBrowserOwnership;
   release: () => Promise<void>;
@@ -932,10 +944,18 @@ const sharedPageOwners = new WeakMap<Page, string>();
 type SharedBrowserState = {
   key?: string;
   browser?: Browser;
+  browserServer?: BrowserServer;
+  browserCodeConnection?: BrowserCodeConnection;
   context?: BrowserContext;
   ownership?: SharedBrowserOwnership;
   refCount: number;
-  initPromise?: Promise<{ browser?: Browser; context: BrowserContext; ownership: SharedBrowserOwnership }>;
+  initPromise?: Promise<{
+    browser?: Browser;
+    browserServer?: BrowserServer;
+    browserCodeConnection: BrowserCodeConnection;
+    context: BrowserContext;
+    ownership: SharedBrowserOwnership;
+  }>;
 };
 const sharedBrowserStates = new Map<string, SharedBrowserState>();
 
@@ -1067,6 +1087,101 @@ function installAccessibilitySnapshotExportControl() {
 
 function installAiBrowserPageRuntime() {
   const win = window as WindowWithAiDomRuntime;
+  const mouseCursorId = '__ai_mouse_cursor__';
+  const mountMouseCursor = () => {
+    const existing = document.getElementById(mouseCursorId);
+    if (existing) return existing;
+    if (!document.documentElement) return undefined;
+    const cursor = document.createElement('div');
+    cursor.id = mouseCursorId;
+    cursor.setAttribute('aria-hidden', 'true');
+    const startX = Math.max(0, Math.round(window.innerWidth / 2));
+    const startY = Math.max(0, Math.round(window.innerHeight / 2));
+    cursor.dataset.x = String(startX);
+    cursor.dataset.y = String(startY);
+    Object.assign(cursor.style, {
+      contain: 'layout style paint',
+      height: '34px',
+      left: '0',
+      opacity: '0',
+      pointerEvents: 'none',
+      position: 'fixed',
+      top: '0',
+      transform: `translate3d(${startX}px, ${startY}px, 0)`,
+      transformOrigin: '0 0',
+      width: '30px',
+      willChange: 'transform, opacity',
+      zIndex: '2147483647',
+    });
+    const pointer = document.createElement('div');
+    const cursorSvg = [
+      '<svg xmlns="http://www.w3.org/2000/svg" width="23" height="30" viewBox="0 0 32 42">',
+      '<path d="M4 3v28.5l7.3-6.9 4.7 12.2 5.6-2.2-4.8-11.8h10.6L4 3z" fill="white" stroke="#111827" stroke-width="2.2" stroke-linejoin="round"/>',
+      '<circle cx="25" cy="8" r="5" fill="#2563eb" stroke="white" stroke-width="2"/>',
+      '</svg>',
+    ].join('');
+    Object.assign(pointer.style, {
+      backgroundImage: `url("data:image/svg+xml,${encodeURIComponent(cursorSvg)}")`,
+      backgroundRepeat: 'no-repeat',
+      backgroundSize: '23px 30px',
+      filter: 'drop-shadow(0 3px 5px rgba(0, 0, 0, 0.42))',
+      height: '30px',
+      left: '0',
+      position: 'absolute',
+      top: '0',
+      width: '23px',
+    });
+    const pulse = document.createElement('div');
+    pulse.dataset.aiMousePulse = 'true';
+    Object.assign(pulse.style, {
+      border: '2px solid rgba(37, 99, 235, .9)',
+      borderRadius: '999px',
+      height: '18px',
+      left: '-8px',
+      opacity: '0',
+      position: 'absolute',
+      top: '-8px',
+      width: '18px',
+    });
+    cursor.append(pointer, pulse);
+    document.documentElement.appendChild(cursor);
+    return cursor;
+  };
+  Object.defineProperty(win, '__aiMoveMouseCursor', {
+    configurable: true,
+    enumerable: false,
+    value: async (rawX: number, rawY: number, options: { immediate?: boolean; kind?: string } = {}) => {
+      const cursor = mountMouseCursor();
+      if (!cursor) return;
+      const x = Math.max(0, Math.min(Math.round(Number(rawX) || 0), Math.max(0, window.innerWidth - 1)));
+      const y = Math.max(0, Math.min(Math.round(Number(rawY) || 0), Math.max(0, window.innerHeight - 1)));
+      const previousX = Number(cursor.dataset.x || window.innerWidth / 2);
+      const previousY = Number(cursor.dataset.y || window.innerHeight / 2);
+      const distance = Math.hypot(x - previousX, y - previousY);
+      const duration = options.immediate ? 0 : Math.round(Math.max(120, Math.min(460, distance * 0.65)));
+      cursor.dataset.x = String(x);
+      cursor.dataset.y = String(y);
+      cursor.style.opacity = '1';
+      cursor.style.transition = duration
+        ? `transform ${duration}ms cubic-bezier(.22,.61,.36,1), opacity 100ms ease`
+        : 'none';
+      cursor.getBoundingClientRect();
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          cursor.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+          window.setTimeout(resolve, duration);
+        });
+      });
+      if (options.kind === 'click' || options.kind === 'double' || options.kind === 'right') {
+        const pulse = cursor.querySelector<HTMLElement>('[data-ai-mouse-pulse="true"]');
+        pulse?.animate([
+          { opacity: 0.9, transform: 'scale(.35)' },
+          { opacity: 0, transform: 'scale(1.65)' },
+        ], { duration: 320, easing: 'ease-out' });
+      }
+    },
+    writable: false,
+  });
   if (!win.__aiBrowserPageRuntimeInstalled) {
     const originalAddEventListener = EventTarget.prototype.addEventListener;
     const listenerTypes = new WeakMap<EventTarget, Set<string>>();
@@ -1101,7 +1216,7 @@ function installAiBrowserPageRuntime() {
     mutationState.observer = new MutationObserver((mutations) => {
       const meaningful = mutations.some((mutation) => {
         const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-        return !target?.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__');
+        return !target?.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__');
       });
       if (!meaningful) return;
       mutationState.pendingMutations = mutationState.pendingMutations || [];
@@ -1144,7 +1259,7 @@ function installAiBrowserPageRuntime() {
   const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
 
   function isOverlay(element: Element) {
-    return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__'));
+    return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__'));
   }
 
   function shadowRootOf(element: Element) {
@@ -2700,7 +2815,7 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   const normalizeText = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
   const candidateTextQuery = normalizeText(input.candidateTextQuery).toLowerCase();
   const candidateTextQueryParts = candidateTextQuery.split(/\s+/).filter((item) => item.length >= 2);
-  const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__';
+  const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__';
   const skippedTextTags = new Set(['script', 'style', 'template', 'noscript']);
   const structuralTextTags = new Set([
     'article',
@@ -3402,6 +3517,73 @@ function sharedBrowserKey(input: {
   return `launch:${JSON.stringify({ launch: input.launchOptions, context: input.contextOptions })}`;
 }
 
+async function availableLoopbackPort() {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const address = server.address();
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  if (!address || typeof address === 'string') throw new Error('Unable to allocate a browserCode CDP port.');
+  return address.port;
+}
+
+async function launchPersistentContextWithBrowserCodeConnection(input: {
+  chromium: BrowserType;
+  userDataDir: string;
+  launchOptions: LaunchOptions;
+  contextOptions: BrowserContextOptions;
+}) {
+  const port = await availableLoopbackPort();
+  const endpoint = cdpEndpointForPort(port);
+  const context = await input.chromium.launchPersistentContext(input.userDataDir, {
+    ...input.launchOptions,
+    ...input.contextOptions,
+    args: [
+      ...(input.launchOptions.args || []).filter((arg) => !/^--remote-debugging-(?:pipe|port)(?:=|$)/.test(arg)),
+      `--remote-debugging-port=${port}`,
+    ],
+  });
+  return {
+    browser: context.browser() || undefined,
+    browserCodeConnection: { protocol: 'cdp', endpoint } satisfies BrowserCodeConnection,
+    context,
+    ownership: 'persistent' as const,
+  };
+}
+
+async function launchBrowserServerWithConnection(input: {
+  chromium: BrowserType;
+  launchOptions: LaunchOptions;
+  contextOptions: BrowserContextOptions;
+}) {
+  const port = await availableLoopbackPort();
+  const cdpEndpoint = cdpEndpointForPort(port);
+  const browserServer = await input.chromium.launchServer({
+    ...input.launchOptions,
+    args: [
+      ...(input.launchOptions.args || []).filter((arg) => !/^--remote-debugging-(?:pipe|port)(?:=|$)/.test(arg)),
+      `--remote-debugging-port=${port}`,
+    ],
+  });
+  const endpoint = browserServer.wsEndpoint();
+  try {
+    const browser = await input.chromium.connect(endpoint);
+    const context = await browser.newContext(input.contextOptions);
+    return {
+      browser,
+      browserServer,
+      browserCodeConnection: { protocol: 'cdp', endpoint: cdpEndpoint } satisfies BrowserCodeConnection,
+      context,
+      ownership: 'launched' as const,
+    };
+  } catch (error) {
+    await browserServer.close().catch(() => undefined);
+    throw error;
+  }
+}
+
 async function connectExistingBrowserOverCdp(input: {
   chromium: BrowserType;
   endpoint: string;
@@ -3411,7 +3593,12 @@ async function connectExistingBrowserOverCdp(input: {
   const browser = await input.chromium.connectOverCDP(input.endpoint, { timeout: 800 }).catch(() => undefined);
   if (!browser) return undefined;
   const context = browser.contexts()[0] || await browser.newContext(input.contextOptions);
-  return { browser, context, ownership: 'connected' as const };
+  return {
+    browser,
+    browserCodeConnection: { protocol: 'cdp', endpoint: input.endpoint } satisfies BrowserCodeConnection,
+    context,
+    ownership: 'connected' as const,
+  };
 }
 
 function externalChromiumExecutablePath(chromium: BrowserType, launchOptions: LaunchOptions) {
@@ -3496,7 +3683,7 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
   const shouldClose = force || process.env.BROWSER_CLOSE_SHARED_WHEN_IDLE === 'true';
   if (!shouldClose) return;
 
-  const { browser, context, ownership } = sharedBrowserState;
+  const { browser, browserServer, context, ownership } = sharedBrowserState;
   if (ownership === 'persistent') {
     await context?.close().catch(() => undefined);
   } else if (ownership === 'launched') {
@@ -3504,7 +3691,10 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
   } else if (ownership === 'connected' && process.env.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true') {
     await browser?.close({ reason: 'Shared browser launch settings changed.' }).catch(() => undefined);
   }
+  await browserServer?.close().catch(() => undefined);
   sharedBrowserState.browser = undefined;
+  sharedBrowserState.browserServer = undefined;
+  sharedBrowserState.browserCodeConnection = undefined;
   sharedBrowserState.context = undefined;
   sharedBrowserState.ownership = undefined;
   sharedBrowserState.initPromise = undefined;
@@ -3537,7 +3727,12 @@ async function acquireSharedBrowser(input: {
       if (input.cdpEndpoint) {
         const browser = await input.chromium.connectOverCDP(input.cdpEndpoint);
         const context = browser.contexts()[0] || await browser.newContext(input.contextOptions);
-        return { browser, context, ownership: 'connected' as const };
+        return {
+          browser,
+          browserCodeConnection: { protocol: 'cdp', endpoint: input.cdpEndpoint } satisfies BrowserCodeConnection,
+          context,
+          ownership: 'connected' as const,
+        };
       }
 
       if (input.userDataDir) {
@@ -3551,11 +3746,12 @@ async function acquireSharedBrowser(input: {
           });
         }
         try {
-          const context = await input.chromium.launchPersistentContext(input.userDataDir, {
-            ...input.launchOptions,
-            ...input.contextOptions,
+          return await launchPersistentContextWithBrowserCodeConnection({
+            chromium: input.chromium,
+            userDataDir: input.userDataDir,
+            launchOptions: input.launchOptions,
+            contextOptions: input.contextOptions,
           });
-          return { browser: context.browser() || undefined, context, ownership: 'persistent' as const };
         } catch (error) {
           const retryConnected = await connectExistingBrowserOverCdp({
             chromium: input.chromium,
@@ -3576,11 +3772,15 @@ async function acquireSharedBrowser(input: {
         }
       }
 
-      const browser = await input.chromium.launch(input.launchOptions);
-      const context = await browser.newContext(input.contextOptions);
-      return { browser, context, ownership: 'launched' as const };
+      return launchBrowserServerWithConnection({
+        chromium: input.chromium,
+        launchOptions: input.launchOptions,
+        contextOptions: input.contextOptions,
+      });
     })().then((lease) => {
       sharedBrowserState.browser = lease.browser;
+      sharedBrowserState.browserServer = 'browserServer' in lease ? lease.browserServer : undefined;
+      sharedBrowserState.browserCodeConnection = lease.browserCodeConnection;
       sharedBrowserState.context = lease.context;
       sharedBrowserState.ownership = lease.ownership;
       return lease;
@@ -3603,6 +3803,9 @@ async function acquireSharedBrowser(input: {
 
 export class BrowserSession {
   private browser?: Browser;
+  private browserServer?: BrowserServer;
+  private browserCodeConnection?: BrowserCodeConnection;
+  private browserCodeKernel?: BrowserCodeKernel;
   private context?: BrowserContext;
   private page?: Page;
   private consoleErrors: string[] = [];
@@ -3796,6 +3999,8 @@ export class BrowserSession {
       });
       this.browserOwnership = 'shared';
       this.browser = lease.browser;
+      this.browserServer = lease.browserServer;
+      this.browserCodeConnection = lease.browserCodeConnection;
       this.context = lease.context;
       this.releaseSharedBrowser = lease.release;
       await this.selectInitialSessionGroupPage(lease.context);
@@ -3805,6 +4010,7 @@ export class BrowserSession {
     if (cdpEndpoint) {
       this.browserOwnership = 'connected';
       this.browser = await chromium.connectOverCDP(cdpEndpoint);
+      this.browserCodeConnection = { protocol: 'cdp', endpoint: cdpEndpoint };
       if (useElectronEmbeddedBrowser) {
         // The renderer creates the exact session tab only after it receives the
         // backend browser:start event. Allow the realtime activation handshake
@@ -3848,6 +4054,7 @@ export class BrowserSession {
         });
         this.browserOwnership = 'connected';
         this.browser = connected.browser;
+        this.browserCodeConnection = connected.browserCodeConnection;
         this.context = connected.context;
         if (useSessionGroupPageSelection) {
           await this.selectInitialSessionGroupPage(connected.context);
@@ -3858,17 +4065,20 @@ export class BrowserSession {
         return;
       }
       this.browserOwnership = 'persistent';
-      let context: BrowserContext;
+      let launched: Awaited<ReturnType<typeof launchPersistentContextWithBrowserCodeConnection>>;
       try {
-        context = await chromium.launchPersistentContext(userDataDir, {
-          ...launchOptions,
-          ...contextOptions,
+        launched = await launchPersistentContextWithBrowserCodeConnection({
+          chromium,
+          userDataDir,
+          launchOptions,
+          contextOptions,
         });
       } catch (error) {
         const connected = await connectExistingBrowserOverCdp({ chromium, endpoint: autoTabGroupCdpEndpoint, contextOptions });
         if (!connected) throw error;
         this.browserOwnership = 'connected';
         this.browser = connected.browser;
+        this.browserCodeConnection = connected.browserCodeConnection;
         this.context = connected.context;
         if (useSessionGroupPageSelection) {
           await this.selectInitialSessionGroupPage(connected.context);
@@ -3878,8 +4088,10 @@ export class BrowserSession {
         }
         return;
       }
+      const context = launched.context;
       this.context = context;
-      this.browser = context.browser() || undefined;
+      this.browser = launched.browser;
+      this.browserCodeConnection = launched.browserCodeConnection;
       if (useSessionGroupPageSelection) {
         await this.selectInitialSessionGroupPage(context);
       } else {
@@ -3890,8 +4102,11 @@ export class BrowserSession {
     }
 
     this.browserOwnership = 'launched';
-    this.browser = await chromium.launch(launchOptions);
-    const context = await this.browser.newContext(contextOptions);
+    const launched = await launchBrowserServerWithConnection({ chromium, launchOptions, contextOptions });
+    this.browser = launched.browser;
+    this.browserServer = launched.browserServer;
+    this.browserCodeConnection = launched.browserCodeConnection;
+    const context = launched.context;
     this.context = context;
     await this.prepareContext(context);
     this.claimPage(await context.newPage());
@@ -5343,7 +5558,7 @@ export class BrowserSession {
       ...journal.updated.map((line) => `updated ${line}`),
       `DOM removed (${journal.removed.length}):`,
       ...journal.removed.map((line) => `removed ${line}`),
-      `Requests started in this window (${requests.length}); use getHttpRequests with request IDs for details:`,
+      `Requests started in this window (${requests.length}); use native Playwright request listeners inside browserCode when more detail is needed:`,
       ...requestLines,
       ...(journal.errors.length ? [`Diagnostics (${journal.errors.length}):`, ...journal.errors] : []),
       ...(journal.overflow ? ['Change journal overflowed; entries may be incomplete.'] : []),
@@ -5448,6 +5663,99 @@ export class BrowserSession {
   }
 
   // 等待用户手动完成验证码/安全校验，超时后返回阻塞信息。
+  async executeBrowserCode(input: {
+    code: string;
+    runId: string;
+    stepIndex: number;
+    maxOutputChars?: number;
+    credentials?: BrowserCodeCredentialBinding[];
+    abortSignal?: AbortSignal;
+  }): Promise<BrowserActionResult> {
+    const code = String(input.code || '');
+    if (!code.trim()) return { ok: false, actual: 'browserCode requires non-empty JavaScript.' };
+    if (code.length > 40_000) return { ok: false, actual: 'browserCode JavaScript exceeds the 40000 character limit.' };
+    if (!this.browserCodeConnection) {
+      return { ok: false, actual: 'browserCode has no direct Playwright connection for this browser session.' };
+    }
+
+    const page = this.activePage;
+    const executionId = randomUUID();
+    await page.evaluate((id) => {
+      Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
+        configurable: true,
+        enumerable: false,
+        value: id,
+        writable: false,
+      });
+    }, executionId);
+
+    const kernel = this.browserCodeKernel ||= new BrowserCodeKernel(this.browserCodeConnection);
+    let execution: Awaited<ReturnType<BrowserCodeKernel['execute']>>;
+    try {
+      execution = await kernel.execute({
+        code,
+        credentials: input.credentials,
+        executionId,
+        maxOutputChars: input.maxOutputChars,
+        abortSignal: input.abortSignal,
+      });
+    } finally {
+      await Promise.all(this.sessionPages().map((candidate) => candidate.evaluate((id) => {
+        const win = window as Window & { __aiBrowserCodeExecutionId?: string };
+        if (win.__aiBrowserCodeExecutionId === id) delete win.__aiBrowserCodeExecutionId;
+      }, executionId).catch(() => undefined)));
+    }
+
+    let selectedPage: Page | undefined;
+    if (execution.selectedExecutionId) {
+      for (const candidate of this.sessionPages()) {
+        const selected = await candidate.evaluate((id) => {
+          const win = window as Window & { __aiBrowserCodeSelectedExecutionId?: string };
+          if (win.__aiBrowserCodeSelectedExecutionId !== id) return false;
+          delete win.__aiBrowserCodeSelectedExecutionId;
+          return true;
+        }, execution.selectedExecutionId).catch(() => false);
+        if (selected) selectedPage = candidate;
+      }
+    }
+    const finalPage = selectedPage || (!page.isClosed() ? page : this.sessionPages().find((candidate) => !candidate.isClosed())) || page;
+    if (!finalPage.isClosed()) this.page = finalPage;
+    const finalUrl = finalPage.isClosed() ? '' : finalPage.url();
+    const finalTitle = finalPage.isClosed() ? '' : await finalPage.title().catch(() => '');
+    const emittedImagePaths: string[] = [];
+    const emittedImageErrors: string[] = [];
+    if (execution.images?.length) {
+      const dir = artifactPath(input.runId || 'browser-code');
+      try {
+        await mkdir(dir, { recursive: true });
+        for (const [index, image] of execution.images.entries()) {
+          const extension = image.mimeType === 'image/jpeg' ? 'jpg' : image.mimeType === 'image/webp' ? 'webp' : 'png';
+          const filePath = path.join(dir, `step-${input.stepIndex}-browser-code-${index + 1}-${randomUUID().slice(0, 8)}.${extension}`);
+          await writeFile(filePath, Buffer.from(image.data, 'base64'));
+          emittedImagePaths.push(filePath);
+        }
+      } catch (error) {
+        emittedImageErrors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    return {
+      ok: execution.ok,
+      actual: JSON.stringify({
+        ok: execution.ok,
+        result: execution.value ?? null,
+        error: execution.error ?? null,
+        aborted: execution.aborted === true,
+        elapsedMs: execution.elapsedMs,
+        finalPage: { url: finalUrl, title: finalTitle },
+        images: emittedImagePaths.map((filePath) => ({ fileName: path.basename(filePath) })),
+        imageErrors: emittedImageErrors,
+        logs: execution.logs,
+      }, null, 2),
+      referenceImagePath: emittedImagePaths[0],
+      referenceImagePaths: emittedImagePaths,
+    };
+  }
+
   async waitForManualVerification(maxMs = Number(process.env.MANUAL_VERIFICATION_TIMEOUT_MS || 180000)): Promise<BrowserActionResult> {
     void maxMs;
     const note = await this.manualVerificationNote();
@@ -5471,6 +5779,8 @@ export class BrowserSession {
 
   // 关闭浏览器；调试场景可选择保留窗口。
   async close(options: { keepOpen?: boolean } = {}) {
+    await this.browserCodeKernel?.close();
+    this.browserCodeKernel = undefined;
     try {
       if (this.context && this.pageDiscoveryListener) {
         this.context.off('page', this.pageDiscoveryListener);
@@ -5499,11 +5809,15 @@ export class BrowserSession {
         return;
       }
       await this.browser?.close().catch(() => undefined);
+      await this.browserServer?.close().catch(() => undefined);
     } finally {
       if (!options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
         this.page = undefined;
         this.context = undefined;
         this.browser = undefined;
+        this.browserServer = undefined;
+        this.browserCodeConnection = undefined;
+        this.browserCodeKernel = undefined;
         this.ownedPages.clear();
       }
     }
@@ -6184,7 +6498,7 @@ export class BrowserSession {
             let top: Element | undefined;
             for (const item of stack) {
               if (!item) continue;
-              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) continue;
+              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) continue;
               top = item;
               break;
             }
@@ -6246,7 +6560,7 @@ export class BrowserSession {
         return `${tag}${id}${cls}${role}${text ? ` text="${text}"` : ''}`;
       }
       return (document.elementsFromPoint(pointX, pointY) as Element[])
-        .filter((element) => !element.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__'))
+        .filter((element) => !element.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__'))
         .slice(0, 5)
         .map(describe)
         .join(' > ') || '[none]';
@@ -7318,7 +7632,7 @@ export class BrowserSession {
         const y = Math.min(window.innerHeight - 1, Math.max(0, rect.top + rect.height * yRatio));
         let top: Element | undefined;
         for (const candidate of document.elementsFromPoint(x, y)) {
-          if (candidate.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) continue;
+          if (candidate.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) continue;
           const candidateStyle = window.getComputedStyle(candidate);
           if (candidateStyle.display !== 'none' && candidateStyle.visibility !== 'hidden') {
             top = candidate;
@@ -7577,7 +7891,7 @@ export class BrowserSession {
     }
     const metrics = this.lastScreenshotMetrics;
     if (!metrics || metrics.capture !== 'viewport') {
-      return { error: 'No current actionable viewport screenshot exists. Call takeScreenshot with capture="viewport" first.' };
+      return { error: 'No current actionable viewport screenshot exists. Emit a fresh viewport image from browserCode before using coordinates.' };
     }
     if (metrics.page !== this.activePage || metrics.url !== this.activePage.url()) {
       return { error: 'The latest screenshot is stale because the active page or URL changed. Capture a new viewport screenshot.' };
@@ -7703,6 +8017,7 @@ export class BrowserSession {
     const from = await this.unifiedActionPoint(input, input.action === 'move');
     throwIfAborted();
     if (!from.point) return { ok: false, actual: from.error || 'Unable to resolve mouse target.' };
+    const fromPoint = from.point;
     const fromLocator = from.reference && isSnapshotReference(from.reference) ? await this.snapshotReferenceLocator(from.reference) : undefined;
     const targetResolutionMs = Date.now() - targetResolutionStartedAt;
     throwIfAborted();
@@ -7813,7 +8128,7 @@ export class BrowserSession {
     await timeBrowserClickStage(clickTimings, 'clickDispatchMs', () => (
       fromLocator
         ? fromLocator.click({ button, clickCount, noWaitAfter: true })
-        : page.mouse.click(from.point.x, from.point.y, { button, clickCount })
+        : page.mouse.click(fromPoint.x, fromPoint.y, { button, clickCount })
     ));
     throwIfAborted();
     const claimedPopup = await timeBrowserClickStage(clickTimings, 'popupWaitMs', () => this.settlePopupAfterAction(popup.popup, popup.waitMs));
@@ -8752,7 +9067,7 @@ export class BrowserSession {
 
   private async readFrameRawDom(target: Page | Frame) {
     return target.evaluate(() => {
-      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__';
+      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__';
       const voidTags = new Set([
         'area',
         'base',

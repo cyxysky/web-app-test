@@ -8,6 +8,8 @@ type ConfigRecord = {
 
 type JsonRow = { record_json: string };
 
+type SkillJsonRow = JsonRow & { user_id: string };
+
 function now() {
   return new Date().toISOString();
 }
@@ -60,8 +62,32 @@ export function readTestCases() {
   return readJsonRows<TestCaseRecord>('SELECT record_json FROM test_case ORDER BY updated_at DESC');
 }
 
-export function readSkills() {
-  return readJsonRows<SkillRecord>('SELECT record_json FROM skill ORDER BY updated_at DESC');
+export function readSkills(userId?: string) {
+  const statement = userId === undefined
+    ? getSqliteDatabase().prepare('SELECT user_id, record_json FROM skill ORDER BY updated_at DESC')
+    : getSqliteDatabase().prepare('SELECT user_id, record_json FROM skill WHERE user_id = ? ORDER BY updated_at DESC');
+  const rows = (userId === undefined ? statement.all() : statement.all(userId)) as SkillJsonRow[];
+  return rows
+    .map((row) => parseSqliteJson<SkillRecord | undefined>(row.record_json, undefined))
+    .filter((item): item is SkillRecord => Boolean(item));
+}
+
+export function writeSkillRecord(skill: SkillRecord, userId: string) {
+  getSqliteDatabase().prepare(`
+    INSERT INTO skill (id, user_id, title, status, record_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      user_id = excluded.user_id,
+      title = excluded.title,
+      status = excluded.status,
+      record_json = excluded.record_json,
+      updated_at = excluded.updated_at
+  `).run(skill.id, userId, skill.title, skill.status, JSON.stringify(skill), skill.createdAt, skill.updatedAt);
+}
+
+export function deleteSkillRecord(skillId: string, userId: string) {
+  const result = getSqliteDatabase().prepare('DELETE FROM skill WHERE id = ? AND user_id = ?').run(skillId, userId);
+  return Number(result.changes) > 0;
 }
 
 export function readRunSchedules() {
@@ -75,16 +101,13 @@ export function replaceTestCaseRecords(input: {
   schedules: RunScheduleRecord[];
 }) {
   runSqliteTransaction((database) => {
-    database.exec('DELETE FROM test_group; DELETE FROM test_case; DELETE FROM skill; DELETE FROM run_schedule;');
+    database.exec('DELETE FROM test_group; DELETE FROM test_case; DELETE FROM run_schedule;');
     const insertGroup = database.prepare(`
       INSERT INTO test_group (id, parent_id, name, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
     `);
     const insertTestCase = database.prepare(`
       INSERT INTO test_case (id, group_id, title, target_url, status, priority, record_json, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const insertSkill = database.prepare(`
-      INSERT INTO skill (id, title, status, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
     `);
     const insertSchedule = database.prepare(`
       INSERT INTO run_schedule (id, name, enabled, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
@@ -104,9 +127,6 @@ export function replaceTestCaseRecords(input: {
         testCase.createdAt,
         testCase.updatedAt,
       );
-    }
-    for (const skill of input.skills) {
-      insertSkill.run(skill.id, skill.title, skill.status, JSON.stringify(skill), skill.createdAt, skill.updatedAt);
     }
     for (const schedule of input.schedules) {
       insertSchedule.run(

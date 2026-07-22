@@ -209,9 +209,9 @@ function collectTaskLedgerItems(steps: StepExecutionResult[]) {
 }
 
 function isInitialReplayNavigation(step?: RecordedFlowStep) {
-  if (step?.name === 'openPage') return true;
-  if (step?.name !== 'page' || !step.input || typeof step.input !== 'object' || Array.isArray(step.input)) return false;
-  return (step.input as Record<string, unknown>).action === 'open';
+  if (step?.name !== 'browserCode' || !step.input || typeof step.input !== 'object' || Array.isArray(step.input)) return false;
+  const code = (step.input as Record<string, unknown>).code;
+  return typeof code === 'string' && /\bpage\.goto\s*\(/.test(code);
 }
 
 function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUrl: string): RecordedFlowStep[] {
@@ -224,8 +224,10 @@ function ensureReplayStartsFromTarget(recordedFlow: RecordedFlowStep[], targetUr
   return [
     {
       index: 1,
-      name: 'page',
-      input: { action: 'open', target: 'current', url: targetUrl },
+      name: 'browserCode',
+      input: {
+        code: `await page.goto(${JSON.stringify(targetUrl)}, { waitUntil: 'domcontentloaded' });\nnodeRepl.write({ url: page.url(), title: await page.title() });`,
+      },
       delayBeforeMs: 0,
       reason: 'Replay starts from the test case target URL so recorded candidate actions run on the expected page.',
       sourceStepIndex: initialNavigation?.sourceStepIndex,

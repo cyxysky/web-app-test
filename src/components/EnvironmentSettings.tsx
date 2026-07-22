@@ -117,6 +117,13 @@ export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> 
   { id: 'debug', label: '调试与高级' },
 ];
 
+const administratorOnlySettingsTabs = new Set<SettingsTab>(['model', 'browser', 'runtime', 'dom-test', 'debug']);
+
+export function environmentSettingsTabsForUser(userId?: string) {
+  if ((userId || '').trim() === '0') return environmentSettingsTabs;
+  return environmentSettingsTabs.filter((tab) => !administratorOnlySettingsTabs.has(tab.id));
+}
+
 const personalMemoryScopeOptions: Array<{ label: string; value: PersonalMemoryScope }> = [
   { label: '全局', value: 'global' },
   { label: '按域名', value: 'domain' },
@@ -175,14 +182,16 @@ function sortPersonalMemoryItems(items: PersonalMemoryItem[]) {
   return [...items].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-function personalMemoryItemApiPath(item: Pick<PersonalMemoryItem, 'id' | 'userId'>) {
-  const query = item.userId ? `?userId=${encodeURIComponent(item.userId)}` : '';
+function personalMemoryItemApiPath(item: Pick<PersonalMemoryItem, 'id' | 'userId'>, userId: string) {
+  const effectiveUserId = item.userId || userId;
+  const query = effectiveUserId ? `?userId=${encodeURIComponent(effectiveUserId)}` : '';
   return `/api/personal-memory/${encodeURIComponent(item.id)}${query}`;
 }
 
-function personalMemoryDraftApiPath(draft: PersonalMemoryDraft) {
+function personalMemoryDraftApiPath(draft: PersonalMemoryDraft, userId: string) {
   if (!draft.id) return '/api/personal-memory';
-  const query = draft.userId ? `?userId=${encodeURIComponent(draft.userId)}` : '';
+  const effectiveUserId = draft.userId || userId;
+  const query = effectiveUserId ? `?userId=${encodeURIComponent(effectiveUserId)}` : '';
   return `/api/personal-memory/${encodeURIComponent(draft.id)}${query}`;
 }
 
@@ -239,6 +248,7 @@ export function EnvironmentSettings({
   onRuntimeEnvSaved,
   onSkillsChanged,
   showTabs = true,
+  userId,
 }: {
   activeTab?: SettingsTab;
   embedded?: boolean;
@@ -248,6 +258,7 @@ export function EnvironmentSettings({
   onRuntimeEnvSaved?: () => void;
   onSkillsChanged?: () => void;
   showTabs?: boolean;
+  userId?: string;
 } = {}) {
   const { language, setLanguage, t } = useI18n();
   const { color, currentColor, scrollbarColor, setColor, setScrollbarColor } = useTheme();
@@ -275,8 +286,14 @@ export function EnvironmentSettings({
   const [deletePersonalMemoryTarget, setDeletePersonalMemoryTarget] = useState<PersonalMemoryItem | null>(null);
   const [deletePersonalMemoryError, setDeletePersonalMemoryError] = useState('');
   const [hasDirectoryPicker, setHasDirectoryPicker] = useState(false);
-  const activeTab = controlledActiveTab || internalActiveTab;
-  const selectTab = onActiveTabChange || setInternalActiveTab;
+  const normalizedUserId = userId?.trim() || '0';
+  const visibleSettingsTabs = environmentSettingsTabsForUser(normalizedUserId);
+  const requestedActiveTab = controlledActiveTab || internalActiveTab;
+  const activeTab = visibleSettingsTabs.some((tab) => tab.id === requestedActiveTab) ? requestedActiveTab : 'general';
+  const selectTab = (tab: SettingsTab) => {
+    if (!visibleSettingsTabs.some((item) => item.id === tab)) return;
+    (onActiveTabChange || setInternalActiveTab)(tab);
+  };
 
   function optionLabel(option: { label: string; value: string }) {
     if (option.label === '关闭' && option.value === 'false') return language === 'en' ? 'Off' : '关闭';
@@ -528,13 +545,13 @@ export function EnvironmentSettings({
   const loadPersonalMemoryItems = useCallback(async () => {
     setLoadingPersonalMemory(true);
     try {
-      const response = await fetch('/api/personal-memory?includeDisabled=true', { cache: 'no-store' });
+      const response = await fetch(`/api/personal-memory?includeDisabled=true&userId=${encodeURIComponent(normalizedUserId)}`, { cache: 'no-store' });
       const data = await readApiJson<{ items?: PersonalMemoryItem[] }>(response, t('读取个性化记忆失败'));
       setPersonalMemoryItems(sortPersonalMemoryItems(Array.isArray(data.items) ? data.items : []));
     } finally {
       setLoadingPersonalMemory(false);
     }
-  }, [t]);
+  }, [normalizedUserId, t]);
 
   useEffect(() => {
     if (activeTab !== 'memory') return;
@@ -544,13 +561,13 @@ export function EnvironmentSettings({
   const loadLoginAccounts = useCallback(async () => {
     setLoadingLoginAccounts(true);
     try {
-      const response = await fetch('/api/login-accounts', { cache: 'no-store' });
+      const response = await fetch(`/api/login-accounts?userId=${encodeURIComponent(normalizedUserId)}`, { cache: 'no-store' });
       const data = await readApiJson<{ accounts?: LoginAccountMetadata[] }>(response, '读取登录账号失败');
       setLoginAccounts(Array.isArray(data.accounts) ? data.accounts : []);
     } finally {
       setLoadingLoginAccounts(false);
     }
-  }, []);
+  }, [normalizedUserId]);
 
   useEffect(() => {
     if (activeTab !== 'accounts') return;
@@ -566,7 +583,7 @@ export function EnvironmentSettings({
     if (!window.confirm(`确认删除“${account.label || account.username}”吗？`)) return;
     setDeletingLoginAccountId(account.id);
     try {
-      const query = account.userId ? `?userId=${encodeURIComponent(account.userId)}` : '';
+      const query = `?userId=${encodeURIComponent(account.userId || normalizedUserId)}`;
       const response = await fetch(`/api/login-accounts/${encodeURIComponent(account.id)}${query}`, { method: 'DELETE' });
       await readApiJson(response, '删除登录账号失败');
       setLoginAccounts((current) => current.filter((item) => item.id !== account.id));
@@ -577,6 +594,7 @@ export function EnvironmentSettings({
 
   function personalMemoryPayload() {
     return {
+      userId: normalizedUserId,
       scope: personalMemoryDraft.scope,
       domain: personalMemoryDraft.scope === 'domain' ? personalMemoryDraft.domain.trim() : '',
       type: personalMemoryDraft.type,
@@ -601,7 +619,7 @@ export function EnvironmentSettings({
     setSavingPersonalMemory(true);
     startGlobalLoading(t(personalMemoryDraft.id ? '正在保存记忆' : '正在新增记忆'));
     try {
-      const response = await fetch(personalMemoryDraftApiPath(personalMemoryDraft), {
+      const response = await fetch(personalMemoryDraftApiPath(personalMemoryDraft, normalizedUserId), {
         method: personalMemoryDraft.id ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -619,7 +637,7 @@ export function EnvironmentSettings({
   async function togglePersonalMemory(item: PersonalMemoryItem) {
     setUpdatingPersonalMemoryId(item.id);
     try {
-      const response = await fetch(personalMemoryItemApiPath(item), {
+      const response = await fetch(personalMemoryItemApiPath(item, normalizedUserId), {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: item.status === 'active' ? 'disabled' : 'active' }),
@@ -649,7 +667,7 @@ export function EnvironmentSettings({
     setDeletePersonalMemoryError('');
     startGlobalLoading(t('正在删除记忆'));
     try {
-      const response = await fetch(personalMemoryItemApiPath(item), { method: 'DELETE' });
+      const response = await fetch(personalMemoryItemApiPath(item, normalizedUserId), { method: 'DELETE' });
       await readApiJson(response, t('删除个性化记忆失败'));
       setPersonalMemoryItems((current) => current.filter((entry) => entry.id !== item.id));
       if (personalMemoryDraft.id === item.id) closePersonalMemoryEditor();
@@ -1025,6 +1043,7 @@ export function EnvironmentSettings({
           onClose={() => setLoginAccountEditor(null)}
           onSaved={replaceLoginAccount}
           open={Boolean(loginAccountEditor)}
+          userId={normalizedUserId}
         />
       </section>
     );
@@ -1058,7 +1077,7 @@ export function EnvironmentSettings({
       <div className={showTabs ? 'settings-layout' : 'settings-layout no-tabs'}>
         {showTabs ? (
           <nav className="settings-tabs" aria-label={t('环境配置分类')}>
-            {environmentSettingsTabs.map((tab) => (
+            {visibleSettingsTabs.map((tab) => (
               <button className={activeTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => selectTab(tab.id)} type="button">
                 {t(tab.label)}
               </button>
@@ -1245,7 +1264,7 @@ export function EnvironmentSettings({
             </section>
           ) : null}
 
-          {activeTab === 'skills' ? <SkillsManager onChanged={onSkillsChanged} /> : null}
+          {activeTab === 'skills' ? <SkillsManager onChanged={onSkillsChanged} userId={normalizedUserId} /> : null}
 
           {activeTab === 'memory' ? renderPersonalMemoryPanel() : null}
 

@@ -47,7 +47,14 @@ export const modelProviderDefinitions: ModelProviderDefinition[] = [
   { value: 'google', label: 'Google Gemini API', defaultModel: 'gemini-3-flash-preview', keyLabel: 'Google 访问密钥' },
   { value: 'codex', label: 'Codex CLI', defaultModel: 'gpt-5.5', keyLabel: 'Codex CLI 使用本地登录，无需 Key', localAuth: true },
   { value: 'anthropic', label: 'Anthropic', defaultModel: 'claude-sonnet-4-5', keyLabel: 'Anthropic 访问密钥', baseUrlLabel: 'Anthropic 服务地址' },
-  { value: 'deepseek', label: 'DeepSeek', defaultModel: 'deepseek-v4-flash', keyLabel: 'DeepSeek 访问密钥' },
+  {
+    value: 'deepseek',
+    label: 'DeepSeek',
+    defaultModel: 'deepseek-v4-flash',
+    keyLabel: 'DeepSeek 访问密钥',
+    baseUrlLabel: 'DeepSeek 服务地址',
+    defaultBaseURL: 'https://api.deepseek.com',
+  },
   {
     value: 'azure-openai',
     label: 'Azure OpenAI',

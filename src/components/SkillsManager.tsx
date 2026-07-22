@@ -100,8 +100,12 @@ function DetailList({ emptyText, items }: { emptyText: string; items?: string[] 
   );
 }
 
-export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
+export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => void; userId?: string } = {}) {
   const { t } = useI18n();
+  const normalizedUserId = userId.trim() || '0';
+  const skillsApiUrl = useCallback((path: string) => (
+    `${path}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(normalizedUserId)}`
+  ), [normalizedUserId]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [expandedSkillIds, setExpandedSkillIds] = useState<string[]>([]);
   const [portalReady, setPortalReady] = useState(false);
@@ -116,7 +120,7 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
   const loadSkills = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await fetch('/api/skills', { cache: 'no-store' });
+      const response = await fetch(skillsApiUrl('/api/skills'), { cache: 'no-store' });
       const data = await readApiJson<SkillsListResponse>(response, t('加载 Skills 失败'));
       setSkills(Array.isArray(data.skills) ? data.skills : []);
     } catch (error) {
@@ -124,7 +128,7 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [skillsApiUrl, t]);
 
   useEffect(() => {
     void loadSkills();
@@ -214,10 +218,10 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
     setSaving(true);
     startGlobalLoading(t('正在保存 Skill'));
     try {
-      const response = await fetch(skillId ? `/api/skills/${skillId}` : '/api/skills', {
+      const response = await fetch(skillsApiUrl(skillId ? `/api/skills/${skillId}` : '/api/skills'), {
         method: skillId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, userId: normalizedUserId }),
       });
       const data = await readApiJson<SkillMutationResponse>(response, t('保存 Skill 失败'));
       if (!data.skill) throw new Error(t('保存 Skill 失败'));
@@ -243,7 +247,7 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
     setDeletingSkillId(target.id);
     startGlobalLoading(t('正在删除 Skill'));
     try {
-      const response = await fetch(`/api/skills/${target.id}`, { method: 'DELETE' });
+      const response = await fetch(skillsApiUrl(`/api/skills/${target.id}`), { method: 'DELETE' });
       await readApiJson<unknown>(response, t('删除 Skill 失败'));
       setSkills((current) => current.filter((item) => item.id !== target.id));
       setExpandedSkillIds((current) => current.filter((id) => id !== target.id));

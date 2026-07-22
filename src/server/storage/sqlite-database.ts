@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 4;
+const currentSchemaVersion = 5;
 const defaultApplicationUserId = '0';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -243,6 +243,28 @@ function applyVersionFourMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionFiveMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 5').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const columns = database.prepare('PRAGMA table_info(skill)').all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === 'user_id')) {
+      database.exec("ALTER TABLE skill ADD COLUMN user_id TEXT NOT NULL DEFAULT '0'");
+    }
+    database.exec("UPDATE skill SET user_id = '0' WHERE user_id IS NULL OR TRIM(user_id) = ''");
+    database.exec('CREATE INDEX IF NOT EXISTS skill_user_updated_at_idx ON skill(user_id, updated_at DESC)');
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (5, 'skills-per-user', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -298,6 +320,7 @@ function initializeSchema(database: DatabaseSync) {
 
     CREATE TABLE IF NOT EXISTS skill (
       id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
       title TEXT NOT NULL,
       status TEXT NOT NULL,
       record_json TEXT NOT NULL,
@@ -405,6 +428,7 @@ function initializeSchema(database: DatabaseSync) {
   `).run(new Date().toISOString());
   applyVersionThreeMigration(database);
   applyVersionFourMigration(database);
+  applyVersionFiveMigration(database);
 }
 
 export function getSqliteDatabase() {

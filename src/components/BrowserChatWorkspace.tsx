@@ -98,7 +98,7 @@ import {
   formatDownloadBytes,
   type SystemDownloadItem,
 } from '@/components/browser-chat-download-model';
-import { EnvironmentSettings, environmentSettingsTabs, type EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
+import { EnvironmentSettings, environmentSettingsTabsForUser, type EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import {
   buildBrowserChatAiCycleRenderEntries,
@@ -845,6 +845,11 @@ export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], st
 
           const detail = { stepIndex: step.index, step, toolIndex, tool };
           sameNameCandidates.push(detail);
+          if (aiTool.id && tool.id === aiTool.id) {
+            details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
+            usedStepTools.add(usedKey);
+            return;
+          }
           if (!exactInput || toolInputSignature(tool.input) === exactInput) {
             details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
             usedStepTools.add(usedKey);
@@ -927,31 +932,16 @@ function summarizeToolFields(fields: unknown) {
 
 function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
-    getHttpRequests: '检查请求',
-    keyboard: '键盘操作',
-    listTabs: '扫描标签页',
-    manageVisualContext: '整理视觉上下文',
-    mouse: '鼠标操作',
-    openPage: '导航页面',
-    page: '页面操作',
+    browserCode: '执行浏览器代码',
     readSubagent: '读取子 Agent',
     reportState: '确认状态',
-    searchSnapshot: '搜索页面快照',
-    selectOption: '选择下拉选项',
-    selectReferenceScreenshots: '引用截图',
     spawnSubagents: '并行子 Agent',
-    switchTab: '切换标签',
-    tab: '标签页操作',
-    takeScreenshot: '截屏取证',
-    takeSnapshot: '读取页面快照',
     waitForHumanVerification: '等待人工验证',
-    waitForPage: '等待页面稳定',
   };
   if (labels[name]) return t(labels[name]);
 
   const lower = name.toLowerCase();
   if (lower.includes('screenshot') || lower.includes('capture')) return t('截屏取证');
-  if (lower.includes('snapshot') || lower.includes('context')) return t('读取页面状态');
   if (lower.includes('clickat') || lower.includes('coordinate')) return t('点选坐标');
   if (lower.includes('click')) return t('点选目标');
   if (lower.includes('fill') || lower.includes('type')) return t('键入内容');
@@ -970,33 +960,9 @@ function browserChatToolMeta(name: string, input: unknown) {
   if (!record) return toolStringValue(input);
 
   const lower = name.toLowerCase();
-  if (name === 'keyboard') return [toolInputValue(record, ['action']), toolInputValue(record, ['text', 'key', 'uid'])].filter(Boolean).join(' · ');
-  if (name === 'selectOption') return [toolInputValue(record, ['uid']), toolInputValue(record, ['value', 'label'])].filter(Boolean).join(' · ');
-  if (name === 'openPage') return toolInputValue(record, ['url']);
-  if (name === 'page') {
-    if (record.action === 'wait') return toolInputValue(record, ['ms']) || '等待页面稳定';
-    const target = record.target === 'new' ? '新标签页' : '当前标签页';
-    return [target, toolInputValue(record, ['url'])].filter(Boolean).join(' · ');
-  }
+  if (name === 'browserCode') return toolInputValue(record, ['reason']) || 'Playwright';
   if (name === 'readSubagent') return toolInputValue(record, ['uuid']);
-  if (name === 'switchTab') return toolInputValue(record, ['index']);
-  if (name === 'tab') return record.action === 'switch' ? toolInputValue(record, ['index']) : '列出全部标签页';
-  if (name === 'waitForPage') return toolInputValue(record, ['ms']);
   if (name === 'waitForHumanVerification') return toolInputValue(record, ['maxMs']);
-  if (name === 'mouse') {
-    const action = toolInputValue(record, ['action']);
-    const target = toolInputValue(record, ['uid', 'x_thousandth']);
-    const deltaY = toolInputValue(record, ['deltaY']);
-    return [action, target, deltaY ? `Y ${deltaY}` : ''].filter(Boolean).join(' · ');
-  }
-  if (name === 'takeSnapshot') return toolInputValue(record, ['mode', 'cursor']);
-  if (name === 'searchSnapshot') return toolInputValue(record, ['tag', 'query']);
-  if (name === 'takeScreenshot') return toolInputValue(record, ['capture']);
-  if (name === 'selectReferenceScreenshots') {
-    const ids = Array.isArray(record.ids) ? record.ids : [];
-    return ids.length ? `${ids.length} 张` : '';
-  }
-  if (name === 'manageVisualContext') return toolInputValue(record, ['action', 'manageReason']);
   if (name === 'spawnSubagents') return Array.isArray(record.tasks) ? `${record.tasks.length} 个任务` : '';
   if (name === 'reportState') return toolInputValue(record, ['action', 'actual', 'status']);
   if (lower.includes('fill')) return summarizeToolFields(record.fields) || toolInputValue(record, ['text', 'content', 'value']);
@@ -1005,14 +971,14 @@ function browserChatToolMeta(name: string, input: unknown) {
   }
   if (lower.includes('find')) return toolInputValue(record, ['targetText', 'scopeId']);
   if (lower.includes('text')) return toolInputValue(record, ['text', 'targetText', 'id']);
-  return toolInputValue(record, ['url', 'text', 'uid', 'query', 'action', 'status']);
+  return toolInputValue(record, ['url', 'text', 'query', 'action', 'status']);
 }
 
 function BrowserChatToolIcon({ name }: { name: string }) {
   const lower = name.toLowerCase();
+  if (name === 'browserCode') return <Braces size={13} />;
   if (lower.includes('subagent')) return <Waypoints size={13} />;
   if (lower.includes('screenshot') || lower.includes('capture')) return <GalleryHorizontalEnd size={13} />;
-  if (lower.includes('snapshot') || lower.includes('context')) return <Braces size={13} />;
   if (lower.includes('type') || lower.includes('fill')) return <PencilLine size={13} />;
   if (lower.includes('press') || lower.includes('key')) return <CornerDownLeft size={13} />;
   if (lower.includes('clickat') || lower.includes('coordinate')) return <Compass size={13} />;
@@ -3004,9 +2970,11 @@ function browserChatSubagentsFromLogs(logs: BrowserChatLogRecord[], toolInput: u
       if (Number.isFinite(stepIndex)) current.stepMap.set(stepIndex, step as unknown as StepExecutionResult);
     }
     if (details && Object.prototype.hasOwnProperty.call(details, 'event')) {
+      const childStepIndex = Number(details.childStepIndex);
       current.logs.push({
         ...log,
         phase,
+        stepIndex: Number.isFinite(childStepIndex) ? childStepIndex : undefined,
         details: browserChatNestedLogDetails(details.event),
       });
     }
@@ -3500,7 +3468,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   const itemViews = items.map((item) => {
     const steps = (item.stepIndexes || [])
       .map((stepIndex) => stepsByIndex.get(stepIndex))
-      .filter((step): step is StepExecutionResult => Boolean(step));
+      .filter((step): step is StepExecutionResult => step?.messageId === item.id);
     return {
       item,
       logs: browserChatLogsForMessage(item, logIndex),
@@ -3618,8 +3586,16 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   const lastMessage = messages[messages.length - 1];
   const skillsById = useMemo(() => new Map(availableSkills.map((skill) => [skill.id, skill])), [availableSkills]);
   const renderEntries = useMemo(
-    () => buildBrowserChatMessageRenderEntries(messages, logIndex, browserChatAssistantMessageHasVisibleText),
-    [logIndex, messages],
+    () => buildBrowserChatMessageRenderEntries(
+      messages,
+      logIndex,
+      browserChatAssistantMessageHasVisibleText,
+      (message) => (message.stepIndexes || []).some((stepIndex) => {
+        const step = stepsByIndex.get(stepIndex);
+        return step?.messageId === message.id && Boolean(step.tools?.length);
+      }),
+    ),
+    [logIndex, messages, stepsByIndex],
   );
   const scrollKey = [
     sessionId || '',
@@ -3716,7 +3692,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         const item = entry.item;
         const itemSteps = (item.stepIndexes || [])
           .map((stepIndex) => stepsByIndex.get(stepIndex))
-          .filter((step): step is StepExecutionResult => Boolean(step));
+          .filter((step): step is StepExecutionResult => step?.messageId === item.id);
         const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
         return (
           <BrowserChatMessageItem
@@ -5882,6 +5858,7 @@ export function BrowserChatWorkspace({
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const requestUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || '0';
+  const visibleSettingsTabs = environmentSettingsTabsForUser(requestUserId);
   const browserChatApiUrl = useCallback((path: string) => (
     `${path}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(requestUserId)}`
   ), [requestUserId]);
@@ -5907,6 +5884,7 @@ export function BrowserChatWorkspace({
   const [modelId, setModelId] = useState(() => initialModelSelection.model);
   const [modelConfig, setModelConfig] = useState<BrowserChatModelConfig | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
+  const activeSettingsTab = visibleSettingsTabs.some((tab) => tab.id === settingsTab) ? settingsTab : 'general';
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
   const attachmentsRef = useRef<BrowserChatAttachment[]>([]);
   const [composerResetToken, setComposerResetToken] = useState(0);
@@ -6215,10 +6193,10 @@ export function BrowserChatWorkspace({
   }, []);
 
   const loadSkills = useCallback(async () => {
-    const response = await fetch('/api/skills', { cache: 'no-store' });
+    const response = await fetch(browserChatApiUrl('/api/skills'), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载 Skills 失败');
     setSkills(Array.isArray(data.skills) ? data.skills : []);
-  }, []);
+  }, [browserChatApiUrl]);
 
   const loadModelConfig = useCallback(async () => {
     const response = await fetch('/api/settings/model', { cache: 'no-store' });
@@ -6793,8 +6771,8 @@ export function BrowserChatWorkspace({
         <section className="browser-chat-sidebar-section browser-chat-settings-section">
           <h2>设置</h2>
           <nav className="browser-chat-subnav" aria-label="环境配置分类">
-            {environmentSettingsTabs.map((tab) => (
-              <button aria-label={tab.label} className={settingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={tab.label} type="button">
+            {visibleSettingsTabs.map((tab) => (
+              <button aria-label={tab.label} className={activeSettingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={tab.label} type="button">
                 <SettingsTabIcon tab={tab.id} />
                 <span>{tab.label}</span>
               </button>
@@ -7111,7 +7089,7 @@ export function BrowserChatWorkspace({
         {activeView === 'settings' ? (
           <div className="browser-chat-settings-pane">
             <EnvironmentSettings
-              activeTab={settingsTab}
+              activeTab={activeSettingsTab}
               embedded
               initialData={initialSettings}
               showTabs={false}
@@ -7119,6 +7097,7 @@ export function BrowserChatWorkspace({
               onModelSaved={() => void loadModelConfig()}
               onRuntimeEnvSaved={() => void loadBrowserRuntimeSettings()}
               onSkillsChanged={() => void loadSkills()}
+              userId={requestUserId}
             />
           </div>
         ) : embeddedBrowserActive ? (

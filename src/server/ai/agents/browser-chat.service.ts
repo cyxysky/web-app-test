@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserActionResult, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
+import type { BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
 import { applicationUserRuntimeKey, normalizeApplicationUserId } from '@/server/auth/user-context';
 import {
   executeInteractiveBrowserTurn,
@@ -15,6 +16,10 @@ import {
 import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
 import { browserChatAttachmentMetadata, isBrowserChatImageAttachment, readBrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachment-reader';
 import { browserChatFirstMessageTitle } from '@/server/ai/agents/browser-chat-message-title';
+import {
+  alignBrowserChatMessageStepIndexes,
+  attachBrowserChatStepOwners,
+} from '@/server/ai/agents/browser-chat-step-ownership';
 import {
   browserChatSubagentSuggestedSummaryChars,
   preserveBrowserChatSubagentSummary,
@@ -51,6 +56,7 @@ import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/mode
 import {
   listLoginAccounts,
   resolveLoginAccountCredentialById,
+  type LoginAccountMetadata,
 } from '@/server/credentials/login-account-vault';
 
 export type BrowserChatAttachment = {
@@ -765,6 +771,13 @@ type BrowserChatResourceSeed = {
   url?: string;
 };
 
+type BrowserChatCredentialDescriptor = {
+  origins: string[];
+  username: string;
+  usernameRef: string;
+  passwordRef: string;
+};
+
 function browserChatResourceUrls(text: string) {
   const matches = text.match(/https?:\/\/[^\s<>"'\]\[(){}，。；、]+/gi) || [];
   return Array.from(new Set(matches.map((value) => value.replace(/[),.;!?]+$/g, '')))).slice(0, 40);
@@ -777,7 +790,7 @@ function browserChatResourceKind(title: string, url?: string): BrowserChatResour
   return url ? 'url' : 'other';
 }
 
-function browserChatResourceSeeds(session: BrowserChatSessionRecord, latestModelText = '') {
+function browserChatResourceSeeds(session: BrowserChatSessionRecord, latestModelText = '', currentUrl = '') {
   const seeds: BrowserChatResourceSeed[] = [];
   const add = (seed: BrowserChatResourceSeed) => {
     const key = `${seed.kind}\u0000${seed.url || seed.title}`.toLowerCase();
@@ -787,6 +800,7 @@ function browserChatResourceSeeds(session: BrowserChatSessionRecord, latestModel
   for (const url of browserChatResourceUrls(latestModelText)) {
     add({ kind: browserChatResourceKind(url, url), title: url, url });
   }
+  if (currentUrl) add({ kind: browserChatResourceKind(currentUrl, currentUrl), title: '当前页面', url: currentUrl });
   if (session.targetUrl) {
     add({ kind: browserChatResourceKind(session.targetUrl, session.targetUrl), title: '目标地址', url: session.targetUrl });
   }
@@ -808,19 +822,40 @@ function browserChatResourceSeeds(session: BrowserChatSessionRecord, latestModel
   return seeds.slice(0, 80);
 }
 
+function httpOrigin(value?: string) {
+  if (!value) return '';
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) ? url.origin : '';
+  } catch {
+    return '';
+  }
+}
+
+function instructionMentionsLoginAccount(instruction: string, account: LoginAccountMetadata) {
+  const normalized = instruction.toLowerCase();
+  return normalized.includes(account.username.toLowerCase())
+    || normalized.includes(account.domain.toLowerCase())
+    || Boolean(account.loginUrl && normalized.includes(account.loginUrl.toLowerCase()));
+}
+
 function browserChatCredentialContext(
   session: BrowserChatSessionRecord,
   seeds: BrowserChatResourceSeed[],
   instruction: string,
 ) {
-  const values = new Map<string, string>();
-  const credentials: Array<{
-    origin: string;
-    username: string;
-    usernameRef: string;
-    passwordRef: string;
-  }> = [];
-  const allowedOrigins = new Set<string>();
+  const matches = new Map<string, { account: LoginAccountMetadata; origins: Set<string> }>();
+  const addAccount = (account: LoginAccountMetadata, origins: string[]) => {
+    const allowedOrigins = origins.filter(Boolean);
+    if (!allowedOrigins.length) return;
+    const existing = matches.get(account.id);
+    if (existing) {
+      allowedOrigins.forEach((origin) => existing.origins.add(origin));
+      return;
+    }
+    matches.set(account.id, { account, origins: new Set(allowedOrigins) });
+  };
+
   for (const seed of seeds) {
     if (!seed.url) continue;
     let url: URL;
@@ -831,61 +866,46 @@ function browserChatCredentialContext(
     }
     if (!['http:', 'https:'].includes(url.protocol)) continue;
     const accounts = listLoginAccounts({ userId: session.userId, domain: url.hostname })
-      .filter((account) => account.status === 'active');
-    const mentioned = accounts.filter((account) => new RegExp(`(^|[^a-z0-9])${account.username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(instruction));
+      .filter((account) => account.status === 'active' && account.hasPassword);
+    const mentioned = accounts.filter((account) => instructionMentionsLoginAccount(instruction, account));
     const account = mentioned.length === 1 ? mentioned[0] : accounts.length === 1 ? accounts[0] : undefined;
-    if (!account || credentials.some((item) => item.origin === url.origin && item.username === account.username)) continue;
-    const secret = resolveLoginAccountCredentialById(account.id, session.userId);
-    if (!secret) continue;
-    const token = randomUUID();
-    const usernameRef = `research_credential_${token}_username`;
-    const passwordRef = `research_credential_${token}_password`;
-    values.set(usernameRef, account.username);
-    values.set(passwordRef, secret.password);
-    allowedOrigins.add(url.origin);
-    if (account.loginUrl) {
-      try {
-        allowedOrigins.add(new URL(account.loginUrl).origin);
-      } catch {
-        // The saved account remains usable for the exact seed origin.
-      }
-    }
-    credentials.push({ origin: url.origin, username: account.username, usernameRef, passwordRef });
+    if (!account) continue;
+    addAccount(account, [url.origin, httpOrigin(account.loginUrl)]);
   }
-  for (const account of listLoginAccounts({ userId: session.userId }).filter((item) => item.status === 'active')) {
-    const usernamePattern = new RegExp(`(^|[^a-z0-9])${account.username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i');
-    const domainPattern = new RegExp(`(^|[^0-9])${account.domain.split('.').at(-1)?.replace(/\D/g, '') || account.domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^0-9]|$)`);
-    if (!usernamePattern.test(instruction) && !instruction.includes(account.domain) && !domainPattern.test(instruction)) continue;
-    let origin = '';
-    try {
-      origin = new URL(account.loginUrl || `https://${account.domain}`).origin;
-    } catch {
-      continue;
-    }
-    if (credentials.some((item) => item.origin === origin && item.username === account.username)) continue;
-    const secret = resolveLoginAccountCredentialById(account.id, session.userId);
-    if (!secret) continue;
-    const token = randomUUID();
-    const usernameRef = `chat_credential_${token}_username`;
-    const passwordRef = `chat_credential_${token}_password`;
-    values.set(usernameRef, account.username);
-    values.set(passwordRef, secret.password);
-    allowedOrigins.add(origin);
-    credentials.push({ origin, username: account.username, usernameRef, passwordRef });
+
+  for (const account of listLoginAccounts({ userId: session.userId })) {
+    if (account.status !== 'active' || !account.hasPassword || !instructionMentionsLoginAccount(instruction, account)) continue;
+    addAccount(account, [httpOrigin(account.loginUrl)]);
   }
-  return {
-    credentials,
-    credentialAllowedOrigins: Array.from(allowedOrigins),
-    resolveCredential: (credentialRef: string) => values.get(credentialRef),
-  };
+
+  const credentials: BrowserChatCredentialDescriptor[] = [];
+  const bindings: BrowserCodeCredentialBinding[] = [];
+  for (const { account, origins } of matches.values()) {
+    const credential = resolveLoginAccountCredentialById(account.id, session.userId);
+    if (!credential) continue;
+    const token = randomUUID();
+    const usernameRef = `credential_${token}_username`;
+    const passwordRef = `credential_${token}_password`;
+    const allowedOrigins = Array.from(origins);
+    credentials.push({ origins: allowedOrigins, username: account.username, usernameRef, passwordRef });
+    bindings.push(
+      { ref: usernameRef, value: account.username, allowedOrigins },
+      { ref: passwordRef, value: credential.password, allowedOrigins },
+    );
+  }
+  return { credentials, bindings };
 }
 
-function browserChatCredentialPrompt(credentials: ReturnType<typeof browserChatCredentialContext>['credentials']) {
+function browserChatCredentialPrompt(credentials: BrowserChatCredentialDescriptor[]) {
   if (!credentials.length) return '';
   return [
     '[后台已匹配的安全账号引用]',
-    ...credentials.map((item) => `- ${item.origin} / ${item.username}：用户名使用 keyboard.credentialRef="${item.usernameRef}"，密码使用 keyboard.credentialRef="${item.passwordRef}"。`),
-    '账号明文密码不会提供给模型。只能在当前页面 origin 与上述 origin 完全一致时使用 credentialRef；不得把凭据写入 text、日志或最终回复。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
+    ...credentials.map((item) => [
+      `- ${item.origins.join('、')} / ${item.username}`,
+      `  用户名：await credentialVault.fill(page.getByLabel('用户名'), "${item.usernameRef}")`,
+      `  密码：await credentialVault.fill(page.getByLabel('密码'), "${item.passwordRef}")`,
+    ].join('\n')),
+    'credentialVault.fill 只会把对应值写入真实 Playwright Locator，并且只允许上述 origin；它不会返回账号或密码明文。不得读取已填充输入框的 inputValue/value，不得在 nodeRepl.write、console、工具参数或最终回复中输出凭据或引用。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
   ].join('\n');
 }
 
@@ -944,9 +964,9 @@ function contentWithInlineReferencesForPrompt(content: string, attachments: Brow
   }).replace(/[ \t]{2,}/g, ' ').trim();
 }
 
-function messageContentForPrompt(message: BrowserChatMessage) {
+function messageContentForPrompt(message: BrowserChatMessage, userId?: string) {
   const selectedSkills = message.skillIds?.length
-    ? store.getSkills(message.skillIds).filter((skill) => skill.status === 'ready')
+    ? store.getSkills(message.skillIds, userId).filter((skill) => skill.status === 'ready')
     : [];
   const text = textFromUnknown(message.content);
   const referencedAttachmentIds = inlineReferencedIds(text, 'ref');
@@ -999,6 +1019,7 @@ function buildConversationSummaryPrompt(input: {
   messages: BrowserChatMessage[];
   estimatedTokens: number;
   thresholdTokens: number;
+  userId?: string;
 }) {
   const source = {
     previousSummary: input.previousContext?.summary || '',
@@ -1007,7 +1028,7 @@ function buildConversationSummaryPrompt(input: {
       role: message.role,
       createdAt: message.createdAt,
       updatedAt: message.updatedAt,
-      content: messageContentForPrompt(message),
+      content: messageContentForPrompt(message, input.userId),
       stepIndexes: message.stepIndexes || [],
       status: message.status,
     })),
@@ -1029,10 +1050,10 @@ function buildConversationSummaryPrompt(input: {
   ].join('\n');
 }
 
-function fallbackConversationSummary(input: { previousContext?: BrowserChatConversationContext; messages: BrowserChatMessage[] }) {
+function fallbackConversationSummary(input: { previousContext?: BrowserChatConversationContext; messages: BrowserChatMessage[]; userId?: string }) {
   return [
     input.previousContext?.summary ? `此前摘要：${input.previousContext.summary}` : '',
-    ...input.messages.map((message) => `${message.role === 'user' ? '用户' : 'AI'}：${messageContentForPrompt(message)}`),
+    ...input.messages.map((message) => `${message.role === 'user' ? '用户' : 'AI'}：${messageContentForPrompt(message, input.userId)}`),
   ].filter(Boolean).join('\n');
 }
 
@@ -1311,8 +1332,11 @@ function recordFromSnapshot(
       .filter((step) => step.status === 'running' && isTransientBrowserChatProgress(step.actual))
       .map((step) => step.index),
   );
-  const steps = (session.steps || []).filter((step) => !transientStepIndexes.has(step.index));
-  const messages = assignAssistantStepIndexesToLatestMessage((session.messages || []).map((rawMessage) => {
+  const steps = attachBrowserChatStepOwners(
+    (session.steps || []).filter((step) => !transientStepIndexes.has(step.index)),
+    session.logs || [],
+  );
+  const messages = alignBrowserChatMessageStepIndexes((session.messages || []).map((rawMessage) => {
     const safeMessage: BrowserChatMessage = {
       ...rawMessage,
       role: rawMessage.role === 'assistant' ? 'assistant' : 'user',
@@ -1340,7 +1364,7 @@ function recordFromSnapshot(
       activity: undefined,
       stepIndexes,
     };
-  }));
+  }), steps);
   return {
     ...session,
     userId: normalizeUserId(session.userId),
@@ -1371,6 +1395,7 @@ function appendLog(
   const runningActivity = runningActivityFromLog(phase, message);
   const details = logDetailsFromUnknown(input.details);
   const logMessageId = input.messageId === null ? undefined : input.messageId ?? session.activeAssistantMessageId;
+  const stepIndex = phase.startsWith('subagent:') ? undefined : input.stepIndex;
   session.logs = trimBrowserChatLogs([
     ...(session.logs || []),
     {
@@ -1380,7 +1405,7 @@ function appendLog(
       message,
       details,
       messageId: logMessageId,
-      stepIndex: input.stepIndex,
+      stepIndex,
       elapsedMs: input.elapsedMs,
     },
   ]);
@@ -1390,8 +1415,8 @@ function appendLog(
       activity: item.status === 'running' && runningActivity
         ? { phase, label: runningActivity, updatedAt: timestamp }
         : item.activity,
-      stepIndexes: input.stepIndex
-        ? Array.from(new Set([...(item.stepIndexes || []), input.stepIndex])).sort((a, b) => a - b)
+      stepIndexes: stepIndex
+        ? Array.from(new Set([...(item.stepIndexes || []), stepIndex])).sort((a, b) => a - b)
         : item.stepIndexes,
       updatedAt: timestamp,
     }));
@@ -1470,27 +1495,6 @@ function mergeStringLists(first?: string[], second?: string[]) {
   return Array.from(new Set([...(first || []), ...(second || [])].filter(Boolean)));
 }
 
-function assignAssistantStepIndexesToLatestMessage(messages: BrowserChatMessage[]) {
-  // A stale transient step can be removed during recovery and its numeric index
-  // reused by the next turn. Disk merging must not attach that reused step to
-  // both assistant messages; the later turn is the authoritative owner.
-  const claimedStepIndexes = new Set<number>();
-  const normalized = [...messages];
-  for (let index = normalized.length - 1; index >= 0; index -= 1) {
-    const message = normalized[index];
-    if (message.role !== 'assistant' || !message.stepIndexes?.length) continue;
-    const stepIndexes = message.stepIndexes.filter((stepIndex) => {
-      if (claimedStepIndexes.has(stepIndex)) return false;
-      claimedStepIndexes.add(stepIndex);
-      return true;
-    });
-    if (stepIndexes.length !== message.stepIndexes.length) {
-      normalized[index] = { ...message, stepIndexes };
-    }
-  }
-  return normalized;
-}
-
 function mergePersistedMessages(existing: BrowserChatMessage[] = [], incoming: BrowserChatMessage[] = []) {
   const byId = new Map<string, BrowserChatMessage>();
   for (const message of existing) byId.set(message.id, message);
@@ -1508,9 +1512,7 @@ function mergePersistedMessages(existing: BrowserChatMessage[] = [], incoming: B
       attachments: incomingPreferred ? message.attachments || previous.attachments : previous.attachments || message.attachments,
     });
   }
-  return assignAssistantStepIndexesToLatestMessage(
-    [...byId.values()].sort((a, b) => messageTimestamp(a) - messageTimestamp(b)),
-  );
+  return [...byId.values()].sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
 }
 
 function stepCompletenessScore(step: StepExecutionResult) {
@@ -1569,16 +1571,21 @@ function mergePersistedSessionSnapshot(
   existing: BrowserChatSessionSnapshot | undefined,
   incoming: BrowserChatSessionSnapshot,
 ): BrowserChatSessionSnapshot {
-  if (!existing) return incoming;
+  if (!existing) {
+    const steps = attachBrowserChatStepOwners(incoming.steps, incoming.logs);
+    return { ...incoming, messages: alignBrowserChatMessageStepIndexes(incoming.messages, steps), steps };
+  }
   const incomingNewer = timestampValue(incoming.updatedAt) >= timestampValue(existing.updatedAt);
   const base = incomingNewer ? { ...existing, ...incoming } : { ...incoming, ...existing };
+  const logs = mergePersistedLogs(existing.logs, incoming.logs);
+  const steps = attachBrowserChatStepOwners(mergePersistedSteps(existing.steps, incoming.steps), logs);
   return {
     ...base,
-    messages: mergePersistedMessages(existing.messages, incoming.messages),
-    steps: mergePersistedSteps(existing.steps, incoming.steps),
+    messages: alignBrowserChatMessageStepIndexes(mergePersistedMessages(existing.messages, incoming.messages), steps),
+    steps,
     consoleErrors: mergeStringLists(existing.consoleErrors, incoming.consoleErrors),
     networkErrors: mergeStringLists(existing.networkErrors, incoming.networkErrors),
-    logs: mergePersistedLogs(existing.logs, incoming.logs),
+    logs,
     conversationContext: mergePersistedConversationContext(existing.conversationContext, incoming.conversationContext),
   };
 }
@@ -1715,6 +1722,7 @@ function conversationForPrompt(
   messages: BrowserChatMessage[],
   context?: BrowserChatConversationContext,
   currentUserMessageId?: string,
+  userId?: string,
 ): InteractiveBrowserTurnMessage[] {
   const stableMessages = stableConversationMessages(messages)
     .filter((message) => message.id !== currentUserMessageId);
@@ -1724,7 +1732,7 @@ function conversationForPrompt(
       role: 'user' as const,
       content: `[历史会话总结]\n${context.summary}`,
     }] : []),
-    ...uncovered.map((message) => ({ role: message.role, content: messageContentForPrompt(message) })),
+    ...uncovered.map((message) => ({ role: message.role, content: messageContentForPrompt(message, userId) })),
   ];
 }
 
@@ -1737,7 +1745,7 @@ async function ensureConversationContextWithinThreshold(
   const currentUserIndex = currentUserMessageId ? stableMessages.findIndex((message) => message.id === currentUserMessageId) : -1;
   const historicalMessages = (currentUserIndex >= 0 ? stableMessages.slice(0, currentUserIndex) : stableMessages)
     .filter((message) => message.id !== session.activeAssistantMessageId);
-  const currentConversation = conversationForPrompt(historicalMessages, session.conversationContext);
+  const currentConversation = conversationForPrompt(historicalMessages, session.conversationContext, undefined, session.userId);
   const thresholdTokens = Math.floor(contextWindowTokens() * contextCompressionThresholdRatio());
   const estimatedTokens = browserChatConversationTokenEstimate(currentConversation);
   if (estimatedTokens <= thresholdTokens) return;
@@ -1751,6 +1759,7 @@ async function ensureConversationContextWithinThreshold(
     messages: sourceMessages,
     estimatedTokens,
     thresholdTokens,
+    userId: session.userId,
   });
   const { provider, model } = getModelSettings();
   appendLog(session, 'conversation:context:request', '历史对话超过上下文阈值，正在压缩为后续模型上下文开头。', {
@@ -1776,7 +1785,7 @@ async function ensureConversationContextWithinThreshold(
         prompt,
         abortSignal: combinedSignal,
       });
-      const summary = compactText(result.text || '', 12000) || fallbackConversationSummary({ previousContext, messages: sourceMessages });
+      const summary = compactText(result.text || '', 12000) || fallbackConversationSummary({ previousContext, messages: sourceMessages, userId: session.userId });
       session.conversationContext = {
         version: 1,
         updatedAt: now(),
@@ -1789,7 +1798,7 @@ async function ensureConversationContextWithinThreshold(
           provider,
           model,
           estimatedTokensBefore: estimatedTokens,
-          estimatedTokensAfter: browserChatConversationTokenEstimate(conversationForPrompt(historicalMessages, session.conversationContext)),
+          estimatedTokensAfter: browserChatConversationTokenEstimate(conversationForPrompt(historicalMessages, session.conversationContext, undefined, session.userId)),
           thresholdTokens,
           context: session.conversationContext,
         }),
@@ -2463,6 +2472,7 @@ export async function generateBrowserChatMessagesSkill(sessionId: string, messag
     content: generated.content,
     sourceSessionId: session.id,
     status: 'ready',
+    userId: session.userId,
   });
   return { skill, sourceMessageIds: uniqueMessageIds };
 }
@@ -2491,7 +2501,7 @@ export async function sendBrowserChatMessage(
   const text = textFromUnknown(content).trim();
   const attachments = normalizeAttachments(attachmentsInput);
   const skillIds = normalizeSkillIds(skillIdsInput);
-  const selectedSkills = store.getSkills(skillIds).filter((skill) => skill.status === 'ready');
+  const selectedSkills = store.getSkills(skillIds, session.userId).filter((skill) => skill.status === 'ready');
   if (!text && !attachments.length && !selectedSkills.length) throw new Error('Message is empty');
   const messageText = text || (selectedSkills.length ? '请结合已选择的 Skills 继续处理当前任务。' : '请结合我提供的引用继续处理当前任务。');
   const skillReferences = formatSkillReferencesForUser(selectedSkills);
@@ -3118,7 +3128,7 @@ async function executeBrowserChatSubagentBatch(input: {
       if (task.url) await child.open(task.url);
       const credentialContext = browserChatCredentialContext(
         session,
-        task.url ? [{ kind: 'url', title: task.title, url: task.url }] : [],
+        browserChatResourceSeeds(session, task.instruction, task.url || child.currentUrl()),
         task.instruction,
       );
       const result = await executeInteractiveBrowserTurn({
@@ -3133,20 +3143,19 @@ async function executeBrowserChatSubagentBatch(input: {
             ? '无头浏览器已经复制主会话当前的 Cookie、localStorage 和 IndexedDB 登录态。请先直接访问目标地址验证登录态，不要重新登录。'
             : '主会话当前没有可复制的浏览器登录态；如果目标页面要求登录，请明确返回登录阻塞，不要猜测页面内容。',
           '你运行在无头浏览器中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要等待用户操作隐藏页面；请明确报告阻塞证据并把该步骤交回主 Agent。',
-          'domChanges.overflow 只表示 MutationObserver 变更队列容量溢出，绝不表示页面下方还有内容。不得因此滚动页面，也不得把“滚动到底部”写入任何任务。只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容不在 full/text 完整 DOM 中时，才允许滚动。',
-          'takeSnapshot 的 full 与 text 都读取已加载页面的完整 DOM；text 是 full 中全部文本的去重阅读视图，不是当前视窗。nextCursor 只是冻结结果的字符分页，不得为分页而滚动。',
+          '浏览器检查与操作统一使用 browserCode，在一个受限程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。',
+          '只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容尚未加载时才滚动；不要把滚动当作默认页面读取方式。',
           summaryGuidanceChars
             ? `完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。配置建议将篇幅控制在约 ${summaryGuidanceChars} 个字符以内，但这不是截断上限；如果完整证据需要更长内容，必须完整返回。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。`
             : '完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。',
           task.instruction,
           browserChatCredentialPrompt(credentialContext.credentials),
-        ].join('\n\n'),
+        ].filter(Boolean).join('\n\n'),
         conversation: [],
         completedSteps: [],
         mode: session.mode,
         safetyMode: session.safetyMode,
-        resolveCredential: credentialContext.resolveCredential,
-        credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
+        credentialBindings: credentialContext.bindings,
         abortSignal: abortController.signal,
         shouldContinue: ownsTurn,
         requestToolConfirmation: session.safetyMode === 'strict'
@@ -3183,11 +3192,10 @@ async function executeBrowserChatSubagentBatch(input: {
             stored.updatedAt = now();
           }
           appendLog(session, `subagent:${task.id}:${event.phase}`, event.message, {
-            stepIndex: event.stepIndex,
             elapsedMs: elapsedFromDetails(eventDetails),
             details: event.phase === 'ai:runtime:response' || event.phase === 'ai:runtime:object'
-              ? fullLogDetails({ batchId, id: task.id, index, title: task.title, event: eventDetails })
-              : { batchId, id: task.id, index, title: task.title, event: eventDetails },
+              ? fullLogDetails({ batchId, id: task.id, index, title: task.title, childStepIndex: event.stepIndex, event: eventDetails })
+              : { batchId, id: task.id, index, title: task.title, childStepIndex: event.stepIndex, event: eventDetails },
             messageId: assistantMessageId,
             deferPersist: true,
           });
@@ -3338,7 +3346,11 @@ async function resumeBlockedBrowserChatSubagent(input: {
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
   const credentialContext = browserChatCredentialContext(
     session,
-    binding.task.url ? [{ kind: 'url', title: binding.title, url: binding.task.url }] : [],
+    browserChatResourceSeeds(
+      session,
+      binding.task.instruction,
+      binding.task.url || binding.browser.currentUrl(),
+    ),
     binding.task.instruction,
   );
   try {
@@ -3357,8 +3369,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       completedSteps: binding.steps,
       mode: session.mode,
       safetyMode: session.safetyMode,
-      resolveCredential: credentialContext.resolveCredential,
-      credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
+      credentialBindings: credentialContext.bindings,
       abortSignal: abortController.signal,
       shouldContinue: ownsTurn,
       requestToolConfirmation: session.safetyMode === 'strict'
@@ -3376,11 +3387,10 @@ async function resumeBlockedBrowserChatSubagent(input: {
         if (!ownsTurn()) return;
         const eventDetails = unwrapLogDetails(event.details).value;
         appendLog(session, `subagent:${binding.id}:${event.phase}`, event.message, {
-          stepIndex: event.stepIndex,
           elapsedMs: elapsedFromDetails(eventDetails),
           details: event.phase === 'ai:runtime:response' || event.phase === 'ai:runtime:object'
-            ? fullLogDetails({ id: binding.id, title: binding.title, event: eventDetails })
-            : { id: binding.id, title: binding.title, event: eventDetails },
+            ? fullLogDetails({ id: binding.id, title: binding.title, childStepIndex: event.stepIndex, event: eventDetails })
+            : { id: binding.id, title: binding.title, childStepIndex: event.stepIndex, event: eventDetails },
           messageId: assistantMessageId,
           deferPersist: true,
         });
@@ -3497,21 +3507,24 @@ async function runBrowserChatMessage(
       ].filter(Boolean).join('\n\n');
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
       const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
-      const credentialContext = browserChatCredentialContext(session, browserChatResourceSeeds(session, modelText), modelText);
+      const credentialContext = browserChatCredentialContext(
+        session,
+        browserChatResourceSeeds(session, modelText, browser.currentUrl()),
+        modelText,
+      );
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
         targetUrl: session.targetUrl || 'about:blank',
         instruction: text,
         modelInstruction: [modelText, browserChatCredentialPrompt(credentialContext.credentials)].filter(Boolean).join('\n\n'),
-        conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId),
+        conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId, session.userId),
         completedSteps: session.steps,
         mode: session.mode,
         safetyMode: session.safetyMode,
         referenceImagePaths,
         skillContext,
-        resolveCredential: credentialContext.resolveCredential,
-        credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
+        credentialBindings: credentialContext.bindings,
         getDynamicSkillContext: () => {
           const currentUrl = browserChatMemoryUrl(browser, session);
           const currentDomain = normalizePersonalMemoryDomain(currentUrl || session.targetUrl);
@@ -3547,9 +3560,10 @@ async function runBrowserChatMessage(
         readFile: (input) => readFileForSession(session, input),
         onProgress: (step) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+          const ownedStep = { ...step, messageId: assistantMessageId };
           const index = session.steps.findIndex((item) => item.index === step.index);
-          if (index >= 0) session.steps[index] = { ...session.steps[index], ...step };
-          else session.steps.push(step);
+          if (index >= 0) session.steps[index] = { ...session.steps[index], ...ownedStep };
+          else session.steps.push(ownedStep);
           session.steps.sort((a, b) => a.index - b.index);
           if (step.index >= fromStepIndex) {
             const timestamp = now();
@@ -3579,7 +3593,9 @@ async function runBrowserChatMessage(
       });
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       appendLog(session, 'chat:run:saving', '正在写入本轮对话最终结果', { deferPersist: true });
-      session.steps = result.steps;
+      session.steps = result.steps.map((step) => (
+        step.index >= fromStepIndex ? { ...step, messageId: assistantMessageId } : step
+      ));
       session.consoleErrors = result.consoleErrors;
       session.networkErrors = result.networkErrors;
       queuePersonalMemoryExtraction({ session, browser, text, result, userMessageId, assistantMessageId });

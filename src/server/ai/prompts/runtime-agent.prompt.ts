@@ -71,8 +71,7 @@ export function buildCompletionVerificationPrompt(input: CompletionVerificationP
 
 export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
   const answerAllowed = allowedTypes.includes('answer');
-  const snapshotMode = allowedTypes.includes('takeSnapshot');
-  const screenshotMode = allowedTypes.includes('takeScreenshot');
+  const browserCodeMode = allowedTypes.includes('browserCode');
   return [
     prompt,
     '',
@@ -85,16 +84,18 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     '- params should include only keys required by that tool plus a concise reason.',
     answerAllowed ? '- In browser chat strict safety mode, important actions must still return the intended tool object; add params.requiresConfirmation=true and a concise Chinese params.confirmationMessage so the UI can pause with Confirm/Cancel buttons before execution. Do not ask the user to type confirmation text.' : '',
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
-    '- In message/reason/action/expected/actual, do not output UIDs, coordinates, deltas, screenshot ids/file names, or tool input JSON as business meaning.',
-    snapshotMode ? '- Use takeSnapshot with params={mode:"full"} by default for the complete loaded semantic DOM baseline. params={mode:"text"} returns ALL text from that same full DOM, including offscreen content, as a deduplicated reading view; it is not viewport-only. params={mode:"changes"} is only the inter-action DOM/request journal. Text pages are fixed at 20,000 characters and full pages at 40,000 characters. changes has no interactive UIDs and does not replace the baseline. Query its request IDs with getHttpRequests. nextCursor pages one frozen result: continue with the same mode and exact cursor and never scroll for pagination.' : '',
-    snapshotMode ? '- Use searchSnapshot to search the complete frozen snapshot. It is read-only: it does not scroll, consume DOM mutations, or invalidate nextCursor. A frozen cursor survives waiting and arbitrary asynchronous DOM changes; only a UI-affecting browser interaction or an explicit fresh takeSnapshot invalidates it. Use only UIDs from the latest snapshot.' : '',
-    snapshotMode ? '- domChanges.overflow only means the MutationObserver change queue exceeded capacity. It never means more content exists below. Never scroll or write "scroll to bottom" into a child-Agent instruction because of overflow; scroll only for explicit lazy-load, virtual-list, or infinite-scroll evidence when the target is absent from full/text.' : '',
-    snapshotMode ? '- Use mouse for every pointer operation and keyboard for every keyboard operation. A UID action scrolls an offscreen target into view automatically.' : '',
-    screenshotMode ? '- takeScreenshot is the visual tool. Only coordinates derived from its latest viewport capture may be used in mouse/keyboard; fullPage captures are read-only evidence.' : '',
-    screenshotMode ? '- If accessibility evidence is missing or visual layering is ambiguous, call takeScreenshot before choosing coordinates.' : '',
+    '- In message/reason/action/expected/actual, do not output coordinates, screenshot ids/file names, or tool input JSON as business meaning.',
+    browserCodeMode ? '- browserCode is the only browser inspection and operation entrypoint. Put one ordinary JavaScript cell in params.code. Use top-level await and do not wrap it in a function or module.' : '',
+    browserCodeMode ? '- The JavaScript kernel persists across browserCode calls. Prefer top-level var for reusable bindings or fresh names, and emit the result with nodeRepl.write(<JSON-serializable value>).' : '',
+    browserCodeMode ? '- browserCode has no whole-cell deadline. Locator/action operations default to 3000ms and navigation defaults to 30000ms so a missing target fails the current cell without destroying persistent bindings. Add a longer explicit Playwright timeout only for a known slow transition.' : '',
+    browserCodeMode ? '- The program receives real Playwright page and context objects. Write ordinary Playwright code directly. Do not import modules or access Node globals, local files, environment variables, cookies, browser storage, or raw credential values. If the prompt supplies a credential reference, fill only the intended locator with await credentialVault.fill(locator, ref); never read the filled field value or output/log credentials or references.' : '',
+    browserCodeMode ? '- DOM code belongs inside await page.evaluate((arg) => { ... }, arg). That callback executes in the browser page VM; the surrounding browserCode program executes in the isolated Node process.' : '',
+    browserCodeMode ? '- Use a recent await page.domSnapshot() as locator ground truth. Refresh it after navigation or a locator failure before constructing a different locator.' : '',
+    browserCodeMode ? '- Pixel evidence stays in browserCode: await nodeRepl.emitImage(await page.screenshot({ fullPage: false })). Use viewport coordinates only from that fresh emitted image; fullPage images are read-only.' : '',
+    browserCodeMode ? '- browser/tab are code APIs in the same kernel: browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, and tab.cua.' : '',
     allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
     allowedTypes.includes('generateMarkdownFile') ? '- For generateMarkdownFile, put the complete Markdown document in params.content and the desired file name in params.fileName. The final visible answer must include the returned download link as a clickable Markdown link.' : '',
-    '- For a browser action, set type to the tool name and put the original tool arguments in params, including reason.',
+    '- For a browser action, set type="browserCode" and put the program in params.code plus a concise params.reason.',
     answerAllowed
       ? '- For browser chat completion, clarification, blocked state, failure, or pure text response, set type="answer" and put the complete Chinese Markdown answer in message. Do not use reportState.'
       : '- For completion, manual verification, failure, or pure status update, use type="reportState".',

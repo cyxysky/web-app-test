@@ -132,6 +132,8 @@ export type TaskLedgerItem = {
 
 export type StepExecutionResult = {
   index: number;
+  /** Browser-chat assistant message that owns this top-level step. */
+  messageId?: string;
   action: string;
   expected: string;
   operation?: TestStep['operation'];

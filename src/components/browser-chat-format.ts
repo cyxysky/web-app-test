@@ -15,11 +15,44 @@ export function stripAnsiControlCodes(value: string) {
   return value.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 }
 
+const payloadLineFeedToken = '\uE000webpilot-payload-lf\uE001';
+const payloadTabToken = '\uE000webpilot-payload-tab\uE001';
+
+function normalizeEmbeddedJson(value: unknown, depth = 0): unknown {
+  if (depth >= 8) return value;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']')))) return value;
+    try {
+      return normalizeEmbeddedJson(JSON.parse(text), depth + 1);
+    } catch {
+      return value;
+    }
+  }
+  if (Array.isArray(value)) return value.map((item) => normalizeEmbeddedJson(item, depth + 1));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizeEmbeddedJson(item, depth + 1)]));
+}
+
+function stringifyPayloadForDisplay(value: unknown) {
+  const normalized = normalizeEmbeddedJson(value);
+  const serialized = JSON.stringify(normalized, (_key, item) => (
+    typeof item === 'string'
+      ? item
+        .replace(/\r\n|\r|\n/g, payloadLineFeedToken)
+        .replace(/\t/g, payloadTabToken)
+      : item
+  ), 2);
+  return serialized
+    .replaceAll(payloadLineFeedToken, '\n')
+    .replaceAll(payloadTabToken, '\t');
+}
+
 export function formatToolPayload(value: unknown) {
   if (value === undefined || value === null || value === '') return 'None';
   if (typeof value === 'string') return stripAnsiControlCodes(value);
   try {
-    return stripAnsiControlCodes(JSON.stringify(value, null, 2));
+    return stripAnsiControlCodes(stringifyPayloadForDisplay(value));
   } catch {
     return stripAnsiControlCodes(String(value));
   }

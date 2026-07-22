@@ -17,10 +17,11 @@ The app uses DeepSeek by default:
 
 ```bash
 DEEPSEEK_API_KEY=your_key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
 AI_MODEL=deepseek-v4-flash
 ```
 
-You can override `AI_PROVIDER`, `AI_MODEL`, `DEEPSEEK_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` in `.env.local`.
+You can override `AI_PROVIDER`, `AI_MODEL`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` in `.env.local`. For the internal TLS forwarding endpoint, keep the hostname and configure `DEEPSEEK_BASE_URL=https://api.deepseek.com:8802` after mapping `api.deepseek.com` to the forwarding IP in the local hosts file.
 If the model call fails, generation falls back to a local structured test case and records the failure reason in the test case risks.
 
 Browser execution accepts `http` and `https` target URLs by default. Set `ALLOWED_TEST_DOMAINS=localhost,127.0.0.1,example.com` to restrict runs to a domain allowlist.
@@ -94,6 +95,18 @@ The compose setup keeps runtime data outside the image:
 - Chromium profiles and caches remain managed by Chromium in their native file layout.
 
 For unattended packaged regression runs, keep `HEADLESS_BROWSER=true`. For account-based exploratory testing or manual verification, prefer a visible or CDP-connected browser.
+
+## Package a standalone HTTP server for Windows
+
+To distribute the backend without Electron, create a self-contained service archive on the build machine:
+
+```powershell
+npm run server:package
+```
+
+This produces `dist-server/WebPilot-Server-<version>.zip`. The target machine only needs Node.js 22.13 or later: extract the archive and run `start.cmd`. It includes all traced Node dependencies and the Playwright Chromium binary, so the target machine does not need `npm install` or `npx playwright install chromium`.
+
+By default it listens on all network interfaces at port `3000` (locally: `http://127.0.0.1:3000`), stores application data under `runtime/`, and runs the browser headlessly. Set `PORT`, `APP_DATA_DIR`, `ARTIFACTS_DIR`, or `HEADLESS_BROWSER` before `start.cmd` to override those defaults.
 
 ## Desktop development
 

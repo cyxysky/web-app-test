@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { modelProviderDefinition } from '../config/settings';
 import {
   modelSelectionDiagnosticLabel,
   modelSelectionValueForConfig,
@@ -20,6 +21,13 @@ const config: RuntimeModelConfig = {
   },
   updatedAt: '',
 };
+
+test('DeepSeek exposes a configurable API base URL', () => {
+  const definition = modelProviderDefinition('deepseek');
+
+  assert.equal(definition.baseUrlLabel, 'DeepSeek 服务地址');
+  assert.equal(definition.defaultBaseURL, 'https://api.deepseek.com');
+});
 
 test('resolveRuntimeModelSelection falls back to configured provider default', () => {
   const selection = resolveRuntimeModelSelection(config, { model: 'missing-model', provider: 'deepseek' });

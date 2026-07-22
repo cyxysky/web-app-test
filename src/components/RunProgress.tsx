@@ -86,101 +86,23 @@ const statusFieldOptions = [
   { label: '阻塞', value: 'blocked' },
 ];
 
-const keyFieldOptions = [
-  'Enter',
-  'Escape',
-  'Tab',
-  'ArrowUp',
-  'ArrowDown',
-  'ArrowLeft',
-  'ArrowRight',
-  'Backspace',
-].map((value) => ({ label: value, value }));
-
 const outputFormatOptions = [
   { label: 'Markdown', value: 'markdown' },
   { label: '纯文本', value: 'plainText' },
   { label: 'JSON', value: 'json' },
 ];
 
-const legacyToolDefinitions: ToolDefinition[] = [
+const toolDefinitions: ToolDefinition[] = [
   {
-    name: 'openPage',
-    label: '打开页面',
-    mode: 'shared',
-    template: { url: '' },
-    fields: [{ key: 'url', label: '目标地址', kind: 'text', placeholder: 'https://example.com' }],
-  },
-  {
-    name: 'takeSnapshot',
-    label: '获取页面快照',
+    name: 'browserCode',
+    label: '执行浏览器代码',
     mode: 'dom',
-    template: { mode: 'actionable' },
+    template: { code: '', reason: '', maxOutputChars: 20000 },
     fields: [
-      { key: 'mode', label: '快照视图', kind: 'select', options: [{ label: '可操作节点', value: 'actionable' }, { label: '完整结构', value: 'full' }, { label: '页面文本', value: 'text' }, { label: '交互间变更', value: 'changes' }] },
-      { key: 'cursor', label: '继续游标', kind: 'text' },
+      { key: 'code', label: 'Playwright 代码', kind: 'textarea' },
+      { key: 'reason', label: '执行原因', kind: 'textarea' },
+      { key: 'maxOutputChars', label: '最大返回字符数', kind: 'number' },
     ],
-  },
-  {
-    name: 'searchSnapshot',
-    label: '搜索页面快照',
-    mode: 'dom',
-    template: { query: '', roles: [], limit: 20 },
-    fields: [
-      { key: 'query', label: '搜索内容', kind: 'text' },
-      { key: 'roles', label: '角色筛选', kind: 'stringList', helper: '每行一个无障碍角色，例如 button、link、textbox。' },
-      { key: 'limit', label: '结果数量', kind: 'number' },
-    ],
-  },
-  {
-    name: 'takeScreenshot',
-    label: '获取页面截图',
-    mode: 'visual',
-    template: { capture: 'viewport' },
-    fields: [{ key: 'capture', label: '截图范围', kind: 'select', options: [{ label: '当前视口', value: 'viewport' }, { label: '完整页面', value: 'fullPage' }] }],
-  },
-  {
-    name: 'mouse',
-    label: '鼠标操作',
-    mode: 'shared',
-    template: { action: 'click', uid: '' },
-    fields: [
-      { key: 'action', label: '鼠标动作', kind: 'select', options: [{ label: '点击', value: 'click' }, { label: '移动 / 悬停', value: 'move' }, { label: '拖拽', value: 'drag' }, { label: '滚动', value: 'scroll' }, { label: '滚入可视区', value: 'scrollIntoView' }] },
-      { key: 'uid', label: '目标 UID', kind: 'text' },
-      { key: 'x_thousandth', label: '截图横坐标（千分比）', kind: 'number' },
-      { key: 'y_thousandth', label: '截图纵坐标（千分比）', kind: 'number' },
-      { key: 'toUid', label: '拖拽终点 UID', kind: 'text' },
-      { key: 'toX_thousandth', label: '终点横坐标（千分比）', kind: 'number' },
-      { key: 'toY_thousandth', label: '终点纵坐标（千分比）', kind: 'number' },
-      { key: 'button', label: '鼠标按键', kind: 'select', options: [{ label: '左键', value: 'left' }, { label: '右键', value: 'right' }, { label: '中键', value: 'middle' }] },
-      { key: 'clickCount', label: '点击次数', kind: 'number' },
-      { key: 'deltaX', label: '横向滚动量', kind: 'number' },
-      { key: 'deltaY', label: '纵向滚动量', kind: 'number' },
-    ],
-  },
-  {
-    name: 'keyboard',
-    label: '键盘操作',
-    mode: 'shared',
-    template: { action: 'type', uid: '', text: '', replace: true },
-    fields: [
-      { key: 'action', label: '键盘动作', kind: 'select', options: [{ label: '输入文本', value: 'type' }, { label: '单个按键', value: 'press' }, { label: '快捷键', value: 'shortcut' }] },
-      { key: 'uid', label: '聚焦目标 UID', kind: 'text' },
-      { key: 'x_thousandth', label: '截图横坐标（千分比）', kind: 'number' },
-      { key: 'y_thousandth', label: '截图纵坐标（千分比）', kind: 'number' },
-      { key: 'text', label: '输入内容', kind: 'textarea' },
-      { key: 'key', label: '按键', kind: 'select', options: keyFieldOptions },
-      { key: 'keys', label: '快捷键组合', kind: 'stringList', helper: '每行一个按键，例如 Control、A。' },
-      { key: 'replace', label: '替换原内容', kind: 'boolean' },
-      { key: 'followByEnter', label: '输入后按 Enter', kind: 'boolean' },
-    ],
-  },
-  {
-    name: 'waitForPage',
-    label: '等待页面',
-    mode: 'shared',
-    template: { ms: 1000 },
-    fields: [{ key: 'ms', label: '等待毫秒', kind: 'number' }],
   },
   {
     name: 'waitForHumanVerification',
@@ -188,27 +110,6 @@ const legacyToolDefinitions: ToolDefinition[] = [
     mode: 'shared',
     template: { maxMs: 180000 },
     fields: [{ key: 'maxMs', label: '最长等待毫秒', kind: 'number' }],
-  },
-  {
-    name: 'listTabs',
-    label: '列出标签页',
-    mode: 'shared',
-    template: {},
-    fields: [],
-  },
-  {
-    name: 'switchTab',
-    label: '切换标签页',
-    mode: 'shared',
-    template: { index: 0 },
-    fields: [{ key: 'index', label: '标签页序号', kind: 'number' }],
-  },
-  {
-    name: 'getHttpRequests',
-    label: '获取 HTTP 请求',
-    mode: 'shared',
-    template: {},
-    fields: [],
   },
   {
     name: 'downloadFile',
@@ -247,23 +148,12 @@ const legacyToolDefinitions: ToolDefinition[] = [
     ],
   },
   {
-    name: 'selectReferenceScreenshots',
-    label: '选择参考截图',
-    mode: 'shared',
-    template: { ids: [], selectionReason: '' },
-    fields: [
-      { key: 'ids', label: '截图 ID', kind: 'stringList', helper: '每行一个截图 ID。' },
-      { key: 'selectionReason', label: '选择原因', kind: 'textarea' },
-      { key: 'sameInterfaceGroup', label: '同界面分组', kind: 'text' },
-    ],
-  },
-  {
     name: 'generateText',
     label: 'AI 文本生成',
     mode: 'editor',
     template: { prompt: '', outputFormat: 'markdown', includePageText: true, includeScreenshot: true, maxCharacters: 1200 },
     fields: [
-      { key: 'prompt', label: '生成提示词', kind: 'textarea', helper: '写清楚需要 AI 基于当前界面分析、总结或提取什么。' },
+      { key: 'prompt', label: '生成提示词', kind: 'textarea' },
       { key: 'outputFormat', label: '输出格式', kind: 'select', options: outputFormatOptions },
       { key: 'includePageText', label: '包含页面文本', kind: 'boolean' },
       { key: 'includeScreenshot', label: '包含当前截图', kind: 'boolean' },
@@ -277,48 +167,6 @@ const toolStatusOptions = [
   { label: '失败', value: 'failed' },
   { label: '未定', value: 'pending' },
 ];
-
-const toolDefinitions: ToolDefinition[] = legacyToolDefinitions.flatMap((definition) => {
-  if (definition.name === 'waitForPage' || definition.name === 'switchTab') return [];
-  if (definition.name === 'openPage') {
-    return [{
-      ...definition,
-      name: 'page',
-      label: '页面操作',
-      template: { action: 'open', target: 'current', url: '' },
-      fields: [
-        { key: 'action', label: '操作', kind: 'select', options: [{ label: '打开页面', value: 'open' }, { label: '等待页面', value: 'wait' }] },
-        { key: 'url', label: '目标地址', kind: 'text', placeholder: 'https://example.com' },
-        { key: 'target', label: '打开位置', kind: 'select', options: [{ label: '当前标签页', value: 'current' }, { label: '新标签页', value: 'new' }] },
-        { key: 'ms', label: '等待毫秒', kind: 'number' },
-      ],
-    }];
-  }
-  if (definition.name === 'listTabs') {
-    return [{
-      ...definition,
-      name: 'tab',
-      label: '标签页操作',
-      template: { action: 'list', index: 0 },
-      fields: [
-        { key: 'action', label: '操作', kind: 'select', options: [{ label: '列出标签页', value: 'list' }, { label: '切换标签页', value: 'switch' }] },
-        { key: 'index', label: '标签页序号', kind: 'number' },
-      ],
-    }];
-  }
-  if (definition.name === 'searchSnapshot') {
-    return [{
-      ...definition,
-      template: { ...definition.template, tag: '' },
-      fields: [
-        ...definition.fields.slice(0, 1),
-        { key: 'tag', label: 'HTML 标签', kind: 'text', helper: '填写后从冻结的 full DOM 返回该标签的全部节点。' },
-        ...definition.fields.slice(1),
-      ],
-    }];
-  }
-  return [definition];
-});
 
 const toolDefinitionsByName = Object.fromEntries(toolDefinitions.map((definition) => [definition.name, definition])) as Record<string, ToolDefinition>;
 const toolDisplayLabels: Record<string, string> = Object.fromEntries(toolDefinitions.map((definition) => [definition.name, definition.label]));
@@ -472,7 +320,7 @@ function toolModeLabel(mode: ToolEditorMode, t: TranslateFn) {
 
 function toolModeTag(definition: ToolDefinition | undefined, t: TranslateFn) {
   if (!definition) return t('未知工具');
-  if (definition.mode === 'dom') return t('语义快照');
+  if (definition.mode === 'dom') return t('浏览器代码');
   if (definition.mode === 'visual') return t('视觉');
   if (definition.mode === 'editor') return t('编辑专用');
   return t('通用');
