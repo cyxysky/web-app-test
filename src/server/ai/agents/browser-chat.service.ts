@@ -27,11 +27,8 @@ import {
 import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
 import {
   extractPersonalMemoryFromTurn,
-  formatPersonalMemoryForPrompt,
-  markPersonalMemoryItemsUsed,
   normalizePersonalMemoryDomain,
   personalMemoryEnabled,
-  searchPersonalMemory,
 } from '@/server/ai/personal-memory';
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
 import type { ModelProvider, RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
@@ -283,51 +280,6 @@ function browserChatBrowserExecutionOptions() {
 function browserChatMemoryUrl(browser: BrowserSession | undefined, session: Pick<BrowserChatSessionSnapshot, 'targetUrl'>) {
   const currentUrl = browser?.currentUrl() || '';
   return currentUrl || session.targetUrl || '';
-}
-
-function browserChatPersonalMemoryContext(input: {
-  session: BrowserChatSessionRecord;
-  browser: BrowserSession;
-  text: string;
-  modelText: string;
-  currentUrl?: string;
-  domainOnly?: boolean;
-  excludedIds?: ReadonlySet<string>;
-  logPhase?: string;
-}) {
-  const currentUrl = input.currentUrl || browserChatMemoryUrl(input.browser, input.session);
-  const currentDomain = normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl);
-  if (!personalMemoryEnabled()) return { context: '', itemIds: [] as string[], domain: currentDomain };
-  const results = searchPersonalMemory({
-    userId: input.session.userId,
-    query: [input.text, input.modelText, input.session.title].filter(Boolean).join('\n'),
-    domain: currentUrl || input.session.targetUrl,
-  }).filter((result) => (
-    (!input.domainOnly || result.item.scope === 'domain')
-    && !input.excludedIds?.has(result.item.id)
-  ));
-  if (!results.length) return { context: '', itemIds: [] as string[], domain: currentDomain };
-  markPersonalMemoryItemsUsed(results.map((result) => result.item.id));
-  appendLog(input.session, input.logPhase || 'memory:prompt', `已注入 ${results.length} 条个性化短记忆。`, {
-    details: {
-      currentDomain,
-      items: results.map((result) => ({
-        id: result.item.id,
-        scope: result.item.scope,
-        domain: result.item.domain,
-        type: result.item.type,
-        key: result.item.key,
-        score: result.score,
-        reasons: result.reasons,
-      })),
-    },
-    deferPersist: true,
-  });
-  return {
-    context: formatPersonalMemoryForPrompt(results),
-    itemIds: results.map((result) => result.item.id),
-    domain: currentDomain,
-  };
 }
 
 function queuePersonalMemoryExtraction(input: {
@@ -744,7 +696,7 @@ async function readFileForSession(
   if (!attachment) {
     return {
       ok: false,
-      actual: '未找到可读取文件。请使用对话附件的 attachmentId，或 downloadFile/generateMarkdownFile 返回的 Artifact ID。',
+      actual: '未找到可读取文件。请使用对话附件的 attachmentId，或 file 工具返回的 Artifact ID。',
     };
   }
   const result = await readBrowserChatAttachment({
@@ -883,7 +835,7 @@ function browserChatCredentialPrompt(credentials: ReturnType<typeof browserChatC
   if (!credentials.length) return '';
   return [
     '[后台已匹配的安全账号引用]',
-    ...credentials.map((item) => `- ${item.origin} / ${item.username}：用户名使用 keyboard.credentialRef="${item.usernameRef}"，密码使用 keyboard.credentialRef="${item.passwordRef}"。`),
+    ...credentials.map((item) => `- ${item.origin} / ${item.username}：用户名使用 interact({action:"type",credentialRef:"${item.usernameRef}"})，密码使用 interact({action:"type",credentialRef:"${item.passwordRef}"})。`),
     '账号明文密码不会提供给模型。只能在当前页面 origin 与上述 origin 完全一致时使用 credentialRef；不得把凭据写入 text、日志或最终回复。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
   ].join('\n');
 }
@@ -3021,7 +2973,7 @@ function readBrowserChatSubagent(sessionId: string): BrowserChatSubagentReader {
           uuid: record.uuid,
           title: record.title,
           status: record.status,
-          error: '该子 Agent 仍在执行中；spawnSubagents 的批次屏障尚未完成。',
+          error: '该子 Agent 仍在执行中；subagent action=spawn 的批次屏障尚未完成。',
         }),
       };
     }
@@ -3139,7 +3091,7 @@ async function executeBrowserChatSubagentBatch(input: {
             : '主会话当前没有可复制的浏览器登录态；如果目标页面要求登录，请明确返回登录阻塞，不要猜测页面内容。',
           '你运行在无头浏览器中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要等待用户操作隐藏页面；请明确报告阻塞证据并把该步骤交回主 Agent。',
           'domChanges.overflow 只表示 MutationObserver 变更队列容量溢出，绝不表示页面下方还有内容。不得因此滚动页面，也不得把“滚动到底部”写入任何任务。只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容不在 full/text 完整 DOM 中时，才允许滚动。',
-          'takeSnapshot 的 full 与 text 都读取已加载页面的完整 DOM；text 是 full 中全部文本的去重阅读视图，不是当前视窗。nextCursor 只是冻结结果的字符分页，不得为分页而滚动。',
+          'inspect action=capture 的 full 与 text 都读取已加载页面的完整 DOM；text 是 full 中全部文本的去重阅读视图，不是当前视窗。nextCursor 只是冻结结果的字符分页，不得为分页而滚动。',
           summaryGuidanceChars
             ? `完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。配置建议将篇幅控制在约 ${summaryGuidanceChars} 个字符以内，但这不是截断上限；如果完整证据需要更长内容，必须完整返回。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。`
             : '完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。',
@@ -3326,7 +3278,7 @@ async function executeBrowserChatSubagentBatch(input: {
       })),
       summary: `${completedCount}/${results.length} 个子 Agent 完成，${partialCount} 个失败分支保留了部分有效内容；任一失败均未中止其他分支。`,
       batchId,
-      next: '使用 readSubagent({ uuid }) 每次读取一个结果；如需读取其他结果，必须在后续模型步骤逐个调用。',
+      next: '使用 subagent({ action: "read", uuid }) 每次读取一个结果；如需读取其他结果，必须在后续模型步骤逐个调用。',
     }),
   };
 }
@@ -3491,15 +3443,7 @@ async function runBrowserChatMessage(
       assertTurnActive();
       await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      const recalledMemoryIds = new Set<string>();
-      const recalledDomains = new Set<string>();
-      const initialPersonalMemory = browserChatPersonalMemoryContext({ session, browser, text, modelText });
-      initialPersonalMemory.itemIds.forEach((id) => recalledMemoryIds.add(id));
-      if (initialPersonalMemory.domain) recalledDomains.add(initialPersonalMemory.domain);
-      const skillContext = [
-        initialPersonalMemory.context,
-        formatSkillsForPrompt(skills),
-      ].filter(Boolean).join('\n\n');
+      const skillContext = formatSkillsForPrompt(skills);
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
       const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
       const credentialContext = browserChatCredentialContext(session, browserChatResourceSeeds(session, modelText), modelText);
@@ -3517,24 +3461,6 @@ async function runBrowserChatMessage(
         skillContext,
         resolveCredential: credentialContext.resolveCredential,
         credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
-        getDynamicSkillContext: () => {
-          const currentUrl = browserChatMemoryUrl(browser, session);
-          const currentDomain = normalizePersonalMemoryDomain(currentUrl || session.targetUrl);
-          if (!currentDomain || recalledDomains.has(currentDomain)) return '';
-          const recalled = browserChatPersonalMemoryContext({
-            session,
-            browser,
-            text,
-            modelText,
-            currentUrl,
-            domainOnly: true,
-            excludedIds: recalledMemoryIds,
-            logPhase: 'memory:prompt:domain-refresh',
-          });
-          recalledDomains.add(currentDomain);
-          recalled.itemIds.forEach((id) => recalledMemoryIds.add(id));
-          return recalled.context;
-        },
         abortSignal: abortController.signal,
         shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
         requestToolConfirmation: session.safetyMode === 'strict'

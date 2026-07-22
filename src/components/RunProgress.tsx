@@ -112,24 +112,18 @@ const legacyToolDefinitions: ToolDefinition[] = [
     fields: [{ key: 'url', label: '目标地址', kind: 'text', placeholder: 'https://example.com' }],
   },
   {
-    name: 'takeSnapshot',
+    name: 'inspect',
     label: '获取页面快照',
     mode: 'dom',
-    template: { mode: 'actionable' },
+    template: { action: 'capture', mode: 'full' },
     fields: [
-      { key: 'mode', label: '快照视图', kind: 'select', options: [{ label: '可操作节点', value: 'actionable' }, { label: '完整结构', value: 'full' }, { label: '页面文本', value: 'text' }, { label: '交互间变更', value: 'changes' }] },
+      { key: 'action', label: '操作', kind: 'select', options: [{ label: '读取快照', value: 'capture' }, { label: '搜索快照', value: 'search' }, { label: '检查 HTTP 请求', value: 'httpRequests' }] },
+      { key: 'mode', label: '快照视图', kind: 'select', options: [{ label: '完整结构', value: 'full' }, { label: '页面文本', value: 'text' }, { label: '交互间变更', value: 'changes' }] },
       { key: 'cursor', label: '继续游标', kind: 'text' },
-    ],
-  },
-  {
-    name: 'searchSnapshot',
-    label: '搜索页面快照',
-    mode: 'dom',
-    template: { query: '', roles: [], limit: 20 },
-    fields: [
       { key: 'query', label: '搜索内容', kind: 'text' },
       { key: 'roles', label: '角色筛选', kind: 'stringList', helper: '每行一个无障碍角色，例如 button、link、textbox。' },
       { key: 'limit', label: '结果数量', kind: 'number' },
+      { key: 'ids', label: '请求 ID', kind: 'stringList', helper: '每行一个 mode=changes 返回的请求 ID；留空则列出近期请求。' },
     ],
   },
   {
@@ -211,26 +205,22 @@ const legacyToolDefinitions: ToolDefinition[] = [
     fields: [],
   },
   {
-    name: 'downloadFile',
-    label: '下载文件',
+    name: 'file',
+    label: '文件操作',
     mode: 'shared',
-    template: { url: '', fileName: '' },
+    template: { action: 'download', url: '', fileName: '' },
     fields: [
+      { key: 'action', label: '操作', kind: 'select', options: [{ label: '下载', value: 'download' }, { label: '生成 Markdown', value: 'writeMarkdown' }, { label: '读取', value: 'read' }] },
       { key: 'url', label: '文件地址', kind: 'text' },
       { key: 'path', label: '相对路径', kind: 'text' },
       { key: 'urlOrPath', label: '地址或路径', kind: 'text' },
       { key: 'fileName', label: '文件名', kind: 'text' },
-    ],
-  },
-  {
-    name: 'generateMarkdownFile',
-    label: '生成 Markdown 文件',
-    mode: 'shared',
-    template: { fileName: '', title: '', content: '' },
-    fields: [
-      { key: 'fileName', label: '文件名', kind: 'text' },
       { key: 'title', label: '标题', kind: 'text' },
       { key: 'content', label: 'Markdown 内容', kind: 'textarea' },
+      { key: 'attachmentId', label: '附件 ID', kind: 'text' },
+      { key: 'artifactId', label: '产物 ID', kind: 'text' },
+      { key: 'offset', label: '读取偏移', kind: 'number' },
+      { key: 'limit', label: '读取上限', kind: 'number' },
     ],
   },
   {
@@ -244,17 +234,6 @@ const legacyToolDefinitions: ToolDefinition[] = [
       { key: 'action', label: '状态摘要', kind: 'textarea' },
       { key: 'expected', label: '预期', kind: 'textarea' },
       { key: 'actual', label: '实际证据', kind: 'textarea' },
-    ],
-  },
-  {
-    name: 'selectReferenceScreenshots',
-    label: '选择参考截图',
-    mode: 'shared',
-    template: { ids: [], selectionReason: '' },
-    fields: [
-      { key: 'ids', label: '截图 ID', kind: 'stringList', helper: '每行一个截图 ID。' },
-      { key: 'selectionReason', label: '选择原因', kind: 'textarea' },
-      { key: 'sameInterfaceGroup', label: '同界面分组', kind: 'text' },
     ],
   },
   {
@@ -279,34 +258,55 @@ const toolStatusOptions = [
 ];
 
 const toolDefinitions: ToolDefinition[] = legacyToolDefinitions.flatMap((definition) => {
-  if (definition.name === 'waitForPage' || definition.name === 'switchTab') return [];
+  if (definition.name === 'waitForPage' || definition.name === 'switchTab' || definition.name === 'listTabs' || definition.name === 'getHttpRequests') return [];
   if (definition.name === 'openPage') {
     return [{
       ...definition,
-      name: 'page',
-      label: '页面操作',
+      name: 'browser',
+      label: '浏览器操作',
       template: { action: 'open', target: 'current', url: '' },
       fields: [
-        { key: 'action', label: '操作', kind: 'select', options: [{ label: '打开页面', value: 'open' }, { label: '等待页面', value: 'wait' }] },
+        { key: 'action', label: '操作', kind: 'select', options: [{ label: '打开页面', value: 'open' }, { label: '等待页面', value: 'wait' }, { label: '列出标签页', value: 'listTabs' }, { label: '切换标签页', value: 'switchTab' }] },
         { key: 'url', label: '目标地址', kind: 'text', placeholder: 'https://example.com' },
         { key: 'target', label: '打开位置', kind: 'select', options: [{ label: '当前标签页', value: 'current' }, { label: '新标签页', value: 'new' }] },
         { key: 'ms', label: '等待毫秒', kind: 'number' },
-      ],
-    }];
-  }
-  if (definition.name === 'listTabs') {
-    return [{
-      ...definition,
-      name: 'tab',
-      label: '标签页操作',
-      template: { action: 'list', index: 0 },
-      fields: [
-        { key: 'action', label: '操作', kind: 'select', options: [{ label: '列出标签页', value: 'list' }, { label: '切换标签页', value: 'switch' }] },
         { key: 'index', label: '标签页序号', kind: 'number' },
       ],
     }];
   }
-  if (definition.name === 'searchSnapshot') {
+  if (definition.name === 'mouse') {
+    return [{
+      ...definition,
+      name: 'interact',
+      label: '页面交互',
+      template: { action: 'click', uid: '' },
+      fields: [
+        { key: 'action', label: '操作', kind: 'select', options: [
+          { label: '点击', value: 'click' }, { label: '移动 / 悬停', value: 'move' }, { label: '拖拽', value: 'drag' }, { label: '滚动', value: 'scroll' }, { label: '滚入可视区', value: 'scrollIntoView' },
+          { label: '输入文本', value: 'type' }, { label: '单个按键', value: 'press' }, { label: '快捷键', value: 'shortcut' }, { label: '选择原生下拉选项', value: 'selectOption' },
+        ] },
+        { key: 'uid', label: '目标 UID', kind: 'text' },
+        { key: 'x_thousandth', label: '截图横坐标（千分比）', kind: 'number' },
+        { key: 'y_thousandth', label: '截图纵坐标（千分比）', kind: 'number' },
+        { key: 'toUid', label: '拖拽终点 UID', kind: 'text' },
+        { key: 'toX_thousandth', label: '终点横坐标（千分比）', kind: 'number' },
+        { key: 'toY_thousandth', label: '终点纵坐标（千分比）', kind: 'number' },
+        { key: 'button', label: '鼠标按键', kind: 'select', options: [{ label: '左键', value: 'left' }, { label: '右键', value: 'right' }, { label: '中键', value: 'middle' }] },
+        { key: 'clickCount', label: '点击次数', kind: 'number' },
+        { key: 'deltaX', label: '横向滚动量', kind: 'number' },
+        { key: 'deltaY', label: '纵向滚动量', kind: 'number' },
+        { key: 'text', label: '输入内容', kind: 'textarea' },
+        { key: 'key', label: '按键', kind: 'select', options: keyFieldOptions },
+        { key: 'keys', label: '快捷键组合', kind: 'stringList', helper: '每行一个按键，例如 Control、A。' },
+        { key: 'replace', label: '替换原内容', kind: 'boolean' },
+        { key: 'followByEnter', label: '输入后按 Enter', kind: 'boolean' },
+        { key: 'value', label: '下拉选项值', kind: 'text' },
+        { key: 'label', label: '下拉选项显示文本', kind: 'text' },
+      ],
+    }];
+  }
+  if (definition.name === 'keyboard') return [];
+  if (definition.name === 'inspect') {
     return [{
       ...definition,
       template: { ...definition.template, tag: '' },

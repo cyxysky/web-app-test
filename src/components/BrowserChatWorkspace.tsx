@@ -832,7 +832,7 @@ function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: St
       }
 
       // A same-name fallback is valid only when it is unambiguous. Showing a
-      // real result from another takeSnapshot is worse than showing the raw
+      // real result from another snapshot is worse than showing the raw
       // model request without a result: it makes debugging impossible.
       if (sameNameCandidates.length === 1) {
         const [detail] = sameNameCandidates;
@@ -900,23 +900,19 @@ function summarizeToolFields(fields: unknown) {
 
 function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
-    getHttpRequests: '检查请求',
+    browser: '浏览器导航',
+    inspect: '页面检查',
+    interact: '页面交互',
     keyboard: '键盘操作',
     listTabs: '扫描标签页',
-    manageVisualContext: '整理视觉上下文',
     mouse: '鼠标操作',
     openPage: '导航页面',
-    page: '页面操作',
-    readSubagent: '读取子 Agent',
     reportState: '确认状态',
-    searchSnapshot: '搜索页面快照',
     selectOption: '选择下拉选项',
-    selectReferenceScreenshots: '引用截图',
-    spawnSubagents: '并行子 Agent',
+    subagent: '子 Agent',
     switchTab: '切换标签',
-    tab: '标签页操作',
     takeScreenshot: '截屏取证',
-    takeSnapshot: '读取页面快照',
+    file: '文件操作',
     waitForHumanVerification: '等待人工验证',
     waitForPage: '等待页面稳定',
   };
@@ -943,17 +939,24 @@ function browserChatToolMeta(name: string, input: unknown) {
   if (!record) return toolStringValue(input);
 
   const lower = name.toLowerCase();
+  if (name === 'interact') {
+    if (record.action === 'selectOption') return [toolInputValue(record, ['uid']), toolInputValue(record, ['value', 'label'])].filter(Boolean).join(' · ');
+    return [toolInputValue(record, ['action']), toolInputValue(record, ['text', 'key', 'uid', 'x_thousandth'])].filter(Boolean).join(' · ');
+  }
   if (name === 'keyboard') return [toolInputValue(record, ['action']), toolInputValue(record, ['text', 'key', 'uid'])].filter(Boolean).join(' · ');
   if (name === 'selectOption') return [toolInputValue(record, ['uid']), toolInputValue(record, ['value', 'label'])].filter(Boolean).join(' · ');
   if (name === 'openPage') return toolInputValue(record, ['url']);
-  if (name === 'page') {
+  if (name === 'browser') {
     if (record.action === 'wait') return toolInputValue(record, ['ms']) || '等待页面稳定';
+    if (record.action === 'listTabs') return '列出全部标签页';
+    if (record.action === 'switchTab') return toolInputValue(record, ['index']);
     const target = record.target === 'new' ? '新标签页' : '当前标签页';
     return [target, toolInputValue(record, ['url'])].filter(Boolean).join(' · ');
   }
-  if (name === 'readSubagent') return toolInputValue(record, ['uuid']);
+  if (name === 'subagent') return record.action === 'spawn'
+    ? (Array.isArray(record.tasks) ? `${record.tasks.length} 个任务` : '')
+    : toolInputValue(record, ['uuid']);
   if (name === 'switchTab') return toolInputValue(record, ['index']);
-  if (name === 'tab') return record.action === 'switch' ? toolInputValue(record, ['index']) : '列出全部标签页';
   if (name === 'waitForPage') return toolInputValue(record, ['ms']);
   if (name === 'waitForHumanVerification') return toolInputValue(record, ['maxMs']);
   if (name === 'mouse') {
@@ -962,15 +965,13 @@ function browserChatToolMeta(name: string, input: unknown) {
     const deltaY = toolInputValue(record, ['deltaY']);
     return [action, target, deltaY ? `Y ${deltaY}` : ''].filter(Boolean).join(' · ');
   }
-  if (name === 'takeSnapshot') return toolInputValue(record, ['mode', 'cursor']);
-  if (name === 'searchSnapshot') return toolInputValue(record, ['tag', 'query']);
-  if (name === 'takeScreenshot') return toolInputValue(record, ['capture']);
-  if (name === 'selectReferenceScreenshots') {
-    const ids = Array.isArray(record.ids) ? record.ids : [];
-    return ids.length ? `${ids.length} 张` : '';
+  if (name === 'inspect') {
+    if (record.action === 'search') return toolInputValue(record, ['tag', 'query']);
+    if (record.action === 'httpRequests') return toolInputValue(record, ['ids']) || '检查近期请求';
+    return toolInputValue(record, ['mode', 'cursor']);
   }
-  if (name === 'manageVisualContext') return toolInputValue(record, ['action', 'manageReason']);
-  if (name === 'spawnSubagents') return Array.isArray(record.tasks) ? `${record.tasks.length} 个任务` : '';
+  if (name === 'takeScreenshot') return toolInputValue(record, ['capture']);
+  if (name === 'file') return toolInputValue(record, ['action', 'fileName', 'artifactId', 'attachmentId']);
   if (name === 'reportState') return toolInputValue(record, ['action', 'actual', 'status']);
   if (lower.includes('fill')) return summarizeToolFields(record.fields) || toolInputValue(record, ['text', 'content', 'value']);
   if (lower.includes('click') || lower.includes('hover') || lower.includes('drag')) {
@@ -986,6 +987,7 @@ function BrowserChatToolIcon({ name }: { name: string }) {
   if (lower.includes('subagent')) return <Waypoints size={13} />;
   if (lower.includes('screenshot') || lower.includes('capture')) return <GalleryHorizontalEnd size={13} />;
   if (lower.includes('snapshot') || lower.includes('context')) return <Braces size={13} />;
+  if (lower.includes('interact')) return <MousePointer2 size={13} />;
   if (lower.includes('type') || lower.includes('fill')) return <PencilLine size={13} />;
   if (lower.includes('press') || lower.includes('key')) return <CornerDownLeft size={13} />;
   if (lower.includes('clickat') || lower.includes('coordinate')) return <Compass size={13} />;
@@ -2508,11 +2510,11 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
           : toolUserActionForTool(logs, step.index, tool.name, tool.input);
         return (
           <div
-            className={`browser-chat-tool-call${tool.name === 'spawnSubagents' ? ' has-subagents' : ''}`}
+            className={`browser-chat-tool-call${tool.name === 'subagent' && toolInputValue(asRecord(tool.input), ['action']) === 'spawn' ? ' has-subagents' : ''}`}
             key={`${step.index}-${toolIndex}-${tool.name}`}
           >
             {tool.reason ? <p className="browser-chat-tool-reason">{tool.reason}</p> : null}
-            {tool.name === 'spawnSubagents' ? (
+            {tool.name === 'subagent' && toolInputValue(asRecord(tool.input), ['action']) === 'spawn' ? (
               <BrowserChatSubagentToolDisclosure
                 cardContent={(
                   <>
@@ -2681,10 +2683,10 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
               );
               return (
                 <div
-                  className={`browser-chat-tool-call${tool.name === 'spawnSubagents' ? ' has-subagents' : ''}`}
+                  className={`browser-chat-tool-call${tool.name === 'subagent' && toolInputValue(asRecord(tool.input), ['action']) === 'spawn' ? ' has-subagents' : ''}`}
                   key={`${tool.id}-${index}`}
                 >
-                  {tool.name === 'spawnSubagents' ? (
+                  {tool.name === 'subagent' && toolInputValue(asRecord(tool.input), ['action']) === 'spawn' ? (
                     <BrowserChatSubagentToolDisclosure
                       cardContent={card}
                       className={stateClass}

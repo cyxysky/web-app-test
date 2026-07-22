@@ -18,7 +18,7 @@ test('readStoredSnapshot requires an explicit refreshed store entry', () => {
   const result = readStoredSnapshot(store, 'run-1');
 
   assert.equal(result.ok, false);
-  assert.match(String(result.actual), /takeSnapshot/);
+  assert.match(String(result.actual), /inspect/);
   assert.equal(store.size, 0);
 });
 
@@ -32,8 +32,8 @@ test('runtime observation cursors round-trip generation view and index', () => {
 test('storeRuntimeObservation advances generation only when storing a new page state', () => {
   const store: RuntimeObservationStore = new Map();
 
-  const first = storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'first page');
-  const second = storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'second page');
+  const first = storeRuntimeObservation(store, 'run-1', 'inspect', 'first page');
+  const second = storeRuntimeObservation(store, 'run-1', 'inspect', 'second page');
   const read = readStoredSnapshot(store, 'run-1', 0, 10000);
 
   assert.equal(first.generation, 1);
@@ -47,7 +47,7 @@ test('storeRuntimeObservation advances generation only when storing a new page s
 test('storeRuntimeObservation exposes previous-to-current changes view', () => {
   const store: RuntimeObservationStore = new Map();
 
-  const first = storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'first page', {
+  const first = storeRuntimeObservation(store, 'run-1', 'inspect', 'first page', {
     defaultType: 'actionable',
     actionable: 'uid=1 button "Open"\nuid=2 textbox "Name" value="old"',
     text: 'Old value\nShared text',
@@ -59,7 +59,7 @@ test('storeRuntimeObservation exposes previous-to-current changes view', () => {
   assert.equal(firstRead.ok, true);
   assert.match(String(firstRead.actual), /baseline snapshot/);
 
-  const second = storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'second page', {
+  const second = storeRuntimeObservation(store, 'run-1', 'inspect', 'second page', {
     defaultType: 'actionable',
     actionable: 'uid=1 button "Open"\nuid=2 textbox "Name" value="new"\nuid=3 button "Save"',
     text: 'New value\nShared text',
@@ -81,10 +81,10 @@ test('storeRuntimeObservation exposes previous-to-current changes view', () => {
 test('clone and restore keep observation stores isolated', () => {
   const source: RuntimeObservationStore = new Map();
   const target: RuntimeObservationStore = new Map();
-  storeRuntimeObservation(source, 'run-1', 'takeSnapshot', 'source page');
+  storeRuntimeObservation(source, 'run-1', 'inspect', 'source page');
 
   const cloned = cloneRuntimeObservationStore(source);
-  storeRuntimeObservation(source, 'run-1', 'takeSnapshot', 'changed page');
+  storeRuntimeObservation(source, 'run-1', 'inspect', 'changed page');
   restoreRuntimeObservationStore(target, cloned);
 
   const read = readStoredSnapshot(target, 'run-1', 0, 10000);
@@ -96,20 +96,20 @@ test('clone and restore keep observation stores isolated', () => {
 
 test('invalidated observations cannot be reused without a refresh', () => {
   const store: RuntimeObservationStore = new Map();
-  storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'first page', {
+  storeRuntimeObservation(store, 'run-1', 'inspect', 'first page', {
     defaultType: 'actionable',
     actionable: 'uid=1 button "Open"',
     text: 'First page',
   });
 
-  invalidateRuntimeObservation(store, 'run-1', 'mouse');
+  invalidateRuntimeObservation(store, 'run-1', 'interact');
   const staleRead = readStoredSnapshot(store, 'run-1', 0, 10000, 'actionable');
 
   assert.equal(staleRead.ok, false);
   assert.match(String(staleRead.actual), /stale/);
-  assert.match(String(staleRead.actual), /mouse/);
+  assert.match(String(staleRead.actual), /interact/);
 
-  storeRuntimeObservation(store, 'run-1', 'takeSnapshot', 'second page', {
+  storeRuntimeObservation(store, 'run-1', 'inspect', 'second page', {
     defaultType: 'actionable',
     actionable: 'uid=2 button "Save"',
     text: 'Second page',
@@ -135,27 +135,27 @@ test('compactStaleSnapshotMessages stales snapshot results before browser action
   const messages = [
     {
       role: 'assistant',
-      content: [{ type: 'tool-call', toolCallId: 'read-1', toolName: 'takeSnapshot', input: { mode: 'actionable' } }],
+      content: [{ type: 'tool-call', toolCallId: 'read-1', toolName: 'inspect', input: { action: 'capture', mode: 'full' } }],
     },
     {
       role: 'tool',
-      content: [{ type: 'tool-result', toolCallId: 'read-1', toolName: 'takeSnapshot', output: { type: 'json', value: { ok: true, actual: 'old uid=1' } } }],
+      content: [{ type: 'tool-result', toolCallId: 'read-1', toolName: 'inspect', output: { type: 'json', value: { ok: true, actual: 'old uid=1' } } }],
     },
     {
       role: 'assistant',
-      content: [{ type: 'tool-call', toolCallId: 'search-1', toolName: 'searchSnapshot', input: { query: 'Open' } }],
+      content: [{ type: 'tool-call', toolCallId: 'search-1', toolName: 'inspect', input: { action: 'search', query: 'Open' } }],
     },
     {
       role: 'tool',
-      content: [{ type: 'tool-result', toolCallId: 'search-1', toolName: 'searchSnapshot', output: { type: 'json', value: { ok: true, actual: 'match uid=1' } } }],
+      content: [{ type: 'tool-result', toolCallId: 'search-1', toolName: 'inspect', output: { type: 'json', value: { ok: true, actual: 'match uid=1' } } }],
     },
     {
       role: 'assistant',
-      content: [{ type: 'tool-call', toolCallId: 'click-1', toolName: 'mouse', input: { action: 'click', uid: '1' } }],
+      content: [{ type: 'tool-call', toolCallId: 'click-1', toolName: 'interact', input: { action: 'click', uid: '1' } }],
     },
     {
       role: 'tool',
-      content: [{ type: 'tool-result', toolCallId: 'click-1', toolName: 'mouse', output: { type: 'json', value: { ok: true, actual: 'clicked' } } }],
+      content: [{ type: 'tool-result', toolCallId: 'click-1', toolName: 'interact', output: { type: 'json', value: { ok: true, actual: 'clicked' } } }],
     },
   ];
 

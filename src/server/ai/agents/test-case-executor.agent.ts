@@ -11,12 +11,8 @@ import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type
 import { richTextToPlainText } from '@/lib/rich-text';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 import {
-  browserKeyboardToolDescription,
-  browserKeyboardToolShape,
-  browserMouseToolDescription,
-  browserMouseToolShape,
-  browserSelectOptionToolDescription,
-  browserSelectOptionToolShape,
+  browserInteractToolDescription,
+  browserInteractToolShape,
 } from './browser-input-tool-schema';
 import {
   compactStaleSnapshotMessages,
@@ -148,7 +144,7 @@ type SelectedScreenshotReference = ScreenshotReference & {
 
 const codexRuntimeObjectSchema = z.object({
   type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op status update.'),
-  message: z.string().nullable().optional().describe('Optional short Chinese progress text that must match the selected tool: takeScreenshot reads pixels; takeSnapshot reads the accessibility tree.'),
+  message: z.string().nullable().optional().describe('Optional short Chinese progress text that must match the selected tool: takeScreenshot reads pixels; inspect reads the accessibility tree.'),
   params: z.object({
     reason: z.string().nullable().optional(),
     url: z.string().nullable().optional(),
@@ -358,10 +354,19 @@ function runtimeRequestConsecutiveFailureLimit(browserChatMode: boolean) {
   return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, browserChatMode ? 3 : 2, 1, 10);
 }
 
-function userFacingToolResult(name: string, result?: BrowserActionResult, _max = 360) {
+function fileArtifactAction(name: string, input?: unknown) {
+  if (name === 'downloadFile') return 'download';
+  if (name === 'generateMarkdownFile') return 'writeMarkdown';
+  if (name !== 'file' || !input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const action = (input as Record<string, unknown>).action;
+  return action === 'download' || action === 'writeMarkdown' ? action : undefined;
+}
+
+function userFacingToolResult(name: string, result?: BrowserActionResult, _max = 360, input?: unknown) {
   void _max;
   if (!result) return undefined;
-  if (name === 'downloadFile' || name === 'generateMarkdownFile') return formatFileArtifactResult(name, result.actual);
+  const fileResult = formatFileArtifactResult(fileArtifactAction(name, input), result.actual);
+  if (fileResult) return fileResult;
   return result.actual;
 }
 
@@ -369,11 +374,12 @@ function compactToolResultForModel(
   name: string,
   result: BrowserActionResult,
   _observationStore?: RuntimeObservationStore,
+  input?: unknown,
 ): BrowserActionResult {
   void _observationStore;
   const modelResult = result;
   if (!modelResult.actual) return modelResult;
-  const fileResult = modelResult.ok ? formatFileArtifactResult(name, modelResult.actual) : undefined;
+  const fileResult = modelResult.ok ? formatFileArtifactResult(fileArtifactAction(name, input), modelResult.actual) : undefined;
   if (fileResult) return { ...modelResult, actual: fileResult };
   return modelResult;
 }
@@ -544,7 +550,7 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       input,
       reason,
       ok: trace.result?.ok,
-      result: userFacingToolResult(trace.name, trace.result, 360),
+      result: userFacingToolResult(trace.name, trace.result, 360, trace.input),
       contextBefore: trace.contextBefore,
       contextAfter: trace.contextAfter,
       visualAfter: trace.visualAfter,
@@ -574,7 +580,7 @@ function screenshotPhaseLabel(phase: ScreenshotReference['phase']) {
 
 function screenshotReferenceGroupOf(step: StepExecutionResult) {
   const scrollTool = (step.tools || []).find((toolCall) => {
-    if (toolCall.name !== 'mouse') return false;
+    if (toolCall.name !== 'interact' && toolCall.name !== 'mouse') return false;
     const input = toolCall.input && typeof toolCall.input === 'object' && !Array.isArray(toolCall.input)
       ? toolCall.input as Record<string, unknown>
       : {};
@@ -637,7 +643,7 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
   if (!recent.length) return '[none]';
   return recent.map((trace, index) => {
     const { reason } = splitToolInputAndReason(trace.input);
-    const fileResult = trace.result?.ok ? formatFileArtifactResult(trace.name, trace.result.actual) : undefined;
+    const fileResult = trace.result?.ok ? formatFileArtifactResult(fileArtifactAction(trace.name, trace.input), trace.result.actual) : undefined;
     const status = !trace.result
       ? 'running'
       : trace.result.ok
@@ -706,7 +712,7 @@ function buildContinuationSummaryPrompt(input: {
     '{ "goal": string, "completed": string[], "currentPage": string, "confirmedFacts": string[], "negativeResults": string[], "failedAttempts": string[], "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
     '',
     'Rules:',
-    '- Preserve that only UIDs from the latest takeSnapshot and coordinates from the latest viewport takeScreenshot are valid for interaction.',
+    '- Preserve that only UIDs from the latest inspect action=capture and coordinates from the latest viewport takeScreenshot are valid for interaction.',
     '- Preserve tool results that materially affect the next action.',
     '- Preserve current URL/page state, blockers, manual verification state, and user constraints.',
     '- Preserve every completed search/query and its observed result. If a query had no result, put the exact query and outcome in negativeResults; do not schedule that same query again unless the user changed it or new evidence contradicts it.',
@@ -892,7 +898,7 @@ function sanitizeNextGoal(value: unknown) {
       .replace(/(?:点击|双击|右键|拖拽|悬停|输入|按下|滚动|选择)\s*[“"']?([^，。；;]*)[”"']?/g, '完成$1')
       .replace(/候选(?:ID|id|编号)\s*[:：]?\s*\d+/gi, '当前截图中的对应候选')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的对应目标')
-      .replace(/\b(?:mouse|keyboard)\s*\([^)]*\)/gi, '根据当前页面选择合适工具'),
+      .replace(/\b(?:interact|mouse|keyboard)\s*\([^)]*\)/gi, '根据当前页面选择合适工具'),
     220,
   );
 }
@@ -901,7 +907,7 @@ function sanitizeCurrentState(value: unknown) {
   if (typeof value !== 'string') return '';
   return sanitizeHistoricalToolText(
     value
-      .replace(/\b(?:mouse|keyboard)\s*\([^)]*\)/gi, '已执行页面操作')
+      .replace(/\b(?:interact|mouse|keyboard)\s*\([^)]*\)/gi, '已执行页面操作')
       .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的目标'),
     260,
   );
@@ -947,7 +953,7 @@ function summarizeTraceForMemory(trace: ToolTrace) {
     typeof input.targetVisual === 'string' ? input.targetVisual : '',
     typeof input.expected === 'string' ? input.expected : '',
   ].map((item) => item.trim()).find((item): item is string => Boolean(item));
-  const displayResult = userFacingToolResult(trace.name, trace.result, trace.result?.ok ? 160 : 180);
+  const displayResult = userFacingToolResult(trace.name, trace.result, trace.result?.ok ? 160 : 180, trace.input);
   const result = !trace.result
     ? 'running'
     : trace.result.ok
@@ -962,7 +968,7 @@ function summarizeTraceForMemory(trace: ToolTrace) {
 function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolTrace, sourceStep?: number) {
   void sourceStep;
   const next: RuntimeWorkingMemory = { ...memory };
-  const displayResult = userFacingToolResult(trace.name, trace.result, 400);
+  const displayResult = userFacingToolResult(trace.name, trace.result, 400, trace.input);
   const resultText = sanitizeHistoricalToolText(displayResult || '', 400);
   next.lastAction = summarizeTraceForMemory(trace);
   next.lastResult = concise(displayResult || trace.result?.actual || '工具调用已开始，正在等待页面反馈。', 240);
@@ -971,7 +977,7 @@ function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolT
     next.currentState = concise(`${trace.name}: ${resultText}`, 260);
   }
   if (trace.result && !trace.result.ok) next.blockers = Array.from(new Set([...next.blockers, concise(trace.result.actual, 220)])).slice(-8);
-  if (trace.name === 'mouse' && trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input) && (trace.input as Record<string, unknown>).action === 'scroll') {
+  if ((trace.name === 'interact' || trace.name === 'mouse') && trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input) && (trace.input as Record<string, unknown>).action === 'scroll') {
     next.phase = '正在查看滚动区域或长页面内容';
     next.scrollSummary = concise([next.scrollSummary, resultText || trace.result?.actual].filter(Boolean).join('；'), 600);
   } else if (trace.name === 'reportState') {
@@ -1307,9 +1313,22 @@ function makeBrowserTools(
     }).optional(),
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
-  const takeSnapshotInput = browserToolInput({
-    cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by the prior takeSnapshot page. When set, mode must match the prior page.'),
-    mode: z.enum(['full', 'text', 'changes']).default('full').describe('full reads the complete loaded semantic DOM; text reads all text from that same complete full DOM, including offscreen content; changes reads the inter-action journal.'),
+  const inspectInput = browserToolInput({
+    action: z.enum(['capture', 'search', 'httpRequests']).default('capture').describe('capture reads or pages the semantic DOM baseline; search queries the frozen baseline; httpRequests reads network requests.'),
+    cursor: z.string().min(1).optional().describe('Opaque nextCursor returned by an earlier inspect action=capture page. When set, mode must match that page.'),
+    mode: z.enum(['full', 'text', 'changes']).default('full').describe('For action=capture: full reads the complete loaded semantic DOM; text reads all text from that same complete full DOM, including offscreen content; changes reads the inter-action journal.'),
+    query: z.string().min(1).max(500).optional().describe('For action=search, the text to find in the frozen DOM baseline.'),
+    tag: z.string().min(1).max(80).optional().describe('For action=search, return matching HTML tags from the complete frozen DOM baseline.'),
+    roles: z.array(z.string().min(1)).max(20).optional().describe('For action=search, optionally restrict results to accessibility roles.'),
+    limit: z.number().int().min(1).max(100).optional().describe('For action=search, maximum number of results.'),
+    ids: z.array(z.string().min(1)).min(1).max(20).optional().describe('For action=httpRequests, optional request IDs from action=capture mode=changes. Omit to list recent requests.'),
+  }).superRefine((input, context) => {
+    if (input.action === 'search' && !input.query && !input.tag) context.addIssue({ code: z.ZodIssueCode.custom, message: 'action=search requires query or tag.' });
+  });
+  const interactInput = browserToolInput(browserInteractToolShape).superRefine((input, context) => {
+    if (input.action !== 'selectOption') return;
+    if (!input.uid?.trim()) context.addIssue({ code: z.ZodIssueCode.custom, message: 'action=selectOption requires a fresh select uid.' });
+    if (!input.value?.trim() && !input.label?.trim()) context.addIssue({ code: z.ZodIssueCode.custom, message: 'action=selectOption requires value or label.' });
   });
 
   async function record(name: string, input: unknown, action: () => Promise<BrowserActionResult>) {
@@ -1337,8 +1356,8 @@ function makeBrowserTools(
       action,
     }).then((result) => {
       const inputRecord = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
-      const readOnlyMergedAction = (name === 'page' && inputRecord.action === 'wait')
-        || (name === 'tab' && inputRecord.action === 'list');
+      const readOnlyMergedAction = name === 'browser'
+        && (inputRecord.action === 'wait' || inputRecord.action === 'listTabs');
       if (runtimeObservationInvalidatingToolNames.has(name) && !readOnlyMergedAction) {
         // Action results carry their authoritative incremental delta in
         // domChanges. Snapshots remain explicit, server-side observations;
@@ -1347,14 +1366,14 @@ function makeBrowserTools(
           invalidateRuntimeObservation(referenceOptions?.observationStore, referenceOptions?.runId, name);
         }
       }
-      return compactToolResultForModel(name, result, referenceOptions?.observationStore);
+      return compactToolResultForModel(name, result, referenceOptions?.observationStore, input);
     });
   }
 
   const sharedTools = {
     ...(modelSupportsScreenshotInput() ? {
       takeScreenshot: tool({
-        description: 'Capture a visual screenshot and attach it to the next model request. The latest viewport screenshot can be targeted with mouse/keyboard x_thousandth and y_thousandth coordinates; fullPage screenshots are read-only evidence.',
+        description: 'Capture a visual screenshot and attach it to the next model request. The latest viewport screenshot can be targeted with interact x_thousandth and y_thousandth coordinates; fullPage screenshots are read-only evidence.',
         inputSchema: browserToolInput({
           capture: z.enum(['viewport', 'fullPage']).optional().describe('Screenshot size. Defaults to viewport; use fullPage only when the visual evidence is outside the current viewport.'),
         }),
@@ -1365,58 +1384,56 @@ function makeBrowserTools(
         )),
       }),
     } : {}),
-    page: tool({
-      description: 'Open a URL or wait for the current page. action=open supports the current tab or a new active tab; action=wait waits for page stability or the exact ms supplied.',
+    browser: tool({
+      description: 'Navigate and manage browser tabs. action=open opens a URL in the current or a new tab; action=wait waits for page stability or an exact duration; action=listTabs returns tabs; action=switchTab activates the supplied tab index.',
       inputSchema: browserToolInput({
-        action: z.enum(['open', 'wait']),
+        action: z.enum(['open', 'wait', 'listTabs', 'switchTab']),
         url: z.string().optional().describe('For action=open, the URL to open. Defaults to the test target URL.'),
         target: z.enum(['current', 'new']).optional().describe('For action=open, open in the current or a new tab. Defaults to current.'),
         ms: z.number().int().nonnegative().optional().describe('For action=wait, optional exact minimum wait duration.'),
+        index: z.number().int().nonnegative().optional().describe('For action=switchTab, index returned by action=listTabs.'),
+      }).superRefine((input, context) => {
+        if (input.action === 'switchTab' && typeof input.index !== 'number') context.addIssue({ code: z.ZodIssueCode.custom, message: 'action=switchTab requires index.' });
       }),
-      execute: (input) => record('page', input, () => input.action === 'wait'
-        ? (typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage())
-        : (input.target === 'new' ? session.openInNewTab(input.url || targetUrl) : session.open(input.url || targetUrl))),
+      execute: (input) => record('browser', input, () => {
+        if (input.action === 'wait') return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
+        if (input.action === 'listTabs') return session.listTabs();
+        if (input.action === 'switchTab') return session.switchTab(input.index ?? 0);
+        return input.target === 'new' ? session.openInNewTab(input.url || targetUrl) : session.open(input.url || targetUrl);
+      }),
     }),
-    mouse: tool({
-      description: browserMouseToolDescription,
-      inputSchema: browserToolInput(browserMouseToolShape),
-      execute: (input) => record('mouse', input, () => session.mouse({
-        action: input.action,
-        uid: input.uid,
-        xThousandth: input.x_thousandth,
-        yThousandth: input.y_thousandth,
-        toUid: input.toUid,
-        toXThousandth: input.toX_thousandth,
-        toYThousandth: input.toY_thousandth,
-        button: input.button,
-        clickCount: input.clickCount,
-        deltaX: input.deltaX,
-        deltaY: input.deltaY,
-      })),
-    }),
-    keyboard: tool({
-      description: browserKeyboardToolDescription,
-      inputSchema: browserToolInput(browserKeyboardToolShape),
-      execute: (input) => record('keyboard', input, () => session.keyboard({
-        action: input.action,
-        uid: input.uid,
-        xThousandth: input.x_thousandth,
-        yThousandth: input.y_thousandth,
-        text: input.text,
-        key: input.key,
-        keys: input.keys,
-        replace: input.replace,
-        followByEnter: input.followByEnter,
-      })),
-    }),
-    selectOption: tool({
-      description: browserSelectOptionToolDescription,
-      inputSchema: browserToolInput(browserSelectOptionToolShape),
-      execute: (input) => record('selectOption', input, () => session.selectOption({
-        uid: input.uid,
-        value: input.value,
-        label: input.label,
-      })),
+    interact: tool({
+      description: browserInteractToolDescription,
+      inputSchema: interactInput,
+      execute: (input) => record('interact', input, () => {
+        if (input.action === 'click' || input.action === 'move' || input.action === 'drag' || input.action === 'scroll' || input.action === 'scrollIntoView') {
+          return session.mouse({
+            action: input.action,
+            uid: input.uid,
+            xThousandth: input.x_thousandth,
+            yThousandth: input.y_thousandth,
+            toUid: input.toUid,
+            toXThousandth: input.toX_thousandth,
+            toYThousandth: input.toY_thousandth,
+            button: input.button,
+            clickCount: input.clickCount,
+            deltaX: input.deltaX,
+            deltaY: input.deltaY,
+          });
+        }
+        if (input.action === 'selectOption') return session.selectOption({ uid: input.uid || '', value: input.value, label: input.label });
+        return session.keyboard({
+          action: input.action,
+          uid: input.uid,
+          xThousandth: input.x_thousandth,
+          yThousandth: input.y_thousandth,
+          text: input.text,
+          key: input.key,
+          keys: input.keys,
+          replace: input.replace,
+          followByEnter: input.followByEnter,
+        });
+      }),
     }),
     waitForHumanVerification: tool({
       description: 'Wait while the user completes a visible CAPTCHA, login verification, or security check in the non-headless browser.',
@@ -1425,62 +1442,34 @@ function makeBrowserTools(
       }),
       execute: (input) => record('waitForHumanVerification', input, () => session.waitForManualVerification(input.maxMs)),
     }),
-    tab: tool({
-      description: 'List browser tabs or switch the active tab.',
-      inputSchema: browserToolInput({
-        action: z.enum(['list', 'switch']),
-        index: z.number().int().nonnegative().optional().describe('Required for action=switch.'),
+    inspect: tool({
+      description: 'Inspect the current browser state. action=capture creates a paged semantic DOM snapshot; action=search queries its frozen full baseline; action=httpRequests lists recent HTTP requests or returns details for IDs from capture mode=changes. Capture a baseline before searching.',
+      inputSchema: inspectInput,
+      execute: (input) => record('inspect', input, async () => {
+        if (input.action === 'httpRequests') return session.getCurrentTabHttpRequests({ ids: input.ids });
+        if (input.action === 'search') return session.searchSnapshot(input);
+        return referenceOptions?.takeSnapshot
+          ? referenceOptions.takeSnapshot({ cursor: input.cursor, mode: input.mode })
+          : { ok: false, actual: 'inspect action=capture is unavailable in this runtime.' };
       }),
-      execute: (input) => record('tab', input, () => input.action === 'list'
-        ? session.listTabs()
-        : typeof input.index === 'number'
-          ? session.switchTab(input.index)
-          : Promise.resolve({ ok: false, actual: 'tab action=switch requires index.' })),
     }),
-    getHttpRequests: tool({
-      description: 'Read HTTP requests for the current tab. Without ids, return recent request summaries. With ids from takeSnapshot({mode:"changes"}), return request body and readable response body for only those requests. Use this when an inter-action change journal lists a request that may explain a delayed UI result.',
+    file: tool({
+      description: 'Manage saved files. action=download saves a URL or page-relative path as an artifact. action=writeMarkdown creates a Markdown artifact. Return saved-file links in the final answer.',
       inputSchema: browserToolInput({
-        ids: z.array(z.string().min(1)).min(1).max(20).optional().describe('Optional request IDs listed by takeSnapshot({mode:"changes"}). Supplying IDs returns their request/response details.'),
+        action: z.enum(['download', 'writeMarkdown']).describe('download saves a remote file; writeMarkdown creates a Markdown file.'),
+        url: z.string().optional().describe('For action=download, an absolute URL. path or urlOrPath may be used instead.'),
+        path: z.string().optional().describe('For action=download, an origin-relative or page-relative path.'),
+        urlOrPath: z.string().optional().describe('For action=download, an absolute URL, origin-relative path, or page-relative path.'),
+        fileName: z.string().optional().describe('Optional saved file name.'),
+        title: z.string().optional().describe('For action=writeMarkdown, fallback file name.'),
+        content: z.string().optional().describe('For action=writeMarkdown, complete Markdown document content.'),
+      }).superRefine((input, context) => {
+        if (input.action === 'download' && !input.url && !input.path && !input.urlOrPath) context.addIssue({ code: z.ZodIssueCode.custom, message: 'action=download requires url, path, or urlOrPath.' });
+        if (input.action === 'writeMarkdown' && !input.content?.trim()) context.addIssue({ code: z.ZodIssueCode.custom, message: 'action=writeMarkdown requires content.' });
       }),
-      execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests({ ids: input.ids })),
-    }),
-    takeSnapshot: tool({
-      description: 'Capture a paged DOM observation. full covers the complete loaded DOM; text contains all text from that same full DOM, including offscreen content, not only the viewport. text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal and has no interactive UIDs. Default to mode=full. nextCursor pages one frozen result: continue with the same mode and exact cursor and never scroll for pagination. searchSnapshot, waiting, and asynchronous DOM mutations do not invalidate it; UI-affecting interactions and an explicit fresh takeSnapshot do.',
-      inputSchema: takeSnapshotInput,
-      execute: (input) => record('takeSnapshot', input, async () => (
-        referenceOptions?.takeSnapshot
-          ? referenceOptions.takeSnapshot(input)
-          : { ok: false, actual: 'takeSnapshot is unavailable in this runtime.' }
-      )),
-    }),
-    searchSnapshot: tool({
-      description: 'Purely search or read tags from the frozen full DOM baseline. query returns ranked matches; tag returns every element of that HTML tag. It never scrolls, consumes mutations, or invalidates pagination.',
-      inputSchema: browserToolInput({
-        query: z.string().min(1).max(500).optional(),
-        tag: z.string().min(1).max(80).optional(),
-        roles: z.array(z.string().min(1)).max(20).optional(),
-        limit: z.number().int().min(1).max(100).optional(),
-      }).refine((input) => Boolean(input.query || input.tag), { message: 'query or tag is required' }),
-      execute: (input) => record('searchSnapshot', input, () => session.searchSnapshot(input)),
-    }),
-    downloadFile: tool({
-      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, an origin-relative path starting with / resolved against the current page origin, or a page-relative path resolved against the current page directory. Use this when the user asks to download/save a file; include the returned download target as a clickable Markdown link in the final answer.',
-      inputSchema: browserToolInput({
-        url: z.string().optional().describe('Absolute download URL. If omitted, path or urlOrPath is used.'),
-        path: z.string().optional().describe('Download path. /files/a.pdf resolves against current page origin; report/a.pdf resolves against current page directory.'),
-        urlOrPath: z.string().optional().describe('Absolute URL, origin-relative path, or page-relative path to download.'),
-        fileName: z.string().optional().describe('Optional saved file name, including extension when known.'),
-      }),
-      execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
-    }),
-    generateMarkdownFile: tool({
-      description: 'Create a Markdown .md file in the configured local output directory or this run artifacts from complete Markdown content written by the AI. Use this when the user asks to generate/export/save a Markdown file, then include the returned Markdown download link exactly as a clickable Markdown link in the final answer.',
-      inputSchema: browserToolInput({
-        fileName: z.string().optional().describe('Optional Markdown file name. The .md extension is added when missing.'),
-        title: z.string().optional().describe('Optional title used as fallback file name.'),
-        content: z.string().min(1).describe('Complete Markdown file content to save.'),
-      }),
-      execute: (input) => record('generateMarkdownFile', input, () => generateMarkdownArtifact({ ...input, runId: referenceOptions?.runId })),
+      execute: (input) => record('file', input, () => input.action === 'download'
+        ? downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })
+        : generateMarkdownArtifact({ ...input, runId: referenceOptions?.runId })),
     }),
     reportState: tool({
       description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or a short textual status update is enough. This tool does not change the browser.',
@@ -1495,51 +1484,6 @@ function makeBrowserTools(
         ok: true,
         actual: `Reported state without browser action: ${input.actual}`,
       })),
-    }),
-    selectReferenceScreenshots: tool({
-      description: 'No-op context tool. Select previous screenshot reference ids from Available previous screenshot references so those images will be attached to the NEXT AI request. The tool output is text only; it does not include image content and does not change the browser.',
-      inputSchema: browserToolInput({
-        ids: z.array(z.string().min(1)).max(6).describe('Reference ids to attach next request, such as step-3-before or step-4-after. Use an empty array to clear selected references.'),
-        selectionReason: z.string().min(1).max(800).describe('Chinese explanation of why these previous screenshots are useful, especially whether they are the same interface at different scroll positions.'),
-        sameInterfaceGroup: z.string().optional().describe('Optional group label when the selected screenshots are believed to be the same interface with different scroll offsets.'),
-      }),
-      execute: (input) => record('selectReferenceScreenshots', input, async () => {
-        const allowed = referenceOptions?.availableReferenceIds;
-        const validIds = allowed
-          ? input.ids.filter((id) => allowed.has(id))
-          : input.ids;
-        await referenceOptions?.onSelectReferenceScreenshots?.({
-          ids: validIds,
-          selectionReason: input.selectionReason,
-          sameInterfaceGroup: input.sameInterfaceGroup,
-        });
-        const skipped = input.ids.filter((id) => !validIds.includes(id));
-        return {
-          ok: true,
-          actual: [
-            validIds.length
-              ? `Selected screenshot references for the next request: ${validIds.join(', ')}.`
-              : 'Cleared selected screenshot references for the next request.',
-            skipped.length ? ` Ignored unavailable ids: ${skipped.join(', ')}.` : '',
-            ` Reason: ${input.selectionReason}`,
-          ].join(''),
-        };
-      }),
-    }),
-    manageVisualContext: tool({
-      description: 'Manage Visual Context Manager without changing the browser. Use rarely to clear history, keep only latest current screenshot, pin current as evidence, or compress a long scroll sequence.',
-      inputSchema: browserToolInput({
-        action: z.enum(['clearHistory', 'keepLatestOnly', 'pinCurrent', 'compressScrollSequence']).describe('Visual context maintenance action.'),
-        manageReason: z.string().min(1).max(500).describe('Chinese reason for this visual context maintenance action.'),
-      }),
-      execute: (input) => record('manageVisualContext', input, async () => {
-        referenceOptions?.visualContext?.manage(input.action, input.manageReason);
-        await referenceOptions?.onVisualContextChange?.(referenceOptions.visualContext?.snapshot() || { current: undefined, history: [] });
-        return {
-          ok: true,
-          actual: `Visual context managed: ${input.action}. ${input.manageReason}`,
-        };
-      }),
     }),
   };
 
@@ -1720,9 +1664,9 @@ function runtimePrompt(input: {
     '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
     '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
     '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
-    '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call getHttpRequests before finalizing that issue when possible.',
-    '- If the user asks to download/save a file, use downloadFile. It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL. When a usable link is already known, pass it directly to downloadFile; do not call getHttpRequests merely to read or rediscover downloadable content.',
-    '- If the user asks to generate/export/save a Markdown file, use generateMarkdownFile with the complete Markdown content. In the final answer, include the returned Markdown download link exactly as a clickable Markdown link.',
+    '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call inspect with action="httpRequests" before finalizing that issue when possible.',
+    '- If the user asks to download/save a file, use file with action="download". It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL. When a usable link is already known, pass it directly to the file tool; do not call inspect action="httpRequests" merely to read or rediscover downloadable content.',
+    '- If the user asks to generate/export/save a Markdown file, use file with action="writeMarkdown" and the complete Markdown content. In the final answer, include the returned Markdown download link exactly as a clickable Markdown link.',
     ...snapshotHardRules(screenshotAvailable),
     input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
     visualMode
@@ -1730,11 +1674,11 @@ function runtimePrompt(input: {
       : screenshotAvailable
         ? '- Browser action reason must cite the current snapshot UID or latest screenshot target.'
         : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
-    `- Use ${evidence} as the current page state. When semantic state is stale, call takeSnapshot({mode:"full"}).`,
+    `- Use ${evidence} as the current page state. When semantic state is stale, call inspect({action:"capture",mode:"full"}).`,
     '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
-    '- If loading/transitioning, call page with action="wait" once. Block only for manual captcha/OTP/security/user input.',
+    '- If loading/transitioning, call browser with action="wait" once. Block only for manual captcha/OTP/security/user input.',
     ...modeActionRules,
-    '- After a click may open a tab/window, call tab with action="list"; use action="switch" if the relevant page is in another tab.',
+    '- After a click may open a tab/window, call browser with action="listTabs"; use action="switchTab" if the relevant page is in another tab.',
     '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
     '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
     browserChatMode
@@ -1786,19 +1730,12 @@ function runtimeToolNames(mode: BrowserSessionMode) {
   void mode;
   return [
     ...(modelSupportsScreenshotInput() ? ['takeScreenshot'] : []),
-    'page',
+    'browser',
     'waitForHumanVerification',
-    'tab',
-    'getHttpRequests',
-    'takeSnapshot',
-    'searchSnapshot',
-    'mouse',
-    'keyboard',
-    'selectOption',
-    'downloadFile',
-    'generateMarkdownFile',
+    'inspect',
+    'file',
+    'interact',
     'reportState',
-    ...(modelSupportsScreenshotInput() ? ['selectReferenceScreenshots', 'manageVisualContext'] : []),
   ];
 }
 
@@ -2092,7 +2029,7 @@ function deriveDecision(text: string, traces: ToolTrace[], goal = ''): RuntimeDe
     return {
       action: note || readableActionFromTrace(last) || toolReason || `AI executed browser action: ${names || last?.name || 'browser action'}`,
       expected: 'This action should advance the user requirement; the next screenshot will verify the result.',
-      actual: last ? userFacingToolResult(last.name, last.result, 500) || 'Tool call finished; waiting for next screenshot to confirm effect.' : 'Tool call finished; waiting for next screenshot to confirm effect.',
+      actual: last ? userFacingToolResult(last.name, last.result, 500, last.input) || 'Tool call finished; waiting for next screenshot to confirm effect.' : 'Tool call finished; waiting for next screenshot to confirm effect.',
       status: failed ? 'failed' : 'passed',
       done: false,
       note,
@@ -2301,13 +2238,13 @@ async function executeRuntimeStep(input: {
       blockers: [],
       pageUnderstanding: '',
       currentState: browserChatMode
-        ? 'No page snapshot is preloaded; call takeSnapshot({mode:"full"}) when browser evidence is needed.'
-        : 'No page snapshot is preloaded; call takeSnapshot({mode:"full"}) before choosing a UID action.',
+        ? 'No page snapshot is preloaded; call inspect({action:"capture",mode:"full"}) when browser evidence is needed.'
+        : 'No page snapshot is preloaded; call inspect({action:"capture",mode:"full"}) before choosing a UID action.',
       scrollSummary: '',
       userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
       nextStep: browserChatMode
         ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
-        : 'Use the latest complete takeSnapshot view for the next missing goal; scroll only when content is lazy-loaded or virtualized.',
+        : 'Use the latest complete inspect action=capture view for the next missing goal; scroll only when content is lazy-loaded or virtualized.',
       taskFrame: testCase.content.taskFrame,
     };
     let latestText = '';
@@ -2388,14 +2325,14 @@ async function executeRuntimeStep(input: {
       const snapshotActual = [
         snapshot.pageSummary,
         snapshot.content,
-        snapshot.nextCursor ? `More pages remain. Continue with takeSnapshot({mode:"${snapshot.mode}",cursor:"${snapshot.nextCursor}"}).` : 'End of this snapshot.',
+        snapshot.nextCursor ? `More pages remain. Continue with inspect({action:"capture",mode:"${snapshot.mode}",cursor:"${snapshot.nextCursor}"}).` : 'End of this snapshot.',
       ].join('\n');
       if (options.cursor || snapshotView === 'changes') return { ok: true, actual: snapshotActual, nextCursor: snapshot.nextCursor };
       const observationViews: BrowserSnapshotViews = {
         defaultType: snapshotView,
         [snapshotView]: snapshot.content,
       };
-      const observation = storeRuntimeObservation(observationStore, input.runId, 'takeSnapshot', snapshot.content, observationViews);
+      const observation = storeRuntimeObservation(observationStore, input.runId, 'inspect', snapshot.content, observationViews);
       if (!observation) {
         return { ok: false, actual: 'Unable to store the current semantic DOM snapshot. Capture it again.' };
       }
@@ -2424,7 +2361,7 @@ async function executeRuntimeStep(input: {
         'Current screenshot observation:',
         `- ${capture} screenshot captured and attached to the next model request.`,
         capture === 'viewport'
-          ? '- This is now the only screenshot whose thousandth coordinates may be used by mouse or keyboard.'
+          ? '- This is now the only screenshot whose thousandth coordinates may be used by interact.'
           : '- Full-page screenshots are read-only and cannot be targeted with viewport coordinates.',
         `Image: ${basenameOfPath(screenshotPath)}`,
       ].join('\n');
@@ -2523,7 +2460,7 @@ async function executeRuntimeStep(input: {
           { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
           ...(appendedMessages.length
             ? appendedMessages
-            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call takeSnapshot({mode:"full"}).' }]),
+            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed before acting, call inspect({action:"capture",mode:"full"}).' }]),
         ];
         attachedImagePaths = appendedImagePaths;
         messageImagePaths = [...attachedImagePaths];
@@ -2598,7 +2535,6 @@ async function executeRuntimeStep(input: {
           await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
           await onDebug?.({ phase: 'ai:tool', stepIndex, message: trace.name + (trace.result ? ' -> ' + (trace.result.ok ? 'ok' : 'failed') : ' started'), details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
         },
-        onSelectReferenceScreenshots: async (selection) => { await applySelectedReferenceScreenshots(selection); },
         observeCurrentScreenshot,
         takeSnapshot,
       });
@@ -3154,6 +3090,18 @@ async function runRecordedTool(
         roles: Array.isArray(input.roles) ? input.roles.filter((role): role is string => typeof role === 'string') : undefined,
         limit: typeof input.limit === 'number' ? input.limit : undefined,
       });
+    case 'interact': {
+      const action = typeof input.action === 'string' ? input.action : '';
+      const legacyName = ['click', 'move', 'drag', 'scroll', 'scrollIntoView'].includes(action)
+        ? 'mouse'
+        : ['type', 'press', 'shortcut'].includes(action)
+          ? 'keyboard'
+          : action === 'selectOption'
+            ? 'selectOption'
+            : undefined;
+      if (!legacyName) return { ok: false, actual: 'interact requires a supported action.' };
+      return runRecordedTool(session, targetUrl, { ...flow, name: legacyName }, options);
+    }
     case 'mouse':
       return session.mouse({
         action: String(input.action || 'click') as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
@@ -3292,15 +3240,10 @@ async function executeCodexRuntimeObject(input: {
   visualContext?: VisualContextManager;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
-  onSelectReferenceScreenshots?: (selection: {
-    ids: string[];
-    selectionReason: string;
-    sameInterfaceGroup?: string;
-  }) => void | Promise<void>;
   takeSnapshot?: (input?: RuntimeObservationReadOptions) => BrowserActionResult | Promise<BrowserActionResult>;
   observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => BrowserActionResult | Promise<BrowserActionResult>;
 }) {
-  const { session, targetUrl, runId, stepIndex, mode, type, message, params, allowedTypes, traces, aiRequest, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots, takeSnapshot, observeCurrentScreenshot } = input;
+  const { session, targetUrl, runId, stepIndex, mode, type, message, params, allowedTypes, traces, aiRequest, visualContext, onVisualContextChange, onToolTrace, takeSnapshot, observeCurrentScreenshot } = input;
   if (!allowedTypes.includes(type)) {
     return {
       text: `Codex returned unsupported action type: ${type}. Allowed types: ${allowedTypes.join(', ')}.`,
@@ -3321,14 +3264,6 @@ async function executeCodexRuntimeObject(input: {
     };
   }
 
-  if (type === 'selectReferenceScreenshots') {
-    await onSelectReferenceScreenshots?.({
-      ids: Array.isArray(params.ids) ? params.ids.filter((id): id is string => typeof id === 'string') : [],
-      selectionReason: typeof params.selectionReason === 'string' ? params.selectionReason : String(params.reason || ''),
-      sameInterfaceGroup: typeof params.sameInterfaceGroup === 'string' ? params.sameInterfaceGroup : undefined,
-    });
-  }
-
   const normalizedParams = { ...params };
   const flow: RecordedFlowStep = {
     index: stepIndex,
@@ -3342,10 +3277,75 @@ async function executeCodexRuntimeObject(input: {
         ? observeCurrentScreenshot({ capture: normalizedParams.capture === 'fullPage' ? 'fullPage' : 'viewport' })
         : { ok: false, actual: 'takeScreenshot is unavailable in this runtime.' };
     }
-    if (type === 'takeSnapshot') {
+    if (type === 'browser') {
+      const action = typeof normalizedParams.action === 'string' ? normalizedParams.action : 'open';
+      if (action === 'wait') return typeof normalizedParams.ms === 'number' ? session.wait(normalizedParams.ms) : session.waitForPage();
+      if (action === 'listTabs') return session.listTabs();
+      if (action === 'switchTab') {
+        if (typeof normalizedParams.index !== 'number') return { ok: false, actual: 'browser action=switchTab requires index.' };
+        return session.switchTab(normalizedParams.index);
+      }
+      if (action !== 'open') return { ok: false, actual: 'browser requires action=open, action=wait, action=listTabs, or action=switchTab.' };
+      return normalizedParams.target === 'new'
+        ? session.openInNewTab(typeof normalizedParams.url === 'string' ? normalizedParams.url : targetUrl)
+        : session.open(typeof normalizedParams.url === 'string' ? normalizedParams.url : targetUrl);
+    }
+    if (type === 'inspect') {
+      const action = normalizedParams.action === 'search' || normalizedParams.action === 'httpRequests' ? normalizedParams.action : 'capture';
+      if (action === 'httpRequests') {
+        return session.getCurrentTabHttpRequests({ ids: Array.isArray(normalizedParams.ids) ? normalizedParams.ids.filter((id): id is string => typeof id === 'string') : undefined });
+      }
+      if (action === 'search') {
+        const query = typeof normalizedParams.query === 'string' ? normalizedParams.query : undefined;
+        const tag = typeof normalizedParams.tag === 'string' ? normalizedParams.tag : undefined;
+        if (!query && !tag) return { ok: false, actual: 'inspect action=search requires query or tag.' };
+        return session.searchSnapshot({
+          query,
+          tag,
+          roles: Array.isArray(normalizedParams.roles) ? normalizedParams.roles.filter((role): role is string => typeof role === 'string') : undefined,
+          limit: typeof normalizedParams.limit === 'number' ? normalizedParams.limit : undefined,
+        });
+      }
       return takeSnapshot
-        ? takeSnapshot(normalizedParams as RuntimeObservationReadOptions)
-        : { ok: false, actual: 'takeSnapshot is unavailable in this runtime.' };
+        ? takeSnapshot({
+          cursor: typeof normalizedParams.cursor === 'string' ? normalizedParams.cursor : undefined,
+          mode: normalizedParams.mode === 'text' || normalizedParams.mode === 'changes' ? normalizedParams.mode : 'full',
+        })
+        : { ok: false, actual: 'inspect action=capture is unavailable in this runtime.' };
+    }
+    if (type === 'interact') {
+      return runRecordedTool(session, targetUrl, {
+        index: stepIndex,
+        name: 'interact',
+        input: normalizedParams,
+        reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
+      }, {
+        currentScreenshotPath: visualContext?.current()?.path,
+        mode,
+        runId,
+        stepIndex,
+      });
+    }
+    if (type === 'file') {
+      if (normalizedParams.action === 'download') {
+        return downloadFileArtifact({
+          runId,
+          url: typeof normalizedParams.url === 'string' ? normalizedParams.url : undefined,
+          path: typeof normalizedParams.path === 'string' ? normalizedParams.path : undefined,
+          urlOrPath: typeof normalizedParams.urlOrPath === 'string' ? normalizedParams.urlOrPath : undefined,
+          sourcePageUrl: session.currentUrl(),
+          fileName: typeof normalizedParams.fileName === 'string' ? normalizedParams.fileName : undefined,
+        });
+      }
+      if (normalizedParams.action === 'writeMarkdown') {
+        return generateMarkdownArtifact({
+          runId,
+          fileName: typeof normalizedParams.fileName === 'string' ? normalizedParams.fileName : undefined,
+          title: typeof normalizedParams.title === 'string' ? normalizedParams.title : undefined,
+          content: typeof normalizedParams.content === 'string' ? normalizedParams.content : undefined,
+        });
+      }
+      return { ok: false, actual: 'file requires action=download or action=writeMarkdown.' };
     }
     return runRecordedTool(session, targetUrl, flow, {
       currentScreenshotPath: visualContext?.current()?.path,
@@ -3368,7 +3368,7 @@ async function executeCodexRuntimeObject(input: {
     onVisualContextChange,
     action: runTool,
   });
-  const fileResult = result.ok ? formatFileArtifactResult(type, result.actual) : undefined;
+  const fileResult = result.ok ? formatFileArtifactResult(fileArtifactAction(type, normalizedParams), result.actual) : undefined;
   return { text: fileResult || readableActionFromRawText(message) || '', executed: true };
 }
 

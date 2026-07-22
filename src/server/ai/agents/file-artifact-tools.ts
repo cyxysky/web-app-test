@@ -100,11 +100,11 @@ function artifactResultPayload(input: {
   };
 }
 
-export function formatFileArtifactResult(toolName: string, actual?: string) {
-  if (toolName !== 'downloadFile' && toolName !== 'generateMarkdownFile') return undefined;
+export function formatFileArtifactResult(action: 'download' | 'writeMarkdown' | string | undefined, actual?: string) {
+  if (action !== 'download' && action !== 'writeMarkdown') return undefined;
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
-    const label = toolName === 'downloadFile' ? 'File downloaded' : 'Markdown file generated';
+    const label = action === 'download' ? 'File downloaded' : 'Markdown file generated';
     const fileName = payload.fileName || 'artifact';
     const target = payload.downloadUrl || payload.url || payload.path || '';
     const targetLine = target
@@ -147,17 +147,17 @@ function fileNameFromUrl(value: string) {
 
 function resolveDownloadUrl(input: DownloadArtifactInput) {
   const raw = String(input.url || input.urlOrPath || input.path || '').trim();
-  if (!raw) throw new Error('downloadFile requires url, path, or urlOrPath.');
+  if (!raw) throw new Error('file action=download requires url, path, or urlOrPath.');
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
 
   const sourcePageUrl = String(input.sourcePageUrl || '').trim();
   if (!sourcePageUrl) {
-    throw new Error('downloadFile needs the current page URL to resolve relative paths; provide an absolute URL instead.');
+    throw new Error('file action=download needs the current page URL to resolve relative paths; provide an absolute URL instead.');
   }
   try {
     return new URL(raw, sourcePageUrl).toString();
   } catch {
-    throw new Error(`downloadFile cannot resolve "${raw}" against current page URL "${sourcePageUrl}".`);
+    throw new Error(`file action=download cannot resolve "${raw}" against current page URL "${sourcePageUrl}".`);
   }
 }
 
@@ -185,7 +185,7 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
     try {
       response = await fetch(url, { signal: abortController.signal });
       if (!response.ok) {
-        return { ok: false, actual: `downloadFile failed: HTTP ${response.status} ${response.statusText} for ${url}` };
+        return { ok: false, actual: `file action=download failed: HTTP ${response.status} ${response.statusText} for ${url}` };
       }
       buffer = await readLimitedResponse(response, FILE_DOWNLOAD_MAX_BYTES);
     } finally {
@@ -212,14 +212,14 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
       })),
     };
   } catch (error) {
-    return { ok: false, actual: `downloadFile failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `file action=download failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
 export async function generateMarkdownArtifact(input: MarkdownArtifactInput): Promise<BrowserActionResult> {
   try {
     const body = String(input.content || '').trim();
-    if (!body) return { ok: false, actual: 'generateMarkdownFile failed: content is empty.' };
+    if (!body) return { ok: false, actual: 'file action=writeMarkdown failed: content is empty.' };
 
     const requestedName = ensureMarkdownExtension(
       sanitizeFileName(input.fileName || input.title || `markdown-${Date.now()}`, `markdown-${Date.now()}`),
@@ -240,6 +240,6 @@ export async function generateMarkdownArtifact(input: MarkdownArtifactInput): Pr
       })),
     };
   } catch (error) {
-    return { ok: false, actual: `generateMarkdownFile failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `file action=writeMarkdown failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }

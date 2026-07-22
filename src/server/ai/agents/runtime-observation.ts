@@ -1,15 +1,12 @@
 import type { ModelMessage } from 'ai';
 import type { BrowserActionResult, BrowserSnapshotView, BrowserSnapshotViews } from '@/server/browser/browser-session';
 
-export const runtimeObservationToolNames = new Set(['takeSnapshot', 'searchSnapshot']);
-export const staleSnapshotText = 'Stale: this old semantic DOM snapshot was replaced or invalidated by a browser action. Call takeSnapshot({mode:"full"}) for fresh UIDs.';
+export const runtimeObservationToolNames = new Set(['inspect']);
+export const staleSnapshotText = 'Stale: this old semantic DOM snapshot was replaced or invalidated by a browser action. Call inspect({action:"capture",mode:"full"}) for fresh UIDs.';
 export const runtimeObservationInvalidatingToolNames = new Set([
-  'page',
-  'mouse',
-  'keyboard',
-  'selectOption',
+  'browser',
+  'interact',
   'waitForHumanVerification',
-  'tab',
 ]);
 
 export type RuntimeObservationRecord = {
@@ -332,12 +329,12 @@ export function readStoredSnapshot(
 ): BrowserActionResult {
   const record = store?.get(observationStoreKey(runId));
   if (!record) {
-    return { ok: false, actual: 'No current semantic DOM snapshot is available for this run. Call takeSnapshot({mode:"full"}) first.' };
+    return { ok: false, actual: 'No current semantic DOM snapshot is available for this run. Call inspect({action:"capture",mode:"full"}) first.' };
   }
   if (record.stale) {
     return {
       ok: false,
-      actual: `Current snapshot generation ${record.generation} is stale${record.staleReason ? ` after ${record.staleReason}` : ''}${record.invalidatedAt ? ` at ${record.invalidatedAt}` : ''}. Call takeSnapshot({mode:"full"}) before using UIDs.`,
+      actual: `Current snapshot generation ${record.generation} is stale${record.staleReason ? ` after ${record.staleReason}` : ''}${record.invalidatedAt ? ` at ${record.invalidatedAt}` : ''}. Call inspect({action:"capture",mode:"full"}) before using UIDs.`,
     };
   }
   const selectedType = view || record.defaultType || 'actionable';
@@ -354,7 +351,7 @@ export function readStoredSnapshot(
     actual: [
       `Current observation from ${record.toolName} generation ${record.generation} at ${record.createdAt}. Type ${selectedType}. Range ${start}-${end}/${text.length}. Available types: ${availableTypes || selectedType}.`,
       text.slice(start, end),
-      end < text.length ? 'More stored snapshot text exists; continue with the nextCursor returned by takeSnapshot.' : 'End of stored snapshot text.',
+      end < text.length ? 'More stored snapshot text exists; continue with the nextCursor returned by inspect action=capture.' : 'End of stored snapshot text.',
     ].join('\n'),
   };
 }
@@ -397,11 +394,11 @@ function modelToolPartInput(part: unknown): unknown {
 
 function modelToolPartRefreshesObservation(part: unknown) {
   const name = modelToolPartName(part);
-  if (name === 'searchSnapshot') return true;
-  if (name !== 'takeSnapshot') return false;
+  if (name !== 'inspect') return false;
   const input = modelToolPartInput(part);
   if (input && typeof input === 'object' && !Array.isArray(input)) {
-    return typeof (input as Record<string, unknown>).cursor !== 'string' && (input as Record<string, unknown>).mode !== 'changes';
+    const record = input as Record<string, unknown>;
+    return record.action === 'capture' && typeof record.cursor !== 'string' && record.mode !== 'changes';
   }
   if (typeof input === 'string') {
     try {
