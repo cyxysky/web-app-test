@@ -13,11 +13,13 @@ export type BrowserChatMessageLike = {
 export type BrowserChatLogIndex<TLog extends BrowserChatLogRecordLike> = {
   byMessageId: Map<string, TLog[]>;
   byStepIndex: Map<number, TLog[]>;
+  order: Map<TLog, number>;
 };
 
 export type BrowserChatAiOutputCycleLike = {
   id: string;
   output: {
+    reasoning?: string[];
     texts: string[];
   };
 };
@@ -29,16 +31,6 @@ export type BrowserChatAiCycleRenderEntry<TCycle extends BrowserChatAiOutputCycl
 export type BrowserChatMessageRenderEntry<TMessage extends BrowserChatMessageLike> =
   | { item: TMessage; kind: 'message' }
   | { id: string; items: TMessage[]; kind: 'executed-group' };
-
-export function browserChatExecutedAiToolEntries<TTool, TDetail>(
-  tools: TTool[],
-  resolveDetail: (tool: TTool, index: number) => TDetail | undefined,
-) {
-  return tools.flatMap((tool, index) => {
-    const detail = resolveDetail(tool, index);
-    return detail === undefined ? [] : [{ tool, index, detail }];
-  });
-}
 
 function hasVisibleText(value: unknown) {
   return typeof value === 'string' && Boolean(value.trim());
@@ -65,8 +57,10 @@ export function assignBrowserChatStepIndexesToLatestMessage<TMessage extends Bro
 export function buildBrowserChatLogIndex<TLog extends BrowserChatLogRecordLike>(logs: TLog[]): BrowserChatLogIndex<TLog> {
   const byMessageId = new Map<string, TLog[]>();
   const byStepIndex = new Map<number, TLog[]>();
+  const order = new Map<TLog, number>();
 
-  for (const log of logs) {
+  for (const [index, log] of logs.entries()) {
+    order.set(log, index);
     if (log.messageId) {
       const entries = byMessageId.get(log.messageId) || [];
       entries.push(log);
@@ -80,7 +74,7 @@ export function buildBrowserChatLogIndex<TLog extends BrowserChatLogRecordLike>(
     }
   }
 
-  return { byMessageId, byStepIndex };
+  return { byMessageId, byStepIndex, order };
 }
 
 export function browserChatLogsForMessage<TMessage extends BrowserChatMessageLike, TLog extends BrowserChatLogRecordLike>(
@@ -89,7 +83,11 @@ export function browserChatLogsForMessage<TMessage extends BrowserChatMessageLik
 ) {
   const directLogs = logIndex.byMessageId.get(message.id) || [];
   const stepLogs = (message.stepIndexes || []).flatMap((stepIndex) => logIndex.byStepIndex.get(stepIndex) || []);
-  return directLogs.length || stepLogs.length ? [...directLogs, ...stepLogs] : [];
+  return directLogs.length || stepLogs.length
+    ? [...directLogs, ...stepLogs].sort((left, right) => (
+      (logIndex.order.get(left) ?? Number.MAX_SAFE_INTEGER) - (logIndex.order.get(right) ?? Number.MAX_SAFE_INTEGER)
+    ))
+    : [];
 }
 
 export function browserChatAssistantMessageHasVisibleText<TMessage extends BrowserChatMessageLike, TLog extends BrowserChatLogRecordLike>(
@@ -103,6 +101,7 @@ export function browserChatAssistantMessageHasVisibleText<TMessage extends Brows
 
 export function buildBrowserChatAiCycleRenderEntries<TCycle extends BrowserChatAiOutputCycleLike>(
   cycles: TCycle[],
+  hasExecutedTool: (cycle: TCycle) => boolean = () => true,
 ): BrowserChatAiCycleRenderEntry<TCycle>[] {
   const entries: BrowserChatAiCycleRenderEntry<TCycle>[] = [];
   let pendingExecuted: TCycle[] = [];
@@ -120,10 +119,13 @@ export function buildBrowserChatAiCycleRenderEntries<TCycle extends BrowserChatA
   };
 
   for (const cycle of cycles) {
-    if (!cycle.output.texts.some(hasVisibleText)) {
+    const hasVisibleOutput = cycle.output.texts.some(hasVisibleText)
+      || (cycle.output.reasoning || []).some(hasVisibleText);
+    if (!hasVisibleOutput && hasExecutedTool(cycle)) {
       pendingExecuted.push(cycle);
       continue;
     }
+    if (!hasVisibleOutput) continue;
     flushExecuted();
     entries.push({ cycle, kind: 'cycle' });
   }

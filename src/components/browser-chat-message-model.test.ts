@@ -6,18 +6,8 @@ import {
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
   browserChatAssistantMessageHasVisibleText,
-  browserChatExecutedAiToolEntries,
   browserChatLogsForMessage,
 } from './browser-chat-message-model';
-
-test('renders only AI tool requests backed by a real execution detail', () => {
-  const tools = ['read-1', 'read-2', 'read-3', 'read-4'];
-  const entries = browserChatExecutedAiToolEntries(tools, (_tool, index) => (
-    index === 0 ? { traceId: 'trace-1' } : undefined
-  ));
-
-  assert.deepEqual(entries, [{ tool: 'read-1', index: 0, detail: { traceId: 'trace-1' } }]);
-});
 
 test('assigns a reused step index only to the latest assistant message', () => {
   const messages = assignBrowserChatStepIndexesToLatestMessage([
@@ -67,13 +57,13 @@ test('keeps a single empty assistant message as a normal message', () => {
 
 test('reads message logs from direct message id and step index', () => {
   const logIndex = buildBrowserChatLogIndex([
-    { id: 'direct', messageId: 'a1' },
     { id: 'step', stepIndex: 2 },
+    { id: 'direct', messageId: 'a1' },
   ]);
 
   const logs = browserChatLogsForMessage({ content: '', id: 'a1', role: 'assistant', stepIndexes: [2] }, logIndex);
 
-  assert.deepEqual(logs.map((log) => log.id), ['direct', 'step']);
+  assert.deepEqual(logs.map((log) => log.id), ['step', 'direct']);
 });
 
 test('groups ai cycles without text into executed entries', () => {
@@ -85,4 +75,20 @@ test('groups ai cycles without text into executed entries', () => {
 
   assert.equal(entries[0]?.kind, 'executed');
   assert.equal(entries[1]?.kind, 'cycle');
+});
+
+test('does not render an executed group for an AI tool request without a real execution', () => {
+  const entries = buildBrowserChatAiCycleRenderEntries([
+    { id: 'c1', output: { texts: [] } },
+  ], () => false);
+
+  assert.deepEqual(entries, []);
+});
+
+test('keeps reasoning-only cycles out of the executed group', () => {
+  const entries = buildBrowserChatAiCycleRenderEntries([
+    { id: 'c1', output: { reasoning: ['checking the file'], texts: [] } },
+  ], () => false);
+
+  assert.equal(entries[0]?.kind, 'cycle');
 });

@@ -9,6 +9,11 @@ import { buildCodexObjectPrompt, buildCompletionPromptLines, buildVerificationPr
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type BrowserSnapshotViews, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { browserChatReplyClaimsBrowserAction, browserChatToolRequirement, type BrowserChatToolRequirement } from './browser-chat-intent';
+import {
+  BROWSER_CHAT_FILE_READ_MAX_CHARS,
+  BROWSER_CHAT_FILE_READ_MIN_CHARS,
+  normalizeBrowserChatFileReadLimit,
+} from './browser-chat-file-read';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
 import {
   browserKeyboardToolDescription,
@@ -1913,19 +1918,17 @@ function makeBrowserTools(
     } : {}),
     ...(referenceOptions?.readFile ? {
       readFile: tool({
-        description: 'Read one registered file on demand. User attachments are listed with attachmentId; downloaded/generated artifacts return an Artifact ID. Use exactly one of attachmentId or artifactId. Read a focused range first; use the returned next offset to continue only when more content is needed. Supports text, PDF, Word, Excel, PowerPoint, OpenDocument, ZIP listings, images, and extensible format detection. For an image, the tool attaches it to the next model request for visual understanding instead of returning image bytes as text.',
+        description: 'Read one registered file on demand. User attachments are listed with attachmentId; downloaded/generated artifacts return an Artifact ID. Use exactly one of attachmentId or artifactId. On the first read, omit offset and limit to read the first 20000 characters. Every text read returns at least 20000 characters. Continue only from the exact next offset returned by the previous read. Supports text, PDF, Word, Excel, PowerPoint, OpenDocument, ZIP listings, images, and extensible format detection. For an image, the tool attaches it to the next model request for visual understanding instead of returning image bytes as text.',
         inputSchema: browserToolInput({
           attachmentId: z.string().min(1).max(160).optional().describe('One uploaded-file ID listed in the conversation metadata.'),
           artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by downloadFile or generateMarkdownFile.'),
           offset: z.number().int().min(0).optional().describe('Zero-based character offset. Omit for the first segment.'),
-          limit: z.number().int().min(1).max(40_000).optional().describe('Maximum returned characters. Start with a focused segment, then continue with the returned next offset when needed.'),
+          limit: z.number().int().min(BROWSER_CHAT_FILE_READ_MIN_CHARS).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional().describe('Returned character count, from 20000 to 40000. Omit to read 20000 characters.'),
         }).refine((input) => Boolean(input.attachmentId) !== Boolean(input.artifactId), { message: 'Provide exactly one of attachmentId or artifactId.' }),
-        execute: (input) => record('readFile', input, () => referenceOptions.readFile!({
-          attachmentId: input.attachmentId,
-          artifactId: input.artifactId,
-          limit: input.limit,
-          offset: input.offset,
-        })),
+        execute: (input) => {
+          const normalizedInput = { ...input, limit: normalizeBrowserChatFileReadLimit(input.limit) };
+          return record('readFile', normalizedInput, () => referenceOptions.readFile!(normalizedInput));
+        },
       }),
     } : {}),
     tab: tool({
@@ -4336,6 +4339,7 @@ async function executeCodexRuntimeObject(input: {
   }
 
   const normalizedParams = { ...params };
+  if (type === 'readFile') normalizedParams.limit = normalizeBrowserChatFileReadLimit(normalizedParams.limit);
   const flow: RecordedFlowStep = {
     index: stepIndex,
     name: type,

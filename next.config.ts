@@ -12,6 +12,7 @@ const nextConfig: NextConfig = {
   },
   serverExternalPackages: [
     'playwright',
+    'pdf-parse',
     'ai-sdk-provider-gemini-cli',
     '@google/gemini-cli-core',
     'tree-sitter-bash',

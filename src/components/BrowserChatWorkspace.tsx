@@ -105,7 +105,6 @@ import {
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
   browserChatAssistantMessageHasVisibleText as modelBrowserChatAssistantMessageHasVisibleText,
-  browserChatExecutedAiToolEntries,
   browserChatLogsForMessage,
   type BrowserChatLogIndex as BrowserChatLogIndexModel,
 } from '@/components/browser-chat-message-model';
@@ -567,7 +566,13 @@ type BrowserChatAiOutputTool = {
   reason?: string;
 };
 
+type BrowserChatAiOutputPart =
+  | { index: number; kind: 'reasoning' }
+  | { index: number; kind: 'text' }
+  | { index: number; kind: 'tool' };
+
 type BrowserChatAiOutputView = {
+  parts: BrowserChatAiOutputPart[];
   reasoning: string[];
   texts: string[];
   tools: BrowserChatAiOutputTool[];
@@ -619,21 +624,22 @@ function toolReasonFromInput(input: unknown) {
 
 function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
   const record = asRecord(part);
-  if (!record) return { reasoning: [], texts: [], tools: [] };
+  if (!record) return { parts: [], reasoning: [], texts: [], tools: [] };
   const type = String(record.type || '').toLowerCase();
   if (type === 'reasoning') {
     const text = textFromAiContentPart(record);
-    return { reasoning: text ? [text] : [], texts: [], tools: [] };
+    return { parts: text ? [{ index: 0, kind: 'reasoning' }] : [], reasoning: text ? [text] : [], texts: [], tools: [] };
   }
   if (type === 'text') {
     const text = textFromAiContentPart(record);
-    return { reasoning: [], texts: text ? [text] : [], tools: [] };
+    return { parts: text ? [{ index: 0, kind: 'text' }] : [], reasoning: [], texts: text ? [text] : [], tools: [] };
   }
   if (type === 'tool-call' || type === 'tool_call') {
     const name = stringFromUnknown(record.toolName) || stringFromUnknown(record.name) || stringFromUnknown(record.tool);
-    if (!name) return { reasoning: [], texts: [], tools: [] };
+    if (!name) return { parts: [], reasoning: [], texts: [], tools: [] };
     const input = record.input ?? record.args ?? record.arguments;
     return {
+      parts: [{ index: 0, kind: 'tool' }],
       reasoning: [],
       texts: [],
       tools: [{
@@ -644,33 +650,42 @@ function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
       }],
     };
   }
-  return { reasoning: [], texts: [], tools: [] };
+  return { parts: [], reasoning: [], texts: [], tools: [] };
 }
 
 function mergeAiOutputView(target: BrowserChatAiOutputView, source: BrowserChatAiOutputView) {
+  const offsets = {
+    reasoning: target.reasoning.length,
+    text: target.texts.length,
+    tool: target.tools.length,
+  };
+  target.parts.push(...source.parts.map((part) => ({
+    ...part,
+    index: part.index + offsets[part.kind],
+  })));
   target.reasoning.push(...source.reasoning);
   target.texts.push(...source.texts);
   target.tools.push(...source.tools);
 }
 
 function aiOutputViewFromContentParts(parts: unknown[]) {
-  const output: BrowserChatAiOutputView = { reasoning: [], texts: [], tools: [] };
+  const output: BrowserChatAiOutputView = { parts: [], reasoning: [], texts: [], tools: [] };
   for (const part of parts) {
     mergeAiOutputView(output, normalizeAiContentPart(part));
   }
   return output;
 }
 
-function aiOutputViewFromResponse(response: unknown) {
+export function aiOutputViewFromResponse(response: unknown) {
   const record = asRecord(response);
-  if (!record) return { reasoning: [], texts: [], tools: [] };
-  const output: BrowserChatAiOutputView = { reasoning: [], texts: [], tools: [] };
+  if (!record) return { parts: [], reasoning: [], texts: [], tools: [] };
+  const output: BrowserChatAiOutputView = { parts: [], reasoning: [], texts: [], tools: [] };
   mergeAiOutputView(output, aiOutputViewFromContentParts(arrayFromUnknown(record.content)));
   if (!output.reasoning.length && !output.texts.length) {
     const reasoningText = stringFromUnknown(record.reasoningText);
-    if (reasoningText) output.reasoning.push(reasoningText);
+    if (reasoningText) mergeAiOutputView(output, normalizeAiContentPart({ type: 'reasoning', text: reasoningText }));
     const text = stringFromUnknown(record.text);
-    if (text) output.texts.push(text);
+    if (text) mergeAiOutputView(output, normalizeAiContentPart({ type: 'text', text }));
   }
   for (const toolCall of arrayFromUnknown(record.toolCalls)) {
     mergeAiOutputView(output, normalizeAiContentPart({ ...asRecord(toolCall), type: 'tool-call' }));
@@ -686,32 +701,37 @@ function aiOutputViewFromResponse(response: unknown) {
   return output;
 }
 
-function dedupeStrings(values: string[]) {
-  const seen = new Set<string>();
-  return values.filter((value) => {
-    const normalized = value.replace(/\s+/g, ' ').trim();
-    if (!normalized || seen.has(normalized)) return false;
-    seen.add(normalized);
-    return true;
-  });
-}
-
-function dedupeAiOutputTools(tools: BrowserChatAiOutputTool[]) {
-  const seen = new Set<string>();
-  return tools.filter((tool) => {
-    const key = `${tool.name}:${formatToolPayload(tool.input)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
 function compactAiOutputView(output: BrowserChatAiOutputView): BrowserChatAiOutputView {
-  return {
-    reasoning: dedupeStrings(output.reasoning),
-    texts: dedupeStrings(output.texts),
-    tools: dedupeAiOutputTools(output.tools),
-  };
+  const compacted: BrowserChatAiOutputView = { parts: [], reasoning: [], texts: [], tools: [] };
+  const seenReasoning = new Set<string>();
+  const seenTexts = new Set<string>();
+  const seenTools = new Set<string>();
+  for (const part of output.parts) {
+    if (part.kind === 'reasoning') {
+      const value = output.reasoning[part.index];
+      const key = value?.replace(/\s+/g, ' ').trim();
+      if (!key || seenReasoning.has(key)) continue;
+      seenReasoning.add(key);
+      mergeAiOutputView(compacted, normalizeAiContentPart({ type: 'reasoning', text: value }));
+      continue;
+    }
+    if (part.kind === 'text') {
+      const value = output.texts[part.index];
+      const key = value?.replace(/\s+/g, ' ').trim();
+      if (!key || seenTexts.has(key)) continue;
+      seenTexts.add(key);
+      mergeAiOutputView(compacted, normalizeAiContentPart({ type: 'text', text: value }));
+      continue;
+    }
+    const tool = output.tools[part.index];
+    if (!tool) continue;
+    const key = `${tool.name}:${formatToolPayload(tool.input)}`;
+    if (seenTools.has(key)) continue;
+    seenTools.add(key);
+    compacted.parts.push({ index: compacted.tools.length, kind: 'tool' });
+    compacted.tools.push(tool);
+  }
+  return compacted;
 }
 
 function hasAiOutputView(output: BrowserChatAiOutputView) {
@@ -760,9 +780,11 @@ function aiOutputCyclesFromLogs(logs: BrowserChatLogRecord[]): BrowserChatAiOutp
     if (!aiOutput) return;
     const output = aiOutputViewFromResponse(aiOutput.response);
     const fallbackText = stringFromUnknown(aiOutput.text);
-    if (fallbackText) output.texts.push(fallbackText);
+    if (fallbackText) mergeAiOutputView(output, normalizeAiContentPart({ type: 'text', text: fallbackText }));
     if (log.phase === 'ai:runtime:object') {
-      output.texts = output.texts.filter((text) => !isCodexRuntimeObjectEnvelope(text));
+      output.parts = output.parts.filter((part) => (
+        part.kind !== 'text' || !isCodexRuntimeObjectEnvelope(output.texts[part.index] || '')
+      ));
     }
     const compacted = compactAiOutputView(output);
     if (!hasAiOutputView(compacted)) return;
@@ -800,7 +822,7 @@ function toolInputSignature(value: unknown) {
   }
 }
 
-function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[]) {
+export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[]) {
   const details = new Map<string, BrowserChatToolDetail>();
   const usedStepTools = new Set<string>();
 
@@ -831,11 +853,16 @@ function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: St
         }
       }
 
-      // A same-name fallback is valid only when it is unambiguous. Showing a
-      // real result from another takeSnapshot is worse than showing the raw
-      // model request without a result: it makes debugging impossible.
-      if (sameNameCandidates.length === 1) {
-        const [detail] = sameNameCandidates;
+      // Tool inputs are normalized before execution (for example readFile adds
+      // its default limit), so the persisted input is not always byte-for-byte
+      // equal to the model request. Within one step both sources are ordered;
+      // prefer the matching reason, then consume the next unused same-name call.
+      const normalizedReason = aiTool.reason?.replace(/\s+/g, ' ').trim();
+      const detail = sameNameCandidates.find((candidate) => (
+        normalizedReason
+        && candidate.tool.reason?.replace(/\s+/g, ' ').trim() === normalizedReason
+      )) || sameNameCandidates[0];
+      if (detail) {
         details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
         usedStepTools.add(`${detail.step.index}:${detail.toolIndex}`);
       }
@@ -1659,8 +1686,7 @@ function isOlderSessionSnapshot(incoming: BrowserChatSession, existing?: Browser
 }
 
 function sessionDisplayTitle(session: BrowserChatSession) {
-  const firstUserMessage = session.messages.find((item) => item.role === 'user')?.content;
-  return compactText(firstUserMessage || '新对话', 38);
+  return compactText(session.title || '新对话', 38);
 }
 
 function formatLogTime(value: string) {
@@ -2600,127 +2626,127 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
   const { output } = cycle;
-  const executedTools = browserChatExecutedAiToolEntries(
-    output.tools,
-    (_tool, index) => toolDetails.get(aiCycleToolKey(cycle.id, index)),
-  ).map(({ tool, index, detail }) => ({ tool, index, toolDetail: detail }));
-  if (!executedTools.length && !output.texts.length && (!showReasoning || !output.reasoning.length)) return null;
-  const firstTool = executedTools[0]?.tool;
-  const firstToolLabel = firstTool ? browserChatToolLabel(firstTool.name, (value) => value) : '';
-  const firstToolMeta = firstTool ? browserChatToolMeta(firstTool.name, firstTool.input) || firstTool.reason : '';
-  const toolTitle = compactText([firstToolLabel, firstToolMeta].filter(Boolean).join(': '), 160);
-  const toolSummary = executedTools.length === 1 ? '执行一个工具' : `执行 ${executedTools.length} 个工具`;
-  const hasPendingConfirmation = executedTools.some(({ tool, toolDetail }) => {
-    return Boolean(pendingConfirmationForTool({
-      pending: pendingToolConfirmation,
-      stepIndex: toolDetail.stepIndex,
-      toolName: tool.name,
-      toolInput: toolDetail.tool.input,
-      toolOk: toolDetail.tool.ok,
-    }));
-  });
+  const orderedParts: Array<
+    | { kind: 'reasoning'; part: BrowserChatAiOutputPart; text: string }
+    | { kind: 'text'; part: BrowserChatAiOutputPart; text: string }
+    | { kind: 'tool'; part: BrowserChatAiOutputPart; tool: BrowserChatAiOutputTool; toolDetail: BrowserChatToolDetail }
+  > = [];
+  for (const part of output.parts) {
+    if (part.kind === 'reasoning') {
+      const text = output.reasoning[part.index];
+      if (showReasoning && text) orderedParts.push({ kind: 'reasoning', part, text });
+      continue;
+    }
+    if (part.kind === 'text') {
+      const text = output.texts[part.index];
+      if (text) orderedParts.push({ kind: 'text', part, text });
+      continue;
+    }
+    const tool = output.tools[part.index];
+    const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, part.index));
+    if (tool && toolDetail) orderedParts.push({ kind: 'tool', part, tool, toolDetail });
+  }
+  if (!orderedParts.length) return null;
   return (
     <div className="browser-chat-ai-cycle">
-      {showReasoning && output.reasoning.length ? (
-        <details className="browser-chat-ai-line-collapse">
-          <summary className="browser-chat-ai-collapse-summary">
-            <Sparkles size={14} />
-            <span>思维链</span>
-            <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
-          </summary>
-          <div className="browser-chat-ai-reasoning-text">
-            {output.reasoning.map((item, index) => (
-              <p key={`${index}-${item.slice(0, 16)}`}>{item}</p>
-            ))}
-          </div>
-        </details>
-      ) : null}
-      {output.texts.length ? (
-        <div className="browser-chat-ai-cycle-text">
-          {output.texts.map((text, index) => (
-            <BrowserChatMarkdown key={`${index}-${text.slice(0, 16)}`} markdown={text} />
-          ))}
-        </div>
-      ) : null}
-      {executedTools.length ? (
-        <details className="browser-chat-ai-line-collapse" open={hasPendingConfirmation || undefined}>
-          <summary className="browser-chat-ai-collapse-summary" title={toolTitle}>
-            <SquareTerminal size={14} />
-            <span>{toolSummary}</span>
-            <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
-          </summary>
-          <div className="browser-chat-ai-cycle-tools">
-            {executedTools.map(({ tool, index, toolDetail }) => {
-              const label = browserChatToolLabel(tool.name, (value) => value);
-              const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
-              const presentation = browserChatToolPresentation(toolDetail.tool, toolDetail.step, running);
-              const { isActive, stateClass } = presentation;
-              const pendingConfirmation = pendingConfirmationForTool({
-                pending: pendingToolConfirmation,
-                stepIndex: toolDetail.stepIndex,
-                toolName: tool.name,
-                toolInput: toolDetail.tool.input,
-                toolOk: toolDetail.tool.ok,
-              });
-              const userAction = pendingConfirmation
-                ? undefined
-                : toolUserActionForTool(logs, toolDetail.stepIndex, tool.name, toolDetail.tool.input);
-              const card = (
-                <>
-                  <span className="browser-chat-tool-icon" aria-hidden="true">
-                    <BrowserChatToolIcon name={tool.name} />
-                  </span>
-                  <span className="browser-chat-tool-content">
-                    <span className="browser-chat-tool-label">
-                      <span className="browser-chat-tool-name">{label}</span>
-                      <BrowserChatToolUserActionTag action={userAction} />
-                    </span>
-                    {meta ? <small className="browser-chat-tool-meta">{compactText(meta, 150)}</small> : null}
-                  </span>
-                </>
-              );
-              return (
-                <div
-                  className={`browser-chat-tool-call${tool.name === 'spawnSubagents' ? ' has-subagents' : ''}`}
-                  key={`${tool.id}-${index}`}
-                >
-                  {tool.name === 'spawnSubagents' ? (
-                    <BrowserChatSubagentToolDisclosure
-                      cardContent={card}
-                      className={stateClass}
-                      isActive={isActive}
-                      logs={logs}
-                      onResume={onResumeHumanVerification}
-                      onSelectTool={onSelectTool}
-                      resuming={resumingHumanVerification}
-                      running={running}
-                      title={`${label}${meta ? ` - ${meta}` : ''}`}
-                      toolInput={toolDetail.tool.input}
-                      toolResult={toolDetail.tool.rawResult ?? toolDetail.tool.result}
-                    />
-                  ) : (
-                    <button
-                      className={`browser-chat-tool-card browser-chat-ai-call-card${stateClass}`}
-                      onClick={() => onSelectTool(toolDetail)}
-                      title={`${label}${meta ? ` - ${meta}` : ''}`}
-                      type="button"
-                    >
-                      {card}
-                      {isActive ? <BrowserChatToolTailParticles /> : null}
-                    </button>
-                  )}
-                  <BrowserChatToolConfirmationActions
-                    pending={pendingConfirmation}
-                    resolvingConfirmationAction={resolvingConfirmationAction}
-                    resolvingConfirmationId={resolvingConfirmationId}
-                    onResolveToolConfirmation={onResolveToolConfirmation}
+      {orderedParts.map((entry, orderedIndex) => {
+        if (entry.kind === 'reasoning') {
+          return (
+            <details className="browser-chat-ai-line-collapse" key={`reasoning-${entry.part.index}-${orderedIndex}`}>
+              <summary className="browser-chat-ai-collapse-summary">
+                <Sparkles size={14} />
+                <span>思维链</span>
+                <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
+              </summary>
+              <div className="browser-chat-ai-reasoning-text"><p>{entry.text}</p></div>
+            </details>
+          );
+        }
+        if (entry.kind === 'text') {
+          return (
+            <div className="browser-chat-ai-cycle-text" key={`text-${entry.part.index}-${orderedIndex}`}>
+              <BrowserChatMarkdown markdown={entry.text} />
+            </div>
+          );
+        }
+        const { tool, toolDetail } = entry;
+        const label = browserChatToolLabel(tool.name, (value) => value);
+        const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
+        const presentation = browserChatToolPresentation(toolDetail.tool, toolDetail.step, running);
+        const { isActive, stateClass } = presentation;
+        const pendingConfirmation = pendingConfirmationForTool({
+          pending: pendingToolConfirmation,
+          stepIndex: toolDetail.stepIndex,
+          toolName: tool.name,
+          toolInput: toolDetail.tool.input,
+          toolOk: toolDetail.tool.ok,
+        });
+        const userAction = pendingConfirmation
+          ? undefined
+          : toolUserActionForTool(logs, toolDetail.stepIndex, tool.name, toolDetail.tool.input);
+        const card = (
+          <>
+            <span className="browser-chat-tool-icon" aria-hidden="true">
+              <BrowserChatToolIcon name={tool.name} />
+            </span>
+            <span className="browser-chat-tool-content">
+              <span className="browser-chat-tool-label">
+                <span className="browser-chat-tool-name">{label}</span>
+                <BrowserChatToolUserActionTag action={userAction} />
+              </span>
+              {meta ? <small className="browser-chat-tool-meta">{compactText(meta, 150)}</small> : null}
+            </span>
+          </>
+        );
+        return (
+          <details
+            className="browser-chat-ai-line-collapse"
+            key={`tool-${tool.id}-${entry.part.index}-${orderedIndex}`}
+            open={Boolean(pendingConfirmation) || undefined}
+          >
+            <summary className="browser-chat-ai-collapse-summary" title={compactText([label, meta].filter(Boolean).join(': '), 160)}>
+              <SquareTerminal size={14} />
+              <span>执行一个工具</span>
+              <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
+            </summary>
+            <div className="browser-chat-ai-cycle-tools">
+              <div className={`browser-chat-tool-call${tool.name === 'spawnSubagents' ? ' has-subagents' : ''}`}>
+                {tool.name === 'spawnSubagents' ? (
+                  <BrowserChatSubagentToolDisclosure
+                    cardContent={card}
+                    className={stateClass}
+                    isActive={isActive}
+                    logs={logs}
+                    onResume={onResumeHumanVerification}
+                    onSelectTool={onSelectTool}
+                    resuming={resumingHumanVerification}
+                    running={running}
+                    title={`${label}${meta ? ` - ${meta}` : ''}`}
+                    toolInput={toolDetail.tool.input}
+                    toolResult={toolDetail.tool.rawResult ?? toolDetail.tool.result}
                   />
-                </div>
-              );
-            })}
-          </div>
-        </details>
-      ) : null}
+                ) : (
+                  <button
+                    className={`browser-chat-tool-card browser-chat-ai-call-card${stateClass}`}
+                    onClick={() => onSelectTool(toolDetail)}
+                    title={`${label}${meta ? ` - ${meta}` : ''}`}
+                    type="button"
+                  >
+                    {card}
+                    {isActive ? <BrowserChatToolTailParticles /> : null}
+                  </button>
+                )}
+                <BrowserChatToolConfirmationActions
+                  pending={pendingConfirmation}
+                  resolvingConfirmationAction={resolvingConfirmationAction}
+                  resolvingConfirmationId={resolvingConfirmationId}
+                  onResolveToolConfirmation={onResolveToolConfirmation}
+                />
+              </div>
+            </div>
+          </details>
+        );
+      })}
     </div>
   );
 });
@@ -2751,17 +2777,20 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
   toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
-  const toolCount = cycles.reduce((count, cycle) => count + cycle.output.tools.length, 0);
+  const toolCount = cycles.reduce((count, cycle) => (
+    count + cycle.output.tools.filter((_tool, index) => toolDetails.has(aiCycleToolKey(cycle.id, index))).length
+  ), 0);
   const reasoningCount = showReasoning ? cycles.reduce((count, cycle) => count + cycle.output.reasoning.length, 0) : 0;
   const hasPendingConfirmation = cycles.some((cycle) => (
     cycle.output.tools.some((tool, index) => {
       const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+      if (!toolDetail) return false;
       return Boolean(pendingConfirmationForTool({
         pending: pendingToolConfirmation,
-        stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
+        stepIndex: toolDetail.stepIndex,
         toolName: tool.name,
-        toolInput: toolDetail?.tool.input ?? tool.input,
-        toolOk: toolDetail?.tool.ok,
+        toolInput: toolDetail.tool.input,
+        toolOk: toolDetail.tool.ok,
       }));
     })
   ));
@@ -3163,12 +3192,19 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const aiOutputCycles = useMemo(() => aiOutputCyclesFromLogs(logs)
     .map((cycle) => (showReasoning ? cycle : {
       ...cycle,
-      output: { ...cycle.output, reasoning: [] },
+      output: {
+        ...cycle.output,
+        parts: cycle.output.parts.filter((part) => part.kind !== 'reasoning'),
+        reasoning: [],
+      },
     }))
     .filter((cycle) => hasAiOutputView(cycle.output)), [logs, showReasoning]);
-  const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(aiOutputCycles), [aiOutputCycles]);
   const aiOutputTextSet = useMemo(() => aiOutputTextSetFromCycles(aiOutputCycles), [aiOutputCycles]);
   const aiCycleToolDetails = useMemo(() => buildAiCycleToolDetailMap(aiOutputCycles, steps), [aiOutputCycles, steps]);
+  const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(
+    aiOutputCycles,
+    (cycle) => cycle.output.tools.some((_tool, index) => aiCycleToolDetails.has(aiCycleToolKey(cycle.id, index))),
+  ), [aiCycleToolDetails, aiOutputCycles]);
   const aiCycleRepresentedToolKeys = new Set([...aiCycleToolDetails.values()].map((detail) => (
     `${detail.stepIndex}:${detail.toolIndex}`
   )));
