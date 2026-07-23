@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
+import { joinWebPilotUrl, WEBPILOT_BASE_PATH } from '@/lib/webpilot-base-path';
 
 type EmbedTokenClaims = {
   version: 1;
@@ -186,11 +187,15 @@ export function normalizeSafetyMode(value: unknown) {
 }
 
 export function publicBaseUrl(request: NextRequest | Request) {
-  return (
-    normalizeString(process.env.WEBPILOT_PUBLIC_BASE_URL)
-    || normalizeString(process.env.NEXT_PUBLIC_WEBPILOT_BASE_URL)
-    || new URL(request.url).origin
-  ).replace(/\/+$/g, '');
+  const configuredUrl = normalizeString(process.env.WEBPILOT_PUBLIC_BASE_URL);
+  if (configuredUrl) return configuredUrl.replace(/\/+$/g, '');
+  const requestUrl = new URL(request.url);
+  const forwardedHost = normalizeString(request.headers.get('x-forwarded-host')).split(',')[0];
+  const forwardedProto = normalizeString(request.headers.get('x-forwarded-proto')).split(',')[0];
+  const publicOrigin = forwardedHost
+    ? `${forwardedProto || requestUrl.protocol.replace(/:$/, '')}://${forwardedHost}`
+    : requestUrl.origin;
+  return joinWebPilotUrl(publicOrigin, WEBPILOT_BASE_PATH).replace(/\/+$/g, '');
 }
 
 export function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {

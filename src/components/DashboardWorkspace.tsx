@@ -14,6 +14,7 @@ import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import type { ModelProvider, RunScheduleRecord, SkillRecord, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 
 function statusLabel(status: string) {
@@ -478,7 +479,7 @@ export function DashboardWorkspace({
     detailRequestIdRef.current = requestId;
     setDetailLoading(true);
     setDetailError('');
-    fetch(`/api/test-cases/${activeDetailCaseId}/detail`, { cache: 'no-store' })
+    fetch(withWebPilotBasePath(`/api/test-cases/${activeDetailCaseId}/detail`), { cache: 'no-store' })
       .then(async (response) => {
         const data = await readApiJson<Record<string, unknown>>(response, t('加载测试用例失败'));
         return data as CaseDetailPayload;
@@ -509,7 +510,7 @@ export function DashboardWorkspace({
     runRequestIdRef.current = requestId;
     setRunLoading(true);
     setRunError('');
-    fetch(`/api/runs/${activeRunId}`, { cache: 'no-store' })
+    fetch(withWebPilotBasePath(`/api/runs/${activeRunId}`), { cache: 'no-store' })
       .then(async (response) => {
         const data = await readApiJson<Record<string, unknown>>(response, t('加载执行记录失败'));
         return data as TestRunRecord;
@@ -534,7 +535,7 @@ export function DashboardWorkspace({
     setCreatingGroup(true);
     startGlobalLoading(t('正在创建分组'));
     try {
-      await fetch('/api/groups', {
+      await fetch(withWebPilotBasePath('/api/groups'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, parentId }),
@@ -567,7 +568,7 @@ export function DashboardWorkspace({
     setDeletingGroupId(group.id);
     startGlobalLoading(t('正在删除分组'));
     try {
-      const response = await fetch(`/api/groups/${group.id}`, { method: 'DELETE' });
+      const response = await fetch(withWebPilotBasePath(`/api/groups/${group.id}`), { method: 'DELETE' });
       await readApiJson<Record<string, unknown>>(response, t('删除分组失败'));
       if (selectedGroupId && descendantIds.has(selectedGroupId)) selectGroup(undefined);
       startTransition(() => router.refresh());
@@ -583,7 +584,7 @@ export function DashboardWorkspace({
     setMovingCaseId(testCaseId);
     startGlobalLoading(t('正在移动测试用例'));
     try {
-      await fetch(`/api/test-cases/${testCaseId}/move`, {
+      await fetch(withWebPilotBasePath(`/api/test-cases/${testCaseId}/move`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ groupId }),
@@ -606,7 +607,7 @@ export function DashboardWorkspace({
     setStartingCaseId(testCaseId);
     startGlobalLoading(t('正在启动测试'));
     try {
-      const response = await fetch(`/api/test-cases/${testCaseId}/run`, {
+      const response = await fetch(withWebPilotBasePath(`/api/test-cases/${testCaseId}/run`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(modelPayload),
@@ -630,7 +631,7 @@ export function DashboardWorkspace({
     startGlobalLoading(t('正在批量启动测试'));
     const openedTabs = selectedCaseIds.map(() => window.open('about:blank', '_blank'));
     try {
-      const response = await fetch('/api/runs/batch', {
+      const response = await fetch(withWebPilotBasePath('/api/runs/batch'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ testCaseIds: selectedCaseIds, ...modelPayload }),
@@ -664,7 +665,7 @@ export function DashboardWorkspace({
     setBatchDeleting(true);
     startGlobalLoading(t('正在批量删除测试用例'));
     try {
-      const response = await fetch('/api/test-cases/batch-delete', {
+      const response = await fetch(withWebPilotBasePath('/api/test-cases/batch-delete'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ testCaseIds: selectedCaseIds }),
@@ -686,7 +687,7 @@ export function DashboardWorkspace({
     setSavingSchedule(true);
     startGlobalLoading(t('正在保存定时任务'));
     try {
-      await fetch('/api/schedules', {
+      await fetch(withWebPilotBasePath('/api/schedules'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

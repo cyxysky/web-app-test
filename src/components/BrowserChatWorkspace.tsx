@@ -125,6 +125,7 @@ import {
   type RuntimeModelConfig,
 } from '@/lib/model-selection';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
+import { withWebPilotBasePath, withoutWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { useTheme } from '@/theme/ThemeProvider';
 import type {
   ModelProvider,
@@ -247,6 +248,7 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = 'webpilotqa.sidebarCollapsed';
 const EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY = 'webpilotqa.embeddedChatCollapsed';
 
 function browserChatViewForPathname(pathname: string, fallback: BrowserChatView): BrowserChatView {
+  pathname = withoutWebPilotBasePath(pathname);
   if (pathname === '/settings' || pathname.startsWith('/settings/')) return 'settings';
   if (pathname === '/dashboard' || pathname.startsWith('/runs/')) return 'chat';
   if (pathname === '/browser-chat' || pathname.startsWith('/browser-chat/')) return 'chat';
@@ -254,8 +256,9 @@ function browserChatViewForPathname(pathname: string, fallback: BrowserChatView)
 }
 
 function navigateBrowserChatView(href: string) {
-  if (window.location.pathname === href) return;
-  window.history.pushState(null, '', href);
+  const targetHref = withWebPilotBasePath(href);
+  if (window.location.pathname === targetHref) return;
+  window.history.pushState(null, '', targetHref);
 }
 
 function readStoredSidebarCollapsed() {
@@ -5860,7 +5863,7 @@ export function BrowserChatWorkspace({
   const requestUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || '0';
   const visibleSettingsTabs = environmentSettingsTabsForUser(requestUserId);
   const browserChatApiUrl = useCallback((path: string) => (
-    `${path}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(requestUserId)}`
+    `${withWebPilotBasePath(path)}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(requestUserId)}`
   ), [requestUserId]);
   const { t } = useI18n();
   const { mode: themeMode, toggleMode } = useTheme();
@@ -6169,7 +6172,7 @@ export function BrowserChatWorkspace({
       },
     };
     setModelConfig(nextConfig);
-    void fetch('/api/settings/model', {
+    void fetch(withWebPilotBasePath('/api/settings/model'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider: nextConfig.provider, providers: nextConfig.providers }),
@@ -6183,7 +6186,7 @@ export function BrowserChatWorkspace({
   }, [modelConfig]);
 
   const loadBrowserRuntimeSettings = useCallback(async () => {
-    const response = await fetch('/api/settings/env', { cache: 'no-store' });
+    const response = await fetch(withWebPilotBasePath('/api/settings/env'), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载浏览器配置失败');
     const saved = Array.isArray(data.saved) ? data.saved as Array<{ key?: string; value?: string }> : [];
     const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
@@ -6199,7 +6202,7 @@ export function BrowserChatWorkspace({
   }, [browserChatApiUrl]);
 
   const loadModelConfig = useCallback(async () => {
-    const response = await fetch('/api/settings/model', { cache: 'no-store' });
+    const response = await fetch(withWebPilotBasePath('/api/settings/model'), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载模型配置失败');
     const config = normalizeRuntimeModelConfig(data.config as Partial<BrowserChatModelConfig> | undefined);
     if (config) setModelConfig(config);
@@ -6415,7 +6418,7 @@ export function BrowserChatWorkspace({
       for (const file of selectedFiles.slice(0, remainingSlots)) {
         const form = new FormData();
         form.append('file', file);
-        const response = await fetch('/api/uploads', { method: 'POST', body: form });
+        const response = await fetch(withWebPilotBasePath('/api/uploads'), { method: 'POST', body: form });
         const data = await readApiJson<Record<string, unknown>>(response, '文件上传失败');
         const fileId = String(data.fileId || data.imageId || temporaryId(file.type.startsWith('image/') ? 'image' : 'file'));
         const kind: BrowserChatAttachmentKind = String(data.type || file.type || '').startsWith('image/') ? 'image' : 'file';
@@ -6426,7 +6429,7 @@ export function BrowserChatWorkspace({
           type: String(data.type || file.type || 'application/octet-stream'),
           size: typeof data.size === 'number' ? data.size : file.size,
           path: String(data.path || `uploads/${fileId}`),
-          url: String(data.url || `/api/artifacts/uploads/${encodeURIComponent(fileId)}`),
+          url: withWebPilotBasePath(String(data.url || `/api/artifacts/uploads/${encodeURIComponent(fileId)}`)),
         });
       }
       return uploaded.length ? addReferenceAttachments(uploaded) : [];

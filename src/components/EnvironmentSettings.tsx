@@ -22,6 +22,7 @@ import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEn
 import { useTheme } from '@/theme/ThemeProvider';
 import { readApiJson } from '@/lib/api-client';
 import { LoginAccountModal, type LoginAccountMetadata } from '@/components/LoginAccountModal';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 export type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
   updatedAt?: string;
@@ -185,14 +186,14 @@ function sortPersonalMemoryItems(items: PersonalMemoryItem[]) {
 function personalMemoryItemApiPath(item: Pick<PersonalMemoryItem, 'id' | 'userId'>, userId: string) {
   const effectiveUserId = item.userId || userId;
   const query = effectiveUserId ? `?userId=${encodeURIComponent(effectiveUserId)}` : '';
-  return `/api/personal-memory/${encodeURIComponent(item.id)}${query}`;
+  return withWebPilotBasePath(`/api/personal-memory/${encodeURIComponent(item.id)}${query}`);
 }
 
 function personalMemoryDraftApiPath(draft: PersonalMemoryDraft, userId: string) {
-  if (!draft.id) return '/api/personal-memory';
+  if (!draft.id) return withWebPilotBasePath('/api/personal-memory');
   const effectiveUserId = draft.userId || userId;
   const query = effectiveUserId ? `?userId=${encodeURIComponent(effectiveUserId)}` : '';
-  return `/api/personal-memory/${encodeURIComponent(draft.id)}${query}`;
+  return withWebPilotBasePath(`/api/personal-memory/${encodeURIComponent(draft.id)}${query}`);
 }
 
 function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
@@ -316,7 +317,7 @@ export function EnvironmentSettings({
     let active = true;
     const refresh = async () => {
       try {
-        const response = await fetch('/api/debug/dom-observation-browser', { cache: 'no-store' });
+        const response = await fetch(withWebPilotBasePath('/api/debug/dom-observation-browser'), { cache: 'no-store' });
         const status = await readApiJson<AccessibilitySnapshotBrowserStatus>(response, '读取页面快照测试浏览器状态失败');
         if (active) setDomTestBrowserStatus(status);
       } catch (error) {
@@ -348,8 +349,8 @@ export function EnvironmentSettings({
     setLoading(true);
     try {
       const [envResponse, modelResponse] = await Promise.all([
-        fetch('/api/settings/env', { cache: 'no-store' }),
-        fetch('/api/settings/model', { cache: 'no-store' }),
+        fetch(withWebPilotBasePath('/api/settings/env'), { cache: 'no-store' }),
+        fetch(withWebPilotBasePath('/api/settings/model'), { cache: 'no-store' }),
       ]);
       const envData = await envResponse.json();
       const modelData = await modelResponse.json();
@@ -381,7 +382,7 @@ export function EnvironmentSettings({
     setSavingEnv(true);
     startGlobalLoading(t('正在保存环境配置'));
     try {
-      const response = await fetch('/api/settings/env', {
+      const response = await fetch(withWebPilotBasePath('/api/settings/env'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ items: items.map((item) => ({ ...item, enabled: true, secret: isSecret(item) })) }),
@@ -398,7 +399,7 @@ export function EnvironmentSettings({
   async function openDomTestBrowser() {
     setOpeningDomTestBrowser(true);
     try {
-      const response = await fetch('/api/debug/dom-observation-browser', { method: 'POST' });
+      const response = await fetch(withWebPilotBasePath('/api/debug/dom-observation-browser'), { method: 'POST' });
       const status = await readApiJson<AccessibilitySnapshotBrowserStatus>(response, '打开页面快照测试浏览器失败');
       setDomTestBrowserStatus(status);
     } catch (error) {
@@ -494,7 +495,7 @@ export function EnvironmentSettings({
     setSavingModel(true);
     startGlobalLoading(t('正在保存模型配置'));
     try {
-      const response = await fetch('/api/settings/model', {
+      const response = await fetch(withWebPilotBasePath('/api/settings/model'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -545,7 +546,7 @@ export function EnvironmentSettings({
   const loadPersonalMemoryItems = useCallback(async () => {
     setLoadingPersonalMemory(true);
     try {
-      const response = await fetch(`/api/personal-memory?includeDisabled=true&userId=${encodeURIComponent(normalizedUserId)}`, { cache: 'no-store' });
+      const response = await fetch(withWebPilotBasePath(`/api/personal-memory?includeDisabled=true&userId=${encodeURIComponent(normalizedUserId)}`), { cache: 'no-store' });
       const data = await readApiJson<{ items?: PersonalMemoryItem[] }>(response, t('读取个性化记忆失败'));
       setPersonalMemoryItems(sortPersonalMemoryItems(Array.isArray(data.items) ? data.items : []));
     } finally {
@@ -561,7 +562,7 @@ export function EnvironmentSettings({
   const loadLoginAccounts = useCallback(async () => {
     setLoadingLoginAccounts(true);
     try {
-      const response = await fetch(`/api/login-accounts?userId=${encodeURIComponent(normalizedUserId)}`, { cache: 'no-store' });
+      const response = await fetch(withWebPilotBasePath(`/api/login-accounts?userId=${encodeURIComponent(normalizedUserId)}`), { cache: 'no-store' });
       const data = await readApiJson<{ accounts?: LoginAccountMetadata[] }>(response, '读取登录账号失败');
       setLoginAccounts(Array.isArray(data.accounts) ? data.accounts : []);
     } finally {
@@ -584,7 +585,7 @@ export function EnvironmentSettings({
     setDeletingLoginAccountId(account.id);
     try {
       const query = `?userId=${encodeURIComponent(account.userId || normalizedUserId)}`;
-      const response = await fetch(`/api/login-accounts/${encodeURIComponent(account.id)}${query}`, { method: 'DELETE' });
+      const response = await fetch(withWebPilotBasePath(`/api/login-accounts/${encodeURIComponent(account.id)}${query}`), { method: 'DELETE' });
       await readApiJson(response, '删除登录账号失败');
       setLoginAccounts((current) => current.filter((item) => item.id !== account.id));
     } finally {

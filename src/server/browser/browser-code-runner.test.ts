@@ -3,7 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import test, { after, before } from 'node:test';
 import { chromium, type Browser, type BrowserContext, type BrowserServer, type Page } from 'playwright';
-import { analyzeBrowserCodeRisk, BrowserCodeKernel, type BrowserCodeCredentialBinding } from './browser-code-runner';
+import {
+  analyzeBrowserCodeRisk,
+  browserCodePolicyViolation,
+  BrowserCodeKernel,
+  type BrowserCodeCredentialBinding,
+} from './browser-code-runner';
 
 let browserServer: BrowserServer;
 let browser: Browser;
@@ -106,6 +111,53 @@ test('browserCode bounds a missing locator and preserves the kernel after the fa
   const recovered = await run(`nodeRepl.write({ bindingBeforeLocatorFailure });`);
   assert.equal(recovered.ok, true, recovered.error);
   assert.deepEqual(recovered.value, { bindingBeforeLocatorFailure: 'still-here' });
+});
+
+test('browserCode requires coordinate screenshots to be reviewed in a previous cell', async () => {
+  const forced = await run(`await page.getByRole('button', { name: 'Save' }).click({ force: true });`);
+  assert.equal(forced.ok, false);
+  assert.match(forced.error || '', /forbids Playwright force: true/);
+
+  const unobservedCoordinate = await run(`await page.mouse.click(10, 10);`);
+  assert.equal(unobservedCoordinate.ok, false);
+  assert.match(unobservedCoordinate.error || '', /viewport screenshot/);
+
+  const sameCellCoordinate = await run(`
+    var coordinateScreenshot = await page.screenshot({ fullPage: false });
+    await nodeRepl.emitImage(coordinateScreenshot);
+    await page.mouse.click(10, 10);
+  `);
+  assert.equal(sameCellCoordinate.ok, false);
+  assert.match(sameCellCoordinate.error || '', /previous browserCode cell/);
+  assert.equal(sameCellCoordinate.images?.length, 1);
+
+  const reviewedScreenshot = await run(`
+    await nodeRepl.emitImage(await page.screenshot({ fullPage: false }));
+    nodeRepl.write({ screenshotReady: true });
+  `);
+  assert.equal(reviewedScreenshot.ok, true, reviewedScreenshot.error);
+  assert.deepEqual(reviewedScreenshot.value, { screenshotReady: true });
+
+  const reviewedCoordinate = await run(`
+    await page.mouse.click(10, 10);
+    nodeRepl.write({ clicked: true });
+  `);
+  assert.equal(reviewedCoordinate.ok, true, reviewedCoordinate.error);
+  assert.deepEqual(reviewedCoordinate.value, { clicked: true });
+});
+
+test('browserCode invalidates coordinate evidence after a DOM redraw', async () => {
+  const screenshot = await run(`
+    await nodeRepl.emitImage(await page.screenshot({ fullPage: false }));
+  `);
+  assert.equal(screenshot.ok, true, screenshot.error);
+
+  await page.evaluate(() => {
+    document.body.dataset.redrawn = String(Date.now());
+  });
+  const staleCoordinate = await run(`await page.mouse.click(10, 10);`);
+  assert.equal(staleCoordinate.ok, false);
+  assert.match(staleCoordinate.error || '', /screenshot is stale/);
 });
 
 test('browserCode emits screenshots from the same JavaScript cell', async () => {
@@ -278,4 +330,9 @@ test('browserCode risk analysis flags external effects and sensitive data', () =
   assert.equal(analyzeBrowserCodeRisk(`await page.getByRole('button', { name: '删除' }).click()`).requiresConfirmation, true);
   assert.equal(analyzeBrowserCodeRisk(`await page.getByLabel('验证码').fill('123456')`).requiresConfirmation, true);
   assert.equal(analyzeBrowserCodeRisk(`return await page.getByRole('heading').innerText()`).requiresConfirmation, false);
+});
+
+test('browserCode policy rejects literal force clicks before execution', () => {
+  assert.match(browserCodePolicyViolation(`await locator.click({ force: true })`) || '', /forbids Playwright force: true/);
+  assert.equal(browserCodePolicyViolation(`await locator.click()`), undefined);
 });

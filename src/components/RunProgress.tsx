@@ -14,6 +14,7 @@ import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import type { RunDebugEvent, StepExecutionResult, TaskFrame, TaskLedgerItem, TestCaseContent, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { readApiJson } from '@/lib/api-client';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 type ImageItem = { title: string; url: string };
 type StepToolCallItem = NonNullable<StepExecutionResult['tools']>[number];
@@ -1152,7 +1153,7 @@ export function RunProgress({
       if (!active) return undefined;
       if (refreshInFlight) return refreshInFlight;
       refreshInFlight = (async () => {
-        const response = await fetch(`/api/runs/${run.id}`, { cache: 'no-store' });
+        const response = await fetch(withWebPilotBasePath(`/api/runs/${run.id}`), { cache: 'no-store' });
         if (!response.ok || !active) {
           if (response.status === 404) stopRealtime();
           return;
@@ -1351,7 +1352,7 @@ export function RunProgress({
     setToolEditError('');
     startGlobalLoading(t('正在保存工具记录'));
     try {
-      const response = await fetch(`/api/runs/${run.id}/steps/${selectedStep.index}/tools`, {
+      const response = await fetch(withWebPilotBasePath(`/api/runs/${run.id}/steps/${selectedStep.index}/tools`), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tools }),
@@ -1372,7 +1373,7 @@ export function RunProgress({
     if (!selectedStep) return;
     startGlobalLoading(t('正在跳过步骤'));
     try {
-      const response = await fetch(`/api/runs/${run.id}/skip`, {
+      const response = await fetch(withWebPilotBasePath(`/api/runs/${run.id}/skip`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stepIndex: selectedStep.index }),
@@ -1387,7 +1388,7 @@ export function RunProgress({
     if (!canContinueBlockedRun) return;
     startGlobalLoading(t('正在继续运行'));
     try {
-      const response = await fetch(`/api/runs/${run.id}/continue`, {
+      const response = await fetch(withWebPilotBasePath(`/api/runs/${run.id}/continue`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       });
@@ -1402,7 +1403,7 @@ export function RunProgress({
     setResumePendingStep(manualIntervention.stepIndex);
     startGlobalLoading(t('正在恢复人工校验'));
     try {
-      const response = await fetch(`/api/runs/${run.id}/resume`, {
+      const response = await fetch(withWebPilotBasePath(`/api/runs/${run.id}/resume`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stepIndex: manualIntervention.stepIndex }),
@@ -1426,7 +1427,7 @@ export function RunProgress({
           ) : null}
           <RunScreenshotChainButton className="link-button" label={t('查看截图链')} run={run} />
           {isFinished(run.status) ? (
-            <a className="link-button" href={`/api/runs/${run.id}/pdf?download=1`} target="_blank" rel="noopener noreferrer">
+            <a className="link-button" href={withWebPilotBasePath(`/api/runs/${run.id}/pdf?download=1`)} target="_blank" rel="noopener noreferrer">
               {t('导出 PDF')}
             </a>
           ) : null}

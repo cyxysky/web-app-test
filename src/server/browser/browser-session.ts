@@ -33,6 +33,7 @@ import {
 } from './ax-snapshot';
 import { captureDomSnapshot } from './dom-snapshot';
 import {
+  browserCodePolicyViolation,
   BrowserCodeKernel,
   type BrowserCodeConnection,
   type BrowserCodeCredentialBinding,
@@ -172,6 +173,16 @@ export type BrowserActionResult = {
     generationId: string;
     refreshed: boolean;
   };
+};
+
+type BrowserPageConsoleEntry = {
+  sequence: number;
+  level: string;
+  text: string;
+  timestamp: string;
+  url: string;
+  lineNumber?: number;
+  columnNumber?: number;
 };
 
 export type BrowserClickTiming = {
@@ -3809,6 +3820,8 @@ export class BrowserSession {
   private context?: BrowserContext;
   private page?: Page;
   private consoleErrors: string[] = [];
+  private pageConsoleEntries: BrowserPageConsoleEntry[] = [];
+  private pageConsoleSequence = 0;
   private networkErrors: string[] = [];
   private domChangeErrors: string[] = [];
   private attachedPages = new WeakSet<Page>();
@@ -4701,6 +4714,26 @@ export class BrowserSession {
   }
 
   // 绑定 console 和网络失败监听，只记录会影响测试判断的关键异常。
+  private recordPageConsoleEntry(
+    page: Page,
+    level: string,
+    text: string,
+    location?: { url?: string; lineNumber?: number; columnNumber?: number },
+  ) {
+    this.pageConsoleEntries.push({
+      sequence: ++this.pageConsoleSequence,
+      level,
+      text: text.slice(0, 4_000),
+      timestamp: new Date().toISOString(),
+      url: location?.url || page.url(),
+      lineNumber: location?.lineNumber,
+      columnNumber: location?.columnNumber,
+    });
+    if (this.pageConsoleEntries.length > 500) {
+      this.pageConsoleEntries.splice(0, this.pageConsoleEntries.length - 500);
+    }
+  }
+
   private attachPageListeners(page: Page) {
     if (this.attachedPages.has(page)) return;
     this.attachedPages.add(page);
@@ -4715,13 +4748,16 @@ export class BrowserSession {
     });
     page.on('console', (message) => {
       const text = message.text();
+      this.recordPageConsoleEntry(page, message.type(), text, message.location());
       if (message.type() === 'error' && !shouldIgnoreConsoleError(text)) {
         this.consoleErrors.push(text);
         this.recordDomChangeError('console', text);
       }
     });
     page.on('pageerror', (error) => {
-      this.recordDomChangeError('page', unknownErrorMessage(error));
+      const text = unknownErrorMessage(error);
+      this.recordPageConsoleEntry(page, 'pageerror', text);
+      this.recordDomChangeError('page', text);
     });
     page.on('dialog', (dialog: Dialog) => {
       // Playwright's automatic close path leaves a rejected promise behind when
@@ -5674,10 +5710,13 @@ export class BrowserSession {
     const code = String(input.code || '');
     if (!code.trim()) return { ok: false, actual: 'browserCode requires non-empty JavaScript.' };
     if (code.length > 40_000) return { ok: false, actual: 'browserCode JavaScript exceeds the 40000 character limit.' };
+    const policyViolation = browserCodePolicyViolation(code);
+    if (policyViolation) return { ok: false, actual: policyViolation };
     if (!this.browserCodeConnection) {
       return { ok: false, actual: 'browserCode has no direct Playwright connection for this browser session.' };
     }
 
+    const pageConsoleSequenceBefore = this.pageConsoleSequence;
     const page = this.activePage;
     const executionId = randomUUID();
     await page.evaluate((id) => {
@@ -5722,6 +5761,16 @@ export class BrowserSession {
     if (!finalPage.isClosed()) this.page = finalPage;
     const finalUrl = finalPage.isClosed() ? '' : finalPage.url();
     const finalTitle = finalPage.isClosed() ? '' : await finalPage.title().catch(() => '');
+    const snapshotOutcome = finalPage.isClosed()
+      ? { snapshot: undefined, error: 'The final browser page is closed.' }
+      : await this.readSnapshotSlice({ refresh: true, mode: 'full', maxChars: 20_000 }).then(
+        (snapshot) => ({ snapshot, error: undefined }),
+        (error) => ({ snapshot: undefined, error: unknownErrorMessage(error) }),
+      );
+    const pageConsole = this.pageConsoleEntries
+      .filter((entry) => entry.sequence > pageConsoleSequenceBefore)
+      .slice(-100)
+      .map(({ sequence, ...entry }) => entry);
     const emittedImagePaths: string[] = [];
     const emittedImageErrors: string[] = [];
     if (execution.images?.length) {
@@ -5738,7 +5787,7 @@ export class BrowserSession {
         emittedImageErrors.push(error instanceof Error ? error.message : String(error));
       }
     }
-    return {
+    const result: BrowserActionResult = {
       ok: execution.ok,
       actual: JSON.stringify({
         ok: execution.ok,
@@ -5747,13 +5796,41 @@ export class BrowserSession {
         aborted: execution.aborted === true,
         elapsedMs: execution.elapsedMs,
         finalPage: { url: finalUrl, title: finalTitle },
+        domSnapshot: snapshotOutcome.snapshot ? {
+          content: snapshotOutcome.snapshot.content,
+          generationId: snapshotOutcome.snapshot.generationId,
+          mode: snapshotOutcome.snapshot.mode,
+          hasMore: snapshotOutcome.snapshot.hasMore,
+          nextIndex: snapshotOutcome.snapshot.nextIndex,
+          returnedEntries: snapshotOutcome.snapshot.returnedEntries,
+          totalEntries: snapshotOutcome.snapshot.totalEntries,
+          nodeCount: snapshotOutcome.snapshot.nodeCount,
+          actionableCount: snapshotOutcome.snapshot.actionableCount,
+          frameCount: snapshotOutcome.snapshot.frameCount,
+          skippedFrameCount: snapshotOutcome.snapshot.skippedFrameCount,
+          captureSource: snapshotOutcome.snapshot.captureSource,
+          timings: snapshotOutcome.snapshot.timings,
+        } : {
+          content: null,
+          error: snapshotOutcome.error,
+        },
+        console: {
+          code: execution.logs,
+          page: pageConsole,
+        },
         images: emittedImagePaths.map((filePath) => ({ fileName: path.basename(filePath) })),
         imageErrors: emittedImageErrors,
-        logs: execution.logs,
       }, null, 2),
       referenceImagePath: emittedImagePaths[0],
       referenceImagePaths: emittedImagePaths,
     };
+    if (snapshotOutcome.snapshot) {
+      result.autoSnapshot = {
+        generationId: snapshotOutcome.snapshot.generationId,
+        refreshed: true,
+      };
+    }
+    return result;
   }
 
   async waitForManualVerification(maxMs = Number(process.env.MANUAL_VERIFICATION_TIMEOUT_MS || 180000)): Promise<BrowserActionResult> {

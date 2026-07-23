@@ -26,6 +26,73 @@ If the model call fails, generation falls back to a local structured test case a
 
 Browser execution accepts `http` and `https` target URLs by default. Set `ALLOWED_TEST_DOMAINS=localhost,127.0.0.1,example.com` to restrict runs to a domain allowlist.
 
+## Embed behind one Nginx path
+
+WebPilot can be published below one path so the host application does not need to proxy every API separately. The path is part of the Next.js build, so set it before starting development or building a package:
+
+```bash
+WEBPILOT_BASE_PATH=/webpilot
+WEBPILOT_PUBLIC_BASE_URL=http://localhost:8080/webpilot
+```
+
+`WEBPILOT_PUBLIC_BASE_URL` is the browser-visible URL. It is optional when Nginx forwards `Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto` correctly, but setting it explicitly avoids ambiguity.
+
+Docker Compose passes `WEBPILOT_BASE_PATH` from `.env` into the image build. After changing it, recreate the image instead of only restarting the existing container:
+
+```bash
+docker compose build --no-cache webpilot-qa
+docker compose up -d webpilot-qa
+```
+
+For a direct Docker build, pass the same value explicitly:
+
+```bash
+docker build --build-arg WEBPILOT_BASE_PATH=/webpilot -t webpilot-qa:latest .
+```
+
+The important Nginx detail is that `proxy_pass` has no trailing `/`; WebPilot's `/webpilot` prefix must reach Next.js unchanged:
+
+```nginx
+server {
+    listen 8080;
+
+    location = /webpilot {
+        return 308 /webpilot/;
+    }
+
+    location /webpilot/ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_buffering off;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:4300;
+    }
+}
+```
+
+Open the Angular application through Nginx at `http://localhost:8080`, not through its original port. The Angular template can then use one same-origin prefix:
+
+```html
+<div id="web-app-xxxx"></div>
+<script src="/webpilot/embed/webpilot.js"></script>
+<script>
+  WebPilotQA.mount('#web-app-xxxx', {
+    apiBaseUrl: '/webpilot',
+    userId: 'u001',
+    targetUrl: location.href
+  });
+</script>
+```
+
+The SDK also derives `/webpilot` from its own script URL, so `apiBaseUrl` may be omitted when the script and API use the same public path.
+
 ## Personal Memory
 
 Browser chat stores local personal memory in the SQLite runtime database.

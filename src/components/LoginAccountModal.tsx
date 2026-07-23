@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { KeyRound, Loader2, Save, ShieldCheck, X } from 'lucide-react';
 import { readApiJson } from '@/lib/api-client';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 export type LoginAccountMetadata = {
   id: string;
@@ -103,7 +104,7 @@ export function LoginAccountModal({
       if (password) body.password = password;
       const effectiveUserId = userId || account?.userId;
       if (effectiveUserId) body.userId = effectiveUserId;
-      const response = await fetch(account ? `/api/login-accounts/${encodeURIComponent(account.id)}` : '/api/login-accounts', {
+      const response = await fetch(withWebPilotBasePath(account ? `/api/login-accounts/${encodeURIComponent(account.id)}` : '/api/login-accounts'), {
         method: account ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

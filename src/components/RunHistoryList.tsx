@@ -9,6 +9,7 @@ import { useI18n } from '@/i18n/I18nProvider';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { readApiJson } from '@/lib/api-client';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 const activeRunStatuses: TestRunRecord['status'][] = ['running', 'queued', 'paused'];
 const finishedRunStatuses: TestRunRecord['status'][] = ['passed', 'failed', 'blocked'];
@@ -72,7 +73,7 @@ export function RunHistoryList({
     setDeleting(true);
     startGlobalLoading(t('正在删除执行记录'));
     try {
-      const response = await fetch('/api/runs/batch-delete', {
+      const response = await fetch(withWebPilotBasePath('/api/runs/batch-delete'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ runIds }),
@@ -93,7 +94,7 @@ export function RunHistoryList({
     setGeneratingSkillRunId(runId);
     startGlobalLoading(t('正在生成 Skill'));
     try {
-      const response = await fetch(`/api/runs/${runId}/skills`, { method: 'POST' });
+      const response = await fetch(withWebPilotBasePath(`/api/runs/${runId}/skills`), { method: 'POST' });
       await readApiJson<Record<string, unknown>>(response, t('生成 Skill 失败'));
       router.refresh();
     } catch (error) {

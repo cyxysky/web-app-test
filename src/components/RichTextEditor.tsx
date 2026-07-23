@@ -3,6 +3,7 @@
 import { Editor } from '@tinymce/tinymce-react';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useTheme } from '@/theme/ThemeProvider';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 type RichTextEditorProps = {
   id: string;
@@ -34,7 +35,7 @@ export function RichTextEditor({
         id={id}
         key={`${id}-${language}-${mode}`}
         init={{
-          base_url: '/api/tinymce',
+          base_url: withWebPilotBasePath('/api/tinymce'),
           suffix: '.min',
           height: minHeight,
           min_height: minHeight,
@@ -53,7 +54,7 @@ export function RichTextEditor({
         }}
         licenseKey="gpl"
         onEditorChange={onChange}
-        tinymceScriptSrc="/api/tinymce/tinymce.min.js"
+        tinymceScriptSrc={withWebPilotBasePath('/api/tinymce/tinymce.min.js')}
         value={value}
       />
     </div>

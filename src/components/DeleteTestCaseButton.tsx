@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { useApiAction } from '@/lib/use-api-action';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 export function DeleteTestCaseButton({
   className = 'ui-button ui-button--danger',
@@ -32,7 +33,7 @@ export function DeleteTestCaseButton({
     const name = testCaseTitle ? `“${testCaseTitle}”` : t('这个测试用例');
     if (!window.confirm(t('确定删除{name}吗？关联执行记录会一起移除。', { name }))) return;
     await run(async () => {
-      const response = await fetch(`/api/test-cases/${testCaseId}`, { method: 'DELETE' });
+      const response = await fetch(withWebPilotBasePath(`/api/test-cases/${testCaseId}`), { method: 'DELETE' });
       await readApiJson<Record<string, unknown>>(response, t('删除用例失败'));
       if (onDeleted) {
         onDeleted();

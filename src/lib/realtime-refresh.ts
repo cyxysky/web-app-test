@@ -1,5 +1,7 @@
 'use client';
 
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
+
 export type RealtimeRefreshEvent = {
   type: 'refresh';
   entityType: 'run' | 'browserChatSession';
@@ -42,7 +44,7 @@ function scheduleReconnect() {
 }
 
 async function refreshWebSocketUrl() {
-  const response = await fetch('/api/realtime/ws', { cache: 'no-store' });
+  const response = await fetch(withWebPilotBasePath('/api/realtime/ws'), { cache: 'no-store' });
   const data = await response.json();
   if (!response.ok || typeof data.url !== 'string') throw new Error(data.error || 'Realtime WebSocket is unavailable');
   return data.url as string;

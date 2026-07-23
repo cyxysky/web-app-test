@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { artifactPath } from '@/server/storage/paths';
 
 export async function POST(request: NextRequest) {
@@ -25,7 +26,7 @@ export async function POST(request: NextRequest) {
     imageId: file.type.startsWith('image/') ? fileId : undefined,
     filePath,
     path: `uploads/${fileId}`,
-    url: `/api/artifacts/uploads/${encodeURIComponent(fileId)}`,
+    url: artifactApiUrlFromRelative(`uploads/${fileId}`),
     name: file.name,
     type: file.type,
     size: file.size,

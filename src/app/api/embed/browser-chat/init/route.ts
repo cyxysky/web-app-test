@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { createBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
 import { startScheduler } from '@/server/ai/agents/test-runner.service';
 import { store } from '@/server/db/store';
+import { joinWebPilotUrl } from '@/lib/webpilot-base-path';
 import {
   createEmbedToken,
   embedErrorJson,
@@ -47,7 +48,7 @@ export async function POST(request: NextRequest) {
       ttlSeconds,
     });
     const baseUrl = publicBaseUrl(request);
-    const iframeUrl = new URL('/browser-chat', baseUrl);
+    const iframeUrl = new URL(joinWebPilotUrl(baseUrl, '/browser-chat'));
     iframeUrl.searchParams.set('webpilotEmbed', '1');
     iframeUrl.searchParams.set('sessionId', session.id);
     if (userId) iframeUrl.searchParams.set('userId', userId);
@@ -57,7 +58,7 @@ export async function POST(request: NextRequest) {
       ok: true,
       version: 1,
       elementName: 'webpilot-browser-chat',
-      entryUrl: `${baseUrl}/embed/webpilot.js`,
+      entryUrl: joinWebPilotUrl(baseUrl, '/embed/webpilot.js'),
       iframeUrl: iframeUrl.toString(),
       apiBaseUrl: baseUrl,
       sessionId: session.id,

@@ -14,6 +14,7 @@ import {
 } from '@/components/TestCaseEditor';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import {
   modelSelectionDiagnosticLabel,
   modelSelectionOptionsForConfig,
@@ -82,7 +83,7 @@ export function TestCaseDetailWorkspace({
     let alive = true;
     async function loadModelConfig() {
       try {
-        const response = await fetch('/api/settings/model', { cache: 'no-store' });
+        const response = await fetch(withWebPilotBasePath('/api/settings/model'), { cache: 'no-store' });
         const data = await readApiJson<Record<string, unknown>>(response, '加载模型配置失败');
         if (!alive) return;
         const nextConfig = normalizeRuntimeModelConfig(data.config as Partial<RuntimeModelConfig> | undefined);

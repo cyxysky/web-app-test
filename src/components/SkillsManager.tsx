@@ -8,6 +8,7 @@ import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import type { SkillRecord } from '@/server/ai/schemas/test-case.schema';
 
 type SkillDraft = {
@@ -104,7 +105,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
   const { t } = useI18n();
   const normalizedUserId = userId.trim() || '0';
   const skillsApiUrl = useCallback((path: string) => (
-    `${path}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(normalizedUserId)}`
+    `${withWebPilotBasePath(path)}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(normalizedUserId)}`
   ), [normalizedUserId]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [expandedSkillIds, setExpandedSkillIds] = useState<string[]>([]);

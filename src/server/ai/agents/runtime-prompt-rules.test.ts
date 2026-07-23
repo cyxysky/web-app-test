@@ -28,6 +28,14 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /browser\.tabs\.list/);
   assert.match(rules, /credentialVault\.fill/);
   assert.match(rules, /never read the filled field value/);
+  assert.match(rules, /freshly captured full semantic DOM snapshot/);
+  assert.match(rules, /page-console delta/);
+  assert.match(rules, /force: true is forbidden/);
+  assert.match(rules, /do not fall back to CUA/);
+  assert.match(rules, /two separate model steps/);
+  assert.match(rules, /Same-cell screenshot-and-click is forbidden/);
+  assert.match(rules, /DOM redraw/);
+  assert.match(rules, /Playwright success does not equal business success/);
   assert.doesNotMatch(rules, /function body|takeSnapshot|searchSnapshot|page\.uid|compatibility facade|per-operation tool protocol/);
 });
 

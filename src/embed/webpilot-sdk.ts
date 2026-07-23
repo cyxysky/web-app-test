@@ -2,15 +2,32 @@ export const WEBPILOT_EMBED_SDK = String.raw`
 (function () {
   'use strict';
 
-  var VERSION = '0.2.0';
+  var VERSION = '0.3.0';
   var ELEMENT_NAME = 'webpilot-browser-chat';
   var currentScript = document.currentScript;
-  var defaultBaseUrl = currentScript && currentScript.src
-    ? new URL(currentScript.src, window.location.href).origin
-    : window.location.origin;
+
+  function scriptBaseUrl(script) {
+    if (!script || !script.src) return window.location.origin;
+    var url = new URL(script.src, window.location.href);
+    var suffix = '/embed/webpilot.js';
+    if (url.pathname.endsWith(suffix)) {
+      url.pathname = url.pathname.slice(0, -suffix.length) || '/';
+    } else {
+      url.pathname = url.pathname.replace(/\/[^/]*$/g, '') || '/';
+    }
+    url.search = '';
+    url.hash = '';
+    return url.toString().replace(/\/+$/g, '');
+  }
+
+  var defaultBaseUrl = scriptBaseUrl(currentScript);
 
   function joinUrl(base, path) {
     return String(base || '').replace(/\/+$/g, '') + '/' + String(path || '').replace(/^\/+/g, '');
+  }
+
+  function normalizeBaseUrl(value) {
+    return new URL(String(value || defaultBaseUrl), window.location.href).toString().replace(/\/+$/g, '');
   }
 
   function parseJsonResponse(response) {
@@ -38,9 +55,9 @@ export const WEBPILOT_EMBED_SDK = String.raw`
 
   function normalizeConfig(config) {
     var next = Object.assign({}, config || {});
-    next.apiBaseUrl = String(next.apiBaseUrl || defaultBaseUrl).replace(/\/+$/g, '');
+    next.apiBaseUrl = normalizeBaseUrl(next.apiBaseUrl);
     if (!next.iframeUrl) {
-      var frameUrl = new URL('/browser-chat', next.apiBaseUrl);
+      var frameUrl = new URL(joinUrl(next.apiBaseUrl, '/browser-chat'));
       frameUrl.searchParams.set('webpilotEmbed', '1');
       if (next.sessionId) frameUrl.searchParams.set('sessionId', next.sessionId);
       if (next.userId) frameUrl.searchParams.set('userId', next.userId);
@@ -120,7 +137,7 @@ export const WEBPILOT_EMBED_SDK = String.raw`
 
   function init(options) {
     options = Object.assign({ targetUrl: window.location.href }, options || {});
-    var apiBaseUrl = String(options.apiBaseUrl || defaultBaseUrl).replace(/\/+$/g, '');
+    var apiBaseUrl = normalizeBaseUrl(options.apiBaseUrl);
     return fetch(joinUrl(apiBaseUrl, '/api/embed/browser-chat/init'), {
       method: 'POST',
       cache: 'no-store',

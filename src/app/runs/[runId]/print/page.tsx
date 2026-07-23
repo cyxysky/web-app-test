@@ -2,6 +2,7 @@ import { notFound } from 'next/navigation';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { remarkSafeBreaks } from '@/lib/markdown';
+import { withWebPilotBasePath, withoutWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { store } from '@/server/db/store';
 import styles from './print.module.css';
 
@@ -20,8 +21,9 @@ function localArtifactUrl(value: string | undefined) {
   try {
     const base = new URL('http://webpilot-print.local');
     const parsed = new URL(value, base);
-    if (parsed.origin !== base.origin || !parsed.pathname.startsWith('/api/artifacts/')) return undefined;
-    return `${parsed.pathname}${parsed.search}`;
+    const pathname = withoutWebPilotBasePath(parsed.pathname);
+    if (parsed.origin !== base.origin || !pathname.startsWith('/api/artifacts/')) return undefined;
+    return withWebPilotBasePath(`${pathname}${parsed.search}`);
   } catch {
     return undefined;
   }

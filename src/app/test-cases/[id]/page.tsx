@@ -1,4 +1,5 @@
 import { redirect } from 'next/navigation';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 export const dynamic = 'force-dynamic';
 
@@ -8,5 +9,5 @@ type PageProps = {
 
 export default async function TestCaseDetailPage({ params }: PageProps) {
   await params;
-  redirect('/browser-chat');
+  redirect(withWebPilotBasePath('/browser-chat'));
 }

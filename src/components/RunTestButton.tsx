@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import type { ModelProvider } from '@/server/ai/schemas/test-case.schema';
 import { readApiJson } from '@/lib/api-client';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 export function RunTestButton({
   iconOnly = false,
@@ -31,7 +32,7 @@ export function RunTestButton({
     startGlobalLoading('正在启动测试');
     try {
       const modelPayload = modelProvider && model ? { modelProvider, model } : {};
-      const response = await fetch(`/api/test-cases/${testCaseId}/run`, {
+      const response = await fetch(withWebPilotBasePath(`/api/test-cases/${testCaseId}/run`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(modelPayload),

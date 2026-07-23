@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
+import { withoutWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 function isInternalNavigationLink(anchor: HTMLAnchorElement) {
   if (anchor.target && anchor.target !== '_self') return false;
@@ -16,6 +17,7 @@ function isInternalNavigationLink(anchor: HTMLAnchorElement) {
 }
 
 function isWorkspaceViewPathname(pathname: string) {
+  pathname = withoutWebPilotBasePath(pathname);
   return pathname === '/browser-chat' || pathname === '/dashboard' || pathname === '/settings';
 }
 

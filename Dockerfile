@@ -6,6 +6,8 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
+ARG WEBPILOT_BASE_PATH
+ENV WEBPILOT_BASE_PATH=${WEBPILOT_BASE_PATH}
 RUN npm run build
 RUN npm prune --omit=dev
 

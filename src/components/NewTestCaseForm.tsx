@@ -9,6 +9,7 @@ import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { TestCaseContent } from '@/server/ai/schemas/test-case.schema';
 import { readApiJson } from '@/lib/api-client';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 type UploadImageResponse = {
   imageId: string;
@@ -44,7 +45,7 @@ export function NewTestCaseForm({
     const form = new FormData();
     form.append('file', file);
     try {
-      const response = await fetch('/api/uploads', { method: 'POST', body: form });
+      const response = await fetch(withWebPilotBasePath('/api/uploads'), { method: 'POST', body: form });
       const data = await readApiJson<UploadImageResponse>(response, t('图片上传失败'));
       setImageNames((current) => [...current, data.imageId]);
     } finally {
@@ -63,7 +64,7 @@ export function NewTestCaseForm({
     setError('');
     startGlobalLoading(t('正在生成测试用例'));
     try {
-      const response = await fetch('/api/test-cases/generate', {
+      const response = await fetch(withWebPilotBasePath('/api/test-cases/generate'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, systemPrompt, targetUrl, browserMode, isMarked, imageNames, groupId }),

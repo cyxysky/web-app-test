@@ -1,6 +1,9 @@
 services:
   webpilot-qa:
-    build: .
+    build:
+      context: .
+      args:
+        WEBPILOT_BASE_PATH: ${WEBPILOT_BASE_PATH:-}
     image: webpilot-qa:latest
     ports:
       - "3000:3000"

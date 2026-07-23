@@ -51,7 +51,7 @@ import {
   writeBrowserChatSessionRecord,
 } from '@/server/storage/sqlite-record-store';
 import { artifactPath as resolveArtifactPath } from '@/server/storage/paths';
-import { artifactApiUrlFromRelative } from '@/lib/artifacts';
+import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 import {
   listLoginAccounts,
@@ -689,7 +689,7 @@ function normalizeAttachments(value: unknown): BrowserChatAttachment[] {
       sourceUrl: isTabReference ? sourceUrl || urlValue : undefined,
       url: isTabReference
         ? sourceUrl || urlValue
-        : (typeof record.url === 'string' && record.url.startsWith('/api/artifacts/') ? record.url : artifactApiUrlFromRelative(attachmentPath)),
+        : (artifactApiUrl(typeof record.url === 'string' ? record.url : undefined) || artifactApiUrlFromRelative(attachmentPath)),
     });
   }
   return attachments;

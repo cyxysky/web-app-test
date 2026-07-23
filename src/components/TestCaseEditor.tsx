@@ -8,6 +8,7 @@ import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { richTextToPlainText } from '@/lib/rich-text';
 import type { ModelProvider, SkillRecord, TaskFrame, TestCaseContent, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
 import { readApiJson } from '@/lib/api-client';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 export type TestCaseEditorActionState = {
   generatingFrame: boolean;
@@ -100,7 +101,7 @@ export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
         },
         steps: [],
       };
-      const response = await fetch(`/api/test-cases/${testCase.id}`, {
+      const response = await fetch(withWebPilotBasePath(`/api/test-cases/${testCase.id}`), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -126,7 +127,7 @@ export const TestCaseEditor = forwardRef<TestCaseEditorHandle, {
     setError('');
     startGlobalLoading(t('正在生成内容框架'));
     try {
-      const response = await fetch(`/api/test-cases/${testCase.id}/task-frame`, {
+      const response = await fetch(withWebPilotBasePath(`/api/test-cases/${testCase.id}/task-frame`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

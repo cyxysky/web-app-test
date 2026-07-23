@@ -36,6 +36,13 @@ export type BrowserCodeRisk = {
   reasons: string[];
 };
 
+export function browserCodePolicyViolation(code: string) {
+  if (/(?:\bforce\b|['"]force['"])\s*:\s*true\b/i.test(code)) {
+    return 'browserCode forbids Playwright force: true. Refresh the page snapshot and resolve overlays, loading state, stale locators, or asynchronous redraws instead.';
+  }
+  return undefined;
+}
+
 export type BrowserCodeCredentialBinding = {
   ref: string;
   value: string;
@@ -90,11 +97,24 @@ function browserCodeKernelMain() {
   const maxBrowserCodeImageBytes = 8 * 1024 * 1024;
   const maxBrowserCodeImageBytesTotal = 20 * 1024 * 1024;
   const childRequire = eval('require') as typeof require;
-  const { randomUUID: childRandomUUID } = childRequire('node:crypto') as typeof import('node:crypto');
+  const {
+    createHash: childCreateHash,
+    randomUUID: childRandomUUID,
+  } = childRequire('node:crypto') as typeof import('node:crypto');
   const repl = childRequire('node:repl') as typeof import('node:repl');
   const { PassThrough } = childRequire('node:stream') as typeof import('node:stream');
   const { Buffer: ChildBuffer } = childRequire('node:buffer') as typeof import('node:buffer');
   const hostProcess = process;
+  type CoordinateClickEvidence = {
+    capturedAt: number;
+    devicePixelRatio: number;
+    documentId: string;
+    height: number;
+    page: import('playwright').Page;
+    revision: number;
+    url: string;
+    width: number;
+  };
   let browser: import('playwright').Browser | undefined;
   let replServer: import('node:repl').REPLServer | undefined;
   let activeExecution: {
@@ -104,8 +124,14 @@ function browserCodeKernelMain() {
     outputs: unknown[];
     startedAt: number;
     credentials: Map<string, BrowserCodeCredentialBinding>;
+    pendingCoordinateClickEvidence: Map<import('playwright').Page, CoordinateClickEvidence>;
   } | undefined;
+  const screenshotProvenance = new WeakMap<object, CoordinateClickEvidence & { fullPage: boolean }>();
+  const screenshotProvenanceByDigest = new Map<string, CoordinateClickEvidence & { fullPage: boolean }>();
+  const coordinateClickEvidenceByDocument = new Map<string, CoordinateClickEvidence>();
   let chain = Promise.resolve();
+
+  const imageDigest = (value: Uint8Array) => childCreateHash('sha256').update(value).digest('hex');
 
   const send = (payload: Record<string, unknown>) => {
     if (typeof hostProcess.send === 'function') hostProcess.send(payload);
@@ -183,6 +209,14 @@ function browserCodeKernelMain() {
       }
       activeExecution.imageBytes += buffer.length;
       activeExecution.images.push({ data: buffer.toString('base64'), mimeType });
+      if (value && typeof value === 'object') {
+        const digest = imageDigest(buffer);
+        const provenance = screenshotProvenance.get(value) || screenshotProvenanceByDigest.get(digest);
+        screenshotProvenanceByDigest.delete(digest);
+        if (provenance && !provenance.fullPage) {
+          activeExecution.pendingCoordinateClickEvidence.set(provenance.page, provenance);
+        }
+      }
       return { bytes: buffer.length, index: activeExecution.images.length - 1, mimeType };
     },
   });
@@ -192,6 +226,7 @@ function browserCodeKernelMain() {
   const tabWrappers = new WeakMap<import('playwright').Page, object>();
   const agentCreatedPages = new Set<import('playwright').Page>();
   const pointerDecoratedPages = new WeakSet<import('playwright').Page>();
+  const screenshotDecoratedPagePrototypes = new WeakSet<object>();
   const pointerDecoratedLocatorPrototypes = new WeakSet<object>();
   const credentialLocatorPrototypes = new WeakSet<object>();
   let nativeFrameLocator: ((this: object, selector: string) => import('playwright').Locator) | undefined;
@@ -230,6 +265,129 @@ function browserCodeKernelMain() {
       if (!rect.width || !rect.height) return undefined;
       return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     }).catch(() => undefined);
+  };
+
+  const captureCoordinateClickState = async (
+    page: import('playwright').Page,
+  ): Promise<CoordinateClickEvidence | undefined> => {
+    if (page.isClosed()) return undefined;
+    const state = await page.evaluate<{
+      devicePixelRatio: number;
+      documentId: string;
+      height: number;
+      revision: number;
+      url: string;
+      width: number;
+    }>(`(() => {
+      const browserWindow = window;
+      if (!browserWindow.__aiCoordinateEvidenceObserver) {
+        browserWindow.__aiCoordinateEvidenceDocumentId = Date.now() + '-' + Math.random();
+        browserWindow.__aiCoordinateEvidenceRevision = 0;
+        const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__';
+        const belongsToRuntimeOverlay = function (node) {
+          const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+          return Boolean(element && (element.matches(overlaySelector) || element.closest(overlaySelector)));
+        };
+        browserWindow.__aiCoordinateEvidenceObserver = new MutationObserver(function (records) {
+          const hasPageMutation = records.some(function (record) {
+            if (record.type !== 'childList') return !belongsToRuntimeOverlay(record.target);
+            const changedNodes = Array.from(record.addedNodes).concat(Array.from(record.removedNodes));
+            return changedNodes.length
+              ? changedNodes.some(function (node) { return !belongsToRuntimeOverlay(node); })
+              : !belongsToRuntimeOverlay(record.target);
+          });
+          if (hasPageMutation) {
+            browserWindow.__aiCoordinateEvidenceRevision = (browserWindow.__aiCoordinateEvidenceRevision || 0) + 1;
+          }
+        });
+        browserWindow.__aiCoordinateEvidenceObserver.observe(document.documentElement, {
+          attributes: true,
+          characterData: true,
+          childList: true,
+          subtree: true,
+        });
+      }
+      return {
+        devicePixelRatio: window.devicePixelRatio,
+        documentId: browserWindow.__aiCoordinateEvidenceDocumentId || '',
+        height: window.innerHeight,
+        revision: browserWindow.__aiCoordinateEvidenceRevision || 0,
+        url: window.location.href,
+        width: window.innerWidth,
+      };
+    })()`).catch(() => undefined);
+    return state ? { ...state, capturedAt: Date.now(), page } : undefined;
+  };
+
+  const sameCoordinateClickState = (
+    evidence: CoordinateClickEvidence,
+    current: CoordinateClickEvidence | undefined,
+  ) => Boolean(
+    current
+    && evidence.url === current.url
+    && evidence.documentId === current.documentId
+    && evidence.width === current.width
+    && evidence.height === current.height
+    && evidence.devicePixelRatio === current.devicePixelRatio
+    && evidence.revision === current.revision
+  );
+
+  const consumeCoordinateClickEvidence = async (page: import('playwright').Page) => {
+    const current = await captureCoordinateClickState(page);
+    const evidence = current
+      ? coordinateClickEvidenceByDocument.get(current.documentId)
+      : undefined;
+    if (!evidence || !current) {
+      throw new Error('Coordinate clicking requires a viewport screenshot emitted by the previous browserCode cell and reviewed by the model before this cell.');
+    }
+    coordinateClickEvidenceByDocument.delete(current.documentId);
+    if (Date.now() - evidence.capturedAt > 5 * 60_000 || !sameCoordinateClickState(evidence, current)) {
+      throw new Error('The previously emitted viewport screenshot is stale because the page URL, viewport, or DOM changed. Emit and review a new screenshot in a separate browserCode cell.');
+    }
+  };
+
+  const decoratePageScreenshotPrototype = (page: import('playwright').Page) => {
+    const prototype = Object.getPrototypeOf(page) as Record<string, unknown> | null;
+    if (!prototype || screenshotDecoratedPagePrototypes.has(prototype)) return;
+    const nativeScreenshot = Reflect.get(prototype, 'screenshot');
+    if (typeof nativeScreenshot !== 'function') return;
+    try {
+      Object.defineProperty(prototype, 'screenshot', {
+        configurable: true,
+        value: async function trackedPageScreenshot(
+          this: import('playwright').Page,
+          ...args: unknown[]
+        ) {
+          await captureCoordinateClickState(this);
+          const image = await Reflect.apply(nativeScreenshot, this, args);
+          const after = await captureCoordinateClickState(this);
+          if (image && typeof image === 'object' && after) {
+            const options = args[0] && typeof args[0] === 'object'
+              ? args[0] as { fullPage?: boolean }
+              : undefined;
+            const provenance = {
+              ...after,
+              capturedAt: Date.now(),
+              fullPage: options?.fullPage === true,
+            };
+            screenshotProvenance.set(image, provenance);
+            if (ChildBuffer.isBuffer(image) || image instanceof Uint8Array) {
+              screenshotProvenanceByDigest.set(imageDigest(ChildBuffer.from(image)), provenance);
+              while (screenshotProvenanceByDigest.size > 20) {
+                const oldestDigest = screenshotProvenanceByDigest.keys().next().value;
+                if (typeof oldestDigest !== 'string') break;
+                screenshotProvenanceByDigest.delete(oldestDigest);
+              }
+            }
+          }
+          return image;
+        },
+        writable: true,
+      });
+      screenshotDecoratedPagePrototypes.add(prototype);
+    } catch {
+      // Keep the native screenshot implementation when the Playwright prototype is immutable.
+    }
   };
 
   const credentialVault = Object.freeze({
@@ -302,6 +460,9 @@ function browserCodeKernelMain() {
         Object.defineProperty(prototype, name, {
           configurable: true,
           value: async function pointerVisualizedLocatorAction(this: object, ...args: unknown[]) {
+            if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
+              throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
+            }
             const targetPage = locatorPage(this);
             if (targetPage && activeExecution) {
               await moveVisibleAiPointer(targetPage, await locatorCenter(this), kind);
@@ -332,6 +493,7 @@ function browserCodeKernelMain() {
     if (pointerDecoratedPages.has(page)) return;
     pointerDecoratedPages.add(page);
     decorateLocatorPrototype(page);
+    decoratePageScreenshotPrototype(page);
     const pageRecord = page as unknown as Record<string, unknown>;
     const patchPageAction = (name: string, kind: 'click' | 'double' | 'move') => {
       const original = Reflect.get(pageRecord, name);
@@ -340,6 +502,9 @@ function browserCodeKernelMain() {
         Object.defineProperty(pageRecord, name, {
           configurable: true,
           value: async (...args: unknown[]) => {
+            if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
+              throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
+            }
             if (activeExecution && typeof args[0] === 'string') {
               const locator = page.locator(args[0]);
               await moveVisibleAiPointer(page, await locatorCenter(locator), kind);
@@ -381,6 +546,7 @@ function browserCodeKernelMain() {
         Object.defineProperty(mouse, 'click', {
           configurable: true,
           value: async (x: number, y: number, options?: { button?: string; clickCount?: number }) => {
+            await consumeCoordinateClickEvidence(page);
             const kind = options?.button === 'right' ? 'right' : (options?.clickCount || 1) > 1 ? 'double' : 'click';
             await moveVisibleAiPointer(page, { x, y }, kind);
             return Reflect.apply(nativeClick, page.mouse, [x, y, options]);
@@ -652,10 +818,24 @@ function browserCodeKernelMain() {
       outputs: [],
       startedAt: Date.now(),
       credentials: new Map((input.credentials || []).map((credential) => [credential.ref, credential])),
+      pendingCoordinateClickEvidence: new Map(),
+    };
+    const publishPendingCoordinateClickEvidence = async () => {
+      if (!activeExecution) return;
+      for (const evidence of activeExecution.pendingCoordinateClickEvidence.values()) {
+        coordinateClickEvidenceByDocument.delete(evidence.documentId);
+        coordinateClickEvidenceByDocument.set(evidence.documentId, evidence);
+        while (coordinateClickEvidenceByDocument.size > 20) {
+          const oldestDocumentId = coordinateClickEvidenceByDocument.keys().next().value;
+          if (typeof oldestDocumentId !== 'string') break;
+          coordinateClickEvidenceByDocument.delete(oldestDocumentId);
+        }
+      }
     };
 
     try {
       await evaluateCell(String(input.code));
+      await publishPendingCoordinateClickEvidence();
       const outputs = activeExecution.outputs;
       const images = activeExecution.images;
       const logs = activeExecution.logs;
@@ -685,6 +865,7 @@ function browserCodeKernelMain() {
         selectedExecutionId,
       });
     } catch (error: unknown) {
+      await publishPendingCoordinateClickEvidence();
       send({
         type: 'result',
         requestId: input.requestId,
