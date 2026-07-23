@@ -2696,7 +2696,7 @@ function installAiBrowserPageRuntime() {
     }
     const value = normalizeVisibleDomText(input.value || '');
     const label = normalizeVisibleDomText(input.label || '');
-    if (!value && !label) return { ok: false, actual: 'selectOption requires a non-empty value or label.' };
+    if (!value && !label) return { ok: false, actual: 'interact action=selectOption requires a non-empty value or label.' };
     const option = Array.from(element.options).find((candidate) => (
       (value && candidate.value === value)
       || (!value && label && normalizeVisibleDomText(candidate.label || candidate.text || candidate.textContent || '') === label)
@@ -4281,7 +4281,7 @@ export class BrowserSession {
   }
 
   // Capture the current viewport. Marker overlays are opt-in and reuse the
-  // exact B-chain DOM UIDs registered by takeSnapshot/searchSnapshot.
+  // exact B-chain DOM UIDs registered by inspect action=capture/action=search.
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
     const totalStartedAt = Date.now();
     const timingSteps: ScreenshotTimingStep[] = [];
@@ -4443,7 +4443,7 @@ export class BrowserSession {
   }
 
   // Minimal explicit screenshot path. Optional markers are sourced from the
-  // same B-chain registry as takeSnapshot/searchSnapshot.
+  // same B-chain registry as inspect action=capture/action=search.
   async takeCurrentScreenshotOnly(runId: string, stepIndex: number, phase: `visual-${number}`, options: ScreenshotCaptureOptions = {}) {
     const capture: ScreenshotCaptureMode = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
     const dir = artifactPath(runId);
@@ -4685,7 +4685,7 @@ export class BrowserSession {
       ...journal.updated.map((line) => `updated ${line}`),
       `DOM removed (${journal.removed.length}):`,
       ...journal.removed.map((line) => `removed ${line}`),
-      `Requests started in this window (${requests.length}); use getHttpRequests with request IDs for details:`,
+      `Requests started in this window (${requests.length}); use inspect action=httpRequests with request IDs for details:`,
       ...requestLines,
       ...(journal.errors.length ? [`Diagnostics (${journal.errors.length}):`, ...journal.errors] : []),
       ...(journal.overflow ? ['Change journal overflowed; entries may be incomplete.'] : []),
@@ -5710,6 +5710,7 @@ export class BrowserSession {
     const startedAt = Date.now();
     let stableSince: number | undefined;
     let previousSignature: string | undefined;
+    let quietThresholdObserved = false;
     while (Date.now() - startedAt < timeoutMs) {
       const remainingBeforeSampleMs = timeoutMs - (Date.now() - startedAt);
       if (remainingBeforeSampleMs <= 0) break;
@@ -5726,11 +5727,19 @@ export class BrowserSession {
       if (!sample.ready) {
         previousSignature = undefined;
         stableSince = undefined;
+        quietThresholdObserved = false;
       } else if (sample.signature !== previousSignature) {
         previousSignature = sample.signature;
         stableSince = sampledAt;
+        quietThresholdObserved = false;
       } else if (stableSince !== undefined && sampledAt - stableSince >= quietMs) {
-        return { stable: true, waitedMs: sampledAt - startedAt, quietMs, timeoutMs };
+        if (quietThresholdObserved) {
+          return { stable: true, waitedMs: sampledAt - startedAt, quietMs, timeoutMs };
+        }
+        // Confirm the quiet threshold on one more bounded poll. This avoids
+        // capturing a transient state whose next scheduled mutation lands
+        // exactly at the quiet-window boundary.
+        quietThresholdObserved = true;
       }
 
       const remainingMs = timeoutMs - (Date.now() - startedAt);
@@ -5912,7 +5921,7 @@ export class BrowserSession {
         this.domVisibleSnapshotKey = undefined;
         const result = {
           ok: true,
-          actual: `${actual}${stabilityNote} Navigation changed the document. DOM UID registry was cleared; call takeSnapshot when you need targets in the new document.`,
+          actual: `${actual}${stabilityNote} Navigation changed the document. DOM UID registry was cleared; call inspect action=capture when you need targets in the new document.`,
         };
         if (options.clickTimings) {
           options.clickTimings.domChangesMs = 0;
@@ -5943,7 +5952,7 @@ export class BrowserSession {
     } catch (error) {
       const result = {
         ok: true,
-        actual: `${actual} DOM incremental change read was unavailable: ${unknownErrorMessage(error)}. Call takeSnapshot if fresh page state is required.`,
+        actual: `${actual} DOM incremental change read was unavailable: ${unknownErrorMessage(error)}. Call inspect action=capture if fresh page state is required.`,
       };
       await this.resetInterActionChangeJournal().catch(() => undefined);
       return result;
@@ -6339,7 +6348,7 @@ export class BrowserSession {
     }
     return {
       ok: false,
-      actual: 'searchSnapshot requires an active B-chain DOM baseline. Call takeSnapshot first; searchSnapshot never invokes full DOMSnapshot or full-page AX collection.',
+      actual: 'inspect action=search requires an active B-chain DOM baseline. Call inspect action=capture first; inspect never invokes full DOMSnapshot or full-page AX collection.',
     };
   }
 
@@ -6349,7 +6358,7 @@ export class BrowserSession {
       const registryCount = this.lastDomNodeReferences.size;
       const baselineState = this.domVisibleSnapshotKey ? 'an active DOM baseline' : 'no active DOM baseline';
       return {
-        error: `UID ${uid} is absent from the current B-chain DOM UID registry (${registryCount} registered UIDs; ${baselineState}). It may appear in domChanges.removed. Use a dom-* UID exactly as returned by the latest takeSnapshot, searchSnapshot, or marked screenshot.`,
+        error: `UID ${uid} is absent from the current B-chain DOM UID registry (${registryCount} registered UIDs; ${baselineState}). It may appear in domChanges.removed. Use a dom-* UID exactly as returned by the latest inspect action=capture/action=search or marked screenshot.`,
       };
     }
     if (!allowNonActionable && !reference.interactive) {
@@ -6399,7 +6408,7 @@ export class BrowserSession {
       }
     }
     if (!reference.localRef || !reference.contextId) {
-      return { error: `UID ${uid} has no live DOM reference. Call takeSnapshot and choose a current UID.` };
+      return { error: `UID ${uid} has no live DOM reference. Call inspect action=capture and choose a current UID.` };
     }
     const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
     if (!frame) return { error: `UID ${uid} belongs to an iframe that no longer exists.` };
@@ -6719,7 +6728,7 @@ export class BrowserSession {
       ) {
         result.domChanges.updated.push(nativeSelectReference.line);
       }
-      result.actual += ' Native select options are exposed in the updated element above. Use selectOption with this UID and an exact option value or full label; do not choose it with keyboard letters.';
+      result.actual += ' Native select options are exposed in the updated element above. Use interact action=selectOption with this UID and an exact option value or full label; do not choose it with keyboard letters.';
     }
     clickTimings.resultAssemblyMs = Date.now() - resultAssemblyStartedAt;
     clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
@@ -6729,11 +6738,11 @@ export class BrowserSession {
   async selectOption(input: BrowserSelectOptionAction): Promise<BrowserActionResult> {
     const previousGeneration = this.actionBaseline();
     const uid = String(input.uid || '').trim();
-    if (!uid) return { ok: false, actual: 'selectOption requires a fresh select UID.' };
+    if (!uid) return { ok: false, actual: 'interact action=selectOption requires a fresh select UID.' };
     const reference = this.lastDomNodeReferences.get(uid);
-    if (!reference) return { ok: false, actual: `UID ${uid} is not present in the current DOM UID registry. Call takeSnapshot and choose a current native select UID.` };
+    if (!reference) return { ok: false, actual: `UID ${uid} is not present in the current DOM UID registry. Call inspect action=capture and choose a current native select UID.` };
     if (reference.tag !== 'select') return { ok: false, actual: `UID ${uid} (${reference.tag} "${reference.label}") is not a native select element.` };
-    if (!reference.localRef) return { ok: false, actual: `UID ${uid} has no live select reference. Call takeSnapshot again.` };
+    if (!reference.localRef) return { ok: false, actual: `UID ${uid} has no live select reference. Call inspect action=capture again.` };
     const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
     if (!frame) return { ok: false, actual: `UID ${uid} belongs to an iframe that no longer exists.` };
     await this.ensureBrowserPageRuntime(frame);
@@ -6771,13 +6780,13 @@ export class BrowserSession {
             target.reference.locatorCandidates || [],
           ) as ElementHandle<Element> | undefined;
           if (!targetHandle) {
-            return { ok: false, actual: `UID ${input.uid} no longer resolves to a live editable element. Call takeSnapshot again.` };
+            return { ok: false, actual: `UID ${input.uid} no longer resolves to a live editable element. Call inspect action=capture again.` };
           }
         }
       }
       const targetsNativeSelect = target.reference?.tag === 'select';
       if (targetsNativeSelect) {
-        return { ok: false, actual: 'Keyboard operation rejected for a native <select>. Use selectOption with this select UID and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
+        return { ok: false, actual: 'Keyboard operation rejected for a native <select>. Use interact action=selectOption with this select UID and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
       }
       if (!targetLocator && !targetHandle && target.reference && !target.reference.interactive) {
         targetLocator = await this.editableIframeLocator(target.reference, target.point);
@@ -6794,7 +6803,7 @@ export class BrowserSession {
         }
         if (targetLocator) {
           const boundHandle = await targetLocator.elementHandle().catch(() => null);
-          if (!boundHandle) return { ok: false, actual: 'Credential entry target is no longer attached. Call takeSnapshot again.' };
+          if (!boundHandle) return { ok: false, actual: 'Credential entry target is no longer attached. Call inspect action=capture again.' };
           targetHandle = boundHandle as ElementHandle<Element>;
           targetLocator = undefined;
         }
@@ -6844,7 +6853,7 @@ export class BrowserSession {
       }
     }
     if (await this.hasFocusedNativeSelect()) {
-      return { ok: false, actual: 'Keyboard operation rejected because a native <select> is focused. Use selectOption with the select UID from takeSnapshot and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
+      return { ok: false, actual: 'Keyboard operation rejected because a native <select> is focused. Use interact action=selectOption with the select UID from inspect action=capture and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
     }
     if (input.action === 'type') {
       if (typeof input.text !== 'string') return { ok: false, actual: 'Keyboard type requires text.' };
@@ -7419,13 +7428,13 @@ export class BrowserSession {
   async readDomObservationSnapshot(options: { cursor?: string; mode?: BrowserSnapshotView } = {}) {
     const startedAt = Date.now();
     const cursor = options.cursor ? this.parseDomObservationCursor(options.cursor) : undefined;
-    if (options.cursor && !cursor) throw new Error('Invalid DOM-observation snapshot cursor. Capture a fresh takeSnapshot instead.');
+    if (options.cursor && !cursor) throw new Error('Invalid DOM-observation snapshot cursor. Capture a fresh inspect action=capture instead.');
 
     if (cursor) {
       if (!options.mode) throw new Error('Snapshot continuation requires the same explicit mode together with cursor.');
       const record = this.domObservationPagination;
       if (!record || record.id !== cursor.id || record.mode !== cursor.mode) {
-        throw new Error('The DOM-observation snapshot cursor is no longer available. Capture a fresh takeSnapshot instead.');
+        throw new Error('The DOM-observation snapshot cursor is no longer available. Capture a fresh inspect action=capture instead.');
       }
       if (options.mode && options.mode !== cursor.mode) {
         throw new Error(`Snapshot cursor mode is ${cursor.mode}; do not change mode while paging.`);
