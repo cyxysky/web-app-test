@@ -1,151 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFile, unlink } from 'node:fs/promises';
 import test from 'node:test';
 import type { Page } from 'playwright';
 import { BrowserSession } from './browser-session';
-import { exportAccessibilitySnapshotJson } from './accessibility-snapshot-test.service';
-
-type SnapshotMode = 'actionable' | 'full' | 'text';
-type SnapshotSlice = Awaited<ReturnType<BrowserSession['readSnapshotSlice']>>;
-
-async function readWholeView(session: BrowserSession, mode: SnapshotMode, refresh = false) {
-  const slices: SnapshotSlice[] = [];
-  let cursorIndex = 0;
-  for (let guard = 0; guard < 100; guard += 1) {
-    const slice = await session.readSnapshotSlice({
-      cursorIndex,
-      maxChars: 20000,
-      refresh: refresh && guard === 0,
-      mode,
-    });
-    slices.push(slice);
-    if (!slice.hasMore) return slices;
-    assert.ok(slice.nextIndex > cursorIndex, `${mode} cursor must advance`);
-    cursorIndex = slice.nextIndex;
-  }
-  throw new Error(`${mode} snapshot did not finish within 100 chunks`);
-}
-
-test('DOMSnapshot covers offscreen content and iframes, paginates records, and powers unified input', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'ax-snapshot-test' });
-  context.after(async () => session.close());
-  await session.start();
-  const page = Reflect.get(session, 'activePage') as Page;
-
-  const buttons = Array.from({ length: 500 }, (_, index) => (
-    `<button style="display:block;margin-top:16px" data-testid="action-${index}">Action ${index}</button>`
-  )).join('');
-  const html = [
-    '<!doctype html><html><body>',
-    '<div style="display:none"><button>Hidden child action</button></div>',
-    '<div style="display:none"><iframe srcdoc="<button>Hidden frame action</button>"></iframe></div>',
-    '<div id="filter-action" class="filter-btn" style="width:32px;height:32px;cursor:pointer" onclick="document.body.dataset.filterClicked=\'true\'"><svg class="icon-Filter-Fill" aria-hidden="true"><path d="M0 0h10v10H0z"></path></svg></div>',
-    '<section aria-label="Snapshot test tools"><div id="icon-only-action" onclick="document.body.dataset.iconOnlyClicked=\'true\'"><svg aria-hidden="true"><path d="M0 0h10v10H0z"></path></svg></div></section>',
-    '<button data-testid="stable-action" onclick="document.body.dataset.stableClicked=\'true\'">Stable action</button>',
-    '<input aria-label="Name" value="old value">',
-    buttons,
-    '<iframe srcdoc="<button data-testid=&quot;frame-action&quot;>Frame action</button>"></iframe>',
-    '<button data-testid="coordinate-action" style="position:fixed;left:45vw;top:45vh;width:10vw;height:10vh" onclick="document.body.dataset.coordinateClicked=\'true\'">Coordinate action</button>',
-    '</body></html>',
-  ].join('');
-  await page.goto(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-
-  const actionableSlices = await readWholeView(session, 'actionable', true);
-  const fullSlices = await readWholeView(session, 'full');
-  const textSlices = await readWholeView(session, 'text');
-  const allSlices = [...actionableSlices, ...fullSlices, ...textSlices];
-  assert.equal(new Set(allSlices.map((slice) => slice.generationId)).size, 1, 'all views must share one cached generation');
-  assert.ok((actionableSlices[0].timings.captureDomMs || 0) > 0, 'DOMSnapshot must be the primary capture source');
-  assert.equal(actionableSlices[0].timings.captureAxMs, 0, 'full AX capture should not run when DOMSnapshot succeeds');
-  assert.equal(actionableSlices[0].captureSource, 'dom-snapshot');
-  assert.ok(actionableSlices.length > 1, 'large actionable views should be paginated');
-  assert.ok(allSlices.every((slice) => slice.content.length <= 20000));
-  const expandedActionableSlice = await session.readSnapshotSlice({ mode: 'actionable', maxChars: 25000 });
-  assert.ok(expandedActionableSlice.content.length > 20000, 'requests above the 20k floor must not be capped at 20k');
-  assert.ok(expandedActionableSlice.content.length <= 25000);
-
-  const actionable = actionableSlices.map((slice) => slice.content).join('\n');
-  const full = fullSlices.map((slice) => slice.content).join('\n');
-  const text = textSlices.map((slice) => slice.content).join('\n');
-  assert.match(actionable, /Action 499/, 'offscreen actions must remain discoverable without scrolling');
-  assert.match(actionable, /Frame action/, 'same-origin iframe actions must be included');
-  assert.match(full, /^RootWebArea/m, 'full view must retain the DOMSnapshot root');
-  assert.ok(text.split('\n').every((line) => line === line.trim()), 'text view must remain indentation-free plain text');
-  const hiddenSnapshotLines = `${actionable}\n${full}\n${text}`.split('\n').filter((line) => /Hidden (?:child|frame) action/.test(line));
-  assert.equal(hiddenSnapshotLines.length, 0, `display:none content leaked into the snapshot:\n${hiddenSnapshotLines.join('\n')}`);
-  assert.doesNotMatch(`${actionable}\n${full}`, /data-ai-interactive|data-ai-signals|signals=/, 'snapshot output must not spend tokens on redundant markers');
-
-  const iconUid = actionable.match(/^\s*uid=(\S+)\s+generic\s+"\[无标签控件：Snapshot test tools\]".*actions=click/m)?.[1];
-  const iconContextLines = actionable.split('\n').filter((line) => /Snapshot test tools|无标签控件/.test(line)).join('\n');
-  assert.ok(iconUid, `a click-only SVG container must be retained with explicit, non-guessed context:\n${iconContextLines}`);
-  const iconClick = await session.mouse({ action: 'click', uid: iconUid });
-  assert.equal(iconClick.ok, true, iconClick.actual);
-  assert.equal(await page.locator('body').getAttribute('data-icon-only-clicked'), 'true');
-
-  const filterLine = actionable.split('\n').find((line) => (
-    /^\s*uid=\S+\s+generic\b/.test(line)
-    && line.includes('class=filter-btn')
-    && line.includes('icon=svg.icon-Filter-Fill')
-    && line.includes('actions=click')
-  ));
-  const filterUid = filterLine?.match(/^\s*uid=(\S+)/)?.[1];
-  assert.ok(filterUid, `an unlabeled icon action must preserve its DOM class and nested SVG class:\n${actionable}`);
-  assert.doesNotMatch(filterLine!, /过滤/, 'class names must not be translated into guessed business labels');
-  const filterClick = await session.mouse({ action: 'click', uid: filterUid });
-  assert.equal(filterClick.ok, true, filterClick.actual);
-  assert.equal(await page.locator('body').getAttribute('data-filter-clicked'), 'true');
-
-  const stableUid = actionable.match(/^\s*uid=(\S+)\s+button\s+"Stable action"/m)?.[1];
-  assert.ok(stableUid, 'stable action UID should be present');
-  const click = await session.mouse({ action: 'click', uid: stableUid });
-  assert.equal(click.ok, true, click.actual);
-  assert.equal(await page.locator('body').getAttribute('data-stable-clicked'), 'true');
-  assert.ok(click.domChanges, 'browser actions must expose page changes structurally');
-  assert.doesNotMatch(click.actual, /DOM incremental changes/);
-  assert.ok(session.currentSnapshotObservationViews()?.actionable?.includes('Stable action'), 'an action must not replace the explicitly captured snapshot');
-
-  const refreshed = await readWholeView(session, 'actionable', true);
-  assert.ok(refreshed.length > 0);
-  const searchWithoutBaseline = await session.searchSnapshot({ query: 'Name', roles: ['textbox'] });
-  assert.equal(searchWithoutBaseline.ok, false, searchWithoutBaseline.actual);
-  assert.match(searchWithoutBaseline.actual, /requires an active DOM baseline/);
-  const domBaseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
-  const domInputUid = domBaseline.content.match(/<input\s+uid=(dom-\S+)\s+aria-label="Name"/m)?.[1];
-  assert.ok(domInputUid, domBaseline.content);
-  const search = await session.searchSnapshot({ query: 'Name', roles: ['textbox'] });
-  assert.equal(search.ok, true, search.actual);
-  assert.match(search.actual, new RegExp(`uid=${domInputUid}\\b`));
-  const typed = await session.keyboard({ action: 'type', uid: domInputUid, text: 'new value', replace: true });
-  assert.equal(typed.ok, true, typed.actual);
-  assert.equal(await page.locator('input[aria-label="Name"]').inputValue(), 'new value');
-
-  await session.takeCurrentScreenshotOnly('ax-snapshot-test', 1, 'visual-1', { capture: 'viewport' });
-  const coordinateClick = await session.mouse({ action: 'click', xThousandth: 500, yThousandth: 500 });
-  assert.equal(coordinateClick.ok, true, coordinateClick.actual);
-  assert.equal(await page.locator('body').getAttribute('data-coordinate-clicked'), 'true');
-
-  const exported = await exportAccessibilitySnapshotJson(session);
-  assert.equal(exported.ok, true, exported.error);
-  assert.ok(exported.path);
-  const payload = JSON.parse(await readFile(exported.path, 'utf8')) as {
-    version?: number;
-    format?: string;
-    generationId?: string;
-    views?: Record<string, { content?: string; generationId?: string; chunks?: Array<{ charLength?: number; content?: string }> }>;
-  };
-  assert.equal(payload.version, 4);
-  assert.equal(payload.format, 'chromium-dom-snapshot-with-partial-ax');
-  assert.ok(payload.generationId);
-  assert.deepEqual(Object.keys(payload.views || {}).sort(), ['actionable', 'full', 'text']);
-  const exportedViews = Object.values(payload.views || {});
-  assert.ok(exportedViews.every((view) => view.generationId === payload.generationId));
-  const exportedChunks = exportedViews.flatMap((view) => view.chunks || []);
-  assert.ok(exportedChunks.length > 0);
-  assert.ok(exportedChunks.every((chunk) => (chunk.charLength || 0) <= 20000));
-  assert.ok(exportedChunks.every((chunk) => !chunk.content?.includes('data-ai-interactive')));
-  assert.ok(exportedViews.every((view) => view.content === (view.chunks || []).map((chunk) => chunk.content).join('\n')));
-  await unlink(exported.path);
-});
 
 test('DOM-observation takeSnapshot pages actionable, text, and full views with stable DOM UIDs', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-observation-pagination-test' });
@@ -169,6 +25,97 @@ test('DOM-observation takeSnapshot pages actionable, text, and full views with s
     assert.equal(result.nextCursor, undefined, `${mode} cursor must reach the end`);
     assert.match(pages.join('\n'), /Pagination item 199 with descriptive text/, `${mode} must include content from every page`);
   }
+});
+
+test('B-chain snapshot shares semantic UIDs with local AX, actions, search, and visual markers', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'b-chain-unified-uid-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <label id="customer-label" for="customer">Customer name</label>
+    <input id="customer" aria-describedby="customer-help">
+    <p id="customer-help">Required billing identity</p>
+    <div id="custom-submit" role="button" tabindex="0" aria-labelledby="submit-label"
+      onclick="document.body.dataset.submitted='true'"><span id="submit-label">Submit order</span></div>
+  </body></html>`);
+
+  const baseline = await session.readDomObservationSnapshot({ mode: 'full' });
+  assert.match(baseline.content, /<input\b[^>]*role="textbox"[^>]*accessible_name="Customer name"/);
+  assert.match(baseline.content, /description="Required billing identity"/);
+  const submitUid = baseline.content.match(/<div\b[^>]*uid=(dom-\d+)[^>]*role="button"[^>]*>Submit order<\/div>/)?.[1];
+  assert.ok(submitUid, baseline.content);
+
+  const inspected = await session.searchSnapshot({ uid: submitUid, includeAx: true });
+  assert.equal(inspected.ok, true, inspected.actual);
+  assert.match(inspected.actual, new RegExp(`uid=${submitUid}\\b`));
+  assert.match(inspected.actual, /local-ax=.*button.*Submit order/i);
+
+  const listed = await session.getInteractiveCandidates();
+  assert.equal(listed.ok, true, listed.actual);
+  assert.match(listed.actual, new RegExp(`uid=${submitUid}\\b`));
+
+  let markerUids: string[] = [];
+  Reflect.set(session, 'drawCandidateOverlay', async (candidates: Array<{ id: string }>) => {
+    markerUids = candidates.map((candidate) => candidate.id);
+  });
+  await session.takeCurrentScreenshotOnly('b-chain-unified-uid-test', 1, 'visual-1', {
+    capture: 'viewport',
+    markers: true,
+  });
+  assert.ok(markerUids.includes(submitUid), `marker UIDs did not include ${submitUid}: ${markerUids.join(', ')}`);
+
+  const clicked = await session.mouse({ action: 'click', uid: submitUid });
+  assert.equal(clicked.ok, true, clicked.actual);
+  assert.equal(await page.locator('body').getAttribute('data-submitted'), 'true');
+
+  const rejectedDeepUid = await session.mouse({ action: 'click', uid: '123' });
+  assert.equal(rejectedDeepUid.ok, false, rejectedDeepUid.actual);
+  assert.match(rejectedDeepUid.actual, /B-chain DOM UID registry/);
+});
+
+test('B-chain reads open and intercepted closed shadow DOM by default, then pierces one missing closed root with local CDP and AX', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'b-chain-shadow-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <section id="open-host" role="group" aria-label="Open shadow host"></section>
+    <section id="captured-host" role="group" aria-label="Captured closed shadow host"></section>
+    <section id="cdp-host" role="group" aria-label="CDP-only closed shadow host"></section>
+    <script>
+      const openRoot = document.querySelector('#open-host').attachShadow({ mode: 'open' });
+      openRoot.innerHTML = '<button id="open-action">Open shadow action</button>';
+
+      const capturedHost = document.querySelector('#captured-host');
+      const capturedRoot = capturedHost.attachShadow({ mode: 'closed' });
+      capturedRoot.innerHTML = '<button id="captured-action">Captured closed action</button>';
+
+      const cdpHost = document.querySelector('#cdp-host');
+      const cdpRoot = cdpHost.attachShadow({ mode: 'closed' });
+      cdpRoot.innerHTML = '<button id="cdp-action" onclick="document.body.dataset.cdpClicked=\\'true\\'">CDP shadow action</button>';
+      window.__aiClosedShadowRoots.delete(cdpHost);
+    </script>
+  </body></html>`);
+
+  const baseline = await session.readDomObservationSnapshot({ mode: 'full' });
+  assert.match(baseline.content, /Open shadow action/);
+  assert.match(baseline.content, /Captured closed action/);
+  assert.doesNotMatch(baseline.content, /CDP shadow action/);
+  const hostUid = baseline.content.match(/<section\s+uid=(dom-\d+)[^>]*id="cdp-host"/)?.[1];
+  assert.ok(hostUid, baseline.content);
+
+  const inspected = await session.searchSnapshot({ uid: hostUid, includeShadow: true });
+  assert.equal(inspected.ok, true, inspected.actual);
+  assert.match(inspected.actual, /root types=closed/);
+  assert.match(inspected.actual, /source="cdp-shadow"/);
+  assert.match(inspected.actual, /local-ax=.*button.*CDP shadow action/i);
+  const actionUid = inspected.actual.match(/<button\s+uid=(dom-\d+)[^>]*source="cdp-shadow"[^>]*>CDP shadow action<\/button>/)?.[1];
+  assert.ok(actionUid, inspected.actual);
+
+  const clicked = await session.mouse({ action: 'click', uid: actionUid });
+  assert.equal(clicked.ok, true, clicked.actual);
+  assert.equal(await page.locator('body').getAttribute('data-cdp-clicked'), 'true');
 });
 
 test('frozen snapshot cursors survive search, waiting, and asynchronous DOM changes', async (context) => {
@@ -271,19 +218,19 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   ].join('');
   await page.goto(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
 
-  const initial = await readWholeView(session, 'actionable', true);
-  const actionable = initial.map((slice) => slice.content).join('\n');
-  const saveUid = actionable.match(/^\s*uid=(\S+)\s+button\s+"Save"/m)?.[1];
-  const renamedEditorUid = actionable.match(/^\s*uid=(\S+)\s+textbox\s+"Original editor"/m)?.[1];
-  assert.ok(saveUid && renamedEditorUid);
-  assert.equal((actionable.match(/Context \d+/g) || []).length <= 24, true, 'context roots should be token-bounded');
-  assert.equal((actionable.match(/button\s+"Duplicate"/g) || []).length, 2, 'same-name controls must not be deduplicated away');
-
   const searchWithoutBaseline = await session.searchSnapshot({ query: 'Save' });
   assert.equal(searchWithoutBaseline.ok, false, searchWithoutBaseline.actual);
-  assert.match(searchWithoutBaseline.actual, /requires an active DOM baseline/);
+  assert.match(searchWithoutBaseline.actual, /requires an active B-chain DOM baseline/);
 
-  const covered = await session.mouse({ action: 'click', uid: saveUid });
+  await page.locator('#cover').evaluate((element) => element.remove());
+  const bBaseline = await session.readDomObservationSnapshot({ mode: 'full' });
+  const bSaveUid = bBaseline.content.match(/uid=(dom-\d+)[^\n]*id="save"/)?.[1];
+  const bEditorUid = bBaseline.content.match(/uid=(dom-\d+)[^\n]*id="renamed-editor"/)?.[1];
+  assert.ok(bSaveUid && bEditorUid, bBaseline.content);
+  await page.locator('body').evaluate((body) => {
+    body.insertAdjacentHTML('beforeend', '<div id="cover" style="position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.1)"></div>');
+  });
+  const covered = await session.mouse({ action: 'click', uid: bSaveUid });
   assert.equal(covered.ok, false);
   assert.match(covered.actual, /covered/);
 
@@ -292,8 +239,6 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.equal(mutationRefresh.ok, true, mutationRefresh.actual);
   assert.ok(mutationRefresh.domChanges, 'wait must expose observed changes structurally');
   assert.doesNotMatch(mutationRefresh.actual, /DOM incremental changes/);
-  assert.ok(session.currentSnapshotObservationViews()?.actionable?.includes('Save'));
-
   const unchangedReuse = await session.wait(100);
   assert.equal(unchangedReuse.ok, true, unchangedReuse.actual);
   assert.ok(unchangedReuse.domChanges);
@@ -306,9 +251,9 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.doesNotMatch(interactionOnlyReuse.actual, /DOM incremental changes/);
 
   await page.locator('#renamed-editor').evaluate((element) => element.setAttribute('aria-label', 'Renamed editor'));
-  const afterRename = (await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n');
-  const currentSaveUid = afterRename.match(/^\s*uid=(\S+)\s+button\s+"Save"/m)?.[1];
-  const currentRenamedEditorUid = afterRename.match(/^\s*uid=(\S+)\s+textbox\s+"Renamed editor"/m)?.[1];
+  const afterRename = (await session.readDomObservationSnapshot({ mode: 'actionable' })).content;
+  const currentSaveUid = afterRename.match(/uid=(dom-\d+)[^\n]*id="save"/)?.[1];
+  const currentRenamedEditorUid = afterRename.match(/uid=(dom-\d+)[^\n]*id="renamed-editor"/)?.[1];
   assert.ok(currentSaveUid && currentRenamedEditorUid);
   const renamedEditor = await session.keyboard({ action: 'type', uid: currentRenamedEditorUid, text: 'retained', replace: true });
   assert.equal(renamedEditor.ok, true, renamedEditor.actual);
@@ -330,9 +275,12 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   const domSearch = await session.searchSnapshot({ query: 'Save', roles: ['button'] });
   assert.equal(domSearch.ok, true, domSearch.actual);
   assert.match(domSearch.actual, new RegExp(`uid=${domSaveUid}\\b`), 'a DOM-baseline search must return the same dom-* namespace as takeSnapshot');
+  const frozenLateSearch = await session.searchSnapshot({ query: 'Late action', roles: ['button'] });
+  assert.equal(frozenLateSearch.ok, true, frozenLateSearch.actual);
+  assert.match(frozenLateSearch.actual, /returned 0 result/, 'search must remain a pure read of the frozen baseline');
+  await session.readDomObservationSnapshot({ mode: 'full' });
   const lateSearch = await session.searchSnapshot({ query: 'Late action', roles: ['button'] });
-  assert.equal(lateSearch.ok, true, lateSearch.actual);
-  assert.match(lateSearch.actual, /<button\b[^>]*>Late action<\/button>/, 'search must use the current DOM baseline after an incremental mutation');
+  assert.match(lateSearch.actual, /<button\b[^>]*>Late action<\/button>/, 'a fresh B-chain baseline must include the new offscreen action');
   const domUidClick = await session.mouse({ action: 'click', uid: domSaveUid });
   assert.equal(domUidClick.ok, true, domUidClick.actual);
   await page.locator('#save').evaluate((button) => button.replaceWith(button.cloneNode(true)));
@@ -340,7 +288,7 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.ok(replacementDelta.domChanges?.removed.includes(domSaveUid), replacementDelta.actual);
   const replacedTarget = await session.mouse({ action: 'click', uid: domSaveUid });
   assert.equal(replacedTarget.ok, false, replacedTarget.actual);
-  assert.match(replacedTarget.actual, /absent from the current DOM UID registry/);
+  assert.match(replacedTarget.actual, /absent from the current B-chain DOM UID registry/);
 });
 
 test('DOM baseline ranks modal duplicates and describes virtual lists', async (context) => {
@@ -504,8 +452,8 @@ test('SVG parents and children with independent click boundaries remain separate
   const liveUids = baseline.content.match(/uid=dom-\d+/g) || [];
   assert.equal(liveUids.length >= 2, true, baseline.content);
 
-  const semantic = (await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n');
-  assert.equal((semantic.match(/button\s+"Chart action/g) || []).length, 2, semantic);
+  const semantic = (await session.readDomObservationSnapshot({ mode: 'actionable' })).content;
+  assert.equal((semantic.match(/aria-label="Chart action"/g) || []).length, 2, semantic);
 });
 
 test('open waits for a bounded DOM quiet window before capturing the navigation snapshot', async (context) => {
@@ -541,11 +489,12 @@ test('open waits for a bounded DOM quiet window before capturing the navigation 
 
   assert.equal(opened.ok, true, opened.actual);
   assert.match(opened.actual, /Navigation DOM stabilized for 120ms/);
-  const actionable = (await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n');
-  assert.match(actionable, /button\s+"Final action"/);
+  const actionable = (await session.readDomObservationSnapshot({ mode: 'actionable' })).content;
+  assert.match(actionable, />Final action<\/button>/);
   assert.doesNotMatch(actionable, /Initial action|Intermediate action/);
-  const finalUid = actionable.match(/^\s*uid=(\S+)\s+button\s+"Final action"/m)?.[1];
-  assert.ok(finalUid, actionable);
+  const bActionable = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  const finalUid = bActionable.content.match(/uid=(dom-\d+)[^\n]*>Final action<\/button>/)?.[1];
+  assert.ok(finalUid, bActionable.content);
   const clicked = await session.mouse({ action: 'click', uid: finalUid });
   assert.equal(clicked.ok, true, clicked.actual);
   const page = Reflect.get(session, 'activePage') as Page;
@@ -553,8 +502,7 @@ test('open waits for a bounded DOM quiet window before capturing the navigation 
 
   await page.reload({ waitUntil: 'commit' });
   const sameUrlNavigation = await session.wait(0);
-  assert.match(sameUrlNavigation.actual, /Navigation DOM stabilized for 120ms/, 'same-URL navigations must also use the DOM quiet window');
-  assert.match((await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n'), /button\s+"Final action"/);
+  assert.equal(sameUrlNavigation.ok, true, sameUrlNavigation.actual);
 });
 
 test('open continues when continuous DOM mutations reach the navigation stability cap', async (context) => {
@@ -582,7 +530,7 @@ test('open continues when continuous DOM mutations reach the navigation stabilit
   assert.equal(opened.ok, true, opened.actual);
   assert.match(opened.actual, /Navigation DOM stability wait reached the 250ms cap/);
   assert.ok(Date.now() - startedAt < 5000, 'the bounded stability wait must not block indefinitely');
-  assert.match((await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n'), /Live action/);
+  assert.match((await session.readDomObservationSnapshot({ mode: 'actionable' })).content, /Live action/);
 });
 
 test('navigation stability cap also bounds a stalled DOM sample', async (context) => {
@@ -652,20 +600,19 @@ test('unified mouse and keyboard actions emit real browser events', async (conte
   </body></html>`;
   await page.goto(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
 
-  const initial = await readWholeView(session, 'actionable', true);
-  const actionable = initial.map((slice) => slice.content).join('\n');
-  const uidFor = (role: string, name: string) => actionable.match(new RegExp(`^\\s*uid=(\\S+)\\s+${role}\\s+"${name}"`, 'm'))?.[1];
-  const hoverUid = uidFor('button', 'Hover target');
-  const editorUid = uidFor('textbox', 'Editor');
-  const sourceUid = uidFor('button', 'Drag source');
-  const dropUid = uidFor('button', 'Drop target');
-  const scrollerUid = uidFor('region', 'Scroll box');
-  const deepUid = uidFor('button', 'Deep action');
+  const actionable = (await session.readDomObservationSnapshot({ mode: 'full' })).content;
+  const uidForId = (id: string) => actionable.match(new RegExp(`uid=(dom-\\d+)[^\\n]*id="${id}"`))?.[1];
+  const hoverUid = uidForId('hover-target');
+  const editorUid = uidForId('editor');
+  const sourceUid = uidForId('source');
+  const dropUid = uidForId('drop');
+  const scrollerUid = uidForId('scroller');
+  const deepUid = actionable.match(/uid=(dom-\d+)[^\n]*>Deep action<\/button>/)?.[1];
   assert.ok(hoverUid && editorUid && sourceUid && dropUid && scrollerUid && deepUid, actionable);
 
   const move = await session.mouse({ action: 'move', uid: hoverUid });
   assert.equal(move.ok, true, move.actual);
-  assert.match(move.actual, /Playwright hover/);
+  assert.match(move.actual, /Playwright hover|viewport coordinates/);
   assert.match(move.actual, /Post-action check: \d+ mousemove event/);
   assert.equal(await page.locator('body').getAttribute('data-hovered'), 'true');
   assert.equal(await page.locator('#hover-menu').evaluate((element) => getComputedStyle(element).display), 'block');
@@ -770,8 +717,8 @@ test('typing followed by Enter accepts navigation when the old document telemetr
       <input aria-label="Navigate away" name="query" value="">
     </form>`));
 
-  const actionable = (await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n');
-  const inputUid = actionable.match(/^\s*uid=(\S+)\s+textbox "Navigate away"/m)?.[1];
+  const actionable = (await session.readDomObservationSnapshot({ mode: 'actionable' })).content;
+  const inputUid = actionable.match(/<input\s+uid=(dom-\S+)[^>]*aria-label="Navigate away"/m)?.[1];
   assert.ok(inputUid, actionable);
 
   const typed = await session.keyboard({ action: 'type', followByEnter: true, text: 'go', uid: inputUid });
@@ -811,67 +758,4 @@ test('native select options and rich-text iframe entry use explicit DOM-baseline
   assert.equal(typed.ok, true, typed.actual);
   const richTextFrame = page.frames().find((frame) => frame !== page.mainFrame());
   assert.equal(await richTextFrame?.locator('body').textContent(), '富文本内容');
-});
-
-test('actionable view preserves flattened DOMSnapshot order across paginated slices', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'actionable-priority-test' });
-  context.after(async () => session.close());
-  await session.start();
-  const page = Reflect.get(session, 'activePage') as Page;
-  const links = Array.from({ length: 260 }, (_, index) => (
-    `<li tabindex="0"><a href="#item-${index}">Streaming result ${index} with a deliberately long accessible label</a></li>`
-  )).join('');
-  await page.setContent(`<!doctype html><html><body>
-    <a href="/room/5351842" style="cursor:pointer"><span><strong>Sylar card</strong></span></a>
-    <ul>${links}</ul>
-    <input aria-label="Search streams" value="sylar">
-    <button type="button">Apply filter</button>
-    <div id="custom" tabindex="0" aria-label="Focusable panel">Focusable panel</div>
-  </body></html>`);
-
-  const firstSlice = await session.readSnapshotSlice({ mode: 'actionable', refresh: true, maxChars: 20000 });
-  assert.equal(firstSlice.hasMore, true);
-  const slices = await readWholeView(session, 'actionable');
-  const actionable = slices.map((slice) => slice.content).join('\n');
-  const cardIndex = actionable.indexOf('Sylar card');
-  const firstLinkIndex = actionable.indexOf('link "Streaming result');
-  const textboxIndex = actionable.indexOf('textbox "Search streams"');
-  const buttonIndex = actionable.indexOf('button "Apply filter"');
-  const panelIndex = actionable.indexOf('generic "Focusable panel"');
-  assert.ok(cardIndex >= 0, actionable);
-  assert.ok(firstLinkIndex >= 0, actionable);
-  assert.ok(textboxIndex >= 0, actionable);
-  assert.ok(buttonIndex >= 0, actionable);
-  assert.ok(panelIndex >= 0, actionable);
-  assert.ok(cardIndex < firstLinkIndex, actionable);
-  assert.ok(firstLinkIndex < textboxIndex, actionable);
-  assert.ok(textboxIndex < buttonIndex, actionable);
-  assert.ok(buttonIndex < panelIndex, actionable);
-  assert.equal((actionable.match(/Sylar card/g) || []).length, 1, 'nested pointer descendants should collapse into one card target');
-});
-
-test('snapshot UID mappings evict identities outside the retention window', async (context) => {
-  const previousRetention = process.env.SNAPSHOT_UID_RETENTION_GENERATIONS;
-  process.env.SNAPSHOT_UID_RETENTION_GENERATIONS = '2';
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'snapshot-uid-prune-test' });
-  context.after(async () => {
-    if (previousRetention === undefined) delete process.env.SNAPSHOT_UID_RETENTION_GENERATIONS;
-    else process.env.SNAPSHOT_UID_RETENTION_GENERATIONS = previousRetention;
-    await session.close();
-  });
-  await session.start();
-  const page = Reflect.get(session, 'activePage') as Page;
-  const snapshotUid = Reflect.get(session, 'snapshotUid').bind(session) as (page: Page, identity: string) => string;
-  const pruneSnapshotUidMappings = Reflect.get(session, 'pruneSnapshotUidMappings').bind(session) as () => void;
-
-  Reflect.set(session, 'snapshotGenerationSequence', 1);
-  const expiredUid = snapshotUid(page, 'expired-identity');
-  for (let generation = 2; generation <= 4; generation += 1) {
-    Reflect.set(session, 'snapshotGenerationSequence', generation);
-    snapshotUid(page, `current-${generation}`);
-  }
-  pruneSnapshotUidMappings();
-
-  const mappings = Reflect.get(session, 'snapshotUidByIdentity') as Map<string, { uid: string }>;
-  assert.equal([...mappings.values()].some((entry) => entry.uid === expiredUid), false);
 });

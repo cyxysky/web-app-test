@@ -478,7 +478,6 @@ function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'skills') return <Braces size={15} />;
   if (tab === 'memory') return <Brain size={15} />;
   if (tab === 'accounts') return <KeyRound size={15} />;
-  if (tab === 'dom-test') return <ScanSearch size={15} />;
   if (tab === 'debug') return <Bug size={15} />;
   return <SlidersHorizontal size={15} />;
 }

@@ -84,7 +84,7 @@ export async function GET(request: NextRequest) {
       opened,
       runId,
       note: pause
-        ? 'A debugger statement ran inside collectAiDomObservation() in the browser page VM. Resume in DevTools to let this request finish. Use serverPause=true when Node inspector breakpoints are needed.'
+        ? 'A debugger statement ran inside the browser-page interactive candidate scan. Resume in DevTools to let this request finish. Use serverPause=true when Node inspector breakpoints are needed.'
         : 'Debugger pause disabled; scan completed immediately.',
       scan,
     });

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { createPortal } from 'react-dom';
-import { ArrowLeft, FileJson2, FolderOpen, KeyRound, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
+import { ArrowLeft, FolderOpen, KeyRound, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { SkillsManager } from '@/components/SkillsManager';
 import {
@@ -71,21 +71,6 @@ type PersonalMemoryDraft = {
 
 type PersonalMemoryEditorMode = 'create' | 'edit' | null;
 
-type AccessibilitySnapshotBrowserStatus = {
-  ok: boolean;
-  running: boolean;
-  currentUrl?: string;
-  error?: string;
-  lastExport?: {
-    fileName?: string;
-    path?: string;
-    url?: string;
-    downloadUrl?: string;
-    bytes?: number;
-    createdAt?: string;
-  };
-};
-
 type SystemBridge = {
   cancelDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
   chooseDownloadDirectory?: (input?: { defaultPath?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
@@ -113,7 +98,6 @@ export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> 
   { id: 'runtime', label: '运行控制' },
   { id: 'memory', label: '个性化记忆' },
   { id: 'accounts', label: '登录账号' },
-  { id: 'dom-test', label: '页面快照测试' },
   { id: 'debug', label: '调试与高级' },
 ];
 
@@ -270,8 +254,6 @@ export function EnvironmentSettings({
   const [savingPersonalMemory, setSavingPersonalMemory] = useState(false);
   const [updatingPersonalMemoryId, setUpdatingPersonalMemoryId] = useState('');
   const [deletingPersonalMemoryId, setDeletingPersonalMemoryId] = useState('');
-  const [openingDomTestBrowser, setOpeningDomTestBrowser] = useState(false);
-  const [domTestBrowserStatus, setDomTestBrowserStatus] = useState<AccessibilitySnapshotBrowserStatus | null>(null);
   const [deletePersonalMemoryTarget, setDeletePersonalMemoryTarget] = useState<PersonalMemoryItem | null>(null);
   const [deletePersonalMemoryError, setDeletePersonalMemoryError] = useState('');
   const [hasDirectoryPicker, setHasDirectoryPicker] = useState(false);
@@ -293,26 +275,6 @@ export function EnvironmentSettings({
   useEffect(() => {
     setPortalReady(true);
   }, []);
-
-  useEffect(() => {
-    if (activeTab !== 'dom-test') return undefined;
-    let active = true;
-    const refresh = async () => {
-      try {
-        const response = await fetch('/api/debug/dom-observation-browser', { cache: 'no-store' });
-        const status = await readApiJson<AccessibilitySnapshotBrowserStatus>(response, '读取页面快照测试浏览器状态失败');
-        if (active) setDomTestBrowserStatus(status);
-      } catch (error) {
-        if (active) setDomTestBrowserStatus({ ok: false, running: false, error: error instanceof Error ? error.message : String(error) });
-      }
-    };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 3000);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [activeTab]);
 
   useEffect(() => {
     if (!personalMemoryEditorMode && !deletePersonalMemoryTarget) return undefined;
@@ -375,19 +337,6 @@ export function EnvironmentSettings({
     } finally {
       setSavingEnv(false);
       stopGlobalLoading();
-    }
-  }
-
-  async function openDomTestBrowser() {
-    setOpeningDomTestBrowser(true);
-    try {
-      const response = await fetch('/api/debug/dom-observation-browser', { method: 'POST' });
-      const status = await readApiJson<AccessibilitySnapshotBrowserStatus>(response, '打开页面快照测试浏览器失败');
-      setDomTestBrowserStatus(status);
-    } catch (error) {
-      setDomTestBrowserStatus({ ok: false, running: false, error: error instanceof Error ? error.message : String(error) });
-    } finally {
-      setOpeningDomTestBrowser(false);
     }
   }
 
@@ -1038,7 +987,7 @@ export function EnvironmentSettings({
   const activeProviderDefaultModel = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
-    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && activeTab !== 'dom-test' && definition?.tab === activeTab);
+    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab);
 
   return (
     <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
@@ -1251,53 +1200,7 @@ export function EnvironmentSettings({
 
           {activeTab === 'accounts' ? renderLoginAccountsPanel() : null}
 
-          {activeTab === 'dom-test' ? (
-            <section>
-              <div className="settings-section-head">
-                <div>
-                  <h2>{t('页面快照测试')}</h2>
-                  <span>{t('在独立测试浏览器中检查 Chromium DOMSnapshot、局部无障碍语义、可操作节点和全部 iframe 的实际采集结果。')}</span>
-                </div>
-              </div>
-              <div className="settings-card">
-                <div className="settings-row">
-                  <div>
-                    <strong>{t('测试浏览器')}</strong>
-                    <span>{t('打开浏览器后访问目标页面，点击右上角“导出页面快照”。actionable、full、text 三种视图会按每段最多 10000 字符写入同一个 JSON 文件。')}</span>
-                  </div>
-                  <button className="ui-button ui-button--neutral" disabled={openingDomTestBrowser} onClick={() => void openDomTestBrowser()} type="button">
-                    {openingDomTestBrowser ? <Loader2 className="spin" size={15} /> : <FileJson2 size={15} />}
-                    {t(domTestBrowserStatus?.running ? '显示测试浏览器' : '打开测试浏览器')}
-                  </button>
-                </div>
-                <div className="settings-row">
-                  <div>
-                    <strong>{t('运行状态')}</strong>
-                    <span data-i18n-skip>
-                      {domTestBrowserStatus?.error
-                        || (domTestBrowserStatus?.running ? `浏览器已打开${domTestBrowserStatus.currentUrl ? ` · ${domTestBrowserStatus.currentUrl}` : ''}` : '浏览器未打开')}
-                    </span>
-                  </div>
-                  {domTestBrowserStatus?.lastExport ? (
-                    <a className="ui-button ui-button--neutral" href={domTestBrowserStatus.lastExport.downloadUrl || domTestBrowserStatus.lastExport.url}>
-                      <FileJson2 size={15} />
-                      {domTestBrowserStatus.lastExport.fileName || t('最近导出')}
-                    </a>
-                  ) : null}
-                </div>
-                {domTestBrowserStatus?.lastExport?.path ? (
-                  <div className="settings-row">
-                    <div>
-                      <strong>{t('最近导出路径')}</strong>
-                      <span data-i18n-skip>{domTestBrowserStatus.lastExport.path}</span>
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            </section>
-          ) : null}
-
-          {activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && activeTab !== 'dom-test' ? (
+          {activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' ? (
             <section>
               <div className="settings-section-head">
                 <div>

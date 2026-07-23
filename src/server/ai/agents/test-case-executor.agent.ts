@@ -5,7 +5,7 @@ import sharp from 'sharp';
 import { z } from 'zod';
 import type { AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, buildVerificationPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
+import { buildCodexObjectPrompt, buildCompletionPromptLines, buildCompletionVerificationPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { clearStepAbortController, registerStepAbortController } from '@/server/ai/run-control.registry';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type BrowserSnapshotViews, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
@@ -148,7 +148,7 @@ type SelectedScreenshotReference = ScreenshotReference & {
 
 const codexRuntimeObjectSchema = z.object({
   type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op status update.'),
-  message: z.string().nullable().optional().describe('Optional short Chinese progress text that must match the selected tool: takeScreenshot reads pixels; takeSnapshot reads the accessibility tree.'),
+  message: z.string().nullable().optional().describe('Optional short Chinese progress text that must match the selected tool: takeScreenshot reads pixels; takeSnapshot reads the fast B-chain semantic DOM.'),
   params: z.object({
     reason: z.string().nullable().optional(),
     url: z.string().nullable().optional(),
@@ -231,19 +231,6 @@ function browserModeFromEnv(): BrowserSessionMode {
 function browserModeOf(testCase: TestCaseRecord): BrowserSessionMode {
   void testCase;
   return browserModeFromEnv();
-}
-
-function runtimePageContextOptions(mode: BrowserSessionMode) {
-  void mode;
-  return {
-    domScope: 'full' as const,
-    includeDomTree: false,
-    includeText: false,
-    includeManualVerification: false,
-    includeInteractiveCandidates: false,
-    textMaxChars: 0,
-    useCachedInteractiveCandidates: false,
-  };
 }
 
 type RuntimePageContext = Awaited<ReturnType<BrowserSession['getPageContext']>>;
@@ -1287,7 +1274,7 @@ function makeBrowserTools(
     getAiRequest?: () => AiRequestSnapshot | undefined;
     onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
     takeSnapshot?: (input?: RuntimeObservationReadOptions) => Promise<BrowserActionResult>;
-    observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => Promise<BrowserActionResult>;
+    observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode; markers?: boolean }) => Promise<BrowserActionResult>;
   },
 ) {
   // Enforce one executed browser tool per model step. The native AI SDK loop may call the model
@@ -1354,13 +1341,14 @@ function makeBrowserTools(
   const sharedTools = {
     ...(modelSupportsScreenshotInput() ? {
       takeScreenshot: tool({
-        description: 'Capture a visual screenshot and attach it to the next model request. The latest viewport screenshot can be targeted with mouse/keyboard x_thousandth and y_thousandth coordinates; fullPage screenshots are read-only evidence.',
+        description: 'Capture a visual screenshot and attach it to the next model request. Set markers=true to label visible interactive elements with the same dom-* UIDs returned by takeSnapshot/searchSnapshot. The latest viewport screenshot can also be targeted with mouse/keyboard x_thousandth and y_thousandth coordinates; fullPage screenshots are read-only evidence.',
         inputSchema: browserToolInput({
           capture: z.enum(['viewport', 'fullPage']).optional().describe('Screenshot size. Defaults to viewport; use fullPage only when the visual evidence is outside the current viewport.'),
+          markers: z.boolean().optional().describe('For viewport screenshots, overlay the current B-chain DOM UIDs on visible interactive elements.'),
         }),
         execute: (input) => record('takeScreenshot', input, async () => (
           referenceOptions?.observeCurrentScreenshot
-            ? referenceOptions.observeCurrentScreenshot({ capture: input.capture })
+            ? referenceOptions.observeCurrentScreenshot({ capture: input.capture, markers: input.markers })
             : { ok: false, actual: 'takeScreenshot is unavailable in this runtime.' }
         )),
       }),
@@ -1445,7 +1433,7 @@ function makeBrowserTools(
       execute: (input) => record('getHttpRequests', input, () => session.getCurrentTabHttpRequests({ ids: input.ids })),
     }),
     takeSnapshot: tool({
-      description: 'Capture a paged DOM observation. full covers the complete loaded DOM; text contains all text from that same full DOM, including offscreen content, not only the viewport. text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal and has no interactive UIDs. Default to mode=full. nextCursor pages one frozen result: continue with the same mode and exact cursor and never scroll for pagination. searchSnapshot, waiting, and asynchronous DOM mutations do not invalidate it; UI-affecting interactions and an explicit fresh takeSnapshot do.',
+      description: 'Capture the fast paged B-chain DOM observation. It uses the page-local DOM runtime and never invokes CDP DOMSnapshot or a full-page AX tree. full covers the loaded DOM; text contains text from that same DOM, including offscreen content. text pages are fixed at 20,000 characters; full pages are fixed at 40,000 characters. mode=changes reads the persistent inter-action journal and has no interactive UIDs. Default to mode=full. nextCursor pages one frozen result: continue with the same mode and exact cursor and never scroll for pagination. searchSnapshot, waiting, and asynchronous DOM mutations do not invalidate it; UI-affecting interactions and an explicit fresh takeSnapshot do.',
       inputSchema: takeSnapshotInput,
       execute: (input) => record('takeSnapshot', input, async () => (
         referenceOptions?.takeSnapshot
@@ -1454,13 +1442,16 @@ function makeBrowserTools(
       )),
     }),
     searchSnapshot: tool({
-      description: 'Purely search or read tags from the frozen full DOM baseline. query returns ranked matches; tag returns every element of that HTML tag. It never scrolls, consumes mutations, or invalidates pagination.',
+      description: 'Purely search or inspect the current frozen B-chain DOM baseline. query returns ranked matches; tag returns every element of that HTML tag; uid inspects one exact current reference. Set includeAx=true only when lightweight DOM semantics are ambiguous. Set includeShadow=true only with one exact uid to perform a bounded local CDP pierce of that host, followed by local AX enrichment; discovered descendants use the same dom-* UID namespace. It never performs a full DOMSnapshot or full AX-tree read.',
       inputSchema: browserToolInput({
         query: z.string().min(1).max(500).optional(),
         tag: z.string().min(1).max(80).optional(),
+        uid: z.string().min(1).max(80).optional(),
         roles: z.array(z.string().min(1)).max(20).optional(),
         limit: z.number().int().min(1).max(100).optional(),
-      }).refine((input) => Boolean(input.query || input.tag), { message: 'query or tag is required' }),
+        includeAx: z.boolean().optional().describe('Best-effort local accessibility snapshot for matched elements only. Never performs a full-page AX scan.'),
+        includeShadow: z.boolean().optional().describe('With one exact uid, inspect only that node for bounded closed/open/UA shadow descendants through local CDP.'),
+      }).refine((input) => Boolean(input.query || input.tag || input.uid), { message: 'query, tag, or uid is required' }),
       execute: (input) => record('searchSnapshot', input, () => session.searchSnapshot(input)),
     }),
     downloadFile: tool({
@@ -1663,7 +1654,7 @@ async function verifyRuntimeCompletion(input: {
 
 function runtimePrompt(input: {
   testCase: TestCaseRecord;
-  pageContext: Awaited<ReturnType<BrowserSession['getPageContext']>>;
+  currentUrl: string;
   completedSteps: StepExecutionResult[];
   workingMemory?: RuntimeWorkingMemory;
   stepIndex: number;
@@ -1674,7 +1665,7 @@ function runtimePrompt(input: {
   selectedScreenshotReferences?: SelectedScreenshotReference[];
   repairContext?: string;
 }) {
-  const { testCase, pageContext, completedSteps } = input;
+  const { testCase, currentUrl, completedSteps } = input;
   const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
   const visualMode = false;
   const attachScreenshot = false;
@@ -1704,7 +1695,7 @@ function runtimePrompt(input: {
     `Requirement: ${requirement}`,
     `Target URL: ${testCase.targetUrl}`,
     `Target host: ${targetHost}`,
-    `Current URL: ${pageContext.url}`,
+    `Current URL: ${currentUrl}`,
     '',
     'Hard rules:',
     browserChatMode
@@ -1748,7 +1739,6 @@ ${caseSystemPrompt}` : '',
     strategyMemory.length ? `Historical failure strategy memory:
 ${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : '',
     '',
-    ...buildVerificationPromptLines(pageContext, attachScreenshot),
     ...buildCompletionPromptLines(attachScreenshot),
     '',
     'Response:',
@@ -2182,7 +2172,7 @@ async function executeRuntimeStep(input: {
     details: { browserMode: mode, screenshotInputEnabled, markerEnabled },
   });
   const contextStartedAt = Date.now();
-  const pageContext = await session.getPageContext(runtimePageContextOptions(mode));
+  const currentUrl = session.currentUrl();
   const contextMs = elapsedSince(contextStartedAt);
   const screenshotReadStartedAt = Date.now();
   const screenshot = undefined;
@@ -2238,7 +2228,7 @@ async function executeRuntimeStep(input: {
     : '';
   const prompt = `${runtimePrompt({
     testCase,
-    pageContext,
+    currentUrl,
     completedSteps,
     stepIndex,
     beforeScreenshotPath,
@@ -2412,22 +2402,24 @@ async function executeRuntimeStep(input: {
       };
     }
 
-    async function observeCurrentScreenshot(options: { capture?: ScreenshotCaptureMode } = {}): Promise<BrowserActionResult> {
+    async function observeCurrentScreenshot(options: { capture?: ScreenshotCaptureMode; markers?: boolean } = {}): Promise<BrowserActionResult> {
       if (!modelSupportsScreenshotInput()) {
         return { ok: false, actual: 'takeScreenshot is unavailable because the configured model does not support image input.' };
       }
       pageStateObservationIndex += 1;
       const capture = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
       const visualIndex = traces.length + pageStateObservationIndex + 1;
-      const screenshotPath = await session.takeCurrentScreenshotOnly(input.runId, stepIndex, `visual-${visualIndex}`, { capture });
+      const markers = options.markers === true && capture === 'viewport';
+      const screenshotPath = await session.takeCurrentScreenshotOnly(input.runId, stepIndex, `visual-${visualIndex}`, { capture, markers });
       const observationText = [
         'Current screenshot observation:',
         `- ${capture} screenshot captured and attached to the next model request.`,
+        markers ? '- Visible marker labels are current dom-* UIDs and can be passed directly to mouse/keyboard.' : '',
         capture === 'viewport'
           ? '- This is now the only screenshot whose thousandth coordinates may be used by mouse or keyboard.'
           : '- Full-page screenshots are read-only and cannot be targeted with viewport coordinates.',
         `Image: ${basenameOfPath(screenshotPath)}`,
-      ].join('\n');
+      ].filter(Boolean).join('\n');
       pendingObservationMessages.push({
         text: `[WebPilot explicit screenshot observation]\n${observationText}`,
         imagePaths: [screenshotPath],
@@ -3143,7 +3135,7 @@ async function runRecordedTool(
         options.runId || 'recorded-flow',
         visualIndex,
         `visual-${visualIndex}`,
-        { capture },
+        { capture, markers: input.markers === true },
       );
       return { ok: true, actual: `Captured ${capture} screenshot: ${screenshotPath}` };
     }
@@ -3151,8 +3143,11 @@ async function runRecordedTool(
       return session.searchSnapshot({
         query: typeof input.query === 'string' ? input.query : undefined,
         tag: typeof input.tag === 'string' ? input.tag : undefined,
+        uid: typeof input.uid === 'string' ? input.uid : undefined,
         roles: Array.isArray(input.roles) ? input.roles.filter((role): role is string => typeof role === 'string') : undefined,
         limit: typeof input.limit === 'number' ? input.limit : undefined,
+        includeAx: input.includeAx === true,
+        includeShadow: input.includeShadow === true,
       });
     case 'mouse':
       return session.mouse({
@@ -3298,7 +3293,7 @@ async function executeCodexRuntimeObject(input: {
     sameInterfaceGroup?: string;
   }) => void | Promise<void>;
   takeSnapshot?: (input?: RuntimeObservationReadOptions) => BrowserActionResult | Promise<BrowserActionResult>;
-  observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode }) => BrowserActionResult | Promise<BrowserActionResult>;
+  observeCurrentScreenshot?: (input?: { capture?: ScreenshotCaptureMode; markers?: boolean }) => BrowserActionResult | Promise<BrowserActionResult>;
 }) {
   const { session, targetUrl, runId, stepIndex, mode, type, message, params, allowedTypes, traces, aiRequest, visualContext, onVisualContextChange, onToolTrace, onSelectReferenceScreenshots, takeSnapshot, observeCurrentScreenshot } = input;
   if (!allowedTypes.includes(type)) {
@@ -3339,7 +3334,10 @@ async function executeCodexRuntimeObject(input: {
   const runTool = async () => {
     if (type === 'takeScreenshot') {
       return observeCurrentScreenshot
-        ? observeCurrentScreenshot({ capture: normalizedParams.capture === 'fullPage' ? 'fullPage' : 'viewport' })
+        ? observeCurrentScreenshot({
+            capture: normalizedParams.capture === 'fullPage' ? 'fullPage' : 'viewport',
+            markers: normalizedParams.markers === true,
+          })
         : { ok: false, actual: 'takeScreenshot is unavailable in this runtime.' };
     }
     if (type === 'takeSnapshot') {
@@ -3741,12 +3739,7 @@ async function executeRecordedFlow(testCase: TestCaseRecord, runId: string, reco
         });
       };
 
-      const pageContext = await session.getPageContext({
-        includeDomTree: false,
-        includeText: true,
-        includeManualVerification: true,
-        includeInteractiveCandidates: false,
-      });
+      const pageContext = await session.getManualVerificationState();
       const explicitManualWait = flow.waitForManual || flow.name === 'waitForHumanVerification';
       if (explicitManualWait || pageContext.isManualVerification) {
         const reason = explicitManualWait
@@ -4054,7 +4047,7 @@ export async function executeTestCase(testCase: TestCaseRecord, runId: string, o
       }
 
       let skippedDuringManualIntervention = false;
-      const pageContext = await session.getPageContext();
+      const pageContext = await session.getManualVerificationState();
       if (pageContext.isManualVerification && !canPromptManualVerification(manualResumeCounts, stepIndex, maxManualPromptsPerStep)) {
         await onDebug?.({
           phase: 'manual:prompt-limit-reached',

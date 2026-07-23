@@ -1,7 +1,7 @@
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Dialog, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, CDPSession, Dialog, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
 import { artifactPath } from '@/server/storage/paths';
 import {
   boundedNonNegativeIntegerEnv,
@@ -20,16 +20,6 @@ import {
   sharedBrowserTabsEnabled,
   withSessionTabGrouperArgs,
 } from './browser-session-runtime';
-import {
-  buildSnapshotViews,
-  captureAxSnapshot,
-  snapshotRoleIsActionable,
-  type CapturedSnapshotFrame,
-  type SnapshotNodeWithUid,
-  type SnapshotRecord,
-  type SnapshotView,
-} from './ax-snapshot';
-import { captureDomSnapshot } from './dom-snapshot';
 import { resolveBrowserSessionSurface, type BrowserSessionSurface } from './browser-session-surface';
 
 function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
@@ -112,14 +102,6 @@ export type BrowserSessionOptions = {
   popupWaitMs?: number;
   /** Caps post-action frame bookkeeping; target resolution still uses the original frame. */
   actionFrameLimit?: number;
-};
-
-export type AccessibilitySnapshotExportControlResult = {
-  ok: boolean;
-  fileName?: string;
-  path?: string;
-  downloadUrl?: string;
-  error?: string;
 };
 
 /**
@@ -302,6 +284,7 @@ export type ScreenshotCaptureMode = 'viewport' | 'fullPage';
 
 type ScreenshotCaptureOptions = {
   capture?: ScreenshotCaptureMode;
+  markers?: boolean;
 };
 
 type InteractiveCandidate = {
@@ -339,7 +322,11 @@ type InteractiveCandidate = {
 
 type DomNodeReference = {
   id: string;
+  source?: 'page-dom' | 'cdp-shadow';
   interactive: boolean;
+  accessibleName?: string;
+  description?: string;
+  role?: string;
   capabilities?: DomActionCapability[];
   confidence?: DomActionConfidence;
   contextText?: string;
@@ -362,6 +349,33 @@ type DomNodeReference = {
   state: string;
   tag: string;
   viewportClip?: BrowserUseViewportClip;
+  axSnapshot?: string;
+  backendDOMNodeId?: number;
+  shadowHostUid?: string;
+};
+
+type CdpDomNode = {
+  nodeId?: number;
+  backendNodeId?: number;
+  nodeType: number;
+  nodeName: string;
+  localName?: string;
+  nodeValue?: string;
+  attributes?: string[];
+  children?: CdpDomNode[];
+  shadowRoots?: CdpDomNode[];
+  shadowRootType?: 'user-agent' | 'open' | 'closed';
+  contentDocument?: CdpDomNode;
+};
+
+type CdpAxNode = {
+  backendDOMNodeId?: number;
+  ignored?: boolean;
+  role?: { value?: unknown };
+  name?: { value?: unknown };
+  description?: { value?: unknown };
+  value?: { value?: unknown };
+  properties?: Array<{ name?: string; value?: { value?: unknown } }>;
 };
 
 function normalizeDomSearchText(value: unknown) {
@@ -378,6 +392,7 @@ function indexDomNodeReference<T extends Omit<DomNodeReference, 'normalizedConte
   const normalizedLine = normalizeDomSearchText(reference.line);
   const tag = normalizeDomSearchText(reference.tag);
   const semanticRoles = new Set<string>([tag]);
+  if (reference.role) semanticRoles.add(normalizeDomSearchText(reference.role));
   for (const match of normalizedLine.matchAll(/\brole="([^"]+)"/g)) semanticRoles.add(normalizeDomSearchText(match[1]));
   if (tag === 'input' || tag === 'textarea' || tag === 'contenteditable') semanticRoles.add('textbox');
   if (tag === 'select') semanticRoles.add('combobox');
@@ -392,6 +407,9 @@ function indexDomNodeReference<T extends Omit<DomNodeReference, 'normalizedConte
     normalizedLine,
     searchText: normalizeDomSearchText([
       reference.label,
+      reference.accessibleName,
+      reference.description,
+      reference.role,
       reference.contextText,
       reference.line,
       reference.tag,
@@ -478,9 +496,11 @@ type BrowserUseVisibleDomSnapshot = {
     url?: string;
   }>;
   items: Array<{
+    accessibleName: string;
     capabilities: DomActionCapability[];
     confidence: DomActionConfidence;
     contextText: string;
+    description: string;
     descriptor: string;
     interactive: boolean;
     label: string;
@@ -490,6 +510,7 @@ type BrowserUseVisibleDomSnapshot = {
     priority: number;
     rect?: BrowserUseViewportClip;
     ref: string;
+    role: string;
     signals: string[];
     state: string;
     tag: string;
@@ -618,6 +639,8 @@ type AiDomRuntime = {
     maxTop: number;
     moved: boolean;
   } | undefined);
+  setDomProbe: (ref: string, token: string) => boolean;
+  clearDomProbe: (ref: string, token: string) => void;
 };
 
 type AiDomMutationStateSnapshot = {
@@ -670,8 +693,9 @@ const aiDomMutationObserverScript = `(() => {
     state.observer = new MutationObserver((mutations) => {
       let meaningful = false;
       for (const mutation of mutations) {
+        if (mutation.type === 'attributes' && mutation.attributeName === 'data-ai-dom-probe') continue;
         const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-        if (!target || !target.closest || !target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) {
+        if (!target || !target.closest || !target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) {
           meaningful = true;
           break;
         }
@@ -680,6 +704,7 @@ const aiDomMutationObserverScript = `(() => {
       state.pendingMutations = state.pendingMutations || [];
       state.journalMutations = state.journalMutations || [];
       for (const mutation of mutations) {
+        if (mutation.type === 'attributes' && mutation.attributeName === 'data-ai-dom-probe') continue;
         if (state.journalMutations.length >= 10000) state.journalOverflow = true;
         else state.journalMutations.push(mutation);
         if (state.pendingMutations.length >= 500) {
@@ -697,7 +722,7 @@ const aiDomMutationObserverScript = `(() => {
     state.interactionListenersInstalled = true;
     const markInteraction = (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      if (target && target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) return;
+      if (target && target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) return;
       state.interactionSequence += 1;
       state.interactionCounts[event.type] = (state.interactionCounts[event.type] || 0) + 1;
       state.lastInteractionType = event.type;
@@ -709,47 +734,10 @@ const aiDomMutationObserverScript = `(() => {
   }
 })()`;
 
-type SnapshotReference = {
-  uid: string;
-  generationId: string;
-  page: Page;
-  documentId: string;
-  frameId: string;
-  framePath?: string;
-  frameUrl?: string;
-  axNodeId?: string;
-  backendDOMNodeId?: number;
-  selector?: string;
-  role: string;
-  name: string;
-  url?: string;
-  actionable: boolean;
-  actions: string[];
-};
-
-type SnapshotGeneration = {
-  id: string;
-  createdAt: string;
+type BrowserActionBaseline = {
   page: Page;
   url: string;
   navigationSequence: number;
-  frames: CapturedSnapshotFrame[];
-  references: Map<string, SnapshotReference>;
-  views: Record<SnapshotView, SnapshotRecord[]>;
-  nodeCount: number;
-  actionableCount: number;
-  skippedFrameCount: number;
-  captureSource: 'dom-snapshot' | 'full-ax-fallback';
-  mutationEpochs: Record<string, number>;
-  timings: {
-    totalMs: number;
-    captureAxMs: number;
-    captureDomMs: number;
-    frameTreeMs: number;
-    axTreeMs: number;
-    axEnrichmentMs: number;
-    domFallbackMs: number;
-  };
 };
 
 export type BrowserMouseAction = {
@@ -788,7 +776,7 @@ export type BrowserSelectOptionAction = {
 
 type ResolvedBrowserActionPoint = {
   error?: string;
-  reference?: SnapshotReference | DomNodeReference;
+  reference?: DomNodeReference;
   point?: {
     x: number;
     y: number;
@@ -797,12 +785,11 @@ type ResolvedBrowserActionPoint = {
   };
 };
 
-function isSnapshotReference(reference: SnapshotReference | DomNodeReference): reference is SnapshotReference {
-  return 'uid' in reference;
-}
-
 type WindowWithAiDomRuntime = Window & {
   __aiBrowserPageRuntimeInstalled?: boolean;
+  __aiAttachShadowPatched?: boolean;
+  __aiClosedShadowRoots?: WeakMap<Element, ShadowRoot>;
+  __aiObserveShadowRoot?: (root: ShadowRoot) => void;
   __aiGetEventListenerTypes?: (target: EventTarget) => string[];
   __aiDomRuntime?: AiDomRuntime;
   __aiDomMutationState?: AiDomMutationStateSnapshot & {
@@ -994,79 +981,19 @@ function isBlankBrowserUrlLike(url: string) {
     );
 }
 
-function installAccessibilitySnapshotExportControl() {
-  if (window.top !== window) return;
-  const controlId = '__ai_dom_export_control__';
-  const browserWindow = window as Window & {
-    __webPilotExportAccessibilitySnapshot?: () => Promise<AccessibilitySnapshotExportControlResult>;
-  };
-  const mount = () => {
-    if (!document.documentElement || document.getElementById(controlId)) return;
-    const button = document.createElement('button');
-    button.id = controlId;
-    button.type = 'button';
-    button.textContent = '导出页面快照';
-    button.title = '获取当前页面及全部 iframe 的语义 DOM 快照，并按每段 20000 字符导出 JSON';
-    button.setAttribute('aria-label', '导出当前页面语义 DOM 快照');
-    Object.assign(button.style, {
-      alignItems: 'center',
-      appearance: 'none',
-      background: '#171717',
-      border: '1px solid rgba(255,255,255,.18)',
-      borderRadius: '8px',
-      boxShadow: '0 8px 24px rgba(0,0,0,.24)',
-      color: '#fff',
-      cursor: 'pointer',
-      display: 'inline-flex',
-      font: '600 13px/1 system-ui, sans-serif',
-      height: '34px',
-      padding: '0 12px',
-      position: 'fixed',
-      right: '16px',
-      top: '16px',
-      zIndex: '2147483647',
-    });
-    button.addEventListener('click', async () => {
-      if (button.disabled) return;
-      button.disabled = true;
-      button.style.cursor = 'wait';
-      button.textContent = '正在采集...';
-      try {
-        const result = await browserWindow.__webPilotExportAccessibilitySnapshot?.();
-        if (!result?.ok) throw new Error(result?.error || '页面快照导出失败');
-        button.textContent = '导出完成';
-        button.title = result.path || result.fileName || '页面快照已导出';
-        if (result.downloadUrl) {
-          const link = document.createElement('a');
-          link.href = result.downloadUrl;
-          link.download = result.fileName || 'accessibility-snapshot.json';
-          link.style.display = 'none';
-          document.documentElement.appendChild(link);
-          link.click();
-          link.remove();
-        }
-      } catch (error) {
-        button.textContent = '导出失败';
-        button.title = error instanceof Error ? error.message : String(error);
-      } finally {
-        window.setTimeout(() => {
-          button.disabled = false;
-          button.style.cursor = 'pointer';
-          button.textContent = '导出页面快照';
-        }, 1800);
-      }
-    });
-    document.documentElement.appendChild(button);
-  };
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', mount, { once: true });
-  } else {
-    mount();
-  }
-}
-
 function installAiBrowserPageRuntime() {
   const win = window as WindowWithAiDomRuntime;
+  const closedShadowRoots = win.__aiClosedShadowRoots ||= new WeakMap<Element, ShadowRoot>();
+  if (!win.__aiAttachShadowPatched) {
+    const originalAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function attachShadow(init: ShadowRootInit) {
+      const root = originalAttachShadow.call(this, init);
+      closedShadowRoots.set(this, root);
+      win.__aiObserveShadowRoot?.(root);
+      return root;
+    };
+    win.__aiAttachShadowPatched = true;
+  }
   if (!win.__aiBrowserPageRuntimeInstalled) {
     const originalAddEventListener = EventTarget.prototype.addEventListener;
     const listenerTypes = new WeakMap<EventTarget, Set<string>>();
@@ -1100,14 +1027,16 @@ function installAiBrowserPageRuntime() {
   if (!mutationState.observer) {
     mutationState.observer = new MutationObserver((mutations) => {
       const meaningful = mutations.some((mutation) => {
+        if (mutation.type === 'attributes' && mutation.attributeName === 'data-ai-dom-probe') return false;
         const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-        return !target?.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__');
+        return !target?.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__');
       });
       if (!meaningful) return;
       mutationState.pendingMutations = mutationState.pendingMutations || [];
       mutationState.pendingMutationKeys = mutationState.pendingMutationKeys || new WeakMap<Node, Set<string>>();
       mutationState.journalMutations = mutationState.journalMutations || [];
       for (const mutation of mutations) {
+        if (mutation.type === 'attributes' && mutation.attributeName === 'data-ai-dom-probe') continue;
         if (mutationState.journalMutations.length >= 10000) mutationState.journalOverflow = true;
         else mutationState.journalMutations.push(mutation);
         if (mutationState.pendingMutations.length >= 500) {
@@ -1136,19 +1065,33 @@ function installAiBrowserPageRuntime() {
       subtree: true,
     });
   }
+  win.__aiObserveShadowRoot = (root) => {
+    mutationState.observer?.observe(root, {
+      attributes: true,
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+  };
+  for (const element of Array.from(document.querySelectorAll('*'))) {
+    const root = element.shadowRoot || closedShadowRoots.get(element);
+    if (root) win.__aiObserveShadowRoot(root);
+  }
 
-  if (win.__aiDomRuntime?.version === 14) return;
+  if (win.__aiDomRuntime?.version === 15) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
   const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
 
   function isOverlay(element: Element) {
-    return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__'));
+    return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__'));
   }
 
   function shadowRootOf(element: Element) {
-    return (element as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot || undefined;
+    return (element as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot
+      || closedShadowRoots.get(element)
+      || undefined;
   }
 
   function flatParentElement(node: Node): Element | undefined {
@@ -1415,8 +1358,16 @@ function installAiBrowserPageRuntime() {
     'aria-labelledby',
     'aria-describedby',
     'aria-controls',
+    'aria-checked',
+    'aria-current',
+    'aria-haspopup',
+    'aria-invalid',
+    'aria-multiline',
     'aria-expanded',
     'aria-pressed',
+    'aria-readonly',
+    'aria-required',
+    'aria-selected',
     'alt',
     'contenteditable',
     'data-testid',
@@ -1483,6 +1434,93 @@ function installAiBrowserPageRuntime() {
 
   function visibleDomElementName(element: Element) {
     return (element.localName || element.nodeName || '').toLowerCase();
+  }
+
+  function visibleDomSemanticRole(element: Element) {
+    const explicit = normalizeVisibleDomText(element.getAttribute('role') || '').toLowerCase().split(/\s+/)[0];
+    if (explicit) return explicit;
+    const tag = visibleDomElementName(element);
+    const type = normalizeVisibleDomText(element.getAttribute('type') || 'text').toLowerCase();
+    if (tag === 'a' && element.hasAttribute('href')) return 'link';
+    if (tag === 'button') return 'button';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'select') return element.hasAttribute('multiple') ? 'listbox' : 'combobox';
+    if (tag === 'option') return 'option';
+    if (tag === 'summary') return 'button';
+    if (tag === 'input') {
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'range') return 'slider';
+      if (type === 'number') return 'spinbutton';
+      if (type === 'search') return 'searchbox';
+      if (['button', 'image', 'reset', 'submit'].includes(type)) return 'button';
+      return 'textbox';
+    }
+    if (isContentEditableOwner(element)) return 'textbox';
+    if (/^h[1-6]$/.test(tag)) return 'heading';
+    if (tag === 'img') return 'image';
+    if (tag === 'nav') return 'navigation';
+    if (tag === 'main') return 'main';
+    if (tag === 'form') return 'form';
+    if (tag === 'dialog') return 'dialog';
+    if (tag === 'table') return 'table';
+    if (tag === 'tr') return 'row';
+    if (tag === 'th') return element.getAttribute('scope') === 'row' ? 'rowheader' : 'columnheader';
+    if (tag === 'td') return 'cell';
+    if (tag === 'ul' || tag === 'ol') return 'list';
+    if (tag === 'li') return 'listitem';
+    return 'generic';
+  }
+
+  function visibleDomReferencedText(element: Element, attributeName: string, maxChars = 240) {
+    const ids = normalizeVisibleDomText(element.getAttribute(attributeName) || '').split(/\s+/).filter(Boolean);
+    const values: string[] = [];
+    let chars = 0;
+    for (const id of ids) {
+      const target = document.getElementById(id);
+      if (!target || isVisibleDomSubtreeHidden(target)) continue;
+      const value = visibleDomTextContent(target, Math.max(1, maxChars - chars));
+      if (!value) continue;
+      values.push(value);
+      chars += value.length + 1;
+      if (chars >= maxChars) break;
+    }
+    return visibleDomUniqueText(values).join(' | ').slice(0, maxChars);
+  }
+
+  function visibleDomAssociatedLabelText(element: Element) {
+    const control = element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+    const labels = 'labels' in control && control.labels ? Array.from(control.labels) : [];
+    return visibleDomUniqueText(labels.map((label) => visibleDomTextContent(label, 180))).join(' | ').slice(0, 240);
+  }
+
+  function visibleDomAccessibleName(element: Element, fallbackText = '') {
+    const tag = visibleDomElementName(element);
+    const type = normalizeVisibleDomText(element.getAttribute('type') || '').toLowerCase();
+    const formControl = element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+    const labelledBy = visibleDomReferencedText(element, 'aria-labelledby');
+    const associatedLabel = visibleDomAssociatedLabelText(element);
+    const buttonValue = tag === 'input' && ['button', 'image', 'reset', 'submit'].includes(type)
+      ? normalizeVisibleDomText(formControl.value || '')
+      : '';
+    return visibleDomUniqueText([
+      labelledBy,
+      element.getAttribute('aria-label') || '',
+      associatedLabel,
+      tag === 'img' || type === 'image' ? element.getAttribute('alt') || '' : '',
+      buttonValue,
+      fallbackText,
+      element.getAttribute('placeholder') || '',
+      element.getAttribute('title') || '',
+      element.getAttribute('name') || '',
+    ]).join(' | ').slice(0, 300);
+  }
+
+  function visibleDomAccessibleDescription(element: Element) {
+    return visibleDomUniqueText([
+      visibleDomReferencedText(element, 'aria-describedby', 300),
+      element.getAttribute('aria-description') || '',
+    ]).join(' | ').slice(0, 300);
   }
 
   function isVisibleDomHidden(element: Element) {
@@ -1568,7 +1606,7 @@ function installAiBrowserPageRuntime() {
     const tag = visibleDomElementName(element);
     if (hasNativeActionSignal(element, tag)) signals.push('native');
     if (element.hasAttribute('onclick')) signals.push('onclick');
-    const role = normalizeVisibleDomText(element.getAttribute('role') || '').toLowerCase();
+    const role = visibleDomSemanticRole(element);
     if (visibleDomActionRolePattern.test(role)) signals.push(`role:${role}`);
     for (const type of recordedEventTypes(element)) {
       if (visibleDomClickEventPattern.test(type) || visibleDomHoverEventPattern.test(type)) signals.push(`listener:${type}`);
@@ -1591,7 +1629,7 @@ function installAiBrowserPageRuntime() {
   }
 
   function hasVisibleDomOwnClickBoundary(element: Element) {
-    const role = normalizeVisibleDomText(element.getAttribute('role') || '').toLowerCase();
+    const role = visibleDomSemanticRole(element);
     return hasNativeActionSignal(element)
       || element.hasAttribute('onclick')
       || hasActionAttribute(element)
@@ -1618,7 +1656,7 @@ function installAiBrowserPageRuntime() {
     const capabilities = new Set<DomActionCapability>();
     const tag = visibleDomElementName(element);
     const type = normalizeVisibleDomText(element.getAttribute('type') || '').toLowerCase();
-    const role = normalizeVisibleDomText(element.getAttribute('role') || '').toLowerCase();
+    const role = visibleDomSemanticRole(element);
     if (tag === 'input') {
       if (/^(button|checkbox|color|file|image|radio|range|reset|submit)$/i.test(type)) capabilities.add('click');
       else capabilities.add('fill');
@@ -1863,7 +1901,15 @@ function installAiBrowserPageRuntime() {
     'value',
     'href',
     'aria-expanded',
+    'aria-checked',
+    'aria-current',
+    'aria-haspopup',
+    'aria-invalid',
+    'aria-multiline',
     'aria-pressed',
+    'aria-readonly',
+    'aria-required',
+    'aria-selected',
     'checked',
     'disabled',
     'readonly',
@@ -1927,8 +1973,16 @@ function installAiBrowserPageRuntime() {
     return visibleDomDescendantSemanticText(element);
   }
 
-  function visibleDomLabelForElement(element: Element, interactive: boolean, lineText: string) {
+  function visibleDomLabelForElement(
+    element: Element,
+    interactive: boolean,
+    lineText: string,
+    accessibleName = visibleDomAccessibleName(element, lineText),
+    description = visibleDomAccessibleDescription(element),
+  ) {
     const values = visibleDomUniqueText([
+      accessibleName,
+      description,
       lineText,
       ...visibleDomLabelAttributeNames.map((name) => visibleDomAttributeValue(element, name) || ''),
       visibleDomAttributeValue(element, 'name') || '',
@@ -2035,6 +2089,7 @@ function installAiBrowserPageRuntime() {
   function visibleDomItem(element: Element, ref: string, signals: string[] = []) {
     const tag = visibleDomElementName(element);
     const attrs = [`node_id=${ref}`];
+    const role = visibleDomSemanticRole(element);
     for (const name of visibleDomRenderedAttributes) {
       const value = visibleDomAttributeValue(element, name);
       if (value) attrs.push(`${name}="${escapeVisibleDomText(value)}"`);
@@ -2075,6 +2130,13 @@ function installAiBrowserPageRuntime() {
     const confidence = visibleDomActionConfidence(element, signals, capabilities);
     const interactive = capabilities.length > 0;
     const text = visibleDomLineText(element, interactive);
+    const accessibleName = visibleDomAccessibleName(element, text);
+    const description = visibleDomAccessibleDescription(element);
+    if (!element.hasAttribute('role') && role !== 'generic') attrs.push(`role="${escapeVisibleDomText(role)}"`);
+    if (accessibleName && accessibleName !== text && accessibleName !== visibleDomAttributeValue(element, 'aria-label')) {
+      attrs.push(`accessible_name="${escapeVisibleDomText(accessibleName)}"`);
+    }
+    if (description) attrs.push(`description="${escapeVisibleDomText(description)}"`);
     const ownText = visibleDomOwnTextContent(element);
     const semanticTextTags = new Set(['a', 'button', 'dd', 'dt', 'figcaption', 'label', 'legend', 'li', 'option', 'p', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
     const formText = ['input', 'select', 'textarea'].includes(tag)
@@ -2096,15 +2158,18 @@ function installAiBrowserPageRuntime() {
       ? `<${tag} ${attrs.join(' ')} />`
       : `<${tag} ${attrs.join(' ')}>${escapeVisibleDomText(text)}</${tag}>`;
     return {
+      accessibleName,
       capabilities,
       confidence,
       contextText,
+      description,
       interactive,
-      label: visibleDomLabelForElement(element, interactive, text),
+      label: visibleDomLabelForElement(element, interactive, text, accessibleName, description),
       line,
       locatorCandidates: visibleDomLocatorCandidates(element),
       priority,
       rect,
+      role,
       signals,
       state: interactive ? visibleDomInteractiveStateForElement(element, signals) : '',
       tag,
@@ -2566,6 +2631,9 @@ function installAiBrowserPageRuntime() {
     const clip = viewportClip || visualViewportRect();
     const clickablePoint = visibleDomClickablePoint(element, clip);
     if (clickablePoint) return { ...clickablePoint, descriptor: descriptor(element) };
+    // Actionable refs must never fall back to an unchecked rectangle center:
+    // failure here normally means the element is covered after the baseline.
+    if (isActionable(element)) return undefined;
     const pointInRect = (rect: DOMRect | ClientRect) => {
       if (rect.width <= 0 || rect.height <= 0) return undefined;
       const left = Math.max(rect.left, clip.left);
@@ -2648,8 +2716,21 @@ function installAiBrowserPageRuntime() {
     };
   }
 
+  const domProbeAttribute = 'data-ai-dom-probe';
+  function setDomProbe(ref: string, token: string) {
+    const element = visibleDomState().refToElement.get(ref);
+    if (!element?.isConnected) return false;
+    element.setAttribute(domProbeAttribute, token);
+    return true;
+  }
+
+  function clearDomProbe(ref: string, token: string) {
+    const element = visibleDomState().refToElement.get(ref);
+    if (element?.getAttribute(domProbeAttribute) === token) element.removeAttribute(domProbeAttribute);
+  }
+
   win.__aiDomRuntime = {
-    version: 14,
+    version: 15,
     mutationState: () => ({ epoch: mutationState.epoch, lastMutationAt: mutationState.lastMutationAt }),
     isOverlay,
     isTraversable,
@@ -2681,664 +2762,8 @@ function installAiBrowserPageRuntime() {
     visibleDomText,
     selectVisibleDomOption,
     scrollVisibleDomVirtualList,
-  };
-}
-
-function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean; requirePointerEvents?: boolean; structuredTextMaxChars?: number; debugPause?: boolean; candidateTextQuery?: string }): PageDomObservationPayload {
-  if (input.debugPause) {
-    debugger;
-  }
-  const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-  if (!runtime) return { structuredText: '', interactiveCandidates: [], links: [] };
-
-  const includeInteractiveCandidates = input.includeInteractiveCandidates !== false;
-  const requirePointerEvents = input.requirePointerEvents === true;
-  const maxStructuredTextChars = Math.max(0, Math.floor(Number(input.structuredTextMaxChars) || 0));
-  const structuredLines: string[] = [];
-  const pageLinks = new Map<string, { url: string; title: string }>();
-  let structuredChars = 0;
-  const normalizeText = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
-  const candidateTextQuery = normalizeText(input.candidateTextQuery).toLowerCase();
-  const candidateTextQueryParts = candidateTextQuery.split(/\s+/).filter((item) => item.length >= 2);
-  const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__';
-  const skippedTextTags = new Set(['script', 'style', 'template', 'noscript']);
-  const structuralTextTags = new Set([
-    'article',
-    'aside',
-    'body',
-    'details',
-    'dialog',
-    'fieldset',
-    'footer',
-    'form',
-    'header',
-    'li',
-    'main',
-    'menu',
-    'nav',
-    'ol',
-    'section',
-    'summary',
-    'table',
-    'tbody',
-    'td',
-    'th',
-    'thead',
-    'tr',
-    'ul',
-  ]);
-
-  function classNameOf(element: Element) {
-    return typeof element.className === 'string'
-      ? normalizeText(element.className).split(/\s+/).filter(Boolean).slice(0, 8).join(' ')
-      : '';
-  }
-
-  function compactClassNameOf(element: Element) {
-    return typeof element.className === 'string'
-      ? element.className.split(/\s+/).filter(Boolean).slice(0, 3).join('.')
-      : '';
-  }
-
-  function isHiddenForStructuredText(element: Element) {
-    if (element.closest(overlaySelector)) return true;
-    if (element.getAttribute('aria-hidden') === 'true') return true;
-    const style = window.getComputedStyle(element);
-    return style.display === 'none'
-      || style.visibility === 'hidden'
-      || style.visibility === 'collapse'
-      || Number(style.opacity || '1') <= 0.01;
-  }
-
-  function appendStructuredText(depth: number, text: string) {
-    if (!maxStructuredTextChars || !text || structuredChars >= maxStructuredTextChars) return;
-    const line = `${'  '.repeat(Math.min(depth, 12))}${text}`;
-    const remaining = maxStructuredTextChars - structuredChars;
-    const chunk = line.length > remaining ? line.slice(0, remaining) : line;
-    if (!chunk) return;
-    structuredLines.push(chunk);
-    structuredChars += chunk.length + 1;
-  }
-
-  function structuredTextLine(element: Element) {
-    const tag = element.tagName.toLowerCase();
-    if (skippedTextTags.has(tag) || isHiddenForStructuredText(element)) return undefined;
-    const role = element.getAttribute('role');
-    const classes = compactClassNameOf(element);
-    const descriptor = `${tag}${classes ? `.${classes}` : ''}${role ? `[role=${role}]` : ''}`;
-    const inputElement = element as HTMLInputElement;
-    const label = [
-      element.getAttribute('aria-label'),
-      element.getAttribute('title'),
-      element.getAttribute('alt'),
-      inputElement.placeholder,
-      inputElement.value,
-      ownText(element),
-    ].map(normalizeText).find(Boolean) || '';
-    const shouldShow = Boolean(label)
-      || structuralTextTags.has(tag)
-      || ['button', 'a', 'input', 'select', 'textarea', 'option'].includes(tag);
-    return shouldShow ? { shown: true, text: label ? `${descriptor}: ${label}` : descriptor } : { shown: false, text: '' };
-  }
-
-  function flatParentElement(node: Node) {
-    return runtime.flatParentElement(node);
-  }
-
-  function hasPointerCursor(element: Element) {
-    const style = window.getComputedStyle(element);
-    if (!/\bpointer\b/i.test(style.cursor || '')) return false;
-    const parent = flatParentElement(element);
-    if (!parent) return true;
-    const parentStyle = window.getComputedStyle(parent);
-    if (!/\bpointer\b/i.test(parentStyle.cursor || '')) return true;
-    return /(?:^|;)\s*cursor\s*:\s*pointer\b/i.test(element.getAttribute('style') || '');
-  }
-
-  function composedContains(ancestor: Element, node: Element) {
-    return runtime.composedContains(ancestor, node);
-  }
-
-  function isInsideShadow(element: Element) {
-    const root = element.getRootNode();
-    return Boolean(root && (root as ShadowRoot).host);
-  }
-
-  function visibleRectOf(element: Element) {
-    return runtime.visibleRect(element, { requirePointerEvents });
-  }
-
-  function children(element: Element) {
-    return runtime.children(element);
-  }
-
-  function ownText(element: Element) {
-    let text = '';
-    for (const node of Array.from(element.childNodes)) {
-      if (node.nodeType === Node.TEXT_NODE) text += node.textContent || '';
-    }
-    const inner = normalizeText((element as HTMLElement).innerText || element.textContent || '');
-    return (normalizeText(text) || inner).slice(0, 140);
-  }
-
-  function contextText(element: Element) {
-    const container = element.closest('li, article, tr, form, [role="listitem"], [role="row"], section, main') || element.parentElement || element;
-    return normalizeText((container as HTMLElement).innerText || container.textContent || '').slice(0, 220);
-  }
-
-  function labelMatchesCandidateTextQuery(value?: string | null) {
-    if (!candidateTextQuery) return true;
-    const label = normalizeText(value).toLowerCase();
-    if (!label) return false;
-    if (label === candidateTextQuery) return true;
-    if (label.startsWith(candidateTextQuery)) return true;
-    if (label.includes(candidateTextQuery)) return true;
-    return candidateTextQueryParts.length >= 2 && candidateTextQueryParts.every((part) => label.includes(part));
-  }
-
-  function labelsMatchCandidateTextQuery(labels: Array<string | undefined>) {
-    return !candidateTextQuery || labels.some(labelMatchesCandidateTextQuery);
-  }
-
-  function recordedEventTypes(element: Element) {
-    return runtime.recordedEventTypes(element);
-  }
-
-  function hasRecordedClickListener(element: Element) {
-    return recordedEventTypes(element).some((type) => /^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/.test(type));
-  }
-
-  function hasRecordedHoverListener(element: Element) {
-    return recordedEventTypes(element).some((type) => /^(mouseenter|mouseover|pointerenter|pointerover)$/.test(type));
-  }
-
-  function hasActionAttribute(element: Element) {
-    return runtime.hasActionAttribute(element);
-  }
-
-  function hasOwnHoverSignal(element: Element) {
-    if (element.hasAttribute('onmouseenter')) return true;
-    if (element.hasAttribute('onmouseover')) return true;
-    if (element.hasAttribute('onpointerenter')) return true;
-    if (element.hasAttribute('onpointerover')) return true;
-    return hasRecordedHoverListener(element);
-  }
-
-  const hoverSelectors = (() => {
-    const selectors: string[] = [];
-    for (const sheet of Array.from(document.styleSheets)) {
-      let rules: CSSRuleList | undefined;
-      try {
-        rules = sheet.cssRules;
-      } catch {
-        continue;
-      }
-      for (const rule of Array.from(rules || [])) {
-        const selectorText = (rule as CSSStyleRule).selectorText;
-        if (!selectorText || !selectorText.includes(':hover')) continue;
-        for (const part of selectorText.split(',')) {
-          const normalized = part
-            .replace(/:hover\b/g, '')
-            .replace(/:(active|focus|focus-visible|focus-within|visited|link)\b/g, '')
-            .trim();
-          if (normalized && !/[>+~]\s*$/.test(normalized)) selectors.push(normalized);
-        }
-      }
-    }
-    return Array.from(new Set(selectors)).slice(0, 600);
-  })();
-
-  function hasCssHoverEffect(element: Element) {
-    const className = typeof element.className === 'string' ? element.className : '';
-    if (/(^|\s)hover[:_-]/.test(className)) return true;
-    for (const selector of hoverSelectors) {
-      try {
-        if (element.matches(selector)) return true;
-      } catch {
-        // Ignore selectors that cannot be used with matches().
-      }
-    }
-    return false;
-  }
-
-  function isContentEditableOwner(element: Element) {
-    const value = element.getAttribute('contenteditable');
-    return value !== null && value.toLowerCase() !== 'false';
-  }
-
-  function labelControlFor(element: Element) {
-    if (element.tagName.toLowerCase() !== 'label') return undefined;
-    const control = (element as HTMLLabelElement).control || undefined;
-    const fallback = control ||
-      (element.getAttribute('for') ? document.getElementById(element.getAttribute('for') || '') || undefined : undefined);
-    const target = fallback ||
-      element.querySelector('button, input, select, textarea, [contenteditable=""], [contenteditable="true"]') ||
-      undefined;
-    if (!target) return undefined;
-    const tag = target.tagName.toLowerCase();
-    return ['button', 'input', 'select', 'textarea'].includes(tag) || isContentEditableOwner(target) ? target : undefined;
-  }
-
-  function interactionSignals(element: Element, tag = element.tagName.toLowerCase()) {
-    const signals: string[] = [];
-    if (
-      ['button', 'details', 'input', 'select', 'textarea', 'summary', 'option'].includes(tag) ||
-      (tag === 'a' && element.hasAttribute('href')) ||
-      (tag === 'label' && labelControlFor(element))
-    ) {
-      signals.push('native');
-    }
-    if (element.hasAttribute('onclick')) signals.push('onclick');
-    if (hasRecordedClickListener(element)) signals.push('listener');
-    if (hasActionAttribute(element)) signals.push('action-attr');
-    if (hasPointerCursor(element)) signals.push('cursor=pointer');
-    const tabindex = element.getAttribute('tabindex');
-    if (tabindex !== null && tabindex !== '-1') signals.push('tabindex');
-    if (isContentEditableOwner(element)) signals.push('contenteditable');
-    if (hasOwnHoverSignal(element)) signals.push('hover-listener');
-    if (hasCssHoverEffect(element)) signals.push('hover-css');
-    return signals;
-  }
-
-  function clickableReason(element: Element) {
-    return interactionSignals(element).length > 0;
-  }
-
-  function isInteractiveDescendant(element: Element) {
-    const tag = element.tagName.toLowerCase();
-    if (tag === 'label' && labelControlFor(element)) return true;
-    const isInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(element);
-    return clickableReason(element) || isInput || hasOwnHoverSignal(element) || hasCssHoverEffect(element);
-  }
-
-  function externalAppTargetForUrl(value?: string | null) {
-    const url = normalizeText(value);
-    const match = url.match(/^([a-z][a-z0-9+.-]*):/i);
-    if (!match) return undefined;
-    const protocol = match[1].toLowerCase();
-    if ([
-      'http',
-      'https',
-      'about',
-      'blob',
-      'data',
-      'javascript',
-      'file',
-      'chrome',
-      'chrome-extension',
-      'edge',
-      'devtools',
-      'view-source',
-    ].includes(protocol)) return undefined;
-    return { protocol };
-  }
-
-  function externalAppTargetForElement(element: Element, href?: string) {
-    const direct = externalAppTargetForUrl(href || element.getAttribute('href'));
-    if (direct) return direct;
-
-    const attributeNames = [
-      'data-href',
-      'data-url',
-      'data-link',
-      'data-uri',
-      'data-deeplink',
-      'data-deep-link',
-      'data-scheme',
-      'data-target-url',
-    ];
-    for (const name of attributeNames) {
-      const value = element.getAttribute(name);
-      const result = externalAppTargetForUrl(value)
-        || (name === 'data-scheme' && /^[a-z][a-z0-9+.-]*$/i.test(normalizeText(value))
-          ? externalAppTargetForUrl(`${normalizeText(value)}:`)
-          : undefined);
-      if (result) return result;
-    }
-
-    const inlineHandler = element.getAttribute('onclick') || '';
-    const handlerMatch = inlineHandler.match(/['"]([a-z][a-z0-9+.-]*:[^'"]*)['"]/i);
-    return externalAppTargetForUrl(handlerMatch?.[1]);
-  }
-
-  function nameOf(element: Element) {
-    const inputElement = element as HTMLInputElement;
-    const labelText = inputElement.labels?.length ? Array.from(inputElement.labels).map((label) => label.textContent || '').join(' ') : '';
-    const imageAlt = Array.from(element.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ');
-    return [
-      element.getAttribute('aria-label'),
-      element.getAttribute('title'),
-      element.getAttribute('alt'),
-      imageAlt,
-      inputElement.placeholder,
-      labelText,
-      ownText(element),
-      inputElement.value,
-    ]
-      .filter(Boolean)
-      .join(' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 180);
-  }
-
-  function topmostRenderableAt(x: number, y: number) {
-    return runtime.topmostRenderableAt(x, y, { requirePointerEvents });
-  }
-
-  function isIndependentPointForOwner(owner: Element, top: Element) {
-    if (top !== owner && !composedContains(owner, top)) return false;
-    let current: Element | undefined = top;
-    let guard = 0;
-    while (current && current !== owner && guard < 256) {
-      if (isInteractiveDescendant(current)) return false;
-      current = flatParentElement(current);
-      guard += 1;
-    }
-    return current === owner;
-  }
-
-  function isInteriorSamplePoint(rect: NonNullable<ReturnType<typeof visibleRectOf>>, x: number, y: number) {
-    const insetX = Math.min(12, Math.max(4, rect.width * 0.12));
-    const insetY = Math.min(12, Math.max(4, rect.height * 0.12));
-    if (rect.width <= insetX * 2 || rect.height <= insetY * 2) return false;
-    return (
-      x >= rect.left + insetX &&
-      x <= rect.right - insetX &&
-      y >= rect.top + insetY &&
-      y <= rect.bottom - insetY
-    );
-  }
-
-  function interactiveDescendantRects(owner: Element) {
-    const rects: Array<NonNullable<ReturnType<typeof visibleRectOf>>> = [];
-    const queue = [...children(owner)];
-    let guard = 0;
-    while (queue.length && guard < 4000) {
-      const child = queue.shift() as Element;
-      if (isInteractiveDescendant(child)) {
-        const rect = visibleRectOf(child);
-        if (rect) rects.push(rect);
-      }
-      queue.push(...children(child));
-      guard += 1;
-    }
-    return rects;
-  }
-
-  function isSeparatedFromInteractiveDescendants(
-    descendantRects: Array<NonNullable<ReturnType<typeof visibleRectOf>>>,
-    x: number,
-    y: number,
-  ) {
-    const clearance = 10;
-    return descendantRects.every(
-      (rect) =>
-        x < rect.left - clearance ||
-        x > rect.right + clearance ||
-        y < rect.top - clearance ||
-        y > rect.bottom + clearance,
-    );
-  }
-
-  function computeVisibility(element: Element, rect: ReturnType<typeof visibleRectOf>) {
-    if (!rect) return undefined;
-    const cols = rect.width >= 80 ? 5 : 3;
-    const rows = rect.height >= 60 ? 5 : 3;
-    const points: Array<{ x: number; y: number; gridRow?: number; gridCol?: number }> = [
-      { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
-    ];
-    const edgeInsetX = Math.min(2, Math.max(0.5, rect.width / 8));
-    const edgeInsetY = Math.min(2, Math.max(0.5, rect.height / 8));
-    points.push(
-      { x: rect.left + edgeInsetX, y: rect.top + edgeInsetY },
-      { x: rect.right - edgeInsetX, y: rect.top + edgeInsetY },
-      { x: rect.left + edgeInsetX, y: rect.bottom - edgeInsetY },
-      { x: rect.right - edgeInsetX, y: rect.bottom - edgeInsetY },
-      { x: rect.left + edgeInsetX, y: rect.top + rect.height / 2 },
-      { x: rect.right - edgeInsetX, y: rect.top + rect.height / 2 },
-      { x: rect.left + rect.width / 2, y: rect.top + edgeInsetY },
-      { x: rect.left + rect.width / 2, y: rect.bottom - edgeInsetY },
-    );
-    for (let row = 0; row < rows; row += 1) {
-      for (let col = 0; col < cols; col += 1) {
-        points.push({
-          x: rect.left + ((col + 0.5) / cols) * rect.width,
-          y: rect.top + ((row + 0.5) / rows) * rect.height,
-          gridRow: row,
-          gridCol: col,
-        });
-      }
-    }
-
-    let owned = 0;
-    let covered = 0;
-    let visiblePoint: { x: number; y: number } | undefined;
-    let independentInteriorPoint: { x: number; y: number } | undefined;
-    let interiorPointCount = 0;
-    const independentGridPoints = new Set<string>();
-    const descendantRects = interactiveDescendantRects(element);
-    for (const point of points) {
-      const { x, y, gridRow, gridCol } = point;
-      const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
-      const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
-      const isInteriorGridPoint =
-        gridRow !== undefined &&
-        gridCol !== undefined &&
-        isInteriorSamplePoint(rect, px, py);
-      if (isInteriorGridPoint) interiorPointCount += 1;
-      const top = topmostRenderableAt(px, py);
-      if (!top) continue;
-      if (top === element || composedContains(element, top)) {
-        owned += 1;
-        if (!visiblePoint) visiblePoint = { x: Math.round(px), y: Math.round(py) };
-        if (
-          isInteriorGridPoint &&
-          isIndependentPointForOwner(element, top) &&
-          isSeparatedFromInteractiveDescendants(descendantRects, px, py)
-        ) {
-          independentGridPoints.add(`${gridRow}:${gridCol}`);
-          if (!independentInteriorPoint) independentInteriorPoint = { x: Math.round(px), y: Math.round(py) };
-        }
-      } else if (!composedContains(top, element)) {
-        covered += 1;
-      }
-    }
-
-    const hasAdjacentIndependentPoints = Array.from(independentGridPoints).some((key) => {
-      const [row, col] = key.split(':').map(Number);
-      return (
-        independentGridPoints.has(`${row - 1}:${col}`) ||
-        independentGridPoints.has(`${row + 1}:${col}`) ||
-        independentGridPoints.has(`${row}:${col - 1}`) ||
-        independentGridPoints.has(`${row}:${col + 1}`)
-      );
-    });
-    const total = points.length;
-    return {
-      visiblePoint,
-      independentInteriorPoint,
-      independentInteriorPointCount: independentGridPoints.size,
-      interiorPointCount,
-      hasAdjacentIndependentPoints,
-      ownedRatio: owned / total,
-      coveredRatio: covered / total,
-    };
-  }
-
-  function visibleProxyForZeroSizeOwner(element: Element) {
-    const queue = [...children(element)];
-    let guard = 0;
-    while (queue.length && guard < 4000) {
-      const child = queue.shift() as Element;
-      const tag = child.tagName.toLowerCase();
-      const childInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(child);
-      const childInteractive = clickableReason(child) || childInput || hasOwnHoverSignal(child) || hasCssHoverEffect(child);
-      const rect = visibleRectOf(child);
-      if (tag !== 'label' && !childInteractive && rect) {
-        const visibility = computeVisibility(element, rect);
-        if (visibility?.visiblePoint && !(visibility.coveredRatio > 0.5 && visibility.ownedRatio < 0.35)) return { rect, visibility };
-      }
-      queue.push(...children(child));
-      guard += 1;
-    }
-    return undefined;
-  }
-
-  function candidateFrom(element: Element, path: number[]): PageInteractiveCandidate | undefined {
-    const tag = element.tagName.toLowerCase();
-    const labelControl = labelControlFor(element);
-    const role = element.getAttribute('role') || undefined;
-    const inputElement = element as HTMLInputElement;
-    const isInput = ['input', 'textarea', 'select'].includes(tag) || isContentEditableOwner(element);
-    const signals = interactionSignals(element, tag);
-    const clickable = signals.length > 0;
-    if (!clickable && !isInput) return undefined;
-
-    const href = tag === 'a' ? ((element as HTMLAnchorElement).href || element.getAttribute('href') || undefined) : undefined;
-    const text = ownText(element);
-    const name = nameOf(element);
-    const placeholder = inputElement.placeholder || undefined;
-    const ariaLabel = element.getAttribute('aria-label') || undefined;
-    const title = element.getAttribute('title') || undefined;
-    let nearbyText: string | undefined;
-    if (!labelsMatchCandidateTextQuery([name, text, ariaLabel || undefined, title || undefined, placeholder, href])) {
-      nearbyText = contextText(element) || undefined;
-      if (!labelsMatchCandidateTextQuery([nearbyText])) return undefined;
-    }
-
-    let rect = visibleRectOf(element);
-    let visibility = rect ? computeVisibility(element, rect) : undefined;
-    if (!rect && clickable) {
-      const proxy = visibleProxyForZeroSizeOwner(element);
-      rect = proxy?.rect;
-      visibility = proxy?.visibility;
-    }
-    if (!rect || !visibility?.visiblePoint) return undefined;
-    if (visibility.coveredRatio > 0.5 && visibility.ownedRatio < 0.35) return undefined;
-
-    const hasIndependentClickArea =
-      clickable &&
-      visibility.hasAdjacentIndependentPoints &&
-      visibility.independentInteriorPointCount >= 2 &&
-      visibility.independentInteriorPointCount / Math.max(1, visibility.interiorPointCount) >= 0.15;
-    const visiblePoint = hasIndependentClickArea
-      ? visibility.independentInteriorPoint || visibility.visiblePoint
-      : visibility.visiblePoint;
-    const viewportArea = window.innerWidth * window.innerHeight;
-    const area = rect.width * rect.height;
-    if (area > viewportArea * 0.75 && !['input', 'textarea', 'select', 'button', 'a'].includes(tag)) return undefined;
-
-    let host: string | undefined;
-    try {
-      host = href ? new URL(href).hostname : undefined;
-    } catch {
-      host = undefined;
-    }
-    const externalAppTarget = externalAppTargetForElement(element, href);
-
-    const className = classNameOf(element);
-    const type = tag === 'input' || tag === 'button' ? element.getAttribute('type') || undefined : undefined;
-    nearbyText ||= contextText(element) || undefined;
-
-    return {
-      id: '',
-      path: path.join('.'),
-      tag,
-      role,
-      type,
-      name: name || undefined,
-      text: text || undefined,
-      className: className || undefined,
-      signals: signals.length ? signals : undefined,
-      nearbyText,
-      href,
-      host,
-      opensExternalApp: externalAppTarget ? true : undefined,
-      externalAppProtocol: externalAppTarget?.protocol,
-      placeholder,
-      ariaLabel,
-      title,
-      rect: {
-        x: Math.round(rect.left),
-        y: Math.round(rect.top),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
-      },
-      center: {
-        x: Math.round(visiblePoint.x),
-        y: Math.round(visiblePoint.y),
-      },
-      clickable,
-      input: isInput,
-      disabled: Boolean(
-        inputElement.disabled ||
-        (labelControl && (labelControl as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | HTMLButtonElement).disabled) ||
-        element.getAttribute('aria-disabled') === 'true',
-      ),
-      hasIndependentClickArea,
-      shadow: isInsideShadow(element),
-    };
-  }
-
-  function pathParts(value: string) {
-    return value.split('.').map((item) => Number(item));
-  }
-
-  function comparePath(a: string, b: string) {
-    const ap = pathParts(a);
-    const bp = pathParts(b);
-    const length = Math.min(ap.length, bp.length);
-    for (let index = 0; index < length; index += 1) {
-      if (ap[index] !== bp[index]) return ap[index] - bp[index];
-    }
-    return ap.length - bp.length;
-  }
-
-  const raw: PageInteractiveCandidate[] = [];
-  const seenPaths = new Set<string>();
-  let visitedElements = 0;
-
-  function pushCandidate(element: Element, path: number[]) {
-    const pathKey = path.join('.');
-    if (seenPaths.has(pathKey)) return;
-    if (!includeInteractiveCandidates) return;
-    const candidate = candidateFrom(element, path);
-    if (!candidate) return;
-    raw.push(candidate);
-    seenPaths.add(pathKey);
-  }
-
-  function walk(element: Element, path: number[], depth: number, textDepth: number) {
-    visitedElements += 1;
-    if (visitedElements > 50000 || depth > 128) return;
-    if (window.getComputedStyle(element).display === 'none') return;
-    if (element instanceof HTMLAnchorElement && element.href && /^https?:\/\//i.test(element.href)) {
-      const title = normalizeText(element.textContent)
-        || normalizeText(element.getAttribute('title'))
-        || normalizeText(element.getAttribute('aria-label'))
-        || normalizeText(element.querySelector('img')?.getAttribute('alt'))
-        || element.href;
-      pageLinks.set(element.href.toLowerCase(), { url: element.href, title });
-    }
-    const structured = maxStructuredTextChars ? structuredTextLine(element) : undefined;
-    const nextTextDepth = structured?.shown ? textDepth + 1 : textDepth;
-    if (structured?.text) appendStructuredText(textDepth, structured.text);
-    pushCandidate(element, path);
-    const childNodes = children(element);
-    for (let index = 0; index < childNodes.length; index += 1) {
-      walk(childNodes[index], [...path, index], depth + 1, nextTextDepth);
-    }
-  }
-
-  walk(document.documentElement, [0], 0, 0);
-
-  const candidates = raw
-    .sort((a, b) => comparePath(a.path, b.path) || a.rect.y - b.rect.y || a.rect.x - b.rect.x);
-  return {
-    structuredText: structuredLines.join('\n'),
-    interactiveCandidates: candidates.map((candidate, index) => ({ ...candidate, id: `${index + 1}` })),
-    links: Array.from(pageLinks.values()).slice(0, 300),
+    setDomProbe,
+    clearDomProbe,
   };
 }
 
@@ -3616,6 +3041,7 @@ export class BrowserSession {
   private lastScreenshotMetrics?: ScreenshotMetrics;
   private screenshotGenerationSequence = 0;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
+  private cdpShadowCandidates = new Map<string, InteractiveCandidate>();
   private lastScreenshotCandidates: InteractiveCandidate[] = [];
   private lastDomNodeReferences = new Map<string, DomNodeReference>();
   private domVisiblePublicIdByFrameLocalRef = new Map<string, string>();
@@ -3637,15 +3063,6 @@ export class BrowserSession {
   private navigationSequenceByPage = new WeakMap<Page, number>();
   private browserRuntimeRevisionByFrame = new WeakMap<Frame, number>();
   private browserRuntimeInstalledRevisionByFrame = new WeakMap<Frame, number>();
-  private snapshotGeneration?: SnapshotGeneration;
-  private snapshotGenerationPromise?: Promise<SnapshotGeneration>;
-  private snapshotGenerationSequence = 0;
-  private snapshotUidSequence = 0;
-  private snapshotUidByIdentity = new Map<string, { uid: string; lastSeenGeneration: number }>();
-  private snapshotPageSequence = 0;
-  private snapshotPageIds = new WeakMap<Page, string>();
-  private accessibilitySnapshotExportControlInstalled = false;
-  private accessibilitySnapshotExporter?: () => Promise<AccessibilitySnapshotExportControlResult>;
   private visitedOrigins = new Set<string>();
   private observedPageLinks = new Map<string, { url: string; title: string }>();
   private readonly pageGroupId: string;
@@ -4322,29 +3739,6 @@ export class BrowserSession {
     await this.activePage.bringToFront();
   }
 
-  async installAccessibilitySnapshotExportControl(exporter: () => Promise<AccessibilitySnapshotExportControlResult>) {
-    if (!this.context) throw new Error('Browser session has not started');
-    this.accessibilitySnapshotExporter = exporter;
-    if (!this.accessibilitySnapshotExportControlInstalled) {
-      this.accessibilitySnapshotExportControlInstalled = true;
-      await this.context.exposeBinding('__webPilotExportAccessibilitySnapshot', async (source) => {
-        if (source.page && !source.page.isClosed()) {
-          this.claimPage(source.page, { allowSteal: true });
-          await source.page.bringToFront().catch(() => undefined);
-        }
-        const handler = this.accessibilitySnapshotExporter;
-        if (!handler) return { ok: false, error: 'Semantic DOM snapshot exporter is unavailable.' };
-        try {
-          return await handler();
-        } catch (error) {
-          return { ok: false, error: error instanceof Error ? error.message : String(error) };
-        }
-      });
-      await this.context.addInitScript(installAccessibilitySnapshotExportControl);
-    }
-    await Promise.all(this.sessionPages().map((page) => page.evaluate(installAccessibilitySnapshotExportControl).catch(() => undefined)));
-  }
-
   private async readPageGroupId(page: Page) {
     if (page.isClosed()) return undefined;
     return page.evaluate(() => {
@@ -4596,7 +3990,7 @@ export class BrowserSession {
 
   // 打开目标页面先等待导航提交，再在有限的 DOM 静默窗口后生成新快照。
   async open(url: string): Promise<BrowserActionResult> {
-    const previousGeneration = this.snapshotGeneration;
+    const previousGeneration = this.actionBaseline();
     const beforeUrl = this.activePage.url();
     let navigationNote = '';
     try {
@@ -4629,7 +4023,28 @@ export class BrowserSession {
   }
 
   async readStructuredPageText() {
-    return (await this.readDomObservation({ includeInteractiveCandidates: false })).structuredText;
+    const maxChars = numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000);
+    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER);
+    const mainFrame = this.activePage.mainFrame();
+    const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
+    const parts: string[] = [];
+    let remainingChars = maxChars;
+    for (const frame of frames) {
+      if (remainingChars <= 0) break;
+      const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
+      if (frame !== mainFrame && framePath === undefined) continue;
+      await this.ensureBrowserPageRuntime(frame);
+      const result = await frame.evaluate((limit) => {
+        const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+        return runtime?.elementText('0', { maxChars: limit });
+      }, remainingChars).catch(() => undefined);
+      const text = result?.text.trim();
+      if (!text) continue;
+      const block = framePath ? `[iframe ${framePath}${frame.url() ? ` ${frame.url()}` : ''}]\n${text}` : text;
+      parts.push(block);
+      remainingChars -= block.length + 2;
+    }
+    return parts.join('\n\n');
   }
 
   /** Read-only link inventory across the current page and its frames. */
@@ -4668,94 +4083,22 @@ export class BrowserSession {
     return links;
   }
 
-  private async readDomObservation(options: {
-    includeInteractiveCandidates: boolean;
-    maxChars?: number;
-    timings?: Record<string, number>;
-  }) {
-    const fallbackMaxChars = numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000));
-    const maxChars = options.maxChars ?? fallbackMaxChars;
-    const frameLimit = numericLimitFromEnv('DOM_STRUCTURED_TEXT_FRAME_LIMIT', numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER));
-    const mainFrame = this.activePage.mainFrame();
-    const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
-    const parts: string[] = [];
-    let chars = 0;
-    const mainCandidates: PageInteractiveCandidate[] = [];
-    const frameCandidates: InteractiveCandidate[] = [];
-    const viewport = options.includeInteractiveCandidates
-      ? await timedBrowserStep(options.timings, 'getViewportForFrameCandidatesMs', () => this.getViewportMetrics().catch(() => ({ width: 0, height: 0, devicePixelRatio: 1 })))
-      : undefined;
-
-    const append = (label: string, text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed || chars >= maxChars) return;
-      const block = label ? `${label}\n${trimmed}` : trimmed;
-      const remaining = maxChars - chars;
-      const chunk = block.length > remaining ? block.slice(0, remaining) : block;
-      if (!chunk) return;
-      parts.push(chunk);
-      chars += chunk.length + 2;
-    };
-
-    for (const frame of frames) {
-      if (chars >= maxChars && !options.includeInteractiveCandidates) break;
-      const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
-      if (frame !== mainFrame && framePath === undefined) continue;
-      const frameBox = framePath && options.includeInteractiveCandidates
-        ? await timedBrowserStep(options.timings, 'getFrameBoxMs', () => frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined))
-        : undefined;
-      if (framePath && options.includeInteractiveCandidates && (!frameBox || frameBox.width <= 2 || frameBox.height <= 2)) continue;
-      const observation = await timedBrowserStep(
-        options.timings,
-        framePath ? 'readFrameDomObservationMs' : 'readMainDomObservationMs',
-        async () => {
-          await this.ensureBrowserPageRuntime(frame);
-          return frame.evaluate(collectAiDomObservation, {
-            includeInteractiveCandidates: options.includeInteractiveCandidates,
-            requirePointerEvents: true,
-            structuredTextMaxChars: Math.max(0, maxChars - chars),
-          }).catch(() => ({ structuredText: '', interactiveCandidates: [] as PageInteractiveCandidate[], links: [] as Array<{ url: string; title: string }> }));
-        },
-      );
-      for (const link of observation.links) {
-        this.observedPageLinks.set(link.url.toLowerCase(), link);
-      }
-      const label = framePath ? `[iframe ${framePath}${frame.url() ? ` ${frame.url()}` : ''}]` : '';
-      append(label, observation.structuredText);
-      if (!options.includeInteractiveCandidates || !observation.interactiveCandidates.length) continue;
-      if (!framePath) {
-        mainCandidates.push(...observation.interactiveCandidates);
-        continue;
-      }
-      if (!frameBox || !viewport) continue;
-      for (const candidate of observation.interactiveCandidates) {
-        const rect = {
-          x: Math.round(frameBox.x + candidate.rect.x),
-          y: Math.round(frameBox.y + candidate.rect.y),
-          width: candidate.rect.width,
-          height: candidate.rect.height,
-        };
-        const center = {
-          x: Math.round(frameBox.x + candidate.center.x),
-          y: Math.round(frameBox.y + candidate.center.y),
-        };
-        if (center.x < 0 || center.y < 0 || center.x >= viewport.width || center.y >= viewport.height) continue;
-        frameCandidates.push({
-          ...candidate,
-          id: '',
-          rect,
-          center,
-          framePath,
-          frameUrl: frame.url() || undefined,
-        });
-      }
-    }
-
+  // 人工验证门禁只读取标题、少量页面文本和验证码输入状态，避免触发完整页面上下文采集。
+  async getManualVerificationState() {
+    const page = this.activePage;
+    const [title, text] = await Promise.all([
+      page.title().catch(() => '').then((value) => this.stripTabTitlePrefix(value)),
+      page.evaluate(() => String(document.body?.innerText || document.documentElement?.textContent || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 6000)).catch(() => ''),
+    ]);
+    const manualVerification = await this.detectManualVerificationContext(title, page.url(), text);
     return {
-      structuredText: parts.join('\n\n'),
-      interactiveCandidates: options.includeInteractiveCandidates
-        ? this.finalizeInteractiveCandidates(mainCandidates, frameCandidates)
-        : [] as InteractiveCandidate[],
+      url: page.url(),
+      title,
+      manualVerification,
+      isManualVerification: manualVerification.detected && !manualVerification.captchaAppearsFilled,
     };
   }
 
@@ -4773,21 +4116,9 @@ export class BrowserSession {
     const includeInteractiveCandidates = options.includeInteractiveCandidates ?? true;
     const useCachedInteractiveCandidates = Boolean(options.useCachedInteractiveCandidates && !options.includeDomTree);
     const timings: Record<string, number> = {};
-    const canUseCombinedDomObservation = includeText
-      && includeInteractiveCandidates
-      && !useCachedInteractiveCandidates
-      && !options.includeDomTree;
-    const domObservationPromise = canUseCombinedDomObservation
-      ? timedBrowserStep(timings, 'readDomObservationMs', () => this.readDomObservation({
-          includeInteractiveCandidates: true,
-          maxChars: numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000)),
-          timings,
-        }))
-      : undefined;
-    const [title, domObservation, structuredTextFallback, viewportMetrics, focusedElement, domTreeResult, interactiveCandidatesFallback, scrollableAreas, pageScrollState] = await Promise.all([
+    const [title, structuredText, viewportMetrics, focusedElement, domTreeResult, interactiveCandidates, scrollableAreas, pageScrollState] = await Promise.all([
       timedBrowserStep(timings, 'readTitleMs', () => this.activePage.title().catch(() => '').then((value) => this.stripTabTitlePrefix(value))),
-      domObservationPromise || Promise.resolve(undefined),
-      !domObservationPromise && includeText
+      includeText
         ? timedBrowserStep(timings, 'readStructuredPageTextMs', () => this.readStructuredPageText())
         : Promise.resolve(''),
       timedBrowserStep(timings, 'getViewportMetricsMs', () => this.getViewportMetrics()),
@@ -4798,7 +4129,7 @@ export class BrowserSession {
             return { tree, observation: this.emptySimplifiedDomObservation(tree) };
           }))
         : Promise.resolve(undefined),
-      domObservationPromise || !includeInteractiveCandidates
+      !includeInteractiveCandidates
         ? Promise.resolve([] as InteractiveCandidate[])
         : useCachedInteractiveCandidates && this.lastInteractiveCandidates.length
             ? Promise.resolve(this.lastInteractiveCandidates)
@@ -4806,8 +4137,6 @@ export class BrowserSession {
       timedBrowserStep(timings, 'refreshScrollableAreasMs', () => this.refreshScrollableAreas().catch(() => this.lastScrollableAreas)),
       timedBrowserStep(timings, 'getPageScrollStateMs', () => this.getPageScrollState().catch(() => undefined)),
     ]);
-    const structuredText = domObservation?.structuredText ?? structuredTextFallback;
-    const interactiveCandidates = domObservation?.interactiveCandidates ?? interactiveCandidatesFallback;
     const text = structuredText;
 
     const manualVerification = options.includeManualVerification === false
@@ -4951,7 +4280,8 @@ export class BrowserSession {
     ];
   }
 
-  // Capture the current viewport. Candidate marker overlays are no longer captured automatically.
+  // Capture the current viewport. Marker overlays are opt-in and reuse the
+  // exact B-chain DOM UIDs registered by takeSnapshot/searchSnapshot.
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
     const totalStartedAt = Date.now();
     const timingSteps: ScreenshotTimingStep[] = [];
@@ -4984,8 +4314,8 @@ export class BrowserSession {
     await timed('prepareArtifactDir', () => mkdir(dir, { recursive: true }));
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    const shouldCaptureCandidates = false;
-    const candidateLabelsEnabled = false;
+    const shouldCaptureCandidates = options.markers === true && capture === 'viewport';
+    const candidateLabelsEnabled = shouldCaptureCandidates;
     const scrollAreaLabelsEnabled = false;
     const candidates = shouldCaptureCandidates
       ? await timed('refreshInteractiveCandidates', () => this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[]), (items) => ({ count: items.length }))
@@ -5112,7 +4442,8 @@ export class BrowserSession {
     return filePath;
   }
 
-  // Minimal takeScreenshot path: save the browser screenshot without DOM, overlay, metadata, or visual-context work.
+  // Minimal explicit screenshot path. Optional markers are sourced from the
+  // same B-chain registry as takeSnapshot/searchSnapshot.
   async takeCurrentScreenshotOnly(runId: string, stepIndex: number, phase: `visual-${number}`, options: ScreenshotCaptureOptions = {}) {
     const capture: ScreenshotCaptureMode = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
     const dir = artifactPath(runId);
@@ -5124,12 +4455,25 @@ export class BrowserSession {
       MIN_SCREENSHOT_TIMEOUT_MS,
       MAX_SCREENSHOT_TIMEOUT_MS,
     );
-    await this.activePage.screenshot({
-      path: filePath,
-      fullPage: capture === 'fullPage',
-      timeout: screenshotTimeoutMs,
-      scale: 'css',
-    });
+    const markedCandidates = options.markers === true && capture === 'viewport'
+      ? await this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[])
+      : [];
+    this.lastScreenshotCandidates = markedCandidates.map((candidate) => ({
+      ...candidate,
+      rect: { ...candidate.rect },
+      center: { ...candidate.center },
+    }));
+    if (markedCandidates.length) await this.drawCandidateOverlay(markedCandidates);
+    try {
+      await this.activePage.screenshot({
+        path: filePath,
+        fullPage: capture === 'fullPage',
+        timeout: screenshotTimeoutMs,
+        scale: 'css',
+      });
+    } finally {
+      if (markedCandidates.length) await this.removeCandidateOverlay();
+    }
     const [image, viewportMetrics, scrollPosition] = await Promise.all([
       this.readPngSize(filePath),
       this.getViewportMetrics(),
@@ -5204,7 +4548,7 @@ export class BrowserSession {
           candidate.framePath ? `frame=${candidate.framePath}` : '',
           candidate.shadow ? 'shadow' : '',
         ].filter(Boolean).join(', ');
-        return `${indent}- #${candidate.id} ${candidate.tag}${className}${role ? `[${role}]` : ''}: "${label.slice(0, 160)}"${state ? ` (${state})` : ''}`;
+        return `${indent}- uid=${candidate.id} ${candidate.tag}${className}${role ? `[${role}]` : ''}: "${label.slice(0, 160)}"${state ? ` (${state})` : ''}`;
       }).join('\n') || '[no visible interactive elements detected]',
     };
   }
@@ -5214,13 +4558,12 @@ export class BrowserSession {
     await this.ensureBrowserPageRuntime();
     const pageUrl = this.activePage.url();
     const pageTitle = await this.activePage.title().catch(() => '');
-    const directObservation = await this.activePage.evaluate(collectAiDomObservation, {
-      includeInteractiveCandidates: true,
-      requirePointerEvents: true,
-      structuredTextMaxChars: 12000,
-      debugPause: input.pause !== false,
-    });
-    const candidates = this.finalizeInteractiveCandidates(directObservation.interactiveCandidates, []);
+    if (input.pause !== false) {
+      await this.activePage.evaluate(() => {
+        debugger;
+      });
+    }
+    const candidates = await this.refreshInteractiveCandidates();
     let screenshotPath: string | undefined;
     let screenshotTiming: ScreenshotTiming | undefined;
     if (input.includeScreenshot !== false) {
@@ -5230,7 +4573,7 @@ export class BrowserSession {
     return {
       url: pageUrl,
       title: pageTitle,
-      directCandidateCount: directObservation.interactiveCandidates.length,
+      directCandidateCount: candidates.length,
       finalizedCandidateCount: candidates.length,
       screenshotPath,
       screenshotTiming,
@@ -5254,7 +4597,6 @@ export class BrowserSession {
         ariaLabel: candidate.ariaLabel,
         nearbyText: candidate.nearbyText,
       })),
-      structuredTextPreview: directObservation.structuredText.slice(0, 2000),
     };
   }
 
@@ -5399,7 +4741,7 @@ export class BrowserSession {
 
   // 切换到指定标签页，并把它设为后续操作的活动页。
   async switchTab(index: number): Promise<BrowserActionResult> {
-    const previousGeneration = this.snapshotGeneration;
+    const previousGeneration = this.actionBaseline();
     const page = this.sessionPages()[index];
     if (!page) return { ok: false, actual: `Tab ${index} not found.` };
     this.page = page;
@@ -5409,7 +4751,7 @@ export class BrowserSession {
 
   // 向当前焦点元素输入文本。
   async waitForPage(): Promise<BrowserActionResult> {
-    const previousGeneration = this.snapshotGeneration;
+    const previousGeneration = this.actionBaseline();
     const loadStateTimeoutMs = boundedPositiveIntegerEnv(
       'BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS',
       DEFAULT_BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS,
@@ -5441,7 +4783,7 @@ export class BrowserSession {
 
   // 等待固定时间，给短动画、下拉面板或异步更新留出渲染时间。
   async wait(ms = 800): Promise<BrowserActionResult> {
-    const previousGeneration = this.snapshotGeneration;
+    const previousGeneration = this.actionBaseline();
     const waitMs = Number.isFinite(ms) ? Math.max(0, Math.ceil(ms)) : 800;
     await this.waitForStableViewport(waitMs);
     return this.completeActionWithDomChanges(`Waited ${waitMs}ms.`, previousGeneration, { invalidateSnapshotCursor: false });
@@ -5968,6 +5310,66 @@ export class BrowserSession {
     return areas;
   }
 
+  private visualCandidateFromDomItem(
+    snapshot: BrowserUseVisibleDomSnapshot,
+    item: BrowserUseVisibleDomSnapshot['items'][number],
+    options: {
+      framePath?: string;
+      frameUrl?: string;
+      offsetX?: number;
+      offsetY?: number;
+      viewportClip?: BrowserUseViewportClip;
+    } = {},
+  ): InteractiveCandidate | undefined {
+    if (!item.rect || !item.interactive) return undefined;
+    const reference = this.domObservationReference(
+      snapshot.stateKey,
+      item,
+      options.framePath,
+      options.frameUrl,
+      options.viewportClip,
+    );
+    this.lastDomNodeReferences.set(reference.id, reference);
+    const offsetX = options.offsetX || 0;
+    const offsetY = options.offsetY || 0;
+    const rect = {
+      x: Math.round(offsetX + item.rect.left),
+      y: Math.round(offsetY + item.rect.top),
+      width: Math.max(1, Math.round(item.rect.right - item.rect.left)),
+      height: Math.max(1, Math.round(item.rect.bottom - item.rect.top)),
+    };
+    const attribute = (name: string) => {
+      const match = item.line.match(new RegExp(`\\b${name}="([^"]*)"`));
+      return match?.[1];
+    };
+    return {
+      id: reference.id,
+      path: item.path,
+      tag: item.tag,
+      role: item.role || undefined,
+      type: attribute('type'),
+      name: item.accessibleName || item.label || undefined,
+      text: item.text || undefined,
+      className: attribute('class'),
+      signals: item.signals,
+      nearbyText: item.contextText || item.description || undefined,
+      href: attribute('href'),
+      placeholder: attribute('placeholder'),
+      ariaLabel: attribute('aria-label'),
+      title: attribute('title'),
+      rect,
+      center: {
+        x: Math.round(rect.x + rect.width / 2),
+        y: Math.round(rect.y + rect.height / 2),
+      },
+      clickable: item.capabilities.includes('click'),
+      input: item.capabilities.includes('fill') || item.capabilities.includes('select'),
+      disabled: /\b(?:disabled="true"|aria-disabled="true")/.test(item.line),
+      framePath: options.framePath,
+      frameUrl: options.frameUrl,
+    };
+  }
+
   private finalizeInteractiveCandidates(
     mainCandidates: PageInteractiveCandidate[],
     frameCandidates: InteractiveCandidate[],
@@ -5979,23 +5381,34 @@ export class BrowserSession {
         return !frameCandidates.some((frameCandidate) => this.rectContains(candidate.rect, frameCandidate.rect));
       })
       .sort((a, b) => this.compareCandidateOrder(a, b))
-      .map((candidate, index) => ({
-        ...candidate,
-        id: `${index + 1}`,
-      }));
+      .map((candidate) => ({ ...candidate }));
     this.lastInteractiveCandidates = candidates;
     return candidates;
   }
 
   private async refreshInteractiveCandidates(options: { candidateTextQuery?: string } = {}) {
-    await this.ensureBrowserPageRuntime();
-    const mainCandidates = await this.activePage
-      .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: true, candidateTextQuery: options.candidateTextQuery })
-      .then((observation) => observation.interactiveCandidates)
-      .catch(() => [] as PageInteractiveCandidate[]);
-
+    const mainFrame = this.activePage.mainFrame();
+    const mainSnapshot = await this.readVisibleDomSnapshot(mainFrame, 2500, 300000, undefined, true);
+    if (!mainSnapshot) return [];
+    if (this.domVisibleSnapshotKey && this.domVisibleSnapshotKey !== mainSnapshot.stateKey) {
+      this.lastDomNodeReferences.clear();
+    }
+    this.resetDomVisibleIdState(mainSnapshot.stateKey);
+    const query = normalizeDomSearchText(options.candidateTextQuery);
+    const matchesQuery = (candidate: InteractiveCandidate) => {
+      if (!query) return true;
+      const reference = this.lastDomNodeReferences.get(candidate.id);
+      return Boolean(reference?.searchText.includes(query));
+    };
+    const mainCandidates = mainSnapshot.items
+      .map((item) => this.visualCandidateFromDomItem(mainSnapshot, item))
+      .filter((candidate): candidate is InteractiveCandidate => Boolean(candidate))
+      .filter(matchesQuery);
     const frameCandidates = await this.refreshFrameInteractiveCandidates(options);
-    return this.finalizeInteractiveCandidates(mainCandidates, frameCandidates);
+    const cdpShadowCandidates = [...this.cdpShadowCandidates.values()]
+      .filter((candidate) => this.lastDomNodeReferences.has(candidate.id))
+      .filter(matchesQuery);
+    return this.finalizeInteractiveCandidates([...mainCandidates, ...cdpShadowCandidates], frameCandidates);
   }
 
   private rectContains(
@@ -6024,31 +5437,20 @@ export class BrowserSession {
       if (!box || box.width <= 2 || box.height <= 2) continue;
 
       await this.ensureBrowserPageRuntime(frame);
-      const localCandidates = await frame
-        .evaluate(collectAiDomObservation, { includeInteractiveCandidates: true, requirePointerEvents: true, candidateTextQuery: options.candidateTextQuery })
-        .then((observation) => observation.interactiveCandidates)
-        .catch(() => [] as PageInteractiveCandidate[]);
-
-      for (const candidate of localCandidates) {
-        const rect = {
-          x: Math.round(box.x + candidate.rect.x),
-          y: Math.round(box.y + candidate.rect.y),
-          width: candidate.rect.width,
-          height: candidate.rect.height,
-        };
-        const center = {
-          x: Math.round(box.x + candidate.center.x),
-          y: Math.round(box.y + candidate.center.y),
-        };
-        if (center.x < 0 || center.y < 0 || center.x >= viewport.width || center.y >= viewport.height) continue;
-        all.push({
-          ...candidate,
-          id: '',
-          rect,
-          center,
+      const snapshot = await this.readVisibleDomSnapshot(frame, 1500, 200000, undefined, true);
+      if (!snapshot) continue;
+      const query = normalizeDomSearchText(options.candidateTextQuery);
+      for (const item of snapshot.items) {
+        const candidate = this.visualCandidateFromDomItem(snapshot, item, {
           framePath,
           frameUrl: frame.url() || undefined,
+          offsetX: box.x,
+          offsetY: box.y,
         });
+        if (!candidate) continue;
+        if (candidate.center.x < 0 || candidate.center.y < 0 || candidate.center.x >= viewport.width || candidate.center.y >= viewport.height) continue;
+        if (query && !this.lastDomNodeReferences.get(candidate.id)?.searchText.includes(query)) continue;
+        all.push(candidate);
       }
     }
 
@@ -6184,7 +5586,7 @@ export class BrowserSession {
             let top: Element | undefined;
             for (const item of stack) {
               if (!item) continue;
-              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) continue;
+              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__')) continue;
               top = item;
               break;
             }
@@ -6246,594 +5648,27 @@ export class BrowserSession {
         return `${tag}${id}${cls}${role}${text ? ` text="${text}"` : ''}`;
       }
       return (document.elementsFromPoint(pointX, pointY) as Element[])
-        .filter((element) => !element.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__'))
+        .filter((element) => !element.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__'))
         .slice(0, 5)
         .map(describe)
         .join(' > ') || '[none]';
     }, { pointX: x, pointY: y }).catch(() => undefined);
   }
 
-  private snapshotPageId(page: Page) {
-    let id = this.snapshotPageIds.get(page);
-    if (!id) {
-      id = `p${++this.snapshotPageSequence}`;
-      this.snapshotPageIds.set(page, id);
-    }
-    return id;
-  }
-
-  private snapshotUid(page: Page, identity: string) {
-    const key = `${this.snapshotPageId(page)}:${identity}`;
-    let entry = this.snapshotUidByIdentity.get(key);
-    if (!entry) {
-      entry = {
-        uid: String(++this.snapshotUidSequence),
-        lastSeenGeneration: this.snapshotGenerationSequence,
-      };
-      this.snapshotUidByIdentity.set(key, entry);
-    } else {
-      entry.lastSeenGeneration = this.snapshotGenerationSequence;
-    }
-    return entry.uid;
-  }
-
-  private pruneSnapshotUidMappings() {
-    const retentionGenerations = boundedPositiveIntegerEnv('SNAPSHOT_UID_RETENTION_GENERATIONS', 12, 2, 200);
-    const maxEntries = boundedPositiveIntegerEnv('SNAPSHOT_UID_MAX_ENTRIES', 20000, 1000, 200000);
-    const oldestGeneration = Math.max(0, this.snapshotGenerationSequence - retentionGenerations);
-    for (const [key, entry] of this.snapshotUidByIdentity) {
-      if (entry.lastSeenGeneration < oldestGeneration) this.snapshotUidByIdentity.delete(key);
-    }
-    if (this.snapshotUidByIdentity.size <= maxEntries) return;
-    const overflow = this.snapshotUidByIdentity.size - maxEntries;
-    const oldest = [...this.snapshotUidByIdentity.entries()]
-      .sort((left, right) => left[1].lastSeenGeneration - right[1].lastSeenGeneration)
-      .slice(0, overflow);
-    for (const [key] of oldest) this.snapshotUidByIdentity.delete(key);
-  }
-
-  private snapshotActionsForNode(node: SnapshotNodeWithUid) {
-    const role = node.role.toLowerCase();
-    const actions = new Set<string>();
-    if (snapshotRoleIsActionable(role) || node.properties.actions) actions.add('click');
-    if (node.properties.focusable) actions.add('focus');
-    if (['textbox', 'searchbox', 'combobox', 'spinbutton'].includes(role)) {
-      actions.add('focus');
-      actions.add('type');
-    }
-    if (['slider', 'scrollbar'].includes(role)) actions.add('scroll');
-    return [...actions];
-  }
-
-  private async collectSnapshotDomFallback(
-    page: Page,
-    frames: CapturedSnapshotFrame[],
-    axNodes: SnapshotNodeWithUid[],
-    playwrightFrames: Frame[],
-  ) {
-    type FallbackCandidate = {
-      selector: string;
-      role: string;
-      name: string;
-      description: string;
-      value: string;
-      url: string;
-      properties: Record<string, string | number | boolean>;
-      actions: string[];
-      depth: number;
-      actionable: boolean;
-    };
-    const hasPrimaryAxTree = axNodes.some((item) => item.source === 'ax');
-    const duplicateName = (name: string, properties: Record<string, string | number | boolean> = {}) => {
-      const readable = name.replace(/\p{Co}/gu, '').trim().toLowerCase();
-      if (readable) return `name:${readable}`;
-      const className = String(properties.class || '').trim().toLowerCase();
-      const icon = String(properties.icon || '').trim().toLowerCase();
-      return className || icon ? `marker:${className}|${icon}` : 'unnamed';
-    };
-    const remainingAxDuplicates = new Map<string, number>();
-    for (const node of axNodes.filter((item) => item.actionable && !hasPrimaryAxTree)) {
-      const key = `${node.frameId}:${node.role.toLowerCase()}:${duplicateName(node.name, node.properties)}`;
-      remainingAxDuplicates.set(key, (remainingAxDuplicates.get(key) || 0) + 1);
-    }
-    const fallbackIdentities = new Set<string>();
-    const fallbackNodes: SnapshotNodeWithUid[] = [];
-    const usedFrameIds = new Set<string>();
-    for (const [frameIndex, frame] of playwrightFrames.entries()) {
-      const privateFrameId = (frame as unknown as { _id?: string })._id;
-      let frameInfo = privateFrameId ? frames.find((item) => item.frameId === privateFrameId) : undefined;
-      if (!frameInfo) {
-        const frameUrl = snapshotFrameUrl(frame.url());
-        frameInfo = frames.find((item) => (
-          !usedFrameIds.has(item.frameId)
-          && snapshotFrameUrl(item.url) === frameUrl
-        ));
-      }
-      const framePath = frame === page.mainFrame() ? undefined : this.getFramePath(frame);
-      if (!frameInfo) {
-        frameInfo = {
-          frameId: `dom-frame-${frameIndex}`,
-          documentId: `dom-document-${frameIndex}`,
-          parentFrameId: undefined,
-          url: frame.url() || undefined,
-          depth: framePath ? framePath.split('.').length : 0,
-        };
-        frames.push(frameInfo);
-      }
-      usedFrameIds.add(frameInfo.frameId);
-      const includeSemanticFallback = Boolean(frameInfo.error) || !axNodes.some((node) => node.frameId === frameInfo.frameId);
-      const candidates = await frame.evaluate((includeSemantic): FallbackCandidate[] => {
-        const win = window as Window & { __aiGetEventListenerTypes?: (target: EventTarget) => string[] };
-        const flatParent = (element: Element): Element | null => {
-          if (element.parentElement) return element.parentElement;
-          const root = element.getRootNode();
-          return root instanceof ShadowRoot ? root.host : null;
-        };
-        const selectorFor = (element: Element) => {
-          const id = element.getAttribute('id');
-          if (id) return `#${CSS.escape(id)}`;
-          for (const attribute of ['data-testid', 'data-test', 'name']) {
-            const value = element.getAttribute(attribute);
-            if (value) return `${element.tagName.toLowerCase()}[${attribute}="${CSS.escape(value)}"]`;
-          }
-          const parts: string[] = [];
-          let current: Element | null = element;
-          while (current && parts.length < 10) {
-            const tag = current.tagName.toLowerCase();
-            const parent = flatParent(current);
-            if (!parent) {
-              parts.unshift(tag);
-              break;
-            }
-            const siblings = Array.from(parent.children).filter((child) => child.tagName === current!.tagName);
-            const index = Math.max(1, siblings.indexOf(current) + 1);
-            parts.unshift(`${tag}:nth-of-type(${index})`);
-            current = parent;
-          }
-          return parts.join(' > ');
-        };
-        const roleFor = (element: Element) => {
-          const explicit = element.getAttribute('role');
-          if (explicit) return explicit.toLowerCase();
-          const tag = element.tagName.toLowerCase();
-          if (tag === 'a') return 'link';
-          if (tag === 'button') return 'button';
-          if (tag === 'select') return 'combobox';
-          if (tag === 'textarea') return 'textbox';
-          if (tag === 'input') {
-            const type = (element.getAttribute('type') || 'text').toLowerCase();
-            if (type === 'checkbox') return 'checkbox';
-            if (type === 'radio') return 'radio';
-            if (['button', 'submit', 'reset'].includes(type)) return 'button';
-            return 'textbox';
-          }
-          if (/^h[1-6]$/.test(tag)) return 'heading';
-          if (tag === 'p') return 'paragraph';
-          if (tag === 'li') return 'listitem';
-          if (tag === 'tr') return 'row';
-          if (tag === 'th') return 'columnheader';
-          if (tag === 'td') return 'cell';
-          if (tag === 'img') return 'image';
-          if (tag === 'nav') return 'navigation';
-          if (tag === 'main') return 'main';
-          if (tag === 'form') return 'form';
-          return 'generic';
-        };
-        const normalize = (value: unknown) => String(value || '').replace(/\s+/g, ' ').trim();
-        const referencedText = (element: Element, attribute: string) => normalize(
-          (element.getAttribute(attribute) || '')
-            .split(/\s+/)
-            .filter(Boolean)
-            .map((id) => document.getElementById(id)?.textContent || '')
-            .join(' '),
-        );
-        const associatedLabel = (element: Element) => {
-          const field = element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
-          const labels = 'labels' in field && field.labels ? Array.from(field.labels) : [];
-          const closest = element.closest('label');
-          if (closest && !labels.includes(closest as HTMLLabelElement)) labels.push(closest as HTMLLabelElement);
-          return normalize(labels.map((label) => label.textContent || '').join(' '));
-        };
-        const classDescriptor = (tag: string, className: string) => {
-          const tokens = normalize(className).split(/\s+/).filter(Boolean);
-          return tokens.length ? `${tag.toLowerCase()}.${tokens.join('.')}` : '';
-        };
-        const embeddedSvgIcons = (element: Element) => {
-          const icons = Array.from(element.querySelectorAll('svg[class]'))
-            .map((icon) => classDescriptor('svg', icon.getAttribute('class') || ''))
-            .filter(Boolean);
-          return [...new Set(icons)].slice(0, 4).join(', ');
-        };
-        const accessibleName = (element: Element, role: string, directText: string) => {
-          const tag = element.tagName.toLowerCase();
-          const type = (element.getAttribute('type') || '').toLowerCase();
-          const labelledBy = referencedText(element, 'aria-labelledby');
-          if (labelledBy) return labelledBy;
-          const ariaLabel = normalize(element.getAttribute('aria-label'));
-          if (ariaLabel) return ariaLabel;
-          const label = associatedLabel(element);
-          if (label) return label;
-          if (tag === 'img') {
-            const alt = normalize(element.getAttribute('alt'));
-            if (alt) return alt;
-          }
-          const text = normalize(element.textContent || directText);
-          if (text && (role !== 'generic' || ['a', 'button', 'label', 'summary'].includes(tag))) return text;
-          if (tag === 'input' && ['button', 'submit', 'reset'].includes(type)) {
-            const buttonValue = normalize((element as HTMLInputElement).value);
-            if (buttonValue) return buttonValue;
-          }
-          return normalize(
-            element.getAttribute('placeholder')
-            || element.getAttribute('title')
-            || element.getAttribute('name')
-            || directText,
-          );
-        };
-        const readable = (value: unknown) => normalize(String(value || '').replace(/\p{Co}/gu, ' '));
-        const unnamedActionContext = (element: Element, role: string) => {
-          const row = element.closest('tr,[role="row"]');
-          const rowText = readable(row?.textContent).slice(0, 180);
-          const column = element.closest('th,[role="columnheader"]');
-          const columnText = readable(column?.textContent).slice(0, 120);
-          if (role === 'checkbox' && rowText) return `[上下文] 选择：${rowText}`;
-          if (role === 'checkbox' && columnText) return `[上下文] ${columnText}列全选`;
-          if (columnText) return `[无标签控件：${columnText}列]`;
-          if (rowText) return `[无标签控件：${rowText}行]`;
-          let current: Element | null = element.parentElement;
-          for (let hops = 0; current && hops < 10; hops += 1) {
-            if (['body', 'html'].includes(current.tagName.toLowerCase())) break;
-            const text = readable(
-              current.getAttribute('aria-label')
-              || current.getAttribute('title')
-              || current.textContent,
-            ).slice(0, 120);
-            if (text) return `[无标签控件：${text}]`;
-            current = flatParent(current);
-          }
-          const title = readable(document.title).slice(0, 100);
-          return title ? `[无标签页面控件：${title}]` : '[无标签页面控件]';
-        };
-        const stateProperties = (element: Element) => {
-          const field = element as unknown as Record<string, unknown>;
-          const properties: Record<string, string | number | boolean> = {};
-          const booleanProperties = ['checked', 'disabled', 'multiple', 'readOnly', 'required', 'selected'] as const;
-          for (const property of booleanProperties) {
-            if (property in field && Boolean(field[property])) {
-              properties[property === 'readOnly' ? 'readonly' : property] = true;
-            }
-          }
-          for (const [attribute, property] of [
-            ['aria-checked', 'checked'],
-            ['aria-disabled', 'disabled'],
-            ['aria-expanded', 'expanded'],
-            ['aria-invalid', 'invalid'],
-            ['aria-pressed', 'pressed'],
-            ['aria-readonly', 'readonly'],
-            ['aria-required', 'required'],
-            ['aria-selected', 'selected'],
-          ] as const) {
-            const value = element.getAttribute(attribute);
-            if (value !== null && value !== 'false') properties[property] = value === 'true' ? true : value;
-          }
-          return properties;
-        };
-        const results: FallbackCandidate[] = [];
-        const stack = Array.from(document.children).reverse().map((element) => ({ element, depth: 0 }));
-        while (stack.length) {
-          const { element, depth } = stack.pop()!;
-          const style = getComputedStyle(element);
-          if (style.display === 'none') continue;
-          const tag = element.tagName.toLowerCase();
-          if (['head', 'script', 'style', 'noscript', 'template', 'meta', 'link'].includes(tag)) continue;
-          const children = [
-            ...Array.from(element.children),
-            ...(element.shadowRoot ? Array.from(element.shadowRoot.children) : []),
-          ];
-          for (let childIndex = children.length - 1; childIndex >= 0; childIndex -= 1) {
-            stack.push({ element: children[childIndex], depth: depth + 1 });
-          }
-          if (style.visibility === 'hidden' || style.visibility === 'collapse') continue;
-          const rect = element.getBoundingClientRect();
-          const eventTypes = win.__aiGetEventListenerTypes?.(element) || [];
-          const actions = new Set<string>();
-          const role = roleFor(element);
-          const inputType = tag === 'input' ? (element.getAttribute('type') || 'text').toLowerCase() : '';
-          const roleSupportsClick = new Set([
-            'button', 'checkbox', 'gridcell', 'link', 'listbox', 'menuitem', 'menuitemcheckbox',
-            'menuitemradio', 'option', 'radio', 'scrollbar', 'slider', 'switch', 'tab', 'treeitem',
-          ]).has(role);
-          if (
-            tag === 'a'
-            || tag === 'button'
-            || (tag === 'input' && ['button', 'checkbox', 'color', 'file', 'image', 'radio', 'range', 'reset', 'submit'].includes(inputType))
-            || element.hasAttribute('onclick')
-            || typeof (element as HTMLElement).onclick === 'function'
-            || eventTypes.some((event) => ['click', 'mousedown', 'pointerdown'].includes(event))
-            || element.hasAttribute('data-action')
-            || element.hasAttribute('data-click')
-            || roleSupportsClick
-          ) actions.add('click');
-          if (
-            tag === 'textarea'
-            || (tag === 'input' && !['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes(inputType))
-            || element.getAttribute('contenteditable') === 'true'
-            || ['textbox', 'searchbox', 'spinbutton'].includes(role)
-          ) {
-            actions.add('focus');
-            actions.add('type');
-          }
-          if (tag === 'select' || role === 'combobox') {
-            actions.add('click');
-            actions.add('focus');
-          }
-          if (element.hasAttribute('tabindex') && !['list', 'listitem', 'row', 'rowgroup', 'table'].includes(role)) {
-            actions.add('focus');
-          }
-          const properties = stateProperties(element);
-          const actionable = actions.size > 0
-            && properties.disabled !== true
-            && style.pointerEvents !== 'none'
-            && rect.width > 0
-            && rect.height > 0;
-          const representedByAx = ['a', 'button', 'input', 'select', 'textarea', 'summary'].includes(tag)
-            || [
-              'button', 'checkbox', 'combobox', 'gridcell', 'link', 'listbox', 'menuitem', 'menuitemcheckbox',
-              'menuitemradio', 'option', 'radio', 'scrollbar', 'searchbox', 'slider', 'spinbutton', 'switch', 'tab',
-              'textbox', 'treeitem',
-            ].includes(role);
-          if (!includeSemantic && representedByAx) continue;
-          const directText = Array.from(element.childNodes)
-            .filter((node) => node.nodeType === Node.TEXT_NODE)
-            .map((node) => node.textContent || '')
-            .join(' ')
-            .replace(/\s+/g, ' ')
-            .trim();
-          const semantic = includeSemantic && (role !== 'generic' || directText.length > 0);
-          if (!actionable && !semantic) continue;
-          const name = accessibleName(element, role, directText).slice(0, 300);
-          if (actionable && !readable(name)) {
-            const className = normalize(element.getAttribute('class') || '').slice(0, 300);
-            const icon = embeddedSvgIcons(element);
-            if (className) properties.class = className;
-            if (icon) properties.icon = icon;
-          }
-          const description = name ? '' : unnamedActionContext(element, role);
-          const field = element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
-          const rawValue = ['input', 'select', 'textarea'].includes(tag) ? normalize(field.value).slice(0, 300) : '';
-          const sensitiveInput = ['input', 'textarea'].includes(tag) && (
-            inputType === 'password'
-            || /(?:^|\s)(?:current-password|new-password|one-time-code)(?:\s|$)/i.test(element.getAttribute('autocomplete') || '')
-            || element.getAttribute('data-webpilot-sensitive-input') === 'true'
-          );
-          const value = sensitiveInput && rawValue ? '[redacted]' : rawValue;
-          const url = tag === 'a' ? String((element as HTMLAnchorElement).href || '') : '';
-          if (!name && !actionable) continue;
-          results.push({
-            selector: selectorFor(element),
-            role,
-            name,
-            description,
-            value,
-            url,
-            properties,
-            actions: [...actions],
-            depth: Math.min(64, depth),
-            actionable,
-          });
-        }
-        return results.slice(0, 2000);
-      }, includeSemanticFallback).catch(() => [] as FallbackCandidate[]);
-
-      for (const candidate of candidates) {
-        const duplicateKey = `${frameInfo.frameId}:${candidate.role.toLowerCase()}:${duplicateName(candidate.name, candidate.properties)}`;
-        const remainingDuplicates = remainingAxDuplicates.get(duplicateKey) || 0;
-        if (remainingDuplicates > 0) {
-          remainingAxDuplicates.set(duplicateKey, remainingDuplicates - 1);
-          continue;
-        }
-        const identity = `${frameInfo.documentId}:${frameInfo.frameId}:dom:${candidate.selector}`;
-        if (fallbackIdentities.has(identity)) continue;
-        const node: SnapshotNodeWithUid = {
-          identity,
-          uid: this.snapshotUid(page, identity),
-          source: 'dom',
-          selector: candidate.selector,
-          framePath,
-          frameId: frameInfo.frameId,
-          documentId: frameInfo.documentId,
-          frameUrl: frameInfo.url,
-          frameDepth: frameInfo.depth,
-          axNodeId: `dom:${candidate.selector}`,
-          childAxNodeIds: [],
-          depth: candidate.depth,
-          ignored: false,
-          role: candidate.role,
-          name: candidate.name,
-          description: candidate.description,
-          value: candidate.value,
-          url: candidate.url,
-          properties: candidate.properties,
-          actionable: candidate.actionable,
-          actions: candidate.actions,
-        };
-        fallbackNodes.push(node);
-        fallbackIdentities.add(identity);
-      }
-    }
-    return fallbackNodes;
-  }
-
-  private async buildSnapshotGeneration(retryAfterMutation = false): Promise<SnapshotGeneration> {
-    const startedAt = Date.now();
+  private actionBaseline(): BrowserActionBaseline {
     const page = this.activePage;
-    const navigationSequenceBefore = this.navigationSequenceByPage.get(page) || 0;
-    const id = `snapshot-${++this.snapshotGenerationSequence}`;
-    const visibleFrameTargets = await this.snapshotFrameTargets();
-    const mutationEpochsBefore = await this.readSnapshotMutationEpochs(visibleFrameTargets);
-    const visiblePlaywrightFrames = visibleFrameTargets.map((target) => target.frame);
-    const allowedFrameIds = new Set(visiblePlaywrightFrames
-      .map((frame) => (frame as unknown as { _id?: string })._id)
-      .filter((frameId): frameId is string => Boolean(frameId)));
-    const framePathById = new Map(visiblePlaywrightFrames.map((frame) => [
-      (frame as unknown as { _id?: string })._id || '',
-      frame === page.mainFrame() ? undefined : this.getFramePath(frame),
-    ]));
-    let frames: CapturedSnapshotFrame[];
-    let primaryNodes: SnapshotNodeWithUid[];
-    let skippedFrameCount = 0;
-    let captureAxMs = 0;
-    let captureDomMs = 0;
-    let frameTreeMs = 0;
-    let axTreeMs = 0;
-    let axEnrichmentMs = 0;
-    let captureSource: SnapshotGeneration['captureSource'] = 'dom-snapshot';
-    try {
-      const capturedDom = await captureDomSnapshot(page);
-      frames = capturedDom.frames.filter((frame) => !allowedFrameIds.size || allowedFrameIds.has(frame.frameId));
-      primaryNodes = capturedDom.nodes
-        .filter((node) => !allowedFrameIds.size || allowedFrameIds.has(node.frameId))
-        .map((node): SnapshotNodeWithUid => ({
-          ...node,
-          uid: this.snapshotUid(page, node.identity),
-          framePath: framePathById.get(node.frameId),
-        }));
-      skippedFrameCount = capturedDom.skippedFrames.length;
-      captureDomMs = capturedDom.timings.domSnapshotMs;
-      frameTreeMs = capturedDom.timings.frameTreeMs;
-      axEnrichmentMs = capturedDom.timings.axEnrichmentMs;
-    } catch {
-      captureSource = 'full-ax-fallback';
-      const capturedAx = await captureAxSnapshot(page, allowedFrameIds.size ? allowedFrameIds : undefined);
-      frames = capturedAx.frames;
-      primaryNodes = capturedAx.nodes.map((node): SnapshotNodeWithUid => ({
-        ...node,
-        uid: this.snapshotUid(page, node.identity),
-        source: 'ax',
-        framePath: framePathById.get(node.frameId),
-        actions: this.snapshotActionsForNode({ ...node, uid: '' }),
-      }));
-      skippedFrameCount = capturedAx.skippedFrames.length;
-      captureAxMs = capturedAx.timings.totalMs;
-      frameTreeMs = capturedAx.timings.frameTreeMs;
-      axTreeMs = capturedAx.timings.axTreeMs;
-    }
-    const fallbackStartedAt = Date.now();
-    const domFallback = await this.collectSnapshotDomFallback(page, frames, primaryNodes, visiblePlaywrightFrames);
-    const domFallbackMs = Date.now() - fallbackStartedAt;
-    const nodes = [...primaryNodes, ...domFallback];
-    const views = buildSnapshotViews(frames, nodes);
-    const references = new Map<string, SnapshotReference>();
-    for (const node of nodes) {
-      references.set(node.uid, {
-        uid: node.uid,
-        generationId: id,
-        page,
-        documentId: node.documentId,
-        frameId: node.frameId,
-        framePath: node.framePath,
-        frameUrl: node.frameUrl,
-        axNodeId: node.axNodeId,
-        backendDOMNodeId: node.backendDOMNodeId,
-        selector: node.selector,
-        role: node.role,
-        name: node.name || node.description || node.value,
-        url: node.url || undefined,
-        actionable: node.actionable,
-        actions: node.actions || this.snapshotActionsForNode(node),
-      });
-    }
-    const mutationEpochs = await this.readSnapshotMutationEpochs(visibleFrameTargets);
-    const navigationSequence = this.navigationSequenceByPage.get(page) || 0;
-    const mutationChangedDuringCapture = Object.keys(mutationEpochsBefore).length !== Object.keys(mutationEpochs).length
-      || Object.keys(mutationEpochs).some((key) => mutationEpochs[key] !== mutationEpochsBefore[key]);
-    if ((mutationChangedDuringCapture || navigationSequence !== navigationSequenceBefore) && !retryAfterMutation) {
-      return this.buildSnapshotGeneration(true);
-    }
-    this.pruneSnapshotUidMappings();
     return {
-      id,
-      createdAt: new Date().toISOString(),
       page,
       url: page.url(),
-      navigationSequence,
-      frames,
-      references,
-      views,
-      nodeCount: nodes.length,
-      actionableCount: nodes.filter((node) => node.actionable).length,
-      skippedFrameCount,
-      captureSource,
-      mutationEpochs,
-      timings: {
-        totalMs: Date.now() - startedAt,
-        captureAxMs,
-        captureDomMs,
-        frameTreeMs,
-        axTreeMs,
-        axEnrichmentMs,
-        domFallbackMs,
-      },
+      navigationSequence: this.navigationSequenceByPage.get(page) || 0,
     };
-  }
-
-  private async ensureSnapshotGeneration(refresh = false) {
-    const page = this.activePage;
-    if (!refresh && this.snapshotGeneration?.page === page && this.snapshotGeneration.url === page.url()) {
-      const changed = await this.snapshotMutationChanged(this.snapshotGeneration).catch(() => true);
-      if (!changed) return this.snapshotGeneration;
-    }
-    if (!refresh && this.snapshotGenerationPromise) return this.snapshotGenerationPromise;
-    if (refresh && this.snapshotGenerationPromise) await this.snapshotGenerationPromise.catch(() => undefined);
-    const promise = this.buildSnapshotGeneration();
-    this.snapshotGenerationPromise = promise;
-    try {
-      const generation = await promise;
-      this.snapshotGeneration = generation;
-      return generation;
-    } finally {
-      if (this.snapshotGenerationPromise === promise) this.snapshotGenerationPromise = undefined;
-    }
-  }
-
-  private invalidateSnapshotGeneration() {
-    this.snapshotGeneration = undefined;
-    this.snapshotGenerationPromise = undefined;
-  }
-
-  private snapshotMutationKey(target: { frame: Frame; framePath?: string }) {
-    return target.framePath || 'main';
-  }
-
-  private async readSnapshotMutationEpochs(
-    targets?: Array<{ frame: Frame; framePath?: string; frameUrl?: string }>,
-  ) {
-    const frameTargets = targets || await this.snapshotFrameTargets();
-    const entries = await Promise.all(frameTargets.map(async (target) => {
-      await this.ensureBrowserPageRuntime(target.frame);
-      const state = await target.frame.evaluate(() => (
-        (window as WindowWithAiDomRuntime).__aiDomMutationState || { epoch: 0, lastMutationAt: 0 }
-      )).catch(() => ({ epoch: -1, lastMutationAt: 0 }));
-      return [this.snapshotMutationKey(target), state.epoch] as const;
-    }));
-    return Object.fromEntries(entries);
-  }
-
-  private async snapshotMutationChanged(generation: SnapshotGeneration) {
-    if (generation.page !== this.activePage || generation.url !== this.activePage.url()) return true;
-    if (generation.navigationSequence !== (this.navigationSequenceByPage.get(this.activePage) || 0)) return true;
-    const current = await this.readSnapshotMutationEpochs();
-    const previousKeys = Object.keys(generation.mutationEpochs);
-    const currentKeys = Object.keys(current);
-    if (previousKeys.length !== currentKeys.length) return true;
-    return currentKeys.some((key) => current[key] !== generation.mutationEpochs[key]);
   }
 
   private async readNavigationDomStabilitySample(): Promise<NavigationDomStabilitySample> {
-    const frameTargets = await this.snapshotFrameTargets();
-    const entries = await Promise.all(frameTargets.map(async (target) => {
-      await this.ensureBrowserPageRuntime(target.frame);
-      const state = await target.frame.evaluate(() => {
+    const mainFrame = this.activePage.mainFrame();
+    const entries = await Promise.all(this.actionFrames().map(async (frame) => {
+      await this.ensureBrowserPageRuntime(frame);
+      const state = await frame.evaluate(() => {
         const mutation = (window as WindowWithAiDomRuntime).__aiDomMutationState;
         return {
           url: window.location.href,
@@ -6844,7 +5679,7 @@ export class BrowserSession {
       }).catch(() => undefined);
       if (!state) return undefined;
       return {
-        key: this.snapshotMutationKey(target),
+        key: frame === mainFrame ? 'main' : this.getFramePath(frame) || frame.url(),
         url: snapshotFrameUrl(state.url),
         readyState: state.readyState,
         epoch: state.epoch,
@@ -6905,35 +5740,6 @@ export class BrowserSession {
     return { stable: false, waitedMs: Date.now() - startedAt, quietMs, timeoutMs };
   }
 
-  private snapshotViewText(generation: SnapshotGeneration, mode: SnapshotView) {
-    const content = generation.views[mode].map((record) => record.line).join('\n');
-    if (content) return content;
-    if (mode === 'actionable') return '[no actionable accessibility nodes in the current page snapshot]';
-    if (mode === 'text') return '[no accessible page text in the current snapshot]';
-    return '[empty semantic DOM snapshot]';
-  }
-
-  private snapshotObservationViews(generation: SnapshotGeneration): BrowserSnapshotViews {
-    return {
-      defaultType: 'actionable',
-      actionable: this.snapshotViewText(generation, 'actionable'),
-      full: this.snapshotViewText(generation, 'full'),
-      text: this.snapshotViewText(generation, 'text'),
-    };
-  }
-
-  currentSnapshotObservationViews() {
-    const generation = this.snapshotGeneration;
-    if (!generation || generation.page !== this.activePage || generation.url !== this.activePage.url()) return undefined;
-    return this.snapshotObservationViews(generation);
-  }
-
-  currentSnapshotGenerationId() {
-    const generation = this.snapshotGeneration;
-    if (!generation || generation.page !== this.activePage || generation.url !== this.activePage.url()) return undefined;
-    return generation.id;
-  }
-
   private async readInteractionCounts(): Promise<BrowserInteractionCounts> {
     const frames = this.actionFrames();
     const records = await Promise.all(frames.map((frame) => frame.evaluate(() => {
@@ -6957,7 +5763,7 @@ export class BrowserSession {
 
   private async completeVerifiedAction(
     actual: string,
-    previousGeneration: SnapshotGeneration | undefined,
+    previousGeneration: BrowserActionBaseline,
     verify: () => Promise<BrowserActionVerification>,
     clickTimings?: BrowserClickTiming,
   ): Promise<BrowserActionResult> {
@@ -7075,7 +5881,7 @@ export class BrowserSession {
 
   private async completeActionWithDomChanges(
     actual: string,
-    previousGeneration: SnapshotGeneration | undefined,
+    previousGeneration: BrowserActionBaseline,
     options: { postNavigation?: boolean; invalidateSnapshotCursor?: boolean; clickTimings?: BrowserClickTiming } = {},
   ): Promise<BrowserActionResult> {
     this.lastScreenshotMetrics = undefined;
@@ -7100,8 +5906,8 @@ export class BrowserSession {
           ? ` Navigation DOM stabilized for ${stability.quietMs}ms after ${stability.waitedMs}ms.`
           : ` Navigation DOM stability wait reached the ${stability.timeoutMs}ms cap; continuing with the current DOM.`;
       if (postNavigation) {
-        this.invalidateSnapshotGeneration();
         this.lastDomNodeReferences.clear();
+        this.cdpShadowCandidates.clear();
         this.domVisiblePublicIdByFrameLocalRef.clear();
         this.domVisibleSnapshotKey = undefined;
         const result = {
@@ -7144,58 +5950,304 @@ export class BrowserSession {
     }
   }
 
-  async readSnapshotSlice(options: {
-    cursorIndex?: number;
-    maxChars?: number;
-    refresh?: boolean;
-    mode?: SnapshotView;
-  } = {}) {
-    const startedAt = Date.now();
-    const mode = options.mode === 'full' || options.mode === 'text' ? options.mode : 'actionable';
-    const maxChars = Math.max(20000, Math.floor(Number(options.maxChars) || 20000));
-    const startIndex = Math.max(0, Math.floor(Number(options.cursorIndex) || 0));
-    const generation = await this.ensureSnapshotGeneration(options.refresh === true);
-    const records = generation.views[mode];
-    const lines: string[] = [];
-    let chars = 0;
-    let nextIndex = Math.min(startIndex, records.length);
-    for (let index = startIndex; index < records.length; index += 1) {
-      const line = records[index].line.trim();
-      const addition = line.length + (lines.length ? 1 : 0);
-      if (lines.length && chars + addition > maxChars) break;
-      lines.push(line);
-      chars += addition;
-      nextIndex = index + 1;
+  private cdpNodeAttributes(node: CdpDomNode) {
+    const values = node.attributes || [];
+    const attributes = new Map<string, string>();
+    for (let index = 0; index + 1 < values.length; index += 2) {
+      attributes.set(String(values[index]).toLowerCase(), String(values[index + 1] || ''));
     }
-    const empty = mode === 'actionable'
-      ? '[no actionable accessibility nodes in the current page snapshot]'
-      : mode === 'text'
-        ? '[no accessible page text in the current snapshot]'
-        : '[empty semantic DOM snapshot]';
-    const content = lines.join('\n') || empty;
+    return attributes;
+  }
+
+  private cdpNodeText(node: CdpDomNode, maxChars = 240) {
+    const values: string[] = [];
+    const visit = (current: CdpDomNode) => {
+      if (values.join(' ').length >= maxChars) return;
+      if (current.nodeType === 3 && current.nodeValue) values.push(current.nodeValue);
+      for (const child of current.children || []) visit(child);
+    };
+    visit(node);
+    return values.join(' ').replace(/\s+/g, ' ').trim().slice(0, maxChars);
+  }
+
+  private cdpShadowRole(tag: string, attributes: Map<string, string>, axNode?: CdpAxNode) {
+    const axRole = String(axNode?.role?.value || '').trim().toLowerCase();
+    if (axRole && axRole !== 'generic' && axRole !== 'none') return axRole;
+    const explicit = String(attributes.get('role') || '').trim().toLowerCase().split(/\s+/)[0];
+    if (explicit) return explicit;
+    const type = String(attributes.get('type') || 'text').toLowerCase();
+    if (tag === 'a' && attributes.has('href')) return 'link';
+    if (tag === 'button' || tag === 'summary') return 'button';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'select') return attributes.has('multiple') ? 'listbox' : 'combobox';
+    if (tag === 'option') return 'option';
+    if (tag === 'input') {
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'range') return 'slider';
+      if (type === 'number') return 'spinbutton';
+      if (type === 'search') return 'searchbox';
+      if (['button', 'image', 'reset', 'submit'].includes(type)) return 'button';
+      return 'textbox';
+    }
+    if (attributes.has('contenteditable')) return 'textbox';
+    return 'generic';
+  }
+
+  private cdpShadowCapabilities(tag: string, role: string, attributes: Map<string, string>) {
+    const capabilities = new Set<DomActionCapability>();
+    const type = String(attributes.get('type') || '').toLowerCase();
+    if (tag === 'input') {
+      if (/^(button|checkbox|color|file|image|radio|range|reset|submit)$/i.test(type)) capabilities.add('click');
+      else capabilities.add('fill');
+      capabilities.add('focus');
+    } else if (tag === 'textarea') {
+      capabilities.add('fill');
+      capabilities.add('focus');
+    } else if (tag === 'select' || tag === 'option') {
+      capabilities.add('select');
+      capabilities.add('focus');
+    } else if (['a', 'button', 'details', 'label', 'summary'].includes(tag)) {
+      capabilities.add('click');
+    }
+    if (role === 'textbox') {
+      capabilities.add('fill');
+      capabilities.add('focus');
+    } else if (role === 'combobox') {
+      capabilities.add('select');
+      capabilities.add('focus');
+    } else if (/^(button|checkbox|link|menuitem|option|radio|slider|spinbutton|switch|tab|treeitem)$/.test(role)) {
+      capabilities.add('click');
+    }
+    if (attributes.has('onclick')) capabilities.add('click');
+    if (attributes.has('tabindex')) capabilities.add('focus');
+    return [...capabilities];
+  }
+
+  private async cdpContentQuad(client: CDPSession, backendNodeId: number) {
+    const result = await client.send('DOM.getContentQuads', { backendNodeId }) as { quads?: number[][] };
+    const quad = (result.quads || [])
+      .filter((item) => item.length >= 8)
+      .sort((left, right) => {
+        const area = (value: number[]) => Math.abs(
+          value[0] * value[3] + value[2] * value[5] + value[4] * value[7] + value[6] * value[1]
+          - value[2] * value[1] - value[4] * value[3] - value[6] * value[5] - value[0] * value[7],
+        ) / 2;
+        return area(right) - area(left);
+      })[0];
+    if (!quad) return undefined;
+    const xs = [quad[0], quad[2], quad[4], quad[6]];
+    const ys = [quad[1], quad[3], quad[5], quad[7]];
+    const left = Math.min(...xs);
+    const right = Math.max(...xs);
+    const top = Math.min(...ys);
+    const bottom = Math.max(...ys);
+    if (right <= left || bottom <= top) return undefined;
     return {
-      content,
-      contentCharLength: content.length,
-      generationId: generation.id,
-      hasMore: nextIndex < records.length,
-      nextIndex,
-      returnedEntries: Math.max(0, nextIndex - startIndex),
-      startIndex,
-      totalEntries: records.length,
-      mode,
-      nodeCount: generation.nodeCount,
-      actionableCount: generation.actionableCount,
-      frameCount: generation.frames.length,
-      skippedFrameCount: generation.skippedFrameCount,
-      captureSource: generation.captureSource,
-      timings: { ...generation.timings, readSliceMs: Date.now() - startedAt },
+      rect: { x: Math.round(left), y: Math.round(top), width: Math.round(right - left), height: Math.round(bottom - top) },
+      center: { x: Math.round((left + right) / 2), y: Math.round((top + bottom) / 2) },
     };
   }
 
-  async searchSnapshot(input: { query?: string; tag?: string; roles?: string[]; limit?: number }): Promise<BrowserActionResult> {
+  private async inspectCdpShadowDom(reference: DomNodeReference): Promise<
+    { references: DomNodeReference[]; rootTypes: string[] }
+    | { error: string }
+  > {
+    if (!this.domVisibleSnapshotKey) return { error: 'No active B-chain DOM baseline is available.' };
+    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
+    if (!frame) return { error: `UID ${reference.id} belongs to an iframe that no longer exists.` };
+    const maxDepth = boundedPositiveIntegerEnv('DOM_CDP_SHADOW_MAX_DEPTH', 6, 1, 12);
+    const maxNodes = boundedPositiveIntegerEnv('DOM_CDP_SHADOW_MAX_NODES', 200, 1, 1000);
+    const token = `p${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+    let probeSet = false;
+    const client = await this.activePage.context().newCDPSession(this.activePage);
+    let searchId = '';
+    try {
+      let backendNodeId = reference.backendDOMNodeId;
+      if (!backendNodeId) {
+        if (!reference.localRef) return { error: `UID ${reference.id} has no live DOM reference for a local CDP probe.` };
+        await this.ensureBrowserPageRuntime(frame);
+        probeSet = await frame.evaluate(({ ref, value }) => {
+          const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+          return runtime?.setDomProbe(ref, value) === true;
+        }, { ref: reference.localRef, value: token }).catch(() => false);
+        if (!probeSet) return { error: `UID ${reference.id} is detached and could not be probed.` };
+        await client.send('DOM.enable');
+        await client.send('DOM.getDocument', { depth: 0, pierce: true });
+        const search = await client.send('DOM.performSearch', {
+          query: `[data-ai-dom-probe="${token}"]`,
+          includeUserAgentShadowDOM: true,
+        }) as { searchId: string; resultCount: number };
+        searchId = search.searchId;
+        if (search.resultCount !== 1) {
+          return { error: `UID ${reference.id} resolved to ${search.resultCount} CDP probe nodes; exactly one is required.` };
+        }
+        const results = await client.send('DOM.getSearchResults', {
+          searchId,
+          fromIndex: 0,
+          toIndex: 1,
+        }) as { nodeIds: number[] };
+        const describedHost = await client.send('DOM.describeNode', { nodeId: results.nodeIds[0], depth: 0 }) as { node: CdpDomNode };
+        backendNodeId = describedHost.node.backendNodeId;
+      }
+      if (!backendNodeId) return { error: `UID ${reference.id} did not resolve to a backend DOM node.` };
+      const described = await client.send('DOM.describeNode', {
+        backendNodeId,
+        depth: maxDepth,
+        pierce: true,
+      }) as { node: CdpDomNode };
+      const roots = reference.source === 'cdp-shadow'
+        ? [described.node]
+        : described.node.shadowRoots || [];
+      if (!roots.length) return { references: [] as DomNodeReference[], rootTypes: [] as string[] };
+
+      const axByBackendId = new Map<number, CdpAxNode>();
+      const axResult = await client.send('Accessibility.queryAXTree', { backendNodeId }).catch(() => undefined) as { nodes?: CdpAxNode[] } | undefined;
+      for (const node of axResult?.nodes || []) {
+        if (node.backendDOMNodeId) axByBackendId.set(node.backendDOMNodeId, node);
+      }
+
+      const references: DomNodeReference[] = [];
+      const rootTypes = new Set<string>();
+      let visited = 0;
+      const visit = (node: CdpDomNode, path: string, rootType?: string) => {
+        if (visited >= maxNodes) return;
+        visited += 1;
+        const currentRootType = node.shadowRootType || rootType;
+        if (node.shadowRootType) rootTypes.add(node.shadowRootType);
+        if (node.nodeType === 1 && node.backendNodeId) {
+          const attributes = this.cdpNodeAttributes(node);
+          const tag = String(node.localName || node.nodeName || 'element').toLowerCase();
+          const axNode = axByBackendId.get(node.backendNodeId);
+          const role = this.cdpShadowRole(tag, attributes, axNode);
+          const capabilities = this.cdpShadowCapabilities(tag, role, attributes);
+          const text = this.cdpNodeText(node);
+          const accessibleName = String(axNode?.name?.value || attributes.get('aria-label') || text || attributes.get('placeholder') || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+          const description = String(axNode?.description?.value || attributes.get('aria-description') || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+          const id = this.publicDomVisibleId(this.domVisibleSnapshotKey!, `cdp:${node.backendNodeId}`);
+          const renderedAttributes = [...attributes.entries()]
+            .filter(([name]) => !name.startsWith('data-ai-'))
+            .slice(0, 20)
+            .map(([name, value]) => `${name}="${String(value).replaceAll('"', '\\"').slice(0, 300)}"`);
+          if (!attributes.has('role') && role !== 'generic') renderedAttributes.push(`role="${role}"`);
+          renderedAttributes.push(`source="cdp-shadow"`);
+          if (currentRootType) renderedAttributes.push(`shadow_root="${currentRootType}"`);
+          const body = accessibleName || text;
+          const line = `<${tag} uid=${id} ${renderedAttributes.join(' ')}>${body}</${tag}>`;
+          const axSnapshot = [
+            role && role !== 'generic' ? `role=${role}` : '',
+            accessibleName ? `name="${accessibleName}"` : '',
+            description ? `description="${description}"` : '',
+          ].filter(Boolean).join(' ');
+          references.push(indexDomNodeReference({
+            id,
+            source: 'cdp-shadow',
+            interactive: capabilities.length > 0,
+            accessibleName,
+            description,
+            role,
+            capabilities,
+            confidence: capabilities.length ? 'high' : 'low',
+            contextText: reference.label,
+            priority: capabilities.length ? 45 : 0,
+            contextId: this.domVisibleSnapshotKey,
+            label: accessibleName || text || `${tag} in ${reference.label}`,
+            line,
+            locatorCandidates: [],
+            path,
+            signals: ['cdp-shadow'],
+            framePath: reference.framePath,
+            frameUrl: reference.frameUrl,
+            descriptor: `${tag}${accessibleName ? ` "${accessibleName}"` : ''} in shadow host ${reference.id}`,
+            state: attributes.has('disabled') || attributes.get('aria-disabled') === 'true' ? 'disabled=true' : '',
+            tag,
+            axSnapshot: axSnapshot || undefined,
+            backendDOMNodeId: node.backendNodeId,
+            shadowHostUid: reference.shadowHostUid || reference.id,
+          }));
+        }
+        let childIndex = 0;
+        for (const child of node.children || []) visit(child, `${path}.${childIndex++}`, currentRootType);
+        for (const root of node.shadowRoots || []) visit(root, `${path}.s${childIndex++}`, root.shadowRootType || currentRootType);
+        if (node.contentDocument) visit(node.contentDocument, `${path}.f${childIndex++}`, currentRootType);
+      };
+      roots.forEach((root, index) => visit(root, `${reference.path}.shadow.${index}`, root.shadowRootType));
+
+      for (const item of references) this.lastDomNodeReferences.set(item.id, item);
+      const interactive = references.filter((item) => item.interactive && item.backendDOMNodeId).slice(0, 40);
+      const geometries = await Promise.all(interactive.map(async (item) => ({
+        item,
+        geometry: await this.cdpContentQuad(client, item.backendDOMNodeId!),
+      })));
+      for (const { item, geometry } of geometries) {
+        if (!geometry) continue;
+        this.cdpShadowCandidates.set(item.id, {
+          id: item.id,
+          path: item.path,
+          tag: item.tag,
+          role: item.role,
+          name: item.accessibleName || item.label,
+          text: item.label,
+          signals: item.signals,
+          rect: geometry.rect,
+          center: geometry.center,
+          clickable: item.capabilities?.includes('click') === true,
+          input: item.capabilities?.some((capability) => capability === 'fill' || capability === 'select') === true,
+          disabled: item.state.includes('disabled=true'),
+          framePath: item.framePath,
+          frameUrl: item.frameUrl,
+          shadow: true,
+        });
+      }
+      return { references, rootTypes: [...rootTypes] };
+    } catch (error) {
+      return { error: `Local CDP shadow inspection failed for UID ${reference.id}: ${unknownErrorMessage(error)}` };
+    } finally {
+      if (searchId) await client.send('DOM.discardSearchResults', { searchId }).catch(() => undefined);
+      if (probeSet && reference.localRef) {
+        await frame.evaluate(({ ref, value }) => {
+          const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+          runtime?.clearDomProbe(ref, value);
+        }, { ref: reference.localRef, value: token }).catch(() => undefined);
+      }
+      await client.detach().catch(() => undefined);
+    }
+  }
+
+  private async localAxSnapshotForDomReference(reference: DomNodeReference) {
+    if (reference.axSnapshot) return reference.axSnapshot;
+    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
+    if (!frame) return undefined;
+    const locators: Locator[] = [];
+    for (const selector of reference.locatorCandidates || []) locators.push(frame.locator(selector));
+    const role = reference.role || reference.semanticRoles.find((item) => !['input', 'select', 'textarea', 'contenteditable'].includes(item));
+    const name = reference.accessibleName || reference.label;
+    if (role && role !== 'generic' && name) {
+      try {
+        locators.push(frame.getByRole(role as Parameters<Frame['getByRole']>[0], { name, exact: true }));
+      } catch {
+        // Unsupported inferred roles simply fall back to stable DOM locators.
+      }
+    }
+    for (const locator of locators.slice(0, 10)) {
+      if (await locator.count().catch(() => 0) !== 1) continue;
+      const snapshot = await locator.ariaSnapshot({ timeout: 1800 }).catch(() => '');
+      const compact = snapshot.replace(/\s+/g, ' ').trim().slice(0, 1600);
+      if (!compact) continue;
+      reference.axSnapshot = compact;
+      return compact;
+    }
+    return undefined;
+  }
+
+  async searchSnapshot(input: { query?: string; tag?: string; uid?: string; roles?: string[]; limit?: number; includeAx?: boolean; includeShadow?: boolean }): Promise<BrowserActionResult> {
     const query = normalizeDomSearchText(input.query);
     const tag = normalizeDomSearchText(input.tag);
-    if (!query && !tag) return { ok: false, actual: 'Snapshot search requires a non-empty query or tag.' };
+    const uid = String(input.uid || '').trim();
+    if (!query && !tag && !uid) return { ok: false, actual: 'Snapshot search requires a query, tag, or current DOM UID.' };
+    if (input.includeShadow && !uid) {
+      return { ok: false, actual: 'Local CDP shadow inspection requires one exact current dom-* UID.' };
+    }
     const roles = new Set((input.roles || []).map(normalizeDomSearchText));
     const queryParts = query.split(/\s+/).filter(Boolean);
     const limit = Math.min(100, Math.max(1, Math.floor(Number(input.limit) || 20)));
@@ -7204,8 +6256,22 @@ export class BrowserSession {
     // MutationObserver queue, refresh the UID registry, scroll, or invalidate
     // an in-progress snapshot cursor.
     if (this.domVisibleSnapshotKey && this.lastDomNodeReferences.size > 0) {
+      const shadowTarget = input.includeShadow ? this.lastDomNodeReferences.get(uid) : undefined;
+      if (input.includeShadow && !shadowTarget) {
+        return { ok: false, actual: `UID ${uid} is not present in the current B-chain DOM baseline.` };
+      }
+      const shadowInspection = input.includeShadow
+        ? await this.inspectCdpShadowDom(shadowTarget!)
+        : undefined;
+      if (shadowInspection && 'error' in shadowInspection && shadowInspection.error) {
+        return { ok: false, actual: shadowInspection.error };
+      }
+      const shadowDetails = shadowInspection && 'references' in shadowInspection
+        ? shadowInspection
+        : undefined;
       const collectMatches = () => [...this.lastDomNodeReferences.values()]
         .filter((reference) => {
+          if (uid && reference.id !== uid) return false;
           if (tag && reference.tag !== tag) return false;
           if (roles.size && ![...roles].some((role) => reference.semanticRoles.includes(role))) return false;
           return !query || reference.searchText.includes(query) || queryParts.every((part) => reference.searchText.includes(part));
@@ -7242,263 +6308,39 @@ export class BrowserSession {
             || left.id.localeCompare(right.id, undefined, { numeric: true });
         });
       const allMatches = collectMatches();
-      const matches = tag ? allMatches : allMatches.slice(0, limit);
+      const matches = uid || !tag ? allMatches.slice(0, limit) : allMatches;
+      const axByUid = new Map<string, string>();
+      if (input.includeAx) {
+        await Promise.all(matches.slice(0, 8).map(async (reference) => {
+          const snapshot = await this.localAxSnapshotForDomReference(reference);
+          if (snapshot) axByUid.set(reference.id, snapshot);
+        }));
+      }
       return {
         ok: true,
         actual: [
-          `Frozen DOM baseline ${tag ? `tag read for <${tag}>` : `search for "${input.query}"`} returned ${matches.length} result(s). The search did not scroll, consume DOM changes, or alter snapshot pagination. Use only the dom-* UIDs shown below exactly as returned.`,
-          matches.map((reference) => reference.line).join('\n') || '[no DOM baseline matches]',
+          `Frozen DOM baseline ${uid ? `UID read for ${uid}` : tag ? `tag read for <${tag}>` : `search for "${input.query}"`} returned ${matches.length} result(s). The search did not scroll, consume DOM changes, or alter snapshot pagination. Use only the dom-* UIDs shown below exactly as returned.`,
+          matches.map((reference) => {
+            const ax = axByUid.get(reference.id);
+            return ax ? `${reference.line}\n  local-ax="${ax.replaceAll('"', '\\"')}"` : reference.line;
+          }).join('\n') || '[no DOM baseline matches]',
+          shadowDetails
+            ? [
+                `Local CDP shadow inspection found ${shadowDetails.references.length} bounded descendant node(s) under ${uid}; root types=${shadowDetails.rootTypes.join('|') || 'none'}.`,
+                shadowDetails.references.map((reference) => (
+                  reference.axSnapshot
+                    ? `${reference.line}\n  local-ax="${reference.axSnapshot.replaceAll('"', '\\"')}"`
+                    : reference.line
+                )).join('\n') || '[no shadow descendants]',
+              ].join('\n')
+            : '',
         ].join('\n'),
       };
     }
     return {
       ok: false,
-      actual: 'searchSnapshot requires an active DOM baseline. Call takeSnapshot first; searchSnapshot never creates or searches a separate CDP UID namespace.',
+      actual: 'searchSnapshot requires an active B-chain DOM baseline. Call takeSnapshot first; searchSnapshot never invokes full DOMSnapshot or full-page AX collection.',
     };
-  }
-
-  private currentSnapshotReference(uid: string) {
-    const generation = this.snapshotGeneration;
-    if (!generation || generation.page !== this.activePage || generation.url !== this.activePage.url()) {
-      return { error: 'No current snapshot generation is available. Call takeSnapshot before using a UID.' };
-    }
-    const reference = generation.references.get(String(uid));
-    if (!reference) {
-      return { error: `UID ${uid} is not present in the latest snapshot ${generation.id}. Take a new snapshot and choose a current UID.` };
-    }
-    return { reference };
-  }
-
-  private async snapshotReferenceLocator(reference: SnapshotReference) {
-    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
-    if (!frame) return undefined;
-    if (reference.selector) {
-      const locator = frame.locator(reference.selector);
-      return await locator.count().catch(() => 0) === 1 ? locator : undefined;
-    }
-    if (!reference.name || !snapshotRoleIsActionable(reference.role)) return undefined;
-    const locator = frame.getByRole(
-      reference.role as Parameters<Frame['getByRole']>[0],
-      { name: reference.name, exact: true },
-    );
-    return await locator.count().catch(() => 0) === 1 ? locator : undefined;
-  }
-
-  private async validateLocatorActionPoint(
-    locator: Locator,
-    reference: SnapshotReference,
-    allowNonActionable: boolean,
-  ) {
-    await locator.scrollIntoViewIfNeeded().catch(() => undefined);
-    if (!await locator.isVisible().catch(() => false)) {
-      return { error: `UID ${reference.uid} is no longer visible.` };
-    }
-    if (!allowNonActionable && !await locator.isEnabled().catch(() => false)) {
-      return { error: `UID ${reference.uid} is disabled and cannot receive an action.` };
-    }
-    const ariaSnapshot = await locator.ariaSnapshot().catch(() => '');
-    let validationError = '';
-    const validation = await locator.evaluate((element) => {
-      const target = element as HTMLElement;
-      const style = window.getComputedStyle(target);
-      const disabled = Boolean(
-        (target as HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).disabled
-        || target.getAttribute('aria-disabled') === 'true',
-      );
-      const rect = target.getBoundingClientRect();
-      const ratios = [
-        [0.5, 0.5], [0.2, 0.5], [0.8, 0.5], [0.5, 0.2], [0.5, 0.8],
-        [0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8],
-      ];
-      let point: number[] | undefined;
-      for (const ratio of ratios) {
-        const xRatio = ratio[0];
-        const yRatio = ratio[1];
-        const x = Math.min(window.innerWidth - 1, Math.max(0, rect.left + rect.width * xRatio));
-        const y = Math.min(window.innerHeight - 1, Math.max(0, rect.top + rect.height * yRatio));
-        let top: Element | undefined;
-        for (const candidate of document.elementsFromPoint(x, y)) {
-          if (candidate.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__')) continue;
-          const candidateStyle = window.getComputedStyle(candidate);
-          if (candidateStyle.display !== 'none' && candidateStyle.visibility !== 'hidden') {
-            top = candidate;
-            break;
-          }
-        }
-        let current: Element | null | undefined = top;
-        for (let guard = 0; current && guard < 64; guard += 1) {
-          if (current === target) {
-            point = ratio;
-            break;
-          }
-          const root = current.getRootNode();
-          current = current.parentElement || (root instanceof ShadowRoot ? root.host : null);
-        }
-        if (point) break;
-      }
-      return {
-        connected: target.isConnected,
-        disabled,
-        visible: rect.width > 0
-          && rect.height > 0
-          && style.display !== 'none'
-          && style.visibility !== 'hidden'
-          && style.visibility !== 'collapse'
-          && Number(style.opacity || '1') > 0.01,
-        point,
-      };
-    }).catch((error) => {
-      validationError = unknownErrorMessage(error);
-      return undefined;
-    });
-    if (!validation) {
-      return { error: `UID ${reference.uid} could not be validated before action: ${validationError || 'unknown Playwright locator error'}.` };
-    }
-    if (!validation?.connected || !validation.visible) {
-      return { error: `UID ${reference.uid} is detached or no longer rendered.` };
-    }
-    if (!allowNonActionable && validation.disabled) {
-      return { error: `UID ${reference.uid} is disabled and cannot receive an action.` };
-    }
-    if (!validation.point) {
-      return { error: `UID ${reference.uid} is covered by another rendered element.` };
-    }
-    const box = await locator.boundingBox().catch(() => undefined);
-    if (!box || box.width <= 0 || box.height <= 0) {
-      return { error: `UID ${reference.uid} no longer has a rendered box.` };
-    }
-    const [xRatio, yRatio] = validation.point;
-    return {
-      point: {
-        x: Math.round(box.x + box.width * xRatio),
-        y: Math.round(box.y + box.height * yRatio),
-        descriptor: `${reference.role} "${reference.name}"${ariaSnapshot ? ' (Playwright accessibility match)' : ''}`,
-        source: 'playwright-accessibility',
-      },
-    };
-  }
-
-  private async resolveSnapshotReferencePoint(uid: string, allowNonActionable = false) {
-    const resolved = this.currentSnapshotReference(uid);
-    if (!resolved.reference) return { error: resolved.error };
-    const reference = resolved.reference;
-    if (!allowNonActionable && !reference.actionable) {
-      return { error: `UID ${uid} (${reference.role} "${reference.name}") is structural text, not an actionable control.` };
-    }
-    const locator = await this.snapshotReferenceLocator(reference);
-    if (locator) {
-      const validated = await this.validateLocatorActionPoint(locator, reference, allowNonActionable);
-      if (!validated.point) return { error: validated.error };
-      return { reference, point: validated.point };
-    }
-    if (!reference.backendDOMNodeId) {
-      return { error: `UID ${uid} has no backing DOM node and cannot receive a mouse or keyboard action.` };
-    }
-    const client = await this.activePage.context().newCDPSession(this.activePage);
-    let targetObjectId: string | undefined;
-    try {
-      const resolvedTarget = await client.send('DOM.resolveNode', {
-        backendNodeId: reference.backendDOMNodeId,
-      }) as { object?: { objectId?: string } };
-      targetObjectId = resolvedTarget.object?.objectId;
-      if (!targetObjectId) return { error: `UID ${uid} no longer resolves to a live DOM element.` };
-      const stateResult = await client.send('Runtime.callFunctionOn', {
-        objectId: targetObjectId,
-        functionDeclaration: `function () {
-          const element = this;
-          const style = window.getComputedStyle(element);
-          const rect = element.getBoundingClientRect();
-          return {
-            connected: element.isConnected,
-            disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
-            visible: rect.width > 0 && rect.height > 0
-              && style.display !== 'none'
-              && style.visibility !== 'hidden'
-              && style.visibility !== 'collapse'
-              && Number(style.opacity || '1') > 0.01,
-          };
-        }`,
-        returnByValue: true,
-      }) as { result?: { value?: { connected?: boolean; disabled?: boolean; visible?: boolean } } };
-      const state = stateResult.result?.value;
-      if (!state?.connected || !state.visible) return { error: `UID ${uid} is detached or no longer rendered.` };
-      if (!allowNonActionable && state.disabled) return { error: `UID ${uid} is disabled and cannot receive an action.` };
-      await client.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: reference.backendDOMNodeId });
-      const result = await client.send('DOM.getContentQuads', { backendNodeId: reference.backendDOMNodeId }) as { quads?: number[][] };
-      const quads = (result.quads || []).filter((quad) => quad.length >= 8);
-      const quad = quads.sort((left, right) => {
-        const area = (value: number[]) => Math.abs(
-          value[0] * value[3] + value[2] * value[5] + value[4] * value[7] + value[6] * value[1]
-          - value[1] * value[2] - value[3] * value[4] - value[5] * value[6] - value[7] * value[0],
-        ) / 2;
-        return area(right) - area(left);
-      })[0];
-      if (!quad) return { error: `UID ${uid} no longer has a rendered content quad.` };
-      const viewport = await this.getViewportMetrics();
-      const center = {
-        x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
-        y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
-      };
-      const candidates = [center, ...[0, 2, 4, 6].map((index) => ({
-        x: center.x * 0.7 + quad[index] * 0.3,
-        y: center.y * 0.7 + quad[index + 1] * 0.3,
-      }))];
-      let actionablePoint: { x: number; y: number } | undefined;
-      for (const candidate of candidates) {
-        const x = Math.round(candidate.x);
-        const y = Math.round(candidate.y);
-        if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) continue;
-        const hit = await client.send('DOM.getNodeForLocation', {
-          x,
-          y,
-          includeUserAgentShadowDOM: true,
-        }).catch(() => undefined) as { backendNodeId?: number } | undefined;
-        if (!hit?.backendNodeId) continue;
-        if (hit.backendNodeId === reference.backendDOMNodeId) {
-          actionablePoint = { x, y };
-          break;
-        }
-        const resolvedHit = await client.send('DOM.resolveNode', { backendNodeId: hit.backendNodeId })
-          .catch(() => undefined) as { object?: { objectId?: string } } | undefined;
-        const hitObjectId = resolvedHit?.object?.objectId;
-        if (!hitObjectId) continue;
-        const containsResult = await client.send('Runtime.callFunctionOn', {
-          objectId: targetObjectId,
-          functionDeclaration: `function (hit) {
-            if (!hit) return false;
-            let current = hit;
-            for (let guard = 0; current && guard < 64; guard += 1) {
-              if (current === this) return true;
-              const root = current.getRootNode ? current.getRootNode() : null;
-              current = current.parentElement || (root && root.host) || null;
-            }
-            return false;
-          }`,
-          arguments: [{ objectId: hitObjectId }],
-          returnByValue: true,
-        }).catch(() => undefined) as { result?: { value?: boolean } } | undefined;
-        await client.send('Runtime.releaseObject', { objectId: hitObjectId }).catch(() => undefined);
-        if (containsResult?.result?.value) {
-          actionablePoint = { x, y };
-          break;
-        }
-      }
-      if (!actionablePoint) return { error: `UID ${uid} is covered by another rendered element.` };
-      return {
-        reference,
-        point: {
-          x: actionablePoint.x,
-          y: actionablePoint.y,
-          descriptor: `${reference.role} "${reference.name}"`,
-          source: 'accessibility-tree',
-        },
-      };
-    } catch (error) {
-      return { error: `UID ${uid} could not be resolved from the latest semantic DOM snapshot: ${unknownErrorMessage(error)}` };
-    } finally {
-      if (targetObjectId) await client.send('Runtime.releaseObject', { objectId: targetObjectId }).catch(() => undefined);
-      await client.detach().catch(() => undefined);
-    }
   }
 
   private async resolveDomObservationReferencePoint(uid: string, allowNonActionable = false) {
@@ -7507,11 +6349,54 @@ export class BrowserSession {
       const registryCount = this.lastDomNodeReferences.size;
       const baselineState = this.domVisibleSnapshotKey ? 'an active DOM baseline' : 'no active DOM baseline';
       return {
-        error: `UID ${uid} is absent from the current DOM UID registry (${registryCount} registered UIDs; ${baselineState}). It was not necessarily removed: it may belong to a different snapshot/UID namespace, or it may appear in domChanges.removed. Use a UID exactly as returned by the latest takeSnapshot or searchSnapshot; do not add or change the dom- prefix.`,
+        error: `UID ${uid} is absent from the current B-chain DOM UID registry (${registryCount} registered UIDs; ${baselineState}). It may appear in domChanges.removed. Use a dom-* UID exactly as returned by the latest takeSnapshot, searchSnapshot, or marked screenshot.`,
       };
     }
     if (!allowNonActionable && !reference.interactive) {
       return { error: `UID ${uid} (${reference.tag} "${reference.label}") is structural text, not an actionable control.` };
+    }
+    if (reference.backendDOMNodeId) {
+      if (!allowNonActionable && reference.state.includes('disabled=true')) {
+        return { error: `UID ${uid} is disabled and cannot receive an action.` };
+      }
+      const client = await this.activePage.context().newCDPSession(this.activePage);
+      try {
+        await client.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: reference.backendDOMNodeId });
+        const geometry = await this.cdpContentQuad(client, reference.backendDOMNodeId);
+        if (!geometry) return { error: `UID ${uid} no longer has a rendered CDP content quad.` };
+        const { rect, center } = geometry;
+        const points = [
+          center,
+          { x: Math.round(rect.x + rect.width * 0.25), y: Math.round(rect.y + rect.height * 0.25) },
+          { x: Math.round(rect.x + rect.width * 0.75), y: Math.round(rect.y + rect.height * 0.25) },
+          { x: Math.round(rect.x + rect.width * 0.25), y: Math.round(rect.y + rect.height * 0.75) },
+          { x: Math.round(rect.x + rect.width * 0.75), y: Math.round(rect.y + rect.height * 0.75) },
+        ];
+        for (const point of points) {
+          const hit = await client.send('DOM.getNodeForLocation', {
+            x: point.x,
+            y: point.y,
+            includeUserAgentShadowDOM: true,
+          }).catch(() => undefined) as { backendNodeId?: number } | undefined;
+          if (hit?.backendNodeId !== reference.backendDOMNodeId) continue;
+          return {
+            reference,
+            point: {
+              x: point.x,
+              y: point.y,
+              descriptor: reference.descriptor,
+              source: 'cdp-shadow',
+            },
+          };
+        }
+        return { error: `UID ${uid} is covered by another rendered element.` };
+      } catch (error) {
+        this.lastDomNodeReferences.delete(uid);
+        this.cdpShadowCandidates.delete(uid);
+        return { error: `UID ${uid} could not be resolved through local CDP shadow access: ${unknownErrorMessage(error)}` };
+      } finally {
+        await client.detach().catch(() => undefined);
+      }
     }
     if (!reference.localRef || !reference.contextId) {
       return { error: `UID ${uid} has no live DOM reference. Call takeSnapshot and choose a current UID.` };
@@ -7619,9 +6504,7 @@ export class BrowserSession {
     const hasAnyCoordinate = input.xThousandth !== undefined || input.yThousandth !== undefined;
     if (hasUid && hasAnyCoordinate) return { error: 'Use either uid or screenshot coordinates, never both.' };
     if (hasUid) {
-      return input.uid!.startsWith('dom-')
-        ? this.resolveDomObservationReferencePoint(input.uid!, allowNonActionable)
-        : this.resolveSnapshotReferencePoint(input.uid!, allowNonActionable);
+      return this.resolveDomObservationReferencePoint(input.uid!, allowNonActionable);
     }
     if (hasAnyCoordinate) return this.resolveScreenshotPoint(input.xThousandth, input.yThousandth);
     return { error: 'A uid or the latest screenshot x_thousandth/y_thousandth coordinates are required.' };
@@ -7636,31 +6519,28 @@ export class BrowserSession {
     };
     throwIfAborted();
     const page = this.activePage;
-    const previousGeneration = this.snapshotGeneration;
+    const previousGeneration = this.actionBaseline();
     if (input.action === 'scroll') {
       let point: { x: number; y: number; descriptor: string; source: string } | undefined;
-      let targetLocator: Locator | undefined;
       if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
         const resolved = await this.unifiedActionPoint(input, true);
         throwIfAborted();
         if (!resolved.point) return { ok: false, actual: resolved.error || 'Unable to resolve scroll target.' };
         point = resolved.point;
-        targetLocator = resolved.reference && isSnapshotReference(resolved.reference) ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
-        if (targetLocator) await targetLocator.hover();
-        else await page.mouse.move(point.x, point.y);
+        await page.mouse.move(point.x, point.y);
       }
       const deltaX = Number.isFinite(input.deltaX) ? Number(input.deltaX) : 0;
       const deltaY = Number.isFinite(input.deltaY) ? Number(input.deltaY) : 0;
       if (!deltaX && !deltaY) return { ok: false, actual: 'Mouse scroll requires a non-zero deltaX or deltaY.' };
       const eventsBefore = await this.readInteractionCounts();
-      const scrollBefore = await this.readScrollPosition(targetLocator, point);
+      const scrollBefore = await this.readScrollPosition(undefined, point);
       await page.mouse.wheel(deltaX, deltaY);
       return this.completeVerifiedAction(
         `Scrolled${point ? ` over ${point.descriptor}` : ' the page'} by (${deltaX}, ${deltaY}).`,
         previousGeneration,
         async () => {
           const eventsAfter = await this.readInteractionCounts();
-          const scrollAfter = await this.readScrollPosition(targetLocator, point);
+          const scrollAfter = await this.readScrollPosition(undefined, point);
           const wheelEvents = this.interactionDelta(eventsBefore, eventsAfter, 'wheel');
           const moved = Boolean(scrollBefore && scrollAfter
             && (scrollBefore.left !== scrollAfter.left || scrollBefore.top !== scrollAfter.top));
@@ -7679,22 +6559,16 @@ export class BrowserSession {
       if (!input.uid) return { ok: false, actual: 'scrollIntoView requires a current snapshot uid.' };
       const resolved = await this.unifiedActionPoint({ uid: input.uid }, true);
       if (!resolved.point) return { ok: false, actual: resolved.error || `Unable to scroll UID ${input.uid} into view.` };
-      const targetLocator = resolved.reference && isSnapshotReference(resolved.reference) ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
       return this.completeVerifiedAction(
         `Scrolled UID ${input.uid} (${resolved.point.descriptor}) into view.`,
         previousGeneration,
         async () => {
-          if (!targetLocator) {
-            return { ok: true, detail: `CDP returned an actionable viewport point at (${resolved.point!.x},${resolved.point!.y}).` };
-          }
-          const box = await targetLocator.boundingBox().catch(() => undefined);
           const viewport = await this.getViewportMetrics();
-          const visible = Boolean(box
-            && box.x < viewport.width
-            && box.y < viewport.height
-            && box.x + box.width > 0
-            && box.y + box.height > 0);
-          return { ok: visible, detail: visible ? 'target bounding box intersects the viewport.' : 'target did not enter the viewport.' };
+          const visible = resolved.point!.x >= 0
+            && resolved.point!.y >= 0
+            && resolved.point!.x < viewport.width
+            && resolved.point!.y < viewport.height;
+          return { ok: visible, detail: visible ? 'target action point intersects the viewport.' : 'target did not enter the viewport.' };
         },
       );
     }
@@ -7703,25 +6577,21 @@ export class BrowserSession {
     const from = await this.unifiedActionPoint(input, input.action === 'move');
     throwIfAborted();
     if (!from.point) return { ok: false, actual: from.error || 'Unable to resolve mouse target.' };
-    const fromLocator = from.reference && isSnapshotReference(from.reference) ? await this.snapshotReferenceLocator(from.reference) : undefined;
     const targetResolutionMs = Date.now() - targetResolutionStartedAt;
     throwIfAborted();
     if (input.action === 'move') {
       const eventsBefore = await this.readInteractionCounts();
-      if (fromLocator) await fromLocator.hover();
-      else await page.mouse.move(from.point.x, from.point.y);
+      await page.mouse.move(from.point.x, from.point.y);
       return this.completeVerifiedAction(
-        `Moved mouse to ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) using ${fromLocator ? 'Playwright hover' : 'viewport coordinates'}.`,
+        `Moved mouse to ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) using viewport coordinates.`,
         previousGeneration,
         async () => {
           const eventsAfter = await this.readInteractionCounts();
           const moveEvents = this.interactionDelta(eventsBefore, eventsAfter, 'mousemove');
-          const hovered = fromLocator
-            ? await fromLocator.evaluate((element) => element.matches(':hover')).catch(() => false)
-            : await page.evaluate(({ x, y }) => {
-              const hit = document.elementFromPoint(x, y);
-              return Boolean(hit && hit.matches(':hover'));
-            }, { x: from.point!.x, y: from.point!.y }).catch(() => false);
+          const hovered = await page.evaluate(({ x, y }) => {
+            const hit = document.elementFromPoint(x, y);
+            return Boolean(hit && hit.matches(':hover'));
+          }, { x: from.point!.x, y: from.point!.y }).catch(() => false);
           return {
             ok: moveEvents > 0 || hovered,
             detail: `${moveEvents} mousemove event(s) observed; target hover=${hovered}.`,
@@ -7737,17 +6607,15 @@ export class BrowserSession {
       }, true);
       throwIfAborted();
       if (!to.point) return { ok: false, actual: to.error || 'Unable to resolve drag destination.' };
-      const toLocator = to.reference && isSnapshotReference(to.reference) ? await this.snapshotReferenceLocator(to.reference) : undefined;
       const button = input.button || 'left';
       const eventsBefore = await this.readInteractionCounts();
-      const sourceHandle = fromLocator ? undefined : await this.viewportDragTarget(page, from.point.x, from.point.y, true);
-      const destinationHandle = toLocator ? undefined : await this.viewportDragTarget(page, to.point.x, to.point.y, false);
-      const sourceTarget = fromLocator || sourceHandle;
-      const destinationTarget = toLocator || destinationHandle;
+      const sourceHandle = await this.viewportDragTarget(page, from.point.x, from.point.y, true);
+      const destinationHandle = await this.viewportDragTarget(page, to.point.x, to.point.y, false);
+      const sourceTarget = sourceHandle;
+      const destinationTarget = destinationHandle;
       let usedHtml5Fallback = false;
       try {
-        if (fromLocator) await fromLocator.hover();
-        else await page.mouse.move(from.point.x, from.point.y);
+        await page.mouse.move(from.point.x, from.point.y);
         await page.mouse.down({ button });
         await page.mouse.move(from.point.x + 8, from.point.y + 4, { steps: 3 });
         await page.mouse.move(to.point.x, to.point.y, { steps: 12 });
@@ -7764,7 +6632,7 @@ export class BrowserSession {
       }
       void this.showClickMarker(to.point.x, to.point.y, 'drag');
       return this.completeVerifiedAction(
-        `Dragged ${from.point.descriptor} to ${to.point.descriptor} using ${fromLocator && toLocator ? 'Playwright locator-guided' : 'viewport-coordinate'} pointer input${usedHtml5Fallback ? ' plus HTML5 DataTransfer fallback' : ''}.`,
+        `Dragged ${from.point.descriptor} to ${to.point.descriptor} using viewport-coordinate pointer input${usedHtml5Fallback ? ' plus HTML5 DataTransfer fallback' : ''}.`,
         previousGeneration,
         async () => {
           const eventsAfter = await this.readInteractionCounts();
@@ -7796,25 +6664,17 @@ export class BrowserSession {
       resultAssemblyMs: 0,
       totalMs: 0,
     };
-    if (fromLocator) {
-      await timeBrowserClickStage(clickTimings, 'waitForClickableMs', () => fromLocator.click({
-        button,
-        clickCount,
-        noWaitAfter: true,
-        trial: true,
-      }));
-    }
     const eventsBefore = await timeBrowserClickStage(clickTimings, 'preClickInteractionReadMs', () => this.readInteractionCounts());
     const urlBefore = page.url();
     const popupSetupStartedAt = Date.now();
     const popup = this.watchForPopup(page);
     clickTimings.popupListenerSetupMs = Date.now() - popupSetupStartedAt;
     throwIfAborted();
-    await timeBrowserClickStage(clickTimings, 'clickDispatchMs', () => (
-      fromLocator
-        ? fromLocator.click({ button, clickCount, noWaitAfter: true })
-        : page.mouse.click(from.point.x, from.point.y, { button, clickCount })
-    ));
+    await timeBrowserClickStage(
+      clickTimings,
+      'clickDispatchMs',
+      () => page.mouse.click(from.point!.x, from.point!.y, { button, clickCount }),
+    );
     throwIfAborted();
     const claimedPopup = await timeBrowserClickStage(clickTimings, 'popupWaitMs', () => this.settlePopupAfterAction(popup.popup, popup.waitMs));
     void this.showClickMarker(from.point.x, from.point.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
@@ -7842,9 +6702,7 @@ export class BrowserSession {
     // enter the page DOM and therefore cannot be reported by MutationObserver.
     // Re-emit the select's current semantic line so the post-click delta still
     // exposes its options and the caller can continue with selectOption.
-    const nativeSelectReference = from.reference
-      && !isSnapshotReference(from.reference)
-      && from.reference.tag === 'select'
+    const nativeSelectReference = from.reference?.tag === 'select'
       ? from.reference
       : undefined;
     const clickedNativeSelect = (
@@ -7869,6 +6727,7 @@ export class BrowserSession {
   }
 
   async selectOption(input: BrowserSelectOptionAction): Promise<BrowserActionResult> {
+    const previousGeneration = this.actionBaseline();
     const uid = String(input.uid || '').trim();
     if (!uid) return { ok: false, actual: 'selectOption requires a fresh select UID.' };
     const reference = this.lastDomNodeReferences.get(uid);
@@ -7886,47 +6745,50 @@ export class BrowserSession {
     const selectedLabel = selected.label ? ` (${selected.label})` : '';
     return this.completeVerifiedAction(
       `Selected native option ${selected.value || input.value || input.label}${selectedLabel}.`,
-      this.snapshotGeneration,
+      previousGeneration,
       async () => ({ ok: true, detail: selected.actual }),
     );
   }
 
   async keyboard(input: BrowserKeyboardAction): Promise<BrowserActionResult> {
     const page = this.activePage;
-    const previousGeneration = this.snapshotGeneration;
+    const previousGeneration = this.actionBaseline();
     let targetLocator: Locator | undefined;
     let targetHandle: ElementHandle<Element> | undefined;
+    let cdpTarget: DomNodeReference | undefined;
     if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
       const target = await this.unifiedActionPoint(input, true);
       if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
-      targetLocator = target.reference && isSnapshotReference(target.reference) ? await this.snapshotReferenceLocator(target.reference) : undefined;
-      if (!targetLocator && target.reference && !isSnapshotReference(target.reference) && target.reference.interactive) {
-        const frame = target.reference.framePath ? this.frameFromPath(target.reference.framePath) : page.mainFrame();
-        if (!frame) return { ok: false, actual: `UID ${input.uid} belongs to an iframe that no longer exists.` };
-        targetHandle = await this.elementHandleForDomPath(
-          frame,
-          target.reference.path,
-          target.reference.locatorCandidates || [],
-        ) as ElementHandle<Element> | undefined;
-        if (!targetHandle) {
-          return { ok: false, actual: `UID ${input.uid} no longer resolves to a live editable element. Call takeSnapshot again.` };
+      if (target.reference?.interactive) {
+        if (target.reference.backendDOMNodeId) {
+          cdpTarget = target.reference;
+        } else {
+          const frame = target.reference.framePath ? this.frameFromPath(target.reference.framePath) : page.mainFrame();
+          if (!frame) return { ok: false, actual: `UID ${input.uid} belongs to an iframe that no longer exists.` };
+          targetHandle = await this.elementHandleForDomPath(
+            frame,
+            target.reference.path,
+            target.reference.locatorCandidates || [],
+          ) as ElementHandle<Element> | undefined;
+          if (!targetHandle) {
+            return { ok: false, actual: `UID ${input.uid} no longer resolves to a live editable element. Call takeSnapshot again.` };
+          }
         }
       }
-      const targetsNativeSelect = Boolean(target.reference && (
-        isSnapshotReference(target.reference)
-          ? await targetLocator?.evaluate((element) => element instanceof HTMLSelectElement).catch(() => false)
-          : target.reference.tag === 'select'
-      ));
+      const targetsNativeSelect = target.reference?.tag === 'select';
       if (targetsNativeSelect) {
         return { ok: false, actual: 'Keyboard operation rejected for a native <select>. Use selectOption with this select UID and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
       }
-      if (!targetLocator && !targetHandle && target.reference && !isSnapshotReference(target.reference) && !target.reference.interactive) {
+      if (!targetLocator && !targetHandle && target.reference && !target.reference.interactive) {
         targetLocator = await this.editableIframeLocator(target.reference, target.point);
         if (!targetLocator) {
           return { ok: false, actual: `UID ${input.uid} (${target.reference.tag} "${target.reference.label}") is structural text, not an editable target.` };
         }
       }
       if (input.allowedOrigins?.length) {
+        if (cdpTarget) {
+          return { ok: false, actual: 'Credential entry is not allowed through a CDP-only shadow reference.' };
+        }
         if (!targetLocator && !targetHandle) {
           return { ok: false, actual: 'Credential entry requires a resolvable element target in the confirmed login page.' };
         }
@@ -7957,7 +6819,14 @@ export class BrowserSession {
           return { ok: false, actual: 'Credential entry is limited to a concrete input or textarea field.' };
         }
       }
-      if (targetLocator || targetHandle) {
+      if (cdpTarget?.backendDOMNodeId) {
+        const client = await page.context().newCDPSession(page);
+        try {
+          await client.send('DOM.focus', { backendNodeId: cdpTarget.backendDOMNodeId });
+        } finally {
+          await client.detach().catch(() => undefined);
+        }
+      } else if (targetLocator || targetHandle) {
         if (targetHandle) await targetHandle.click({ noWaitAfter: true });
         else await targetLocator!.click({ noWaitAfter: true });
         if (targetHandle) await targetHandle.focus();
@@ -8008,7 +6877,9 @@ export class BrowserSession {
         ? await targetHandle.isEditable().catch(() => false)
         : targetLocator
           ? await targetLocator.isEditable().catch(() => false)
-        : await page.locator(':focus').isEditable().catch(() => false);
+          : cdpTarget
+            ? cdpTarget.capabilities?.includes('fill') === true
+            : await page.locator(':focus').isEditable().catch(() => false);
       if (!editable) return { ok: false, actual: 'Keyboard type requires an editable focused textbox or contenteditable target.' };
       const valueBefore = await this.editableValue(targetLocator, targetHandle);
       const eventsBefore = await this.readInteractionCounts();
@@ -8241,6 +7112,9 @@ export class BrowserSession {
         references.push(indexDomNodeReference({
           id: publicId,
           interactive: item.interactive,
+          accessibleName: item.accessibleName,
+          description: item.description,
+          role: item.role,
           capabilities: item.capabilities,
           confidence: item.confidence,
           contextText: item.contextText,
@@ -8401,6 +7275,7 @@ export class BrowserSession {
     this.domVisibleSnapshotKey = mainSnapshotKey;
     this.domVisiblePublicIdByFrameLocalRef.clear();
     this.domVisibleNextPublicId = 1;
+    this.cdpShadowCandidates.clear();
   }
 
   private publicDomVisibleId(stateKey: string, localRef: string) {
@@ -8435,6 +7310,9 @@ export class BrowserSession {
     return indexDomNodeReference({
       id,
       interactive: item.interactive,
+      accessibleName: item.accessibleName,
+      description: item.description,
+      role: item.role,
       capabilities: item.capabilities,
       confidence: item.confidence,
       contextText: item.contextText,
@@ -8534,10 +7412,9 @@ export class BrowserSession {
   }
 
   /**
-   * Read the lightweight DOM-observation snapshot used as the baseline for
-   * incremental MutationObserver updates. It intentionally avoids CDP
-   * DOMSnapshot/AX collection, which is reserved for explicit legacy search
-   * tools and is never run after every action.
+   * Read the lightweight B-chain baseline used by snapshots, search, actions,
+   * visual markers, and incremental MutationObserver updates. Full CDP
+   * DOMSnapshot and full-page AX collection are intentionally absent.
    */
   async readDomObservationSnapshot(options: { cursor?: string; mode?: BrowserSnapshotView } = {}) {
     const startedAt = Date.now();
@@ -8752,7 +7629,7 @@ export class BrowserSession {
 
   private async readFrameRawDom(target: Page | Frame) {
     return target.evaluate(() => {
-      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_dom_export_control__';
+      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__';
       const voidTags = new Set([
         'area',
         'base',

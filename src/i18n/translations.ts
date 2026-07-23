@@ -148,7 +148,7 @@ const en: Record<string, string> = {
   '嵌入式 Electron 浏览器': 'Embedded Electron browser',
   '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。': 'Use the native Electron BrowserView in desktop chat mode. When enabled, the chat page switches to a center browser and right-side chat layout.',
   '浏览器控制模式': 'Browser control mode',
-  '使用 DOMSnapshot 与局部无障碍语义生成 UID；视觉信息通过 takeScreenshot 按需获取。': 'Generate UIDs from DOMSnapshot with partial accessibility semantics; fetch visual information on demand with takeScreenshot.',
+  '使用页面 DOM、Shadow DOM 与按需局部无障碍语义生成统一 UID；视觉信息通过 takeScreenshot 按需获取。': 'Generate unified UIDs from the page DOM, Shadow DOM, and on-demand local accessibility semantics; fetch visual information on demand with takeScreenshot.',
   '语义快照': 'Semantic snapshot',
   '现有浏览器 CDP 地址': 'Existing browser CDP endpoint',
   '连接已开启远程调试的 Chrome/Edge，例如 http://127.0.0.1:9222；可复用登录态。留空则启动新浏览器。': 'Connect to a Chrome/Edge browser with remote debugging enabled, such as http://127.0.0.1:9222, to reuse login state. Leave empty to launch a new browser.',
