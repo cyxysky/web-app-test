@@ -9,9 +9,16 @@ function browserReachableUrl(request: Request, port: number) {
   const forwardedHost = request.headers.get('x-forwarded-host') || '';
   const forwardedProto = request.headers.get('x-forwarded-proto') || '';
   const host = (forwardedHost || url.host || `127.0.0.1:${port}`).split(',')[0].trim();
-  const hostname = host.includes(':') ? host.split(':')[0] : host;
+  let hostname = url.hostname;
+  try {
+    hostname = new URL(`http://${host}`).hostname;
+  } catch {
+    hostname = host;
+  }
+  if (hostname === 'localhost' || hostname === '[::1]' || hostname === '::1') hostname = '127.0.0.1';
+  const reachableHostname = hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname;
   const protocol = forwardedProto === 'https' || url.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${hostname || '127.0.0.1'}:${port}/browser-preview`;
+  return `${protocol}//${reachableHostname || '127.0.0.1'}:${port}/browser-preview`;
 }
 
 export async function GET(request: Request) {

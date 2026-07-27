@@ -1,6 +1,26 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { revokeBrowserChatTurn, runtimeSnapshotIsNewer } from './browser-chat-interrupt-state';
+import { racePromiseWithAbort, revokeBrowserChatTurn, runtimeSnapshotIsNewer } from './browser-chat-interrupt-state';
+
+test('rejects immediately when abort wins a provider request that is still pending', async () => {
+  const controller = new AbortController();
+  const pending = new Promise<string>(() => {});
+  const raced = racePromiseWithAbort(pending, controller.signal);
+
+  controller.abort(new Error('Browser chat operation interrupted by user.'));
+
+  await assert.rejects(raced, /interrupted by user/);
+});
+
+test('does not start waiting when the signal was already aborted', async () => {
+  const controller = new AbortController();
+  controller.abort(new Error('already interrupted'));
+
+  await assert.rejects(
+    racePromiseWithAbort(Promise.resolve('late result'), controller.signal),
+    /already interrupted/,
+  );
+});
 
 test('revokes turn ownership before dispatching abort and does not await settlement', () => {
   const controller = new AbortController();

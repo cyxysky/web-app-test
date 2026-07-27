@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type WheelEvent as ReactWheelEvent, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createContext, memo, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type WheelEvent as ReactWheelEvent, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   closestCenter,
   DndContext,
@@ -279,11 +279,34 @@ function writeStoredEmbeddedChatCollapsed(collapsed: boolean) {
 }
 
 function hasRunningAssistantMessage(session?: Pick<BrowserChatSession, 'messages'> | null) {
-  return Boolean(session?.messages?.some((message) => message.role === 'assistant' && message.status === 'running'));
+  const lastMessage = session?.messages?.[session.messages.length - 1];
+  return Boolean(lastMessage?.role === 'assistant' && lastMessage.status === 'running');
 }
 
 function isBrowserChatSessionRunning(session?: BrowserChatSession | null) {
   return Boolean(session && (session.busy || session.status === 'running' || hasRunningAssistantMessage(session)));
+}
+
+function interruptBrowserChatSessionOptimistically(session: BrowserChatSession, timestamp: string): BrowserChatSession {
+  return {
+    ...session,
+    busy: false,
+    error: undefined,
+    status: session.status === 'closed' ? 'closed' : 'idle',
+    // Keep the server timestamp so the authoritative interrupt response is
+    // never rejected as "older" when the Web client clock is ahead.
+    updatedAt: session.updatedAt,
+    messages: session.messages.map((message) => (
+      message.role === 'assistant' && message.status === 'running'
+        ? { ...message, activity: undefined, status: 'interrupted', updatedAt: timestamp }
+        : message
+    )),
+    steps: session.steps.map((step) => (
+      step.status === 'queued' || step.status === 'running'
+        ? { ...step, status: 'blocked' }
+        : step
+    )),
+  };
 }
 
 type BrowserChatToolDetail = {
@@ -4778,6 +4801,342 @@ function EmbeddedBrowserTabGroupDropZone({
   );
 }
 
+type BrowserChatPreviewTab = {
+  index: number;
+  url: string;
+  active: boolean;
+};
+
+type BrowserChatPreviewFrame = {
+  capturedAt: string;
+  contentType: 'image/jpeg' | 'image/png';
+  data: string;
+  tabs: BrowserChatPreviewTab[];
+  url: string;
+  viewport: { width: number; height: number };
+};
+
+type BrowserChatPreviewInput =
+  | { kind: 'move'; xRatio: number; yRatio: number }
+  | { kind: 'click'; xRatio: number; yRatio: number; button: 'left' | 'right' | 'middle'; clickCount: number }
+  | { kind: 'scroll'; xRatio: number; yRatio: number; deltaX: number; deltaY: number }
+  | { kind: 'key'; key: string }
+  | { kind: 'text'; text: string };
+
+function BrowserChatWebPreviewModal({
+  onClose,
+  sessionId,
+  userId,
+}: {
+  onClose: () => void;
+  sessionId: string;
+  userId: string;
+}) {
+  const streamRef = useRef<WebSocket | null>(null);
+  const previewImageRef = useRef<HTMLImageElement | null>(null);
+  const pendingFrameRef = useRef<BrowserChatPreviewFrame | null>(null);
+  const frameRenderRequestRef = useRef<number | undefined>(undefined);
+  const pendingMoveRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'move' }> | null>(null);
+  const moveFlushTimerRef = useRef<number | undefined>(undefined);
+  const pendingScrollRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'scroll' }> | null>(null);
+  const scrollFlushTimerRef = useRef<number | undefined>(undefined);
+  const [frame, setFrame] = useState<BrowserChatPreviewFrame | null>(null);
+  const [status, setStatus] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
+  const [streamError, setStreamError] = useState('');
+  const [inputError, setInputError] = useState('');
+
+  useEffect(() => {
+    let disposed = false;
+    let reconnectTimer: number | undefined;
+    const connect = async () => {
+      try {
+        const response = await fetch('/api/browser-chat/preview-stream', { cache: 'no-store' });
+        const data = await response.json() as { error?: string; url?: string };
+        if (!response.ok || !data.url) throw new Error(data.error || '实时界面连接失败');
+        if (disposed) return;
+        const url = new URL(data.url);
+        url.searchParams.set('sessionId', sessionId);
+        url.searchParams.set('userId', userId);
+        const stream = new WebSocket(url);
+        streamRef.current = stream;
+        stream.onopen = () => setStreamError('');
+        stream.onmessage = (event) => {
+          try {
+            const message = JSON.parse(String(event.data)) as BrowserChatPreviewFrame & { error?: string; type?: string };
+            if (message.type === 'frame') {
+              pendingFrameRef.current = message;
+              if (frameRenderRequestRef.current === undefined) {
+                frameRenderRequestRef.current = window.requestAnimationFrame(() => {
+                  frameRenderRequestRef.current = undefined;
+                  const nextFrame = pendingFrameRef.current;
+                  pendingFrameRef.current = null;
+                  if (!nextFrame) return;
+                  setFrame(nextFrame);
+                  setStatus('live');
+                  setStreamError('');
+                });
+              }
+            } else if (message.type === 'activeTabChanged') {
+              setStatus('reconnecting');
+            } else if (message.type === 'inputError') {
+              setInputError(message.error || '实时界面操作失败');
+            } else if (message.type === 'error') {
+              setStreamError(message.error || '实时界面连接失败');
+            }
+          } catch {
+            setStreamError('实时画面数据无效');
+          }
+        };
+        stream.onerror = () => setStreamError((current) => current || '实时界面连接中断，正在重连');
+        stream.onclose = () => {
+          if (streamRef.current === stream) streamRef.current = null;
+          if (disposed) return;
+          setStatus('reconnecting');
+          reconnectTimer = window.setTimeout(() => void connect(), 600);
+        };
+      } catch (error) {
+        if (disposed) return;
+        setStatus('reconnecting');
+        setStreamError(error instanceof Error ? error.message : '实时界面连接失败');
+        reconnectTimer = window.setTimeout(() => void connect(), 600);
+      }
+    };
+    void connect();
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      const stream = streamRef.current;
+      streamRef.current = null;
+      stream?.close();
+    };
+  }, [sessionId, userId]);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [onClose]);
+
+  useEffect(() => () => {
+    pendingFrameRef.current = null;
+    pendingMoveRef.current = null;
+    if (frameRenderRequestRef.current !== undefined) window.cancelAnimationFrame(frameRenderRequestRef.current);
+    if (moveFlushTimerRef.current !== undefined) window.clearTimeout(moveFlushTimerRef.current);
+    if (scrollFlushTimerRef.current !== undefined) window.clearTimeout(scrollFlushTimerRef.current);
+  }, []);
+
+  const postInput = useCallback((input: BrowserChatPreviewInput, reportError: boolean) => {
+    const stream = streamRef.current;
+    if (!stream || stream.readyState !== WebSocket.OPEN) {
+      if (reportError) setInputError('实时界面正在重连，请稍后重试');
+      return false;
+    }
+    stream.send(JSON.stringify({ event: input, type: 'input' }));
+    return true;
+  }, []);
+
+  const sendInput = useCallback((input: BrowserChatPreviewInput) => {
+    setInputError('');
+    return postInput(input, true);
+  }, [postInput]);
+
+  const hasFrame = frame !== null;
+
+  const relativePoint = useCallback((clientX: number, clientY: number, element: HTMLElement) => {
+    if (!frame) return undefined;
+    const rect = previewImageRef.current?.getBoundingClientRect() || element.getBoundingClientRect();
+    if (!rect.width || !rect.height) return undefined;
+    if (
+      clientX < rect.left
+      || clientX > rect.right
+      || clientY < rect.top
+      || clientY > rect.bottom
+    ) return undefined;
+    return {
+      xRatio: Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)),
+      yRatio: Math.min(1, Math.max(0, (clientY - rect.top) / rect.height)),
+    };
+  }, [frame]);
+
+  const clickPreview = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 && event.button !== 1) return;
+    const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
+    if (!point) return;
+    event.currentTarget.focus();
+    event.preventDefault();
+    sendInput({
+      kind: 'click',
+      ...point,
+      button: event.button === 1 ? 'middle' : 'left',
+      clickCount: 1,
+    });
+  }, [relativePoint, sendInput]);
+
+  const movePreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'touch') return;
+    const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
+    if (!point) return;
+    pendingMoveRef.current = { kind: 'move', ...point };
+    if (moveFlushTimerRef.current !== undefined) return;
+    moveFlushTimerRef.current = window.setTimeout(() => {
+      moveFlushTimerRef.current = undefined;
+      const input = pendingMoveRef.current;
+      pendingMoveRef.current = null;
+      if (input) postInput(input, false);
+    }, 16);
+  }, [postInput, relativePoint]);
+
+  const openPreviewContextMenu = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
+    if (!point) return;
+    event.preventDefault();
+    event.currentTarget.focus();
+    sendInput({ kind: 'click', ...point, button: 'right', clickCount: 1 });
+  }, [relativePoint, sendInput]);
+
+  const scrollPreview = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
+    const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
+    if (!point) return;
+    event.preventDefault();
+    const current = pendingScrollRef.current;
+    pendingScrollRef.current = {
+      kind: 'scroll',
+      ...point,
+      deltaX: (current?.deltaX || 0) + event.deltaX,
+      deltaY: (current?.deltaY || 0) + event.deltaY,
+    };
+    if (scrollFlushTimerRef.current !== undefined) return;
+    scrollFlushTimerRef.current = window.setTimeout(() => {
+      scrollFlushTimerRef.current = undefined;
+      const input = pendingScrollRef.current;
+      pendingScrollRef.current = null;
+      if (input) sendInput(input);
+    }, 16);
+  }, [relativePoint, sendInput]);
+
+  const pressPreviewKey = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.nativeEvent.isComposing || event.key === 'Process') return;
+    const modifierShortcut = event.ctrlKey || event.metaKey || event.altKey;
+    let key = event.key;
+    if (modifierShortcut) {
+      const parts = [
+        event.ctrlKey ? 'Control' : '',
+        event.metaKey ? 'Meta' : '',
+        event.altKey ? 'Alt' : '',
+        event.shiftKey ? 'Shift' : '',
+        key.length === 1 ? key.toUpperCase() : key,
+      ].filter(Boolean);
+      key = parts.join('+');
+    } else if (event.shiftKey && key.length > 1) {
+      key = `Shift+${key}`;
+    } else if (key === ' ') {
+      key = 'Space';
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    sendInput({ kind: 'key', key });
+  }, [sendInput]);
+
+  const pastePreviewText = useCallback((event: ReactClipboardEvent<HTMLDivElement>) => {
+    const text = event.clipboardData.getData('text');
+    if (!text) return;
+    event.preventDefault();
+    sendInput({ kind: 'text', text });
+  }, [sendInput]);
+
+  const switchPreviewTab = useCallback(async (index: number) => {
+    try {
+      const response = await fetch(`/api/browser-chat/${encodeURIComponent(sessionId)}/tabs/${index}?userId=${encodeURIComponent(userId)}`, {
+        method: 'POST',
+      });
+      const data = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(data.error || '切换标签页失败');
+      setStatus('reconnecting');
+    } catch (error) {
+      setInputError(error instanceof Error ? error.message : '切换标签页失败');
+    }
+  }, [sessionId, userId]);
+
+  const statusLabel = status === 'live' ? '实时' : status === 'reconnecting' ? '正在重连' : '正在连接';
+
+  return (
+    <div className="ui-modal-overlay browser-chat-web-preview-overlay" onClick={onClose} role="presentation">
+      <div
+        aria-label="实时界面"
+        aria-modal="true"
+        className="ui-modal browser-chat-web-preview-modal"
+        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <header className="ui-modal-header browser-chat-web-preview-header" style={{ padding: '0px 16px'}}>
+          <div className="ui-modal-heading">
+            <div className="browser-chat-web-preview-title-row">
+              <h2 className="ui-modal-title">实时界面</h2>
+              <span className={`browser-chat-web-preview-status is-${status}`}>
+                <span />
+                {statusLabel}
+              </span>
+              <span className="browser-chat-web-preview-url" title={frame?.url || ''}>
+                {frame?.url || '等待会话浏览器启动'}
+              </span>
+            </div>
+          </div>
+          <button aria-label="关闭实时界面" className="ui-icon-button ui-modal-close" onClick={onClose} title="关闭" type="button">
+            <X size={18} />
+          </button>
+        </header>
+
+        {frame?.tabs?.length ? (
+          <div className="browser-chat-web-preview-tabs">
+            {frame.tabs.map((tab) => (
+              <button
+                className={tab.active ? 'active' : ''}
+                key={`${tab.index}:${tab.url}`}
+                onClick={() => void switchPreviewTab(tab.index)}
+                title={tab.url}
+                type="button"
+              >
+                <Globe size={13} />
+                <span>{tab.url || `标签页 ${tab.index + 1}`}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="browser-chat-web-preview-body">
+          <div
+            aria-label="可操作的浏览器实时画面"
+            className={frame ? 'browser-chat-web-preview-stage has-frame' : 'browser-chat-web-preview-stage'}
+            onContextMenu={openPreviewContextMenu}
+            onKeyDown={pressPreviewKey}
+            onPaste={pastePreviewText}
+            onPointerDown={clickPreview}
+            onPointerMove={movePreviewPointer}
+            onWheel={scrollPreview}
+            role="application"
+            tabIndex={0}
+          >
+            {frame ? (
+              <img alt="浏览器实时画面" draggable={false} ref={previewImageRef} src={`data:${frame.contentType};base64,${frame.data}`} />
+            ) : (
+              <div className="browser-chat-web-preview-empty">
+                <Loader2 className="spin" size={22} />
+                <strong>{streamError || '正在等待浏览器画面'}</strong>
+                <span>发送一条需要访问网页的消息后，画面会自动出现。</span>
+              </div>
+            )}
+          </div>
+          {streamError && frame ? <div className="browser-chat-web-preview-alert">{streamError}</div> : null}
+          {inputError ? <div className="browser-chat-web-preview-alert">{inputError}</div> : null}
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
 const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   active,
   activationRequestId,
@@ -5897,6 +6256,7 @@ export function BrowserChatWorkspace({
   const sessionVersionsRef = useRef(new Map<string, number>());
   const sessionRefreshTimersRef = useRef(new Map<string, number>());
   const sessionListRefreshTimerRef = useRef<number | undefined>(undefined);
+  const interruptRequestSequenceRef = useRef(0);
   const activeView = browserChatViewForPathname(pathname, initialView);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
@@ -5945,6 +6305,8 @@ export function BrowserChatWorkspace({
   const [downloadCenterOpen, setDownloadCenterOpen] = useState(false);
   const [browserGroupPickerOpen, setBrowserGroupPickerOpen] = useState(false);
   const [embeddedBrowserDialogOpen, setEmbeddedBrowserDialogOpen] = useState(false);
+  const [webPreviewRuntime, setWebPreviewRuntime] = useState(false);
+  const [webPreviewOpen, setWebPreviewOpen] = useState(false);
   const selectedSessionRunning = isBrowserChatSessionRunning(session);
   const selectedRunningSession = selectedSessionRunning ? session : undefined;
   const currentBusy = busy || selectedSessionRunning || interrupting;
@@ -6006,7 +6368,12 @@ export function BrowserChatWorkspace({
   useEffect(() => {
     setSidebarCollapsed(readStoredSidebarCollapsed());
     setEmbeddedChatCollapsed(readStoredEmbeddedChatCollapsed());
+    setWebPreviewRuntime(!window.webPilotEmbeddedBrowser);
   }, []);
+
+  useEffect(() => {
+    setWebPreviewOpen(false);
+  }, [session?.id]);
 
   useEffect(() => {
     function closeSidebarMenus(event: PointerEvent) {
@@ -6505,17 +6872,40 @@ export function BrowserChatWorkspace({
     if (!targetId || interrupting) return;
     setInterrupting(true);
     setError('');
+    const timestamp = new Date().toISOString();
+    setBusy(false);
+    setPendingMessageSessionId((current) => current === targetId ? null : current);
+    setSession((current) => current?.id === targetId
+      ? interruptBrowserChatSessionOptimistically(current, timestamp)
+      : current);
+    setSessions((current) => current.map((item) => item.id === targetId
+      ? interruptBrowserChatSessionOptimistically(item, timestamp)
+      : item));
+    const interruptRequestSequence = ++interruptRequestSequenceRef.current;
+    const releaseInterrupting = () => {
+      if (interruptRequestSequenceRef.current === interruptRequestSequence) setInterrupting(false);
+    };
+    const releaseLoadingTimer = window.setTimeout(releaseInterrupting, 400);
+    const requestController = new AbortController();
+    const requestTimeout = window.setTimeout(() => requestController.abort(), 5000);
     try {
-      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${targetId}/interrupt`), { method: 'POST' });
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${targetId}/interrupt`), {
+        method: 'POST',
+        signal: requestController.signal,
+      });
       const data = await readApiJson<Record<string, unknown>>(response, '中断对话失败');
       upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === targetId });
       setBusy(false);
       setPendingMessageSessionId((current) => current === targetId ? null : current);
     } catch (interruptError) {
-      setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
+      if (!requestController.signal.aborted) {
+        setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
+      }
       await refreshSession(targetId, { activate: activeSessionIdRef.current === targetId }).catch(() => undefined);
     } finally {
-      setInterrupting(false);
+      window.clearTimeout(releaseLoadingTimer);
+      window.clearTimeout(requestTimeout);
+      releaseInterrupting();
     }
   }
 
@@ -6962,29 +7352,45 @@ export function BrowserChatWorkspace({
 
   const renderChatPaneActions = () => (
     <div className="browser-chat-pane-actions">
+      {webPreviewRuntime && session ? (
+        <button
+          aria-label="打开实时界面"
+          className="browser-chat-web-preview-button"
+          disabled={session.status === 'closed'}
+          onClick={() => setWebPreviewOpen(true)}
+          title={session.status === 'closed' ? '当前对话已结束' : '打开实时界面'}
+          type="button"
+        >
+          <AppWindow size={17} />
+        </button>
+      ) : null}
       {session ? (
         <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title="结束会话" type="button">
           <Power size={17} />
         </button>
       ) : null}
-      <BrowserChatGroupBindingCenter
-        disabled={!session?.id}
-        groupId={session?.browserGroupId}
-        onClose={() => setBrowserGroupPickerOpen(false)}
-        onSelect={assignBrowserGroup}
-        onToggle={toggleBrowserGroupPicker}
-        open={browserGroupPickerOpen}
-      />
-      <BrowserChatDownloadCenter
-        downloads={downloads}
-        open={downloadCenterOpen}
-        onClose={() => setDownloadCenterOpen(false)}
-        onRemove={(id) => {
-          removedDownloadIdsRef.current.add(id);
-          setDownloads((current) => current.filter((download) => download.id !== id));
-        }}
-        onToggle={toggleDownloadCenter}
-      />
+      {!webPreviewRuntime ? (
+        <>
+          <BrowserChatGroupBindingCenter
+            disabled={!session?.id}
+            groupId={session?.browserGroupId}
+            onClose={() => setBrowserGroupPickerOpen(false)}
+            onSelect={assignBrowserGroup}
+            onToggle={toggleBrowserGroupPicker}
+            open={browserGroupPickerOpen}
+          />
+          <BrowserChatDownloadCenter
+            downloads={downloads}
+            open={downloadCenterOpen}
+            onClose={() => setDownloadCenterOpen(false)}
+            onRemove={(id) => {
+              removedDownloadIdsRef.current.add(id);
+              setDownloads((current) => current.filter((download) => download.id !== id));
+            }}
+            onToggle={toggleDownloadCenter}
+          />
+        </>
+      ) : null}
     </div>
   );
 
@@ -7245,6 +7651,14 @@ export function BrowserChatWorkspace({
           </div>
         )}
       </main>
+
+      {webPreviewRuntime && webPreviewOpen && session ? (
+        <BrowserChatWebPreviewModal
+          onClose={() => setWebPreviewOpen(false)}
+          sessionId={session.id}
+          userId={session.userId || requestUserId}
+        />
+      ) : null}
 
       {liveToolDialog ? (
         <BrowserChatToolDialog

@@ -768,6 +768,35 @@ export type BrowserKeyboardAction = {
   allowedOrigins?: string[];
 };
 
+export type BrowserLiveInput =
+  | {
+      kind: 'move';
+      xRatio: number;
+      yRatio: number;
+    }
+  | {
+      kind: 'click';
+      xRatio: number;
+      yRatio: number;
+      button?: 'left' | 'right' | 'middle';
+      clickCount?: number;
+    }
+  | {
+      kind: 'scroll';
+      xRatio: number;
+      yRatio: number;
+      deltaX: number;
+      deltaY: number;
+    }
+  | {
+      kind: 'key';
+      key: string;
+    }
+  | {
+      kind: 'text';
+      text: string;
+    };
+
 export type BrowserSelectOptionAction = {
   uid: string;
   value?: string;
@@ -875,7 +904,7 @@ export type BrowserTabSnapshot = {
 
 export type BrowserScreencastFrame = {
   data: string;
-  contentType: 'image/png';
+  contentType: 'image/jpeg' | 'image/png';
   capturedAt: string;
   url: string;
   tabs: BrowserTabSnapshot[];
@@ -3063,6 +3092,10 @@ export class BrowserSession {
   private navigationSequenceByPage = new WeakMap<Page, number>();
   private browserRuntimeRevisionByFrame = new WeakMap<Frame, number>();
   private browserRuntimeInstalledRevisionByFrame = new WeakMap<Frame, number>();
+  private livePreviewNativeViewportRestoredPages = new WeakSet<Page>();
+  private livePreviewNativeTabRefreshAt = 0;
+  private nativeTabGrouperEnabled = false;
+  private usesSessionGroupPageSelection = false;
   private visitedOrigins = new Set<string>();
   private observedPageLinks = new Map<string, { url: string; title: string }>();
   private readonly pageGroupId: string;
@@ -3164,6 +3197,8 @@ export class BrowserSession {
       || (sharedBrowserTabsEnabled() && !useElectronEmbeddedBrowser && !browserProfileKey)
     );
     const useSessionGroupPageSelection = tabGrouperEnabled || Boolean(browserProfileKey);
+    this.nativeTabGrouperEnabled = tabGrouperEnabled;
+    this.usesSessionGroupPageSelection = useSessionGroupPageSelection;
     const restoreLastSession = tabGrouperEnabled && process.env.BROWSER_RESTORE_LAST_SESSION !== 'false';
     const autoTabGroupProfileKey = browserProfileKey || (useSharedBrowserTabs ? 'shared' : this.pageGroupId);
     const autoTabGroupProfileDir = tabGrouperEnabled && !cdpEndpoint && !requestedUserDataDir
@@ -3762,18 +3797,97 @@ export class BrowserSession {
     }));
   }
 
+  private async refreshSessionGroupPages(options: { forceNativeRefresh?: boolean } = {}) {
+    const context = this.context;
+    if (!context) return this.sessionPages();
+
+    if (this.browserSurface === 'electron-embedded') {
+      await this.findElectronEmbeddedBrowserSessionPages(context);
+    }
+    if (this.usesSessionGroupPageSelection) {
+      await this.reclaimSessionPagesByMarker(context);
+    }
+    const now = Date.now();
+    if (
+      this.nativeTabGrouperEnabled
+      && (options.forceNativeRefresh || now - this.livePreviewNativeTabRefreshAt >= 1000)
+    ) {
+      this.livePreviewNativeTabRefreshAt = now;
+      const nativeGroup = await this.findNativeTabGroupTabs(context);
+      if (nativeGroup?.found) {
+        await this.claimPagesByNativeTabUrls(context, nativeGroup.tabs);
+        await this.reclaimSessionPagesByMarker(context);
+      }
+    }
+
+    const pages = this.sessionPages();
+    const visibility = await Promise.all(pages.map(async (page) => ({
+      page,
+      visible: await page.evaluate(() => document.visibilityState === 'visible').catch(() => false),
+    })));
+    const visiblePage = visibility.find((item) => item.visible)?.page;
+    if (visiblePage && visiblePage !== this.page) this.page = visiblePage;
+    return pages;
+  }
+
+  async refreshTabsSnapshot() {
+    await this.refreshSessionGroupPages({ forceNativeRefresh: true });
+    return this.getTabsSnapshot();
+  }
+
   async startScreencast(options: {
     onActivePageChanged?: () => void;
-    everyNthFrame?: number;
     onError?: (error: unknown) => void;
     onFrame: (frame: BrowserScreencastFrame) => void | Promise<void>;
   }): Promise<BrowserScreencastHandle> {
+    await this.refreshSessionGroupPages({ forceNativeRefresh: true });
     const page = this.activePage;
+    if (!this.livePreviewNativeViewportRestoredPages.has(page)) {
+      const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
+      const hasFixedViewport = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH') !== undefined
+        && positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT') !== undefined;
+      const viewportMode = process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase();
+      const fixedViewport = viewportMode === 'fixed' || (!viewportMode && hasFixedViewport);
+      if (!headless && !fixedViewport && this.browserSurface === 'external') {
+        const viewportClient = await page.context().newCDPSession(page);
+        try {
+          await viewportClient.send('Emulation.clearDeviceMetricsOverride');
+          const { windowId } = await viewportClient.send('Browser.getWindowForTarget');
+          await viewportClient.send('Browser.setWindowBounds', {
+            bounds: { windowState: 'maximized' },
+            windowId,
+          }).catch(() => undefined);
+        } finally {
+          await viewportClient.detach().catch(() => undefined);
+        }
+      }
+      this.livePreviewNativeViewportRestoredPages.add(page);
+    }
     const client = await page.context().newCDPSession(page);
-    const contentType: BrowserScreencastFrame['contentType'] = 'image/png';
-    const rawEveryNthFrame = Number(options.everyNthFrame ?? process.env.BROWSER_SCREENCAST_EVERY_NTH_FRAME ?? 1);
-    const everyNthFrame = Math.min(8, Math.max(1, Math.floor(Number.isFinite(rawEveryNthFrame) ? rawEveryNthFrame : 1)));
+    const format = process.env.BROWSER_SCREENCAST_FORMAT?.trim().toLowerCase() === 'jpeg' ? 'jpeg' : 'png';
+    const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
+    const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 100);
+    const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 100)));
+    const rawMaxWidth = Number(process.env.BROWSER_SCREENCAST_MAX_WIDTH ?? 2560);
+    const rawMaxHeight = Number(process.env.BROWSER_SCREENCAST_MAX_HEIGHT ?? 1440);
+    const maxWidth = Math.min(3840, Math.max(960, Math.floor(Number.isFinite(rawMaxWidth) ? rawMaxWidth : 2560)));
+    const maxHeight = Math.min(2160, Math.max(540, Math.floor(Number.isFinite(rawMaxHeight) ? rawMaxHeight : 1440)));
     let stopped = false;
+    let stopPromise: Promise<void> | undefined;
+    let pageChangePoll: ReturnType<typeof setInterval> | undefined;
+    async function stopScreencast(notifyPageChanged: boolean) {
+      if (stopPromise) return stopPromise;
+      stopped = true;
+      if (pageChangePoll) clearInterval(pageChangePoll);
+      pageChangePoll = undefined;
+      client.off('Page.screencastFrame', onFrame);
+      stopPromise = (async () => {
+        await client.send('Page.stopScreencast').catch(() => undefined);
+        await client.detach().catch(() => undefined);
+        if (notifyPageChanged) await options.onActivePageChanged?.();
+      })();
+      return stopPromise;
+    }
     const onFrame = (event: {
       data?: string;
       metadata?: { deviceHeight?: number; deviceWidth?: number };
@@ -3785,12 +3899,7 @@ export class BrowserSession {
       if (stopped || !event.data) return;
       const activePage = this.page && !this.page.isClosed() ? this.page : this.sessionPages()[0];
       if (!activePage || activePage !== page || page.isClosed()) {
-        stopped = true;
-        void Promise.resolve(options.onActivePageChanged?.())
-          .finally(() => {
-            void client.send('Page.stopScreencast').catch(() => undefined);
-            void client.detach().catch(() => undefined);
-          });
+        void stopScreencast(true);
         return;
       }
       const fallback = page.viewportSize() || { width: 1280, height: 720 };
@@ -3809,9 +3918,21 @@ export class BrowserSession {
     client.on('Page.screencastFrame', onFrame);
     try {
       await client.send('Page.startScreencast', {
-        everyNthFrame,
-        format: 'png',
+        format,
+        maxHeight,
+        maxWidth,
+        ...(format === 'jpeg' ? { quality } : {}),
       });
+      pageChangePoll = setInterval(() => {
+        void this.refreshSessionGroupPages()
+          .then(() => {
+            const activePage = this.page && !this.page.isClosed() ? this.page : this.sessionPages()[0];
+            if (!activePage || activePage !== page || page.isClosed()) return stopScreencast(true);
+            return undefined;
+          })
+          .catch((error) => options.onError?.(error));
+      }, 250);
+      pageChangePoll.unref?.();
     } catch (error) {
       client.off('Page.screencastFrame', onFrame);
       await client.detach().catch(() => undefined);
@@ -3819,13 +3940,71 @@ export class BrowserSession {
     }
     return {
       stop: async () => {
-        if (stopped) return;
-        stopped = true;
-        client.off('Page.screencastFrame', onFrame);
-        await client.send('Page.stopScreencast').catch(() => undefined);
-        await client.detach().catch(() => undefined);
+        await stopScreencast(false);
       },
     };
+  }
+
+  async dispatchLiveInput(input: BrowserLiveInput): Promise<BrowserActionResult> {
+    const page = this.activePage;
+    const clampRatio = (value: number) => Math.min(1, Math.max(0, Number(value)));
+    const invalidateObservation = () => {
+      this.lastScreenshotMetrics = undefined;
+      this.domObservationPagination = undefined;
+      this.lastDomNodeReferences.clear();
+      this.cdpShadowCandidates.clear();
+      this.domVisiblePublicIdByFrameLocalRef.clear();
+      this.domVisibleSnapshotKey = undefined;
+      this.lastInteractiveCandidates = [];
+      this.lastScreenshotCandidates = [];
+    };
+
+    if (input.kind === 'move' || input.kind === 'click' || input.kind === 'scroll') {
+      if (!Number.isFinite(input.xRatio) || !Number.isFinite(input.yRatio)) {
+        return { ok: false, actual: 'Live browser input requires finite relative coordinates.' };
+      }
+      const viewport = await this.getViewportMetrics();
+      const x = Math.min(viewport.width - 1, Math.max(0, Math.round(clampRatio(input.xRatio) * viewport.width)));
+      const y = Math.min(viewport.height - 1, Math.max(0, Math.round(clampRatio(input.yRatio) * viewport.height)));
+      await page.mouse.move(x, y);
+
+      if (input.kind === 'move') {
+        return { ok: true, actual: `Live browser pointer moved to (${x}, ${y}).` };
+      }
+
+      if (input.kind === 'click') {
+        const button = input.button === 'right' || input.button === 'middle' ? input.button : 'left';
+        const clickCount = Math.min(2, Math.max(1, Math.floor(Number(input.clickCount) || 1)));
+        await page.mouse.click(x, y, { button, clickCount });
+        invalidateObservation();
+        return { ok: true, actual: `Live browser clicked (${x}, ${y}).` };
+      }
+
+      const deltaX = Math.min(2400, Math.max(-2400, Number(input.deltaX) || 0));
+      const deltaY = Math.min(2400, Math.max(-2400, Number(input.deltaY) || 0));
+      if (!deltaX && !deltaY) return { ok: true, actual: 'Live browser scroll had no movement.' };
+      await page.mouse.wheel(deltaX, deltaY);
+      invalidateObservation();
+      return { ok: true, actual: `Live browser scrolled by (${deltaX}, ${deltaY}).` };
+    }
+
+    if (input.kind === 'key') {
+      const key = String(input.key || '').trim();
+      if (!key || key.length > 80) return { ok: false, actual: 'Live browser key is invalid.' };
+      await page.keyboard.press(key);
+      invalidateObservation();
+      return { ok: true, actual: `Live browser pressed ${key}.` };
+    }
+
+    if (input.kind === 'text') {
+      const text = String(input.text || '');
+      if (!text || text.length > 10_000) return { ok: false, actual: 'Live browser text is empty or too long.' };
+      await page.keyboard.insertText(text);
+      invalidateObservation();
+      return { ok: true, actual: `Live browser inserted ${text.length} character(s).` };
+    }
+
+    return { ok: false, actual: 'Live browser input kind is unsupported.' };
   }
 
   private async closeOwnedPages() {

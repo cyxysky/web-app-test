@@ -1,7 +1,7 @@
 ﻿import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { generateText } from 'ai';
-import { BrowserSession, type BrowserActionResult, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import { applicationUserRuntimeKey, normalizeApplicationUserId } from '@/server/auth/user-context';
 import {
   executeInteractiveBrowserTurn,
@@ -1764,8 +1764,16 @@ function isDeadBrowserSessionError(error: unknown) {
 }
 
 type BrowserChatTurnGuard = () => void;
+type BrowserChatStartOptions = {
+  markSessionRunning?: boolean;
+  preferExistingPage?: boolean;
+};
 
-async function ensureStarted(session: BrowserChatSessionRecord, assertTurnActive?: BrowserChatTurnGuard) {
+async function ensureStarted(
+  session: BrowserChatSessionRecord,
+  assertTurnActive?: BrowserChatTurnGuard,
+  options: BrowserChatStartOptions = {},
+) {
   assertTurnActive?.();
   const existing = browserStartPromises.get(session.id);
   if (existing) {
@@ -1773,7 +1781,7 @@ async function ensureStarted(session: BrowserChatSessionRecord, assertTurnActive
     assertTurnActive?.();
     return browser;
   }
-  const startPromise = ensureStartedNow(session, assertTurnActive);
+  const startPromise = ensureStartedNow(session, assertTurnActive, options);
   browserStartPromises.set(session.id, startPromise);
   try {
     return await startPromise;
@@ -1782,19 +1790,31 @@ async function ensureStarted(session: BrowserChatSessionRecord, assertTurnActive
   }
 }
 
-function createBrowserChatBrowser(session: BrowserChatSessionRecord) {
+function createBrowserChatBrowser(session: BrowserChatSessionRecord, preferExistingPage = false) {
   return new BrowserSession(session.mode, {
     browserSurface: 'electron-embedded',
     browserProfileKey: browserChatBrowserProfileKey(session),
     ...browserChatBrowserExecutionOptions(),
     isMarked: true,
-    preferExistingPage: false,
+    preferExistingPage,
     runId: session.id,
   });
 }
 
-async function browserForTurnDecision(session: BrowserChatSessionRecord, assertTurnActive?: BrowserChatTurnGuard) {
+function restoreBrowserSessionPrototype(browser?: BrowserSession) {
+  if (browser && Object.getPrototypeOf(browser) !== BrowserSession.prototype) {
+    Object.setPrototypeOf(browser, BrowserSession.prototype);
+  }
+  return browser;
+}
+
+async function browserForTurnDecision(
+  session: BrowserChatSessionRecord,
+  assertTurnActive?: BrowserChatTurnGuard,
+  options: BrowserChatStartOptions = {},
+) {
   assertTurnActive?.();
+  restoreBrowserSessionPrototype(session.browser);
   if (session.browser && session.started && !session.browser.isUsable()) {
     assertTurnActive?.();
     appendLog(session, 'browser:stale', '历史对话的浏览器已关闭或页面已失效，正在重新接管本会话。');
@@ -1806,13 +1826,17 @@ async function browserForTurnDecision(session: BrowserChatSessionRecord, assertT
     persistAndNotify(session.id);
   }
   assertTurnActive?.();
-  if (!session.browser) session.browser = createBrowserChatBrowser(session);
+  if (!session.browser) session.browser = createBrowserChatBrowser(session, options.preferExistingPage);
   return session.browser;
 }
 
-async function ensureStartedNow(session: BrowserChatSessionRecord, assertTurnActive?: BrowserChatTurnGuard) {
+async function ensureStartedNow(
+  session: BrowserChatSessionRecord,
+  assertTurnActive?: BrowserChatTurnGuard,
+  options: BrowserChatStartOptions = {},
+) {
   assertTurnActive?.();
-  const browser = await browserForTurnDecision(session, assertTurnActive);
+  const browser = await browserForTurnDecision(session, assertTurnActive, options);
   assertTurnActive?.();
   if (session.started && browser.isUsable()) {
     appendLog(session, 'browser:reuse', '复用当前会话已有浏览器标签');
@@ -1825,7 +1849,7 @@ async function ensureStartedNow(session: BrowserChatSessionRecord, assertTurnAct
   const hasPriorConversation = session.steps.length > 0
     || session.messages.some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
   session.browser = browser;
-  session.status = 'running';
+  if (options.markSessionRunning !== false) session.status = 'running';
   session.updatedAt = now();
   persistAndNotify(session.id);
   try {
@@ -2036,10 +2060,34 @@ export async function startBrowserChatScreencast(
   if (!session || session.status === 'closed') return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
 
-  if (!session.started || !session.browser || !session.browser.isUsable()) {
-    throw new Error('当前会话还没有运行中的浏览器；请先发送AI访问请求，浏览器启动后会自动显示画面。');
+  const hasBrowserRuntimeHistory = session.logs.some((log) => log.phase.startsWith('browser:'));
+  let browser = restoreBrowserSessionPrototype(session.browser);
+  if (
+    browser
+    && session.started
+    && browser.isUsable()
+    && !session.busy
+    && session.status !== 'running'
+    && hasBrowserRuntimeHistory
+    && !browser.hasNonBlankActivePage()
+  ) {
+    await browser.close({ keepOpen: true }).catch(() => undefined);
+    session.browser = undefined;
+    session.started = false;
+    browser = undefined;
   }
-  const browser = session.browser;
+  if (!browser || !session.started || !browser.isUsable()) {
+    if (!hasBrowserRuntimeHistory) {
+      throw new Error('当前会话还没有运行中的浏览器；请先发送AI访问请求，浏览器启动后会自动显示画面。');
+    }
+    browser = await ensureStarted(session, undefined, {
+      markSessionRunning: false,
+      preferExistingPage: true,
+    });
+  }
+  if (!browser.isUsable()) {
+    throw new Error('无法重新接管当前会话的浏览器，请确认浏览器窗口仍然存在。');
+  }
   return browser.startScreencast({
     onActivePageChanged: handlers.onActivePageChanged,
     onError: handlers.onError,
@@ -2049,6 +2097,25 @@ export async function startBrowserChatScreencast(
       return handlers.onFrame(frame);
     },
   });
+}
+
+export async function dispatchBrowserChatPreviewInput(
+  sessionId: string,
+  userId: string | number | undefined,
+  input: BrowserLiveInput,
+) {
+  const session = hydrateSession(sessionId);
+  if (!session || session.status === 'closed') return undefined;
+  if (!sessionBelongsToUser(session, userId)) return undefined;
+  const browser = restoreBrowserSessionPrototype(session.browser);
+  if (!session.started || !browser || !browser.isUsable()) {
+    throw new Error('当前会话还没有运行中的浏览器，无法操作实时界面。');
+  }
+
+  const result = await browser.dispatchLiveInput(input);
+  session.tabs = browser.getTabsSnapshot();
+  session.targetUrl = exportableTargetUrl(browser.currentUrl()) || session.targetUrl;
+  return result;
 }
 
 async function deleteBrowserChatSessionFromMemory(sessionId: string) {
