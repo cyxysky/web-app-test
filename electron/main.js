@@ -1,6 +1,6 @@
 const { app, BrowserWindow, Menu, WebContentsView, dialog, ipcMain, nativeTheme, session: electronSession, shell } = require('electron');
 const { spawn } = require('node:child_process');
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
@@ -16,6 +16,11 @@ app.setName(APP_NAME);
 app.commandLine.appendSwitch('remote-debugging-port', String(EMBEDDED_BROWSER_CDP_PORT));
 
 let serverProcess;
+let localServerUrl = '';
+const serverShutdownToken = randomUUID();
+let applicationShutdownStarted = false;
+let applicationShutdownReady = false;
+let electronResourcesDestroyed = false;
 let mainWindow;
 let embeddedBrowserView;
 let embeddedBrowserAttached = false;
@@ -2636,6 +2641,7 @@ async function startServer(appDataDir) {
     PORT: String(port),
     TINYMCE_ROOT: tinymceRoot(),
     WEBPILOT_ELECTRON_CDP_PORT: String(EMBEDDED_BROWSER_CDP_PORT),
+    WEBPILOT_INTERNAL_SHUTDOWN_TOKEN: serverShutdownToken,
   };
 
   const args = app.isPackaged ? [serverScript] : [serverScript, 'start', '-p', String(port), '-H', '127.0.0.1'];
@@ -2669,6 +2675,7 @@ async function startServer(appDataDir) {
   });
 
   const url = `http://127.0.0.1:${port}`;
+  localServerUrl = url;
   await waitForHttp(`${url}/dashboard`, 60_000, 3);
   await waitForHttp(`${url}/api/test-cases`, 30_000, 2);
   return url;
@@ -2998,7 +3005,34 @@ app.on('window-all-closed', () => {
   app.quit();
 });
 
-app.on('before-quit', () => {
+function requestLocalServerShutdown() {
+  if (!localServerUrl || !serverProcess || serverProcess.killed) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const shutdownUrl = new URL(`${localServerUrl}/api/system/shutdown`);
+    const request = http.request({
+      hostname: shutdownUrl.hostname,
+      port: shutdownUrl.port,
+      path: shutdownUrl.pathname,
+      method: 'POST',
+      headers: {
+        'x-webpilot-shutdown-token': serverShutdownToken,
+      },
+    }, (response) => {
+      response.resume();
+      response.once('end', () => {
+        if ((response.statusCode || 500) < 400) resolve();
+        else reject(new Error(`Server shutdown returned HTTP ${response.statusCode || 500}.`));
+      });
+    });
+    request.setTimeout(8_000, () => request.destroy(new Error('Server shutdown timed out.')));
+    request.once('error', reject);
+    request.end();
+  });
+}
+
+function destroyElectronResources() {
+  if (electronResourcesDestroyed) return;
+  electronResourcesDestroyed = true;
   clearEmbeddedBrowserFitTimer();
   clearEmbeddedBrowserStateChangeTimer();
   clearEmbeddedBrowserPersistenceTimer();
@@ -3012,4 +3046,21 @@ app.on('before-quit', () => {
   if (serverProcess && !serverProcess.killed) serverProcess.kill();
   electronStateDatabase?.close();
   electronStateDatabase = undefined;
+}
+
+app.on('before-quit', (event) => {
+  if (applicationShutdownReady) {
+    destroyElectronResources();
+    return;
+  }
+  event.preventDefault();
+  if (applicationShutdownStarted) return;
+  applicationShutdownStarted = true;
+  void requestLocalServerShutdown()
+    .catch((error) => appendLog(`Server browser cleanup failed before quit: ${error instanceof Error ? error.message : String(error)}`))
+    .finally(() => {
+      destroyElectronResources();
+      applicationShutdownReady = true;
+      app.quit();
+    });
 });

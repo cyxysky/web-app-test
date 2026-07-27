@@ -60,6 +60,22 @@ server {
         return 308 /webpilot/;
     }
 
+    # Browser preview is a separate WebSocket server. This exact location must
+    # be declared before the general Next.js proxy and must use the same fixed
+    # port as BROWSER_CHAT_PREVIEW_WS_PORT (18021 by default).
+    location = /webpilot/browser-preview {
+        proxy_pass http://127.0.0.1:18021/browser-preview;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
+    }
+
     location /webpilot/ {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
@@ -76,6 +92,8 @@ server {
     }
 }
 ```
+
+The general `/webpilot/` HTTP proxy is not sufficient for live browser preview because Next.js listens on port `3000` while the preview WebSocket server listens on `BROWSER_CHAT_PREVIEW_WS_PORT` (`18021` by default). When Nginx runs on another host or outside the WebPilot container, expose that port and replace `127.0.0.1` with the reachable WebPilot service address.
 
 Open the Angular application through Nginx at `http://localhost:8080`, not through its original port. The Angular template can then use one same-origin prefix:
 

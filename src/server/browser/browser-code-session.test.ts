@@ -2,7 +2,16 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import type { Page } from 'playwright';
-import { BrowserSession } from './browser-session';
+import { BrowserSession, closeAllBrowserSessions } from './browser-session';
+
+async function waitForCondition(check: () => boolean | Promise<boolean>, timeoutMs = 8_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  throw new Error(`Condition was not met within ${timeoutMs}ms`);
+}
 
 test('BrowserSession executes browserCode against the controlled Playwright page', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-session-test' });
@@ -132,4 +141,169 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.ok(applyBox);
   assert.ok(Math.abs(cursorState.x - (applyBox.x + applyBox.width / 2)) <= 1);
   assert.ok(Math.abs(cursorState.y - (applyBox.y + applyBox.height / 2)) <= 1);
+});
+
+test('live preview follows a clicked popup and emits an initial frame after tab switching', async (context) => {
+  const session = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-live-preview-tab-test',
+  });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`
+    <!doctype html>
+    <html><body style="margin:0">
+      <button id="open-detail" style="height:80px;width:240px" onclick="window.open('about:blank#detail', '_blank')">
+        Open detail
+      </button>
+    </body></html>
+  `);
+
+  const initialTabs = await session.refreshTabsSnapshot();
+  assert.equal(initialTabs.length, 1);
+  const originalTabId = initialTabs[0].id;
+  const initialFrames: Array<{ url: string }> = [];
+  let activePageChanged = false;
+  const firstHandle = await session.startScreencast({
+    onActivePageChanged: () => { activePageChanged = true; },
+    onFrame: (frame) => { initialFrames.push({ url: frame.url }); },
+  });
+  assert.ok(initialFrames.length >= 1, 'screencast attach should emit an initial frame');
+
+  const buttonBox = await page.locator('#open-detail').boundingBox();
+  const viewport = page.viewportSize();
+  assert.ok(buttonBox && viewport);
+  const click = await session.dispatchLiveInput({
+    kind: 'click',
+    xRatio: (buttonBox.x + buttonBox.width / 2) / viewport.width,
+    yRatio: (buttonBox.y + buttonBox.height / 2) / viewport.height,
+    button: 'left',
+    clickCount: 1,
+  });
+  assert.equal(click.ok, true, click.actual);
+
+  let popupTabs = await session.refreshTabsSnapshot();
+  await waitForCondition(async () => {
+    popupTabs = await session.refreshTabsSnapshot();
+    return popupTabs.length === 2 && popupTabs.some((tab) => tab.active && tab.url.endsWith('#detail'));
+  });
+  await waitForCondition(() => activePageChanged);
+  await firstHandle.stop();
+
+  const switchResult = await session.switchLivePreviewTab(originalTabId);
+  assert.equal(switchResult.ok, true, switchResult.actual);
+  const switchedTabs = await session.refreshTabsSnapshot();
+  assert.equal(switchedTabs.length, 2);
+  assert.equal(switchedTabs.find((tab) => tab.id === originalTabId)?.active, true);
+
+  const switchedFrames: Array<{ url: string }> = [];
+  const switchedHandle = await session.startScreencast({
+    onFrame: (frame) => { switchedFrames.push({ url: frame.url }); },
+  });
+  assert.ok(switchedFrames.length >= 1, 'switched static tab should emit a frame immediately');
+  assert.equal(switchedFrames.at(-1)?.url, 'about:blank');
+  await switchedHandle.stop();
+});
+
+test('force close releases a browser even when the debug keep-open flag is enabled', async () => {
+  const previousKeepOpen = process.env.KEEP_BROWSER_OPEN_AFTER_RUN;
+  const session = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-force-close-test',
+  });
+  try {
+    await session.start();
+    assert.equal(session.isUsable(), true);
+    process.env.KEEP_BROWSER_OPEN_AFTER_RUN = 'true';
+    await session.close({ force: true });
+    assert.equal(session.isUsable(), false);
+  } finally {
+    if (previousKeepOpen === undefined) delete process.env.KEEP_BROWSER_OPEN_AFTER_RUN;
+    else process.env.KEEP_BROWSER_OPEN_AFTER_RUN = previousKeepOpen;
+    await session.close({ force: true }).catch(() => undefined);
+  }
+});
+
+test('force close terminates an external Chromium process reached through CDP', async () => {
+  const previousEndpoint = process.env.BROWSER_CDP_ENDPOINT;
+  const previousSharedTabs = process.env.BROWSER_SHARED_TABS;
+  const owner = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-cdp-process-owner-test',
+  });
+  const connected = new BrowserSession('dom', {
+    headless: true,
+    runId: 'browser-cdp-process-connection-test',
+  });
+  try {
+    await owner.start();
+    const connection = Reflect.get(owner, 'browserCodeConnection') as { endpoint?: string } | undefined;
+    assert.ok(connection?.endpoint);
+    process.env.BROWSER_CDP_ENDPOINT = connection.endpoint;
+    process.env.BROWSER_SHARED_TABS = 'false';
+    await connected.start();
+    assert.equal(connected.isUsable(), true);
+
+    await connected.close({ force: true });
+    await waitForCondition(async () => !await fetch(`${connection.endpoint}/json/version`)
+      .then((response) => response.ok)
+      .catch(() => false));
+  } finally {
+    if (previousEndpoint === undefined) delete process.env.BROWSER_CDP_ENDPOINT;
+    else process.env.BROWSER_CDP_ENDPOINT = previousEndpoint;
+    if (previousSharedTabs === undefined) delete process.env.BROWSER_SHARED_TABS;
+    else process.env.BROWSER_SHARED_TABS = previousSharedTabs;
+    await connected.close({ force: true }).catch(() => undefined);
+    await owner.close({ force: true }).catch(() => undefined);
+  }
+});
+
+test('application shutdown closes every registered test browser', async () => {
+  const first = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-shutdown-first-test',
+  });
+  const second = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-shutdown-second-test',
+  });
+  const sharedFirst = new BrowserSession('dom', {
+    headless: true,
+    sharedBrowserRuntimeKey: 'browser-shutdown-shared-test',
+    runId: 'browser-shutdown-shared-first-test',
+  });
+  const sharedSecond = new BrowserSession('dom', {
+    headless: true,
+    sharedBrowserRuntimeKey: 'browser-shutdown-shared-test',
+    runId: 'browser-shutdown-shared-second-test',
+  });
+  try {
+    await Promise.all([first.start(), second.start()]);
+    await sharedFirst.start();
+    await sharedSecond.start();
+    await first.close({ keepOpen: true });
+    assert.equal(first.isUsable(), true);
+    assert.equal(second.isUsable(), true);
+    assert.equal(sharedFirst.isUsable(), true);
+    assert.equal(sharedSecond.isUsable(), true);
+
+    await closeAllBrowserSessions();
+    assert.equal(first.isUsable(), false);
+    assert.equal(second.isUsable(), false);
+    assert.equal(sharedFirst.isUsable(), false);
+    assert.equal(sharedSecond.isUsable(), false);
+  } finally {
+    await Promise.all([
+      first.close({ force: true }).catch(() => undefined),
+      second.close({ force: true }).catch(() => undefined),
+      sharedFirst.close({ force: true }).catch(() => undefined),
+      sharedSecond.close({ force: true }).catch(() => undefined),
+    ]);
+  }
 });

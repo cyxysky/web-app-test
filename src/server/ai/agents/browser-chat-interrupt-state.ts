@@ -8,6 +8,33 @@ export type InterruptibleBrowserChatRuntime = {
   updatedAt: string;
 };
 
+export function racePromiseWithAbort<T>(operation: PromiseLike<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return Promise.resolve(operation);
+  const abortError = () => signal.reason instanceof Error
+    ? signal.reason
+    : new Error('Operation aborted.');
+  if (signal.aborted) return Promise.reject(abortError());
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(abortError());
+    };
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(operation).then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
 /**
  * Revoke a turn synchronously, then dispatch abort without waiting for the
  * underlying model request, browser tool, or child Agent to settle.

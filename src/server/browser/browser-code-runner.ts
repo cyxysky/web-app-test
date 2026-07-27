@@ -57,6 +57,11 @@ export type BrowserCodeExecutionInput = {
   abortSignal?: AbortSignal;
 };
 
+export type BrowserCodeKernelOptions = {
+  executionTimeoutMs?: number;
+  readyTimeoutMs?: number;
+};
+
 type PendingExecution = {
   abortSignal?: AbortSignal;
   onAbort: () => void;
@@ -68,6 +73,8 @@ type PendingExecution = {
 const defaultMaxOutputChars = 20_000;
 const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
+const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
+const defaultBrowserCodeExecutionTimeoutMs = 90_000;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -702,7 +709,10 @@ function browserCodeKernelMain() {
     type: 'playwright',
     user: Object.freeze({
       claimTab: async (value: unknown) => {
-        const claimedPage = pageFromTab(value);
+        const currentPage = replServer?.context.page as import('playwright').Page | undefined;
+        const claimedPage = value === undefined || value === null
+          ? currentPage && !currentPage.isClosed() ? currentPage : currentPages().at(-1)
+          : pageFromTab(value);
         if (!claimedPage) throw new Error('The requested browser tab is no longer available.');
         selectPage(claimedPage);
         return tabForPage(claimedPage);
@@ -939,17 +949,23 @@ function browserCodeChildArgs(tempDir: string) {
     '--max-old-space-size=128',
     '--max-semi-space-size=32',
     '--stack-size=4096',
-    '-e',
-    childSource(),
+    '-',
   ];
 }
 
 function browserCodeChildEnv(tempDir: string): NodeJS.ProcessEnv {
   const env = Object.fromEntries(
-    ['SystemRoot', 'WINDIR', 'HOME', 'NODE_PATH', 'ELECTRON_RUN_AS_NODE']
+    ['SystemRoot', 'WINDIR', 'HOME', 'ELECTRON_RUN_AS_NODE']
       .flatMap((name) => process.env[name] ? [[name, process.env[name] as string]] : []),
   );
-  return { ...env, NODE_ENV: 'production', TEMP: tempDir, TMP: tempDir, TMPDIR: tempDir };
+  return {
+    ...env,
+    NODE_ENV: 'production',
+    NODE_PATH: browserCodeModuleReadRoots().join(path.delimiter),
+    TEMP: tempDir,
+    TMP: tempDir,
+    TMPDIR: tempDir,
+  };
 }
 
 function removeBrowserCodeTempDir(tempDir?: string) {
@@ -964,15 +980,20 @@ function removeBrowserCodeTempDir(tempDir?: string) {
 export class BrowserCodeKernel {
   private child?: ChildProcess;
   private closed = false;
+  private executionTimer?: ReturnType<typeof setTimeout>;
   private pending?: PendingExecution;
   private readyPromise?: Promise<void>;
   private readyReject?: (error: Error) => void;
   private readyResolve?: () => void;
+  private readyTimer?: ReturnType<typeof setTimeout>;
   private stderr = '';
   private tail = Promise.resolve();
   private tempDir?: string;
 
-  constructor(private readonly connection: BrowserCodeConnection) {}
+  constructor(
+    private readonly connection: BrowserCodeConnection,
+    private readonly options: BrowserCodeKernelOptions = {},
+  ) {}
 
   execute(input: BrowserCodeExecutionInput): Promise<BrowserCodeRunResult> {
     const task = this.tail.then(() => this.executeNow(input));
@@ -1028,6 +1049,21 @@ export class BrowserCodeKernel {
         startedAt,
       };
       input.abortSignal?.addEventListener('abort', onAbort, { once: true });
+      const executionTimeoutMs = boundedInteger(
+        this.options.executionTimeoutMs ?? process.env.AI_BROWSER_CODE_EXECUTION_TIMEOUT_MS,
+        defaultBrowserCodeExecutionTimeoutMs,
+        100,
+        10 * 60_000,
+      );
+      this.executionTimer = setTimeout(() => {
+        if (this.pending?.requestId !== requestId) return;
+        this.finishPending({
+          ok: false,
+          error: `browserCode execution timed out after ${executionTimeoutMs}ms; the JavaScript kernel was restarted.`,
+          logs: [],
+        });
+        this.stopChild();
+      }, executionTimeoutMs);
       this.child?.send({
         type: 'execute',
         code: input.code,
@@ -1061,20 +1097,32 @@ export class BrowserCodeKernel {
       this.readyReject = reject;
     });
     this.readyPromise = readyPromise;
-    const child = spawn(process.execPath, browserCodeChildArgs(tempDir), {
-      cwd: process.cwd(),
-      env: browserCodeChildEnv(tempDir),
-      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
-      windowsHide: true,
-    });
+    let child: ChildProcess;
+    try {
+      child = spawn(process.execPath, browserCodeChildArgs(tempDir), {
+        cwd: process.cwd(),
+        env: browserCodeChildEnv(tempDir),
+        stdio: ['pipe', 'ignore', 'pipe', 'ipc'],
+        windowsHide: true,
+      });
+    } catch (error) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      this.rejectReady(normalized);
+      this.tempDir = undefined;
+      removeBrowserCodeTempDir(tempDir);
+      return readyPromise;
+    }
     this.child = child;
+    child.stdin?.end(childSource(), 'utf8');
     child.stderr?.on('data', (chunk: Buffer) => {
       this.stderr = `${this.stderr}${chunk.toString('utf8')}`.slice(-maxDiagnosticChars);
     });
     child.on('message', (message: unknown) => this.handleMessage(message));
     child.on('error', (error) => {
+      if (this.child !== child) return;
       this.rejectReady(error);
       this.finishPending({ ok: false, error: error.message, logs: [] });
+      this.stopChild();
     });
     child.on('exit', (code, signal) => {
       removeBrowserCodeTempDir(tempDir);
@@ -1086,6 +1134,18 @@ export class BrowserCodeKernel {
       this.rejectReady(error);
       this.finishPending({ ok: false, error: error.message, logs: [] });
     });
+    const readyTimeoutMs = boundedInteger(
+      this.options.readyTimeoutMs ?? process.env.AI_BROWSER_CODE_KERNEL_READY_TIMEOUT_MS,
+      defaultBrowserCodeKernelReadyTimeoutMs,
+      100,
+      60_000,
+    );
+    this.readyTimer = setTimeout(() => {
+      if (this.child !== child) return;
+      const error = new Error(`browserCode JavaScript kernel startup timed out after ${readyTimeoutMs}ms.`);
+      this.rejectReady(error);
+      this.stopChild();
+    }, readyTimeoutMs);
     child.send({ type: 'init', connection: this.connection }, (error) => {
       if (!error) return;
       this.rejectReady(error);
@@ -1098,9 +1158,7 @@ export class BrowserCodeKernel {
     if (!message || typeof message !== 'object') return;
     const record = message as Record<string, unknown>;
     if (record.type === 'ready') {
-      this.readyResolve?.();
-      this.readyResolve = undefined;
-      this.readyReject = undefined;
+      this.resolveReady();
       return;
     }
     if (record.type === 'init-error') {
@@ -1135,15 +1193,37 @@ export class BrowserCodeKernel {
     const pending = this.pending;
     if (!pending) return;
     this.pending = undefined;
+    this.clearExecutionTimer();
     pending.abortSignal?.removeEventListener('abort', pending.onAbort);
     pending.resolve({ ...result, elapsedMs: Date.now() - pending.startedAt });
   }
 
   private rejectReady(error: Error) {
+    this.clearReadyTimer();
     this.readyReject?.(error);
     this.readyReject = undefined;
     this.readyResolve = undefined;
     this.readyPromise = undefined;
+  }
+
+  private resolveReady() {
+    const resolve = this.readyResolve;
+    this.clearReadyTimer();
+    this.readyReject = undefined;
+    this.readyResolve = undefined;
+    resolve?.();
+  }
+
+  private clearExecutionTimer() {
+    if (!this.executionTimer) return;
+    clearTimeout(this.executionTimer);
+    this.executionTimer = undefined;
+  }
+
+  private clearReadyTimer() {
+    if (!this.readyTimer) return;
+    clearTimeout(this.readyTimer);
+    this.readyTimer = undefined;
   }
 
   private stopChild() {
@@ -1152,6 +1232,8 @@ export class BrowserCodeKernel {
     this.child = undefined;
     this.readyPromise = undefined;
     this.tempDir = undefined;
+    this.clearExecutionTimer();
+    this.clearReadyTimer();
     if (child && !child.killed) child.kill();
     removeBrowserCodeTempDir(tempDir);
   }

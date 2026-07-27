@@ -10,6 +10,7 @@ import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type
 import { analyzeBrowserCodeRisk, type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { browserChatReplyClaimsBrowserAction, browserChatToolRequirement, type BrowserChatToolRequirement } from './browser-chat-intent';
+import { racePromiseWithAbort } from './browser-chat-interrupt-state';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
   BROWSER_CHAT_FILE_READ_MIN_CHARS,
@@ -590,7 +591,8 @@ async function generateTextWithTimeout(options: Parameters<typeof generateText>[
   // spawnSubagents must remain awaited until every child finishes, so an
   // elapsed wall-clock timeout must never start a second main-Agent attempt.
   if (typeof (options as { prepareStep?: unknown }).prepareStep === 'function') {
-    return generateText(options);
+    const upstream = options.abortSignal;
+    return racePromiseWithAbort(generateText(options), upstream);
   }
   const timeoutMs = Number.isFinite(timeoutOverrideMs) && Number(timeoutOverrideMs) > 0
     ? Math.floor(Number(timeoutOverrideMs))
@@ -2495,6 +2497,7 @@ async function executeRuntimeStep(input: {
   }
 
   async function runAgent(includeImage: boolean, retryState?: RuntimeRetryState) {
+    ensureActive();
     const traces: ToolTrace[] = [...durableTraces];
     const codexMode = isCodexProvider();
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
@@ -3042,6 +3045,7 @@ async function executeRuntimeStep(input: {
               consecutiveFailureLimit,
             },
           });
+          ensureActive();
           break;
         }
         ensureActive();
@@ -3059,7 +3063,9 @@ async function executeRuntimeStep(input: {
             agentStepIndex: retryState ? retryState.agentStepOffset + 1 : undefined,
           },
         });
+        ensureActive();
       }
+      ensureActive();
       return await runAgent(includeImage, retryState);
     } catch (error) {
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
@@ -3070,6 +3076,7 @@ async function executeRuntimeStep(input: {
     }
   }
 
+  ensureActive();
   if (lastError && typeof lastError === 'object') {
     (lastError as { aiRequest?: AiRequestSnapshot }).aiRequest ??= lastAiRequest;
     (lastError as { runtimeRetry?: { consecutiveFailures: number; consecutiveFailureLimit: number } }).runtimeRetry ??= {

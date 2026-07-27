@@ -183,7 +183,7 @@ test('browserCode exposes browser and tab lifecycle as JavaScript APIs', async (
       { url: /#runtime-ready$/, timeoutMs: 3000 },
     );
     var runtimeOpenTabs = await runtimeBrowser.user.openTabs();
-    await runtimeBrowser.user.claimTab(runtimeOpenTabs.find((item) => item.id === runtimeTab.id));
+    await runtimeBrowser.user.claimTab();
     await runtimeBrowser.tabs.finalize({ keep: [{ tab: runtimeTab, status: 'deliverable' }] });
     nodeRepl.write({
       browserCount: (await agent.browsers.list()).length,
@@ -241,7 +241,7 @@ test('browserCode allows normal constructor and prototype DOM code without expos
   });
 });
 
-test('browserCode has no whole-cell deadline and stops an unbounded user promise only on explicit abort', async () => {
+test('browserCode stops an unbounded user promise on explicit abort', async () => {
   const controller = new AbortController();
   const pending = run(`
     await page.evaluate(() => { window.__browserCodeAbortTestStarted = true; });
@@ -258,6 +258,37 @@ test('browserCode has no whole-cell deadline and stops an unbounded user promise
   assert.equal(result.ok, false);
   assert.equal(result.aborted, true);
   assert.match(result.error || '', /aborted/);
+});
+
+test('browserCode watchdog stops an unresponsive cell and restarts the kernel', async () => {
+  const watchdogKernel = new BrowserCodeKernel(
+    { protocol: 'cdp', endpoint: cdpEndpoint },
+    { executionTimeoutMs: 250 },
+  );
+  const execute = async (code: string) => {
+    const executionId = randomUUID();
+    await page.evaluate((id) => {
+      Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
+        configurable: true,
+        value: id,
+      });
+    }, executionId);
+    return watchdogKernel.execute({ code, executionId });
+  };
+
+  try {
+    const startedAt = Date.now();
+    const timedOut = await execute('await new Promise(() => undefined);');
+    assert.equal(timedOut.ok, false);
+    assert.match(timedOut.error || '', /timed out after 250ms/);
+    assert.ok(Date.now() - startedAt < 5_000, 'watchdog should return control instead of leaving the cell pending');
+
+    const recovered = await execute(`nodeRepl.write({ recovered: true, title: await page.title() });`);
+    assert.equal(recovered.ok, true, recovered.error);
+    assert.deepEqual(recovered.value, { recovered: true, title: 'Editor' });
+  } finally {
+    await watchdogKernel.close();
+  }
 });
 
 test('browserCode truncates oversized return values', async () => {
