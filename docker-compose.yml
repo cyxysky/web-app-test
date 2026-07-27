@@ -4,6 +4,7 @@ services:
     image: webpilot-qa:latest
     ports:
       - "3000:3000"
+      - "${BROWSER_CHAT_PREVIEW_WS_PORT:-18021}:${BROWSER_CHAT_PREVIEW_WS_PORT:-18021}"
     env_file:
       - .env
     environment:
@@ -11,6 +12,7 @@ services:
       HEADLESS_BROWSER: "true"
       HOSTNAME: 0.0.0.0
       PORT: "3000"
+      BROWSER_CHAT_PREVIEW_WS_PORT: "${BROWSER_CHAT_PREVIEW_WS_PORT:-18021}"
     volumes:
       - ./.data:/app/.data
       - ./artifacts:/app/artifacts

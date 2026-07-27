@@ -896,6 +896,7 @@ type BrowserOwnership = 'launched' | 'connected' | 'persistent' | 'shared';
 type SharedBrowserOwnership = Exclude<BrowserOwnership, 'shared'>;
 
 export type BrowserTabSnapshot = {
+  id: string;
   index: number;
   url: string;
   active: boolean;
@@ -940,7 +941,7 @@ type SharedBrowserLease = {
   browser?: Browser;
   context: BrowserContext;
   ownership: SharedBrowserOwnership;
-  release: () => Promise<void>;
+  release: (force?: boolean) => Promise<void>;
 };
 
 const preparedContextInitScripts = new WeakSet<BrowserContext>();
@@ -954,6 +955,20 @@ type SharedBrowserState = {
   initPromise?: Promise<{ browser?: Browser; context: BrowserContext; ownership: SharedBrowserOwnership }>;
 };
 const sharedBrowserStates = new Map<string, SharedBrowserState>();
+
+type BrowserSessionProcessState = {
+  sessions: Set<BrowserSession>;
+  shutdownHooksInstalled: boolean;
+  shuttingDown?: Promise<void>;
+};
+
+const browserSessionProcessState = ((globalThis as typeof globalThis & {
+  __webPilotBrowserSessionProcessState?: BrowserSessionProcessState;
+}).__webPilotBrowserSessionProcessState ??= {
+  sessions: new Set<BrowserSession>(),
+  shutdownHooksInstalled: false,
+});
+browserSessionProcessState.sessions ??= new Set<BrowserSession>();
 
 function sharedBrowserStateFor(runtimeKey: string) {
   let state = sharedBrowserStates.get(runtimeKey);
@@ -2955,7 +2970,20 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
     await context?.close().catch(() => undefined);
   } else if (ownership === 'launched') {
     await browser?.close().catch(() => undefined);
-  } else if (ownership === 'connected' && process.env.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true') {
+  } else if (ownership === 'connected' && (force || process.env.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true')) {
+    if (force && browser) {
+      const client = await browser.newBrowserCDPSession().catch(() => undefined);
+      if (client) {
+        await Promise.race([
+          client.send('Browser.close').catch(() => undefined),
+          sleep(1000),
+        ]);
+        await Promise.race([
+          client.detach().catch(() => undefined),
+          sleep(500),
+        ]);
+      }
+    }
     await browser?.close({ reason: 'Shared browser launch settings changed.' }).catch(() => undefined);
   }
   sharedBrowserState.browser = undefined;
@@ -3046,11 +3074,11 @@ async function acquireSharedBrowser(input: {
   let released = false;
   return {
     ...lease,
-    release: async () => {
+    release: async (force = false) => {
       if (released) return;
       released = true;
       sharedBrowserState.refCount = Math.max(0, sharedBrowserState.refCount - 1);
-      await closeIdleSharedBrowser(runtimeKey, sharedBrowserState);
+      await closeIdleSharedBrowser(runtimeKey, sharedBrowserState, force);
     },
   };
 }
@@ -3086,7 +3114,7 @@ export class BrowserSession {
   private lastScreenshotTiming?: ScreenshotTiming;
   private ownedPages = new Set<Page>();
   private browserOwnership: BrowserOwnership = 'launched';
-  private releaseSharedBrowser?: () => Promise<void>;
+  private releaseSharedBrowser?: (force?: boolean) => Promise<void>;
   private pageDiscoveryListener?: (page: Page) => void;
   private pageGroupInitScriptPages = new WeakSet<Page>();
   private navigationSequenceByPage = new WeakMap<Page, number>();
@@ -3094,6 +3122,9 @@ export class BrowserSession {
   private browserRuntimeInstalledRevisionByFrame = new WeakMap<Frame, number>();
   private livePreviewNativeViewportRestoredPages = new WeakSet<Page>();
   private livePreviewNativeTabRefreshAt = 0;
+  private livePreviewTabIdSequence = 0;
+  private livePreviewTabIds = new WeakMap<Page, string>();
+  private nativeTabIdByPage = new WeakMap<Page, number>();
   private nativeTabGrouperEnabled = false;
   private usesSessionGroupPageSelection = false;
   private visitedOrigins = new Set<string>();
@@ -3106,6 +3137,7 @@ export class BrowserSession {
     private readonly options: BrowserSessionOptions = {},
   ) {
     this.pageGroupId = normalizePageGroupId(options.runId);
+    browserSessionProcessState.sessions.add(this);
   }
 
   isUsable() {
@@ -3532,8 +3564,10 @@ export class BrowserSession {
       || tabs.at(-1);
   }
 
-  private async activateNativeTabGroupTab(context: BrowserContext, tabs: NativeTabGroupPage[]) {
-    const tab = this.chooseNativeTabGroupTab(tabs);
+  private async activateNativeTabGroupTab(context: BrowserContext, tabs: NativeTabGroupPage[], targetTabId?: number) {
+    const tab = targetTabId
+      ? tabs.find((candidate) => candidate.tabId === targetTabId)
+      : this.chooseNativeTabGroupTab(tabs);
     if (!tab?.tabId) return undefined;
     const worker = await this.sessionTabGrouperWorker(context);
     if (!worker) return undefined;
@@ -3565,10 +3599,13 @@ export class BrowserSession {
   }
 
   private async claimPagesByNativeTabUrls(context: BrowserContext, tabs: NativeTabGroupPage[]) {
-    const remainingByUrl = new Map<string, number>();
+    this.ensureLivePreviewState();
+    const remainingByUrl = new Map<string, NativeTabGroupPage[]>();
     for (const tab of tabs) {
       if (!tab.url || isBlankBrowserUrlLike(tab.url)) continue;
-      remainingByUrl.set(tab.url, (remainingByUrl.get(tab.url) || 0) + 1);
+      const matches = remainingByUrl.get(tab.url) || [];
+      matches.push(tab);
+      remainingByUrl.set(tab.url, matches);
     }
     if (!remainingByUrl.size) return [];
 
@@ -3576,9 +3613,10 @@ export class BrowserSession {
     for (const page of context.pages()) {
       if (page.isClosed()) continue;
       const url = page.url();
-      const remaining = remainingByUrl.get(url) || 0;
-      if (remaining <= 0) continue;
-      remainingByUrl.set(url, remaining - 1);
+      const matches = remainingByUrl.get(url);
+      const nativeTab = matches?.shift();
+      if (!nativeTab) continue;
+      this.nativeTabIdByPage.set(page, nativeTab.tabId);
       if (this.claimPage(page, { makeActive: false })) claimedPages.push(page);
     }
     return claimedPages;
@@ -3631,7 +3669,10 @@ export class BrowserSession {
   private async claimPopupIfOwned(page: Page) {
     const opener = await page.opener().catch(() => null);
     if (!opener || !this.ownedPages.has(opener)) return;
-    if (this.claimPage(page)) await page.bringToFront().catch(() => undefined);
+    if (this.claimPage(page)) {
+      await page.bringToFront().catch(() => undefined);
+      if (!page.isClosed() && this.ownedPages.has(page)) this.page = page;
+    }
   }
 
   async startTrace(runId: string) {
@@ -3786,10 +3827,36 @@ export class BrowserSession {
     }).catch(() => undefined);
   }
 
+  private ensureLivePreviewState() {
+    this.livePreviewNativeViewportRestoredPages ||= new WeakSet<Page>();
+    this.livePreviewTabIds ||= new WeakMap<Page, string>();
+    this.nativeTabIdByPage ||= new WeakMap<Page, number>();
+    if (!Number.isFinite(this.livePreviewNativeTabRefreshAt)) this.livePreviewNativeTabRefreshAt = 0;
+    if (!Number.isFinite(this.livePreviewTabIdSequence)) this.livePreviewTabIdSequence = 0;
+    if (typeof this.nativeTabGrouperEnabled !== 'boolean') {
+      const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
+      this.nativeTabGrouperEnabled = this.options.isolated !== true && sessionTabGrouperEnabled(headless);
+    }
+    if (typeof this.usesSessionGroupPageSelection !== 'boolean') {
+      this.usesSessionGroupPageSelection = this.nativeTabGrouperEnabled || Boolean(this.options.browserProfileKey);
+    }
+  }
+
+  private livePreviewTabId(page: Page) {
+    this.ensureLivePreviewState();
+    const existing = this.livePreviewTabIds.get(page);
+    if (existing) return existing;
+    const id = `${this.pageGroupId}:tab:${++this.livePreviewTabIdSequence}`;
+    this.livePreviewTabIds.set(page, id);
+    return id;
+  }
+
   getTabsSnapshot(): BrowserTabSnapshot[] {
+    this.ensureLivePreviewState();
     const pages = this.sessionPages();
     const active = this.page && !this.page.isClosed() ? this.page : pages[0];
     return pages.map((page, index) => ({
+      id: this.livePreviewTabId(page),
       index,
       url: page.url(),
       active: page === active,
@@ -3798,6 +3865,7 @@ export class BrowserSession {
   }
 
   private async refreshSessionGroupPages(options: { forceNativeRefresh?: boolean } = {}) {
+    this.ensureLivePreviewState();
     const context = this.context;
     if (!context) return this.sessionPages();
 
@@ -3825,8 +3893,12 @@ export class BrowserSession {
       page,
       visible: await page.evaluate(() => document.visibilityState === 'visible').catch(() => false),
     })));
+    const currentPageVisible = visibility.some((item) => item.page === this.page && item.visible);
     const visiblePage = visibility.find((item) => item.visible)?.page;
-    if (visiblePage && visiblePage !== this.page) this.page = visiblePage;
+    // The explicitly selected page is authoritative. Some CDP targets report
+    // multiple pages as visible, so always taking the first visible page can
+    // undo a live-preview tab switch and reattach the old screencast forever.
+    if (!currentPageVisible && visiblePage && visiblePage !== this.page) this.page = visiblePage;
     return pages;
   }
 
@@ -3835,11 +3907,34 @@ export class BrowserSession {
     return this.getTabsSnapshot();
   }
 
+  private async activateSessionPage(page: Page) {
+    this.ensureLivePreviewState();
+    const context = this.context;
+    if (context && this.nativeTabGrouperEnabled) {
+      const nativeGroup = await this.findNativeTabGroupTabs(context);
+      const nativeTabId = this.nativeTabIdByPage.get(page);
+      if (nativeGroup?.found && nativeTabId) {
+        await this.activateNativeTabGroupTab(context, nativeGroup.tabs, nativeTabId);
+      }
+    }
+    await page.bringToFront();
+    this.page = page;
+  }
+
+  async switchLivePreviewTab(tabId: string): Promise<BrowserActionResult> {
+    const pages = await this.refreshSessionGroupPages({ forceNativeRefresh: true });
+    const page = pages.find((candidate) => this.livePreviewTabId(candidate) === tabId);
+    if (!page) return { ok: false, actual: 'The selected live-preview tab no longer exists.' };
+    await this.activateSessionPage(page);
+    return { ok: true, actual: `Switched live preview to ${page.url()}` };
+  }
+
   async startScreencast(options: {
     onActivePageChanged?: () => void;
     onError?: (error: unknown) => void;
     onFrame: (frame: BrowserScreencastFrame) => void | Promise<void>;
   }): Promise<BrowserScreencastHandle> {
+    this.ensureLivePreviewState();
     await this.refreshSessionGroupPages({ forceNativeRefresh: true });
     const page = this.activePage;
     if (!this.livePreviewNativeViewportRestoredPages.has(page)) {
@@ -3923,6 +4018,29 @@ export class BrowserSession {
         maxWidth,
         ...(format === 'jpeg' ? { quality } : {}),
       });
+      // A newly selected static page may not produce a screencast damage event.
+      // Emit one authoritative frame immediately so the client can replace the
+      // previous tab image and leave its reconnecting state deterministically.
+      const initialFrameData = await page.screenshot({
+        fullPage: false,
+        type: format,
+        ...(format === 'jpeg' ? { quality } : {}),
+      }).catch(() => undefined);
+      if (initialFrameData && !stopped && !page.isClosed() && this.page === page) {
+        const fallback = page.viewportSize() || { width: 1280, height: 720 };
+        const viewport = await page.evaluate(() => ({
+          height: Math.max(1, Math.floor(window.innerHeight || document.documentElement.clientHeight || 1)),
+          width: Math.max(1, Math.floor(window.innerWidth || document.documentElement.clientWidth || 1)),
+        })).catch(() => fallback);
+        await options.onFrame({
+          capturedAt: new Date().toISOString(),
+          contentType,
+          data: initialFrameData.toString('base64'),
+          tabs: this.getTabsSnapshot(),
+          url: page.url(),
+          viewport,
+        });
+      }
       pageChangePoll = setInterval(() => {
         void this.refreshSessionGroupPages()
           .then(() => {
@@ -3975,7 +4093,20 @@ export class BrowserSession {
       if (input.kind === 'click') {
         const button = input.button === 'right' || input.button === 'middle' ? input.button : 'left';
         const clickCount = Math.min(2, Math.max(1, Math.floor(Number(input.clickCount) || 1)));
+        const popupPromise = button === 'left'
+          ? page.waitForEvent('popup', { timeout: 1500 }).catch(() => undefined)
+          : Promise.resolve(undefined);
         await page.mouse.click(x, y, { button, clickCount });
+        const popup = await Promise.race([
+          popupPromise,
+          sleep(80).then(() => undefined),
+        ]);
+        if (popup) {
+          await this.claimPopupPage(popup);
+        } else {
+          void popupPromise.then((latePopup) => this.claimPopupPage(latePopup).catch(() => undefined));
+        }
+        await this.refreshSessionGroupPages({ forceNativeRefresh: true });
         invalidateObservation();
         return { ok: true, actual: `Live browser clicked (${x}, ${y}).` };
       }
@@ -4921,10 +5052,10 @@ export class BrowserSession {
   // 切换到指定标签页，并把它设为后续操作的活动页。
   async switchTab(index: number): Promise<BrowserActionResult> {
     const previousGeneration = this.actionBaseline();
-    const page = this.sessionPages()[index];
+    const pages = await this.refreshSessionGroupPages({ forceNativeRefresh: true });
+    const page = pages[index];
     if (!page) return { ok: false, actual: `Tab ${index} not found.` };
-    this.page = page;
-    await page.bringToFront();
+    await this.activateSessionPage(page);
     return this.completeActionWithDomChanges(`Switched to tab ${index}: ${page.url()}`, previousGeneration);
   }
 
@@ -4991,26 +5122,43 @@ export class BrowserSession {
   }
 
   // 关闭浏览器；调试场景可选择保留窗口。
-  async close(options: { keepOpen?: boolean } = {}) {
+  async close(options: { keepOpen?: boolean; force?: boolean } = {}) {
+    const shouldKeepOpen = !options.force && (
+      options.keepOpen === true
+      || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true'
+    );
     try {
       if (this.context && this.pageDiscoveryListener) {
         this.context.off('page', this.pageDiscoveryListener);
         this.pageDiscoveryListener = undefined;
       }
       if (this.browserOwnership === 'shared') {
-        if (this.browserSurface !== 'electron-embedded' && !options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
+        if (this.browserSurface !== 'electron-embedded' && !shouldKeepOpen) {
           await this.closeOwnedPages();
         }
-        await this.releaseSharedBrowser?.();
+        await this.releaseSharedBrowser?.(options.force);
         this.releaseSharedBrowser = undefined;
         return;
       }
-      if (options.keepOpen || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true') return;
+      if (shouldKeepOpen) return;
       if (this.browserOwnership === 'connected') {
         if (this.browserSurface === 'electron-embedded') {
           await this.clearElectronEmbeddedSessionData();
           await this.closeOwnedPages();
           return;
+        }
+        if (options.force && this.browser) {
+          const client = await this.browser.newBrowserCDPSession().catch(() => undefined);
+          if (client) {
+            await Promise.race([
+              client.send('Browser.close').catch(() => undefined),
+              sleep(1000),
+            ]);
+            await Promise.race([
+              client.detach().catch(() => undefined),
+              sleep(500),
+            ]);
+          }
         }
         await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
         return;
@@ -5021,7 +5169,8 @@ export class BrowserSession {
       }
       await this.browser?.close().catch(() => undefined);
     } finally {
-      if (!options.keepOpen && process.env.KEEP_BROWSER_OPEN_AFTER_RUN !== 'true') {
+      if (!shouldKeepOpen) {
+        browserSessionProcessState.sessions.delete(this);
         this.page = undefined;
         this.context = undefined;
         this.browser = undefined;
@@ -5671,7 +5820,9 @@ export class BrowserSession {
   private async claimPopupPage(newPage: Page | undefined, timings?: Record<string, number>) {
     if (!newPage) return undefined;
     this.claimPage(newPage);
+    await this.markPageGroup(newPage);
     await timedBrowserStep(timings, 'bringPopupToFrontMs', () => newPage.bringToFront().catch(() => undefined));
+    if (!newPage.isClosed() && this.ownedPages.has(newPage)) this.page = newPage;
     return newPage;
   }
 
@@ -8651,3 +8802,38 @@ export class BrowserSession {
     }, { x, y, kind }).catch(() => undefined);
   }
 }
+
+export async function closeAllBrowserSessions() {
+  if (browserSessionProcessState.shuttingDown) return browserSessionProcessState.shuttingDown;
+  browserSessionProcessState.shuttingDown = (async () => {
+    const sessions = [...browserSessionProcessState.sessions];
+    await Promise.allSettled(sessions.map(async (session) => {
+      if (Object.getPrototypeOf(session) !== BrowserSession.prototype) {
+        Object.setPrototypeOf(session, BrowserSession.prototype);
+      }
+      await session.close({ force: true });
+    }));
+    browserSessionProcessState.sessions.clear();
+  })().finally(() => {
+    browserSessionProcessState.shuttingDown = undefined;
+  });
+  return browserSessionProcessState.shuttingDown;
+}
+
+function installBrowserSessionProcessShutdownHooks() {
+  if (browserSessionProcessState.shutdownHooksInstalled) return;
+  browserSessionProcessState.shutdownHooksInstalled = true;
+  const shutdown = () => {
+    const forceExitTimer = setTimeout(() => process.exit(1), 8_000);
+    forceExitTimer.unref?.();
+    void closeAllBrowserSessions().finally(() => {
+      clearTimeout(forceExitTimer);
+      process.exit(0);
+    });
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+  if (process.platform !== 'win32') process.once('SIGHUP', shutdown);
+}
+
+installBrowserSessionProcessShutdownHooks();

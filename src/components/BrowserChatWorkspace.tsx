@@ -126,6 +126,7 @@ import {
   type RuntimeModelConfig,
 } from '@/lib/model-selection';
 import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { useTheme } from '@/theme/ThemeProvider';
 import type {
   ModelProvider,
@@ -4808,6 +4809,7 @@ function EmbeddedBrowserTabGroupDropZone({
 }
 
 type BrowserChatPreviewTab = {
+  id: string;
   index: number;
   url: string;
   active: boolean;
@@ -4856,7 +4858,7 @@ function BrowserChatWebPreviewModal({
     let reconnectTimer: number | undefined;
     const connect = async () => {
       try {
-        const response = await fetch('/api/browser-chat/preview-stream', { cache: 'no-store' });
+        const response = await fetch(withWebPilotBasePath('/api/browser-chat/preview-stream'), { cache: 'no-store' });
         const data = await response.json() as { error?: string; url?: string };
         if (!response.ok || !data.url) throw new Error(data.error || '实时界面连接失败');
         if (disposed) return;
@@ -4884,6 +4886,9 @@ function BrowserChatWebPreviewModal({
               }
             } else if (message.type === 'activeTabChanged') {
               setStatus('reconnecting');
+            } else if (message.type === 'ready') {
+              setStatus((current) => current === 'reconnecting' ? 'connecting' : current);
+              setStreamError('');
             } else if (message.type === 'inputError') {
               setInputError(message.error || '实时界面操作失败');
             } else if (message.type === 'error') {
@@ -5052,14 +5057,14 @@ function BrowserChatWebPreviewModal({
     sendInput({ kind: 'text', text });
   }, [sendInput]);
 
-  const switchPreviewTab = useCallback(async (index: number) => {
+  const switchPreviewTab = useCallback(async (tabId: string) => {
     try {
-      const response = await fetch(`/api/browser-chat/${encodeURIComponent(sessionId)}/tabs/${index}?userId=${encodeURIComponent(userId)}`, {
+      const response = await fetch(withWebPilotBasePath(`/api/browser-chat/${encodeURIComponent(sessionId)}/tabs/${encodeURIComponent(tabId)}?userId=${encodeURIComponent(userId)}`), {
         method: 'POST',
       });
       const data = await response.json() as { error?: string };
       if (!response.ok) throw new Error(data.error || '切换标签页失败');
-      setStatus('reconnecting');
+      setStatus((current) => current === 'live' ? current : 'connecting');
     } catch (error) {
       setInputError(error instanceof Error ? error.message : '切换标签页失败');
     }
@@ -5099,8 +5104,8 @@ function BrowserChatWebPreviewModal({
             {frame.tabs.map((tab) => (
               <button
                 className={tab.active ? 'active' : ''}
-                key={`${tab.index}:${tab.url}`}
-                onClick={() => void switchPreviewTab(tab.index)}
+                key={tab.id}
+                onClick={() => void switchPreviewTab(tab.id)}
                 title={tab.url}
                 type="button"
               >
@@ -5368,7 +5373,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     void loadEmbeddedBrowserState();
     const bridge = window.webPilotEmbeddedBrowser;
     return bridge?.onStateChange?.((result) => applyEmbeddedBrowserState(result)) || undefined;
-  }, [active, applyEmbeddedBrowserState, enabled, loadEmbeddedBrowserState]);
+  }, [active, applyEmbeddedBrowserState, enabled, loadEmbeddedBrowserState, sessionId]);
 
   useEffect(() => {
     const tabList = tabListRef.current;

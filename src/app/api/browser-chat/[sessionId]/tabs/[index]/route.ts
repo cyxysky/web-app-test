@@ -18,16 +18,15 @@ function requestUserId(request: NextRequest) {
 
 export async function POST(request: NextRequest, context: RouteContext) {
   const { sessionId, index } = await context.params;
-  const parsed = Number(index);
   try {
-    const session = await switchBrowserChatTab(sessionId, parsed, requestUserId(request));
+    const session = await switchBrowserChatTab(sessionId, index, requestUserId(request));
     if (!session) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
     return noStoreJson({ session });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to switch browser tab';
     return noStoreJson(
       { error: message },
-      { status: /session not found/i.test(message) || /closed/i.test(message) ? 404 : /Invalid tab index/i.test(message) ? 400 : 500 },
+      { status: /session not found/i.test(message) || /closed/i.test(message) ? 404 : /Invalid tab id/i.test(message) ? 400 : 500 },
     );
   }
 }

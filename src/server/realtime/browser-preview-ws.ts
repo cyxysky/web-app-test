@@ -33,7 +33,7 @@ type BrowserPreviewWebSocketState = {
   starting?: Promise<BrowserPreviewWebSocketInfo>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 5;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 6;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
@@ -270,7 +270,7 @@ function listen(server: http.Server, port: number): Promise<number> {
     const onError = (error: NodeJS.ErrnoException) => {
       cleanup();
       if (error.code === 'EADDRINUSE') {
-        listen(server, port + 1).then(resolve, reject);
+        reject(new Error(`Browser preview WebSocket port ${port} is already in use. Set BROWSER_CHAT_PREVIEW_WS_PORT to the fixed port forwarded by Nginx.`));
         return;
       }
       reject(error);
@@ -295,6 +295,7 @@ async function attachScreencast(client: BrowserPreviewClient) {
         if (client.socket.destroyed || generation !== client.attachGeneration) return;
         sendToClient(client, { type: 'activeTabChanged', sessionId });
         client.stop = undefined;
+        if (client.reattachTimer) clearTimeout(client.reattachTimer);
         client.reattachTimer = setTimeout(() => {
           client.reattachTimer = undefined;
           if (!client.socket.destroyed && generation === client.attachGeneration) void attachScreencast(client);
