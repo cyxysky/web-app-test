@@ -3,6 +3,38 @@ import test from 'node:test';
 import type { Page } from 'playwright';
 import { BrowserSession } from './browser-session';
 
+test('live preview input renders one shared AI mouse cursor at the action point', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'live-preview-cursor-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.goto(`data:text/html,${encodeURIComponent(`<!doctype html><html><body style="margin:0">
+    <button id="apply" style="height:80px;width:240px" onclick="document.body.dataset.clicked='yes'">Apply</button>
+  </body></html>`)}`);
+
+  const buttonBox = await page.locator('#apply').boundingBox();
+  const viewport = page.viewportSize();
+  assert.ok(buttonBox && viewport);
+  const x = buttonBox.x + buttonBox.width / 2;
+  const y = buttonBox.y + buttonBox.height / 2;
+  const pointer = { xRatio: x / viewport.width, yRatio: y / viewport.height };
+
+  const moved = await session.dispatchLiveInput({ kind: 'move', ...pointer });
+  assert.equal(moved.ok, true, moved.actual);
+  const clicked = await session.dispatchLiveInput({ kind: 'click', ...pointer, button: 'left', clickCount: 1 });
+  assert.equal(clicked.ok, true, clicked.actual);
+  assert.equal(await page.locator('body').getAttribute('data-clicked'), 'yes');
+  assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 1);
+  const cursor = await page.locator('#__ai_mouse_cursor__').evaluate((element) => ({
+    opacity: (element as HTMLElement).style.opacity,
+    x: Number((element as HTMLElement).dataset.x),
+    y: Number((element as HTMLElement).dataset.y),
+  }));
+  assert.equal(cursor.opacity, '1');
+  assert.ok(Math.abs(cursor.x - x) <= 1);
+  assert.ok(Math.abs(cursor.y - y) <= 1);
+});
+
 test('DOM-observation takeSnapshot pages actionable, text, and full views with stable DOM UIDs', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-observation-pagination-test' });
   context.after(async () => session.close());
