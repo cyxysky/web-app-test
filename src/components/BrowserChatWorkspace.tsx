@@ -108,6 +108,7 @@ import {
   browserChatLogsForMessage,
   type BrowserChatLogIndex as BrowserChatLogIndexModel,
 } from '@/components/browser-chat-message-model';
+import { findRequestedBrowserChatSession } from '@/components/browser-chat-session-selection';
 import {
   visibleBrowserChatExecutionLogs,
 } from '@/components/browser-chat-log-model';
@@ -6224,6 +6225,7 @@ export function BrowserChatWorkspace({
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const requestUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || '0';
+  const requestedSessionId = searchParams.get('sessionId')?.trim() || '';
   const visibleSettingsTabs = environmentSettingsTabsForUser(requestUserId);
   const browserChatApiUrl = useCallback((path: string) => (
     `${withWebPilotBasePath(path)}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(requestUserId)}`
@@ -6236,6 +6238,7 @@ export function BrowserChatWorkspace({
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const embeddedWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const mountedSessionActivationRef = useRef('');
   const sessionVersionsRef = useRef(new Map<string, number>());
   const sessionRefreshTimersRef = useRef(new Map<string, number>());
   const sessionListRefreshTimerRef = useRef<number | undefined>(undefined);
@@ -6645,7 +6648,20 @@ export function BrowserChatWorkspace({
     const data = await readApiJson<Record<string, unknown>>(response, '加载对话历史失败');
     const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => normalizeSession(item)) : [];
     setSessions(nextSessions);
-  }, [browserChatApiUrl]);
+    const requestedSession = findRequestedBrowserChatSession(nextSessions, requestedSessionId);
+    if (!requestedSession || mountedSessionActivationRef.current === requestedSession.id) return;
+    mountedSessionActivationRef.current = requestedSession.id;
+    activeSessionIdRef.current = requestedSession.id;
+    setSession(requestedSession);
+    setMode(normalizeMode(requestedSession.mode));
+    setSafetyMode(normalizeSafetyMode(requestedSession.safetyMode));
+    const nextModel = resolveRuntimeModelSelection(null, {
+      model: requestedSession.model,
+      provider: requestedSession.modelProvider,
+    });
+    setModelProvider(nextModel.provider);
+    setModelId(nextModel.model);
+  }, [browserChatApiUrl, requestedSessionId]);
 
   const refreshSession = useCallback(async (sessionId: string, options: { activate?: boolean } = {}) => {
     const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}`), { cache: 'no-store' });

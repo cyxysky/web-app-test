@@ -1670,7 +1670,7 @@ function makeBrowserTools(
 
   const sharedTools = {
     browserCode: tool({
-      description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the only browser inspection, screenshot, and operation entrypoint. Every result automatically includes a fresh full semantic DOM snapshot, page-console delta, and code-console output. Use top-level await, nodeRepl.write(value) for JSON, and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. When the prompt supplies a credential reference, credentialVault.fill(locator, ref) securely fills the real Playwright locator without returning the raw value. Locator actions have a 3000ms default timeout and navigation has a 30000ms default timeout; force: true is forbidden, and a failed operation ends only the current cell and preserves kernel bindings.',
+      description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the primary browser inspection, screenshot, and operation entrypoint. Every result automatically includes a fresh full semantic DOM snapshot, page-console delta, and code-console output. Use top-level await, nodeRepl.write(value) for JSON, and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. When the prompt supplies a credential reference, credentialVault.fill(locator, ref) securely fills the real Playwright locator without returning the raw value. Locator actions have a 3000ms default timeout and navigation has a 30000ms default timeout; force: true and scripted DOM clicks are forbidden, and a failed operation ends only the current cell and preserves kernel bindings.',
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
         maxOutputChars: z.number().int().min(1_000).max(50_000).optional().describe('Maximum serialized return size. Defaults to 20000 characters.'),
@@ -1686,6 +1686,17 @@ function makeBrowserTools(
           abortSignal,
         }));
       },
+    }),
+    clickByUid: tool({
+      description: 'Click exactly one rendered element using its exact UID from the latest automatically returned semantic DOM snapshot. Use only when a normal visible Playwright locator cannot uniquely identify the target. The runtime rejects stale, hidden, disabled, detached, or covered UIDs. Never invent or reuse an older UID.',
+      inputSchema: browserToolInput({
+        uid: z.string().min(1).max(160).describe('Exact UID copied from the latest automatic DOM snapshot.'),
+      }),
+      execute: (input) => record('clickByUid', input, (abortSignal) => session.mouse({
+        action: 'click',
+        uid: input.uid,
+        abortSignal,
+      })),
     }),
     waitForHumanVerification: tool({
       description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever live page evidence shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
@@ -1948,6 +1959,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
   void mode;
   return [
     'browserCode',
+    'clickByUid',
     'waitForHumanVerification',
     'spawnSubagents',
     'readSubagent',
@@ -1960,6 +1972,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
 
 const browserSessionToolNames = new Set([
   'browserCode',
+  'clickByUid',
   'waitForHumanVerification',
   'spawnSubagents',
 ]);
@@ -3127,7 +3140,7 @@ function browserChatRequirement(input: {
     'Browser-chat behavior:',
     '- Follow the latest user message first; use earlier model messages only as conversation context.',
     toolRequirement === 'action'
-      ? '- HARD REQUIREMENT: This latest message requests a browser-changing action. Execute browserCode before claiming completion; prior evidence and text-only claims do not satisfy it.'
+      ? '- HARD REQUIREMENT: This latest message requests a browser-changing action. Execute browserCode or clickByUid before claiming completion; prior evidence and text-only claims do not satisfy it.'
       : toolRequirement === 'inspection'
         ? '- HARD REQUIREMENT: This latest message requests live page inspection. Execute browserCode before answering from page state.'
         : '',
@@ -3143,7 +3156,7 @@ function browserChatRequirement(input: {
 
 function browserChatTurnHasToolEvidence(steps: StepExecutionResult[], requirement: BrowserChatToolRequirement) {
   const toolCalls = steps.flatMap((step) => (step.tools || []).filter((toolCall) => toolCall.ok !== false));
-  if (requirement === 'action') return toolCalls.some((toolCall) => toolCall.name === 'browserCode');
+  if (requirement === 'action') return toolCalls.some((toolCall) => toolCall.name === 'browserCode' || toolCall.name === 'clickByUid');
   return toolCalls.some((toolCall) => toolCall.name === 'browserCode');
 }
 
@@ -3769,6 +3782,12 @@ async function runRecordedTool(
         credentials: credentialBindings,
         runId: runId || 'browser-code',
         stepIndex: flow.index,
+        abortSignal,
+      });
+    case 'clickByUid':
+      return session.mouse({
+        action: 'click',
+        uid: typeof input.uid === 'string' ? input.uid : '',
         abortSignal,
       });
     case 'waitForHumanVerification':

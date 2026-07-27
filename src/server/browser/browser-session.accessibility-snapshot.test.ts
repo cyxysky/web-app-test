@@ -39,6 +39,9 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
     '<!doctype html><html><body>',
     '<div style="display:none"><button>Hidden child action</button></div>',
     '<div style="display:none"><iframe srcdoc="<button>Hidden frame action</button>"></iframe></div>',
+    '<div style="display:none"><button>Confirm duplicate</button></div>',
+    '<div style="visibility:hidden"><button>Confirm duplicate</button></div>',
+    '<button data-testid="visible-confirm" onclick="document.body.dataset.visibleConfirmClicked=\'true\'">Confirm duplicate</button>',
     '<div id="filter-action" class="filter-btn" style="width:32px;height:32px;cursor:pointer" onclick="document.body.dataset.filterClicked=\'true\'"><svg class="icon-Filter-Fill" aria-hidden="true"><path d="M0 0h10v10H0z"></path></svg></div>',
     '<section aria-label="Snapshot test tools"><div id="icon-only-action" onclick="document.body.dataset.iconOnlyClicked=\'true\'"><svg aria-hidden="true"><path d="M0 0h10v10H0z"></path></svg></div></section>',
     '<button data-testid="stable-action" onclick="document.body.dataset.stableClicked=\'true\'">Stable action</button>',
@@ -73,6 +76,13 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
   assert.ok(text.split('\n').every((line) => line === line.trim()), 'text view must remain indentation-free plain text');
   const hiddenSnapshotLines = `${actionable}\n${full}\n${text}`.split('\n').filter((line) => /Hidden (?:child|frame) action/.test(line));
   assert.equal(hiddenSnapshotLines.length, 0, `display:none content leaked into the snapshot:\n${hiddenSnapshotLines.join('\n')}`);
+  const confirmLines = actionable.split('\n').filter((line) => /button\s+"Confirm duplicate"/.test(line));
+  assert.equal(confirmLines.length, 1, `only the rendered same-name button should be actionable:\n${confirmLines.join('\n')}`);
+  const confirmUid = confirmLines[0]?.match(/^\s*uid=(\S+)/)?.[1];
+  assert.ok(confirmUid, actionable);
+  const confirmClick = await session.mouse({ action: 'click', uid: confirmUid });
+  assert.equal(confirmClick.ok, true, confirmClick.actual);
+  assert.equal(await page.locator('body').getAttribute('data-visible-confirm-clicked'), 'true');
   assert.doesNotMatch(`${actionable}\n${full}`, /data-ai-interactive|data-ai-signals|signals=/, 'snapshot output must not spend tokens on redundant markers');
 
   const iconUid = actionable.match(/^\s*uid=(\S+)\s+generic\s+"\[无标签控件：Snapshot test tools\]".*actions=click/m)?.[1];

@@ -40,6 +40,13 @@ export function browserCodePolicyViolation(code: string) {
   if (/(?:\bforce\b|['"]force['"])\s*:\s*true\b/i.test(code)) {
     return 'browserCode forbids Playwright force: true. Refresh the page snapshot and resolve overlays, loading state, stale locators, or asynchronous redraws instead.';
   }
+  if (/\.dispatchEvent\s*\(\s*(?:[^,()]+,\s*)?['"]click['"]/i.test(code)) {
+    return 'browserCode forbids dispatchEvent("click") because it bypasses Playwright actionability. Use one unique visible Playwright locator or clickByUid with a UID from the latest DOM snapshot.';
+  }
+  if (/\.evaluate(?:All|Handle)?\s*\([\s\S]{0,300}?=>\s*\{[\s\S]{0,3000}?\.click\s*\(/i.test(code)
+    || /\.evaluate(?:All|Handle)?\s*\([\s\S]{0,300}?=>\s*(?!\{)[^;\r\n]{0,1000}?\.click\s*\(/i.test(code)) {
+    return 'browserCode forbids DOM element.click() inside evaluate callbacks because it bypasses Playwright actionability. Use one unique visible Playwright locator or clickByUid with a UID from the latest DOM snapshot.';
+  }
   return undefined;
 }
 

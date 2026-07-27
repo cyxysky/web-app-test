@@ -4866,7 +4866,6 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   box-sizing: border-box;
   max-width: 100%;
   min-width: 0;
-  overflow-x: hidden;
 }
 
 .browser-chat-tool-detail-summary :where(div, span, strong),

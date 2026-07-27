@@ -367,3 +367,35 @@ test('browserCode policy rejects literal force clicks before execution', () => {
   assert.match(browserCodePolicyViolation(`await locator.click({ force: true })`) || '', /forbids Playwright force: true/);
   assert.equal(browserCodePolicyViolation(`await locator.click()`), undefined);
 });
+
+test('browserCode policy rejects scripted clicks that bypass actionability', () => {
+  assert.match(
+    browserCodePolicyViolation(`await page.locator('button').dispatchEvent('click')`) || '',
+    /forbids dispatchEvent/,
+  );
+  assert.match(
+    browserCodePolicyViolation(`await page.evaluate(() => document.querySelector('button').click())`) || '',
+    /forbids DOM element\.click/,
+  );
+  assert.match(
+    browserCodePolicyViolation(`await page.locator('button').evaluate((button) => button.click())`) || '',
+    /forbids DOM element\.click/,
+  );
+  assert.match(
+    browserCodePolicyViolation(`await page.evaluate(() => {
+      const buttons = document.querySelectorAll('button');
+      for (const button of buttons) {
+        if (button.textContent.includes('确定')) {
+          button.click();
+          return true;
+        }
+      }
+      return false;
+    })`) || '',
+    /forbids DOM element\.click/,
+  );
+  assert.equal(
+    browserCodePolicyViolation(`await page.evaluate(() => document.title); await page.getByRole('button', { name: 'Save' }).click()`),
+    undefined,
+  );
+});

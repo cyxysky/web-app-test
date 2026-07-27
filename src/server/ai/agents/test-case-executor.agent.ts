@@ -1268,7 +1268,7 @@ function makeBrowserTools(
 
   const sharedTools = {
     browserCode: tool({
-      description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the only browser inspection, screenshot, and operation entrypoint. Every result automatically includes a fresh full semantic DOM snapshot, page-console delta, and code-console output. Use nodeRepl.write(value) for JSON and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. Locator actions default to 3000ms and navigation defaults to 30000ms; force: true is forbidden, and a failed operation preserves kernel bindings.',
+      description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the primary browser inspection, screenshot, and operation entrypoint. Every result automatically includes a fresh full semantic DOM snapshot, page-console delta, and code-console output. Use nodeRepl.write(value) for JSON and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. Locator actions default to 3000ms and navigation defaults to 30000ms; force: true and scripted DOM clicks are forbidden, and a failed operation preserves kernel bindings.',
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist.'),
         maxOutputChars: z.number().int().min(1_000).max(50_000).optional().describe('Maximum serialized return size. Defaults to 20000 characters.'),
@@ -1278,6 +1278,17 @@ function makeBrowserTools(
         maxOutputChars: input.maxOutputChars,
         runId: referenceOptions?.runId || 'browser-code',
         stepIndex: referenceOptions?.stepIndex || 0,
+        abortSignal: referenceOptions?.abortSignal,
+      })),
+    }),
+    clickByUid: tool({
+      description: 'Click exactly one rendered element using its exact UID from the latest automatically returned semantic DOM snapshot. Use only when a normal visible Playwright locator cannot uniquely identify the target. The runtime rejects stale, hidden, disabled, detached, or covered UIDs. Never invent or reuse an older UID.',
+      inputSchema: browserToolInput({
+        uid: z.string().min(1).max(160).describe('Exact UID copied from the latest automatic DOM snapshot.'),
+      }),
+      execute: (input) => record('clickByUid', input, () => session.mouse({
+        action: 'click',
+        uid: input.uid,
         abortSignal: referenceOptions?.abortSignal,
       })),
     }),
@@ -1562,6 +1573,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
   void mode;
   return [
     'browserCode',
+    'clickByUid',
     'waitForHumanVerification',
     'downloadFile',
     'generateMarkdownFile',
@@ -2808,6 +2820,12 @@ async function runRecordedTool(
         maxOutputChars: typeof input.maxOutputChars === 'number' ? input.maxOutputChars : undefined,
         runId: options.runId || 'browser-code',
         stepIndex: options.stepIndex ?? flow.index,
+        abortSignal: options.abortSignal,
+      });
+    case 'clickByUid':
+      return session.mouse({
+        action: 'click',
+        uid: typeof input.uid === 'string' ? input.uid : '',
         abortSignal: options.abortSignal,
       });
     case 'waitForHumanVerification':

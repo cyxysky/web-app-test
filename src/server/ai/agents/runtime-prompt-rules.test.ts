@@ -12,7 +12,7 @@ function combinedRules(screenshotAvailable: boolean) {
 
 test('browserCode rules describe direct Playwright execution with bounded operations', () => {
   const rules = combinedRules(true);
-  assert.match(rules, /only browser inspection and operation tool/);
+  assert.match(rules, /primary browser inspection and operation tool/);
   assert.match(rules, /ordinary JavaScript cell/);
   assert.match(rules, /real Playwright page and context objects/);
   assert.match(rules, /ordinary Playwright APIs directly/);
@@ -21,7 +21,7 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /page\.domSnapshot/);
   assert.match(rules, /nodeRepl\.write/);
   assert.match(rules, /bindings persist across calls/);
-  assert.match(rules, /no whole-cell deadline/);
+  assert.match(rules, /infrastructure watchdog/);
   assert.match(rules, /default to 3000ms/);
   assert.match(rules, /navigation defaults to 30000ms/);
   assert.match(rules, /nodeRepl\.emitImage/);
@@ -31,6 +31,10 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /freshly captured full semantic DOM snapshot/);
   assert.match(rules, /page-console delta/);
   assert.match(rules, /force: true is forbidden/);
+  assert.match(rules, /filter\(\{ visible: true \}\)/);
+  assert.match(rules, /require count\(\) === 1/);
+  assert.match(rules, /Never use first\(\), last\(\), or nth\(\)/);
+  assert.match(rules, /clickByUid/);
   assert.match(rules, /do not fall back to CUA/);
   assert.match(rules, /two separate model steps/);
   assert.match(rules, /Same-cell screenshot-and-click is forbidden/);
