@@ -108,6 +108,7 @@ import {
   browserChatLogsForMessage,
   type BrowserChatLogIndex as BrowserChatLogIndexModel,
 } from '@/components/browser-chat-message-model';
+import { findRequestedBrowserChatSession } from '@/components/browser-chat-session-selection';
 import {
   visibleBrowserChatExecutionLogs,
 } from '@/components/browser-chat-log-model';
@@ -245,6 +246,11 @@ type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'webpilotqa.sidebarCollapsed';
 const EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY = 'webpilotqa.embeddedChatCollapsed';
+
+function portalToDocumentBody(content: ReactNode) {
+  if (typeof document === 'undefined') return content;
+  return createPortal(content, document.body);
+}
 
 function browserChatViewForPathname(pathname: string, fallback: BrowserChatView): BrowserChatView {
   if (pathname === '/settings' || pathname.startsWith('/settings/')) return 'settings';
@@ -6172,7 +6178,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         ) : null}
       </div>
     </section>
-    {newGroupDialogOpen ? (
+    {newGroupDialogOpen ? portalToDocumentBody(
       <div className="ui-modal-overlay" onClick={() => {
         if (creatingNewGroup) return;
         setNewGroupDialogOpen(false);
@@ -6242,6 +6248,7 @@ export function BrowserChatWorkspace({
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const requestUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || '0';
+  const requestedSessionId = searchParams.get('sessionId')?.trim() || '';
   const browserChatApiUrl = useCallback((path: string) => (
     `${path}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(requestUserId)}`
   ), [requestUserId]);
@@ -6253,6 +6260,7 @@ export function BrowserChatWorkspace({
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const embeddedWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const mountedSessionActivationRef = useRef('');
   const sessionVersionsRef = useRef(new Map<string, number>());
   const sessionRefreshTimersRef = useRef(new Map<string, number>());
   const sessionListRefreshTimerRef = useRef<number | undefined>(undefined);
@@ -6661,7 +6669,20 @@ export function BrowserChatWorkspace({
     const data = await readApiJson<Record<string, unknown>>(response, '加载对话历史失败');
     const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => normalizeSession(item)) : [];
     setSessions(nextSessions);
-  }, [browserChatApiUrl]);
+    const requestedSession = findRequestedBrowserChatSession(nextSessions, requestedSessionId);
+    if (!requestedSession || mountedSessionActivationRef.current === requestedSession.id) return;
+    mountedSessionActivationRef.current = requestedSession.id;
+    activeSessionIdRef.current = requestedSession.id;
+    setSession(requestedSession);
+    setMode(normalizeMode(requestedSession.mode));
+    setSafetyMode(normalizeSafetyMode(requestedSession.safetyMode));
+    const nextModel = resolveRuntimeModelSelection(null, {
+      model: requestedSession.model,
+      provider: requestedSession.modelProvider,
+    });
+    setModelProvider(nextModel.provider);
+    setModelId(nextModel.model);
+  }, [browserChatApiUrl, requestedSessionId]);
 
   const refreshSession = useCallback(async (sessionId: string, options: { activate?: boolean } = {}) => {
     const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}`), { cache: 'no-store' });
@@ -7652,7 +7673,7 @@ export function BrowserChatWorkspace({
         )}
       </main>
 
-      {webPreviewRuntime && webPreviewOpen && session ? (
+      {webPreviewRuntime && webPreviewOpen && session ? portalToDocumentBody(
         <BrowserChatWebPreviewModal
           onClose={() => setWebPreviewOpen(false)}
           sessionId={session.id}
@@ -7660,7 +7681,7 @@ export function BrowserChatWorkspace({
         />
       ) : null}
 
-      {liveToolDialog ? (
+      {liveToolDialog ? portalToDocumentBody(
         <BrowserChatToolDialog
           detail={liveToolDialog}
           onClose={() => setToolDialog(null)}
@@ -7668,7 +7689,7 @@ export function BrowserChatWorkspace({
         />
       ) : null}
 
-      {logDialogMessageId ? (
+      {logDialogMessageId ? portalToDocumentBody(
         <BrowserChatLogDialog
           entries={logDialogEntries}
           messageContent={logDialogMessage ? compactText(logDialogMessage.content, 80) : undefined}
@@ -7676,7 +7697,7 @@ export function BrowserChatWorkspace({
         />
       ) : null}
 
-      {imagePreview ? (
+      {imagePreview ? portalToDocumentBody(
         <div className="fullscreen-image-viewer" onClick={() => setImagePreview(null)} role="presentation">
           <div className="image-viewer-toolbar" onClick={(event) => event.stopPropagation()}>
             <strong>{imagePreview.name}</strong>
