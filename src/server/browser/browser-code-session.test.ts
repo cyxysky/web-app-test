@@ -18,7 +18,7 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
-  await page.setContent(`
+  await page.goto(`data:text/html,${encodeURIComponent(`
     <!doctype html>
     <html><body>
       <label>Name <input aria-label="Name"></label>
@@ -32,7 +32,7 @@ test('BrowserSession executes browserCode against the controlled Playwright page
       <button type="button" onclick="console.log('apply-clicked'); document.body.dataset.applied = 'yes'; document.getElementById('status').textContent = 'Applied'">Apply</button>
       <p id="status">Pending</p>
     </body></html>
-  `);
+  `)}`);
 
   const screenshotAction = await session.executeBrowserCode({
     code: `
@@ -117,7 +117,7 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.ok(result.result?.nameBox);
   assert.ok(Math.abs((result.result?.locatorCursor?.x || 0) - (result.result.nameBox.x + result.result.nameBox.width / 2)) <= 1);
   assert.ok(Math.abs((result.result?.locatorCursor?.y || 0) - (result.result.nameBox.y + result.result.nameBox.height / 2)) <= 1);
-  assert.match(result.result?.url || '', /^about:blank$/);
+  assert.match(result.result?.url || '', /^data:text\/html,/);
   assert.equal(result.result?.uidType, 'undefined');
   assert.equal(result.result?.nativeContext, true);
   assert.equal(result.result?.pageCount, 1);
@@ -152,14 +152,14 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
-  await page.setContent(`
+  await page.goto(`data:text/html,${encodeURIComponent(`
     <!doctype html>
     <html><body style="margin:0">
       <button id="open-detail" style="height:80px;width:240px" onclick="window.open('about:blank#detail', '_blank')">
         Open detail
       </button>
     </body></html>
-  `);
+  `)}`);
 
   const initialTabs = await session.refreshTabsSnapshot();
   assert.equal(initialTabs.length, 1);
@@ -183,6 +183,7 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
     clickCount: 1,
   });
   assert.equal(click.ok, true, click.actual);
+  assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 1);
 
   let popupTabs = await session.refreshTabsSnapshot();
   await waitForCondition(async () => {
@@ -203,7 +204,7 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
     onFrame: (frame) => { switchedFrames.push({ url: frame.url }); },
   });
   assert.ok(switchedFrames.length >= 1, 'switched static tab should emit a frame immediately');
-  assert.equal(switchedFrames.at(-1)?.url, 'about:blank');
+  assert.equal(switchedFrames.at(-1)?.url, page.url());
   await switchedHandle.stop();
 });
 

@@ -691,7 +691,7 @@ const aiDomMutationObserverScript = `(() => {
       let meaningful = false;
       for (const mutation of mutations) {
         const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-        if (!target || !target.closest || !target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) {
+        if (!target || !target.closest || !target.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) {
           meaningful = true;
           break;
         }
@@ -717,7 +717,7 @@ const aiDomMutationObserverScript = `(() => {
     state.interactionListenersInstalled = true;
     const markInteraction = (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      if (target && target.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) return;
+      if (target && target.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) return;
       state.interactionSequence += 1;
       state.interactionCounts[event.type] = (state.interactionCounts[event.type] || 0) + 1;
       state.lastInteractionType = event.type;
@@ -852,7 +852,8 @@ function isSnapshotReference(reference: SnapshotReference | DomNodeReference): r
 
 type WindowWithAiDomRuntime = Window & {
   __aiBrowserPageRuntimeInstalled?: boolean;
-  __aiMoveMouseCursor?: (x: number, y: number, options?: { immediate?: boolean; kind?: string }) => Promise<void>;
+  __aiMouseCursorListenersInstalled?: boolean;
+  __aiMoveMouseCursor?: (x: number, y: number, options?: { kind?: string }) => void;
   __aiGetEventListenerTypes?: (target: EventTarget) => string[];
   __aiDomRuntime?: AiDomRuntime;
   __aiDomMutationState?: AiDomMutationStateSnapshot & {
@@ -1205,28 +1206,16 @@ function installAiBrowserPageRuntime() {
   Object.defineProperty(win, '__aiMoveMouseCursor', {
     configurable: true,
     enumerable: false,
-    value: async (rawX: number, rawY: number, options: { immediate?: boolean; kind?: string } = {}) => {
+    value: (rawX: number, rawY: number, options: { kind?: string } = {}) => {
       const cursor = mountMouseCursor();
       if (!cursor) return;
       const x = Math.max(0, Math.min(Math.round(Number(rawX) || 0), Math.max(0, window.innerWidth - 1)));
       const y = Math.max(0, Math.min(Math.round(Number(rawY) || 0), Math.max(0, window.innerHeight - 1)));
-      const previousX = Number(cursor.dataset.x || window.innerWidth / 2);
-      const previousY = Number(cursor.dataset.y || window.innerHeight / 2);
-      const distance = Math.hypot(x - previousX, y - previousY);
-      const duration = options.immediate ? 0 : Math.round(Math.max(120, Math.min(460, distance * 0.65)));
       cursor.dataset.x = String(x);
       cursor.dataset.y = String(y);
       cursor.style.opacity = '1';
-      cursor.style.transition = duration
-        ? `transform ${duration}ms cubic-bezier(.22,.61,.36,1), opacity 100ms ease`
-        : 'none';
-      cursor.getBoundingClientRect();
-      await new Promise<void>((resolve) => {
-        requestAnimationFrame(() => {
-          cursor.style.transform = `translate3d(${x}px, ${y}px, 0)`;
-          window.setTimeout(resolve, duration);
-        });
-      });
+      cursor.style.transition = 'none';
+      cursor.style.transform = `translate3d(${x}px, ${y}px, 0)`;
       if (options.kind === 'click' || options.kind === 'double' || options.kind === 'right') {
         const pulse = cursor.querySelector<HTMLElement>('[data-ai-mouse-pulse="true"]');
         pulse?.animate([
@@ -1237,6 +1226,19 @@ function installAiBrowserPageRuntime() {
     },
     writable: false,
   });
+  if (!win.__aiMouseCursorListenersInstalled) {
+    window.addEventListener('mousemove', (event) => {
+      win.__aiMoveMouseCursor?.(event.clientX, event.clientY, { kind: 'move' });
+    }, true);
+    window.addEventListener('mousedown', (event) => {
+      const kind = event.button === 2 ? 'right' : event.detail > 1 ? 'double' : 'click';
+      win.__aiMoveMouseCursor?.(event.clientX, event.clientY, { kind });
+    }, true);
+    window.addEventListener('dblclick', (event) => {
+      win.__aiMoveMouseCursor?.(event.clientX, event.clientY, { kind: 'double' });
+    }, true);
+    win.__aiMouseCursorListenersInstalled = true;
+  }
   if (!win.__aiBrowserPageRuntimeInstalled) {
     const originalAddEventListener = EventTarget.prototype.addEventListener;
     const listenerTypes = new WeakMap<EventTarget, Set<string>>();
@@ -1271,7 +1273,7 @@ function installAiBrowserPageRuntime() {
     mutationState.observer = new MutationObserver((mutations) => {
       const meaningful = mutations.some((mutation) => {
         const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-        return !target?.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__');
+        return !target?.closest?.('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__');
       });
       if (!meaningful) return;
       mutationState.pendingMutations = mutationState.pendingMutations || [];
@@ -1314,7 +1316,7 @@ function installAiBrowserPageRuntime() {
   const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
 
   function isOverlay(element: Element) {
-    return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__'));
+    return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__'));
   }
 
   function shadowRootOf(element: Element) {
@@ -2870,7 +2872,7 @@ function collectAiDomObservation(input: { includeInteractiveCandidates?: boolean
   const normalizeText = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
   const candidateTextQuery = normalizeText(input.candidateTextQuery).toLowerCase();
   const candidateTextQueryParts = candidateTextQuery.split(/\s+/).filter((item) => item.length >= 2);
-  const overlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__';
+  const overlaySelector = '#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__';
   const skippedTextTags = new Set(['script', 'style', 'template', 'noscript']);
   const structuralTextTags = new Set([
     'article',
@@ -4899,6 +4901,7 @@ export class BrowserSession {
 
   async dispatchLiveInput(input: BrowserLiveInput): Promise<BrowserActionResult> {
     const page = this.activePage;
+    await this.ensureBrowserPageRuntime(page);
     const clampRatio = (value: number) => Math.min(1, Math.max(0, Number(value)));
     const invalidateObservation = () => {
       this.lastScreenshotMetrics = undefined;
@@ -4917,9 +4920,8 @@ export class BrowserSession {
       const viewport = await this.getViewportMetrics();
       const x = Math.min(viewport.width - 1, Math.max(0, Math.round(clampRatio(input.xRatio) * viewport.width)));
       const y = Math.min(viewport.height - 1, Math.max(0, Math.round(clampRatio(input.yRatio) * viewport.height)));
-      await page.mouse.move(x, y);
-
       if (input.kind === 'move') {
+        await page.mouse.move(x, y);
         return { ok: true, actual: `Live browser pointer moved to (${x}, ${y}).` };
       }
 
@@ -4930,20 +4932,16 @@ export class BrowserSession {
           ? page.waitForEvent('popup', { timeout: 1500 }).catch(() => undefined)
           : Promise.resolve(undefined);
         await page.mouse.click(x, y, { button, clickCount });
-        const popup = await Promise.race([
-          popupPromise,
-          sleep(80).then(() => undefined),
-        ]);
-        if (popup) {
+        void popupPromise.then(async (popup) => {
+          if (!popup) return;
           await this.claimPopupPage(popup);
-        } else {
-          void popupPromise.then((latePopup) => this.claimPopupPage(latePopup).catch(() => undefined));
-        }
-        await this.refreshSessionGroupPages({ forceNativeRefresh: true });
+          await this.refreshSessionGroupPages({ forceNativeRefresh: true });
+        }).catch(() => undefined);
         invalidateObservation();
         return { ok: true, actual: `Live browser clicked (${x}, ${y}).` };
       }
 
+      await page.mouse.move(x, y);
       const deltaX = Math.min(2400, Math.max(-2400, Number(input.deltaX) || 0));
       const deltaY = Math.min(2400, Math.max(-2400, Number(input.deltaY) || 0));
       if (!deltaX && !deltaY) return { ok: true, actual: 'Live browser scroll had no movement.' };
@@ -5573,9 +5571,6 @@ export class BrowserSession {
     this.lastOriginalScreenshotPath = undefined;
     const separateMarkerMap = false;
     await timed('removeCandidateOverlayBefore', () => this.removeCandidateOverlay());
-    if (phase === 'before' || String(phase).startsWith('visual-')) {
-      await timed('removeClickMarker', () => this.removeClickMarker());
-    } else skipped('removeClickMarker');
     const screenshotTimeoutMs = boundedPositiveIntegerEnv(
       'SCREENSHOT_TIMEOUT_MS',
       DEFAULT_SCREENSHOT_TIMEOUT_MS,
@@ -6027,6 +6022,7 @@ export class BrowserSession {
 
     const pageConsoleSequenceBefore = this.pageConsoleSequence;
     const page = this.activePage;
+    await this.ensureBrowserPageRuntime(page);
     const executionId = randomUUID();
     await page.evaluate((id) => {
       Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
@@ -6904,7 +6900,7 @@ export class BrowserSession {
             let top: Element | undefined;
             for (const item of stack) {
               if (!item) continue;
-              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) continue;
+              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) continue;
               top = item;
               break;
             }
@@ -6966,7 +6962,7 @@ export class BrowserSession {
         return `${tag}${id}${cls}${role}${text ? ` text="${text}"` : ''}`;
       }
       return (document.elementsFromPoint(pointX, pointY) as Element[])
-        .filter((element) => !element.closest?.('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__'))
+        .filter((element) => !element.closest?.('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__'))
         .slice(0, 5)
         .map(describe)
         .join(' > ') || '[none]';
@@ -8038,7 +8034,7 @@ export class BrowserSession {
         const y = Math.min(window.innerHeight - 1, Math.max(0, rect.top + rect.height * yRatio));
         let top: Element | undefined;
         for (const candidate of document.elementsFromPoint(x, y)) {
-          if (candidate.closest('#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) continue;
+          if (candidate.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) continue;
           const candidateStyle = window.getComputedStyle(candidate);
           if (candidateStyle.display !== 'none' && candidateStyle.visibility !== 'hidden') {
             top = candidate;
@@ -8483,7 +8479,6 @@ export class BrowserSession {
         await sourceHandle?.dispose().catch(() => undefined);
         await destinationHandle?.dispose().catch(() => undefined);
       }
-      void this.showClickMarker(to.point.x, to.point.y, 'drag');
       return this.completeVerifiedAction(
         `Dragged ${from.point.descriptor} to ${to.point.descriptor} using ${fromLocator && toLocator ? 'Playwright locator-guided' : 'viewport-coordinate'} pointer input${usedHtml5Fallback ? ' plus HTML5 DataTransfer fallback' : ''}.`,
         previousGeneration,
@@ -8538,7 +8533,6 @@ export class BrowserSession {
     ));
     throwIfAborted();
     const claimedPopup = await timeBrowserClickStage(clickTimings, 'popupWaitMs', () => this.settlePopupAfterAction(popup.popup, popup.waitMs));
-    void this.showClickMarker(from.point.x, from.point.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
     const result = await this.completeVerifiedAction(
       `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${from.point.source}.`,
       previousGeneration,
@@ -9473,7 +9467,7 @@ export class BrowserSession {
 
   private async readFrameRawDom(target: Page | Frame) {
     return target.evaluate(() => {
-      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_last_click_marker__, #__ai_mouse_cursor__, #__ai_dom_export_control__';
+      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__';
       const voidTags = new Set([
         'area',
         'base',
@@ -10233,79 +10227,6 @@ export class BrowserSession {
       .catch(() => undefined);
   }
 
-  // 操作前原图不应包含上一轮注入的点击位置标记。
-  private async removeClickMarker() {
-    await this.activePage
-      .evaluate(() => {
-        document.getElementById('__ai_last_click_marker__')?.remove();
-      })
-      .catch(() => undefined);
-  }
-
-  // 在页面上留下上一次鼠标动作的位置。下一轮截图会看到这个鼠标指针，
-  // 便于人工和模型理解刚才点在哪里；扫描候选元素时会主动忽略它。
-  private async showClickMarker(x: number, y: number, kind: string) {
-    await this.activePage.evaluate(({ x: markerX, y: markerY, kind: markerKind }) => {
-      const previous = document.getElementById('__ai_last_click_marker__');
-      previous?.remove();
-      const marker = document.createElement('div');
-      marker.id = '__ai_last_click_marker__';
-      marker.setAttribute('aria-hidden', 'true');
-      const badgeText = markerKind === 'double' ? '2x' : markerKind === 'right' ? 'R' : markerKind === 'drag' ? 'D' : '';
-      const cursorSvg = [
-        '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="29" viewBox="0 0 32 42">',
-        '<path d="M4 3v28.5l7.3-6.9 4.7 12.2 5.6-2.2-4.8-11.8h10.6L4 3z" fill="white" stroke="#111827" stroke-width="2.2" stroke-linejoin="round"/>',
-        '<path d="M11.2 24.6 16 36.8" stroke="rgba(255,255,255,.65)" stroke-width="1.1"/>',
-        '</svg>',
-      ].join('');
-      const cursor = document.createElement('div');
-      Object.assign(cursor.style, {
-        position: 'absolute',
-        left: '0',
-        top: '0',
-        width: '22px',
-        height: '29px',
-        backgroundImage: `url("data:image/svg+xml,${encodeURIComponent(cursorSvg)}")`,
-        backgroundRepeat: 'no-repeat',
-        backgroundSize: '22px 29px',
-        filter: 'drop-shadow(0 3px 5px rgba(0, 0, 0, 0.38))',
-      });
-      marker.appendChild(cursor);
-      if (badgeText) {
-        const badge = document.createElement('div');
-        badge.textContent = badgeText;
-        Object.assign(badge.style, {
-          position: 'absolute',
-          left: '12px',
-          top: '14px',
-          minWidth: '13px',
-          height: '13px',
-          padding: '0 2px',
-          borderRadius: '999px',
-          background: '#2563eb',
-          color: '#fff',
-          border: '1px solid #fff',
-          boxSizing: 'border-box',
-          font: '900 8px/11px Arial, sans-serif',
-          textAlign: 'center',
-          boxShadow: '0 1px 4px rgba(0,0,0,0.28)',
-        });
-        marker.appendChild(badge);
-      }
-      Object.assign(marker.style, {
-        position: 'fixed',
-        left: `${markerX}px`,
-        top: `${markerY}px`,
-        width: '30px',
-        height: '34px',
-        marginLeft: '-1px',
-        marginTop: '-1px',
-        pointerEvents: 'none',
-        zIndex: '2147483647',
-      });
-      document.documentElement.appendChild(marker);
-    }, { x, y, kind }).catch(() => undefined);
-  }
 }
 
 export async function closeAllBrowserSessions() {
