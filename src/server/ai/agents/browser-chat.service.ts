@@ -3228,6 +3228,10 @@ async function executeBrowserChatSubagentBatch(input: {
         browserChatResourceSeeds(session, task.instruction, task.url || child.currentUrl()),
         task.instruction,
       );
+      const operationalContext = [
+        browserChatPersonalMemoryContext({ session, browser: child, text: task.instruction, modelText: task.instruction }).context,
+        browserChatCredentialPrompt(credentialContext.credentials),
+      ].filter(Boolean).join('\n\n');
       const result = await executeInteractiveBrowserTurn({
         session: child,
         runId: `${session.id}_${task.id}`,
@@ -3246,8 +3250,8 @@ async function executeBrowserChatSubagentBatch(input: {
             ? `完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。配置建议将篇幅控制在约 ${summaryGuidanceChars} 个字符以内，但这不是截断上限；如果完整证据需要更长内容，必须完整返回。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。`
             : '完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。',
           task.instruction,
-          browserChatCredentialPrompt(credentialContext.credentials),
         ].filter(Boolean).join('\n\n'),
+        operationalContext,
         conversation: [],
         completedSteps: [],
         mode: session.mode,
@@ -3450,6 +3454,10 @@ async function resumeBlockedBrowserChatSubagent(input: {
     ),
     binding.task.instruction,
   );
+  const operationalContext = [
+    browserChatPersonalMemoryContext({ session, browser: binding.browser, text: binding.task.instruction, modelText: binding.task.instruction }).context,
+    browserChatCredentialPrompt(credentialContext.credentials),
+  ].filter(Boolean).join('\n\n');
   try {
     const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
       session: binding.browser,
@@ -3460,8 +3468,8 @@ async function resumeBlockedBrowserChatSubagent(input: {
         `你是并行子 Agent“${binding.title}”，正在继续同一个已暂停的分支。`,
         '用户已点击“校验完成，继续执行”。不要要求用户再发送文字；先读取当前页面状态，再继续原任务。',
         binding.task.instruction,
-        browserChatCredentialPrompt(credentialContext.credentials),
       ].filter(Boolean).join('\n\n'),
+      operationalContext,
       conversation: [],
       completedSteps: binding.steps,
       mode: session.mode,
@@ -3598,10 +3606,7 @@ async function runBrowserChatMessage(
       const initialPersonalMemory = browserChatPersonalMemoryContext({ session, browser, text, modelText });
       initialPersonalMemory.itemIds.forEach((id) => recalledMemoryIds.add(id));
       if (initialPersonalMemory.domain) recalledDomains.add(initialPersonalMemory.domain);
-      const skillContext = [
-        initialPersonalMemory.context,
-        formatSkillsForPrompt(skills),
-      ].filter(Boolean).join('\n\n');
+      const skillContext = formatSkillsForPrompt(skills);
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
       const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
       const credentialContext = browserChatCredentialContext(
@@ -3609,12 +3614,17 @@ async function runBrowserChatMessage(
         browserChatResourceSeeds(session, modelText, browser.currentUrl()),
         modelText,
       );
+      const operationalContext = [
+        initialPersonalMemory.context,
+        browserChatCredentialPrompt(credentialContext.credentials),
+      ].filter(Boolean).join('\n\n');
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
         targetUrl: session.targetUrl || 'about:blank',
         instruction: text,
-        modelInstruction: [modelText, browserChatCredentialPrompt(credentialContext.credentials)].filter(Boolean).join('\n\n'),
+        modelInstruction: modelText,
+        operationalContext,
         conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId, session.userId),
         completedSteps: session.steps,
         mode: session.mode,
@@ -3622,7 +3632,7 @@ async function runBrowserChatMessage(
         referenceImagePaths,
         skillContext,
         credentialBindings: credentialContext.bindings,
-        getDynamicSkillContext: () => {
+        getDynamicPersonalMemoryContext: () => {
           const currentUrl = browserChatMemoryUrl(browser, session);
           const currentDomain = normalizePersonalMemoryDomain(currentUrl || session.targetUrl);
           if (!currentDomain || recalledDomains.has(currentDomain)) return '';
