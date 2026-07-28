@@ -127,6 +127,12 @@ type BrowserChatRuntimeRecord = {
   systemPrompt: string;
 };
 
+type BrowserChatOperationalContext = {
+  operationalContext: string;
+  resolveCredential?: (credentialRef: string) => string | undefined;
+  credentialAllowedOrigins?: string[];
+};
+
 const codexRuntimeObjectSchema = z.object({
   type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op status update.'),
   message: z.string().nullable().optional().describe('Optional short Chinese progress text that must match the selected tool: takeScreenshot reads pixels; inspect reads the accessibility tree.'),
@@ -1357,6 +1363,8 @@ function makeBrowserTools(
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
     resolveCredential?: (credentialRef: string) => string | undefined;
     credentialAllowedOrigins?: string[];
+    getResolveCredential?: () => ((credentialRef: string) => string | undefined) | undefined;
+    getCredentialAllowedOrigins?: () => string[] | undefined;
     runSubagents?: BrowserChatSubagentRunner;
     readSubagent?: BrowserChatSubagentReader;
     readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
@@ -1370,7 +1378,7 @@ function makeBrowserTools(
   // effects; the following calls receive an ignored result and the model can continue from the
   // fresh tool result in the next step.
   const toolExecutionGate = referenceOptions?.toolExecutionGate || { stepNumber: 0, executed: false };
-  const credentialAllowedOrigins = new Set((referenceOptions?.credentialAllowedOrigins || []).flatMap((value) => {
+  const activeCredentialAllowedOrigins = () => new Set((referenceOptions?.getCredentialAllowedOrigins?.() || referenceOptions?.credentialAllowedOrigins || []).flatMap((value) => {
     try {
       const url = new URL(value);
       return /^https?:$/.test(url.protocol) ? [url.origin] : [];
@@ -1378,9 +1386,16 @@ function makeBrowserTools(
       return [];
     }
   }));
-  const credentialRestricted = typeof referenceOptions?.resolveCredential === 'function';
+  const resolveActiveCredential = (credentialRef: string) => {
+    const activeResolver = referenceOptions?.getResolveCredential?.();
+    return activeResolver
+      ? activeResolver(credentialRef)
+      : referenceOptions?.resolveCredential?.(credentialRef);
+  };
+  const credentialRestricted = Boolean(referenceOptions?.getResolveCredential || referenceOptions?.resolveCredential);
   const credentialOriginAllowed = (value: string) => {
     if (!credentialRestricted) return true;
+    const credentialAllowedOrigins = activeCredentialAllowedOrigins();
     if (!credentialAllowedOrigins.size) return false;
     try {
       const url = new URL(value, session.currentUrl() || targetUrl);
@@ -1568,7 +1583,7 @@ function makeBrowserTools(
           return { ok: false, actual: 'Credential entry was blocked because the current page is outside the confirmed login origin.' };
         }
         const credentialText = input.credentialRef
-          ? referenceOptions?.resolveCredential?.(input.credentialRef)
+          ? resolveActiveCredential(input.credentialRef)
           : undefined;
         if (input.credentialRef && credentialText === undefined) {
           return { ok: false, actual: `Credential reference ${input.credentialRef} is unavailable or expired.` };
@@ -1583,7 +1598,7 @@ function makeBrowserTools(
           keys: input.keys,
           replace: input.replace,
           followByEnter: input.followByEnter,
-          allowedOrigins: input.credentialRef ? [...credentialAllowedOrigins] : undefined,
+          allowedOrigins: input.credentialRef ? [...activeCredentialAllowedOrigins()] : undefined,
         });
       }),
     }),
@@ -2143,7 +2158,7 @@ async function executeRuntimeStep(input: {
   shouldContinue?: () => boolean;
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
-  getDynamicSkillContext?: () => string | Promise<string>;
+  getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   resolveCredential?: (credentialRef: string) => string | undefined;
   credentialAllowedOrigins?: string[];
@@ -2205,6 +2220,9 @@ async function executeRuntimeStep(input: {
     runtimeRecord,
     operationalContext: input.operationalContext,
   })}${userReferenceImagePrompt}`;
+  let activeOperationalContext = input.operationalContext || '';
+  let activeResolveCredential = input.resolveCredential;
+  let activeCredentialAllowedOrigins = input.credentialAllowedOrigins || [];
   const promptMs = elapsedSince(promptStartedAt);
   await onDebug?.({
     phase: 'perf:runtime-input',
@@ -2254,9 +2272,7 @@ async function executeRuntimeStep(input: {
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
-    const initialRequestPrompt = prompt;
-    const requestPrompt = codexMode ? buildCodexObjectPrompt(initialRequestPrompt, allowedToolTypes) : initialRequestPrompt;
-    const requestSystemPrompt = requestPrompt;
+    let requestSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(runtimeRecord),
       phase: 'Browser chat turn; answer directly when current evidence is enough, otherwise use one browser tool.',
@@ -2502,31 +2518,30 @@ async function executeRuntimeStep(input: {
 
     async function prepareStep(turnIndex: number, previousMessages?: RuntimeModelMessage[]) {
       ensureActive();
+      if (input.getRuntimeOperationalContext) {
+        try {
+          const runtimeContext = await input.getRuntimeOperationalContext();
+          ensureActive();
+          activeOperationalContext = runtimeContext.operationalContext;
+          activeResolveCredential = runtimeContext.resolveCredential;
+          activeCredentialAllowedOrigins = runtimeContext.credentialAllowedOrigins || [];
+        } catch (error) {
+          await onDebug?.({
+            phase: 'runtime-context:refresh:error',
+            stepIndex,
+            message: `Unable to rebuild runtime context for the current page: ${infrastructureError(error)}`,
+            details: serializeError(error),
+          });
+        }
+      }
+      const refreshedPrompt = `${runtimePrompt({ runtimeRecord, operationalContext: activeOperationalContext })}${userReferenceImagePrompt}`;
+      requestSystemPrompt = codexMode ? buildCodexObjectPrompt(refreshedPrompt, allowedToolTypes) : refreshedPrompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = contextWindowTokens();
       const thresholdRatio = contextCompressionThresholdRatio();
       const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
       const appendedMessages: RuntimeModelMessage[] = [];
       const appendedImagePaths: string[] = [];
-      if (input.getDynamicSkillContext) {
-        try {
-          const dynamicSkillContext = textFromUnknown(await input.getDynamicSkillContext()).trim();
-          ensureActive();
-          if (dynamicSkillContext) {
-            pendingObservationMessages.push({
-              text: `[WebPilot Skill instructions for the current page]\n${dynamicSkillContext}`,
-              imagePaths: [],
-            });
-          }
-        } catch (error) {
-          await onDebug?.({
-            phase: 'memory:prompt:domain-refresh:error',
-            stepIndex,
-            message: `Unable to refresh domain memory for the current page: ${infrastructureError(error)}`,
-            details: serializeError(error),
-          });
-        }
-      }
       while (pendingObservationMessages.length) {
         const observation = pendingObservationMessages.shift();
         if (!observation) break;
@@ -2643,8 +2658,8 @@ async function executeRuntimeStep(input: {
         abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
-        resolveCredential: input.resolveCredential,
-        credentialAllowedOrigins: input.credentialAllowedOrigins,
+        resolveCredential: activeResolveCredential,
+        credentialAllowedOrigins: activeCredentialAllowedOrigins,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
@@ -2715,6 +2730,8 @@ async function executeRuntimeStep(input: {
       requestToolConfirmation: input.requestToolConfirmation,
       resolveCredential: input.resolveCredential,
       credentialAllowedOrigins: input.credentialAllowedOrigins,
+      getResolveCredential: () => activeResolveCredential,
+      getCredentialAllowedOrigins: () => activeCredentialAllowedOrigins,
       runSubagents: input.runSubagents,
       readSubagent: input.readSubagent,
       readFile: input.readFile,
@@ -2956,13 +2973,9 @@ function createInteractiveBrowserRuntimeRecord(input: {
   safetyMode?: BrowserChatSafetyMode;
   targetUrl: string;
   instruction: string;
-  skillContext?: string;
 }): BrowserChatRuntimeRecord {
   const targetUrl = input.targetUrl || 'about:blank';
-  const systemPrompt = [
-    browserChatSafetyInstructions(input.safetyMode),
-    input.skillContext,
-  ].filter(Boolean).join('\n\n');
+  const systemPrompt = browserChatSafetyInstructions(input.safetyMode);
   return {
     description: input.instruction,
     targetUrl,
@@ -2990,8 +3003,7 @@ export async function executeInteractiveBrowserTurn(input: {
   mode?: BrowserSessionMode;
   safetyMode?: BrowserChatSafetyMode;
   referenceImagePaths?: string[];
-  skillContext?: string;
-  getDynamicSkillContext?: () => string | Promise<string>;
+  getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
   onProgress?: (step: StepExecutionResult) => void | Promise<void>;
   onDebug?: ExecutionDebug;
   abortSignal?: AbortSignal;
@@ -3014,7 +3026,6 @@ export async function executeInteractiveBrowserTurn(input: {
     safetyMode: input.safetyMode,
     targetUrl: input.targetUrl,
     instruction: input.instruction,
-    skillContext: input.skillContext,
   });
   const runtimeMode = browserModeOf();
   const runtimeObservationStore: RuntimeObservationStore = new Map();
@@ -3102,7 +3113,7 @@ export async function executeInteractiveBrowserTurn(input: {
         conversation: input.conversation || [],
         runtimeObservationStore,
         referenceImagePaths: input.referenceImagePaths,
-        getDynamicSkillContext: input.getDynamicSkillContext,
+        getRuntimeOperationalContext: input.getRuntimeOperationalContext,
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,

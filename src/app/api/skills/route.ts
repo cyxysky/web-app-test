@@ -19,6 +19,7 @@ export async function POST(request: NextRequest) {
       id: typeof body.id === 'string' ? body.id : undefined,
       title: String(body.title || ''),
       description: String(body.description || ''),
+      domains: Array.isArray(body.domains) ? body.domains.map(String) : [],
       tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
       triggerPhrases: Array.isArray(body.triggerPhrases) ? body.triggerPhrases.map(String) : [],
       content,

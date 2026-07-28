@@ -25,7 +25,7 @@ import {
   revokeBrowserChatTurn,
   runtimeSnapshotIsNewer,
 } from '@/server/ai/agents/browser-chat-interrupt-state';
-import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
+import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl } from '@/server/ai/agents/skill-context';
 import {
   extractPersonalMemoryFromTurn,
   formatPersonalMemoryForPrompt,
@@ -723,49 +723,6 @@ type BrowserChatResourceSeed = {
   url?: string;
 };
 
-function browserChatResourceUrls(text: string) {
-  const matches = text.match(/https?:\/\/[^\s<>"'\]\[(){}，。；、]+/gi) || [];
-  return Array.from(new Set(matches.map((value) => value.replace(/[),.;!?]+$/g, '')))).slice(0, 40);
-}
-
-function browserChatResourceKind(title: string, url?: string): BrowserChatResourceSeed['kind'] {
-  const value = `${title}\n${url || ''}`.toLowerCase();
-  if (value.includes('axure') || value.includes('axshare.com') || /\/start\.html(?:$|[?#])/i.test(value)) return 'axure';
-  if (/\.(?:png|jpe?g|gif|webp|bmp|svg)(?:$|[?#])/i.test(value)) return 'image';
-  return url ? 'url' : 'other';
-}
-
-function browserChatResourceSeeds(session: BrowserChatSessionRecord, latestModelText = '') {
-  const seeds: BrowserChatResourceSeed[] = [];
-  const add = (seed: BrowserChatResourceSeed) => {
-    const key = `${seed.kind}\u0000${seed.url || seed.title}`.toLowerCase();
-    if (seeds.some((item) => `${item.kind}\u0000${item.url || item.title}`.toLowerCase() === key)) return;
-    seeds.push(seed);
-  };
-  for (const url of browserChatResourceUrls(latestModelText)) {
-    add({ kind: browserChatResourceKind(url, url), title: url, url });
-  }
-  if (session.targetUrl) {
-    add({ kind: browserChatResourceKind(session.targetUrl, session.targetUrl), title: '目标地址', url: session.targetUrl });
-  }
-  for (const message of session.messages) {
-    for (const url of browserChatResourceUrls(textFromUnknown(message.content))) {
-      add({ kind: browserChatResourceKind(url, url), title: url, url });
-    }
-    for (const attachment of message.attachments || []) {
-      const url = attachment.kind === 'tab' ? attachment.sourceUrl || attachment.url : attachment.url || undefined;
-      add({
-        kind: attachment.kind === 'tab'
-          ? browserChatResourceKind(attachment.name, url) === 'axure' ? 'axure' : 'tab'
-          : attachment.kind || browserChatResourceKind(attachment.name, url),
-        title: attachment.name,
-        url,
-      });
-    }
-  }
-  return seeds.slice(0, 80);
-}
-
 function browserChatCredentialContext(
   session: BrowserChatSessionRecord,
   seeds: BrowserChatResourceSeed[],
@@ -859,6 +816,53 @@ function browserChatRelevantMemoryPrompt(session: BrowserChatSessionRecord, brow
   if (!matches.length) return '';
   markPersonalMemoryItemsUsed(matches.map((match) => match.item.id));
   return formatPersonalMemoryForPrompt(matches);
+}
+
+function createBrowserChatRuntimeOperationalContext(input: {
+  session: BrowserChatSessionRecord;
+  browser: BrowserSession;
+  instruction: string;
+  explicitlySelectedSkills?: SkillRecord[];
+}) {
+  let cachedKey = '';
+  let cachedContext: {
+    operationalContext: string;
+    resolveCredential?: (credentialRef: string) => string | undefined;
+    credentialAllowedOrigins: string[];
+  } | undefined;
+  return () => {
+    const currentUrl = browserChatMemoryUrl(input.browser, input.session);
+    let currentOrigin = '';
+    try {
+      currentOrigin = new URL(currentUrl).origin;
+    } catch {
+      currentOrigin = normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl);
+    }
+    const key = currentOrigin || 'global';
+    if (cachedContext && cachedKey === key) return cachedContext;
+    const skills = runtimeSkillsForUrl(
+      store.listSkills().filter((skill) => skill.status === 'ready'),
+      input.explicitlySelectedSkills || [],
+      currentUrl || input.session.targetUrl,
+    );
+    const credentialUrl = /^https?:\/\//i.test(currentUrl) ? currentUrl : input.session.targetUrl;
+    const credentials = browserChatCredentialContext(
+      input.session,
+      credentialUrl ? [{ kind: 'url', title: '当前页面', url: credentialUrl }] : [],
+      input.instruction,
+    );
+    cachedKey = key;
+    cachedContext = {
+      operationalContext: [
+        formatSkillsForPrompt(skills),
+        browserChatRelevantMemoryPrompt(input.session, input.browser, input.instruction),
+        browserChatCredentialPrompt(credentials.credentials),
+      ].filter(Boolean).join('\n\n'),
+      resolveCredential: credentials.resolveCredential,
+      credentialAllowedOrigins: credentials.credentialAllowedOrigins,
+    };
+    return cachedContext;
+  };
 }
 
 function attachmentKindLabel(attachment: BrowserChatAttachment) {
@@ -2524,6 +2528,7 @@ export async function generateBrowserChatMessagesSkill(sessionId: string, messag
   const skill = store.upsertSkill({
     title: generated.title,
     description: generated.description,
+    domains: generated.domains,
     tags: generated.tags,
     triggerPhrases: generated.triggerPhrases,
     content: generated.content,
@@ -3182,15 +3187,12 @@ async function executeBrowserChatSubagentBatch(input: {
     try {
       await child.start();
       if (task.url) await child.open(task.url);
-      const credentialContext = browserChatCredentialContext(
+      const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
         session,
-        task.url ? [{ kind: 'url', title: task.title, url: task.url }] : [],
-        task.instruction,
-      );
-      const operationalContext = [
-        browserChatRelevantMemoryPrompt(session, child, task.instruction),
-        browserChatCredentialPrompt(credentialContext.credentials),
-      ].filter(Boolean).join('\n\n');
+        browser: child,
+        instruction: task.instruction,
+      });
+      const initialRuntimeContext = getRuntimeOperationalContext();
       const result = await executeInteractiveBrowserTurn({
         session: child,
         runId: `${session.id}_${task.id}`,
@@ -3210,13 +3212,14 @@ async function executeBrowserChatSubagentBatch(input: {
             : '完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。',
           task.instruction,
         ].join('\n\n'),
-        operationalContext,
+        operationalContext: initialRuntimeContext.operationalContext,
         conversation: [],
         completedSteps: [],
         mode: session.mode,
         safetyMode: session.safetyMode,
-        resolveCredential: credentialContext.resolveCredential,
-        credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
+        resolveCredential: initialRuntimeContext.resolveCredential,
+        credentialAllowedOrigins: initialRuntimeContext.credentialAllowedOrigins,
+        getRuntimeOperationalContext,
         abortSignal: abortController.signal,
         shouldContinue: ownsTurn,
         requestToolConfirmation: session.safetyMode === 'strict'
@@ -3406,15 +3409,12 @@ async function resumeBlockedBrowserChatSubagent(input: {
 }) {
   const { session, binding, userMessage, assistantMessageId, fromStepIndex, abortController } = input;
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
-  const credentialContext = browserChatCredentialContext(
+  const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
     session,
-    binding.task.url ? [{ kind: 'url', title: binding.title, url: binding.task.url }] : [],
-    binding.task.instruction,
-  );
-  const operationalContext = [
-    browserChatRelevantMemoryPrompt(session, binding.browser, binding.task.instruction),
-    browserChatCredentialPrompt(credentialContext.credentials),
-  ].filter(Boolean).join('\n\n');
+    browser: binding.browser,
+    instruction: binding.task.instruction,
+  });
+  const initialRuntimeContext = getRuntimeOperationalContext();
   try {
     const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
       session: binding.browser,
@@ -3426,13 +3426,14 @@ async function resumeBlockedBrowserChatSubagent(input: {
         '用户已点击“校验完成，继续执行”。不要要求用户再发送文字；先读取当前页面状态，再继续原任务。',
         binding.task.instruction,
       ].filter(Boolean).join('\n\n'),
-      operationalContext,
+      operationalContext: initialRuntimeContext.operationalContext,
       conversation: [],
       completedSteps: binding.steps,
       mode: session.mode,
       safetyMode: session.safetyMode,
-      resolveCredential: credentialContext.resolveCredential,
-      credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
+      resolveCredential: initialRuntimeContext.resolveCredential,
+      credentialAllowedOrigins: initialRuntimeContext.credentialAllowedOrigins,
+      getRuntimeOperationalContext,
       abortSignal: abortController.signal,
       shouldContinue: ownsTurn,
       requestToolConfirmation: session.safetyMode === 'strict'
@@ -3560,29 +3561,30 @@ async function runBrowserChatMessage(
       assertTurnActive();
       await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      const skillContext = formatSkillsForPrompt(skills);
+      const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
+        session,
+        browser,
+        instruction: modelText,
+        explicitlySelectedSkills: skills,
+      });
+      const initialRuntimeContext = getRuntimeOperationalContext();
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
       const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
-      const credentialContext = browserChatCredentialContext(session, browserChatResourceSeeds(session, modelText), modelText);
-      const operationalContext = [
-        browserChatRelevantMemoryPrompt(session, browser, modelText),
-        browserChatCredentialPrompt(credentialContext.credentials),
-      ].filter(Boolean).join('\n\n');
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
         targetUrl: session.targetUrl || 'about:blank',
         instruction: text,
         modelInstruction: modelText,
-        operationalContext,
+        operationalContext: initialRuntimeContext.operationalContext,
         conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId),
         completedSteps: session.steps,
         mode: session.mode,
         safetyMode: session.safetyMode,
         referenceImagePaths,
-        skillContext,
-        resolveCredential: credentialContext.resolveCredential,
-        credentialAllowedOrigins: credentialContext.credentialAllowedOrigins,
+        resolveCredential: initialRuntimeContext.resolveCredential,
+        credentialAllowedOrigins: initialRuntimeContext.credentialAllowedOrigins,
+        getRuntimeOperationalContext,
         abortSignal: abortController.signal,
         shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
         requestToolConfirmation: session.safetyMode === 'strict'

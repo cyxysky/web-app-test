@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/test-case.schema';
-import { formatSkillReferencesForUser, formatSkillsForPrompt } from './skill-context';
+import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl, skillMatchesUrl } from './skill-context';
 
 const skill: SkillRecord = {
   id: 'skill-search-room',
@@ -48,4 +48,21 @@ test('legacy cautions migrate into the compact recovery section', () => {
     recovery: ['失败时使用备用入口'],
     verification: ['页面显示成功状态'],
   });
+});
+
+test('domain-scoped skills only match their configured host', () => {
+  const domainSkill = { ...skill, id: 'domain-skill', domains: ['10.10.0.90'] };
+  assert.equal(skillMatchesUrl(domainSkill, 'https://10.10.0.90/ipd'), true);
+  assert.equal(skillMatchesUrl(domainSkill, 'https://example.com'), false);
+});
+
+test('runtime skills keep explicit selections and add matching global and domain skills', () => {
+  const explicit = { ...skill, id: 'explicit', domains: ['other.example'] };
+  const global = { ...skill, id: 'global', domains: [] };
+  const matching = { ...skill, id: 'matching', domains: ['*.example.com'] };
+  const unrelated = { ...skill, id: 'unrelated', domains: ['unrelated.example'] };
+  assert.deepEqual(
+    runtimeSkillsForUrl([global, matching, unrelated], [explicit], 'https://app.example.com/path').map((item) => item.id),
+    ['explicit', 'global', 'matching'],
+  );
 });

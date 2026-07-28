@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { getModel } from '@/server/ai/model';
 import { skillContentSchema, type SkillRecord, type StepExecutionResult, type TestCaseRecord, type TestRunRecord } from '@/server/ai/schemas/test-case.schema';
 import { richTextToPlainText } from '@/lib/rich-text';
+import { normalizeSkillDomain } from './skill-context';
 
 const generatedSkillSchema = z.object({
   title: z.string().min(2).max(80),
@@ -150,6 +151,7 @@ export async function generateSkillFromRun(input: {
   return {
     title: result.object.title,
     description: result.object.description,
+    domains: [normalizeSkillDomain(testCase.targetUrl)].filter(Boolean),
     tags: distinctText(result.object.tags, 6),
     triggerPhrases: distinctText(result.object.triggerPhrases, 8),
     content: {

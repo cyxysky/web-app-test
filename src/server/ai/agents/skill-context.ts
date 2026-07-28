@@ -15,6 +15,52 @@ export function activeSkills(skills: SkillRecord[]) {
   return skills.filter((skill) => skill.status === 'ready').slice(0, 8);
 }
 
+export function normalizeSkillDomain(value: string) {
+  const raw = value.trim().toLowerCase();
+  if (!raw) return '';
+  const wildcard = raw.startsWith('*.');
+  const candidate = wildcard ? raw.slice(2) : raw;
+  try {
+    const hostname = new URL(candidate.includes('://') ? candidate : `https://${candidate}`).hostname
+      .replace(/^\.+|\.+$/g, '');
+    return hostname ? `${wildcard ? '*.' : ''}${hostname}` : '';
+  } catch {
+    return candidate.split('/')[0].split(':')[0].replace(/^\.+|\.+$/g, '');
+  }
+}
+
+export function normalizeSkillDomains(values?: string[]) {
+  return Array.from(new Set((values || []).map(normalizeSkillDomain).filter(Boolean)));
+}
+
+function hostnameFromUrl(value: string) {
+  try {
+    return new URL(value).hostname.toLowerCase().replace(/^\.+|\.+$/g, '');
+  } catch {
+    return normalizeSkillDomain(value).replace(/^\*\./, '');
+  }
+}
+
+export function skillMatchesUrl(skill: SkillRecord, currentUrl: string) {
+  const domains = normalizeSkillDomains(skill.domains);
+  if (!domains.length) return true;
+  const hostname = hostnameFromUrl(currentUrl);
+  if (!hostname) return false;
+  return domains.some((domain) => {
+    if (!domain.startsWith('*.')) return hostname === domain;
+    const base = domain.slice(2);
+    return hostname === base || hostname.endsWith(`.${base}`);
+  });
+}
+
+export function runtimeSkillsForUrl(allSkills: SkillRecord[], explicitlySelected: SkillRecord[], currentUrl: string) {
+  const selectedIds = new Set(explicitlySelected.map((skill) => skill.id));
+  return activeSkills([
+    ...explicitlySelected,
+    ...allSkills.filter((skill) => !selectedIds.has(skill.id) && skillMatchesUrl(skill, currentUrl)),
+  ]);
+}
+
 export function formatSkillReferencesForUser(skills: SkillRecord[]) {
   const selected = activeSkills(skills);
   if (!selected.length) return '';
@@ -29,8 +75,8 @@ export function formatSkillsForPrompt(skills: SkillRecord[]) {
   const selected = activeSkills(skills);
   if (!selected.length) return '';
   return [
-    'Loaded reusable Skills:',
-    'Match each <skills id="N"> reference in the user message to Skill N below.',
+    'Loaded reusable Skills for the current browser domain:',
+    'A Skill may be loaded automatically by domain or explicitly referenced by the user.',
     'Use these Skills as semantic operating guidance only. Do not copy old ids, coordinates, screenshots, run ids, or raw tool inputs. Prefer current page evidence when it contradicts a Skill.',
     ...selected.map((skill, index) => [
       '',

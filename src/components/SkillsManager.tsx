@@ -13,6 +13,7 @@ import type { SkillRecord } from '@/server/ai/schemas/test-case.schema';
 type SkillDraft = {
   title: string;
   description: string;
+  domains: string;
   status: SkillRecord['status'];
   tags: string;
   triggerPhrases: string;
@@ -34,6 +35,7 @@ type SkillMutationResponse = {
 const emptyDraft: SkillDraft = {
   title: '',
   description: '',
+  domains: '',
   status: 'ready',
   tags: '',
   triggerPhrases: '',
@@ -50,6 +52,7 @@ function draftFromSkill(skill: SkillRecord): SkillDraft {
   return {
     title: skill.title,
     description: skill.description,
+    domains: lines(skill.domains),
     status: skill.status,
     tags: skill.tags.join(', '),
     triggerPhrases: skill.triggerPhrases.join('\n'),
@@ -71,6 +74,7 @@ function payloadFromDraft(draft: SkillDraft) {
   return {
     title: draft.title.trim(),
     description: draft.description.trim(),
+    domains: splitList(draft.domains),
     status: draft.status,
     tags: splitList(draft.tags),
     triggerPhrases: splitList(draft.triggerPhrases),
@@ -325,6 +329,9 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
                       <p className="skills-manager-item-description">{skill.description || skill.id}</p>
                       <div className="skills-manager-chip-row">
                         <em className={`skill-status status-${skill.status}`}>{t(statusLabel(skill.status))}</em>
+                        <span className="skills-manager-chip">
+                          {skill.domains?.length ? skill.domains.join(', ') : t('所有域名')}
+                        </span>
                         {skill.tags.length ? skill.tags.map((tag) => (
                           <span className="skills-manager-chip" key={tag}>{tag}</span>
                         )) : <span className="skills-manager-muted">{t('暂无标签')}</span>}
@@ -408,6 +415,10 @@ export function SkillsManager({ onChanged }: { onChanged?: () => void } = {}) {
               <label className="skills-manager-field wide">
                 <span>{t('描述')}</span>
                 <textarea className="textarea settings-control" value={draft.description} onChange={(event) => update({ description: event.target.value })} placeholder={t('一句话说明能力和适用场景')} />
+              </label>
+              <label className="skills-manager-field wide">
+                <span>{t('适用域名')}</span>
+                <textarea className="textarea settings-control compact" value={draft.domains} onChange={(event) => update({ domains: event.target.value })} placeholder={t('留空表示所有域名；每行一个域名，可使用 *.example.com')} />
               </label>
               {editorMode === 'edit' ? <label className="skills-manager-field">
                 <span>{t('标签')}</span>
