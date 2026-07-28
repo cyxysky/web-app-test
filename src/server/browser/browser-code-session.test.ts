@@ -183,7 +183,7 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
     clickCount: 1,
   });
   assert.equal(click.ok, true, click.actual);
-  assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 1);
+  assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 0, 'user live-preview input must not create the AI cursor');
 
   let popupTabs = await session.refreshTabsSnapshot();
   await waitForCondition(async () => {
@@ -206,6 +206,49 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
   assert.ok(switchedFrames.length >= 1, 'switched static tab should emit a frame immediately');
   assert.equal(switchedFrames.at(-1)?.url, page.url());
   await switchedHandle.stop();
+});
+
+test('live preview supports drag and does not drive the AI cursor', async (context) => {
+  const session = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-live-preview-drag-test',
+  });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.goto(`data:text/html,${encodeURIComponent(`
+    <!doctype html>
+    <html><body style="margin:0;padding:40px;display:flex;gap:240px">
+      <div id="source" draggable="true" style="width:120px;height:100px;background:#2563eb">Source</div>
+      <div id="target" style="width:180px;height:140px;background:#e5e7eb">Target</div>
+      <script>
+        source.addEventListener('dragstart', (event) => event.dataTransfer.setData('text/plain', 'source'));
+        target.addEventListener('dragover', (event) => event.preventDefault());
+        target.addEventListener('drop', (event) => {
+          event.preventDefault();
+          document.body.dataset.dropped = event.dataTransfer.getData('text/plain');
+        });
+      </script>
+    </body></html>
+  `)}`);
+
+  const sourceBox = await page.locator('#source').boundingBox();
+  const targetBox = await page.locator('#target').boundingBox();
+  const viewport = page.viewportSize();
+  assert.ok(sourceBox && targetBox && viewport);
+  const drag = await session.dispatchLiveInput({
+    kind: 'drag',
+    xRatio: (sourceBox.x + sourceBox.width / 2) / viewport.width,
+    yRatio: (sourceBox.y + sourceBox.height / 2) / viewport.height,
+    toXRatio: (targetBox.x + targetBox.width / 2) / viewport.width,
+    toYRatio: (targetBox.y + targetBox.height / 2) / viewport.height,
+    button: 'left',
+  });
+
+  assert.equal(drag.ok, true, drag.actual);
+  assert.equal(await page.locator('body').getAttribute('data-dropped'), 'source');
+  assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 0, 'user live-preview drag must not create the AI cursor');
 });
 
 test('force close releases a browser even when the debug keep-open flag is enabled', async () => {

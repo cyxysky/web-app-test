@@ -4799,6 +4799,7 @@ type BrowserChatPreviewFrame = {
 type BrowserChatPreviewInput =
   | { kind: 'move'; xRatio: number; yRatio: number }
   | { kind: 'click'; xRatio: number; yRatio: number; button: 'left' | 'right' | 'middle'; clickCount: number }
+  | { kind: 'drag'; xRatio: number; yRatio: number; toXRatio: number; toYRatio: number; button: 'left' | 'right' | 'middle' }
   | { kind: 'scroll'; xRatio: number; yRatio: number; deltaX: number; deltaY: number }
   | { kind: 'key'; key: string }
   | { kind: 'text'; text: string };
@@ -4817,6 +4818,16 @@ function BrowserChatWebPreviewModal({
   const pendingFrameRef = useRef<BrowserChatPreviewFrame | null>(null);
   const frameRenderRequestRef = useRef<number | undefined>(undefined);
   const pendingMoveRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'move' }> | null>(null);
+  const pointerGestureRef = useRef<{
+    button: 'left' | 'middle';
+    clickCount: number;
+    current: { xRatio: number; yRatio: number };
+    dragged: boolean;
+    pointerId: number;
+    start: { xRatio: number; yRatio: number };
+    startClientX: number;
+    startClientY: number;
+  } | null>(null);
   const moveFlushTimerRef = useRef<number | undefined>(undefined);
   const pendingScrollRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'scroll' }> | null>(null);
   const scrollFlushTimerRef = useRef<number | undefined>(undefined);
@@ -4905,6 +4916,7 @@ function BrowserChatWebPreviewModal({
   useEffect(() => () => {
     pendingFrameRef.current = null;
     pendingMoveRef.current = null;
+    pointerGestureRef.current = null;
     if (frameRenderRequestRef.current !== undefined) window.cancelAnimationFrame(frameRenderRequestRef.current);
     if (moveFlushTimerRef.current !== undefined) window.clearTimeout(moveFlushTimerRef.current);
     if (scrollFlushTimerRef.current !== undefined) window.clearTimeout(scrollFlushTimerRef.current);
@@ -4927,40 +4939,53 @@ function BrowserChatWebPreviewModal({
 
   const hasFrame = frame !== null;
 
-  const relativePoint = useCallback((clientX: number, clientY: number, element: HTMLElement) => {
+  const relativePoint = useCallback((clientX: number, clientY: number, element: HTMLElement, clamp = false) => {
     if (!frame) return undefined;
     const rect = previewImageRef.current?.getBoundingClientRect() || element.getBoundingClientRect();
     if (!rect.width || !rect.height) return undefined;
-    if (
+    if (!clamp && (
       clientX < rect.left
       || clientX > rect.right
       || clientY < rect.top
       || clientY > rect.bottom
-    ) return undefined;
+    )) return undefined;
     return {
       xRatio: Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)),
       yRatio: Math.min(1, Math.max(0, (clientY - rect.top) / rect.height)),
     };
   }, [frame]);
 
-  const clickPreview = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+  const beginPreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 && event.button !== 1) return;
     const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
     if (!point) return;
     event.currentTarget.focus();
     event.preventDefault();
-    sendInput({
-      kind: 'click',
-      ...point,
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    pointerGestureRef.current = {
       button: event.button === 1 ? 'middle' : 'left',
-      clickCount: 1,
-    });
-  }, [relativePoint, sendInput]);
+      clickCount: Math.min(2, Math.max(1, event.detail || 1)),
+      current: point,
+      dragged: false,
+      pointerId: event.pointerId,
+      start: point,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+    };
+  }, [relativePoint]);
 
   const movePreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.pointerType === 'touch') return;
-    const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
+    const gesture = pointerGestureRef.current;
+    if (!gesture && event.pointerType === 'touch') return;
+    const point = relativePoint(event.clientX, event.clientY, event.currentTarget, Boolean(gesture));
     if (!point) return;
+    if (gesture && gesture.pointerId === event.pointerId) {
+      gesture.current = point;
+      if (Math.hypot(event.clientX - gesture.startClientX, event.clientY - gesture.startClientY) >= 4) {
+        gesture.dragged = true;
+      }
+      return;
+    }
     pendingMoveRef.current = { kind: 'move', ...point };
     if (moveFlushTimerRef.current !== undefined) return;
     moveFlushTimerRef.current = window.setTimeout(() => {
@@ -4970,6 +4995,41 @@ function BrowserChatWebPreviewModal({
       if (input) postInput(input, false);
     }, 16);
   }, [postInput, relativePoint]);
+
+  const endPreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = pointerGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const point = relativePoint(event.clientX, event.clientY, event.currentTarget, true) || gesture.current;
+    pointerGestureRef.current = null;
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+    }
+    event.preventDefault();
+    if (gesture.dragged) {
+      sendInput({
+        kind: 'drag',
+        ...gesture.start,
+        toXRatio: point.xRatio,
+        toYRatio: point.yRatio,
+        button: gesture.button,
+      });
+      return;
+    }
+    sendInput({
+      kind: 'click',
+      ...point,
+      button: gesture.button,
+      clickCount: gesture.clickCount,
+    });
+  }, [relativePoint, sendInput]);
+
+  const cancelPreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (pointerGestureRef.current?.pointerId !== event.pointerId) return;
+    pointerGestureRef.current = null;
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+    }
+  }, []);
 
   const openPreviewContextMenu = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
     const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
@@ -5095,8 +5155,10 @@ function BrowserChatWebPreviewModal({
             onContextMenu={openPreviewContextMenu}
             onKeyDown={pressPreviewKey}
             onPaste={pastePreviewText}
-            onPointerDown={clickPreview}
+            onPointerCancel={cancelPreviewPointer}
+            onPointerDown={beginPreviewPointer}
             onPointerMove={movePreviewPointer}
+            onPointerUp={endPreviewPointer}
             onWheel={scrollPreview}
             role="application"
             tabIndex={0}

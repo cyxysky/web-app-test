@@ -33,7 +33,7 @@ type BrowserPreviewWebSocketState = {
   starting?: Promise<BrowserPreviewWebSocketInfo>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 6;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 7;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
@@ -134,6 +134,16 @@ function readLiveInput(value: unknown): BrowserLiveInput | undefined {
       yRatio: Number(input.yRatio),
       button: input.button === 'right' || input.button === 'middle' ? input.button : 'left',
       clickCount: Number(input.clickCount),
+    };
+  }
+  if (input.kind === 'drag') {
+    return {
+      kind: 'drag',
+      xRatio: Number(input.xRatio),
+      yRatio: Number(input.yRatio),
+      toXRatio: Number(input.toXRatio),
+      toYRatio: Number(input.toYRatio),
+      button: input.button === 'right' || input.button === 'middle' ? input.button : 'left',
     };
   }
   if (input.kind === 'scroll') {

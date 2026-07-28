@@ -246,6 +246,38 @@ function browserCodeKernelMain() {
   let nativeFrameLocator: ((this: object, selector: string) => import('playwright').Locator) | undefined;
   let nativeLocatorFill: ((this: object, value: string) => Promise<void>) | undefined;
 
+  const moveVisibleAiPointer = async (
+    page: import('playwright').Page,
+    point: { x: number; y: number } | undefined,
+    kind = 'move',
+  ) => {
+    if (!activeExecution || !point || page.isClosed()) return;
+    await page.evaluate(({ x, y, pointerKind }) => {
+      const browserWindow = window as Window & {
+        __aiMoveMouseCursor?: (cursorX: number, cursorY: number, options?: { kind?: string }) => void;
+      };
+      browserWindow.__aiMoveMouseCursor?.(x, y, { kind: pointerKind });
+    }, { x: point.x, y: point.y, pointerKind: kind }).catch(() => undefined);
+  };
+
+  const locatorPage = (locator: object) => {
+    const frame = Reflect.get(locator, '_frame') as { _page?: import('playwright').Page; page?: () => import('playwright').Page } | undefined;
+    if (typeof frame?.page === 'function') return frame.page();
+    return frame?._page;
+  };
+
+  const locatorCenter = async (locator: object) => {
+    const candidate = locator as {
+      evaluate?: <T>(callback: (element: Element) => T) => Promise<T>;
+    };
+    return candidate.evaluate?.((element) => {
+      element.scrollIntoView({ block: 'center', inline: 'center' });
+      const rect = element.getBoundingClientRect();
+      if (!rect.width || !rect.height) return undefined;
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    }).catch(() => undefined);
+  };
+
   const captureCoordinateClickState = async (
     page: import('playwright').Page,
   ): Promise<CoordinateClickEvidence | undefined> => {
@@ -432,7 +464,7 @@ function browserCodeKernelMain() {
       nativeLocatorFill = locatorFill as (this: object, value: string) => Promise<void>;
     }
     pointerDecoratedLocatorPrototypes.add(prototype);
-    const patch = (name: string) => {
+    const patch = (name: string, kind: 'click' | 'double' | 'move') => {
       const original = Reflect.get(prototype, name);
       if (typeof original !== 'function') return;
       try {
@@ -441,6 +473,13 @@ function browserCodeKernelMain() {
           value: async function pointerVisualizedLocatorAction(this: object, ...args: unknown[]) {
             if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
               throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
+            }
+            const targetPage = locatorPage(this);
+            if (targetPage && activeExecution) {
+              await moveVisibleAiPointer(targetPage, await locatorCenter(this), kind);
+              if (name === 'dragTo' && args[0] && typeof args[0] === 'object') {
+                await moveVisibleAiPointer(targetPage, await locatorCenter(args[0]), 'move');
+              }
             }
             return Reflect.apply(original, this, args);
           },
@@ -451,14 +490,14 @@ function browserCodeKernelMain() {
         // page.mouse actions remain visualized even when a locator cannot be decorated.
       }
     };
-    patch('click');
-    patch('dblclick');
-    patch('hover');
-    patch('check');
-    patch('uncheck');
-    patch('setChecked');
-    patch('tap');
-    patch('dragTo');
+    patch('click', 'click');
+    patch('dblclick', 'double');
+    patch('hover', 'move');
+    patch('check', 'click');
+    patch('uncheck', 'click');
+    patch('setChecked', 'click');
+    patch('tap', 'click');
+    patch('dragTo', 'click');
   };
 
   const decoratePage = (page: import('playwright').Page) => {
@@ -467,7 +506,7 @@ function browserCodeKernelMain() {
     decorateLocatorPrototype(page);
     decoratePageScreenshotPrototype(page);
     const pageRecord = page as unknown as Record<string, unknown>;
-    const patchPageAction = (name: string) => {
+    const patchPageAction = (name: string, kind: 'click' | 'double' | 'move') => {
       const original = Reflect.get(pageRecord, name);
       if (typeof original !== 'function') return;
       try {
@@ -477,6 +516,9 @@ function browserCodeKernelMain() {
             if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
               throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
             }
+            if (activeExecution && typeof args[0] === 'string') {
+              await moveVisibleAiPointer(page, await locatorCenter(page.locator(args[0])), kind);
+            }
             return Reflect.apply(original, page, args);
           },
           writable: true,
@@ -485,14 +527,29 @@ function browserCodeKernelMain() {
         // Keep the native Playwright method when the page object is immutable.
       }
     };
-    patchPageAction('click');
-    patchPageAction('dblclick');
-    patchPageAction('hover');
-    patchPageAction('check');
-    patchPageAction('uncheck');
-    patchPageAction('tap');
+    patchPageAction('click', 'click');
+    patchPageAction('dblclick', 'double');
+    patchPageAction('hover', 'move');
+    patchPageAction('check', 'click');
+    patchPageAction('uncheck', 'click');
+    patchPageAction('tap', 'click');
 
     const mouse = page.mouse as unknown as Record<string, unknown>;
+    const nativeMove = Reflect.get(mouse, 'move');
+    if (typeof nativeMove === 'function') {
+      try {
+        Object.defineProperty(mouse, 'move', {
+          configurable: true,
+          value: async (x: number, y: number, options?: unknown) => {
+            await moveVisibleAiPointer(page, { x, y }, 'move');
+            return Reflect.apply(nativeMove, page.mouse, [x, y, options]);
+          },
+          writable: true,
+        });
+      } catch {
+        // Keep the native mouse implementation when it cannot be decorated.
+      }
+    }
     const nativeClick = Reflect.get(mouse, 'click');
     if (typeof nativeClick === 'function') {
       try {
@@ -500,6 +557,8 @@ function browserCodeKernelMain() {
           configurable: true,
           value: async (x: number, y: number, options?: { button?: string; clickCount?: number }) => {
             await consumeCoordinateClickEvidence(page);
+            const kind = options?.button === 'right' ? 'right' : (options?.clickCount || 1) > 1 ? 'double' : 'click';
+            await moveVisibleAiPointer(page, { x, y }, kind);
             return Reflect.apply(nativeClick, page.mouse, [x, y, options]);
           },
           writable: true,
