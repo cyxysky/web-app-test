@@ -17,7 +17,7 @@ import {
   normalizeBrowserChatFileReadLimit,
 } from './browser-chat-file-read';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
-import { browserActionRules, browserCodeRules, browserContextLine, screenshotObservationRule } from './runtime-prompt-rules';
+import { browserActionRules, browserChatCodeRules, browserCodeRules, browserContextLine, screenshotObservationRule } from './runtime-prompt-rules';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
@@ -1862,6 +1862,37 @@ function runtimePrompt(input: {
         'Call waitForHumanVerification immediately. Do not attempt to solve, guess, bypass, or submit this verification yourself.',
       ].join('\n')
     : '';
+  if (browserChatMode) {
+    return [
+      'You are an AI browser chat agent. Satisfy the latest user message from the live browser or answer directly when browser evidence is unnecessary.',
+      `Request:\n${requirement}`,
+      `Browser: target=${testCase.targetUrl}; current=${pageContext.url}`,
+      manualVerificationBlocker,
+      '',
+      'Operating rules:',
+      '- In one model step, either answer in Chinese Markdown without a tool or call at most one relevant tool. A new action request is a new occurrence even when its wording repeats an earlier request.',
+      '- Keep tool input limited to the exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. RunState, Working Memory, old UIDs, coordinates, screenshots, and prior tool JSON are context only and must not be copied or reused as current evidence.',
+      '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
+      ...browserChatCodeRules(screenshotAvailable),
+      '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
+      '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
+      '- For downloads, call downloadFile with the already-known absolute or page-relative URL. For Markdown export, call generateMarkdownFile with the complete content. Report the saved file name and return its clickable download link.',
+      caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
+      customPrompt,
+      input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
+      '',
+      'Current context:',
+      browserContextLine(),
+      compactRunContext,
+      availableScreenshotReferences.length ? `Available previous screenshot references:\n${formatScreenshotReferences(availableScreenshotReferences)}` : '',
+      selectedScreenshotReferences.length ? `Selected reference screenshots:\n${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
+      selectedScreenshotReferences.length
+        ? 'Previous screenshots are read-only context; never reuse their UIDs or coordinates for a current action.'
+        : '',
+      '',
+      'Finish with Chinese Markdown when the request is satisfied, blocked, failed, or needs clarification. Do not return standalone JSON.',
+    ].filter(Boolean).join('\n');
+  }
   return [
     browserChatMode
       ? 'You are an AI browser chat agent.'
@@ -3128,29 +3159,18 @@ function browserChatMaxConsecutiveAiRequestFailures() {
 }
 
 function browserChatRequirement(input: {
-  targetUrl: string;
   instruction: string;
 }) {
   const toolRequirement = browserChatToolRequirement(input.instruction);
   return [
-    'Browser chat mode: live conversation, not a fixed test case.',
     `Latest user message: ${input.instruction}`,
-    `Fallback target URL: ${input.targetUrl || 'about:blank'}`,
-    '',
-    'Browser-chat behavior:',
-    '- Follow the latest user message first; use earlier model messages only as conversation context.',
     toolRequirement === 'action'
-      ? '- HARD REQUIREMENT: This latest message requests a browser-changing action. Execute browserCode or clickByUid before claiming completion; prior evidence and text-only claims do not satisfy it.'
+      ? '- This message requests a browser-changing action. Execute browserCode or clickByUid before claiming completion; prior turns do not satisfy this new action.'
       : toolRequirement === 'inspection'
-        ? '- HARD REQUIREMENT: This latest message requests live page inspection. Execute browserCode before answering from page state.'
+        ? '- This message requests live page inspection. Execute browserCode before making claims about the current page.'
         : '',
-    '- Every new user action message is a new occurrence. Even when it repeats the previous wording, a previous tool call never satisfies the new message.',
-    '- Use browser tools only for live action or page inspection. If current evidence is enough, answer directly.',
-    '- Requirement-link delegation rule: inspect the requirement page anchors with browserCode. Delegate every independently readable PRD/document URL to spawnSubagents with its exact URL and a self-contained evidence request; keep the requirement root and dependent end-to-end flow in the main Agent.',
-    '- Parallel-first rule: whenever you discover two or more independent URLs, documents, roles, environments, or test branches that can be investigated without depending on each other, prefer one spawnSubagents call immediately instead of opening and analyzing them serially in the main Agent.',
-    '- spawnSubagents returns child UUIDs after every child reaches a terminal state. Read at most one result in each model step with readSubagent({ uuid }). If more results are needed, continue with another readSubagent call in the next model step.',
-    '- Stop this turn when the latest user message is satisfied, blocked by manual input, or needs clarification.',
-    '- Final visible answer must be Chinese Markdown. Do not include JSON, tool parameters, candidate ids, coordinates, or screenshot paths.',
+    '- Use browser tools only for live action or current-page evidence; otherwise answer directly from conversation context.',
+    '- Only for multi-document requirement analysis: inspect the root links, spawn one parallel batch for independently readable URLs with self-contained evidence requests, keep dependent end-to-end work in the main Agent, and read at most one completed child result per later model step.',
   ].filter(Boolean).join('\n');
 }
 
@@ -3189,7 +3209,6 @@ function createInteractiveBrowserTestCase(input: {
   const now = new Date().toISOString();
   const targetUrl = input.targetUrl || 'about:blank';
   const requirement = browserChatRequirement({
-    targetUrl,
     instruction: input.instruction,
   });
   const systemPrompt = [

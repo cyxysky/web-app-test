@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { browserActionRules, browserCodeRules, screenshotObservationRule } from './runtime-prompt-rules';
+import { browserActionRules, browserChatCodeRules, browserCodeRules, screenshotObservationRule } from './runtime-prompt-rules';
 
 function combinedRules(screenshotAvailable: boolean) {
   return [
@@ -48,4 +48,20 @@ test('screenshot guidance stays inside browserCode', () => {
   assert.match(combinedRules(true), /page\.screenshot/);
   assert.doesNotMatch(combinedRules(false), /takeScreenshot/);
   assert.match(combinedRules(false), /browserCode for inspection and browser operations/);
+});
+
+test('browser chat keeps browserCode capabilities in a compact non-duplicated rule set', () => {
+  const rules = browserChatCodeRules(true).join('\n');
+  assert.equal(browserChatCodeRules(true).length, 7);
+  assert.match(rules, /real Playwright page\/context/);
+  assert.match(rules, /persistent top-level-await JavaScript kernel/);
+  assert.match(rules, /fresh full semantic DOM snapshot/);
+  assert.match(rules, /filter visible candidates and require exactly one/);
+  assert.match(rules, /clickByUid/);
+  assert.match(rules, /force:true/);
+  assert.match(rules, /verify business state after every change/);
+  assert.match(rules, /nodeRepl\.emitImage/);
+  assert.match(rules, /next cell/);
+  assert.match(rules, /context\.pages/);
+  assert.match(rules, /credentialVault\.fill/);
 });

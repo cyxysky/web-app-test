@@ -14,6 +14,20 @@ export function browserCodeRules() {
   ];
 }
 
+export function browserChatCodeRules(screenshotAvailable = true) {
+  return [
+    '- Use browserCode for live inspection and operation. It receives the real Playwright page/context and a persistent top-level-await JavaScript kernel: keep cells bounded, use top-level var or fresh names, and return compact evidence with nodeRepl.write(...).',
+    '- Each browserCode result already includes a fresh full semantic DOM snapshot plus code/page console deltas. Treat them as the next-step ground truth, inspect errors, keep DOM-only code inside page.evaluate, and do not import modules or access Node globals, files, environment variables, cookies, or browser storage.',
+    '- Prefer a semantic Playwright locator scoped to the visible dialog/region. For duplicate labels, filter visible candidates and require exactly one; never guess with first/last/nth. Use locator.selectOption(...) for native <select>.',
+    '- If no normal locator uniquely identifies the rendered target, use clickByUid only with its exact UID from the latest automatic DOM snapshot. Never invent, edit, or reuse an older UID.',
+    '- Never use force:true. After a locator timeout, inspect the fresh snapshot for loading, overlays, popups, detachment, or redraw; do not bypass it with CUA, page.mouse, DOM click, dispatchEvent, or script click. Combine deterministic inspection/action in one cell, wait only for a known transition, scroll only for lazy/virtual content, and verify business state after every change.',
+    screenshotAvailable
+      ? '- For a Playwright-indescribable visual control only, emit a fresh viewport image with nodeRepl.emitImage(await page.screenshot({fullPage:false})) and end the cell; after the model sees that image, one coordinate/CUA action may be performed in the next cell. Full-page images are read-only, and navigation, viewport change, or DOM redraw invalidates the image.'
+      : '- Image and coordinate targeting are unavailable; use Playwright locators, DOM evidence, or the latest snapshot UID.',
+    '- For tabs/windows, use context.pages() or the available browser.tabs/browser.user/tab.playwright/tab.cua APIs. When given a credential reference, use credentialVault.fill(locator, ref) only; never read or output credential values or references.',
+  ];
+}
+
 export function browserActionRules(screenshotAvailable = true) {
   return [
     '- Default to a semantic Playwright locator scoped to the current visible dialog or region, such as getByRole(..., { exact: true }). Before clicking duplicate text, keep only rendered candidates with locator.filter({ visible: true }) and require count() === 1. Never use first(), last(), or nth() to guess among same-name candidates.',
