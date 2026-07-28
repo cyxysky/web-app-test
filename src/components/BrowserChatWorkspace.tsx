@@ -108,7 +108,7 @@ import {
   browserChatLogsForMessage,
   type BrowserChatLogIndex as BrowserChatLogIndexModel,
 } from '@/components/browser-chat-message-model';
-import { findRequestedBrowserChatSession } from '@/components/browser-chat-session-selection';
+import { loadRequestedBrowserChatSessionDetail } from '@/components/browser-chat-session-selection';
 import {
   visibleBrowserChatExecutionLogs,
 } from '@/components/browser-chat-log-model';
@@ -6643,26 +6643,6 @@ export function BrowserChatWorkspace({
     return normalized;
   }, []);
 
-  const loadSessions = useCallback(async () => {
-    const response = await fetch(browserChatApiUrl('/api/browser-chat'), { cache: 'no-store' });
-    const data = await readApiJson<Record<string, unknown>>(response, '加载对话历史失败');
-    const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => normalizeSession(item)) : [];
-    setSessions(nextSessions);
-    const requestedSession = findRequestedBrowserChatSession(nextSessions, requestedSessionId);
-    if (!requestedSession || mountedSessionActivationRef.current === requestedSession.id) return;
-    mountedSessionActivationRef.current = requestedSession.id;
-    activeSessionIdRef.current = requestedSession.id;
-    setSession(requestedSession);
-    setMode(normalizeMode(requestedSession.mode));
-    setSafetyMode(normalizeSafetyMode(requestedSession.safetyMode));
-    const nextModel = resolveRuntimeModelSelection(null, {
-      model: requestedSession.model,
-      provider: requestedSession.modelProvider,
-    });
-    setModelProvider(nextModel.provider);
-    setModelId(nextModel.model);
-  }, [browserChatApiUrl, requestedSessionId]);
-
   const refreshSession = useCallback(async (sessionId: string, options: { activate?: boolean } = {}) => {
     const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}`), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载对话失败');
@@ -6680,6 +6660,38 @@ export function BrowserChatWorkspace({
     }
     return loadedSession;
   }, [browserChatApiUrl, modelConfig, upsertSession]);
+
+  const activateSession = useCallback(async (sessionId: string) => {
+    if (loadingSessionRef.current === sessionId) return undefined;
+    loadingSessionRef.current = sessionId;
+    activeSessionIdRef.current = sessionId;
+    setLoadingSessionId(sessionId);
+    try {
+      return await refreshSession(sessionId, { activate: true });
+    } finally {
+      if (loadingSessionRef.current === sessionId) {
+        loadingSessionRef.current = null;
+        setLoadingSessionId(null);
+      }
+    }
+  }, [refreshSession]);
+
+  const loadSessions = useCallback(async () => {
+    const response = await fetch(browserChatApiUrl('/api/browser-chat'), { cache: 'no-store' });
+    const data = await readApiJson<Record<string, unknown>>(response, '加载对话历史失败');
+    const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => normalizeSession(item)) : [];
+    setSessions(nextSessions);
+    await loadRequestedBrowserChatSessionDetail(nextSessions, requestedSessionId, async (requestedSession) => {
+      if (mountedSessionActivationRef.current === requestedSession.id) return;
+      mountedSessionActivationRef.current = requestedSession.id;
+      try {
+        await activateSession(requestedSession.id);
+      } catch (loadError) {
+        if (mountedSessionActivationRef.current === requestedSession.id) mountedSessionActivationRef.current = '';
+        throw loadError;
+      }
+    });
+  }, [activateSession, browserChatApiUrl, requestedSessionId]);
 
   const scheduleLoadSessions = useCallback((delay = 80) => {
     if (sessionListRefreshTimerRef.current) window.clearTimeout(sessionListRefreshTimerRef.current);
@@ -7151,30 +7163,15 @@ export function BrowserChatWorkspace({
 
   async function loadSession(sessionId: string) {
     if (loadingSessionRef.current === sessionId) return;
-    loadingSessionRef.current = sessionId;
-    setLoadingSessionId(sessionId);
     setError('');
     setComposerResetToken((current) => current + 1);
     attachmentsRef.current = [];
     setAttachments([]);
     try {
-      const loadedSession = await refreshSession(sessionId, { activate: true });
-      setMode(normalizeMode(loadedSession.mode));
-      setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
-      const nextModel = resolveRuntimeModelSelection(modelConfig, {
-        model: loadedSession.model,
-        provider: loadedSession.modelProvider,
-      });
-      setModelProvider(nextModel.provider);
-      setModelId(nextModel.model);
+      await activateSession(sessionId);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载对话失败');
       void loadSessions().catch(() => undefined);
-    } finally {
-      if (loadingSessionRef.current === sessionId) {
-        loadingSessionRef.current = null;
-        setLoadingSessionId(null);
-      }
     }
   }
 
