@@ -957,7 +957,7 @@ function estimateTextTokens(value: string) {
 function contextWindowTokens() {
   const raw = Number(process.env.AI_CONTEXT_WINDOW_TOKENS || process.env.AI_MODEL_CONTEXT_TOKENS || '');
   if (Number.isFinite(raw) && raw > 1000) return Math.floor(raw);
-  return 32000;
+  return 256000;
 }
 
 function contextCompressionThresholdRatio() {
