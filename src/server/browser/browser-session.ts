@@ -782,6 +782,14 @@ export type BrowserLiveInput =
       clickCount?: number;
     }
   | {
+      kind: 'drag';
+      xRatio: number;
+      yRatio: number;
+      toXRatio: number;
+      toYRatio: number;
+      button?: 'left' | 'right' | 'middle';
+    }
+  | {
       kind: 'scroll';
       xRatio: number;
       yRatio: number;
@@ -819,6 +827,7 @@ type WindowWithAiDomRuntime = Window & {
   __aiAttachShadowPatched?: boolean;
   __aiClosedShadowRoots?: WeakMap<Element, ShadowRoot>;
   __aiObserveShadowRoot?: (root: ShadowRoot) => void;
+  __aiMoveMouseCursor?: (x: number, y: number, options?: { kind?: string }) => void;
   __aiGetEventListenerTypes?: (target: EventTarget) => string[];
   __aiDomRuntime?: AiDomRuntime;
   __aiDomMutationState?: AiDomMutationStateSnapshot & {
@@ -835,8 +844,6 @@ type WindowWithAiDomRuntime = Window & {
     nextId: number;
     refToElement: Map<string, Element>;
   };
-  __aiMouseCursorListenersInstalled?: boolean;
-  __aiMoveMouseCursor?: (x: number, y: number, options?: { kind?: string }) => void;
 };
 
 type ManualVerificationDetails = {
@@ -1112,19 +1119,6 @@ function installAiBrowserPageRuntime() {
     },
     writable: false,
   });
-  if (!win.__aiMouseCursorListenersInstalled) {
-    window.addEventListener('mousemove', (event) => {
-      win.__aiMoveMouseCursor?.(event.clientX, event.clientY, { kind: 'move' });
-    }, true);
-    window.addEventListener('mousedown', (event) => {
-      const kind = event.button === 2 ? 'right' : event.detail > 1 ? 'double' : 'click';
-      win.__aiMoveMouseCursor?.(event.clientX, event.clientY, { kind });
-    }, true);
-    window.addEventListener('dblclick', (event) => {
-      win.__aiMoveMouseCursor?.(event.clientX, event.clientY, { kind: 'double' });
-    }, true);
-    win.__aiMouseCursorListenersInstalled = true;
-  }
   const closedShadowRoots = win.__aiClosedShadowRoots ||= new WeakMap<Element, ShadowRoot>();
   if (!win.__aiAttachShadowPatched) {
     const originalAttachShadow = Element.prototype.attachShadow;
@@ -4176,7 +4170,7 @@ export class BrowserSession {
       this.lastScreenshotCandidates = [];
     };
 
-    if (input.kind === 'move' || input.kind === 'click' || input.kind === 'scroll') {
+    if (input.kind === 'move' || input.kind === 'click' || input.kind === 'drag' || input.kind === 'scroll') {
       if (!Number.isFinite(input.xRatio) || !Number.isFinite(input.yRatio)) {
         return { ok: false, actual: 'Live browser input requires finite relative coordinates.' };
       }
@@ -4202,6 +4196,25 @@ export class BrowserSession {
         }).catch(() => undefined);
         invalidateObservation();
         return { ok: true, actual: `Live browser clicked (${x}, ${y}).` };
+      }
+
+      if (input.kind === 'drag') {
+        if (!Number.isFinite(input.toXRatio) || !Number.isFinite(input.toYRatio)) {
+          return { ok: false, actual: 'Live browser drag requires finite destination coordinates.' };
+        }
+        const toX = Math.min(viewport.width - 1, Math.max(0, Math.round(clampRatio(input.toXRatio) * viewport.width)));
+        const toY = Math.min(viewport.height - 1, Math.max(0, Math.round(clampRatio(input.toYRatio) * viewport.height)));
+        const button = input.button === 'right' || input.button === 'middle' ? input.button : 'left';
+        const steps = Math.min(24, Math.max(2, Math.round(Math.hypot(toX - x, toY - y) / 40)));
+        await page.mouse.move(x, y);
+        await page.mouse.down({ button });
+        try {
+          await page.mouse.move(toX, toY, { steps });
+        } finally {
+          await page.mouse.up({ button }).catch(() => undefined);
+        }
+        invalidateObservation();
+        return { ok: true, actual: `Live browser dragged from (${x}, ${y}) to (${toX}, ${toY}).` };
       }
 
       await page.mouse.move(x, y);
@@ -6958,6 +6971,7 @@ export class BrowserSession {
         if (!resolved.point) return { ok: false, actual: resolved.error || 'Unable to resolve scroll target.' };
         point = resolved.point;
         await page.mouse.move(point.x, point.y);
+        await this.showAiMouseCursor(page, point.x, point.y, 'move');
       }
       const deltaX = Number.isFinite(input.deltaX) ? Number(input.deltaX) : 0;
       const deltaY = Number.isFinite(input.deltaY) ? Number(input.deltaY) : 0;
@@ -7012,6 +7026,7 @@ export class BrowserSession {
     if (input.action === 'move') {
       const eventsBefore = await this.readInteractionCounts();
       await page.mouse.move(from.point.x, from.point.y);
+      await this.showAiMouseCursor(page, from.point.x, from.point.y, 'move');
       return this.completeVerifiedAction(
         `Moved mouse to ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) using viewport coordinates.`,
         previousGeneration,
@@ -7046,10 +7061,12 @@ export class BrowserSession {
       let usedHtml5Fallback = false;
       try {
         await page.mouse.move(from.point.x, from.point.y);
+        await this.showAiMouseCursor(page, from.point.x, from.point.y, 'move');
         await page.mouse.down({ button });
         await page.mouse.move(from.point.x + 8, from.point.y + 4, { steps: 3 });
         await page.mouse.move(to.point.x, to.point.y, { steps: 12 });
         await page.mouse.up({ button });
+        await this.showAiMouseCursor(page, to.point.x, to.point.y, 'drag');
         const nativeEvents = await this.readInteractionCounts();
         const nativeDropCompleted = this.interactionDelta(eventsBefore, nativeEvents, 'drop') > 0;
         if (button === 'left' && !nativeDropCompleted && sourceTarget && destinationTarget) {
@@ -7099,6 +7116,7 @@ export class BrowserSession {
     const popup = this.watchForPopup(page);
     clickTimings.popupListenerSetupMs = Date.now() - popupSetupStartedAt;
     throwIfAborted();
+    await this.showAiMouseCursor(page, from.point.x, from.point.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
     await timeBrowserClickStage(
       clickTimings,
       'clickDispatchMs',
@@ -7255,6 +7273,7 @@ export class BrowserSession {
           await client.detach().catch(() => undefined);
         }
       } else if (targetLocator || targetHandle) {
+        await this.showAiMouseCursor(page, target.point.x, target.point.y, 'click');
         if (targetHandle) await targetHandle.click({ noWaitAfter: true });
         else await targetLocator!.click({ noWaitAfter: true });
         if (targetHandle) await targetHandle.focus();
@@ -7266,6 +7285,7 @@ export class BrowserSession {
           ))).catch(() => false);
         if (!focused) return { ok: false, actual: 'The keyboard target did not receive focus after Playwright click and focus.' };
       } else {
+        await this.showAiMouseCursor(page, target.point.x, target.point.y, 'click');
         await page.mouse.click(target.point.x, target.point.y);
         const focused = page.locator(':focus');
         if (await focused.count().catch(() => 0) === 1) targetLocator = focused;
@@ -8815,6 +8835,14 @@ export class BrowserSession {
         document.getElementById('__ai_candidate_overlay__')?.remove();
       })
       .catch(() => undefined);
+  }
+
+  private async showAiMouseCursor(page: Page, x: number, y: number, kind: string) {
+    await this.ensureBrowserPageRuntime(page);
+    await page.evaluate(({ cursorX, cursorY, cursorKind }) => {
+      const browserWindow = window as WindowWithAiDomRuntime;
+      browserWindow.__aiMoveMouseCursor?.(cursorX, cursorY, { kind: cursorKind });
+    }, { cursorX: x, cursorY: y, cursorKind: kind }).catch(() => undefined);
   }
 
 }

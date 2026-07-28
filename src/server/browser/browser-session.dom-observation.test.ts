@@ -3,36 +3,69 @@ import test from 'node:test';
 import type { Page } from 'playwright';
 import { BrowserSession } from './browser-session';
 
-test('live preview input renders one shared AI mouse cursor at the action point', async (context) => {
+test('AI mouse actions own the shared cursor while live preview input supports drag without moving it', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'live-preview-cursor-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
-  await page.goto(`data:text/html,${encodeURIComponent(`<!doctype html><html><body style="margin:0">
-    <button id="apply" style="height:80px;width:240px" onclick="document.body.dataset.clicked='yes'">Apply</button>
+  await page.goto(`data:text/html,${encodeURIComponent(`<!doctype html><html><body style="margin:0;padding:40px;display:flex;gap:120px;align-items:flex-start">
+    <button id="apply" style="height:80px;width:180px">AI target</button>
+    <button id="user-click" style="height:80px;width:180px" onclick="document.body.dataset.clicked='yes'">User target</button>
+    <div id="source" draggable="true" style="width:120px;height:100px;background:#2563eb">Source</div>
+    <div id="target" style="width:180px;height:140px;background:#e5e7eb">Target</div>
+    <script>
+      source.addEventListener('dragstart', (event) => event.dataTransfer.setData('text/plain', 'source'));
+      target.addEventListener('dragover', (event) => event.preventDefault());
+      target.addEventListener('drop', (event) => {
+        event.preventDefault();
+        document.body.dataset.dropped = event.dataTransfer.getData('text/plain');
+      });
+    </script>
   </body></html>`)}`);
 
-  const buttonBox = await page.locator('#apply').boundingBox();
-  const viewport = page.viewportSize();
-  assert.ok(buttonBox && viewport);
-  const x = buttonBox.x + buttonBox.width / 2;
-  const y = buttonBox.y + buttonBox.height / 2;
-  const pointer = { xRatio: x / viewport.width, yRatio: y / viewport.height };
-
-  const moved = await session.dispatchLiveInput({ kind: 'move', ...pointer });
+  const observation = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  const applyUid = observation.content.match(/uid=(dom-\d+)[^\n]*id="apply"/)?.[1];
+  assert.ok(applyUid, observation.content);
+  const moved = await session.mouse({ action: 'move', uid: applyUid });
   assert.equal(moved.ok, true, moved.actual);
-  const clicked = await session.dispatchLiveInput({ kind: 'click', ...pointer, button: 'left', clickCount: 1 });
+
+  const applyBox = await page.locator('#apply').boundingBox();
+  const clickBox = await page.locator('#user-click').boundingBox();
+  const sourceBox = await page.locator('#source').boundingBox();
+  const targetBox = await page.locator('#target').boundingBox();
+  const viewport = page.viewportSize();
+  assert.ok(applyBox && clickBox && sourceBox && targetBox && viewport);
+  const aiX = applyBox.x + applyBox.width / 2;
+  const aiY = applyBox.y + applyBox.height / 2;
+
+  const clicked = await session.dispatchLiveInput({
+    kind: 'click',
+    xRatio: (clickBox.x + clickBox.width / 2) / viewport.width,
+    yRatio: (clickBox.y + clickBox.height / 2) / viewport.height,
+    button: 'left',
+    clickCount: 1,
+  });
   assert.equal(clicked.ok, true, clicked.actual);
   assert.equal(await page.locator('body').getAttribute('data-clicked'), 'yes');
-  assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 1);
+  const dragged = await session.dispatchLiveInput({
+    kind: 'drag',
+    xRatio: (sourceBox.x + sourceBox.width / 2) / viewport.width,
+    yRatio: (sourceBox.y + sourceBox.height / 2) / viewport.height,
+    toXRatio: (targetBox.x + targetBox.width / 2) / viewport.width,
+    toYRatio: (targetBox.y + targetBox.height / 2) / viewport.height,
+    button: 'left',
+  });
+  assert.equal(dragged.ok, true, dragged.actual);
+  assert.equal(await page.locator('body').getAttribute('data-dropped'), 'source');
+
   const cursor = await page.locator('#__ai_mouse_cursor__').evaluate((element) => ({
     opacity: (element as HTMLElement).style.opacity,
     x: Number((element as HTMLElement).dataset.x),
     y: Number((element as HTMLElement).dataset.y),
   }));
   assert.equal(cursor.opacity, '1');
-  assert.ok(Math.abs(cursor.x - x) <= 1);
-  assert.ok(Math.abs(cursor.y - y) <= 1);
+  assert.ok(Math.abs(cursor.x - aiX) <= 1);
+  assert.ok(Math.abs(cursor.y - aiY) <= 1);
 });
 
 test('DOM-observation takeSnapshot pages actionable, text, and full views with stable DOM UIDs', async (context) => {
