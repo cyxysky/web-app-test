@@ -108,7 +108,7 @@ import {
   browserChatLogsForMessage,
   type BrowserChatLogIndex as BrowserChatLogIndexModel,
 } from '@/components/browser-chat-message-model';
-import { loadRequestedBrowserChatSessionDetail } from '@/components/browser-chat-session-selection';
+import { browserChatViewNavigationHref, loadRequestedBrowserChatSessionDetail } from '@/components/browser-chat-session-selection';
 import {
   visibleBrowserChatExecutionLogs,
 } from '@/components/browser-chat-log-model';
@@ -258,8 +258,9 @@ function browserChatViewForPathname(pathname: string, fallback: BrowserChatView)
 
 function navigateBrowserChatView(href: string) {
   const targetHref = withWebPilotBasePath(href);
-  if (window.location.pathname === targetHref) return;
-  window.history.pushState(null, '', targetHref);
+  const nextHref = browserChatViewNavigationHref(targetHref, window.location.href);
+  if (`${window.location.pathname}${window.location.search}${window.location.hash}` === nextHref) return;
+  window.history.pushState(null, '', nextHref);
 }
 
 function readStoredSidebarCollapsed() {
@@ -6304,8 +6305,16 @@ export function BrowserChatWorkspace({
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const requestUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || '0';
-  const requestedSessionId = searchParams.get('sessionId')?.trim() || '';
+  const queryUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || '0';
+  const querySessionId = searchParams.get('sessionId')?.trim() || '';
+  const queryTargetUrl = searchParams.get('targetUrl')?.trim() || '';
+  const mountedIdentityRef = useRef<{ sessionId: string; targetUrl: string; userId: string } | null>(null);
+  if (!mountedIdentityRef.current && searchParams.get('webpilotEmbed') === '1') {
+    mountedIdentityRef.current = { sessionId: querySessionId, targetUrl: queryTargetUrl, userId: queryUserId };
+  }
+  const requestUserId = mountedIdentityRef.current?.userId || queryUserId;
+  const requestedSessionId = mountedIdentityRef.current?.sessionId || querySessionId;
+  const requestedTargetUrl = mountedIdentityRef.current?.targetUrl || queryTargetUrl;
   const visibleSettingsTabs = environmentSettingsTabsForUser(requestUserId);
   const browserChatApiUrl = useCallback((path: string) => (
     `${withWebPilotBasePath(path)}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(requestUserId)}`
@@ -6865,7 +6874,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(browserChatApiUrl('/api/browser-chat'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ safetyMode, modelProvider, model: modelId, userId: requestUserId }),
+      body: JSON.stringify({ safetyMode, modelProvider, model: modelId, targetUrl: requestedTargetUrl, userId: requestUserId }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '创建对话会话失败');
     return upsertSession(data.session as BrowserChatSession, { activate: true });
@@ -7627,7 +7636,7 @@ export function BrowserChatWorkspace({
                 if (ownerSessionId && ownerSessionId !== activeSessionIdRef.current) void loadSession(ownerSessionId);
               }}
               sessionId={session?.id}
-              userId={session?.userId || '0'}
+              userId={session?.userId || requestUserId}
             />
             {embeddedChatCollapsed ? null : (
               <div

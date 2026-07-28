@@ -16,3 +16,10 @@ export async function loadRequestedBrowserChatSessionDetail<TSession extends { i
   if (!requestedSession) return undefined;
   return loadDetail(requestedSession);
 }
+
+export function browserChatViewNavigationHref(targetHref: string, currentHref: string) {
+  const current = new URL(currentHref);
+  const target = new URL(targetHref, current);
+  target.search = current.search;
+  return `${target.pathname}${target.search}${target.hash}`;
+}

@@ -2015,7 +2015,7 @@ export function createBrowserChatSession(input: {
   const timestamp = now();
   const session: BrowserChatSessionRecord = {
     id: id('chat'),
-    title: input.title?.trim() || '浏览器对话操作',
+    title: input.title?.trim() || '',
     userId: normalizeUserId(input.userId),
     browserGroupId: '',
     targetUrl: exportableTargetUrl(input.targetUrl || ''),
@@ -2068,7 +2068,7 @@ export function listBrowserChatSessions(input: { userId?: string | number } = {}
   const summaries = new Map(readSessionSummaries().map((session) => [session.id, session]));
   for (const session of sessions.values()) summaries.set(session.id, summarySnapshot(session));
   return [...summaries.values()]
-    .filter((session) => sessionBelongsToUser(session, input.userId))
+    .filter((session) => session.messages.length > 0 && sessionBelongsToUser(session, input.userId))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 

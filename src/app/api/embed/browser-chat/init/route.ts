@@ -1,8 +1,9 @@
 import { NextRequest } from 'next/server';
-import { createBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
+import { getBrowserChatSession, listBrowserChatSessions } from '@/server/ai/agents/browser-chat.service';
 import { startScheduler } from '@/server/ai/agents/test-runner.service';
 import { store } from '@/server/db/store';
 import { joinWebPilotUrl } from '@/lib/webpilot-base-path';
+import { selectEmbeddedBrowserChatSessionId } from '@/server/embed/browser-chat-init';
 import {
   createEmbedToken,
   embedErrorJson,
@@ -29,30 +30,29 @@ export async function POST(request: NextRequest) {
     startScheduler();
 
     const userId = requestUserId(request, body);
-    const session = createBrowserChatSession({
-      targetUrl: normalizeString(body.targetUrl),
-      mode: 'dom',
-      safetyMode: normalizeSafetyMode(body.safetyMode),
-      modelProvider: typeof body.modelProvider === 'string' ? body.modelProvider : undefined,
-      model: typeof body.model === 'string' ? body.model : undefined,
-      title: normalizeString(body.title) || undefined,
-      userId,
-    });
+    const requestedSessionId = normalizeString(body.sessionId);
+    const initialSessionId = selectEmbeddedBrowserChatSessionId(
+      listBrowserChatSessions({ userId }),
+      requestedSessionId,
+    );
+    const session = initialSessionId ? getBrowserChatSession(initialSessionId, userId) : undefined;
+    if (requestedSessionId && !session) throw new Error('Browser chat session not found');
     const ttlSeconds = Number.isFinite(Number(body.tokenTtlSeconds))
       ? Number(body.tokenTtlSeconds)
       : undefined;
-    const { token, expiresAt } = createEmbedToken({
+    const embedAuth = session ? createEmbedToken({
       sessionId: session.id,
       userId,
       origin: requestOrigin(request),
       ttlSeconds,
-    });
+    }) : undefined;
     const baseUrl = publicBaseUrl(request);
     const iframeUrl = new URL(joinWebPilotUrl(baseUrl, '/browser-chat'));
     iframeUrl.searchParams.set('webpilotEmbed', '1');
-    iframeUrl.searchParams.set('sessionId', session.id);
+    if (session) iframeUrl.searchParams.set('sessionId', session.id);
     if (userId) iframeUrl.searchParams.set('userId', userId);
-    if (session.targetUrl) iframeUrl.searchParams.set('targetUrl', session.targetUrl);
+    const targetUrl = session?.targetUrl || normalizeString(body.targetUrl);
+    if (targetUrl) iframeUrl.searchParams.set('targetUrl', targetUrl);
 
     return embedJson({
       ok: true,
@@ -61,12 +61,13 @@ export async function POST(request: NextRequest) {
       entryUrl: joinWebPilotUrl(baseUrl, '/embed/webpilot.js'),
       iframeUrl: iframeUrl.toString(),
       apiBaseUrl: baseUrl,
-      sessionId: session.id,
-      session,
-      token,
-      expiresAt,
-      mode: session.mode,
-      safetyMode: session.safetyMode,
+      sessionId: session?.id,
+      session: session || null,
+      userId,
+      token: embedAuth?.token,
+      expiresAt: embedAuth?.expiresAt,
+      mode: session?.mode || 'dom',
+      safetyMode: session?.safetyMode || normalizeSafetyMode(body.safetyMode),
       mountId: normalizeString(body.mountId) || normalizeString(body.containerId) || undefined,
     });
   } catch (error) {
