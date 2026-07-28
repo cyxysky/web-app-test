@@ -101,6 +101,8 @@ export type SkillRecord = {
   id: string;
   title: string;
   description: string;
+  /** Empty means global; otherwise the Skill is loaded only for matching hosts. */
+  domains?: string[];
   tags: string[];
   triggerPhrases: string[];
   content: SkillContent;

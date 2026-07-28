@@ -30,7 +30,7 @@ import {
   revokeBrowserChatTurn,
   runtimeSnapshotIsNewer,
 } from '@/server/ai/agents/browser-chat-interrupt-state';
-import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
+import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl } from '@/server/ai/agents/skill-context';
 import {
   extractPersonalMemoryFromTurn,
   formatPersonalMemoryForPrompt,
@@ -910,6 +910,55 @@ function browserChatCredentialPrompt(credentials: BrowserChatCredentialDescripto
     ].join('\n')),
     'credentialVault.fill 只会把对应值写入真实 Playwright Locator，并且只允许上述 origin；它不会返回账号或密码明文。不得读取已填充输入框的 inputValue/value，不得在 nodeRepl.write、console、工具参数或最终回复中输出凭据或引用。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
   ].join('\n');
+}
+
+function createBrowserChatRuntimeOperationalContext(input: {
+  session: BrowserChatSessionRecord;
+  browser: BrowserSession;
+  text: string;
+  modelText: string;
+  explicitlySelectedSkills?: SkillRecord[];
+}) {
+  let cachedKey = '';
+  let cachedContext: { operationalContext: string; credentialBindings: BrowserCodeCredentialBinding[] } | undefined;
+  return () => {
+    const currentUrl = browserChatMemoryUrl(input.browser, input.session);
+    const key = httpOrigin(currentUrl) || normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl) || 'global';
+    if (cachedContext && cachedKey === key) return cachedContext;
+    const skills = runtimeSkillsForUrl(
+      store.listSkills(undefined, input.session.userId).filter((skill) => skill.status === 'ready'),
+      input.explicitlySelectedSkills || [],
+      currentUrl || input.session.targetUrl,
+    );
+    const memory = browserChatPersonalMemoryContext({
+      session: input.session,
+      browser: input.browser,
+      text: input.text,
+      modelText: input.modelText,
+      currentUrl,
+      logPhase: 'memory:prompt:runtime-refresh',
+    });
+    const credentialUrl = httpOrigin(currentUrl) ? currentUrl : input.session.targetUrl;
+    const credentials = browserChatCredentialContext(
+      input.session,
+      credentialUrl ? [{
+        kind: browserChatResourceKind(credentialUrl, credentialUrl),
+        title: '当前页面',
+        url: credentialUrl,
+      }] : [],
+      input.modelText,
+    );
+    cachedKey = key;
+    cachedContext = {
+      operationalContext: [
+        formatSkillsForPrompt(skills),
+        memory.context,
+        browserChatCredentialPrompt(credentials.credentials),
+      ].filter(Boolean).join('\n\n'),
+      credentialBindings: credentials.bindings,
+    };
+    return cachedContext;
+  };
 }
 
 function attachmentKindLabel(attachment: BrowserChatAttachment) {
@@ -2564,6 +2613,7 @@ export async function generateBrowserChatMessagesSkill(sessionId: string, messag
   const skill = store.upsertSkill({
     title: generated.title,
     description: generated.description,
+    domains: generated.domains,
     tags: generated.tags,
     triggerPhrases: generated.triggerPhrases,
     content: generated.content,
@@ -3223,15 +3273,13 @@ async function executeBrowserChatSubagentBatch(input: {
     try {
       await child.start();
       if (task.url) await child.open(task.url);
-      const credentialContext = browserChatCredentialContext(
+      const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
         session,
-        browserChatResourceSeeds(session, task.instruction, task.url || child.currentUrl()),
-        task.instruction,
-      );
-      const operationalContext = [
-        browserChatPersonalMemoryContext({ session, browser: child, text: task.instruction, modelText: task.instruction }).context,
-        browserChatCredentialPrompt(credentialContext.credentials),
-      ].filter(Boolean).join('\n\n');
+        browser: child,
+        text: task.instruction,
+        modelText: task.instruction,
+      });
+      const initialRuntimeContext = getRuntimeOperationalContext();
       const result = await executeInteractiveBrowserTurn({
         session: child,
         runId: `${session.id}_${task.id}`,
@@ -3251,12 +3299,13 @@ async function executeBrowserChatSubagentBatch(input: {
             : '完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。',
           task.instruction,
         ].filter(Boolean).join('\n\n'),
-        operationalContext,
+        operationalContext: initialRuntimeContext.operationalContext,
         conversation: [],
         completedSteps: [],
         mode: session.mode,
         safetyMode: session.safetyMode,
-        credentialBindings: credentialContext.bindings,
+        credentialBindings: initialRuntimeContext.credentialBindings,
+        getRuntimeOperationalContext,
         abortSignal: abortController.signal,
         shouldContinue: ownsTurn,
         requestToolConfirmation: session.safetyMode === 'strict'
@@ -3445,19 +3494,13 @@ async function resumeBlockedBrowserChatSubagent(input: {
 }) {
   const { session, binding, userMessage, assistantMessageId, fromStepIndex, abortController } = input;
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
-  const credentialContext = browserChatCredentialContext(
+  const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
     session,
-    browserChatResourceSeeds(
-      session,
-      binding.task.instruction,
-      binding.task.url || binding.browser.currentUrl(),
-    ),
-    binding.task.instruction,
-  );
-  const operationalContext = [
-    browserChatPersonalMemoryContext({ session, browser: binding.browser, text: binding.task.instruction, modelText: binding.task.instruction }).context,
-    browserChatCredentialPrompt(credentialContext.credentials),
-  ].filter(Boolean).join('\n\n');
+    browser: binding.browser,
+    text: binding.task.instruction,
+    modelText: binding.task.instruction,
+  });
+  const initialRuntimeContext = getRuntimeOperationalContext();
   try {
     const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
       session: binding.browser,
@@ -3469,12 +3512,13 @@ async function resumeBlockedBrowserChatSubagent(input: {
         '用户已点击“校验完成，继续执行”。不要要求用户再发送文字；先读取当前页面状态，再继续原任务。',
         binding.task.instruction,
       ].filter(Boolean).join('\n\n'),
-      operationalContext,
+      operationalContext: initialRuntimeContext.operationalContext,
       conversation: [],
       completedSteps: binding.steps,
       mode: session.mode,
       safetyMode: session.safetyMode,
-      credentialBindings: credentialContext.bindings,
+      credentialBindings: initialRuntimeContext.credentialBindings,
+      getRuntimeOperationalContext,
       abortSignal: abortController.signal,
       shouldContinue: ownsTurn,
       requestToolConfirmation: session.safetyMode === 'strict'
@@ -3601,55 +3645,30 @@ async function runBrowserChatMessage(
       assertTurnActive();
       await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-      const recalledMemoryIds = new Set<string>();
-      const recalledDomains = new Set<string>();
-      const initialPersonalMemory = browserChatPersonalMemoryContext({ session, browser, text, modelText });
-      initialPersonalMemory.itemIds.forEach((id) => recalledMemoryIds.add(id));
-      if (initialPersonalMemory.domain) recalledDomains.add(initialPersonalMemory.domain);
-      const skillContext = formatSkillsForPrompt(skills);
+      const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
+        session,
+        browser,
+        text,
+        modelText,
+        explicitlySelectedSkills: skills,
+      });
+      const initialRuntimeContext = getRuntimeOperationalContext();
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
       const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
-      const credentialContext = browserChatCredentialContext(
-        session,
-        browserChatResourceSeeds(session, modelText, browser.currentUrl()),
-        modelText,
-      );
-      const operationalContext = [
-        initialPersonalMemory.context,
-        browserChatCredentialPrompt(credentialContext.credentials),
-      ].filter(Boolean).join('\n\n');
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
         targetUrl: session.targetUrl || 'about:blank',
         instruction: text,
         modelInstruction: modelText,
-        operationalContext,
+        operationalContext: initialRuntimeContext.operationalContext,
         conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId, session.userId),
         completedSteps: session.steps,
         mode: session.mode,
         safetyMode: session.safetyMode,
         referenceImagePaths,
-        skillContext,
-        credentialBindings: credentialContext.bindings,
-        getDynamicPersonalMemoryContext: () => {
-          const currentUrl = browserChatMemoryUrl(browser, session);
-          const currentDomain = normalizePersonalMemoryDomain(currentUrl || session.targetUrl);
-          if (!currentDomain || recalledDomains.has(currentDomain)) return '';
-          const recalled = browserChatPersonalMemoryContext({
-            session,
-            browser,
-            text,
-            modelText,
-            currentUrl,
-            domainOnly: true,
-            excludedIds: recalledMemoryIds,
-            logPhase: 'memory:prompt:domain-refresh',
-          });
-          recalledDomains.add(currentDomain);
-          recalled.itemIds.forEach((id) => recalledMemoryIds.add(id));
-          return recalled.context;
-        },
+        credentialBindings: initialRuntimeContext.credentialBindings,
+        getRuntimeOperationalContext,
         abortSignal: abortController.signal,
         shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
         requestToolConfirmation: session.safetyMode === 'strict'

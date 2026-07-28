@@ -384,6 +384,7 @@ function normalizeSkillContent(content?: Partial<SkillContent> & {
 function normalizeSkillRecord(record: SkillRecord): SkillRecord {
   return {
     ...record,
+    domains: normalizeSkillItems(record.domains, 12),
     tags: normalizeSkillItems(record.tags, 6),
     triggerPhrases: normalizeSkillItems(record.triggerPhrases, 8),
     content: normalizeSkillContent(record.content),
@@ -460,6 +461,7 @@ export const store = {
     return skills.filter((skill) => [
       skill.title,
       skill.description,
+      ...(skill.domains || []),
       ...skill.tags,
       ...skill.triggerPhrases,
     ].some((value) => value.toLowerCase().includes(normalizedQuery)));
@@ -476,6 +478,7 @@ export const store = {
     id?: string;
     title: string;
     description: string;
+    domains?: string[];
     tags?: string[];
     triggerPhrases?: string[];
     content: SkillContent;
@@ -492,6 +495,7 @@ export const store = {
       id: existing?.id || id('skl'),
       title: input.title.trim() || existing?.title || 'Runtime Skill',
       description: input.description.trim() || existing?.description || '',
+      domains: input.domains || existing?.domains || [],
       tags: input.tags || existing?.tags || [],
       triggerPhrases: input.triggerPhrases || existing?.triggerPhrases || [],
       content: normalizeSkillContent(input.content),

@@ -113,6 +113,11 @@ type BrowserChatRuntimeRecord = {
   systemPrompt: string;
 };
 
+type BrowserChatOperationalContext = {
+  operationalContext: string;
+  credentialBindings?: BrowserCodeCredentialBinding[];
+};
+
 const codexRuntimeObjectSchema = z.object({
   type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op status update.'),
   message: z.string().nullable().optional().describe('Optional short Chinese progress text that must match the selected tool.'),
@@ -1284,6 +1289,7 @@ function makeBrowserTools(
     onReadFileImage?: (input: { path: string }) => void;
     ensureBrowserStarted?: () => Promise<void>;
     credentialBindings?: BrowserCodeCredentialBinding[];
+    getCredentialBindings?: () => BrowserCodeCredentialBinding[] | undefined;
   },
 ) {
   // Enforce one executed browser tool per model step. The native AI SDK loop may call the model
@@ -1382,7 +1388,7 @@ function makeBrowserTools(
         return record('browserCode', normalizedInput, (abortSignal) => session.executeBrowserCode({
           code: normalizedInput.code,
           maxOutputChars: normalizedInput.maxOutputChars,
-          credentials: referenceOptions?.credentialBindings,
+          credentials: referenceOptions?.getCredentialBindings?.() || referenceOptions?.credentialBindings,
           runId: referenceOptions?.runId || 'browser-code',
           stepIndex: referenceOptions?.stepIndex || 0,
           abortSignal,
@@ -1939,7 +1945,7 @@ async function executeRuntimeStep(input: {
   shouldContinue?: () => boolean;
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
-  getDynamicPersonalMemoryContext?: () => string | Promise<string>;
+  getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   allowedToolTypes?: string[];
   runSubagents?: BrowserChatSubagentRunner;
@@ -1999,6 +2005,8 @@ async function executeRuntimeStep(input: {
     runtimeRecord,
     operationalContext: input.operationalContext,
   })}${userReferenceImagePrompt}`;
+  let activeOperationalContext = input.operationalContext || '';
+  let activeCredentialBindings = input.credentialBindings || [];
   const promptMs = elapsedSince(promptStartedAt);
   await onDebug?.({
     phase: 'perf:runtime-input',
@@ -2048,9 +2056,7 @@ async function executeRuntimeStep(input: {
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
-    const initialRequestPrompt = prompt;
-    const requestPrompt = codexMode ? buildCodexObjectPrompt(initialRequestPrompt, allowedToolTypes) : initialRequestPrompt;
-    const requestSystemPrompt = requestPrompt;
+    let requestSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(runtimeRecord),
       phase: 'Browser chat turn; answer directly when current evidence is enough, otherwise use one browser tool.',
@@ -2216,31 +2222,29 @@ async function executeRuntimeStep(input: {
 
     async function prepareStep(turnIndex: number, previousMessages?: RuntimeModelMessage[]) {
       ensureActive();
+      if (input.getRuntimeOperationalContext) {
+        try {
+          const runtimeContext = await input.getRuntimeOperationalContext();
+          ensureActive();
+          activeOperationalContext = runtimeContext.operationalContext;
+          activeCredentialBindings = runtimeContext.credentialBindings || [];
+        } catch (error) {
+          await onDebug?.({
+            phase: 'runtime-context:refresh:error',
+            stepIndex,
+            message: `Unable to rebuild runtime context for the current page: ${infrastructureError(error)}`,
+            details: serializeError(error),
+          });
+        }
+      }
+      const refreshedPrompt = `${runtimePrompt({ runtimeRecord, operationalContext: activeOperationalContext })}${userReferenceImagePrompt}`;
+      requestSystemPrompt = codexMode ? buildCodexObjectPrompt(refreshedPrompt, allowedToolTypes) : refreshedPrompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = contextWindowTokens();
       const thresholdRatio = contextCompressionThresholdRatio();
       const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
       const appendedMessages: RuntimeModelMessage[] = [];
       const appendedImagePaths: string[] = [];
-      if (input.getDynamicPersonalMemoryContext) {
-        try {
-          const dynamicMemoryContext = textFromUnknown(await input.getDynamicPersonalMemoryContext()).trim();
-          ensureActive();
-          if (dynamicMemoryContext) {
-            pendingObservationMessages.push({
-              text: `[Relevant personal memory for the current domain]\n${dynamicMemoryContext}`,
-              imagePaths: [],
-            });
-          }
-        } catch (error) {
-          await onDebug?.({
-            phase: 'memory:prompt:domain-refresh:error',
-            stepIndex,
-            message: `Unable to refresh domain memory for the current page: ${infrastructureError(error)}`,
-            details: serializeError(error),
-          });
-        }
-      }
       while (pendingObservationMessages.length) {
         const observation = pendingObservationMessages.shift();
         if (!observation) break;
@@ -2358,7 +2362,7 @@ async function executeRuntimeStep(input: {
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
-        credentialBindings: input.credentialBindings,
+        credentialBindings: activeCredentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
         onDebug,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
@@ -2432,6 +2436,7 @@ async function executeRuntimeStep(input: {
       readSubagent: input.readSubagent,
       readFile: input.readFile,
       credentialBindings: input.credentialBindings,
+      getCredentialBindings: () => activeCredentialBindings,
       onReadFileImage: ({ path }) => {
         if (!modelSupportsScreenshotInput()) return;
         pendingObservationMessages.push({
@@ -2648,13 +2653,9 @@ function createInteractiveBrowserRuntimeRecord(input: {
   safetyMode?: BrowserChatSafetyMode;
   targetUrl: string;
   instruction: string;
-  skillContext?: string;
 }): BrowserChatRuntimeRecord {
   const targetUrl = input.targetUrl || 'about:blank';
-  const systemPrompt = [
-    browserChatSafetyInstructions(input.safetyMode),
-    input.skillContext,
-  ].filter(Boolean).join('\n\n');
+  const systemPrompt = browserChatSafetyInstructions(input.safetyMode);
   return {
     description: input.instruction,
     targetUrl,
@@ -2682,8 +2683,7 @@ export async function executeInteractiveBrowserTurn(input: {
   mode?: BrowserSessionMode;
   safetyMode?: BrowserChatSafetyMode;
   referenceImagePaths?: string[];
-  skillContext?: string;
-  getDynamicPersonalMemoryContext?: () => string | Promise<string>;
+  getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
   onProgress?: (step: StepExecutionResult) => void | Promise<void>;
   onDebug?: ExecutionDebug;
   abortSignal?: AbortSignal;
@@ -2705,7 +2705,6 @@ export async function executeInteractiveBrowserTurn(input: {
     safetyMode: input.safetyMode,
     targetUrl: input.targetUrl,
     instruction: input.instruction,
-    skillContext: input.skillContext,
   });
   const runtimeMode = browserModeOf();
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
@@ -2791,7 +2790,7 @@ export async function executeInteractiveBrowserTurn(input: {
         operationalContext: input.operationalContext,
         conversation: input.conversation || [],
         referenceImagePaths: input.referenceImagePaths,
-        getDynamicPersonalMemoryContext: input.getDynamicPersonalMemoryContext,
+        getRuntimeOperationalContext: input.getRuntimeOperationalContext,
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
