@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, Dialog, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
 import { artifactPath } from '@/server/storage/paths';
+import { browserPreviewFrameIntervalMs } from './browser-preview-cadence';
 import {
   boundedNonNegativeIntegerEnv,
   boundedPositiveIntegerEnv,
@@ -801,6 +802,10 @@ export type BrowserKeyboardAction = {
 };
 
 export type BrowserLiveInput =
+  | {
+      kind: 'tab';
+      tabId: string;
+    }
   | {
       kind: 'move';
       xRatio: number;
@@ -4752,8 +4757,11 @@ export class BrowserSession {
   }
 
   async switchLivePreviewTab(tabId: string): Promise<BrowserActionResult> {
-    const pages = await this.refreshSessionGroupPages({ forceNativeRefresh: true });
-    const page = pages.find((candidate) => this.livePreviewTabId(candidate) === tabId);
+    let page = this.sessionPages().find((candidate) => this.livePreviewTabId(candidate) === tabId);
+    if (!page) {
+      const refreshedPages = await this.refreshSessionGroupPages({ forceNativeRefresh: true });
+      page = refreshedPages.find((candidate) => this.livePreviewTabId(candidate) === tabId);
+    }
     if (!page) return { ok: false, actual: 'The selected live-preview tab no longer exists.' };
     await this.activateSessionPage(page);
     return { ok: true, actual: `Switched live preview to ${page.url()}` };
@@ -4789,101 +4797,77 @@ export class BrowserSession {
       this.livePreviewNativeViewportRestoredPages.add(page);
     }
     const client = await page.context().newCDPSession(page);
-    const format = process.env.BROWSER_SCREENCAST_FORMAT?.trim().toLowerCase() === 'jpeg' ? 'jpeg' : 'png';
+    const configuredFormat = process.env.BROWSER_SCREENCAST_FORMAT?.trim().toLowerCase();
+    const format = configuredFormat === 'png' ? 'png' : 'jpeg';
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
-    const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 100);
-    const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 100)));
-    const rawMaxWidth = Number(process.env.BROWSER_SCREENCAST_MAX_WIDTH ?? 2560);
-    const rawMaxHeight = Number(process.env.BROWSER_SCREENCAST_MAX_HEIGHT ?? 1440);
-    const maxWidth = Math.min(3840, Math.max(960, Math.floor(Number.isFinite(rawMaxWidth) ? rawMaxWidth : 2560)));
-    const maxHeight = Math.min(2160, Math.max(540, Math.floor(Number.isFinite(rawMaxHeight) ? rawMaxHeight : 1440)));
+    const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 72);
+    const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 72)));
+    const frameIntervalMs = browserPreviewFrameIntervalMs(process.env.BROWSER_PREVIEW_FPS);
     let stopped = false;
     let stopPromise: Promise<void> | undefined;
-    let pageChangePoll: ReturnType<typeof setInterval> | undefined;
-    async function stopScreencast(notifyPageChanged: boolean) {
+    let frameTimer: ReturnType<typeof setTimeout> | undefined;
+    let nextFrameAt = Date.now();
+    let viewport = await this.getViewportMetrics().catch(() => page.viewportSize() || { width: 1280, height: 720 });
+    let viewportRefreshAt = Date.now() + 1000;
+
+    const activePreviewPage = () => (this.page && !this.page.isClosed() ? this.page : this.sessionPages()[0]);
+    const stopScreencast = async (notifyPageChanged: boolean) => {
       if (stopPromise) return stopPromise;
       stopped = true;
-      if (pageChangePoll) clearInterval(pageChangePoll);
-      pageChangePoll = undefined;
-      client.off('Page.screencastFrame', onFrame);
+      if (frameTimer) clearTimeout(frameTimer);
+      frameTimer = undefined;
       stopPromise = (async () => {
-        await client.send('Page.stopScreencast').catch(() => undefined);
         await client.detach().catch(() => undefined);
         if (notifyPageChanged) await options.onActivePageChanged?.();
       })();
       return stopPromise;
-    }
-    const onFrame = (event: {
-      data?: string;
-      metadata?: { deviceHeight?: number; deviceWidth?: number };
-      sessionId?: number;
-    }) => {
-      if (event.sessionId !== undefined) {
-        void client.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
-      }
-      if (stopped || !event.data) return;
-      const activePage = this.page && !this.page.isClosed() ? this.page : this.sessionPages()[0];
-      if (!activePage || activePage !== page || page.isClosed()) {
-        void stopScreencast(true);
+    };
+    const captureFrame = async (): Promise<void> => {
+      if (stopped) return;
+      if (page.isClosed() || activePreviewPage() !== page) {
+        await stopScreencast(true);
         return;
       }
-      const fallback = page.viewportSize() || { width: 1280, height: 720 };
-      const width = Math.floor(Number(event.metadata?.deviceWidth) || fallback.width);
-      const height = Math.floor(Number(event.metadata?.deviceHeight) || fallback.height);
-      void Promise.resolve(options.onFrame({
-        capturedAt: new Date().toISOString(),
-        contentType,
-        data: event.data,
-        metadata: event.metadata,
-        tabs: this.getTabsSnapshot(),
-        url: page.url(),
-        viewport: { width, height },
-      })).catch((error) => options.onError?.(error));
-    };
-    client.on('Page.screencastFrame', onFrame);
-    try {
-      await client.send('Page.startScreencast', {
-        format,
-        maxHeight,
-        maxWidth,
-        ...(format === 'jpeg' ? { quality } : {}),
-      });
-      // A newly selected static page may not produce a screencast damage event.
-      // Emit one authoritative frame immediately so the client can replace the
-      // previous tab image and leave its reconnecting state deterministically.
-      const initialFrameData = await page.screenshot({
-        fullPage: false,
-        type: format,
-        ...(format === 'jpeg' ? { quality } : {}),
-      }).catch(() => undefined);
-      if (initialFrameData && !stopped && !page.isClosed() && this.page === page) {
-        const fallback = page.viewportSize() || { width: 1280, height: 720 };
-        const viewport = await page.evaluate(() => ({
-          height: Math.max(1, Math.floor(window.innerHeight || document.documentElement.clientHeight || 1)),
-          width: Math.max(1, Math.floor(window.innerWidth || document.documentElement.clientWidth || 1)),
-        })).catch(() => fallback);
+      try {
+        const result = await client.send('Page.captureScreenshot', {
+          captureBeyondViewport: false,
+          format,
+          fromSurface: true,
+          optimizeForSpeed: true,
+          ...(format === 'jpeg' ? { quality } : {}),
+        });
+        if (stopped || page.isClosed() || activePreviewPage() !== page) {
+          await stopScreencast(true);
+          return;
+        }
+        if (Date.now() >= viewportRefreshAt) {
+          viewport = await this.getViewportMetrics().catch(() => viewport);
+          viewportRefreshAt = Date.now() + 1000;
+        }
         await options.onFrame({
           capturedAt: new Date().toISOString(),
           contentType,
-          data: initialFrameData.toString('base64'),
+          data: result.data,
           tabs: this.getTabsSnapshot(),
           url: page.url(),
-          viewport,
+          viewport: { width: viewport.width, height: viewport.height },
         });
+      } catch (error) {
+        if (!stopped) options.onError?.(error);
+      } finally {
+        if (!stopped) {
+          nextFrameAt += frameIntervalMs;
+          const delay = Math.max(0, nextFrameAt - Date.now());
+          if (!delay) nextFrameAt = Date.now();
+          frameTimer = setTimeout(() => void captureFrame(), delay);
+          frameTimer.unref?.();
+        }
       }
-      pageChangePoll = setInterval(() => {
-        void this.refreshSessionGroupPages()
-          .then(() => {
-            const activePage = this.page && !this.page.isClosed() ? this.page : this.sessionPages()[0];
-            if (!activePage || activePage !== page || page.isClosed()) return stopScreencast(true);
-            return undefined;
-          })
-          .catch((error) => options.onError?.(error));
-      }, 250);
-      pageChangePoll.unref?.();
+    };
+    try {
+      await captureFrame();
     } catch (error) {
-      client.off('Page.screencastFrame', onFrame);
-      await client.detach().catch(() => undefined);
+      await stopScreencast(false);
       throw error;
     }
     return {
@@ -4894,6 +4878,7 @@ export class BrowserSession {
   }
 
   async dispatchLiveInput(input: BrowserLiveInput): Promise<BrowserActionResult> {
+    if (input.kind === 'tab') return this.switchLivePreviewTab(input.tabId);
     const page = this.activePage;
     await this.ensureBrowserPageRuntime(page);
     const clampRatio = (value: number) => Math.min(1, Math.max(0, Number(value)));

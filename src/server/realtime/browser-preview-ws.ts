@@ -33,7 +33,7 @@ type BrowserPreviewWebSocketState = {
   starting?: Promise<BrowserPreviewWebSocketInfo>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 7;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 8;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
@@ -124,6 +124,9 @@ function sendFrameToClient(client: BrowserPreviewClient, payload: unknown) {
 function readLiveInput(value: unknown): BrowserLiveInput | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const input = value as Record<string, unknown>;
+  if (input.kind === 'tab' && typeof input.tabId === 'string' && input.tabId.trim()) {
+    return { kind: 'tab', tabId: input.tabId.trim() };
+  }
   if (input.kind === 'move') {
     return { kind: 'move', xRatio: Number(input.xRatio), yRatio: Number(input.yRatio) };
   }
@@ -212,6 +215,9 @@ function handleClientMessage(client: BrowserPreviewClient, text: string) {
           requestId,
           error: result?.actual || 'Browser chat session not found',
         });
+      } else if (input.kind === 'tab') {
+        sendToClient(client, { type: 'activeTabChanged', sessionId: client.sessionId });
+        await reattachScreencast(client);
       }
     } catch (error) {
       sendToClient(client, {
@@ -323,8 +329,7 @@ async function attachScreencast(client: BrowserPreviewClient) {
       },
     });
     if (!handle) {
-      sendToClient(client, { type: 'error', error: 'Browser chat session not found' });
-      await removeClient(client);
+      sendToClient(client, { type: 'unavailable', error: 'Browser chat session or its test browser is not available' });
       return;
     }
     if (client.socket.destroyed || generation !== client.attachGeneration) {
@@ -335,11 +340,21 @@ async function attachScreencast(client: BrowserPreviewClient) {
     sendToClient(client, { type: 'ready', sessionId });
   } catch (error) {
     sendToClient(client, {
-      type: 'error',
+      type: 'unavailable',
       error: error instanceof Error ? error.message : 'Failed to start browser screencast',
     });
-    await removeClient(client);
   }
+}
+
+async function reattachScreencast(client: BrowserPreviewClient) {
+  if (client.socket.destroyed) return;
+  client.attachGeneration += 1;
+  if (client.reattachTimer) clearTimeout(client.reattachTimer);
+  client.reattachTimer = undefined;
+  const stop = client.stop;
+  client.stop = undefined;
+  await stop?.().catch(() => undefined);
+  if (!client.socket.destroyed) await attachScreencast(client);
 }
 
 function createBrowserPreviewServer() {

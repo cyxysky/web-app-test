@@ -4816,6 +4816,7 @@ type BrowserChatPreviewFrame = {
 };
 
 type BrowserChatPreviewInput =
+  | { kind: 'tab'; tabId: string }
   | { kind: 'move'; xRatio: number; yRatio: number }
   | { kind: 'click'; xRatio: number; yRatio: number; button: 'left' | 'right' | 'middle'; clickCount: number }
   | { kind: 'drag'; xRatio: number; yRatio: number; toXRatio: number; toYRatio: number; button: 'left' | 'right' | 'middle' }
@@ -4833,6 +4834,7 @@ function BrowserChatWebPreviewModal({
   userId: string;
 }) {
   const streamRef = useRef<WebSocket | null>(null);
+  const reconnectEnabledRef = useRef(true);
   const previewImageRef = useRef<HTMLImageElement | null>(null);
   const pendingFrameRef = useRef<BrowserChatPreviewFrame | null>(null);
   const frameRenderRequestRef = useRef<number | undefined>(undefined);
@@ -4851,13 +4853,14 @@ function BrowserChatWebPreviewModal({
   const pendingScrollRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'scroll' }> | null>(null);
   const scrollFlushTimerRef = useRef<number | undefined>(undefined);
   const [frame, setFrame] = useState<BrowserChatPreviewFrame | null>(null);
-  const [status, setStatus] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
+  const [status, setStatus] = useState<'connecting' | 'live' | 'reconnecting' | 'unavailable'>('connecting');
   const [streamError, setStreamError] = useState('');
   const [inputError, setInputError] = useState('');
 
   useEffect(() => {
     let disposed = false;
     let reconnectTimer: number | undefined;
+    reconnectEnabledRef.current = true;
     const connect = async () => {
       try {
         const response = await fetch(withWebPilotBasePath('/api/browser-chat/preview-stream'), { cache: 'no-store' });
@@ -4893,6 +4896,10 @@ function BrowserChatWebPreviewModal({
               setStreamError('');
             } else if (message.type === 'inputError') {
               setInputError(message.error || '实时界面操作失败');
+            } else if (message.type === 'unavailable') {
+              reconnectEnabledRef.current = false;
+              setStatus('unavailable');
+              setStreamError(message.error || '当前会话没有运行中的测试浏览器');
             } else if (message.type === 'error') {
               setStreamError(message.error || '实时界面连接失败');
             }
@@ -4903,7 +4910,7 @@ function BrowserChatWebPreviewModal({
         stream.onerror = () => setStreamError((current) => current || '实时界面连接中断，正在重连');
         stream.onclose = () => {
           if (streamRef.current === stream) streamRef.current = null;
-          if (disposed) return;
+          if (disposed || !reconnectEnabledRef.current) return;
           setStatus('reconnecting');
           reconnectTimer = window.setTimeout(() => void connect(), 600);
         };
@@ -5108,20 +5115,22 @@ function BrowserChatWebPreviewModal({
     sendInput({ kind: 'text', text });
   }, [sendInput]);
 
-  const switchPreviewTab = useCallback(async (tabId: string) => {
-    try {
-      const response = await fetch(withWebPilotBasePath(`/api/browser-chat/${encodeURIComponent(sessionId)}/tabs/${encodeURIComponent(tabId)}?userId=${encodeURIComponent(userId)}`), {
-        method: 'POST',
-      });
-      const data = await response.json() as { error?: string };
-      if (!response.ok) throw new Error(data.error || '切换标签页失败');
-      setStatus((current) => current === 'live' ? current : 'connecting');
-    } catch (error) {
-      setInputError(error instanceof Error ? error.message : '切换标签页失败');
-    }
-  }, [sessionId, userId]);
+  const switchPreviewTab = useCallback((tabId: string) => {
+    setFrame((current) => current ? {
+      ...current,
+      tabs: current.tabs.map((tab) => ({ ...tab, active: tab.id === tabId })),
+    } : current);
+    setStatus('reconnecting');
+    sendInput({ kind: 'tab', tabId });
+  }, [sendInput]);
 
-  const statusLabel = status === 'live' ? '实时' : status === 'reconnecting' ? '正在重连' : '正在连接';
+  const statusLabel = status === 'live'
+    ? '实时'
+    : status === 'reconnecting'
+      ? '正在重连'
+      : status === 'unavailable'
+        ? '浏览器未运行'
+        : '正在连接';
 
   return (
     <div className="ui-modal-overlay browser-chat-web-preview-overlay" onClick={onClose} role="presentation">

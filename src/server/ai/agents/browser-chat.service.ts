@@ -2196,43 +2196,9 @@ export async function startBrowserChatScreencast(
   if (!session || session.status === 'closed') return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
 
-  const hasBrowserRuntimeHistory = session.logs.some((log) => log.phase.startsWith('browser:'));
-  let browser = restoreBrowserSessionPrototype(session.browser);
-  if (
-    browser
-    && session.started
-    && browser.isUsable()
-    && !session.busy
-    && session.status !== 'running'
-    && hasBrowserRuntimeHistory
-    && !browser.hasNonBlankActivePage()
-  ) {
-    const stalePreviewBrowser = browser;
-    // Detach synchronously before awaiting close. Otherwise a newly started
-    // conversation can capture this instance while close() is pending and then
-    // fail the browser-identity guard when the preview creates a replacement.
-    if (
-      session.browser === stalePreviewBrowser
-      && !session.busy
-      && !session.activeAssistantMessageId
-    ) {
-      session.browser = undefined;
-      session.started = false;
-      browser = undefined;
-      await stalePreviewBrowser.close({ keepOpen: true }).catch(() => undefined);
-    }
-  }
+  const browser = restoreBrowserSessionPrototype(session.browser);
   if (!browser || !session.started || !browser.isUsable()) {
-    if (!hasBrowserRuntimeHistory) {
-      throw new Error('当前会话还没有运行中的浏览器；请先发送AI访问请求，浏览器启动后会自动显示画面。');
-    }
-    browser = await ensureStarted(session, undefined, {
-      markSessionRunning: false,
-      preferExistingPage: true,
-    });
-  }
-  if (!browser.isUsable()) {
-    throw new Error('无法重新接管当前会话的浏览器，请确认浏览器窗口仍然存在。');
+    throw new Error('当前会话没有运行中的测试浏览器；打开预览不会自动启动或重新打开浏览器。');
   }
   return browser.startScreencast({
     onActivePageChanged: handlers.onActivePageChanged,
@@ -2261,6 +2227,10 @@ export async function dispatchBrowserChatPreviewInput(
   const result = await browser.dispatchLiveInput(input);
   session.tabs = browser.getTabsSnapshot();
   session.targetUrl = exportableTargetUrl(browser.currentUrl()) || session.targetUrl;
+  if (input.kind === 'tab' && result.ok) {
+    session.updatedAt = now();
+    persistAndNotify(session.id);
+  }
   return result;
 }
 
