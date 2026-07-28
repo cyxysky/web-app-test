@@ -11,6 +11,7 @@ import { analyzeBrowserCodeRisk, type BrowserCodeCredentialBinding } from '@/ser
 import { richTextToPlainText } from '@/lib/rich-text';
 import { browserChatReplyClaimsBrowserAction, browserChatToolRequirement, type BrowserChatToolRequirement } from './browser-chat-intent';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
+import { shouldCompleteRecoveredBrowserChatReply } from './browser-chat-retry-outcome';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
   BROWSER_CHAT_FILE_READ_MIN_CHARS,
@@ -2577,7 +2578,11 @@ async function executeRuntimeStep(input: {
         ensureActive();
       }
       ensureActive();
-      return await runAgent(includeImage, retryState);
+      const result = await runAgent(includeImage, retryState);
+      return {
+        ...result,
+        recoveredAfterRetry: retryingAfterFailure,
+      };
     } catch (error) {
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
       lastError = error;
@@ -2903,6 +2908,23 @@ export async function executeInteractiveBrowserTurn(input: {
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
       if (runningIndex >= 0) steps.splice(runningIndex, 1);
+      const completeRecoveredReply = shouldCompleteRecoveredBrowserChatReply({
+        recoveredAfterRetry: actionResult.recoveredAfterRetry,
+        reply: browserChatReply,
+        hasToolTrace: false,
+        requiresToolEvidence: Boolean(requiredTool),
+      });
+      if (completeRecoveredReply) {
+        await input.onDebug?.({
+          phase: 'chat:retry-completed',
+          stepIndex,
+          message: 'The retried AI request returned an explicit final answer; ending the current browser chat turn.',
+        });
+        reply = browserChatReply;
+        finalStatus = 'passed';
+        endedWithFinalAnswer = true;
+        break;
+      }
       const hasRequiredToolEvidence = requiredTool ? browserChatTurnHasToolEvidence(newSteps, requiredTool) : false;
       const unsupportedActionClaim = browserChatReplyClaimsBrowserAction(browserChatReply)
         && !browserChatTurnHasToolEvidence(newSteps, 'action');
@@ -2969,6 +2991,27 @@ export async function executeInteractiveBrowserTurn(input: {
     ensureActive();
     await input.onProgress?.(completedStep);
     ensureActive();
+    const completeRecoveredReply = shouldCompleteRecoveredBrowserChatReply({
+      recoveredAfterRetry: actionResult.recoveredAfterRetry,
+      reply: browserChatReply,
+      hasToolTrace: actionResult.traces.length > 0,
+      requiresToolEvidence: Boolean(requiredTool),
+    });
+    if (completeRecoveredReply) {
+      await input.onDebug?.({
+        phase: 'chat:retry-completed',
+        stepIndex,
+        message: 'The retried AI request returned an explicit final answer; ending the current browser chat turn without starting another browser step.',
+        details: {
+          requiredTool,
+          tools: completedStep.tools,
+        },
+      });
+      reply = browserChatReply;
+      finalStatus = decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed';
+      endedWithFinalAnswer = true;
+      break;
+    }
     const completedTurnHasRequiredTool = requiredTool ? browserChatTurnHasToolEvidence(newSteps, requiredTool) : false;
     const completedTurnUnsupportedActionClaim = browserChatReplyClaimsBrowserAction(browserChatReply)
       && !browserChatTurnHasToolEvidence(newSteps, 'action');
