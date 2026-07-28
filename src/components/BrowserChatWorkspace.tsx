@@ -3633,7 +3633,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     sessionBusy ? 'busy' : 'idle',
   ].join(':');
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const sessionChanged = previousSessionIdRef.current !== sessionId;
     previousSessionIdRef.current = sessionId;
     if (!sessionChanged && !followLatestRef.current) return undefined;
@@ -3659,7 +3659,25 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     const container = scrollRef.current;
     if (!container) return;
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-    followLatestRef.current = distanceFromBottom <= 96;
+    followLatestRef.current = distanceFromBottom <= 2;
+  }, []);
+
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return undefined;
+    let frame = 0;
+    const observer = new MutationObserver(() => {
+      if (!followLatestRef.current) return;
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      });
+    });
+    observer.observe(container, { childList: true, characterData: true, subtree: true });
+    return () => {
+      observer.disconnect();
+      if (frame) cancelAnimationFrame(frame);
+    };
   }, []);
 
   return (
