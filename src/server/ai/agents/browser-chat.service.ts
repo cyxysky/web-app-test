@@ -28,8 +28,11 @@ import {
 import { formatSkillReferencesForUser, formatSkillsForPrompt } from '@/server/ai/agents/skill-context';
 import {
   extractPersonalMemoryFromTurn,
+  formatPersonalMemoryForPrompt,
+  markPersonalMemoryItemsUsed,
   normalizePersonalMemoryDomain,
   personalMemoryEnabled,
+  searchPersonalMemory,
 } from '@/server/ai/personal-memory';
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
 import type { ModelProvider, RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
@@ -842,6 +845,20 @@ function browserChatCredentialPrompt(credentials: ReturnType<typeof browserChatC
     ...credentials.map((item) => `- ${item.origin} / ${item.username}：用户名使用 interact({action:"type",credentialRef:"${item.usernameRef}"})，密码使用 interact({action:"type",credentialRef:"${item.passwordRef}"})。`),
     '账号明文密码不会提供给模型。只能在当前页面 origin 与上述 origin 完全一致时使用 credentialRef；不得把凭据写入 text、日志或最终回复。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
   ].join('\n');
+}
+
+function browserChatRelevantMemoryPrompt(session: BrowserChatSessionRecord, browser: BrowserSession, instruction: string) {
+  if (!personalMemoryEnabled()) return '';
+  const currentUrl = browserChatMemoryUrl(browser, session);
+  const matches = searchPersonalMemory({
+    userId: session.userId,
+    query: instruction,
+    domain: normalizePersonalMemoryDomain(currentUrl || session.targetUrl),
+    limit: 6,
+  });
+  if (!matches.length) return '';
+  markPersonalMemoryItemsUsed(matches.map((match) => match.item.id));
+  return formatPersonalMemoryForPrompt(matches);
 }
 
 function attachmentKindLabel(attachment: BrowserChatAttachment) {
@@ -3170,6 +3187,10 @@ async function executeBrowserChatSubagentBatch(input: {
         task.url ? [{ kind: 'url', title: task.title, url: task.url }] : [],
         task.instruction,
       );
+      const operationalContext = [
+        browserChatRelevantMemoryPrompt(session, child, task.instruction),
+        browserChatCredentialPrompt(credentialContext.credentials),
+      ].filter(Boolean).join('\n\n');
       const result = await executeInteractiveBrowserTurn({
         session: child,
         runId: `${session.id}_${task.id}`,
@@ -3188,8 +3209,8 @@ async function executeBrowserChatSubagentBatch(input: {
             ? `完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。配置建议将篇幅控制在约 ${summaryGuidanceChars} 个字符以内，但这不是截断上限；如果完整证据需要更长内容，必须完整返回。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。`
             : '完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。',
           task.instruction,
-          browserChatCredentialPrompt(credentialContext.credentials),
         ].join('\n\n'),
+        operationalContext,
         conversation: [],
         completedSteps: [],
         mode: session.mode,
@@ -3390,6 +3411,10 @@ async function resumeBlockedBrowserChatSubagent(input: {
     binding.task.url ? [{ kind: 'url', title: binding.title, url: binding.task.url }] : [],
     binding.task.instruction,
   );
+  const operationalContext = [
+    browserChatRelevantMemoryPrompt(session, binding.browser, binding.task.instruction),
+    browserChatCredentialPrompt(credentialContext.credentials),
+  ].filter(Boolean).join('\n\n');
   try {
     const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
       session: binding.browser,
@@ -3400,8 +3425,8 @@ async function resumeBlockedBrowserChatSubagent(input: {
         `你是并行子 Agent“${binding.title}”，正在继续同一个已暂停的分支。`,
         '用户已点击“校验完成，继续执行”。不要要求用户再发送文字；先读取当前页面状态，再继续原任务。',
         binding.task.instruction,
-        browserChatCredentialPrompt(credentialContext.credentials),
       ].filter(Boolean).join('\n\n'),
+      operationalContext,
       conversation: [],
       completedSteps: binding.steps,
       mode: session.mode,
@@ -3539,12 +3564,17 @@ async function runBrowserChatMessage(
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
       const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
       const credentialContext = browserChatCredentialContext(session, browserChatResourceSeeds(session, modelText), modelText);
+      const operationalContext = [
+        browserChatRelevantMemoryPrompt(session, browser, modelText),
+        browserChatCredentialPrompt(credentialContext.credentials),
+      ].filter(Boolean).join('\n\n');
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
         targetUrl: session.targetUrl || 'about:blank',
         instruction: text,
-        modelInstruction: [modelText, browserChatCredentialPrompt(credentialContext.credentials)].filter(Boolean).join('\n\n'),
+        modelInstruction: modelText,
+        operationalContext,
         conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId),
         completedSteps: session.steps,
         mode: session.mode,

@@ -3,9 +3,9 @@ import { readFile } from 'node:fs/promises';
 import { generateText, hasToolCall, tool, type ModelMessage } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, TestCaseRecord, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import { buildCodexObjectPrompt, buildCompletionPromptLines, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
+import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type BrowserSnapshotViews, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { browserChatReplyClaimsBrowserAction, browserChatToolRequirement, type BrowserChatToolRequirement } from './browser-chat-intent';
@@ -30,7 +30,7 @@ import {
   type RuntimeObservationReadOptions,
   type RuntimeObservationStore,
 } from './runtime-observation';
-import { browserActionRules, browserChatDomRules, currentSnapshotContextLine, screenshotObservationRule, snapshotHardRules } from './runtime-prompt-rules';
+import { browserChatDomRules } from './runtime-prompt-rules';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
@@ -121,17 +121,10 @@ type RuntimeDecision = {
   ledgerItems?: TaskLedgerItem[];
 };
 
-type ScreenshotReference = {
-  id: string;
-  path: string;
-  stepIndex: number;
-  phase: 'before' | 'after' | 'screenshot';
-  sameInterfaceGroup?: string;
+type BrowserChatRuntimeRecord = {
   description: string;
-};
-
-type SelectedScreenshotReference = ScreenshotReference & {
-  selectionReason?: string;
+  targetUrl: string;
+  systemPrompt: string;
 };
 
 const codexRuntimeObjectSchema = z.object({
@@ -204,8 +197,7 @@ function browserModeFromEnv(): BrowserSessionMode {
   return 'dom';
 }
 
-function browserModeOf(testCase: TestCaseRecord): BrowserSessionMode {
-  void testCase;
+function browserModeOf(): BrowserSessionMode {
   return browserModeFromEnv();
 }
 
@@ -322,10 +314,8 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
   return Math.min(Math.max(normalized, min), max);
 }
 
-function runtimeRequestConsecutiveFailureLimit(browserChatMode: boolean) {
-  const retryEnabled = browserChatMode || process.env.AI_RUNTIME_RETRY_ON_PURE_FAILURE === 'true';
-  if (!retryEnabled) return 1;
-  return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, browserChatMode ? 3 : 2, 1, 10);
+function runtimeRequestConsecutiveFailureLimit() {
+  return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, 3, 1, 10);
 }
 
 function upstreamApiDisconnectReason(value?: string) {
@@ -710,21 +700,16 @@ function codexRuntimeObjectFromText(text: string, fallbackType: 'answer' | 'repo
   return parsed.success ? parsed.data : candidate as CodexRuntimeObject;
 }
 
-function requirementOf(testCase: TestCaseRecord) {
-  return richTextToPlainText(testCase.content.userRequirement || testCase.description) || testCase.description || testCase.title;
+function requirementOf(runtimeRecord: BrowserChatRuntimeRecord) {
+  return richTextToPlainText(runtimeRecord.description) || runtimeRecord.description;
 }
 
-// 读取测试用例上的额外系统提示词，例如级联选择器必须选到叶子节点。
-function systemPromptOf(testCase: TestCaseRecord) {
-  return richTextToPlainText(testCase.content.systemPrompt || '').trim();
-}
-
-function isBrowserChatTestCase(testCase: TestCaseRecord) {
-  return testCase.id.startsWith('chat_') || testCase.title === 'Browser chat operation';
+function systemPromptOf(runtimeRecord: BrowserChatRuntimeRecord) {
+  return richTextToPlainText(runtimeRecord.systemPrompt || '').trim();
 }
 
 // 将浏览器工具调用轨迹压缩为步骤证据，保存到运行历史中。
-const browserChatDefaultSystemPrompt = 'This is an interactive browser chat. Do not assume a fixed test-case script; operate from the live page and answer the latest user message in Chinese.';
+const browserChatDefaultSystemPrompt = 'This is an interactive browser chat. Operate from the live page and answer the latest user message in Chinese.';
 
 function browserChatSystemPromptForRuntime(value: string) {
   return value.replace(browserChatDefaultSystemPrompt, '').trim();
@@ -755,63 +740,6 @@ function upsertToolTrace(traces: ToolTrace[], trace: ToolTrace) {
   const index = trace.id ? traces.findIndex((item) => item.id === trace.id) : -1;
   if (index >= 0) traces[index] = trace;
   else traces.push(trace);
-}
-
-function screenshotPhaseLabel(phase: ScreenshotReference['phase']) {
-  if (phase === 'before') return 'before action';
-  if (phase === 'after') return 'after action';
-  return 'step screenshot';
-}
-
-function screenshotReferenceGroupOf(step: StepExecutionResult) {
-  const scrollTool = (step.tools || []).find((toolCall) => {
-    if (toolCall.name !== 'interact' && toolCall.name !== 'mouse') return false;
-    const input = toolCall.input && typeof toolCall.input === 'object' && !Array.isArray(toolCall.input)
-      ? toolCall.input as Record<string, unknown>
-      : {};
-    return input.action === 'scroll';
-  });
-  if (!scrollTool) return undefined;
-  const input = scrollTool.input && typeof scrollTool.input === 'object' && !Array.isArray(scrollTool.input)
-    ? scrollTool.input as Record<string, unknown>
-    : {};
-  const area = typeof input.uid === 'string' ? `uid-${input.uid}` : 'page';
-  return `scroll-step-${step.index}-${area}`;
-}
-
-function buildAvailableScreenshotReferences(steps: StepExecutionResult[], limit = Number(process.env.AI_PROMPT_SCREENSHOT_REFERENCE_LIMIT || 2)): ScreenshotReference[] {
-  const refs: ScreenshotReference[] = [];
-  for (const step of steps) {
-    const entries: Array<{ phase: ScreenshotReference['phase']; path?: string }> = [
-      { phase: 'after', path: step.afterScreenshotPath },
-      { phase: 'screenshot', path: step.screenshotPath },
-      { phase: 'before', path: step.beforeScreenshotPath },
-    ];
-    const seenPaths = new Set<string>();
-    for (const entry of entries) {
-      if (!entry.path || seenPaths.has(entry.path)) continue;
-      seenPaths.add(entry.path);
-      const group = screenshotReferenceGroupOf(step);
-      refs.push({
-        id: `step-${step.index}-${entry.phase}`,
-        path: entry.path,
-        stepIndex: step.index,
-        phase: entry.phase,
-        sameInterfaceGroup: group,
-        description: `Step ${step.index} ${screenshotPhaseLabel(entry.phase)}`,
-      });
-    }
-  }
-  return refs.slice(-limit);
-}
-
-function formatScreenshotReferences(refs: ScreenshotReference[]) {
-  if (!refs.length) return '[none]';
-  return refs.map((ref) => [
-    `- ${ref.id}`,
-    `step ${ref.stepIndex}`,
-    ref.phase,
-  ].filter(Boolean).join(' | ')).join('\n');
 }
 
 function concise(value?: string, max = 220) {
@@ -965,18 +893,6 @@ function isInfrastructureNoise(value?: string) {
     || providerToolSchemaError(value);
 }
 
-function isUsefulHistoryStep(step: StepExecutionResult) {
-  const text = `${step.action}\n${step.actual}\n${step.note || ''}`;
-  if (isInfrastructureNoise(text)) return false;
-  return Boolean(
-    step.status === 'passed'
-    || step.observation
-    || step.findings?.length
-    || step.memoryItems?.length
-    || step.tools?.length,
-  );
-}
-
 function sanitizeHistoricalToolText(value: unknown, max = 180) {
   if (typeof value !== 'string') return '';
   return concise(
@@ -994,98 +910,6 @@ function sanitizeHistoricalToolText(value: unknown, max = 180) {
   );
 }
 
-function summarizeStepToolCallForPrompt(toolCall: StepToolCall) {
-  const reason = sanitizeHistoricalToolText(toolCall.reason, 140);
-  const result = sanitizeHistoricalToolText(toolCall.result, 140);
-  const status = toolCall.recovered === true && toolCall.transient === true
-    ? ' recovered'
-    : toolCall.ok === false ? ' failed' : '';
-  return `${toolCall.name}${status}${reason ? `: ${reason}` : ''}${result ? ` -> ${result}` : ''}`;
-}
-
-function buildCompactRunContext(steps: StepExecutionResult[], activeMemory?: RuntimeWorkingMemory) {
-  const usefulSteps = steps.filter(isUsefulHistoryStep);
-  const latestStep = usefulSteps.at(-1);
-  const latestTool = latestStep?.tools?.at(-1);
-  const persistedWorkingMemory = steps.map((step) => step.workingMemory).filter(Boolean).at(-1);
-  const latestWorkingMemory = activeMemory || persistedWorkingMemory;
-  const latestNextGoal = sanitizeNextGoal(activeMemory?.nextStep || persistedWorkingMemory?.nextStep || steps.map((step) => step.workingMemory?.nextStep).filter(Boolean).at(-1));
-  const currentState = sanitizeCurrentState(latestWorkingMemory?.currentState || latestWorkingMemory?.pageUnderstanding || latestStep?.observation || latestStep?.note || '');
-  const nextObjective = latestNextGoal || '根据当前截图和ledgerDigest完成下一个未完成目标';
-  const lastAction = activeMemory?.lastAction
-    ? concise([activeMemory.lastAction, activeMemory.lastResult].filter(Boolean).join(' -> '), 180)
-    : latestTool
-    ? summarizeStepToolCallForPrompt(latestTool)
-    : latestStep ? `Step ${latestStep.index}: ${concise(latestStep.observation || latestStep.note || latestStep.action, 140)}` : '[none]';
-  const taskFrame = latestWorkingMemory?.taskFrame || collectTaskFrameFromSteps(steps);
-  const durableLedgerItems = mergeLedgerItems([], [
-    ...collectLedgerItemsFromSteps(steps),
-    ...(activeMemory?.ledgerItems || []),
-  ], ledgerMemoryLimit());
-  const runState = {
-    currentState: currentState || null,
-    nextObjective,
-    lastActionOrResult: lastAction,
-    taskFrame: taskFrame || null,
-    ledgerDigest: formatLedgerDigest(durableLedgerItems),
-    derivedSignals: {
-      completedSteps: steps.length,
-      ledgerItemCount: durableLedgerItems.length,
-    },
-    stateRule: 'Preserve currentState and ledgerDigest as authoritative compact memory. Do not discard or overwrite prior ledger conclusions unless current evidence truly contradicts them.',
-  };
-
-  return [
-    'RunState JSON (authoritative compact state):',
-    JSON.stringify(runState, null, 2),
-  ].join('\n');
-}
-
-function codexExecutedActionMessages(steps: StepExecutionResult[]): RuntimeModelMessage[] {
-  const actions = steps
-    .filter(isUsefulHistoryStep)
-    .flatMap((step) => (step.tools || []).map((tool) => ({ stepIndex: step.index, tool })))
-    .slice(-8);
-  return actions.flatMap(({ stepIndex, tool }) => {
-    const input = tool.input === undefined ? {} : tool.input;
-    const result = textFromUnknown(tool.rawResult ?? tool.result).trim() || '[no execution result recorded]';
-    return [
-      {
-        role: 'assistant' as const,
-        content: `[Previously requested browser action]\nstep=${stepIndex}\ntool=${tool.name}\ninput=${JSON.stringify(input)}`,
-      },
-      {
-        role: 'user' as const,
-        content: `[Browser action execution result]\nstep=${stepIndex}\ntool=${tool.name}\nok=${tool.ok !== false}\nresult=${result}`,
-      },
-    ];
-  });
-}
-
-function formatLedgerDigest(items: TaskLedgerItem[], limit = Number(process.env.AI_LEDGER_DIGEST_LIMIT || 1000)) {
-  if (!items.length) return [];
-  return items.slice(-Math.max(1, limit)).map((item) => {
-    const step = item.sourceStep ? `S${item.sourceStep}` : 'S?';
-    const dimension = item.dimensionId || 'general';
-    const status = item.status || 'finding';
-    const severity = item.severity || 'info';
-    const summary = item.summary || item.actual || item.expected || item.evidence?.[0] || '';
-    return `[${step}/${dimension}/${status}/${severity}] ${concise([item.title, summary].filter(Boolean).join(': '), 180)}`;
-  });
-}
-
-function hostOf(url: string) {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return '';
-  }
-}
-
-
-
-
-
 function defaultVisualAfterForTool(name: string): VisualAfterPolicy {
   void name;
   return { capture: 'auto', retention: 'replace' };
@@ -1099,29 +923,6 @@ function sanitizeVisualAfterRetention(retention: unknown, fallback: VisualAfterP
   if (typeof retention !== 'string') return fallback;
   if (retention === 'auto' || retention === 'replace' || retention === 'append') return retention;
   return fallback;
-}
-
-function sanitizeNextGoal(value: unknown) {
-  if (typeof value !== 'string') return '';
-  return sanitizeHistoricalToolText(
-    value
-      .replace(/继续\s*(?:点击|双击|右键|拖拽|悬停|输入|按下|滚动|选择)/g, '继续完成')
-      .replace(/(?:点击|双击|右键|拖拽|悬停|输入|按下|滚动|选择)\s*[“"']?([^，。；;]*)[”"']?/g, '完成$1')
-      .replace(/候选(?:ID|id|编号)\s*[:：]?\s*\d+/gi, '当前截图中的对应候选')
-      .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的对应目标')
-      .replace(/\b(?:interact|mouse|keyboard)\s*\([^)]*\)/gi, '根据当前页面选择合适工具'),
-    220,
-  );
-}
-
-function sanitizeCurrentState(value: unknown) {
-  if (typeof value !== 'string') return '';
-  return sanitizeHistoricalToolText(
-    value
-      .replace(/\b(?:interact|mouse|keyboard)\s*\([^)]*\)/gi, '已执行页面操作')
-      .replace(/(?:候选|编号|id)\s*\d+/gi, '当前截图中的目标'),
-    260,
-  );
 }
 
 const noVisualAfterCaptureToolNames = new Set<string>();
@@ -1540,12 +1341,6 @@ function makeBrowserTools(
   aiRequest?: AiRequestSnapshot,
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>,
   referenceOptions?: {
-    availableReferenceIds?: Set<string>;
-    onSelectReferenceScreenshots?: (input: {
-      ids: string[];
-      selectionReason: string;
-      sameInterfaceGroup?: string;
-    }) => void | Promise<void>;
     runId?: string;
     stepIndex?: number;
     allowedToolTypes?: string[];
@@ -1918,53 +1713,16 @@ function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
 // 根据当前模式生成验证码/安全校验规则；DOM 模式不要要求 AI 读取截图。
 
 function runtimePrompt(input: {
-  testCase: TestCaseRecord;
-  currentUrl: string;
-  completedSteps: StepExecutionResult[];
-  workingMemory?: RuntimeWorkingMemory;
-  stepIndex: number;
-  beforeScreenshotPath: string;
-  hasMarkerScreenshot?: boolean;
-  markerOverlayInScreenshot?: boolean;
-  availableScreenshotReferences?: ScreenshotReference[];
-  selectedScreenshotReferences?: SelectedScreenshotReference[];
-  repairContext?: string;
+  runtimeRecord: BrowserChatRuntimeRecord;
+  operationalContext?: string;
 }) {
-  const { testCase, currentUrl, completedSteps } = input;
-  const targetHost = hostOf(testCase.targetUrl) || '[unknown target host]';
-  const visualMode = false;
-  const attachScreenshot = false;
-  const visualMarkersWithoutOverlay = false;
-  const visualTextCandidateFallback = false;
-  void input.markerOverlayInScreenshot;
-  void input.hasMarkerScreenshot;
-  const rawCaseSystemPrompt = systemPromptOf(testCase);
-  const requirement = requirementOf(testCase);
-  const browserChatMode = isBrowserChatTestCase(testCase);
-  const caseSystemPrompt = browserChatMode ? browserChatSystemPromptForRuntime(rawCaseSystemPrompt) : rawCaseSystemPrompt;
-  const compactRunContext = browserChatMode ? '' : buildCompactRunContext(completedSteps, input.workingMemory);
+  const { runtimeRecord } = input;
+  const rawCaseSystemPrompt = systemPromptOf(runtimeRecord);
+  const caseSystemPrompt = browserChatSystemPromptForRuntime(rawCaseSystemPrompt);
   const customPrompt = customRuntimePromptFromEnv();
-  const availableScreenshotReferences = input.availableScreenshotReferences || [];
-  const selectedScreenshotReferences = input.selectedScreenshotReferences || [];
-  const strategyMemory = (testCase.strategyMemory || [])
-    .filter((hint) => !isInfrastructureNoise(hint))
-    .map((hint) => concise(hint, 220))
-    .slice(-4);
   const screenshotAvailable = modelSupportsScreenshotInput();
-  const candidateContext = screenshotAvailable
-    ? '[legacy candidate map disabled; use inspect UIDs or latest screenshot coordinates]'
-    : '[legacy candidate map disabled; use fresh inspect UIDs]';
-  const externalAppCandidateContext = '';
-  const evidence = screenshotAvailable
-    ? 'the latest semantic DOM snapshot across the main document and all attached iframes, plus an optional latest viewport screenshot'
-    : 'the latest semantic DOM snapshot across the main document and all attached iframes';
-  const markerTargetRules: string[] = [];
-  const modeActionRules = browserActionRules(screenshotAvailable);
-  if (browserChatMode) {
-    return [
+  return [
       'You are an AI browser chat agent. Satisfy the latest user message from the live browser or answer directly when browser evidence is unnecessary.',
-      `Request:\n${requirement}`,
-      `Browser: target=${testCase.targetUrl}; current=${currentUrl}`,
       '',
       'Operating rules:',
       '- In one model step, either answer in Chinese Markdown without a tool or call at most one relevant tool. A new action request is a new occurrence even when its wording repeats an earlier request.',
@@ -1972,112 +1730,16 @@ function runtimePrompt(input: {
       '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
       ...browserChatDomRules(screenshotAvailable),
       '- After every state-changing action, verify the requested business result from its DOM delta, validation state, URL, field value, toast, dialog, table state, a delayed changes capture, or a fresh full capture. If progress stops, inspect fresh evidence and change approach instead of repeating the same failed target.',
+      '- Only for multi-document requirement analysis, inspect/search the root links, spawn one parallel subagent batch for independent URLs, keep dependent end-to-end work in the main Agent, and read one completed child result per later model step.',
       '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
       '- Use file action="read" for one attachment/artifact, action="download" with an already-known absolute or page-relative URL, and action="writeMarkdown" with complete content. Report a saved file name and return its clickable download link.',
       caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
-      customPrompt,
-      input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
-      '',
-      'Current context:',
-      currentSnapshotContextLine(true),
-      availableScreenshotReferences.length ? `Available previous screenshot references:\n${formatScreenshotReferences(availableScreenshotReferences)}` : '',
-      selectedScreenshotReferences.length ? `Selected reference screenshots:\n${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
-      selectedScreenshotReferences.length
-        ? 'Previous screenshots are read-only context; never reuse their UIDs or coordinates for a current action.'
+      input.operationalContext
+        ? `Relevant memory and secure capabilities supplied by the runtime:\n${input.operationalContext}`
         : '',
+      customPrompt,
       '',
       'Finish with Chinese Markdown when the request is satisfied, blocked, failed, or needs clarification. Do not return standalone JSON.',
-    ].filter(Boolean).join('\n');
-  }
-  return [
-    browserChatMode
-      ? 'You are an AI browser chat agent.'
-      : 'You are an AI browser testing agent. Call exactly ONE tool. Use reportState only when no browser action is needed.',
-    browserChatMode ? '' : `Requirement: ${requirement}`,
-    `Target URL: ${testCase.targetUrl}`,
-    `Target host: ${targetHost}`,
-    `Current URL: ${currentUrl}`,
-    '',
-    'Hard rules:',
-    browserChatMode
-      ? '- Browser chat may either answer with Chinese Markdown and no tool, or call at most one browser tool when action/inspection is needed.'
-      : '- One tool only. You may include a short ordinary Chinese progress sentence alongside the tool call.',
-    browserChatMode
-      ? '- Keep browser action tool params minimal: reason, exact tool arguments, optional visualAfter, and optional requiresConfirmation/confirmationMessage only when strict safety requires a button confirmation. If no browser action is needed, answer directly in Markdown without calling a tool.'
-      : '- Keep tool params minimal: reason, exact tool arguments, and optional visualAfter. Do not add separate state summaries, memory notes, finding lists, task frames, or ledger JSON.',
-    browserChatMode ? '' : '- Treat RunState JSON and Working Memory as compact context only. Do not copy them into tool params.',
-    browserChatMode ? '' : '- Historical actions are semantic summaries only. Do not reuse historical candidate ids, area ids, coordinates, deltas, screenshot ids, or old tool input JSON.',
-    '- In reason/message/action/expected/actual, do not output candidate ids as business meaning, area ids, coordinates, deltas, screenshot file ids, or tool input JSON.',
-    '- When a candidate is marked external-app=<protocol>, clicking it is an external application launch attempt. The browser page may remain unchanged, and native app launch success is not server-verifiable.',
-    browserChatMode ? '' : '- If ledgerDigest already covers a requirement area, do not restart that area by habit; continue only with missing or contradicted work.',
-    browserChatMode ? '' : '- This is a testing workflow, not a generic browser assistant. In every step, actively look for product defects, requirement mismatches, broken navigation, unexpected page states, visible loading stalls, validation problems, and reliability risks.',
-    browserChatMode ? '' : '- When a problem is observed or strongly indicated by tool/page feedback, describe it in ordinary assistant text or reportState actual; do not create extra structured memory fields.',
-    browserChatMode ? '' : '- If the page looks broken, data is missing, a request may have failed, or an issue may be caused by an API/static-resource failure, call inspect with action="httpRequests" before finalizing that issue when possible.',
-    '- If the user asks to download/save a file, use file with action="download". It accepts an absolute URL, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf resolved against the current page URL. When a usable link is already known, pass it directly to the file tool; do not call inspect action="httpRequests" merely to read or rediscover downloadable content.',
-    browserChatMode ? '- Strict safety confirmations must use tool params requiresConfirmation=true and confirmationMessage; never ask the user to type a confirmation message for that purpose.' : '',
-    '- If the user asks to generate/export/save a Markdown file, use file with action="writeMarkdown" and the complete Markdown content. In the final answer, include the returned Markdown download link exactly as a clickable Markdown link.',
-    ...snapshotHardRules(screenshotAvailable),
-    input.repairContext ? `Replay repair mode:\n${input.repairContext}` : '',
-    visualMode
-      ? '- Candidate action reason must describe the visible text/icon/position/role from the CURRENT screenshot before choosing id.'
-      : screenshotAvailable
-        ? '- Browser action reason must cite the current snapshot UID or latest screenshot target used for the action.'
-        : '- Browser action reason must cite a fresh UID from the latest semantic DOM snapshot.',
-    `- Use ${evidence} as the current page state. When semantic state is stale, call inspect({action:"capture",mode:"full"}).`,
-    '- If no progress or target mismatch, choose a different evidence-based path; do not repeat the same visible target by habit.',
-    '- If loading/transitioning, call browser with action="wait" once. Block only for manual captcha/OTP/security/user input.',
-    ...modeActionRules,
-    '- After a click may open a tab/window, call browser with action="listTabs"; use action="switchTab" if the relevant page is in another tab.',
-    '- Block only for empty captcha/OTP/security/manual verification. If captchaAppearsFilled=true, submit/login and continue.',
-    '- If the current page requires user-side captcha/OTP/security/manual verification, call waitForHumanVerification. It pauses the run for user intervention and no further AI tool should be requested from that screenshot.',
-    '- If login, password, OTP, QR-code scan, payment confirmation, or identity confirmation requires user-owned credentials or a personal device and those credentials were not explicitly supplied, call waitForHumanVerification instead of inventing credentials or only describing the blocker in text.',
-    browserChatMode
-      ? ''
-      : '- Finish only when EVERY requirement clause is satisfied; use reportState with done=true/status=passed. Otherwise call one more useful browser tool or reportState with done=false when only reporting status.',
-    screenshotObservationRule(screenshotAvailable),
-    ...markerTargetRules,
-    caseSystemPrompt ? `${browserChatMode ? 'Browser-chat loaded instructions and Skills' : 'Test-case-specific instructions'}:
-${caseSystemPrompt}` : '',
-    customPrompt,
-    !browserChatMode && strategyMemory.length ? `Historical failure strategy memory:
-${strategyMemory.map((hint, index) => `${index + 1}. ${hint}`).join('\n')}` : '',
-    '',
-    ...(browserChatMode ? [] : buildCompletionPromptLines(attachScreenshot)),
-    '',
-    'Response:',
-    browserChatMode
-      ? '- Either return normal Chinese Markdown text with no tool, or call one browser tool if action/inspection is needed. Tool params are only for the selected tool.'
-      : '- Call one tool. Use ordinary assistant text for progress/explanation, and tool params only for the selected tool.',
-    visualMode
-      ? '- Candidate action reason must mention the current-screenshot visual feature, not just an id.'
-      : screenshotAvailable
-        ? '- Browser action reason must mention the current UID or latest screenshot visual target.'
-        : '- Browser action reason must mention the current snapshot UID.',
-    browserChatMode
-      ? '- To finish/block/fail/clarify in browser chat, return normal Chinese Markdown text with no tool call. Do not return JSON.'
-      : '- To finish/block/fail or only report status, call reportState. Do not return standalone JSON.',
-    screenshotAvailable
-      ? '- Progress text and the selected tool must agree. Use takeScreenshot for pixels and inspect for the accessibility tree.'
-      : '- Progress text must describe inspect as a semantic DOM snapshot, not as a screenshot.',
-    '- When a file tool succeeds, mention the saved file name and include its returned download target as a clickable Markdown link.',
-    '',
-    'Current context:',
-    browserChatMode ? currentSnapshotContextLine(true) : currentSnapshotContextLine(false),
-    visualMode && externalAppCandidateContext ? `External application candidates in the current candidate map:
-${externalAppCandidateContext}` : '',
-    visualMarkersWithoutOverlay || visualTextCandidateFallback ? `Visible interactive elements:
-${candidateContext}` : '',
-    compactRunContext,
-    availableScreenshotReferences.length ? `Available previous screenshot references:
-${formatScreenshotReferences(availableScreenshotReferences)}` : '',
-    selectedScreenshotReferences.length ? `Selected reference screenshots:
-${formatScreenshotReferences(selectedScreenshotReferences)}` : '',
-    selectedScreenshotReferences.length
-      ? 'Reference screenshot rule: selected reference images help connect scroll continuity or compare earlier page state. They may show the same interface at different scroll offsets when sameInterfaceGroup matches, but their candidate ids are historical and must never be used for the current action.'
-      : '',
-    screenshotAvailable
-      ? 'Screenshot image/path is not attached automatically. takeScreenshot attaches explicit visual evidence to the next model request when available.'
-      : '',
   ].filter(Boolean).join('\n');
 }
 
@@ -2365,17 +2027,6 @@ function mergeLedgerItems(existing: TaskLedgerItem[] = [], incoming: TaskLedgerI
   return [...map.values()].slice(-limit);
 }
 
-function collectTaskFrameFromSteps(steps: StepExecutionResult[]) {
-  return steps.map((step) => step.taskFrame || step.workingMemory?.taskFrame).filter(Boolean).at(-1);
-}
-
-function collectLedgerItemsFromSteps(steps: StepExecutionResult[]) {
-  return mergeLedgerItems([], [
-    ...steps.flatMap((step) => step.ledgerItems || []),
-    ...steps.flatMap((step) => step.workingMemory?.ledgerItems || []),
-  ], ledgerMemoryLimit());
-}
-
 function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''): Pick<RuntimeDecision, 'taskFrame' | 'ledgerItems'> {
   void traces;
   void goal;
@@ -2479,28 +2130,20 @@ function progressFieldsFromToolTraces(
 
 async function executeRuntimeStep(input: {
   session: BrowserSession;
-  testCase: TestCaseRecord;
+  runtimeRecord: BrowserChatRuntimeRecord;
   runId: string;
   stepIndex: number;
   beforeScreenshotPath: string;
   instruction?: string;
+  operationalContext?: string;
   conversation?: InteractiveBrowserTurnMessage[];
-  completedSteps: StepExecutionResult[];
   runtimeObservationStore?: RuntimeObservationStore;
-  selectedScreenshotReferences?: SelectedScreenshotReference[];
   referenceImagePaths?: string[];
-  onSelectReferenceScreenshots?: (selection: {
-    ids: string[];
-    selectionReason: string;
-    sameInterfaceGroup?: string;
-    availableReferences: ScreenshotReference[];
-  }) => void | Promise<void>;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   getDynamicSkillContext?: () => string | Promise<string>;
-  repairContext?: string;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   resolveCredential?: (credentialRef: string) => string | undefined;
   credentialAllowedOrigins?: string[];
@@ -2514,22 +2157,17 @@ async function executeRuntimeStep(input: {
 }) {
   const {
     session,
-    testCase,
+    runtimeRecord,
     stepIndex,
     beforeScreenshotPath,
-    completedSteps,
-    selectedScreenshotReferences = [],
     referenceImagePaths = [],
-    onSelectReferenceScreenshots,
     abortSignal,
     onDebug,
     onToolTrace,
   } = input;
-  const mode = browserModeOf(testCase);
-  const browserChatMode = isBrowserChatTestCase(testCase);
+  const mode = browserModeOf();
   const screenshotInputEnabled = false;
   const markerEnabled = false;
-  const markerOverlayInScreenshot = false;
   const ensureActive = () => throwIfStopped(abortSignal, input.shouldContinue);
   const markerScreenshotPath = undefined;
   const originalScreenshotPath = session.getLastOriginalScreenshotPath();
@@ -2541,15 +2179,9 @@ async function executeRuntimeStep(input: {
     details: { browserMode: mode, screenshotInputEnabled, markerEnabled },
   });
   const contextStartedAt = Date.now();
-  const currentUrl = input.isBrowserStarted?.() === false
-    ? testCase.targetUrl || 'about:blank'
-    : session.currentUrl();
-  ensureActive();
   const contextMs = elapsedSince(contextStartedAt);
   const screenshotReadStartedAt = Date.now();
   const screenshot = undefined;
-  ensureActive();
-  const markerScreenshot = undefined;
   ensureActive();
   const userReferenceImagePaths = Array.from(new Set(referenceImagePaths.filter(Boolean))).slice(0, 4);
   const userReferenceImages = modelSupportsScreenshotInput()
@@ -2559,40 +2191,7 @@ async function executeRuntimeStep(input: {
       })))
     : [];
   ensureActive();
-  let runtimeSelectedScreenshotReferences = [...selectedScreenshotReferences];
-  const loadSelectedReferenceScreenshots = async () => modelSupportsScreenshotInput()
-    ? Promise.all(runtimeSelectedScreenshotReferences.map(async (ref) => ({
-        ref,
-        image: await readScreenshotForAi(ref.path).catch(() => undefined),
-      })))
-    : [];
-  let runtimeSelectedReferenceScreenshots = await loadSelectedReferenceScreenshots();
-  ensureActive();
   const screenshotReadMs = elapsedSince(screenshotReadStartedAt);
-  const availableScreenshotReferences = buildAvailableScreenshotReferences(completedSteps);
-  const availableReferenceIds = new Set(availableScreenshotReferences.map((ref) => ref.id));
-  const applySelectedReferenceScreenshots = async (selection: {
-    ids: string[];
-    selectionReason: string;
-    sameInterfaceGroup?: string;
-  }) => {
-    const validIds = selection.ids.filter((id) => availableReferenceIds.has(id));
-    runtimeSelectedScreenshotReferences = validIds
-      .map((id) => availableScreenshotReferences.find((ref) => ref.id === id))
-      .filter((ref): ref is ScreenshotReference => Boolean(ref))
-      .map((ref) => ({
-        ...ref,
-        selectionReason: selection.selectionReason,
-        sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
-      }));
-    runtimeSelectedReferenceScreenshots = await loadSelectedReferenceScreenshots();
-    await onSelectReferenceScreenshots?.({
-      ...selection,
-      ids: validIds,
-      availableReferences: availableScreenshotReferences,
-    });
-    return validIds;
-  };
   const promptStartedAt = Date.now();
   const userReferenceImagePrompt = userReferenceImagePaths.length
     ? [
@@ -2603,16 +2202,8 @@ async function executeRuntimeStep(input: {
       ].join('\n')
     : '';
   const prompt = `${runtimePrompt({
-    testCase,
-    currentUrl,
-    completedSteps,
-    stepIndex,
-    beforeScreenshotPath,
-    hasMarkerScreenshot: Boolean(markerScreenshot),
-    markerOverlayInScreenshot,
-    availableScreenshotReferences,
-    selectedScreenshotReferences: runtimeSelectedScreenshotReferences,
-    repairContext: input.repairContext,
+    runtimeRecord,
+    operationalContext: input.operationalContext,
   })}${userReferenceImagePrompt}`;
   const promptMs = elapsedSince(promptStartedAt);
   await onDebug?.({
@@ -2626,7 +2217,7 @@ async function executeRuntimeStep(input: {
       screenshotInputEnabled,
       screenshotBytes: undefined,
       markerScreenshotBytes: undefined,
-      selectedReferenceScreenshotCount: runtimeSelectedReferenceScreenshots.filter((item) => item.image).length,
+      selectedReferenceScreenshotCount: 0,
       userReferenceImageCount: userReferenceImages.filter((item) => item.image).length,
       browserMode: mode,
     },
@@ -2651,7 +2242,7 @@ async function executeRuntimeStep(input: {
       name !== 'subagent' || Boolean(input.runSubagents || input.readSubagent)
     ));
     const runtimeTools = runtimeAllowedToolTypes({
-      browserChatMode,
+      browserChatMode: true,
       codexMode,
       nativeToolNames: availableRuntimeToolNames,
       observationToolNames: runtimeObservationToolNames,
@@ -2665,29 +2256,21 @@ async function executeRuntimeStep(input: {
     visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
     const initialRequestPrompt = prompt;
     const requestPrompt = codexMode ? buildCodexObjectPrompt(initialRequestPrompt, allowedToolTypes) : initialRequestPrompt;
-    const requestSystemPrompt: string | undefined = browserChatMode ? requestPrompt : undefined;
+    const requestSystemPrompt = requestPrompt;
     let workingMemory: RuntimeWorkingMemory = {
-      taskGoal: requirementOf(testCase),
-      phase: browserChatMode
-        ? 'Browser chat turn; answer directly when current evidence is enough, otherwise use one browser tool.'
-        : 'Entering the browser Agent Loop; choose one semantic, visual, interaction, or reporting tool.',
+      taskGoal: requirementOf(runtimeRecord),
+      phase: 'Browser chat turn; answer directly when current evidence is enough, otherwise use one browser tool.',
       completed: [],
       findings: [],
       blockers: [],
       pageUnderstanding: '',
-      currentState: browserChatMode
-        ? 'No page snapshot is preloaded; call inspect({action:"capture",mode:"full"}) when browser evidence is needed.'
-        : 'No page snapshot is preloaded; call inspect({action:"capture",mode:"full"}) before choosing a UID action.',
+      currentState: 'No page snapshot is preloaded; call inspect({action:"capture",mode:"full"}) when browser evidence is needed.',
       scrollSummary: '',
-      userConstraints: systemPromptOf(testCase) ? [systemPromptOf(testCase)] : [],
-      nextStep: browserChatMode
-        ? 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.'
-        : 'Use the current DOM baseline plus the latest incremental changes for the next missing goal; use interact action=scroll only when content is lazy-loaded or virtualized.',
-      taskFrame: testCase.content.taskFrame,
+      userConstraints: systemPromptOf(runtimeRecord) ? [systemPromptOf(runtimeRecord)] : [],
+      nextStep: 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.',
     };
     let latestText = '';
     const initialVisualPaths: string[] = [];
-    const initialSelectedReferenceImagePaths = browserChatMode ? [] : runtimeSelectedReferenceScreenshots.filter((item) => item.image).map((item) => item.ref.path);
     const initialUserReferenceImagePaths = userReferenceImages.filter((item) => item.image).map((item) => item.imagePath);
     type PendingObservationMessage = {
       text: string;
@@ -2704,59 +2287,49 @@ async function executeRuntimeStep(input: {
         };
       })
       .filter((message): message is { role: 'user' | 'assistant'; content: string } => Boolean(message)) as RuntimeModelMessage[];
-    const initialImagePaths = [...initialVisualPaths, ...initialSelectedReferenceImagePaths, ...initialUserReferenceImagePaths];
+    const initialImagePaths = [...initialVisualPaths, ...initialUserReferenceImagePaths];
     const initialImages: Buffer[] = [];
     for (const imagePath of initialImagePaths) {
       const image = await readScreenshotForAi(imagePath).catch(() => undefined);
       if (image) initialImages.push(image);
     }
     let initialMessages = [...historyMessages] as RuntimeModelMessage[];
-    if (browserChatMode) {
-      const latestInstruction = (
-        textFromUnknown(input.instruction)
-        || textFromUnknown(testCase.description)
-        || textFromUnknown(testCase.content?.description)
-      ).trim();
-      const hasLatestUserMessage = Boolean(latestInstruction && initialMessages.some((message) => {
-        if (message.role !== 'user' || typeof message.content !== 'string') return false;
-        const content = textFromUnknown(message.content);
-        return content.trim() === latestInstruction || content.includes(latestInstruction);
-      }));
-      if (latestInstruction && !hasLatestUserMessage) {
-        initialMessages.push({ role: 'user' as const, content: latestInstruction });
-      }
-      if (initialImages.length) {
-        const latestUserIndex = initialMessages.map((message) => message.role).lastIndexOf('user');
-        const fallbackText = latestInstruction || 'User uploaded reference image(s).';
-        if (latestUserIndex >= 0) {
-          const latestUser = initialMessages[latestUserIndex];
-          const text = typeof latestUser.content === 'string' && latestUser.content.trim()
-            ? latestUser.content
-            : fallbackText;
-          initialMessages[latestUserIndex] = {
-            role: 'user' as const,
-            content: [
-              { type: 'text' as const, text },
-              ...initialImages.map((image) => ({ type: 'image' as const, image })),
-            ],
-          };
-        } else {
-          initialMessages.push({
-            role: 'user' as const,
-            content: [
-              { type: 'text' as const, text: fallbackText },
-              ...initialImages.map((image) => ({ type: 'image' as const, image })),
-            ],
-          });
-        }
-      }
-    } else {
-      const initialContent: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: requestPrompt }];
-      for (const image of initialImages) initialContent.push({ type: 'image', image });
-      initialMessages = [...historyMessages, { role: 'user' as const, content: initialContent }] as RuntimeModelMessage[];
+    const latestInstruction = (
+      textFromUnknown(input.instruction)
+      || textFromUnknown(runtimeRecord.description)
+    ).trim();
+    const hasLatestUserMessage = Boolean(latestInstruction && initialMessages.some((message) => {
+      if (message.role !== 'user' || typeof message.content !== 'string') return false;
+      const content = textFromUnknown(message.content);
+      return content.trim() === latestInstruction || content.includes(latestInstruction);
+    }));
+    if (latestInstruction && !hasLatestUserMessage) {
+      initialMessages.push({ role: 'user' as const, content: latestInstruction });
     }
-    if (codexMode && !browserChatMode && input.completedSteps.length) {
-      initialMessages.push(...codexExecutedActionMessages(input.completedSteps));
+    if (initialImages.length) {
+      const latestUserIndex = initialMessages.map((message) => message.role).lastIndexOf('user');
+      const fallbackText = latestInstruction || 'User uploaded reference image(s).';
+      if (latestUserIndex >= 0) {
+        const latestUser = initialMessages[latestUserIndex];
+        const text = typeof latestUser.content === 'string' && latestUser.content.trim()
+          ? latestUser.content
+          : fallbackText;
+        initialMessages[latestUserIndex] = {
+          role: 'user' as const,
+          content: [
+            { type: 'text' as const, text },
+            ...initialImages.map((image) => ({ type: 'image' as const, image })),
+          ],
+        };
+      } else {
+        initialMessages.push({
+          role: 'user' as const,
+          content: [
+            { type: 'text' as const, text: fallbackText },
+            ...initialImages.map((image) => ({ type: 'image' as const, image })),
+          ],
+        });
+      }
     }
     if (retryState?.messages.length) {
       initialMessages = [...retryState.messages];
@@ -2771,13 +2344,13 @@ async function executeRuntimeStep(input: {
     let aiRequest = createAiRequestSnapshot({
       kind: 'runtime',
       stepIndex,
-      prompt: browserChatMode ? '[system prompt]' : requestPrompt,
+      prompt: '[system prompt]',
       systemPrompt: requestSystemPrompt,
       screenshotPath: undefined,
       imagePaths: messageImagePaths,
       imageAttached: Boolean(messageImagePaths.length),
       tools: allowedToolTypes,
-      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, markerScreenshotPath, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled: false, screenshotToolEnabled: modelSupportsScreenshotInput(), browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: initialSelectedReferenceImagePaths.length, userReferenceImageCount: initialUserReferenceImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId) },
+      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, markerScreenshotPath, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled: false, screenshotToolEnabled: modelSupportsScreenshotInput(), browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: 0, userReferenceImageCount: initialUserReferenceImagePaths.length, observationCount: runtimeObservationCount(observationStore, input.runId) },
     });
     lastAiRequest = aiRequest;
     const toolExecutionGate = { stepNumber: 0, executed: false };
@@ -2891,7 +2464,7 @@ async function executeRuntimeStep(input: {
           messages: [{
             role: 'user' as const,
             content: buildContinuationSummaryPrompt({
-              goal: requirementOf(testCase),
+              goal: requirementOf(runtimeRecord),
               browserMode: mode,
               stepIndex,
               agentStep: agentStepIndex,
@@ -2907,7 +2480,7 @@ async function executeRuntimeStep(input: {
         });
         ensureActive();
         return (result.text || '').trim() || fallbackContinuationSummary({
-          goal: requirementOf(testCase),
+          goal: requirementOf(runtimeRecord),
           browserMode: mode,
           stepIndex,
           agentStep: agentStepIndex,
@@ -2917,7 +2490,7 @@ async function executeRuntimeStep(input: {
       } catch (error) {
         if (isBrowserChatAbortError(error, abortSignal)) throw browserChatAbortError(abortSignal);
         return fallbackContinuationSummary({
-          goal: requirementOf(testCase),
+          goal: requirementOf(runtimeRecord),
           browserMode: mode,
           stepIndex,
           agentStep: agentStepIndex,
@@ -2941,7 +2514,7 @@ async function executeRuntimeStep(input: {
           ensureActive();
           if (dynamicSkillContext) {
             pendingObservationMessages.push({
-              text: `[WebPilot domain memory recalled for the current page]\n${dynamicSkillContext}`,
+              text: `[WebPilot Skill instructions for the current page]\n${dynamicSkillContext}`,
               imagePaths: [],
             });
           }
@@ -3056,7 +2629,7 @@ async function executeRuntimeStep(input: {
       );
       const execution = await executeCodexRuntimeObject({
         session,
-        targetUrl: testCase.targetUrl,
+        targetUrl: runtimeRecord.targetUrl,
         runId: input.runId,
         stepIndex,
         mode,
@@ -3112,12 +2685,12 @@ async function executeRuntimeStep(input: {
         aiRequest,
         visualContext: visualContext.snapshot(),
         workingMemory,
-        endedWithText: browserChatMode && !execution.executed && Boolean(textFromUnknown(execution.text).trim()),
+        endedWithText: !execution.executed && Boolean(textFromUnknown(execution.text).trim()),
       };
     }
 
     const stopWhen = [hasToolCall('reportState'), hasToolCall('waitForHumanVerification')];
-    nativeToolsRef.current = makeBrowserTools(session, testCase.targetUrl, mode, traces, aiRequest, async (trace) => {
+    nativeToolsRef.current = makeBrowserTools(session, runtimeRecord.targetUrl, mode, traces, aiRequest, async (trace) => {
       ensureActive();
       upsertToolTrace(durableTraces, trace);
       workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
@@ -3130,7 +2703,6 @@ async function executeRuntimeStep(input: {
         details: { trace, visualContext: visualContext.snapshot(), workingMemory },
       });
     }, {
-      availableReferenceIds,
       allowedToolTypes,
       runId: input.runId,
       stepIndex,
@@ -3160,10 +2732,6 @@ async function executeRuntimeStep(input: {
       onVisualContextChange: async (snapshot) => {
         ensureActive();
         await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
-      },
-      onSelectReferenceScreenshots: async (selection) => {
-        ensureActive();
-        await applySelectedReferenceScreenshots(selection);
       },
     });
     const toolsForRequest = nativeToolsRef.current;
@@ -3238,7 +2806,7 @@ async function executeRuntimeStep(input: {
         aiRequest,
         visualContext: visualContext.snapshot(),
         workingMemory,
-        endedWithText: browserChatMode && Boolean(textFromUnknown(latestText).trim()) && traces.at(-1)?.name !== 'waitForHumanVerification',
+        endedWithText: Boolean(textFromUnknown(latestText).trim()) && traces.at(-1)?.name !== 'waitForHumanVerification',
       };
     } catch (error) {
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
@@ -3250,7 +2818,7 @@ async function executeRuntimeStep(input: {
   // Keep SDK retries disabled, but allow the runtime loop to retry transient upstream
   // disconnects with the exact model messages prepared for the failed request. The
   // limit is consecutive failures; any successful model step resets the counter.
-  const consecutiveFailureLimit = runtimeRequestConsecutiveFailureLimit(browserChatMode);
+  const consecutiveFailureLimit = runtimeRequestConsecutiveFailureLimit();
   let lastError: unknown;
   let retryingAfterFailure = false;
 
@@ -3340,21 +2908,6 @@ function browserChatMaxConsecutiveAiRequestFailures() {
   return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 3));
 }
 
-function browserChatRequirement(input: {
-  instruction: string;
-}) {
-  const toolRequirement = browserChatToolRequirement(input.instruction);
-  return [
-    toolRequirement === 'action'
-      ? '- The latest message requests a browser-changing action. Execute a relevant browser/interact/file operation before claiming completion; prior turns do not satisfy this new action.'
-      : toolRequirement === 'inspection'
-        ? '- The latest message requests current-page evidence. Execute inspect or takeScreenshot as appropriate before making page-state claims.'
-        : '',
-    '- Use browser tools only for live action or current-page evidence; otherwise answer directly from conversation context.',
-    '- Only for multi-document requirement analysis: inspect/search the root links, spawn one parallel subagent batch for independently readable URLs with self-contained evidence requests, keep dependent end-to-end work in the main Agent, and read at most one completed child result per later model step.',
-  ].filter(Boolean).join('\n');
-}
-
 const browserChatNonActionToolNames = new Set([
   'reportState',
   'inspect',
@@ -3399,48 +2952,21 @@ function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
   ].join('\n');
 }
 
-function createInteractiveBrowserTestCase(input: {
-  id: string;
-  mode?: BrowserSessionMode;
+function createInteractiveBrowserRuntimeRecord(input: {
   safetyMode?: BrowserChatSafetyMode;
   targetUrl: string;
   instruction: string;
   skillContext?: string;
-}): TestCaseRecord {
-  const now = new Date().toISOString();
+}): BrowserChatRuntimeRecord {
   const targetUrl = input.targetUrl || 'about:blank';
-  const requirement = browserChatRequirement({
-    instruction: input.instruction,
-  });
   const systemPrompt = [
     browserChatSafetyInstructions(input.safetyMode),
     input.skillContext,
   ].filter(Boolean).join('\n\n');
   return {
-    id: input.id,
-    title: 'Browser chat operation',
     description: input.instruction,
     targetUrl,
-    status: 'running',
-    priority: 'medium',
-    content: {
-      title: 'Browser chat operation',
-      description: input.instruction,
-      targetUrl,
-      priority: 'medium',
-      browserMode: 'dom',
-      isMarked: false,
-      userRequirement: requirement,
-      systemPrompt,
-      preconditions: [],
-      testData: {},
-      steps: [],
-      expectedResults: ['Satisfy the latest user message or clearly report the blocker.'],
-      risks: ['The user may continue the task with another chat message after this turn.'],
-    },
-    imageNames: [],
-    createdAt: now,
-    updatedAt: now,
+    systemPrompt,
   };
 }
 
@@ -3458,6 +2984,7 @@ export async function executeInteractiveBrowserTurn(input: {
   targetUrl: string;
   instruction: string;
   modelInstruction?: string;
+  operationalContext?: string;
   conversation?: InteractiveBrowserTurnMessage[];
   completedSteps?: StepExecutionResult[];
   mode?: BrowserSessionMode;
@@ -3483,16 +3010,13 @@ export async function executeInteractiveBrowserTurn(input: {
   const ensureActive = () => throwIfStopped(input.abortSignal, input.shouldContinue);
   const steps = [...(input.completedSteps || [])];
   const newSteps: StepExecutionResult[] = [];
-  const testCase = createInteractiveBrowserTestCase({
-    id: `chat_${input.runId}`,
-    mode: input.mode,
+  const runtimeRecord = createInteractiveBrowserRuntimeRecord({
     safetyMode: input.safetyMode,
     targetUrl: input.targetUrl,
     instruction: input.instruction,
     skillContext: input.skillContext,
   });
-  const runtimeMode = browserModeOf(testCase);
-  let selectedScreenshotReferences: SelectedScreenshotReference[] = [];
+  const runtimeMode = browserModeOf();
   const runtimeObservationStore: RuntimeObservationStore = new Map();
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
@@ -3567,29 +3091,18 @@ export async function executeInteractiveBrowserTurn(input: {
     try {
       actionResult = await executeRuntimeStep({
         session: input.session,
-        testCase,
+        runtimeRecord,
         runId: input.runId,
         stepIndex,
         beforeScreenshotPath: beforeScreenshotPath || '',
         instruction: rejectedDirectAnswerCount
           ? `${input.modelInstruction || input.instruction}\n\n[Backend correction] Your previous text-only completion claim was rejected because this user message requires a real browser tool. Execute the requested action or inspection now. Do not claim success without a successful tool result from this turn.`
           : input.modelInstruction || input.instruction,
+        operationalContext: input.operationalContext,
         conversation: input.conversation || [],
-        completedSteps: steps.filter((step) => step.index !== stepIndex),
         runtimeObservationStore,
-        selectedScreenshotReferences,
         referenceImagePaths: input.referenceImagePaths,
         getDynamicSkillContext: input.getDynamicSkillContext,
-        onSelectReferenceScreenshots: async (selection) => {
-          selectedScreenshotReferences = selection.ids
-            .map((id) => selection.availableReferences.find((ref) => ref.id === id))
-            .filter((ref): ref is ScreenshotReference => Boolean(ref))
-            .map((ref) => ({
-              ...ref,
-              selectionReason: selection.selectionReason,
-              sameInterfaceGroup: selection.sameInterfaceGroup || ref.sameInterfaceGroup,
-            }));
-        },
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
@@ -3611,7 +3124,7 @@ export async function executeInteractiveBrowserTurn(input: {
             ...runningStep,
             actual: 'AI called a browser tool; waiting for page feedback.',
             tools: summarizeToolTraces(liveToolTraces),
-            ...progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress),
+            ...progressFieldsFromToolTraces(liveToolTraces, requirementOf(runtimeRecord), stepIndex, latestToolProgress),
           });
           ensureActive();
         },
@@ -3658,7 +3171,7 @@ export async function executeInteractiveBrowserTurn(input: {
         continue;
       }
       ensureActive();
-      const recoveredState = progressFieldsFromToolTraces(liveToolTraces, requirementOf(testCase), stepIndex, latestToolProgress);
+      const recoveredState = progressFieldsFromToolTraces(liveToolTraces, requirementOf(runtimeRecord), stepIndex, latestToolProgress);
       const errorStep = await createRecoverableRuntimeErrorStep({
         session: input.session,
         runId: input.runId,
@@ -3745,7 +3258,7 @@ export async function executeInteractiveBrowserTurn(input: {
     }
 
     const afterScreenshotPath = await takeStepScreenshot('after', stepIndex);
-    const decision = deriveBrowserChatStepDecision(actionResult.text, actionResult.traces, requirementOf(testCase));
+    const decision = deriveBrowserChatStepDecision(actionResult.text, actionResult.traces, requirementOf(runtimeRecord));
     const completedStep: StepExecutionResult = {
       index: stepIndex,
       action: decision.action,
