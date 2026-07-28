@@ -25,6 +25,23 @@ export function snapshotHardRules(screenshotAvailable = true) {
   ];
 }
 
+export function browserChatDomRules(screenshotAvailable = true) {
+  return [
+    '- Use inspect action="capture", mode="full" for the current complete semantic DOM. mode="text" is the deduplicated reading view of all loaded text including offscreen content; mode="changes" is only the inter-action DOM/request journal and has no actionable UIDs. State-changing tools return an immediate DOM delta; use changes for delayed updates and treat validationErrors as failure.',
+    '- A nextCursor continues one frozen capture with the same mode and exact cursor; never scroll for pagination. Use inspect action="search" to query that frozen baseline and action="httpRequests" for listed request details. With one exact current UID, includeAx/includeShadow may add bounded local AX or closed-shadow evidence without changing the dom-* UID namespace.',
+    '- Use only current evidence for UIDs, entity IDs, hrefs, and navigation URLs. Removed UIDs are invalid; never infer absence from one bounded result. domChanges.overflow means only a full mutation queue, never more page content.',
+    screenshotAvailable
+      ? '- Use interact with either one current UID or coordinates from the latest viewport screenshot, never both. It supports click/double/right/middle, move/hover, drag, scroll/scrollIntoView, type, press, shortcut, and selectOption; UID actions scroll targets into view automatically, and page scrolling is only for confirmed lazy/virtual content.'
+      : '- Use interact with one current UID. It supports click/double/right/middle, move/hover, drag, scroll/scrollIntoView, type, press, shortcut, and selectOption; UID actions scroll targets into view automatically, and page scrolling is only for confirmed lazy/virtual content.',
+    '- For native <select>, use interact action="selectOption" with its current UID and an exact option value or full visible label; never click it first or choose through keyboard arrows/letters.',
+    screenshotAvailable
+      ? '- Use takeScreenshot for pixels, ambiguous layers, canvas, charts, icon-only or custom controls. markers=true shares current dom-* UIDs with inspect/interact; only the latest viewport image authorizes coordinates, while fullPage images and previous screenshots are read-only.'
+      : '- Image and coordinate targeting are unavailable; inspect the DOM and act with current UIDs.',
+    '- Use browser action="open" for navigation, action="wait" once for a known transition, and listTabs/switchTab after an action may open another tab.',
+    '- For a supplied credential reference, use interact action="type" with a current field UID only; never use coordinates, read back the value, or expose the credential/reference.',
+  ];
+}
+
 export function browserActionRules(screenshotAvailable = true) {
   return [
     '- Native HTML <select> hard rule: you MUST call interact action="selectOption" with the select UID and an exact option value or full visible label from the snapshot. Never click the select first, never use keyboard letters/ArrowUp/ArrowDown/Enter to choose, and never inspect the platform dropdown for DOM changes.',

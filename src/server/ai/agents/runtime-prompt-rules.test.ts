@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { browserActionRules, screenshotObservationRule, snapshotHardRules } from './runtime-prompt-rules';
+import { browserActionRules, browserChatDomRules, screenshotObservationRule, snapshotHardRules } from './runtime-prompt-rules';
 
 function combinedRules(screenshotAvailable: boolean) {
   return [
@@ -46,4 +46,21 @@ test('snapshot rules distinguish frozen pagination from page scrolling and overf
   assert.match(rules, /domChanges\.overflow.*MutationObserver/i);
   assert.match(rules, /NEVER means there is more page content below/i);
   assert.match(rules, /child-Agent tasks/i);
+});
+
+test('browser chat keeps native DOM and interaction capabilities in compact rules', () => {
+  const rules = browserChatDomRules(true).join('\n');
+  assert.equal(browserChatDomRules(true).length, 8);
+  assert.match(rules, /mode="full"/);
+  assert.match(rules, /mode="text"/);
+  assert.match(rules, /mode="changes"/);
+  assert.match(rules, /nextCursor/);
+  assert.match(rules, /action="search"/);
+  assert.match(rules, /action="httpRequests"/);
+  assert.match(rules, /includeAx\/includeShadow/);
+  assert.match(rules, /move\/hover, drag/);
+  assert.match(rules, /selectOption/);
+  assert.match(rules, /takeScreenshot/);
+  assert.match(rules, /listTabs\/switchTab/);
+  assert.match(rules, /credential reference/);
 });
