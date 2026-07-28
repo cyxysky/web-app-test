@@ -9,9 +9,8 @@ import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { analyzeBrowserCodeRisk, type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
 import { richTextToPlainText } from '@/lib/rich-text';
-import { browserChatReplyClaimsBrowserAction, browserChatToolRequirement, type BrowserChatToolRequirement } from './browser-chat-intent';
+import { aiSdkFinishMessage, aiSdkFinishState } from './ai-sdk-finish-state';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
-import { shouldCompleteRecoveredBrowserChatReply } from './browser-chat-retry-outcome';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
   BROWSER_CHAT_FILE_READ_MIN_CHARS,
@@ -2400,13 +2399,19 @@ async function executeRuntimeStep(input: {
           extra: { responseType: 'object', objectType: object.type },
         }),
       });
+      consecutiveRequestFailures = 0;
+      const finishState = aiSdkFinishState(result.finishReason, {
+        runtimeContinuationRequired: execution.executed,
+      });
       return {
         text: execution.text,
         traces,
         aiRequest,
         visualContext: visualContext.snapshot(),
         workingMemory,
-        endedWithText: !execution.executed && Boolean(textFromUnknown(execution.text).trim()),
+        finishReason: finishState.finishReason,
+        responseFinished: finishState.terminatesTurn,
+        responseStatus: finishState.status,
       };
     }
 
@@ -2483,7 +2488,6 @@ async function executeRuntimeStep(input: {
         },
         onStepFinish: async (event) => {
           ensureActive();
-          consecutiveRequestFailures = 0;
           latestText = event.text || '';
           const eventStep = event as { stepNumber?: unknown };
           const turnIndex = typeof eventStep.stepNumber === 'number' ? eventStep.stepNumber : toolExecutionGate.stepNumber;
@@ -2517,14 +2521,18 @@ async function executeRuntimeStep(input: {
         abortSignal,
       }, input.agentLoopTimeoutMs);
       ensureActive();
+      consecutiveRequestFailures = 0;
       latestText = toolConsistentAssistantText(result.text || latestText, traces.at(-1)?.name);
+      const finishState = aiSdkFinishState(result.finishReason);
       return {
         text: latestText,
         traces,
         aiRequest,
         visualContext: visualContext.snapshot(),
         workingMemory,
-        endedWithText: Boolean(textFromUnknown(latestText).trim()) && traces.at(-1)?.name !== 'waitForHumanVerification',
+        finishReason: finishState.finishReason,
+        responseFinished: finishState.terminatesTurn,
+        responseStatus: finishState.status,
       };
     } catch (error) {
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
@@ -2535,7 +2543,7 @@ async function executeRuntimeStep(input: {
 
   // Keep SDK retries disabled, but allow the runtime loop to retry transient upstream
   // disconnects with the exact model messages prepared for the failed request. The
-  // limit is consecutive failures; any successful model step resets the counter.
+  // limit is consecutive failures; only a resolved SDK response resets the counter.
   const consecutiveFailureLimit = runtimeRequestConsecutiveFailureLimit();
   let lastError: unknown;
   let retryingAfterFailure = false;
@@ -2578,11 +2586,7 @@ async function executeRuntimeStep(input: {
         ensureActive();
       }
       ensureActive();
-      const result = await runAgent(includeImage, retryState);
-      return {
-        ...result,
-        recoveredAfterRetry: retryingAfterFailure,
-      };
+      return await runAgent(includeImage, retryState);
     } catch (error) {
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
       lastError = error;
@@ -2628,12 +2632,6 @@ export type InteractiveBrowserTurnResult = {
 function browserChatMaxConsecutiveAiRequestFailures() {
   const raw = Number(process.env.AI_BROWSER_CHAT_MAX_CONSECUTIVE_REQUEST_FAILURES || 3);
   return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 3));
-}
-
-function browserChatTurnHasToolEvidence(steps: StepExecutionResult[], requirement: BrowserChatToolRequirement) {
-  const toolCalls = steps.flatMap((step) => (step.tools || []).filter((toolCall) => toolCall.ok !== false));
-  if (requirement === 'action') return toolCalls.some((toolCall) => toolCall.name === 'browserCode' || toolCall.name === 'clickByUid');
-  return toolCalls.some((toolCall) => toolCall.name === 'browserCode');
 }
 
 function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
@@ -2715,8 +2713,6 @@ export async function executeInteractiveBrowserTurn(input: {
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
-  const requiredTool = browserChatToolRequirement(input.instruction);
-  let rejectedDirectAnswerCount = 0;
   const maxConsecutiveAiRequestFailures = browserChatMaxConsecutiveAiRequestFailures();
   let consecutiveAiRequestFailures = 0;
 
@@ -2789,9 +2785,7 @@ export async function executeInteractiveBrowserTurn(input: {
         runId: input.runId,
         stepIndex,
         beforeScreenshotPath: beforeScreenshotPath || '',
-        instruction: rejectedDirectAnswerCount
-          ? `${input.modelInstruction || input.instruction}\n\n[Backend correction] Your previous text-only completion claim was rejected because this user message requires a real browser tool. Execute the requested action or inspection now. Do not claim success without a successful tool result from this turn.`
-          : input.modelInstruction || input.instruction,
+        instruction: input.modelInstruction || input.instruction,
         operationalContext: input.operationalContext,
         conversation: input.conversation || [],
         referenceImagePaths: input.referenceImagePaths,
@@ -2904,65 +2898,31 @@ export async function executeInteractiveBrowserTurn(input: {
 
     ensureActive();
     consecutiveAiRequestFailures = 0;
-    const browserChatReply = actionResult.endedWithText ? textFromUnknown(actionResult.text).trim() : '';
+    const browserChatReply = textFromUnknown(actionResult.text).trim();
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
       if (runningIndex >= 0) steps.splice(runningIndex, 1);
-      const completeRecoveredReply = shouldCompleteRecoveredBrowserChatReply({
-        recoveredAfterRetry: actionResult.recoveredAfterRetry,
-        reply: browserChatReply,
-        hasToolTrace: false,
-        requiresToolEvidence: Boolean(requiredTool),
-      });
-      if (completeRecoveredReply) {
+      if (actionResult.responseFinished) {
         await input.onDebug?.({
-          phase: 'chat:retry-completed',
+          phase: 'chat:ai-response-finished',
           stepIndex,
-          message: 'The retried AI request returned an explicit final answer; ending the current browser chat turn.',
-        });
-        reply = browserChatReply;
-        finalStatus = 'passed';
-        endedWithFinalAnswer = true;
-        break;
-      }
-      const hasRequiredToolEvidence = requiredTool ? browserChatTurnHasToolEvidence(newSteps, requiredTool) : false;
-      const unsupportedActionClaim = browserChatReplyClaimsBrowserAction(browserChatReply)
-        && !browserChatTurnHasToolEvidence(newSteps, 'action');
-      const rejectDirectAnswer = Boolean(browserChatReply && (
-        (requiredTool && !hasRequiredToolEvidence)
-        || unsupportedActionClaim
-      ));
-      if (rejectDirectAnswer) {
-        rejectedDirectAnswerCount += 1;
-        await input.onDebug?.({
-          phase: 'chat:direct-answer-rejected',
-          stepIndex,
-          message: `Rejected text-only browser completion claim ${rejectedDirectAnswerCount}; required tool evidence was missing.`,
+          message: `AI SDK finished the response with reason ${actionResult.finishReason}; ending the current browser chat turn.`,
           details: {
-            requiredTool,
-            unsupportedActionClaim,
-            reply: browserChatReply,
+            finishReason: actionResult.finishReason,
+            responseStatus: actionResult.responseStatus,
           },
         });
-        if (rejectedDirectAnswerCount <= 2) continue;
-        reply = '本轮没有执行所请求的浏览器操作：模型连续返回了缺少工具证据的完成声明，系统已拒绝将其记为成功。请重试本条指令。';
-        finalStatus = 'failed';
+        reply = browserChatReply || aiSdkFinishMessage(actionResult.finishReason);
+        finalStatus = actionResult.responseStatus;
         endedWithFinalAnswer = true;
         break;
       }
       await input.onDebug?.({
-        phase: browserChatReply ? 'chat:direct-answer' : 'chat:no-tool-response',
+        phase: 'chat:no-tool-response',
         stepIndex,
-        message: browserChatReply
-          ? 'Browser chat completed with an explicit Markdown answer and no browser tool.'
-          : 'Browser chat returned no browser tool and no explicit final answer; continuing until the AI explicitly answers, blocks, or is stopped.',
+        message: `AI SDK did not finish the response and returned no browser tool; finish reason is ${actionResult.finishReason || 'unknown'}.`,
+        details: { finishReason: actionResult.finishReason },
       });
-      if (browserChatReply) {
-        reply = browserChatReply;
-        finalStatus = 'passed';
-        endedWithFinalAnswer = true;
-        break;
-      }
       continue;
     }
 
@@ -2991,61 +2951,22 @@ export async function executeInteractiveBrowserTurn(input: {
     ensureActive();
     await input.onProgress?.(completedStep);
     ensureActive();
-    const completeRecoveredReply = shouldCompleteRecoveredBrowserChatReply({
-      recoveredAfterRetry: actionResult.recoveredAfterRetry,
-      reply: browserChatReply,
-      hasToolTrace: actionResult.traces.length > 0,
-      requiresToolEvidence: Boolean(requiredTool),
-    });
-    if (completeRecoveredReply) {
-      await input.onDebug?.({
-        phase: 'chat:retry-completed',
-        stepIndex,
-        message: 'The retried AI request returned an explicit final answer; ending the current browser chat turn without starting another browser step.',
-        details: {
-          requiredTool,
-          tools: completedStep.tools,
-        },
-      });
-      reply = browserChatReply;
-      finalStatus = decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed';
-      endedWithFinalAnswer = true;
-      break;
-    }
-    const completedTurnHasRequiredTool = requiredTool ? browserChatTurnHasToolEvidence(newSteps, requiredTool) : false;
-    const completedTurnUnsupportedActionClaim = browserChatReplyClaimsBrowserAction(browserChatReply)
-      && !browserChatTurnHasToolEvidence(newSteps, 'action');
-    const rejectCompletedTurnReply = Boolean(browserChatReply && (
-      (requiredTool && !completedTurnHasRequiredTool)
-      || completedTurnUnsupportedActionClaim
-    ));
-    if (rejectCompletedTurnReply) {
-      rejectedDirectAnswerCount += 1;
-      await input.onDebug?.({
-        phase: 'chat:direct-answer-rejected',
-        stepIndex,
-        message: `Rejected browser completion claim ${rejectedDirectAnswerCount}; the executed tools did not satisfy the required ${requiredTool || 'action'} evidence.`,
-        details: {
-          requiredTool,
-          unsupportedActionClaim: completedTurnUnsupportedActionClaim,
-          reply: browserChatReply,
-          tools: completedStep.tools,
-        },
-      });
-      if (rejectedDirectAnswerCount <= 2) {
-        reply = '';
-        continue;
-      }
-      reply = '本轮没有执行所请求的浏览器操作：模型连续返回了与工具证据不一致的完成声明，系统已拒绝将其记为成功。请重试本条指令。';
-      finalStatus = 'failed';
-      endedWithFinalAnswer = true;
-      break;
-    }
-    if (browserChatReply) reply = browserChatReply;
-
     const lastToolName = actionResult.traces.at(-1)?.name;
-    if (browserChatReply) {
-      finalStatus = decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed';
+    if (actionResult.responseFinished) {
+      await input.onDebug?.({
+        phase: 'chat:ai-response-finished',
+        stepIndex,
+        message: `AI SDK finished the response with reason ${actionResult.finishReason}; ending the current browser chat turn without starting another browser step.`,
+        details: {
+          finishReason: actionResult.finishReason,
+          responseStatus: actionResult.responseStatus,
+          tools: completedStep.tools,
+        },
+      });
+      reply = browserChatReply || browserChatReplyFromDecision(decision, lastToolName) || aiSdkFinishMessage(actionResult.finishReason);
+      finalStatus = actionResult.responseStatus === 'passed'
+        ? decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed'
+        : actionResult.responseStatus;
       endedWithFinalAnswer = true;
       break;
     }
