@@ -4821,8 +4821,8 @@ export class BrowserSession {
     const configuredFormat = process.env.BROWSER_SCREENCAST_FORMAT?.trim().toLowerCase();
     const format = configuredFormat === 'png' ? 'png' : 'jpeg';
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
-    const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 85);
-    const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 85)));
+    const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 100);
+    const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 100)));
     const frameIntervalMs = browserPreviewFrameIntervalMs(process.env.BROWSER_PREVIEW_FPS);
     let stopped = false;
     let stopPromise: Promise<void> | undefined;
