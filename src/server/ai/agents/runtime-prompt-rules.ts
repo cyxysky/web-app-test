@@ -1,10 +1,10 @@
 export function browserCodeRules() {
   return [
-    '- browserCode is the primary browser inspection and operation tool. Put one ordinary JavaScript cell in params.code. clickByUid is the narrow fallback for a UID from the latest automatic DOM snapshot when a normal locator cannot uniquely identify the rendered target.',
+    '- browserCode is the primary browser inspection and operation tool. Put one ordinary JavaScript cell in params.code. Code mode has no UID-click tool.',
     '- The code receives the real Playwright page and context objects. Use ordinary Playwright APIs directly.',
     '- The JavaScript kernel persists for the browser session. Write top-level statements and top-level await; do not wrap the code in a function or module.',
     '- Use top-level var for reusable bindings or choose fresh names because bindings persist across calls. Emit the result with nodeRepl.write(<JSON-serializable value>).',
-    '- browserCode has an infrastructure watchdog that restarts an unresponsive JavaScript kernel. Keep each cell bounded. Playwright locator/action operations default to 3000ms and navigation defaults to 30000ms, so a missing target returns control without destroying persistent bindings. Use an explicit per-operation timeout only when the page has a known longer transition.',
+    '- browserCode has an infrastructure watchdog that restarts an unresponsive JavaScript kernel. Keep each cell bounded. Playwright locator/action operations default to 5000ms and navigation defaults to 30000ms, so a missing target returns control without destroying persistent bindings. Use an explicit per-operation timeout only when the page has a known longer transition.',
     '- Every browserCode result automatically includes a freshly captured full semantic DOM snapshot and the page-console delta produced during that cell, in addition to code-console output. Treat both as post-execution evidence and inspect console errors before deciding the next step.',
     '- Inspect page structure and state inside the same program. Prefer the automatically returned fresh DOM snapshot as the next call\'s locator ground truth; use page.domSnapshot() or page.evaluate only when focused evidence is needed before an action inside the current cell.',
     '- For pixel evidence, stay inside browserCode: const image = await page.screenshot({ fullPage: false }); await nodeRepl.emitImage(image). Full-page images are read-only; use viewport coordinates only from a freshly emitted viewport image.',
@@ -19,11 +19,11 @@ export function browserChatCodeRules(screenshotAvailable = true) {
     '- Use browserCode for live inspection and operation. It receives the real Playwright page/context and a persistent top-level-await JavaScript kernel: keep cells bounded, use top-level var or fresh names, and return compact evidence with nodeRepl.write(...).',
     '- Each browserCode result already includes a fresh full semantic DOM snapshot plus code/page console deltas. Treat them as the next-step ground truth, inspect errors, keep DOM-only code inside page.evaluate, and do not import modules or access Node globals, files, environment variables, cookies, or browser storage.',
     '- Prefer a semantic Playwright locator scoped to the visible dialog/region. For duplicate labels, filter visible candidates and require exactly one; never guess with first/last/nth. Use locator.selectOption(...) for native <select>.',
-    '- If no normal locator uniquely identifies the rendered target, use clickByUid only with its exact UID from the latest automatic DOM snapshot. Never invent, edit, or reuse an older UID.',
+    '- If no normal locator uniquely identifies the rendered target, inspect fresh DOM evidence and refine the locator scope. Code mode has no UID-click tool.',
     '- Never use force:true. After a locator timeout, inspect the fresh snapshot for loading, overlays, popups, detachment, or redraw; do not bypass it with CUA, page.mouse, DOM click, dispatchEvent, or script click. Combine deterministic inspection/action in one cell, wait only for a known transition, scroll only for lazy/virtual content, and verify business state after every change.',
     screenshotAvailable
       ? '- For a Playwright-indescribable visual control only, emit a fresh viewport image with nodeRepl.emitImage(await page.screenshot({fullPage:false})) and end the cell; after the model sees that image, one coordinate/CUA action may be performed in the next cell. Full-page images are read-only, and navigation, viewport change, or DOM redraw invalidates the image.'
-      : '- Image and coordinate targeting are unavailable; use Playwright locators, DOM evidence, or the latest snapshot UID.',
+      : '- Image and coordinate targeting are unavailable; use Playwright locators or DOM evidence.',
     '- For tabs/windows, use context.pages() or the available browser.tabs/browser.user/tab.playwright/tab.cua APIs. When given a credential reference, use credentialVault.fill(locator, ref) only; never read or output credential values or references.',
   ];
 }
@@ -46,8 +46,8 @@ export function browserChatDomRules(screenshotAvailable = true) {
 export function browserActionRules(screenshotAvailable = true) {
   return [
     '- Default to a semantic Playwright locator scoped to the current visible dialog or region, such as getByRole(..., { exact: true }). Before clicking duplicate text, keep only rendered candidates with locator.filter({ visible: true }) and require count() === 1. Never use first(), last(), or nth() to guess among same-name candidates.',
-    '- If a normal locator cannot uniquely identify the rendered target, use clickByUid with the exact UID from the latest automatically returned DOM snapshot. Never invent, edit, or reuse an older UID.',
-    '- Playwright force: true is forbidden. If a locator click times out, do not fall back to CUA, page.mouse, DOM element.click(), dispatchEvent(), or script click. Stop and inspect the automatically returned fresh snapshot for a loading layer, popup, overlay, stale locator, detached element, or asynchronous redraw before constructing the next locator or using its current UID.',
+    '- If no normal locator uniquely identifies the rendered target, inspect fresh DOM evidence and refine the locator scope until exactly one visible Playwright target remains.',
+    '- Playwright force: true is forbidden. If a locator click times out, do not fall back to CUA, page.mouse, DOM element.click(), dispatchEvent(), or script click. Stop and inspect the automatically returned fresh snapshot for a loading layer, popup, overlay, stale locator, detached element, or asynchronous redraw before constructing the next locator.',
     '- CUA or coordinate clicking is allowed only for a special visual control that Playwright cannot describe. Use two separate model steps: first end a browserCode cell after emitting a fresh viewport screenshot, then inspect the returned image, confirm the intended point is not obscured, and perform one coordinate click in the next browserCode cell. Same-cell screenshot-and-click is forbidden, and the runtime rejects stale evidence after navigation, viewport change, or DOM redraw.',
     '- Use stable Playwright locators for semantic elements. For native HTML <select>, call locator.selectOption(...) directly.',
     '- Combine dependent inspection and action steps in one browserCode program when their control flow is deterministic.',

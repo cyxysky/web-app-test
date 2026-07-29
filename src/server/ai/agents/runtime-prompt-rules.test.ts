@@ -22,7 +22,7 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /nodeRepl\.write/);
   assert.match(rules, /bindings persist across calls/);
   assert.match(rules, /infrastructure watchdog/);
-  assert.match(rules, /default to 3000ms/);
+  assert.match(rules, /default to 5000ms/);
   assert.match(rules, /navigation defaults to 30000ms/);
   assert.match(rules, /nodeRepl\.emitImage/);
   assert.match(rules, /browser\.tabs\.list/);
@@ -34,7 +34,8 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /filter\(\{ visible: true \}\)/);
   assert.match(rules, /require count\(\) === 1/);
   assert.match(rules, /Never use first\(\), last\(\), or nth\(\)/);
-  assert.match(rules, /clickByUid/);
+  assert.doesNotMatch(rules, /clickByUid/);
+  assert.match(rules, /no UID-click tool/);
   assert.match(rules, /do not fall back to CUA/);
   assert.match(rules, /two separate model steps/);
   assert.match(rules, /Same-cell screenshot-and-click is forbidden/);
@@ -57,7 +58,8 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
   assert.match(rules, /fresh full semantic DOM snapshot/);
   assert.match(rules, /filter visible candidates and require exactly one/);
-  assert.match(rules, /clickByUid/);
+  assert.doesNotMatch(rules, /clickByUid/);
+  assert.match(rules, /no UID-click tool/);
   assert.match(rules, /force:true/);
   assert.match(rules, /verify business state after every change/);
   assert.match(rules, /nodeRepl\.emitImage/);

@@ -1264,7 +1264,7 @@ function makeBrowserTools(
   const sharedTools = {
     ...(mode === 'code' ? {
     browserCode: tool({
-      description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the primary browser inspection, screenshot, and operation entrypoint. Every result automatically includes a fresh full semantic DOM snapshot, page-console delta, and code-console output. Use top-level await, nodeRepl.write(value) for JSON, and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. When the prompt supplies a credential reference, credentialVault.fill(locator, ref) securely fills the real Playwright locator without returning the raw value. Locator actions have a 3000ms default timeout and navigation has a 30000ms default timeout; force: true and scripted DOM clicks are forbidden, and a failed operation ends only the current cell and preserves kernel bindings.',
+      description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the primary browser inspection, screenshot, and operation entrypoint. Every result automatically includes a fresh full semantic DOM snapshot, page-console delta, and code-console output. Use top-level await, nodeRepl.write(value) for JSON, and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. When the prompt supplies a credential reference, credentialVault.fill(locator, ref) securely fills the real Playwright locator without returning the raw value. Locator actions have a 5000ms default timeout and navigation has a 30000ms default timeout; force: true and scripted DOM clicks are forbidden, and a failed operation ends only the current cell and preserves kernel bindings.',
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
         maxOutputChars: z.number().int().min(1_000).max(50_000).optional().describe('Maximum serialized return size. Defaults to 20000 characters.'),
@@ -1280,17 +1280,6 @@ function makeBrowserTools(
           abortSignal,
         }));
       },
-    }),
-    clickByUid: tool({
-      description: 'Click exactly one rendered element using its exact UID from the latest automatically returned semantic DOM snapshot. Use only when a normal visible Playwright locator cannot uniquely identify the target. The runtime rejects stale, hidden, disabled, detached, or covered UIDs. Never invent or reuse an older UID.',
-      inputSchema: browserToolInput({
-        uid: z.string().min(1).max(160).describe('Exact UID copied from the latest automatic DOM snapshot.'),
-      }),
-      execute: (input) => record('clickByUid', input, (abortSignal) => session.mouse({
-        action: 'click',
-        uid: input.uid,
-        abortSignal,
-      })),
     }),
     } : {
       ...(modelSupportsScreenshotInput() ? {
@@ -1527,7 +1516,7 @@ function runtimePrompt(input: {
     '',
     'Operating rules:',
     '- In one model step, either answer in Chinese Markdown without a tool or call at most one relevant tool. A new action request is a new occurrence even when its wording repeats an earlier request.',
-    `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Inspect the live page with ${input.mode === 'code' ? 'browserCode' : 'inspect'} before acting; do not reuse stale UIDs, coordinates, screenshots, or prior tool JSON.`,
+    `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Inspect the live page with ${input.mode === 'code' ? 'browserCode' : 'inspect'} before acting; do not reuse stale coordinates, screenshots, prior tool JSON, or DOM evidence from an older page state.`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
@@ -1548,7 +1537,7 @@ function runtimePrompt(input: {
 
 function runtimeToolNames(mode: BrowserSessionMode) {
   const operationTools = mode === 'code'
-    ? ['browserCode', 'clickByUid']
+    ? ['browserCode']
     : ['takeScreenshot', 'browser', 'interact', 'inspect'];
   return [
     ...operationTools,
@@ -1564,7 +1553,6 @@ function runtimeToolNames(mode: BrowserSessionMode) {
 
 const browserSessionToolNames = new Set([
   'browserCode',
-  'clickByUid',
   'takeScreenshot',
   'browser',
   'interact',
@@ -3058,12 +3046,6 @@ async function runRecordedTool(
         credentials: credentialBindings,
         runId: runId || 'browser-code',
         stepIndex: flow.index,
-        abortSignal,
-      });
-    case 'clickByUid':
-      return session.mouse({
-        action: 'click',
-        uid: typeof input.uid === 'string' ? input.uid : '',
         abortSignal,
       });
     case 'waitForHumanVerification':

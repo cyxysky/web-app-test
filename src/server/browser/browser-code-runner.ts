@@ -41,11 +41,11 @@ export function browserCodePolicyViolation(code: string) {
     return 'browserCode forbids Playwright force: true. Refresh the page snapshot and resolve overlays, loading state, stale locators, or asynchronous redraws instead.';
   }
   if (/\.dispatchEvent\s*\(\s*(?:[^,()]+,\s*)?['"]click['"]/i.test(code)) {
-    return 'browserCode forbids dispatchEvent("click") because it bypasses Playwright actionability. Use one unique visible Playwright locator or clickByUid with a UID from the latest DOM snapshot.';
+    return 'browserCode forbids dispatchEvent("click") because it bypasses Playwright actionability. Refresh the DOM evidence and use one unique visible Playwright locator.';
   }
   if (/\.evaluate(?:All|Handle)?\s*\([\s\S]{0,300}?=>\s*\{[\s\S]{0,3000}?\.click\s*\(/i.test(code)
     || /\.evaluate(?:All|Handle)?\s*\([\s\S]{0,300}?=>\s*(?!\{)[^;\r\n]{0,1000}?\.click\s*\(/i.test(code)) {
-    return 'browserCode forbids DOM element.click() inside evaluate callbacks because it bypasses Playwright actionability. Use one unique visible Playwright locator or clickByUid with a UID from the latest DOM snapshot.';
+    return 'browserCode forbids DOM element.click() inside evaluate callbacks because it bypasses Playwright actionability. Refresh the DOM evidence and use one unique visible Playwright locator.';
   }
   return undefined;
 }
@@ -105,8 +105,9 @@ export function analyzeBrowserCodeRisk(code: string): BrowserCodeRisk {
 }
 
 function browserCodeKernelMain() {
-  const browserCodeActionTimeoutMs = 3_000;
+  const browserCodeActionTimeoutMs = 5_000;
   const browserCodeNavigationTimeoutMs = 30_000;
+  const browserCodePointerLookupTimeoutMs = 250;
   const maxBrowserCodeImages = 4;
   const maxBrowserCodeImageBytes = 8 * 1024 * 1024;
   const maxBrowserCodeImageBytesTotal = 20 * 1024 * 1024;
@@ -299,14 +300,18 @@ function browserCodeKernelMain() {
 
   const locatorCenter = async (locator: object) => {
     const candidate = locator as {
-      evaluate?: <T>(callback: (element: Element) => T) => Promise<T>;
+      evaluate?: <T>(
+        callback: (element: Element) => T,
+        argument?: unknown,
+        options?: { timeout?: number },
+      ) => Promise<T>;
     };
     return candidate.evaluate?.((element) => {
       element.scrollIntoView({ block: 'center', inline: 'center' });
       const rect = element.getBoundingClientRect();
       if (!rect.width || !rect.height) return undefined;
       return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-    }).catch(() => undefined);
+    }, undefined, { timeout: browserCodePointerLookupTimeoutMs }).catch(() => undefined);
   };
 
   const captureCoordinateClickState = async (
