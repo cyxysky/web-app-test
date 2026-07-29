@@ -20,6 +20,10 @@ test('browser preview FPS setting is a bounded integer input', () => {
 });
 
 test('browser viewport size and output quality are configured independently', () => {
+  const maximize = runtimeEnvDefinition('BROWSER_FULLSCREEN');
+  assert.equal(maximize?.label, '浏览器启动时最大化');
+  assert.match(maximize?.description || '', /打开实时预览不会改变/);
+
   const viewport = runtimeEnvDefinition('BROWSER_VIEWPORT_MODE');
   assert.ok(viewport);
   assert.equal(viewport.control, 'select');

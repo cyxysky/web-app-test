@@ -70,7 +70,7 @@ async function storedTabSession(tab) {
 }
 
 async function groupTab(tab, sessionId, groupTitle) {
-  if (!tab?.id || !tab.windowId || !sessionId) return;
+  if (!tab?.id || !tab.windowId || !sessionId) return false;
   const title = cleanText(groupTitle, `AI Session ${sessionId}`);
   const key = `${tab.windowId}:${sessionId}`;
   let groupId = sessionGroups.get(key);
@@ -91,7 +91,7 @@ async function groupTab(tab, sessionId, groupTitle) {
     }).catch(() => undefined);
   }
 
-  if (typeof groupId !== 'number') return;
+  if (typeof groupId !== 'number') return false;
   sessionGroups.set(key, groupId);
   await chrome.tabGroups.update(groupId, {
     title,
@@ -99,6 +99,7 @@ async function groupTab(tab, sessionId, groupTitle) {
     collapsed: false,
   }).catch(() => undefined);
   await rememberTabSession(tab, sessionId, title, groupId);
+  return true;
 }
 
 function tabSnapshot(tab) {
@@ -112,11 +113,12 @@ function tabSnapshot(tab) {
   };
 }
 
-async function applySessionMarkerToTab(tab, sessionId) {
+async function applySessionMarkerToTab(tab, sessionId, groupTitle) {
   if (!tab?.id || !sessionId) return;
   await chrome.tabs.sendMessage(tab.id, {
     type: 'apply-tab-session-marker',
     sessionId,
+    groupTitle,
   }).catch(() => undefined);
 }
 
@@ -131,7 +133,7 @@ async function findSessionGroupTabs(input) {
     const groupTabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
     for (const tab of groupTabs) {
       await rememberTabSession(tab, sessionId, groupTitle, group.id);
-      await applySessionMarkerToTab(tab, sessionId);
+      await applySessionMarkerToTab(tab, sessionId, groupTitle);
       tabs.push(tabSnapshot({ ...tab, groupId: group.id }));
     }
   }
@@ -150,7 +152,11 @@ async function activateSessionGroupTab(input) {
 
   await chrome.windows.update(target.windowId, { focused: true }).catch(() => undefined);
   const tab = await chrome.tabs.update(target.tabId, { active: true }).catch(() => undefined);
-  if (tab) await applySessionMarkerToTab(tab, cleanText(input?.sessionId, ''));
+  if (tab) await applySessionMarkerToTab(
+    tab,
+    cleanText(input?.sessionId, ''),
+    cleanText(input?.groupTitle, ''),
+  );
   return { ok: Boolean(tab), tab: tab ? tabSnapshot(tab) : target, lookup };
 }
 
@@ -171,7 +177,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const sessionId = cleanText(message.sessionId, '');
   const groupTitle = cleanText(message.groupTitle, sessionId ? `AI Session ${sessionId}` : 'AI Session');
   groupTab(tab, sessionId, groupTitle)
-    .then(() => sendResponse({ ok: true }))
+    .then((grouped) => sendResponse({ ok: grouped }))
     .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
   return true;
 });

@@ -3541,10 +3541,16 @@ function applyPageGroupMarker(input: { id: string; title: string; prefix: string
     value: input.id,
     writable: true,
   });
-  document.documentElement?.setAttribute('data-ai-web-test-session-group-id', input.id);
+  if (document.documentElement?.getAttribute('data-ai-web-test-session-group-id') !== input.id) {
+    document.documentElement?.setAttribute('data-ai-web-test-session-group-id', input.id);
+  }
+  if (document.documentElement?.getAttribute('data-ai-web-test-session-group-title') !== input.title) {
+    document.documentElement?.setAttribute('data-ai-web-test-session-group-title', input.title);
+  }
   const windowNameMarker = `AI_WEB_TEST_SESSION_GROUP:${input.id};`;
   const previousWindowName = String(window.name || '').replace(/^AI_WEB_TEST_SESSION_GROUP:[^;]*;/, '');
-  window.name = `${windowNameMarker}${previousWindowName}`;
+  const nextWindowName = `${windowNameMarker}${previousWindowName}`;
+  if (window.name !== nextWindowName) window.name = nextWindowName;
   window.postMessage({
     source: 'AI_WEB_TEST_SESSION_TAB_GROUP',
     type: 'group-tab',
@@ -4204,13 +4210,14 @@ export class BrowserSession {
     const context = launched.context;
     this.context = context;
     await this.prepareContext(context);
-    this.claimPage(await context.newPage());
+    await this.selectInitialPage(context);
   }
 
   private async selectInitialSessionGroupPage(context: BrowserContext) {
     await this.prepareContext(context, { claimPages: false });
     this.installOwnedPageDiscovery(context);
     const page = await this.findInitialSharedPage(context);
+    await this.ensurePageGroup(page);
     await page.bringToFront().catch(() => undefined);
     return page;
   }
@@ -4538,8 +4545,8 @@ export class BrowserSession {
     const alreadyOwned = this.ownedPages.has(page);
     this.ownedPages.add(page);
     this.attachPageListeners(page);
-    void this.markPageGroup(page);
     if (!alreadyOwned) {
+      void this.markPageGroup(page);
       page.once('close', () => {
         this.ownedPages.delete(page);
         if (sharedPageOwners.get(page) === this.pageGroupId) sharedPageOwners.delete(page);
@@ -4578,6 +4585,7 @@ export class BrowserSession {
       : undefined;
     const page = preferred || pages[0] || await context.newPage();
     this.claimPage(page);
+    await this.ensurePageGroup(page);
     await page.bringToFront().catch(() => undefined);
     return page;
   }
@@ -4619,6 +4627,15 @@ export class BrowserSession {
     }
     await this.ensureBrowserPageRuntime(page);
     await page.evaluate(applyPageGroupMarker, markerInput).catch(() => undefined);
+  }
+
+  private async ensurePageGroup(page: Page) {
+    if (page.isClosed()) return;
+    await this.markPageGroup(page);
+    if (!this.nativeTabGrouperEnabled || page.isClosed()) return;
+    await page.waitForFunction((groupId) => (
+      document.documentElement?.getAttribute('data-ai-web-test-session-grouped-id') === groupId
+    ), this.pageGroupId, { timeout: 1000 }).catch(() => undefined);
   }
 
   private async ensureBrowserPageRuntime(target: Page | Frame = this.activePage) {
@@ -4811,13 +4828,6 @@ export class BrowserSession {
       const viewportClient = await page.context().newCDPSession(page);
       try {
         await viewportClient.send('Emulation.clearDeviceMetricsOverride');
-        if (fullscreen && this.browserSurface === 'external') {
-          const { windowId } = await viewportClient.send('Browser.getWindowForTarget');
-          await viewportClient.send('Browser.setWindowBounds', {
-            bounds: { windowState: 'maximized' },
-            windowId,
-          }).catch(() => undefined);
-        }
       } finally {
         await viewportClient.detach().catch(() => undefined);
       }
@@ -4844,7 +4854,6 @@ export class BrowserSession {
     this.ensureLivePreviewState();
     await this.refreshSessionGroupPages({ forceNativeRefresh: true });
     const page = this.activePage;
-    await this.applyConfiguredViewport(page);
     const client = await page.context().newCDPSession(page);
     const format = resolveBrowserPreviewImageFormat(process.env.BROWSER_SCREENCAST_FORMAT);
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
@@ -5327,7 +5336,7 @@ export class BrowserSession {
       }
       navigationNote = ` Navigation reported an error before commit; continuing from current URL: ${currentUrl}.`;
     }
-    await this.markPageGroup(this.activePage);
+    await this.ensurePageGroup(this.activePage);
     return this.completeActionWithDomChanges(
       `Opened page: ${url}${navigationNote}`,
       previousGeneration,
@@ -6233,7 +6242,7 @@ export class BrowserSession {
 
     const pageConsoleSequenceBefore = this.pageConsoleSequence;
     const page = this.activePage;
-    await this.ensureBrowserPageRuntime(page);
+    await this.ensurePageGroup(page);
     const executionId = randomUUID();
     await page.evaluate((id) => {
       Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
@@ -6245,6 +6254,15 @@ export class BrowserSession {
     }, executionId);
 
     const kernel = this.browserCodeKernel ||= new BrowserCodeKernel(this.browserCodeConnection);
+    const executionContext = this.context;
+    const pagesBeforeExecution = new Set(executionContext?.pages() || []);
+    const pagesCreatedDuringExecution = new Set<Page>();
+    const claimCodeCreatedPage = (candidate: Page) => {
+      if (candidate.isClosed() || pagesBeforeExecution.has(candidate)) return;
+      pagesCreatedDuringExecution.add(candidate);
+      this.claimPage(candidate, { makeActive: false });
+    };
+    executionContext?.on('page', claimCodeCreatedPage);
     let execution: Awaited<ReturnType<BrowserCodeKernel['execute']>>;
     try {
       execution = await kernel.execute({
@@ -6255,6 +6273,12 @@ export class BrowserSession {
         abortSignal: input.abortSignal,
       });
     } finally {
+      executionContext?.off('page', claimCodeCreatedPage);
+      for (const candidate of executionContext?.pages() || []) claimCodeCreatedPage(candidate);
+      await Promise.all([
+        ...Array.from(pagesCreatedDuringExecution, (candidate) => this.ensurePageGroup(candidate)),
+        ...(!page.isClosed() ? [this.ensurePageGroup(page)] : []),
+      ]);
       await Promise.all(this.sessionPages().map((candidate) => candidate.evaluate((id) => {
         const win = window as Window & { __aiBrowserCodeExecutionId?: string };
         if (win.__aiBrowserCodeExecutionId === id) delete win.__aiBrowserCodeExecutionId;
@@ -6263,14 +6287,17 @@ export class BrowserSession {
 
     let selectedPage: Page | undefined;
     if (execution.selectedExecutionId) {
-      for (const candidate of this.sessionPages()) {
+      for (const candidate of executionContext?.pages() || this.sessionPages()) {
         const selected = await candidate.evaluate((id) => {
           const win = window as Window & { __aiBrowserCodeSelectedExecutionId?: string };
           if (win.__aiBrowserCodeSelectedExecutionId !== id) return false;
           delete win.__aiBrowserCodeSelectedExecutionId;
           return true;
         }, execution.selectedExecutionId).catch(() => false);
-        if (selected) selectedPage = candidate;
+        if (selected && this.claimPage(candidate, { makeActive: false })) {
+          await this.ensurePageGroup(candidate);
+          selectedPage = candidate;
+        }
       }
     }
     const finalPage = selectedPage || (!page.isClosed() ? page : this.sessionPages().find((candidate) => !candidate.isClosed())) || page;
@@ -6449,7 +6476,7 @@ export class BrowserSession {
       30000,
     );
     await this.activePage.waitForLoadState('domcontentloaded', { timeout: loadStateTimeoutMs }).catch(() => undefined);
-    await this.markPageGroup(this.activePage);
+    await this.ensurePageGroup(this.activePage);
     if (Number.isFinite(settleMs) && settleMs > 0) {
       await this.waitForStableViewport(Math.min(Math.max(settleMs, 0), 2000));
     }
@@ -7025,7 +7052,7 @@ export class BrowserSession {
   ) {
     if (!newPage) return undefined;
     this.claimPage(newPage, { makeActive: false });
-    await this.markPageGroup(newPage);
+    await this.ensurePageGroup(newPage);
     if (selectionSequence !== this.livePreviewExplicitPageSelectionSequence) return newPage;
     await timedBrowserStep(timings, 'bringPopupToFrontMs', () => newPage.bringToFront().catch(() => undefined));
     if (

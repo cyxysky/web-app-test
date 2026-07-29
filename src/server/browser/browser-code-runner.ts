@@ -239,12 +239,43 @@ function browserCodeKernelMain() {
   const tabPages = new WeakMap<object, import('playwright').Page>();
   const tabWrappers = new WeakMap<import('playwright').Page, object>();
   const agentCreatedPages = new Set<import('playwright').Page>();
+  const nativeContextNewPages = new WeakMap<import('playwright').BrowserContext, () => Promise<import('playwright').Page>>();
   const pointerDecoratedPages = new WeakSet<import('playwright').Page>();
   const screenshotDecoratedPagePrototypes = new WeakSet<object>();
   const pointerDecoratedLocatorPrototypes = new WeakSet<object>();
   const credentialLocatorPrototypes = new WeakSet<object>();
   let nativeFrameLocator: ((this: object, selector: string) => import('playwright').Locator) | undefined;
   let nativeLocatorFill: ((this: object, value: string) => Promise<void>) | undefined;
+
+  const createSessionPage = async (targetContext: import('playwright').BrowserContext) => {
+    const nativeNewPage = nativeContextNewPages.get(targetContext) || targetContext.newPage.bind(targetContext);
+    const openerPage = replServer?.context.page as import('playwright').Page | undefined;
+    if (!openerPage || openerPage.isClosed() || openerPage.context() !== targetContext) return nativeNewPage();
+    const [popupPage] = await Promise.all([
+      targetContext.waitForEvent('page', {
+        predicate: async (candidatePage) => await candidatePage.opener().catch(() => undefined) === openerPage,
+        timeout: browserCodeNavigationTimeoutMs,
+      }),
+      openerPage.evaluate(() => {
+        if (!window.open('about:blank', '_blank')) throw new Error('The browser blocked the new tab.');
+      }),
+    ]);
+    return popupPage;
+  };
+
+  const decorateContextNewPage = (browserContext: import('playwright').BrowserContext) => {
+    if (nativeContextNewPages.has(browserContext)) return;
+    nativeContextNewPages.set(browserContext, browserContext.newPage.bind(browserContext));
+    try {
+      Object.defineProperty(browserContext, 'newPage', {
+        configurable: true,
+        value: () => createSessionPage(browserContext),
+        writable: true,
+      });
+    } catch {
+      // browser.tabs.new still uses createSessionPage when the context object is immutable.
+    }
+  };
 
   const moveVisibleAiPointer = async (
     page: import('playwright').Page,
@@ -702,7 +733,7 @@ function browserCodeKernelMain() {
         const selected = replServer?.context.context as import('playwright').BrowserContext | undefined;
         const targetContext = selected || browser?.contexts()[0];
         if (!targetContext) throw new Error('No browser context is available.');
-        const newPage = await targetContext.newPage();
+        const newPage = await createSessionPage(targetContext);
         agentCreatedPages.add(newPage);
         selectPage(newPage);
         if (options.url) await newPage.goto(options.url);
@@ -814,6 +845,7 @@ function browserCodeKernelMain() {
     if (!replServer) throw new Error('browserCode JavaScript kernel is not initialized.');
     const page = await findExecutionPage(input.executionId);
     const browserContext = page.context();
+    decorateContextNewPage(browserContext);
     browserContext.setDefaultTimeout(browserCodeActionTimeoutMs);
     browserContext.setDefaultNavigationTimeout(browserCodeNavigationTimeoutMs);
     for (const contextPage of browserContext.pages()) {

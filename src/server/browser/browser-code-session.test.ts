@@ -151,6 +151,46 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.ok(Math.abs(cursorState.y - (applyBox.y + applyBox.height / 2)) <= 1);
 });
 
+test('browserCode-created tabs are owned and group-marked before preview starts', async (context) => {
+  const session = new BrowserSession('code', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-code-tab-group-test',
+  });
+  context.after(async () => session.close());
+  await session.start();
+  const initialPage = Reflect.get(session, 'activePage') as Page;
+  await initialPage.setContent('<title>Initial</title><main>Initial tab</main>');
+
+  const action = await session.executeBrowserCode({
+    code: `
+      var createdTab = await browser.tabs.new({
+        url: 'data:text/html,<title>Created</title><main>Created tab</main>',
+      });
+      var directContextTab = await context.newPage();
+      await directContextTab.goto('data:text/html,<title>Direct</title><main>Direct context tab</main>');
+      nodeRepl.write({ directUrl: directContextTab.url(), url: createdTab.url() });
+    `,
+    runId: 'browser-code-tab-group-test',
+    stepIndex: 1,
+  });
+
+  assert.equal(action.ok, true, action.actual);
+  const tabs = session.getTabsSnapshot();
+  assert.equal(tabs.length, 3, 'new code-mode tabs should be registered without opening preview');
+  assert.equal(tabs.filter((tab) => tab.active).length, 1);
+  assert.match(session.currentUrl(), /^data:text\/html,/);
+  const groupId = Reflect.get(session, 'pageGroupId') as string;
+  const ownedPages = Array.from(Reflect.get(session, 'ownedPages') as Set<Page>);
+  assert.equal(ownedPages.length, 3);
+  const markerStates = await Promise.all(ownedPages.map((page) => page.evaluate(() => ({
+    groupId: document.documentElement.getAttribute('data-ai-web-test-session-group-id'),
+    groupTitle: document.documentElement.getAttribute('data-ai-web-test-session-group-title'),
+  }))));
+  assert.ok(markerStates.every((marker) => marker.groupId === groupId));
+  assert.equal(new Set(markerStates.map((marker) => marker.groupTitle)).size, 1);
+});
+
 test('live preview follows a clicked popup and emits an initial frame after tab switching', async (context) => {
   const session = new BrowserSession('dom', {
     headless: true,
@@ -169,6 +209,16 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
     </body></html>
   `)}`);
 
+  const mutableSession = session as unknown as {
+    applyConfiguredViewport: (target: Page) => Promise<void>;
+  };
+  const applyConfiguredViewport = mutableSession.applyConfiguredViewport.bind(session);
+  let previewViewportApplications = 0;
+  mutableSession.applyConfiguredViewport = async (target) => {
+    previewViewportApplications += 1;
+    await applyConfiguredViewport(target);
+  };
+
   const initialTabs = await session.refreshTabsSnapshot();
   assert.equal(initialTabs.length, 1);
   const originalTabId = initialTabs[0].id;
@@ -179,6 +229,7 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
     onFrame: (frame) => { initialFrames.push({ capturedAt: frame.capturedAt, url: frame.url }); },
   });
   assert.ok(initialFrames.length >= 1, 'screencast attach should emit an initial frame');
+  assert.equal(previewViewportApplications, 0, 'opening preview must not reapply viewport or window state');
   await waitForCondition(() => initialFrames.length >= 6, 1_000);
   const fixedCadenceWindowMs = Date.parse(initialFrames[5].capturedAt) - Date.parse(initialFrames[0].capturedAt);
   assert.ok(fixedCadenceWindowMs <= 500, `static preview should publish at fixed cadence, received six frames in ${fixedCadenceWindowMs}ms`);
@@ -314,10 +365,12 @@ test('browser viewport size and output pixel ratio are independent', async () =>
 
     process.env.BROWSER_VIEWPORT_WIDTH = '1366';
     process.env.BROWSER_VIEWPORT_HEIGHT = '768';
-    const resizedHandle = await session.startScreencast({
-      onFrame: () => undefined,
+    const resizeAction = await session.executeBrowserCode({
+      code: 'nodeRepl.write({ viewport: page.viewportSize() });',
+      runId: 'browser-output-pixel-ratio-test',
+      stepIndex: 2,
     });
-    await resizedHandle.stop();
+    assert.equal(resizeAction.ok, true, resizeAction.actual);
     assert.deepEqual(page.viewportSize(), { width: 1366, height: 768 });
   } finally {
     await session.close({ force: true }).catch(() => undefined);
