@@ -22,3 +22,11 @@ test('uses the direct preview port when the application has no base path', () =>
     'ws://127.0.0.1:18021/browser-preview',
   );
 });
+
+test('uses the direct preview port for a local base-path build without a reverse proxy', () => {
+  const request = new Request('http://localhost:3000/webpilot/api/browser-chat/preview-stream');
+  assert.equal(
+    browserReachableUrl(request, 18021, '/webpilot'),
+    'ws://127.0.0.1:18021/browser-preview',
+  );
+});

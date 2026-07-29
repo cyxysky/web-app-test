@@ -3628,23 +3628,46 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     const container = scrollRef.current;
     if (!container) return;
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-    followLatestRef.current = distanceFromBottom <= 2;
+    followLatestRef.current = distanceFromBottom <= 16;
   }, []);
 
   useEffect(() => {
     const container = scrollRef.current;
     if (!container) return undefined;
     let frame = 0;
-    const observer = new MutationObserver(() => {
+    const observedChildren = new Set<Element>();
+    const scheduleScrollToBottom = () => {
       if (!followLatestRef.current) return;
       if (frame) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
+        frame = 0;
+        if (!followLatestRef.current) return;
         container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
       });
+    };
+    const resizeObserver = new ResizeObserver(scheduleScrollToBottom);
+    const syncObservedChildren = () => {
+      const currentChildren = new Set(Array.from(container.children));
+      for (const child of observedChildren) {
+        if (currentChildren.has(child)) continue;
+        resizeObserver.unobserve(child);
+        observedChildren.delete(child);
+      }
+      for (const child of currentChildren) {
+        if (observedChildren.has(child)) continue;
+        observedChildren.add(child);
+        resizeObserver.observe(child);
+      }
+    };
+    const mutationObserver = new MutationObserver(() => {
+      syncObservedChildren();
+      scheduleScrollToBottom();
     });
-    observer.observe(container, { childList: true, characterData: true, subtree: true });
+    syncObservedChildren();
+    mutationObserver.observe(container, { childList: true, characterData: true, subtree: true });
     return () => {
-      observer.disconnect();
+      mutationObserver.disconnect();
+      resizeObserver.disconnect();
       if (frame) cancelAnimationFrame(frame);
     };
   }, []);

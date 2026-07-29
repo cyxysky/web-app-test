@@ -13,7 +13,8 @@ export function browserReachableUrl(request: Request, port: number, basePath = W
     if (configured.protocol === 'https:') configured.protocol = 'wss:';
     return configured.toString().replace(/\/$/, '');
   }
-  if (basePath) {
+  const reverseProxyDetected = Boolean(forwardedHost || forwardedProto);
+  if (basePath && reverseProxyDetected) {
     return `${protocol}//${host}${withWebPilotBasePath('/browser-preview', basePath)}`;
   }
   let hostname = url.hostname;
