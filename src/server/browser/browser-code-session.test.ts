@@ -258,6 +258,45 @@ test('live preview supports drag and does not drive the AI cursor', async (conte
   assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 0, 'user live-preview drag must not create the AI cursor');
 });
 
+test('browser viewport resolution applies to new and already running pages', async () => {
+  const previousResolution = process.env.BROWSER_VIEWPORT_RESOLUTION;
+  const previousWidth = process.env.BROWSER_VIEWPORT_WIDTH;
+  const previousHeight = process.env.BROWSER_VIEWPORT_HEIGHT;
+  process.env.BROWSER_VIEWPORT_RESOLUTION = '1080p';
+  delete process.env.BROWSER_VIEWPORT_WIDTH;
+  delete process.env.BROWSER_VIEWPORT_HEIGHT;
+  const session = new BrowserSession('code', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-viewport-resolution-test',
+  });
+
+  try {
+    await session.start();
+    const page = Reflect.get(session, 'activePage') as Page;
+    assert.deepEqual(page.viewportSize(), { width: 1920, height: 1080 });
+
+    process.env.BROWSER_VIEWPORT_RESOLUTION = 'custom';
+    process.env.BROWSER_VIEWPORT_WIDTH = '1366';
+    process.env.BROWSER_VIEWPORT_HEIGHT = '768';
+    const action = await session.executeBrowserCode({
+      code: 'nodeRepl.write({ viewport: page.viewportSize() });',
+      runId: 'browser-viewport-resolution-test',
+      stepIndex: 1,
+    });
+    assert.equal(action.ok, true, action.actual);
+    assert.deepEqual(page.viewportSize(), { width: 1366, height: 768 });
+  } finally {
+    await session.close({ force: true }).catch(() => undefined);
+    if (previousResolution === undefined) delete process.env.BROWSER_VIEWPORT_RESOLUTION;
+    else process.env.BROWSER_VIEWPORT_RESOLUTION = previousResolution;
+    if (previousWidth === undefined) delete process.env.BROWSER_VIEWPORT_WIDTH;
+    else process.env.BROWSER_VIEWPORT_WIDTH = previousWidth;
+    if (previousHeight === undefined) delete process.env.BROWSER_VIEWPORT_HEIGHT;
+    else process.env.BROWSER_VIEWPORT_HEIGHT = previousHeight;
+  }
+});
+
 test('force close releases the browser', async () => {
   const session = new BrowserSession('dom', {
     headless: true,

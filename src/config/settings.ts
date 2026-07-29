@@ -1,4 +1,5 @@
 import type { ModelProvider } from '@/server/ai/schemas/runtime.schema';
+import { browserViewportResolutionPresets } from '@/config/browser-viewport-resolution';
 
 export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'memory' | 'accounts' | 'dom-test' | 'debug';
 
@@ -137,9 +138,9 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'BROWSER_CHANNEL', label: '浏览器通道', description: '可选 chrome、msedge 等本机浏览器通道；留空使用 Playwright Chromium。', tab: 'browser', defaultValue: '', control: 'text' },
   { key: 'HEADLESS_BROWSER', label: '无头浏览器', description: '是否隐藏浏览器窗口运行。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'BROWSER_FULLSCREEN', label: '浏览器全屏', description: '启动浏览器时是否尽量使用全屏窗口。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'BROWSER_VIEWPORT_MODE', label: '视口模式', description: '自动时跟随真实浏览器窗口；固定时使用下方视口宽高。', tab: 'browser', defaultValue: 'auto', control: 'select', options: [{ label: '自动跟随窗口', value: 'auto' }, { label: '固定宽高', value: 'fixed' }] },
-  { key: 'BROWSER_VIEWPORT_WIDTH', label: '视口宽度', description: '固定模式下的浏览器视口宽度；留空则自动跟随窗口。', tab: 'browser', defaultValue: '', control: 'number' },
-  { key: 'BROWSER_VIEWPORT_HEIGHT', label: '视口高度', description: '固定模式下的浏览器视口高度；留空则自动跟随窗口。', tab: 'browser', defaultValue: '', control: 'number' },
+  { key: 'BROWSER_VIEWPORT_RESOLUTION', label: '浏览器画面分辨率', description: '设置浏览器实际渲染视口；自动模式跟随真实窗口，选择高分辨率会同步增加截图和实时预览的编码压力。', tab: 'browser', defaultValue: 'auto', control: 'select', options: browserViewportResolutionPresets.map(({ label, value }) => ({ label, value })) },
+  { key: 'BROWSER_VIEWPORT_WIDTH', label: '自定义视口宽度', description: '仅在画面分辨率选择“自定义宽高”时使用。', tab: 'browser', defaultValue: '', control: 'number', min: 1, step: 1 },
+  { key: 'BROWSER_VIEWPORT_HEIGHT', label: '自定义视口高度', description: '仅在画面分辨率选择“自定义宽高”时使用。', tab: 'browser', defaultValue: '', control: 'number', min: 1, step: 1 },
   { key: 'BROWSER_SLOW_MO_MS', label: '浏览器动作延迟', description: 'Playwright 每个动作的慢速延迟，单位毫秒。生产运行建议为 0。', tab: 'browser', defaultValue: '0', control: 'number' },
   { key: 'BROWSER_ACTION_SETTLE_MS', label: '动作后等待', description: '每次动作后额外等待页面稳定的时间。', tab: 'browser', defaultValue: '0', control: 'number' },
   { key: 'BROWSER_NAVIGATION_DOM_QUIET_MS', label: '导航后 DOM 静默窗口', description: '导航提交后 DOM 连续保持不变达到该时长即生成语义快照，单位毫秒；0 表示关闭。', tab: 'browser', defaultValue: '250', control: 'number' },
@@ -148,11 +149,9 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'BROWSER_IGNORE_HTTPS_ERRORS', label: '忽略 HTTPS 错误', description: '测试环境证书异常时允许继续打开页面。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'BROWSER_HTTP_REQUEST_HISTORY_LIMIT', label: 'HTTP 请求历史上限', description: '每个标签页保留多少条 HTTP 请求记录，供 AI 诊断接口和资源加载问题。', tab: 'browser', defaultValue: '400', control: 'number' },
   { key: 'AI_HTTP_REQUEST_TOOL_LIMIT', label: 'HTTP 请求工具返回条数', description: 'AI 调用 getHttpRequests 时最多返回当前标签页最近多少条请求。', tab: 'browser', defaultValue: '80', control: 'number' },
-  { key: 'SCREENSHOT_STABILIZE_MS', label: '截图前稳定等待', description: '截图前等待页面稳定的时间。', tab: 'browser', defaultValue: '1000', control: 'number' },
   { key: 'SCREENSHOT_TIMEOUT_MS', label: '截图超时', description: 'Playwright 截图等待上限，单位毫秒；默认 15000。', tab: 'browser', defaultValue: '15000', control: 'number' },
-  { key: 'BROWSER_CHAT_DOM_SCREENSHOTS', label: 'DOM 模式保存截图', description: '对话 DOM 模式是否保存步骤截图；关闭时不会因截图超时阻塞执行。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'AI_SCREENSHOT_MAX_KB', label: 'AI 截图压缩上限', description: '发送给 AI 的截图大小上限，留空表示不压缩。', tab: 'browser', defaultValue: '', control: 'number' },
-  { key: 'SEND_SCREENSHOT_TO_AI', label: '强制发送截图', description: '覆盖模型能力判断，留空表示自动判断。', tab: 'browser', defaultValue: '', control: 'select', options: [{ label: '自动', value: '' }, ...boolOptions] },
+  { key: 'SEND_SCREENSHOT_TO_AI', label: 'AI 图片输入', description: '控制是否向模型提供图片工具和图片内容；自动模式按模型能力判断，不会自动截取每一步。', tab: 'browser', defaultValue: '', control: 'select', options: [{ label: '自动判断', value: '' }, { label: '启用', value: 'true' }, { label: '禁用', value: 'false' }] },
 
   { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。', tab: 'runtime', defaultValue: '', control: 'textarea' },
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
@@ -174,13 +173,8 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS', label: '个性化记忆提炼超时', description: '对话结束后，记忆提炼模型请求允许的最长时间，单位毫秒。', tab: 'runtime', defaultValue: '30000', control: 'number' },
   { key: 'AI_CONTEXT_WINDOW_TOKENS', label: '上下文窗口大小', description: '估算模型上下文窗口大小。', tab: 'runtime', defaultValue: '256000', control: 'number' },
   { key: 'AI_CONTEXT_COMPRESSION_THRESHOLD', label: '上下文压缩阈值', description: '超过上下文窗口多少比例后压缩历史。', tab: 'runtime', defaultValue: '0.7', control: 'number' },
-  { key: 'AI_AGENT_LOOP_SUMMARY_INPUT_MAX_CHARS', label: '压缩摘要输入上限', description: 'Agent Loop 生成续接摘要时保留的历史字符上限；会优先保留上一摘要和最新工具结果。', tab: 'runtime', defaultValue: '120000', control: 'number' },
-  { key: 'AI_AGENT_LOOP_SUMMARY_OUTPUT_MAX_CHARS', label: '压缩摘要输出上限', description: 'Agent Loop 续接摘要允许的最大字符数。', tab: 'runtime', defaultValue: '24000', control: 'number' },
   { key: 'AI_IMAGE_CONTEXT_ESTIMATE_TOKENS', label: '单张图片估算 Token', description: '估算每张截图占用的上下文 token。', tab: 'runtime', defaultValue: '1200', control: 'number' },
   { key: 'AI_VISUAL_HISTORY_LIMIT', label: '视觉历史上限', description: 'Visual Context Manager 保留多少张历史图。', tab: 'runtime', defaultValue: '6', control: 'number' },
-  { key: 'AI_VISUAL_COMPRESSED_HISTORY_LIMIT', label: '压缩后历史图上限', description: '上下文压缩后保留多少张历史图。', tab: 'runtime', defaultValue: '2', control: 'number' },
-  { key: 'AI_VISUAL_COMPRESSED_PINNED_LIMIT', label: '压缩后证据图上限', description: '上下文压缩后保留多少张固定证据图。', tab: 'runtime', defaultValue: '2', control: 'number' },
-  { key: 'AI_PROMPT_SCREENSHOT_REFERENCE_LIMIT', label: '历史截图引用上限', description: '可供 AI 选择引用的历史截图数量。', tab: 'runtime', defaultValue: '8', control: 'number' },
 
   { key: 'AI_COMPLETION_VERIFY', label: '完成结果二次校验', description: 'AI 声明完成后是否再做一次完成校验。', tab: 'debug', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'PLAYWRIGHT_TRACE', label: 'Playwright Trace', description: '是否保存 Playwright trace。', tab: 'debug', defaultValue: 'true', control: 'boolean', options: boolOptions },

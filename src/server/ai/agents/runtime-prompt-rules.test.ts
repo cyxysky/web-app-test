@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { browserActionRules, browserChatCodeRules, browserCodeRules, screenshotObservationRule } from './runtime-prompt-rules';
+import { browserActionRules, browserChatCodeRules, browserChatDomRules, browserCodeRules, screenshotObservationRule } from './runtime-prompt-rules';
 
 function combinedRules(screenshotAvailable: boolean) {
   return [
@@ -64,4 +64,12 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /next cell/);
   assert.match(rules, /context\.pages/);
   assert.match(rules, /credentialVault\.fill/);
+});
+
+test('DOM mode requests screenshots explicitly instead of receiving automatic captures', () => {
+  const visualRules = browserChatDomRules(true).join('\n');
+  assert.match(visualRules, /No screenshot is attached automatically/);
+  assert.match(visualRules, /call takeScreenshot/);
+  assert.match(visualRules, /end that model step/);
+  assert.doesNotMatch(browserChatDomRules(false).join('\n'), /takeScreenshot/);
 });

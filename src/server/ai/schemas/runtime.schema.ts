@@ -178,11 +178,6 @@ export type StepToolCall = {
   rawResult?: unknown;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
-  visualAfter?: {
-    capture?: 'auto' | 'viewport' | 'fullPage';
-    retention?: 'auto' | 'replace' | 'append';
-    reason?: string;
-  };
   screenshots?: Array<{
     title: string;
     path: string;

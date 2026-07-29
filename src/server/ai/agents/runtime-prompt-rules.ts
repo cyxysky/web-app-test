@@ -34,7 +34,7 @@ export function browserChatDomRules(screenshotAvailable = true) {
     '- Continue a paged frozen capture only with its exact nextCursor and the same mode. Never scroll for snapshot pagination. Use inspect action="search" to narrow the current baseline and action="httpRequests" for network evidence.',
     '- Use only current dom-* UIDs. A state-changing action returns an immediate DOM delta; any UID listed as removed is invalid. Treat validationErrors as action failure and correct the named field before continuing.',
     screenshotAvailable
-      ? '- Use interact with either one current UID or coordinates from the latest viewport screenshot, never both. Full-page and older screenshots are read-only evidence.'
+      ? '- No screenshot is attached automatically. When pixel evidence is necessary, call takeScreenshot with capture="viewport" and end that model step; after inspecting the returned image, use interact with either coordinates from that latest viewport screenshot or one current UID, never both. Full-page and older screenshots are read-only evidence.'
       : '- Use interact with one current UID; coordinate targeting is unavailable.',
     '- interact supports click, hover, drag, scrolling, type, press, shortcuts, and selectOption. UID actions scroll their target into view; scroll the page only for confirmed lazy or virtual content.',
     '- For a native select, use interact action="selectOption" with its current UID and an exact option value or full label. Do not click the platform dropdown or choose with keyboard arrows.',

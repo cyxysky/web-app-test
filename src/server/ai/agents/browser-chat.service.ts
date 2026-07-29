@@ -3342,7 +3342,6 @@ async function runBrowserChatMessage(
           assertTurnActive();
           if (startedBrowser !== browser) throw new Error('Browser session changed while the AI was deciding; retry this browser tool on the active session.');
         },
-        isBrowserStarted: () => session.started && session.browser === browser && browser.isUsable(),
         runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
         readSubagent: readBrowserChatSubagent(session.id),
         readFile: (input) => readFileForSession(session, input),

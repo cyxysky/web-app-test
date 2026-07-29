@@ -113,13 +113,6 @@ export function BrowserChatToolDialog({
           )}
         </section>
 
-        {detail.tool.visualAfter ? (
-          <section className="browser-chat-tool-detail-section">
-            <h3>视觉截图参数</h3>
-            <BrowserChatPayloadDetails className="browser-chat-tool-detail-payload" payload={formatToolPayload(detail.tool.visualAfter)} title="查看视觉截图参数" />
-          </section>
-        ) : null}
-
         {detail.tool.screenshots?.length ? (
           <section className="browser-chat-tool-detail-section">
             <h3>截图记录</h3>

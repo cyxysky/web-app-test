@@ -6,7 +6,7 @@ import { z } from 'zod';
 import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
-import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserSessionMode } from '@/server/browser/browser-session';
 import { analyzeBrowserCodeRisk, type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
 import { browserInteractToolDescription, browserInteractToolShape } from './browser-input-tool-schema';
 import { richTextToPlainText } from '@/lib/rich-text';
@@ -46,7 +46,6 @@ type ToolTrace = {
   postprocessTimings?: Record<string, number>;
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
-  visualAfter?: VisualAfterPolicy;
   screenshots?: Array<{
     title: string;
     path: string;
@@ -58,13 +57,6 @@ type ToolTraceProgress = {
   workingMemory: RuntimeWorkingMemory;
   visualContext: ReturnType<VisualContextManager['snapshot']>;
 };
-
-type VisualAfterPolicy = {
-  capture?: 'auto' | 'viewport' | 'fullPage';
-  retention?: 'auto' | 'replace' | 'append';
-  reason?: string;
-};
-
 
 type BrowserChatSafetyMode = 'strict' | 'full';
 
@@ -694,7 +686,6 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       rawResult: trace.result,
       contextBefore: trace.contextBefore,
       contextAfter: trace.contextAfter,
-      visualAfter: trace.visualAfter,
       screenshots: trace.screenshots,
     };
   });
@@ -866,50 +857,6 @@ function sanitizeHistoricalToolText(value: unknown, max = 180) {
   );
 }
 
-function defaultVisualAfterForTool(name: string): VisualAfterPolicy {
-  void name;
-  return { capture: 'auto', retention: 'replace' };
-}
-
-function browserChatDomScreenshotsEnabled() {
-  return process.env.BROWSER_CHAT_DOM_SCREENSHOTS === 'true';
-}
-
-function sanitizeVisualAfterRetention(retention: unknown, fallback: VisualAfterPolicy['retention']) {
-  if (typeof retention !== 'string') return fallback;
-  if (retention === 'auto' || retention === 'replace' || retention === 'append') return retention;
-  return fallback;
-}
-
-const noVisualAfterCaptureToolNames = new Set<string>();
-
-function visualAfterFromInput(name: string, input: unknown): VisualAfterPolicy {
-  const fallback = defaultVisualAfterForTool(name);
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return fallback;
-  const raw = (input as Record<string, unknown>).visualAfter;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fallback;
-  const visualAfter = raw as Record<string, unknown>;
-  const capture = typeof visualAfter.capture === 'string' && ['auto', 'viewport', 'fullPage'].includes(visualAfter.capture)
-    ? visualAfter.capture as VisualAfterPolicy['capture']
-    : fallback.capture;
-  return {
-    capture,
-    retention: sanitizeVisualAfterRetention(visualAfter.retention, fallback.retention),
-    reason: typeof visualAfter.reason === 'string' ? visualAfter.reason : undefined,
-  };
-}
-
-function shouldCaptureVisualAfter(name: string, visualAfter: VisualAfterPolicy) {
-  if (!browserChatDomScreenshotsEnabled()) return false;
-  if (visualAfter.capture === 'viewport' || visualAfter.capture === 'fullPage') return true;
-  return !noVisualAfterCaptureToolNames.has(name);
-}
-
-function screenshotOptionsFromVisualAfter(visualAfter: VisualAfterPolicy): { capture: ScreenshotCaptureMode } {
-  if (visualAfter.capture === 'fullPage') return { capture: 'fullPage' };
-  return { capture: 'viewport' };
-}
-
 function summarizeTraceForMemory(trace: ToolTrace) {
   const input = trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input)
     ? trace.input as Record<string, unknown>
@@ -968,26 +915,10 @@ class VisualContextManager {
 
   constructor(private readonly maxHistory = Number(process.env.AI_VISUAL_HISTORY_LIMIT || 6)) {}
 
-  init(frame: Omit<VisualFrameRecord, 'id' | 'role' | 'createdAt'>) {
-    const record = this.createFrame(frame, 'current');
-    this.frames = [record];
-    this.currentId = record.id;
-    return record;
-  }
-
-  apply(frame: Omit<VisualFrameRecord, 'id' | 'role' | 'createdAt'>, policy: VisualAfterPolicy) {
-    const retention = policy.retention === 'append' ? 'append' : 'replace';
-    if (retention === 'append') {
-      this.demoteCurrent();
-      const record = this.createFrame(frame, 'current');
-      this.frames.push(record);
-      this.currentId = record.id;
-      this.trim();
-      return record;
-    }
+  append(frame: Omit<VisualFrameRecord, 'id' | 'role' | 'createdAt'>) {
     this.demoteCurrent();
     const record = this.createFrame(frame, 'current');
-    this.frames = [...this.frames.filter((item) => item.role === 'pinned'), record];
+    this.frames.push(record);
     this.currentId = record.id;
     this.trim();
     return record;
@@ -1006,24 +937,6 @@ class VisualContextManager {
       this.frames = this.frames.filter((frame) => frame.group !== 'scroll-sequence' || frame.id === this.currentId || keep.has(frame.id) || frame.role === 'pinned');
     }
     this.trim();
-  }
-
-  compressForBudget(reason: string) {
-    const beforeCount = this.frames.length;
-    const current = this.current();
-    const historyLimit = Math.max(0, Number(process.env.AI_VISUAL_COMPRESSED_HISTORY_LIMIT || 2));
-    const pinnedLimit = Math.max(0, Number(process.env.AI_VISUAL_COMPRESSED_PINNED_LIMIT || 2));
-    const keep = new Map<string, VisualFrameRecord>();
-    for (const frame of this.frames.filter((item) => item.role !== 'pinned' && item.id !== this.currentId).slice(-historyLimit)) {
-      keep.set(frame.id, { ...frame, reason: frame.reason || reason });
-    }
-    for (const frame of this.frames.filter((item) => item.role === 'pinned').slice(-pinnedLimit)) {
-      keep.set(frame.id, { ...frame, reason: frame.reason || reason });
-    }
-    if (current) keep.set(current.id, { ...current, reason: current.reason || reason });
-    this.frames = Array.from(keep.values());
-    this.trim();
-    return Math.max(0, beforeCount - this.frames.length);
   }
 
   current() {
@@ -1092,13 +1005,6 @@ class VisualContextManager {
   }
 }
 
-function pushBeforeFrameScreenshots(screenshots: ToolTrace['screenshots'], name: string, frame?: VisualFrameRecord) {
-  if (!frame?.path) return;
-  screenshots?.push({ title: `${name} before`, path: frame.path, kind: 'history' });
-  if (frame.originalPath) screenshots?.push({ title: `${name} before original`, path: frame.originalPath, kind: 'original' });
-  if (frame.markerPath) screenshots?.push({ title: `${name} before marker map`, path: frame.markerPath, kind: 'marker' });
-}
-
 function pushFailureFrameScreenshots(screenshots: ToolTrace['screenshots'], name: string, frame?: VisualFrameRecord) {
   if (!frame?.path) return;
   screenshots?.push({ title: `${name} failure evidence`, path: frame.path, kind: 'other' });
@@ -1113,12 +1019,9 @@ function createToolTrace(input: {
   aiRequest?: AiRequestSnapshot;
   runId?: string;
   stepIndex?: number;
-  visualContext?: VisualContextManager;
 }) {
-  const { traces, name, toolInput, aiRequest, runId, stepIndex, visualContext } = input;
+  const { traces, name, toolInput, aiRequest, runId, stepIndex } = input;
   const screenshots: ToolTrace['screenshots'] = [];
-  if (browserChatDomScreenshotsEnabled()) pushBeforeFrameScreenshots(screenshots, name, visualContext?.current());
-  const visualAfter = browserChatDomScreenshotsEnabled() ? visualAfterFromInput(name, toolInput) : undefined;
   const traceId = runtimeToolTraceId({ runId, stepIndex, traceIndex: traces.length + 1 });
   const trace: ToolTrace = {
     id: traceId,
@@ -1126,7 +1029,6 @@ function createToolTrace(input: {
     input: toolInput,
     startedAt: Date.now(),
     contextBefore: toolContextFromAiRequest(aiRequest),
-    visualAfter,
     screenshots,
   };
   traces.push(trace);
@@ -1134,75 +1036,43 @@ function createToolTrace(input: {
 }
 
 async function finalizeToolTraceVisuals(input: {
-  session: BrowserSession;
-  traces: ToolTrace[];
   trace: ToolTrace;
   result: BrowserActionResult;
-  runId?: string;
   stepIndex?: number;
   visualContext?: VisualContextManager;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
-  onDebug?: ExecutionDebug;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { session, traces, trace, runId, stepIndex, visualContext, abortSignal, shouldContinue, onDebug, onVisualContextChange } = input;
+  const { trace, stepIndex, visualContext, abortSignal, shouldContinue, onVisualContextChange } = input;
   throwIfStopped(abortSignal, shouldContinue);
-  let result = input.result;
+  const result = input.result;
   const screenshots = trace.screenshots || [];
   const emittedImagePaths = result.referenceImagePaths?.length
     ? result.referenceImagePaths
     : result.referenceImagePath ? [result.referenceImagePath] : [];
   for (const [index, imagePath] of emittedImagePaths.entries()) {
     if (!screenshots.some((item) => item.path === imagePath)) {
-      screenshots.push({ title: `${trace.name} code image ${index + 1}`, path: imagePath, kind: 'current' });
+      screenshots.push({
+        title: `${trace.name} explicit image ${index + 1}`,
+        path: imagePath,
+        kind: index === emittedImagePaths.length - 1 ? 'current' : 'history',
+      });
     }
   }
-  const visualAfter = trace.visualAfter || defaultVisualAfterForTool(trace.name);
-
-  if (result.ok && shouldCaptureVisualAfter(trace.name, visualAfter) && runId && stepIndex !== undefined && visualContext) {
-    try {
-      throwIfStopped(abortSignal, shouldContinue);
-      const visualIndex = traces.filter((item) => item.screenshots?.some((shot) => shot.kind === 'current')).length + 1;
-      const screenshotOptions = screenshotOptionsFromVisualAfter(visualAfter);
-      const screenshotStartedAt = Date.now();
-      const screenshotPath = await session.takeScreenshot(runId, stepIndex, `visual-${visualIndex}`, screenshotOptions);
-      throwIfStopped(abortSignal, shouldContinue);
-      const timingSummary = session.formatLastScreenshotTiming();
-      await onDebug?.({
-        phase: 'browser:screenshot:visual-after',
-        stepIndex,
-        message: `${trace.name} visual-after screenshot captured in ${elapsedSince(screenshotStartedAt)}ms${timingSummary ? ` ${timingSummary}` : ''}`,
-        details: {
-          elapsedMs: elapsedSince(screenshotStartedAt),
-          path: screenshotPath,
-          capture: screenshotOptions.capture,
-          toolName: trace.name,
-          timings: session.getLastScreenshotTiming(),
-        },
-      });
-      const markerPath = session.getLastCandidateMarkerScreenshotPath();
-      const originalPath = session.getLastOriginalScreenshotPath();
-      const frame = visualContext.apply({
-        path: screenshotPath,
-        originalPath,
-        markerPath,
-        stepIndex,
-        toolName: trace.name,
-        capture: screenshotOptions.capture,
-        reason: visualAfter.reason || `${trace.name} after screenshot`,
-      }, visualAfter);
-      screenshots.push({ title: `${trace.name} ${screenshotOptions.capture} after`, path: screenshotPath, kind: frame.role === 'pinned' ? 'pinned' : 'current' });
-      if (originalPath) screenshots.push({ title: `${trace.name} ${screenshotOptions.capture} after original`, path: originalPath, kind: 'original' });
-      if (markerPath) screenshots.push({ title: `${trace.name} marker map`, path: markerPath, kind: 'marker' });
-      await onVisualContextChange?.(visualContext.snapshot());
-    } catch (error) {
-      if (abortSignal?.aborted || (shouldContinue && !shouldContinue())) throw browserChatAbortError(abortSignal);
-      result = {
-        ...result,
-        actual: `${result.actual} Visual-after screenshot failed, so the action is kept and will not be retried: ${infrastructureError(error)}`,
-      };
-    }
+  if (result.ok && emittedImagePaths.length && visualContext) {
+    const toolInput = trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input)
+      ? trace.input as Record<string, unknown>
+      : {};
+    const capture = toolInput.capture === 'fullPage' ? 'fullPage' : 'viewport';
+    visualContext.append({
+      path: emittedImagePaths.at(-1) || emittedImagePaths[0],
+      stepIndex: stepIndex || 0,
+      toolName: trace.name,
+      capture,
+      reason: `${trace.name} explicit visual evidence`,
+    });
+    await onVisualContextChange?.(visualContext.snapshot());
   } else if (!result.ok && visualContext) {
     pushFailureFrameScreenshots(screenshots, trace.name, visualContext.current());
   }
@@ -1213,7 +1083,6 @@ async function finalizeToolTraceVisuals(input: {
 }
 
 async function executeTracedBrowserAction(input: {
-  session: BrowserSession;
   traces: ToolTrace[];
   name: string;
   toolInput: unknown;
@@ -1224,13 +1093,12 @@ async function executeTracedBrowserAction(input: {
   visualContext?: VisualContextManager;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
-  onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { session, traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onDebug, onToolTrace, onVisualContextChange } = input;
+  const { traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onToolTrace, onVisualContextChange } = input;
   throwIfStopped(abortSignal, shouldContinue);
-  const trace = createToolTrace({ traces, name, toolInput, aiRequest, runId, stepIndex, visualContext });
+  const trace = createToolTrace({ traces, name, toolInput, aiRequest, runId, stepIndex });
   const postprocessTimings: Record<string, number> = {};
   trace.postprocessTimings = postprocessTimings;
   let postprocessStartedAt = Date.now();
@@ -1260,19 +1128,15 @@ async function executeTracedBrowserAction(input: {
   throwIfStopped(abortSignal, shouldContinue);
   postprocessStartedAt = Date.now();
   result = await finalizeToolTraceVisuals({
-    session,
-    traces,
     trace,
     result,
-    runId,
     stepIndex,
     visualContext,
     abortSignal,
     shouldContinue,
-    onDebug,
     onVisualContextChange,
   });
-  postprocessTimings.visualAfterMs = elapsedSince(postprocessStartedAt);
+  postprocessTimings.visualContextMs = elapsedSince(postprocessStartedAt);
   throwIfStopped(abortSignal, shouldContinue);
   trace.completedAt = Date.now();
   trace.elapsedMs = trace.startedAt ? trace.completedAt - trace.startedAt : undefined;
@@ -1306,7 +1170,7 @@ function makeBrowserTools(
     runSubagents?: BrowserChatSubagentRunner;
     readSubagent?: BrowserChatSubagentReader;
     readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
-    onReadFileImage?: (input: { path: string }) => void;
+    onReferenceImage?: (input: { path: string }) => void;
     ensureBrowserStarted?: () => Promise<void>;
     credentialBindings?: BrowserCodeCredentialBinding[];
     getCredentialBindings?: () => BrowserCodeCredentialBinding[] | undefined;
@@ -1372,7 +1236,6 @@ function makeBrowserTools(
     };
     const traceVisualContext = referenceOptions?.visualContext;
     return executeTracedBrowserAction({
-      session,
       traces,
       name,
       toolInput: input,
@@ -1382,7 +1245,6 @@ function makeBrowserTools(
       abortSignal: referenceOptions?.abortSignal,
       shouldContinue: referenceOptions?.shouldContinue,
       aiRequest: referenceOptions?.getAiRequest?.() || aiRequest,
-      onDebug: referenceOptions?.onDebug,
       onToolTrace,
       onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
       action: actionWithConfirmation,
@@ -1391,7 +1253,7 @@ function makeBrowserTools(
     const imagePaths = result.referenceImagePaths?.length
       ? result.referenceImagePaths
       : result.referenceImagePath ? [result.referenceImagePath] : [];
-    for (const path of new Set(imagePaths)) referenceOptions?.onReadFileImage?.({ path });
+    for (const path of new Set(imagePaths)) referenceOptions?.onReferenceImage?.({ path });
     return compactToolResultForModel(name, result);
     });
   }
@@ -2077,7 +1939,6 @@ async function executeRuntimeStep(input: {
   runtimeRecord: BrowserChatRuntimeRecord;
   runId: string;
   stepIndex: number;
-  beforeScreenshotPath: string;
   instruction?: string;
   operationalContext?: string;
   conversation?: InteractiveBrowserTurnMessage[];
@@ -2094,14 +1955,12 @@ async function executeRuntimeStep(input: {
   readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
-  isBrowserStarted?: () => boolean;
   agentLoopTimeoutMs?: number;
 }) {
   const {
     session,
     runtimeRecord,
     stepIndex,
-    beforeScreenshotPath,
     referenceImagePaths = [],
     abortSignal,
     onDebug,
@@ -2109,10 +1968,11 @@ async function executeRuntimeStep(input: {
   } = input;
   const mode = input.mode;
   const screenshotInputEnabled = false;
+  const imageInputAvailable = modelSupportsScreenshotInput();
+  const screenshotToolEnabled = mode === 'dom' && imageInputAvailable;
+  const browserCodeImageOutputEnabled = mode === 'code' && imageInputAvailable;
   const markerEnabled = false;
   const ensureActive = () => throwIfStopped(abortSignal, input.shouldContinue);
-  const markerScreenshotPath = undefined;
-  const originalScreenshotPath = session.getLastOriginalScreenshotPath();
   ensureActive();
   await onDebug?.({
     phase: 'ai:runtime-input:start',
@@ -2181,7 +2041,8 @@ async function executeRuntimeStep(input: {
     const codexMode = isCodexProvider();
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
     const availableRuntimeToolNames = runtimeToolNames(mode).filter((name) => (
-      (name !== 'spawnSubagents' || Boolean(input.runSubagents))
+      (name !== 'takeScreenshot' || screenshotToolEnabled)
+      && (name !== 'spawnSubagents' || Boolean(input.runSubagents))
       && (name !== 'readSubagent' || Boolean(input.readSubagent))
       && (name !== 'readFile' || Boolean(input.readFile))
     ));
@@ -2197,7 +2058,6 @@ async function executeRuntimeStep(input: {
       : runtimeTools;
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
-    visualContext.init({ path: beforeScreenshotPath, originalPath: originalScreenshotPath, markerPath: markerScreenshotPath, stepIndex, capture: 'viewport', reason: 'Initial current screenshot for this agent loop' });
     let requestSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
     let workingMemory: RuntimeWorkingMemory = {
       taskGoal: requirementOf(runtimeRecord),
@@ -2293,7 +2153,7 @@ async function executeRuntimeStep(input: {
       imagePaths: messageImagePaths,
       imageAttached: Boolean(messageImagePaths.length),
       tools: allowedToolTypes,
-      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, markerScreenshotPath, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: modelSupportsScreenshotInput(), screenshotInputEnabled: false, screenshotToolEnabled: false, browserCodeImageOutputEnabled: modelSupportsScreenshotInput(), browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: 0, userReferenceImageCount: initialUserReferenceImagePaths.length },
+      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: imageInputAvailable, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: 0, userReferenceImageCount: initialUserReferenceImagePaths.length },
     });
     lastAiRequest = aiRequest;
     const toolExecutionGate = { stepNumber: 0, executed: false };
@@ -2458,7 +2318,7 @@ async function executeRuntimeStep(input: {
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, explicitPageState: true, screenshotToolEnabled: false, browserCodeImageOutputEnabled: modelSupportsScreenshotInput(), modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
       return {
         system: requestSystemPrompt || undefined,
@@ -2508,7 +2368,6 @@ async function executeRuntimeStep(input: {
         readFile: input.readFile,
         credentialBindings: activeCredentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
-        onDebug,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
         onToolTrace: async (trace) => {
           ensureActive();
@@ -2590,10 +2449,10 @@ async function executeRuntimeStep(input: {
       readFile: input.readFile,
       credentialBindings: input.credentialBindings,
       getCredentialBindings: () => activeCredentialBindings,
-      onReadFileImage: ({ path }) => {
+      onReferenceImage: ({ path }) => {
         if (!modelSupportsScreenshotInput()) return;
         pendingObservationMessages.push({
-          text: '[文件视觉内容]\n已读取图片文件；该图片已附加到本次工具调用后的下一轮模型请求。请直接基于图片内容进行分析。',
+          text: '[显式视觉内容]\n工具返回了一张图片；该图片已附加到下一轮模型请求。请直接基于图片内容进行分析。',
           imagePaths: [path],
         });
       },
@@ -2842,7 +2701,6 @@ export async function executeInteractiveBrowserTurn(input: {
   readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
-  isBrowserStarted?: () => boolean;
   agentLoopTimeoutMs?: number;
   allowedToolTypes?: string[];
 }): Promise<InteractiveBrowserTurnResult> {
@@ -2859,64 +2717,16 @@ export async function executeInteractiveBrowserTurn(input: {
   let reply = '';
   let endedWithFinalAnswer = false;
 
-  async function takeStepScreenshot(phase: 'before' | 'after', stepIndex: number) {
-    if (input.isBrowserStarted?.() === false) {
-      await input.onDebug?.({
-        phase: `browser:screenshot:${phase}:skipped`,
-        stepIndex,
-        message: `Skipped automatic ${phase} screenshot because no browser tool has started this session yet.`,
-        details: { browserMode: runtimeMode, browserStarted: false },
-      });
-      return undefined;
-    }
-    if (runtimeMode === 'code' || !browserChatDomScreenshotsEnabled()) {
-      await input.onDebug?.({
-        phase: `browser:screenshot:${phase}:skipped`,
-        stepIndex,
-        message: runtimeMode === 'code'
-          ? `Skipped automatic ${phase} screenshot; browserCode emits visual evidence explicitly.`
-          : `Skipped automatic ${phase} screenshot; DOM mode captures screenshots only when requested.`,
-        details: { browserMode: runtimeMode, enabledBy: runtimeMode === 'dom' ? 'BROWSER_CHAT_DOM_SCREENSHOTS=true' : 'browserCode' },
-      });
-      return undefined;
-    }
-    const startedAt = Date.now();
-    try {
-      const screenshotPath = await input.session.takeScreenshot(input.runId, stepIndex, phase);
-      ensureActive();
-      const message = phase === 'before'
-        ? `Current page screenshot captured in ${elapsedSince(startedAt)}ms.`
-        : `Post-action screenshot captured in ${elapsedSince(startedAt)}ms.`;
-      const timingSummary = input.session.formatLastScreenshotTiming();
-      await input.onDebug?.({
-        phase: `browser:screenshot:${phase}`,
-        stepIndex,
-        message: timingSummary ? `${message} ${timingSummary}` : message,
-        details: { elapsedMs: elapsedSince(startedAt), path: screenshotPath, timings: input.session.getLastScreenshotTiming() },
-      });
-      return screenshotPath;
-    } catch (error) {
-      throw error;
-    }
-  }
-
   while (true) {
     ensureActive();
     const stepIndex = Math.max(input.initialStepIndex || 0, ...steps.map((step) => step.index)) + 1;
     await input.onDebug?.({ phase: 'chat:step:start', stepIndex, message: `正在准备第 ${stepIndex} 步浏览器操作。` });
-    let runningStep: StepExecutionResult = {
+    const runningStep: StepExecutionResult = {
       index: stepIndex,
       action: 'AI is handling the latest browser chat message',
       expected: 'AI should inspect the live browser state and perform one useful browser action or report the current state.',
-      actual: 'AI is preparing the current browser state.',
-      status: 'running',
-    };
-
-    const beforeScreenshotPath = await takeStepScreenshot('before', stepIndex);
-    runningStep = {
-      ...runningStep,
       actual: 'AI is choosing the next browser action from the current page.',
-      beforeScreenshotPath,
+      status: 'running',
     };
 
     const liveToolTraces: ToolTrace[] = [];
@@ -2930,7 +2740,6 @@ export async function executeInteractiveBrowserTurn(input: {
         runtimeRecord,
         runId: input.runId,
         stepIndex,
-        beforeScreenshotPath: beforeScreenshotPath || '',
         instruction: input.modelInstruction || input.instruction,
         operationalContext: input.operationalContext,
         conversation: input.conversation || [],
@@ -2945,7 +2754,6 @@ export async function executeInteractiveBrowserTurn(input: {
         readFile: input.readFile,
         credentialBindings: input.credentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
-        isBrowserStarted: input.isBrowserStarted,
         agentLoopTimeoutMs: input.agentLoopTimeoutMs,
         onDebug: input.onDebug,
         onToolTrace: async (trace, progress) => {
@@ -2968,11 +2776,7 @@ export async function executeInteractiveBrowserTurn(input: {
       ensureActive();
       const recoveredState = progressFieldsFromToolTraces(liveToolTraces, requirementOf(runtimeRecord), stepIndex, latestToolProgress);
       const errorStep = await createRuntimeErrorStep({
-        session: input.session,
-        runId: input.runId,
         stepIndex,
-        mode: runtimeMode,
-        beforeScreenshotPath,
         error,
         tools: summarizeToolTraces(liveToolTraces),
         aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
@@ -3030,7 +2834,6 @@ export async function executeInteractiveBrowserTurn(input: {
       continue;
     }
 
-    const afterScreenshotPath = await takeStepScreenshot('after', stepIndex);
     const decision = deriveBrowserChatStepDecision(actionResult.text, actionResult.traces, requirementOf(runtimeRecord));
     const completedStep: StepExecutionResult = {
       index: stepIndex,
@@ -3043,9 +2846,6 @@ export async function executeInteractiveBrowserTurn(input: {
       ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
         .map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex })),
       aiRequest: actionResult.aiRequest,
-      beforeScreenshotPath,
-      afterScreenshotPath,
-      screenshotPath: afterScreenshotPath,
       tools: summarizeToolTraces(actionResult.traces),
       visualContext: actionResult.visualContext,
       workingMemory: actionResult.workingMemory,
@@ -3208,20 +3008,13 @@ function serializeError(error: unknown) {
 }
 
 async function createRuntimeErrorStep(input: {
-  session: BrowserSession;
-  runId: string;
   stepIndex: number;
-  mode?: BrowserSessionMode;
-  beforeScreenshotPath?: string;
   error: unknown;
   tools?: StepToolCall[];
   aiRequest?: AiRequestSnapshot;
   recoveredState?: Partial<StepExecutionResult>;
 }): Promise<StepExecutionResult> {
-  const { session, runId, stepIndex, mode, beforeScreenshotPath, error, tools, aiRequest, recoveredState } = input;
-  const afterScreenshotPath = mode === 'dom'
-    ? undefined
-    : await session.takeScreenshot(runId, stepIndex, 'after').catch(() => undefined);
+  const { stepIndex, error, tools, aiRequest, recoveredState } = input;
   const retryInfo = runtimeRetryFromError(error);
 
   return {
@@ -3234,9 +3027,6 @@ async function createRuntimeErrorStep(input: {
       : 'The assistant should stop this turn and preserve the latest browser state.',
     actual: userFacingRecoverableRuntimeError(error),
     status: 'failed',
-    beforeScreenshotPath,
-    afterScreenshotPath,
-    screenshotPath: afterScreenshotPath,
     taskFrame: recoveredState?.taskFrame,
     ledgerItems: recoveredState?.ledgerItems,
     workingMemory: recoveredState?.workingMemory,
@@ -3323,10 +3113,9 @@ async function executeCodexRuntimeObject(input: {
   ensureBrowserStarted?: () => Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
-  onDebug?: ExecutionDebug;
   onReferenceImage?: (path: string) => void;
 }) {
-  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readFile, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onDebug, onReferenceImage } = input;
+  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readFile, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -3394,7 +3183,6 @@ async function executeCodexRuntimeObject(input: {
   };
 
   const result = await executeTracedBrowserAction({
-    session,
     traces,
     name: type,
     toolInput: normalizedParams,
@@ -3404,7 +3192,6 @@ async function executeCodexRuntimeObject(input: {
     visualContext,
     abortSignal,
     shouldContinue,
-    onDebug,
     onToolTrace,
     onVisualContextChange,
     action: async (_actionSignal, trace) => {

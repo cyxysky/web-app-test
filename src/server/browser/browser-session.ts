@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, Dialog, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
+import { resolveBrowserViewportSize } from '@/config/browser-viewport-resolution';
 import { artifactPath } from '@/server/storage/paths';
 import { browserPreviewFrameIntervalMs } from './browser-preview-cadence';
 import {
@@ -16,7 +17,6 @@ import {
   electronEmbeddedBrowserEnabled,
   normalizePageGroupId,
   numericLimitFromEnv,
-  positiveIntegerEnv,
   sessionTabGrouperDebugPort,
   sessionTabGrouperEnabled,
   sessionTabGrouperProfileDir,
@@ -3921,7 +3921,7 @@ export class BrowserSession {
   private browserRuntimeInstalledRevisionByFrame = new WeakMap<Frame, number>();
   private livePreviewExplicitPageSelectionAt = 0;
   private livePreviewExplicitPageSelectionSequence = 0;
-  private livePreviewNativeViewportRestoredPages = new WeakSet<Page>();
+  private configuredViewportKeyByPage = new WeakMap<Page, string>();
   private livePreviewNativeTabRefreshAt = 0;
   private livePreviewTabIdSequence = 0;
   private livePreviewTabIds = new WeakMap<Page, string>();
@@ -3987,14 +3987,11 @@ export class BrowserSession {
     const isolated = this.options.isolated === true;
     this.browserSurface = resolveBrowserSessionSurface(this.options, electronEmbeddedBrowserEnabled());
     const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
-    const configuredViewportWidth = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH');
-    const configuredViewportHeight = positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT');
-    const hasConfiguredViewport = configuredViewportWidth !== undefined && configuredViewportHeight !== undefined;
-    const rawViewportMode = process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase();
-    const viewportMode = rawViewportMode === 'fixed' || (!rawViewportMode && hasConfiguredViewport) ? 'fixed' : 'auto';
-    const fixedViewport = viewportMode === 'fixed' && hasConfiguredViewport
-      ? { width: configuredViewportWidth, height: configuredViewportHeight }
-      : undefined;
+    const fixedViewport = resolveBrowserViewportSize(
+      process.env.BROWSER_VIEWPORT_RESOLUTION,
+      process.env.BROWSER_VIEWPORT_WIDTH,
+      process.env.BROWSER_VIEWPORT_HEIGHT,
+    );
     const headlessFallbackViewport = { width: fullscreen ? 1920 : 1280, height: fullscreen ? 1080 : 800 };
     const useNativeViewport = !headless && !fixedViewport;
     const contextViewport = useNativeViewport ? null : fixedViewport || headlessFallbackViewport;
@@ -4618,6 +4615,7 @@ export class BrowserSession {
   }
 
   private async ensureBrowserPageRuntime(target: Page | Frame = this.activePage) {
+    if ('mainFrame' in target) await this.applyConfiguredViewport(target).catch(() => undefined);
     const frame = 'mainFrame' in target ? target.mainFrame() : target;
     const revision = this.browserRuntimeRevisionByFrame.get(frame) || 0;
     if (this.browserRuntimeInstalledRevisionByFrame.get(frame) === revision) return;
@@ -4679,7 +4677,7 @@ export class BrowserSession {
   }
 
   private ensureLivePreviewState() {
-    this.livePreviewNativeViewportRestoredPages ||= new WeakSet<Page>();
+    this.configuredViewportKeyByPage ||= new WeakMap<Page, string>();
     this.livePreviewTabIds ||= new WeakMap<Page, string>();
     this.nativeTabIdByPage ||= new WeakMap<Page, number>();
     if (!Number.isFinite(this.livePreviewExplicitPageSelectionAt)) this.livePreviewExplicitPageSelectionAt = 0;
@@ -4777,6 +4775,53 @@ export class BrowserSession {
     this.livePreviewExplicitPageSelectionSequence += 1;
   }
 
+  private async applyConfiguredViewport(page: Page) {
+    this.ensureLivePreviewState();
+    if (page.isClosed()) return;
+    const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
+    const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
+    const resolution = process.env.BROWSER_VIEWPORT_RESOLUTION?.trim().toLowerCase() || 'auto';
+    const fixedViewport = resolveBrowserViewportSize(
+      resolution,
+      process.env.BROWSER_VIEWPORT_WIDTH,
+      process.env.BROWSER_VIEWPORT_HEIGHT,
+    );
+    const viewport = fixedViewport || (headless
+      ? { width: fullscreen ? 1920 : 1280, height: fullscreen ? 1080 : 800 }
+      : undefined);
+    const settingKey = [
+      resolution,
+      process.env.BROWSER_VIEWPORT_WIDTH || '',
+      process.env.BROWSER_VIEWPORT_HEIGHT || '',
+      headless ? 'headless' : 'headful',
+      fullscreen ? 'fullscreen' : 'windowed',
+      this.browserSurface,
+    ].join(':');
+    if (this.configuredViewportKeyByPage.get(page) === settingKey) return;
+
+    if (viewport) {
+      const current = page.viewportSize();
+      if (!current || current.width !== viewport.width || current.height !== viewport.height) {
+        await page.setViewportSize(viewport);
+      }
+    } else {
+      const viewportClient = await page.context().newCDPSession(page);
+      try {
+        await viewportClient.send('Emulation.clearDeviceMetricsOverride');
+        if (fullscreen && this.browserSurface === 'external') {
+          const { windowId } = await viewportClient.send('Browser.getWindowForTarget');
+          await viewportClient.send('Browser.setWindowBounds', {
+            bounds: { windowState: 'maximized' },
+            windowId,
+          }).catch(() => undefined);
+        }
+      } finally {
+        await viewportClient.detach().catch(() => undefined);
+      }
+    }
+    this.configuredViewportKeyByPage.set(page, settingKey);
+  }
+
   async switchLivePreviewTab(tabId: string): Promise<BrowserActionResult> {
     let page = this.sessionPages().find((candidate) => this.livePreviewTabId(candidate) === tabId);
     if (!page) {
@@ -4796,27 +4841,7 @@ export class BrowserSession {
     this.ensureLivePreviewState();
     await this.refreshSessionGroupPages({ forceNativeRefresh: true });
     const page = this.activePage;
-    if (!this.livePreviewNativeViewportRestoredPages.has(page)) {
-      const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
-      const hasFixedViewport = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH') !== undefined
-        && positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT') !== undefined;
-      const viewportMode = process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase();
-      const fixedViewport = viewportMode === 'fixed' || (!viewportMode && hasFixedViewport);
-      if (!headless && !fixedViewport && this.browserSurface === 'external') {
-        const viewportClient = await page.context().newCDPSession(page);
-        try {
-          await viewportClient.send('Emulation.clearDeviceMetricsOverride');
-          const { windowId } = await viewportClient.send('Browser.getWindowForTarget');
-          await viewportClient.send('Browser.setWindowBounds', {
-            bounds: { windowState: 'maximized' },
-            windowId,
-          }).catch(() => undefined);
-        } finally {
-          await viewportClient.detach().catch(() => undefined);
-        }
-      }
-      this.livePreviewNativeViewportRestoredPages.add(page);
-    }
+    await this.applyConfiguredViewport(page);
     const client = await page.context().newCDPSession(page);
     const configuredFormat = process.env.BROWSER_SCREENCAST_FORMAT?.trim().toLowerCase();
     const format = configuredFormat === 'png' ? 'png' : 'jpeg';
@@ -5616,10 +5641,6 @@ export class BrowserSession {
       }
     };
     const skipped = (name: string) => timingSteps.push({ name, elapsedMs: 0, skipped: true });
-    const stabilizeMs = Number(process.env.SCREENSHOT_STABILIZE_MS || 0);
-    if (Number.isFinite(stabilizeMs) && stabilizeMs > 0) {
-      await timed('stabilizeViewport', () => this.waitForStableViewport(Math.min(Math.max(stabilizeMs, 0), 5000)));
-    } else skipped('stabilizeViewport');
     const capture: ScreenshotCaptureMode = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
     const dir = artifactPath(runId);
     await timed('prepareArtifactDir', () => mkdir(dir, { recursive: true }));

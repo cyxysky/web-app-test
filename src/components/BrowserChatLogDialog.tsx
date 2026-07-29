@@ -73,7 +73,7 @@ function formatPostprocessTimings(value: unknown) {
     'desktopAfterMs',
     'notifyStartMs',
     'notifyResultMs',
-    'visualAfterMs',
+    'visualContextMs',
     'notifyCompleteMs',
   ];
   return fields
