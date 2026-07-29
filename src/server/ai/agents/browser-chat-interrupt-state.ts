@@ -8,6 +8,62 @@ export type InterruptibleBrowserChatRuntime = {
   updatedAt: string;
 };
 
+export type RegisteredBrowserChatTurn<TSession> = {
+  session: TSession;
+  assistantMessageId: string;
+  abortController: AbortController;
+};
+
+export function registerBrowserChatTurn<TSession>(
+  registry: Map<string, RegisteredBrowserChatTurn<TSession>>,
+  sessionId: string,
+  turn: RegisteredBrowserChatTurn<TSession>,
+) {
+  registry.set(sessionId, turn);
+}
+
+export function registeredBrowserChatTurnIsActive<TSession>(
+  registry: Map<string, RegisteredBrowserChatTurn<TSession>>,
+  sessionId: string,
+  session: TSession,
+  assistantMessageId: string,
+  abortController: AbortController,
+) {
+  const registered = registry.get(sessionId);
+  return registered?.session === session
+    && registered.assistantMessageId === assistantMessageId
+    && registered.abortController === abortController
+    && !abortController.signal.aborted;
+}
+
+export function clearRegisteredBrowserChatTurn<TSession>(
+  registry: Map<string, RegisteredBrowserChatTurn<TSession>>,
+  sessionId: string,
+  assistantMessageId: string,
+  abortController: AbortController,
+) {
+  const registered = registry.get(sessionId);
+  if (
+    registered?.assistantMessageId !== assistantMessageId
+    || registered.abortController !== abortController
+  ) return false;
+  registry.delete(sessionId);
+  return true;
+}
+
+export function revokeRegisteredBrowserChatTurn<TSession>(
+  registry: Map<string, RegisteredBrowserChatTurn<TSession>>,
+  sessionId: string,
+  reason: Error,
+) {
+  const registered = registry.get(sessionId);
+  if (!registered) return undefined;
+  registry.delete(sessionId);
+  const abortDispatched = !registered.abortController.signal.aborted;
+  if (abortDispatched) registered.abortController.abort(reason);
+  return { ...registered, abortDispatched };
+}
+
 export function racePromiseWithAbort<T>(operation: PromiseLike<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return Promise.resolve(operation);
   const abortError = () => signal.reason instanceof Error

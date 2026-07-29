@@ -27,8 +27,13 @@ import {
   settleBrowserChatSubagents,
 } from '@/server/ai/agents/browser-chat-subagents';
 import {
+  clearRegisteredBrowserChatTurn,
+  registerBrowserChatTurn,
+  registeredBrowserChatTurnIsActive,
   revokeBrowserChatTurn,
+  revokeRegisteredBrowserChatTurn,
   runtimeSnapshotIsNewer,
+  type RegisteredBrowserChatTurn,
 } from '@/server/ai/agents/browser-chat-interrupt-state';
 import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl } from '@/server/ai/agents/skill-context';
 import {
@@ -153,6 +158,8 @@ type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
   started: boolean;
 };
 
+type BrowserChatActiveTurn = RegisteredBrowserChatTurn<BrowserChatSessionRecord>;
+
 type BrowserChatBlockedSubagentRuntime = {
   id: string;
   sessionId: string;
@@ -185,6 +192,7 @@ type BrowserChatStoredSubagent = {
 
 type BrowserChatRuntimeState = {
   sessions: Map<string, BrowserChatSessionRecord>;
+  activeTurns: Map<string, BrowserChatActiveTurn>;
   browserStartPromises: Map<string, Promise<BrowserSession>>;
   blockedSubagents: Map<string, BrowserChatBlockedSubagentRuntime>;
   subagentResults: Map<string, Map<string, BrowserChatStoredSubagent>>;
@@ -202,6 +210,7 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
   __browserChatRuntimeState?: BrowserChatRuntimeState;
 }).__browserChatRuntimeState ??= {
   sessions: new Map<string, BrowserChatSessionRecord>(),
+  activeTurns: new Map<string, BrowserChatActiveTurn>(),
   browserStartPromises: new Map<string, Promise<BrowserSession>>(),
   blockedSubagents: new Map(),
   subagentResults: new Map(),
@@ -215,6 +224,7 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
   lastPersistWarningAt: 0,
 });
 browserChatRuntimeState.sessions ??= new Map();
+browserChatRuntimeState.activeTurns ??= new Map();
 browserChatRuntimeState.browserStartPromises ??= new Map();
 browserChatRuntimeState.blockedSubagents ??= new Map();
 browserChatRuntimeState.subagentResults ??= new Map();
@@ -223,6 +233,7 @@ browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
+const activeTurns = browserChatRuntimeState.activeTurns;
 const browserStartPromises = browserChatRuntimeState.browserStartPromises;
 const blockedSubagents = browserChatRuntimeState.blockedSubagents;
 const subagentResults = browserChatRuntimeState.subagentResults;
@@ -1307,6 +1318,13 @@ function shouldPreserveRuntimeTurn(existing: BrowserChatSessionRecord, fromDisk:
   const assistantMessageId = existing.activeAssistantMessageId;
   const abortController = existing.activeAbortController;
   if (!assistantMessageId || !abortController) return false;
+  if (!registeredBrowserChatTurnIsActive(
+    activeTurns,
+    existing.id,
+    existing,
+    assistantMessageId,
+    abortController,
+  )) return false;
   if (abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId)) return false;
   if (!fromDisk.busy && fromDisk.status !== 'running' && !hasRunningAssistantMessage(fromDisk, assistantMessageId)) return false;
   return hasRunningAssistantMessage(fromDisk, assistantMessageId);
@@ -2030,6 +2048,7 @@ async function closeBlockedBrowserChatSubagents(
 }
 
 async function stopBrowserChatRuntime(session: BrowserChatSessionRecord, reason: Error) {
+  revokeRegisteredBrowserChatTurn(activeTurns, session.id, reason);
   if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
     session.activeAbortController.abort(reason);
   }
@@ -2320,7 +2339,7 @@ export async function sendBrowserChatMessage(
   if (normalizedClientMessageId && session.messages.some((message) => message.clientMessageId === normalizedClientMessageId)) {
     return snapshot(session);
   }
-  if (session.busy) throw new Error('Browser chat session is already running');
+  if (session.busy || activeTurns.has(session.id)) throw new Error('Browser chat session is already running');
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);
   session.pendingToolConfirmation = undefined;
@@ -2359,6 +2378,11 @@ export async function sendBrowserChatMessage(
   session.activeAssistantMessageId = assistantMessage.id;
   const abortController = new AbortController();
   session.activeAbortController = abortController;
+  registerBrowserChatTurn(activeTurns, session.id, {
+    session,
+    assistantMessageId: assistantMessage.id,
+    abortController,
+  });
   session.busy = true;
   session.status = 'running';
   session.error = undefined;
@@ -2424,6 +2448,11 @@ export function resumeBrowserChatHumanVerification(sessionId: string, userId?: s
   interruptedAssistantMessageIds.delete(paused.message.id);
   session.activeAssistantMessageId = paused.message.id;
   session.activeAbortController = abortController;
+  registerBrowserChatTurn(activeTurns, session.id, {
+    session,
+    assistantMessageId: paused.message.id,
+    abortController,
+  });
   session.busy = true;
   session.status = 'running';
   session.error = undefined;
@@ -2577,6 +2606,13 @@ function runningActivityFromLog(phase: string, message: string) {
 
 function isActiveBrowserChatTurn(session: BrowserChatSessionRecord, assistantMessageId: string, abortController: AbortController) {
   return !interruptedAssistantMessageIds.has(assistantMessageId)
+    && registeredBrowserChatTurnIsActive(
+      activeTurns,
+      session.id,
+      session,
+      assistantMessageId,
+      abortController,
+    )
     && sessions.get(session.id) === session
     && session.activeAssistantMessageId === assistantMessageId
     && session.activeAbortController === abortController
@@ -2735,23 +2771,45 @@ export function resolveBrowserChatToolConfirmation(
 }
 
 export function interruptBrowserChatSession(sessionId: string, userId?: string | number) {
-  const session = hydrateSession(sessionId);
+  // Prefer the live runtime record. Interrupt must not wait for persistence
+  // rehydration while an AI request is actively running.
+  const registeredTurn = activeTurns.get(sessionId);
+  const session = sessions.get(sessionId) || registeredTurn?.session || hydrateSession(sessionId);
   if (!session) return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
   const timestamp = now();
-  const assistantMessageId = session.activeAssistantMessageId || latestRunningAssistantMessageId(session);
+  const reason = new Error('Browser chat operation interrupted by user.');
+  const assistantMessageIds = new Set([
+    registeredTurn?.assistantMessageId,
+    session.activeAssistantMessageId,
+    latestRunningAssistantMessageId(session),
+  ].filter((value): value is string => Boolean(value)));
+  const assistantMessageId = registeredTurn?.assistantMessageId
+    || session.activeAssistantMessageId
+    || latestRunningAssistantMessageId(session);
 
-  // Revoke ownership before dispatching abort. Abort listeners may settle on a
-  // later microtask, but every stale callback is rejected immediately by
-  // isActiveBrowserChatTurn and can no longer write into this session.
-  markAssistantMessageInterrupted(assistantMessageId);
-  cancelPendingToolConfirmation(session);
-  const interruptedRuntime = revokeBrowserChatTurn(
+  // Delete the execution registration before dispatching abort. This is the
+  // irreversible stop boundary: persisted state, delayed request retries, and
+  // child-Agent completions cannot recreate ownership for this execution.
+  for (const messageId of assistantMessageIds) markAssistantMessageInterrupted(messageId);
+  const registeredRevocation = revokeRegisteredBrowserChatTurn(activeTurns, sessionId, reason);
+  const runtimeRecords = new Set<BrowserChatSessionRecord>([
     session,
-    timestamp,
-    new Error('Browser chat operation interrupted by user.'),
-  );
-  preserveInterruptedTurn(session, assistantMessageId, timestamp);
+    ...(registeredTurn?.session ? [registeredTurn.session] : []),
+  ]);
+  let sessionAbortDispatched = false;
+  for (const runtimeRecord of runtimeRecords) {
+    cancelPendingToolConfirmation(runtimeRecord);
+    const revoked = revokeBrowserChatTurn(runtimeRecord, timestamp, reason);
+    sessionAbortDispatched ||= revoked.abortDispatched;
+    if (assistantMessageIds.size === 0) {
+      preserveInterruptedTurn(runtimeRecord, undefined, timestamp);
+    } else {
+      for (const messageId of assistantMessageIds) {
+        preserveInterruptedTurn(runtimeRecord, messageId, timestamp);
+      }
+    }
+  }
   preserveInterruptedSubagents(session.id, assistantMessageId);
   void closeBlockedBrowserChatSubagents(session.id, assistantMessageId);
 
@@ -2762,7 +2820,11 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
       time: timestamp,
       phase: 'chat:interrupt:completed',
       message: '已立即撤销当前回合并向正在执行的请求发送中止信号。',
-      details: safeJson({ assistantMessageId, abortDispatched: interruptedRuntime.abortDispatched }),
+      details: safeJson({
+        assistantMessageId,
+        abortDispatched: Boolean(registeredRevocation?.abortDispatched || sessionAbortDispatched),
+        executionRevoked: Boolean(registeredTurn),
+      }),
     },
   ]);
 
@@ -2932,7 +2994,9 @@ async function executeBrowserChatSubagentBatch(input: {
     let latestChildText = '';
     try {
       await child.start();
+      if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
       if (task.url) await child.open(task.url);
+      if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
       const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
         session,
         browser: child,
@@ -3232,6 +3296,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       }));
       session.status = 'idle';
       session.busy = false;
+      clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
       session.activeAssistantMessageId = undefined;
       session.activeAbortController = undefined;
       session.updatedAt = timestamp;
@@ -3276,6 +3341,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
     session.error = message;
     session.status = 'error';
     session.busy = false;
+    clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
     session.activeAssistantMessageId = undefined;
     session.activeAbortController = undefined;
     session.updatedAt = timestamp;
@@ -3416,6 +3482,7 @@ async function runBrowserChatMessage(
       session.status = 'idle';
       session.busy = false;
       session.pendingToolConfirmation = undefined;
+      clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
       session.activeAssistantMessageId = undefined;
       session.activeAbortController = undefined;
       session.updatedAt = completedAt;
@@ -3466,10 +3533,12 @@ async function runBrowserChatMessage(
         status: interrupted ? 'interrupted' : 'failed',
         activity: undefined,
       }));
+      clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
       session.activeAssistantMessageId = undefined;
       session.activeAbortController = undefined;
       persistAndNotify(session.id);
     } finally {
+      clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
       if (session.pendingToolConfirmation?.messageId === assistantMessageId) {
         cancelPendingToolConfirmation(session);
         session.pendingToolConfirmation = undefined;

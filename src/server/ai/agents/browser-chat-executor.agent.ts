@@ -1516,6 +1516,7 @@ function runtimePrompt(input: {
     '',
     'Operating rules:',
     '- In one model step, either answer in Chinese Markdown without a tool or call at most one relevant tool. A new action request is a new occurrence even when its wording repeats an earlier request.',
+    '- Before any state-changing browser operation, first understand the user\'s exact goal and confirm with fresh live evidence the current page, active dialog/layer, intended outcome, exact target, and any loading or blocking state. If anything is uncertain, inspect first; never operate from assumptions or stale history.',
     `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Inspect the live page with ${input.mode === 'code' ? 'browserCode' : 'inspect'} before acting; do not reuse stale coordinates, screenshots, prior tool JSON, or DOM evidence from an older page state.`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),

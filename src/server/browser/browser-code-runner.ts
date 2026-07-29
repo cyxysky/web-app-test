@@ -82,6 +82,7 @@ const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 2;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -247,6 +248,16 @@ function browserCodeKernelMain() {
   const credentialLocatorPrototypes = new WeakSet<object>();
   let nativeFrameLocator: ((this: object, selector: string) => import('playwright').Locator) | undefined;
   let nativeLocatorFill: ((this: object, value: string) => Promise<void>) | undefined;
+
+  const actionArgsWithMinimumTimeout = (args: unknown[], optionsIndex: number) => {
+    const options = args[optionsIndex];
+    if (!options || typeof options !== 'object' || Array.isArray(options)) return args;
+    const timeout = Number(Reflect.get(options, 'timeout'));
+    if (!Number.isFinite(timeout) || timeout <= 0 || timeout >= browserCodeActionTimeoutMs) return args;
+    const normalized = [...args];
+    normalized[optionsIndex] = { ...options, timeout: browserCodeActionTimeoutMs };
+    return normalized;
+  };
 
   const createSessionPage = async (targetContext: import('playwright').BrowserContext) => {
     const nativeNewPage = nativeContextNewPages.get(targetContext) || targetContext.newPage.bind(targetContext);
@@ -510,14 +521,15 @@ function browserCodeKernelMain() {
             if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
               throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
             }
+            const normalizedArgs = actionArgsWithMinimumTimeout(args, name === 'dragTo' ? 1 : 0);
             const targetPage = locatorPage(this);
             if (targetPage && activeExecution) {
               await moveVisibleAiPointer(targetPage, await locatorCenter(this), kind);
-              if (name === 'dragTo' && args[0] && typeof args[0] === 'object') {
-                await moveVisibleAiPointer(targetPage, await locatorCenter(args[0]), 'move');
+              if (name === 'dragTo' && normalizedArgs[0] && typeof normalizedArgs[0] === 'object') {
+                await moveVisibleAiPointer(targetPage, await locatorCenter(normalizedArgs[0]), 'move');
               }
             }
-            return Reflect.apply(original, this, args);
+            return Reflect.apply(original, this, normalizedArgs);
           },
           writable: true,
         });
@@ -552,10 +564,11 @@ function browserCodeKernelMain() {
             if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
               throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
             }
-            if (activeExecution && typeof args[0] === 'string') {
-              await moveVisibleAiPointer(page, await locatorCenter(page.locator(args[0])), kind);
+            const normalizedArgs = actionArgsWithMinimumTimeout(args, 1);
+            if (activeExecution && typeof normalizedArgs[0] === 'string') {
+              await moveVisibleAiPointer(page, await locatorCenter(page.locator(normalizedArgs[0])), kind);
             }
-            return Reflect.apply(original, page, args);
+            return Reflect.apply(original, page, normalizedArgs);
           },
           writable: true,
         });

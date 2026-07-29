@@ -16,6 +16,9 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /ordinary JavaScript cell/);
   assert.match(rules, /real Playwright page and context objects/);
   assert.match(rules, /ordinary Playwright APIs directly/);
+  assert.match(rules, /Before every state-changing action/);
+  assert.match(rules, /current page, active dialog or layer/);
+  assert.match(rules, /do not act from assumptions or old history/);
   assert.match(rules, /locator\.selectOption/);
   assert.match(rules, /page\.evaluate/);
   assert.match(rules, /page\.domSnapshot/);
@@ -58,6 +61,8 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
   assert.match(rules, /fresh full semantic DOM snapshot/);
   assert.match(rules, /filter visible candidates and require exactly one/);
+  assert.match(rules, /understand exactly what the user wants/);
+  assert.match(rules, /if anything is uncertain, inspect instead of acting/i);
   assert.doesNotMatch(rules, /clickByUid/);
   assert.match(rules, /no UID-click tool/);
   assert.match(rules, /force:true/);
@@ -73,5 +78,7 @@ test('DOM mode requests screenshots explicitly instead of receiving automatic ca
   assert.match(visualRules, /No screenshot is attached automatically/);
   assert.match(visualRules, /call takeScreenshot/);
   assert.match(visualRules, /end that model step/);
+  assert.match(visualRules, /confirm from a fresh inspect result/);
+  assert.match(visualRules, /inspect again instead of acting/);
   assert.doesNotMatch(browserChatDomRules(false).join('\n'), /takeScreenshot/);
 });

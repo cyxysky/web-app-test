@@ -2,6 +2,7 @@ export function browserCodeRules() {
   return [
     '- browserCode is the primary browser inspection and operation tool. Put one ordinary JavaScript cell in params.code. Code mode has no UID-click tool.',
     '- The code receives the real Playwright page and context objects. Use ordinary Playwright APIs directly.',
+    '- Before every state-changing action, use fresh live evidence to identify the current page, active dialog or layer, exact intended outcome, unique visible target, and any loading or blocking state. If any of these is uncertain, inspect first and do not act from assumptions or old history.',
     '- The JavaScript kernel persists for the browser session. Write top-level statements and top-level await; do not wrap the code in a function or module.',
     '- Use top-level var for reusable bindings or choose fresh names because bindings persist across calls. Emit the result with nodeRepl.write(<JSON-serializable value>).',
     '- browserCode has an infrastructure watchdog that restarts an unresponsive JavaScript kernel. Keep each cell bounded. Playwright locator/action operations default to 5000ms and navigation defaults to 30000ms, so a missing target returns control without destroying persistent bindings. Use an explicit per-operation timeout only when the page has a known longer transition.',
@@ -18,7 +19,7 @@ export function browserChatCodeRules(screenshotAvailable = true) {
   return [
     '- Use browserCode for live inspection and operation. It receives the real Playwright page/context and a persistent top-level-await JavaScript kernel: keep cells bounded, use top-level var or fresh names, and return compact evidence with nodeRepl.write(...).',
     '- Each browserCode result already includes a fresh full semantic DOM snapshot plus code/page console deltas. Treat them as the next-step ground truth, inspect errors, keep DOM-only code inside page.evaluate, and do not import modules or access Node globals, files, environment variables, cookies, or browser storage.',
-    '- Prefer a semantic Playwright locator scoped to the visible dialog/region. For duplicate labels, filter visible candidates and require exactly one; never guess with first/last/nth. Use locator.selectOption(...) for native <select>.',
+    '- Before every state-changing action, first understand exactly what the user wants and confirm from fresh live evidence the current page, active dialog/region, expected result, unique visible target, and blockers. Inspect in the same browserCode cell or use the immediately preceding fresh result; if anything is uncertain, inspect instead of acting. Prefer a semantic Playwright locator scoped to that confirmed visible dialog/region. For duplicate labels, filter visible candidates and require exactly one; never guess with first/last/nth. Use locator.selectOption(...) for native <select>.',
     '- If no normal locator uniquely identifies the rendered target, inspect fresh DOM evidence and refine the locator scope. Code mode has no UID-click tool.',
     '- Never use force:true. After a locator timeout, inspect the fresh snapshot for loading, overlays, popups, detachment, or redraw; do not bypass it with CUA, page.mouse, DOM click, dispatchEvent, or script click. Combine deterministic inspection/action in one cell, wait only for a known transition, scroll only for lazy/virtual content, and verify business state after every change.',
     screenshotAvailable
@@ -31,6 +32,7 @@ export function browserChatCodeRules(screenshotAvailable = true) {
 export function browserChatDomRules(screenshotAvailable = true) {
   return [
     '- Use inspect action="capture" mode="full" for the complete loaded semantic DOM. mode="text" is the reading view of all loaded text; mode="changes" contains only inter-action changes and has no actionable UIDs.',
+    '- Before every state-changing action, first understand exactly what the user wants and confirm from a fresh inspect result the current page, active dialog/layer, expected result, exact target, and loading or blocking state. If anything is uncertain or the interface may have changed, inspect again instead of acting.',
     '- Continue a paged frozen capture only with its exact nextCursor and the same mode. Never scroll for snapshot pagination. Use inspect action="search" to narrow the current baseline and action="httpRequests" for network evidence.',
     '- Use only current dom-* UIDs. A state-changing action returns an immediate DOM delta; any UID listed as removed is invalid. Treat validationErrors as action failure and correct the named field before continuing.',
     screenshotAvailable
@@ -45,6 +47,7 @@ export function browserChatDomRules(screenshotAvailable = true) {
 
 export function browserActionRules(screenshotAvailable = true) {
   return [
+    '- Before every state-changing action, establish fresh evidence for the current page, active dialog or layer, exact intended outcome, unique visible target, and any loading or blocking state. If any part is uncertain, inspect first and do not act from assumptions or prior history.',
     '- Default to a semantic Playwright locator scoped to the current visible dialog or region, such as getByRole(..., { exact: true }). Before clicking duplicate text, keep only rendered candidates with locator.filter({ visible: true }) and require count() === 1. Never use first(), last(), or nth() to guess among same-name candidates.',
     '- If no normal locator uniquely identifies the rendered target, inspect fresh DOM evidence and refine the locator scope until exactly one visible Playwright target remains.',
     '- Playwright force: true is forbidden. If a locator click times out, do not fall back to CUA, page.mouse, DOM element.click(), dispatchEvent(), or script click. Stop and inspect the automatically returned fresh snapshot for a loading layer, popup, overlay, stale locator, detached element, or asynchronous redraw before constructing the next locator.',

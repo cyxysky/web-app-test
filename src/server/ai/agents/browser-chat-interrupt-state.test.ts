@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { racePromiseWithAbort, revokeBrowserChatTurn, runtimeSnapshotIsNewer } from './browser-chat-interrupt-state';
+import {
+  clearRegisteredBrowserChatTurn,
+  racePromiseWithAbort,
+  registerBrowserChatTurn,
+  registeredBrowserChatTurnIsActive,
+  revokeBrowserChatTurn,
+  revokeRegisteredBrowserChatTurn,
+  runtimeSnapshotIsNewer,
+  type RegisteredBrowserChatTurn,
+} from './browser-chat-interrupt-state';
 
 test('rejects immediately when abort wins a provider request that is still pending', async () => {
   const controller = new AbortController();
@@ -60,6 +69,57 @@ test('revokes turn ownership before dispatching abort and does not await settlem
   });
   assert.equal(session.pendingToolConfirmation, undefined);
   assert.equal(session.error, undefined);
+});
+
+test('a user interrupt permanently revokes the registered execution before abort listeners and retries run', () => {
+  const registry = new Map<string, RegisteredBrowserChatTurn<{ id: string }>>();
+  const session = { id: 'session-1' };
+  const controller = new AbortController();
+  registerBrowserChatTurn(registry, session.id, {
+    session,
+    assistantMessageId: 'assistant-1',
+    abortController: controller,
+  });
+  let activeWhenAbortWasDispatched = true;
+  controller.signal.addEventListener('abort', () => {
+    activeWhenAbortWasDispatched = registeredBrowserChatTurnIsActive(
+      registry,
+      session.id,
+      session,
+      'assistant-1',
+      controller,
+    );
+  });
+
+  const revoked = revokeRegisteredBrowserChatTurn(registry, session.id, new Error('interrupted'));
+
+  assert.equal(revoked?.assistantMessageId, 'assistant-1');
+  assert.equal(revoked?.abortDispatched, true);
+  assert.equal(activeWhenAbortWasDispatched, false);
+  assert.equal(registeredBrowserChatTurnIsActive(registry, session.id, session, 'assistant-1', controller), false);
+  assert.equal(clearRegisteredBrowserChatTurn(registry, session.id, 'assistant-1', controller), false);
+});
+
+test('registering a later turn never reactivates an interrupted execution', () => {
+  const registry = new Map<string, RegisteredBrowserChatTurn<{ id: string }>>();
+  const session = { id: 'session-1' };
+  const oldController = new AbortController();
+  registerBrowserChatTurn(registry, session.id, {
+    session,
+    assistantMessageId: 'assistant-old',
+    abortController: oldController,
+  });
+  revokeRegisteredBrowserChatTurn(registry, session.id, new Error('interrupted'));
+
+  const nextController = new AbortController();
+  registerBrowserChatTurn(registry, session.id, {
+    session,
+    assistantMessageId: 'assistant-next',
+    abortController: nextController,
+  });
+
+  assert.equal(registeredBrowserChatTurnIsActive(registry, session.id, session, 'assistant-old', oldController), false);
+  assert.equal(registeredBrowserChatTurnIsActive(registry, session.id, session, 'assistant-next', nextController), true);
 });
 
 test('does not revive a newer in-memory interruption from an older persisted snapshot', () => {

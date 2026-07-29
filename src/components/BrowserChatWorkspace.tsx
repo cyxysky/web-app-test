@@ -6987,9 +6987,10 @@ export function BrowserChatWorkspace({
     };
     const releaseLoadingTimer = window.setTimeout(releaseInterrupting, 400);
     const requestController = new AbortController();
-    const requestTimeout = window.setTimeout(() => requestController.abort(), 5000);
+    const requestTimeout = window.setTimeout(() => requestController.abort(), 30000);
     try {
       const response = await fetch(browserChatApiUrl(`/api/browser-chat/${targetId}/interrupt`), {
+        keepalive: true,
         method: 'POST',
         signal: requestController.signal,
       });

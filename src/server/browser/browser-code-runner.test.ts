@@ -102,10 +102,11 @@ test('browserCode bounds a missing locator and preserves the kernel after the fa
   const startedAt = Date.now();
   const failed = await run(`
     var bindingBeforeLocatorFailure = 'still-here';
-    await page.getByRole('button', { name: 'Missing button' }).click();
+    await page.getByRole('button', { name: 'Missing button' }).click({ timeout: 3000 });
   `);
   assert.equal(failed.ok, false);
-  assert.match(failed.error || '', /timeout|exceeded/i);
+  assert.match(failed.error || '', /Timeout 5000ms exceeded/i);
+  assert.doesNotMatch(failed.error || '', /Timeout 3000ms exceeded/i);
   assert.ok(Date.now() - startedAt < 8_000, 'missing locator should return control through the operation timeout');
 
   const recovered = await run(`nodeRepl.write({ bindingBeforeLocatorFailure });`);

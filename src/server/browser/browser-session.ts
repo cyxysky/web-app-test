@@ -38,6 +38,7 @@ import {
 } from './ax-snapshot';
 import { captureDomSnapshot } from './dom-snapshot';
 import {
+  BROWSER_CODE_KERNEL_RUNTIME_REVISION,
   browserCodePolicyViolation,
   BrowserCodeKernel,
   type BrowserCodeConnection,
@@ -3902,6 +3903,7 @@ export class BrowserSession {
   private browserServer?: BrowserServer;
   private browserCodeConnection?: BrowserCodeConnection;
   private browserCodeKernel?: BrowserCodeKernel;
+  private browserCodeKernelRevision?: number;
   private context?: BrowserContext;
   private page?: Page;
   private consoleErrors: string[] = [];
@@ -6253,7 +6255,15 @@ export class BrowserSession {
       });
     }, executionId);
 
+    if (
+      this.browserCodeKernel
+      && this.browserCodeKernelRevision !== BROWSER_CODE_KERNEL_RUNTIME_REVISION
+    ) {
+      await this.browserCodeKernel.close();
+      this.browserCodeKernel = undefined;
+    }
     const kernel = this.browserCodeKernel ||= new BrowserCodeKernel(this.browserCodeConnection);
+    this.browserCodeKernelRevision = BROWSER_CODE_KERNEL_RUNTIME_REVISION;
     const executionContext = this.context;
     const pagesBeforeExecution = new Set(executionContext?.pages() || []);
     const pagesCreatedDuringExecution = new Set<Page>();
@@ -6411,6 +6421,7 @@ export class BrowserSession {
     );
     await this.browserCodeKernel?.close();
     this.browserCodeKernel = undefined;
+    this.browserCodeKernelRevision = undefined;
     try {
       if (this.context && this.pageDiscoveryListener) {
         this.context.off('page', this.pageDiscoveryListener);
@@ -6462,6 +6473,7 @@ export class BrowserSession {
         this.browserServer = undefined;
         this.browserCodeConnection = undefined;
         this.browserCodeKernel = undefined;
+        this.browserCodeKernelRevision = undefined;
         this.ownedPages.clear();
       }
     }
