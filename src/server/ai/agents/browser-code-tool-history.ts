@@ -23,41 +23,19 @@ function boundedValue(value: unknown, maxChars = 2_400) {
   }
 }
 
-function compactPostActionObservation(value: unknown) {
-  const observation = recordFromUnknown(value);
-  if (!observation) return undefined;
-  const activity = recordFromUnknown(observation.activity);
-  const page = recordFromUnknown(observation.page);
-  const changes = recordFromUnknown(observation.domChanges);
+function compactDomChanges(value: unknown) {
+  const changes = recordFromUnknown(value);
+  if (!changes) return undefined;
   const extra = recordFromUnknown(changes?.extra);
   const count = (items: unknown) => Array.isArray(items) ? items.length : 0;
   return {
-    captured: observation.captured === true,
-    reason: observation.reason,
-    error: observation.error,
-    activity: activity ? {
-      actions: Array.isArray(activity.actions) ? activity.actions.slice(0, 12) : [],
-      navigationChanged: activity.navigationChanged === true,
-      tabChanged: activity.tabChanged === true,
-    } : undefined,
-    page: page ? {
-      url: page.url,
-      title: page.title,
-      readyState: page.readyState,
-      activeElement: boundedValue(page.activeElement, 600),
-      dialogs: boundedValue(page.dialogs, 1_200),
-      notices: boundedValue(page.notices, 800),
-      busyElementCount: page.busyElementCount,
-    } : undefined,
-    domChanges: changes ? {
-      addedCount: count(changes.added),
-      updatedCount: count(changes.updated),
-      removedCount: count(changes.removed),
-      validationErrors: Array.isArray(extra?.validationErrors) ? extra.validationErrors.slice(0, 5) : [],
-      errors: Array.isArray(extra?.errors) ? extra.errors.slice(0, 3) : [],
-      overflow: changes.overflow === true,
-      truncated: changes.truncated === true,
-    } : undefined,
+    epoch: changes.epoch,
+    addedCount: count(changes.added),
+    updatedCount: count(changes.updated),
+    removedCount: count(changes.removed),
+    validationErrors: Array.isArray(extra?.validationErrors) ? extra.validationErrors.slice(0, 5) : [],
+    errors: Array.isArray(extra?.errors) ? extra.errors.slice(0, 3) : [],
+    overflow: changes.overflow === true,
   };
 }
 
@@ -80,7 +58,7 @@ function compactBrowserCodeActual(actual: string) {
     aborted: parsed.aborted,
     elapsedMs: parsed.elapsedMs,
     finalPage: boundedValue(parsed.finalPage, 800),
-    postActionObservation: compactPostActionObservation(parsed.postActionObservation),
+    domChanges: compactDomChanges(parsed.domChanges),
     legacySnapshot: legacySnapshot ? {
       generationId: legacySnapshot.generationId,
       mode: legacySnapshot.mode,

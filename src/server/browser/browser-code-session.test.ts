@@ -110,14 +110,10 @@ test('BrowserSession executes browserCode against the controlled Playwright page
       nativeContext?: boolean;
       pageCount?: number;
     };
-    postActionObservation?: {
-      captured?: boolean;
-      activity?: { actions?: string[] };
-      domChanges?: {
-        added?: string[];
-        updated?: string[];
-        extra?: { added?: string[]; updated?: string[] };
-      };
+    domChanges?: {
+      added?: string[];
+      updated?: string[];
+      extra?: { added?: string[]; updated?: string[] };
     };
     console?: {
       code?: Array<{ level?: string; text?: string }>;
@@ -133,9 +129,8 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.equal(result.result?.uidType, 'undefined');
   assert.equal(result.result?.nativeContext, true);
   assert.equal(result.result?.pageCount, 1);
-  assert.equal(result.postActionObservation?.captured, true);
-  assert.ok(result.postActionObservation?.activity?.actions?.includes('mouse.click'));
-  assert.match(JSON.stringify(result.postActionObservation?.domChanges || {}), /Applied/);
+  assert.match(JSON.stringify(result.domChanges || {}), /Applied/);
+  assert.equal('postActionObservation' in result, false);
   assert.equal('domSnapshot' in result, false);
   assert.deepEqual(result.console?.code, []);
   assert.ok(result.console?.page?.some((entry) => entry.level === 'log' && entry.text === 'apply-clicked'));
@@ -152,6 +147,26 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.ok(applyBox);
   assert.ok(Math.abs(cursorState.x - (applyBox.x + applyBox.width / 2)) <= 1);
   assert.ok(Math.abs(cursorState.y - (applyBox.y + applyBox.height / 2)) <= 1);
+
+  const readOnlyAction = await session.executeBrowserCode({
+    code: `nodeRepl.write({ title: await page.title(), url: page.url() });`,
+    runId: 'browser-code-session-test',
+    stepIndex: 3,
+  });
+  assert.equal(readOnlyAction.ok, true, readOnlyAction.actual);
+  const readOnlyResult = JSON.parse(readOnlyAction.actual) as Record<string, unknown>;
+  assert.equal('domChanges' in readOnlyResult, false);
+  assert.equal('postActionObservation' in readOnlyResult, false);
+
+  const readOnlyFailure = await session.executeBrowserCode({
+    code: `await page.locator('[data-never-exists]').innerText({ timeout: 100 });`,
+    runId: 'browser-code-session-test',
+    stepIndex: 4,
+  });
+  assert.equal(readOnlyFailure.ok, false);
+  const readOnlyFailureResult = JSON.parse(readOnlyFailure.actual) as Record<string, unknown>;
+  assert.equal('domChanges' in readOnlyFailureResult, false);
+  assert.equal('postActionObservation' in readOnlyFailureResult, false);
 });
 
 test('browserCode-created tabs are owned and group-marked before preview starts', async (context) => {
@@ -179,6 +194,9 @@ test('browserCode-created tabs are owned and group-marked before preview starts'
   });
 
   assert.equal(action.ok, true, action.actual);
+  const actionResult = JSON.parse(action.actual) as Record<string, unknown>;
+  assert.equal('domChanges' in actionResult, true, 'tab operations should return an incremental DOM result even when it is empty');
+  assert.equal('postActionObservation' in actionResult, false);
   const tabs = session.getTabsSnapshot();
   assert.equal(tabs.length, 3, 'new code-mode tabs should be registered without opening preview');
   assert.equal(tabs.filter((tab) => tab.active).length, 1);

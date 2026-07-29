@@ -23,7 +23,6 @@ export type BrowserCodeImage = {
 export type BrowserCodeActivity = {
   actions: string[];
   navigationChanged: boolean;
-  requiresPostActionObservation: boolean;
   tabChanged: boolean;
 };
 
@@ -90,7 +89,7 @@ const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 3;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 4;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -555,7 +554,7 @@ function browserCodeKernelMain() {
     };
     patch('click', 'click');
     patch('dblclick', 'double');
-    patch('hover', 'move', false);
+    patch('hover', 'move');
     patch('check', 'click');
     patch('uncheck', 'click');
     patch('setChecked', 'click');
@@ -610,7 +609,7 @@ function browserCodeKernelMain() {
     };
     patchPageAction('click', 'click');
     patchPageAction('dblclick', 'double');
-    patchPageAction('hover', 'move', false);
+    patchPageAction('hover', 'move');
     patchPageAction('check', 'click');
     patchPageAction('uncheck', 'click');
     patchPageAction('tap', 'click');
@@ -639,6 +638,7 @@ function browserCodeKernelMain() {
           configurable: true,
           value: async (x: number, y: number, options?: unknown) => {
             await moveVisibleAiPointer(page, { x, y }, 'move');
+            recordAction('mouse.move');
             return Reflect.apply(nativeMove, page.mouse, [x, y, options]);
           },
           writable: true,
@@ -995,7 +995,6 @@ function browserCodeKernelMain() {
       const activity: BrowserCodeActivity = {
         actions: [...activeExecution.actions],
         navigationChanged,
-        requiresPostActionObservation: activeExecution.actions.size > 0 || navigationChanged || tabChanged,
         tabChanged,
       };
       let selectedExecutionId: string | undefined;
@@ -1035,7 +1034,6 @@ function browserCodeKernelMain() {
         activity: {
           actions: [...activeExecution.actions],
           navigationChanged: false,
-          requiresPostActionObservation: true,
           tabChanged: false,
         },
       });

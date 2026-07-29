@@ -90,7 +90,11 @@ test('browserCode sandbox executes ordinary Playwright code directly', async () 
   });
   assert.equal(result.logs.length, 1);
   assert.equal(result.logs[0].text, 'starting');
-  assert.equal(result.activity?.requiresPostActionObservation, false);
+  assert.deepEqual(result.activity, {
+    actions: [],
+    navigationChanged: false,
+    tabChanged: false,
+  });
 });
 
 test('browserCode keeps JavaScript bindings across cells like the Codex kernel', async () => {
@@ -108,13 +112,18 @@ test('browserCode bounds a missing locator and preserves the kernel after the fa
   assert.equal(failed.ok, false);
   assert.match(failed.error || '', /Timeout 5000ms exceeded/i);
   assert.doesNotMatch(failed.error || '', /Timeout 3000ms exceeded/i);
-  assert.equal(failed.activity?.requiresPostActionObservation, true);
   assert.ok(failed.activity?.actions.includes('locator.click'));
   assert.ok(Date.now() - startedAt < 8_000, 'missing locator should return control through the operation timeout');
 
   const recovered = await run(`nodeRepl.write({ bindingBeforeLocatorFailure });`);
   assert.equal(recovered.ok, true, recovered.error);
   assert.deepEqual(recovered.value, { bindingBeforeLocatorFailure: 'still-here' });
+});
+
+test('browserCode records hover as a browser operation', async () => {
+  const hovered = await run(`await saveButton.hover();`);
+  assert.equal(hovered.ok, true, hovered.error);
+  assert.ok(hovered.activity?.actions.includes('locator.hover'));
 });
 
 test('browserCode requires coordinate screenshots to be reviewed in a previous cell', async () => {

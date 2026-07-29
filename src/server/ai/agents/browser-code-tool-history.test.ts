@@ -23,13 +23,27 @@ test('older browserCode results are compacted while the latest result stays exac
     ok: true,
     result: { found: 3 },
     finalPage: { url: 'https://example.test/old', title: 'Old' },
-    domSnapshot: { content: 'x'.repeat(20_000), generationId: 'g1', nodeCount: 300 },
+    domChanges: {
+      epoch: 7,
+      added: [`<button>${'x'.repeat(20_000)}</button>`],
+      updated: [],
+      removed: [],
+      extra: { added: [], updated: [], errors: [], validationErrors: [] },
+      overflow: false,
+    },
   });
   const latestActual = JSON.stringify({
     ok: true,
     result: { completed: true },
     finalPage: { url: 'https://example.test/current', title: 'Current' },
-    postActionObservation: { captured: true, reason: 'browser-action' },
+    domChanges: {
+      epoch: 8,
+      added: ['<status>Done'],
+      updated: [],
+      removed: [],
+      extra: { added: [], updated: [], errors: [], validationErrors: [] },
+      overflow: false,
+    },
   });
   const genericTool: ModelMessage = {
     role: 'tool',
@@ -48,7 +62,7 @@ test('older browserCode results are compacted while the latest result stays exac
   assert.ok(oldOutput.length < 4_000);
   assert.doesNotMatch(oldOutput, /x{100}/);
   assert.match(oldOutput, /"found":3/);
-  assert.match(oldOutput, /Full historical DOM content removed/);
+  assert.match(oldOutput, /"addedCount":1/);
   assert.equal(latestOutput, latestActual);
   assert.equal(compacted[1], genericTool);
 });

@@ -16,9 +16,9 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /ordinary JavaScript cell/);
   assert.match(rules, /real Playwright page and context objects/);
   assert.match(rules, /ordinary Playwright APIs directly/);
-  assert.match(rules, /Before every state-changing action/);
-  assert.match(rules, /current page, active dialog or layer/);
-  assert.match(rules, /do not act from assumptions or old history/);
+  assert.match(rules, /Before every click, hover, fill, press, select, drag/);
+  assert.match(rules, /latest page hierarchy and content/);
+  assert.match(rules, /Do not act from an older snapshot or conversation history/);
   assert.match(rules, /locator\.selectOption/);
   assert.match(rules, /page\.evaluate/);
   assert.match(rules, /page\.domSnapshot/);
@@ -31,12 +31,16 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /browser\.tabs\.list/);
   assert.match(rules, /credentialVault\.fill/);
   assert.match(rules, /never read the filled field value/);
-  assert.match(rules, /bounded postActionObservation/);
+  assert.match(rules, /incremental domChanges/);
+  assert.match(rules, /data-testid/);
+  assert.match(rules, /stable data-\*/);
+  assert.match(rules, /unique exact href/);
+  assert.match(rules, /targeted Playwright or read-only DOM inspection/);
   assert.match(rules, /code\/page console deltas/);
-  assert.match(rules, /Call page\.domSnapshot\(\) explicitly/);
+  assert.match(rules, /first call page\.domSnapshot\(\)/);
   assert.match(rules, /force: true is forbidden/);
   assert.match(rules, /filter\(\{ visible: true \}\)/);
-  assert.match(rules, /require count\(\) === 1/);
+  assert.match(rules, /act only when count\(\) === 1/);
   assert.match(rules, /Never use first\(\), last\(\), or nth\(\)/);
   assert.doesNotMatch(rules, /clickByUid/);
   assert.match(rules, /no UID-click tool/);
@@ -46,6 +50,7 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /DOM redraw/);
   assert.match(rules, /Playwright success does not equal business success/);
   assert.doesNotMatch(rules, /function body|takeSnapshot|searchSnapshot|page\.uid|compatibility facade|per-operation tool protocol/);
+  assert.doesNotMatch(rules, /postActionObservation|dialogs\/notices\/focus/);
 });
 
 test('screenshot guidance stays inside browserCode', () => {
@@ -60,11 +65,13 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.equal(browserChatCodeRules(true).length, 7);
   assert.match(rules, /real Playwright page\/context/);
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
-  assert.match(rules, /bounded postActionObservation/);
-  assert.match(rules, /explicit page\.domSnapshot\(\)/);
-  assert.match(rules, /filter visible candidates and require exactly one/);
-  assert.match(rules, /understand exactly what the user wants/);
-  assert.match(rules, /if anything is uncertain, inspect instead of acting/i);
+  assert.match(rules, /incremental domChanges/);
+  assert.match(rules, /call page\.domSnapshot\(\)/);
+  assert.match(rules, /count\(\) === 1/);
+  assert.match(rules, /identify the stable parent container/);
+  assert.match(rules, /filter\(\{ visible: true \}\)/);
+  assert.match(rules, /act only when count\(\) === 1/);
+  assert.match(rules, /If anything remains uncertain, inspect instead of acting/);
   assert.doesNotMatch(rules, /clickByUid/);
   assert.match(rules, /no UID-click tool/);
   assert.match(rules, /force:true/);
