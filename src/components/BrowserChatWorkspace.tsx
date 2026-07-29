@@ -6313,6 +6313,7 @@ export function BrowserChatWorkspace({
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [mode, setMode] = useState<BrowserChatMode>('code');
+  const defaultModeRef = useRef<BrowserChatMode>('code');
   const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
   const [modelProvider, setModelProvider] = useState<ModelProvider>(() => initialModelSelection.provider);
   const [modelId, setModelId] = useState(() => initialModelSelection.model);
@@ -6614,9 +6615,11 @@ export function BrowserChatWorkspace({
     const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
     const reasoningSetting = saved.find((item) => item.key === 'BROWSER_CHAT_SHOW_REASONING');
     const browserModeSetting = saved.find((item) => item.key === 'AI_BROWSER_MODE');
+    const savedMode = normalizeMode(browserModeSetting?.value);
     setEmbeddedBrowserEnabled(embeddedSetting?.value === 'true');
     setShowReasoning(reasoningSetting?.value === 'true');
-    if (!activeSessionIdRef.current) setMode(normalizeMode(browserModeSetting?.value));
+    defaultModeRef.current = savedMode;
+    if (!activeSessionIdRef.current) setMode(savedMode);
   }, []);
 
   const loadSkills = useCallback(async () => {
@@ -6801,6 +6804,10 @@ export function BrowserChatWorkspace({
       sessionVersionsRef.current.set(event.id, event.version);
       if (event.deleted) {
         setSessions((current) => current.filter((item) => item.id !== event.id));
+        if (activeSessionIdRef.current === event.id) {
+          activeSessionIdRef.current = null;
+          setMode(defaultModeRef.current);
+        }
         setSession((current) => (current?.id === event.id ? null : current));
         setSelectedSessionIds((current) => current.filter((id) => id !== event.id));
         return;
@@ -6834,7 +6841,9 @@ export function BrowserChatWorkspace({
       body: JSON.stringify({ mode, safetyMode, modelProvider, model: modelId, targetUrl: requestedTargetUrl, userId: requestUserId }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '创建对话会话失败');
-    return upsertSession(data.session as BrowserChatSession, { activate: true });
+    const created = upsertSession(data.session as BrowserChatSession, { activate: true });
+    activeSessionIdRef.current = created.id;
+    return created;
   }
 
   async function ensureSession() {
@@ -6846,7 +6855,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/message`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds, userId: requestUserId }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, safetyMode, modelProvider, model: modelId, skillIds, userId: requestUserId }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '发送消息失败');
     return data.session as BrowserChatSession;
@@ -7037,7 +7046,11 @@ export function BrowserChatWorkspace({
       await readApiJson<Record<string, unknown>>(response, '删除历史对话失败');
       setSessions((current) => current.filter((item) => item.id !== sessionId));
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
-      if (session?.id === sessionId) setSession(null);
+      if (session?.id === sessionId) {
+        activeSessionIdRef.current = null;
+        setMode(defaultModeRef.current);
+        setSession(null);
+      }
       if (deletedSession) await discardEmbeddedBrowserDataForSessions([deletedSession]);
       await loadSessions().catch(() => undefined);
     } catch (deleteError) {
@@ -7089,7 +7102,11 @@ export function BrowserChatWorkspace({
       await readApiJson<Record<string, unknown>>(response, '批量删除历史对话失败');
       setSessions((current) => current.filter((item) => !deletingIdSet.has(item.id)));
       setSelectedSessionIds((current) => current.filter((id) => !deletingIdSet.has(id)));
-      if (session?.id && deletingIdSet.has(session.id)) setSession(null);
+      if (session?.id && deletingIdSet.has(session.id)) {
+        activeSessionIdRef.current = null;
+        setMode(defaultModeRef.current);
+        setSession(null);
+      }
       await discardEmbeddedBrowserDataForSessions(deletedSessions);
       await loadSessions().catch(() => undefined);
     } catch (deleteError) {
@@ -7132,6 +7149,8 @@ export function BrowserChatWorkspace({
     setComposerResetToken((current) => current + 1);
     attachmentsRef.current = [];
     setAttachments([]);
+    activeSessionIdRef.current = null;
+    setMode(defaultModeRef.current);
     setSession(null);
   }
 
