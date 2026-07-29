@@ -5,8 +5,17 @@ export type AiSdkFinishState = {
   status: 'passed' | 'failed' | 'blocked';
 };
 
+function normalizedFinishReason(value: unknown) {
+  if (typeof value === 'string') return value.trim() || undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as { raw?: unknown; unified?: unknown };
+  if (typeof record.unified === 'string' && record.unified.trim()) return record.unified.trim();
+  if (typeof record.raw === 'string' && record.raw.trim()) return record.raw.trim();
+  return undefined;
+}
+
 export function aiSdkFinishState(value: unknown, options: { runtimeContinuationRequired?: boolean } = {}): AiSdkFinishState {
-  const finishReason = typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  const finishReason = normalizedFinishReason(value);
   if (options.runtimeContinuationRequired) {
     return { finishReason, retryRequest: false, terminatesTurn: false, status: 'passed' };
   }

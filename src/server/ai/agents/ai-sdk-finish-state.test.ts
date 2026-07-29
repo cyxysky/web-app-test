@@ -11,6 +11,38 @@ test('treats stop as a normally completed AI response', () => {
   });
 });
 
+test('reads AI SDK 6 structured finish reasons', () => {
+  assert.deepEqual(aiSdkFinishState({ unified: 'stop', raw: 'stop' }), {
+    finishReason: 'stop',
+    retryRequest: false,
+    terminatesTurn: true,
+    status: 'passed',
+  });
+  assert.deepEqual(aiSdkFinishState({ unified: 'tool-calls', raw: 'tool_calls' }), {
+    finishReason: 'tool-calls',
+    retryRequest: false,
+    terminatesTurn: false,
+    status: 'passed',
+  });
+  assert.deepEqual(aiSdkFinishState({ unified: 'error', raw: 'provider_error' }), {
+    finishReason: 'error',
+    retryRequest: true,
+    terminatesTurn: false,
+    status: 'failed',
+  });
+  assert.deepEqual(aiSdkFinishState({ unified: 'content-filter', raw: 'safety' }), {
+    finishReason: 'content-filter',
+    retryRequest: false,
+    terminatesTurn: true,
+    status: 'blocked',
+  });
+});
+
+test('uses a structured raw finish reason only when unified is absent', () => {
+  assert.equal(aiSdkFinishState({ raw: 'stop' }).terminatesTurn, true);
+  assert.equal(aiSdkFinishState({ unified: '', raw: 'tool-calls' }).terminatesTurn, false);
+});
+
 test('keeps tool-calls inside the tool loop', () => {
   assert.deepEqual(aiSdkFinishState('tool-calls'), {
     finishReason: 'tool-calls',
