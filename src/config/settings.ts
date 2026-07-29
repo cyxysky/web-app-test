@@ -26,6 +26,9 @@ export type RuntimeEnvDefinition = {
   tab: Exclude<SettingsTab, 'general' | 'model' | 'skills' | 'memory' | 'accounts' | 'dom-test'>;
   defaultValue: string;
   control: 'boolean' | 'number' | 'select' | 'text' | 'secret' | 'textarea';
+  min?: number;
+  max?: number;
+  step?: number;
   options?: Array<{ label: string; value: string }>;
   picker?: 'directory';
   secret?: boolean;
@@ -126,6 +129,7 @@ const boolOptions = [
 ];
 
 export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
+  { key: 'BROWSER_PREVIEW_FPS', label: '实时预览帧率', description: '实时预览每秒发送的画面帧数；可设置 1–60 FPS，帧率越高，服务器编码和网络传输压力越大。', tab: 'browser', defaultValue: '20', control: 'number', min: 1, max: 60, step: 1 },
   { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: '代码模式让 Agent 执行受限 Playwright 代码；DOM 模式通过结构化 inspect/interact 工具操作页面。新会话使用保存后的模式。', tab: 'browser', defaultValue: 'code', control: 'select', options: [{ label: '代码模式', value: 'code' }, { label: 'DOM 模式', value: 'dom' }] },
   { key: 'BROWSER_CDP_ENDPOINT', label: '现有浏览器 CDP 地址', description: '连接已开启远程调试的 Chrome/Edge，例如 http://127.0.0.1:9222；可复用登录态。留空则启动新浏览器。', tab: 'browser', defaultValue: '', control: 'text' },
@@ -191,6 +195,22 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
 ];
 
 export const runtimeEnvKeys = runtimeEnvDefinitions.map((item) => item.key);
+
+export function normalizeRuntimeEnvValue(definition: RuntimeEnvDefinition, value: string) {
+  if (definition.control !== 'number' || (definition.min === undefined && definition.max === undefined)) return value;
+  if (!value.trim()) return definition.defaultValue;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return definition.defaultValue;
+  const minimum = definition.min ?? Number.NEGATIVE_INFINITY;
+  const maximum = definition.max ?? Number.POSITIVE_INFINITY;
+  let normalized = Math.min(maximum, Math.max(minimum, numeric));
+  if (definition.step && Number.isFinite(definition.step) && definition.step > 0) {
+    const base = definition.min ?? 0;
+    normalized = base + Math.round((normalized - base) / definition.step) * definition.step;
+    normalized = Math.min(maximum, Math.max(minimum, normalized));
+  }
+  return String(normalized);
+}
 
 export function runtimeEnvDefinition(key: string) {
   return runtimeEnvDefinitions.find((item) => item.key === key);

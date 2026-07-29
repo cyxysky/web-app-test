@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { runtimeEnvDefinitions } from '@/config/settings';
+import { normalizeRuntimeEnvValue, runtimeEnvDefinitions } from '@/config/settings';
 import { store } from '@/server/db/store';
 import { readRuntimeSettingsItems } from '@/server/settings/settings-snapshot';
 
@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
         key: definition.key,
         value: secret && !submittedValue
           ? savedByKey.get(definition.key)?.value ?? definition.defaultValue
-          : typeof item?.value === 'string' ? submittedValue : definition.defaultValue,
+          : typeof item?.value === 'string' ? normalizeRuntimeEnvValue(definition, submittedValue) : definition.defaultValue,
         enabled: true,
         secret,
       };

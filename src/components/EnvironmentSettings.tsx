@@ -749,8 +749,11 @@ export function EnvironmentSettings({
       <input
         className="input settings-control"
         inputMode={definition?.control === 'number' ? 'decimal' : undefined}
+        min={definition?.min}
+        max={definition?.max}
         placeholder={item.hasValue ? t('已配置，留空表示不修改') : t('未设置')}
         type={definition?.control === 'number' ? 'number' : isSecret(item) ? 'password' : 'text'}
+        step={definition?.step}
         value={item.value}
         onChange={(event) => update(index, { value: event.target.value })}
       />

@@ -4823,7 +4823,7 @@ export class BrowserSession {
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
     const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 100);
     const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 100)));
-    const frameIntervalMs = browserPreviewFrameIntervalMs(process.env.BROWSER_PREVIEW_FPS);
+    const currentFrameIntervalMs = () => browserPreviewFrameIntervalMs(process.env.BROWSER_PREVIEW_FPS);
     let stopped = false;
     let stopPromise: Promise<void> | undefined;
     let frameTimer: ReturnType<typeof setTimeout> | undefined;
@@ -4892,7 +4892,7 @@ export class BrowserSession {
         viewport,
       });
     };
-    let nextFrameAt = Date.now() + frameIntervalMs;
+    let nextFrameAt = Date.now() + currentFrameIntervalMs();
     const publishFrameLoop = async (): Promise<void> => {
       if (stopped) return;
       try {
@@ -4901,7 +4901,7 @@ export class BrowserSession {
         if (!stopped) options.onError?.(error);
       } finally {
         if (!stopped) {
-          nextFrameAt += frameIntervalMs;
+          nextFrameAt += currentFrameIntervalMs();
           const delay = Math.max(0, nextFrameAt - Date.now());
           if (!delay) nextFrameAt = Date.now();
           frameTimer = setTimeout(() => void publishFrameLoop(), delay);
@@ -4945,6 +4945,7 @@ export class BrowserSession {
       }
       if (!stopped && latestFrame) {
         await publishLatestFrame();
+        const frameIntervalMs = currentFrameIntervalMs();
         nextFrameAt = Date.now() + frameIntervalMs;
         frameTimer = setTimeout(() => void publishFrameLoop(), frameIntervalMs);
         frameTimer.unref?.();
