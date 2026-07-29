@@ -3579,6 +3579,13 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const followLatestRef = useRef(true);
   const previousSessionIdRef = useRef(sessionId);
+  const getScrollContainer = useCallback(() => {
+    const messageList = scrollRef.current;
+    if (!messageList) return null;
+    if (messageList.closest('.browser-chat-chat-pane.embedded-chat')) return messageList;
+    const workspace = messageList.closest('.browser-chat-main');
+    return workspace instanceof HTMLElement ? workspace : messageList;
+  }, []);
   const lastMessage = messages[messages.length - 1];
   const skillsById = useMemo(() => new Map(availableSkills.map((skill) => [skill.id, skill])), [availableSkills]);
   const renderEntries = useMemo(
@@ -3609,7 +3616,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     let frame = 0;
     let nextFrame = 0;
     const scrollToBottom = () => {
-      const container = scrollRef.current;
+      const container = getScrollContainer();
       if (!container) return;
       container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
       followLatestRef.current = true;
@@ -3622,18 +3629,19 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       if (frame) cancelAnimationFrame(frame);
       if (nextFrame) cancelAnimationFrame(nextFrame);
     };
-  }, [scrollKey, sessionId]);
+  }, [getScrollContainer, scrollKey, sessionId]);
 
   const trackScrollPosition = useCallback(() => {
-    const container = scrollRef.current;
+    const container = getScrollContainer();
     if (!container) return;
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     followLatestRef.current = distanceFromBottom <= 16;
-  }, []);
+  }, [getScrollContainer]);
 
   useEffect(() => {
-    const container = scrollRef.current;
-    if (!container) return undefined;
+    const messageList = scrollRef.current;
+    const scrollContainer = getScrollContainer();
+    if (!messageList || !scrollContainer) return undefined;
     let frame = 0;
     const observedChildren = new Set<Element>();
     const scheduleScrollToBottom = () => {
@@ -3642,12 +3650,12 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       frame = requestAnimationFrame(() => {
         frame = 0;
         if (!followLatestRef.current) return;
-        container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+        scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
       });
     };
     const resizeObserver = new ResizeObserver(scheduleScrollToBottom);
     const syncObservedChildren = () => {
-      const currentChildren = new Set(Array.from(container.children));
+      const currentChildren = new Set(Array.from(messageList.children));
       for (const child of observedChildren) {
         if (currentChildren.has(child)) continue;
         resizeObserver.unobserve(child);
@@ -3663,17 +3671,19 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       syncObservedChildren();
       scheduleScrollToBottom();
     });
+    scrollContainer.addEventListener('scroll', trackScrollPosition, { passive: true });
     syncObservedChildren();
-    mutationObserver.observe(container, { childList: true, characterData: true, subtree: true });
+    mutationObserver.observe(messageList, { childList: true, characterData: true, subtree: true });
     return () => {
+      scrollContainer.removeEventListener('scroll', trackScrollPosition);
       mutationObserver.disconnect();
       resizeObserver.disconnect();
       if (frame) cancelAnimationFrame(frame);
     };
-  }, []);
+  }, [getScrollContainer, trackScrollPosition]);
 
   return (
-    <div className="browser-chat-message-list" onScroll={trackScrollPosition} ref={scrollRef}>
+    <div className="browser-chat-message-list" ref={scrollRef}>
       {renderEntries.map((entry) => {
         if (entry.kind === 'executed-group') {
           return (

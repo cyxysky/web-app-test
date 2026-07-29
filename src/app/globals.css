@@ -8996,8 +8996,8 @@ body.is-dragging-embedded-tab * {
 .browser-chat-chat-pane {
   display: flex;
   flex-direction: column;
-  height: 100%;
-  min-height: 0;
+  height: auto;
+  min-height: 100%;
   min-width: 0;
   padding: 28px 24px 32px;
   position: relative;
@@ -9014,7 +9014,7 @@ body.is-dragging-embedded-tab * {
   display: flex;
   gap: 4px;
   justify-content: flex-end;
-  position: absolute;
+  position: fixed;
   right: 18px;
   top: 18px;
   z-index: 18;
@@ -9259,6 +9259,7 @@ body.is-dragging-embedded-tab * {
 }
 
 .browser-chat-chat-pane.embedded-chat .browser-chat-pane-actions {
+  position: absolute;
   right: 14px;
   top: 12px;
 }
@@ -9405,6 +9406,12 @@ body.is-dragging-embedded-tab * {
   padding: 52px 4px 8px;
   scrollbar-gutter: stable;
   width: min(100%, 920px);
+}
+
+.browser-chat-chat-pane:not(.embedded-chat) .browser-chat-message-list {
+  flex: 0 0 auto;
+  overflow-y: visible;
+  scrollbar-gutter: auto;
 }
 
 .browser-chat-message-list > * {
