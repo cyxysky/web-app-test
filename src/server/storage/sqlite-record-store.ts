@@ -1,4 +1,5 @@
-import type { RunScheduleRecord, SkillRecord, TestCaseRecord, TestGroupRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { DatabaseSync } from 'node:sqlite';
+import type { SkillRecord } from '@/server/ai/schemas/runtime.schema';
 import { getSqliteDatabase, parseSqliteJson, runSqliteTransaction } from '@/server/storage/sqlite-database';
 
 type ConfigRecord = {
@@ -54,14 +55,6 @@ export function writeConfigRecord(data: ConfigRecord) {
   `).run(JSON.stringify(data.runtimeEnv || []), data.modelConfig === undefined ? null : JSON.stringify(data.modelConfig), now());
 }
 
-export function readTestGroups() {
-  return readJsonRows<TestGroupRecord>('SELECT record_json FROM test_group ORDER BY created_at ASC');
-}
-
-export function readTestCases() {
-  return readJsonRows<TestCaseRecord>('SELECT record_json FROM test_case ORDER BY updated_at DESC');
-}
-
 export function readSkills(userId?: string) {
   const statement = userId === undefined
     ? getSqliteDatabase().prepare('SELECT user_id, record_json FROM skill ORDER BY updated_at DESC')
@@ -88,82 +81,6 @@ export function writeSkillRecord(skill: SkillRecord, userId: string) {
 export function deleteSkillRecord(skillId: string, userId: string) {
   const result = getSqliteDatabase().prepare('DELETE FROM skill WHERE id = ? AND user_id = ?').run(skillId, userId);
   return Number(result.changes) > 0;
-}
-
-export function readRunSchedules() {
-  return readJsonRows<RunScheduleRecord>('SELECT record_json FROM run_schedule ORDER BY created_at ASC');
-}
-
-export function replaceTestCaseRecords(input: {
-  groups: TestGroupRecord[];
-  testCases: TestCaseRecord[];
-  skills: SkillRecord[];
-  schedules: RunScheduleRecord[];
-}) {
-  runSqliteTransaction((database) => {
-    database.exec('DELETE FROM test_group; DELETE FROM test_case; DELETE FROM run_schedule;');
-    const insertGroup = database.prepare(`
-      INSERT INTO test_group (id, parent_id, name, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    const insertTestCase = database.prepare(`
-      INSERT INTO test_case (id, group_id, title, target_url, status, priority, record_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const insertSchedule = database.prepare(`
-      INSERT INTO run_schedule (id, name, enabled, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    for (const group of input.groups) {
-      insertGroup.run(group.id, group.parentId || null, group.name, JSON.stringify(group), group.createdAt, group.updatedAt);
-    }
-    for (const testCase of input.testCases) {
-      insertTestCase.run(
-        testCase.id,
-        testCase.groupId || null,
-        testCase.title,
-        testCase.targetUrl,
-        testCase.status,
-        testCase.priority,
-        JSON.stringify(testCase),
-        testCase.createdAt,
-        testCase.updatedAt,
-      );
-    }
-    for (const schedule of input.schedules) {
-      insertSchedule.run(
-        schedule.id,
-        schedule.name,
-        schedule.enabled ? 1 : 0,
-        JSON.stringify(schedule),
-        schedule.createdAt,
-        schedule.updatedAt,
-      );
-    }
-  });
-}
-
-export function readTestRuns() {
-  return readJsonRows<TestRunRecord>('SELECT record_json FROM test_run ORDER BY created_at DESC');
-}
-
-export function replaceTestRuns(runs: TestRunRecord[]) {
-  runSqliteTransaction((database) => {
-    database.exec('DELETE FROM test_run');
-    const insert = database.prepare(`
-      INSERT INTO test_run (id, test_case_id, status, record_json, created_at, started_at, ended_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    for (const run of runs) {
-      insert.run(
-        run.id,
-        run.testCaseId,
-        run.status,
-        JSON.stringify(run),
-        run.createdAt,
-        run.startedAt || null,
-        run.endedAt || null,
-      );
-    }
-  });
 }
 
 export function readPersonalMemoryRecords<T>() {
@@ -223,12 +140,35 @@ export function readBrowserChatLogs<T>(sessionId: string) {
     .filter((item): item is T => Boolean(item));
 }
 
-export function readBrowserChatSessionRecord<T extends { logs?: unknown[] }>(sessionId: string) {
+function readBrowserChatMessages<T>(sessionId: string) {
+  const rows = getSqliteDatabase().prepare(`
+    SELECT record_json FROM browser_chat_message WHERE session_id = ? ORDER BY time ASC
+  `).all(sessionId) as JsonRow[];
+  return rows
+    .map((row) => parseSqliteJson<T | undefined>(row.record_json, undefined))
+    .filter((item): item is T => Boolean(item));
+}
+
+function readBrowserChatSteps<T>(sessionId: string) {
+  const rows = getSqliteDatabase().prepare(`
+    SELECT record_json FROM browser_chat_step WHERE session_id = ? ORDER BY step_index ASC
+  `).all(sessionId) as JsonRow[];
+  return rows
+    .map((row) => parseSqliteJson<T | undefined>(row.record_json, undefined))
+    .filter((item): item is T => Boolean(item));
+}
+
+export function readBrowserChatSessionRecord<T extends { logs?: unknown[]; messages?: unknown[]; steps?: unknown[] }>(sessionId: string) {
   const row = getSqliteDatabase().prepare(`
     SELECT snapshot_json FROM browser_chat_session WHERE id = ?
   `).get(sessionId) as { snapshot_json?: string } | undefined;
   const snapshot = parseSqliteJson<T | undefined>(row?.snapshot_json, undefined);
-  return snapshot ? { ...snapshot, logs: readBrowserChatLogs(sessionId) } : undefined;
+  return snapshot ? {
+    ...snapshot,
+    messages: readBrowserChatMessages(sessionId),
+    steps: readBrowserChatSteps(sessionId),
+    logs: readBrowserChatLogs(sessionId),
+  } : undefined;
 }
 
 export function readBrowserChatSessionSummaries<T>() {
@@ -240,20 +180,28 @@ export function readBrowserChatSessionSummaries<T>() {
     .filter((item): item is T => Boolean(item));
 }
 
-export function writeBrowserChatSessionRecord<TSnapshot extends BrowserChatSessionFields, TLog extends { id: string; time: string }>(
+export function writeBrowserChatSessionRecord<
+  TSnapshot extends BrowserChatSessionFields,
+  TMessage extends { id: string; createdAt: string; updatedAt?: string },
+  TStep extends { index: number },
+  TLog extends { id: string; time: string },
+>(
   snapshot: TSnapshot,
   summary: unknown,
+  messages: TMessage[],
+  steps: TStep[],
   logs: TLog[],
 ) {
   runSqliteTransaction((database) => {
     database.prepare(`
       INSERT INTO browser_chat_session (
-        id, user_id, title, status, snapshot_json, summary_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, user_id, title, status, revision, snapshot_json, summary_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         user_id = excluded.user_id,
         title = excluded.title,
         status = excluded.status,
+        revision = browser_chat_session.revision + 1,
         snapshot_json = excluded.snapshot_json,
         summary_json = excluded.summary_json,
         updated_at = excluded.updated_at
@@ -267,12 +215,46 @@ export function writeBrowserChatSessionRecord<TSnapshot extends BrowserChatSessi
       snapshot.createdAt,
       snapshot.updatedAt,
     );
-    database.prepare('DELETE FROM browser_chat_log WHERE session_id = ?').run(snapshot.id);
+
+    const upsertMessage = database.prepare(`
+      INSERT INTO browser_chat_message (session_id, id, time, record_json) VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_id, id) DO UPDATE SET time = excluded.time, record_json = excluded.record_json
+    `);
+    for (const message of messages) {
+      upsertMessage.run(snapshot.id, message.id, message.updatedAt || message.createdAt, JSON.stringify(message));
+    }
+    pruneBrowserChatRows(database, 'browser_chat_message', 'id', snapshot.id, messages.map((message) => message.id));
+
+    const upsertStep = database.prepare(`
+      INSERT INTO browser_chat_step (session_id, step_index, record_json) VALUES (?, ?, ?)
+      ON CONFLICT(session_id, step_index) DO UPDATE SET record_json = excluded.record_json
+    `);
+    for (const step of steps) upsertStep.run(snapshot.id, step.index, JSON.stringify(step));
+    pruneBrowserChatRows(database, 'browser_chat_step', 'step_index', snapshot.id, steps.map((step) => step.index));
+
     const insertLog = database.prepare(`
       INSERT INTO browser_chat_log (session_id, id, time, record_json) VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_id, id) DO UPDATE SET time = excluded.time, record_json = excluded.record_json
     `);
     for (const log of logs) insertLog.run(snapshot.id, log.id, log.time, JSON.stringify(log));
+    pruneBrowserChatRows(database, 'browser_chat_log', 'id', snapshot.id, logs.map((log) => log.id));
   });
+}
+
+function pruneBrowserChatRows(
+  database: DatabaseSync,
+  table: 'browser_chat_message' | 'browser_chat_step' | 'browser_chat_log',
+  key: 'id' | 'step_index',
+  sessionId: string,
+  retainedKeys: Array<string | number>,
+) {
+  if (!retainedKeys.length) {
+    database.prepare(`DELETE FROM ${table} WHERE session_id = ?`).run(sessionId);
+    return;
+  }
+  const placeholders = retainedKeys.map(() => '?').join(', ');
+  database.prepare(`DELETE FROM ${table} WHERE session_id = ? AND ${key} NOT IN (${placeholders})`)
+    .run(sessionId, ...retainedKeys);
 }
 
 export function deleteBrowserChatSessionRecord(sessionId: string) {

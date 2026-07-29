@@ -72,6 +72,7 @@ export function buildCompletionVerificationPrompt(input: CompletionVerificationP
 export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
   const answerAllowed = allowedTypes.includes('answer');
   const browserCodeMode = allowedTypes.includes('browserCode');
+  const domMode = allowedTypes.includes('inspect') && allowedTypes.includes('interact');
   return [
     prompt,
     '',
@@ -95,9 +96,12 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     browserCodeMode ? '- After every state-changing action, verify the expected business state with a targeted locator, URL, value, toast, dialog, or table-state check. Playwright success does not equal business success.' : '',
     browserCodeMode ? '- Pixel evidence stays in browserCode: await nodeRepl.emitImage(await page.screenshot({ fullPage: false })). CUA or coordinates are allowed only for special visual controls Playwright cannot describe and require two model steps: end the first browserCode cell after emitting the viewport screenshot, inspect the returned image, then perform one coordinate click in the next cell. Same-cell screenshot-and-click is forbidden; navigation, viewport changes, or DOM redraws invalidate the evidence. FullPage images are read-only.' : '',
     browserCodeMode ? '- browser/tab are code APIs in the same kernel: browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, and tab.cua.' : '',
+    domMode ? '- DOM mode uses inspect for semantic page evidence, interact for one current UID or latest viewport coordinates, browser for navigation/tabs, and takeScreenshot only when pixel evidence is needed.' : '',
+    domMode ? '- Begin browser work with type="inspect", params.action="capture", params.mode="full". Use only the current dom-* UID returned by inspect; never invent or reuse a removed UID.' : '',
+    domMode ? '- For a native select use type="interact", params.action="selectOption", params.uid, and an exact params.value or params.label. For credentials use params.credentialRef with a current field UID; never put the secret in params.text.' : '',
     allowedTypes.includes('downloadFile') ? '- For downloadFile, put an absolute URL in params.url, an origin-relative path like /files/a.pdf, or a page-relative path like report/a.pdf in params.path/urlOrPath. Use params.fileName only when the desired saved name is known.' : '',
     allowedTypes.includes('generateMarkdownFile') ? '- For generateMarkdownFile, put the complete Markdown document in params.content and the desired file name in params.fileName. The final visible answer must include the returned download link as a clickable Markdown link.' : '',
-    '- For a browser action, set type="browserCode" and put the program in params.code plus a concise params.reason.',
+    browserCodeMode ? '- For a browser action, set type="browserCode" and put the program in params.code plus a concise params.reason.' : '',
     answerAllowed
       ? '- For browser chat completion, clarification, blocked state, failure, or pure text response, set type="answer" and put the complete Chinese Markdown answer in message. Do not use reportState.'
       : '- For completion, manual verification, failure, or pure status update, use type="reportState".',
@@ -110,7 +114,7 @@ export function customRuntimePromptFromEnv() {
   return [
     'Additional user-configured rules (append-only):',
     '- These rules supplement the built-in Agent Loop prompt; they do not replace it.',
-    '- They must not override, weaken, or bypass built-in rules, safety rules, tool contracts, test-case instructions, or the current user requirement.',
+    '- They must not override, weaken, or bypass built-in rules, safety rules, tool contracts, loaded Skills, or the current user requirement.',
     '- If an additional rule conflicts with existing instructions, follow the existing higher-priority instruction.',
     rules,
   ].join('\n');

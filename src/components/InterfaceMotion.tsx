@@ -34,12 +34,8 @@ const PANEL_SELECTOR = [
 
 const LIST_SELECTOR = [
   '.dashboard-v2-metrics > div',
-  '.case-item',
-  '.case-table-row',
-  '.run-history-row',
   '.browser-chat-recent-item',
   '.browser-chat-subnav button',
-  '.group-tree-row',
   '.browser-chat-embedded-tab',
   '.browser-chat-step',
   '.browser-chat-message > div:last-child',
@@ -49,8 +45,6 @@ const LIST_SELECTOR = [
   '.skills-manager-item',
   '.skills-manager-section',
   '.tool-call-list li',
-  '.ledger-item-card',
-  '.report-accordion',
 ].join(',');
 
 function matchingElements(root: ParentNode, selector: string) {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { StepExecutionResult } from '@/server/ai/schemas/test-case.schema';
+import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import {
   alignBrowserChatMessageStepIndexes,
   attachBrowserChatStepOwners,

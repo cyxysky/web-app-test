@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { defaultModelByProvider, defaultModelForProvider, modelListForProvider, modelProviderDefinitions, modelProviderValues, modelProviderDefinition } from '@/config/settings';
 import { store } from '@/server/db/store';
-import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/test-case.schema';
+import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
 import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 
 const providers = new Set<ModelProvider>(modelProviderValues);
+const noStoreHeaders = { 'Cache-Control': 'no-store, max-age=0' };
 
 function normalizeProvider(value: unknown): ModelProvider {
   const provider = String(value || 'openrouter').trim().toLowerCase();
@@ -40,7 +41,7 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
       defaultModel: model,
       model,
       models,
-      apiKey: typeof item.apiKey === 'string' ? item.apiKey : '',
+      ...(typeof item.apiKey === 'string' && item.apiKey ? { apiKey: item.apiKey } : {}),
       baseURL: typeof item.baseURL === 'string' ? item.baseURL : definition.defaultBaseURL || '',
     };
   }
@@ -48,7 +49,7 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
 }
 
 export async function GET() {
-  return NextResponse.json(readModelSettingsState());
+  return NextResponse.json(readModelSettingsState(), { headers: noStoreHeaders });
 }
 
 export async function POST(request: NextRequest) {
@@ -65,20 +66,20 @@ export async function POST(request: NextRequest) {
         defaultModel: model,
         model,
         models,
-        apiKey: typeof body.apiKey === 'string' ? body.apiKey : '',
+        ...(typeof body.apiKey === 'string' && body.apiKey.trim() ? { apiKey: body.apiKey } : {}),
         baseURL: typeof body.baseURL === 'string' ? body.baseURL : modelProviderDefinition(provider).defaultBaseURL || '',
       };
     }
-    const config = store.saveModelConfig({
+    store.saveModelConfig({
       provider,
       providers: providersInput,
     });
     store.applyRuntimeEnv();
-    return NextResponse.json({ ok: true, config });
+    return NextResponse.json({ ok: true, ...readModelSettingsState() }, { headers: noStoreHeaders });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : '保存模型配置失败' },
-      { status: 400 },
+      { status: 400, headers: noStoreHeaders },
     );
   }
 }

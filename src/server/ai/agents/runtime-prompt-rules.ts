@@ -28,6 +28,21 @@ export function browserChatCodeRules(screenshotAvailable = true) {
   ];
 }
 
+export function browserChatDomRules(screenshotAvailable = true) {
+  return [
+    '- Use inspect action="capture" mode="full" for the complete loaded semantic DOM. mode="text" is the reading view of all loaded text; mode="changes" contains only inter-action changes and has no actionable UIDs.',
+    '- Continue a paged frozen capture only with its exact nextCursor and the same mode. Never scroll for snapshot pagination. Use inspect action="search" to narrow the current baseline and action="httpRequests" for network evidence.',
+    '- Use only current dom-* UIDs. A state-changing action returns an immediate DOM delta; any UID listed as removed is invalid. Treat validationErrors as action failure and correct the named field before continuing.',
+    screenshotAvailable
+      ? '- Use interact with either one current UID or coordinates from the latest viewport screenshot, never both. Full-page and older screenshots are read-only evidence.'
+      : '- Use interact with one current UID; coordinate targeting is unavailable.',
+    '- interact supports click, hover, drag, scrolling, type, press, shortcuts, and selectOption. UID actions scroll their target into view; scroll the page only for confirmed lazy or virtual content.',
+    '- For a native select, use interact action="selectOption" with its current UID and an exact option value or full label. Do not click the platform dropdown or choose with keyboard arrows.',
+    '- Use browser for navigation, waiting, listing tabs, and switching tabs. After an action may open a tab, list tabs before choosing the next target.',
+    '- For a supplied credential reference, use interact action="type" with a current field UID only. Never place the secret in text, read it back, or expose the reference.',
+  ];
+}
+
 export function browserActionRules(screenshotAvailable = true) {
   return [
     '- Default to a semantic Playwright locator scoped to the current visible dialog or region, such as getByRole(..., { exact: true }). Before clicking duplicate text, keep only rendered candidates with locator.filter({ visible: true }) and require count() === 1. Never use first(), last(), or nth() to guess among same-name candidates.',

@@ -1,8 +1,7 @@
 import { generateObject } from 'ai';
 import { z } from 'zod';
 import { getModel } from '@/server/ai/model';
-import { skillContentSchema, type SkillRecord, type StepExecutionResult, type TestCaseRecord, type TestRunRecord } from '@/server/ai/schemas/test-case.schema';
-import { richTextToPlainText } from '@/lib/rich-text';
+import { skillContentSchema, type SkillRecord, type StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { normalizeSkillDomain } from './skill-context';
 
 const generatedSkillSchema = z.object({
@@ -89,25 +88,25 @@ function compactStep(step: StepExecutionResult) {
   };
 }
 
-export async function generateSkillFromRun(input: {
-  run: TestRunRecord;
-  testCase: TestCaseRecord;
+export async function generateSkillFromBrowserHistory(input: {
+  browserMode: 'code' | 'dom';
+  consoleErrors?: string[];
+  constraints?: string;
+  goal: string;
+  networkErrors?: string[];
+  sourceId: string;
+  status: 'passed' | 'failed' | 'blocked';
+  steps: StepExecutionResult[];
+  targetUrl: string;
+  title: string;
 }): Promise<Omit<SkillRecord, 'id' | 'createdAt' | 'updatedAt' | 'version' | 'status'>> {
-  const { run, testCase } = input;
-  const steps = run.result?.steps || [];
+  const { steps } = input;
   if (!steps.length) throw new Error('Run has no executable steps to convert into a skill.');
-  const sourceGoal = richTextToPlainText(
-    testCase.content.userRequirement
-    || testCase.description
-    || testCase.title,
-  );
-  const rawConstraints = richTextToPlainText(testCase.content.systemPrompt || '');
-  const stableConstraints = rawConstraints.includes('该上下文由浏览器对话生成') ? '' : rawConstraints;
-  const diagnostics = run.status === 'passed'
+  const diagnostics = input.status === 'passed'
     ? []
     : distinctText([
-      ...(run.result?.consoleErrors || []).slice(-6),
-      ...(run.result?.networkErrors || []).slice(-6),
+      ...(input.consoleErrors || []).slice(-6),
+      ...(input.networkErrors || []).slice(-6),
     ], 6);
 
   const result = await generateObject({
@@ -132,12 +131,12 @@ export async function generateSkillFromRun(input: {
       '- Keep workflow steps actionable but semantic: describe what to find/click/check, not old ids or exact pixels.',
       '',
       `Reusable source JSON:\n${safeJson({
-        title: testCase.title,
-        targetUrl: testCase.targetUrl,
-        goal: sourceGoal,
-        constraints: stableConstraints || undefined,
-        browserMode: testCase.content.browserMode,
-        status: run.status,
+        title: input.title,
+        targetUrl: input.targetUrl,
+        goal: input.goal,
+        constraints: input.constraints || undefined,
+        browserMode: input.browserMode,
+        status: input.status,
         diagnostics: diagnostics.length ? diagnostics : undefined,
         steps: steps.map(compactStep),
       }, 10000)}`,
@@ -151,7 +150,7 @@ export async function generateSkillFromRun(input: {
   return {
     title: result.object.title,
     description: result.object.description,
-    domains: [normalizeSkillDomain(testCase.targetUrl)].filter(Boolean),
+    domains: [normalizeSkillDomain(input.targetUrl)].filter(Boolean),
     tags: distinctText(result.object.tags, 6),
     triggerPhrases: distinctText(result.object.triggerPhrases, 8),
     content: {
@@ -159,7 +158,6 @@ export async function generateSkillFromRun(input: {
       recovery,
       verification: distinctText(result.object.content.verification, 4),
     },
-    sourceRunId: run.id,
-    sourceTestCaseId: testCase.id,
+    sourceSessionId: input.sourceId,
   };
 }

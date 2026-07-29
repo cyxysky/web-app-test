@@ -22,7 +22,6 @@ fs.rmSync(outputRoot, { recursive: true, force: true });
 copyDir(path.join(root, '.next', 'standalone'), serverOutput);
 copyInto(path.join(root, '.next', 'static'), path.join(serverOutput, '.next', 'static'));
 copyInto(path.join(root, 'public'), path.join(serverOutput, 'public'));
-copyDir(path.join(root, 'node_modules', 'tinymce'), path.join(outputRoot, 'tinymce'));
 
 if (!fs.existsSync(path.join(serverOutput, 'server.js'))) {
   throw new Error('Next standalone server was not found. Run next build with output: "standalone" first.');

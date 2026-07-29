@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/test-case.schema';
+import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
 
 type RouteContext = {
@@ -46,8 +46,6 @@ export async function PUT(request: NextRequest, context: RouteContext) {
       tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
       triggerPhrases: Array.isArray(body.triggerPhrases) ? body.triggerPhrases.map(String) : [],
       content,
-      sourceRunId: typeof body.sourceRunId === 'string' ? body.sourceRunId : undefined,
-      sourceTestCaseId: typeof body.sourceTestCaseId === 'string' ? body.sourceTestCaseId : undefined,
       sourceSessionId: typeof body.sourceSessionId === 'string' ? body.sourceSessionId : undefined,
       status: normalizeStatus(body.status),
       userId,

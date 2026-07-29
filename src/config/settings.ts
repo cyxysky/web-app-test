@@ -1,4 +1,4 @@
-import type { ModelProvider } from '@/server/ai/schemas/test-case.schema';
+import type { ModelProvider } from '@/server/ai/schemas/runtime.schema';
 
 export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'memory' | 'accounts' | 'dom-test' | 'debug';
 
@@ -127,7 +127,7 @@ const boolOptions = [
 
 export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
-  { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: '使用 DOMSnapshot 与局部无障碍语义生成 UID；视觉信息通过 takeScreenshot 按需获取。', tab: 'browser', defaultValue: 'dom', control: 'select', options: [{ label: '语义快照', value: 'dom' }] },
+  { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: '代码模式让 Agent 执行受限 Playwright 代码；DOM 模式通过结构化 inspect/interact 工具操作页面。新会话使用保存后的模式。', tab: 'browser', defaultValue: 'code', control: 'select', options: [{ label: '代码模式', value: 'code' }, { label: 'DOM 模式', value: 'dom' }] },
   { key: 'BROWSER_CDP_ENDPOINT', label: '现有浏览器 CDP 地址', description: '连接已开启远程调试的 Chrome/Edge，例如 http://127.0.0.1:9222；可复用登录态。留空则启动新浏览器。', tab: 'browser', defaultValue: '', control: 'text' },
   { key: 'BROWSER_USER_DATA_DIR', label: '浏览器用户数据目录', description: '未配置 CDP 时使用指定 profile 启动持久浏览器，适合保存登录态。留空使用临时上下文。', tab: 'browser', defaultValue: '', control: 'text' },
   { key: 'BROWSER_CHANNEL', label: '浏览器通道', description: '可选 chrome、msedge 等本机浏览器通道；留空使用 Playwright Chromium。', tab: 'browser', defaultValue: '', control: 'text' },
@@ -150,14 +150,12 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_SCREENSHOT_MAX_KB', label: 'AI 截图压缩上限', description: '发送给 AI 的截图大小上限，留空表示不压缩。', tab: 'browser', defaultValue: '', control: 'number' },
   { key: 'SEND_SCREENSHOT_TO_AI', label: '强制发送截图', description: '覆盖模型能力判断，留空表示自动判断。', tab: 'browser', defaultValue: '', control: 'select', options: [{ label: '自动', value: '' }, ...boolOptions] },
 
-  { key: 'KEEP_BROWSER_OPEN_AFTER_RUN', label: '运行后保留浏览器', description: '运行结束后是否保持浏览器打开。', tab: 'runtime', defaultValue: 'false', control: 'boolean', options: boolOptions },
-  { key: 'KEEP_BROWSER_OPEN_ON_AI_ERROR', label: 'AI 错误时保留浏览器', description: 'AI 调用异常时是否保留浏览器用于排查。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。', tab: 'runtime', defaultValue: '', control: 'textarea' },
-  { key: 'RUN_WORKER_CONCURRENCY', label: '运行并发数', description: '同时执行多少个测试运行。', tab: 'runtime', defaultValue: '1', control: 'number' },
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
-  { key: 'AI_TEST_REQUEST_TIMEOUT_MS', label: 'AI 请求超时', description: '单次模型请求最长等待时间。', tab: 'runtime', defaultValue: '30000', control: 'number' },
+  { key: 'AI_REQUEST_TIMEOUT_MS', label: 'AI 请求超时', description: '单次模型请求最长等待时间。', tab: 'runtime', defaultValue: '30000', control: 'number' },
   { key: 'AI_AGENT_LOOP_TIMEOUT_MS', label: 'Agent Loop 请求超时', description: '带工具循环的单个用户请求最长等待时间；留空时默认 120000。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_SUBAGENT_LOOP_TIMEOUT_MS', label: '子 Agent 执行超时', description: '单个并行子 Agent 的完整工具循环最长时间；默认 600000 毫秒，不限制工具回合数。', tab: 'runtime', defaultValue: '600000', control: 'number' },
+  { key: 'AI_SUBAGENT_CONCURRENCY', label: '子 Agent 全局并发数', description: '整个服务同时运行的子 Agent 上限；超过上限的任务排队，避免浏览器和模型请求瞬时占满资源。', tab: 'runtime', defaultValue: '3', control: 'number' },
   { key: 'AI_SUBAGENT_RESULT_MAX_CHARS', label: '子 Agent 总结建议长度', description: '写入子 Agent 提示词的建议最大字符数；只引导模型控制篇幅，后端不会截断实际结果。', tab: 'runtime', defaultValue: '40000', control: 'number' },
   { key: 'AI_RUNTIME_REQUEST_RETRY_ATTEMPTS', label: 'AI 请求连续失败上限', description: 'Agent Loop 中上游连接或请求级错误连续失败达到该次数后停止；成功一次会清零。', tab: 'runtime', defaultValue: '3', control: 'number' },
   { key: 'BROWSER_CHAT_KEEP_BROWSER_OPEN_AFTER_TURN', label: '对话完成保留浏览器', description: '浏览器对话每轮完成后是否保留浏览器，便于同一用户后续对话复用。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
@@ -181,7 +179,6 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_PROMPT_SCREENSHOT_REFERENCE_LIMIT', label: '历史截图引用上限', description: '可供 AI 选择引用的历史截图数量。', tab: 'runtime', defaultValue: '8', control: 'number' },
 
   { key: 'AI_COMPLETION_VERIFY', label: '完成结果二次校验', description: 'AI 声明完成后是否再做一次完成校验。', tab: 'debug', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'AI_TEST_DEBUG', label: '调试事件记录', description: '是否记录 AI 请求、工具调用和性能事件。', tab: 'debug', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'PLAYWRIGHT_TRACE', label: 'Playwright Trace', description: '是否保存 Playwright trace。', tab: 'debug', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'CODEX_PATH', label: 'Codex CLI 路径', description: '自定义 Codex CLI 可执行文件路径。', tab: 'debug', defaultValue: '', control: 'text' },
   { key: 'CODEX_CWD', label: 'Codex 工作目录', description: 'Codex CLI 默认工作目录。', tab: 'debug', defaultValue: '', control: 'text' },

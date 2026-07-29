@@ -73,7 +73,6 @@ import {
   Settings,
   SlidersHorizontal,
   Sparkles,
-  FilePlus2,
   SquareArrowOutUpRight,
   SquareTerminal,
   Square,
@@ -86,7 +85,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { usePathname, useRouter, useSearchParams } from 'next/navigation';
+import { usePathname, useSearchParams } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -132,7 +131,7 @@ import type {
   ModelProvider,
   SkillRecord,
   StepExecutionResult,
-} from '@/server/ai/schemas/test-case.schema';
+} from '@/server/ai/schemas/runtime.schema';
 
 type BrowserChatMessage = {
   id: string;
@@ -240,7 +239,7 @@ type BrowserChatSession = {
 };
 
 type BrowserChatView = 'chat' | 'settings';
-type BrowserChatMode = 'dom';
+type BrowserChatMode = 'code' | 'dom';
 type BrowserChatSafetyMode = 'strict' | 'full';
 type BrowserChatModelConfig = RuntimeModelConfig;
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
@@ -251,7 +250,7 @@ const EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY = 'webpilotqa.embeddedChatCollapsed';
 function browserChatViewForPathname(pathname: string, fallback: BrowserChatView): BrowserChatView {
   pathname = withoutWebPilotBasePath(pathname);
   if (pathname === '/settings' || pathname.startsWith('/settings/')) return 'settings';
-  if (pathname === '/dashboard' || pathname.startsWith('/runs/')) return 'chat';
+  if (pathname === '/dashboard') return 'chat';
   if (pathname === '/browser-chat' || pathname.startsWith('/browser-chat/')) return 'chat';
   return fallback;
 }
@@ -1608,8 +1607,7 @@ function temporaryId(prefix: string) {
 }
 
 function normalizeMode(value?: string): BrowserChatMode {
-  void value;
-  return 'dom';
+  return value === 'dom' ? 'dom' : 'code';
 }
 
 function normalizeSafetyMode(value?: string): BrowserChatSafetyMode {
@@ -3342,10 +3340,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
 
 const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   skillsById,
-  exportingMessageId,
-  exportingSelectedMessages,
   generatingSkillMessageId,
-  generatingSkillSelectedMessages,
   item,
   itemLogs,
   itemSteps,
@@ -3363,34 +3358,28 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   sessionBusy,
   totalStepCount,
 }: {
-  exportingMessageId: string | null;
-  exportingSelectedMessages: boolean;
   generatingSkillMessageId: string | null;
-  generatingSkillSelectedMessages: boolean;
   item: BrowserChatMessage;
   itemLogs: BrowserChatLogRecord[];
   itemSteps: StepExecutionResult[];
   lastAssistantMessageId?: string;
-  onExportMessage: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onResumeHumanVerification?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
-  onToggleExportSelection: (messageId: string, selected: boolean) => void;
   pendingToolConfirmation?: BrowserChatToolConfirmation;
   resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   resumingHumanVerification?: boolean;
-  selectedForExport: boolean;
   sessionBusy: boolean;
   skillsById: Map<string, SkillRecord>;
   totalStepCount: number;
 }) {
   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
-  const canExportMessage = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
-  const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
+  const canGenerateSkill = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
+  const actionDisabled = Boolean(generatingSkillMessageId);
   const messageSkills = useMemo(() => {
     return Array.from(new Set(item.skillIds || [])).map((skillId) => {
       const skill = skillsById.get(skillId);
@@ -3440,7 +3429,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
                 查看日志
               </button>
             ) : null}
-            {canExportMessage ? (
+            {canGenerateSkill ? (
               <button
                 className="browser-chat-log-button"
                 disabled={actionDisabled}
@@ -3548,60 +3537,40 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
 
 const BrowserChatMessageList = memo(function BrowserChatMessageList({
   availableSkills,
-  exportingMessageId,
-  exportingSelectedMessages,
   generatingSkillMessageId,
-  generatingSkillSelectedMessages,
   lastAssistantMessageId,
   logIndex,
   messages,
-  onBulkExportMessages,
-  onBulkGenerateSkillMessages,
-  onClearExportSelection,
-  onExportMessage,
   onGenerateSkill,
   onPreviewImage,
   onResolveToolConfirmation,
   onResumeHumanVerification,
   onSelectTool,
   onShowLogs,
-  onToggleExportSelection,
   pendingToolConfirmation,
   resolvingConfirmationAction,
   resolvingConfirmationId,
   resumingHumanVerification,
-  selectedExportMessageIdSet,
-  selectedExportMessageIds,
   sessionId,
   sessionBusy,
   stepsByIndex,
   totalStepCount,
 }: {
   availableSkills: SkillRecord[];
-  exportingMessageId: string | null;
-  exportingSelectedMessages: boolean;
   generatingSkillMessageId: string | null;
-  generatingSkillSelectedMessages: boolean;
   lastAssistantMessageId?: string;
   logIndex: BrowserChatLogIndex;
   messages: BrowserChatMessage[];
-  onBulkExportMessages: () => void | Promise<void>;
-  onBulkGenerateSkillMessages: () => void | Promise<void>;
-  onClearExportSelection: () => void;
-  onExportMessage: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onResumeHumanVerification?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onShowLogs: (messageId: string) => void;
-  onToggleExportSelection: (messageId: string, selected: boolean) => void;
   pendingToolConfirmation?: BrowserChatToolConfirmation;
   resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   resumingHumanVerification?: boolean;
-  selectedExportMessageIdSet: Set<string>;
-  selectedExportMessageIds: string[];
   sessionId?: string;
   sessionBusy: boolean;
   stepsByIndex: Map<number, StepExecutionResult>;
@@ -3610,7 +3579,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const followLatestRef = useRef(true);
   const previousSessionIdRef = useRef(sessionId);
-  const actionDisabled = Boolean(exportingMessageId || generatingSkillMessageId) || exportingSelectedMessages || generatingSkillSelectedMessages;
   const lastMessage = messages[messages.length - 1];
   const skillsById = useMemo(() => new Map(availableSkills.map((skill) => [skill.id, skill])), [availableSkills]);
   const renderEntries = useMemo(
@@ -3683,38 +3651,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
 
   return (
     <div className="browser-chat-message-list" onScroll={trackScrollPosition} ref={scrollRef}>
-      {selectedExportMessageIds.length ? (
-        <div className="browser-chat-message-export-bar">
-          <span>已选 {selectedExportMessageIds.length} 轮</span>
-          <button
-            className="browser-chat-log-button"
-            disabled={actionDisabled}
-            onClick={() => void onBulkExportMessages()}
-            type="button"
-          >
-            {exportingSelectedMessages ? <Loader2 className="spin" size={14} /> : <FilePlus2 size={14} />}
-            导出为用例
-          </button>
-          <button
-            className="browser-chat-log-button"
-            disabled={actionDisabled}
-            onClick={() => void onBulkGenerateSkillMessages()}
-            type="button"
-          >
-            {generatingSkillSelectedMessages ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
-            生成 Skill
-          </button>
-          <button
-            className="browser-chat-log-button"
-            disabled={actionDisabled}
-            onClick={onClearExportSelection}
-            type="button"
-          >
-            <X size={14} />
-            清空
-          </button>
-        </div>
-      ) : null}
       {renderEntries.map((entry) => {
         if (entry.kind === 'executed-group') {
           return (
@@ -3742,28 +3678,22 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
         return (
           <BrowserChatMessageItem
-            exportingMessageId={exportingMessageId}
-            exportingSelectedMessages={exportingSelectedMessages}
             generatingSkillMessageId={generatingSkillMessageId}
-            generatingSkillSelectedMessages={generatingSkillSelectedMessages}
             item={item}
             itemLogs={itemLogs}
             itemSteps={itemSteps}
             key={item.id}
             lastAssistantMessageId={lastAssistantMessageId}
-            onExportMessage={onExportMessage}
             onGenerateSkill={onGenerateSkill}
             onPreviewImage={onPreviewImage}
             onResolveToolConfirmation={onResolveToolConfirmation}
             onResumeHumanVerification={onResumeHumanVerification}
             onSelectTool={onSelectTool}
             onShowLogs={onShowLogs}
-            onToggleExportSelection={onToggleExportSelection}
             pendingToolConfirmation={pendingToolConfirmation}
             resolvingConfirmationAction={resolvingConfirmationAction}
             resolvingConfirmationId={resolvingConfirmationId}
             resumingHumanVerification={resumingHumanVerification}
-            selectedForExport={selectedExportMessageIdSet.has(item.id)}
             sessionBusy={sessionBusy}
             skillsById={skillsById}
             totalStepCount={totalStepCount}
@@ -4809,7 +4739,8 @@ type BrowserChatPreviewTab = {
 type BrowserChatPreviewFrame = {
   capturedAt: string;
   contentType: 'image/jpeg' | 'image/png';
-  data: string;
+  imageUrl: string;
+  sequence?: number;
   tabs: BrowserChatPreviewTab[];
   url: string;
   viewport: { width: number; height: number };
@@ -4837,6 +4768,7 @@ function BrowserChatWebPreviewModal({
   const reconnectEnabledRef = useRef(true);
   const previewImageRef = useRef<HTMLImageElement | null>(null);
   const pendingFrameRef = useRef<BrowserChatPreviewFrame | null>(null);
+  const frameObjectUrlRef = useRef('');
   const frameRenderRequestRef = useRef<number | undefined>(undefined);
   const pendingMoveRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'move' }> | null>(null);
   const pointerGestureRef = useRef<{
@@ -4871,13 +4803,46 @@ function BrowserChatWebPreviewModal({
         url.searchParams.set('sessionId', sessionId);
         url.searchParams.set('userId', userId);
         const stream = new WebSocket(url);
+        stream.binaryType = 'arraybuffer';
         streamRef.current = stream;
         stream.onopen = () => setStreamError('');
         stream.onmessage = (event) => {
           try {
+            if (event.data instanceof ArrayBuffer) {
+              const bytes = new Uint8Array(event.data);
+              if (bytes.byteLength < 4) throw new Error('Invalid binary frame');
+              const metadataLength = new DataView(event.data).getUint32(0, false);
+              if (metadataLength <= 0 || metadataLength + 4 > bytes.byteLength) throw new Error('Invalid binary metadata');
+              const metadata = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + metadataLength))) as Omit<BrowserChatPreviewFrame, 'imageUrl'>;
+              const imageUrl = URL.createObjectURL(new Blob(
+                [bytes.slice(4 + metadataLength)],
+                { type: metadata.contentType },
+              ));
+              const previousPending = pendingFrameRef.current?.imageUrl;
+              if (previousPending?.startsWith('blob:')) URL.revokeObjectURL(previousPending);
+              pendingFrameRef.current = { ...metadata, imageUrl };
+              if (frameRenderRequestRef.current === undefined) {
+                frameRenderRequestRef.current = window.requestAnimationFrame(() => {
+                  frameRenderRequestRef.current = undefined;
+                  const nextFrame = pendingFrameRef.current;
+                  pendingFrameRef.current = null;
+                  if (!nextFrame) return;
+                  if (frameObjectUrlRef.current) URL.revokeObjectURL(frameObjectUrlRef.current);
+                  frameObjectUrlRef.current = nextFrame.imageUrl;
+                  setFrame(nextFrame);
+                  setStatus('live');
+                  setStreamError('');
+                });
+              }
+              return;
+            }
             const message = JSON.parse(String(event.data)) as BrowserChatPreviewFrame & { error?: string; type?: string };
             if (message.type === 'frame') {
-              pendingFrameRef.current = message;
+              const legacyMessage = message as BrowserChatPreviewFrame & { data?: string };
+              pendingFrameRef.current = {
+                ...message,
+                imageUrl: legacyMessage.imageUrl || `data:${message.contentType};base64,${legacyMessage.data || ''}`,
+              };
               if (frameRenderRequestRef.current === undefined) {
                 frameRenderRequestRef.current = window.requestAnimationFrame(() => {
                   frameRenderRequestRef.current = undefined;
@@ -4940,6 +4905,10 @@ function BrowserChatWebPreviewModal({
   }, [onClose]);
 
   useEffect(() => () => {
+    if (frameObjectUrlRef.current) URL.revokeObjectURL(frameObjectUrlRef.current);
+    const pendingUrl = pendingFrameRef.current?.imageUrl;
+    if (pendingUrl?.startsWith('blob:')) URL.revokeObjectURL(pendingUrl);
+    frameObjectUrlRef.current = '';
     pendingFrameRef.current = null;
     pendingMoveRef.current = null;
     pointerGestureRef.current = null;
@@ -4962,8 +4931,6 @@ function BrowserChatWebPreviewModal({
     setInputError('');
     return postInput(input, true);
   }, [postInput]);
-
-  const hasFrame = frame !== null;
 
   const relativePoint = useCallback((clientX: number, clientY: number, element: HTMLElement, clamp = false) => {
     if (!frame) return undefined;
@@ -5192,7 +5159,7 @@ function BrowserChatWebPreviewModal({
             tabIndex={0}
           >
             {frame ? (
-              <img alt="浏览器实时画面" draggable={false} ref={previewImageRef} src={`data:${frame.contentType};base64,${frame.data}`} />
+              <img alt="浏览器实时画面" draggable={false} ref={previewImageRef} src={frame.imageUrl} />
             ) : (
               <div className="browser-chat-web-preview-empty">
                 <Loader2 className="spin" size={22} />
@@ -6311,7 +6278,6 @@ export function BrowserChatWorkspace({
   initialView?: BrowserChatView;
   initialSettings?: EnvironmentSettingsInitialData;
 }) {
-  const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const queryUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || '0';
@@ -6346,7 +6312,7 @@ export function BrowserChatWorkspace({
   const [session, setSession] = useState<BrowserChatSession | null>(null);
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
-  const [mode, setMode] = useState<BrowserChatMode>('dom');
+  const [mode, setMode] = useState<BrowserChatMode>('code');
   const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
   const [modelProvider, setModelProvider] = useState<ModelProvider>(() => initialModelSelection.provider);
   const [modelId, setModelId] = useState(() => initialModelSelection.model);
@@ -6371,11 +6337,7 @@ export function BrowserChatWorkspace({
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
   const [recentSelectionMode, setRecentSelectionMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
-  const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
-  const [exportingSelectedMessages, setExportingSelectedMessages] = useState(false);
   const [generatingSkillMessageId, setGeneratingSkillMessageId] = useState<string | null>(null);
-  const [generatingSkillSelectedMessages, setGeneratingSkillSelectedMessages] = useState(false);
-  const [selectedExportMessageIds, setSelectedExportMessageIds] = useState<string[]>([]);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
   const fullLogSessionIdsRef = useRef(new Set<string>());
@@ -6507,7 +6469,6 @@ export function BrowserChatWorkspace({
   }, [attachments]);
 
   const stepsByIndex = useMemo(() => new Map(steps.map((step) => [step.index, step])), [steps]);
-  const selectedExportMessageIdSet = useMemo(() => new Set(selectedExportMessageIds), [selectedExportMessageIds]);
   const logIndex = useMemo(() => buildBrowserChatLogIndex(logs), [logs]);
   const logDialogMessage = useMemo(
     () => messages.find((item) => item.id === logDialogMessageId),
@@ -6569,17 +6530,6 @@ export function BrowserChatWorkspace({
         fullLogSessionIdsRef.current.delete(sessionId);
       });
   }, [browserChatApiUrl]);
-  const toggleExportMessageSelection = useCallback((messageId: string, selected: boolean) => {
-    setSelectedExportMessageIds((current) => {
-      const next = new Set(current);
-      if (selected) next.add(messageId);
-      else next.delete(messageId);
-      return [...next];
-    });
-  }, []);
-  const clearExportMessageSelection = useCallback(() => {
-    setSelectedExportMessageIds([]);
-  }, []);
   const recentSessions = useMemo(() => {
     const merged = new Map<string, BrowserChatSession>();
     for (const item of sessions) merged.set(item.id, item);
@@ -6663,8 +6613,10 @@ export function BrowserChatWorkspace({
     const saved = Array.isArray(data.saved) ? data.saved as Array<{ key?: string; value?: string }> : [];
     const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
     const reasoningSetting = saved.find((item) => item.key === 'BROWSER_CHAT_SHOW_REASONING');
+    const browserModeSetting = saved.find((item) => item.key === 'AI_BROWSER_MODE');
     setEmbeddedBrowserEnabled(embeddedSetting?.value === 'true');
     setShowReasoning(reasoningSetting?.value === 'true');
+    if (!activeSessionIdRef.current) setMode(normalizeMode(browserModeSetting?.value));
   }, []);
 
   const loadSkills = useCallback(async () => {
@@ -6715,10 +6667,6 @@ export function BrowserChatWorkspace({
 
   useEffect(() => {
     activeSessionIdRef.current = session?.id || null;
-  }, [session?.id]);
-
-  useEffect(() => {
-    setSelectedExportMessageIds([]);
   }, [session?.id]);
 
   const upsertSession = useCallback((nextSession: BrowserChatSession, options: { activate?: boolean; version?: number } = {}) => {
@@ -6883,7 +6831,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(browserChatApiUrl('/api/browser-chat'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ safetyMode, modelProvider, model: modelId, targetUrl: requestedTargetUrl, userId: requestUserId }),
+      body: JSON.stringify({ mode, safetyMode, modelProvider, model: modelId, targetUrl: requestedTargetUrl, userId: requestUserId }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '创建对话会话失败');
     return upsertSession(data.session as BrowserChatSession, { activate: true });
@@ -7156,81 +7104,9 @@ export function BrowserChatWorkspace({
     event.currentTarget.closest('details')?.removeAttribute('open');
   }
 
-  const openTargetCaseDetail = useCallback((testCaseId: string) => {
-    router.push(`/dashboard?caseId=${encodeURIComponent(testCaseId)}`);
-  }, [router]);
-
-  const exportSelectedMessagesToTestCase = useCallback(async () => {
-    const sessionId = session?.id;
-    if (!sessionId || !selectedExportMessageIds.length || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
-    const messageIds = selectedExportMessageIds;
-    setExportingSelectedMessages(true);
-    setError('');
-    startGlobalLoading('正在导出选中对话轮次');
-    try {
-      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/export`), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messageIds }),
-      });
-      const data = await readApiJson<Record<string, unknown>>(response, '导出测试用例失败');
-      setSelectedExportMessageIds([]);
-      if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
-    } catch (exportError) {
-      setError(exportError instanceof Error ? exportError.message : '导出测试用例失败');
-    } finally {
-      setExportingSelectedMessages(false);
-      stopGlobalLoading();
-    }
-  }, [browserChatApiUrl, exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, selectedExportMessageIds, session?.id]);
-
-  const exportMessageToTestCase = useCallback(async (messageId: string) => {
-    const sessionId = session?.id;
-    if (!sessionId || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
-    setExportingMessageId(messageId);
-    setError('');
-    try {
-      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/export`), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messageId }),
-      });
-      const data = await readApiJson<Record<string, unknown>>(response, '导出测试用例失败');
-      if (typeof data.testCaseId === 'string') openTargetCaseDetail(data.testCaseId);
-    } catch (exportError) {
-      setError(exportError instanceof Error ? exportError.message : '导出测试用例失败');
-    } finally {
-      setExportingMessageId(null);
-    }
-  }, [browserChatApiUrl, exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, openTargetCaseDetail, session?.id]);
-
-  const generateSelectedMessagesSkill = useCallback(async () => {
-    const sessionId = session?.id;
-    if (!sessionId || !selectedExportMessageIds.length || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
-    const messageIds = selectedExportMessageIds;
-    setGeneratingSkillSelectedMessages(true);
-    setError('');
-    startGlobalLoading('正在生成 Skill');
-    try {
-      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/skills`), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messageIds }),
-      });
-      await readApiJson<Record<string, unknown>>(response, '生成 Skill 失败');
-      setSelectedExportMessageIds([]);
-      await loadSkills();
-    } catch (skillError) {
-      setError(skillError instanceof Error ? skillError.message : '生成 Skill 失败');
-    } finally {
-      setGeneratingSkillSelectedMessages(false);
-      stopGlobalLoading();
-    }
-  }, [browserChatApiUrl, exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, selectedExportMessageIds, session?.id]);
-
   const generateMessageSkill = useCallback(async (messageId: string) => {
     const sessionId = session?.id;
-    if (!sessionId || exportingMessageId || exportingSelectedMessages || generatingSkillMessageId || generatingSkillSelectedMessages) return;
+    if (!sessionId || generatingSkillMessageId) return;
     setGeneratingSkillMessageId(messageId);
     setError('');
     startGlobalLoading('正在生成 Skill');
@@ -7248,7 +7124,7 @@ export function BrowserChatWorkspace({
       setGeneratingSkillMessageId(null);
       stopGlobalLoading();
     }
-  }, [browserChatApiUrl, exportingMessageId, exportingSelectedMessages, generatingSkillMessageId, generatingSkillSelectedMessages, loadSkills, session?.id]);
+  }, [browserChatApiUrl, generatingSkillMessageId, loadSkills, session?.id]);
 
   async function startNewConversation() {
     if (loadingSessionId) return;
@@ -7496,30 +7372,20 @@ export function BrowserChatWorkspace({
       {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages ? (
         <BrowserChatMessageList
           availableSkills={skills}
-          exportingMessageId={exportingMessageId}
-          exportingSelectedMessages={exportingSelectedMessages}
           generatingSkillMessageId={generatingSkillMessageId}
-          generatingSkillSelectedMessages={generatingSkillSelectedMessages}
           lastAssistantMessageId={lastAssistantMessageId}
           logIndex={logIndex}
           messages={visibleMessages}
-          onBulkExportMessages={exportSelectedMessagesToTestCase}
-          onBulkGenerateSkillMessages={generateSelectedMessagesSkill}
-          onClearExportSelection={clearExportMessageSelection}
-          onExportMessage={exportMessageToTestCase}
           onGenerateSkill={generateMessageSkill}
           onPreviewImage={previewAttachment}
           onResolveToolConfirmation={resolveToolConfirmation}
           onResumeHumanVerification={resumeHumanVerification}
           onSelectTool={setToolDialog}
           onShowLogs={showMessageLogs}
-          onToggleExportSelection={toggleExportMessageSelection}
           pendingToolConfirmation={session?.pendingToolConfirmation}
           resolvingConfirmationAction={resolvingConfirmationAction}
           resolvingConfirmationId={resolvingConfirmationId}
           resumingHumanVerification={resumingHumanVerification}
-          selectedExportMessageIdSet={selectedExportMessageIdSet}
-          selectedExportMessageIds={selectedExportMessageIds}
           sessionId={session?.id}
           sessionBusy={selectedSessionRunning}
           stepsByIndex={stepsByIndex}
@@ -7684,30 +7550,20 @@ export function BrowserChatWorkspace({
             {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages ? (
               <BrowserChatMessageList
                 availableSkills={skills}
-                exportingMessageId={exportingMessageId}
-                exportingSelectedMessages={exportingSelectedMessages}
                 generatingSkillMessageId={generatingSkillMessageId}
-                generatingSkillSelectedMessages={generatingSkillSelectedMessages}
                 lastAssistantMessageId={lastAssistantMessageId}
                 logIndex={logIndex}
                 messages={visibleMessages}
-                onBulkExportMessages={exportSelectedMessagesToTestCase}
-                onBulkGenerateSkillMessages={generateSelectedMessagesSkill}
-                onClearExportSelection={clearExportMessageSelection}
-                onExportMessage={exportMessageToTestCase}
                 onGenerateSkill={generateMessageSkill}
                 onPreviewImage={previewAttachment}
                 onResolveToolConfirmation={resolveToolConfirmation}
                 onResumeHumanVerification={resumeHumanVerification}
                 onSelectTool={setToolDialog}
                 onShowLogs={showMessageLogs}
-                onToggleExportSelection={toggleExportMessageSelection}
                 pendingToolConfirmation={session?.pendingToolConfirmation}
                 resolvingConfirmationAction={resolvingConfirmationAction}
                 resolvingConfirmationId={resolvingConfirmationId}
                 resumingHumanVerification={resumingHumanVerification}
-                selectedExportMessageIdSet={selectedExportMessageIdSet}
-                selectedExportMessageIds={selectedExportMessageIds}
                 sessionId={session?.id}
                 sessionBusy={selectedSessionRunning}
                 stepsByIndex={stepsByIndex}

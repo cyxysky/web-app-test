@@ -5,7 +5,7 @@ import {
   modelProviderDefinitions,
   runtimeEnvDefinitions,
 } from '@/config/settings';
-import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/test-case.schema';
+import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
 
 function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
@@ -42,11 +42,14 @@ export function readRuntimeSettingsItems() {
   const savedByKey = new Map(store.listRuntimeEnv().map((item) => [item.key, item]));
   return runtimeEnvDefinitions.map((definition) => {
     const saved = savedByKey.get(definition.key);
+    const secret = saved?.secret ?? Boolean(definition.secret);
+    const value = saved?.value ?? definition.defaultValue;
     return {
       key: definition.key,
-      value: saved?.value ?? definition.defaultValue,
+      value: secret ? '' : value,
+      hasValue: secret ? Boolean(value) : undefined,
       enabled: true,
-      secret: saved?.secret ?? Boolean(definition.secret),
+      secret,
       updatedAt: saved?.updatedAt,
     };
   });
@@ -54,11 +57,21 @@ export function readRuntimeSettingsItems() {
 
 export function readModelSettingsState() {
   const saved = store.getModelConfig();
+  const providers = completeProviders(saved?.providers);
+  for (const provider of Object.keys(providers) as ModelProvider[]) {
+    const current = providers[provider];
+    if (!current) continue;
+    providers[provider] = {
+      ...current,
+      apiKey: '',
+      hasApiKey: Boolean(current.apiKey),
+    };
+  }
   return {
     saved: Boolean(saved),
     config: {
       provider: saved?.provider || 'openrouter',
-      providers: completeProviders(saved?.providers),
+      providers,
       updatedAt: saved?.updatedAt || '',
     },
   };

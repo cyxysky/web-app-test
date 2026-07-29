@@ -5,7 +5,7 @@ import {
   modelProviderDefinition,
   modelProviderDefinitions,
 } from '@/config/settings';
-import type { ModelConfigRecord, ModelProvider } from '@/server/ai/schemas/test-case.schema';
+import type { ModelConfigRecord, ModelProvider } from '@/server/ai/schemas/runtime.schema';
 
 export type RuntimeModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
 

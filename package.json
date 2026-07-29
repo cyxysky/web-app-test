@@ -47,7 +47,6 @@
     "@dnd-kit/utilities": "^3.2.2",
     "@openrouter/ai-sdk-provider": "^2.9.0",
     "@tanstack/react-virtual": "^3.14.3",
-    "@tinymce/tinymce-react": "^6.3.0",
     "ai": "^6.0.193",
     "ai-sdk-provider-codex-cli": "^1.2.1",
     "animejs": "^4.5.0",
@@ -63,7 +62,6 @@
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
     "sharp": "^0.34.5",
-    "tinymce": "^8.5.1",
     "xlsx": "^0.18.5",
     "zod": "^4.4.3"
   },
@@ -98,10 +96,6 @@
       {
         "from": "dist-desktop/server",
         "to": "server"
-      },
-      {
-        "from": "dist-desktop/tinymce",
-        "to": "tinymce"
       },
       {
         "from": "assets/app-icon.png",

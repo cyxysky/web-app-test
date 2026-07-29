@@ -25,9 +25,6 @@ const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'PRE', 'CODE', 'KBD', 'SAMP', 'TEX
 const SKIP_SELECTORS = [
   '[data-i18n-skip]',
   '.browser-chat-agent-markdown',
-  '.markdown-report',
-  '.rich-text-editor',
-  '.tox',
 ];
 
 type I18nContextValue = {

@@ -164,11 +164,6 @@ function serverDirectory() {
   return process.cwd();
 }
 
-function tinymceRoot() {
-  if (app.isPackaged) return path.join(process.resourcesPath, 'tinymce');
-  return path.join(process.cwd(), 'node_modules', 'tinymce');
-}
-
 function appIconPath() {
   const fileName = process.platform === 'win32' ? 'app-icon.ico' : 'app-icon.png';
   if (app.isPackaged) return path.join(process.resourcesPath, fileName);
@@ -2639,7 +2634,6 @@ async function startServer(appDataDir) {
     NODE_PATH: app.isPackaged ? path.join(serverDir, 'node_modules') : process.env.NODE_PATH,
     NODE_ENV: 'production',
     PORT: String(port),
-    TINYMCE_ROOT: tinymceRoot(),
     WEBPILOT_ELECTRON_CDP_PORT: String(EMBEDDED_BROWSER_CDP_PORT),
     WEBPILOT_INTERNAL_SHUTDOWN_TOKEN: serverShutdownToken,
   };
@@ -2677,7 +2671,7 @@ async function startServer(appDataDir) {
   const url = `http://127.0.0.1:${port}`;
   localServerUrl = url;
   await waitForHttp(`${url}/dashboard`, 60_000, 3);
-  await waitForHttp(`${url}/api/test-cases`, 30_000, 2);
+  await waitForHttp(`${url}/api/browser-chat?userId=0`, 30_000, 2);
   return url;
 }
 

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import http from 'node:http';
 import type { Socket } from 'node:net';
 
-export type RefreshEntityType = 'run' | 'browserChatSession';
+export type RefreshEntityType = 'browserChatSession';
 
 export type RefreshWebSocketEvent = {
   type: 'refresh';

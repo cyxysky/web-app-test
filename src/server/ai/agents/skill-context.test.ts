@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/test-case.schema';
+import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/runtime.schema';
 import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl, skillMatchesUrl } from './skill-context';
 
 const skill: SkillRecord = {

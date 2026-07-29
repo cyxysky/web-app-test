@@ -3,11 +3,12 @@ import { readFile } from 'node:fs/promises';
 import { generateText, hasToolCall, tool, type ModelMessage } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
-import type { AiRequestSnapshot, AiToolContextSnapshot, RecordedFlowStep, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/test-case.schema';
+import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode, type ScreenshotCaptureMode } from '@/server/browser/browser-session';
 import { analyzeBrowserCodeRisk, type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
+import { browserInteractToolDescription, browserInteractToolShape } from './browser-input-tool-schema';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { aiSdkFinishMessage, aiSdkFinishState } from './ai-sdk-finish-state';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
@@ -17,7 +18,7 @@ import {
   normalizeBrowserChatFileReadLimit,
 } from './browser-chat-file-read';
 import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
-import { browserChatCodeRules } from './runtime-prompt-rules';
+import { browserChatCodeRules, browserChatDomRules } from './runtime-prompt-rules';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
@@ -145,6 +146,31 @@ const codexRuntimeObjectSchema = z.object({
     confirmationMessage: z.string().nullable().optional(),
     code: z.string().nullable().optional(),
     maxOutputChars: z.number().nullable().optional(),
+    target: z.enum(['current', 'new']).nullable().optional(),
+    ms: z.number().nullable().optional(),
+    index: z.number().nullable().optional(),
+    mode: z.enum(['full', 'text', 'changes']).nullable().optional(),
+    cursor: z.string().nullable().optional(),
+    query: z.string().nullable().optional(),
+    tag: z.string().nullable().optional(),
+    roles: z.array(z.string()).nullable().optional(),
+    uid: z.string().nullable().optional(),
+    x_thousandth: z.number().nullable().optional(),
+    y_thousandth: z.number().nullable().optional(),
+    toUid: z.string().nullable().optional(),
+    toX_thousandth: z.number().nullable().optional(),
+    toY_thousandth: z.number().nullable().optional(),
+    button: z.enum(['left', 'right', 'middle']).nullable().optional(),
+    clickCount: z.number().nullable().optional(),
+    deltaX: z.number().nullable().optional(),
+    deltaY: z.number().nullable().optional(),
+    credentialRef: z.string().nullable().optional(),
+    key: z.string().nullable().optional(),
+    keys: z.array(z.string()).nullable().optional(),
+    replace: z.boolean().nullable().optional(),
+    followByEnter: z.boolean().nullable().optional(),
+    value: z.string().nullable().optional(),
+    label: z.string().nullable().optional(),
   }).describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason.'),
 });
 type CodexRuntimeObject = z.infer<typeof codexRuntimeObjectSchema>;
@@ -158,15 +184,6 @@ function modelSupportsScreenshotInput() {
   const model = configuredModel.toLowerCase();
   return provider !== 'deepseek' && !model.startsWith('deepseek');
 }
-
-function browserModeFromEnv(): BrowserSessionMode {
-  return 'dom';
-}
-
-function browserModeOf(): BrowserSessionMode {
-  return browserModeFromEnv();
-}
-
 
 function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
   if (!aiRequest?.id) return undefined;
@@ -547,7 +564,7 @@ function throwIfStopped(signal?: AbortSignal, shouldContinue?: () => boolean) {
 // 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
 function generateTextTimeoutMs(options: Parameters<typeof generateText>[0]) {
   void options;
-  const raw = Number(process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
+  const raw = Number(process.env.AI_REQUEST_TIMEOUT_MS || 30000);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 30000;
 }
 
@@ -1269,6 +1286,8 @@ async function executeTracedBrowserAction(input: {
 
 function makeBrowserTools(
   session: BrowserSession,
+  targetUrl: string,
+  mode: BrowserSessionMode,
   traces: ToolTrace[],
   aiRequest?: AiRequestSnapshot,
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>,
@@ -1377,7 +1396,11 @@ function makeBrowserTools(
     });
   }
 
+  const credentialBindings = () => referenceOptions?.getCredentialBindings?.() || referenceOptions?.credentialBindings || [];
+  const credentialBinding = (ref?: string) => credentialBindings().find((item) => item.ref === ref);
+
   const sharedTools = {
+    ...(mode === 'code' ? {
     browserCode: tool({
       description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the primary browser inspection, screenshot, and operation entrypoint. Every result automatically includes a fresh full semantic DOM snapshot, page-console delta, and code-console output. Use top-level await, nodeRepl.write(value) for JSON, and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. When the prompt supplies a credential reference, credentialVault.fill(locator, ref) securely fills the real Playwright locator without returning the raw value. Locator actions have a 3000ms default timeout and navigation has a 30000ms default timeout; force: true and scripted DOM clicks are forbidden, and a failed operation ends only the current cell and preserves kernel bindings.',
       inputSchema: browserToolInput({
@@ -1406,6 +1429,114 @@ function makeBrowserTools(
         uid: input.uid,
         abortSignal,
       })),
+    }),
+    } : {
+      ...(modelSupportsScreenshotInput() ? {
+        takeScreenshot: tool({
+          description: 'Capture the current browser as explicit visual evidence. Only a viewport screenshot may authorize a later coordinate interaction; fullPage is read-only.',
+          inputSchema: browserToolInput({
+            capture: z.enum(['viewport', 'fullPage']).optional(),
+          }),
+          execute: (input) => record('takeScreenshot', input, async () => {
+            const path = await session.takeScreenshot(
+              referenceOptions?.runId || 'browser-chat',
+              referenceOptions?.stepIndex || 0,
+              'manual',
+              { capture: input.capture },
+            );
+            return { ok: true, actual: `Captured ${input.capture || 'viewport'} screenshot.`, referenceImagePath: path };
+          }),
+        }),
+      } : {}),
+      browser: tool({
+        description: 'Navigate and manage tabs. open navigates, wait waits for a known transition, listTabs returns current tabs, and switchTab activates an index returned by listTabs.',
+        inputSchema: browserToolInput({
+          action: z.enum(['open', 'wait', 'listTabs', 'switchTab']),
+          url: z.string().optional(),
+          target: z.enum(['current', 'new']).optional(),
+          ms: z.number().int().nonnegative().optional(),
+          index: z.number().int().nonnegative().optional(),
+        }).superRefine((input, context) => {
+          if (input.action === 'switchTab' && typeof input.index !== 'number') {
+            context.addIssue({ code: z.ZodIssueCode.custom, message: 'switchTab requires index.' });
+          }
+        }),
+        execute: (input) => record('browser', input, () => {
+          if (input.action === 'wait') return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
+          if (input.action === 'listTabs') return session.listTabs();
+          if (input.action === 'switchTab') return session.switchTab(input.index || 0);
+          const url = input.url || targetUrl;
+          return input.target === 'new' ? session.openInNewTab(url) : session.open(url);
+        }),
+      }),
+      interact: tool({
+        description: browserInteractToolDescription,
+        inputSchema: browserToolInput(browserInteractToolShape),
+        execute: (input) => record('interact', input, async (abortSignal) => {
+          if (['click', 'move', 'drag', 'scroll', 'scrollIntoView'].includes(input.action)) {
+            return session.mouse({
+              action: input.action as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
+              abortSignal,
+              uid: input.uid,
+              xThousandth: input.x_thousandth,
+              yThousandth: input.y_thousandth,
+              toUid: input.toUid,
+              toXThousandth: input.toX_thousandth,
+              toYThousandth: input.toY_thousandth,
+              button: input.button,
+              clickCount: input.clickCount,
+              deltaX: input.deltaX,
+              deltaY: input.deltaY,
+            });
+          }
+          if (input.action === 'selectOption') {
+            return session.selectOption({ uid: input.uid || '', value: input.value, label: input.label });
+          }
+          const binding = credentialBinding(input.credentialRef);
+          if (input.credentialRef && (!binding || input.action !== 'type' || !input.uid)) {
+            return { ok: false, actual: 'Credential entry requires a valid runtime reference and a current field UID.' };
+          }
+          return session.keyboard({
+            action: input.action as 'type' | 'press' | 'shortcut',
+            uid: input.uid,
+            xThousandth: input.x_thousandth,
+            yThousandth: input.y_thousandth,
+            text: binding ? binding.value : input.text,
+            key: input.key,
+            keys: input.keys,
+            replace: input.replace,
+            followByEnter: input.followByEnter,
+            allowedOrigins: binding?.allowedOrigins,
+          });
+        }),
+      }),
+      inspect: tool({
+        description: 'Read the current semantic DOM baseline, query that frozen baseline, or inspect recent HTTP requests. Use capture mode=full before choosing a UID.',
+        inputSchema: browserToolInput({
+          action: z.enum(['capture', 'search', 'httpRequests']).default('capture'),
+          cursor: z.string().min(1).optional(),
+          mode: z.enum(['full', 'text', 'changes']).default('full'),
+          query: z.string().min(1).max(500).optional(),
+          tag: z.string().min(1).max(80).optional(),
+          roles: z.array(z.string().min(1)).max(20).optional(),
+          limit: z.number().int().min(1).max(100).optional(),
+          ids: z.array(z.string().min(1)).min(1).max(20).optional(),
+        }).superRefine((input, context) => {
+          if (input.action === 'search' && !input.query && !input.tag) {
+            context.addIssue({ code: z.ZodIssueCode.custom, message: 'search requires query or tag.' });
+          }
+        }),
+        execute: (input) => record('inspect', input, async () => {
+          if (input.action === 'httpRequests') return session.getCurrentTabHttpRequests({ ids: input.ids });
+          if (input.action === 'search') return session.searchSnapshot(input);
+          const snapshot = await session.readDomObservationSnapshot({ cursor: input.cursor, mode: input.mode });
+          return {
+            ok: true,
+            actual: [snapshot.pageSummary, snapshot.content].filter(Boolean).join('\n'),
+            nextCursor: snapshot.nextCursor,
+          };
+        }),
+      }),
     }),
     waitForHumanVerification: tool({
       description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever live page evidence shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
@@ -1521,6 +1652,7 @@ function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
 
 function runtimePrompt(input: {
   runtimeRecord: BrowserChatRuntimeRecord;
+  mode: BrowserSessionMode;
   operationalContext?: string;
 }) {
   const { runtimeRecord } = input;
@@ -1533,13 +1665,15 @@ function runtimePrompt(input: {
     '',
     'Operating rules:',
     '- In one model step, either answer in Chinese Markdown without a tool or call at most one relevant tool. A new action request is a new occurrence even when its wording repeats an earlier request.',
-    '- Keep tool input limited to the exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Inspect the live page in browserCode before acting; do not reuse old UIDs, coordinates, screenshots, or prior tool JSON as current evidence.',
+    `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Inspect the live page with ${input.mode === 'code' ? 'browserCode' : 'inspect'} before acting; do not reuse stale UIDs, coordinates, screenshots, or prior tool JSON.`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
-    ...browserChatCodeRules(screenshotAvailable),
+    ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
     '- Only for multi-document requirement analysis, inspect/search the root links, spawn one parallel subagent batch for independent URLs, keep dependent end-to-end work in the main Agent, and read one completed child result per later model step.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
-    '- For downloads, call downloadFile with the already-known absolute or page-relative URL. For Markdown export, call generateMarkdownFile with the complete content. Report the saved file name and return its clickable download link.',
+    input.mode === 'code'
+      ? '- For downloads, call downloadFile with the known URL. For Markdown export, call generateMarkdownFile with the complete content.'
+      : '- Use file action="download" for known URLs, action="writeMarkdown" for Markdown output, and action="read" for registered files.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     input.operationalContext
       ? `Relevant memory and secure capabilities supplied by the runtime:\n${input.operationalContext}`
@@ -1551,10 +1685,11 @@ function runtimePrompt(input: {
 }
 
 function runtimeToolNames(mode: BrowserSessionMode) {
-  void mode;
+  const operationTools = mode === 'code'
+    ? ['browserCode', 'clickByUid']
+    : ['takeScreenshot', 'browser', 'interact', 'inspect'];
   return [
-    'browserCode',
-    'clickByUid',
+    ...operationTools,
     'waitForHumanVerification',
     'spawnSubagents',
     'readSubagent',
@@ -1568,6 +1703,10 @@ function runtimeToolNames(mode: BrowserSessionMode) {
 const browserSessionToolNames = new Set([
   'browserCode',
   'clickByUid',
+  'takeScreenshot',
+  'browser',
+  'interact',
+  'inspect',
   'waitForHumanVerification',
   'spawnSubagents',
 ]);
@@ -1934,6 +2073,7 @@ function progressFieldsFromToolTraces(
 
 async function executeRuntimeStep(input: {
   session: BrowserSession;
+  mode: BrowserSessionMode;
   runtimeRecord: BrowserChatRuntimeRecord;
   runId: string;
   stepIndex: number;
@@ -1967,7 +2107,7 @@ async function executeRuntimeStep(input: {
     onDebug,
     onToolTrace,
   } = input;
-  const mode = browserModeOf();
+  const mode = input.mode;
   const screenshotInputEnabled = false;
   const markerEnabled = false;
   const ensureActive = () => throwIfStopped(abortSignal, input.shouldContinue);
@@ -2004,6 +2144,7 @@ async function executeRuntimeStep(input: {
     : '';
   const prompt = `${runtimePrompt({
     runtimeRecord,
+    mode,
     operationalContext: input.operationalContext,
   })}${userReferenceImagePrompt}`;
   let activeOperationalContext = input.operationalContext || '';
@@ -2065,7 +2206,9 @@ async function executeRuntimeStep(input: {
       findings: [],
       blockers: [],
       pageUnderstanding: '',
-      currentState: 'No page state is preloaded; use browserCode when browser evidence is needed.',
+      currentState: mode === 'code'
+        ? 'No page state is preloaded; use browserCode when browser evidence is needed.'
+        : 'No page state is preloaded; use inspect action=capture mode=full when browser evidence is needed.',
       scrollSummary: '',
       userConstraints: systemPromptOf(runtimeRecord) ? [systemPromptOf(runtimeRecord)] : [],
       nextStep: 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.',
@@ -2238,7 +2381,7 @@ async function executeRuntimeStep(input: {
           });
         }
       }
-      const refreshedPrompt = `${runtimePrompt({ runtimeRecord, operationalContext: activeOperationalContext })}${userReferenceImagePrompt}`;
+      const refreshedPrompt = `${runtimePrompt({ runtimeRecord, mode, operationalContext: activeOperationalContext })}${userReferenceImagePrompt}`;
       requestSystemPrompt = codexMode ? buildCodexObjectPrompt(refreshedPrompt, allowedToolTypes) : refreshedPrompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = contextWindowTokens();
@@ -2420,7 +2563,7 @@ async function executeRuntimeStep(input: {
     }
 
     const stopWhen = [hasToolCall('reportState'), hasToolCall('waitForHumanVerification')];
-    nativeToolsRef.current = makeBrowserTools(session, traces, aiRequest, async (trace) => {
+    nativeToolsRef.current = makeBrowserTools(session, runtimeRecord.targetUrl, mode, traces, aiRequest, async (trace) => {
       ensureActive();
       upsertToolTrace(durableTraces, trace);
       workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
@@ -2711,7 +2854,7 @@ export async function executeInteractiveBrowserTurn(input: {
     targetUrl: input.targetUrl,
     instruction: input.instruction,
   });
-  const runtimeMode = browserModeOf();
+  const runtimeMode = input.mode === 'dom' ? 'dom' : 'code';
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
@@ -2726,12 +2869,14 @@ export async function executeInteractiveBrowserTurn(input: {
       });
       return undefined;
     }
-    if (runtimeMode === 'dom' && !browserChatDomScreenshotsEnabled()) {
+    if (runtimeMode === 'code' || !browserChatDomScreenshotsEnabled()) {
       await input.onDebug?.({
         phase: `browser:screenshot:${phase}:skipped`,
         stepIndex,
-        message: `Skipped automatic ${phase} screenshot; explicit browserCode image evidence remains authoritative.`,
-        details: { browserMode: runtimeMode, enabledBy: 'BROWSER_CHAT_DOM_SCREENSHOTS=true' },
+        message: runtimeMode === 'code'
+          ? `Skipped automatic ${phase} screenshot; browserCode emits visual evidence explicitly.`
+          : `Skipped automatic ${phase} screenshot; DOM mode captures screenshots only when requested.`,
+        details: { browserMode: runtimeMode, enabledBy: runtimeMode === 'dom' ? 'BROWSER_CHAT_DOM_SCREENSHOTS=true' : 'browserCode' },
       });
       return undefined;
     }
@@ -2781,6 +2926,7 @@ export async function executeInteractiveBrowserTurn(input: {
     try {
       actionResult = await executeRuntimeStep({
         session: input.session,
+        mode: runtimeMode,
         runtimeRecord,
         runId: input.runId,
         stepIndex,
@@ -3106,7 +3252,7 @@ function flowInput(input: unknown) {
 
 async function runRecordedTool(
   session: BrowserSession,
-  flow: RecordedFlowStep,
+  flow: BrowserOperationRecord,
   runId?: string,
   abortSignal?: AbortSignal,
   credentialBindings?: BrowserCodeCredentialBinding[],
@@ -3205,7 +3351,7 @@ async function executeCodexRuntimeObject(input: {
   let normalizedParams = { ...params };
   if (type === 'browserCode') normalizedParams = browserCodeInputWithRisk(normalizedParams, Boolean(requestToolConfirmation));
   if (type === 'readFile') normalizedParams.limit = normalizeBrowserChatFileReadLimit(normalizedParams.limit);
-  const flow: RecordedFlowStep = {
+  const flow: BrowserOperationRecord = {
     index: stepIndex,
     name: type,
     input: normalizedParams,

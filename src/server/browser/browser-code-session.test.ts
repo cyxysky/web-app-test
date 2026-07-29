@@ -251,8 +251,7 @@ test('live preview supports drag and does not drive the AI cursor', async (conte
   assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 0, 'user live-preview drag must not create the AI cursor');
 });
 
-test('force close releases a browser even when the debug keep-open flag is enabled', async () => {
-  const previousKeepOpen = process.env.KEEP_BROWSER_OPEN_AFTER_RUN;
+test('force close releases the browser', async () => {
   const session = new BrowserSession('dom', {
     headless: true,
     isolated: true,
@@ -261,12 +260,9 @@ test('force close releases a browser even when the debug keep-open flag is enabl
   try {
     await session.start();
     assert.equal(session.isUsable(), true);
-    process.env.KEEP_BROWSER_OPEN_AFTER_RUN = 'true';
     await session.close({ force: true });
     assert.equal(session.isUsable(), false);
   } finally {
-    if (previousKeepOpen === undefined) delete process.env.KEEP_BROWSER_OPEN_AFTER_RUN;
-    else process.env.KEEP_BROWSER_OPEN_AFTER_RUN = previousKeepOpen;
     await session.close({ force: true }).catch(() => undefined);
   }
 });

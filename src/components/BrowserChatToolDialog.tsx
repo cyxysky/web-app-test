@@ -5,7 +5,7 @@ import { BrowserChatPayloadDetails } from '@/components/BrowserChatPayloadDetail
 import { formatToolPayload } from '@/components/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
 import { artifactApiUrl } from '@/lib/artifacts';
-import type { StepExecutionResult } from '@/server/ai/schemas/test-case.schema';
+import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
 

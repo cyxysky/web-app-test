@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { generateText } from 'ai';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import type { StepExecutionResult } from '@/server/ai/schemas/test-case.schema';
+import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { readPersonalMemoryRecords, replacePersonalMemoryRecords } from '@/server/storage/sqlite-record-store';
 
 export type PersonalMemoryScope = 'global' | 'domain';
@@ -107,7 +107,7 @@ function personalMemoryExtractionInputLimit() {
 }
 
 function personalMemoryExtractionTimeoutMs() {
-  const raw = Number(process.env.AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS || process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000);
+  const raw = Number(process.env.AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || 30000);
   return Number.isFinite(raw) ? Math.min(Math.max(Math.floor(raw), 1000), 120000) : 30000;
 }
 

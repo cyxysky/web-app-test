@@ -9,7 +9,7 @@ import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
-import type { SkillRecord } from '@/server/ai/schemas/test-case.schema';
+import type { SkillRecord } from '@/server/ai/schemas/runtime.schema';
 
 type SkillDraft = {
   title: string;
@@ -392,7 +392,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
             <header className="ui-modal-header">
               <div className="ui-modal-heading">
                 <h2 className="ui-modal-title" id="skills-manager-modal-title">{editorMode === 'edit' ? t('编辑 Skill') : t('新建 Skill')}</h2>
-                <p className="ui-modal-subtitle">{editorMode === 'edit' ? editingSkillId : t('保存后即可在对话和测试用例中使用')}</p>
+                <p className="ui-modal-subtitle">{editorMode === 'edit' ? editingSkillId : t('保存后即可在对话中使用')}</p>
               </div>
               <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" onClick={closeEditorModal} type="button">
                 <X size={16} />
@@ -481,7 +481,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                 <Trash2 size={20} />
               </div>
               <h3>{deleteTarget.title}</h3>
-              <p>{t('确定删除这个 Skill 吗？已加载它的测试用例会自动移除引用。')}</p>
+              <p>{t('确定删除这个 Skill 吗？')}</p>
             </div>
             <footer className="ui-modal-footer">
               <button className="ui-button ui-button--neutral" disabled={Boolean(deletingSkillId)} onClick={closeDeleteModal} type="button">

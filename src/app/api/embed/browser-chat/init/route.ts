@@ -1,6 +1,5 @@
 import { NextRequest } from 'next/server';
 import { getBrowserChatSession, listBrowserChatSessions } from '@/server/ai/agents/browser-chat.service';
-import { startScheduler } from '@/server/ai/agents/test-runner.service';
 import { store } from '@/server/db/store';
 import { joinWebPilotUrl } from '@/lib/webpilot-base-path';
 import { selectEmbeddedBrowserChatSessionId } from '@/server/embed/browser-chat-init';
@@ -27,7 +26,6 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json().catch(() => ({}));
     store.applyRuntimeEnv();
-    startScheduler();
 
     const userId = requestUserId(request, body);
     const requestedSessionId = normalizeString(body.sessionId);
@@ -66,7 +64,7 @@ export async function POST(request: NextRequest) {
       userId,
       token: embedAuth?.token,
       expiresAt: embedAuth?.expiresAt,
-      mode: session?.mode || 'dom',
+      mode: session?.mode || (process.env.AI_BROWSER_MODE === 'dom' ? 'dom' : 'code'),
       safetyMode: session?.safetyMode || normalizeSafetyMode(body.safetyMode),
       mountId: normalizeString(body.mountId) || normalizeString(body.containerId) || undefined,
     });

@@ -101,7 +101,7 @@ function stringifyDiagnosticValue(value: unknown) {
   }
 }
 
-export type BrowserSessionMode = 'dom';
+export type BrowserSessionMode = 'code' | 'dom';
 
 export type BrowserSessionOptions = {
   browserSurface?: BrowserSessionSurface;
@@ -136,7 +136,7 @@ export type AccessibilitySnapshotExportControlResult = {
  * @returns 鉴定模式
  */
 function browserSessionModeFromEnv(): BrowserSessionMode {
-  return 'dom';
+  return process.env.AI_BROWSER_MODE?.trim().toLowerCase() === 'dom' ? 'dom' : 'code';
 }
 
 export type BrowserSnapshotView = 'actionable' | 'full' | 'text' | 'changes';
@@ -6073,7 +6073,14 @@ export class BrowserSession {
     const pageConsole = this.pageConsoleEntries
       .filter((entry) => entry.sequence > pageConsoleSequenceBefore)
       .slice(-100)
-      .map(({ sequence, ...entry }) => entry);
+      .map((entry) => ({
+        level: entry.level,
+        text: entry.text,
+        timestamp: entry.timestamp,
+        url: entry.url,
+        lineNumber: entry.lineNumber,
+        columnNumber: entry.columnNumber,
+      }));
     const emittedImagePaths: string[] = [];
     const emittedImageErrors: string[] = [];
     if (execution.images?.length) {
@@ -6161,7 +6168,6 @@ export class BrowserSession {
   async close(options: { keepOpen?: boolean; force?: boolean } = {}) {
     const shouldKeepOpen = !options.force && (
       options.keepOpen === true
-      || process.env.KEEP_BROWSER_OPEN_AFTER_RUN === 'true'
     );
     await this.browserCodeKernel?.close();
     this.browserCodeKernel = undefined;

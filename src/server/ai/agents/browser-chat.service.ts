@@ -13,7 +13,7 @@ import {
   type InteractiveBrowserTurnMessage,
   type InteractiveBrowserTurnResult,
 } from '@/server/ai/agents/browser-chat-executor.agent';
-import { generateSkillFromRun } from '@/server/ai/agents/skill-generator.agent';
+import { generateSkillFromBrowserHistory } from '@/server/ai/agents/skill-generator.agent';
 import { browserChatAttachmentMetadata, isBrowserChatImageAttachment, readBrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachment-reader';
 import { browserChatFirstMessageTitle } from '@/server/ai/agents/browser-chat-message-title';
 import {
@@ -40,7 +40,7 @@ import {
   searchPersonalMemory,
 } from '@/server/ai/personal-memory';
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
-import type { ModelProvider, RecordedFlowStep, SkillRecord, StepExecutionResult, TestCaseContent, TestCaseRecord, TestRunRecord } from '@/server/ai/schemas/test-case.schema';
+import type { ModelProvider, SkillRecord, StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import {
@@ -593,16 +593,6 @@ function exportedTargetUrl(session: BrowserChatSessionRecord, steps: StepExecuti
   ]);
 }
 
-function exportedRecordedToolInput(toolName: string, input: unknown, targetUrl: string) {
-  if (!/^openPage$/i.test(toolName) && !(toolName === 'page' && flowInputRecord(input).action === 'open')) return input;
-  const url = exportableTargetUrl(inputUrl(input));
-  if (url) return input;
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return targetUrl ? { url: targetUrl } : input;
-  const rest = { ...(input as Record<string, unknown>) };
-  delete rest.url;
-  return targetUrl ? { ...rest, url: targetUrl } : rest;
-}
-
 function textFromUnknown(value: unknown): string {
   if (typeof value === 'string') return value;
   if (value === undefined || value === null) return '';
@@ -781,48 +771,11 @@ type BrowserChatCredentialDescriptor = {
   passwordRef: string;
 };
 
-function browserChatResourceUrls(text: string) {
-  const matches = text.match(/https?:\/\/[^\s<>"'\]\[(){}，。；、]+/gi) || [];
-  return Array.from(new Set(matches.map((value) => value.replace(/[),.;!?]+$/g, '')))).slice(0, 40);
-}
-
 function browserChatResourceKind(title: string, url?: string): BrowserChatResourceSeed['kind'] {
   const value = `${title}\n${url || ''}`.toLowerCase();
   if (value.includes('axure') || value.includes('axshare.com') || /\/start\.html(?:$|[?#])/i.test(value)) return 'axure';
   if (/\.(?:png|jpe?g|gif|webp|bmp|svg)(?:$|[?#])/i.test(value)) return 'image';
   return url ? 'url' : 'other';
-}
-
-function browserChatResourceSeeds(session: BrowserChatSessionRecord, latestModelText = '', currentUrl = '') {
-  const seeds: BrowserChatResourceSeed[] = [];
-  const add = (seed: BrowserChatResourceSeed) => {
-    const key = `${seed.kind}\u0000${seed.url || seed.title}`.toLowerCase();
-    if (seeds.some((item) => `${item.kind}\u0000${item.url || item.title}`.toLowerCase() === key)) return;
-    seeds.push(seed);
-  };
-  for (const url of browserChatResourceUrls(latestModelText)) {
-    add({ kind: browserChatResourceKind(url, url), title: url, url });
-  }
-  if (currentUrl) add({ kind: browserChatResourceKind(currentUrl, currentUrl), title: '当前页面', url: currentUrl });
-  if (session.targetUrl) {
-    add({ kind: browserChatResourceKind(session.targetUrl, session.targetUrl), title: '目标地址', url: session.targetUrl });
-  }
-  for (const message of session.messages) {
-    for (const url of browserChatResourceUrls(textFromUnknown(message.content))) {
-      add({ kind: browserChatResourceKind(url, url), title: url, url });
-    }
-    for (const attachment of message.attachments || []) {
-      const url = attachment.kind === 'tab' ? attachment.sourceUrl || attachment.url : attachment.url || undefined;
-      add({
-        kind: attachment.kind === 'tab'
-          ? browserChatResourceKind(attachment.name, url) === 'axure' ? 'axure' : 'tab'
-          : attachment.kind || browserChatResourceKind(attachment.name, url),
-        title: attachment.name,
-        url,
-      });
-    }
-  }
-  return seeds.slice(0, 80);
 }
 
 function httpOrigin(value?: string) {
@@ -1117,19 +1070,7 @@ function safeJson(value: unknown) {
   }
 }
 
-function testOperationFromToolName(name?: string, input?: unknown): NonNullable<TestCaseContent['steps'][number]['operation']> {
-  if (name === 'page') return flowInputRecord(input).action === 'wait' ? 'wait' : 'open';
-  if (/open|url|navigate/i.test(name || '')) return 'open';
-  if (/click|hover|drag/i.test(name || '')) return 'click';
-  if (/type|fill|input/i.test(name || '')) return 'fill';
-  if (/press|key/i.test(name || '')) return 'press';
-  if (/select/i.test(name || '')) return 'select';
-  if (/wait/i.test(name || '')) return 'wait';
-  if (/screenshot/i.test(name || '')) return 'screenshot';
-  return 'assert';
-}
-
-type CompletedRunStatus = Extract<TestRunRecord['status'], 'passed' | 'failed' | 'blocked'>;
+type CompletedRunStatus = 'passed' | 'failed' | 'blocked';
 
 function statusFromSteps(steps: StepExecutionResult[]): CompletedRunStatus {
   if (steps.some((step) => step.status === 'blocked')) return 'blocked';
@@ -1496,18 +1437,20 @@ function readSessionLogRecords(sessionId: string) {
 function readSessionSnapshot(sessionId: string) {
   const item = readBrowserChatSessionRecord<BrowserChatSessionSnapshot>(sessionId);
   if (!isBrowserChatSessionSnapshot(item)) return undefined;
-  return { ...item, logs: trimBrowserChatLogs(readSessionLogRecords(sessionId)) };
+  return { ...item, logs: trimBrowserChatLogs(item.logs || []) };
 }
 
 function writeSessionSnapshot(item: BrowserChatSessionSnapshot, options: { mergePersisted?: boolean } = {}) {
-  const logs = options.mergePersisted === false
-    ? item.logs
-    : mergePersistedLogs(readSessionLogRecords(item.id), item.logs);
+  const logs = options.mergePersisted === true
+    ? mergePersistedLogs(readSessionLogRecords(item.id), item.logs)
+    : item.logs;
   const storedLogs = logs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(logs) : logs;
-  const durableSnapshot = { ...item, logs: [] };
+  const durableSnapshot = { ...item, messages: [], steps: [], logs: [] };
   writeBrowserChatSessionRecord(
     durableSnapshot,
     summaryFromSnapshot({ ...item, logs: trimBrowserChatLogs(storedLogs) }),
+    item.messages,
+    item.steps,
     storedLogs,
   );
 }
@@ -1700,12 +1643,11 @@ function persistSession(sessionId: string, options: { mergePersisted?: boolean }
       deleteSessionSnapshot(sessionId);
       return true;
     }
-    const persistedSnapshot = options.mergePersisted === false ? undefined : readSessionSnapshot(sessionId);
-    const writtenSnapshot = options.mergePersisted === false
-      ? incoming
-      : mergePersistedSessionSnapshot(persistedSnapshot, incoming);
+    const shouldMergePersisted = options.mergePersisted === true;
+    const persistedSnapshot = shouldMergePersisted ? readSessionSnapshot(sessionId) : undefined;
+    const writtenSnapshot = shouldMergePersisted ? mergePersistedSessionSnapshot(persistedSnapshot, incoming) : incoming;
     writeSessionSnapshot(writtenSnapshot, { mergePersisted: options.mergePersisted });
-    if (options.mergePersisted !== false) applyPersistedSnapshotToRuntime(writtenSnapshot);
+    if (shouldMergePersisted) applyPersistedSnapshotToRuntime(writtenSnapshot);
     return true;
   } catch (error) {
     warnPersistFailure(error);
@@ -1824,7 +1766,7 @@ async function ensureConversationContextWithinThreshold(
   });
   const startedAt = Date.now();
   try {
-    const timeoutMs = Math.max(1000, Number(process.env.AI_BROWSER_CHAT_CONTEXT_TIMEOUT_MS || process.env.AI_TEST_REQUEST_TIMEOUT_MS || 30000));
+    const timeoutMs = Math.max(1000, Number(process.env.AI_BROWSER_CHAT_CONTEXT_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || 30000));
     const timeoutController = new AbortController();
     const timer = setTimeout(() => timeoutController.abort(new Error(`AI conversation context summary timed out after ${timeoutMs}ms`)), timeoutMs);
     const combinedSignal = abortSignal ? AbortSignal.any([abortSignal, timeoutController.signal]) : timeoutController.signal;
@@ -2019,7 +1961,9 @@ export function createBrowserChatSession(input: {
     userId: normalizeUserId(input.userId),
     browserGroupId: '',
     targetUrl: exportableTargetUrl(input.targetUrl || ''),
-    mode: 'dom',
+    mode: input.mode === 'dom' || input.mode === 'code'
+      ? input.mode
+      : process.env.AI_BROWSER_MODE?.trim().toLowerCase() === 'dom' ? 'dom' : 'code',
     safetyMode: normalizeSafetyMode(input.safetyMode),
     modelProvider: modelSettings.provider,
     model: modelSettings.model,
@@ -2273,205 +2217,6 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
   return { deleted, requested: uniqueIds.length };
 }
 
-type BrowserChatStepToolCall = NonNullable<StepExecutionResult['tools']>[number];
-
-function isRecoveredTransientStepTool(tool: BrowserChatStepToolCall | undefined) {
-  return tool?.recovered === true && tool.transient === true;
-}
-
-function firstPersistentStepTool(step: StepExecutionResult) {
-  return step.tools?.find((tool) => !isRecoveredTransientStepTool(tool));
-}
-
-export function exportBrowserChatMessageToTestCase(sessionId: string, messageId: string, userId?: string | number) {
-  const session = hydrateSession(sessionId);
-  if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
-  const messageIndex = session.messages.findIndex((message) => message.id === messageId && message.role === 'assistant');
-  if (messageIndex < 0) throw new Error('Browser chat assistant message not found');
-  const message = session.messages[messageIndex];
-  const previousUser = [...session.messages.slice(0, messageIndex)].reverse().find((item) => item.role === 'user');
-  const selectedStepIndexes = new Set(message.stepIndexes || []);
-  const selectedSteps = session.steps
-    .filter((step) => selectedStepIndexes.size ? selectedStepIndexes.has(step.index) : step.index > 0)
-    .map((step) => ({ ...step, status: step.status === 'running' ? 'passed' : step.status }))
-    .sort((a, b) => a.index - b.index);
-  if (!selectedSteps.length) throw new Error('No executed browser steps found for this message');
-  const targetUrl = exportedTargetUrl(session, selectedSteps);
-
-  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).flatMap((tool, toolIndex) => (
-    isRecoveredTransientStepTool(tool) ? [] : [{
-    index: 0,
-    name: tool.name,
-    input: exportedRecordedToolInput(tool.name, tool.input, targetUrl),
-    reason: tool.reason,
-    sourceStepIndex: step.index,
-    sourceStepAction: step.action,
-    sourceStepExpected: step.expected,
-    sourceToolIndex: toolIndex + 1,
-  }]))).map((flow, index) => ({ ...flow, index: index + 1 }));
-
-  const titleSeed = previousUser?.content || message.content || '浏览器对话导出用例';
-  const content: TestCaseContent = {
-    title: `对话导出 - ${compactText(titleSeed, 36)}`,
-    description: [
-      previousUser ? `用户消息：${previousUser.content}` : '',
-      `AI 输出：${message.content}`,
-    ].filter(Boolean).join('\n\n'),
-    targetUrl,
-    priority: 'medium',
-    browserMode: session.mode,
-    isMarked: true,
-    userRequirement: previousUser?.content || message.content,
-    systemPrompt: '该用例由浏览器对话导出，已包含对话中 AI 实际执行过的步骤记录。',
-    preconditions: ['已根据浏览器对话完成过一次执行，导出时同步创建一条已完成运行记录。'],
-    testData: {},
-    steps: selectedSteps.map((step, index) => {
-      const firstTool = firstPersistentStepTool(step);
-      return {
-        index: index + 1,
-        operation: testOperationFromToolName(firstTool?.name, firstTool?.input),
-        action: compactText(step.action || firstTool?.name || `执行步骤 ${step.index}`, 240),
-        input: firstTool?.input ? safeJson(firstTool.input) : undefined,
-        expected: compactText(step.expected || step.actual || '该步骤应按对话中的已执行结果完成。', 320),
-        riskLevel: step.status === 'failed' ? 'warning' : 'safe',
-      };
-    }),
-    expectedResults: [message.content || '复现对话中 AI 已完成的浏览器操作。'],
-    risks: session.networkErrors.length || session.consoleErrors.length
-      ? ['原对话执行过程中存在控制台或网络诊断记录，复跑时需要关注稳定性。']
-      : [],
-    recordedFlow: recordedFlow.length ? recordedFlow : undefined,
-  };
-
-  const testCase = store.createTestCase(content, []);
-  const run = store.createRun(testCase.id);
-  const finishedAt = now();
-  const status = statusFromSteps(selectedSteps);
-  const completedRun = store.updateRun(run.id, {
-    status,
-    startedAt: message.createdAt || session.createdAt,
-    endedAt: finishedAt,
-    result: {
-      steps: selectedSteps,
-      consoleErrors: session.consoleErrors,
-      networkErrors: session.networkErrors,
-      taskFrame: selectedSteps.at(-1)?.taskFrame,
-      ledgerItems: selectedSteps.flatMap((step) => step.ledgerItems || []),
-    },
-  }) || run;
-  store.updateTestCaseStatus(testCase.id, status === 'passed' ? 'passed' : status);
-  return { testCase: store.getTestCase(testCase.id) || testCase, run: completedRun };
-}
-
-export function exportBrowserChatMessagesToTestCase(sessionId: string, messageIds: string[], userId?: string | number) {
-  const session = hydrateSession(sessionId);
-  if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
-  const uniqueMessageIds = Array.from(new Set(messageIds.map((item) => item.trim()).filter(Boolean)));
-  if (!uniqueMessageIds.length) throw new Error('请选择要导出的对话轮次');
-
-  const selectedIdSet = new Set(uniqueMessageIds);
-  const selectedMessages = session.messages
-    .map((message, index) => ({ message, index }))
-    .filter((item) => selectedIdSet.has(item.message.id) && item.message.role === 'assistant');
-  if (!selectedMessages.length) throw new Error('请选择可导出的 AI 回复消息');
-
-  const selectedStepIndexSet = new Set<number>();
-  for (const { message } of selectedMessages) {
-    for (const stepIndex of message.stepIndexes || []) selectedStepIndexSet.add(stepIndex);
-  }
-
-  const rawSteps = session.steps
-    .filter((step) => selectedStepIndexSet.size ? selectedStepIndexSet.has(step.index) : step.index > 0)
-    .map((step) => ({ ...step, status: step.status === 'running' ? 'passed' : step.status }))
-    .sort((a, b) => a.index - b.index);
-  if (!rawSteps.length) throw new Error('选中的对话轮次没有可导出的执行步骤');
-
-  const selectedSteps = rawSteps.map((step, index): StepExecutionResult => ({
-    ...step,
-    index: index + 1,
-  }));
-  const targetUrl = exportedTargetUrl(session, selectedSteps);
-  const recordedFlow: RecordedFlowStep[] = selectedSteps.flatMap((step) => (step.tools || []).flatMap((tool, toolIndex) => (
-    isRecoveredTransientStepTool(tool) ? [] : [{
-    index: 0,
-    name: tool.name,
-    input: exportedRecordedToolInput(tool.name, tool.input, targetUrl),
-    reason: tool.reason,
-    sourceStepIndex: step.index,
-    sourceStepAction: step.action,
-    sourceStepExpected: step.expected,
-    sourceToolIndex: toolIndex + 1,
-  }]))).map((flow, index) => ({ ...flow, index: index + 1 }));
-
-  const turnDescriptions = selectedMessages.map(({ message, index }, turnIndex) => {
-    const previousUser = [...session.messages.slice(0, index)].reverse().find((item) => item.role === 'user');
-    return [
-      `轮次 ${turnIndex + 1}`,
-      previousUser?.content ? `用户消息：${previousUser.content}` : '',
-      message.content ? `AI 输出：${message.content}` : '',
-    ].filter(Boolean).join('\n');
-  });
-  const selectedUserGoals = Array.from(new Set(selectedMessages
-    .map(({ index }) => [...session.messages.slice(0, index)].reverse().find((item) => item.role === 'user')?.content?.trim())
-    .filter((item): item is string => Boolean(item))));
-  const firstSelected = selectedMessages[0];
-  const firstPreviousUser = firstSelected
-    ? [...session.messages.slice(0, firstSelected.index)].reverse().find((item) => item.role === 'user')
-    : undefined;
-  const titleSeed = firstPreviousUser?.content || firstSelected?.message.content || session.title || '浏览器对话导出用例';
-  const expectedResults = selectedMessages
-    .map((item) => item.message.content)
-    .filter((item): item is string => Boolean(item?.trim()))
-    .map((item) => compactText(item, 420));
-  const content: TestCaseContent = {
-    title: `对话导出 - ${compactText(titleSeed, 36)}`,
-    description: turnDescriptions.join('\n\n'),
-    targetUrl,
-    priority: 'medium',
-    browserMode: session.mode,
-    isMarked: true,
-    userRequirement: selectedUserGoals.join('\n') || titleSeed,
-    systemPrompt: '该用例由浏览器对话中的多轮消息导出，已包含所选轮次中 AI 实际执行过的步骤记录。',
-    preconditions: ['已根据所选浏览器对话轮次完成过执行，导出时同步创建一条已完成运行记录。'],
-    testData: {},
-    steps: selectedSteps.map((step, index) => {
-      const firstTool = firstPersistentStepTool(step);
-      return {
-        index: index + 1,
-        operation: testOperationFromToolName(firstTool?.name),
-        action: compactText(step.action || firstTool?.name || `执行步骤 ${step.index}`, 240),
-        input: firstTool?.input ? safeJson(firstTool.input) : undefined,
-        expected: compactText(step.expected || step.actual || '该步骤应按对话中的已执行结果完成。', 320),
-        riskLevel: step.status === 'failed' ? 'warning' : 'safe',
-      };
-    }),
-    expectedResults: expectedResults.length ? expectedResults : ['复现选中对话轮次中 AI 已完成的浏览器操作。'],
-    risks: session.networkErrors.length || session.consoleErrors.length
-      ? ['原对话执行过程中存在控制台或网络诊断记录，复跑时需要关注稳定性。']
-      : [],
-    recordedFlow: recordedFlow.length ? recordedFlow : undefined,
-  };
-
-  const testCase = store.createTestCase(content, []);
-  const run = store.createRun(testCase.id);
-  const finishedAt = now();
-  const status = statusFromSteps(selectedSteps);
-  const completedRun = store.updateRun(run.id, {
-    status,
-    startedAt: selectedMessages[0]?.message.createdAt || session.createdAt,
-    endedAt: finishedAt,
-    result: {
-      steps: selectedSteps,
-      consoleErrors: session.consoleErrors,
-      networkErrors: session.networkErrors,
-      taskFrame: selectedSteps.at(-1)?.taskFrame,
-      ledgerItems: selectedSteps.flatMap((step) => step.ledgerItems || []),
-    },
-  }) || run;
-  store.updateTestCaseStatus(testCase.id, status === 'passed' ? 'passed' : status);
-  return { testCase: store.getTestCase(testCase.id) || testCase, run: completedRun, exportedMessageIds: uniqueMessageIds };
-}
-
 export async function generateBrowserChatMessagesSkill(sessionId: string, messageIds: string[], userId?: string | number) {
   const session = hydrateSession(sessionId);
   if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
@@ -2514,72 +2259,17 @@ export async function generateBrowserChatMessagesSkill(sessionId: string, messag
     ? [...session.messages.slice(0, firstSelected.index)].reverse().find((item) => item.role === 'user')
     : undefined;
   const titleSeed = firstPreviousUser?.content || firstSelected?.message.content || session.title || '浏览器对话 Skill';
-  const timestamp = now();
-  const content: TestCaseContent = {
-    title: `对话 Skill - ${compactText(titleSeed, 36)}`,
-    description: turnDescriptions.join('\n\n'),
-    targetUrl,
-    priority: 'medium',
+  const generated = await generateSkillFromBrowserHistory({
     browserMode: session.mode,
-    isMarked: true,
-    userRequirement: turnDescriptions.join('\n\n') || titleSeed,
-    systemPrompt: '该上下文由浏览器对话生成，用于提炼可复用 Skill，不会创建测试用例。',
-    preconditions: ['已在浏览器对话中完成过相关操作，Skill 只保留可复用的操作经验。'],
-    testData: {},
-    steps: selectedSteps.map((step, index) => {
-      const firstTool = firstPersistentStepTool(step);
-      return {
-        index: index + 1,
-        operation: testOperationFromToolName(firstTool?.name),
-        action: compactText(step.action || firstTool?.name || `执行步骤 ${step.index}`, 240),
-        input: firstTool?.input ? safeJson(firstTool.input) : undefined,
-        expected: compactText(step.expected || step.actual || '该步骤应按对话中的已执行结果完成。', 320),
-        riskLevel: step.status === 'failed' ? 'warning' : 'safe',
-      };
-    }),
-    expectedResults: selectedMessages
-      .map((item) => item.message.content)
-      .filter((item): item is string => Boolean(item?.trim()))
-      .map((item) => compactText(item, 420)),
-    risks: session.networkErrors.length || session.consoleErrors.length
-      ? ['原对话执行过程中存在控制台或网络诊断记录，复用时需要关注稳定性。']
-      : [],
-  };
-  const syntheticTestCase: TestCaseRecord = {
-    id: `chat_case_${session.id}`,
-    title: content.title,
-    description: content.description,
-    targetUrl,
-    status: 'generated',
-    priority: content.priority,
-    content,
-    imageNames: [],
-    createdAt: session.createdAt,
-    updatedAt: timestamp,
-  };
-  const syntheticRun: TestRunRecord = {
-    id: `chat_run_${session.id}`,
-    testCaseId: syntheticTestCase.id,
+    consoleErrors: session.consoleErrors,
+    goal: turnDescriptions.join('\n\n') || titleSeed,
+    networkErrors: session.networkErrors,
+    sourceId: session.id,
     status: statusFromSteps(selectedSteps),
-    startedAt: selectedMessages[0]?.message.createdAt || session.createdAt,
-    endedAt: timestamp,
-    createdAt: session.createdAt,
-    result: {
-      steps: selectedSteps,
-      consoleErrors: session.consoleErrors,
-      networkErrors: session.networkErrors,
-      taskFrame: selectedSteps.at(-1)?.taskFrame,
-      ledgerItems: selectedSteps.flatMap((step) => step.ledgerItems || []),
-    },
-    report: {
-      title: content.title,
-      summary: content.description || titleSeed,
-      markdown: turnDescriptions.join('\n\n'),
-      suggestions: [],
-    },
-  };
-
-  const generated = await generateSkillFromRun({ run: syntheticRun, testCase: syntheticTestCase });
+    steps: selectedSteps,
+    targetUrl,
+    title: `对话 Skill - ${compactText(titleSeed, 36)}`,
+  });
   const skill = store.upsertSkill({
     title: generated.title,
     description: generated.description,
@@ -2827,7 +2517,7 @@ function warnPersistFailure(error: unknown) {
 
 function runningAssistantActivity(step: StepExecutionResult, timestamp: string) {
   const latestTool = step.tools?.at(-1);
-  if (latestTool && isRecoveredTransientStepTool(latestTool)) {
+  if (latestTool?.recovered === true && latestTool.transient === true) {
     return { phase: 'tool:recovered', label: `工具目标已刷新：${latestTool.name}`, updatedAt: timestamp };
   }
   if (step.status === 'failed' && latestTool?.ok !== false) {
@@ -3262,7 +2952,9 @@ async function executeBrowserChatSubagentBatch(input: {
             ? '无头浏览器已经复制主会话当前的 Cookie、localStorage 和 IndexedDB 登录态。请先直接访问目标地址验证登录态，不要重新登录。'
             : '主会话当前没有可复制的浏览器登录态；如果目标页面要求登录，请明确返回登录阻塞，不要猜测页面内容。',
           '你运行在无头浏览器中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要等待用户操作隐藏页面；请明确报告阻塞证据并把该步骤交回主 Agent。',
-          '浏览器检查与操作统一使用 browserCode，在一个受限程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。',
+          session.mode === 'code'
+            ? '浏览器检查与操作统一使用 browserCode，在一个受限程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。'
+            : '浏览器检查与操作使用 inspect 获取当前结构化页面状态，再使用 browser/interact 完成动作；只操作 inspect 返回的可见、可交互节点。',
           '只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容尚未加载时才滚动；不要把滚动当作默认页面读取方式。',
           summaryGuidanceChars
             ? `完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。配置建议将篇幅控制在约 ${summaryGuidanceChars} 个字符以内，但这不是截断上限；如果完整证据需要更长内容，必须完整返回。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。`

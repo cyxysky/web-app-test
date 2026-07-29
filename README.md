@@ -1,8 +1,8 @@
 # Web App Test
 
-AI-driven web testing workspace built with Next.js, AI SDK, and Playwright.
+AI browser workspace built with Next.js, AI SDK, and Playwright.
 
-The project is focused on test execution, exploratory coverage, replay, evidence capture, and final test reports. Browser automation is treated as the execution mechanism, not the product goal.
+The project is focused on persistent browser conversations, live browser control, reusable domain skills, personal memory, credentials, and observable Agent execution.
 
 ## Run
 
@@ -22,9 +22,7 @@ AI_MODEL=deepseek-v4-flash
 ```
 
 You can override `AI_PROVIDER`, `AI_MODEL`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` in `.env.local`. For the internal TLS forwarding endpoint, keep the hostname and configure `DEEPSEEK_BASE_URL=https://api.deepseek.com:8802` after mapping `api.deepseek.com` to the forwarding IP in the local hosts file.
-If the model call fails, generation falls back to a local structured test case and records the failure reason in the test case risks.
-
-Browser execution accepts `http` and `https` target URLs by default. Set `ALLOWED_TEST_DOMAINS=localhost,127.0.0.1,example.com` to restrict runs to a domain allowlist.
+Browser execution accepts `http` and `https` target URLs. Configure its operation mode, browser connection, safety policy, and runtime limits on the settings page.
 
 ## Embed behind one Nginx path
 
@@ -132,11 +130,10 @@ Minimal management API:
 - `PATCH /api/personal-memory/{id}`
 - `DELETE /api/personal-memory/{id}`
 
-Each test case can choose a browser operation mode:
+New browser conversations use the operation mode saved in Settings:
 
-- `Default configuration` keeps compatibility with `isClick` / `AI_BROWSER_MODE`.
-- `DOM interaction` uses textual interactive candidates and the simplified DOM tree.
-- `Visual markers` sends one viewport screenshot with numbered marker labels overlaid by default.
+- `Code mode` executes restricted Playwright code and can fall back to stable DOM node ids.
+- `DOM mode` uses structured inspect and interact tools over visible, actionable DOM nodes.
 
 ## Reuse an Existing Browser
 
@@ -154,11 +151,7 @@ BROWSER_CDP_ENDPOINT=http://127.0.0.1:9222
 
 You can also set `BROWSER_USER_DATA_DIR` to let Playwright launch a persistent browser profile when a CDP endpoint is not configured.
 
-Replay uses `REPLAY_STEP_DELAY_MS` between recorded actions by default, so fixed flows wait for page transitions instead of firing every operation immediately. If a recorded flow reaches CAPTCHA, login verification, or another user-side security check, the run pauses and waits for the user to click “执行完毕” before continuing.
-
-When a recorded operation fails, `REPLAY_AI_REPAIR=true` lets the AI inspect the current page, choose a replacement operation, record the failed replay action as an issue, and continue the remaining replay flow after the repair succeeds.
-
-During AI execution, `getHttpRequests` is available as a read-only diagnostic tool for the current tab. The agent can use it to verify API status codes, failed requests, and missing resource evidence before recording a network-related issue. Issues and risks in the final report include the reason and a screenshot from the source step when available.
+During Agent execution, `getHttpRequests` is available as a read-only diagnostic tool for the current tab. The Agent can use it to verify API status codes, failed requests, and missing-resource evidence before deciding the next browser action.
 
 ## Package and Run with Docker
 
@@ -175,11 +168,11 @@ Then open `http://localhost:3000`.
 
 The compose setup keeps runtime data outside the image:
 
-- `.data/webpilot.db` is the SQLite source of truth for model/runtime settings, test cases, runs, browser-chat sessions, personal memory, and Electron workspace state.
-- `artifacts/` keeps screenshots, traces, uploads, reports, and other large generated files outside the database.
+- `.data/webpilot.db` is the SQLite source of truth for model/runtime settings, browser conversations, skills, personal memory, credentials metadata, and Electron workspace state.
+- `artifacts/` keeps screenshots, traces, uploads, and other large generated files outside the database.
 - Chromium profiles and caches remain managed by Chromium in their native file layout.
 
-For unattended packaged regression runs, keep `HEADLESS_BROWSER=true`. For account-based exploratory testing or manual verification, prefer a visible or CDP-connected browser.
+For unattended browser tasks, keep `HEADLESS_BROWSER=true`. For account-based interaction or manual verification, prefer a visible or CDP-connected browser.
 
 ## Package a standalone HTTP server for Windows
 

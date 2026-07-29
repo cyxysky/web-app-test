@@ -1,4 +1,4 @@
-import type { StepExecutionResult } from '@/server/ai/schemas/test-case.schema';
+import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 
 type BrowserChatStepOwnerMessage = {
   id: string;

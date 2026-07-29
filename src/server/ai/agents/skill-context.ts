@@ -1,4 +1,4 @@
-import type { SkillRecord, TestCaseRecord } from '@/server/ai/schemas/test-case.schema';
+import type { SkillRecord } from '@/server/ai/schemas/runtime.schema';
 
 function compactText(value: string, max = 900) {
   const text = value.replace(/\s+/g, ' ').trim();
@@ -87,19 +87,4 @@ export function formatSkillsForPrompt(skills: SkillRecord[]) {
       listBlock('Verification', skill.content.verification),
     ].filter(Boolean).join('\n')),
   ].join('\n');
-}
-
-export function withSkillContext(testCase: TestCaseRecord, skills: SkillRecord[]) {
-  const skillContext = formatSkillsForPrompt(skills);
-  if (!skillContext) return testCase;
-  return {
-    ...testCase,
-    content: {
-      ...testCase.content,
-      systemPrompt: [
-        testCase.content.systemPrompt,
-        skillContext,
-      ].filter(Boolean).join('\n\n'),
-    },
-  };
 }

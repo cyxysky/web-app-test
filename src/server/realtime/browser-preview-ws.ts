@@ -11,15 +11,25 @@ type BrowserPreviewWebSocketInfo = {
 
 type BrowserPreviewClient = {
   actionChain: Promise<void>;
-  attachGeneration: number;
   buffer: Buffer;
   frameBlocked: boolean;
-  pendingFrame?: unknown;
+  pendingFrame?: Buffer;
   pendingMove?: Extract<BrowserLiveInput, { kind: 'move' }>;
-  reattachTimer?: ReturnType<typeof setTimeout>;
   moveActive: boolean;
   sessionId: string;
   socket: Socket;
+  streamKey: string;
+  userId: string;
+};
+
+type BrowserPreviewStream = {
+  clients: Set<BrowserPreviewClient>;
+  generation: number;
+  key: string;
+  reattachTimer?: ReturnType<typeof setTimeout>;
+  sequence: number;
+  sessionId: string;
+  starting?: Promise<void>;
   stop?: () => Promise<void>;
   userId: string;
 };
@@ -31,9 +41,10 @@ type BrowserPreviewWebSocketState = {
   port?: number;
   server?: http.Server;
   starting?: Promise<BrowserPreviewWebSocketInfo>;
+  streams: Map<string, BrowserPreviewStream>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 8;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 9;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
@@ -43,8 +54,10 @@ function state() {
   if (!globalThis.__browserChatPreviewWebSocketState) {
     globalThis.__browserChatPreviewWebSocketState = {
       clients: new Set<BrowserPreviewClient>(),
+      streams: new Map<string, BrowserPreviewStream>(),
     };
   }
+  globalThis.__browserChatPreviewWebSocketState.streams ??= new Map<string, BrowserPreviewStream>();
   return globalThis.__browserChatPreviewWebSocketState;
 }
 
@@ -76,6 +89,22 @@ function encodeWebSocketText(payload: string) {
   return Buffer.concat([header, data]);
 }
 
+function encodeWebSocketBinary(payload: Buffer) {
+  if (payload.length < 126) return Buffer.concat([Buffer.from([0x82, payload.length]), payload]);
+  if (payload.length <= 0xffff) {
+    const header = Buffer.alloc(4);
+    header[0] = 0x82;
+    header[1] = 126;
+    header.writeUInt16BE(payload.length, 2);
+    return Buffer.concat([header, payload]);
+  }
+  const header = Buffer.alloc(10);
+  header[0] = 0x82;
+  header[1] = 127;
+  header.writeBigUInt64BE(BigInt(payload.length), 2);
+  return Buffer.concat([header, payload]);
+}
+
 function encodeControlFrame(opcode: number, payload = Buffer.alloc(0)) {
   return Buffer.concat([Buffer.from([0x80 | opcode, payload.length]), payload]);
 }
@@ -92,14 +121,11 @@ function sendToClient(client: BrowserPreviewClient, payload: unknown) {
 
 async function removeClient(client: BrowserPreviewClient) {
   state().clients.delete(client);
-  client.attachGeneration += 1;
   client.pendingFrame = undefined;
   client.pendingMove = undefined;
-  if (client.reattachTimer) clearTimeout(client.reattachTimer);
-  client.reattachTimer = undefined;
-  const stop = client.stop;
-  client.stop = undefined;
-  await stop?.().catch(() => undefined);
+  const stream = state().streams.get(client.streamKey);
+  stream?.clients.delete(client);
+  if (stream && stream.clients.size === 0) await stopStream(stream);
   client.socket.destroy();
 }
 
@@ -110,15 +136,37 @@ function flushPendingFrame(client: BrowserPreviewClient) {
   if (frame !== undefined) sendFrameToClient(client, frame);
 }
 
-function sendFrameToClient(client: BrowserPreviewClient, payload: unknown) {
+function sendFrameToClient(client: BrowserPreviewClient, payload: Buffer) {
   if (client.frameBlocked) {
     client.pendingFrame = payload;
     return;
   }
-  if (sendToClient(client, payload)) return;
+  try {
+    if (!client.socket.destroyed && client.socket.write(payload)) return;
+  } catch {
+    void removeClient(client);
+    return;
+  }
   client.frameBlocked = true;
   client.pendingFrame = undefined;
   client.socket.once('drain', () => flushPendingFrame(client));
+}
+
+function binaryFramePayload(frame: { data: string; [key: string]: unknown }, sequence: number) {
+  const image = Buffer.from(frame.data, 'base64');
+  const metadata = Buffer.from(JSON.stringify({ ...frame, data: undefined, sequence, type: 'frame' }), 'utf8');
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(metadata.length, 0);
+  return encodeWebSocketBinary(Buffer.concat([header, metadata, image]));
+}
+
+function broadcastText(stream: BrowserPreviewStream, payload: unknown) {
+  for (const client of [...stream.clients]) sendToClient(client, payload);
+}
+
+function broadcastFrame(stream: BrowserPreviewStream, frame: { data: string; [key: string]: unknown }) {
+  const payload = binaryFramePayload(frame, ++stream.sequence);
+  for (const client of [...stream.clients]) sendFrameToClient(client, payload);
 }
 
 function readLiveInput(value: unknown): BrowserLiveInput | undefined {
@@ -216,8 +264,11 @@ function handleClientMessage(client: BrowserPreviewClient, text: string) {
           error: result?.actual || 'Browser chat session not found',
         });
       } else if (input.kind === 'tab') {
-        sendToClient(client, { type: 'activeTabChanged', sessionId: client.sessionId });
-        await reattachScreencast(client);
+        const stream = state().streams.get(client.streamKey);
+        if (stream) {
+          broadcastText(stream, { type: 'activeTabChanged', sessionId: client.sessionId });
+          await restartStream(stream);
+        }
       }
     } catch (error) {
       sendToClient(client, {
@@ -297,64 +348,93 @@ function listen(server: http.Server, port: number): Promise<number> {
   });
 }
 
-async function attachScreencast(client: BrowserPreviewClient) {
-  const { sessionId, userId } = client;
+async function attachStream(stream: BrowserPreviewStream) {
+  if (stream.starting) return stream.starting;
+  if (stream.stop || stream.clients.size === 0) return;
+  const { sessionId, userId } = stream;
   if (!sessionId) {
-    sendToClient(client, { type: 'error', error: 'Missing browser chat sessionId' });
-    await removeClient(client);
+    broadcastText(stream, { type: 'error', error: 'Missing browser chat sessionId' });
     return;
   }
-  const generation = ++client.attachGeneration;
-  try {
-    const handle = await startBrowserChatScreencast(sessionId, userId, {
-      onActivePageChanged: () => {
-        if (client.socket.destroyed || generation !== client.attachGeneration) return;
-        sendToClient(client, { type: 'activeTabChanged', sessionId });
-        client.stop = undefined;
-        if (client.reattachTimer) clearTimeout(client.reattachTimer);
-        client.reattachTimer = setTimeout(() => {
-          client.reattachTimer = undefined;
-          if (!client.socket.destroyed && generation === client.attachGeneration) void attachScreencast(client);
-        }, 0);
-      },
-      onError: (error) => sendToClient(client, {
-        type: 'error',
-        error: error instanceof Error ? error.message : 'Browser screencast failed',
-      }),
-      onFrame: (frame) => {
-        sendFrameToClient(client, {
-          ...frame,
-          type: 'frame',
-        });
-      },
-    });
-    if (!handle) {
-      sendToClient(client, { type: 'unavailable', error: 'Browser chat session or its test browser is not available' });
-      return;
+  const generation = ++stream.generation;
+  stream.starting = (async () => {
+    try {
+      const handle = await startBrowserChatScreencast(sessionId, userId, {
+        onActivePageChanged: () => {
+          if (generation !== stream.generation || stream.clients.size === 0) return;
+          broadcastText(stream, { type: 'activeTabChanged', sessionId });
+          if (stream.reattachTimer) clearTimeout(stream.reattachTimer);
+          stream.reattachTimer = setTimeout(() => {
+            stream.reattachTimer = undefined;
+            if (generation === stream.generation && stream.clients.size > 0) void restartStream(stream);
+          }, 0);
+        },
+        onError: (error) => broadcastText(stream, {
+          type: 'error',
+          error: error instanceof Error ? error.message : 'Browser screencast failed',
+        }),
+        onFrame: (frame) => broadcastFrame(stream, frame),
+      });
+      if (!handle) {
+        broadcastText(stream, { type: 'unavailable', error: 'Browser chat session or its browser is not available' });
+        return;
+      }
+      if (generation !== stream.generation || stream.clients.size === 0) {
+        await handle.stop().catch(() => undefined);
+        return;
+      }
+      stream.stop = handle.stop;
+      broadcastText(stream, { type: 'ready', sessionId });
+    } catch (error) {
+      broadcastText(stream, {
+        type: 'unavailable',
+        error: error instanceof Error ? error.message : 'Failed to start browser screencast',
+      });
     }
-    if (client.socket.destroyed || generation !== client.attachGeneration) {
-      await handle.stop().catch(() => undefined);
-      return;
-    }
-    client.stop = handle.stop;
-    sendToClient(client, { type: 'ready', sessionId });
-  } catch (error) {
-    sendToClient(client, {
-      type: 'unavailable',
-      error: error instanceof Error ? error.message : 'Failed to start browser screencast',
-    });
-  }
+  })().finally(() => {
+    stream.starting = undefined;
+  });
+  return stream.starting;
 }
 
-async function reattachScreencast(client: BrowserPreviewClient) {
-  if (client.socket.destroyed) return;
-  client.attachGeneration += 1;
-  if (client.reattachTimer) clearTimeout(client.reattachTimer);
-  client.reattachTimer = undefined;
-  const stop = client.stop;
-  client.stop = undefined;
+async function restartStream(stream: BrowserPreviewStream) {
+  stream.generation += 1;
+  if (stream.reattachTimer) clearTimeout(stream.reattachTimer);
+  stream.reattachTimer = undefined;
+  await stream.starting?.catch(() => undefined);
+  const stop = stream.stop;
+  stream.stop = undefined;
   await stop?.().catch(() => undefined);
-  if (!client.socket.destroyed) await attachScreencast(client);
+  if (stream.clients.size > 0) await attachStream(stream);
+}
+
+async function stopStream(stream: BrowserPreviewStream) {
+  stream.generation += 1;
+  if (stream.reattachTimer) clearTimeout(stream.reattachTimer);
+  stream.reattachTimer = undefined;
+  await stream.starting?.catch(() => undefined);
+  const stop = stream.stop;
+  stream.stop = undefined;
+  await stop?.().catch(() => undefined);
+  if (state().streams.get(stream.key) === stream) state().streams.delete(stream.key);
+}
+
+function subscribeClient(client: BrowserPreviewClient) {
+  let stream = state().streams.get(client.streamKey);
+  if (!stream) {
+    stream = {
+      clients: new Set(),
+      generation: 0,
+      key: client.streamKey,
+      sequence: 0,
+      sessionId: client.sessionId,
+      userId: client.userId,
+    };
+    state().streams.set(client.streamKey, stream);
+  }
+  stream.clients.add(client);
+  if (stream.stop) sendToClient(client, { type: 'ready', sessionId: client.sessionId });
+  else void attachStream(stream);
 }
 
 function createBrowserPreviewServer() {
@@ -386,21 +466,22 @@ function createBrowserPreviewServer() {
 
     const client: BrowserPreviewClient = {
       actionChain: Promise.resolve(),
-      attachGeneration: 0,
       buffer: Buffer.alloc(0),
       frameBlocked: false,
       moveActive: false,
       sessionId: (url.searchParams.get('sessionId') || '').trim(),
       socket: netSocket,
+      streamKey: '',
       userId: (url.searchParams.get('userId') || url.searchParams.get('qzUserId') || '').trim(),
     };
+    client.streamKey = `${client.userId}\u0000${client.sessionId}`;
     state().clients.add(client);
     netSocket.setNoDelay(true);
     netSocket.on('data', (chunk) => handleClientData(client, chunk));
     netSocket.on('close', () => void removeClient(client));
     netSocket.on('error', () => void removeClient(client));
     sendToClient(client, { type: 'hello', connectedAt: new Date().toISOString() });
-    void attachScreencast(client);
+    subscribeClient(client);
   });
 
   return server;
@@ -410,6 +491,7 @@ async function closeOutdatedBrowserPreviewServer(current: BrowserPreviewWebSocke
   if (!current.server) return;
   const clients = [...current.clients];
   await Promise.all(clients.map((client) => removeClient(client)));
+  await Promise.all([...current.streams.values()].map((stream) => stopStream(stream)));
   if (current.heartbeat) clearInterval(current.heartbeat);
   current.heartbeat = undefined;
   const server = current.server;

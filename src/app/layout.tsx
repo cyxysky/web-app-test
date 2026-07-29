@@ -7,8 +7,8 @@ import { ThemeProvider } from '@/theme/ThemeProvider';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'WebPilot QA',
-  description: 'AI-assisted browser testing and evidence reporting.',
+  title: 'WebPilot',
+  description: 'Persistent AI browser conversations and live browser control.',
 };
 
 const themeBootScript = `

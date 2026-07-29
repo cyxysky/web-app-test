@@ -18,13 +18,14 @@ import { useI18n } from '@/i18n/I18nProvider';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { languageOptions } from '@/i18n/translations';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
-import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/test-case.schema';
+import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/runtime.schema';
 import { useTheme } from '@/theme/ThemeProvider';
 import { readApiJson } from '@/lib/api-client';
 import { LoginAccountModal, type LoginAccountMetadata } from '@/components/LoginAccountModal';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 export type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
+  hasValue?: boolean;
   updatedAt?: string;
 };
 
@@ -207,6 +208,7 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
       model,
       models,
       apiKey: current?.apiKey || '',
+      hasApiKey: Boolean(current?.hasApiKey || current?.apiKey),
       baseURL: current?.baseURL ?? definition.defaultBaseURL ?? '',
       updatedAt: current?.updatedAt,
     };
@@ -747,7 +749,7 @@ export function EnvironmentSettings({
       <input
         className="input settings-control"
         inputMode={definition?.control === 'number' ? 'decimal' : undefined}
-        placeholder={t('未设置')}
+        placeholder={item.hasValue ? t('已配置，留空表示不修改') : t('未设置')}
         type={definition?.control === 'number' ? 'number' : isSecret(item) ? 'password' : 'text'}
         value={item.value}
         onChange={(event) => update(index, { value: event.target.value })}
@@ -1248,8 +1250,12 @@ export function EnvironmentSettings({
                     disabled={Boolean(activeProviderOption.localAuth)}
                     type="password"
                     value={activeProviderSettings.apiKey || ''}
-                    onChange={(event) => updateActiveProviderSettings({ apiKey: event.target.value })}
-                    placeholder={activeProviderOption.localAuth ? t('本地登录，无需 Key') : t('填写该服务商的访问密钥')}
+                    onChange={(event) => updateActiveProviderSettings({ apiKey: event.target.value, hasApiKey: Boolean(event.target.value) || activeProviderSettings.hasApiKey })}
+                    placeholder={activeProviderOption.localAuth
+                      ? t('本地登录，无需 Key')
+                      : activeProviderSettings.hasApiKey
+                        ? t('已配置，留空表示不修改')
+                        : t('填写该服务商的访问密钥')}
                   />
                 </div>
                 {activeProviderOption.baseUrlLabel ? (

@@ -178,8 +178,7 @@ export function normalizeString(value: unknown) {
 }
 
 export function normalizeMode(value: unknown) {
-  void value;
-  return 'dom';
+  return value === 'dom' ? 'dom' : 'code';
 }
 
 export function normalizeSafetyMode(value: unknown) {

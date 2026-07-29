@@ -46,7 +46,7 @@ function copyPlaywrightChromium() {
 }
 
 function writeStartScript() {
-  const startScript = `@echo off\r\nsetlocal\r\n\r\nset "WEBPILOT_SERVER_ROOT=%~dp0"\r\nif not defined APP_DATA_DIR set "APP_DATA_DIR=%WEBPILOT_SERVER_ROOT%runtime"\r\nif not defined ARTIFACTS_DIR set "ARTIFACTS_DIR=%APP_DATA_DIR%\\artifacts"\r\nif not defined PLAYWRIGHT_BROWSERS_PATH set "PLAYWRIGHT_BROWSERS_PATH=%WEBPILOT_SERVER_ROOT%ms-playwright"\r\nif not defined TINYMCE_ROOT set "TINYMCE_ROOT=%WEBPILOT_SERVER_ROOT%tinymce"\r\nif not defined HOSTNAME set "HOSTNAME=0.0.0.0"\r\nif not defined PORT set "PORT=17890"\r\nif not defined NODE_ENV set "NODE_ENV=production"\r\nif not defined HEADLESS_BROWSER set "HEADLESS_BROWSER=true"\r\n\r\nif not exist "%APP_DATA_DIR%" mkdir "%APP_DATA_DIR%"\r\nif not exist "%ARTIFACTS_DIR%" mkdir "%ARTIFACTS_DIR%"\r\n\r\npushd "%WEBPILOT_SERVER_ROOT%server"\r\nnode server.js\r\nset "WEBPILOT_SERVER_EXIT_CODE=%ERRORLEVEL%"\r\npopd\r\nexit /b %WEBPILOT_SERVER_EXIT_CODE%\r\n`;
+  const startScript = `@echo off\r\nsetlocal\r\n\r\nset "WEBPILOT_SERVER_ROOT=%~dp0"\r\nif not defined APP_DATA_DIR set "APP_DATA_DIR=%WEBPILOT_SERVER_ROOT%runtime"\r\nif not defined ARTIFACTS_DIR set "ARTIFACTS_DIR=%APP_DATA_DIR%\\artifacts"\r\nif not defined PLAYWRIGHT_BROWSERS_PATH set "PLAYWRIGHT_BROWSERS_PATH=%WEBPILOT_SERVER_ROOT%ms-playwright"\r\nif not defined HOSTNAME set "HOSTNAME=0.0.0.0"\r\nif not defined PORT set "PORT=17890"\r\nif not defined NODE_ENV set "NODE_ENV=production"\r\nif not defined HEADLESS_BROWSER set "HEADLESS_BROWSER=true"\r\n\r\nif not exist "%APP_DATA_DIR%" mkdir "%APP_DATA_DIR%"\r\nif not exist "%ARTIFACTS_DIR%" mkdir "%ARTIFACTS_DIR%"\r\n\r\npushd "%WEBPILOT_SERVER_ROOT%server"\r\nnode server.js\r\nset "WEBPILOT_SERVER_EXIT_CODE=%ERRORLEVEL%"\r\npopd\r\nexit /b %WEBPILOT_SERVER_EXIT_CODE%\r\n`;
   fs.writeFileSync(path.join(distributionRoot, 'start.cmd'), startScript.replace('PORT=17890', 'PORT=3000'), 'utf8');
 }
 
@@ -89,7 +89,6 @@ fs.rmSync(outputRoot, { recursive: true, force: true });
 copyDir(path.join(root, '.next', 'standalone'), serverRoot);
 copyInto(path.join(root, '.next', 'static'), path.join(serverRoot, '.next', 'static'));
 copyInto(path.join(root, 'public'), path.join(serverRoot, 'public'));
-copyDir(path.join(root, 'node_modules', 'tinymce'), path.join(distributionRoot, 'tinymce'));
 copyPlaywrightChromium();
 
 if (!fs.existsSync(path.join(serverRoot, 'server.js'))) {
