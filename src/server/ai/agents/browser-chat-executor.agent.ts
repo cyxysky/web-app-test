@@ -381,11 +381,11 @@ function userFacingInfrastructureError(value?: string, context?: { error?: unkno
       '本轮操作已停止，当前页面状态已保留。',
     ].join('\n');
   }
-  if (providerToolSchemaError(text)) return 'AI 模型请求失败：当前模型网关不兼容本轮工具调用格式，已保留页面状态并准备继续。';
+  if (providerToolSchemaError(text)) return 'AI 模型请求失败：当前模型网关不兼容本轮工具调用格式。本轮操作已停止，当前页面状态已保留。';
   if (/Request aborted|operation interrupted/i.test(text)) return '本轮 AI 请求被中断，未继续写入技术错误。';
-  if (/timed out|timeout/i.test(text)) return 'AI 请求超时，已保留当前页面状态并准备继续。';
-  if (/No capacity available|rate limit/i.test(text)) return 'AI 服务暂时不可用，已保留当前页面状态并准备继续。';
-  return 'AI 请求或响应处理失败，已保留当前页面状态并准备继续。';
+  if (/timed out|timeout/i.test(text)) return 'AI 请求在请求级重试后仍然超时。本轮操作已停止，当前页面状态已保留。';
+  if (/No capacity available|rate limit/i.test(text)) return 'AI 服务在请求级重试后仍然不可用。本轮操作已停止，当前页面状态已保留。';
+  return 'AI 请求或响应处理在请求级重试后仍然失败。本轮操作已停止，当前页面状态已保留。';
 }
 
 function userFacingToolResult(name: string, result?: BrowserActionResult, _max = 360) {
@@ -823,12 +823,6 @@ function estimateTextTokens(text: string) {
 
 function imageTokenEstimatePerImage() {
   return Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
-}
-
-function isInfrastructureNoise(value?: string) {
-  if (!value) return false;
-  return /No capacity available|Request aborted|Active browser page has been closed|Execution context was destroyed|ECONNRESET|ETIMEDOUT|timeout|rate limit|model .*server|Failed after \d+ attempts/i.test(value)
-    || providerToolSchemaError(value);
 }
 
 function sanitizeHistoricalToolText(value: unknown, max = 180) {
@@ -2629,11 +2623,6 @@ export type InteractiveBrowserTurnResult = {
   networkErrors: string[];
 };
 
-function browserChatMaxConsecutiveAiRequestFailures() {
-  const raw = Number(process.env.AI_BROWSER_CHAT_MAX_CONSECUTIVE_REQUEST_FAILURES || 3);
-  return Math.max(1, Math.floor(Number.isFinite(raw) ? raw : 3));
-}
-
 function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
   if (mode === 'full') {
     return [
@@ -2713,8 +2702,6 @@ export async function executeInteractiveBrowserTurn(input: {
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
-  const maxConsecutiveAiRequestFailures = browserChatMaxConsecutiveAiRequestFailures();
-  let consecutiveAiRequestFailures = 0;
 
   async function takeStepScreenshot(phase: 'before' | 'after', stepIndex: number) {
     if (input.isBrowserStarted?.() === false) {
@@ -2818,47 +2805,10 @@ export async function executeInteractiveBrowserTurn(input: {
       ensureActive();
     } catch (error) {
       if (isBrowserChatAbortError(error, input.abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(input.abortSignal);
-      const errorText = infrastructureError(error);
-      const upstreamDisconnected = isUpstreamAiDisconnectError(error);
-      if (!upstreamDisconnected && !liveToolTraces.length && isInfrastructureNoise(errorText)) {
-        consecutiveAiRequestFailures += 1;
-        const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
-        if (runningIndex >= 0) steps.splice(runningIndex, 1);
-        await input.onDebug?.({
-          phase: 'chat:runtime:request-aborted',
-          stepIndex,
-          message: `Browser chat AI request failed before any browser tool executed: ${trimDebugText(errorText, 700)}`,
-          details: serializeError(error),
-        });
-        if (consecutiveAiRequestFailures > maxConsecutiveAiRequestFailures) {
-          ensureActive();
-          const errorStep = await createRecoverableRuntimeErrorStep({
-            session: input.session,
-            runId: input.runId,
-            stepIndex,
-            mode: runtimeMode,
-            beforeScreenshotPath,
-            error,
-            tools: [],
-            aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
-          });
-          ensureActive();
-          upsertStep(steps, errorStep);
-          newSteps.push(errorStep);
-          await input.onProgress?.(errorStep);
-          ensureActive();
-          finalStatus = 'failed';
-          reply = '';
-          endedWithFinalAnswer = true;
-          break;
-        }
-        finalStatus = 'passed';
-        reply = '';
-        continue;
-      }
+      const retryInfo = runtimeRetryFromError(error);
       ensureActive();
       const recoveredState = progressFieldsFromToolTraces(liveToolTraces, requirementOf(runtimeRecord), stepIndex, latestToolProgress);
-      const errorStep = await createRecoverableRuntimeErrorStep({
+      const errorStep = await createRuntimeErrorStep({
         session: input.session,
         runId: input.runId,
         stepIndex,
@@ -2875,7 +2825,7 @@ export async function executeInteractiveBrowserTurn(input: {
       await input.onProgress?.(errorStep);
       ensureActive();
       await input.onDebug?.({
-        phase: 'ai:runtime:recoverable-error',
+        phase: retryInfo ? 'ai:runtime:retry-exhausted' : 'ai:runtime:error',
         stepIndex,
         message: userFacingRecoverableRuntimeError(error),
         details: {
@@ -2883,21 +2833,16 @@ export async function executeInteractiveBrowserTurn(input: {
           screenshotPath: errorStep.screenshotPath,
           aiRequest: errorStep.aiRequest,
           tools: errorStep.tools,
-          upstreamDisconnected,
+          retryInfo,
         },
       });
-      if (upstreamDisconnected) {
-        finalStatus = 'failed';
-        reply = userFacingRecoverableRuntimeError(error);
-        endedWithFinalAnswer = true;
-        break;
-      }
-      reply = '';
-      continue;
+      finalStatus = 'failed';
+      reply = userFacingRecoverableRuntimeError(error);
+      endedWithFinalAnswer = true;
+      break;
     }
 
     ensureActive();
-    consecutiveAiRequestFailures = 0;
     const browserChatReply = textFromUnknown(actionResult.text).trim();
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
@@ -3078,10 +3023,6 @@ function infrastructureError(error: unknown) {
   return details ? `${message}\n${details}` : message;
 }
 
-function isUpstreamAiDisconnectError(error: unknown) {
-  return Boolean(upstreamApiDisconnectReason(infrastructureError(error)));
-}
-
 function userFacingRecoverableRuntimeError(error: unknown) {
   return userFacingInfrastructureError(infrastructureError(error), {
     error,
@@ -3107,7 +3048,7 @@ function serializeError(error: unknown) {
   };
 }
 
-async function createRecoverableRuntimeErrorStep(input: {
+async function createRuntimeErrorStep(input: {
   session: BrowserSession;
   runId: string;
   stepIndex: number;
@@ -3122,18 +3063,16 @@ async function createRecoverableRuntimeErrorStep(input: {
   const afterScreenshotPath = mode === 'dom'
     ? undefined
     : await session.takeScreenshot(runId, stepIndex, 'after').catch(() => undefined);
-  const upstreamDisconnected = isUpstreamAiDisconnectError(error);
+  const retryInfo = runtimeRetryFromError(error);
 
   return {
     index: stepIndex,
-    action: upstreamDisconnected
-      ? 'Upstream AI connection was interrupted; stopping this browser-chat turn'
-      : 'AI request or response handling failed; continuing automatically',
-    expected: upstreamDisconnected
-      ? 'The assistant should stop this turn and show the upstream disconnect reason to the user.'
-      : mode === 'dom'
-        ? 'A single AI request/tool/parse failure should not stop the flow; the next round will continue from the latest page context.'
-        : 'A single AI request/tool/parse failure should not stop the flow; the next round will continue from the latest screenshot.',
+    action: retryInfo
+      ? 'AI request retries were exhausted; stopping this browser-chat turn'
+      : 'AI request or response handling failed; stopping this browser-chat turn',
+    expected: retryInfo
+      ? 'The assistant should stop after the request-level retry limit and preserve the latest browser state.'
+      : 'The assistant should stop this turn and preserve the latest browser state.',
     actual: userFacingRecoverableRuntimeError(error),
     status: 'failed',
     beforeScreenshotPath,
