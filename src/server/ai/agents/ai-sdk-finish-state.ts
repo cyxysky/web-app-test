@@ -1,5 +1,6 @@
 export type AiSdkFinishState = {
   finishReason?: string;
+  retryRequest: boolean;
   terminatesTurn: boolean;
   status: 'passed' | 'failed' | 'blocked';
 };
@@ -7,18 +8,21 @@ export type AiSdkFinishState = {
 export function aiSdkFinishState(value: unknown, options: { runtimeContinuationRequired?: boolean } = {}): AiSdkFinishState {
   const finishReason = typeof value === 'string' && value.trim() ? value.trim() : undefined;
   if (options.runtimeContinuationRequired) {
-    return { finishReason, terminatesTurn: false, status: 'passed' };
+    return { finishReason, retryRequest: false, terminatesTurn: false, status: 'passed' };
   }
   if (!finishReason || finishReason === 'tool-calls') {
-    return { finishReason, terminatesTurn: false, status: 'passed' };
+    return { finishReason, retryRequest: false, terminatesTurn: false, status: 'passed' };
   }
   if (finishReason === 'stop') {
-    return { finishReason, terminatesTurn: true, status: 'passed' };
+    return { finishReason, retryRequest: false, terminatesTurn: true, status: 'passed' };
+  }
+  if (finishReason === 'error') {
+    return { finishReason, retryRequest: true, terminatesTurn: false, status: 'failed' };
   }
   if (finishReason === 'content-filter') {
-    return { finishReason, terminatesTurn: true, status: 'blocked' };
+    return { finishReason, retryRequest: false, terminatesTurn: true, status: 'blocked' };
   }
-  return { finishReason, terminatesTurn: true, status: 'failed' };
+  return { finishReason, retryRequest: false, terminatesTurn: true, status: 'failed' };
 }
 
 export function aiSdkFinishMessage(finishReason?: string) {

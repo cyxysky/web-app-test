@@ -5,6 +5,7 @@ import { aiSdkFinishMessage, aiSdkFinishState } from './ai-sdk-finish-state';
 test('treats stop as a normally completed AI response', () => {
   assert.deepEqual(aiSdkFinishState('stop'), {
     finishReason: 'stop',
+    retryRequest: false,
     terminatesTurn: true,
     status: 'passed',
   });
@@ -13,6 +14,7 @@ test('treats stop as a normally completed AI response', () => {
 test('keeps tool-calls inside the tool loop', () => {
   assert.deepEqual(aiSdkFinishState('tool-calls'), {
     finishReason: 'tool-calls',
+    retryRequest: false,
     terminatesTurn: false,
     status: 'passed',
   });
@@ -21,29 +23,43 @@ test('keeps tool-calls inside the tool loop', () => {
 test('keeps a Codex object response running when its generated object executed a tool', () => {
   assert.deepEqual(aiSdkFinishState('stop', { runtimeContinuationRequired: true }), {
     finishReason: 'stop',
+    retryRequest: false,
+    terminatesTurn: false,
+    status: 'passed',
+  });
+  assert.deepEqual(aiSdkFinishState('error', { runtimeContinuationRequired: true }), {
+    finishReason: 'error',
+    retryRequest: false,
     terminatesTurn: false,
     status: 'passed',
   });
 });
 
-test('terminates without retrying for all SDK terminal failure reasons', () => {
+test('retries an SDK error finish reason instead of treating it as task completion', () => {
+  assert.deepEqual(aiSdkFinishState('error'), {
+    finishReason: 'error',
+    retryRequest: true,
+    terminatesTurn: false,
+    status: 'failed',
+  });
+});
+
+test('terminates without retrying for deterministic SDK terminal reasons', () => {
   assert.deepEqual(aiSdkFinishState('length'), {
     finishReason: 'length',
+    retryRequest: false,
     terminatesTurn: true,
     status: 'failed',
   });
   assert.deepEqual(aiSdkFinishState('content-filter'), {
     finishReason: 'content-filter',
+    retryRequest: false,
     terminatesTurn: true,
     status: 'blocked',
   });
-  assert.deepEqual(aiSdkFinishState('error'), {
-    finishReason: 'error',
-    terminatesTurn: true,
-    status: 'failed',
-  });
   assert.deepEqual(aiSdkFinishState('other'), {
     finishReason: 'other',
+    retryRequest: false,
     terminatesTurn: true,
     status: 'failed',
   });
@@ -52,6 +68,7 @@ test('terminates without retrying for all SDK terminal failure reasons', () => {
 test('treats a future nonempty SDK finish reason as terminal', () => {
   assert.deepEqual(aiSdkFinishState('provider-finished'), {
     finishReason: 'provider-finished',
+    retryRequest: false,
     terminatesTurn: true,
     status: 'failed',
   });
@@ -60,6 +77,7 @@ test('treats a future nonempty SDK finish reason as terminal', () => {
 test('does not invent a terminal state when the SDK returned no finish reason', () => {
   assert.deepEqual(aiSdkFinishState(undefined), {
     finishReason: undefined,
+    retryRequest: false,
     terminatesTurn: false,
     status: 'passed',
   });

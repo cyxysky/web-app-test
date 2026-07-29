@@ -373,6 +373,7 @@ function upstreamDisconnectLines(
 
 function userFacingInfrastructureError(value?: string, context?: { error?: unknown; aiRequest?: AiRequestSnapshot }) {
   const text = value || '';
+  const retryInfo = runtimeRetryFromError(context?.error);
   const upstreamReason = upstreamApiDisconnectReason(text);
   if (upstreamReason) {
     return [
@@ -380,6 +381,12 @@ function userFacingInfrastructureError(value?: string, context?: { error?: unkno
       ...upstreamDisconnectLines(upstreamReason, text, context),
       '本轮操作已停止，当前页面状态已保留。',
     ].join('\n');
+  }
+  if (/AI SDK returned retryable finish reason "error"/i.test(text)) {
+    const attempts = retryInfo
+      ? `连续 ${retryInfo.consecutiveFailures} 次，达到上限 ${retryInfo.consecutiveFailureLimit} 次`
+      : '达到请求级重试上限';
+    return `AI SDK ${attempts}返回错误结束状态。本轮操作已停止，当前页面状态已保留。`;
   }
   if (providerToolSchemaError(text)) return 'AI 模型请求失败：当前模型网关不兼容本轮工具调用格式。本轮操作已停止，当前页面状态已保留。';
   if (/Request aborted|operation interrupted/i.test(text)) return '本轮 AI 请求被中断，未继续写入技术错误。';
@@ -2393,10 +2400,13 @@ async function executeRuntimeStep(input: {
           extra: { responseType: 'object', objectType: object.type },
         }),
       });
-      consecutiveRequestFailures = 0;
       const finishState = aiSdkFinishState(result.finishReason, {
         runtimeContinuationRequired: execution.executed,
       });
+      if (finishState.retryRequest) {
+        throw new Error(`AI SDK returned retryable finish reason "${finishState.finishReason}".`);
+      }
+      consecutiveRequestFailures = 0;
       return {
         text: execution.text,
         traces,
@@ -2515,9 +2525,12 @@ async function executeRuntimeStep(input: {
         abortSignal,
       }, input.agentLoopTimeoutMs);
       ensureActive();
-      consecutiveRequestFailures = 0;
       latestText = toolConsistentAssistantText(result.text || latestText, traces.at(-1)?.name);
       const finishState = aiSdkFinishState(result.finishReason);
+      if (finishState.retryRequest) {
+        throw new Error(`AI SDK returned retryable finish reason "${finishState.finishReason}".`);
+      }
+      consecutiveRequestFailures = 0;
       return {
         text: latestText,
         traces,
