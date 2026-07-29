@@ -34,6 +34,7 @@
 
 html {
   background: var(--background);
+  height: 100%;
   overflow-x: hidden;
 }
 
@@ -46,6 +47,7 @@ body {
     Arial,
     "Microsoft YaHei",
     sans-serif;
+  height: 100%;
   overflow-x: hidden;
 }
 
@@ -6755,7 +6757,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-shell {
   display: grid;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 100%;
   padding: 0;
   width: 100%;
 }
@@ -6767,7 +6770,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: grid;
   gap: 0;
   grid-template-columns: var(--browser-chat-sidebar-expanded-width) minmax(0, 1fr);
-  height: 100vh;
+  height: 100%;
+  min-height: 0;
   min-width: 0;
   transition: grid-template-columns 0.22s ease;
   width: 100%;
@@ -7127,7 +7131,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
   min-width: 0;
   padding: 14px 10px;
   position: relative;
@@ -7894,7 +7899,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-main {
   background: var(--body-gradient), var(--background);
   display: block;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
   overflow: auto;
   overflow-x: hidden;
   min-width: 0;
@@ -7903,7 +7909,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-embedded-workspace {
   display: grid;
   grid-template-columns: minmax(420px, 1fr) 8px minmax(320px, var(--embedded-chat-width, 420px));
-  height: 100vh;
+  height: 100%;
   min-height: 0;
   min-width: 0;
   overflow: hidden;
@@ -8990,16 +8996,15 @@ body.is-dragging-embedded-tab * {
 .browser-chat-chat-pane {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
   min-height: 0;
   min-width: 0;
-  overflow: hidden;
   padding: 28px 24px 32px;
   position: relative;
 }
 
 .browser-chat-chat-pane.embedded-chat {
-  height: 100vh;
+  height: 100%;
   min-height: 0;
   padding: 18px 14px 20px;
 }
