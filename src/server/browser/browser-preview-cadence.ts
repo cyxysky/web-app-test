@@ -1,4 +1,4 @@
-export const MIN_BROWSER_PREVIEW_FPS = 12;
+export const MIN_BROWSER_PREVIEW_FPS = 20;
 export const MAX_BROWSER_PREVIEW_FPS = 30;
 
 export function browserPreviewFramesPerSecond(value: unknown) {

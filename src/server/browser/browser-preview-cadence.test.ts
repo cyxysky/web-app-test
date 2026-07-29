@@ -5,10 +5,10 @@ import {
   browserPreviewFramesPerSecond,
 } from './browser-preview-cadence';
 
-test('browser preview never runs below twelve frames per second', () => {
-  assert.equal(browserPreviewFramesPerSecond(undefined), 12);
-  assert.equal(browserPreviewFramesPerSecond(1), 12);
-  assert.equal(browserPreviewFrameIntervalMs(12), 83);
+test('browser preview never runs below twenty frames per second', () => {
+  assert.equal(browserPreviewFramesPerSecond(undefined), 20);
+  assert.equal(browserPreviewFramesPerSecond(1), 20);
+  assert.equal(browserPreviewFrameIntervalMs(20), 50);
 });
 
 test('browser preview accepts faster rates without unbounded capture load', () => {
