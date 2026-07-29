@@ -1,5 +1,4 @@
 import type { ModelProvider } from '@/server/ai/schemas/runtime.schema';
-import { browserViewportResolutionPresets } from '@/config/browser-viewport-resolution';
 
 export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'memory' | 'accounts' | 'dom-test' | 'debug';
 
@@ -131,6 +130,8 @@ const boolOptions = [
 
 export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'BROWSER_PREVIEW_FPS', label: '实时预览帧率', description: '实时预览每秒发送的画面帧数；可设置 1–60 FPS，帧率越高，服务器编码和网络传输压力越大。', tab: 'browser', defaultValue: '20', control: 'number', min: 1, max: 60, step: 1 },
+  { key: 'BROWSER_OUTPUT_PIXEL_RATIO', label: '输出像素倍率', description: '在不改变网页 CSS 视口和布局的前提下，提高实时预览与系统截图的输出像素密度；倍率越高，编码、内存和网络压力越大。', tab: 'browser', defaultValue: '1.5', control: 'number', min: 1, max: 2, step: 0.25 },
+  { key: 'BROWSER_SCREENCAST_FORMAT', label: '实时预览图片格式', description: 'JPEG 体积较小，适合高帧率；PNG 无损且文字更清晰，但会显著增加编码与网络压力。', tab: 'browser', defaultValue: 'jpeg', control: 'select', options: [{ label: 'JPEG（高帧率推荐）', value: 'jpeg' }, { label: 'PNG（无损）', value: 'png' }] },
   { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: '代码模式让 Agent 执行受限 Playwright 代码；DOM 模式通过结构化 inspect/interact 工具操作页面。新会话使用保存后的模式。', tab: 'browser', defaultValue: 'code', control: 'select', options: [{ label: '代码模式', value: 'code' }, { label: 'DOM 模式', value: 'dom' }] },
   { key: 'BROWSER_CDP_ENDPOINT', label: '现有浏览器 CDP 地址', description: '连接已开启远程调试的 Chrome/Edge，例如 http://127.0.0.1:9222；可复用登录态。留空则启动新浏览器。', tab: 'browser', defaultValue: '', control: 'text' },
@@ -138,9 +139,9 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'BROWSER_CHANNEL', label: '浏览器通道', description: '可选 chrome、msedge 等本机浏览器通道；留空使用 Playwright Chromium。', tab: 'browser', defaultValue: '', control: 'text' },
   { key: 'HEADLESS_BROWSER', label: '无头浏览器', description: '是否隐藏浏览器窗口运行。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'BROWSER_FULLSCREEN', label: '浏览器全屏', description: '启动浏览器时是否尽量使用全屏窗口。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'BROWSER_VIEWPORT_RESOLUTION', label: '浏览器画面分辨率', description: '设置浏览器实际渲染视口；自动模式跟随真实窗口，选择高分辨率会同步增加截图和实时预览的编码压力。', tab: 'browser', defaultValue: 'auto', control: 'select', options: browserViewportResolutionPresets.map(({ label, value }) => ({ label, value })) },
-  { key: 'BROWSER_VIEWPORT_WIDTH', label: '自定义视口宽度', description: '仅在画面分辨率选择“自定义宽高”时使用。', tab: 'browser', defaultValue: '', control: 'number', min: 1, step: 1 },
-  { key: 'BROWSER_VIEWPORT_HEIGHT', label: '自定义视口高度', description: '仅在画面分辨率选择“自定义宽高”时使用。', tab: 'browser', defaultValue: '', control: 'number', min: 1, step: 1 },
+  { key: 'BROWSER_VIEWPORT_MODE', label: '视口模式', description: '自动时跟随真实浏览器窗口；固定时使用下方视口宽高。此设置决定网页布局，不用于提升输出清晰度。', tab: 'browser', defaultValue: 'auto', control: 'select', options: [{ label: '自动跟随窗口', value: 'auto' }, { label: '固定宽高', value: 'fixed' }] },
+  { key: 'BROWSER_VIEWPORT_WIDTH', label: '视口宽度', description: '固定模式下的浏览器视口宽度；留空则自动跟随窗口。', tab: 'browser', defaultValue: '', control: 'number', min: 1, step: 1 },
+  { key: 'BROWSER_VIEWPORT_HEIGHT', label: '视口高度', description: '固定模式下的浏览器视口高度；留空则自动跟随窗口。', tab: 'browser', defaultValue: '', control: 'number', min: 1, step: 1 },
   { key: 'BROWSER_SLOW_MO_MS', label: '浏览器动作延迟', description: 'Playwright 每个动作的慢速延迟，单位毫秒。生产运行建议为 0。', tab: 'browser', defaultValue: '0', control: 'number' },
   { key: 'BROWSER_ACTION_SETTLE_MS', label: '动作后等待', description: '每次动作后额外等待页面稳定的时间。', tab: 'browser', defaultValue: '0', control: 'number' },
   { key: 'BROWSER_NAVIGATION_DOM_QUIET_MS', label: '导航后 DOM 静默窗口', description: '导航提交后 DOM 连续保持不变达到该时长即生成语义快照，单位毫秒；0 表示关闭。', tab: 'browser', defaultValue: '250', control: 'number' },

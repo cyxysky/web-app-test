@@ -4,7 +4,10 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, Dialog, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
-import { resolveBrowserViewportSize } from '@/config/browser-viewport-resolution';
+import {
+  resolveBrowserOutputPixelRatio,
+  resolveBrowserPreviewImageFormat,
+} from '@/config/browser-output-settings';
 import { artifactPath } from '@/server/storage/paths';
 import { browserPreviewFrameIntervalMs } from './browser-preview-cadence';
 import {
@@ -17,6 +20,7 @@ import {
   electronEmbeddedBrowserEnabled,
   normalizePageGroupId,
   numericLimitFromEnv,
+  positiveIntegerEnv,
   sessionTabGrouperDebugPort,
   sessionTabGrouperEnabled,
   sessionTabGrouperProfileDir,
@@ -76,7 +80,16 @@ const DEFAULT_BROWSER_NAVIGATION_DOM_QUIET_MS = 250;
 const DEFAULT_BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = 1000;
 const BROWSER_NAVIGATION_DOM_STABILITY_POLL_MS = 50;
 
+function fixedBrowserViewportFromEnv() {
+  if (process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase() !== 'fixed') return undefined;
+  const width = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH');
+  const height = positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT');
+  return width && height ? { width, height } : undefined;
+}
 
+function browserOutputPixelRatioFromEnv() {
+  return resolveBrowserOutputPixelRatio(process.env.BROWSER_OUTPUT_PIXEL_RATIO);
+}
 
 function compactDiagnosticText(value: string, maxLength: number) {
   const normalized = value.replace(/\s+/g, ' ').trim();
@@ -271,7 +284,7 @@ type ScreenshotMetrics = {
   viewport: { width: number; height: number };
   viewportMetrics: ViewportMetrics;
   devicePixelRatio: number;
-  scale: 'css';
+  outputPixelRatio: number;
   capture: ScreenshotCaptureMode;
   generation: number;
   page: Page;
@@ -3987,11 +4000,7 @@ export class BrowserSession {
     const isolated = this.options.isolated === true;
     this.browserSurface = resolveBrowserSessionSurface(this.options, electronEmbeddedBrowserEnabled());
     const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
-    const fixedViewport = resolveBrowserViewportSize(
-      process.env.BROWSER_VIEWPORT_RESOLUTION,
-      process.env.BROWSER_VIEWPORT_WIDTH,
-      process.env.BROWSER_VIEWPORT_HEIGHT,
-    );
+    const fixedViewport = fixedBrowserViewportFromEnv();
     const headlessFallbackViewport = { width: fullscreen ? 1920 : 1280, height: fullscreen ? 1080 : 800 };
     const useNativeViewport = !headless && !fixedViewport;
     const contextViewport = useNativeViewport ? null : fixedViewport || headlessFallbackViewport;
@@ -4059,7 +4068,6 @@ export class BrowserSession {
         windowSizeArg,
         fullscreen ? '--start-maximized' : '',
         ignoreHTTPSErrors ? '--ignore-certificate-errors' : '',
-        '--force-device-scale-factor=1',
         '--high-dpi-support=1',
         '--no-first-run',
         '--no-default-browser-check',
@@ -4071,7 +4079,6 @@ export class BrowserSession {
     const contextOptions: BrowserContextOptions = {
       viewport: contextViewport,
       ignoreHTTPSErrors,
-      ...(contextViewport ? { deviceScaleFactor: 1 } : {}),
       ...(this.options.storageState ? { storageState: this.options.storageState } : {}),
     };
 
@@ -4780,17 +4787,13 @@ export class BrowserSession {
     if (page.isClosed()) return;
     const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
     const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
-    const resolution = process.env.BROWSER_VIEWPORT_RESOLUTION?.trim().toLowerCase() || 'auto';
-    const fixedViewport = resolveBrowserViewportSize(
-      resolution,
-      process.env.BROWSER_VIEWPORT_WIDTH,
-      process.env.BROWSER_VIEWPORT_HEIGHT,
-    );
+    const viewportMode = process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase() === 'fixed' ? 'fixed' : 'auto';
+    const fixedViewport = fixedBrowserViewportFromEnv();
     const viewport = fixedViewport || (headless
       ? { width: fullscreen ? 1920 : 1280, height: fullscreen ? 1080 : 800 }
       : undefined);
     const settingKey = [
-      resolution,
+      viewportMode,
       process.env.BROWSER_VIEWPORT_WIDTH || '',
       process.env.BROWSER_VIEWPORT_HEIGHT || '',
       headless ? 'headless' : 'headful',
@@ -4843,16 +4846,25 @@ export class BrowserSession {
     const page = this.activePage;
     await this.applyConfiguredViewport(page);
     const client = await page.context().newCDPSession(page);
-    const configuredFormat = process.env.BROWSER_SCREENCAST_FORMAT?.trim().toLowerCase();
-    const format = configuredFormat === 'png' ? 'png' : 'jpeg';
+    const format = resolveBrowserPreviewImageFormat(process.env.BROWSER_SCREENCAST_FORMAT);
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
+    const outputPixelRatio = browserOutputPixelRatioFromEnv();
     const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 100);
     const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 100)));
     const currentFrameIntervalMs = () => browserPreviewFrameIntervalMs(process.env.BROWSER_PREVIEW_FPS);
     let stopped = false;
     let stopPromise: Promise<void> | undefined;
     let frameTimer: ReturnType<typeof setTimeout> | undefined;
-    let viewport = await this.getViewportMetrics().catch(() => page.viewportSize() || { width: 1280, height: 720 });
+    const originalPlaywrightViewport = page.viewportSize();
+    const cssViewport = await this.getViewportMetrics().catch(() => ({
+      ...(page.viewportSize() || { width: 1280, height: 720 }),
+      devicePixelRatio: 1,
+    }));
+    let viewport = {
+      width: Math.max(1, Math.round(cssViewport.width * outputPixelRatio)),
+      height: Math.max(1, Math.round(cssViewport.height * outputPixelRatio)),
+    };
+    let outputMetricsOverrideApplied = false;
     let latestFrame: BrowserScreencastFrame | undefined;
     let resolveInitialFrame: (() => void) | undefined;
     const initialFrameReady = new Promise<void>((resolve) => {
@@ -4870,6 +4882,18 @@ export class BrowserSession {
       client.off('Page.screencastFrame', onNativeFrame);
       stopPromise = (async () => {
         await client.send('Page.stopScreencast').catch(() => undefined);
+        if (outputMetricsOverrideApplied) {
+          if (originalPlaywrightViewport) {
+            await client.send('Emulation.setDeviceMetricsOverride', {
+              width: originalPlaywrightViewport.width,
+              height: originalPlaywrightViewport.height,
+              deviceScaleFactor: Math.max(0.1, cssViewport.devicePixelRatio || 1),
+              mobile: false,
+            }).catch(() => undefined);
+          } else {
+            await client.send('Emulation.clearDeviceMetricsOverride').catch(() => undefined);
+          }
+        }
         await client.detach().catch(() => undefined);
         if (notifyPageChanged) await options.onActivePageChanged?.();
       })();
@@ -4936,6 +4960,22 @@ export class BrowserSession {
     };
     client.on('Page.screencastFrame', onNativeFrame);
     try {
+      if (outputPixelRatio !== 1) {
+        await client.send('Emulation.setDeviceMetricsOverride', {
+          width: Math.max(1, Math.round(cssViewport.width)),
+          height: Math.max(1, Math.round(cssViewport.height)),
+          deviceScaleFactor: Math.max(0.1, cssViewport.devicePixelRatio || 1),
+          mobile: false,
+          viewport: {
+            x: 0,
+            y: 0,
+            width: Math.max(1, Math.round(cssViewport.width)),
+            height: Math.max(1, Math.round(cssViewport.height)),
+            scale: outputPixelRatio,
+          },
+        });
+        outputMetricsOverrideApplied = true;
+      }
       await client.send('Page.startScreencast', {
         everyNthFrame: 1,
         format,
@@ -4950,8 +4990,17 @@ export class BrowserSession {
       ]);
       if (initialWaitTimer) clearTimeout(initialWaitTimer);
       if (!latestFrame && !stopped && !page.isClosed() && activePreviewPage() === page) {
+        const layoutMetrics = await client.send('Page.getLayoutMetrics');
+        const visualViewport = layoutMetrics.cssVisualViewport;
         const result = await client.send('Page.captureScreenshot', {
           captureBeyondViewport: false,
+          clip: {
+            x: visualViewport.pageX,
+            y: visualViewport.pageY,
+            width: visualViewport.clientWidth,
+            height: visualViewport.clientHeight,
+            scale: outputPixelRatio,
+          },
           format,
           fromSurface: true,
           optimizeForSpeed: true,
@@ -5617,6 +5666,65 @@ export class BrowserSession {
     ];
   }
 
+  private async capturePngScreenshot(input: {
+    capture: ScreenshotCaptureMode;
+    filePath: string;
+    timeoutMs: number;
+  }) {
+    const outputPixelRatio = browserOutputPixelRatioFromEnv();
+    if (outputPixelRatio === 1) {
+      await this.activePage.screenshot({
+        animations: 'disabled',
+        caret: 'hide',
+        path: input.filePath,
+        fullPage: input.capture === 'fullPage',
+        scale: 'css',
+        timeout: input.timeoutMs,
+      });
+      return;
+    }
+
+    const client = await this.activePage.context().newCDPSession(this.activePage);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        (async () => {
+          const metrics = await client.send('Page.getLayoutMetrics');
+          const source = input.capture === 'fullPage'
+            ? metrics.cssContentSize
+            : metrics.cssVisualViewport;
+          const x = 'pageX' in source ? source.pageX : source.x;
+          const y = 'pageY' in source ? source.pageY : source.y;
+          const width = 'clientWidth' in source ? source.clientWidth : source.width;
+          const height = 'clientHeight' in source ? source.clientHeight : source.height;
+          const result = await client.send('Page.captureScreenshot', {
+            captureBeyondViewport: input.capture === 'fullPage',
+            clip: {
+              x,
+              y,
+              width: Math.max(1, width),
+              height: Math.max(1, height),
+              scale: outputPixelRatio,
+            },
+            format: 'png',
+            fromSurface: true,
+            optimizeForSpeed: false,
+          });
+          await writeFile(input.filePath, Buffer.from(result.data, 'base64'));
+        })(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            reject(new Error(`Browser screenshot timed out after ${input.timeoutMs}ms.`));
+          }, input.timeoutMs);
+          timeout.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      await client.detach().catch(() => undefined);
+    }
+  }
+
   // Capture the current viewport. Candidate marker overlays are no longer captured automatically.
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
     const totalStartedAt = Date.now();
@@ -5681,14 +5789,6 @@ export class BrowserSession {
       MIN_SCREENSHOT_TIMEOUT_MS,
       MAX_SCREENSHOT_TIMEOUT_MS,
     );
-    const screenshotOptions = {
-      animations: 'disabled' as const,
-      caret: 'hide' as const,
-      path: filePath,
-      fullPage: capture === 'fullPage',
-      scale: 'css' as const,
-      timeout: screenshotTimeoutMs,
-    };
     // Original clean screenshots are disabled globally; keep only the primary screenshot
     // and, when configured, the separate marker map.
     skipped('captureOriginalScreenshot');
@@ -5700,7 +5800,11 @@ export class BrowserSession {
       ));
     } else skipped('drawInlineOverlay');
     try {
-      await timed('capturePrimaryScreenshot', () => this.activePage.screenshot(screenshotOptions), () => ({ path: filePath }));
+      await timed('capturePrimaryScreenshot', () => this.capturePngScreenshot({
+        capture,
+        filePath,
+        timeoutMs: screenshotTimeoutMs,
+      }), () => ({ path: filePath }));
     } catch (error) {
       throw await this.buildScreenshotFailureError(error, {
         phase: String(phase),
@@ -5717,7 +5821,11 @@ export class BrowserSession {
       const markerFilePath = path.join(dir, `step-${stepIndex}-${phase}-markers.png`);
       await timed('drawMarkerOverlay', () => this.drawCandidateOverlay(candidates, true, scrollAreaLabelsEnabled ? scrollAreas : []));
       try {
-        await timed('captureMarkerScreenshot', () => this.activePage.screenshot({ ...screenshotOptions, path: markerFilePath }), () => ({ path: markerFilePath }));
+        await timed('captureMarkerScreenshot', () => this.capturePngScreenshot({
+          capture,
+          filePath: markerFilePath,
+          timeoutMs: screenshotTimeoutMs,
+        }), () => ({ path: markerFilePath }));
         this.lastCandidateMarkerScreenshotPath = markerFilePath;
       } catch (error) {
         throw await this.buildScreenshotFailureError(error, {
@@ -5745,7 +5853,7 @@ export class BrowserSession {
       viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
       viewportMetrics,
       devicePixelRatio: viewportMetrics.devicePixelRatio,
-      scale: 'css',
+      outputPixelRatio: browserOutputPixelRatioFromEnv(),
       capture,
       generation: ++this.screenshotGenerationSequence,
       page: this.activePage,
@@ -5783,11 +5891,10 @@ export class BrowserSession {
       MIN_SCREENSHOT_TIMEOUT_MS,
       MAX_SCREENSHOT_TIMEOUT_MS,
     );
-    await this.activePage.screenshot({
-      path: filePath,
-      fullPage: capture === 'fullPage',
-      timeout: screenshotTimeoutMs,
-      scale: 'css',
+    await this.capturePngScreenshot({
+      capture,
+      filePath,
+      timeoutMs: screenshotTimeoutMs,
     });
     const [image, viewportMetrics, scrollPosition] = await Promise.all([
       this.readPngSize(filePath),
@@ -5800,7 +5907,7 @@ export class BrowserSession {
       viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
       viewportMetrics,
       devicePixelRatio: viewportMetrics.devicePixelRatio,
-      scale: 'css',
+      outputPixelRatio: browserOutputPixelRatioFromEnv(),
       capture,
       generation: ++this.screenshotGenerationSequence,
       page: this.activePage,

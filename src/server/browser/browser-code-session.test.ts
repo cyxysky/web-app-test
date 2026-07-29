@@ -13,6 +13,14 @@ async function waitForCondition(check: () => boolean | Promise<boolean>, timeout
   throw new Error(`Condition was not met within ${timeoutMs}ms`);
 }
 
+function readPngDimensions(buffer: Buffer) {
+  assert.equal(buffer.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  return {
+    width: buffer.readUInt32BE(16),
+    height: buffer.readUInt32BE(20),
+  };
+}
+
 test('BrowserSession executes browserCode against the controlled Playwright page', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-session-test' });
   context.after(async () => session.close());
@@ -258,42 +266,71 @@ test('live preview supports drag and does not drive the AI cursor', async (conte
   assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 0, 'user live-preview drag must not create the AI cursor');
 });
 
-test('browser viewport resolution applies to new and already running pages', async () => {
-  const previousResolution = process.env.BROWSER_VIEWPORT_RESOLUTION;
+test('browser viewport size and output pixel ratio are independent', async () => {
+  const previousMode = process.env.BROWSER_VIEWPORT_MODE;
   const previousWidth = process.env.BROWSER_VIEWPORT_WIDTH;
   const previousHeight = process.env.BROWSER_VIEWPORT_HEIGHT;
-  process.env.BROWSER_VIEWPORT_RESOLUTION = '1080p';
-  delete process.env.BROWSER_VIEWPORT_WIDTH;
-  delete process.env.BROWSER_VIEWPORT_HEIGHT;
+  const previousPixelRatio = process.env.BROWSER_OUTPUT_PIXEL_RATIO;
+  const previousFormat = process.env.BROWSER_SCREENCAST_FORMAT;
+  process.env.BROWSER_VIEWPORT_MODE = 'fixed';
+  process.env.BROWSER_VIEWPORT_WIDTH = '800';
+  process.env.BROWSER_VIEWPORT_HEIGHT = '600';
+  process.env.BROWSER_OUTPUT_PIXEL_RATIO = '2';
+  process.env.BROWSER_SCREENCAST_FORMAT = 'png';
   const session = new BrowserSession('code', {
     headless: true,
     isolated: true,
-    runId: 'browser-viewport-resolution-test',
+    runId: 'browser-output-pixel-ratio-test',
   });
 
   try {
     await session.start();
     const page = Reflect.get(session, 'activePage') as Page;
-    assert.deepEqual(page.viewportSize(), { width: 1920, height: 1080 });
+    await page.setContent('<!doctype html><html><body><main>Pixel ratio test</main></body></html>');
+    assert.deepEqual(page.viewportSize(), { width: 800, height: 600 });
 
-    process.env.BROWSER_VIEWPORT_RESOLUTION = 'custom';
+    const screenshotPath = await session.takeScreenshot(
+      'browser-output-pixel-ratio-test',
+      1,
+      'manual',
+      { capture: 'viewport' },
+    );
+    assert.deepEqual(readPngDimensions(await readFile(screenshotPath)), { width: 1600, height: 1200 });
+
+    const frames: Array<{ contentType: string; data: string; viewport: { width: number; height: number } }> = [];
+    const handle = await session.startScreencast({
+      onFrame: (frame) => { frames.push(frame); },
+    });
+    assert.ok(frames.length >= 1, 'screencast should emit an initial frame');
+    assert.equal(frames[0].contentType, 'image/png');
+    assert.deepEqual(readPngDimensions(Buffer.from(frames[0].data, 'base64')), { width: 1600, height: 1200 });
+    assert.deepEqual(frames[0].viewport, { width: 1600, height: 1200 });
+    await handle.stop();
+    assert.deepEqual(await page.evaluate(() => ({
+      devicePixelRatio: window.devicePixelRatio,
+      height: window.innerHeight,
+      width: window.innerWidth,
+    })), { devicePixelRatio: 1, height: 600, width: 800 });
+
     process.env.BROWSER_VIEWPORT_WIDTH = '1366';
     process.env.BROWSER_VIEWPORT_HEIGHT = '768';
-    const action = await session.executeBrowserCode({
-      code: 'nodeRepl.write({ viewport: page.viewportSize() });',
-      runId: 'browser-viewport-resolution-test',
-      stepIndex: 1,
+    const resizedHandle = await session.startScreencast({
+      onFrame: () => undefined,
     });
-    assert.equal(action.ok, true, action.actual);
+    await resizedHandle.stop();
     assert.deepEqual(page.viewportSize(), { width: 1366, height: 768 });
   } finally {
     await session.close({ force: true }).catch(() => undefined);
-    if (previousResolution === undefined) delete process.env.BROWSER_VIEWPORT_RESOLUTION;
-    else process.env.BROWSER_VIEWPORT_RESOLUTION = previousResolution;
+    if (previousMode === undefined) delete process.env.BROWSER_VIEWPORT_MODE;
+    else process.env.BROWSER_VIEWPORT_MODE = previousMode;
     if (previousWidth === undefined) delete process.env.BROWSER_VIEWPORT_WIDTH;
     else process.env.BROWSER_VIEWPORT_WIDTH = previousWidth;
     if (previousHeight === undefined) delete process.env.BROWSER_VIEWPORT_HEIGHT;
     else process.env.BROWSER_VIEWPORT_HEIGHT = previousHeight;
+    if (previousPixelRatio === undefined) delete process.env.BROWSER_OUTPUT_PIXEL_RATIO;
+    else process.env.BROWSER_OUTPUT_PIXEL_RATIO = previousPixelRatio;
+    if (previousFormat === undefined) delete process.env.BROWSER_SCREENCAST_FORMAT;
+    else process.env.BROWSER_SCREENCAST_FORMAT = previousFormat;
   }
 });
 

@@ -19,13 +19,27 @@ test('browser preview FPS setting is a bounded integer input', () => {
   assert.equal(normalizeRuntimeEnvValue(definition, ''), '20');
 });
 
-test('browser viewport resolution setting exposes named presets and custom dimensions', () => {
-  const definition = runtimeEnvDefinition('BROWSER_VIEWPORT_RESOLUTION');
-  assert.ok(definition);
-  assert.equal(definition.control, 'select');
-  assert.equal(definition.defaultValue, 'auto');
-  assert.deepEqual(definition.options?.map((option) => option.value), ['auto', '1080p', '2k', '4k', '8k', 'custom']);
-  assert.equal(runtimeEnvDefinition('BROWSER_VIEWPORT_MODE'), undefined);
+test('browser viewport size and output quality are configured independently', () => {
+  const viewport = runtimeEnvDefinition('BROWSER_VIEWPORT_MODE');
+  assert.ok(viewport);
+  assert.equal(viewport.control, 'select');
+  assert.deepEqual(viewport.options?.map((option) => option.value), ['auto', 'fixed']);
+  assert.equal(runtimeEnvDefinition('BROWSER_VIEWPORT_RESOLUTION'), undefined);
+
+  const pixelRatio = runtimeEnvDefinition('BROWSER_OUTPUT_PIXEL_RATIO');
+  assert.ok(pixelRatio);
+  assert.equal(pixelRatio.control, 'number');
+  assert.equal(pixelRatio.defaultValue, '1.5');
+  assert.equal(pixelRatio.min, 1);
+  assert.equal(pixelRatio.max, 2);
+  assert.equal(pixelRatio.step, 0.25);
+  assert.equal(normalizeRuntimeEnvValue(pixelRatio, '0.5'), '1');
+  assert.equal(normalizeRuntimeEnvValue(pixelRatio, '1.6'), '1.5');
+  assert.equal(normalizeRuntimeEnvValue(pixelRatio, '3'), '2');
+
+  const format = runtimeEnvDefinition('BROWSER_SCREENCAST_FORMAT');
+  assert.ok(format);
+  assert.deepEqual(format.options?.map((option) => option.value), ['jpeg', 'png']);
 });
 
 test('settings omit unused automatic screenshot and context compression controls', () => {
