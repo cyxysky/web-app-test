@@ -164,13 +164,16 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
   const initialTabs = await session.refreshTabsSnapshot();
   assert.equal(initialTabs.length, 1);
   const originalTabId = initialTabs[0].id;
-  const initialFrames: Array<{ url: string }> = [];
+  const initialFrames: Array<{ capturedAt: string; url: string }> = [];
   let activePageChanged = false;
   const firstHandle = await session.startScreencast({
     onActivePageChanged: () => { activePageChanged = true; },
-    onFrame: (frame) => { initialFrames.push({ url: frame.url }); },
+    onFrame: (frame) => { initialFrames.push({ capturedAt: frame.capturedAt, url: frame.url }); },
   });
   assert.ok(initialFrames.length >= 1, 'screencast attach should emit an initial frame');
+  await waitForCondition(() => initialFrames.length >= 6, 1_000);
+  const fixedCadenceWindowMs = Date.parse(initialFrames[5].capturedAt) - Date.parse(initialFrames[0].capturedAt);
+  assert.ok(fixedCadenceWindowMs <= 500, `static preview should publish at fixed cadence, received six frames in ${fixedCadenceWindowMs}ms`);
 
   const buttonBox = await page.locator('#open-detail').boundingBox();
   const viewport = page.viewportSize();
@@ -197,7 +200,11 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
   assert.equal(switchResult.ok, true, switchResult.actual);
   const switchedTabs = await session.refreshTabsSnapshot();
   assert.equal(switchedTabs.length, 2);
-  assert.equal(switchedTabs.find((tab) => tab.id === originalTabId)?.active, true);
+  assert.equal(
+    switchedTabs.find((tab) => tab.id === originalTabId)?.active,
+    true,
+    `original tab should remain selected after refresh: ${JSON.stringify(switchedTabs)}`,
+  );
 
   const switchedFrames: Array<{ url: string }> = [];
   const switchedHandle = await session.startScreencast({

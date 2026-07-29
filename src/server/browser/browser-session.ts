@@ -3919,6 +3919,8 @@ export class BrowserSession {
   private navigationSequenceByPage = new WeakMap<Page, number>();
   private browserRuntimeRevisionByFrame = new WeakMap<Frame, number>();
   private browserRuntimeInstalledRevisionByFrame = new WeakMap<Frame, number>();
+  private livePreviewExplicitPageSelectionAt = 0;
+  private livePreviewExplicitPageSelectionSequence = 0;
   private livePreviewNativeViewportRestoredPages = new WeakSet<Page>();
   private livePreviewNativeTabRefreshAt = 0;
   private livePreviewTabIdSequence = 0;
@@ -4487,11 +4489,17 @@ export class BrowserSession {
   }
 
   private async claimPopupIfOwned(page: Page) {
+    const selectionSequence = this.livePreviewExplicitPageSelectionSequence;
     const opener = await page.opener().catch(() => null);
     if (!opener || !this.ownedPages.has(opener)) return;
-    if (this.claimPage(page)) {
+    if (this.claimPage(page, { makeActive: false })) {
+      if (selectionSequence !== this.livePreviewExplicitPageSelectionSequence) return;
       await page.bringToFront().catch(() => undefined);
-      if (!page.isClosed() && this.ownedPages.has(page)) this.page = page;
+      if (
+        selectionSequence === this.livePreviewExplicitPageSelectionSequence
+        && !page.isClosed()
+        && this.ownedPages.has(page)
+      ) this.page = page;
     }
   }
 
@@ -4674,6 +4682,8 @@ export class BrowserSession {
     this.livePreviewNativeViewportRestoredPages ||= new WeakSet<Page>();
     this.livePreviewTabIds ||= new WeakMap<Page, string>();
     this.nativeTabIdByPage ||= new WeakMap<Page, number>();
+    if (!Number.isFinite(this.livePreviewExplicitPageSelectionAt)) this.livePreviewExplicitPageSelectionAt = 0;
+    if (!Number.isFinite(this.livePreviewExplicitPageSelectionSequence)) this.livePreviewExplicitPageSelectionSequence = 0;
     if (!Number.isFinite(this.livePreviewNativeTabRefreshAt)) this.livePreviewNativeTabRefreshAt = 0;
     if (!Number.isFinite(this.livePreviewTabIdSequence)) this.livePreviewTabIdSequence = 0;
     if (typeof this.nativeTabGrouperEnabled !== 'boolean') {
@@ -4741,7 +4751,8 @@ export class BrowserSession {
     // The explicitly selected page is authoritative. Some CDP targets report
     // multiple pages as visible, so always taking the first visible page can
     // undo a live-preview tab switch and reattach the old screencast forever.
-    if (!currentPageVisible && visiblePage && visiblePage !== this.page) this.page = visiblePage;
+    const explicitSelectionSettling = now - this.livePreviewExplicitPageSelectionAt < 1_000;
+    if (!explicitSelectionSettling && !currentPageVisible && visiblePage && visiblePage !== this.page) this.page = visiblePage;
     return pages;
   }
 
@@ -4762,6 +4773,8 @@ export class BrowserSession {
     }
     await page.bringToFront();
     this.page = page;
+    this.livePreviewExplicitPageSelectionAt = Date.now();
+    this.livePreviewExplicitPageSelectionSequence += 1;
   }
 
   async switchLivePreviewTab(tabId: string): Promise<BrowserActionResult> {
@@ -4814,9 +4827,12 @@ export class BrowserSession {
     let stopped = false;
     let stopPromise: Promise<void> | undefined;
     let frameTimer: ReturnType<typeof setTimeout> | undefined;
-    let nextFrameAt = Date.now();
     let viewport = await this.getViewportMetrics().catch(() => page.viewportSize() || { width: 1280, height: 720 });
-    let viewportRefreshAt = Date.now() + 1000;
+    let latestFrame: BrowserScreencastFrame | undefined;
+    let resolveInitialFrame: (() => void) | undefined;
+    const initialFrameReady = new Promise<void>((resolve) => {
+      resolveInitialFrame = resolve;
+    });
 
     const activePreviewPage = () => (this.page && !this.page.isClosed() ? this.page : this.sessionPages()[0]);
     const stopScreencast = async (notifyPageChanged: boolean) => {
@@ -4824,42 +4840,63 @@ export class BrowserSession {
       stopped = true;
       if (frameTimer) clearTimeout(frameTimer);
       frameTimer = undefined;
+      resolveInitialFrame?.();
+      resolveInitialFrame = undefined;
+      client.off('Page.screencastFrame', onNativeFrame);
       stopPromise = (async () => {
+        await client.send('Page.stopScreencast').catch(() => undefined);
         await client.detach().catch(() => undefined);
         if (notifyPageChanged) await options.onActivePageChanged?.();
       })();
       return stopPromise;
     };
-    const captureFrame = async (): Promise<void> => {
-      if (stopped) return;
+    const onNativeFrame = (event: {
+      data?: string;
+      metadata?: { deviceHeight?: number; deviceWidth?: number };
+      sessionId?: number;
+    }) => {
+      if (event.sessionId !== undefined) {
+        void client.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
+      }
+      if (stopped || !event.data) return;
+      if (page.isClosed() || activePreviewPage() !== page) {
+        void stopScreencast(true);
+        return;
+      }
+      const width = Math.max(1, Math.floor(Number(event.metadata?.deviceWidth) || viewport.width));
+      const height = Math.max(1, Math.floor(Number(event.metadata?.deviceHeight) || viewport.height));
+      viewport = { width, height };
+      latestFrame = {
+        capturedAt: new Date().toISOString(),
+        contentType,
+        data: event.data,
+        metadata: event.metadata,
+        tabs: this.getTabsSnapshot(),
+        url: page.url(),
+        viewport,
+      };
+      resolveInitialFrame?.();
+      resolveInitialFrame = undefined;
+    };
+    const publishLatestFrame = async () => {
+      if (stopped || !latestFrame) return;
       if (page.isClosed() || activePreviewPage() !== page) {
         await stopScreencast(true);
         return;
       }
+      await options.onFrame({
+        ...latestFrame,
+        capturedAt: new Date().toISOString(),
+        tabs: this.getTabsSnapshot(),
+        url: page.url(),
+        viewport,
+      });
+    };
+    let nextFrameAt = Date.now() + frameIntervalMs;
+    const publishFrameLoop = async (): Promise<void> => {
+      if (stopped) return;
       try {
-        const result = await client.send('Page.captureScreenshot', {
-          captureBeyondViewport: false,
-          format,
-          fromSurface: true,
-          optimizeForSpeed: true,
-          ...(format === 'jpeg' ? { quality } : {}),
-        });
-        if (stopped || page.isClosed() || activePreviewPage() !== page) {
-          await stopScreencast(true);
-          return;
-        }
-        if (Date.now() >= viewportRefreshAt) {
-          viewport = await this.getViewportMetrics().catch(() => viewport);
-          viewportRefreshAt = Date.now() + 1000;
-        }
-        await options.onFrame({
-          capturedAt: new Date().toISOString(),
-          contentType,
-          data: result.data,
-          tabs: this.getTabsSnapshot(),
-          url: page.url(),
-          viewport: { width: viewport.width, height: viewport.height },
-        });
+        await publishLatestFrame();
       } catch (error) {
         if (!stopped) options.onError?.(error);
       } finally {
@@ -4867,13 +4904,51 @@ export class BrowserSession {
           nextFrameAt += frameIntervalMs;
           const delay = Math.max(0, nextFrameAt - Date.now());
           if (!delay) nextFrameAt = Date.now();
-          frameTimer = setTimeout(() => void captureFrame(), delay);
+          frameTimer = setTimeout(() => void publishFrameLoop(), delay);
           frameTimer.unref?.();
         }
       }
     };
+    client.on('Page.screencastFrame', onNativeFrame);
     try {
-      await captureFrame();
+      await client.send('Page.startScreencast', {
+        everyNthFrame: 1,
+        format,
+        ...(format === 'jpeg' ? { quality } : {}),
+      });
+      let initialWaitTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        initialFrameReady,
+        new Promise<void>((resolve) => {
+          initialWaitTimer = setTimeout(resolve, 250);
+        }),
+      ]);
+      if (initialWaitTimer) clearTimeout(initialWaitTimer);
+      if (!latestFrame && !stopped && !page.isClosed() && activePreviewPage() === page) {
+        const result = await client.send('Page.captureScreenshot', {
+          captureBeyondViewport: false,
+          format,
+          fromSurface: true,
+          optimizeForSpeed: true,
+          ...(format === 'jpeg' ? { quality } : {}),
+        });
+        if (!latestFrame) {
+          latestFrame = {
+            capturedAt: new Date().toISOString(),
+            contentType,
+            data: result.data,
+            tabs: this.getTabsSnapshot(),
+            url: page.url(),
+            viewport,
+          };
+        }
+      }
+      if (!stopped && latestFrame) {
+        await publishLatestFrame();
+        nextFrameAt = Date.now() + frameIntervalMs;
+        frameTimer = setTimeout(() => void publishFrameLoop(), frameIntervalMs);
+        frameTimer.unref?.();
+      }
     } catch (error) {
       await stopScreencast(false);
       throw error;
@@ -4918,10 +4993,11 @@ export class BrowserSession {
         const popupPromise = button === 'left'
           ? page.waitForEvent('popup', { timeout: 1500 }).catch(() => undefined)
           : Promise.resolve(undefined);
+        const popupSelectionSequence = this.livePreviewExplicitPageSelectionSequence;
         await page.mouse.click(x, y, { button, clickCount });
         void popupPromise.then(async (popup) => {
           if (!popup) return;
-          await this.claimPopupPage(popup);
+          await this.claimPopupPage(popup, undefined, popupSelectionSequence);
           await this.refreshSessionGroupPages({ forceNativeRefresh: true });
         }).catch(() => undefined);
         invalidateObservation();
@@ -6813,24 +6889,34 @@ export class BrowserSession {
     };
   }
 
-  private async claimPopupPage(newPage: Page | undefined, timings?: Record<string, number>) {
+  private async claimPopupPage(
+    newPage: Page | undefined,
+    timings?: Record<string, number>,
+    selectionSequence = this.livePreviewExplicitPageSelectionSequence,
+  ) {
     if (!newPage) return undefined;
-    this.claimPage(newPage);
+    this.claimPage(newPage, { makeActive: false });
     await this.markPageGroup(newPage);
+    if (selectionSequence !== this.livePreviewExplicitPageSelectionSequence) return newPage;
     await timedBrowserStep(timings, 'bringPopupToFrontMs', () => newPage.bringToFront().catch(() => undefined));
-    if (!newPage.isClosed() && this.ownedPages.has(newPage)) this.page = newPage;
+    if (
+      selectionSequence === this.livePreviewExplicitPageSelectionSequence
+      && !newPage.isClosed()
+      && this.ownedPages.has(newPage)
+    ) this.page = newPage;
     return newPage;
   }
 
   private async settlePopupAfterAction(popup: Promise<Page | undefined>, waitMs: number, timings?: Record<string, number>) {
     if (waitMs <= 0) return undefined;
+    const selectionSequence = this.livePreviewExplicitPageSelectionSequence;
     const fastWaitMs = Math.min(waitMs, boundedNonNegativeIntegerEnv('BROWSER_POPUP_FAST_WAIT_MS', 250, 1000));
     const newPage = await timedBrowserStep(timings, 'popupFastWaitMs', () => Promise.race([
       popup,
       sleep(fastWaitMs).then(() => undefined),
     ]));
-    if (newPage) return this.claimPopupPage(newPage, timings);
-    void popup.then((latePage) => this.claimPopupPage(latePage).catch(() => undefined));
+    if (newPage) return this.claimPopupPage(newPage, timings, selectionSequence);
+    void popup.then((latePage) => this.claimPopupPage(latePage, undefined, selectionSequence).catch(() => undefined));
     return undefined;
   }
 
