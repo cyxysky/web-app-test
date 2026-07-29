@@ -30,3 +30,16 @@ test('uses the direct preview port for a local base-path build without a reverse
     'ws://127.0.0.1:18021/browser-preview',
   );
 });
+
+test('ignores framework-generated forwarded headers for a local base-path request', () => {
+  const request = new Request('http://localhost:3000/webpilot/api/browser-chat/preview-stream', {
+    headers: {
+      'x-forwarded-host': 'localhost:3000',
+      'x-forwarded-proto': 'http',
+    },
+  });
+  assert.equal(
+    browserReachableUrl(request, 18021, '/webpilot'),
+    'ws://127.0.0.1:18021/browser-preview',
+  );
+});

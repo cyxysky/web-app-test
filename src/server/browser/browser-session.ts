@@ -625,6 +625,7 @@ type AiDomRuntime = {
     ref: string,
     viewportClip?: BrowserUseViewportClip,
   ) => ({ x: number; y: number; descriptor: string } | undefined);
+  visibleDomElement: (ref: string) => Element | undefined;
   visibleDomText: (ref: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
   selectVisibleDomOption: (ref: string, input: { value?: string; label?: string }) => ({
     ok: boolean;
@@ -1308,7 +1309,7 @@ function installAiBrowserPageRuntime() {
     });
   }
 
-  if (win.__aiDomRuntime?.version === 14) return;
+  if (win.__aiDomRuntime?.version === 15) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
@@ -2755,6 +2756,12 @@ function installAiBrowserPageRuntime() {
     return point ? { ...point, descriptor: descriptor(element) } : undefined;
   }
 
+  function visibleDomElement(ref: string) {
+    const element = visibleDomState().refToElement.get(ref);
+    if (!element?.isConnected) return undefined;
+    return actionableTargetFor(element);
+  }
+
   function scrollVisibleDomVirtualList(ref: string, input: { advance?: boolean; top?: number } = {}) {
     const element = visibleDomState().refToElement.get(ref) as HTMLElement | undefined;
     if (!element?.isConnected || element.clientHeight <= 0 || element.scrollHeight <= element.clientHeight) return undefined;
@@ -2820,7 +2827,7 @@ function installAiBrowserPageRuntime() {
   }
 
   win.__aiDomRuntime = {
-    version: 14,
+    version: 15,
     mutationState: () => ({ epoch: mutationState.epoch, lastMutationAt: mutationState.lastMutationAt }),
     isOverlay,
     isTraversable,
@@ -2848,6 +2855,7 @@ function installAiBrowserPageRuntime() {
     journalDomDelta,
     discardDomJournal,
     elementText,
+    visibleDomElement,
     visibleDomPoint,
     visibleDomText,
     selectVisibleDomOption,
@@ -6950,6 +6958,23 @@ export class BrowserSession {
     return element;
   }
 
+  private async elementHandleForDomReference(reference: DomNodeReference) {
+    if (!reference.localRef) return undefined;
+    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
+    if (!frame) return undefined;
+    await this.ensureBrowserPageRuntime(frame);
+    const handle = await frame.evaluateHandle((ref) => {
+      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+      return runtime?.visibleDomElement(ref) || null;
+    }, reference.localRef).catch(() => undefined);
+    const element = handle?.asElement();
+    if (!element) {
+      await handle?.dispose().catch(() => undefined);
+      return undefined;
+    }
+    return element as ElementHandle<Element>;
+  }
+
   private async describeTopmostAtViewportPoint(x: number, y: number) {
     return this.activePage.evaluate(({ pointX, pointY }) => {
       if (pointX < 0 || pointY < 0 || pointX >= window.innerWidth || pointY >= window.innerHeight) {
@@ -8520,30 +8545,59 @@ export class BrowserSession {
       resultAssemblyMs: 0,
       totalMs: 0,
     };
-    if (fromLocator) {
-      await timeBrowserClickStage(clickTimings, 'waitForClickableMs', () => fromLocator.click({
-        button,
-        clickCount,
-        noWaitAfter: true,
-        trial: true,
-      }));
+    const fromDomHandle = from.reference && !isSnapshotReference(from.reference)
+      ? await this.elementHandleForDomReference(from.reference)
+      : undefined;
+    if (from.reference && !isSnapshotReference(from.reference) && !fromDomHandle) {
+      return { ok: false, actual: `UID ${input.uid} no longer resolves to the exact live DOM element. Capture a fresh DOM snapshot before retrying.` };
+    }
+    const playwrightClickTarget = fromLocator || fromDomHandle;
+    if (playwrightClickTarget) {
+      try {
+        await timeBrowserClickStage(clickTimings, 'waitForClickableMs', () => playwrightClickTarget.click({
+          button,
+          clickCount,
+          noWaitAfter: true,
+          trial: true,
+        }));
+      } catch (error) {
+        await fromDomHandle?.dispose().catch(() => undefined);
+        clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
+        return {
+          ok: false,
+          actual: `UID ${input.uid || from.point.descriptor} failed Playwright actionability validation and was not clicked: ${unknownErrorMessage(error)}`,
+          clickTimings,
+        };
+      }
     }
     const eventsBefore = await timeBrowserClickStage(clickTimings, 'preClickInteractionReadMs', () => this.readInteractionCounts());
     const urlBefore = page.url();
     const popupSetupStartedAt = Date.now();
     const popup = this.watchForPopup(page);
     clickTimings.popupListenerSetupMs = Date.now() - popupSetupStartedAt;
-    throwIfAborted();
-    await this.showAiMouseCursor(page, fromPoint.x, fromPoint.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
-    await timeBrowserClickStage(clickTimings, 'clickDispatchMs', () => (
-      fromLocator
-        ? fromLocator.click({ button, clickCount, noWaitAfter: true })
-        : page.mouse.click(fromPoint.x, fromPoint.y, { button, clickCount })
-    ));
+    try {
+      throwIfAborted();
+      await this.showAiMouseCursor(page, fromPoint.x, fromPoint.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
+      await timeBrowserClickStage(clickTimings, 'clickDispatchMs', () => (
+        playwrightClickTarget
+          ? playwrightClickTarget.click({ button, clickCount, noWaitAfter: true })
+          : page.mouse.click(fromPoint.x, fromPoint.y, { button, clickCount })
+      ));
+    } catch (error) {
+      if (input.abortSignal?.aborted) throw error;
+      clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
+      return {
+        ok: false,
+        actual: `UID ${input.uid || from.point.descriptor} became non-actionable before Playwright could click it: ${unknownErrorMessage(error)}`,
+        clickTimings,
+      };
+    } finally {
+      await fromDomHandle?.dispose().catch(() => undefined);
+    }
     throwIfAborted();
     const claimedPopup = await timeBrowserClickStage(clickTimings, 'popupWaitMs', () => this.settlePopupAfterAction(popup.popup, popup.waitMs));
     const result = await this.completeVerifiedAction(
-      `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${from.point.source}.`,
+      `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${fromDomHandle ? 'dom-observation+playwright-actionability' : from.point.source}.`,
       previousGeneration,
       async () => {
         const eventsAfter = await this.readInteractionCounts();

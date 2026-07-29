@@ -13,8 +13,14 @@ export function browserReachableUrl(request: Request, port: number, basePath = W
     if (configured.protocol === 'https:') configured.protocol = 'wss:';
     return configured.toString().replace(/\/$/, '');
   }
+  const requestHostname = url.hostname.toLowerCase();
+  const localRequest = requestHostname === 'localhost'
+    || requestHostname === '127.0.0.1'
+    || requestHostname === '0.0.0.0'
+    || requestHostname === '[::1]'
+    || requestHostname === '::1';
   const reverseProxyDetected = Boolean(forwardedHost || forwardedProto);
-  if (basePath && reverseProxyDetected) {
+  if (basePath && reverseProxyDetected && !localRequest) {
     return `${protocol}//${host}${withWebPilotBasePath('/browser-preview', basePath)}`;
   }
   let hostname = url.hostname;
@@ -23,7 +29,7 @@ export function browserReachableUrl(request: Request, port: number, basePath = W
   } catch {
     hostname = host;
   }
-  if (hostname === 'localhost' || hostname === '0.0.0.0' || hostname === '[::1]' || hostname === '::1') hostname = '127.0.0.1';
+  if (localRequest || hostname === 'localhost' || hostname === '0.0.0.0' || hostname === '[::1]' || hostname === '::1') hostname = '127.0.0.1';
   const reachableHostname = hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname;
   return `${protocol}//${reachableHostname || '127.0.0.1'}:${port}/browser-preview`;
 }

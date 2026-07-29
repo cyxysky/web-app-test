@@ -343,8 +343,17 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   const lateSearch = await session.searchSnapshot({ query: 'Late action', roles: ['button'] });
   assert.equal(lateSearch.ok, true, lateSearch.actual);
   assert.match(lateSearch.actual, /<button\b[^>]*>Late action<\/button>/, 'search must use the current DOM baseline after an incremental mutation');
+  await page.locator('body').evaluate((body) => body.removeAttribute('data-saved'));
+  await page.locator('#save').evaluate((button) => button.setAttribute('disabled', ''));
+  const disabledDomUidClick = await session.mouse({ action: 'click', uid: domSaveUid });
+  assert.equal(disabledDomUidClick.ok, false, disabledDomUidClick.actual);
+  assert.match(disabledDomUidClick.actual, /Playwright actionability validation/);
+  assert.equal(await page.locator('body').getAttribute('data-saved'), null, 'a failed actionability trial must not dispatch a click');
+  await page.locator('#save').evaluate((button) => button.removeAttribute('disabled'));
   const domUidClick = await session.mouse({ action: 'click', uid: domSaveUid });
   assert.equal(domUidClick.ok, true, domUidClick.actual);
+  assert.match(domUidClick.actual, /source=dom-observation\+playwright-actionability/);
+  assert.equal(await page.locator('body').getAttribute('data-saved'), 'true');
   await page.locator('#save').evaluate((button) => button.replaceWith(button.cloneNode(true)));
   const replacementDelta = await session.readDomChanges();
   assert.ok(replacementDelta.domChanges?.removed.includes(domSaveUid), replacementDelta.actual);
