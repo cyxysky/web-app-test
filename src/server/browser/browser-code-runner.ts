@@ -20,6 +20,13 @@ export type BrowserCodeImage = {
   mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
 };
 
+export type BrowserCodeActivity = {
+  actions: string[];
+  navigationChanged: boolean;
+  requiresPostActionObservation: boolean;
+  tabChanged: boolean;
+};
+
 export type BrowserCodeRunResult = {
   ok: boolean;
   value?: unknown;
@@ -28,6 +35,7 @@ export type BrowserCodeRunResult = {
   logs: BrowserCodeExecutionLog[];
   images?: BrowserCodeImage[];
   selectedExecutionId?: string;
+  activity?: BrowserCodeActivity;
   aborted?: boolean;
 };
 
@@ -82,7 +90,7 @@ const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 2;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 3;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -134,6 +142,7 @@ function browserCodeKernelMain() {
   let browser: import('playwright').Browser | undefined;
   let replServer: import('node:repl').REPLServer | undefined;
   let activeExecution: {
+    actions: Set<string>;
     logs: BrowserCodeExecutionLog[];
     images: BrowserCodeImage[];
     imageBytes: number;
@@ -148,6 +157,10 @@ function browserCodeKernelMain() {
   let chain = Promise.resolve();
 
   const imageDigest = (value: Uint8Array) => childCreateHash('sha256').update(value).digest('hex');
+
+  const recordAction = (action: string) => {
+    activeExecution?.actions.add(action);
+  };
 
   const send = (payload: Record<string, unknown>) => {
     if (typeof hostProcess.send === 'function') hostProcess.send(payload);
@@ -492,6 +505,7 @@ function browserCodeKernelMain() {
         throw new Error('credentialVault.fill() could not access the trusted Playwright locator implementation.');
       }
       const trustedLocator = Reflect.apply(nativeFrameLocator, targetFrame, [selector]);
+      recordAction('credential.fill');
       await Reflect.apply(nativeLocatorFill, trustedLocator, [credential.value]);
       return { filled: true, origin };
     },
@@ -511,7 +525,7 @@ function browserCodeKernelMain() {
       nativeLocatorFill = locatorFill as (this: object, value: string) => Promise<void>;
     }
     pointerDecoratedLocatorPrototypes.add(prototype);
-    const patch = (name: string, kind: 'click' | 'double' | 'move') => {
+    const patch = (name: string, kind: 'click' | 'double' | 'move', changesState = true) => {
       const original = Reflect.get(prototype, name);
       if (typeof original !== 'function') return;
       try {
@@ -529,6 +543,7 @@ function browserCodeKernelMain() {
                 await moveVisibleAiPointer(targetPage, await locatorCenter(normalizedArgs[0]), 'move');
               }
             }
+            if (changesState) recordAction(`locator.${name}`);
             return Reflect.apply(original, this, normalizedArgs);
           },
           writable: true,
@@ -540,12 +555,28 @@ function browserCodeKernelMain() {
     };
     patch('click', 'click');
     patch('dblclick', 'double');
-    patch('hover', 'move');
+    patch('hover', 'move', false);
     patch('check', 'click');
     patch('uncheck', 'click');
     patch('setChecked', 'click');
     patch('tap', 'click');
     patch('dragTo', 'click');
+    for (const name of ['fill', 'type', 'press', 'selectOption', 'clear', 'setInputFiles']) {
+      const original = Reflect.get(prototype, name);
+      if (typeof original !== 'function') continue;
+      try {
+        Object.defineProperty(prototype, name, {
+          configurable: true,
+          value: async function observedLocatorAction(this: object, ...args: unknown[]) {
+            recordAction(`locator.${name}`);
+            return Reflect.apply(original, this, args);
+          },
+          writable: true,
+        });
+      } catch {
+        // Keep the native Playwright method when the locator prototype is immutable.
+      }
+    }
   };
 
   const decoratePage = (page: import('playwright').Page) => {
@@ -554,7 +585,7 @@ function browserCodeKernelMain() {
     decorateLocatorPrototype(page);
     decoratePageScreenshotPrototype(page);
     const pageRecord = page as unknown as Record<string, unknown>;
-    const patchPageAction = (name: string, kind: 'click' | 'double' | 'move') => {
+    const patchPageAction = (name: string, kind: 'click' | 'double' | 'move', changesState = true) => {
       const original = Reflect.get(pageRecord, name);
       if (typeof original !== 'function') return;
       try {
@@ -568,6 +599,7 @@ function browserCodeKernelMain() {
             if (activeExecution && typeof normalizedArgs[0] === 'string') {
               await moveVisibleAiPointer(page, await locatorCenter(page.locator(normalizedArgs[0])), kind);
             }
+            if (changesState) recordAction(`page.${name}`);
             return Reflect.apply(original, page, normalizedArgs);
           },
           writable: true,
@@ -578,10 +610,26 @@ function browserCodeKernelMain() {
     };
     patchPageAction('click', 'click');
     patchPageAction('dblclick', 'double');
-    patchPageAction('hover', 'move');
+    patchPageAction('hover', 'move', false);
     patchPageAction('check', 'click');
     patchPageAction('uncheck', 'click');
     patchPageAction('tap', 'click');
+    for (const name of ['fill', 'type', 'press', 'selectOption', 'setInputFiles', 'goto', 'reload', 'goBack', 'goForward', 'setContent']) {
+      const original = Reflect.get(pageRecord, name);
+      if (typeof original !== 'function') continue;
+      try {
+        Object.defineProperty(pageRecord, name, {
+          configurable: true,
+          value: async (...args: unknown[]) => {
+            recordAction(`page.${name}`);
+            return Reflect.apply(original, page, args);
+          },
+          writable: true,
+        });
+      } catch {
+        // Keep the native Playwright method when the page object is immutable.
+      }
+    }
 
     const mouse = page.mouse as unknown as Record<string, unknown>;
     const nativeMove = Reflect.get(mouse, 'move');
@@ -608,6 +656,7 @@ function browserCodeKernelMain() {
             await consumeCoordinateClickEvidence(page);
             const kind = options?.button === 'right' ? 'right' : (options?.clickCount || 1) > 1 ? 'double' : 'click';
             await moveVisibleAiPointer(page, { x, y }, kind);
+            recordAction('mouse.click');
             return Reflect.apply(nativeClick, page.mouse, [x, y, options]);
           },
           writable: true,
@@ -616,6 +665,29 @@ function browserCodeKernelMain() {
         // Keep the native mouse implementation when it cannot be decorated.
       }
     }
+    const patchInputDevice = (device: Record<string, unknown>, name: string, action: string) => {
+      const original = Reflect.get(device, name);
+      if (typeof original !== 'function') return;
+      try {
+        Object.defineProperty(device, name, {
+          configurable: true,
+          value: async (...args: unknown[]) => {
+            recordAction(action);
+            return Reflect.apply(original, device, args);
+          },
+          writable: true,
+        });
+      } catch {
+        // Keep the native input method when it cannot be decorated.
+      }
+    };
+    patchInputDevice(mouse, 'wheel', 'mouse.wheel');
+    patchInputDevice(mouse, 'down', 'mouse.down');
+    patchInputDevice(mouse, 'up', 'mouse.up');
+    const keyboard = page.keyboard as unknown as Record<string, unknown>;
+    patchInputDevice(keyboard, 'press', 'keyboard.press');
+    patchInputDevice(keyboard, 'type', 'keyboard.type');
+    patchInputDevice(keyboard, 'insertText', 'keyboard.insertText');
   };
 
   const tabId = (page: import('playwright').Page) => {
@@ -633,6 +705,7 @@ function browserCodeKernelMain() {
     replServer.context.page = page;
     replServer.context.context = page.context();
     replServer.context.tab = tabForPage(page);
+    recordAction('tab.use');
     return page;
   };
 
@@ -703,8 +776,14 @@ function browserCodeKernelMain() {
       id: tabId(page),
       playwright: page,
       cua,
-      close: () => page.close(),
-      goto: (url: string, options?: Parameters<import('playwright').Page['goto']>[1]) => page.goto(url, options),
+      close: () => {
+        recordAction('tab.close');
+        return page.close();
+      },
+      goto: (url: string, options?: Parameters<import('playwright').Page['goto']>[1]) => {
+        recordAction('tab.goto');
+        return page.goto(url, options);
+      },
       screenshot: (options: Parameters<import('playwright').Page['screenshot']>[0] = {}) => page.screenshot(options),
       title: () => page.title(),
       url: () => page.url(),
@@ -738,6 +817,7 @@ function browserCodeKernelMain() {
     nameSession: async (name: string) => { void name; },
     tabs: Object.freeze({
       finalize: async (input: { keep?: Array<{ status: 'deliverable' | 'handoff'; tab: unknown }> } = {}) => {
+        recordAction('tabs.finalize');
         const keepPages = new Set((input.keep || []).map((item) => pageFromTab(item.tab)).filter(Boolean));
         const closing = [...agentCreatedPages].filter((candidatePage) => !candidatePage.isClosed() && !keepPages.has(candidatePage));
         await Promise.all(closing.map((candidatePage) => candidatePage.close().catch(() => undefined)));
@@ -748,6 +828,7 @@ function browserCodeKernelMain() {
       },
       list: async () => currentPages().map(tabForPage),
       new: async (options: { url?: string } = {}) => {
+        recordAction('tabs.new');
         const selected = replServer?.context.context as import('playwright').BrowserContext | undefined;
         const targetContext = selected || browser?.contexts()[0];
         if (!targetContext) throw new Error('No browser context is available.');
@@ -863,6 +944,9 @@ function browserCodeKernelMain() {
     if (!replServer) throw new Error('browserCode JavaScript kernel is not initialized.');
     const page = await findExecutionPage(input.executionId);
     const browserContext = page.context();
+    const initialPage = page;
+    const initialUrl = page.url();
+    const initialPageCount = browserContext.pages().filter((candidatePage) => !candidatePage.isClosed()).length;
     decorateContextNewPage(browserContext);
     browserContext.setDefaultTimeout(browserCodeActionTimeoutMs);
     browserContext.setDefaultNavigationTimeout(browserCodeNavigationTimeoutMs);
@@ -875,6 +959,7 @@ function browserCodeKernelMain() {
     replServer.context.context = browserContext;
     replServer.context.tab = tabForPage(page);
     activeExecution = {
+      actions: new Set(),
       imageBytes: 0,
       images: [],
       logs: [],
@@ -903,6 +988,16 @@ function browserCodeKernelMain() {
       const images = activeExecution.images;
       const logs = activeExecution.logs;
       const selectedPage = replServer.context.page as import('playwright').Page | undefined;
+      const finalPage = selectedPage && !selectedPage.isClosed() ? selectedPage : undefined;
+      const finalPageCount = browserContext.pages().filter((candidatePage) => !candidatePage.isClosed()).length;
+      const navigationChanged = Boolean(finalPage && finalPage.url() !== initialUrl);
+      const tabChanged = finalPage !== initialPage || finalPageCount !== initialPageCount;
+      const activity: BrowserCodeActivity = {
+        actions: [...activeExecution.actions],
+        navigationChanged,
+        requiresPostActionObservation: activeExecution.actions.size > 0 || navigationChanged || tabChanged,
+        tabChanged,
+      };
       let selectedExecutionId: string | undefined;
       if (selectedPage && typeof selectedPage.evaluate === 'function' && !selectedPage.isClosed()) {
         selectedExecutionId = childRandomUUID();
@@ -926,6 +1021,7 @@ function browserCodeKernelMain() {
         logs,
         images,
         selectedExecutionId,
+        activity,
       });
     } catch (error: unknown) {
       await publishPendingCoordinateClickEvidence();
@@ -936,6 +1032,12 @@ function browserCodeKernelMain() {
         error: error instanceof Error ? error.message : String(error),
         images: activeExecution.images,
         logs: activeExecution.logs,
+        activity: {
+          actions: [...activeExecution.actions],
+          navigationChanged: false,
+          requiresPostActionObservation: true,
+          tabChanged: false,
+        },
       });
     } finally {
       activeExecution = undefined;
@@ -1231,6 +1333,9 @@ export class BrowserCodeKernel {
         logs,
         images,
         selectedExecutionId: typeof record.selectedExecutionId === 'string' ? record.selectedExecutionId : undefined,
+        activity: record.activity && typeof record.activity === 'object'
+          ? record.activity as BrowserCodeActivity
+          : undefined,
       });
     } else {
       this.finishPending({
@@ -1238,6 +1343,9 @@ export class BrowserCodeKernel {
         error: typeof record.error === 'string' ? record.error : 'browserCode execution failed.',
         images,
         logs,
+        activity: record.activity && typeof record.activity === 'object'
+          ? record.activity as BrowserCodeActivity
+          : undefined,
       });
     }
   }

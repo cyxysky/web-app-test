@@ -22,6 +22,7 @@ import { browserChatCodeRules, browserChatDomRules } from './runtime-prompt-rule
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
+import { compactOlderBrowserCodeToolResults } from './browser-code-tool-history';
 import {
   isEffectiveToolTraceFailure,
   notifyRuntimeToolTrace,
@@ -1264,7 +1265,7 @@ function makeBrowserTools(
   const sharedTools = {
     ...(mode === 'code' ? {
     browserCode: tool({
-      description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the primary browser inspection, screenshot, and operation entrypoint. Every result automatically includes a fresh full semantic DOM snapshot, page-console delta, and code-console output. Use top-level await, nodeRepl.write(value) for JSON, and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. When the prompt supplies a credential reference, credentialVault.fill(locator, ref) securely fills the real Playwright locator without returning the raw value. Locator actions have a 5000ms default timeout and navigation has a 30000ms default timeout; force: true and scripted DOM clicks are forbidden, and a failed operation ends only the current cell and preserves kernel bindings.',
+      description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the primary browser inspection, screenshot, and operation entrypoint. Every result includes final page identity plus page/code console deltas; action, navigation, tab-change, and failure cells also include a bounded lightweight postActionObservation, while pure reads do not. Use targeted Playwright reads or call page.domSnapshot() explicitly when broader structure is needed. Use top-level await, nodeRepl.write(value) for compact JSON, and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. When the prompt supplies a credential reference, credentialVault.fill(locator, ref) securely fills the real Playwright locator without returning the raw value. Locator actions have a 5000ms default timeout and navigation has a 30000ms default timeout; force: true and scripted DOM clicks are forbidden, and a failed operation ends only the current cell and preserves kernel bindings.',
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
         maxOutputChars: z.number().int().min(1_000).max(50_000).optional().describe('Maximum serialized return size. Defaults to 20000 characters.'),
@@ -2256,6 +2257,7 @@ async function executeRuntimeStep(input: {
       let messagesToSend = compactedModelContext?.length
         ? [...compactedModelContext, ...messagesAddedAfterCompactedContext(sourceMessages)]
         : sourceMessages;
+      messagesToSend = compactOlderBrowserCodeToolResults(messagesToSend);
       if (appendedMessages.length) {
         messagesToSend = [...messagesToSend, ...appendedMessages];
         messageImagePaths = [...messageImagePaths, ...appendedImagePaths];

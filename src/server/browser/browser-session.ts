@@ -41,6 +41,7 @@ import {
   BROWSER_CODE_KERNEL_RUNTIME_REVISION,
   browserCodePolicyViolation,
   BrowserCodeKernel,
+  type BrowserCodeActivity,
   type BrowserCodeConnection,
   type BrowserCodeCredentialBinding,
 } from './browser-code-runner';
@@ -183,10 +184,6 @@ export type BrowserActionResult = {
       validationErrors: string[];
     };
     overflow: boolean;
-  };
-  autoSnapshot?: {
-    generationId: string;
-    refreshed: boolean;
   };
 };
 
@@ -6245,6 +6242,8 @@ export class BrowserSession {
     const pageConsoleSequenceBefore = this.pageConsoleSequence;
     const page = this.activePage;
     await this.ensurePageGroup(page);
+    await this.resetInterActionChangeJournal().catch(() => undefined);
+    const initialUrl = page.url();
     const executionId = randomUUID();
     await page.evaluate((id) => {
       Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
@@ -6314,12 +6313,33 @@ export class BrowserSession {
     if (!finalPage.isClosed()) this.page = finalPage;
     const finalUrl = finalPage.isClosed() ? '' : finalPage.url();
     const finalTitle = finalPage.isClosed() ? '' : await finalPage.title().catch(() => '');
-    const snapshotOutcome = finalPage.isClosed()
-      ? { snapshot: undefined, error: 'The final browser page is closed.' }
-      : await this.readSnapshotSlice({ refresh: true, mode: 'full', maxChars: 20_000 }).then(
-        (snapshot) => ({ snapshot, error: undefined }),
-        (error) => ({ snapshot: undefined, error: unknownErrorMessage(error) }),
-      );
+    const inferredActivity: BrowserCodeActivity = {
+      actions: execution.activity?.actions || [],
+      navigationChanged: execution.activity?.navigationChanged === true || finalUrl !== initialUrl,
+      requiresPostActionObservation: execution.activity?.requiresPostActionObservation === true
+        || !execution.ok
+        || finalPage !== page
+        || finalUrl !== initialUrl
+        || pagesCreatedDuringExecution.size > 0,
+      tabChanged: execution.activity?.tabChanged === true || finalPage !== page || pagesCreatedDuringExecution.size > 0,
+    };
+    const postActionObservation = inferredActivity.requiresPostActionObservation
+      ? finalPage.isClosed()
+        ? {
+          captured: false,
+          error: 'The final browser page is closed.',
+          activity: inferredActivity,
+        }
+        : await this.readBrowserCodePostActionObservation(inferredActivity).catch((error) => ({
+          captured: false,
+          error: unknownErrorMessage(error),
+          activity: inferredActivity,
+        }))
+      : {
+        captured: false,
+        reason: 'No state-changing browser action, navigation, tab change, or execution error was detected. Use targeted Playwright reads or page.domSnapshot() when more page evidence is required.',
+        activity: inferredActivity,
+      };
     const pageConsole = this.pageConsoleEntries
       .filter((entry) => entry.sequence > pageConsoleSequenceBefore)
       .slice(-100)
@@ -6356,24 +6376,7 @@ export class BrowserSession {
         aborted: execution.aborted === true,
         elapsedMs: execution.elapsedMs,
         finalPage: { url: finalUrl, title: finalTitle },
-        domSnapshot: snapshotOutcome.snapshot ? {
-          content: snapshotOutcome.snapshot.content,
-          generationId: snapshotOutcome.snapshot.generationId,
-          mode: snapshotOutcome.snapshot.mode,
-          hasMore: snapshotOutcome.snapshot.hasMore,
-          nextIndex: snapshotOutcome.snapshot.nextIndex,
-          returnedEntries: snapshotOutcome.snapshot.returnedEntries,
-          totalEntries: snapshotOutcome.snapshot.totalEntries,
-          nodeCount: snapshotOutcome.snapshot.nodeCount,
-          actionableCount: snapshotOutcome.snapshot.actionableCount,
-          frameCount: snapshotOutcome.snapshot.frameCount,
-          skippedFrameCount: snapshotOutcome.snapshot.skippedFrameCount,
-          captureSource: snapshotOutcome.snapshot.captureSource,
-          timings: snapshotOutcome.snapshot.timings,
-        } : {
-          content: null,
-          error: snapshotOutcome.error,
-        },
+        postActionObservation,
         console: {
           code: execution.logs,
           page: pageConsole,
@@ -6384,13 +6387,99 @@ export class BrowserSession {
       referenceImagePath: emittedImagePaths[0],
       referenceImagePaths: emittedImagePaths,
     };
-    if (snapshotOutcome.snapshot) {
-      result.autoSnapshot = {
-        generationId: snapshotOutcome.snapshot.generationId,
-        refreshed: true,
-      };
-    }
     return result;
+  }
+
+  private async readBrowserCodePostActionObservation(activity: BrowserCodeActivity) {
+    const startedAt = Date.now();
+    const page = this.activePage;
+    const pageState = await page.evaluate(() => {
+      const visible = (element: Element) => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && Number(style.opacity || 1) > 0
+          && rect.width > 0
+          && rect.height > 0;
+      };
+      const describe = (element: Element | null) => {
+        if (!element) return undefined;
+        const html = element as HTMLElement;
+        const input = element as HTMLInputElement;
+        const type = input.type?.toLowerCase();
+        const text = String(html.innerText || html.textContent || '').replace(/\s+/g, ' ').trim();
+        return {
+          tag: element.tagName.toLowerCase(),
+          role: element.getAttribute('role') || undefined,
+          id: element.id || undefined,
+          name: element.getAttribute('aria-label') || element.getAttribute('name') || undefined,
+          text: text ? text.slice(0, 240) : undefined,
+          value: 'value' in input && type !== 'password' ? String(input.value || '').slice(0, 160) : undefined,
+          disabled: element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true' || undefined,
+        };
+      };
+      const dialogs = [...document.querySelectorAll('dialog[open], [role="dialog"], [aria-modal="true"]')]
+        .filter(visible)
+        .slice(0, 5)
+        .map((element) => {
+          const heading = element.querySelector('h1, h2, h3, [role="heading"]');
+          const text = String((element as HTMLElement).innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+          return {
+            ...describe(element),
+            heading: String(heading?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200) || undefined,
+            text: text.slice(0, 800) || undefined,
+          };
+        });
+      const notices = [...document.querySelectorAll('[role="alert"], [role="status"]')]
+        .filter(visible)
+        .slice(0, 8)
+        .map((element) => describe(element));
+      return {
+        url: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        activeElement: describe(document.activeElement),
+        dialogs,
+        notices,
+        busyElementCount: [...document.querySelectorAll('[aria-busy="true"], [role="progressbar"]')].filter(visible).length,
+      };
+    });
+    const changesResult = await this.readDomChanges();
+    const sourceChanges = changesResult.domChanges;
+    const maxEntries = 30;
+    const compactLines = (lines: string[] = []) => lines.slice(0, maxEntries).map((line) => line.slice(0, 1_000));
+    const domChanges = sourceChanges ? {
+      epoch: sourceChanges.epoch,
+      added: compactLines(sourceChanges.added),
+      updated: compactLines(sourceChanges.updated),
+      removed: sourceChanges.removed.slice(0, maxEntries),
+      extra: {
+        added: compactLines(sourceChanges.extra.added),
+        updated: compactLines(sourceChanges.extra.updated),
+        errors: sourceChanges.extra.errors.slice(0, 10).map((line) => line.slice(0, 1_000)),
+        validationErrors: sourceChanges.extra.validationErrors.slice(0, 10).map((line) => line.slice(0, 1_000)),
+      },
+      overflow: sourceChanges.overflow,
+      truncated: [
+        sourceChanges.added,
+        sourceChanges.updated,
+        sourceChanges.removed,
+        sourceChanges.extra.added,
+        sourceChanges.extra.updated,
+      ].some((entries) => entries.length > maxEntries),
+    } : undefined;
+    await this.resetInterActionChangeJournal().catch(() => undefined);
+    return {
+      captured: true,
+      reason: !activity.actions.length
+        ? activity.navigationChanged ? 'navigation' : activity.tabChanged ? 'tab-change' : 'execution-error'
+        : 'browser-action',
+      activity,
+      page: pageState,
+      domChanges,
+      elapsedMs: Date.now() - startedAt,
+    };
   }
 
   async waitForManualVerification(maxMs = Number(process.env.MANUAL_VERIFICATION_TIMEOUT_MS || 180000)): Promise<BrowserActionResult> {

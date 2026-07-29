@@ -11,6 +11,7 @@ export type RefreshWebSocketEvent = {
   updatedAt: string;
   version: number;
   deleted?: boolean;
+  patch?: unknown;
 };
 
 type RefreshWebSocketInfo = {
@@ -245,6 +246,7 @@ export function publishRefreshEvent(input: {
   deleted?: boolean;
   entityType: RefreshEntityType;
   id: string;
+  patch?: unknown;
   updatedAt?: string;
 }) {
   if (!input.id) return;
@@ -259,6 +261,7 @@ export function publishRefreshEvent(input: {
     updatedAt: input.updatedAt || new Date().toISOString(),
     version,
     ...(input.deleted ? { deleted: true } : {}),
+    ...(input.patch === undefined ? {} : { patch: input.patch }),
   };
   current.pending.push(event);
   if (current.pending.length > 500) current.pending = current.pending.slice(-500);

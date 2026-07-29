@@ -50,10 +50,9 @@ import { store } from '@/server/db/store';
 import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
 import {
   deleteBrowserChatSessionRecord,
-  readBrowserChatLogs,
   readBrowserChatSessionRecord,
   readBrowserChatSessionSummaries,
-  writeBrowserChatSessionRecord,
+  writeBrowserChatSessionDelta,
 } from '@/server/storage/sqlite-record-store';
 import { artifactPath as resolveArtifactPath } from '@/server/storage/paths';
 import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
@@ -158,6 +157,23 @@ type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
   started: boolean;
 };
 
+type BrowserChatPersistenceCursor = {
+  logs: Map<string, BrowserChatLogRecord>;
+  messages: Map<string, BrowserChatMessage>;
+  steps: Map<number, StepExecutionResult>;
+};
+
+export type BrowserChatSessionRealtimePatch = {
+  session: Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'>;
+  summary: BrowserChatSessionSnapshot;
+  logs?: BrowserChatLogRecord[];
+  messages?: BrowserChatMessage[];
+  steps?: StepExecutionResult[];
+  removedLogIds?: string[];
+  removedMessageIds?: string[];
+  removedStepIndexes?: number[];
+};
+
 type BrowserChatActiveTurn = RegisteredBrowserChatTurn<BrowserChatSessionRecord>;
 
 type BrowserChatBlockedSubagentRuntime = {
@@ -203,6 +219,7 @@ type BrowserChatRuntimeState = {
     promise: Promise<BrowserToolConfirmationDecision>;
   }>;
   pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
+  persistenceCursors: Map<string, BrowserChatPersistenceCursor>;
   lastPersistWarningAt: number;
 };
 
@@ -221,6 +238,7 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
     promise: Promise<BrowserToolConfirmationDecision>;
   }>(),
   pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
+  persistenceCursors: new Map<string, BrowserChatPersistenceCursor>(),
   lastPersistWarningAt: 0,
 });
 browserChatRuntimeState.sessions ??= new Map();
@@ -231,6 +249,7 @@ browserChatRuntimeState.subagentResults ??= new Map();
 browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
+browserChatRuntimeState.persistenceCursors ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
 const activeTurns = browserChatRuntimeState.activeTurns;
@@ -240,6 +259,7 @@ const subagentResults = browserChatRuntimeState.subagentResults;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
+const persistenceCursors = browserChatRuntimeState.persistenceCursors;
 const runningHydrationGraceMs = 2 * 60 * 1000;
 const fullLogDetailsFlag = '__browserChatFullLogDetails';
 
@@ -451,10 +471,10 @@ function id(prefix: string) {
   return `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
 }
 
-function notifySessionUpdate(sessionId: string) {
+function notifySessionUpdate(sessionId: string, patch?: BrowserChatSessionRealtimePatch) {
   const session = sessions.get(sessionId);
   if (session) {
-    publishRefreshEvent({ entityType: 'browserChatSession', id: sessionId, updatedAt: session.updatedAt });
+    publishRefreshEvent({ entityType: 'browserChatSession', id: sessionId, updatedAt: session.updatedAt, patch });
   } else {
     publishRefreshEvent({ entityType: 'browserChatSession', id: sessionId, deleted: true });
   }
@@ -1115,7 +1135,7 @@ function summaryFromSnapshot(session: BrowserChatSessionSnapshot): BrowserChatSe
     steps: [],
     consoleErrors: [],
     networkErrors: [],
-    logs: session.busy ? session.logs.slice(-8) : [],
+    logs: [],
   };
 }
 
@@ -1448,33 +1468,75 @@ function isBrowserChatSessionSnapshot(value: unknown): value is BrowserChatSessi
     && typeof (value as { id?: unknown }).id === 'string';
 }
 
-function readSessionLogRecords(sessionId: string) {
-  return readBrowserChatLogs<BrowserChatLogRecord>(sessionId);
-}
-
 function readSessionSnapshot(sessionId: string) {
   const item = readBrowserChatSessionRecord<BrowserChatSessionSnapshot>(sessionId);
   if (!isBrowserChatSessionSnapshot(item)) return undefined;
   return { ...item, logs: trimBrowserChatLogs(item.logs || []) };
 }
 
-function writeSessionSnapshot(item: BrowserChatSessionSnapshot, options: { mergePersisted?: boolean } = {}) {
-  const logs = options.mergePersisted === true
-    ? mergePersistedLogs(readSessionLogRecords(item.id), item.logs)
-    : item.logs;
-  const storedLogs = logs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(logs) : logs;
-  const durableSnapshot = { ...item, messages: [], steps: [], logs: [] };
-  writeBrowserChatSessionRecord(
-    durableSnapshot,
-    summaryFromSnapshot({ ...item, logs: trimBrowserChatLogs(storedLogs) }),
-    item.messages,
-    item.steps,
-    storedLogs,
+function persistenceDelta(item: BrowserChatSessionSnapshot) {
+  const previous = persistenceCursors.get(item.id);
+  const messageIds = new Set(item.messages.map((message) => message.id));
+  const stepIndexes = new Set(item.steps.map((step) => step.index));
+  const logIds = new Set(item.logs.map((log) => log.id));
+  return {
+    messages: item.messages.filter((message) => previous?.messages.get(message.id) !== message),
+    steps: item.steps.filter((step) => previous?.steps.get(step.index) !== step),
+    logs: item.logs.filter((log) => previous?.logs.get(log.id) !== log),
+    removedMessageIds: previous ? [...previous.messages.keys()].filter((id) => !messageIds.has(id)) : [],
+    removedStepIndexes: previous ? [...previous.steps.keys()].filter((index) => !stepIndexes.has(index)) : [],
+    removedLogIds: previous ? [...previous.logs.keys()].filter((id) => !logIds.has(id)) : [],
+  };
+}
+
+function seedPersistenceCursor(
+  item: Pick<BrowserChatSessionSnapshot, 'id' | 'logs' | 'messages' | 'steps'>,
+  persisted: Pick<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'> = item,
+) {
+  const messages = new Map(persisted.messages.map((message) => [message.id, message]));
+  for (const message of item.messages) messages.set(message.id, message);
+  const steps = new Map(persisted.steps.map((step) => [step.index, step]));
+  for (const step of item.steps) steps.set(step.index, step);
+  const logs = new Map(persisted.logs.map((log) => [log.id, log]));
+  for (const log of item.logs) logs.set(log.id, log);
+  persistenceCursors.set(item.id, {
+    messages,
+    steps,
+    logs,
+  });
+}
+
+function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSessionRealtimePatch {
+  const storedLogs = item.logs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(item.logs) : item.logs;
+  const persistedItem = storedLogs === item.logs ? item : { ...item, logs: storedLogs };
+  const delta = persistenceDelta(persistedItem);
+  const sessionRecord: Partial<BrowserChatSessionSnapshot> = { ...persistedItem };
+  delete sessionRecord.messages;
+  delete sessionRecord.steps;
+  delete sessionRecord.logs;
+  const session = sessionRecord as Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'>;
+  const summary = summaryFromSnapshot(persistedItem);
+  writeBrowserChatSessionDelta(
+    { ...session, messages: [], steps: [], logs: [] },
+    summary,
+    delta,
   );
+  seedPersistenceCursor(persistedItem);
+  return {
+    session,
+    summary,
+    ...(delta.messages.length ? { messages: delta.messages } : {}),
+    ...(delta.steps.length ? { steps: delta.steps.map(compactStepForClient) } : {}),
+    ...(delta.logs.length ? { logs: delta.logs } : {}),
+    ...(delta.removedMessageIds.length ? { removedMessageIds: delta.removedMessageIds } : {}),
+    ...(delta.removedStepIndexes.length ? { removedStepIndexes: delta.removedStepIndexes } : {}),
+    ...(delta.removedLogIds.length ? { removedLogIds: delta.removedLogIds } : {}),
+  };
 }
 
 function deleteSessionSnapshot(sessionId: string) {
   deleteBrowserChatSessionRecord(sessionId);
+  persistenceCursors.delete(sessionId);
 }
 
 function timestampValue(value?: string) {
@@ -1627,12 +1689,12 @@ function applyPersistedSnapshotToRuntime(persistedSnapshot: BrowserChatSessionSn
   const existing = sessions.get(persistedSnapshot.id);
   if (!existing) {
     sessions.set(persistedSnapshot.id, recordFromSnapshot(persistedSnapshot));
-    return;
+    return true;
   }
   // Deferred progress writes and immediate interruption both make the in-memory
   // record newer than SQLite for a short period. A GET during that window must
   // not revive an older running turn or replace its live AbortController.
-  if (runtimeSnapshotIsNewer(existing.updatedAt, persistedSnapshot.updatedAt)) return;
+  if (runtimeSnapshotIsNewer(existing.updatedAt, persistedSnapshot.updatedAt)) return false;
   const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, persistedSnapshot);
   const fromDisk = mergeRuntimeSessionState(
     recordFromSnapshot(persistedSnapshot, { preserveRunningState: preserveRuntimeTurn }),
@@ -1645,15 +1707,19 @@ function applyPersistedSnapshotToRuntime(persistedSnapshot: BrowserChatSessionSn
     started: existing.started,
   };
   Object.assign(existing, fromDisk, runtimeState);
+  return true;
 }
 
 function hydrateSession(sessionId: string) {
   const persisted = readSessionSnapshot(sessionId);
-  if (persisted) applyPersistedSnapshotToRuntime(persisted);
-  return sessions.get(sessionId);
+  const applied = persisted ? applyPersistedSnapshotToRuntime(persisted) : false;
+  const session = sessions.get(sessionId);
+  if (session && persisted && applied) seedPersistenceCursor(session, persisted);
+  else if (persisted && !persistenceCursors.has(sessionId)) seedPersistenceCursor(persisted);
+  return session;
 }
 
-function persistSession(sessionId: string, options: { mergePersisted?: boolean } = {}) {
+function persistSession(sessionId: string, options: { mergePersisted?: boolean } = {}): BrowserChatSessionRealtimePatch | true | false {
   try {
     const currentSession = sessions.get(sessionId);
     const incoming = currentSession ? snapshot(currentSession, { fullSteps: true }) : undefined;
@@ -1664,9 +1730,13 @@ function persistSession(sessionId: string, options: { mergePersisted?: boolean }
     const shouldMergePersisted = options.mergePersisted === true;
     const persistedSnapshot = shouldMergePersisted ? readSessionSnapshot(sessionId) : undefined;
     const writtenSnapshot = shouldMergePersisted ? mergePersistedSessionSnapshot(persistedSnapshot, incoming) : incoming;
-    writeSessionSnapshot(writtenSnapshot, { mergePersisted: options.mergePersisted });
-    if (shouldMergePersisted) applyPersistedSnapshotToRuntime(writtenSnapshot);
-    return true;
+    const patch = writeSessionSnapshot(writtenSnapshot);
+    if (shouldMergePersisted) {
+      applyPersistedSnapshotToRuntime(writtenSnapshot);
+      const runtimeSession = sessions.get(sessionId);
+      if (runtimeSession) seedPersistenceCursor(runtimeSession, writtenSnapshot);
+    }
+    return patch;
   } catch (error) {
     warnPersistFailure(error);
     return false;
@@ -1704,7 +1774,7 @@ function persistAndNotify(sessionId: string, options: { defer?: boolean; mergePe
   clearPendingPersist(sessionId);
   const persisted = persistSession(sessionId, { mergePersisted: options.mergePersisted });
   if (!persisted) return false;
-  notifySessionUpdate(sessionId);
+  notifySessionUpdate(sessionId, persisted === true ? undefined : persisted);
   return true;
 }
 

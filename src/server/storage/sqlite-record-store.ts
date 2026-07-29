@@ -241,6 +241,76 @@ export function writeBrowserChatSessionRecord<
   });
 }
 
+export function writeBrowserChatSessionDelta<
+  TSnapshot extends BrowserChatSessionFields,
+  TMessage extends { id: string; createdAt: string; updatedAt?: string },
+  TStep extends { index: number },
+  TLog extends { id: string; time: string },
+>(
+  snapshot: TSnapshot,
+  summary: unknown,
+  delta: {
+    messages?: TMessage[];
+    steps?: TStep[];
+    logs?: TLog[];
+    removedMessageIds?: string[];
+    removedStepIndexes?: number[];
+    removedLogIds?: string[];
+  },
+) {
+  runSqliteTransaction((database) => {
+    database.prepare(`
+      INSERT INTO browser_chat_session (
+        id, user_id, title, status, revision, snapshot_json, summary_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        user_id = excluded.user_id,
+        title = excluded.title,
+        status = excluded.status,
+        revision = browser_chat_session.revision + 1,
+        snapshot_json = excluded.snapshot_json,
+        summary_json = excluded.summary_json,
+        updated_at = excluded.updated_at
+    `).run(
+      snapshot.id,
+      snapshot.userId || null,
+      snapshot.title,
+      snapshot.status,
+      JSON.stringify(snapshot),
+      JSON.stringify(summary),
+      snapshot.createdAt,
+      snapshot.updatedAt,
+    );
+
+    const upsertMessage = database.prepare(`
+      INSERT INTO browser_chat_message (session_id, id, time, record_json) VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_id, id) DO UPDATE SET time = excluded.time, record_json = excluded.record_json
+    `);
+    for (const message of delta.messages || []) {
+      upsertMessage.run(snapshot.id, message.id, message.updatedAt || message.createdAt, JSON.stringify(message));
+    }
+
+    const upsertStep = database.prepare(`
+      INSERT INTO browser_chat_step (session_id, step_index, record_json) VALUES (?, ?, ?)
+      ON CONFLICT(session_id, step_index) DO UPDATE SET record_json = excluded.record_json
+    `);
+    for (const step of delta.steps || []) upsertStep.run(snapshot.id, step.index, JSON.stringify(step));
+
+    const upsertLog = database.prepare(`
+      INSERT INTO browser_chat_log (session_id, id, time, record_json) VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_id, id) DO UPDATE SET time = excluded.time, record_json = excluded.record_json
+    `);
+    for (const log of delta.logs || []) upsertLog.run(snapshot.id, log.id, log.time, JSON.stringify(log));
+
+    const deleteMessage = database.prepare('DELETE FROM browser_chat_message WHERE session_id = ? AND id = ?');
+    for (const messageId of delta.removedMessageIds || []) deleteMessage.run(snapshot.id, messageId);
+    const deleteStep = database.prepare('DELETE FROM browser_chat_step WHERE session_id = ? AND step_index = ?');
+    for (const stepIndex of delta.removedStepIndexes || []) deleteStep.run(snapshot.id, stepIndex);
+    const deleteLog = database.prepare('DELETE FROM browser_chat_log WHERE session_id = ? AND id = ?');
+    for (const logId of delta.removedLogIds || []) deleteLog.run(snapshot.id, logId);
+  });
+}
+
 function pruneBrowserChatRows(
   database: DatabaseSync,
   table: 'browser_chat_message' | 'browser_chat_step' | 'browser_chat_log',

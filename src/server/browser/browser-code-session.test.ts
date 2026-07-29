@@ -110,10 +110,14 @@ test('BrowserSession executes browserCode against the controlled Playwright page
       nativeContext?: boolean;
       pageCount?: number;
     };
-    domSnapshot?: {
-      content?: string;
-      generationId?: string;
-      mode?: string;
+    postActionObservation?: {
+      captured?: boolean;
+      activity?: { actions?: string[] };
+      domChanges?: {
+        added?: string[];
+        updated?: string[];
+        extra?: { added?: string[]; updated?: string[] };
+      };
     };
     console?: {
       code?: Array<{ level?: string; text?: string }>;
@@ -129,13 +133,12 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.equal(result.result?.uidType, 'undefined');
   assert.equal(result.result?.nativeContext, true);
   assert.equal(result.result?.pageCount, 1);
-  assert.match(result.domSnapshot?.content || '', /Applied/);
-  assert.equal(result.domSnapshot?.mode, 'full');
-  assert.ok(result.domSnapshot?.generationId);
+  assert.equal(result.postActionObservation?.captured, true);
+  assert.ok(result.postActionObservation?.activity?.actions?.includes('mouse.click'));
+  assert.match(JSON.stringify(result.postActionObservation?.domChanges || {}), /Applied/);
+  assert.equal('domSnapshot' in result, false);
   assert.deepEqual(result.console?.code, []);
   assert.ok(result.console?.page?.some((entry) => entry.level === 'log' && entry.text === 'apply-clicked'));
-  assert.equal(action.autoSnapshot?.generationId, result.domSnapshot?.generationId);
-  assert.equal(action.autoSnapshot?.refreshed, true);
   assert.deepEqual(action.referenceImagePaths, []);
   assert.equal(await page.getByLabel('Name').inputValue(), 'Alice');
   assert.equal(await page.getByLabel('Role').inputValue(), 'admin');

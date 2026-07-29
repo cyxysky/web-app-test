@@ -31,8 +31,9 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /browser\.tabs\.list/);
   assert.match(rules, /credentialVault\.fill/);
   assert.match(rules, /never read the filled field value/);
-  assert.match(rules, /freshly captured full semantic DOM snapshot/);
-  assert.match(rules, /page-console delta/);
+  assert.match(rules, /bounded postActionObservation/);
+  assert.match(rules, /code\/page console deltas/);
+  assert.match(rules, /Call page\.domSnapshot\(\) explicitly/);
   assert.match(rules, /force: true is forbidden/);
   assert.match(rules, /filter\(\{ visible: true \}\)/);
   assert.match(rules, /require count\(\) === 1/);
@@ -59,7 +60,8 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.equal(browserChatCodeRules(true).length, 7);
   assert.match(rules, /real Playwright page\/context/);
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
-  assert.match(rules, /fresh full semantic DOM snapshot/);
+  assert.match(rules, /bounded postActionObservation/);
+  assert.match(rules, /explicit page\.domSnapshot\(\)/);
   assert.match(rules, /filter visible candidates and require exactly one/);
   assert.match(rules, /understand exactly what the user wants/);
   assert.match(rules, /if anything is uncertain, inspect instead of acting/i);

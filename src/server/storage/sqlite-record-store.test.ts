@@ -60,6 +60,38 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
     assert.deepEqual(second?.steps.map((item) => item.value), ['updated']);
     assert.deepEqual(second?.logs.map((item) => item.value), ['updated']);
 
+    recordStore.writeBrowserChatSessionDelta(
+      { ...snapshot, updatedAt: new Date().toISOString() },
+      { id: snapshot.id },
+      {
+        messages: [{ id: 'm3', createdAt: time, content: 'delta' }],
+        steps: [{ index: 3, value: 'delta' }],
+        logs: [{ id: 'l3', time, value: 'delta' }],
+      },
+    );
+    const deltaAdded = recordStore.readBrowserChatSessionRecord<{
+      messages: Array<{ content: string }>;
+      steps: Array<{ value: string }>;
+      logs: Array<{ value: string }>;
+    }>(snapshot.id);
+    assert.deepEqual(deltaAdded?.messages.map((item) => item.content), ['updated', 'delta']);
+    assert.deepEqual(deltaAdded?.steps.map((item) => item.value), ['updated', 'delta']);
+    assert.deepEqual(deltaAdded?.logs.map((item) => item.value), ['updated', 'delta']);
+
+    recordStore.writeBrowserChatSessionDelta(
+      { ...snapshot, updatedAt: new Date().toISOString() },
+      { id: snapshot.id },
+      { removedMessageIds: ['m2'], removedStepIndexes: [2], removedLogIds: ['l2'] },
+    );
+    const deltaRemoved = recordStore.readBrowserChatSessionRecord<{
+      messages: Array<{ content: string }>;
+      steps: Array<{ value: string }>;
+      logs: Array<{ value: string }>;
+    }>(snapshot.id);
+    assert.deepEqual(deltaRemoved?.messages.map((item) => item.content), ['delta']);
+    assert.deepEqual(deltaRemoved?.steps.map((item) => item.value), ['delta']);
+    assert.deepEqual(deltaRemoved?.logs.map((item) => item.value), ['delta']);
+
     const retiredTables = databaseModule.getSqliteDatabase().prepare(`
       SELECT name FROM sqlite_master
       WHERE type = 'table' AND name IN ('test_group', 'test_case', 'run_schedule', 'test_run')

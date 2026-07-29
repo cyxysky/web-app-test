@@ -9,6 +9,7 @@ export type RealtimeRefreshEvent = {
   updatedAt: string;
   version: number;
   deleted?: boolean;
+  patch?: unknown;
 };
 
 type RealtimeMessage = RealtimeRefreshEvent | {

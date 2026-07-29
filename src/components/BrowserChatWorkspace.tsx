@@ -238,6 +238,17 @@ type BrowserChatSession = {
   error?: string;
 };
 
+type BrowserChatSessionRealtimePatch = {
+  session?: Omit<BrowserChatSession, 'logs' | 'messages' | 'steps'>;
+  summary?: BrowserChatSession;
+  logs?: BrowserChatLogRecord[];
+  messages?: BrowserChatMessage[];
+  steps?: StepExecutionResult[];
+  removedLogIds?: string[];
+  removedMessageIds?: string[];
+  removedStepIndexes?: number[];
+};
+
 type BrowserChatView = 'chat' | 'settings';
 type BrowserChatMode = 'code' | 'dom';
 type BrowserChatSafetyMode = 'strict' | 'full';
@@ -1655,6 +1666,50 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
     pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
     steps: session.steps || [],
   };
+}
+
+function browserChatRealtimePatch(value: unknown): BrowserChatSessionRealtimePatch | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const patch = value as BrowserChatSessionRealtimePatch;
+  if (!patch.session || typeof patch.session.id !== 'string') return undefined;
+  return patch;
+}
+
+function mergeBrowserChatSessionRealtimePatch(
+  current: BrowserChatSession,
+  patch: BrowserChatSessionRealtimePatch,
+): BrowserChatSession {
+  const removedMessageIds = new Set(patch.removedMessageIds || []);
+  const messages = new Map(
+    current.messages
+      .filter((message) => !removedMessageIds.has(message.id))
+      .map((message) => [message.id, message]),
+  );
+  for (const message of patch.messages || []) messages.set(message.id, message);
+
+  const removedStepIndexes = new Set(patch.removedStepIndexes || []);
+  const steps = new Map(
+    current.steps
+      .filter((step) => !removedStepIndexes.has(step.index))
+      .map((step) => [step.index, step]),
+  );
+  for (const step of patch.steps || []) steps.set(step.index, step);
+
+  const removedLogIds = new Set(patch.removedLogIds || []);
+  const logs = new Map(
+    current.logs
+      .filter((log) => !removedLogIds.has(log.id))
+      .map((log) => [log.id, log]),
+  );
+  for (const log of patch.logs || []) logs.set(log.id, log);
+
+  return normalizeSession({
+    ...current,
+    ...patch.session,
+    messages: [...messages.values()].sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')),
+    steps: [...steps.values()].sort((a, b) => a.index - b.index),
+    logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
+  });
 }
 
 function sessionSortTime(session: BrowserChatSession) {
@@ -6845,8 +6900,31 @@ export function BrowserChatWorkspace({
         setSelectedSessionIds((current) => current.filter((id) => id !== event.id));
         return;
       }
-      if (activeSessionIdRef.current === event.id) scheduleSessionRefresh(event.id);
-      else scheduleLoadSessions();
+      const patch = browserChatRealtimePatch(event.patch);
+      if (!patch) {
+        if (activeSessionIdRef.current === event.id) scheduleSessionRefresh(event.id);
+        else scheduleLoadSessions();
+        return;
+      }
+      if (patch.logs?.length || patch.removedLogIds?.length) {
+        fullLogSessionIdsRef.current.delete(event.id);
+      }
+      if (activeSessionIdRef.current === event.id) {
+        setSession((current) => current?.id === event.id
+          ? mergeBrowserChatSessionRealtimePatch(current, patch)
+          : current);
+      }
+      setSessions((current) => {
+        const existing = current.find((item) => item.id === event.id);
+        const nextSummary = patch.summary
+          ? normalizeSession(patch.summary)
+          : existing
+            ? mergeBrowserChatSessionRealtimePatch(existing, patch)
+            : undefined;
+        if (!nextSummary) return current;
+        return [nextSummary, ...current.filter((item) => item.id !== event.id)]
+          .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
+      });
     }, { onStatus: setRealtimeConnected });
   }, [scheduleLoadSessions, scheduleSessionRefresh]);
 
