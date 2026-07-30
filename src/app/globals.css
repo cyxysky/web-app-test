@@ -5714,6 +5714,10 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   min-width: 0;
 }
 
+.domain-accordion-item + .domain-accordion-item {
+  border-top: 1px solid var(--border);
+}
+
 .domain-accordion-item > .personal-memory-item,
 .domain-accordion-item > .login-account-item,
 .domain-accordion-item > .skills-manager-item {
