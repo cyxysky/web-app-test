@@ -31,17 +31,18 @@ export function browserChatCodeRules(screenshotAvailable = true) {
 
 export function browserChatDomRules(screenshotAvailable = true) {
   return [
-    '- Use inspect action="capture" mode="full" for the complete loaded semantic DOM. mode="text" is the reading view of all loaded text; mode="changes" contains only inter-action changes and has no actionable UIDs.',
+    '- Use inspect action="capture" mode="full" for the complete loaded semantic DOM and its snapshotId. mode="text" is the reading view of all loaded text; mode="changes" contains only inter-action changes.',
     '- Before every state-changing action, first understand exactly what the user wants and confirm from a fresh inspect result the current page, active dialog/layer, expected result, exact target, and loading or blocking state. If anything is uncertain or the interface may have changed, inspect again instead of acting.',
     '- Continue a paged frozen capture only with its exact nextCursor and the same mode. Never scroll for snapshot pagination. Use inspect action="search" to narrow the current baseline and action="httpRequests" for network evidence.',
-    '- Use only current dom-* UIDs. A state-changing action returns an immediate DOM delta; any UID listed as removed is invalid. Treat validationErrors as action failure and correct the named field before continuing.',
+    '- Every DOM interaction must send the snapshotId from that same inspect result. Prefer target kind="semantic": use an exact visible/accessibility name or stable attributes (id, aria-label, title, data-*, href, name, placeholder), optionally with a unique scope parent plus role. The runtime checks the current real elements and executes only when exactly one actionable match remains. Never use partial text, first/nth, or an unscoped duplicate. Use kind="ref" only when the target has no stable semantic identity; refs are short-lived and never fuzzy-rebound. A state-changing action returns an immediate DOM delta; older full DOM updates are compacted and only the newest remains authoritative.',
+    '- Ordinary clicks never bypass actionability or covering layers. Only when a fresh inspect proves the exact intended action is to close the currently visible overlay may you send action="click" with force=true. Force skips only actionability/cover checks; snapshot ownership, live-node identity, and target uniqueness are still mandatory. Never use force to make an uncertain target succeed; inspect again immediately afterward.',
     screenshotAvailable
-      ? '- No screenshot is attached automatically. When pixel evidence is necessary, call takeScreenshot with capture="viewport" and end that model step; after inspecting the returned image, use interact with either coordinates from that latest viewport screenshot or one current UID, never both. Full-page and older screenshots are read-only evidence.'
-      : '- Use interact with one current UID; coordinate targeting is unavailable.',
-    '- interact supports click, hover, drag, scrolling, type, press, shortcuts, and selectOption. UID actions scroll their target into view; scroll the page only for confirmed lazy or virtual content.',
-    '- For a native select, use interact action="selectOption" with its current UID and an exact option value or full label. Do not click the platform dropdown or choose with keyboard arrows.',
+      ? '- No screenshot is attached automatically. When pixel evidence is necessary, call takeScreenshot with capture="viewport" and end that model step; after inspecting the returned image, use interact with either coordinates from that latest viewport screenshot or one snapshot-bound target, never both. Full-page and older screenshots are read-only evidence.'
+      : '- Use interact with one current snapshot-bound target; coordinate targeting is unavailable.',
+    '- interact supports click, hover, drag, scrolling, type, press, shortcuts, and selectOption. DOM targets scroll into view as needed; scroll the page only for confirmed lazy or virtual content.',
+    '- For a native select, use interact action="selectOption" with a current snapshot-bound target and an exact option value or full label. Do not click the platform dropdown or choose with keyboard arrows.',
     '- Use browser for navigation, waiting, listing tabs, and switching tabs. After an action may open a tab, list tabs before choosing the next target.',
-    '- For a supplied credential reference, use interact action="type" with a current field UID only. Never place the secret in text, read it back, or expose the reference.',
+    '- For a supplied credential reference, use interact action="type" with a current snapshot-bound field target only. Never place the secret in text, read it back, or expose the reference.',
   ];
 }
 

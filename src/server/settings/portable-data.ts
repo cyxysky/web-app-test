@@ -23,7 +23,7 @@ export type PortableDataKind = 'credentials' | 'skills' | 'memory' | 'model';
 type SecretDataKind = 'credentials' | 'model';
 
 const portableFormat = 'webpilot-data-transfer';
-const portableVersion = 1;
+const portableVersion = 2;
 
 const credentialItemSchema = z.object({
   domain: z.string().trim().min(1).max(1_000),
@@ -32,6 +32,7 @@ const credentialItemSchema = z.object({
   label: z.string().trim().max(500),
   loginUrl: z.string().trim().max(4_000),
   status: z.enum(['active', 'disabled']),
+  shared: z.boolean(),
 }).strict();
 
 const skillItemSchema = z.object({
@@ -39,12 +40,12 @@ const skillItemSchema = z.object({
   title: z.string().trim().min(1).max(500),
   description: z.string().trim().max(4_000),
   domains: z.array(z.string().trim().max(1_000)).max(100),
-  tags: z.array(z.string().trim().max(200)).max(100),
   triggerPhrases: z.array(z.string().trim().max(500)).max(100),
   content: z.object({
     details: z.string().max(30_000),
   }).strict(),
   status: z.enum(['draft', 'ready', 'disabled']),
+  shared: z.boolean(),
 }).strict();
 
 const memoryItemSchema = z.object({
@@ -57,6 +58,7 @@ const memoryItemSchema = z.object({
   confidence: z.number().min(0).max(1),
   sourceUrl: z.string().trim().max(2_000).optional(),
   status: z.enum(['active', 'disabled']),
+  shared: z.boolean(),
 }).strict();
 
 const modelProviderSettingsSchema = z.object({
@@ -242,16 +244,18 @@ export function exportPortableData(input: {
     };
   }
   if (input.kind === 'skills') {
-    const items = z.array(skillItemSchema).parse(store.listSkills(undefined, String(input.userId ?? ''))
+    const ownerUserId = String(input.userId ?? '').trim() || '0';
+    const items = z.array(skillItemSchema).parse(store.listSkills(undefined, ownerUserId)
+      .filter((skill) => skill.userId === ownerUserId)
       .map((skill) => ({
         id: skill.id,
         title: skill.title,
         description: skill.description,
         domains: skill.domains || [],
-        tags: skill.tags,
         triggerPhrases: skill.triggerPhrases,
         content: skill.content,
         status: skill.status,
+        shared: skill.shared,
       })));
     return {
       fileName: `webpilot-skills-${suffix}.json`,
@@ -259,10 +263,11 @@ export function exportPortableData(input: {
       count: items.length,
     };
   }
+  const ownerUserId = String(input.userId ?? '').trim() || '0';
   const items = z.array(memoryItemSchema).parse(listPersonalMemoryItems({
-    userId: input.userId,
+    userId: ownerUserId,
     includeDisabled: true,
-  }).map((item) => ({
+  }).filter((item) => item.userId === ownerUserId).map((item) => ({
     scope: item.scope,
     domain: item.domain,
     type: item.type,
@@ -272,6 +277,7 @@ export function exportPortableData(input: {
     confidence: item.confidence,
     sourceUrl: item.sourceUrl,
     status: item.status,
+    shared: item.shared,
   })));
   return {
     fileName: `webpilot-memory-${suffix}.json`,
@@ -297,8 +303,9 @@ function importCredentials(items: CredentialItem[], userId: unknown) {
 }
 
 function importSkills(items: SkillItem[], userId: unknown) {
-  const normalizedUserId = String(userId ?? '').trim();
-  const existingSkills = store.listSkills(undefined, normalizedUserId);
+  const normalizedUserId = String(userId ?? '').trim() || '0';
+  const existingSkills = store.listSkills(undefined, normalizedUserId)
+    .filter((skill) => skill.userId === normalizedUserId);
   const byId = new Map(existingSkills.map((skill) => [skill.id, skill]));
   const byIdentity = new Map(existingSkills.map((skill) => [skillIdentity({
     title: skill.title,
@@ -313,10 +320,10 @@ function importSkills(items: SkillItem[], userId: unknown) {
       title: item.title,
       description: item.description,
       domains: item.domains,
-      tags: item.tags,
       triggerPhrases: item.triggerPhrases,
       content: item.content,
       status: item.status,
+      shared: item.shared,
       userId: normalizedUserId,
     });
     if (existing) updated += 1;
@@ -328,7 +335,9 @@ function importSkills(items: SkillItem[], userId: unknown) {
 }
 
 function importMemory(items: MemoryItem[], userId: unknown) {
-  const existing = listPersonalMemoryItems({ userId, includeDisabled: true });
+  const normalizedUserId = String(userId ?? '').trim() || '0';
+  const existing = listPersonalMemoryItems({ userId: normalizedUserId, includeDisabled: true })
+    .filter((item) => item.userId === normalizedUserId);
   const identities = new Set(existing.map((item) => [
     item.scope,
     item.domain,
@@ -339,7 +348,7 @@ function importMemory(items: MemoryItem[], userId: unknown) {
   let updated = 0;
   for (const item of items) {
     const identity = [item.scope, item.domain, item.type, item.key.toLowerCase()].join('\u0001');
-    savePersonalMemoryItem({ ...item, userId });
+    savePersonalMemoryItem({ ...item, userId: normalizedUserId });
     if (identities.has(identity)) updated += 1;
     else {
       identities.add(identity);

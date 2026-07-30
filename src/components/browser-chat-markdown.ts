@@ -9,6 +9,8 @@ function restoreCollapsedMarkdownBlocks(value: string) {
 
 function normalizeMarkdownSegment(value: string) {
   return restoreCollapsedMarkdownBlocks(value)
+    .replace(/\\\*\\\*([^\n]+?)\\\*\\\*/g, '**$1**')
+    .replace(/\*\*((?:https?:\/\/)[^\s*<>]+)\*\*/gi, '**<$1>**')
     .replace(/\r\n?/g, '\n')
     .replace(/([。！？；;])\s+(?=\*\*[^*\n]{1,40}\*\*\s*[:：])/g, '$1\n\n')
     .replace(/([:：。！？；;])\s+-\s+/g, '$1\n- ')

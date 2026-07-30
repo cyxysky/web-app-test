@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { z } from 'zod';
 import {
   deleteLoginAccount,
+  getLoginAccountById,
   updateLoginAccount,
 } from '@/server/credentials/login-account-vault';
 import { noStoreJson } from '@/server/http/no-store-response';
@@ -20,6 +21,7 @@ const updateSchema = z.object({
   label: z.string().trim().max(500).optional(),
   loginUrl: z.string().trim().max(4_000).optional(),
   status: z.enum(['active', 'disabled']).optional(),
+  shared: z.boolean().optional(),
 }).strict().refine((body) => (
   body.domain !== undefined
   || body.username !== undefined
@@ -27,6 +29,7 @@ const updateSchema = z.object({
   || body.label !== undefined
   || body.loginUrl !== undefined
   || body.status !== undefined
+  || body.shared !== undefined
 ), { message: '没有可更新的账号字段' });
 
 function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
@@ -36,7 +39,7 @@ function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId
     ?? request.nextUrl.searchParams.get('userId')
     ?? request.nextUrl.searchParams.get('qzUserId')
     ?? '',
-  ).trim();
+  ).trim() || '0';
 }
 
 function publicError(error: unknown) {
@@ -48,6 +51,9 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
   try {
     const { id } = await context.params;
     const body = updateSchema.parse(await request.json());
+    const userId = requestUserId(request, body);
+    const visibleAccount = getLoginAccountById(id, userId);
+    if (visibleAccount && visibleAccount.userId !== userId) return noStoreJson({ error: 'Only the account creator can edit this shared account' }, { status: 403 });
     const account = updateLoginAccount(id, {
       domain: body.domain,
       username: body.username,
@@ -55,7 +61,8 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
       label: body.label,
       loginUrl: body.loginUrl,
       status: body.status,
-    }, requestUserId(request, body));
+      shared: body.shared,
+    }, userId);
     if (!account) return noStoreJson({ error: '登录账号不存在' }, { status: 404 });
     return noStoreJson({ account });
   } catch (error) {
@@ -70,7 +77,10 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
 export async function DELETE(request: NextRequest, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const deleted = deleteLoginAccount(id, requestUserId(request));
+    const userId = requestUserId(request);
+    const visibleAccount = getLoginAccountById(id, userId);
+    if (visibleAccount && visibleAccount.userId !== userId) return noStoreJson({ error: 'Only the account creator can delete this shared account' }, { status: 403 });
+    const deleted = deleteLoginAccount(id, userId);
     if (!deleted) return noStoreJson({ error: '登录账号不存在' }, { status: 404 });
     return noStoreJson({ ok: true });
   } catch (error) {

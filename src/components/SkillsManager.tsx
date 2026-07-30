@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronDown, Edit3, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
+import { ChevronDown, Clock3, Edit3, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { DataTransferButtons } from '@/components/DataTransferButtons';
 import { DomainGroupedAccordion } from '@/components/DomainGroupedAccordion';
@@ -14,11 +14,11 @@ import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import type { SkillRecord } from '@/server/ai/schemas/runtime.schema';
 
 type SkillDraft = {
+  shared: boolean;
   title: string;
   description: string;
   domains: string;
   status: SkillRecord['status'];
-  tags: string;
   triggerPhrases: string;
   details: string;
 };
@@ -34,22 +34,22 @@ type SkillMutationResponse = {
 };
 
 const emptyDraft: SkillDraft = {
+  shared: false,
   title: '',
   description: '',
   domains: '',
   status: 'ready',
-  tags: '',
   triggerPhrases: '',
   details: '',
 };
 
 function draftFromSkill(skill: SkillRecord): SkillDraft {
   return {
+    shared: skill.shared,
     title: skill.title,
     description: skill.description,
     domains: (skill.domains || []).join('\n'),
     status: skill.status,
-    tags: skill.tags.join(', '),
     triggerPhrases: skill.triggerPhrases.join('\n'),
     details: skill.content.details,
   };
@@ -61,11 +61,11 @@ function splitList(value: string) {
 
 function payloadFromDraft(draft: SkillDraft) {
   return {
+    shared: draft.shared,
     title: draft.title.trim(),
     description: draft.description.trim(),
     domains: splitList(draft.domains),
     status: draft.status,
-    tags: splitList(draft.tags),
     triggerPhrases: splitList(draft.triggerPhrases),
     content: {
       details: draft.details.trim(),
@@ -153,6 +153,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
   }
 
   function openEditSkill(skill: SkillRecord) {
+    if (skill.userId !== normalizedUserId) return;
     setEditingSkillId(skill.id);
     setDraft(draftFromSkill(skill));
     setEditorMode('edit');
@@ -166,6 +167,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
   }
 
   function requestDeleteSkill(skill: SkillRecord) {
+    if (skill.userId !== normalizedUserId) return;
     setDeleteTarget(skill);
   }
 
@@ -272,10 +274,11 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                   skill.title,
                   skill.description,
                   ...(skill.domains || []),
-                  ...skill.tags,
                   ...skill.triggerPhrases,
                   skill.content.details,
                   statusLabel(skill.status),
+                  skill.shared ? '所有 ID 共享' : '仅创建 ID',
+                  skill.userId,
                 ]}
                 getUpdatedAt={(skill) => skill.updatedAt}
                 items={skills}
@@ -297,6 +300,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                       <b>{skill.title}</b>
                     </button>
                     <div className="skills-manager-item-actions">
+                      {skill.userId === normalizedUserId ? <>
                       <button
                         aria-label={t('编辑 Skill')}
                         className="ui-icon-button"
@@ -316,36 +320,34 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                       >
                         {deletingSkillId === skill.id ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
                       </button>
+                      </> : <span className="resource-readonly-label">只读</span>}
                     </div>
                   </div>
 
                   {expanded ? (
                     <div className="skills-manager-item-detail">
-                      <p className="skills-manager-item-description">{skill.description || skill.id}</p>
-                      <div className="skills-manager-chip-row">
-                        <em className={`skill-status status-${skill.status}`}>{t(statusLabel(skill.status))}</em>
-                        <span className="skills-manager-chip">
-                          {skill.domains?.length ? skill.domains.join(', ') : t('所有域名')}
-                        </span>
-                        {skill.tags.length ? skill.tags.map((tag) => (
-                          <span className="skills-manager-chip" key={tag}>{tag}</span>
-                        )) : <span className="skills-manager-muted">{t('暂无标签')}</span>}
-                      </div>
-
-                      <div className="skills-manager-section wide">
-                        <div>
-                          <h4>{t('触发词')}</h4>
-                          <span>{skill.triggerPhrases.length}</span>
-                        </div>
-                        <div className="skills-manager-trigger-list">
-                          {skill.triggerPhrases.length ? skill.triggerPhrases.map((phrase) => (
-                            <span key={phrase}>{phrase}</span>
-                          )) : <p className="skills-manager-muted">{t('暂无触发词')}</p>}
+                      <div className="skills-manager-item-intro">
+                        <p className="skills-manager-item-description">{skill.description || skill.id}</p>
+                        <div className="skills-manager-chip-row">
+                          <em className={`skill-status status-${skill.status}`}>{t(statusLabel(skill.status))}</em>
+                          {skill.shared ? <em className="resource-shared-badge">{skill.userId === normalizedUserId ? '所有 ID 共享' : `ID ${skill.userId} 共享`}</em> : null}
                         </div>
                       </div>
 
                       <div className="skills-manager-section-grid">
-                        <div className="skills-manager-section wide">
+                        <div className="skills-manager-section">
+                          <div>
+                            <h4>{t('触发词')}</h4>
+                            <span>{skill.triggerPhrases.length}</span>
+                          </div>
+                          <div className="skills-manager-trigger-list">
+                            {skill.triggerPhrases.length ? skill.triggerPhrases.map((phrase) => (
+                              <span key={phrase}>{phrase}</span>
+                            )) : <p className="skills-manager-muted">{t('暂无触发词')}</p>}
+                          </div>
+                        </div>
+
+                        <div className="skills-manager-section">
                           <div>
                             <h4>{t('详细内容')}</h4>
                           </div>
@@ -356,7 +358,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                       </div>
 
                       <div className="skills-manager-footnote">
-                        <Edit3 size={14} />
+                        <Clock3 size={13} />
                         <span>{t('最近更新')}：{new Date(skill.updatedAt).toLocaleString()}</span>
                       </div>
                     </div>
@@ -416,11 +418,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                 <span>{t('适用域名')}</span>
                 <textarea className="textarea settings-control compact" value={draft.domains} onChange={(event) => update({ domains: event.target.value })} placeholder={t('留空表示所有域名；每行一个域名，可使用 *.example.com')} />
               </label>
-              {editorMode === 'edit' ? <label className="skills-manager-field">
-                <span>{t('标签')}</span>
-                <textarea className="textarea settings-control compact" value={draft.tags} onChange={(event) => update({ tags: event.target.value })} placeholder={t('逗号或换行分隔')} />
-              </label> : null}
-              <label className={editorMode === 'create' ? 'skills-manager-field wide' : 'skills-manager-field'}>
+              <label className="skills-manager-field wide">
                 <span>{t('触发词')}</span>
                 <textarea className="textarea settings-control compact" value={draft.triggerPhrases} onChange={(event) => update({ triggerPhrases: event.target.value })} placeholder={t('每行一个精确的用户意图')} />
               </label>
@@ -428,6 +426,15 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                 <span>{t('详细内容')}</span>
                 <textarea className="textarea settings-control skill-details" maxLength={30_000} value={draft.details} onChange={(event) => update({ details: event.target.value })} placeholder={t('填写完整操作说明，支持多段文本和 Markdown')} />
               </label>
+              <div className="resource-sharing-field wide">
+                <div>
+                  <strong>所有 ID 共享</strong>
+                  <small>其他 ID 可以使用此 Skill，但只有创建 ID {editorMode === 'edit' ? skills.find((skill) => skill.id === editingSkillId)?.userId || normalizedUserId : normalizedUserId} 可以编辑或删除</small>
+                </div>
+                <button aria-pressed={draft.shared} className={`settings-toggle${draft.shared ? ' on' : ''}`} disabled={saving} onClick={() => update({ shared: !draft.shared })} type="button">
+                  <span />
+                </button>
+              </div>
             </div>
 
             <footer className="ui-modal-footer">

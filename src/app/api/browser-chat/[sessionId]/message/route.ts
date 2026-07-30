@@ -22,7 +22,6 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const session = await sendBrowserChatMessage(
       sessionId,
       body.content,
-      body.mode,
       body.safetyMode,
       body.modelProvider,
       body.model,

@@ -8,11 +8,11 @@ import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import { BrowserSession, type BrowserActionResult, type BrowserSessionMode } from '@/server/browser/browser-session';
 import { analyzeBrowserCodeRisk, type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
-import { browserInteractToolDescription, browserInteractToolShape } from './browser-input-tool-schema';
+import { browserElementTargetSchema, browserInteractToolDescription, browserInteractToolShape, refineBrowserInteractTarget } from './browser-input-tool-schema';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { aiSdkFinishMessage, aiSdkFinishState } from './ai-sdk-finish-state';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
-import { normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
+import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
   BROWSER_CHAT_FILE_READ_MIN_CHARS,
@@ -32,7 +32,7 @@ import {
   type RuntimeRetryDecision,
 } from './runtime-retry-policy';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
-import { compactOlderBrowserCodeToolResults } from './browser-code-tool-history';
+import { compactOlderBrowserToolResults } from './browser-code-tool-history';
 import {
   estimateRuntimeTextTokens,
   runtimeContextCompressionThresholdRatio,
@@ -158,7 +158,7 @@ const codexRuntimeObjectSchema = z.object({
     confirmationMessage: z.string().nullable().optional(),
     code: z.string().nullable().optional(),
     maxOutputChars: z.number().nullable().optional(),
-    target: z.enum(['current', 'new']).nullable().optional(),
+    target: z.union([z.enum(['current', 'new']), browserElementTargetSchema]).nullable().optional(),
     ms: z.number().nullable().optional(),
     index: z.number().nullable().optional(),
     mode: z.enum(['full', 'text', 'changes']).nullable().optional(),
@@ -166,10 +166,10 @@ const codexRuntimeObjectSchema = z.object({
     query: z.string().nullable().optional(),
     tag: z.string().nullable().optional(),
     roles: z.array(z.string()).nullable().optional(),
-    uid: z.string().nullable().optional(),
+    snapshotId: z.string().nullable().optional(),
     x_thousandth: z.number().nullable().optional(),
     y_thousandth: z.number().nullable().optional(),
-    toUid: z.string().nullable().optional(),
+    toTarget: browserElementTargetSchema.nullable().optional(),
     toX_thousandth: z.number().nullable().optional(),
     toY_thousandth: z.number().nullable().optional(),
     button: z.enum(['left', 'right', 'middle']).nullable().optional(),
@@ -296,7 +296,7 @@ function trimDebugText(value: string, max = 4000) {
 
 function looksLikeDomSnapshot(value?: string) {
   const text = (value || '').trim();
-  return Boolean(text && /\buid=\d+\s+(?:RootWebArea|button|link|textbox|combobox|StaticText)\b/.test(text));
+  return isBrowserChatDomObservationText(text);
 }
 
 function providerToolSchemaError(value?: string) {
@@ -1256,34 +1256,37 @@ function makeBrowserTools(
       }),
       interact: tool({
         description: browserInteractToolDescription,
-        inputSchema: browserToolInput(browserInteractToolShape),
+        inputSchema: browserToolInput(browserInteractToolShape).superRefine(refineBrowserInteractTarget),
         execute: (input) => record('interact', input, async (abortSignal) => {
           if (['click', 'move', 'drag', 'scroll', 'scrollIntoView'].includes(input.action)) {
             return session.mouse({
               action: input.action as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
               abortSignal,
-              uid: input.uid,
+              snapshotId: input.snapshotId,
+              target: input.target,
               xThousandth: input.x_thousandth,
               yThousandth: input.y_thousandth,
-              toUid: input.toUid,
+              toTarget: input.toTarget,
               toXThousandth: input.toX_thousandth,
               toYThousandth: input.toY_thousandth,
               button: input.button,
               clickCount: input.clickCount,
+              force: input.force,
               deltaX: input.deltaX,
               deltaY: input.deltaY,
             });
           }
           if (input.action === 'selectOption') {
-            return session.selectOption({ uid: input.uid || '', value: input.value, label: input.label });
+            return session.selectOption({ snapshotId: input.snapshotId, target: input.target, value: input.value, label: input.label });
           }
           const binding = credentialBinding(input.credentialRef);
-          if (input.credentialRef && (!binding || input.action !== 'type' || !input.uid)) {
-            return { ok: false, actual: 'Credential entry requires a valid runtime reference and a current field UID.' };
+          if (input.credentialRef && (!binding || input.action !== 'type' || !input.target)) {
+            return { ok: false, actual: 'Credential entry requires a valid runtime reference and a current snapshot-bound field target.' };
           }
           return session.keyboard({
             action: input.action as 'type' | 'press' | 'shortcut',
-            uid: input.uid,
+            snapshotId: input.snapshotId,
+            target: input.target,
             xThousandth: input.x_thousandth,
             yThousandth: input.y_thousandth,
             text: binding ? binding.value : input.text,
@@ -1296,7 +1299,7 @@ function makeBrowserTools(
         }),
       }),
       inspect: tool({
-        description: 'Read the current semantic DOM baseline, query that frozen baseline, or inspect recent HTTP requests. Use capture mode=full before choosing a UID.',
+        description: 'Read the current semantic DOM baseline and snapshotId, query that frozen baseline, or inspect recent HTTP requests. Use capture mode=full before constructing a semantic target or fallback ref.',
         inputSchema: browserToolInput({
           action: z.enum(['capture', 'search', 'httpRequests']).default('capture'),
           cursor: z.string().min(1).optional(),
@@ -2210,11 +2213,11 @@ async function executeRuntimeStep(input: {
       let unsummarizedMessages = compactedModelContext?.length
         ? messagesAddedAfterCompactedContext(sourceMessages)
         : sourceMessages;
-      unsummarizedMessages = compactOlderBrowserCodeToolResults(unsummarizedMessages);
+      unsummarizedMessages = compactOlderBrowserToolResults(unsummarizedMessages, mode);
       let messagesToSend = compactedModelContext?.length
         ? [...compactedModelContext, ...unsummarizedMessages]
         : unsummarizedMessages;
-      messagesToSend = compactOlderBrowserCodeToolResults(messagesToSend);
+      messagesToSend = compactOlderBrowserToolResults(messagesToSend, mode);
       if (appendedMessages.length) {
         messagesToSend = [...messagesToSend, ...appendedMessages];
         unsummarizedMessages = [...unsummarizedMessages, ...appendedMessages];
@@ -2873,7 +2876,9 @@ export async function executeInteractiveBrowserTurn(input: {
           tools: completedStep.tools,
         },
       });
-      reply = browserChatReply || browserChatReplyFromDecision(decision, lastToolName) || aiSdkFinishMessage(actionResult.finishReason);
+      reply = browserChatReply
+        || (lastToolName === 'reportState' ? browserChatReplyFromDecision(decision, lastToolName) : '')
+        || aiSdkFinishMessage(actionResult.finishReason);
       finalStatus = actionResult.responseStatus === 'passed'
         ? decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed'
         : actionResult.responseStatus;

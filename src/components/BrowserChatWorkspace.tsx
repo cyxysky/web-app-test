@@ -3243,7 +3243,8 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
   const desiredExpandedRef = useRef(autoOpen);
   const openFrameRef = useRef(0);
   const previousAutoOpenRef = useRef(autoOpen);
-  const elapsed = formatBrowserChatElapsedTime(browserChatMessageElapsedMs(message));
+  const [liveNowMs, setLiveNowMs] = useState(() => Date.now());
+  const elapsed = formatBrowserChatElapsedTime(browserChatMessageElapsedMs(message, running ? liveNowMs : undefined));
   const setDisclosureExpanded = useCallback((nextExpanded: boolean) => {
     desiredExpandedRef.current = nextExpanded;
     if (openFrameRef.current) cancelAnimationFrame(openFrameRef.current);
@@ -3268,6 +3269,13 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
   useEffect(() => () => {
     if (openFrameRef.current) cancelAnimationFrame(openFrameRef.current);
   }, []);
+
+  useEffect(() => {
+    if (!running) return undefined;
+    setLiveNowMs(Date.now());
+    const timer = window.setInterval(() => setLiveNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [running]);
 
   return (
     <section className={`browser-chat-process-disclosure${expanded ? ' is-expanded' : ''}`}>
@@ -4218,7 +4226,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
         return [
           skill.title,
           skill.description,
-          ...skill.tags,
           ...skill.triggerPhrases,
         ].some((value) => value.toLowerCase().includes(skillQuery));
       })
@@ -6880,7 +6887,7 @@ export function BrowserChatWorkspace({
     setEmbeddedBrowserEnabled(embeddedSetting?.value === 'true');
     setShowReasoning(reasoningSetting?.value === 'true');
     defaultModeRef.current = savedMode;
-    if (!activeSessionIdRef.current) setMode(savedMode);
+    setMode(savedMode);
   }, []);
 
   const loadSkills = useCallback(async () => {
@@ -7128,7 +7135,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(browserChatApiUrl('/api/browser-chat'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode, safetyMode, modelProvider, model: modelId, targetUrl: requestedTargetUrl, userId: requestUserId }),
+      body: JSON.stringify({ safetyMode, modelProvider, model: modelId, targetUrl: requestedTargetUrl, userId: requestUserId }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '创建对话会话失败');
     const created = upsertSession(data.session as BrowserChatSession, { activate: true });
@@ -7145,7 +7152,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/message`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, mode, safetyMode, modelProvider, model: modelId, skillIds, userId: requestUserId }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds, userId: requestUserId }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '发送消息失败');
     return data.session as BrowserChatSession;

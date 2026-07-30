@@ -139,8 +139,69 @@ export function compactOlderBrowserCodeToolResults(messages: ModelMessage[]): Mo
             ? compactBrowserCodeActual(output.value)
             : compactBrowserCodeResult(output.value),
         },
-      } as typeof rawPart;
+      } as unknown as typeof rawPart;
     });
     return { ...message, content } as ModelMessage;
   });
+}
+
+function compactOlderDomUpdates(messages: ModelMessage[]): ModelMessage[] {
+  const locations: Array<{ messageIndex: number; partIndex: number }> = [];
+  for (const [messageIndex, message] of messages.entries()) {
+    if (message.role !== 'tool' || !Array.isArray(message.content)) continue;
+    for (const [partIndex, rawPart] of message.content.entries()) {
+      const part = rawPart as MutableToolResultPart;
+      const value = recordFromUnknown(part.output?.value);
+      const domChanges = value ? recordFromUnknown(value.domChanges) : undefined;
+      const hasFullDomUpdate = domChanges && (
+        Array.isArray(domChanges.added)
+        || Array.isArray(domChanges.updated)
+        || Array.isArray(domChanges.removed)
+      );
+      if (part.type === 'tool-result' && value && hasFullDomUpdate) {
+        locations.push({ messageIndex, partIndex });
+      }
+    }
+  }
+  if (locations.length < 2) return messages;
+  const latest = locations.at(-1)!;
+  const compactLocations = new Map<number, Set<number>>();
+  for (const location of locations) {
+    if (location.messageIndex === latest.messageIndex && location.partIndex === latest.partIndex) continue;
+    const indexes = compactLocations.get(location.messageIndex) || new Set<number>();
+    indexes.add(location.partIndex);
+    compactLocations.set(location.messageIndex, indexes);
+  }
+  return messages.map((message, messageIndex) => {
+    const indexes = compactLocations.get(messageIndex);
+    if (!indexes || message.role !== 'tool' || !Array.isArray(message.content)) return message;
+    const content = message.content.map((rawPart, partIndex) => {
+      if (!indexes.has(partIndex)) return rawPart;
+      const part = rawPart as MutableToolResultPart;
+      const output = part.output;
+      const value = recordFromUnknown(output?.value);
+      if (!output || !value) return rawPart;
+      return {
+        ...part,
+        output: {
+          ...output,
+          value: {
+            ...value,
+            domChanges: compactDomChanges(value.domChanges),
+            historicalDomUpdate: true,
+          },
+        },
+      } as unknown as typeof rawPart;
+    });
+    return { ...message, content } as ModelMessage;
+  });
+}
+
+/**
+ * Keep only the latest full DOM update in DOM mode. Older updates retain their
+ * outcome and compact counts, while persisted traces remain untouched.
+ */
+export function compactOlderBrowserToolResults(messages: ModelMessage[], mode: 'code' | 'dom') {
+  const compacted = compactOlderBrowserCodeToolResults(messages);
+  return mode === 'dom' ? compactOlderDomUpdates(compacted) : compacted;
 }

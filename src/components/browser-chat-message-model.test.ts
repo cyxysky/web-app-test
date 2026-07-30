@@ -22,6 +22,16 @@ test('formats the completed assistant processing duration', () => {
   assert.equal(formatBrowserChatElapsedTime(undefined), '');
 });
 
+test('uses the live clock for a running assistant instead of the latest interface update', () => {
+  const elapsed = browserChatMessageElapsedMs({
+    createdAt: '2026-07-30T10:00:00.000Z',
+    updatedAt: '2026-07-30T10:00:03.000Z',
+  }, Date.parse('2026-07-30T10:00:20.000Z'));
+
+  assert.equal(elapsed, 20_000);
+  assert.equal(formatBrowserChatElapsedTime(elapsed), '20s');
+});
+
 test('groups consecutive assistant messages without visible text', () => {
   const messages = [
     { content: 'start', id: 'u1', role: 'user' as const },

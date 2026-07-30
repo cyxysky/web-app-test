@@ -12,7 +12,7 @@ function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId
     ?? request.nextUrl.searchParams.get('userId')
     ?? request.nextUrl.searchParams.get('qzUserId')
     ?? '',
-  ).trim();
+  ).trim() || '0';
 }
 
 export async function GET(request: NextRequest) {
@@ -30,11 +30,11 @@ export async function POST(request: NextRequest) {
       title: String(body.title || ''),
       description: String(body.description || ''),
       domains: Array.isArray(body.domains) ? body.domains.map(String) : [],
-      tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
       triggerPhrases: Array.isArray(body.triggerPhrases) ? body.triggerPhrases.map(String) : [],
       content,
       sourceSessionId: typeof body.sourceSessionId === 'string' ? body.sourceSessionId : undefined,
       status: ['draft', 'ready', 'disabled'].includes(String(body.status)) ? body.status : 'ready',
+      shared: body.shared === true,
       userId: requestUserId(request, body),
     });
     return NextResponse.json({ skill });

@@ -18,6 +18,7 @@ const createSchema = z.object({
   label: z.string().trim().max(500).optional(),
   loginUrl: z.string().trim().max(4_000).optional(),
   status: z.enum(['active', 'disabled']).optional(),
+  shared: z.boolean().optional(),
 }).strict();
 
 function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
@@ -27,7 +28,7 @@ function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId
     ?? request.nextUrl.searchParams.get('userId')
     ?? request.nextUrl.searchParams.get('qzUserId')
     ?? '',
-  ).trim();
+  ).trim() || '0';
 }
 
 function publicError(error: unknown) {
@@ -60,6 +61,7 @@ export async function POST(request: NextRequest) {
       label: body.label,
       loginUrl: body.loginUrl,
       status: body.status,
+      shared: body.shared,
     });
     return noStoreJson({ account }, { status: 201 });
   } catch (error) {

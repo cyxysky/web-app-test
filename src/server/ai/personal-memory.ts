@@ -12,6 +12,7 @@ export type PersonalMemoryStatus = 'active' | 'disabled';
 export type PersonalMemoryItem = {
   id: string;
   userId: string;
+  shared: boolean;
   scope: PersonalMemoryScope;
   domain: string;
   type: PersonalMemoryType;
@@ -31,6 +32,7 @@ export type PersonalMemoryItem = {
 };
 
 export type PersonalMemoryDraft = {
+  shared?: unknown;
   scope?: unknown;
   domain?: unknown;
   type?: unknown;
@@ -198,6 +200,7 @@ function normalizeMemoryDraft(input: PersonalMemoryDraft, defaults: {
   const aliases = normalizeAliases(input.aliases, key);
   return {
     userId: defaults.userId,
+    shared: input.shared === true,
     scope,
     domain,
     type,
@@ -266,11 +269,16 @@ export function listPersonalMemoryItems(input: {
   const userId = normalizePersonalMemoryUserId(input.userId);
   const domain = normalizePersonalMemoryDomain(input.domain);
   return readStore().items.filter((item) => {
-    if (item.userId !== userId) return false;
+    if (item.userId !== userId && !item.shared) return false;
     if (!input.includeDisabled && item.status !== 'active') return false;
     if (!domain) return true;
     return item.scope === 'global' || domainMatches(item.domain, domain);
   });
+}
+
+export function getPersonalMemoryItem(id: string, userId?: unknown) {
+  const normalizedUserId = normalizePersonalMemoryUserId(userId);
+  return readStore().items.find((item) => item.id === id && (item.userId === normalizedUserId || item.shared));
 }
 
 export function savePersonalMemoryItem(input: PersonalMemoryDraft & {
@@ -291,6 +299,10 @@ export function savePersonalMemoryItem(input: PersonalMemoryDraft & {
   const store = readStore();
   const timestamp = now();
   const requestedId = compactText(input.id, 120);
+  const requestedItem = requestedId ? store.items.find((item) => item.id === requestedId) : undefined;
+  if (requestedItem && requestedItem.userId !== userId) {
+    throw new Error('Only the memory creator can edit this shared memory.');
+  }
   const identity = memoryIdentity(draft);
   const existingIndex = store.items.findIndex((item) => (
     (requestedId && item.id === requestedId && item.userId === userId)
@@ -299,6 +311,7 @@ export function savePersonalMemoryItem(input: PersonalMemoryDraft & {
   const previous = existingIndex >= 0 ? store.items[existingIndex] : undefined;
   const item: PersonalMemoryItem = {
     ...draft,
+    shared: input.shared === undefined ? previous?.shared ?? false : draft.shared,
     id: previous?.id || requestedId || `mem_${randomUUID()}`,
     createdAt: previous?.createdAt || timestamp,
     updatedAt: timestamp,
@@ -381,7 +394,7 @@ export function searchPersonalMemory(input: {
   if (limit <= 0) return [];
   const results: PersonalMemorySearchResult[] = [];
   for (const item of readStore().items) {
-    if (item.userId !== userId || item.status !== 'active') continue;
+    if ((item.userId !== userId && !item.shared) || item.status !== 'active') continue;
     const reasons: string[] = [];
     let score = 0;
     if (item.scope === 'domain') {
@@ -594,6 +607,7 @@ export function upsertExtractedPersonalMemoryItems(input: {
       const item: PersonalMemoryItem = {
         ...previous,
         ...draft,
+        shared: previous.shared,
         aliases: Array.from(new Set([...previous.aliases, ...draft.aliases])).slice(0, 8),
         text: itemText({ ...draft, aliases: Array.from(new Set([...previous.aliases, ...draft.aliases])).slice(0, 8) }),
         confidence: Math.max(previous.confidence, draft.confidence),

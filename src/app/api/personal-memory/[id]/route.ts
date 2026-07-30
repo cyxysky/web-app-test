@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import {
   deletePersonalMemoryItem,
+  getPersonalMemoryItem,
   updatePersonalMemoryItem,
 } from '@/server/ai/personal-memory';
 import { noStoreJson } from '@/server/http/no-store-response';
@@ -14,14 +15,17 @@ type RouteContext = {
 
 function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
   const url = new URL(request.url);
-  return String(body?.userId ?? body?.qzUserId ?? url.searchParams.get('userId') ?? url.searchParams.get('qzUserId') ?? '').trim();
+  return String(body?.userId ?? body?.qzUserId ?? url.searchParams.get('userId') ?? url.searchParams.get('qzUserId') ?? '').trim() || '0';
 }
 
 export async function PATCH(request: NextRequest, context: RouteContext) {
   try {
     const { id } = await context.params;
     const body = await request.json();
-    const item = updatePersonalMemoryItem(id, body && typeof body === 'object' && !Array.isArray(body) ? body : {}, requestUserId(request, body));
+    const userId = requestUserId(request, body);
+    const visibleItem = getPersonalMemoryItem(id, userId);
+    if (visibleItem && visibleItem.userId !== userId) return noStoreJson({ error: 'Only the memory creator can edit this shared memory' }, { status: 403 });
+    const item = updatePersonalMemoryItem(id, body && typeof body === 'object' && !Array.isArray(body) ? body : {}, userId);
     if (!item) return noStoreJson({ error: 'Personal memory item not found' }, { status: 404 });
     return noStoreJson({ item });
   } catch (error) {
@@ -35,7 +39,10 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
 export async function DELETE(request: NextRequest, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const deleted = deletePersonalMemoryItem(id, requestUserId(request));
+    const userId = requestUserId(request);
+    const visibleItem = getPersonalMemoryItem(id, userId);
+    if (visibleItem && visibleItem.userId !== userId) return noStoreJson({ error: 'Only the memory creator can delete this shared memory' }, { status: 403 });
+    const deleted = deletePersonalMemoryItem(id, userId);
     if (!deleted) return noStoreJson({ error: 'Personal memory item not found' }, { status: 404 });
     return noStoreJson({ ok: true, deleted });
   } catch (error) {

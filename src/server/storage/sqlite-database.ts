@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 7;
+const currentSchemaVersion = 8;
 const defaultApplicationUserId = '0';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -307,6 +307,31 @@ function applyVersionSevenMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionEightMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 8').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const table of ['skill', 'personal_memory_item', 'login_account']) {
+      const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === 'shared')) {
+        database.exec(`ALTER TABLE ${table} ADD COLUMN shared INTEGER NOT NULL DEFAULT 0`);
+      }
+    }
+    database.exec('CREATE INDEX IF NOT EXISTS skill_shared_updated_at_idx ON skill(shared, updated_at DESC)');
+    database.exec('CREATE INDEX IF NOT EXISTS personal_memory_shared_updated_at_idx ON personal_memory_item(shared, updated_at DESC)');
+    database.exec('CREATE INDEX IF NOT EXISTS login_account_shared_domain_idx ON login_account(shared, domain, updated_at DESC)');
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (8, 'cross-user-shared-resources', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -341,6 +366,7 @@ function initializeSchema(database: DatabaseSync) {
     CREATE TABLE IF NOT EXISTS skill (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
+      shared INTEGER NOT NULL DEFAULT 0,
       title TEXT NOT NULL,
       status TEXT NOT NULL,
       record_json TEXT NOT NULL,
@@ -394,6 +420,7 @@ function initializeSchema(database: DatabaseSync) {
     CREATE TABLE IF NOT EXISTS personal_memory_item (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
+      shared INTEGER NOT NULL DEFAULT 0,
       scope TEXT NOT NULL,
       domain TEXT NOT NULL,
       type TEXT NOT NULL,
@@ -410,6 +437,7 @@ function initializeSchema(database: DatabaseSync) {
     CREATE TABLE IF NOT EXISTS login_account (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
+      shared INTEGER NOT NULL DEFAULT 0,
       domain TEXT NOT NULL,
       username TEXT NOT NULL,
       label TEXT NOT NULL,
@@ -447,6 +475,7 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionFiveMigration(database);
   applyVersionSixMigration(database);
   applyVersionSevenMigration(database);
+  applyVersionEightMigration(database);
 }
 
 export function getSqliteDatabase() {

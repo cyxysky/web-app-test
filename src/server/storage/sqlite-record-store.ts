@@ -9,7 +9,7 @@ type ConfigRecord = {
 
 type JsonRow = { record_json: string };
 
-type SkillJsonRow = JsonRow & { user_id: string };
+type SkillJsonRow = JsonRow & { user_id: string; shared: number };
 
 function now() {
   return new Date().toISOString();
@@ -57,25 +57,28 @@ export function writeConfigRecord(data: ConfigRecord) {
 
 export function readSkills(userId?: string) {
   const statement = userId === undefined
-    ? getSqliteDatabase().prepare('SELECT user_id, record_json FROM skill ORDER BY updated_at DESC')
-    : getSqliteDatabase().prepare('SELECT user_id, record_json FROM skill WHERE user_id = ? ORDER BY updated_at DESC');
+    ? getSqliteDatabase().prepare('SELECT user_id, shared, record_json FROM skill ORDER BY updated_at DESC')
+    : getSqliteDatabase().prepare('SELECT user_id, shared, record_json FROM skill WHERE user_id = ? OR shared = 1 ORDER BY updated_at DESC');
   const rows = (userId === undefined ? statement.all() : statement.all(userId)) as SkillJsonRow[];
   return rows
-    .map((row) => parseSqliteJson<SkillRecord | undefined>(row.record_json, undefined))
+    .map((row) => {
+      const record = parseSqliteJson<SkillRecord | undefined>(row.record_json, undefined);
+      return record ? { ...record, userId: row.user_id, shared: Boolean(row.shared) } : undefined;
+    })
     .filter((item): item is SkillRecord => Boolean(item));
 }
 
 export function writeSkillRecord(skill: SkillRecord, userId: string) {
   getSqliteDatabase().prepare(`
-    INSERT INTO skill (id, user_id, title, status, record_json, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO skill (id, user_id, shared, title, status, record_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
-      user_id = excluded.user_id,
+      shared = excluded.shared,
       title = excluded.title,
       status = excluded.status,
       record_json = excluded.record_json,
       updated_at = excluded.updated_at
-  `).run(skill.id, userId, skill.title, skill.status, JSON.stringify(skill), skill.createdAt, skill.updatedAt);
+  `).run(skill.id, userId, skill.shared ? 1 : 0, skill.title, skill.status, JSON.stringify(skill), skill.createdAt, skill.updatedAt);
 }
 
 export function deleteSkillRecord(skillId: string, userId: string) {
@@ -90,6 +93,7 @@ export function readPersonalMemoryRecords<T>() {
 export function replacePersonalMemoryRecords(items: Array<{
   id: string;
   userId: string;
+  shared: boolean;
   scope: string;
   domain: string;
   type: string;
@@ -102,13 +106,14 @@ export function replacePersonalMemoryRecords(items: Array<{
     database.exec('DELETE FROM personal_memory_item');
     const insert = database.prepare(`
       INSERT INTO personal_memory_item (
-        id, user_id, scope, domain, type, memory_key, status, record_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, user_id, shared, scope, domain, type, memory_key, status, record_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const item of items) {
       insert.run(
         item.id,
         item.userId,
+        item.shared ? 1 : 0,
         item.scope,
         item.domain,
         item.type,

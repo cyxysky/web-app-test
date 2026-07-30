@@ -159,13 +159,19 @@ function normalizeSkillContent(content?: Partial<SkillContent>): SkillContent {
 
 function normalizeSkillRecord(record: SkillRecord): SkillRecord {
   return {
-    ...record,
+    id: record.id,
+    userId: normalizeApplicationUserId(record.userId),
+    shared: record.shared === true,
+    title: record.title,
+    description: record.description,
     domains: normalizeSkillItems(record.domains, 12),
-    tags: normalizeSkillItems(record.tags, 6),
     triggerPhrases: normalizeSkillItems(record.triggerPhrases, 8),
     content: normalizeSkillContent(record.content),
+    sourceSessionId: record.sourceSessionId,
     status: record.status || 'ready',
     version: record.version || 1,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
   };
 }
 
@@ -189,7 +195,6 @@ export const store = {
       skill.title,
       skill.description,
       ...(skill.domains || []),
-      ...skill.tags,
       ...skill.triggerPhrases,
     ].some((value) => value.toLowerCase().includes(normalizedQuery)));
   },
@@ -206,22 +211,27 @@ export const store = {
     title: string;
     description: string;
     domains?: string[];
-    tags?: string[];
     triggerPhrases?: string[];
     content: SkillContent;
     sourceSessionId?: string;
     status?: SkillRecord['status'];
+    shared?: boolean;
     userId?: string | number;
   }) {
     const userId = normalizeApplicationUserId(input.userId);
     const timestamp = now();
-    const existing = input.id ? this.getSkill(input.id, userId) : undefined;
+    const storedExisting = input.id ? readSkills().find((skill) => skill.id === input.id) : undefined;
+    if (storedExisting && normalizeApplicationUserId(storedExisting.userId) !== userId) {
+      throw new Error('Only the Skill creator can edit this shared Skill.');
+    }
+    const existing = storedExisting ? normalizeSkillRecord(storedExisting) : undefined;
     const skill = normalizeSkillRecord({
       id: existing?.id || id('skl'),
+      userId,
+      shared: input.shared ?? existing?.shared ?? false,
       title: input.title.trim() || existing?.title || 'Runtime Skill',
       description: input.description.trim() || existing?.description || '',
       domains: input.domains || existing?.domains || [],
-      tags: input.tags || existing?.tags || [],
       triggerPhrases: input.triggerPhrases || existing?.triggerPhrases || [],
       content: normalizeSkillContent(input.content),
       sourceSessionId: input.sourceSessionId || existing?.sourceSessionId,

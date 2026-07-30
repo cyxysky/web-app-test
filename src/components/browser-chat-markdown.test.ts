@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { normalizeBrowserChatMarkdown } from './browser-chat-markdown';
 
 test('restores headings and tables from a collapsed model Markdown reply', () => {
@@ -16,4 +20,22 @@ test('keeps valid Markdown and code spans intact', () => {
   const markdown = '## 标题\n\n| 字段 | 内容 |\n|---|---|\n| 编号 | 31465 |\n\n`a --- ## b`\n\n```txt\na --- ## b\n```';
 
   assert.equal(normalizeBrowserChatMarkdown(markdown), markdown);
+});
+
+test('renders emphasized URLs correctly before Chinese punctuation', () => {
+  const messages = [
+    '已为您打开 **https://10.10.0.90**。需要继续操作吗？',
+    '已为您打开 \\*\\*https://10.10.0.90\\*\\*。保留孤立的 \\*，以及 `\\*\\*code\\*\\*`。',
+  ];
+
+  for (const markdown of messages) {
+    const normalized = normalizeBrowserChatMarkdown(markdown);
+    const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+      remarkPlugins: [remarkGfm],
+    }, normalized));
+
+    assert.match(normalized, /\*\*<https:\/\/10\.10\.0\.90>\*\*。/);
+    assert.match(html, /<strong><a href="https:\/\/10\.10\.0\.90">https:\/\/10\.10\.0\.90<\/a><\/strong>。/);
+    assert.doesNotMatch(html, /\*\*https:\/\//);
+  }
 });

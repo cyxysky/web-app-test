@@ -5,9 +5,10 @@ import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUr
 
 const skill: SkillRecord = {
   id: 'skill-search-room',
+  userId: '0',
+  shared: false,
   title: '进入指定直播间',
   description: '通过主播名进入指定直播间。',
-  tags: ['内部管理标签'],
   triggerPhrases: ['打开指定主播直播间'],
   content: {
     details: [
@@ -27,7 +28,7 @@ test('compact user Skill references contain only the id mapping and title', () =
   assert.match(reference, /<skills id="1">/);
   assert.match(reference, /Title: 进入指定直播间/);
   assert.doesNotMatch(reference, /通过主播名/);
-  assert.doesNotMatch(reference, /内部管理标签|打开指定主播直播间|Workflow/);
+  assert.doesNotMatch(reference, /打开指定主播直播间|Workflow/);
 });
 
 test('detailed Skill prompt injects operating content once and omits matching metadata', () => {
@@ -36,7 +37,7 @@ test('detailed Skill prompt injects operating content once and omits matching me
   assert.equal((prompt.match(/打开直播平台并定位主播搜索入口/g) || []).length, 1);
   assert.equal((prompt.match(/搜索建议未出现时改用房间号/g) || []).length, 1);
   assert.equal((prompt.match(/地址和页面标题均对应目标主播/g) || []).length, 1);
-  assert.doesNotMatch(prompt, /内部管理标签|打开指定主播直播间|Trigger phrases|Tags:/);
+  assert.doesNotMatch(prompt, /打开指定主播直播间|Trigger phrases/);
 });
 
 test('Skill content keeps the detailed Markdown block intact', () => {

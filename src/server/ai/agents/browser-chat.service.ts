@@ -41,6 +41,7 @@ import {
   type RegisteredBrowserChatTurn,
 } from '@/server/ai/agents/browser-chat-interrupt-state';
 import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl } from '@/server/ai/agents/skill-context';
+import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
 import {
   extractPersonalMemoryFromTurn,
   formatPersonalMemoryForPrompt,
@@ -1161,6 +1162,7 @@ function sessionSnapshotHeader(
   session: BrowserChatSessionRecord,
 ): Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'> {
   finalizeIdleRunningAssistantMessages(session);
+  if (!session.busy && session.status !== 'running') session.mode = configuredBrowserChatMode();
   return {
     id: session.id,
     title: session.title,
@@ -1231,12 +1233,13 @@ function runtimeResponseTextFromLog(log: BrowserChatLogRecord) {
   const details = parseLogDetails(log.details);
   if (details && typeof details === 'object') {
     const text = (details as { text?: unknown }).text;
-    if (typeof text === 'string' && text.trim()) return text.trim();
+    const normalized = typeof text === 'string' ? normalizeBrowserChatFinalReplyText(text) : '';
+    if (normalized && !isBrowserChatDomObservationText(normalized)) return normalized;
   }
   const fallback = log.message
     .replace(/;\s*turn\s+\d+\/\d+;\s*AI\+tool[\s\S]*$/i, '')
     .trim();
-  return /^AI returned no text/i.test(fallback) ? '' : fallback;
+  return /^AI returned no text/i.test(fallback) || isBrowserChatDomObservationText(fallback) ? '' : fallback;
 }
 
 function recoverAssistantMessageFromLogs(
@@ -1398,6 +1401,7 @@ function recordFromSnapshot(
   return {
     ...session,
     userId: normalizeUserId(session.userId),
+    mode: configuredBrowserChatMode(),
     tabs: session.tabs || [],
     targetUrl: exportableTargetUrl(session.targetUrl),
     safetyMode: normalizeSafetyMode(session.safetyMode),
@@ -1947,6 +1951,10 @@ function createBrowserChatBrowser(session: BrowserChatSessionRecord, preferExist
   });
 }
 
+function configuredBrowserChatMode(): BrowserSessionMode {
+  return process.env.AI_BROWSER_MODE?.trim().toLowerCase() === 'dom' ? 'dom' : 'code';
+}
+
 function restoreBrowserSessionPrototype(browser?: BrowserSession) {
   if (browser && Object.getPrototypeOf(browser) !== BrowserSession.prototype) {
     Object.setPrototypeOf(browser, BrowserSession.prototype);
@@ -2041,7 +2049,6 @@ async function ensureStartedNow(
 
 export function createBrowserChatSession(input: {
   targetUrl?: string;
-  mode?: BrowserSessionMode;
   safetyMode?: BrowserChatSafetyMode;
   modelProvider?: unknown;
   model?: unknown;
@@ -2057,9 +2064,7 @@ export function createBrowserChatSession(input: {
     userId: normalizeUserId(input.userId),
     browserGroupId: '',
     targetUrl: exportableTargetUrl(input.targetUrl || ''),
-    mode: input.mode === 'dom' || input.mode === 'code'
-      ? input.mode
-      : process.env.AI_BROWSER_MODE?.trim().toLowerCase() === 'dom' ? 'dom' : 'code',
+    mode: configuredBrowserChatMode(),
     safetyMode: normalizeSafetyMode(input.safetyMode),
     modelProvider: modelSettings.provider,
     model: modelSettings.model,
@@ -2465,7 +2470,6 @@ export async function generateBrowserChatMessagesSkill(sessionId: string, messag
     title: generated.title,
     description: generated.description,
     domains: generated.domains,
-    tags: generated.tags,
     triggerPhrases: generated.triggerPhrases,
     content: generated.content,
     sourceSessionId: session.id,
@@ -2483,7 +2487,6 @@ export async function generateBrowserChatMessageSkill(sessionId: string, message
 export async function sendBrowserChatMessage(
   sessionId: string,
   content: string,
-  mode?: BrowserSessionMode,
   safetyMode?: BrowserChatSafetyMode,
   modelProvider?: unknown,
   model?: unknown,
@@ -2512,10 +2515,13 @@ export async function sendBrowserChatMessage(
     return snapshot(session);
   }
   if (session.busy || activeTurns.has(session.id)) throw new Error('Browser chat session is already running');
+  // Operation mode is shared application configuration. A conversation or
+  // mounted user must never preserve or override an older mode value.
+  store.applyRuntimeEnv();
+  session.mode = configuredBrowserChatMode();
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);
   session.pendingToolConfirmation = undefined;
-  if (mode && !session.started && !session.steps.length && !session.messages.length) session.mode = mode;
   session.safetyMode = normalizeSafetyMode(safetyMode ?? session.safetyMode);
   const modelSettings = browserChatModelSettings(modelProvider ?? session.modelProvider, model ?? session.model);
   session.modelProvider = modelSettings.provider;

@@ -7,7 +7,6 @@ import { normalizeSkillDomain } from './skill-context';
 const generatedSkillSchema = z.object({
   title: z.string().min(2).max(80),
   description: z.string().min(8).max(240),
-  tags: z.array(z.string().min(1).max(32)).min(1).max(6),
   triggerPhrases: z.array(z.string().min(2).max(80)).min(2).max(8),
   content: skillContentSchema.extend({
     details: z.string().min(20).max(8_000),
@@ -97,7 +96,7 @@ export async function generateSkillFromBrowserHistory(input: {
   steps: StepExecutionResult[];
   targetUrl: string;
   title: string;
-}): Promise<Omit<SkillRecord, 'id' | 'createdAt' | 'updatedAt' | 'version' | 'status'>> {
+}): Promise<Omit<SkillRecord, 'id' | 'userId' | 'shared' | 'createdAt' | 'updatedAt' | 'version' | 'status'>> {
   const { steps } = input;
   if (!steps.length) throw new Error('Run has no executable steps to convert into a skill.');
   const diagnostics = input.status === 'passed'
@@ -142,7 +141,6 @@ export async function generateSkillFromBrowserHistory(input: {
     title: result.object.title,
     description: result.object.description,
     domains: [normalizeSkillDomain(input.targetUrl)].filter(Boolean),
-    tags: distinctText(result.object.tags, 6),
     triggerPhrases: distinctText(result.object.triggerPhrases, 8),
     content: {
       details: result.object.content.details.trim(),

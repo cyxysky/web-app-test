@@ -723,8 +723,6 @@ const en: Record<string, string> = {
   '可用': 'Ready',
   '描述': 'Description',
   '一句话说明能力和适用场景': 'Describe the capability and usage scope in one sentence',
-  '标签': 'Tags',
-  '暂无标签': 'No tags',
   '触发词': 'Trigger phrases',
   '暂无触发词': 'No trigger phrases',
   '每行一个精确的用户意图': 'One precise user intent per line',

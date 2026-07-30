@@ -48,10 +48,11 @@ export type SkillContent = z.infer<typeof skillContentSchema>;
 
 export type SkillRecord = {
   id: string;
+  userId: string;
+  shared: boolean;
   title: string;
   description: string;
   domains?: string[];
-  tags: string[];
   triggerPhrases: string[];
   content: SkillContent;
   sourceSessionId?: string;

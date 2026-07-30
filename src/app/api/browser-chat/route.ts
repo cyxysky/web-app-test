@@ -20,7 +20,6 @@ export async function POST(request: NextRequest) {
     const body = createBrowserChatSessionRequestSchema.parse(await request.json().catch(() => ({})));
     const session = createBrowserChatSession({
       targetUrl: body.targetUrl,
-      mode: body.mode,
       safetyMode: body.safetyMode,
       modelProvider: body.modelProvider,
       model: body.model,

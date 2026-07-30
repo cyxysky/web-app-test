@@ -362,6 +362,107 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.match(replacedTarget.actual, /absent from the current DOM UID registry/);
 });
 
+test('DOM actions resolve exact semantic targets and reject stale or ambiguous contracts', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-uid-target-text-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <button id="target-110" type="button" onclick="document.body.dataset.clicked='110'">110</button>
+    <button id="target-500" type="button" onclick="document.body.dataset.clicked='500'">500</button>
+    <button id="icon-close" aria-label="关闭弹窗" type="button" onclick="document.body.dataset.clicked='close'"></button>
+    <button type="button">重复目标</button><button type="button">重复目标</button>
+  </body></html>`);
+
+  const snapshot = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  const target110Uid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="target-110"/)?.[1];
+  const target500Uid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="target-500"/)?.[1];
+  const iconCloseUid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="icon-close"/)?.[1];
+  const duplicateUid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*>重复目标<\/button>/)?.[1];
+  assert.ok(snapshot.snapshotId && target110Uid && target500Uid && iconCloseUid && duplicateUid, snapshot.content);
+
+  const rejected = await session.mouse({
+    action: 'click',
+    snapshotId: 'dom-observation-stale',
+    target: { kind: 'semantic', attributes: { id: 'target-500' } },
+  });
+  assert.equal(rejected.ok, false, rejected.actual);
+  assert.match(rejected.actual, /STALE_TARGET/);
+  assert.equal(await page.locator('body').getAttribute('data-clicked'), null);
+
+  const ambiguous = await session.mouse({
+    action: 'click',
+    snapshotId: snapshot.snapshotId,
+    target: { kind: 'semantic', role: 'button', name: '重复目标' },
+  });
+  assert.equal(ambiguous.ok, false, ambiguous.actual);
+  assert.match(ambiguous.actual, /AMBIGUOUS_TARGET/);
+
+  const iconClicked = await session.mouse({
+    action: 'click',
+    snapshotId: snapshot.snapshotId,
+    target: { kind: 'semantic', attributes: { id: 'icon-close' } },
+  });
+  assert.equal(iconClicked.ok, true, iconClicked.actual);
+  assert.equal(await page.locator('body').getAttribute('data-clicked'), 'close');
+
+  const clicked = await session.mouse({
+    action: 'click',
+    snapshotId: snapshot.snapshotId,
+    target: { kind: 'semantic', role: 'button', name: '110' },
+  });
+  assert.equal(clicked.ok, true, clicked.actual);
+  assert.equal(await page.locator('body').getAttribute('data-clicked'), '110');
+});
+
+test('DOM UID force click explicitly dismisses an overlay without activating the covered target', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-covered-target-dismiss-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <button id="covered-target" type="button" onclick="document.body.dataset.targetClicked='true'">打开详情</button>
+    <div class="modal-mask" style="position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.2)" onclick="this.remove();document.body.dataset.dismissed='true'"></div>
+  </body></html>`);
+
+  const snapshot = await session.readDomObservationSnapshot({ mode: 'full' });
+  const targetUid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="covered-target"/)?.[1];
+  assert.ok(snapshot.snapshotId && targetUid, snapshot.content);
+  const target = { kind: 'semantic' as const, attributes: { id: 'covered-target' } };
+
+  const normalClick = await session.mouse({ action: 'click', snapshotId: snapshot.snapshotId, target });
+  assert.equal(normalClick.ok, false, normalClick.actual);
+  assert.match(normalClick.actual, /force=true/);
+  assert.equal(await page.locator('body').getAttribute('data-dismissed'), null);
+
+  const dismissed = await session.mouse({ action: 'click', snapshotId: snapshot.snapshotId, target, force: true });
+  assert.equal(dismissed.ok, true, dismissed.actual);
+  assert.match(dismissed.actual, /explicit-forced-real-pointer/);
+  assert.equal(await page.locator('body').getAttribute('data-dismissed'), 'true');
+  assert.equal(await page.locator('body').getAttribute('data-target-clicked'), null, 'the covered target must not be force-clicked');
+
+  const clicked = await session.mouse({ action: 'click', snapshotId: snapshot.snapshotId, target });
+  assert.equal(clicked.ok, true, clicked.actual);
+  assert.equal(await page.locator('body').getAttribute('data-target-clicked'), 'true');
+
+  await page.setContent(`<!doctype html><html><body>
+    <button id="blocked-target" type="button">不可强点</button>
+    <div class="floating-panel" style="position:fixed;inset:0;z-index:100;background:white"></div>
+  </body></html>`);
+  const blockedSnapshot = await session.readDomObservationSnapshot({ mode: 'full' });
+  const blockedUid = blockedSnapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="blocked-target"/)?.[1];
+  assert.ok(blockedSnapshot.snapshotId && blockedUid, blockedSnapshot.content);
+  const blockedStartedAt = Date.now();
+  const blocked = await session.mouse({
+    action: 'click',
+    snapshotId: blockedSnapshot.snapshotId,
+    target: { kind: 'semantic', attributes: { id: 'blocked-target' } },
+  });
+  assert.equal(blocked.ok, false, blocked.actual);
+  assert.match(blocked.actual, /force=true/);
+  assert.ok(Date.now() - blockedStartedAt < 1_000, 'a covered target must fail before Playwright waits for its actionability timeout');
+});
+
 test('DOM baseline ranks modal duplicates and describes virtual lists', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-ranking-and-virtual-list-test' });
   context.after(async () => session.close());

@@ -37,9 +37,14 @@ function hasVisibleText(value: unknown) {
   return typeof value === 'string' && Boolean(value.trim());
 }
 
-export function browserChatMessageElapsedMs(message: Pick<BrowserChatMessageLike, 'createdAt' | 'updatedAt'>) {
+export function browserChatMessageElapsedMs(
+  message: Pick<BrowserChatMessageLike, 'createdAt' | 'updatedAt'>,
+  liveNowMs?: number,
+) {
   const startedAt = Date.parse(message.createdAt || '');
-  const completedAt = Date.parse(message.updatedAt || message.createdAt || '');
+  const completedAt = Number.isFinite(liveNowMs)
+    ? Number(liveNowMs)
+    : Date.parse(message.updatedAt || message.createdAt || '');
   if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt)) return undefined;
   return Math.max(0, completedAt - startedAt);
 }

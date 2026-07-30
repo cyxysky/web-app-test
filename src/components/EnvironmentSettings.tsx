@@ -45,6 +45,7 @@ type PersonalMemoryStatus = 'active' | 'disabled';
 type PersonalMemoryItem = {
   id: string;
   userId: string;
+  shared: boolean;
   scope: PersonalMemoryScope;
   domain: string;
   type: PersonalMemoryType;
@@ -64,6 +65,7 @@ type PersonalMemoryItem = {
 type PersonalMemoryDraft = {
   id?: string;
   userId?: string;
+  shared: boolean;
   scope: PersonalMemoryScope;
   domain: string;
   type: PersonalMemoryType;
@@ -147,6 +149,7 @@ const personalMemoryStatusOptions: Array<{ label: string; value: PersonalMemoryS
 
 function createPersonalMemoryDraft(): PersonalMemoryDraft {
   return {
+    shared: false,
     scope: 'global',
     domain: '',
     type: 'alias',
@@ -161,6 +164,7 @@ function personalMemoryDraftFromItem(item: PersonalMemoryItem): PersonalMemoryDr
   return {
     id: item.id,
     userId: item.userId,
+    shared: item.shared,
     scope: item.scope,
     domain: item.domain || '',
     type: item.type,
@@ -187,15 +191,13 @@ function sortPersonalMemoryItems(items: PersonalMemoryItem[]) {
 }
 
 function personalMemoryItemApiPath(item: Pick<PersonalMemoryItem, 'id' | 'userId'>, userId: string) {
-  const effectiveUserId = item.userId || userId;
-  const query = effectiveUserId ? `?userId=${encodeURIComponent(effectiveUserId)}` : '';
+  const query = userId ? `?userId=${encodeURIComponent(userId)}` : '';
   return withWebPilotBasePath(`/api/personal-memory/${encodeURIComponent(item.id)}${query}`);
 }
 
 function personalMemoryDraftApiPath(draft: PersonalMemoryDraft, userId: string) {
   if (!draft.id) return withWebPilotBasePath('/api/personal-memory');
-  const effectiveUserId = draft.userId || userId;
-  const query = effectiveUserId ? `?userId=${encodeURIComponent(effectiveUserId)}` : '';
+  const query = userId ? `?userId=${encodeURIComponent(userId)}` : '';
   return withWebPilotBasePath(`/api/personal-memory/${encodeURIComponent(draft.id)}${query}`);
 }
 
@@ -545,6 +547,7 @@ export function EnvironmentSettings({
   }
 
   function openEditPersonalMemory(item: PersonalMemoryItem) {
+    if (item.userId !== normalizedUserId) return;
     setPersonalMemoryDraft(personalMemoryDraftFromItem(item));
     setPersonalMemoryEditorMode('edit');
   }
@@ -597,6 +600,7 @@ export function EnvironmentSettings({
   }
 
   function requestDeleteLoginAccount(account: LoginAccountMetadata) {
+    if (account.userId !== normalizedUserId) return;
     setDeleteLoginAccountTarget(account);
     setDeleteLoginAccountError('');
   }
@@ -614,7 +618,7 @@ export function EnvironmentSettings({
     setDeleteLoginAccountError('');
     startGlobalLoading(t('正在删除登录账号'));
     try {
-      const query = `?userId=${encodeURIComponent(account.userId || normalizedUserId)}`;
+      const query = `?userId=${encodeURIComponent(normalizedUserId)}`;
       const response = await fetch(withWebPilotBasePath(`/api/login-accounts/${encodeURIComponent(account.id)}${query}`), { method: 'DELETE' });
       await readApiJson(response, t('删除登录账号失败'));
       setLoginAccounts((current) => current.filter((item) => item.id !== account.id));
@@ -630,6 +634,7 @@ export function EnvironmentSettings({
   function personalMemoryPayload() {
     return {
       userId: normalizedUserId,
+      shared: personalMemoryDraft.shared,
       scope: personalMemoryDraft.scope,
       domain: personalMemoryDraft.scope === 'domain' ? personalMemoryDraft.domain.trim() : '',
       type: personalMemoryDraft.type,
@@ -670,6 +675,7 @@ export function EnvironmentSettings({
   }
 
   async function togglePersonalMemory(item: PersonalMemoryItem) {
+    if (item.userId !== normalizedUserId) return;
     setUpdatingPersonalMemoryId(item.id);
     try {
       const response = await fetch(personalMemoryItemApiPath(item, normalizedUserId), {
@@ -685,6 +691,7 @@ export function EnvironmentSettings({
   }
 
   function requestDeletePersonalMemory(item: PersonalMemoryItem) {
+    if (item.userId !== normalizedUserId) return;
     setDeletePersonalMemoryTarget(item);
     setDeletePersonalMemoryError('');
   }
@@ -878,6 +885,21 @@ export function EnvironmentSettings({
                 onChange={(event) => updatePersonalMemoryDraft({ value: event.target.value })}
               />
             </label>
+            <div className="resource-sharing-field wide">
+              <div>
+                <strong>所有 ID 共享</strong>
+                <small>其他 ID 可以使用此记忆，但只有创建 ID {personalMemoryDraft.userId || normalizedUserId} 可以编辑或删除</small>
+              </div>
+              <button
+                aria-pressed={personalMemoryDraft.shared}
+                className={`settings-toggle${personalMemoryDraft.shared ? ' on' : ''}`}
+                disabled={savingPersonalMemory}
+                onClick={() => updatePersonalMemoryDraft({ shared: !personalMemoryDraft.shared })}
+                type="button"
+              >
+                <span />
+              </button>
+            </div>
           </div>
 
           <footer className="ui-modal-footer">
@@ -1013,6 +1035,8 @@ export function EnvironmentSettings({
               item.status,
               personalMemoryTypeLabel(item.type),
               item.status === 'active' ? '启用' : '停用',
+              item.shared ? '所有 ID 共享' : '仅创建 ID',
+              item.userId,
               ...(item.aliases || []),
             ]}
             getUpdatedAt={(item) => item.updatedAt}
@@ -1021,16 +1045,24 @@ export function EnvironmentSettings({
               <article className={`personal-memory-item ${item.status}`} data-i18n-skip key={item.id}>
                 <div className="personal-memory-item-main">
                   <div className="personal-memory-meta">
-                    <span>{item.scope === 'domain' ? item.domain || t('未填域名') : t('全局')}</span>
                     <span>{t(personalMemoryTypeLabel(item.type))}</span>
                     <span className={`personal-memory-status ${item.status}`}>{item.status === 'active' ? t('启用') : t('停用')}</span>
+                    {item.shared ? <span className="resource-shared-badge">{item.userId === normalizedUserId ? '所有 ID 共享' : `ID ${item.userId} 共享`}</span> : null}
                     {item.useCount ? <span>{t('使用 {count} 次', { count: item.useCount })}</span> : null}
                   </div>
-                  <h3>{item.key}</h3>
-                  <p>{item.value}</p>
-                  {item.aliases?.length ? <small>{item.aliases.join(', ')}</small> : null}
+                  <div className="personal-memory-copy">
+                    <h3>{item.key}</h3>
+                    <p>{item.value}</p>
+                  </div>
+                  {item.aliases?.length ? (
+                    <div className="personal-memory-aliases">
+                      <span>{t('等价说法')}</span>
+                      <small>{item.aliases.join(' · ')}</small>
+                    </div>
+                  ) : null}
                 </div>
                 <div className="personal-memory-actions">
+                  {item.userId === normalizedUserId ? <>
                   <button
                     aria-label={t('编辑记忆')}
                     className="settings-model-row-button"
@@ -1061,6 +1093,7 @@ export function EnvironmentSettings({
                   >
                     {deletingPersonalMemoryId === item.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
                   </button>
+                  </> : <span className="resource-readonly-label">只读</span>}
                 </div>
               </article>
             )}
@@ -1114,6 +1147,8 @@ export function EnvironmentSettings({
               account.loginUrl || '',
               account.status,
               account.status === 'active' ? '可用于目标测试' : '已停用',
+              account.shared ? '所有 ID 共享' : '仅创建 ID',
+              account.userId,
             ]}
             getUpdatedAt={(account) => account.updatedAt}
             items={loginAccounts}
@@ -1123,9 +1158,10 @@ export function EnvironmentSettings({
                 <div className="login-account-item-main">
                   <strong>{account.label || account.username}</strong>
                   <span>{account.username} · {account.domain}</span>
-                  <small>{account.status === 'active' ? '可用于目标测试' : '已停用'}{account.useCount ? ` · 已使用 ${account.useCount} 次` : ''}</small>
+                  <small>{account.status === 'active' ? '可用于目标测试' : '已停用'}{account.shared ? ` · ${account.userId === normalizedUserId ? '所有 ID 共享' : `由 ID ${account.userId} 共享`}` : ''}{account.useCount ? ` · 已使用 ${account.useCount} 次` : ''}</small>
                 </div>
                 <div className="login-account-item-actions">
+                  {account.userId === normalizedUserId ? <>
                   <button aria-label="编辑登录账号" className="settings-model-row-button" onClick={() => setLoginAccountEditor(account)} title="编辑登录账号" type="button">
                     <PencilLine size={15} />
                   </button>
@@ -1139,6 +1175,7 @@ export function EnvironmentSettings({
                   >
                     {deletingLoginAccountId === account.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
                   </button>
+                  </> : <span className="resource-readonly-label">只读</span>}
                 </div>
               </article>
             )}

@@ -9,6 +9,7 @@ import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 export type LoginAccountMetadata = {
   id: string;
   userId: string;
+  shared: boolean;
   domain: string;
   username: string;
   label: string;
@@ -58,6 +59,7 @@ export function LoginAccountModal({
   const [loginUrl, setLoginUrl] = useState('');
   const [password, setPassword] = useState('');
   const [username, setUsername] = useState('');
+  const [shared, setShared] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
@@ -69,6 +71,7 @@ export function LoginAccountModal({
     setLabel(account?.label || initialLabel || '');
     setLoginUrl(account?.loginUrl || initialLoginUrl || '');
     setUsername(account?.username || initialUsername || '');
+    setShared(account?.shared === true);
     setPassword('');
     setError('');
   }, [account, initialDomain, initialLabel, initialLoginUrl, initialUsername, open]);
@@ -100,6 +103,7 @@ export function LoginAccountModal({
         loginUrl: loginUrl.trim(),
         status: account?.status || 'active',
         username: username.trim(),
+        shared,
       };
       if (password) body.password = password;
       const effectiveUserId = userId || account?.userId;
@@ -163,6 +167,15 @@ export function LoginAccountModal({
             <span>密码 {editing ? <small>留空则不修改</small> : null}</span>
             <input autoComplete="new-password" className="input" disabled={saving} onChange={(event) => setPassword(event.target.value)} placeholder={editing ? '保持原密码' : '输入登录密码'} type="password" value={password} />
           </label>
+          <div className="resource-sharing-field wide">
+            <div>
+              <strong>所有 ID 共享</strong>
+              <small>其他 ID 可以调用此账号，但只有创建 ID {account?.userId || userId || '0'} 可以编辑或删除</small>
+            </div>
+            <button aria-pressed={shared} className={`settings-toggle${shared ? ' on' : ''}`} disabled={saving} onClick={() => setShared((value) => !value)} type="button">
+              <span />
+            </button>
+          </div>
           <div className="login-account-security-note wide">
             <KeyRound aria-hidden="true" size={14} />
             <span>密码加密保存在本机后台；规划模型只会看到域名和用户名，登录时只使用短期安全引用。</span>

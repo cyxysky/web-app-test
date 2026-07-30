@@ -167,6 +167,8 @@ export type BrowserSnapshotViews = Partial<Record<BrowserSnapshotView, string>> 
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** Snapshot/observation that owns any DOM refs returned with this result. */
+  snapshotId?: string;
   /** Click-specific timing breakdown for diagnosing browser action latency. */
   clickTimings?: BrowserClickTiming;
   /** A user-provided or generated image that should be attached to the next model request. */
@@ -176,6 +178,7 @@ export type BrowserActionResult = {
   /** A compact continuation cursor for paged snapshot readers. */
   nextCursor?: string;
   domChanges?: {
+    snapshotId?: string;
     epoch: number;
     added: string[];
     updated: string[];
@@ -375,6 +378,7 @@ type InteractiveCandidate = {
 
 type DomNodeReference = {
   id: string;
+  observationId?: string;
   interactive: boolean;
   capabilities?: DomActionCapability[];
   confidence?: DomActionConfidence;
@@ -639,7 +643,12 @@ type AiDomRuntime = {
   visibleDomPoint: (
     ref: string,
     viewportClip?: BrowserUseViewportClip,
-  ) => ({ x: number; y: number; descriptor: string } | undefined);
+  ) => ({
+    x: number;
+    y: number;
+    descriptor: string;
+    coveredBy?: string;
+  } | undefined);
   visibleDomElement: (ref: string) => Element | undefined;
   visibleDomText: (ref: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
   selectVisibleDomOption: (ref: string, input: { value?: string; label?: string }) => ({
@@ -792,20 +801,29 @@ type SnapshotGeneration = {
 export type BrowserMouseAction = {
   action: 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView';
   abortSignal?: AbortSignal;
+  snapshotId?: string;
+  target?: BrowserElementTarget;
+  /** Internal direct-call shorthand; model-facing tools use target. */
   uid?: string;
   xThousandth?: number;
   yThousandth?: number;
+  toTarget?: BrowserElementTarget;
+  /** Internal direct-call shorthand; model-facing tools use toTarget. */
   toUid?: string;
   toXThousandth?: number;
   toYThousandth?: number;
   button?: 'left' | 'right' | 'middle';
   clickCount?: number;
+  force?: boolean;
   deltaX?: number;
   deltaY?: number;
 };
 
 export type BrowserKeyboardAction = {
   action: 'type' | 'press' | 'shortcut';
+  snapshotId?: string;
+  target?: BrowserElementTarget;
+  /** Internal direct-call shorthand; model-facing tools use target. */
   uid?: string;
   xThousandth?: number;
   yThousandth?: number;
@@ -859,9 +877,25 @@ export type BrowserLiveInput =
     };
 
 export type BrowserSelectOptionAction = {
-  uid: string;
+  snapshotId?: string;
+  target?: BrowserElementTarget;
+  /** Internal direct-call shorthand; model-facing tools use target. */
+  uid?: string;
   value?: string;
   label?: string;
+};
+
+export type BrowserTargetSelector = {
+  role?: string;
+  name?: string;
+  attributes?: Record<string, string>;
+  exact?: true;
+};
+
+export type BrowserElementTarget = BrowserTargetSelector & {
+  kind: 'ref' | 'semantic';
+  ref?: string;
+  scope?: BrowserTargetSelector;
 };
 
 type ResolvedBrowserActionPoint = {
@@ -872,11 +906,83 @@ type ResolvedBrowserActionPoint = {
     y: number;
     descriptor: string;
     source: string;
+    coveredBy?: string;
   };
 };
 
 function isSnapshotReference(reference: SnapshotReference | DomNodeReference): reference is SnapshotReference {
   return 'uid' in reference;
+}
+
+const stableBrowserTargetAttributeName = /^(?:id|aria-label|title|data-[\w:-]+|href|name|placeholder)$/;
+
+function normalizeExactBrowserTargetValue(value: unknown) {
+  return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+}
+
+function domReferenceAttributes(reference: DomNodeReference) {
+  const attributes: Record<string, string> = {};
+  for (const match of reference.line.matchAll(/\s([:\w-]+)="([^"]*)"/g)) {
+    if (stableBrowserTargetAttributeName.test(match[1])) attributes[match[1]] = match[2];
+  }
+  return attributes;
+}
+
+function browserTargetSelectorMatchesReference(reference: DomNodeReference, selector: BrowserTargetSelector) {
+  if (selector.role && !reference.semanticRoles.includes(normalizeDomSearchText(selector.role))) return false;
+  const attributes = domReferenceAttributes(reference);
+  if (selector.name) {
+    const expectedName = normalizeDomSearchText(selector.name);
+    const names = [reference.label, attributes['aria-label'], attributes.title, attributes.placeholder]
+      .map(normalizeDomSearchText)
+      .filter(Boolean);
+    if (!names.includes(expectedName)) return false;
+  }
+  for (const [name, expected] of Object.entries(selector.attributes || {})) {
+    if (!stableBrowserTargetAttributeName.test(name)) return false;
+    if (normalizeExactBrowserTargetValue(attributes[name]) !== normalizeExactBrowserTargetValue(expected)) return false;
+  }
+  return true;
+}
+
+function domReferenceIsInside(reference: DomNodeReference, scope: DomNodeReference) {
+  return reference.framePath === scope.framePath
+    && reference.path !== scope.path
+    && reference.path.startsWith(`${scope.path}.`);
+}
+
+type LiveDomTargetFacts = {
+  attributes: Record<string, string>;
+  connected: boolean;
+  names: string[];
+  roles: string[];
+  tag: string;
+  visible: boolean;
+};
+
+function browserTargetSelectorMatchesLiveFacts(facts: LiveDomTargetFacts, selector: BrowserTargetSelector) {
+  if (selector.role && !facts.roles.map(normalizeDomSearchText).includes(normalizeDomSearchText(selector.role))) return false;
+  if (selector.name) {
+    const expectedName = normalizeDomSearchText(selector.name);
+    if (!facts.names.map(normalizeDomSearchText).filter(Boolean).includes(expectedName)) return false;
+  }
+  for (const [name, expected] of Object.entries(selector.attributes || {})) {
+    if (!stableBrowserTargetAttributeName.test(name)) return false;
+    if (normalizeExactBrowserTargetValue(facts.attributes[name]) !== normalizeExactBrowserTargetValue(expected)) return false;
+  }
+  return true;
+}
+
+function domReferenceFingerprintMatchesLiveFacts(reference: DomNodeReference, facts: LiveDomTargetFacts) {
+  if (normalizeDomSearchText(reference.tag) !== normalizeDomSearchText(facts.tag)) return false;
+  const attributes = domReferenceAttributes(reference);
+  for (const [name, expected] of Object.entries(attributes)) {
+    if (normalizeExactBrowserTargetValue(facts.attributes[name]) !== normalizeExactBrowserTargetValue(expected)) return false;
+  }
+  if (!Object.keys(attributes).length && reference.normalizedLabel) {
+    return facts.names.map(normalizeDomSearchText).includes(reference.normalizedLabel);
+  }
+  return true;
 }
 
 type WindowWithAiDomRuntime = Window & {
@@ -1325,7 +1431,7 @@ function installAiBrowserPageRuntime() {
     });
   }
 
-  if (win.__aiDomRuntime?.version === 15) return;
+  if (win.__aiDomRuntime?.version === 17) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
@@ -2747,6 +2853,38 @@ function installAiBrowserPageRuntime() {
     };
   }
 
+  function visibleDomCoveredPoint(element: Element, viewportClip: BrowserUseViewportClip) {
+    const rect = visibleDomRect(element, viewportClip);
+    if (!rect) return undefined;
+    const insetX = Math.min(10, Math.max(1, (rect.right - rect.left) / 4));
+    const insetY = Math.min(10, Math.max(1, (rect.bottom - rect.top) / 4));
+    const samples = [
+      [rect.left + (rect.right - rect.left) / 2, rect.top + (rect.bottom - rect.top) / 2],
+      [rect.left + insetX, rect.top + (rect.bottom - rect.top) / 2],
+      [rect.right - insetX, rect.top + (rect.bottom - rect.top) / 2],
+      [rect.left + (rect.right - rect.left) / 2, rect.top + insetY],
+      [rect.left + (rect.right - rect.left) / 2, rect.bottom - insetY],
+      [rect.left + insetX, rect.top + insetY],
+      [rect.right - insetX, rect.top + insetY],
+      [rect.left + insetX, rect.bottom - insetY],
+      [rect.right - insetX, rect.bottom - insetY],
+    ];
+    let firstCovered: { x: number; y: number; coveredBy: string } | undefined;
+    for (const [rawX, rawY] of samples) {
+      const x = Math.min(Math.max(rawX, 0), window.innerWidth - 1);
+      const y = Math.min(Math.max(rawY, 0), window.innerHeight - 1);
+      const cover = topmostRenderableAt(x, y, { requirePointerEvents: true });
+      if (!cover || cover === element || composedContains(element, cover)) continue;
+      const candidate = {
+        x,
+        y,
+        coveredBy: descriptor(cover),
+      };
+      firstCovered ||= candidate;
+    }
+    return firstCovered;
+  }
+
   function visibleDomPoint(ref: string, viewportClip?: BrowserUseViewportClip) {
     const element = visibleDomState().refToElement.get(ref);
     if (!element?.isConnected) return undefined;
@@ -2754,6 +2892,8 @@ function installAiBrowserPageRuntime() {
     const clip = viewportClip || visualViewportRect();
     const clickablePoint = visibleDomClickablePoint(element, clip);
     if (clickablePoint) return { ...clickablePoint, descriptor: descriptor(element) };
+    const coveredPoint = visibleDomCoveredPoint(element, clip);
+    if (coveredPoint) return { ...coveredPoint, descriptor: descriptor(element) };
     const pointInRect = (rect: DOMRect | ClientRect) => {
       if (rect.width <= 0 || rect.height <= 0) return undefined;
       const left = Math.max(rect.left, clip.left);
@@ -2843,7 +2983,7 @@ function installAiBrowserPageRuntime() {
   }
 
   win.__aiDomRuntime = {
-    version: 15,
+    version: 17,
     mutationState: () => ({ epoch: mutationState.epoch, lastMutationAt: mutationState.lastMutationAt }),
     isOverlay,
     isTraversable,
@@ -3925,6 +4065,8 @@ export class BrowserSession {
   private lastDomNodeReferences = new Map<string, DomNodeReference>();
   private domVisiblePublicIdByFrameLocalRef = new Map<string, string>();
   private domVisibleSnapshotKey?: string;
+  private domVisibleObservationId?: string;
+  private domVisibleExposedReferenceIds = new Set<string>();
   private domVisibleNextPublicId = 1;
   private domObservationPagination?: DomObservationPagination;
   private domObservationPaginationSequence = 0;
@@ -5057,6 +5199,8 @@ export class BrowserSession {
       this.lastDomNodeReferences.clear();
       this.domVisiblePublicIdByFrameLocalRef.clear();
       this.domVisibleSnapshotKey = undefined;
+      this.domVisibleObservationId = undefined;
+      this.domVisibleExposedReferenceIds.clear();
       this.lastInteractiveCandidates = [];
       this.lastScreenshotCandidates = [];
     };
@@ -8095,6 +8239,8 @@ export class BrowserSession {
         this.lastDomNodeReferences.clear();
         this.domVisiblePublicIdByFrameLocalRef.clear();
         this.domVisibleSnapshotKey = undefined;
+        this.domVisibleObservationId = undefined;
+        this.domVisibleExposedReferenceIds.clear();
         const result = {
           ok: true,
           actual: `${actual}${stabilityNote} Navigation changed the document. DOM UID registry was cleared; call takeSnapshot when you need targets in the new document.`,
@@ -8117,6 +8263,7 @@ export class BrowserSession {
       const result = {
         ok: true,
         actual: `${actual}${stabilityNote}${validationNote}`,
+        snapshotId: changes.snapshotId,
         domChanges: changes.domChanges,
       };
       if (options.clickTimings) {
@@ -8234,10 +8381,12 @@ export class BrowserSession {
         });
       const allMatches = collectMatches();
       const matches = tag ? allMatches : allMatches.slice(0, limit);
+      for (const reference of matches) this.domVisibleExposedReferenceIds.add(reference.id);
       return {
         ok: true,
+        snapshotId: this.domVisibleObservationId,
         actual: [
-          `Frozen DOM baseline ${tag ? `tag read for <${tag}>` : `search for "${input.query}"`} returned ${matches.length} result(s). The search did not scroll, consume DOM changes, or alter snapshot pagination. Use only the dom-* UIDs shown below exactly as returned.`,
+          `Frozen DOM baseline ${this.domVisibleObservationId || 'unknown'} ${tag ? `tag read for <${tag}>` : `search for "${input.query}"`} returned ${matches.length} result(s). The search did not scroll, consume DOM changes, or alter snapshot pagination.`,
           matches.map((reference) => reference.line).join('\n') || '[no DOM baseline matches]',
         ].join('\n'),
       };
@@ -8492,6 +8641,152 @@ export class BrowserSession {
     }
   }
 
+  private async liveDomTargetFacts(reference: DomNodeReference): Promise<LiveDomTargetFacts | undefined> {
+    if (!reference.localRef) return undefined;
+    const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
+    if (!frame) return undefined;
+    await this.ensureBrowserPageRuntime(frame);
+    return frame.evaluate((ref) => {
+      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+      const element = runtime?.visibleDomElement(ref);
+      if (!element) return undefined;
+      const tag = element.tagName.toLowerCase();
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      const attributes: Record<string, string> = {};
+      for (const name of element.getAttributeNames()) {
+        if (/^(?:id|aria-label|title|data-[\w:-]+|href|name|placeholder)$/.test(name)) {
+          attributes[name] = element.getAttribute(name) || '';
+        }
+      }
+      const roles = [element.getAttribute('role') || ''];
+      if (tag === 'button') roles.push('button');
+      if (tag === 'a' && element.hasAttribute('href')) roles.push('link');
+      if (tag === 'textarea') roles.push('textbox');
+      if (tag === 'select') roles.push('combobox');
+      if (tag === 'input') {
+        const type = (element as HTMLInputElement).type || 'text';
+        if (type === 'checkbox') roles.push('checkbox');
+        else if (type === 'radio') roles.push('radio');
+        else if (['button', 'submit', 'reset', 'image'].includes(type)) roles.push('button');
+        else if (type !== 'hidden') roles.push('textbox');
+      }
+      const labelText = 'labels' in element && (element as HTMLInputElement).labels
+        ? Array.from((element as HTMLInputElement).labels || []).map((label) => label.textContent || '').join(' ')
+        : '';
+      const names = [
+        element.getAttribute('aria-label') || '',
+        element.getAttribute('title') || '',
+        element.getAttribute('placeholder') || '',
+        labelText,
+        element.textContent || '',
+      ].map((value) => value.replace(/\s+/g, ' ').trim()).filter(Boolean);
+      return {
+        attributes,
+        connected: element.isConnected,
+        names,
+        roles: Array.from(new Set(roles.filter(Boolean))),
+        tag,
+        visible: rect.width > 0
+          && rect.height > 0
+          && style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && style.visibility !== 'collapse'
+          && Number(style.opacity || '1') > 0.01,
+      };
+    }, reference.localRef).catch(() => undefined);
+  }
+
+  private domTargetCandidates(snapshotId: string, selector: BrowserTargetSelector, allowNonActionable: boolean) {
+    return [...this.lastDomNodeReferences.values()].filter((reference) => (
+      reference.observationId === snapshotId
+      && this.domVisibleExposedReferenceIds.has(reference.id)
+      && (allowNonActionable || reference.interactive)
+      && browserTargetSelectorMatchesReference(reference, selector)
+    ));
+  }
+
+  private async uniqueCurrentDomTarget(
+    snapshotId: string,
+    selector: BrowserTargetSelector,
+    allowNonActionable: boolean,
+    scope?: DomNodeReference,
+    label = 'target',
+  ) {
+    const candidates = this.domTargetCandidates(snapshotId, selector, allowNonActionable)
+      .filter((reference) => !scope || domReferenceIsInside(reference, scope));
+    if (!candidates.length) {
+      return { error: `TARGET_NOT_FOUND: ${label} does not match any element exposed by snapshot ${snapshotId}. Capture a fresh inspect result and refine the exact semantic target.` };
+    }
+    if (candidates.length > 100) {
+      return { error: `AMBIGUOUS_TARGET: ${label} matches more than 100 snapshot elements. Add a stable scope or stronger attribute.` };
+    }
+    const current: DomNodeReference[] = [];
+    for (const reference of candidates) {
+      const facts = await this.liveDomTargetFacts(reference);
+      if (!facts?.connected || !facts.visible || !browserTargetSelectorMatchesLiveFacts(facts, selector)) continue;
+      current.push(reference);
+      if (current.length > 1) break;
+    }
+    if (current.length !== 1) {
+      return {
+        error: current.length
+          ? `AMBIGUOUS_TARGET: ${label} matches multiple current rendered elements. Add a unique scope or stronger stable attribute; first/nth fallback is forbidden.`
+          : `STALE_TARGET: ${label} no longer matches a current rendered element. Capture a fresh inspect result before acting.`,
+      };
+    }
+    return { reference: current[0] };
+  }
+
+  private async resolveStructuredActionTarget(
+    snapshotId: string | undefined,
+    target: BrowserElementTarget,
+    allowNonActionable: boolean,
+  ): Promise<ResolvedBrowserActionPoint> {
+    const declaredSnapshotId = String(snapshotId || '').trim();
+    if (!declaredSnapshotId) return { error: 'STALE_TARGET: snapshotId is required for a DOM target.' };
+
+    if (target.kind === 'semantic') {
+      if (!this.domVisibleObservationId || declaredSnapshotId !== this.domVisibleObservationId) {
+        return { error: `STALE_TARGET: snapshot ${declaredSnapshotId} is not the current DOM observation ${this.domVisibleObservationId || '(none)'}. Capture a fresh inspect result.` };
+      }
+      let scope: DomNodeReference | undefined;
+      if (target.scope) {
+        const resolvedScope = await this.uniqueCurrentDomTarget(declaredSnapshotId, target.scope, true, undefined, 'scope');
+        if (!resolvedScope.reference) return { error: resolvedScope.error };
+        scope = resolvedScope.reference;
+      }
+      const resolved = await this.uniqueCurrentDomTarget(declaredSnapshotId, target, allowNonActionable, scope);
+      if (!resolved.reference) return { error: resolved.error };
+      return this.resolveDomObservationReferencePoint(resolved.reference.id, allowNonActionable);
+    }
+
+    const ref = String(target.ref || '').trim();
+    if (!ref) return { error: 'TARGET_NOT_FOUND: ref target is empty.' };
+    if (ref.startsWith('dom-')) {
+      const reference = this.lastDomNodeReferences.get(ref);
+      if (!reference) return { error: `STALE_TARGET: ref ${ref} is absent from the current DOM registry. Capture a fresh inspect result.` };
+      if (reference.observationId !== declaredSnapshotId || this.domVisibleObservationId !== declaredSnapshotId) {
+        return { error: `STALE_TARGET: ref ${ref} belongs to ${reference.observationId || '(unknown)'}, not current snapshot ${declaredSnapshotId}.` };
+      }
+      if (!this.domVisibleExposedReferenceIds.has(ref)) {
+        return { error: `STALE_TARGET: ref ${ref} was not exposed in the read pages of snapshot ${declaredSnapshotId}. Read that page or search the current snapshot first.` };
+      }
+      const facts = await this.liveDomTargetFacts(reference);
+      if (!facts?.connected || !domReferenceFingerprintMatchesLiveFacts(reference, facts)) {
+        return { error: `STALE_TARGET: ref ${ref} no longer identifies the same live element. Capture a fresh inspect result; automatic fuzzy rebinding is disabled.` };
+      }
+      return this.resolveDomObservationReferencePoint(ref, allowNonActionable);
+    }
+
+    const reference = this.currentSnapshotReference(ref);
+    if (!reference.reference) return { error: reference.error };
+    if (reference.reference.generationId !== declaredSnapshotId) {
+      return { error: `STALE_TARGET: ref ${ref} belongs to ${reference.reference.generationId}, not snapshot ${declaredSnapshotId}.` };
+    }
+    return this.resolveSnapshotReferencePoint(ref, allowNonActionable);
+  }
+
   private async resolveDomObservationReferencePoint(uid: string, allowNonActionable = false) {
     const reference = this.lastDomNodeReferences.get(uid);
     if (!reference) {
@@ -8533,6 +8828,7 @@ export class BrowserSession {
         y: Math.round(localPoint.y + offsetY),
         descriptor: localPoint.descriptor || reference.descriptor,
         source: 'dom-observation',
+        coveredBy: localPoint.coveredBy,
       },
     };
   }
@@ -8603,19 +8899,31 @@ export class BrowserSession {
   }
 
   private async unifiedActionPoint(
-    input: { uid?: string; xThousandth?: number; yThousandth?: number },
+    input: {
+      snapshotId?: string;
+      target?: BrowserElementTarget;
+      uid?: string;
+      xThousandth?: number;
+      yThousandth?: number;
+      force?: boolean;
+    },
     allowNonActionable = false,
   ): Promise<ResolvedBrowserActionPoint> {
-    const hasUid = typeof input.uid === 'string' && input.uid.trim().length > 0;
+    const legacyUid = typeof input.uid === 'string' ? input.uid.trim() : '';
+    const target = input.target || (legacyUid ? { kind: 'ref' as const, ref: legacyUid } : undefined);
+    const hasTarget = Boolean(target);
     const hasAnyCoordinate = input.xThousandth !== undefined || input.yThousandth !== undefined;
-    if (hasUid && hasAnyCoordinate) return { error: 'Use either uid or screenshot coordinates, never both.' };
-    if (hasUid) {
-      return input.uid!.startsWith('dom-')
-        ? this.resolveDomObservationReferencePoint(input.uid!, allowNonActionable)
-        : this.resolveSnapshotReferencePoint(input.uid!, allowNonActionable);
+    if (hasTarget && hasAnyCoordinate) return { error: 'Use either a snapshot-bound target or screenshot coordinates, never both.' };
+    if (target) {
+      if (input.target || input.snapshotId) {
+        return this.resolveStructuredActionTarget(input.snapshotId, target, allowNonActionable);
+      }
+      return legacyUid.startsWith('dom-')
+        ? this.resolveDomObservationReferencePoint(legacyUid, allowNonActionable)
+        : this.resolveSnapshotReferencePoint(legacyUid, allowNonActionable);
     }
     if (hasAnyCoordinate) return this.resolveScreenshotPoint(input.xThousandth, input.yThousandth);
-    return { error: 'A uid or the latest screenshot x_thousandth/y_thousandth coordinates are required.' };
+    return { error: 'A snapshot-bound target or the latest screenshot x_thousandth/y_thousandth coordinates are required.' };
   }
 
   async mouse(input: BrowserMouseAction): Promise<BrowserActionResult> {
@@ -8631,7 +8939,7 @@ export class BrowserSession {
     if (input.action === 'scroll') {
       let point: { x: number; y: number; descriptor: string; source: string } | undefined;
       let targetLocator: Locator | undefined;
-      if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
+      if (input.target || input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
         const resolved = await this.unifiedActionPoint(input, true);
         throwIfAborted();
         if (!resolved.point) return { ok: false, actual: resolved.error || 'Unable to resolve scroll target.' };
@@ -8668,12 +8976,12 @@ export class BrowserSession {
     }
 
     if (input.action === 'scrollIntoView') {
-      if (!input.uid) return { ok: false, actual: 'scrollIntoView requires a current snapshot uid.' };
-      const resolved = await this.unifiedActionPoint({ uid: input.uid }, true);
-      if (!resolved.point) return { ok: false, actual: resolved.error || `Unable to scroll UID ${input.uid} into view.` };
+      if (!input.target && !input.uid) return { ok: false, actual: 'scrollIntoView requires a current snapshot-bound target.' };
+      const resolved = await this.unifiedActionPoint({ snapshotId: input.snapshotId, target: input.target, uid: input.uid }, true);
+      if (!resolved.point) return { ok: false, actual: resolved.error || 'Unable to scroll the target into view.' };
       const targetLocator = resolved.reference && isSnapshotReference(resolved.reference) ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
       return this.completeVerifiedAction(
-        `Scrolled UID ${input.uid} (${resolved.point.descriptor}) into view.`,
+        `Scrolled target ${resolved.point.descriptor} into view.`,
         previousGeneration,
         async () => {
           if (!targetLocator) {
@@ -8692,13 +9000,20 @@ export class BrowserSession {
     }
 
     const targetResolutionStartedAt = Date.now();
-    const from = await this.unifiedActionPoint(input, input.action === 'move');
+    const forceClick = input.action === 'click' && input.force === true;
+    const from = await this.unifiedActionPoint(input, input.action === 'move' || forceClick);
     throwIfAborted();
     if (!from.point) return { ok: false, actual: from.error || 'Unable to resolve mouse target.' };
     const fromPoint = from.point;
-    const fromLocator = from.reference && isSnapshotReference(from.reference) ? await this.snapshotReferenceLocator(from.reference) : undefined;
+    const fromLocator = !forceClick && from.reference && isSnapshotReference(from.reference) ? await this.snapshotReferenceLocator(from.reference) : undefined;
     const targetResolutionMs = Date.now() - targetResolutionStartedAt;
     throwIfAborted();
+    if (fromPoint.coveredBy && input.action !== 'click') {
+      return {
+        ok: false,
+        actual: `Target ${input.uid || fromPoint.descriptor} is currently covered by ${fromPoint.coveredBy}; ${input.action} was not sent. Dismiss the top layer or inspect the current dialog first.`,
+      };
+    }
     if (input.action === 'move') {
       const eventsBefore = await this.readInteractionCounts();
       if (fromLocator) await fromLocator.hover();
@@ -8725,6 +9040,8 @@ export class BrowserSession {
     }
     if (input.action === 'drag') {
       const to = await this.unifiedActionPoint({
+        snapshotId: input.snapshotId,
+        target: input.toTarget,
         uid: input.toUid,
         xThousandth: input.toXThousandth,
         yThousandth: input.toYThousandth,
@@ -8791,13 +9108,21 @@ export class BrowserSession {
       resultAssemblyMs: 0,
       totalMs: 0,
     };
-    const fromDomHandle = from.reference && !isSnapshotReference(from.reference)
+    if (fromPoint.coveredBy && !forceClick) {
+      clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
+      return {
+        ok: false,
+        actual: `Target ${input.uid || fromPoint.descriptor} is currently covered by ${fromPoint.coveredBy}, so no click was sent. Inspect the active layer first. Use force=true only when the fresh page state confirms this exact click is intended to close that layer.`,
+        clickTimings,
+      };
+    }
+    const fromDomHandle = !forceClick && from.reference && !isSnapshotReference(from.reference)
       ? await this.elementHandleForDomReference(from.reference)
       : undefined;
-    if (from.reference && !isSnapshotReference(from.reference) && !fromDomHandle) {
-      return { ok: false, actual: `UID ${input.uid} no longer resolves to the exact live DOM element. Capture a fresh DOM snapshot before retrying.` };
+    if (!forceClick && from.reference && !isSnapshotReference(from.reference) && !fromDomHandle) {
+      return { ok: false, actual: 'The selected target no longer resolves to the exact live DOM element. Capture a fresh DOM snapshot before retrying.' };
     }
-    const playwrightClickTarget = fromLocator || fromDomHandle;
+    const playwrightClickTarget = forceClick ? undefined : fromLocator || fromDomHandle;
     if (playwrightClickTarget) {
       try {
         await timeBrowserClickStage(clickTimings, 'waitForClickableMs', () => playwrightClickTarget.click({
@@ -8811,7 +9136,7 @@ export class BrowserSession {
         clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
         return {
           ok: false,
-          actual: `UID ${input.uid || from.point.descriptor} failed Playwright actionability validation and was not clicked: ${unknownErrorMessage(error)}`,
+          actual: `Target ${input.uid || from.point.descriptor} failed Playwright actionability validation and was not clicked: ${unknownErrorMessage(error)}`,
           clickTimings,
         };
       }
@@ -8834,7 +9159,7 @@ export class BrowserSession {
       clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
       return {
         ok: false,
-        actual: `UID ${input.uid || from.point.descriptor} became non-actionable before Playwright could click it: ${unknownErrorMessage(error)}`,
+        actual: `Target ${input.uid || from.point.descriptor} became non-actionable before Playwright could click it: ${unknownErrorMessage(error)}`,
         clickTimings,
       };
     } finally {
@@ -8843,7 +9168,7 @@ export class BrowserSession {
     throwIfAborted();
     const claimedPopup = await timeBrowserClickStage(clickTimings, 'popupWaitMs', () => this.settlePopupAfterAction(popup.popup, popup.waitMs));
     const result = await this.completeVerifiedAction(
-      `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${fromDomHandle ? 'dom-observation+playwright-actionability' : from.point.source}.`,
+      `Clicked ${from.point.descriptor} at (${from.point.x}, ${from.point.y}) with button=${button}, count=${clickCount}, source=${forceClick ? 'explicit-forced-real-pointer' : fromDomHandle ? 'dom-observation+playwright-actionability' : from.point.source}.`,
       previousGeneration,
       async () => {
         const eventsAfter = await this.readInteractionCounts();
@@ -8885,7 +9210,7 @@ export class BrowserSession {
       ) {
         result.domChanges.updated.push(nativeSelectReference.line);
       }
-      result.actual += ' Native select options are exposed in the updated element above. Use selectOption with this UID and an exact option value or full label; do not choose it with keyboard letters.';
+      result.actual += ' Native select options are exposed in the updated element above. Use selectOption with the current snapshotId, the same snapshot-bound target, and an exact option value or full label; do not choose it with keyboard letters.';
     }
     clickTimings.resultAssemblyMs = Date.now() - resultAssemblyStartedAt;
     clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
@@ -8893,11 +9218,24 @@ export class BrowserSession {
   }
 
   async selectOption(input: BrowserSelectOptionAction): Promise<BrowserActionResult> {
-    const uid = String(input.uid || '').trim();
-    if (!uid) return { ok: false, actual: 'selectOption requires a fresh select UID.' };
-    const reference = this.lastDomNodeReferences.get(uid);
-    if (!reference) return { ok: false, actual: `UID ${uid} is not present in the current DOM UID registry. Call takeSnapshot and choose a current native select UID.` };
+    if (!input.target && !input.uid) return { ok: false, actual: 'selectOption requires a fresh snapshot-bound select target.' };
+    const actionPoint = await this.unifiedActionPoint({
+      snapshotId: input.snapshotId,
+      target: input.target,
+      uid: input.uid,
+    });
+    if (!actionPoint.point || !actionPoint.reference) {
+      return { ok: false, actual: actionPoint.error || 'Unable to resolve the current select target.' };
+    }
+    if (isSnapshotReference(actionPoint.reference)) {
+      return { ok: false, actual: 'selectOption requires a DOM observation target for a native <select>.' };
+    }
+    const reference = actionPoint.reference;
+    const uid = reference.id;
     if (reference.tag !== 'select') return { ok: false, actual: `UID ${uid} (${reference.tag} "${reference.label}") is not a native select element.` };
+    if (actionPoint.point.coveredBy) {
+      return { ok: false, actual: `Select UID ${uid} is currently covered by ${actionPoint.point.coveredBy}. Dismiss the active layer before selecting an option.` };
+    }
     if (!reference.localRef) return { ok: false, actual: `UID ${uid} has no live select reference. Call takeSnapshot again.` };
     const frame = reference.framePath ? this.frameFromPath(reference.framePath) : this.activePage.mainFrame();
     if (!frame) return { ok: false, actual: `UID ${uid} belongs to an iframe that no longer exists.` };
@@ -8920,20 +9258,23 @@ export class BrowserSession {
     const previousGeneration = this.snapshotGeneration;
     let targetLocator: Locator | undefined;
     let targetHandle: ElementHandle<Element> | undefined;
-    if (input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
+    if (input.target || input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
       const target = await this.unifiedActionPoint(input, true);
       if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
+      if (target.point.coveredBy) {
+        return { ok: false, actual: `Keyboard target ${input.uid || target.point.descriptor} is currently covered by ${target.point.coveredBy}. Dismiss the active layer before typing or pressing keys.` };
+      }
       targetLocator = target.reference && isSnapshotReference(target.reference) ? await this.snapshotReferenceLocator(target.reference) : undefined;
       if (!targetLocator && target.reference && !isSnapshotReference(target.reference) && target.reference.interactive) {
         const frame = target.reference.framePath ? this.frameFromPath(target.reference.framePath) : page.mainFrame();
-        if (!frame) return { ok: false, actual: `UID ${input.uid} belongs to an iframe that no longer exists.` };
+        if (!frame) return { ok: false, actual: 'The selected keyboard target belongs to an iframe that no longer exists.' };
         targetHandle = await this.elementHandleForDomPath(
           frame,
           target.reference.path,
           target.reference.locatorCandidates || [],
         ) as ElementHandle<Element> | undefined;
         if (!targetHandle) {
-          return { ok: false, actual: `UID ${input.uid} no longer resolves to a live editable element. Call takeSnapshot again.` };
+          return { ok: false, actual: 'The selected keyboard target no longer resolves to a live editable element. Capture a fresh inspect snapshot.' };
         }
       }
       const targetsNativeSelect = Boolean(target.reference && (
@@ -8947,7 +9288,7 @@ export class BrowserSession {
       if (!targetLocator && !targetHandle && target.reference && !isSnapshotReference(target.reference) && !target.reference.interactive) {
         targetLocator = await this.editableIframeLocator(target.reference, target.point);
         if (!targetLocator) {
-          return { ok: false, actual: `UID ${input.uid} (${target.reference.tag} "${target.reference.label}") is structural text, not an editable target.` };
+          return { ok: false, actual: `Target ${target.reference.tag} "${target.reference.label}" is structural text, not an editable target.` };
         }
       }
       if (input.allowedOrigins?.length) {
@@ -9425,6 +9766,8 @@ export class BrowserSession {
   private resetDomVisibleIdState(mainSnapshotKey: string, force = false) {
     if (!force && this.domVisibleSnapshotKey === mainSnapshotKey) return;
     this.domVisibleSnapshotKey = mainSnapshotKey;
+    this.domVisibleObservationId = undefined;
+    this.domVisibleExposedReferenceIds.clear();
     this.domVisiblePublicIdByFrameLocalRef.clear();
     this.domVisibleNextPublicId = 1;
   }
@@ -9439,6 +9782,20 @@ export class BrowserSession {
       this.domVisiblePublicIdByFrameLocalRef.set(key, id);
     }
     return id;
+  }
+
+  private exposeDomReferencesFromText(content: string) {
+    for (const match of content.matchAll(/\buid=(dom-\d+)\b/g)) {
+      if (this.lastDomNodeReferences.has(match[1])) this.domVisibleExposedReferenceIds.add(match[1]);
+    }
+  }
+
+  private bindDomReferencesToObservation(observationId: string) {
+    this.domVisibleObservationId = observationId;
+    this.domVisibleExposedReferenceIds.clear();
+    for (const [id, reference] of this.lastDomNodeReferences) {
+      this.lastDomNodeReferences.set(id, { ...reference, observationId });
+    }
   }
 
   private removeDomVisibleReference(stateKey: string, localRef: string) {
@@ -9460,6 +9817,7 @@ export class BrowserSession {
     const id = this.publicDomVisibleId(stateKey, item.ref);
     return indexDomNodeReference({
       id,
+      observationId: this.domVisibleObservationId,
       interactive: item.interactive,
       capabilities: item.capabilities,
       confidence: item.confidence,
@@ -9580,8 +9938,10 @@ export class BrowserSession {
         throw new Error(`Snapshot cursor mode is ${cursor.mode}; do not change mode while paging.`);
       }
       const page = this.domObservationPage(record, cursor.index);
+      this.exposeDomReferencesFromText(page.content);
       return {
         ...page,
+        snapshotId: this.domVisibleObservationId,
         mode: record.mode,
         pageSummary: record.mode === 'changes'
           ? `Inter-action changes: page ${page.pageNumber}/${page.totalPages}, entries ${page.startIndex + 1}-${page.startIndex + page.returnedEntries}/${page.totalEntries}.`
@@ -9607,8 +9967,10 @@ export class BrowserSession {
       };
       this.domObservationPagination = record;
       const page = this.domObservationPage(record, 0);
+      this.exposeDomReferencesFromText(page.content);
       return {
         ...page,
+        snapshotId: this.domVisibleObservationId,
         mode,
         pageSummary: `Inter-action changes ${changes.journal.id}: page ${page.pageNumber}/${page.totalPages}, entries ${page.startIndex + 1}-${page.startIndex + page.returnedEntries}/${page.totalEntries}.`,
         nodeCount: 0,
@@ -9641,12 +10003,15 @@ export class BrowserSession {
       url: this.activePage.url(),
     };
     this.domObservationPagination = record;
+    this.bindDomReferencesToObservation(record.id);
     // Establish the returned snapshot as the delta baseline without walking
     // historical page-load mutations. A queue discard is intentionally O(1).
     await this.discardDomChanges();
     const page = this.domObservationPage(record, 0);
+    this.exposeDomReferencesFromText(page.content);
     return {
       ...page,
+      snapshotId: record.id,
       mode,
       pageSummary: `DOM snapshot ${mode}: page ${page.pageNumber}/${page.totalPages}, entries ${page.startIndex + 1}-${page.startIndex + page.returnedEntries}/${page.totalEntries}.`,
       nodeCount: result.observation.domNodeCount,
@@ -9696,6 +10061,7 @@ export class BrowserSession {
       for (const item of delta.added) {
         const reference = this.domObservationReference(delta.stateKey, item, framePath, frameUrl);
         this.lastDomNodeReferences.set(reference.id, reference);
+        this.domVisibleExposedReferenceIds.add(reference.id);
         added.push(reference.line);
         const validationError = this.domObservationValidationError(reference.line);
         if (validationError) validationErrors.add(validationError);
@@ -9703,6 +10069,7 @@ export class BrowserSession {
       for (const item of delta.updated) {
         const reference = this.domObservationReference(delta.stateKey, item, framePath, frameUrl);
         this.lastDomNodeReferences.set(reference.id, reference);
+        this.domVisibleExposedReferenceIds.add(reference.id);
         updated.push(reference.line);
         const validationError = this.domObservationValidationError(reference.line);
         if (validationError) validationErrors.add(validationError);
@@ -9725,7 +10092,9 @@ export class BrowserSession {
     return {
       ok: true,
       actual: 'DOM incremental changes captured.',
+      snapshotId: this.domVisibleObservationId,
       domChanges: {
+        snapshotId: this.domVisibleObservationId,
         epoch,
         added,
         updated,

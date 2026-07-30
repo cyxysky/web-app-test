@@ -21,6 +21,7 @@ export type LoginAccountStatus = 'active' | 'disabled';
 export type LoginAccountMetadata = {
   id: string;
   userId: string;
+  shared: boolean;
   domain: string;
   username: string;
   label: string;
@@ -45,6 +46,7 @@ export type LoginAccountPortableRecord = {
   label: string;
   loginUrl: string;
   status: LoginAccountStatus;
+  shared: boolean;
 };
 
 export type CreateLoginAccountInput = {
@@ -55,6 +57,7 @@ export type CreateLoginAccountInput = {
   label?: string;
   loginUrl?: string;
   status?: LoginAccountStatus;
+  shared?: boolean;
 };
 
 export type UpdateLoginAccountInput = {
@@ -64,11 +67,13 @@ export type UpdateLoginAccountInput = {
   label?: string;
   loginUrl?: string;
   status?: LoginAccountStatus;
+  shared?: boolean;
 };
 
 type LoginAccountRow = {
   id: string;
   user_id: string;
+  shared: number;
   domain: string;
   username: string;
   label: string;
@@ -92,7 +97,7 @@ type PasswordEnvelope = {
 };
 
 const metadataColumns = `
-  id, user_id, domain, username, label, login_url, status,
+  id, user_id, shared, domain, username, label, login_url, status,
   CASE WHEN length(password_envelope) > 0 THEN 1 ELSE 0 END AS has_password,
   created_at, updated_at, last_used_at, use_count
 `;
@@ -334,6 +339,7 @@ function metadataFromRow(row: LoginAccountRow): LoginAccountMetadata {
   return {
     id: row.id,
     userId: row.user_id,
+    shared: Boolean(row.shared),
     domain: row.domain,
     username: row.username,
     label: row.label,
@@ -352,14 +358,14 @@ function metadataById(id: string, userId: string) {
   return getSqliteDatabase().prepare(`
     SELECT ${metadataColumns}
     FROM login_account
-    WHERE id = ? AND user_id = ?
+    WHERE id = ? AND (user_id = ? OR shared = 1)
   `).get(id, userId) as LoginAccountRow | undefined;
 }
 
 function fullRowById(id: string, userId: string) {
   ensureLoginAccountUserMigration();
   return getSqliteDatabase().prepare(`
-    SELECT * FROM login_account WHERE id = ? AND user_id = ?
+    SELECT * FROM login_account WHERE id = ? AND (user_id = ? OR shared = 1)
   `).get(id, userId) as LoginAccountRow | undefined;
 }
 
@@ -373,15 +379,15 @@ export function listLoginAccounts(input: { userId?: unknown; domain?: unknown } 
     ? getSqliteDatabase().prepare(`
         SELECT ${metadataColumns}
         FROM login_account
-        WHERE user_id = ? AND domain = ?
-        ORDER BY updated_at DESC
-      `).all(userId, domain)
+        WHERE (user_id = ? OR shared = 1) AND domain = ?
+        ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, updated_at DESC
+      `).all(userId, domain, userId)
     : getSqliteDatabase().prepare(`
         SELECT ${metadataColumns}
         FROM login_account
-        WHERE user_id = ?
-        ORDER BY updated_at DESC
-      `).all(userId)) as LoginAccountRow[];
+        WHERE user_id = ? OR shared = 1
+        ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, updated_at DESC
+      `).all(userId, userId)) as LoginAccountRow[];
   return rows.map(metadataFromRow);
 }
 
@@ -400,6 +406,7 @@ export function exportLoginAccountCredentials(userId?: unknown): LoginAccountPor
     label: row.label,
     loginUrl: row.login_url,
     status: normalizeStatus(row.status, 'disabled'),
+    shared: Boolean(row.shared),
   }));
 }
 
@@ -434,6 +441,7 @@ export function createLoginAccount(input: CreateLoginAccountInput) {
   const label = normalizeLabel(input.label, username);
   const loginUrl = normalizeLoginUrl(input.loginUrl, domain);
   const status = normalizeStatus(input.status);
+  const shared = input.shared === true;
   const id = `account_${randomUUID()}`;
   const timestamp = now();
   const identity: Pick<LoginAccountRow, 'id' | 'user_id' | 'domain' | 'username'> = {
@@ -446,12 +454,13 @@ export function createLoginAccount(input: CreateLoginAccountInput) {
   try {
     getSqliteDatabase().prepare(`
       INSERT INTO login_account (
-        id, user_id, domain, username, label, login_url, status,
+        id, user_id, shared, domain, username, label, login_url, status,
         password_envelope, created_at, updated_at, last_used_at, use_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
     `).run(
       id,
       userId,
+      shared ? 1 : 0,
       domain,
       username,
       label,
@@ -486,6 +495,7 @@ export function updateLoginAccount(id: string, input: UpdateLoginAccountInput, u
       ? normalizeLoginUrl(previous.login_url, domain)
       : normalizeLoginUrl(input.loginUrl, domain);
     const status = normalizeStatus(input.status, normalizeStatus(previous.status, 'disabled'));
+    const shared = input.shared ?? Boolean(previous.shared);
     const identity: Pick<LoginAccountRow, 'id' | 'user_id' | 'domain' | 'username'> = {
       id: previous.id,
       user_id: previous.user_id,
@@ -502,7 +512,7 @@ export function updateLoginAccount(id: string, input: UpdateLoginAccountInput, u
     try {
       database.prepare(`
         UPDATE login_account
-        SET domain = ?, username = ?, label = ?, login_url = ?, status = ?,
+        SET domain = ?, username = ?, label = ?, login_url = ?, status = ?, shared = ?,
             password_envelope = ?, updated_at = ?
         WHERE id = ? AND user_id = ?
       `).run(
@@ -511,6 +521,7 @@ export function updateLoginAccount(id: string, input: UpdateLoginAccountInput, u
         label,
         loginUrl,
         status,
+        shared ? 1 : 0,
         passwordEnvelope,
         timestamp,
         previous.id,
@@ -577,7 +588,9 @@ export function resolveLoginAccountCredential(input: {
   const username = normalizeUsername(input.username);
   const row = getSqliteDatabase().prepare(`
     SELECT * FROM login_account
-    WHERE user_id = ? AND domain = ? AND username = ?
-  `).get(userId, domain, username) as LoginAccountRow | undefined;
+    WHERE (user_id = ? OR shared = 1) AND domain = ? AND username = ?
+    ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, updated_at DESC
+    LIMIT 1
+  `).get(userId, domain, username, userId) as LoginAccountRow | undefined;
   return row ? resolveCredentialRow(row) : undefined;
 }
