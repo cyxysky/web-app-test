@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ChevronDown, Edit3, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
+import { DataTransferButtons } from '@/components/DataTransferButtons';
+import { DomainGroupedAccordion } from '@/components/DomainGroupedAccordion';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
@@ -18,9 +20,7 @@ type SkillDraft = {
   status: SkillRecord['status'];
   tags: string;
   triggerPhrases: string;
-  workflow: string;
-  recovery: string;
-  verification: string;
+  details: string;
 };
 
 type EditorMode = 'create' | 'edit' | null;
@@ -40,35 +40,23 @@ const emptyDraft: SkillDraft = {
   status: 'ready',
   tags: '',
   triggerPhrases: '',
-  workflow: '',
-  recovery: '',
-  verification: '',
+  details: '',
 };
-
-function lines(items?: string[]) {
-  return (items || []).join('\n');
-}
 
 function draftFromSkill(skill: SkillRecord): SkillDraft {
   return {
     title: skill.title,
     description: skill.description,
-    domains: lines(skill.domains),
+    domains: (skill.domains || []).join('\n'),
     status: skill.status,
     tags: skill.tags.join(', '),
     triggerPhrases: skill.triggerPhrases.join('\n'),
-    workflow: lines(skill.content.workflow),
-    recovery: lines(skill.content.recovery),
-    verification: lines(skill.content.verification),
+    details: skill.content.details,
   };
 }
 
 function splitList(value: string) {
   return value.split(/[\n,\uFF0C]+/).map((item) => item.trim()).filter(Boolean);
-}
-
-function splitLines(value: string) {
-  return value.split('\n').map((item) => item.trim()).filter(Boolean);
 }
 
 function payloadFromDraft(draft: SkillDraft) {
@@ -80,9 +68,7 @@ function payloadFromDraft(draft: SkillDraft) {
     tags: splitList(draft.tags),
     triggerPhrases: splitList(draft.triggerPhrases),
     content: {
-      workflow: splitLines(draft.workflow),
-      recovery: splitLines(draft.recovery),
-      verification: splitLines(draft.verification),
+      details: draft.details.trim(),
     },
   };
 }
@@ -91,18 +77,6 @@ function statusLabel(status: SkillRecord['status']) {
   if (status === 'draft') return '草稿';
   if (status === 'disabled') return '停用';
   return '可用';
-}
-
-function DetailList({ emptyText, items }: { emptyText: string; items?: string[] }) {
-  const values = (items || []).filter(Boolean);
-  if (!values.length) return <p className="skills-manager-muted">{emptyText}</p>;
-  return (
-    <ul className="skills-manager-detail-list">
-      {values.map((item, index) => (
-        <li key={`${item}-${index}`}>{item}</li>
-      ))}
-    </ul>
-  );
 }
 
 export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => void; userId?: string } = {}) {
@@ -200,14 +174,6 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
     setDeleteTarget(null);
   }
 
-  function detailSections(skill: SkillRecord) {
-    return [
-      { key: 'workflow', label: t('操作流程'), items: skill.content.workflow },
-      { key: 'recovery', label: t('恢复策略'), items: skill.content.recovery },
-      { key: 'verification', label: t('验证方式'), items: skill.content.verification },
-    ];
-  }
-
   async function saveSkill() {
     const payload = payloadFromDraft(draft);
     if (!payload.title) {
@@ -216,6 +182,10 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
     }
     if (!payload.description) {
       window.alert(t('请输入 Skill 描述'));
+      return;
+    }
+    if (!payload.content.details) {
+      window.alert(t('请输入 Skill 详细内容'));
       return;
     }
 
@@ -273,14 +243,17 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
         <div>
           <h2>{t('Skills 管理')}</h2>
         </div>
-        <button className="ui-button ui-icon-button" onClick={openCreateSkill} type="button">
-          <Plus size={15} />
-          {t('新建 Skill')}
-        </button>
+        <div className="personal-memory-head-actions">
+          <DataTransferButtons kind="skills" onImported={loadSkills} userId={normalizedUserId} />
+          <button className="ui-button ui-icon-button" onClick={openCreateSkill} type="button">
+            <Plus size={15} />
+            {t('新建 Skill')}
+          </button>
+        </div>
       </div>
 
       <div className="skills-manager-layout">
-        <div className="settings-card skills-manager-list">
+        <div className="skills-manager-list">
           <div className="skills-manager-list-body">
             {loading ? (
               <div className="settings-loading-panel compact" role="status" aria-live="polite" aria-label={t('正在加载 Skills')}>
@@ -289,7 +262,24 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                   <h2>{t('正在加载 Skills')}</h2>
                 </div>
               </div>
-            ) : skills.length ? skills.map((skill) => {
+            ) : (
+              <DomainGroupedAccordion
+                emptyText={t('暂无 Skills')}
+                getDomains={(skill) => skill.domains || []}
+                getId={(skill) => skill.id}
+                getName={(skill) => skill.title}
+                getSearchText={(skill) => [
+                  skill.title,
+                  skill.description,
+                  ...(skill.domains || []),
+                  ...skill.tags,
+                  ...skill.triggerPhrases,
+                  skill.content.details,
+                  statusLabel(skill.status),
+                ]}
+                getUpdatedAt={(skill) => skill.updatedAt}
+                items={skills}
+                renderItem={(skill) => {
               const expanded = expandedSkillIds.includes(skill.id);
               return (
                 <div
@@ -355,15 +345,14 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                       </div>
 
                       <div className="skills-manager-section-grid">
-                        {detailSections(skill).map((section) => (
-                          <div className={section.key === 'workflow' ? 'skills-manager-section wide' : 'skills-manager-section'} key={section.key}>
-                            <div>
-                              <h4>{section.label}</h4>
-                              <span>{section.items?.length || 0}</span>
-                            </div>
-                            <DetailList emptyText={t('暂无内容')} items={section.items} />
+                        <div className="skills-manager-section wide">
+                          <div>
+                            <h4>{t('详细内容')}</h4>
                           </div>
-                        ))}
+                          {skill.content.details
+                            ? <div className="skills-manager-details">{skill.content.details}</div>
+                            : <p className="skills-manager-muted">{t('暂无内容')}</p>}
+                        </div>
                       </div>
 
                       <div className="skills-manager-footnote">
@@ -374,8 +363,10 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                   ) : null}
                 </div>
               );
-            }) : (
-              <div className="empty-state">{t('暂无 Skills')}</div>
+                }}
+                searchPlaceholder={t('筛选 Skills')}
+                unscopedLabel={t('所有域名')}
+              />
             )}
           </div>
         </div>
@@ -434,16 +425,8 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                 <textarea className="textarea settings-control compact" value={draft.triggerPhrases} onChange={(event) => update({ triggerPhrases: event.target.value })} placeholder={t('每行一个精确的用户意图')} />
               </label>
               <label className="skills-manager-field wide">
-                <span>{t('操作流程')}</span>
-                <textarea className="textarea settings-control tall" value={draft.workflow} onChange={(event) => update({ workflow: event.target.value })} placeholder={t('每行一个步骤')} />
-              </label>
-              <label className="skills-manager-field">
-                <span>{t('恢复策略')}</span>
-                <textarea className="textarea settings-control" value={draft.recovery} onChange={(event) => update({ recovery: event.target.value })} placeholder={t('只填写失败时的替代操作')} />
-              </label>
-              <label className="skills-manager-field">
-                <span>{t('验证方式')}</span>
-                <textarea className="textarea settings-control" value={draft.verification} onChange={(event) => update({ verification: event.target.value })} placeholder={t('只填写最终可观察的成功信号')} />
+                <span>{t('详细内容')}</span>
+                <textarea className="textarea settings-control skill-details" maxLength={30_000} value={draft.details} onChange={(event) => update({ details: event.target.value })} placeholder={t('填写完整操作说明，支持多段文本和 Markdown')} />
               </label>
             </div>
 

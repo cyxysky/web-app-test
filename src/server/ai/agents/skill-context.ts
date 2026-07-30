@@ -5,10 +5,10 @@ function compactText(value: string, max = 900) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
-function listBlock(title: string, items: string[]) {
-  const clean = items.map((item) => compactText(item, 260)).filter(Boolean);
-  if (!clean.length) return '';
-  return [`${title}:`, ...clean.map((item, index) => `${index + 1}. ${item}`)].join('\n');
+function detailsBlock(value: string) {
+  const details = value.trim();
+  if (!details) return '';
+  return `Details:\n${details.slice(0, 12_000)}`;
 }
 
 export function activeSkills(skills: SkillRecord[]) {
@@ -82,9 +82,7 @@ export function formatSkillsForPrompt(skills: SkillRecord[]) {
       '',
       `Skill ${index + 1} (referenced by <skills id="${index + 1}">): ${skill.title}`,
       `Description: ${compactText(skill.description, 360)}`,
-      listBlock('Workflow', skill.content.workflow),
-      listBlock('Recovery', skill.content.recovery),
-      listBlock('Verification', skill.content.verification),
+      detailsBlock(skill.content.details),
     ].filter(Boolean).join('\n')),
   ].join('\n');
 }

@@ -5,9 +5,11 @@ export type BrowserChatLogRecordLike = {
 
 export type BrowserChatMessageLike = {
   content?: string;
+  createdAt?: string;
   id: string;
   role: 'user' | 'assistant';
   stepIndexes?: number[];
+  updatedAt?: string;
 };
 
 export type BrowserChatLogIndex<TLog extends BrowserChatLogRecordLike> = {
@@ -33,6 +35,26 @@ export type BrowserChatMessageRenderEntry<TMessage extends BrowserChatMessageLik
 
 function hasVisibleText(value: unknown) {
   return typeof value === 'string' && Boolean(value.trim());
+}
+
+export function browserChatMessageElapsedMs(message: Pick<BrowserChatMessageLike, 'createdAt' | 'updatedAt'>) {
+  const startedAt = Date.parse(message.createdAt || '');
+  const completedAt = Date.parse(message.updatedAt || message.createdAt || '');
+  if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt)) return undefined;
+  return Math.max(0, completedAt - startedAt);
+}
+
+export function formatBrowserChatElapsedTime(value: number | undefined) {
+  if (!Number.isFinite(value)) return '';
+  const totalSeconds = Math.max(0, Math.round(Number(value) / 1_000));
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  return [
+    hours ? `${hours}h` : '',
+    minutes ? `${minutes}m` : '',
+    `${seconds}s`,
+  ].filter(Boolean).join(' ');
 }
 
 export function buildBrowserChatLogIndex<TLog extends BrowserChatLogRecordLike>(logs: TLog[]): BrowserChatLogIndex<TLog> {

@@ -1,12 +1,26 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  browserChatMessageElapsedMs,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
   browserChatAssistantMessageHasVisibleText,
   browserChatLogsForMessage,
+  formatBrowserChatElapsedTime,
 } from './browser-chat-message-model';
+
+test('formats the completed assistant processing duration', () => {
+  const elapsed = browserChatMessageElapsedMs({
+    createdAt: '2026-07-30T10:00:00.000Z',
+    updatedAt: '2026-07-30T10:34:09.000Z',
+  });
+
+  assert.equal(elapsed, 2_049_000);
+  assert.equal(formatBrowserChatElapsedTime(elapsed), '34m 9s');
+  assert.equal(formatBrowserChatElapsedTime(9_200), '9s');
+  assert.equal(formatBrowserChatElapsedTime(undefined), '');
+});
 
 test('groups consecutive assistant messages without visible text', () => {
   const messages = [

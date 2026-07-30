@@ -251,9 +251,6 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
   });
   assert.ok(initialFrames.length >= 1, 'screencast attach should emit an initial frame');
   assert.equal(previewViewportApplications, 0, 'opening preview must not reapply viewport or window state');
-  await waitForCondition(() => initialFrames.length >= 6, 1_000);
-  const fixedCadenceWindowMs = Date.parse(initialFrames[5].capturedAt) - Date.parse(initialFrames[0].capturedAt);
-  assert.ok(fixedCadenceWindowMs <= 500, `static preview should publish at fixed cadence, received six frames in ${fixedCadenceWindowMs}ms`);
 
   const buttonBox = await page.locator('#open-detail').boundingBox();
   const viewport = page.viewportSize();
@@ -369,6 +366,18 @@ test('browser viewport size and output pixel ratio are independent', async () =>
     );
     assert.deepEqual(readPngDimensions(await readFile(screenshotPath)), { width: 1600, height: 1200 });
 
+    const browserContext = page.context();
+    const originalNewCdpSession = browserContext.newCDPSession.bind(browserContext);
+    const previewCdpMethods: string[] = [];
+    Reflect.set(browserContext, 'newCDPSession', async (target: Page) => {
+      const cdpSession = await originalNewCdpSession(target);
+      const originalSend = cdpSession.send.bind(cdpSession) as (method: string, params?: object) => Promise<unknown>;
+      Reflect.set(cdpSession, 'send', (method: string, params?: object) => {
+        previewCdpMethods.push(method);
+        return originalSend(method, params);
+      });
+      return cdpSession;
+    });
     const frames: Array<{ contentType: string; data: string; viewport: { width: number; height: number } }> = [];
     const handle = await session.startScreencast({
       onFrame: (frame) => { frames.push(frame); },
@@ -377,6 +386,12 @@ test('browser viewport size and output pixel ratio are independent', async () =>
     assert.equal(frames[0].contentType, 'image/png');
     assert.deepEqual(readPngDimensions(Buffer.from(frames[0].data, 'base64')), { width: 1600, height: 1200 });
     assert.deepEqual(frames[0].viewport, { width: 1600, height: 1200 });
+    assert.equal(previewCdpMethods.includes('Emulation.setDeviceMetricsOverride'), false, 'preview must not mutate page device metrics');
+    assert.deepEqual(await page.evaluate(() => ({
+      devicePixelRatio: window.devicePixelRatio,
+      height: window.innerHeight,
+      width: window.innerWidth,
+    })), { devicePixelRatio: 1, height: 600, width: 800 });
     await handle.stop();
     assert.deepEqual(await page.evaluate(() => ({
       devicePixelRatio: window.devicePixelRatio,

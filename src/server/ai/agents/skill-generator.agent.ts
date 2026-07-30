@@ -10,9 +10,7 @@ const generatedSkillSchema = z.object({
   tags: z.array(z.string().min(1).max(32)).min(1).max(6),
   triggerPhrases: z.array(z.string().min(2).max(80)).min(2).max(8),
   content: skillContentSchema.extend({
-    workflow: z.array(z.string().min(4).max(260)).min(2).max(8),
-    recovery: z.array(z.string().min(4).max(220)).max(3),
-    verification: z.array(z.string().min(4).max(220)).min(1).max(4),
+    details: z.string().min(20).max(8_000),
   }),
 });
 
@@ -121,14 +119,12 @@ export async function generateSkillFromBrowserHistory(input: {
       '- Write the skill in Chinese if the source requirement is Chinese; otherwise use the source language.',
       '- Description: one sentence that combines capability and precise usage scope. Do not repeat it elsewhere.',
       '- Trigger phrases: specific user intents that should activate this Skill. Avoid broad phrases such as "open website" or "search".',
-      '- Workflow: 2-8 semantic action steps. Put a page-recognition or locator hint directly in its relevant step instead of creating a separate pattern section.',
-      '- Recovery: only alternative actions for likely failures. Do not restate normal workflow steps or generic warnings.',
-      '- Verification: only final observable success signals. Do not duplicate them as workflow steps.',
+      '- Details: write the complete reusable operating guidance as one structured Markdown block. Include page recognition, stable locator hints, ordered actions, useful branches, and observable success conditions where they matter.',
       '- Keep every fact in exactly one output field. Remove paraphrases and near-duplicates across fields.',
       '- Do NOT preserve volatile details: candidate ids, DOM node ids, coordinates, screenshot paths, run ids, temporary file names, timestamps, or raw tool JSON.',
       '- Do NOT include passwords, cookies, tokens, one-time codes, personal accounts, or secrets. Replace them with generic placeholders.',
       '- Avoid describing this as a report. It is a reusable operating skill for later AI browser runs.',
-      '- Keep workflow steps actionable but semantic: describe what to find/click/check, not old ids or exact pixels.',
+      '- Keep the details actionable but semantic: describe what to find/click/check, not old ids or exact pixels.',
       '',
       `Reusable source JSON:\n${safeJson({
         title: input.title,
@@ -142,11 +138,6 @@ export async function generateSkillFromBrowserHistory(input: {
       }, 10000)}`,
     ].join('\n'),
   });
-  const workflow = distinctText(result.object.content.workflow, 8);
-  const workflowKeys = new Set(workflow.map(normalizedText));
-  const recovery = distinctText(result.object.content.recovery, 3)
-    .filter((item) => !workflowKeys.has(normalizedText(item)));
-
   return {
     title: result.object.title,
     description: result.object.description,
@@ -154,9 +145,7 @@ export async function generateSkillFromBrowserHistory(input: {
     tags: distinctText(result.object.tags, 6),
     triggerPhrases: distinctText(result.object.triggerPhrases, 8),
     content: {
-      workflow,
-      recovery,
-      verification: distinctText(result.object.content.verification, 4),
+      details: result.object.content.details.trim(),
     },
     sourceSessionId: input.sourceId,
   };

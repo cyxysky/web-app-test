@@ -12,6 +12,7 @@ import { browserInteractToolDescription, browserInteractToolShape } from './brow
 import { richTextToPlainText } from '@/lib/rich-text';
 import { aiSdkFinishMessage, aiSdkFinishState } from './ai-sdk-finish-state';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
+import { normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
   BROWSER_CHAT_FILE_READ_MIN_CHARS,
@@ -21,8 +22,26 @@ import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifac
 import { browserChatCodeRules, browserChatDomRules } from './runtime-prompt-rules';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
+import {
+  classifyRuntimeRetry,
+  runtimeExecutionDetails,
+  runtimeExecutionIdentity,
+  runtimeRetryDelayMs,
+  waitForRuntimeRetry,
+  type RuntimeExecutionIdentity,
+  type RuntimeRetryDecision,
+} from './runtime-retry-policy';
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
 import { compactOlderBrowserCodeToolResults } from './browser-code-tool-history';
+import {
+  estimateRuntimeTextTokens,
+  runtimeContextCompressionThresholdRatio,
+  runtimeContextWindowTokens,
+} from './runtime-context-budget';
+import {
+  buildRuntimeContinuationSummaryPrompt,
+  fallbackRuntimeContinuationSummary,
+} from './runtime-context-compression';
 import {
   isEffectiveToolTraceFailure,
   notifyRuntimeToolTrace,
@@ -498,6 +517,14 @@ function cleanDisplayText(value?: string) {
   return trimmed;
 }
 
+function cleanFinalDisplayText(value?: string) {
+  const trimmed = normalizeBrowserChatFinalReplyText(value);
+  if (!trimmed || /^无$|^none$/i.test(trimmed)) return undefined;
+  if (looksLikeDomSnapshot(trimmed)) return undefined;
+  if (parseJsonObjectText(trimmed)) return undefined;
+  return trimmed;
+}
+
 function readableTextFromToolRecord(record: Record<string, unknown>, options: { reportState?: boolean } = {}) {
   const preferredKeys = options.reportState
     ? ['action', 'actual', 'reason']
@@ -724,28 +751,8 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
   }).join('\n');
 }
 
-function contextWindowTokens() {
-  const raw = Number(process.env.AI_CONTEXT_WINDOW_TOKENS || process.env.AI_MODEL_CONTEXT_TOKENS || '');
-  if (Number.isFinite(raw) && raw > 1000) return Math.floor(raw);
-  return 256000;
-}
-
-function contextCompressionThresholdRatio() {
-  const raw = Number(process.env.AI_CONTEXT_COMPRESSION_THRESHOLD || process.env.AI_CONTEXT_COMPRESSION_RATIO || 0.7);
-  if (!Number.isFinite(raw) || raw <= 0) return 0.7;
-  return raw > 1 ? Math.min(0.98, raw / 100) : Math.min(0.98, raw);
-}
-
 function agentStepLabel(stepIndex: number) {
   return String(stepIndex + 1);
-}
-
-function continuationSummaryMessageHistory(modelMessages: unknown) {
-  const record = modelMessages && typeof modelMessages === 'object' && !Array.isArray(modelMessages)
-    ? modelMessages as Record<string, unknown>
-    : {};
-  const messages = Array.isArray(record.messages) ? record.messages : [];
-  return JSON.stringify({ messages }, null, 2);
 }
 
 function continuationRuntimeState(memory: RuntimeWorkingMemory) {
@@ -762,80 +769,6 @@ function continuationRuntimeState(memory: RuntimeWorkingMemory) {
   };
 }
 
-function buildContinuationSummaryPrompt(input: {
-  goal: string;
-  browserMode: BrowserSessionMode;
-  stepIndex: number;
-  agentStep: number;
-  estimatedTokens: number;
-  thresholdTokens: number;
-  modelMessages: unknown;
-  workingMemory: RuntimeWorkingMemory;
-}) {
-  const serializedMessages = continuationSummaryMessageHistory(input.modelMessages);
-  return [
-    'You are compressing a WebPilot browser-agent loop so the SAME user request can continue in a fresh model context.',
-    'Return concise JSON only. Do not use markdown.',
-    '',
-    'Required JSON shape:',
-    '{ "goal": string, "completed": string[], "currentPage": string, "confirmedFacts": string[], "negativeResults": string[], "failedAttempts": string[], "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
-    '',
-    'Rules:',
-    '- Preserve stable Playwright locator intent and the exact structured evidence returned by browserCode when it materially affects the next action.',
-    '- Preserve tool results that materially affect the next action.',
-    '- Preserve current URL/page state, blockers, manual verification state, and user constraints.',
-    '- Preserve every completed search/query and its observed result. If a query had no result, put the exact query and outcome in negativeResults; do not schedule that same query again unless the user changed it or new evidence contradicts it.',
-    '- Merge the previousContinuationSummary with the newest evidence. The authoritative runtime state below is produced after the latest completed tool call and wins on conflict.',
-    '- Do not include raw screenshots, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON unless essential.',
-    '- Write Chinese for user-facing summaries when possible.',
-    '',
-    `Goal: ${input.goal}`,
-    `Executor step: ${input.stepIndex}`,
-    `Agent step before compression: ${input.agentStep}`,
-    `Browser mode: ${input.browserMode}`,
-    `Estimated model-context tokens: ${input.estimatedTokens}/${input.thresholdTokens}`,
-    '',
-    `Authoritative current runtime state JSON:\n${JSON.stringify(continuationRuntimeState(input.workingMemory), null, 2)}`,
-    '',
-    `Complete message history JSON (backend did not truncate or select excerpts):\n${serializedMessages}`,
-  ].join('\n');
-}
-
-function fallbackContinuationSummary(input: {
-  goal: string;
-  browserMode: BrowserSessionMode;
-  stepIndex: number;
-  agentStep: number;
-  traces: ToolTrace[];
-  workingMemory: RuntimeWorkingMemory;
-}) {
-  return JSON.stringify({
-    goal: input.goal,
-    browserMode: input.browserMode,
-    executorStep: input.stepIndex,
-    agentStepBeforeCompression: input.agentStep,
-    completed: input.workingMemory.completed,
-    currentPage: input.workingMemory.currentState || input.workingMemory.pageUnderstanding || '',
-    importantEvidence: input.workingMemory.findings,
-    confirmedFacts: input.workingMemory.findings,
-    negativeResults: [],
-    failedAttempts: [],
-    openObservations: [],
-    remaining: input.workingMemory.nextStep ? [input.workingMemory.nextStep] : [],
-    nextStep: input.workingMemory.nextStep || 'Continue from the latest live browser state.',
-    recentToolAttempts: formatCurrentToolAttemptSummary(input.traces, 5),
-  }, null, 2);
-}
-
-function estimateTextTokens(text: string) {
-  let ascii = 0;
-  let nonAscii = 0;
-  for (const char of text) {
-    if (char.charCodeAt(0) <= 0x7f) ascii += 1;
-    else nonAscii += 1;
-  }
-  return Math.ceil(ascii / 4 + nonAscii);
-}
 
 function imageTokenEstimatePerImage() {
   return Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
@@ -1704,13 +1637,13 @@ function modelMessagesTextAndImageStats(messages: unknown, tools?: RuntimeToolDe
   };
   walk(messages);
   const serialized = JSON.stringify(messages) || '';
-  const estimatedValueTextTokens = estimateTextTokens(text);
-  const estimatedSerializedTextTokens = estimateTextTokens(serialized);
+  const estimatedValueTextTokens = estimateRuntimeTextTokens(text);
+  const estimatedSerializedTextTokens = estimateRuntimeTextTokens(serialized);
   const estimatedTextTokens = Math.max(estimatedValueTextTokens, estimatedSerializedTextTokens);
   const estimatedImageTokens = imageCount * imageTokenEstimatePerImage();
   const toolSchema = toolSchemaEstimateInput(tools);
   const serializedToolSchema = JSON.stringify(toolSchema) || '';
-  const estimatedToolSchemaTokens = estimateTextTokens(serializedToolSchema);
+  const estimatedToolSchemaTokens = estimateRuntimeTextTokens(serializedToolSchema);
   return {
     textCharacters: text.length,
     serializedCharacters: serialized.length,
@@ -1928,6 +1861,7 @@ async function executeRuntimeStep(input: {
   mode: BrowserSessionMode;
   runtimeRecord: BrowserChatRuntimeRecord;
   runId: string;
+  turnId?: string;
   stepIndex: number;
   instruction?: string;
   operationalContext?: string;
@@ -2025,8 +1959,18 @@ async function executeRuntimeStep(input: {
     lastRetryState = cloneRuntimeRetryState(state);
   }
 
-  async function runAgent(includeImage: boolean, retryState?: RuntimeRetryState) {
+  async function runAgent(
+    includeImage: boolean,
+    retryState: RuntimeRetryState | undefined,
+    executionIdentity: RuntimeExecutionIdentity,
+  ) {
     ensureActive();
+    const onAttemptDebug: ExecutionDebug | undefined = onDebug
+      ? (event) => onDebug({
+          ...event,
+          details: runtimeExecutionDetails(event.details, executionIdentity),
+        })
+      : undefined;
     const traces: ToolTrace[] = [...durableTraces];
     const codexMode = isCodexProvider();
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
@@ -2154,6 +2098,12 @@ async function executeRuntimeStep(input: {
     const continuationSummaryMarker = '[WebPilot continuation summary]';
     let compactedModelContext: RuntimeModelMessage[] | undefined;
     let compactedSourceMessageCount = 0;
+    const restoredContinuationMessage = initialMessages.find((message) => (
+      textFromUnknown(message.content).startsWith(continuationSummaryMarker)
+    ));
+    let continuationSummaryText = restoredContinuationMessage
+      ? textFromUnknown(restoredContinuationMessage.content).slice(continuationSummaryMarker.length).trim()
+      : '';
 
     function messagesAddedAfterCompactedContext(sourceMessages: RuntimeModelMessage[]) {
       if (!compactedModelContext?.length) return sourceMessages;
@@ -2169,23 +2119,39 @@ async function executeRuntimeStep(input: {
       return sourceMessages.slice(Math.min(compactedSourceMessageCount, sourceMessages.length));
     }
 
-    const summarizeContinuation = async (modelMessagesForLog: unknown, turnIndex: number, messageStats: ReturnType<typeof modelMessagesTextAndImageStats>, thresholdTokens: number) => {
+    const summarizeContinuation = async (
+      deltaModelMessages: unknown,
+      turnIndex: number,
+      estimatedTokens: number,
+      thresholdTokens: number,
+    ) => {
       ensureActive();
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
+      const startedAt = Date.now();
+      const fallback = () => fallbackRuntimeContinuationSummary({
+        goal: requirementOf(runtimeRecord),
+        browserMode: mode,
+        stepIndex,
+        agentStep: agentStepIndex,
+        previousSummary: continuationSummaryText,
+        recentToolAttempts: formatCurrentToolAttemptSummary(traces, 5),
+        runtimeState: continuationRuntimeState(workingMemory),
+      });
       try {
         const result = await generateTextWithTimeout({
           model: getModel(),
           messages: [{
             role: 'user' as const,
-            content: buildContinuationSummaryPrompt({
+            content: buildRuntimeContinuationSummaryPrompt({
               goal: requirementOf(runtimeRecord),
               browserMode: mode,
               stepIndex,
               agentStep: agentStepIndex,
-              estimatedTokens: messageStats.estimatedTotalTokens,
+              estimatedTokens,
               thresholdTokens,
-              modelMessages: modelMessagesForLog,
-              workingMemory,
+              previousSummary: continuationSummaryText,
+              deltaModelMessages,
+              runtimeState: continuationRuntimeState(workingMemory),
             }),
           }],
           temperature: 0.1,
@@ -2193,24 +2159,11 @@ async function executeRuntimeStep(input: {
           abortSignal,
         });
         ensureActive();
-        return (result.text || '').trim() || fallbackContinuationSummary({
-          goal: requirementOf(runtimeRecord),
-          browserMode: mode,
-          stepIndex,
-          agentStep: agentStepIndex,
-          traces,
-          workingMemory,
-        });
+        const text = (result.text || '').trim();
+        return { summary: text || fallback(), elapsedMs: Date.now() - startedAt, fallback: !text };
       } catch (error) {
         if (isBrowserChatAbortError(error, abortSignal)) throw browserChatAbortError(abortSignal);
-        return fallbackContinuationSummary({
-          goal: requirementOf(runtimeRecord),
-          browserMode: mode,
-          stepIndex,
-          agentStep: agentStepIndex,
-          traces,
-          workingMemory,
-        });
+        return { summary: fallback(), elapsedMs: Date.now() - startedAt, fallback: true };
       }
     };
 
@@ -2223,7 +2176,7 @@ async function executeRuntimeStep(input: {
           activeOperationalContext = runtimeContext.operationalContext;
           activeCredentialBindings = runtimeContext.credentialBindings || [];
         } catch (error) {
-          await onDebug?.({
+          await onAttemptDebug?.({
             phase: 'runtime-context:refresh:error',
             stepIndex,
             message: `Unable to rebuild runtime context for the current page: ${infrastructureError(error)}`,
@@ -2234,8 +2187,8 @@ async function executeRuntimeStep(input: {
       const refreshedPrompt = `${runtimePrompt({ runtimeRecord, mode, operationalContext: activeOperationalContext })}${userReferenceImagePrompt}`;
       requestSystemPrompt = codexMode ? buildCodexObjectPrompt(refreshedPrompt, allowedToolTypes) : refreshedPrompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
-      const windowTokens = contextWindowTokens();
-      const thresholdRatio = contextCompressionThresholdRatio();
+      const windowTokens = runtimeContextWindowTokens();
+      const thresholdRatio = runtimeContextCompressionThresholdRatio();
       const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
       const appendedMessages: RuntimeModelMessage[] = [];
       const appendedImagePaths: string[] = [];
@@ -2254,12 +2207,17 @@ async function executeRuntimeStep(input: {
       }
 
       const sourceMessages = previousMessages?.length ? [...previousMessages] : [...initialMessages];
-      let messagesToSend = compactedModelContext?.length
-        ? [...compactedModelContext, ...messagesAddedAfterCompactedContext(sourceMessages)]
+      let unsummarizedMessages = compactedModelContext?.length
+        ? messagesAddedAfterCompactedContext(sourceMessages)
         : sourceMessages;
+      unsummarizedMessages = compactOlderBrowserCodeToolResults(unsummarizedMessages);
+      let messagesToSend = compactedModelContext?.length
+        ? [...compactedModelContext, ...unsummarizedMessages]
+        : unsummarizedMessages;
       messagesToSend = compactOlderBrowserCodeToolResults(messagesToSend);
       if (appendedMessages.length) {
         messagesToSend = [...messagesToSend, ...appendedMessages];
+        unsummarizedMessages = [...unsummarizedMessages, ...appendedMessages];
         messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
       }
 
@@ -2269,7 +2227,17 @@ async function executeRuntimeStep(input: {
       const modelInputForStats = sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths);
       const messageStats = modelMessagesTextAndImageStats(modelInputForStats, codexMode ? undefined : nativeToolsRef.current);
       if ((previousMessages?.length || messagesToSend.length > 1) && messageStats.estimatedTotalTokens > thresholdTokens) {
-        const summary = await summarizeContinuation(modelInputForStats, turnIndex, messageStats, thresholdTokens);
+        const deltaInputForSummary = sanitizeModelInputForStats('', unsummarizedMessages, appendedImagePaths);
+        const deltaStats = modelMessagesTextAndImageStats(deltaInputForSummary, undefined);
+        const summaryResult = await summarizeContinuation(
+          deltaInputForSummary,
+          turnIndex,
+          deltaStats.estimatedTotalTokens,
+          thresholdTokens,
+        );
+        const summary = summaryResult.summary;
+        const previousSummaryChars = continuationSummaryText.length;
+        continuationSummaryText = summary;
         contextSegmentationTurns += 1;
         messagesToSend = [
           { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
@@ -2286,9 +2254,15 @@ async function executeRuntimeStep(input: {
           reason: 'modelMessages exceeded context threshold',
           estimatedTokensBefore: messageStats.estimatedTotalTokens,
           estimatedTokensAfter: afterStats.estimatedTotalTokens,
+          summaryInputEstimatedTokens: deltaStats.estimatedTotalTokens,
+          summaryElapsedMs: summaryResult.elapsedMs,
+          summaryFallback: summaryResult.fallback,
+          previousSummaryChars,
+          summaryChars: summary.length,
+          unsummarizedMessageCount: unsummarizedMessages.length,
           thresholdTokens,
         };
-        await onDebug?.({
+        await onAttemptDebug?.({
           phase: 'ai:context-segmented',
           stepIndex,
           message: `Model message context exceeded threshold; inserted continuation summary segment ${contextSegmentationTurns}.`,
@@ -2322,7 +2296,7 @@ async function executeRuntimeStep(input: {
       const aiStartedAt = Date.now();
       const { system, messages, modelMessagesForLog } = await prepareStep(0);
       ensureActive();
-      await onDebug?.({
+      await onAttemptDebug?.({
         phase: 'ai:runtime:request',
         stepIndex,
         message: 'AI request started; waiting for browser action decision.',
@@ -2359,14 +2333,14 @@ async function executeRuntimeStep(input: {
         readFile: input.readFile,
         credentialBindings: activeCredentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
-        onVisualContextChange: async (snapshot) => { ensureActive(); await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
+        onVisualContextChange: async (snapshot) => { ensureActive(); await onAttemptDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
         onToolTrace: async (trace) => {
           ensureActive();
           upsertToolTrace(durableTraces, trace);
           workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
           await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
           ensureActive();
-          await onDebug?.({ phase: 'ai:tool', stepIndex, message: `${trace.name} -> ${toolTraceStatus(trace)}`, details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
+          await onAttemptDebug?.({ phase: 'ai:tool', stepIndex, message: `${trace.name} -> ${toolTraceStatus(trace)}`, details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
         },
         onReferenceImage: (path) => {
           if (!modelSupportsScreenshotInput()) return;
@@ -2377,7 +2351,7 @@ async function executeRuntimeStep(input: {
         },
       });
       ensureActive();
-      await onDebug?.({
+      await onAttemptDebug?.({
         phase: 'ai:runtime:object',
         stepIndex,
         message: 'Codex object -> ' + object.type + '; AI+tool ' + elapsedSince(aiStartedAt) + 'ms',
@@ -2419,7 +2393,7 @@ async function executeRuntimeStep(input: {
       workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
       await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
       ensureActive();
-      await onDebug?.({
+      await onAttemptDebug?.({
         phase: 'ai:tool',
         stepIndex,
         message: `${trace.name} -> ${toolTraceStatus(trace)}`,
@@ -2448,10 +2422,10 @@ async function executeRuntimeStep(input: {
         });
       },
       ensureBrowserStarted: input.ensureBrowserStarted,
-      onDebug,
+      onDebug: onAttemptDebug,
       onVisualContextChange: async (snapshot) => {
         ensureActive();
-        await onDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
+        await onAttemptDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
       },
     });
     const toolsForRequest = nativeToolsRef.current;
@@ -2470,7 +2444,7 @@ async function executeRuntimeStep(input: {
           toolExecutionGate.executed = false;
           stepTraceStarts.set(stepNumber, traces.length);
           stepStartedAt.set(stepNumber, Date.now());
-          await onDebug?.({
+          await onAttemptDebug?.({
             phase: 'ai:runtime:request',
             stepIndex,
             message: 'AI request started; waiting for browser action decision. agent step ' + agentStepLabel(retryAgentStepOffset + stepNumber) + '.',
@@ -2491,7 +2465,7 @@ async function executeRuntimeStep(input: {
           const traceStart = stepTraceStarts.get(turnIndex) ?? 0;
           const newTraces = traces.slice(traceStart);
           const startedAt = stepStartedAt.get(turnIndex) || Date.now();
-          await onDebug?.({
+          await onAttemptDebug?.({
             phase: 'ai:runtime:response',
             stepIndex,
             message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; agent step ' + agentStepLabel(retryAgentStepOffset + turnIndex) + '; AI+tool ' + elapsedSince(startedAt) + 'ms',
@@ -2517,9 +2491,11 @@ async function executeRuntimeStep(input: {
         maxRetries: 0,
         abortSignal,
       }, input.agentLoopTimeoutMs);
-      ensureActive();
-      latestText = toolConsistentAssistantText(result.text || latestText, traces.at(-1)?.name);
       const finishState = aiSdkFinishState(result.finishReason);
+      ensureActive();
+      latestText = finishState.terminatesTurn
+        ? cleanFinalDisplayText(result.text || latestText) || ''
+        : toolConsistentAssistantText(result.text || latestText, traces.at(-1)?.name);
       if (finishState.retryRequest) {
         throw new Error(`AI SDK returned retryable finish reason "${finishState.finishReason}".`);
       }
@@ -2547,9 +2523,18 @@ async function executeRuntimeStep(input: {
   const consecutiveFailureLimit = runtimeRequestConsecutiveFailureLimit();
   let lastError: unknown;
   let retryingAfterFailure = false;
+  let lastRetryDecision: RuntimeRetryDecision | undefined;
+  let retryDelayMs = 0;
+  let attemptNumber = 0;
 
   while (true) {
     ensureActive();
+    attemptNumber += 1;
+    const executionIdentity = runtimeExecutionIdentity(
+      input.turnId || input.runId,
+      stepIndex,
+      attemptNumber,
+    );
     const includeImage = Boolean(screenshot);
     const retryState = retryingAfterFailure && lastRetryState?.messages.length ? lastRetryState : undefined;
     try {
@@ -2563,6 +2548,8 @@ async function executeRuntimeStep(input: {
               error: infrastructureError(lastError),
               consecutiveFailures: consecutiveRequestFailures,
               consecutiveFailureLimit,
+              execution: executionIdentity,
+              retryDecision: lastRetryDecision,
             },
           });
           ensureActive();
@@ -2572,11 +2559,14 @@ async function executeRuntimeStep(input: {
         await onDebug?.({
           phase: 'ai:runtime:retry',
           stepIndex,
-          message: `AI request failed; retrying after consecutive failure ${consecutiveRequestFailures}/${consecutiveFailureLimit} with the previously prepared model messages.`,
+          message: `AI request failed transiently; retrying after ${retryDelayMs}ms (${consecutiveRequestFailures}/${consecutiveFailureLimit}) with the previously prepared model messages.`,
           details: {
             error: infrastructureError(lastError),
             consecutiveFailures: consecutiveRequestFailures,
             consecutiveFailureLimit,
+            delayMs: retryDelayMs,
+            execution: executionIdentity,
+            retryDecision: lastRetryDecision,
             reusePreparedMessages: Boolean(retryState),
             messageCount: retryState?.messages.length,
             imageCount: retryState?.imagePaths.length,
@@ -2584,14 +2574,33 @@ async function executeRuntimeStep(input: {
           },
         });
         ensureActive();
+        await waitForRuntimeRetry(retryDelayMs, abortSignal, input.shouldContinue);
+        ensureActive();
       }
       ensureActive();
-      return await runAgent(includeImage, retryState);
+      return await runAgent(includeImage, retryState, executionIdentity);
     } catch (error) {
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
       lastError = error;
       consecutiveRequestFailures += 1;
+      lastRetryDecision = classifyRuntimeRetry(error, abortSignal);
+      if (!lastRetryDecision.retryable) {
+        await onDebug?.({
+          phase: 'ai:runtime:retry-skipped',
+          stepIndex,
+          message: `AI request failed with a non-retryable ${lastRetryDecision.category} error; no automatic retry will be started.`,
+          details: {
+            error: infrastructureError(error),
+            consecutiveFailures: consecutiveRequestFailures,
+            consecutiveFailureLimit,
+            execution: executionIdentity,
+            retryDecision: lastRetryDecision,
+          },
+        });
+        break;
+      }
       if (consecutiveRequestFailures >= consecutiveFailureLimit) break;
+      retryDelayMs = runtimeRetryDelayMs(consecutiveRequestFailures, lastRetryDecision);
       retryingAfterFailure = true;
     }
   }
@@ -2599,18 +2608,22 @@ async function executeRuntimeStep(input: {
   ensureActive();
   if (lastError && typeof lastError === 'object') {
     (lastError as { aiRequest?: AiRequestSnapshot }).aiRequest ??= lastAiRequest;
-    (lastError as { runtimeRetry?: { consecutiveFailures: number; consecutiveFailureLimit: number } }).runtimeRetry ??= {
+    (lastError as { runtimeRetry?: Record<string, unknown> }).runtimeRetry ??= {
       consecutiveFailures: consecutiveRequestFailures,
       consecutiveFailureLimit,
+      decision: lastRetryDecision,
+      retryDelayMs,
     };
     throw lastError;
   }
 
   const wrapped = new Error(String(lastError || 'AI request failed before a response was returned'));
   (wrapped as { aiRequest?: AiRequestSnapshot }).aiRequest = lastAiRequest;
-  (wrapped as { runtimeRetry?: { consecutiveFailures: number; consecutiveFailureLimit: number } }).runtimeRetry = {
+  (wrapped as { runtimeRetry?: Record<string, unknown> }).runtimeRetry = {
     consecutiveFailures: consecutiveRequestFailures,
     consecutiveFailureLimit,
+    decision: lastRetryDecision,
+    retryDelayMs,
   };
   throw wrapped;
 }
@@ -2671,6 +2684,7 @@ function upsertStep(steps: StepExecutionResult[], step: StepExecutionResult) {
 export async function executeInteractiveBrowserTurn(input: {
   session: BrowserSession;
   runId: string;
+  turnId?: string;
   initialStepIndex?: number;
   targetUrl: string;
   instruction: string;
@@ -2730,6 +2744,7 @@ export async function executeInteractiveBrowserTurn(input: {
         mode: runtimeMode,
         runtimeRecord,
         runId: input.runId,
+        turnId: input.turnId || input.runId,
         stepIndex,
         instruction: input.modelInstruction || input.instruction,
         operationalContext: input.operationalContext,

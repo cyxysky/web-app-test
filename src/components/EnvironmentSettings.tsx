@@ -22,6 +22,8 @@ import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEn
 import { useTheme } from '@/theme/ThemeProvider';
 import { readApiJson } from '@/lib/api-client';
 import { LoginAccountModal, type LoginAccountMetadata } from '@/components/LoginAccountModal';
+import { DataTransferButtons } from '@/components/DataTransferButtons';
+import { DomainGroupedAccordion } from '@/components/DomainGroupedAccordion';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 export type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
@@ -276,6 +278,8 @@ export function EnvironmentSettings({
   const [loginAccountEditor, setLoginAccountEditor] = useState<LoginAccountMetadata | 'create' | null>(null);
   const [loadingLoginAccounts, setLoadingLoginAccounts] = useState(false);
   const [deletingLoginAccountId, setDeletingLoginAccountId] = useState('');
+  const [deleteLoginAccountTarget, setDeleteLoginAccountTarget] = useState<LoginAccountMetadata | null>(null);
+  const [deleteLoginAccountError, setDeleteLoginAccountError] = useState('');
   const [portalReady, setPortalReady] = useState(false);
   const [loading, setLoading] = useState(!initialData);
   const [savingEnv, setSavingEnv] = useState(false);
@@ -335,17 +339,18 @@ export function EnvironmentSettings({
   }, [activeTab]);
 
   useEffect(() => {
-    if (!personalMemoryEditorMode && !deletePersonalMemoryTarget) return undefined;
+    if (!personalMemoryEditorMode && !deletePersonalMemoryTarget && !deleteLoginAccountTarget) return undefined;
     function closeOnEscape(event: KeyboardEvent) {
-      if (event.key !== 'Escape' || savingPersonalMemory || deletingPersonalMemoryId) return;
+      if (event.key !== 'Escape' || savingPersonalMemory || deletingPersonalMemoryId || deletingLoginAccountId) return;
       if (personalMemoryEditorMode) closePersonalMemoryEditor();
       if (deletePersonalMemoryTarget) closeDeletePersonalMemoryModal();
+      if (deleteLoginAccountTarget) closeDeleteLoginAccountModal();
     }
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
   // The close handlers intentionally read the latest editor state when Escape is pressed.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deletePersonalMemoryTarget, deletingPersonalMemoryId, personalMemoryEditorMode, savingPersonalMemory]);
+  }, [deleteLoginAccountTarget, deletePersonalMemoryTarget, deletingLoginAccountId, deletingPersonalMemoryId, personalMemoryEditorMode, savingPersonalMemory]);
 
   async function load() {
     setLoading(true);
@@ -513,6 +518,15 @@ export function EnvironmentSettings({
     }
   }
 
+  async function reloadModelConfigAfterImport() {
+    const response = await fetch(withWebPilotBasePath('/api/settings/model'), { cache: 'no-store' });
+    const data = await readApiJson<{ config?: Partial<ModelConfig> }>(response, t('读取模型配置失败'));
+    const nextModel = createModelConfig(data.config);
+    setModelConfig(nextModel);
+    setModelDraft(nextModel);
+    onModelSaved?.();
+  }
+
   function updatePersonalMemoryDraft(patch: Partial<PersonalMemoryDraft>) {
     setPersonalMemoryDraft((current) => {
       const next = { ...current, ...patch };
@@ -582,16 +596,34 @@ export function EnvironmentSettings({
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)));
   }
 
-  async function deleteLoginAccount(account: LoginAccountMetadata) {
-    if (!window.confirm(`确认删除“${account.label || account.username}”吗？`)) return;
+  function requestDeleteLoginAccount(account: LoginAccountMetadata) {
+    setDeleteLoginAccountTarget(account);
+    setDeleteLoginAccountError('');
+  }
+
+  function closeDeleteLoginAccountModal() {
+    if (deletingLoginAccountId) return;
+    setDeleteLoginAccountTarget(null);
+    setDeleteLoginAccountError('');
+  }
+
+  async function confirmDeleteLoginAccount() {
+    const account = deleteLoginAccountTarget;
+    if (!account) return;
     setDeletingLoginAccountId(account.id);
+    setDeleteLoginAccountError('');
+    startGlobalLoading(t('正在删除登录账号'));
     try {
       const query = `?userId=${encodeURIComponent(account.userId || normalizedUserId)}`;
       const response = await fetch(withWebPilotBasePath(`/api/login-accounts/${encodeURIComponent(account.id)}${query}`), { method: 'DELETE' });
-      await readApiJson(response, '删除登录账号失败');
+      await readApiJson(response, t('删除登录账号失败'));
       setLoginAccounts((current) => current.filter((item) => item.id !== account.id));
+      setDeleteLoginAccountTarget(null);
+    } catch (error) {
+      setDeleteLoginAccountError(error instanceof Error ? error.message : t('删除登录账号失败'));
     } finally {
       setDeletingLoginAccountId('');
+      stopGlobalLoading();
     }
   }
 
@@ -901,6 +933,44 @@ export function EnvironmentSettings({
     ), document.body);
   }
 
+  function renderDeleteLoginAccountModal() {
+    if (!deleteLoginAccountTarget || !portalReady) return null;
+    const deleting = deletingLoginAccountId === deleteLoginAccountTarget.id;
+    return createPortal((
+      <div className="ui-modal-overlay" onMouseDown={closeDeleteLoginAccountModal}>
+        <section
+          aria-labelledby="login-account-delete-title"
+          aria-modal="true"
+          className="ui-modal ui-modal--compact"
+          onMouseDown={(event) => event.stopPropagation()}
+          role="dialog"
+        >
+          <header className="ui-modal-header">
+            <h2 className="ui-modal-title" id="login-account-delete-title">{t('删除登录账号')}</h2>
+            <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={deleting} onClick={closeDeleteLoginAccountModal} type="button">
+              <X size={16} />
+            </button>
+          </header>
+          <div className="ui-modal-body skills-manager-delete-body">
+            <h3>{deleteLoginAccountTarget.label || deleteLoginAccountTarget.username}</h3>
+            <p>{t('确认删除这个登录账号？')}</p>
+            {deleteLoginAccountError ? <p className="personal-memory-delete-error">{deleteLoginAccountError}</p> : null}
+          </div>
+          <footer className="ui-modal-footer">
+            <button className="ui-button ui-button--neutral" disabled={deleting} onClick={closeDeleteLoginAccountModal} type="button">
+              <X size={15} />
+              {t('取消')}
+            </button>
+            <button className="ui-button ui-button--danger" disabled={deleting} onClick={() => void confirmDeleteLoginAccount()} type="button">
+              {deleting ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
+              {t('删除')}
+            </button>
+          </footer>
+        </section>
+      </div>
+    ), document.body);
+  }
+
   function renderPersonalMemoryPanel() {
     return (
       <section className={loadingPersonalMemory ? 'personal-memory-settings is-loading' : 'personal-memory-settings'}>
@@ -910,6 +980,7 @@ export function EnvironmentSettings({
             <span>{t('{count} 条记录，存储于本地数据库', { count: personalMemoryItems.length })}</span>
           </div>
           <div className="personal-memory-head-actions">
+            <DataTransferButtons kind="memory" onImported={loadPersonalMemoryItems} userId={normalizedUserId} />
             <button className="ui-button ui-icon-button" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">
               <RefreshCw size={15} />
               {t('刷新')}
@@ -928,9 +999,25 @@ export function EnvironmentSettings({
               <h2>{t('正在读取个性化记忆')}</h2>
             </div>
           </div>
-        ) : personalMemoryItems.length ? (
-          <div className="personal-memory-list">
-            {personalMemoryItems.map((item) => (
+        ) : (
+          <DomainGroupedAccordion
+            emptyText={t('暂无个性化记忆')}
+            getDomains={(item) => item.scope === 'domain' && item.domain ? [item.domain] : []}
+            getId={(item) => item.id}
+            getName={(item) => item.key}
+            getSearchText={(item) => [
+              item.key,
+              item.value,
+              item.domain,
+              item.type,
+              item.status,
+              personalMemoryTypeLabel(item.type),
+              item.status === 'active' ? '启用' : '停用',
+              ...(item.aliases || []),
+            ]}
+            getUpdatedAt={(item) => item.updatedAt}
+            items={personalMemoryItems}
+            renderItem={(item) => (
               <article className={`personal-memory-item ${item.status}`} data-i18n-skip key={item.id}>
                 <div className="personal-memory-item-main">
                   <div className="personal-memory-meta">
@@ -976,10 +1063,10 @@ export function EnvironmentSettings({
                   </button>
                 </div>
               </article>
-            ))}
-          </div>
-        ) : (
-          <div className="empty-state">{t('暂无个性化记忆')}</div>
+            )}
+            searchPlaceholder={t('筛选记忆')}
+            unscopedLabel={t('全局')}
+          />
         )}
         {renderPersonalMemoryEditorModal()}
         {renderDeletePersonalMemoryModal()}
@@ -996,6 +1083,7 @@ export function EnvironmentSettings({
             <span>{loginAccounts.length} 个按域名保存的账号；密码只在后台解密并通过短期安全引用使用</span>
           </div>
           <div className="personal-memory-head-actions">
+            <DataTransferButtons kind="credentials" onImported={loadLoginAccounts} userId={normalizedUserId} />
             <button className="ui-button ui-icon-button" disabled={loadingLoginAccounts} onClick={() => void loadLoginAccounts()} type="button">
               <RefreshCw size={15} />
               刷新
@@ -1012,9 +1100,24 @@ export function EnvironmentSettings({
             <LiquidGlassLoader className="ui-liquid-glass-loader--compact" />
             <div><h2>正在读取登录账号</h2></div>
           </div>
-        ) : loginAccounts.length ? (
-          <div className="login-account-list">
-            {loginAccounts.map((account) => (
+        ) : (
+          <DomainGroupedAccordion
+            className="login-account-domain-list"
+            emptyText={t('尚未保存登录账号。目标测试需要新账号时，也可以直接在目标卡片中创建。')}
+            getDomains={(account) => [account.domain]}
+            getId={(account) => account.id}
+            getName={(account) => account.label || account.username}
+            getSearchText={(account) => [
+              account.label,
+              account.username,
+              account.domain,
+              account.loginUrl || '',
+              account.status,
+              account.status === 'active' ? '可用于目标测试' : '已停用',
+            ]}
+            getUpdatedAt={(account) => account.updatedAt}
+            items={loginAccounts}
+            renderItem={(account) => (
               <article className="login-account-item" key={account.id}>
                 <span className="login-account-item-icon" aria-hidden="true"><KeyRound size={17} /></span>
                 <div className="login-account-item-main">
@@ -1030,7 +1133,7 @@ export function EnvironmentSettings({
                     aria-label="删除登录账号"
                     className="settings-model-row-button danger"
                     disabled={deletingLoginAccountId === account.id}
-                    onClick={() => void deleteLoginAccount(account)}
+                    onClick={() => requestDeleteLoginAccount(account)}
                     title="删除登录账号"
                     type="button"
                   >
@@ -1038,10 +1141,10 @@ export function EnvironmentSettings({
                   </button>
                 </div>
               </article>
-            ))}
-          </div>
-        ) : (
-          <div className="empty-state">尚未保存登录账号。目标测试需要新账号时，也可以直接在目标卡片中创建。</div>
+            )}
+            searchPlaceholder={t('筛选登录账号')}
+            unscopedLabel={t('未分组')}
+          />
         )}
 
         <LoginAccountModal
@@ -1051,6 +1154,7 @@ export function EnvironmentSettings({
           open={Boolean(loginAccountEditor)}
           userId={normalizedUserId}
         />
+        {renderDeleteLoginAccountModal()}
       </section>
     );
   }
@@ -1173,10 +1277,13 @@ export function EnvironmentSettings({
                   <h2>{t('模型配置')}</h2>
                   <span>{t('每个服务商独立保存模型、Key 和 Base URL，切换服务商不会串用密钥。')}</span>
                 </div>
-                <button className="ui-button ui-icon-button" disabled={savingModel || loading} onClick={saveModel} type="button">
-                  {savingModel ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
-                  {t('保存')}
-                </button>
+                <div className="personal-memory-head-actions">
+                  <DataTransferButtons disabled={savingModel || loading} kind="model" onImported={reloadModelConfigAfterImport} userId={normalizedUserId} />
+                  <button className="ui-button ui-icon-button" disabled={savingModel || loading} onClick={saveModel} type="button">
+                    {savingModel ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+                    {t('保存')}
+                  </button>
+                </div>
               </div>
               <div className="settings-card">
                 <div className="settings-row">

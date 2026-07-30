@@ -10,9 +10,11 @@ const skill: SkillRecord = {
   tags: ['内部管理标签'],
   triggerPhrases: ['打开指定主播直播间'],
   content: {
-    workflow: ['打开直播平台并定位主播搜索入口', '输入主播名并选择匹配结果'],
-    recovery: ['搜索建议未出现时改用房间号'],
-    verification: ['地址和页面标题均对应目标主播'],
+    details: [
+      '1. 打开直播平台并定位主播搜索入口。',
+      '2. 输入主播名并选择匹配结果；搜索建议未出现时改用房间号。',
+      '3. 确认地址和页面标题均对应目标主播。',
+    ].join('\n'),
   },
   status: 'ready',
   version: 1,
@@ -37,16 +39,12 @@ test('detailed Skill prompt injects operating content once and omits matching me
   assert.doesNotMatch(prompt, /内部管理标签|打开指定主播直播间|Trigger phrases|Tags:/);
 });
 
-test('legacy cautions migrate into the compact recovery section', () => {
+test('Skill content keeps the detailed Markdown block intact', () => {
   const content = parseSkillContent({
-    workflow: ['执行操作'],
-    cautions: ['失败时使用备用入口'],
-    verification: ['页面显示成功状态'],
+    details: '## 操作\n\n1. 执行操作\n2. 页面显示成功状态',
   });
   assert.deepEqual(content, {
-    workflow: ['执行操作'],
-    recovery: ['失败时使用备用入口'],
-    verification: ['页面显示成功状态'],
+    details: '## 操作\n\n1. 执行操作\n2. 页面显示成功状态',
   });
 });
 

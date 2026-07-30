@@ -11,6 +11,10 @@ import {
 import { artifactPath } from '@/server/storage/paths';
 import { browserPreviewFrameIntervalMs } from './browser-preview-cadence';
 import {
+  BrowserPreviewFramePump,
+  type BrowserPreviewFramePumpMetrics,
+} from './browser-preview-frame-pump';
+import {
   boundedNonNegativeIntegerEnv,
   boundedPositiveIntegerEnv,
   browserTabTitlePrefixEnabled,
@@ -973,6 +977,7 @@ export type BrowserScreencastFrame = {
 };
 
 export type BrowserScreencastHandle = {
+  metrics: () => BrowserPreviewFramePumpMetrics;
   stop: () => Promise<void>;
 };
 
@@ -4862,8 +4867,6 @@ export class BrowserSession {
     const currentFrameIntervalMs = () => browserPreviewFrameIntervalMs(process.env.BROWSER_PREVIEW_FPS);
     let stopped = false;
     let stopPromise: Promise<void> | undefined;
-    let frameTimer: ReturnType<typeof setTimeout> | undefined;
-    const originalPlaywrightViewport = page.viewportSize();
     const cssViewport = await this.getViewportMetrics().catch(() => ({
       ...(page.viewportSize() || { width: 1280, height: 720 }),
       devicePixelRatio: 1,
@@ -4872,36 +4875,110 @@ export class BrowserSession {
       width: Math.max(1, Math.round(cssViewport.width * outputPixelRatio)),
       height: Math.max(1, Math.round(cssViewport.height * outputPixelRatio)),
     };
-    let outputMetricsOverrideApplied = false;
-    let latestFrame: BrowserScreencastFrame | undefined;
+    let receivedOutputFrame = false;
+    let latestNativeMetadata: { deviceHeight?: number; deviceWidth?: number } | undefined;
+    let nextScaledCaptureAt = 0;
+    let scaledCapturePending = false;
+    let scaledCapturePromise: Promise<void> | undefined;
+    let scaledCaptureTimer: ReturnType<typeof setTimeout> | undefined;
     let resolveInitialFrame: (() => void) | undefined;
     const initialFrameReady = new Promise<void>((resolve) => {
       resolveInitialFrame = resolve;
     });
+    const framePump = new BrowserPreviewFramePump<BrowserScreencastFrame>({
+      intervalMs: currentFrameIntervalMs,
+      onError: options.onError,
+      onFrame: options.onFrame,
+    });
 
     const activePreviewPage = () => (this.page && !this.page.isClosed() ? this.page : this.sessionPages()[0]);
+    const pushOutputFrame = (
+      data: string,
+      outputViewport: { width: number; height: number },
+      metadata?: { deviceHeight?: number; deviceWidth?: number },
+    ) => {
+      if (stopped || page.isClosed() || activePreviewPage() !== page) return;
+      viewport = outputViewport;
+      receivedOutputFrame = true;
+      framePump.push({
+        capturedAt: new Date().toISOString(),
+        contentType,
+        data,
+        metadata: metadata ? {
+          ...metadata,
+          deviceHeight: outputViewport.height,
+          deviceWidth: outputViewport.width,
+        } : undefined,
+        tabs: this.getTabsSnapshot(),
+        url: page.url(),
+        viewport: outputViewport,
+      });
+      resolveInitialFrame?.();
+      resolveInitialFrame = undefined;
+    };
+    const captureScaledOutputFrame = async (
+      metadata?: { deviceHeight?: number; deviceWidth?: number },
+    ) => {
+      if (stopped || page.isClosed() || activePreviewPage() !== page) return;
+      const layoutMetrics = await client.send('Page.getLayoutMetrics');
+      const visualViewport = layoutMetrics.cssVisualViewport;
+      const outputViewport = {
+        width: Math.max(1, Math.round(visualViewport.clientWidth * outputPixelRatio)),
+        height: Math.max(1, Math.round(visualViewport.clientHeight * outputPixelRatio)),
+      };
+      const result = await client.send('Page.captureScreenshot', {
+        captureBeyondViewport: false,
+        clip: {
+          x: visualViewport.pageX,
+          y: visualViewport.pageY,
+          width: visualViewport.clientWidth,
+          height: visualViewport.clientHeight,
+          scale: outputPixelRatio,
+        },
+        format,
+        fromSurface: true,
+        optimizeForSpeed: true,
+        ...(format === 'jpeg' ? { quality } : {}),
+      });
+      pushOutputFrame(result.data, outputViewport, metadata);
+    };
+    const requestScaledOutputFrame = (
+      metadata?: { deviceHeight?: number; deviceWidth?: number },
+    ) => {
+      latestNativeMetadata = metadata;
+      scaledCapturePending = true;
+      if (scaledCapturePromise || scaledCaptureTimer || stopped) return;
+      const delay = Math.max(0, nextScaledCaptureAt - Date.now());
+      if (delay) {
+        scaledCaptureTimer = setTimeout(() => {
+          scaledCaptureTimer = undefined;
+          requestScaledOutputFrame(latestNativeMetadata);
+        }, delay);
+        scaledCaptureTimer.unref?.();
+        return;
+      }
+      scaledCapturePending = false;
+      scaledCapturePromise = captureScaledOutputFrame(latestNativeMetadata).catch((error) => {
+        if (!stopped) options.onError?.(error);
+      }).finally(() => {
+        scaledCapturePromise = undefined;
+        nextScaledCaptureAt = Date.now() + currentFrameIntervalMs();
+        if (scaledCapturePending && !stopped) requestScaledOutputFrame(latestNativeMetadata);
+      });
+    };
     const stopScreencast = async (notifyPageChanged: boolean) => {
       if (stopPromise) return stopPromise;
       stopped = true;
-      if (frameTimer) clearTimeout(frameTimer);
-      frameTimer = undefined;
+      scaledCapturePending = false;
+      if (scaledCaptureTimer) clearTimeout(scaledCaptureTimer);
+      scaledCaptureTimer = undefined;
       resolveInitialFrame?.();
       resolveInitialFrame = undefined;
       client.off('Page.screencastFrame', onNativeFrame);
       stopPromise = (async () => {
         await client.send('Page.stopScreencast').catch(() => undefined);
-        if (outputMetricsOverrideApplied) {
-          if (originalPlaywrightViewport) {
-            await client.send('Emulation.setDeviceMetricsOverride', {
-              width: originalPlaywrightViewport.width,
-              height: originalPlaywrightViewport.height,
-              deviceScaleFactor: Math.max(0.1, cssViewport.devicePixelRatio || 1),
-              mobile: false,
-            }).catch(() => undefined);
-          } else {
-            await client.send('Emulation.clearDeviceMetricsOverride').catch(() => undefined);
-          }
-        }
+        await scaledCapturePromise?.catch(() => undefined);
+        await framePump.stop();
         await client.detach().catch(() => undefined);
         if (notifyPageChanged) await options.onActivePageChanged?.();
       })();
@@ -4920,70 +4997,16 @@ export class BrowserSession {
         void stopScreencast(true);
         return;
       }
-      const width = Math.max(1, Math.floor(Number(event.metadata?.deviceWidth) || viewport.width));
-      const height = Math.max(1, Math.floor(Number(event.metadata?.deviceHeight) || viewport.height));
-      viewport = { width, height };
-      latestFrame = {
-        capturedAt: new Date().toISOString(),
-        contentType,
-        data: event.data,
-        metadata: event.metadata,
-        tabs: this.getTabsSnapshot(),
-        url: page.url(),
-        viewport,
-      };
-      resolveInitialFrame?.();
-      resolveInitialFrame = undefined;
-    };
-    const publishLatestFrame = async () => {
-      if (stopped || !latestFrame) return;
-      if (page.isClosed() || activePreviewPage() !== page) {
-        await stopScreencast(true);
+      if (outputPixelRatio !== 1) {
+        requestScaledOutputFrame(event.metadata);
         return;
       }
-      await options.onFrame({
-        ...latestFrame,
-        capturedAt: new Date().toISOString(),
-        tabs: this.getTabsSnapshot(),
-        url: page.url(),
-        viewport,
-      });
-    };
-    let nextFrameAt = Date.now() + currentFrameIntervalMs();
-    const publishFrameLoop = async (): Promise<void> => {
-      if (stopped) return;
-      try {
-        await publishLatestFrame();
-      } catch (error) {
-        if (!stopped) options.onError?.(error);
-      } finally {
-        if (!stopped) {
-          nextFrameAt += currentFrameIntervalMs();
-          const delay = Math.max(0, nextFrameAt - Date.now());
-          if (!delay) nextFrameAt = Date.now();
-          frameTimer = setTimeout(() => void publishFrameLoop(), delay);
-          frameTimer.unref?.();
-        }
-      }
+      const width = Math.max(1, Math.floor(Number(event.metadata?.deviceWidth) || viewport.width));
+      const height = Math.max(1, Math.floor(Number(event.metadata?.deviceHeight) || viewport.height));
+      pushOutputFrame(event.data, { width, height }, event.metadata);
     };
     client.on('Page.screencastFrame', onNativeFrame);
     try {
-      if (outputPixelRatio !== 1) {
-        await client.send('Emulation.setDeviceMetricsOverride', {
-          width: Math.max(1, Math.round(cssViewport.width)),
-          height: Math.max(1, Math.round(cssViewport.height)),
-          deviceScaleFactor: Math.max(0.1, cssViewport.devicePixelRatio || 1),
-          mobile: false,
-          viewport: {
-            x: 0,
-            y: 0,
-            width: Math.max(1, Math.round(cssViewport.width)),
-            height: Math.max(1, Math.round(cssViewport.height)),
-            scale: outputPixelRatio,
-          },
-        });
-        outputMetricsOverrideApplied = true;
-      }
       await client.send('Page.startScreencast', {
         everyNthFrame: 1,
         format,
@@ -4997,46 +5020,26 @@ export class BrowserSession {
         }),
       ]);
       if (initialWaitTimer) clearTimeout(initialWaitTimer);
-      if (!latestFrame && !stopped && !page.isClosed() && activePreviewPage() === page) {
-        const layoutMetrics = await client.send('Page.getLayoutMetrics');
-        const visualViewport = layoutMetrics.cssVisualViewport;
-        const result = await client.send('Page.captureScreenshot', {
-          captureBeyondViewport: false,
-          clip: {
-            x: visualViewport.pageX,
-            y: visualViewport.pageY,
-            width: visualViewport.clientWidth,
-            height: visualViewport.clientHeight,
-            scale: outputPixelRatio,
-          },
-          format,
-          fromSurface: true,
-          optimizeForSpeed: true,
-          ...(format === 'jpeg' ? { quality } : {}),
-        });
-        if (!latestFrame) {
-          latestFrame = {
-            capturedAt: new Date().toISOString(),
-            contentType,
-            data: result.data,
-            tabs: this.getTabsSnapshot(),
-            url: page.url(),
-            viewport,
-          };
-        }
+      if (!receivedOutputFrame && scaledCapturePromise) {
+        let scaledCaptureWaitTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          initialFrameReady,
+          new Promise<void>((resolve) => {
+            scaledCaptureWaitTimer = setTimeout(resolve, 1_000);
+          }),
+        ]);
+        if (scaledCaptureWaitTimer) clearTimeout(scaledCaptureWaitTimer);
       }
-      if (!stopped && latestFrame) {
-        await publishLatestFrame();
-        const frameIntervalMs = currentFrameIntervalMs();
-        nextFrameAt = Date.now() + frameIntervalMs;
-        frameTimer = setTimeout(() => void publishFrameLoop(), frameIntervalMs);
-        frameTimer.unref?.();
+      if (!receivedOutputFrame && !stopped && !page.isClosed() && activePreviewPage() === page) {
+        await captureScaledOutputFrame(latestNativeMetadata);
       }
+      if (!stopped) await framePump.flushLatest();
     } catch (error) {
       await stopScreencast(false);
       throw error;
     }
     return {
+      metrics: () => framePump.metrics(),
       stop: async () => {
         await stopScreencast(false);
       },

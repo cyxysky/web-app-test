@@ -38,6 +38,15 @@ export type LoginAccountCredential = {
   password: string;
 };
 
+export type LoginAccountPortableRecord = {
+  domain: string;
+  username: string;
+  password: string;
+  label: string;
+  loginUrl: string;
+  status: LoginAccountStatus;
+};
+
 export type CreateLoginAccountInput = {
   userId?: unknown;
   domain: string;
@@ -374,6 +383,24 @@ export function listLoginAccounts(input: { userId?: unknown; domain?: unknown } 
         ORDER BY updated_at DESC
       `).all(userId)) as LoginAccountRow[];
   return rows.map(metadataFromRow);
+}
+
+export function exportLoginAccountCredentials(userId?: unknown): LoginAccountPortableRecord[] {
+  ensureLoginAccountUserMigration();
+  const normalizedUserId = normalizeLoginAccountUserId(userId);
+  const rows = getSqliteDatabase().prepare(`
+    SELECT * FROM login_account
+    WHERE user_id = ?
+    ORDER BY updated_at DESC
+  `).all(normalizedUserId) as LoginAccountRow[];
+  return rows.map((row) => ({
+    domain: row.domain,
+    username: row.username,
+    password: decryptPassword(row),
+    label: row.label,
+    loginUrl: row.login_url,
+    status: normalizeStatus(row.status, 'disabled'),
+  }));
 }
 
 export function getLoginAccountById(id: string, userId?: unknown) {

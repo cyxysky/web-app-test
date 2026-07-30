@@ -3,6 +3,7 @@ import http from 'node:http';
 import type { Socket } from 'node:net';
 import { dispatchBrowserChatPreviewInput, startBrowserChatScreencast } from '@/server/ai/agents/browser-chat.service';
 import type { BrowserLiveInput } from '@/server/browser/browser-session';
+import type { BrowserPreviewFramePumpMetrics } from '@/server/browser/browser-preview-frame-pump';
 
 type BrowserPreviewWebSocketInfo = {
   port: number;
@@ -23,14 +24,20 @@ type BrowserPreviewClient = {
 };
 
 type BrowserPreviewStream = {
+  backpressureDrops: number;
   clients: Set<BrowserPreviewClient>;
   generation: number;
   key: string;
+  metrics?: () => BrowserPreviewFramePumpMetrics;
+  metricsTimer?: ReturnType<typeof setInterval>;
+  networkBytes: number;
+  payloadBuildMs: number;
   reattachTimer?: ReturnType<typeof setTimeout>;
   sequence: number;
   sessionId: string;
   starting?: Promise<void>;
   stop?: () => Promise<void>;
+  wireFrames: number;
   userId: string;
 };
 
@@ -44,7 +51,7 @@ type BrowserPreviewWebSocketState = {
   streams: Map<string, BrowserPreviewStream>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 10;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 11;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
@@ -136,20 +143,23 @@ function flushPendingFrame(client: BrowserPreviewClient) {
   if (frame !== undefined) sendFrameToClient(client, frame);
 }
 
-function sendFrameToClient(client: BrowserPreviewClient, payload: Buffer) {
+function sendFrameToClient(client: BrowserPreviewClient, payload: Buffer): 'closed' | 'pending' | 'replaced' | 'sent' {
   if (client.frameBlocked) {
+    const replaced = client.pendingFrame !== undefined;
     client.pendingFrame = payload;
-    return;
+    return replaced ? 'replaced' : 'pending';
   }
   try {
-    if (!client.socket.destroyed && client.socket.write(payload)) return;
+    if (!client.socket.destroyed && client.socket.write(payload)) return 'sent';
   } catch {
     void removeClient(client);
-    return;
+    return 'closed';
   }
+  if (client.socket.destroyed) return 'closed';
   client.frameBlocked = true;
   client.pendingFrame = undefined;
   client.socket.once('drain', () => flushPendingFrame(client));
+  return 'sent';
 }
 
 function binaryFramePayload(frame: { data: string; [key: string]: unknown }, sequence: number) {
@@ -165,8 +175,49 @@ function broadcastText(stream: BrowserPreviewStream, payload: unknown) {
 }
 
 function broadcastFrame(stream: BrowserPreviewStream, frame: { data: string; [key: string]: unknown }) {
+  const payloadStartedAt = performance.now();
   const payload = binaryFramePayload(frame, ++stream.sequence);
-  for (const client of [...stream.clients]) sendFrameToClient(client, payload);
+  stream.payloadBuildMs += performance.now() - payloadStartedAt;
+  let recipients = 0;
+  for (const client of [...stream.clients]) {
+    const result = sendFrameToClient(client, payload);
+    if (result !== 'closed') recipients += 1;
+    if (result === 'replaced') stream.backpressureDrops += 1;
+  }
+  stream.wireFrames += 1;
+  stream.networkBytes += payload.length * recipients;
+}
+
+function stopStreamMetrics(stream: BrowserPreviewStream) {
+  if (stream.metricsTimer) clearInterval(stream.metricsTimer);
+  stream.metricsTimer = undefined;
+  stream.metrics = undefined;
+}
+
+function startStreamMetrics(stream: BrowserPreviewStream, metrics: () => BrowserPreviewFramePumpMetrics) {
+  stopStreamMetrics(stream);
+  stream.metrics = metrics;
+  stream.metricsTimer = setInterval(() => {
+    const pumpMetrics = stream.metrics?.();
+    const elapsedSeconds = Math.max(0.001, pumpMetrics?.elapsedSeconds || 0.001);
+    broadcastText(stream, {
+      type: 'frameHeartbeat',
+      sequence: stream.sequence,
+      time: new Date().toISOString(),
+      metrics: {
+        ...pumpMetrics,
+        backpressureDrops: stream.backpressureDrops,
+        duplicateFrames: 0,
+        networkBytes: stream.networkBytes,
+        networkBytesPerSecond: stream.networkBytes / elapsedSeconds,
+        payloadBuildMs: stream.payloadBuildMs,
+        payloadBuildMsPerFrame: stream.wireFrames ? stream.payloadBuildMs / stream.wireFrames : 0,
+        pendingClientFrames: [...stream.clients].filter((client) => client.pendingFrame !== undefined).length,
+        wireFrames: stream.wireFrames,
+      },
+    });
+  }, 1_000);
+  stream.metricsTimer.unref?.();
 }
 
 function readLiveInput(value: unknown): BrowserLiveInput | undefined {
@@ -384,6 +435,7 @@ async function attachStream(stream: BrowserPreviewStream) {
         return;
       }
       stream.stop = handle.stop;
+      startStreamMetrics(stream, handle.metrics);
       broadcastText(stream, { type: 'ready', sessionId });
     } catch (error) {
       broadcastText(stream, {
@@ -404,6 +456,7 @@ async function restartStream(stream: BrowserPreviewStream) {
   await stream.starting?.catch(() => undefined);
   const stop = stream.stop;
   stream.stop = undefined;
+  stopStreamMetrics(stream);
   await stop?.().catch(() => undefined);
   if (stream.clients.size > 0) await attachStream(stream);
 }
@@ -415,6 +468,7 @@ async function stopStream(stream: BrowserPreviewStream) {
   await stream.starting?.catch(() => undefined);
   const stop = stream.stop;
   stream.stop = undefined;
+  stopStreamMetrics(stream);
   await stop?.().catch(() => undefined);
   if (state().streams.get(stream.key) === stream) state().streams.delete(stream.key);
 }
@@ -423,12 +477,16 @@ function subscribeClient(client: BrowserPreviewClient) {
   let stream = state().streams.get(client.streamKey);
   if (!stream) {
     stream = {
+      backpressureDrops: 0,
       clients: new Set(),
       generation: 0,
       key: client.streamKey,
+      networkBytes: 0,
+      payloadBuildMs: 0,
       sequence: 0,
       sessionId: client.sessionId,
       userId: client.userId,
+      wireFrames: 0,
     };
     state().streams.set(client.streamKey, stream);
   }

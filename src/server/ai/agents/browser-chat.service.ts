@@ -17,6 +17,11 @@ import { generateSkillFromBrowserHistory } from '@/server/ai/agents/skill-genera
 import { browserChatAttachmentMetadata, isBrowserChatImageAttachment, readBrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachment-reader';
 import { browserChatFirstMessageTitle } from '@/server/ai/agents/browser-chat-message-title';
 import {
+  estimateRuntimeTextTokens,
+  runtimeContextCompressionThresholdRatio,
+  runtimeContextWindowTokens,
+} from '@/server/ai/agents/runtime-context-budget';
+import {
   alignBrowserChatMessageStepIndexes,
   attachBrowserChatStepOwners,
 } from '@/server/ai/agents/browser-chat-step-ownership';
@@ -54,7 +59,22 @@ import {
   readBrowserChatSessionSummaries,
   writeBrowserChatSessionDelta,
 } from '@/server/storage/sqlite-record-store';
+import {
+  browserChatHistoryLimit,
+  readBrowserChatLogsPage,
+  readBrowserChatMessagesPage,
+  readBrowserChatSessionHeader,
+  readBrowserChatSessionWindow,
+  readBrowserChatStepsPage,
+  type BrowserChatHistoryState,
+} from '@/server/storage/browser-chat-history-store';
 import { artifactPath as resolveArtifactPath } from '@/server/storage/paths';
+import {
+  deleteBrowserChatArtifacts,
+  enforceBrowserChatArtifactQuota,
+  scheduleBrowserChatArtifactMaintenance,
+} from '@/server/storage/browser-chat-artifact-lifecycle';
+import { scheduleSqliteMaintenance } from '@/server/storage/sqlite-maintenance';
 import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 import {
@@ -101,6 +121,9 @@ export type BrowserChatLogRecord = {
   messageId?: string;
   stepIndex?: number;
   elapsedMs?: number;
+  turnId?: string;
+  attemptId?: string;
+  toolCallId?: string;
 };
 
 export type BrowserChatConversationContext = {
@@ -148,6 +171,10 @@ export type BrowserChatSessionSnapshot = {
   logs: BrowserChatLogRecord[];
   conversationContext?: BrowserChatConversationContext;
   pendingToolConfirmation?: BrowserChatToolConfirmation;
+};
+
+export type BrowserChatSessionPage = BrowserChatSessionSnapshot & {
+  history: BrowserChatHistoryState;
 };
 
 type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
@@ -260,6 +287,11 @@ const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssist
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
 const persistenceCursors = browserChatRuntimeState.persistenceCursors;
+
+scheduleBrowserChatArtifactMaintenance(() => (
+  readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>().map((session) => session.id)
+));
+scheduleSqliteMaintenance();
 const runningHydrationGraceMs = 2 * 60 * 1000;
 const fullLogDetailsFlag = '__browserChatFullLogDetails';
 
@@ -1024,30 +1056,8 @@ function stableConversationMessages(messages: BrowserChatMessage[]) {
   ));
 }
 
-function estimateTextTokens(value: string) {
-  let ascii = 0;
-  let nonAscii = 0;
-  for (const char of value) {
-    if (char.charCodeAt(0) <= 0x7f) ascii += 1;
-    else nonAscii += 1;
-  }
-  return Math.ceil(ascii / 4 + nonAscii);
-}
-
-function contextWindowTokens() {
-  const raw = Number(process.env.AI_CONTEXT_WINDOW_TOKENS || process.env.AI_MODEL_CONTEXT_TOKENS || '');
-  if (Number.isFinite(raw) && raw > 1000) return Math.floor(raw);
-  return 256000;
-}
-
-function contextCompressionThresholdRatio() {
-  const raw = Number(process.env.AI_CONTEXT_COMPRESSION_THRESHOLD || process.env.AI_CONTEXT_COMPRESSION_RATIO || 0.7);
-  if (!Number.isFinite(raw) || raw <= 0) return 0.7;
-  return raw > 1 ? Math.min(0.98, raw / 100) : Math.min(0.98, raw);
-}
-
 function browserChatConversationTokenEstimate(messages: InteractiveBrowserTurnMessage[]) {
-  return estimateTextTokens(messages.map((message) => `${message.role}: ${message.content}`).join('\n\n'));
+  return estimateRuntimeTextTokens(messages.map((message) => `${message.role}: ${message.content}`).join('\n\n'));
 }
 
 function buildConversationSummaryPrompt(input: {
@@ -1147,7 +1157,9 @@ function browserChatTabs(session: BrowserChatSessionRecord): BrowserTabSnapshot[
   }
 }
 
-function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: boolean } = {}): BrowserChatSessionSnapshot {
+function sessionSnapshotHeader(
+  session: BrowserChatSessionRecord,
+): Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'> {
   finalizeIdleRunningAssistantMessages(session);
   return {
     id: session.id,
@@ -1167,43 +1179,30 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     updatedAt: session.updatedAt,
     closedAt: session.closedAt,
     error: session.error,
-    messages: [...session.messages],
-    steps: options.fullSteps ? [...session.steps] : session.steps.map(compactStepForClient),
     consoleErrors: [...session.consoleErrors],
     networkErrors: [...session.networkErrors],
-    logs: [...(session.logs || [])],
     conversationContext: normalizeConversationContext(session.conversationContext),
     pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
   };
 }
 
+function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: boolean } = {}): BrowserChatSessionSnapshot {
+  return {
+    ...sessionSnapshotHeader(session),
+    messages: [...session.messages],
+    steps: options.fullSteps ? [...session.steps] : session.steps.map(compactStepForClient),
+    logs: [...(session.logs || [])],
+  };
+}
+
 function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionSnapshot {
-  finalizeIdleRunningAssistantMessages(session);
   return summaryFromSnapshot({
-    id: session.id,
-    title: session.title,
-    userId: session.userId,
-    browserGroupId: session.browserGroupId,
-    targetUrl: session.targetUrl,
-    noVncUrl: browserChatNoVncUrl(session),
-    mode: session.mode,
-    safetyMode: normalizeSafetyMode(session.safetyMode),
-    modelProvider: normalizeModelProvider(session.modelProvider),
-    model: browserChatModelSettings(session.modelProvider, session.model).model,
-    status: session.status,
-    busy: session.busy,
-    tabs: browserChatTabs(session),
-    createdAt: session.createdAt,
-    updatedAt: session.updatedAt,
-    closedAt: session.closedAt,
-    error: session.error,
+    ...sessionSnapshotHeader(session),
     messages: [...session.messages],
     steps: [],
     consoleErrors: [],
     networkErrors: [],
     logs: [...(session.logs || [])],
-    conversationContext: normalizeConversationContext(session.conversationContext),
-    pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
   });
 }
 
@@ -1425,6 +1424,12 @@ function appendLog(
   const timestamp = now();
   const runningActivity = runningActivityFromLog(phase, message);
   const details = logDetailsFromUnknown(input.details);
+  const detailRecord = input.details && typeof input.details === 'object' && !Array.isArray(input.details)
+    ? input.details as Record<string, unknown>
+    : {};
+  const execution = detailRecord.execution && typeof detailRecord.execution === 'object' && !Array.isArray(detailRecord.execution)
+    ? detailRecord.execution as Record<string, unknown>
+    : {};
   const logMessageId = input.messageId === null ? undefined : input.messageId ?? session.activeAssistantMessageId;
   const stepIndex = phase.startsWith('subagent:') ? undefined : input.stepIndex;
   session.logs = trimBrowserChatLogs([
@@ -1438,6 +1443,9 @@ function appendLog(
       messageId: logMessageId,
       stepIndex,
       elapsedMs: input.elapsedMs,
+      turnId: typeof execution.turnId === 'string' ? execution.turnId : undefined,
+      attemptId: typeof execution.attemptId === 'string' ? execution.attemptId : undefined,
+      toolCallId: typeof execution.toolCallId === 'string' ? execution.toolCallId : undefined,
     },
   ]);
   if (logMessageId && logMessageId === session.activeAssistantMessageId) {
@@ -1827,7 +1835,7 @@ async function ensureConversationContextWithinThreshold(
   const historicalMessages = (currentUserIndex >= 0 ? stableMessages.slice(0, currentUserIndex) : stableMessages)
     .filter((message) => message.id !== session.activeAssistantMessageId);
   const currentConversation = conversationForPrompt(historicalMessages, session.conversationContext, undefined, session.userId);
-  const thresholdTokens = Math.floor(contextWindowTokens() * contextCompressionThresholdRatio());
+  const thresholdTokens = Math.floor(runtimeContextWindowTokens() * runtimeContextCompressionThresholdRatio());
   const estimatedTokens = browserChatConversationTokenEstimate(currentConversation);
   if (estimatedTokens <= thresholdTokens) return;
 
@@ -2079,6 +2087,89 @@ export function getBrowserChatSession(sessionId: string, userId?: string | numbe
   return session ? snapshot(session) : undefined;
 }
 
+export function getBrowserChatSessionPage(sessionId: string, userId?: string | number) {
+  const persisted = readBrowserChatSessionWindow<
+    BrowserChatSessionSnapshot,
+    BrowserChatMessage,
+    StepExecutionResult,
+    BrowserChatLogRecord
+  >(sessionId);
+  const live = sessions.get(sessionId);
+  if (!persisted && !live) return undefined;
+  const base = live ? {
+    ...sessionSnapshotHeader(live),
+    messages: [],
+    steps: [],
+    logs: [],
+  } : persisted as BrowserChatSessionPage;
+  if (!sessionBelongsToUser(base, userId)) return undefined;
+  if (!persisted) {
+    return {
+      ...base,
+      messages: live?.messages.slice(-80) || [],
+      steps: live?.steps.slice(-120).map(compactStepForClient) || [],
+      logs: live?.logs.slice(-200) || [],
+      history: {
+        messages: { hasMore: false },
+        steps: { hasMore: false },
+        logs: { hasMore: false },
+      },
+    } satisfies BrowserChatSessionPage;
+  }
+  return {
+    ...base,
+    messages: persisted.messages,
+    steps: persisted.steps.map(compactStepForClient),
+    logs: persisted.logs,
+    history: persisted.history,
+  } satisfies BrowserChatSessionPage;
+}
+
+export function getBrowserChatSessionHistory(
+  sessionId: string,
+  userId: string | number | undefined,
+  input: {
+    logCursor?: string;
+    logLimit?: number;
+    messageCursor?: string;
+    messageLimit?: number;
+    stepCursor?: string;
+    stepLimit?: number;
+  },
+) {
+  const session = sessions.get(sessionId) || readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
+  if (session && !sessionBelongsToUser(session, userId)) return undefined;
+  if (!session) return undefined;
+  const messages = input.messageCursor
+    ? readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
+        cursor: input.messageCursor,
+        limit: browserChatHistoryLimit(input.messageLimit, 80),
+      })
+    : undefined;
+  const steps = input.stepCursor
+    ? readBrowserChatStepsPage<StepExecutionResult>(sessionId, {
+        cursor: input.stepCursor,
+        limit: browserChatHistoryLimit(input.stepLimit, 120),
+      })
+    : undefined;
+  const logs = input.logCursor
+    ? readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, {
+        cursor: input.logCursor,
+        limit: browserChatHistoryLimit(input.logLimit, 200),
+      })
+    : undefined;
+  return {
+    ...(messages ? { messages: messages.items } : {}),
+    ...(steps ? { steps: steps.items.map(compactStepForClient) } : {}),
+    ...(logs ? { logs: logs.items } : {}),
+    history: {
+      ...(messages ? { messages: { cursor: messages.cursor, hasMore: messages.hasMore } } : {}),
+      ...(steps ? { steps: { cursor: steps.cursor, hasMore: steps.hasMore } } : {}),
+      ...(logs ? { logs: { cursor: logs.cursor, hasMore: logs.hasMore } } : {}),
+    },
+  };
+}
+
 export function setBrowserChatSessionGroup(sessionId: string, groupId: string, userId?: string | number) {
   const session = hydrateSession(sessionId);
   if (!session || !sessionBelongsToUser(session, userId)) return undefined;
@@ -2090,10 +2181,19 @@ export function setBrowserChatSessionGroup(sessionId: string, groupId: string, u
   return snapshot(session);
 }
 
-export function getBrowserChatSessionLogs(sessionId: string, userId?: string | number) {
-  const session = hydrateSession(sessionId);
-  if (!session || !sessionBelongsToUser(session, userId)) return undefined;
-  return [...(session.logs || [])];
+export function getBrowserChatSessionLogs(
+  sessionId: string,
+  userId?: string | number,
+  input: { cursor?: string; limit?: number; messageId?: string } = {},
+) {
+  const session = sessions.get(sessionId) || readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
+  if (session && !sessionBelongsToUser(session, userId)) return undefined;
+  if (!session) return undefined;
+  const page = readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, input);
+  return {
+    logs: page.items,
+    history: { cursor: page.cursor, hasMore: page.hasMore },
+  };
 }
 
 export function listBrowserChatSessions(input: { userId?: string | number } = {}) {
@@ -2186,6 +2286,7 @@ export async function deleteBrowserChatSession(sessionId: string, userId?: strin
     sessions.set(sessionId, removed.session);
     throw new Error('Browser chat session was removed from memory, but the database could not be updated.');
   }
+  await deleteBrowserChatArtifacts(sessionId).catch((error) => warnPersistFailure(error));
   return removed.deleted;
 }
 
@@ -2301,6 +2402,7 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
       for (const item of removed) sessions.set(item.deleted.id, item.session);
       throw new Error('Browser chat sessions were removed from memory, but the database could not be updated.');
     }
+    await Promise.all(removed.map((item) => deleteBrowserChatArtifacts(item.deleted.id).catch((error) => warnPersistFailure(error))));
     for (const item of removed) notifySessionUpdate(item.deleted.id);
   }
   return { deleted, requested: uniqueIds.length };
@@ -3077,6 +3179,7 @@ async function executeBrowserChatSubagentBatch(input: {
       const result = await executeInteractiveBrowserTurn({
         session: child,
         runId: `${session.id}_${task.id}`,
+        turnId: `${assistantMessageId}:subagent:${task.id}`,
         targetUrl: task.url || session.targetUrl || child.currentUrl() || 'about:blank',
         instruction: task.instruction,
         modelInstruction: [
@@ -3301,6 +3404,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
     const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
       session: binding.browser,
       runId: `${session.id}_${binding.id}_verification_resume`,
+      turnId: `${assistantMessageId}:subagent:${binding.id}:verification-resume`,
       targetUrl: binding.task.url || binding.browser.currentUrl() || session.targetUrl || 'about:blank',
       instruction: `${binding.task.instruction}\n\n[系统续跑] 用户已完成当前可见页面的人工校验，请立即读取最新页面并从暂停点继续。`,
       modelInstruction: [
@@ -3456,6 +3560,7 @@ async function runBrowserChatMessage(
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
+        turnId: assistantMessageId,
         targetUrl: session.targetUrl || 'about:blank',
         instruction: text,
         modelInstruction: modelText,
@@ -3573,6 +3678,7 @@ async function runBrowserChatMessage(
         },
       ]);
       persistAndNotify(session.id);
+      void enforceBrowserChatArtifactQuota(session.id).catch((error) => warnPersistFailure(error));
       void ensureConversationContextWithinThreshold(session).catch(() => undefined);
     } catch (error) {
       const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);

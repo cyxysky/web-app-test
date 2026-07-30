@@ -1,0 +1,87 @@
+type RuntimeContinuationState = {
+  blockers?: unknown;
+  completed?: unknown;
+  currentState?: unknown;
+  findings?: unknown;
+  lastAction?: unknown;
+  lastResult?: unknown;
+  nextStep?: unknown;
+  pageUnderstanding?: unknown;
+  userConstraints?: unknown;
+};
+
+function serializedMessageDelta(modelMessages: unknown) {
+  const record = modelMessages && typeof modelMessages === 'object' && !Array.isArray(modelMessages)
+    ? modelMessages as Record<string, unknown>
+    : {};
+  const messages = Array.isArray(record.messages) ? record.messages : [];
+  return JSON.stringify({ messages }, null, 2);
+}
+
+export function buildRuntimeContinuationSummaryPrompt(input: {
+  agentStep: number;
+  browserMode: string;
+  deltaModelMessages: unknown;
+  estimatedTokens: number;
+  goal: string;
+  previousSummary?: string;
+  runtimeState: RuntimeContinuationState;
+  stepIndex: number;
+  thresholdTokens: number;
+}) {
+  return [
+    'You are incrementally compressing a WebPilot browser-agent loop so the SAME user request can continue in a fresh model context.',
+    'Return concise JSON only. Do not use markdown.',
+    '',
+    'Required JSON shape:',
+    '{ "goal": string, "completed": string[], "currentPage": string, "confirmedFacts": string[], "negativeResults": string[], "failedAttempts": string[], "importantEvidence": string[], "openObservations": string[], "remaining": string[], "nextStep": string }',
+    '',
+    'Rules:',
+    '- Merge the previous summary with only the new unsummarized message delta below.',
+    '- Preserve stable Playwright locator intent and exact structured evidence when it materially affects the next action.',
+    '- Preserve current URL/page state, blockers, manual verification state, user constraints, completed searches, empty results, and failed attempts.',
+    '- The authoritative runtime state was produced after the latest completed tool call and wins on conflict.',
+    '- Do not include raw screenshots, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON unless essential.',
+    '- Write Chinese for user-facing summaries when possible.',
+    '',
+    `Goal: ${input.goal}`,
+    `Executor step: ${input.stepIndex}`,
+    `Agent step before compression: ${input.agentStep}`,
+    `Browser mode: ${input.browserMode}`,
+    `Estimated model-context tokens: ${input.estimatedTokens}/${input.thresholdTokens}`,
+    '',
+    `Previous continuation summary JSON:\n${input.previousSummary || '[none]'}`,
+    '',
+    `Authoritative current runtime state JSON:\n${JSON.stringify(input.runtimeState, null, 2)}`,
+    '',
+    `New unsummarized message delta JSON:\n${serializedMessageDelta(input.deltaModelMessages)}`,
+  ].join('\n');
+}
+
+export function fallbackRuntimeContinuationSummary(input: {
+  agentStep: number;
+  browserMode: string;
+  goal: string;
+  previousSummary?: string;
+  recentToolAttempts: string;
+  runtimeState: RuntimeContinuationState;
+  stepIndex: number;
+}) {
+  return JSON.stringify({
+    goal: input.goal,
+    browserMode: input.browserMode,
+    executorStep: input.stepIndex,
+    agentStepBeforeCompression: input.agentStep,
+    previousContinuationSummary: input.previousSummary || undefined,
+    completed: input.runtimeState.completed || [],
+    currentPage: input.runtimeState.currentState || input.runtimeState.pageUnderstanding || '',
+    importantEvidence: input.runtimeState.findings || [],
+    confirmedFacts: input.runtimeState.findings || [],
+    negativeResults: [],
+    failedAttempts: [],
+    openObservations: [],
+    remaining: input.runtimeState.nextStep ? [input.runtimeState.nextStep] : [],
+    nextStep: input.runtimeState.nextStep || 'Continue from the latest live browser state.',
+    recentToolAttempts: input.recentToolAttempts,
+  }, null, 2);
+}

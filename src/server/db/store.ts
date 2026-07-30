@@ -151,11 +151,9 @@ function normalizeSkillItems(items: string[] | undefined, limit: number) {
   return output;
 }
 
-function normalizeSkillContent(content?: Partial<SkillContent> & { cautions?: string[] }): SkillContent {
+function normalizeSkillContent(content?: Partial<SkillContent>): SkillContent {
   return {
-    workflow: normalizeSkillItems(content?.workflow, 8),
-    recovery: normalizeSkillItems(content?.recovery || content?.cautions, 3),
-    verification: normalizeSkillItems(content?.verification, 4),
+    details: String(content?.details || '').trim().slice(0, 30_000),
   };
 }
 

@@ -129,7 +129,7 @@ const boolOptions = [
 ];
 
 export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
-  { key: 'BROWSER_PREVIEW_FPS', label: '实时预览帧率', description: '实时预览每秒发送的画面帧数；可设置 1–60 FPS，帧率越高，服务器编码和网络传输压力越大。', tab: 'browser', defaultValue: '20', control: 'number', min: 1, max: 60, step: 1 },
+  { key: 'BROWSER_PREVIEW_FPS', label: '实时预览帧率', description: '实时预览新画面的最大发送帧率；可设置 1–60 FPS。页面静止时不会重复发送相同图片，只保留轻量心跳。', tab: 'browser', defaultValue: '20', control: 'number', min: 1, max: 60, step: 1 },
   { key: 'BROWSER_OUTPUT_PIXEL_RATIO', label: '输出像素倍率', description: '在不改变网页 CSS 视口和布局的前提下，提高实时预览与系统截图的输出像素密度；倍率越高，编码、内存和网络压力越大。', tab: 'browser', defaultValue: '1.5', control: 'number', min: 1, max: 2, step: 0.25 },
   { key: 'BROWSER_SCREENCAST_FORMAT', label: '实时预览图片格式', description: 'JPEG 体积较小，适合高帧率；PNG 无损且文字更清晰，但会显著增加编码与网络压力。', tab: 'browser', defaultValue: 'jpeg', control: 'select', options: [{ label: 'JPEG（高帧率推荐）', value: 'jpeg' }, { label: 'PNG（无损）', value: 'png' }] },
   { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
