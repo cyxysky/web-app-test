@@ -212,7 +212,7 @@ test('frozen snapshot cursors survive search, waiting, and asynchronous DOM chan
 
   const refreshed = await session.readDomObservationSnapshot({ mode: 'full' });
   assert.ok(refreshed.nextCursor);
-  const buttonUid = refreshed.content.match(/uid=(dom-\d+)[^\n]*Frozen row/)?.[1];
+  const buttonUid = refreshed.content.match(/uid=(dom-\d+-\d+)[^\n]*Frozen row/)?.[1];
   assert.ok(buttonUid, refreshed.content);
   const clicked = await session.mouse({ action: 'click', uid: buttonUid });
   assert.equal(clicked.ok, true, clicked.actual);
@@ -335,7 +335,7 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.equal(await page.locator('body').getAttribute('data-saved'), 'true');
 
   const domBaseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
-  const domSaveUid = domBaseline.content.match(/uid=(dom-\d+)[^\n]*id="save"/)?.[1];
+  const domSaveUid = domBaseline.content.match(/uid=(dom-\d+-\d+)[^\n]*id="save"/)?.[1];
   assert.ok(domSaveUid, domBaseline.content);
   const domSearch = await session.searchSnapshot({ query: 'Save', roles: ['button'] });
   assert.equal(domSearch.ok, true, domSearch.actual);
@@ -362,7 +362,39 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
   assert.match(replacedTarget.actual, /absent from the current DOM UID registry/);
 });
 
-test('DOM actions resolve exact semantic targets and reject stale or ambiguous contracts', async (context) => {
+test('DOM page runtime refreshes a stale injected snapshot implementation', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-runtime-revision-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <button id="runtime-target" type="button" onclick="document.body.dataset.clicked='true'">Open filters</button>
+  </body></html>`);
+
+  await page.evaluate(() => {
+    const runtime = (window as typeof window & {
+      __aiDomRuntime?: Record<string, (...args: unknown[]) => unknown>;
+    }).__aiDomRuntime;
+    if (!runtime) throw new Error('DOM runtime was not installed');
+    Object.assign(runtime, { version: 18 });
+    for (const method of ['visibleDomSnapshot', 'fullDomSnapshot']) {
+      if (runtime[method]) runtime[method] = () => undefined;
+    }
+  });
+  const frame = page.mainFrame();
+  const revisions = Reflect.get(session, 'browserRuntimeRevisionByFrame') as WeakMap<object, number>;
+  const installedRevisions = Reflect.get(session, 'browserRuntimeInstalledRevisionByFrame') as WeakMap<object, unknown>;
+  installedRevisions.set(frame, revisions.get(frame) || 0);
+
+  const snapshot = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  const targetUid = snapshot.content.match(/<button\s+uid=(dom-\d+-\d+)[^>]*id="runtime-target"/)?.[1];
+  assert.ok(targetUid, snapshot.content);
+  const clicked = await session.mouse({ action: 'click', target: { kind: 'ref', ref: targetUid } });
+  assert.equal(clicked.ok, true, clicked.actual);
+  assert.equal(await page.locator('body').getAttribute('data-clicked'), 'true');
+});
+
+test('DOM actions use current backend-bound refs without semantic fingerprint validation', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-uid-target-text-test' });
   context.after(async () => session.close());
   await session.start();
@@ -371,45 +403,68 @@ test('DOM actions resolve exact semantic targets and reject stale or ambiguous c
     <button id="target-110" type="button" onclick="document.body.dataset.clicked='110'">110</button>
     <button id="target-500" type="button" onclick="document.body.dataset.clicked='500'">500</button>
     <button id="icon-close" aria-label="关闭弹窗" type="button" onclick="document.body.dataset.clicked='close'"></button>
-    <button type="button">重复目标</button><button type="button">重复目标</button>
+    <a id="escaped-link" href="/issue/detail?source=ipd&amp;id=528" onclick="event.preventDefault();document.body.dataset.clicked='escaped-link'">原始需求 528</a>
+    <input id="keyword" aria-label="筛选条件" placeholder="请输入条件" />
   </body></html>`);
 
   const snapshot = await session.readDomObservationSnapshot({ mode: 'actionable' });
-  const target110Uid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="target-110"/)?.[1];
-  const target500Uid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="target-500"/)?.[1];
-  const iconCloseUid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="icon-close"/)?.[1];
-  const duplicateUid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*>重复目标<\/button>/)?.[1];
-  assert.ok(snapshot.snapshotId && target110Uid && target500Uid && iconCloseUid && duplicateUid, snapshot.content);
+  const target110Uid = snapshot.content.match(/<button\s+uid=(dom-\d+-\d+)[^>]*id="target-110"/)?.[1];
+  const target500Uid = snapshot.content.match(/<button\s+uid=(dom-\d+-\d+)[^>]*id="target-500"/)?.[1];
+  const iconCloseUid = snapshot.content.match(/<button\s+uid=(dom-\d+-\d+)[^>]*id="icon-close"/)?.[1];
+  const escapedLinkUid = snapshot.content.match(/<a\s+uid=(dom-\d+-\d+)[^>]*id="escaped-link"/)?.[1];
+  const keywordUid = snapshot.content.match(/<input\s+uid=(dom-\d+-\d+)[^>]*id="keyword"/)?.[1];
+  assert.ok(snapshot.snapshotId && target110Uid && target500Uid && iconCloseUid && escapedLinkUid && keywordUid, snapshot.content);
+  assert.match(snapshot.content, /href="\/issue\/detail\?source=ipd&amp;id=528"/);
 
-  const rejected = await session.mouse({
-    action: 'click',
-    snapshotId: 'dom-observation-stale',
-    target: { kind: 'semantic', attributes: { id: 'target-500' } },
-  });
+  Reflect.set(session, 'domVisibleObservationId', 'dom-observation-newer');
+  const rejected = await session.mouse({ action: 'click', target: { kind: 'ref', ref: target500Uid } });
   assert.equal(rejected.ok, false, rejected.actual);
   assert.match(rejected.actual, /STALE_TARGET/);
   assert.equal(await page.locator('body').getAttribute('data-clicked'), null);
+  Reflect.set(session, 'domVisibleObservationId', snapshot.snapshotId);
 
-  const ambiguous = await session.mouse({
-    action: 'click',
-    snapshotId: snapshot.snapshotId,
-    target: { kind: 'semantic', role: 'button', name: '重复目标' },
+  await page.locator('#target-500').evaluate((element) => {
+    element.id = 'target-500-updated';
+    element.textContent = '500 updated';
   });
-  assert.equal(ambiguous.ok, false, ambiguous.actual);
-  assert.match(ambiguous.actual, /AMBIGUOUS_TARGET/);
+  const refClicked = await session.mouse({
+    action: 'click',
+    target: { kind: 'ref', ref: target500Uid },
+  });
+  assert.equal(refClicked.ok, true, refClicked.actual);
+  assert.equal(await page.locator('body').getAttribute('data-clicked'), '500');
+
+  await page.locator('#escaped-link').evaluate((element) => element.setAttribute('href', '/issue/detail?source=ipd&id=529'));
+  const escapedLinkClicked = await session.mouse({
+    action: 'click',
+    target: { kind: 'ref', ref: escapedLinkUid },
+  });
+  assert.equal(escapedLinkClicked.ok, true, escapedLinkClicked.actual);
+  assert.equal(await page.locator('body').getAttribute('data-clicked'), 'escaped-link');
+
+  await page.locator('#keyword').evaluate((element) => {
+    element.setAttribute('aria-label', '筛选条件已更新');
+    element.setAttribute('placeholder', '输入新的条件');
+  });
+  const typed = await session.keyboard({
+    action: 'type',
+    target: { kind: 'ref', ref: keywordUid },
+    text: '需求',
+    replace: true,
+  });
+  assert.equal(typed.ok, true, typed.actual);
+  assert.equal(await page.locator('#keyword').inputValue(), '需求');
 
   const iconClicked = await session.mouse({
     action: 'click',
-    snapshotId: snapshot.snapshotId,
-    target: { kind: 'semantic', attributes: { id: 'icon-close' } },
+    target: { kind: 'ref', ref: iconCloseUid },
   });
   assert.equal(iconClicked.ok, true, iconClicked.actual);
   assert.equal(await page.locator('body').getAttribute('data-clicked'), 'close');
 
   const clicked = await session.mouse({
     action: 'click',
-    snapshotId: snapshot.snapshotId,
-    target: { kind: 'semantic', role: 'button', name: '110' },
+    target: { kind: 'ref', ref: target110Uid },
   });
   assert.equal(clicked.ok, true, clicked.actual);
   assert.equal(await page.locator('body').getAttribute('data-clicked'), '110');
@@ -426,22 +481,22 @@ test('DOM UID force click explicitly dismisses an overlay without activating the
   </body></html>`);
 
   const snapshot = await session.readDomObservationSnapshot({ mode: 'full' });
-  const targetUid = snapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="covered-target"/)?.[1];
+  const targetUid = snapshot.content.match(/<button\s+uid=(dom-\d+-\d+)[^>]*id="covered-target"/)?.[1];
   assert.ok(snapshot.snapshotId && targetUid, snapshot.content);
-  const target = { kind: 'semantic' as const, attributes: { id: 'covered-target' } };
+  const target = { kind: 'ref' as const, ref: targetUid };
 
-  const normalClick = await session.mouse({ action: 'click', snapshotId: snapshot.snapshotId, target });
+  const normalClick = await session.mouse({ action: 'click', target });
   assert.equal(normalClick.ok, false, normalClick.actual);
   assert.match(normalClick.actual, /force=true/);
   assert.equal(await page.locator('body').getAttribute('data-dismissed'), null);
 
-  const dismissed = await session.mouse({ action: 'click', snapshotId: snapshot.snapshotId, target, force: true });
+  const dismissed = await session.mouse({ action: 'click', target, force: true });
   assert.equal(dismissed.ok, true, dismissed.actual);
   assert.match(dismissed.actual, /explicit-forced-real-pointer/);
   assert.equal(await page.locator('body').getAttribute('data-dismissed'), 'true');
   assert.equal(await page.locator('body').getAttribute('data-target-clicked'), null, 'the covered target must not be force-clicked');
 
-  const clicked = await session.mouse({ action: 'click', snapshotId: snapshot.snapshotId, target });
+  const clicked = await session.mouse({ action: 'click', target });
   assert.equal(clicked.ok, true, clicked.actual);
   assert.equal(await page.locator('body').getAttribute('data-target-clicked'), 'true');
 
@@ -450,13 +505,12 @@ test('DOM UID force click explicitly dismisses an overlay without activating the
     <div class="floating-panel" style="position:fixed;inset:0;z-index:100;background:white"></div>
   </body></html>`);
   const blockedSnapshot = await session.readDomObservationSnapshot({ mode: 'full' });
-  const blockedUid = blockedSnapshot.content.match(/<button\s+uid=(dom-\d+)[^>]*id="blocked-target"/)?.[1];
+  const blockedUid = blockedSnapshot.content.match(/<button\s+uid=(dom-\d+-\d+)[^>]*id="blocked-target"/)?.[1];
   assert.ok(blockedSnapshot.snapshotId && blockedUid, blockedSnapshot.content);
   const blockedStartedAt = Date.now();
   const blocked = await session.mouse({
     action: 'click',
-    snapshotId: blockedSnapshot.snapshotId,
-    target: { kind: 'semantic', attributes: { id: 'blocked-target' } },
+    target: { kind: 'ref', ref: blockedUid },
   });
   assert.equal(blocked.ok, false, blocked.actual);
   assert.match(blocked.actual, /force=true/);
@@ -481,7 +535,7 @@ test('DOM baseline ranks modal duplicates and describes virtual lists', async (c
   assert.match(baseline.content, /actions="scroll,search"/);
   assert.match(baseline.content, /visible_range="\d+-\d+"/);
 
-  const modalUid = baseline.content.match(/uid=(dom-\d+)[^\n]*data-testid="modal-delete"/)?.[1];
+  const modalUid = baseline.content.match(/uid=(dom-\d+-\d+)[^\n]*data-testid="modal-delete"/)?.[1];
   assert.ok(modalUid, baseline.content);
   assert.ok(
     baseline.content.indexOf('data-testid="modal-delete"') < baseline.content.indexOf('data-testid="page-delete"'),
@@ -491,7 +545,7 @@ test('DOM baseline ranks modal duplicates and describes virtual lists', async (c
   assert.ok([...indexedReferences.values()].every((reference) => reference.searchText && reference.semanticRoles?.length), 'DOM references should be indexed when the baseline is created');
   const ranked = await session.searchSnapshot({ query: 'Delete', roles: ['button'] });
   assert.equal(ranked.ok, true, ranked.actual);
-  assert.equal(ranked.actual.match(/uid=(dom-\d+)/)?.[1], modalUid, ranked.actual);
+  assert.equal(ranked.actual.match(/uid=(dom-\d+-\d+)/)?.[1], modalUid, ranked.actual);
 });
 
 test('searchSnapshot is a pure frozen-baseline read and never scrolls virtual lists', async (context) => {
@@ -518,6 +572,62 @@ test('searchSnapshot is a pure frozen-baseline read and never scrolls virtual li
   assert.match(missing.actual, /returned 0 result/);
   const scrollAfterMissingSearch = await page.locator('#virtual-results').evaluate((element) => element.scrollTop);
   assert.ok(Math.abs(scrollAfterMissingSearch - scrollBeforeMissingSearch) <= 1, `${scrollBeforeMissingSearch} -> ${scrollAfterMissingSearch}`);
+});
+
+test('selectOption scans a virtual list in the backend and clicks the exact mounted match', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'virtual-list-select-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <div id="virtual-options" aria-label="Virtual options" style="height:120px;overflow-y:auto;border:1px solid black">
+      <div id="virtual-before"></div>
+      <div id="virtual-window"></div>
+      <div id="virtual-after"></div>
+    </div>
+  </body></html>`);
+  await page.evaluate(() => {
+    const list = document.querySelector<HTMLElement>('#virtual-options')!;
+    const before = document.querySelector<HTMLElement>('#virtual-before')!;
+    const windowElement = document.querySelector<HTMLElement>('#virtual-window')!;
+    const after = document.querySelector<HTMLElement>('#virtual-after')!;
+    const total = 80;
+    const rowHeight = 30;
+    const windowSize = 5;
+    const render = () => {
+      const first = Math.min(total - windowSize, Math.max(0, Math.floor(list.scrollTop / rowHeight)));
+      before.style.height = `${first * rowHeight}px`;
+      after.style.height = `${Math.max(0, total - first - windowSize) * rowHeight}px`;
+      const fragment = document.createDocumentFragment();
+      for (let index = first; index < Math.min(total, first + windowSize); index += 1) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.style.cssText = `display:block;height:${rowHeight}px;width:220px`;
+        button.textContent = `Virtual option ${index + 1}`;
+        button.addEventListener('click', () => {
+          document.body.dataset.virtualSelected = String(index + 1);
+        });
+        fragment.append(button);
+      }
+      windowElement.replaceChildren(fragment);
+    };
+    list.addEventListener('scroll', render);
+    render();
+  });
+
+  const baseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
+  const listUid = baseline.content.match(/<div\s+uid=(dom-\d+-\d+)[^>]*id="virtual-options"[^>]*virtualized="possible"/)?.[1];
+  assert.ok(listUid, baseline.content);
+  assert.doesNotMatch(baseline.content, /Virtual option 63/);
+
+  const selected = await session.selectOption({
+    target: { kind: 'ref', ref: listUid },
+    label: 'Virtual option 63',
+  });
+  assert.equal(selected.ok, true, selected.actual);
+  assert.match(selected.actual, /Selected virtual-list option/);
+  assert.equal(await page.locator('body').getAttribute('data-virtual-selected'), '63');
+  assert.ok(await page.locator('#virtual-options').evaluate((element) => element.scrollTop > 0));
 });
 
 test('searchSnapshot tag returns every matching element from the frozen full DOM', async (context) => {
@@ -566,6 +676,85 @@ test('DOM mutation deltas coalesce repeated attributes and promote nested text c
   assert.match(labelUpdates[0], />After label<\/button>/);
 });
 
+test('post-action domChanges includes every mounted rendered option even outside a scroll viewport', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-mounted-scroll-options-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent('<!doctype html><html><body><button id="open-options" type="button">Open options</button></body></html>');
+  await page.locator('#open-options').evaluate((button) => {
+    button.addEventListener('click', () => {
+      const panel = document.createElement('div');
+      panel.id = 'mounted-options';
+      panel.style.cssText = 'position:fixed;left:20px;top:60px;width:240px;height:90px;overflow-y:auto;background:white';
+      for (let index = 1; index <= 30; index += 1) {
+        const option = document.createElement('button');
+        option.type = 'button';
+        option.style.cssText = 'display:block;width:220px;height:30px';
+        option.textContent = `Mounted option ${index}`;
+        option.addEventListener('click', () => {
+          document.body.dataset.mountedSelected = String(index);
+        });
+        panel.append(option);
+      }
+      const hidden = document.createElement('div');
+      hidden.style.display = 'none';
+      const hiddenOption = document.createElement('button');
+      hiddenOption.textContent = 'Hidden mounted option';
+      hidden.append(hiddenOption);
+      panel.append(hidden);
+      document.body.append(panel);
+    });
+  });
+
+  const baseline = await session.readDomObservationSnapshot({ mode: 'full' });
+  const openUid = baseline.content.match(/<button\s+uid=(dom-\d+-\d+)[^>]*id="open-options"/)?.[1];
+  assert.ok(openUid, baseline.content);
+  const opened = await session.mouse({ action: 'click', target: { kind: 'ref', ref: openUid } });
+  assert.equal(opened.ok, true, opened.actual);
+  const added = opened.domChanges?.added.join('\n') || '';
+  const lastOptionUid = added.match(/<button\s+uid=(dom-\d+-\d+)[^>]*>Mounted option 30<\/button>/)?.[1];
+  assert.ok(lastOptionUid, added);
+  assert.doesNotMatch(added, /Hidden mounted option/);
+  assert.doesNotMatch(added, /scroll_required/);
+
+  const selected = await session.mouse({ action: 'click', target: { kind: 'ref', ref: lastOptionUid } });
+  assert.equal(selected.ok, true, selected.actual);
+  assert.equal(await page.locator('body').getAttribute('data-mounted-selected'), '30');
+  assert.ok(await page.locator('#mounted-options').evaluate((element) => element.scrollTop > 0));
+});
+
+test('fresh DOM captures use a new UID epoch and reset the local sequence', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-uid-epoch-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html><html><body>
+    <button id="epoch-target" type="button" onclick="document.body.dataset.epochClicked='true'">Epoch target</button>
+  </body></html>`);
+
+  const first = await session.readDomObservationSnapshot({ mode: 'full' });
+  const firstIds = [...first.content.matchAll(/\buid=(dom-(\d+)-(\d+))\b/g)];
+  const firstTarget = first.content.match(/<button\s+uid=(dom-\d+-\d+)[^>]*id="epoch-target"/)?.[1];
+  assert.ok(firstTarget && firstIds.length, first.content);
+  assert.equal(Math.min(...firstIds.map((match) => Number(match[3]))), 1);
+
+  const second = await session.readDomObservationSnapshot({ mode: 'full' });
+  const secondIds = [...second.content.matchAll(/\buid=(dom-(\d+)-(\d+))\b/g)];
+  const secondTarget = second.content.match(/<button\s+uid=(dom-\d+-\d+)[^>]*id="epoch-target"/)?.[1];
+  assert.ok(secondTarget && secondIds.length, second.content);
+  assert.notEqual(secondIds[0][2], firstIds[0][2]);
+  assert.equal(Math.min(...secondIds.map((match) => Number(match[3]))), 1);
+  assert.notEqual(secondTarget, firstTarget);
+
+  const stale = await session.mouse({ action: 'click', target: { kind: 'ref', ref: firstTarget } });
+  assert.equal(stale.ok, false, stale.actual);
+  assert.match(stale.actual, /STALE_TARGET/);
+  const current = await session.mouse({ action: 'click', target: { kind: 'ref', ref: secondTarget } });
+  assert.equal(current.ok, true, current.actual);
+  assert.equal(await page.locator('body').getAttribute('data-epoch-clicked'), 'true');
+});
+
 test('DOM mutation deltas expose non-actionable semantic context and page diagnostics under extra', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-mutation-extra-test' });
   context.after(async () => session.close());
@@ -594,7 +783,7 @@ test('post-action form validation errors are elevated instead of remaining only 
     <button id="submit" type="button" onclick="document.body.insertAdjacentHTML('beforeend', '<div class=&quot;error&quot;>Link is required</div>')">Submit</button>
   </body></html>`);
   const baseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
-  const uid = baseline.content.match(/uid=(dom-\d+)[^\n]*>Submit<\/button>/)?.[1];
+  const uid = baseline.content.match(/uid=(dom-\d+-\d+)[^\n]*>Submit<\/button>/)?.[1];
   assert.ok(uid, baseline.content);
 
   const result = await session.mouse({ action: 'click', uid });
@@ -621,7 +810,7 @@ test('SVG parents and children with independent click boundaries remain separate
   const baseline = await session.readDomObservationSnapshot({ mode: 'actionable' });
   assert.match(baseline.content, /<svg\b[^>]*action_scope="container"/);
   assert.match(baseline.content, /<rect\b[^>]*action_scope="own"/);
-  const liveUids = baseline.content.match(/uid=dom-\d+/g) || [];
+  const liveUids = baseline.content.match(/uid=dom-\d+-\d+/g) || [];
   assert.equal(liveUids.length >= 2, true, baseline.content);
 
   const semantic = (await readWholeView(session, 'actionable', true)).map((slice) => slice.content).join('\n');
@@ -906,16 +1095,19 @@ test('native select options and rich-text iframe entry use explicit DOM-baseline
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
   await page.goto(`data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html><html><body>
-    <select id="category" aria-label="故障分类"><option value="">无</option><option value="15002">新增需求或本身的bug</option><option value="15004">其他问题</option></select>
+    <select id="category" aria-label="故障分类"><option value="">无</option><option value="15002">新增需求或本身的bug</option><option value="15004">其他问题</option>${Array.from({ length: 75 }, (_, index) => `<option value="bulk-${index + 1}">批量选项 ${index + 1}</option>`).join('')}</select>
     <iframe title="Rich Text Area" srcdoc="<!doctype html><body contenteditable='true' aria-label='Rich Text Area'></body>"></iframe>
   </body></html>`)} `);
   const actionable = await session.readDomObservationSnapshot({ mode: 'actionable' });
   const selectUid = actionable.content.match(/<select\s+uid=(dom-\S+)[^>]*options="[^"]*15002=新增需求或本身的bug/)?.[1];
   assert.ok(selectUid, actionable.content);
+  assert.match(actionable.content, /option_count="78"/);
+  assert.match(actionable.content, /bulk-75=批量选项 75/);
   const clicked = await session.mouse({ action: 'click', uid: selectUid });
   assert.equal(clicked.ok, true, clicked.actual);
   assert.match(clicked.actual, /Use selectOption .* exact option value or full label/);
   assert.match(clicked.domChanges?.updated.join('\n') || '', /<select\s+uid=dom-\S+[^>]*options="[^"]*15002=/);
+  assert.match(clicked.domChanges?.updated.join('\n') || '', /bulk-75=批量选项 75/);
   const rejectedKeyboardSelection = await session.keyboard({ action: 'press', key: 'ArrowDown' });
   assert.equal(rejectedKeyboardSelection.ok, false, rejectedKeyboardSelection.actual);
   assert.match(rejectedKeyboardSelection.actual, /Use selectOption/);

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { createPortal } from 'react-dom';
-import { ArrowLeft, FileJson2, FolderOpen, KeyRound, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
+import { ArrowLeft, FolderOpen, KeyRound, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { SkillsManager } from '@/components/SkillsManager';
 import {
@@ -77,21 +77,6 @@ type PersonalMemoryDraft = {
 
 type PersonalMemoryEditorMode = 'create' | 'edit' | null;
 
-type AccessibilitySnapshotBrowserStatus = {
-  ok: boolean;
-  running: boolean;
-  currentUrl?: string;
-  error?: string;
-  lastExport?: {
-    fileName?: string;
-    path?: string;
-    url?: string;
-    downloadUrl?: string;
-    bytes?: number;
-    createdAt?: string;
-  };
-};
-
 type SystemBridge = {
   cancelDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
   chooseDownloadDirectory?: (input?: { defaultPath?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
@@ -119,11 +104,10 @@ export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> 
   { id: 'runtime', label: '运行控制' },
   { id: 'memory', label: '个性化记忆' },
   { id: 'accounts', label: '登录账号' },
-  { id: 'dom-test', label: '页面快照测试' },
   { id: 'debug', label: '调试与高级' },
 ];
 
-const administratorOnlySettingsTabs = new Set<SettingsTab>(['model', 'browser', 'runtime', 'dom-test', 'debug']);
+const administratorOnlySettingsTabs = new Set<SettingsTab>(['model', 'browser', 'runtime', 'debug']);
 
 export function environmentSettingsTabsForUser(userId?: string) {
   if ((userId || '').trim() === '0') return environmentSettingsTabs;
@@ -290,8 +274,6 @@ export function EnvironmentSettings({
   const [savingPersonalMemory, setSavingPersonalMemory] = useState(false);
   const [updatingPersonalMemoryId, setUpdatingPersonalMemoryId] = useState('');
   const [deletingPersonalMemoryId, setDeletingPersonalMemoryId] = useState('');
-  const [openingDomTestBrowser, setOpeningDomTestBrowser] = useState(false);
-  const [domTestBrowserStatus, setDomTestBrowserStatus] = useState<AccessibilitySnapshotBrowserStatus | null>(null);
   const [deletePersonalMemoryTarget, setDeletePersonalMemoryTarget] = useState<PersonalMemoryItem | null>(null);
   const [deletePersonalMemoryError, setDeletePersonalMemoryError] = useState('');
   const [hasDirectoryPicker, setHasDirectoryPicker] = useState(false);
@@ -319,26 +301,6 @@ export function EnvironmentSettings({
   useEffect(() => {
     setPortalReady(true);
   }, []);
-
-  useEffect(() => {
-    if (activeTab !== 'dom-test') return undefined;
-    let active = true;
-    const refresh = async () => {
-      try {
-        const response = await fetch(withWebPilotBasePath('/api/debug/dom-observation-browser'), { cache: 'no-store' });
-        const status = await readApiJson<AccessibilitySnapshotBrowserStatus>(response, '读取页面快照测试浏览器状态失败');
-        if (active) setDomTestBrowserStatus(status);
-      } catch (error) {
-        if (active) setDomTestBrowserStatus({ ok: false, running: false, error: error instanceof Error ? error.message : String(error) });
-      }
-    };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 3000);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [activeTab]);
 
   useEffect(() => {
     if (!personalMemoryEditorMode && !deletePersonalMemoryTarget && !deleteLoginAccountTarget) return undefined;
@@ -402,19 +364,6 @@ export function EnvironmentSettings({
     } finally {
       setSavingEnv(false);
       stopGlobalLoading();
-    }
-  }
-
-  async function openDomTestBrowser() {
-    setOpeningDomTestBrowser(true);
-    try {
-      const response = await fetch(withWebPilotBasePath('/api/debug/dom-observation-browser'), { method: 'POST' });
-      const status = await readApiJson<AccessibilitySnapshotBrowserStatus>(response, '打开页面快照测试浏览器失败');
-      setDomTestBrowserStatus(status);
-    } catch (error) {
-      setDomTestBrowserStatus({ ok: false, running: false, error: error instanceof Error ? error.message : String(error) });
-    } finally {
-      setOpeningDomTestBrowser(false);
     }
   }
 
@@ -582,12 +531,12 @@ export function EnvironmentSettings({
     setLoadingLoginAccounts(true);
     try {
       const response = await fetch(withWebPilotBasePath(`/api/login-accounts?userId=${encodeURIComponent(normalizedUserId)}`), { cache: 'no-store' });
-      const data = await readApiJson<{ accounts?: LoginAccountMetadata[] }>(response, '读取登录账号失败');
+      const data = await readApiJson<{ accounts?: LoginAccountMetadata[] }>(response, t('读取登录账号失败'));
       setLoginAccounts(Array.isArray(data.accounts) ? data.accounts : []);
     } finally {
       setLoadingLoginAccounts(false);
     }
-  }, [normalizedUserId]);
+  }, [normalizedUserId, t]);
 
   useEffect(() => {
     if (activeTab !== 'accounts') return;
@@ -887,8 +836,8 @@ export function EnvironmentSettings({
             </label>
             <div className="resource-sharing-field wide">
               <div>
-                <strong>所有 ID 共享</strong>
-                <small>其他 ID 可以使用此记忆，但只有创建 ID {personalMemoryDraft.userId || normalizedUserId} 可以编辑或删除</small>
+                <strong>{t('所有 ID 共享')}</strong>
+                <small>{t('其他 ID 可以使用此记忆，但只有创建 ID {id} 可以编辑或删除', { id: personalMemoryDraft.userId || normalizedUserId })}</small>
               </div>
               <button
                 aria-pressed={personalMemoryDraft.shared}
@@ -1034,8 +983,8 @@ export function EnvironmentSettings({
               item.type,
               item.status,
               personalMemoryTypeLabel(item.type),
-              item.status === 'active' ? '启用' : '停用',
-              item.shared ? '所有 ID 共享' : '仅创建 ID',
+              t(item.status === 'active' ? '启用' : '停用'),
+              item.shared ? t('所有 ID 共享') : t('仅创建 ID'),
               item.userId,
               ...(item.aliases || []),
             ]}
@@ -1047,7 +996,7 @@ export function EnvironmentSettings({
                   <div className="personal-memory-meta">
                     <span>{t(personalMemoryTypeLabel(item.type))}</span>
                     <span className={`personal-memory-status ${item.status}`}>{item.status === 'active' ? t('启用') : t('停用')}</span>
-                    {item.shared ? <span className="resource-shared-badge">{item.userId === normalizedUserId ? '所有 ID 共享' : `ID ${item.userId} 共享`}</span> : null}
+                    {item.shared ? <span className="resource-shared-badge">{item.userId === normalizedUserId ? t('所有 ID 共享') : t('ID {id} 共享', { id: item.userId })}</span> : null}
                     {item.useCount ? <span>{t('使用 {count} 次', { count: item.useCount })}</span> : null}
                   </div>
                   <div className="personal-memory-copy">
@@ -1093,7 +1042,7 @@ export function EnvironmentSettings({
                   >
                     {deletingPersonalMemoryId === item.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
                   </button>
-                  </> : <span className="resource-readonly-label">只读</span>}
+                  </> : <span className="resource-readonly-label">{t('只读')}</span>}
                 </div>
               </article>
             )}
@@ -1112,26 +1061,26 @@ export function EnvironmentSettings({
       <section className="login-account-settings">
         <div className="settings-section-head">
           <div>
-            <h2>登录账号</h2>
-            <span>{loginAccounts.length} 个按域名保存的账号；密码只在后台解密并通过短期安全引用使用</span>
+            <h2>{t('登录账号')}</h2>
+            <span>{t('{count} 个按域名保存的账号；密码只在后台解密并通过短期安全引用使用', { count: loginAccounts.length })}</span>
           </div>
           <div className="personal-memory-head-actions">
             <DataTransferButtons kind="credentials" onImported={loadLoginAccounts} userId={normalizedUserId} />
             <button className="ui-button ui-icon-button" disabled={loadingLoginAccounts} onClick={() => void loadLoginAccounts()} type="button">
               <RefreshCw size={15} />
-              刷新
+              {t('刷新')}
             </button>
             <button className="ui-button ui-icon-button" onClick={() => setLoginAccountEditor('create')} type="button">
               <Plus size={15} />
-              新增账号
+              {t('新增账号')}
             </button>
           </div>
         </div>
 
         {loadingLoginAccounts ? (
-          <div className="settings-loading-panel compact" role="status" aria-live="polite">
+          <div className="settings-loading-panel compact" role="status" aria-live="polite" aria-label={t('正在读取登录账号')}>
             <LiquidGlassLoader className="ui-liquid-glass-loader--compact" />
-            <div><h2>正在读取登录账号</h2></div>
+            <div><h2>{t('正在读取登录账号')}</h2></div>
           </div>
         ) : (
           <DomainGroupedAccordion
@@ -1146,8 +1095,8 @@ export function EnvironmentSettings({
               account.domain,
               account.loginUrl || '',
               account.status,
-              account.status === 'active' ? '可用于目标测试' : '已停用',
-              account.shared ? '所有 ID 共享' : '仅创建 ID',
+              t(account.status === 'active' ? '可用于目标测试' : '已停用'),
+              account.shared ? t('所有 ID 共享') : t('仅创建 ID'),
               account.userId,
             ]}
             getUpdatedAt={(account) => account.updatedAt}
@@ -1158,24 +1107,28 @@ export function EnvironmentSettings({
                 <div className="login-account-item-main">
                   <strong>{account.label || account.username}</strong>
                   <span>{account.username} · {account.domain}</span>
-                  <small>{account.status === 'active' ? '可用于目标测试' : '已停用'}{account.shared ? ` · ${account.userId === normalizedUserId ? '所有 ID 共享' : `由 ID ${account.userId} 共享`}` : ''}{account.useCount ? ` · 已使用 ${account.useCount} 次` : ''}</small>
+                  <small>
+                    {t(account.status === 'active' ? '可用于目标测试' : '已停用')}
+                    {account.shared ? ` · ${account.userId === normalizedUserId ? t('所有 ID 共享') : t('由 ID {id} 共享', { id: account.userId })}` : ''}
+                    {account.useCount ? ` · ${t('已使用 {count} 次', { count: account.useCount })}` : ''}
+                  </small>
                 </div>
                 <div className="login-account-item-actions">
                   {account.userId === normalizedUserId ? <>
-                  <button aria-label="编辑登录账号" className="settings-model-row-button" onClick={() => setLoginAccountEditor(account)} title="编辑登录账号" type="button">
+                  <button aria-label={t('编辑登录账号')} className="settings-model-row-button" onClick={() => setLoginAccountEditor(account)} title={t('编辑登录账号')} type="button">
                     <PencilLine size={15} />
                   </button>
                   <button
-                    aria-label="删除登录账号"
+                    aria-label={t('删除登录账号')}
                     className="settings-model-row-button danger"
                     disabled={deletingLoginAccountId === account.id}
                     onClick={() => requestDeleteLoginAccount(account)}
-                    title="删除登录账号"
+                    title={t('删除登录账号')}
                     type="button"
                   >
                     {deletingLoginAccountId === account.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
                   </button>
-                  </> : <span className="resource-readonly-label">只读</span>}
+                  </> : <span className="resource-readonly-label">{t('只读')}</span>}
                 </div>
               </article>
             )}
@@ -1204,7 +1157,7 @@ export function EnvironmentSettings({
   const activeProviderDefaultModel = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
-    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && activeTab !== 'dom-test' && definition?.tab === activeTab);
+    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab);
 
   return (
     <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
@@ -1424,53 +1377,7 @@ export function EnvironmentSettings({
 
           {activeTab === 'accounts' ? renderLoginAccountsPanel() : null}
 
-          {activeTab === 'dom-test' ? (
-            <section>
-              <div className="settings-section-head">
-                <div>
-                  <h2>{t('页面快照测试')}</h2>
-                  <span>{t('在独立测试浏览器中检查 Chromium DOMSnapshot、局部无障碍语义、可操作节点和全部 iframe 的实际采集结果。')}</span>
-                </div>
-              </div>
-              <div className="settings-card">
-                <div className="settings-row">
-                  <div>
-                    <strong>{t('测试浏览器')}</strong>
-                    <span>{t('打开浏览器后访问目标页面，点击右上角“导出页面快照”。actionable、full、text 三种视图会按每段最多 10000 字符写入同一个 JSON 文件。')}</span>
-                  </div>
-                  <button className="ui-button ui-button--neutral" disabled={openingDomTestBrowser} onClick={() => void openDomTestBrowser()} type="button">
-                    {openingDomTestBrowser ? <Loader2 className="spin" size={15} /> : <FileJson2 size={15} />}
-                    {t(domTestBrowserStatus?.running ? '显示测试浏览器' : '打开测试浏览器')}
-                  </button>
-                </div>
-                <div className="settings-row">
-                  <div>
-                    <strong>{t('运行状态')}</strong>
-                    <span data-i18n-skip>
-                      {domTestBrowserStatus?.error
-                        || (domTestBrowserStatus?.running ? `浏览器已打开${domTestBrowserStatus.currentUrl ? ` · ${domTestBrowserStatus.currentUrl}` : ''}` : '浏览器未打开')}
-                    </span>
-                  </div>
-                  {domTestBrowserStatus?.lastExport ? (
-                    <a className="ui-button ui-button--neutral" href={domTestBrowserStatus.lastExport.downloadUrl || domTestBrowserStatus.lastExport.url}>
-                      <FileJson2 size={15} />
-                      {domTestBrowserStatus.lastExport.fileName || t('最近导出')}
-                    </a>
-                  ) : null}
-                </div>
-                {domTestBrowserStatus?.lastExport?.path ? (
-                  <div className="settings-row">
-                    <div>
-                      <strong>{t('最近导出路径')}</strong>
-                      <span data-i18n-skip>{domTestBrowserStatus.lastExport.path}</span>
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            </section>
-          ) : null}
-
-          {activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && activeTab !== 'dom-test' ? (
+          {activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' ? (
             <section>
               <div className="settings-section-head">
                 <div>

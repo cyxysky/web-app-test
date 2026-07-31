@@ -529,7 +529,6 @@ function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'skills') return <Braces size={15} />;
   if (tab === 'memory') return <Brain size={15} />;
   if (tab === 'accounts') return <KeyRound size={15} />;
-  if (tab === 'dom-test') return <ScanSearch size={15} />;
   if (tab === 'debug') return <Bug size={15} />;
   return <SlidersHorizontal size={15} />;
 }
@@ -7470,12 +7469,12 @@ export function BrowserChatWorkspace({
     if (activeView === 'settings') {
       return (
         <section className="browser-chat-sidebar-section browser-chat-settings-section">
-          <h2>设置</h2>
-          <nav className="browser-chat-subnav" aria-label="环境配置分类">
+          <h2>{t('设置')}</h2>
+          <nav className="browser-chat-subnav" aria-label={t('环境配置分类')}>
             {visibleSettingsTabs.map((tab) => (
-              <button aria-label={tab.label} className={activeSettingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={tab.label} type="button">
+              <button aria-label={t(tab.label)} className={activeSettingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={t(tab.label)} type="button">
                 <SettingsTabIcon tab={tab.id} />
-                <span>{tab.label}</span>
+                <span>{t(tab.label)}</span>
               </button>
             ))}
           </nav>

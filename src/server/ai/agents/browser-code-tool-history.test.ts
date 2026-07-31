@@ -62,7 +62,7 @@ test('older browserCode results are compacted while the latest result stays exac
   assert.ok(oldOutput.length < 4_000);
   assert.doesNotMatch(oldOutput, /x{100}/);
   assert.match(oldOutput, /"found":3/);
-  assert.match(oldOutput, /"addedCount":1/);
+  assert.doesNotMatch(oldOutput, /domChanges|addedCount/);
   assert.equal(latestOutput, latestActual);
   assert.equal(compacted[1], genericTool);
 });
@@ -70,6 +70,97 @@ test('older browserCode results are compacted while the latest result stays exac
 test('a single browserCode result is not rewritten', () => {
   const source = [browserCodeToolMessage('only', '{"ok":true}')];
   assert.equal(compactOlderBrowserCodeToolResults(source), source);
+});
+
+test('the latest operation evidence stays exact after a later read-only browserCode result', () => {
+  const oldOperation = browserCodeToolMessage('old-operation', JSON.stringify({
+    ok: true,
+    domChanges: {
+      epoch: 1,
+      added: ['<button>Old</button>'],
+      updated: [],
+      removed: [],
+      extra: { added: [], updated: [], errors: [], validationErrors: [] },
+      overflow: false,
+    },
+    axTree: '- button "Old"',
+  }));
+  const latestOperationActual = JSON.stringify({
+    ok: true,
+    domChanges: {
+      epoch: 2,
+      added: ['<button>Current</button>'],
+      updated: [],
+      removed: [],
+      extra: { added: [], updated: [], errors: [], validationErrors: [] },
+      overflow: false,
+    },
+    axTree: '- button "Current"',
+  });
+  const latestOperation = browserCodeToolMessage('latest-operation', latestOperationActual);
+  const readOnly = browserCodeToolMessage('read-only', JSON.stringify({
+    ok: true,
+    result: { url: 'https://example.test/current' },
+  }));
+
+  const compacted = compactOlderBrowserCodeToolResults([oldOperation, latestOperation, readOnly]);
+  const oldOutput = (compacted[0] as unknown as { content: Array<{ output: { value: { actual: string } } }> }).content[0].output.value.actual;
+  const latestOperationOutput = (compacted[1] as unknown as { content: Array<{ output: { value: { actual: string } } }> }).content[0].output.value.actual;
+  const latestOperationValue = JSON.parse(latestOperationOutput) as {
+    axTree?: string;
+    domChanges?: { added?: string[] };
+  };
+
+  assert.match(oldOutput, /historicalToolResult/);
+  assert.doesNotMatch(oldOutput, /button \\"Old\\"/);
+  assert.equal(latestOperationValue.axTree, '- button "Current"');
+  assert.deepEqual(latestOperationValue.domChanges?.added, ['<button>Current</button>']);
+  assert.equal(compacted[2], readOnly);
+});
+
+test('the latest top-level AX replaces an older nested AX in the same stored result', () => {
+  const source = [browserCodeToolMessage('operation', JSON.stringify({
+    ok: true,
+    result: [{
+      openTabs: [{ url: 'https://example.test' }],
+      domSnapshot: '[ax-tree]\n- button "Before"',
+    }],
+    axTree: '- button "After"',
+  }))];
+
+  const compacted = compactOlderBrowserCodeToolResults(source);
+  const output = (compacted[0] as unknown as { content: Array<{ output: { value: { actual: string } } }> }).content[0].output.value.actual;
+  const parsed = JSON.parse(output) as { axTree?: string; result?: Array<Record<string, unknown>> };
+
+  assert.equal(parsed.axTree, '- button "After"');
+  assert.equal(parsed.result?.[0]?.domSnapshot, undefined);
+  assert.doesNotMatch(output, /button \\"Before\\"/);
+});
+
+test('AX and domChanges retain their newest occurrences independently', () => {
+  const operation = browserCodeToolMessage('operation', JSON.stringify({
+    ok: true,
+    domChanges: {
+      epoch: 3,
+      added: ['<dialog>Current change</dialog>'],
+      updated: [],
+      removed: [],
+    },
+    axTree: '- dialog "Operation tree"',
+  }));
+  const laterInspection = browserCodeToolMessage('inspection', JSON.stringify({
+    ok: true,
+    result: { snapshot: '[ax-tree]\n- dialog "Latest tree"' },
+  }));
+
+  const compacted = compactOlderBrowserCodeToolResults([operation, laterInspection]);
+  const operationOutput = (compacted[0] as unknown as { content: Array<{ output: { value: { actual: string } } }> }).content[0].output.value.actual;
+  const inspectionOutput = (compacted[1] as unknown as { content: Array<{ output: { value: { actual: string } } }> }).content[0].output.value.actual;
+
+  assert.match(operationOutput, /Current change/);
+  assert.doesNotMatch(operationOutput, /Operation tree/);
+  assert.match(inspectionOutput, /Latest tree/);
+  assert.doesNotMatch(inspectionOutput, /domChanges/);
 });
 
 function domToolMessage(id: string, text: string): ModelMessage {
@@ -105,16 +196,8 @@ test('DOM mode retains only the latest full post-action DOM update', () => {
   const latestValue = (compacted[1] as unknown as { content: Array<{ output: { value: Record<string, unknown> } }> }).content[0].output.value;
 
   assert.equal(oldValue.actual, 'clicked old');
-  assert.deepEqual(oldValue.domChanges, {
-    epoch: 1,
-    addedCount: 1,
-    updatedCount: 0,
-    removedCount: 0,
-    validationErrors: [],
-    errors: [],
-    overflow: false,
-  });
-  assert.equal(oldValue.historicalDomUpdate, true);
+  assert.equal(oldValue.domChanges, undefined);
+  assert.equal(oldValue.historicalDomUpdate, undefined);
   assert.match(JSON.stringify(latestValue.domChanges), /latest-update/);
 });
 

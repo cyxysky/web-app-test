@@ -1,6 +1,6 @@
 import type { ModelProvider } from '@/server/ai/schemas/runtime.schema';
 
-export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'memory' | 'accounts' | 'dom-test' | 'debug';
+export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'memory' | 'accounts' | 'debug';
 
 export type ModelProviderDefinition = {
   value: ModelProvider;
@@ -23,7 +23,7 @@ export type RuntimeEnvDefinition = {
   key: string;
   label: string;
   description: string;
-  tab: Exclude<SettingsTab, 'general' | 'model' | 'skills' | 'memory' | 'accounts' | 'dom-test'>;
+  tab: Exclude<SettingsTab, 'general' | 'model' | 'skills' | 'memory' | 'accounts'>;
   defaultValue: string;
   control: 'boolean' | 'number' | 'select' | 'text' | 'secret' | 'textarea';
   min?: number;

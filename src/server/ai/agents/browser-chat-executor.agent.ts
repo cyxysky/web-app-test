@@ -41,6 +41,7 @@ import {
 import {
   buildRuntimeContinuationSummaryPrompt,
   fallbackRuntimeContinuationSummary,
+  sanitizeRuntimeContinuationSummary,
 } from './runtime-context-compression';
 import {
   isEffectiveToolTraceFailure,
@@ -166,7 +167,6 @@ const codexRuntimeObjectSchema = z.object({
     query: z.string().nullable().optional(),
     tag: z.string().nullable().optional(),
     roles: z.array(z.string()).nullable().optional(),
-    snapshotId: z.string().nullable().optional(),
     x_thousandth: z.number().nullable().optional(),
     y_thousandth: z.number().nullable().optional(),
     toTarget: browserElementTargetSchema.nullable().optional(),
@@ -437,6 +437,13 @@ function compactToolResultForModel(
   result: BrowserActionResult,
 ): BrowserActionResult {
   const modelResult = { ...result };
+  delete modelResult.snapshotId;
+  if (name === 'browserCode') delete modelResult.observation;
+  if (modelResult.domChanges) {
+    modelResult.domChanges = { ...modelResult.domChanges };
+    delete modelResult.domChanges.snapshotId;
+    if (name === 'browserCode') delete modelResult.domChanges.observation;
+  }
   delete modelResult.referenceImagePath;
   delete modelResult.referenceImagePaths;
   if (!modelResult.actual) return modelResult;
@@ -1198,7 +1205,7 @@ function makeBrowserTools(
   const sharedTools = {
     ...(mode === 'code' ? {
     browserCode: tool({
-      description: 'Execute one ordinary JavaScript cell against the real Playwright page/context in a persistent isolated Node-backed kernel. This is the primary browser inspection, screenshot, and operation entrypoint. Every result includes final page identity plus page/code console deltas; actual browser operations, navigation, and tab changes directly include DOM mode incremental domChanges, while pure reads include no automatic DOM content. Before every state-changing action, call page.domSnapshot() for the latest hierarchy and content, then use targeted Playwright or read-only DOM inspection as needed to identify a stable parent by data-testid, stable data-*, or unique exact href, locate the child inside it by role or exact text, filter visible candidates, and require count() === 1 before acting. Never use first/last/nth to bypass ambiguity. Use top-level await, nodeRepl.write(value) for compact JSON, and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks require the model to inspect a viewport screenshot returned by the previous cell; same-cell screenshot-and-click is rejected. When the prompt supplies a credential reference, credentialVault.fill(locator, ref) securely fills the real Playwright locator without returning the raw value. Locator actions have a 5000ms default timeout and navigation has a 30000ms default timeout; force: true and scripted DOM clicks are forbidden, and a failed operation ends only the current cell and preserves kernel bindings.',
+      description: 'Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() explicitly returns the page-body Playwright AX tree. Operation/navigation/tab-change results include final page identity, direct incremental domChanges, and console deltas, but never an automatic axTree. The model decides when to write page.domSnapshot() or targeted Playwright/DOM/value/text/URL/network reads. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. Page and Locator factory methods automatically remove matches hidden by themselves or an ancestor and matches without a non-empty rendered rectangle before count() or positional selection. Runtime then applies target-style and real hit-test checks followed by action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate; that selected locator still receives normal actionability validation. Hidden file inputs used by setInputFiles are the sole rendered-existence exception at the action boundary; an ancestor pointer-events:none alone does not reject a target. Use nodeRepl.write(value) for compact JSON and nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. force:true and scripted DOM clicks are forbidden.',
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
         maxOutputChars: z.number().int().min(1_000).max(50_000).optional().describe('Maximum serialized return size. Defaults to 20000 characters.'),
@@ -1262,7 +1269,6 @@ function makeBrowserTools(
             return session.mouse({
               action: input.action as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
               abortSignal,
-              snapshotId: input.snapshotId,
               target: input.target,
               xThousandth: input.x_thousandth,
               yThousandth: input.y_thousandth,
@@ -1277,15 +1283,14 @@ function makeBrowserTools(
             });
           }
           if (input.action === 'selectOption') {
-            return session.selectOption({ snapshotId: input.snapshotId, target: input.target, value: input.value, label: input.label });
+            return session.selectOption({ target: input.target, value: input.value, label: input.label, abortSignal });
           }
           const binding = credentialBinding(input.credentialRef);
           if (input.credentialRef && (!binding || input.action !== 'type' || !input.target)) {
-            return { ok: false, actual: 'Credential entry requires a valid runtime reference and a current snapshot-bound field target.' };
+            return { ok: false, actual: 'Credential entry requires a valid runtime reference and a current backend-bound field target.' };
           }
           return session.keyboard({
             action: input.action as 'type' | 'press' | 'shortcut',
-            snapshotId: input.snapshotId,
             target: input.target,
             xThousandth: input.x_thousandth,
             yThousandth: input.y_thousandth,
@@ -1299,7 +1304,7 @@ function makeBrowserTools(
         }),
       }),
       inspect: tool({
-        description: 'Read the current semantic DOM baseline and snapshotId, query that frozen baseline, or inspect recent HTTP requests. Use capture mode=full before constructing a semantic target or fallback ref.',
+        description: 'Read and backend-bind the current semantic DOM baseline, query that frozen baseline, or inspect recent HTTP requests. Use capture mode=full before constructing a semantic target or fallback dom-* ref. Later interact calls send only target.',
         inputSchema: browserToolInput({
           action: z.enum(['capture', 'search', 'httpRequests']).default('capture'),
           cursor: z.string().min(1).optional(),
@@ -1453,8 +1458,10 @@ function runtimePrompt(input: {
     '',
     'Operating rules:',
     '- In one model step, either answer in Chinese Markdown without a tool or call at most one relevant tool. A new action request is a new occurrence even when its wording repeats an earlier request.',
-    '- Before any state-changing browser operation, first understand the user\'s exact goal and confirm with fresh live evidence the current page, active dialog/layer, intended outcome, exact target, and any loading or blocking state. If anything is uncertain, inspect first; never operate from assumptions or stale history.',
-    `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Inspect the live page with ${input.mode === 'code' ? 'browserCode' : 'inspect'} before acting; do not reuse stale coordinates, screenshots, prior tool JSON, or DOM evidence from an older page state.`,
+    input.mode === 'code'
+      ? '- Code mode may execute multiple bounded browser operations in one browserCode cell after the model has inspected current evidence in a preceding tool result. At the beginning of every new or resumed user request, first use a separate read-only browserCode cell to inspect existing tabs/groups, the active page identity, and enough current AX/DOM/Playwright evidence chosen by the model. Use targeted Playwright reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels, appearance, or prior experience.'
+      : '- Every DOM-mode browser change follows a strict closed loop: observe the current page and activeSurface, execute one operation, then re-observe. Never infer control type, editability, interaction sequence, or completion state from a label, appearance, or prior experience. Use exact current attributes and newly mounted structure, and decide from returned evidence whether a targeted read-only business-state check is needed.',
+    `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. In ${input.mode === 'code' ? 'Code mode, operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() is an explicit page-body AX read and the model may instead write targeted Playwright or DOM reads' : 'DOM mode, a fresh inspect is the mandatory pre-action observation and the interact verification result is a hard condition'}.${input.mode === 'dom' ? ' The shared [page-state].activeSurface identifies the current topmost interactive surface or blocking layer even when background AX/DOM nodes remain present.' : ''}`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
@@ -2105,7 +2112,9 @@ async function executeRuntimeStep(input: {
       textFromUnknown(message.content).startsWith(continuationSummaryMarker)
     ));
     let continuationSummaryText = restoredContinuationMessage
-      ? textFromUnknown(restoredContinuationMessage.content).slice(continuationSummaryMarker.length).trim()
+      ? sanitizeRuntimeContinuationSummary(
+        textFromUnknown(restoredContinuationMessage.content).slice(continuationSummaryMarker.length),
+      )
       : '';
 
     function messagesAddedAfterCompactedContext(sourceMessages: RuntimeModelMessage[]) {
@@ -2162,7 +2171,7 @@ async function executeRuntimeStep(input: {
           abortSignal,
         });
         ensureActive();
-        const text = (result.text || '').trim();
+        const text = sanitizeRuntimeContinuationSummary(result.text || '');
         return { summary: text || fallback(), elapsedMs: Date.now() - startedAt, fallback: !text };
       } catch (error) {
         if (isBrowserChatAbortError(error, abortSignal)) throw browserChatAbortError(abortSignal);

@@ -276,8 +276,8 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                   ...(skill.domains || []),
                   ...skill.triggerPhrases,
                   skill.content.details,
-                  statusLabel(skill.status),
-                  skill.shared ? '所有 ID 共享' : '仅创建 ID',
+                  t(statusLabel(skill.status)),
+                  skill.shared ? t('所有 ID 共享') : t('仅创建 ID'),
                   skill.userId,
                 ]}
                 getUpdatedAt={(skill) => skill.updatedAt}
@@ -320,7 +320,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                       >
                         {deletingSkillId === skill.id ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
                       </button>
-                      </> : <span className="resource-readonly-label">只读</span>}
+                      </> : <span className="resource-readonly-label">{t('只读')}</span>}
                     </div>
                   </div>
 
@@ -330,7 +330,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
                         <p className="skills-manager-item-description">{skill.description || skill.id}</p>
                         <div className="skills-manager-chip-row">
                           <em className={`skill-status status-${skill.status}`}>{t(statusLabel(skill.status))}</em>
-                          {skill.shared ? <em className="resource-shared-badge">{skill.userId === normalizedUserId ? '所有 ID 共享' : `ID ${skill.userId} 共享`}</em> : null}
+                          {skill.shared ? <em className="resource-shared-badge">{skill.userId === normalizedUserId ? t('所有 ID 共享') : t('ID {id} 共享', { id: skill.userId })}</em> : null}
                         </div>
                       </div>
 
@@ -428,8 +428,10 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
               </label>
               <div className="resource-sharing-field wide">
                 <div>
-                  <strong>所有 ID 共享</strong>
-                  <small>其他 ID 可以使用此 Skill，但只有创建 ID {editorMode === 'edit' ? skills.find((skill) => skill.id === editingSkillId)?.userId || normalizedUserId : normalizedUserId} 可以编辑或删除</small>
+                  <strong>{t('所有 ID 共享')}</strong>
+                  <small>{t('其他 ID 可以使用此 Skill，但只有创建 ID {id} 可以编辑或删除', {
+                    id: editorMode === 'edit' ? skills.find((skill) => skill.id === editingSkillId)?.userId || normalizedUserId : normalizedUserId,
+                  })}</small>
                 </div>
                 <button aria-pressed={draft.shared} className={`settings-toggle${draft.shared ? ' on' : ''}`} disabled={saving} onClick={() => update({ shared: !draft.shared })} type="button">
                   <span />

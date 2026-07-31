@@ -20,10 +20,42 @@ export type BrowserCodeImage = {
   mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
 };
 
+type BrowserCodePageObservation = {
+  epoch: number;
+  url: string;
+  title: string;
+  focusedElement?: { descriptor: string; label: string };
+  activeSurface?: {
+    id: string;
+    descriptor: string;
+    kind: 'dialog' | 'popover' | 'menu' | 'listbox' | 'panel' | 'overlay';
+    label: string;
+    modal: boolean;
+    blocking: boolean;
+    focusedInside: boolean;
+    zIndex: number;
+    rect: {
+      bottom: number;
+      height: number;
+      left: number;
+      right: number;
+      top: number;
+      width: number;
+    };
+    signals: string[];
+    framePath?: string;
+  };
+  surfaceTransition: 'initial' | 'unchanged' | 'opened' | 'closed' | 'changed';
+};
+
 export type BrowserCodeActivity = {
   actions: string[];
   navigationChanged: boolean;
   tabChanged: boolean;
+  verification?: {
+    status: 'passed' | 'failed';
+    detail: string;
+  };
 };
 
 export type BrowserCodeRunResult = {
@@ -89,7 +121,7 @@ const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 4;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 13;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -138,10 +170,21 @@ function browserCodeKernelMain() {
     url: string;
     width: number;
   };
+  type KernelPageObservation = BrowserCodePageObservation;
+  type ActionObservation = {
+    action: string;
+    before?: KernelPageObservation;
+    after?: KernelPageObservation;
+  };
+  const compactObservationUrl = (value: string) => (
+    value.length <= 2048
+      ? value
+      : `${value.slice(0, 2000)}...[truncated; length=${value.length}]`
+  );
   let browser: import('playwright').Browser | undefined;
   let replServer: import('node:repl').REPLServer | undefined;
   let activeExecution: {
-    actions: Set<string>;
+    actions: string[];
     logs: BrowserCodeExecutionLog[];
     images: BrowserCodeImage[];
     imageBytes: number;
@@ -149,16 +192,19 @@ function browserCodeKernelMain() {
     startedAt: number;
     credentials: Map<string, BrowserCodeCredentialBinding>;
     pendingCoordinateClickEvidence: Map<import('playwright').Page, CoordinateClickEvidence>;
+    observationsBeforeAction: WeakMap<import('playwright').Page, KernelPageObservation>;
+    verification?: BrowserCodeActivity['verification'];
   } | undefined;
   const screenshotProvenance = new WeakMap<object, CoordinateClickEvidence & { fullPage: boolean }>();
   const screenshotProvenanceByDigest = new Map<string, CoordinateClickEvidence & { fullPage: boolean }>();
   const coordinateClickEvidenceByDocument = new Map<string, CoordinateClickEvidence>();
+  const lastActionObservationByPage = new WeakMap<import('playwright').Page, ActionObservation>();
   let chain = Promise.resolve();
 
   const imageDigest = (value: Uint8Array) => childCreateHash('sha256').update(value).digest('hex');
 
   const recordAction = (action: string) => {
-    activeExecution?.actions.add(action);
+    activeExecution?.actions.push(action);
   };
 
   const send = (payload: Record<string, unknown>) => {
@@ -258,8 +304,14 @@ function browserCodeKernelMain() {
   const screenshotDecoratedPagePrototypes = new WeakSet<object>();
   const pointerDecoratedLocatorPrototypes = new WeakSet<object>();
   const credentialLocatorPrototypes = new WeakSet<object>();
+  const rawLocatorByExistingLocator = new WeakMap<object, import('playwright').Locator>();
   let nativeFrameLocator: ((this: object, selector: string) => import('playwright').Locator) | undefined;
+  let nativeLocatorFilter: ((this: object, options?: unknown) => import('playwright').Locator) | undefined;
   let nativeLocatorFill: ((this: object, value: string) => Promise<void>) | undefined;
+  const nativeLocatorActions = new Map<
+    string,
+    (this: object, ...args: unknown[]) => Promise<unknown>
+  >();
 
   const actionArgsWithMinimumTimeout = (args: unknown[], optionsIndex: number) => {
     const options = args[optionsIndex];
@@ -269,6 +321,13 @@ function browserCodeKernelMain() {
     const normalized = [...args];
     normalized[optionsIndex] = { ...options, timeout: browserCodeActionTimeoutMs };
     return normalized;
+  };
+
+  const existingLocator = (locator: import('playwright').Locator) => {
+    if (!nativeLocatorFilter) return locator;
+    const filtered = Reflect.apply(nativeLocatorFilter, locator, [{ visible: true }]);
+    rawLocatorByExistingLocator.set(filtered, locator);
+    return filtered;
   };
 
   const createSessionPage = async (targetContext: import('playwright').BrowserContext) => {
@@ -319,6 +378,297 @@ function browserCodeKernelMain() {
     const frame = Reflect.get(locator, '_frame') as { _page?: import('playwright').Page; page?: () => import('playwright').Page } | undefined;
     if (typeof frame?.page === 'function') return frame.page();
     return frame?._page;
+  };
+
+  const readUnifiedPageObservation = async (
+    page: import('playwright').Page,
+  ): Promise<KernelPageObservation> => {
+    const mainFrame = page.mainFrame();
+    const observations = await Promise.all(page.frames().slice(0, 25).map(async (frame) => {
+      const observation = await frame.evaluate(() => {
+        const browserWindow = window as Window & {
+          __aiDomMutationState?: { epoch?: number };
+          __aiDomRuntime?: { pageObservation?: () => KernelPageObservation };
+        };
+        const shared = browserWindow.__aiDomRuntime?.pageObservation?.();
+        if (shared) return shared;
+        const visible = (element: Element) => {
+          if (!element.isConnected || element.hasAttribute('hidden') || element.getAttribute('aria-hidden') === 'true') return false;
+          let current: Element | null = element;
+          while (current) {
+            const style = getComputedStyle(current);
+            if (
+              style.display === 'none'
+              || style.visibility === 'hidden'
+              || style.visibility === 'collapse'
+              || Number(style.opacity || '1') <= 0.01
+            ) return false;
+            current = current.parentElement;
+          }
+          const rect = element.getBoundingClientRect();
+          return rect.width > 2 && rect.height > 2;
+        };
+        const surface = Array.from(document.querySelectorAll(
+          'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]',
+        )).filter(visible).at(-1);
+        const rect = surface?.getBoundingClientRect();
+        const descriptor = (element: Element) => `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ''}`;
+        const activeSurface = surface && rect ? {
+          id: `${descriptor(surface)}|${String(surface.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80)}`,
+          descriptor: descriptor(surface),
+          kind: surface.getAttribute('role') === 'menu'
+            ? 'menu'
+            : surface.getAttribute('role') === 'listbox' ? 'listbox' : 'dialog',
+          label: String(surface.getAttribute('aria-label') || surface.getAttribute('title') || surface.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+          modal: surface.getAttribute('aria-modal') === 'true' || surface instanceof HTMLDialogElement,
+          blocking: true,
+          focusedInside: Boolean(document.activeElement && surface.contains(document.activeElement)),
+          zIndex: Number.parseInt(getComputedStyle(surface).zIndex, 10) || 0,
+          rect: {
+            bottom: rect.bottom,
+            height: rect.height,
+            left: rect.left,
+            right: rect.right,
+            top: rect.top,
+            width: rect.width,
+          },
+          signals: ['fallback-semantic-surface'],
+        } : undefined;
+        const focused = document.activeElement instanceof Element && document.activeElement !== document.body
+          ? document.activeElement
+          : undefined;
+        return {
+          epoch: Number(browserWindow.__aiDomMutationState?.epoch || 0),
+          url: (() => {
+            const currentUrl = window.location.href;
+            return currentUrl.length <= 2048
+              ? currentUrl
+              : `${currentUrl.slice(0, 2000)}...[truncated; length=${currentUrl.length}]`;
+          })(),
+          title: document.title,
+          ...(focused ? {
+            focusedElement: {
+              descriptor: descriptor(focused),
+              label: String(
+                focused.getAttribute('aria-label')
+                || focused.getAttribute('title')
+                || focused.getAttribute('placeholder')
+                || focused.textContent
+                || '',
+              ).replace(/\s+/g, ' ').trim().slice(0, 120),
+            },
+          } : {}),
+          ...(activeSurface ? { activeSurface } : {}),
+          surfaceTransition: 'initial' as const,
+        };
+      }).catch(() => undefined);
+      if (!observation) return undefined;
+      return {
+        ...observation,
+        ...(observation.activeSurface && frame !== mainFrame ? {
+          activeSurface: {
+            ...observation.activeSurface,
+            framePath: frame.url() || 'iframe',
+          },
+        } : {}),
+      } as KernelPageObservation;
+    }));
+    const available = observations.filter((item): item is KernelPageObservation => Boolean(item));
+    const main = available[0];
+    const selectedSurface = available
+      .flatMap((item) => item.activeSurface ? [{ observation: item, surface: item.activeSurface }] : [])
+      .sort((left, right) => (
+        Number(right.surface.blocking) - Number(left.surface.blocking)
+        || Number(right.surface.modal) - Number(left.surface.modal)
+        || right.surface.zIndex - left.surface.zIndex
+      ))[0];
+    return {
+      epoch: available.reduce((max, item) => Math.max(max, item.epoch), 0),
+      url: main?.url || compactObservationUrl(page.url()),
+      title: main?.title || await page.title().catch(() => ''),
+      ...(main?.focusedElement ? { focusedElement: main.focusedElement } : {}),
+      ...(selectedSurface ? { activeSurface: selectedSurface.surface } : {}),
+      surfaceTransition: selectedSurface?.observation.surfaceTransition || main?.surfaceTransition || 'initial',
+    };
+  };
+
+  const markPageObserved = async (page: import('playwright').Page) => {
+    if (!activeExecution) throw new Error('Page observation is only available while browserCode is executing.');
+    const observation = await readUnifiedPageObservation(page);
+    activeExecution.observationsBeforeAction.set(page, observation);
+    return observation;
+  };
+
+  const prepareStateChangingAction = (
+    page: import('playwright').Page | undefined,
+    action: string,
+  ) => {
+    void page;
+    recordAction(action);
+  };
+
+  const completeStateChangingAction = async (
+    page: import('playwright').Page | undefined,
+    action: string,
+  ) => {
+    if (!activeExecution || !page) return;
+    const before = activeExecution.observationsBeforeAction.get(page);
+    const after = await readUnifiedPageObservation(page);
+    lastActionObservationByPage.set(page, { action, before, after });
+    activeExecution.observationsBeforeAction.set(page, after);
+  };
+
+  const resolveActionableLocator = async (
+    locator: object,
+    action: string,
+  ) => {
+    if (
+      !locator
+      || typeof locator !== 'object'
+      || typeof Reflect.get(locator, 'count') !== 'function'
+      || typeof Reflect.get(locator, 'evaluate') !== 'function'
+      || typeof Reflect.get(locator, 'evaluateAll') !== 'function'
+      || typeof Reflect.get(locator, 'filter') !== 'function'
+    ) {
+      throw new Error(
+        `ACTIONABILITY_FAILED: ${action} requires a real Playwright Locator from the active browser session.`,
+      );
+    }
+    const originalCandidate = locator as import('playwright').Locator;
+    const originalCount = await originalCandidate.count();
+    const skipVisibleFilter = action.toLowerCase() === 'setinputfiles';
+    const candidateSet = skipVisibleFilter
+      ? originalCandidate
+      : originalCandidate.filter({ visible: true });
+    let results = await candidateSet.evaluateAll((elements, operation) => {
+      const browserWindow = window as Window & {
+        __aiDomRuntime?: {
+          actionability?: (
+            target: Element,
+            options?: { action?: string },
+          ) => { ok: boolean; reason: string; descriptor: string; coveredBy?: string };
+        };
+      };
+      return elements.map((element): {
+        ok: boolean;
+        reason: string;
+        descriptor: string;
+        coveredBy?: string;
+      } => {
+        const shared = browserWindow.__aiDomRuntime?.actionability?.(element, { action: operation });
+        if (shared) return shared;
+        const descriptor = `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ''}`;
+        if (!element.isConnected) {
+          return { ok: false, reason: 'target is detached from the current document', descriptor };
+        }
+        const fileInputAction = operation.toLowerCase() === 'setinputfiles';
+        const pointerAction = /^(click|dblclick|hover|tap|check|uncheck|setchecked|dragto|draganddrop)$/.test(operation.toLowerCase());
+        const targetStyle = getComputedStyle(element);
+        if (pointerAction && targetStyle.pointerEvents === 'none') {
+          return { ok: false, reason: `${descriptor} has computed pointer-events:none`, descriptor };
+        }
+        let current: Element | null = element;
+        while (current) {
+          const currentDescriptor = `${current.tagName.toLowerCase()}${current.id ? `#${current.id}` : ''}`;
+          if (current.hasAttribute('hidden')) return { ok: false, reason: `${currentDescriptor} has the hidden attribute`, descriptor };
+          if (current.getAttribute('aria-hidden') === 'true') return { ok: false, reason: `${currentDescriptor} or an ancestor has aria-hidden=true`, descriptor };
+          if ((current as HTMLElement).inert || current.hasAttribute('inert')) return { ok: false, reason: `${currentDescriptor} or an ancestor is inert`, descriptor };
+          const style = getComputedStyle(current);
+          if (!fileInputAction && style.display === 'none') return { ok: false, reason: `${currentDescriptor} or an ancestor has display:none`, descriptor };
+          if (!fileInputAction && (style.visibility === 'hidden' || style.visibility === 'collapse')) return { ok: false, reason: `${currentDescriptor} or an ancestor has visibility:${style.visibility}`, descriptor };
+          if (!fileInputAction && (style.contentVisibility === 'hidden' || Number(style.opacity || '1') <= 0.01)) return { ok: false, reason: `${currentDescriptor} or an ancestor is not visibly rendered`, descriptor };
+          current = current.parentElement;
+        }
+        const disabled = (() => {
+          try {
+            return element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true';
+          } catch {
+            return element.getAttribute('aria-disabled') === 'true';
+          }
+        })();
+        if (disabled) return { ok: false, reason: `${descriptor} is disabled`, descriptor };
+        if (!fileInputAction) {
+          const rect = Array.from(element.getClientRects()).find((item) => item.width > 0 && item.height > 0);
+          if (!rect) return { ok: false, reason: `${descriptor} has no rendered client rectangle`, descriptor };
+        }
+        if (/^(fill|type|clear|presssequentially)$/.test(operation.toLowerCase())) {
+          const field = element as HTMLInputElement | HTMLTextAreaElement;
+          if (!(element as HTMLElement).isContentEditable && !(element instanceof HTMLInputElement) && !(element instanceof HTMLTextAreaElement)) {
+            return { ok: false, reason: `${descriptor} is not editable`, descriptor };
+          }
+          if (!(element as HTMLElement).isContentEditable && (field.readOnly || field.disabled)) {
+            return { ok: false, reason: `${descriptor} is readonly or disabled`, descriptor };
+          }
+        }
+        if (operation.toLowerCase() === 'selectoption' && !(element instanceof HTMLSelectElement)) {
+          return { ok: false, reason: `${descriptor} is not a native select element`, descriptor };
+        }
+        return { ok: true, reason: 'exact live element is actionable', descriptor };
+      });
+    }, action);
+    const normalizedAction = action.toLowerCase();
+    const trialMethod = normalizedAction === 'setchecked'
+      || normalizedAction === 'dragto'
+      || normalizedAction === 'draganddrop'
+      ? 'click'
+      : ['click', 'dblclick', 'hover', 'tap', 'check', 'uncheck'].includes(normalizedAction)
+        ? normalizedAction
+        : undefined;
+    if (trialMethod) {
+      const nativeTrialAction = nativeLocatorActions.get(trialMethod);
+      const trialResults: typeof results = [];
+      for (const [index, result] of results.entries()) {
+        if (!nativeTrialAction) {
+          trialResults.push({
+            ...result,
+            ok: false,
+            reason: `${result.ok ? '' : `${result.reason}; `}native Locator.${trialMethod} trial is unavailable`,
+          });
+          continue;
+        }
+        try {
+          await Reflect.apply(nativeTrialAction, candidateSet.nth(index), [{
+            timeout: result.ok ? browserCodeActionTimeoutMs : browserCodePointerLookupTimeoutMs,
+            trial: true,
+          }]);
+          trialResults.push({
+            ...result,
+            ok: result.ok,
+            reason: result.ok
+              ? `Playwright ${trialMethod} trial passed`
+              : `${result.reason}; Playwright ${trialMethod} trial passed`,
+          });
+        } catch (error) {
+          const detail = (error instanceof Error ? error.message : String(error))
+            .replace(/\s+/g, ' ')
+            .slice(0, 600);
+          trialResults.push({
+            ...result,
+            ok: false,
+            reason: `${result.ok ? '' : `${result.reason}; `}Playwright ${trialMethod} trial failed: ${detail}`,
+          });
+        }
+      }
+      results = trialResults;
+    }
+    const actionableIndices = results
+      .map((result, index) => result.ok ? index : -1)
+      .filter((index) => index >= 0);
+    if (actionableIndices.length !== 1) {
+      const visibilityStage = skipVisibleFilter
+        ? `${results.length} candidates entered the file-input exception path`
+        : `${results.length} passed automatic visible filtering`;
+      const diagnostics = results.slice(0, 8).map((result, index) => (
+        `#${index + 1} ${result.descriptor}: ${result.ok ? 'actionable' : result.reason}`
+        + (result.coveredBy ? `; covered by ${result.coveredBy}` : '')
+      )).join(' | ');
+      throw new Error(
+        `ACTIONABILITY_FAILED: ${action} matched ${originalCount} elements; ${visibilityStage}; `
+        + `${actionableIndices.length} passed full actionability. Exactly one candidate must pass both stages.`
+        + (diagnostics ? ` ${diagnostics}` : ''),
+      );
+    }
+    return candidateSet.nth(actionableIndices[0]);
   };
 
   const locatorCenter = async (locator: object) => {
@@ -504,8 +854,11 @@ function browserCodeKernelMain() {
         throw new Error('credentialVault.fill() could not access the trusted Playwright locator implementation.');
       }
       const trustedLocator = Reflect.apply(nativeFrameLocator, targetFrame, [selector]);
-      recordAction('credential.fill');
-      await Reflect.apply(nativeLocatorFill, trustedLocator, [credential.value]);
+      const actionableLocator = await resolveActionableLocator(trustedLocator, 'fill');
+      prepareStateChangingAction(targetPage, 'credential.fill');
+      await moveVisibleAiPointer(targetPage, await locatorCenter(actionableLocator), 'click');
+      await Reflect.apply(nativeLocatorFill, actionableLocator, [credential.value]);
+      await completeStateChangingAction(targetPage, 'credential.fill');
       return { filled: true, origin };
     },
   });
@@ -516,6 +869,7 @@ function browserCodeKernelMain() {
     credentialLocatorPrototypes.add(prototype);
     const framePrototype = Object.getPrototypeOf(page.mainFrame()) as Record<string, unknown> | null;
     const frameLocator = framePrototype && Reflect.get(framePrototype, 'locator');
+    const locatorFilter = Reflect.get(prototype, 'filter');
     const locatorFill = Reflect.get(prototype, 'fill');
     if (!nativeFrameLocator && typeof frameLocator === 'function') {
       nativeFrameLocator = frameLocator as (this: object, selector: string) => import('playwright').Locator;
@@ -523,10 +877,36 @@ function browserCodeKernelMain() {
     if (!nativeLocatorFill && typeof locatorFill === 'function') {
       nativeLocatorFill = locatorFill as (this: object, value: string) => Promise<void>;
     }
+    if (!nativeLocatorFilter && typeof locatorFilter === 'function') {
+      nativeLocatorFilter = locatorFilter as (this: object, options?: unknown) => import('playwright').Locator;
+    }
     pointerDecoratedLocatorPrototypes.add(prototype);
+    for (const name of ['locator', 'getByAltText', 'getByLabel', 'getByPlaceholder', 'getByRole', 'getByTestId', 'getByText', 'getByTitle']) {
+      const original = Reflect.get(prototype, name);
+      if (typeof original !== 'function') continue;
+      try {
+        Object.defineProperty(prototype, name, {
+          configurable: true,
+          value: function existingChainedLocator(this: import('playwright').Locator, ...args: unknown[]) {
+            const rawBase = rawLocatorByExistingLocator.get(this) || this;
+            const locator = Reflect.apply(original, rawBase, args) as import('playwright').Locator;
+            return existingLocator(locator);
+          },
+          writable: true,
+        });
+      } catch {
+        // Keep the native locator factory when its prototype is immutable.
+      }
+    }
     const patch = (name: string, kind: 'click' | 'double' | 'move', changesState = true) => {
       const original = Reflect.get(prototype, name);
       if (typeof original !== 'function') return;
+      if (!nativeLocatorActions.has(name)) {
+        nativeLocatorActions.set(
+          name,
+          original as (this: object, ...args: unknown[]) => Promise<unknown>,
+        );
+      }
       try {
         Object.defineProperty(prototype, name, {
           configurable: true,
@@ -534,16 +914,27 @@ function browserCodeKernelMain() {
             if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
               throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
             }
-            const normalizedArgs = actionArgsWithMinimumTimeout(args, name === 'dragTo' ? 1 : 0);
+            const normalizedArgs = actionArgsWithMinimumTimeout(
+              args,
+              name === 'dragTo' || name === 'setChecked' ? 1 : 0,
+            );
             const targetPage = locatorPage(this);
+            let actionableLocator = this as import('playwright').Locator;
+            const executionArgs = [...normalizedArgs];
             if (targetPage && activeExecution) {
-              await moveVisibleAiPointer(targetPage, await locatorCenter(this), kind);
+              actionableLocator = await resolveActionableLocator(this, name);
               if (name === 'dragTo' && normalizedArgs[0] && typeof normalizedArgs[0] === 'object') {
-                await moveVisibleAiPointer(targetPage, await locatorCenter(normalizedArgs[0]), 'move');
+                executionArgs[0] = await resolveActionableLocator(normalizedArgs[0], name);
+              }
+              if (changesState) prepareStateChangingAction(targetPage, `locator.${name}`);
+              await moveVisibleAiPointer(targetPage, await locatorCenter(actionableLocator), kind);
+              if (name === 'dragTo' && executionArgs[0] && typeof executionArgs[0] === 'object') {
+                await moveVisibleAiPointer(targetPage, await locatorCenter(executionArgs[0]), 'move');
               }
             }
-            if (changesState) recordAction(`locator.${name}`);
-            return Reflect.apply(original, this, normalizedArgs);
+            const result = await Reflect.apply(original, actionableLocator, executionArgs);
+            if (changesState) await completeStateChangingAction(targetPage, `locator.${name}`);
+            return result;
           },
           writable: true,
         });
@@ -560,15 +951,46 @@ function browserCodeKernelMain() {
     patch('setChecked', 'click');
     patch('tap', 'click');
     patch('dragTo', 'click');
-    for (const name of ['fill', 'type', 'press', 'selectOption', 'clear', 'setInputFiles']) {
+    for (const name of [
+      'fill',
+      'type',
+      'press',
+      'pressSequentially',
+      'selectOption',
+      'clear',
+      'setInputFiles',
+      'focus',
+      'blur',
+      'selectText',
+      'scrollIntoViewIfNeeded',
+    ]) {
       const original = Reflect.get(prototype, name);
       if (typeof original !== 'function') continue;
+      if (!nativeLocatorActions.has(name)) {
+        nativeLocatorActions.set(
+          name,
+          original as (this: object, ...args: unknown[]) => Promise<unknown>,
+        );
+      }
       try {
         Object.defineProperty(prototype, name, {
           configurable: true,
           value: async function observedLocatorAction(this: object, ...args: unknown[]) {
-            recordAction(`locator.${name}`);
-            return Reflect.apply(original, this, args);
+            const targetPage = locatorPage(this);
+            let actionableLocator = this as import('playwright').Locator;
+            if (targetPage && activeExecution) {
+              const locatorToResolve = name === 'setInputFiles'
+                ? rawLocatorByExistingLocator.get(this) || this
+                : this;
+              actionableLocator = await resolveActionableLocator(locatorToResolve, name);
+              prepareStateChangingAction(targetPage, `locator.${name}`);
+              await moveVisibleAiPointer(targetPage, await locatorCenter(actionableLocator), 'click');
+            } else {
+              recordAction(`locator.${name}`);
+            }
+            const result = await Reflect.apply(original, actionableLocator, args);
+            await completeStateChangingAction(targetPage, `locator.${name}`);
+            return result;
           },
           writable: true,
         });
@@ -584,7 +1006,28 @@ function browserCodeKernelMain() {
     decorateLocatorPrototype(page);
     decoratePageScreenshotPrototype(page);
     const pageRecord = page as unknown as Record<string, unknown>;
-    const patchPageAction = (name: string, kind: 'click' | 'double' | 'move', changesState = true) => {
+    for (const name of ['locator', 'getByAltText', 'getByLabel', 'getByPlaceholder', 'getByRole', 'getByTestId', 'getByText', 'getByTitle']) {
+      const original = Reflect.get(pageRecord, name);
+      if (typeof original !== 'function') continue;
+      try {
+        Object.defineProperty(pageRecord, name, {
+          configurable: true,
+          value: (...args: unknown[]) => existingLocator(
+            Reflect.apply(original, page, args) as import('playwright').Locator,
+          ),
+          writable: true,
+        });
+      } catch {
+        // Keep the native page locator factory when the page object is immutable.
+      }
+    }
+    const patchPageAction = (
+      name: string,
+      kind: 'click' | 'double' | 'move',
+      changesState = true,
+      optionsIndex = 1,
+      targetIndices = [0],
+    ) => {
       const original = Reflect.get(pageRecord, name);
       if (typeof original !== 'function') return;
       try {
@@ -594,12 +1037,70 @@ function browserCodeKernelMain() {
             if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
               throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
             }
-            const normalizedArgs = actionArgsWithMinimumTimeout(args, 1);
-            if (activeExecution && typeof normalizedArgs[0] === 'string') {
-              await moveVisibleAiPointer(page, await locatorCenter(page.locator(normalizedArgs[0])), kind);
+            const normalizedArgs = actionArgsWithMinimumTimeout(args, optionsIndex);
+            const targetLocators = new Map<number, import('playwright').Locator>();
+            if (activeExecution) {
+              for (const targetIndex of targetIndices) {
+                if (typeof normalizedArgs[targetIndex] !== 'string') continue;
+                const locator = page.locator(normalizedArgs[targetIndex] as string);
+                const locatorToResolve = name === 'setInputFiles'
+                  ? rawLocatorByExistingLocator.get(locator) || locator
+                  : locator;
+                targetLocators.set(
+                  targetIndex,
+                  await resolveActionableLocator(locatorToResolve, name === 'dragAndDrop' ? 'dragTo' : name),
+                );
+              }
+              if (changesState) prepareStateChangingAction(page, `page.${name}`);
+              const orderedTargets = targetIndices
+                .map((targetIndex) => targetLocators.get(targetIndex))
+                .filter((locator): locator is import('playwright').Locator => Boolean(locator));
+              for (const [index, locator] of orderedTargets.entries()) {
+                await moveVisibleAiPointer(
+                  page,
+                  await locatorCenter(locator),
+                  index === orderedTargets.length - 1 ? kind : 'move',
+                );
+              }
             }
-            if (changesState) recordAction(`page.${name}`);
-            return Reflect.apply(original, page, normalizedArgs);
+            let result: unknown;
+            const sourceLocator = targetLocators.get(0);
+            if (activeExecution && sourceLocator) {
+              const locatorMethod = name === 'dragAndDrop' ? 'dragTo' : name;
+              const nativeLocatorAction = nativeLocatorActions.get(locatorMethod);
+              if (!nativeLocatorAction) {
+                throw new Error(`browserCode could not access the native Locator.${locatorMethod} implementation.`);
+              }
+              if (name === 'dragAndDrop') {
+                const targetLocator = targetLocators.get(1);
+                if (!targetLocator) {
+                  throw new Error('page.dragAndDrop() requires one resolved source and target locator.');
+                }
+                const rawOptions = normalizedArgs[2];
+                const locatorOptions = rawOptions && typeof rawOptions === 'object' && !Array.isArray(rawOptions)
+                  ? { ...rawOptions as Record<string, unknown> }
+                  : rawOptions;
+                if (locatorOptions && typeof locatorOptions === 'object') {
+                  delete (locatorOptions as Record<string, unknown>).strict;
+                }
+                result = await Reflect.apply(nativeLocatorAction, sourceLocator, [
+                  targetLocator,
+                  locatorOptions,
+                ]);
+              } else {
+                const locatorArgs = normalizedArgs.slice(1).map((arg) => {
+                  if (!arg || typeof arg !== 'object' || Array.isArray(arg) || !Reflect.has(arg, 'strict')) return arg;
+                  const normalized = { ...arg as Record<string, unknown> };
+                  delete normalized.strict;
+                  return normalized;
+                });
+                result = await Reflect.apply(nativeLocatorAction, sourceLocator, locatorArgs);
+              }
+            } else {
+              result = await Reflect.apply(original, page, normalizedArgs);
+            }
+            if (changesState) await completeStateChangingAction(page, `page.${name}`);
+            return result;
           },
           writable: true,
         });
@@ -613,6 +1114,9 @@ function browserCodeKernelMain() {
     patchPageAction('check', 'click');
     patchPageAction('uncheck', 'click');
     patchPageAction('tap', 'click');
+    patchPageAction('setChecked', 'click', true, 2);
+    patchPageAction('focus', 'click');
+    patchPageAction('dragAndDrop', 'click', true, 2, [0, 1]);
     for (const name of ['fill', 'type', 'press', 'selectOption', 'setInputFiles', 'goto', 'reload', 'goBack', 'goForward', 'setContent']) {
       const original = Reflect.get(pageRecord, name);
       if (typeof original !== 'function') continue;
@@ -620,8 +1124,35 @@ function browserCodeKernelMain() {
         Object.defineProperty(pageRecord, name, {
           configurable: true,
           value: async (...args: unknown[]) => {
-            recordAction(`page.${name}`);
-            return Reflect.apply(original, page, args);
+            const selectorAction = ['fill', 'type', 'press', 'selectOption', 'setInputFiles'].includes(name);
+            let actionableLocator: import('playwright').Locator | undefined;
+            if (activeExecution && selectorAction && typeof args[0] === 'string') {
+              const locator = page.locator(args[0]);
+              const locatorToResolve = name === 'setInputFiles'
+                ? rawLocatorByExistingLocator.get(locator) || locator
+                : locator;
+              actionableLocator = await resolveActionableLocator(locatorToResolve, name);
+              await moveVisibleAiPointer(page, await locatorCenter(actionableLocator), 'click');
+            }
+            prepareStateChangingAction(page, `page.${name}`);
+            let result: unknown;
+            if (activeExecution && actionableLocator) {
+              const nativeLocatorAction = nativeLocatorActions.get(name);
+              if (!nativeLocatorAction) {
+                throw new Error(`browserCode could not access the native Locator.${name} implementation.`);
+              }
+              const locatorArgs = args.slice(1).map((arg) => {
+                if (!arg || typeof arg !== 'object' || Array.isArray(arg) || !Reflect.has(arg, 'strict')) return arg;
+                const normalized = { ...arg as Record<string, unknown> };
+                delete normalized.strict;
+                return normalized;
+              });
+              result = await Reflect.apply(nativeLocatorAction, actionableLocator, locatorArgs);
+            } else {
+              result = await Reflect.apply(original, page, args);
+            }
+            await completeStateChangingAction(page, `page.${name}`);
+            return result;
           },
           writable: true,
         });
@@ -637,9 +1168,11 @@ function browserCodeKernelMain() {
         Object.defineProperty(mouse, 'move', {
           configurable: true,
           value: async (x: number, y: number, options?: unknown) => {
+            prepareStateChangingAction(page, 'mouse.move');
             await moveVisibleAiPointer(page, { x, y }, 'move');
-            recordAction('mouse.move');
-            return Reflect.apply(nativeMove, page.mouse, [x, y, options]);
+            const result = await Reflect.apply(nativeMove, page.mouse, [x, y, options]);
+            await completeStateChangingAction(page, 'mouse.move');
+            return result;
           },
           writable: true,
         });
@@ -654,10 +1187,13 @@ function browserCodeKernelMain() {
           configurable: true,
           value: async (x: number, y: number, options?: { button?: string; clickCount?: number }) => {
             await consumeCoordinateClickEvidence(page);
+            await markPageObserved(page);
+            prepareStateChangingAction(page, 'mouse.click');
             const kind = options?.button === 'right' ? 'right' : (options?.clickCount || 1) > 1 ? 'double' : 'click';
             await moveVisibleAiPointer(page, { x, y }, kind);
-            recordAction('mouse.click');
-            return Reflect.apply(nativeClick, page.mouse, [x, y, options]);
+            const result = await Reflect.apply(nativeClick, page.mouse, [x, y, options]);
+            await completeStateChangingAction(page, 'mouse.click');
+            return result;
           },
           writable: true,
         });
@@ -665,15 +1201,26 @@ function browserCodeKernelMain() {
         // Keep the native mouse implementation when it cannot be decorated.
       }
     }
-    const patchInputDevice = (device: Record<string, unknown>, name: string, action: string) => {
+    const patchInputDevice = (
+      device: Record<string, unknown>,
+      name: string,
+      action: string,
+      options: { componentOnly?: boolean } = {},
+    ) => {
       const original = Reflect.get(device, name);
       if (typeof original !== 'function') return;
       try {
         Object.defineProperty(device, name, {
           configurable: true,
           value: async (...args: unknown[]) => {
-            recordAction(action);
-            return Reflect.apply(original, device, args);
+            if (options.componentOnly) {
+              recordAction(action);
+              return Reflect.apply(original, device, args);
+            }
+            prepareStateChangingAction(page, action);
+            const result = await Reflect.apply(original, device, args);
+            await completeStateChangingAction(page, action);
+            return result;
           },
           writable: true,
         });
@@ -682,8 +1229,8 @@ function browserCodeKernelMain() {
       }
     };
     patchInputDevice(mouse, 'wheel', 'mouse.wheel');
-    patchInputDevice(mouse, 'down', 'mouse.down');
-    patchInputDevice(mouse, 'up', 'mouse.up');
+    patchInputDevice(mouse, 'down', 'mouse.down', { componentOnly: true });
+    patchInputDevice(mouse, 'up', 'mouse.up', { componentOnly: true });
     const keyboard = page.keyboard as unknown as Record<string, unknown>;
     patchInputDevice(keyboard, 'press', 'keyboard.press');
     patchInputDevice(keyboard, 'type', 'keyboard.type');
@@ -728,19 +1275,190 @@ function browserCodeKernelMain() {
     return undefined;
   };
 
+  type BrowserCodeVerifyStateInput = {
+    description: string;
+    locator?: import('playwright').Locator | string;
+    state?: 'visible' | 'hidden' | 'attached' | 'detached' | 'editable' | 'enabled' | 'checked' | 'filled' | 'value' | 'text' | 'attribute';
+    attribute?: string;
+    equals?: string;
+    includes?: string;
+    url?: string | RegExp;
+    activeSurface?: 'opened' | 'closed' | 'changed' | 'present' | 'absent';
+  };
+
+  const verifyPageState = async (
+    page: import('playwright').Page,
+    input: BrowserCodeVerifyStateInput,
+  ) => {
+    if (!activeExecution) throw new Error('page.verifyState() is only available while browserCode is executing.');
+    const lastAction = lastActionObservationByPage.get(page);
+    const description = String(input?.description || '').trim();
+    if (!description) throw new Error('page.verifyState() requires a concise expected business-state description.');
+    const checks: Array<{ name: string; ok: boolean; actual: unknown }> = [];
+    const current = await readUnifiedPageObservation(page);
+    if (input.url !== undefined) {
+      const expected = input.url;
+      const currentUrl = page.url();
+      const regexLike = expected && typeof expected === 'object' && typeof Reflect.get(expected, 'test') === 'function';
+      const ok = regexLike
+        ? Boolean(Reflect.apply(Reflect.get(expected, 'test') as (...args: unknown[]) => unknown, expected, [currentUrl]))
+        : currentUrl === String(expected);
+      checks.push({ name: 'url', ok, actual: compactObservationUrl(currentUrl) });
+    }
+    if (input.activeSurface) {
+      if (
+        ['opened', 'closed', 'changed'].includes(input.activeSurface)
+        && !lastAction?.before
+      ) {
+        throw new Error(
+          `page.verifyState() activeSurface="${input.activeSurface}" requires a preceding browser action observation. `
+          + 'Use activeSurface="present"/"absent" for a standalone current-state check.',
+        );
+      }
+      const beforeId = lastAction?.before?.activeSurface?.id || '';
+      const currentId = current.activeSurface?.id || '';
+      const ok = input.activeSurface === 'opened'
+        ? !beforeId && Boolean(currentId)
+        : input.activeSurface === 'closed'
+          ? Boolean(beforeId) && !currentId
+          : input.activeSurface === 'changed'
+            ? beforeId !== currentId
+            : input.activeSurface === 'present'
+              ? Boolean(currentId)
+              : !currentId;
+      checks.push({
+        name: `activeSurface:${input.activeSurface}`,
+        ok,
+        actual: current.activeSurface || null,
+      });
+    }
+    const locatorInput = input?.locator;
+    let locator: import('playwright').Locator | undefined;
+    if (typeof locatorInput === 'string') {
+      locator = page.locator(locatorInput);
+    } else if (locatorInput !== undefined) {
+      if (
+        !locatorInput
+        || typeof locatorInput !== 'object'
+        || typeof Reflect.get(locatorInput, 'count') !== 'function'
+        || typeof Reflect.get(locatorInput, 'evaluate') !== 'function'
+      ) {
+        throw new Error(
+          'page.verifyState() locator must be a Playwright Locator from the active page or a selector string.',
+        );
+      }
+      locator = locatorInput;
+    }
+    if (locator) {
+      const count = await locator.count();
+      const state = input.state || (input.equals !== undefined || input.includes !== undefined ? 'text' : undefined);
+      if (!state) throw new Error('page.verifyState() locator verification requires state, equals, or includes.');
+      if (state === 'detached') {
+        checks.push({ name: 'locator:detached', ok: count === 0, actual: { count } });
+      } else if (state === 'hidden') {
+        const hidden = count === 0 || count === 1 && !await locator.isVisible().catch(() => false);
+        checks.push({ name: 'locator:hidden', ok: hidden, actual: { count } });
+      } else {
+        if (count !== 1) {
+          checks.push({ name: `locator:${state}`, ok: false, actual: { count } });
+        } else {
+          let actual: unknown;
+          let ok = false;
+          if (state === 'visible') {
+            actual = await locator.isVisible().catch(() => false);
+            ok = actual === true;
+          } else if (state === 'attached') {
+            actual = { count };
+            ok = true;
+          } else if (state === 'editable') {
+            actual = await locator.isEditable().catch(() => false);
+            ok = actual === true;
+          } else if (state === 'enabled') {
+            actual = await locator.isEnabled().catch(() => false);
+            ok = actual === true;
+          } else if (state === 'checked') {
+            actual = await locator.isChecked().catch(() => false);
+            ok = actual === true;
+          } else {
+            actual = state === 'filled'
+              ? await locator.evaluate((element) => {
+                if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+                  return element.value.length;
+                }
+                return ((element as HTMLElement).innerText || element.textContent || '').length;
+              }).catch(() => 0)
+              : state === 'text'
+              ? await locator.innerText().catch(() => '')
+              : state === 'attribute'
+                ? input.attribute
+                  ? await locator.getAttribute(input.attribute).catch(() => null)
+                  : null
+                : await locator.evaluate((element) => {
+                if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+                  return element.value;
+                }
+                return (element as HTMLElement).innerText || element.textContent || '';
+              }).catch(() => '');
+            const text = String(actual ?? '');
+            if (state === 'attribute' && !input.attribute) {
+              ok = false;
+            } else if (state === 'filled') ok = Number(actual) > 0;
+            else if (input.equals !== undefined) ok = text === String(input.equals);
+            else if (input.includes !== undefined) ok = text.includes(String(input.includes));
+            else ok = true;
+          }
+          checks.push({ name: `locator:${state}`, ok, actual });
+        }
+      }
+    }
+    if (!checks.length) {
+      throw new Error('page.verifyState() requires url, activeSurface, or locator state evidence.');
+    }
+    const passed = checks.every((check) => check.ok);
+    const detail = `${description}: ${checks.map((check) => `${check.name}=${check.ok}`).join(', ')}`;
+    activeExecution.verification = {
+      status: passed ? 'passed' : 'failed',
+      detail,
+    };
+    if (!passed) {
+      throw new Error(
+        `BUSINESS_STATE_VERIFICATION_FAILED: ${detail}. `
+        + 'Do not repeat the operation. Re-observe the latest page state and decide the next single step.',
+      );
+    }
+    return {
+      ok: true,
+      description,
+      checks,
+      observation: current,
+    };
+  };
+
   function tabForPage(page: import('playwright').Page) {
     decoratePage(page);
     const existing = tabWrappers.get(page);
     if (existing) return existing;
     const extendedPage = page as import('playwright').Page & {
       domSnapshot?: () => Promise<string>;
+      verifyState?: (input: BrowserCodeVerifyStateInput) => Promise<unknown>;
       expectNavigation?: <T>(action: () => Promise<T>, options?: { timeoutMs?: number; url?: string | RegExp; waitUntil?: NonNullable<Parameters<import('playwright').Page['waitForURL']>[1]>['waitUntil'] }) => Promise<T>;
     };
     if (typeof extendedPage.domSnapshot !== 'function') {
       Object.defineProperty(extendedPage, 'domSnapshot', {
         configurable: false,
         enumerable: false,
-        value: () => page.locator('body').ariaSnapshot({ timeout: browserCodeActionTimeoutMs }),
+        value: async () => {
+          const snapshot = await page.locator('body').ariaSnapshot({ timeout: browserCodeActionTimeoutMs });
+          return `[ax-tree]\n${snapshot}`;
+        },
+        writable: false,
+      });
+    }
+    if (typeof extendedPage.verifyState !== 'function') {
+      Object.defineProperty(extendedPage, 'verifyState', {
+        configurable: false,
+        enumerable: false,
+        value: (input: BrowserCodeVerifyStateInput) => verifyPageState(page, input),
         writable: false,
       });
     }
@@ -794,12 +1512,21 @@ function browserCodeKernelMain() {
     return wrapper;
   }
 
-  const tabInfo = async (page: import('playwright').Page) => ({
-    id: tabId(page),
-    lastOpened: Date.now(),
-    title: await page.title().catch(() => ''),
-    url: page.url(),
-  });
+  const tabInfo = async (page: import('playwright').Page) => {
+    const group = await page.evaluate(() => ({
+      id: document.documentElement.getAttribute('data-ai-web-test-session-group-id') || undefined,
+      title: document.documentElement.getAttribute('data-ai-web-test-session-group-title') || undefined,
+    })).catch(() => ({ id: undefined, title: undefined }));
+    return {
+      id: tabId(page),
+      active: replServer?.context.page === page,
+      groupId: group.id,
+      groupTitle: group.title,
+      lastOpened: Date.now(),
+      title: await page.title().catch(() => ''),
+      url: page.url(),
+    };
+  };
 
   const currentPages = () => browser
     ? browser.contexts().flatMap((candidateContext) => candidateContext.pages()).filter((candidatePage) => !candidatePage.isClosed())
@@ -809,7 +1536,10 @@ function browserCodeKernelMain() {
     capabilities: Object.freeze({ cua: true, images: true, playwright: true, tabLifecycle: true }),
     documentation: async () => [
       'browserCode exposes one controlled browser runtime in ordinary JavaScript.',
-      'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.expectNavigation(), and nodeRepl.emitImage().',
+      'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.verifyState(), page.expectNavigation(), and nodeRepl.emitImage().',
+      'page.domSnapshot() is a read-only Playwright AX-tree capture. browser.user.openTabs() reports active-tab and tab-group metadata.',
+      'Page and Locator factory methods expose only currently rendered matches: hidden descendants and zero-rectangle nodes are excluded before count() and positional selection. Element actions then validate target computed style and hit testing, run an action-specific Playwright trial for every remaining pointer candidate, and execute only the unique candidate that passes all stages; CSS-hidden file inputs used by setInputFiles are recovered only at that action boundary.',
+      'page.verifyState() is an optional read-only assertion helper; it never gates later actions or successful cell completion.',
       `Playwright action timeout: ${browserCodeActionTimeoutMs}ms; navigation timeout: ${browserCodeNavigationTimeoutMs}ms.`,
     ].join('\n'),
     id: 'current',
@@ -959,7 +1689,7 @@ function browserCodeKernelMain() {
     replServer.context.context = browserContext;
     replServer.context.tab = tabForPage(page);
     activeExecution = {
-      actions: new Set(),
+      actions: [],
       imageBytes: 0,
       images: [],
       logs: [],
@@ -967,6 +1697,7 @@ function browserCodeKernelMain() {
       startedAt: Date.now(),
       credentials: new Map((input.credentials || []).map((credential) => [credential.ref, credential])),
       pendingCoordinateClickEvidence: new Map(),
+      observationsBeforeAction: new WeakMap(),
     };
     const publishPendingCoordinateClickEvidence = async () => {
       if (!activeExecution) return;
@@ -996,6 +1727,7 @@ function browserCodeKernelMain() {
         actions: [...activeExecution.actions],
         navigationChanged,
         tabChanged,
+        ...(activeExecution.verification ? { verification: activeExecution.verification } : {}),
       };
       let selectedExecutionId: string | undefined;
       if (selectedPage && typeof selectedPage.evaluate === 'function' && !selectedPage.isClosed()) {
@@ -1035,6 +1767,7 @@ function browserCodeKernelMain() {
           actions: [...activeExecution.actions],
           navigationChanged: false,
           tabChanged: false,
+          ...(activeExecution.verification ? { verification: activeExecution.verification } : {}),
         },
       });
     } finally {

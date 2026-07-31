@@ -17,8 +17,8 @@ test('final browser-chat replies preserve Markdown block boundaries', () => {
 });
 
 test('DOM observations are never treated as final assistant prose', () => {
-  assert.equal(isBrowserChatDomObservationText('DOM snapshot full: page 1/1\n<div uid=dom-1>首页</div>'), true);
-  assert.equal(isBrowserChatDomObservationText('<button uid=dom-42 aria-label="关闭"></button>'), true);
+  assert.equal(isBrowserChatDomObservationText('DOM snapshot full: page 1/1\n<div uid=dom-1-1>首页</div>'), true);
+  assert.equal(isBrowserChatDomObservationText('<button uid=dom-3-42 aria-label="关闭"></button>'), true);
   assert.equal(isBrowserChatDomObservationText('uid=12 button "Save"'), true);
   assert.equal(isBrowserChatDomObservationText('已完成操作，当前页面显示保存成功。'), false);
 });

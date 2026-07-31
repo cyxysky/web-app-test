@@ -36,7 +36,7 @@ before(async () => {
   browser = await chromium.connect(browserServer.wsEndpoint());
   browserContext = await browser.newContext();
   page = await browserContext.newPage();
-  await page.setContent('<title>Editor</title><button>Save</button>');
+  await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
   kernel = new BrowserCodeKernel({ protocol: 'cdp', endpoint: cdpEndpoint });
 });
 
@@ -81,20 +81,19 @@ test('browserCode sandbox executes ordinary Playwright code directly', async () 
   `);
 
   assert.equal(result.ok, true, result.error);
-  assert.deepEqual(result.value, {
-    title: 'Editor',
-    text: 'Save',
-    snapshot: '- button "Save"',
-    url: 'about:blank',
-    uidType: 'undefined',
-  });
+  const firstValue = result.value as Record<string, unknown>;
+  assert.equal(firstValue.title, 'Editor');
+  assert.equal(firstValue.text, 'Save');
+  assert.match(String(firstValue.snapshot), /^\[ax-tree\]\n/);
+  assert.match(String(firstValue.snapshot), /- button "Save"/);
+  assert.equal(firstValue.url, 'about:blank');
+  assert.equal(firstValue.uidType, 'undefined');
   assert.equal(result.logs.length, 1);
   assert.equal(result.logs[0].text, 'starting');
-  assert.deepEqual(result.activity, {
-    actions: [],
-    navigationChanged: false,
-    tabChanged: false,
-  });
+  assert.deepEqual(result.activity?.actions, []);
+  assert.equal(result.activity?.navigationChanged, false);
+  assert.equal(result.activity?.tabChanged, false);
+  assert.equal(result.activity ? 'observation' in result.activity : false, false);
 });
 
 test('browserCode keeps JavaScript bindings across cells like the Codex kernel', async () => {
@@ -107,23 +106,425 @@ test('browserCode bounds a missing locator and preserves the kernel after the fa
   const startedAt = Date.now();
   const failed = await run(`
     var bindingBeforeLocatorFailure = 'still-here';
+    await page.domSnapshot();
     await page.getByRole('button', { name: 'Missing button' }).click({ timeout: 3000 });
   `);
   assert.equal(failed.ok, false);
-  assert.match(failed.error || '', /Timeout 5000ms exceeded/i);
-  assert.doesNotMatch(failed.error || '', /Timeout 3000ms exceeded/i);
-  assert.ok(failed.activity?.actions.includes('locator.click'));
-  assert.ok(Date.now() - startedAt < 8_000, 'missing locator should return control through the operation timeout');
+  assert.match(failed.error || '', /ACTIONABILITY_FAILED: click matched 0 elements/i);
+  assert.equal(failed.activity?.actions.includes('locator.click'), false, 'a rejected candidate must not be recorded as an executed action');
+  assert.ok(Date.now() - startedAt < 2_000, 'missing locator should fail before entering Playwright action timeout');
 
   const recovered = await run(`nodeRepl.write({ bindingBeforeLocatorFailure });`);
   assert.equal(recovered.ok, true, recovered.error);
   assert.deepEqual(recovered.value, { bindingBeforeLocatorFailure: 'still-here' });
 });
 
-test('browserCode records hover as a browser operation', async () => {
-  const hovered = await run(`await saveButton.hover();`);
+test('browserCode actions do not require a same-cell domSnapshot gate', async () => {
+  const hovered = await run(`
+    await saveButton.hover();
+    await page.verifyState({
+      description: 'Save button received hover',
+      locator: saveButton,
+      state: 'attribute',
+      attribute: 'data-hovered',
+      equals: 'true',
+    });
+  `);
   assert.equal(hovered.ok, true, hovered.error);
   assert.ok(hovered.activity?.actions.includes('locator.hover'));
+  assert.equal(hovered.activity?.verification?.status, 'passed');
+});
+
+test('browserCode auto-filters hidden candidates and permits explicit positional disambiguation', async () => {
+  await page.evaluate(() => {
+    const hidden = document.createElement('div');
+    hidden.id = 'hidden-parent';
+    hidden.style.display = 'none';
+    hidden.innerHTML = `
+      <button id="hidden-action">Hidden action</button>
+      <button class="auto-filter-locator">Hidden locator action</button>
+      <button class="auto-filter-page">Hidden page action</button>
+      <input class="auto-filter-page-fill">
+      <input class="hidden-file-input" type="file">
+      <span class="qz-modal-title">Hidden modal title</span>
+    `;
+    const zeroSizedTitle = document.createElement('span');
+    zeroSizedTitle.className = 'qz-modal-title';
+    zeroSizedTitle.textContent = 'Zero-sized modal title';
+    Object.assign(zeroSizedTitle.style, {
+      display: 'block',
+      height: '0',
+      overflow: 'hidden',
+      width: '0',
+    });
+    const visibleTitle = document.createElement('span');
+    visibleTitle.className = 'qz-modal-title';
+    visibleTitle.textContent = 'Visible modal title';
+    const visibleLocatorAction = document.createElement('button');
+    visibleLocatorAction.className = 'auto-filter-locator';
+    visibleLocatorAction.textContent = 'Visible locator action';
+    visibleLocatorAction.onclick = () => { document.body.dataset.autoFilteredLocator = 'done'; };
+    const visiblePageAction = document.createElement('button');
+    visiblePageAction.className = 'auto-filter-page';
+    visiblePageAction.textContent = 'Visible page action';
+    visiblePageAction.onclick = () => { document.body.dataset.autoFilteredPage = 'done'; };
+    const visiblePageFill = document.createElement('input');
+    visiblePageFill.className = 'auto-filter-page-fill';
+    visiblePageFill.id = 'auto-filter-page-fill-target';
+    const readonlyPageFill = document.createElement('input');
+    readonlyPageFill.className = 'auto-filter-page-fill';
+    readonlyPageFill.id = 'auto-filter-page-fill-readonly';
+    readonlyPageFill.readOnly = true;
+    const disabledAction = document.createElement('button');
+    disabledAction.className = 'auto-filter-actionability';
+    disabledAction.textContent = 'Disabled action';
+    disabledAction.disabled = true;
+    const enabledAction = document.createElement('button');
+    enabledAction.className = 'auto-filter-actionability';
+    enabledAction.textContent = 'Enabled action';
+    enabledAction.onclick = () => { document.body.dataset.autoFilteredActionability = 'done'; };
+    const transparentAction = document.createElement('button');
+    transparentAction.className = 'auto-filter-opacity';
+    transparentAction.textContent = 'Transparent action';
+    transparentAction.style.opacity = '0';
+    const opaqueAction = document.createElement('button');
+    opaqueAction.className = 'auto-filter-opacity';
+    opaqueAction.textContent = 'Opaque action';
+    opaqueAction.onclick = () => { document.body.dataset.autoFilteredOpacity = 'done'; };
+    const invalidActionA = document.createElement('button');
+    invalidActionA.className = 'all-invalid-action';
+    invalidActionA.disabled = true;
+    const invalidActionB = invalidActionA.cloneNode(true);
+    const duplicateA = document.createElement('button');
+    duplicateA.className = 'duplicate-action';
+    duplicateA.textContent = 'Duplicate';
+    const duplicateB = duplicateA.cloneNode(true);
+    const pointerEventsParent = document.createElement('div');
+    pointerEventsParent.className = 'pointer-events-parent';
+    pointerEventsParent.style.pointerEvents = 'none';
+    const pointerEventsChild = document.createElement('button');
+    pointerEventsChild.className = 'pointer-events-child';
+    pointerEventsChild.style.pointerEvents = 'auto';
+    pointerEventsChild.textContent = 'Child restores pointer events';
+    pointerEventsChild.onclick = () => { document.body.dataset.pointerEventsChild = 'done'; };
+    pointerEventsParent.append(pointerEventsChild);
+    const ownPointerEventsNone = document.createElement('button');
+    ownPointerEventsNone.className = 'own-pointer-events-action';
+    ownPointerEventsNone.style.pointerEvents = 'none';
+    ownPointerEventsNone.textContent = 'Target pointer events none';
+    const ownPointerEventsAuto = document.createElement('button');
+    ownPointerEventsAuto.className = 'own-pointer-events-action';
+    ownPointerEventsAuto.textContent = 'Target pointer events auto';
+    ownPointerEventsAuto.onclick = () => { document.body.dataset.ownPointerEventsAction = 'done'; };
+    const coveredContainer = document.createElement('div');
+    coveredContainer.className = 'hit-test-container';
+    coveredContainer.style.display = 'inline-block';
+    coveredContainer.style.position = 'relative';
+    const coveredCandidate = document.createElement('button');
+    coveredCandidate.className = 'hit-test-action';
+    coveredCandidate.textContent = 'Covered candidate';
+    const cover = document.createElement('div');
+    Object.assign(cover.style, {
+      background: 'rgba(255, 255, 255, 0.01)',
+      inset: '0',
+      position: 'absolute',
+      zIndex: '2',
+    });
+    coveredContainer.append(coveredCandidate, cover);
+    const uncoveredCandidate = document.createElement('button');
+    uncoveredCandidate.className = 'hit-test-action';
+    uncoveredCandidate.textContent = 'Uncovered candidate';
+    uncoveredCandidate.onclick = () => { document.body.dataset.hitTestAction = 'done'; };
+    const movingTrialAction = document.createElement('button');
+    movingTrialAction.className = 'trial-filter-action';
+    movingTrialAction.textContent = 'Moving trial candidate';
+    const stableTrialAction = document.createElement('button');
+    stableTrialAction.className = 'trial-filter-action';
+    stableTrialAction.textContent = 'Stable trial candidate';
+    stableTrialAction.onclick = () => { document.body.dataset.trialFilteredAction = 'done'; };
+    document.body.append(
+      hidden,
+      visibleLocatorAction,
+      visiblePageAction,
+      readonlyPageFill,
+      visiblePageFill,
+      disabledAction,
+      enabledAction,
+      transparentAction,
+      opaqueAction,
+      invalidActionA,
+      invalidActionB,
+      duplicateA,
+      duplicateB,
+      pointerEventsParent,
+      ownPointerEventsNone,
+      ownPointerEventsAuto,
+      coveredContainer,
+      uncoveredCandidate,
+      movingTrialAction,
+      stableTrialAction,
+      zeroSizedTitle,
+      visibleTitle,
+    );
+    movingTrialAction.animate(
+      [{ transform: 'translateX(0px)' }, { transform: 'translateX(24px)' }],
+      { duration: 80, direction: 'alternate', iterations: Infinity },
+    );
+  });
+  try {
+    const hidden = await run(`
+      await page.domSnapshot();
+      await page.locator('#hidden-action').click();
+    `);
+    assert.equal(hidden.ok, false);
+    assert.match(
+      hidden.error || '',
+      /matched 0 elements; 0 passed automatic visible filtering; 0 passed full actionability/i,
+    );
+
+    const hiddenFocus = await run(`
+      await page.domSnapshot();
+      await page.locator('#hidden-action').focus();
+    `);
+    assert.equal(hiddenFocus.ok, false);
+    assert.match(
+      hiddenFocus.error || '',
+      /matched 0 elements; 0 passed automatic visible filtering; 0 passed full actionability/i,
+    );
+
+    const existingTitles = await run(`
+      var modalTitles = page.locator('span.qz-modal-title');
+      nodeRepl.write({
+        count: await modalTitles.count(),
+        firstText: await modalTitles.first().innerText(),
+      });
+    `);
+    assert.equal(existingTitles.ok, true, existingTitles.error);
+    assert.deepEqual(existingTitles.value, {
+      count: 1,
+      firstText: 'Visible modal title',
+    });
+
+    const autoFilteredLocator = await run(`
+      await page.domSnapshot();
+      await page.locator('.auto-filter-locator').click();
+    `);
+    assert.equal(autoFilteredLocator.ok, true, autoFilteredLocator.error);
+    assert.equal(await page.locator('body').getAttribute('data-auto-filtered-locator'), 'done');
+
+    const autoFilteredPage = await run(`
+      await page.domSnapshot();
+      await page.click('.auto-filter-page');
+    `);
+    assert.equal(autoFilteredPage.ok, true, autoFilteredPage.error);
+    assert.equal(await page.locator('body').getAttribute('data-auto-filtered-page'), 'done');
+
+    const autoFilteredPageFill = await run(`
+      await page.domSnapshot();
+      await page.fill('.auto-filter-page-fill', 'visible-value');
+    `);
+    assert.equal(autoFilteredPageFill.ok, true, autoFilteredPageFill.error);
+    assert.equal(await page.locator('#auto-filter-page-fill-target').inputValue(), 'visible-value');
+    assert.equal(await page.locator('#auto-filter-page-fill-readonly').inputValue(), '');
+    assert.equal(await page.locator('#hidden-parent .auto-filter-page-fill').inputValue(), '');
+
+    const autoFilteredActionability = await run(`
+      await page.domSnapshot();
+      await page.locator('.auto-filter-actionability').click();
+    `);
+    assert.equal(autoFilteredActionability.ok, true, autoFilteredActionability.error);
+    assert.equal(await page.locator('body').getAttribute('data-auto-filtered-actionability'), 'done');
+
+    const autoFilteredOpacity = await run(`
+      await page.domSnapshot();
+      await page.locator('.auto-filter-opacity').click();
+    `);
+    assert.equal(autoFilteredOpacity.ok, true, autoFilteredOpacity.error);
+    assert.equal(await page.locator('body').getAttribute('data-auto-filtered-opacity'), 'done');
+
+    const pointerEventsOverride = await run(`
+      await page.domSnapshot();
+      await page.locator('.pointer-events-child').click();
+    `);
+    assert.equal(pointerEventsOverride.ok, true, pointerEventsOverride.error);
+    assert.equal(await page.locator('body').getAttribute('data-pointer-events-child'), 'done');
+
+    const ownPointerEvents = await run(`
+      await page.domSnapshot();
+      await page.locator('.own-pointer-events-action').click();
+    `);
+    assert.equal(ownPointerEvents.ok, true, ownPointerEvents.error);
+    assert.equal(await page.locator('body').getAttribute('data-own-pointer-events-action'), 'done');
+
+    const hitTestAction = await run(`
+      await page.domSnapshot();
+      await page.locator('.hit-test-action').click();
+    `);
+    assert.equal(hitTestAction.ok, true, hitTestAction.error);
+    assert.equal(await page.locator('body').getAttribute('data-hit-test-action'), 'done');
+
+    const trialFilteredAction = await run(`
+      await page.domSnapshot();
+      await page.locator('.trial-filter-action').click();
+    `);
+    assert.equal(trialFilteredAction.ok, true, trialFilteredAction.error);
+    assert.equal(await page.locator('body').getAttribute('data-trial-filtered-action'), 'done');
+
+    const allInvalid = await run(`
+      await page.domSnapshot();
+      await page.locator('.all-invalid-action').click();
+    `);
+    assert.equal(allInvalid.ok, false);
+    assert.match(
+      allInvalid.error || '',
+      /matched 2 elements; 2 passed automatic visible filtering; 0 passed full actionability/i,
+    );
+
+    const hiddenFileInput = await run(`
+      await page.domSnapshot();
+      await page.locator('.hidden-file-input').setInputFiles([]);
+    `);
+    assert.equal(hiddenFileInput.ok, true, hiddenFileInput.error);
+
+    const ambiguous = await run(`
+      await page.domSnapshot();
+      await page.locator('.duplicate-action').click();
+    `);
+    assert.equal(ambiguous.ok, false);
+    assert.match(
+      ambiguous.error || '',
+      /matched 2 elements; 2 passed automatic visible filtering; 2 passed full actionability/i,
+    );
+
+    const positional = await run(`
+      await page.domSnapshot();
+      await page.locator('.duplicate-action').first().click();
+      await page.locator('.duplicate-action').last().hover();
+      await page.locator('.duplicate-action').nth(1).click();
+    `);
+    assert.equal(positional.ok, true, positional.error);
+    assert.deepEqual(positional.activity?.actions, ['locator.click', 'locator.hover', 'locator.click']);
+
+  } finally {
+    await page.locator(
+      '#hidden-parent, .auto-filter-locator, .auto-filter-page, .auto-filter-page-fill, '
+      + '.auto-filter-actionability, .auto-filter-opacity, .all-invalid-action, .duplicate-action, '
+      + '.pointer-events-parent, .own-pointer-events-action, .hit-test-container, .hit-test-action, .trial-filter-action, '
+      + '.qz-modal-title',
+    ).evaluateAll((elements) => elements.forEach((element) => element.remove()));
+    await page.locator('body').evaluate((body) => {
+      delete body.dataset.autoFilteredLocator;
+      delete body.dataset.autoFilteredPage;
+      delete body.dataset.autoFilteredActionability;
+      delete body.dataset.autoFilteredOpacity;
+      delete body.dataset.pointerEventsChild;
+      delete body.dataset.ownPointerEventsAction;
+      delete body.dataset.hitTestAction;
+      delete body.dataset.trialFilteredAction;
+    });
+  }
+});
+
+test('browserCode permits multiple bounded state-changing operations per cell', async () => {
+  await page.evaluate(() => {
+    const first = document.createElement('button');
+    first.id = 'single-step-first';
+    first.textContent = 'First step';
+    first.onclick = () => { document.body.dataset.firstStep = 'done'; };
+    const second = document.createElement('button');
+    second.id = 'single-step-second';
+    second.textContent = 'Second step';
+    second.onmouseenter = () => { document.body.dataset.secondHover = 'done'; };
+    second.onclick = () => { document.body.dataset.secondStep = 'done'; };
+    document.body.append(first, second);
+  });
+  try {
+    const result = await run(`
+      await page.domSnapshot();
+      await page.locator('#single-step-first').click();
+      await page.verifyState({
+        description: 'First step completed',
+        locator: page.locator('body'),
+        state: 'attribute',
+        attribute: 'data-first-step',
+        equals: 'done',
+      });
+      await page.locator('#single-step-second').hover();
+      await page.locator('#single-step-second').click();
+    `);
+    assert.equal(result.ok, true, result.error);
+    assert.equal(await page.locator('body').getAttribute('data-first-step'), 'done');
+    assert.equal(await page.locator('body').getAttribute('data-second-hover'), 'done');
+    assert.equal(await page.locator('body').getAttribute('data-second-step'), 'done');
+    assert.deepEqual(
+      result.activity?.actions.filter((action) => action === 'locator.click'),
+      ['locator.click', 'locator.click'],
+    );
+    assert.ok(result.activity?.actions.includes('locator.hover'));
+  } finally {
+    await page.locator('#single-step-first, #single-step-second').evaluateAll((elements) => elements.forEach((element) => element.remove()));
+    await page.locator('body').evaluate((body) => {
+      delete body.dataset.firstStep;
+      delete body.dataset.secondHover;
+      delete body.dataset.secondStep;
+    });
+  }
+});
+
+test('browserCode leaves post-action verification to the model without blocking later cells', async () => {
+  await page.evaluate(() => {
+    const button = document.createElement('button');
+    button.id = 'pending-verification';
+    button.textContent = 'Optional verification';
+    button.onclick = () => {
+      document.body.dataset.optionalVerification = String(
+        Number(document.body.dataset.optionalVerification || '0') + 1,
+      );
+    };
+    document.body.append(button);
+  });
+  try {
+    const unverified = await run(`
+      await page.domSnapshot();
+      await page.locator('#pending-verification').click();
+    `);
+    assert.equal(unverified.ok, true, unverified.error);
+    assert.equal(unverified.activity?.verification, undefined);
+    assert.equal(await page.locator('body').getAttribute('data-optional-verification'), '1');
+
+    const nextCell = await run(`
+      await page.domSnapshot();
+      await page.locator('#pending-verification').click();
+    `);
+    assert.equal(nextCell.ok, true, nextCell.error);
+    assert.equal(await page.locator('body').getAttribute('data-optional-verification'), '2');
+
+    const invalidLocator = await run(`
+      await page.verifyState({
+        description: 'Invalid locator is rejected clearly',
+        locator: {},
+        state: 'visible',
+      });
+    `);
+    assert.equal(invalidLocator.ok, false);
+    assert.match(invalidLocator.error || '', /Locator from the active page or a selector string/);
+    assert.doesNotMatch(invalidLocator.error || '', /count is not a function/);
+
+    const verified = await run(`
+      await page.verifyState({
+        description: 'Optional verification accepts a selector string',
+        locator: '#pending-verification',
+        state: 'visible',
+      });
+    `);
+    assert.equal(verified.ok, true, verified.error);
+    assert.equal(verified.activity?.verification?.status, 'passed');
+  } finally {
+    await page.locator('#pending-verification').evaluate((element) => element.remove());
+    await page.locator('body').evaluate((body) => {
+      delete body.dataset.optionalVerification;
+    });
+  }
 });
 
 test('browserCode requires coordinate screenshots to be reviewed in a previous cell', async () => {
@@ -153,6 +554,13 @@ test('browserCode requires coordinate screenshots to be reviewed in a previous c
 
   const reviewedCoordinate = await run(`
     await page.mouse.click(10, 10);
+    await page.verifyState({
+      description: 'Coordinate click reached the Save button',
+      locator: page.locator('body'),
+      state: 'attribute',
+      attribute: 'data-coordinate-clicked',
+      equals: 'true',
+    });
     nodeRepl.write({ clicked: true });
   `);
   assert.equal(reviewedCoordinate.ok, true, reviewedCoordinate.error);
@@ -187,16 +595,38 @@ test('browserCode emits screenshots from the same JavaScript cell', async () => 
 });
 
 test('browserCode exposes browser and tab lifecycle as JavaScript APIs', async () => {
-  const result = await run(`
+  const created = await run(`
     var runtimeBrowser = await agent.browsers.getDefault();
     var runtimeTab = await runtimeBrowser.tabs.new();
     await runtimeTab.playwright.setContent('<title>Runtime tab</title><button onclick="location.hash=&quot;runtime-ready&quot;">Continue</button>');
+    await page.verifyState({
+      description: 'Runtime tab content is ready',
+      locator: page.getByRole('button', { name: 'Continue' }),
+      state: 'visible',
+    });
+    nodeRepl.write({ created: true });
+  `);
+  assert.equal(created.ok, true, created.error);
+
+  const navigated = await run(`
+    runtimeTab.use();
+    await runtimeTab.playwright.domSnapshot();
     await runtimeTab.playwright.expectNavigation(
       () => runtimeTab.playwright.getByRole('button', { name: 'Continue' }).click(),
       { url: /#runtime-ready$/, timeoutMs: 3000 },
     );
+    await runtimeTab.playwright.verifyState({
+      description: 'Runtime tab reached the expected hash',
+      url: /#runtime-ready$/,
+    });
+    nodeRepl.write({ navigationUrl: page.url() });
+  `);
+  assert.equal(navigated.ok, true, navigated.error);
+  assert.deepEqual(navigated.value, { navigationUrl: 'about:blank#runtime-ready' });
+
+  const result = await run(`
     var runtimeOpenTabs = await runtimeBrowser.user.openTabs();
-    await runtimeBrowser.user.claimTab();
+    runtimeTab.use();
     await runtimeBrowser.tabs.finalize({ keep: [{ tab: runtimeTab, status: 'deliverable' }] });
     nodeRepl.write({
       browserCount: (await agent.browsers.list()).length,
@@ -319,7 +749,18 @@ test('browserCode restarts with a clean kernel after an aborted cell', async () 
 
 test('browserCode fills credential references only on an allowed origin without returning the raw value', async () => {
   await browserContext.route('http://credential.test/**', (route) => route.fulfill({
-    body: '<title>Login</title><label>Username<input></label><label>Password<input type="password"></label>',
+    body: `
+      <title>Login</title>
+      <div class="ng-login-container" style="display:none">
+        <input name="username">
+        <input name="password" type="password">
+        <button type="submit">Hidden submit</button>
+      </div>
+      <input name="hidden-token" type="hidden">
+      <input id="readonly-username" name="username" readonly>
+      <label>Username<input name="username"></label>
+      <label>Password<input name="password" type="password"></label>
+    `,
     contentType: 'text/html',
   }));
   await page.goto('http://credential.test/login');
@@ -341,8 +782,81 @@ test('browserCode fills credential references only on an allowed origin without 
     const fakeLocatorLeakCheck = await run(`nodeRepl.write(capturedCredentialValue);`);
     assert.equal(fakeLocatorLeakCheck.value, 'not-exposed');
 
+    const autoFilteredCredential = await run(`
+      await page.domSnapshot();
+      await credentialVault.fill(page.locator('input[name="username"]'), 'username-ref');
+    `, {
+      credentials: [{ ref: 'username-ref', value: secret, allowedOrigins: ['http://credential.test'] }],
+    });
+    assert.equal(autoFilteredCredential.ok, true, autoFilteredCredential.error);
+    assert.equal(await page.locator('label input[name="username"]').inputValue(), secret);
+    assert.equal(await page.locator('#readonly-username').inputValue(), '');
+    assert.equal(await page.locator('.ng-login-container input[name="username"]').inputValue(), '');
+    assert.doesNotMatch(JSON.stringify(autoFilteredCredential), new RegExp(secret));
+
+    await page.locator('label input[name="username"]').fill('');
+    await page.locator('label input[name="password"]').fill('');
+    const multiCredential = await run(`
+      await page.domSnapshot();
+      await credentialVault.fill(page.locator('input[name="username"]'), 'username-ref');
+      await credentialVault.fill(page.locator('input[name="password"]'), 'password-ref');
+    `, {
+      credentials: [
+        { ref: 'username-ref', value: secret, allowedOrigins: ['http://credential.test'] },
+        { ref: 'password-ref', value: secret, allowedOrigins: ['http://credential.test'] },
+      ],
+    });
+    assert.equal(multiCredential.ok, true, multiCredential.error);
+    assert.equal(await page.locator('label input[name="username"]').inputValue(), secret);
+    assert.equal(await page.locator('label input[name="password"]').inputValue(), secret);
+    assert.deepEqual(
+      multiCredential.activity?.actions,
+      ['credential.fill', 'credential.fill'],
+    );
+    assert.doesNotMatch(JSON.stringify(multiCredential), new RegExp(secret));
+
+    const hiddenCredential = await run(`
+      await page.domSnapshot();
+      await credentialVault.fill(page.locator('.ng-login-container input[name="username"]'), 'username-ref');
+    `, {
+      credentials: [{ ref: 'username-ref', value: secret, allowedOrigins: ['http://credential.test'] }],
+    });
+    assert.equal(hiddenCredential.ok, false);
+    assert.match(
+      hiddenCredential.error || '',
+      /matched 0 elements; 0 passed automatic visible filtering; 0 passed full actionability/i,
+    );
+    assert.equal(await page.locator('.ng-login-container input[name="username"]').inputValue(), '');
+
+    const hiddenInputCredential = await run(`
+      await page.domSnapshot();
+      await credentialVault.fill(page.locator('input[name="hidden-token"]'), 'hidden-token-ref');
+    `, {
+      credentials: [{ ref: 'hidden-token-ref', value: secret, allowedOrigins: ['http://credential.test'] }],
+    });
+    assert.equal(hiddenInputCredential.ok, false);
+    assert.match(
+      hiddenInputCredential.error || '',
+      /matched 0 elements; 0 passed automatic visible filtering; 0 passed full actionability/i,
+    );
+    assert.equal(await page.locator('input[name="hidden-token"]').inputValue(), '');
+
+    const hiddenButton = await run(`
+      await page.domSnapshot();
+      await page.locator('.ng-login-container button[type="submit"]').click();
+    `);
+    assert.equal(hiddenButton.ok, false);
+    assert.match(
+      hiddenButton.error || '',
+      /matched 0 elements; 0 passed automatic visible filtering; 0 passed full actionability/i,
+    );
+
     const result = await run(`
-      var credentialFillResult = await credentialVault.fill(page.getByLabel('Password'), 'password-ref');
+      await page.domSnapshot();
+      var credentialFillResult = await credentialVault.fill(
+        page.locator('input[name="password"]').filter({ visible: true }),
+        'password-ref'
+      );
       nodeRepl.write(credentialFillResult);
     `, {
       credentials: [{ ref: 'password-ref', value: secret, allowedOrigins: ['http://credential.test'] }],
@@ -350,22 +864,22 @@ test('browserCode fills credential references only on an allowed origin without 
 
     assert.equal(result.ok, true, result.error);
     assert.deepEqual(result.value, { filled: true, origin: 'http://credential.test' });
-    assert.equal(await page.getByLabel('Password').inputValue(), secret);
+    assert.equal(await page.locator('label input[name="password"]').inputValue(), secret);
     assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
 
-    await page.getByLabel('Password').fill('');
+    await page.locator('label input[name="password"]').fill('');
     const rejected = await run(`
-      await credentialVault.fill(page.getByLabel('Password'), 'wrong-origin-ref');
+      await credentialVault.fill(page.locator('label input[name="password"]'), 'wrong-origin-ref');
     `, {
       credentials: [{ ref: 'wrong-origin-ref', value: secret, allowedOrigins: ['http://other.test'] }],
     });
     assert.equal(rejected.ok, false);
     assert.match(rejected.error || '', /not allowed for http:\/\/credential\.test/);
-    assert.equal(await page.getByLabel('Password').inputValue(), '');
+    assert.equal(await page.locator('label input[name="password"]').inputValue(), '');
     assert.doesNotMatch(JSON.stringify(rejected), new RegExp(secret));
   } finally {
     await page.goto('about:blank');
-    await page.setContent('<title>Editor</title><button>Save</button>');
+    await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
     await browserContext.unroute('http://credential.test/**');
   }
 });

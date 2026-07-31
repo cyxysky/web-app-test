@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { KeyRound, Loader2, Save, ShieldCheck, X } from 'lucide-react';
+import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
@@ -53,6 +54,7 @@ export function LoginAccountModal({
   open: boolean;
   userId?: string;
 }) {
+  const { t } = useI18n();
   const [portalReady, setPortalReady] = useState(false);
   const [domain, setDomain] = useState('');
   const [label, setLabel] = useState('');
@@ -91,7 +93,7 @@ export function LoginAccountModal({
   async function save() {
     const normalizedDomain = loginAccountDomain(domain || loginUrl);
     if (!normalizedDomain || !username.trim() || (!editing && !password)) {
-      setError('请填写域名、用户名和密码。');
+      setError(t('请填写域名、用户名和密码。'));
       return;
     }
     setSaving(true);
@@ -113,14 +115,14 @@ export function LoginAccountModal({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      const data = await readApiJson<{ account?: LoginAccountMetadata }>(response, account ? '更新账号失败' : '保存账号失败');
-      if (!data.account) throw new Error('后台没有返回账号信息');
+      const data = await readApiJson<{ account?: LoginAccountMetadata }>(response, t(account ? '更新账号失败' : '保存账号失败'));
+      if (!data.account) throw new Error(t('后台没有返回账号信息'));
       setPassword('');
       onSaved(data.account);
       onClose();
     } catch (saveError) {
       setPassword('');
-      setError(saveError instanceof Error ? saveError.message : '保存账号失败');
+      setError(saveError instanceof Error ? saveError.message : t('保存账号失败'));
     } finally {
       setSaving(false);
     }
@@ -138,39 +140,39 @@ export function LoginAccountModal({
         <header className="ui-modal-header login-account-modal-header">
           <span className="login-account-modal-icon" aria-hidden="true"><ShieldCheck size={18} /></span>
           <div className="ui-modal-heading">
-            <h2 className="ui-modal-title" id="login-account-modal-title">{editing ? '编辑登录账号' : '新增登录账号'}</h2>
-            <p className="ui-modal-subtitle">按域名保存，目标测试会自动匹配并通过安全引用登录</p>
+            <h2 className="ui-modal-title" id="login-account-modal-title">{t(editing ? '编辑登录账号' : '新增登录账号')}</h2>
+            <p className="ui-modal-subtitle">{t('按域名保存，目标测试会自动匹配并通过安全引用登录')}</p>
           </div>
-          <button aria-label="关闭" className="ui-icon-button ui-modal-close" disabled={saving} onClick={onClose} type="button">
+          <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={saving} onClick={onClose} type="button">
             <X size={16} />
           </button>
         </header>
 
         <div className="ui-modal-body login-account-form">
           <label>
-            <span>名称</span>
-            <input className="input" disabled={saving} onChange={(event) => setLabel(event.target.value)} placeholder="例如：测试环境管理员" value={label} />
+            <span>{t('名称')}</span>
+            <input className="input" disabled={saving} onChange={(event) => setLabel(event.target.value)} placeholder={t('例如：测试环境管理员')} value={label} />
           </label>
           <label>
-            <span>域名</span>
+            <span>{t('域名')}</span>
             <input className="input" disabled={saving} onChange={(event) => setDomain(event.target.value)} placeholder="app.example.com" value={domain} />
           </label>
           <label className="wide">
-            <span>登录地址 <small>可选</small></span>
+            <span>{t('登录地址')} <small>{t('可选')}</small></span>
             <input className="input" disabled={saving} onBlur={() => !domain && setDomain(loginAccountDomain(loginUrl))} onChange={(event) => setLoginUrl(event.target.value)} placeholder="https://app.example.com/login" value={loginUrl} />
           </label>
           <label>
-            <span>用户名</span>
+            <span>{t('用户名')}</span>
             <input autoComplete="off" className="input" disabled={saving} onChange={(event) => setUsername(event.target.value)} placeholder="admin@example.com" value={username} />
           </label>
           <label>
-            <span>密码 {editing ? <small>留空则不修改</small> : null}</span>
-            <input autoComplete="new-password" className="input" disabled={saving} onChange={(event) => setPassword(event.target.value)} placeholder={editing ? '保持原密码' : '输入登录密码'} type="password" value={password} />
+            <span>{t('密码')} {editing ? <small>{t('留空则不修改')}</small> : null}</span>
+            <input autoComplete="new-password" className="input" disabled={saving} onChange={(event) => setPassword(event.target.value)} placeholder={t(editing ? '保持原密码' : '输入登录密码')} type="password" value={password} />
           </label>
           <div className="resource-sharing-field wide">
             <div>
-              <strong>所有 ID 共享</strong>
-              <small>其他 ID 可以调用此账号，但只有创建 ID {account?.userId || userId || '0'} 可以编辑或删除</small>
+              <strong>{t('所有 ID 共享')}</strong>
+              <small>{t('其他 ID 可以调用此账号，但只有创建 ID {id} 可以编辑或删除', { id: account?.userId || userId || '0' })}</small>
             </div>
             <button aria-pressed={shared} className={`settings-toggle${shared ? ' on' : ''}`} disabled={saving} onClick={() => setShared((value) => !value)} type="button">
               <span />
@@ -178,16 +180,16 @@ export function LoginAccountModal({
           </div>
           <div className="login-account-security-note wide">
             <KeyRound aria-hidden="true" size={14} />
-            <span>密码加密保存在本机后台；规划模型只会看到域名和用户名，登录时只使用短期安全引用。</span>
+            <span>{t('密码加密保存在本机后台；规划模型只会看到域名和用户名，登录时只使用短期安全引用。')}</span>
           </div>
           {error ? <p className="login-account-modal-error wide" role="alert">{error}</p> : null}
         </div>
 
         <footer className="ui-modal-footer">
-          <button className="ui-button ui-button--neutral" disabled={saving} onClick={onClose} type="button">取消</button>
+          <button className="ui-button ui-button--neutral" disabled={saving} onClick={onClose} type="button">{t('取消')}</button>
           <button className="ui-button ui-button--primary" disabled={saving} onClick={() => void save()} type="button">
             {saving ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
-            {saving ? '正在保存' : '保存账号'}
+            {t(saving ? '正在保存' : '保存账号')}
           </button>
         </footer>
       </section>

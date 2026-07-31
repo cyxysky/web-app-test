@@ -10,6 +10,39 @@ type RuntimeContinuationState = {
   userConstraints?: unknown;
 };
 
+const TRANSIENT_BROWSER_EVIDENCE_KEYS = new Set(['axTree', 'domChanges', 'domSnapshot']);
+
+function sanitizeContinuationValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return /\[ax-tree\]|"(?:axTree|domChanges|domSnapshot)"\s*:/.test(value)
+      ? undefined
+      : value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map(sanitizeContinuationValue)
+      .filter((item) => item !== undefined);
+  }
+  if (!value || typeof value !== 'object') return value;
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (TRANSIENT_BROWSER_EVIDENCE_KEYS.has(key)) continue;
+    const next = sanitizeContinuationValue(child);
+    if (next !== undefined) sanitized[key] = next;
+  }
+  return sanitized;
+}
+
+export function sanitizeRuntimeContinuationSummary(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  try {
+    return JSON.stringify(sanitizeContinuationValue(JSON.parse(trimmed)));
+  } catch {
+    return /\[ax-tree\]|"(?:axTree|domChanges|domSnapshot)"\s*:/.test(trimmed) ? '' : trimmed;
+  }
+}
+
 function serializedMessageDelta(modelMessages: unknown) {
   const record = modelMessages && typeof modelMessages === 'object' && !Array.isArray(modelMessages)
     ? modelMessages as Record<string, unknown>
@@ -41,7 +74,7 @@ export function buildRuntimeContinuationSummaryPrompt(input: {
     '- Preserve stable Playwright locator intent and exact structured evidence when it materially affects the next action.',
     '- Preserve current URL/page state, blockers, manual verification state, user constraints, completed searches, empty results, and failed attempts.',
     '- The authoritative runtime state was produced after the latest completed tool call and wins on conflict.',
-    '- Do not include raw screenshots, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON unless essential.',
+    '- Never copy raw screenshots, AX trees, page.domSnapshot() output, domChanges payloads, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON into the summary. Preserve only the durable fact learned from that transient evidence.',
     '- Write Chinese for user-facing summaries when possible.',
     '',
     `Goal: ${input.goal}`,
@@ -72,7 +105,7 @@ export function fallbackRuntimeContinuationSummary(input: {
     browserMode: input.browserMode,
     executorStep: input.stepIndex,
     agentStepBeforeCompression: input.agentStep,
-    previousContinuationSummary: input.previousSummary || undefined,
+    previousContinuationSummary: sanitizeRuntimeContinuationSummary(input.previousSummary || '') || undefined,
     completed: input.runtimeState.completed || [],
     currentPage: input.runtimeState.currentState || input.runtimeState.pageUnderstanding || '',
     importantEvidence: input.runtimeState.findings || [],

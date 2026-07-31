@@ -42,19 +42,76 @@ test('BrowserSession executes browserCode against the controlled Playwright page
     </body></html>
   `)}`);
 
-  const screenshotAction = await session.executeBrowserCode({
+  const fillName = await session.executeBrowserCode({
     code: `
-      console.info('session-cell-started');
-      const name = page.locator('[aria-label="Name"]');
-      await name.click();
+      var name = page.locator('[aria-label="Name"]').filter({ visible: true });
+      await name.fill('Alice');
+      await page.verifyState({
+        description: 'Name value was entered',
+        locator: name,
+        state: 'value',
+        equals: 'Alice',
+      });
       var nameBox = await name.boundingBox();
       var locatorCursor = await page.locator('#__ai_mouse_cursor__').evaluate((element) => ({
         x: Number(element.dataset.x),
         y: Number(element.dataset.y),
       }));
-      await page.keyboard.type('Alice');
-      await page.getByLabel('Role').selectOption('admin');
-      const button = page.getByRole('button', { name: 'Apply' });
+    `,
+    runId: 'browser-code-session-test',
+    stepIndex: 1,
+  });
+  assert.equal(fillName.ok, true, fillName.actual);
+  assert.equal(fillName.observation, undefined);
+  const fillNameActual = JSON.parse(fillName.actual) as {
+    observation?: unknown;
+    domChanges?: { observation?: unknown };
+    axTree?: string;
+  };
+  assert.equal(fillNameActual.observation, undefined);
+  assert.equal(fillNameActual.domChanges?.observation, undefined);
+  assert.equal(fillNameActual.axTree, undefined);
+
+  const missingAction = await session.executeBrowserCode({
+    code: `
+      await page.domSnapshot();
+      await page.locator('#missing-action-target').click();
+    `,
+    runId: 'browser-code-session-test',
+    stepIndex: 2,
+  });
+  assert.equal(missingAction.ok, false);
+  assert.equal(missingAction.observation, undefined);
+  const missingActual = JSON.parse(missingAction.actual) as {
+    observation?: unknown;
+    domChanges?: { observation?: unknown };
+    axTree?: string;
+  };
+  assert.equal(missingActual.observation, undefined);
+  assert.equal(missingActual.domChanges?.observation, undefined);
+  assert.equal(missingActual.axTree, undefined);
+
+  const selectRole = await session.executeBrowserCode({
+    code: `
+      await page.domSnapshot();
+      var role = page.getByLabel('Role').filter({ visible: true });
+      await role.selectOption('admin');
+      await page.verifyState({
+        description: 'Admin role was selected',
+        locator: role,
+        state: 'value',
+        equals: 'admin',
+      });
+    `,
+    runId: 'browser-code-session-test',
+    stepIndex: 3,
+  });
+  assert.equal(selectRole.ok, true, selectRole.actual);
+
+  const screenshotAction = await session.executeBrowserCode({
+    code: `
+      console.info('session-cell-started');
+      var button = page.getByRole('button', { name: 'Apply' }).filter({ visible: true });
       var buttonLabel = await button.evaluate((element, suffix) => element.textContent + suffix, '!');
       var buttonBox = await button.boundingBox();
       if (!buttonBox) throw new Error('Apply button is not visible');
@@ -62,7 +119,7 @@ test('BrowserSession executes browserCode against the controlled Playwright page
       nodeRepl.write({ screenshotReady: true });
     `,
     runId: 'browser-code-session-test',
-    stepIndex: 1,
+    stepIndex: 4,
   });
 
   assert.equal(screenshotAction.ok, true, screenshotAction.actual);
@@ -76,6 +133,12 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   const action = await session.executeBrowserCode({
     code: `
       await page.mouse.click(buttonBox.x + buttonBox.width / 2, buttonBox.y + buttonBox.height / 2);
+      await page.verifyState({
+        description: 'Apply action completed',
+        locator: page.locator('#status'),
+        state: 'text',
+        equals: 'Applied',
+      });
       const state = await page.evaluate(() => ({
         name: document.querySelector('[aria-label="Name"]').value,
         role: document.querySelector('[aria-label="Role"]').value,
@@ -95,7 +158,7 @@ test('BrowserSession executes browserCode against the controlled Playwright page
       nodeRepl.write(sessionResult);
     `,
     runId: 'browser-code-session-test',
-    stepIndex: 2,
+    stepIndex: 5,
   });
 
   assert.equal(action.ok, true, action.actual);
@@ -115,6 +178,7 @@ test('BrowserSession executes browserCode against the controlled Playwright page
       updated?: string[];
       extra?: { added?: string[]; updated?: string[] };
     };
+    axTree?: string;
     console?: {
       code?: Array<{ level?: string; text?: string }>;
       page?: Array<{ level?: string; text?: string }>;
@@ -130,6 +194,7 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.equal(result.result?.nativeContext, true);
   assert.equal(result.result?.pageCount, 1);
   assert.match(JSON.stringify(result.domChanges || {}), /Applied/);
+  assert.equal(result.axTree, undefined);
   assert.equal('postActionObservation' in result, false);
   assert.equal('domSnapshot' in result, false);
   assert.deepEqual(result.console?.code, []);
@@ -151,21 +216,23 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   const readOnlyAction = await session.executeBrowserCode({
     code: `nodeRepl.write({ title: await page.title(), url: page.url() });`,
     runId: 'browser-code-session-test',
-    stepIndex: 3,
+    stepIndex: 5,
   });
   assert.equal(readOnlyAction.ok, true, readOnlyAction.actual);
   const readOnlyResult = JSON.parse(readOnlyAction.actual) as Record<string, unknown>;
   assert.equal('domChanges' in readOnlyResult, false);
+  assert.equal('axTree' in readOnlyResult, false);
   assert.equal('postActionObservation' in readOnlyResult, false);
 
   const readOnlyFailure = await session.executeBrowserCode({
     code: `await page.locator('[data-never-exists]').innerText({ timeout: 100 });`,
     runId: 'browser-code-session-test',
-    stepIndex: 4,
+    stepIndex: 6,
   });
   assert.equal(readOnlyFailure.ok, false);
   const readOnlyFailureResult = JSON.parse(readOnlyFailure.actual) as Record<string, unknown>;
   assert.equal('domChanges' in readOnlyFailureResult, false);
+  assert.equal('axTree' in readOnlyFailureResult, false);
   assert.equal('postActionObservation' in readOnlyFailureResult, false);
 });
 
@@ -180,21 +247,30 @@ test('browserCode-created tabs are owned and group-marked before preview starts'
   const initialPage = Reflect.get(session, 'activePage') as Page;
   await initialPage.setContent('<title>Initial</title><main>Initial tab</main>');
 
-  const action = await session.executeBrowserCode({
+  const createdAction = await session.executeBrowserCode({
     code: `
       var createdTab = await browser.tabs.new({
         url: 'data:text/html,<title>Created</title><main>Created tab</main>',
       });
+      nodeRepl.write({ url: createdTab.url() });
+    `,
+    runId: 'browser-code-tab-group-test',
+    stepIndex: 1,
+  });
+  assert.equal(createdAction.ok, true, createdAction.actual);
+
+  const directAction = await session.executeBrowserCode({
+    code: `
       var directContextTab = await context.newPage();
       await directContextTab.goto('data:text/html,<title>Direct</title><main>Direct context tab</main>');
       nodeRepl.write({ directUrl: directContextTab.url(), url: createdTab.url() });
     `,
     runId: 'browser-code-tab-group-test',
-    stepIndex: 1,
+    stepIndex: 2,
   });
 
-  assert.equal(action.ok, true, action.actual);
-  const actionResult = JSON.parse(action.actual) as Record<string, unknown>;
+  assert.equal(directAction.ok, true, directAction.actual);
+  const actionResult = JSON.parse(directAction.actual) as Record<string, unknown>;
   assert.equal('domChanges' in actionResult, true, 'tab operations should return an incremental DOM result even when it is empty');
   assert.equal('postActionObservation' in actionResult, false);
   const tabs = session.getTabsSnapshot();
@@ -202,6 +278,22 @@ test('browserCode-created tabs are owned and group-marked before preview starts'
   assert.equal(tabs.filter((tab) => tab.active).length, 1);
   assert.match(session.currentUrl(), /^data:text\/html,/);
   const groupId = Reflect.get(session, 'pageGroupId') as string;
+  const inventoryAction = await session.executeBrowserCode({
+    code: `
+      var continuationTabInventory = await browser.user.openTabs();
+      nodeRepl.write(continuationTabInventory);
+    `,
+    runId: 'browser-code-tab-group-test',
+    stepIndex: 3,
+  });
+  assert.equal(inventoryAction.ok, true, inventoryAction.actual);
+  const inventoryResult = JSON.parse(inventoryAction.actual) as {
+    result?: Array<{ active?: boolean; groupId?: string; groupTitle?: string }>;
+  };
+  assert.equal(inventoryResult.result?.length, 3);
+  assert.equal(inventoryResult.result?.filter((tab) => tab.active).length, 1);
+  assert.ok(inventoryResult.result?.every((tab) => tab.groupId === groupId));
+  assert.ok(inventoryResult.result?.every((tab) => Boolean(tab.groupTitle)));
   const ownedPages = Array.from(Reflect.get(session, 'ownedPages') as Set<Page>);
   assert.equal(ownedPages.length, 3);
   const markerStates = await Promise.all(ownedPages.map((page) => page.evaluate(() => ({
