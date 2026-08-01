@@ -5846,7 +5846,6 @@ export class BrowserSession {
     const client = await page.context().newCDPSession(page);
     const format = resolveBrowserPreviewImageFormat(process.env.BROWSER_SCREENCAST_FORMAT);
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
-    const outputPixelRatio = browserOutputPixelRatioFromEnv();
     const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 100);
     const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 100)));
     const currentFrameIntervalMs = () => browserPreviewFrameIntervalMs(process.env.BROWSER_PREVIEW_FPS);
@@ -5857,15 +5856,10 @@ export class BrowserSession {
       devicePixelRatio: 1,
     }));
     let viewport = {
-      width: Math.max(1, Math.round(cssViewport.width * outputPixelRatio)),
-      height: Math.max(1, Math.round(cssViewport.height * outputPixelRatio)),
+      width: Math.max(1, Math.round(cssViewport.width)),
+      height: Math.max(1, Math.round(cssViewport.height)),
     };
     let receivedOutputFrame = false;
-    let latestNativeMetadata: { deviceHeight?: number; deviceWidth?: number } | undefined;
-    let nextScaledCaptureAt = 0;
-    let scaledCapturePending = false;
-    let scaledCapturePromise: Promise<void> | undefined;
-    let scaledCaptureTimer: ReturnType<typeof setTimeout> | undefined;
     let resolveInitialFrame: (() => void) | undefined;
     const initialFrameReady = new Promise<void>((resolve) => {
       resolveInitialFrame = resolve;
@@ -5901,25 +5895,18 @@ export class BrowserSession {
       resolveInitialFrame?.();
       resolveInitialFrame = undefined;
     };
-    const captureScaledOutputFrame = async (
+    const captureFallbackFrame = async (
       metadata?: { deviceHeight?: number; deviceWidth?: number },
     ) => {
       if (stopped || page.isClosed() || activePreviewPage() !== page) return;
       const layoutMetrics = await client.send('Page.getLayoutMetrics');
       const visualViewport = layoutMetrics.cssVisualViewport;
       const outputViewport = {
-        width: Math.max(1, Math.round(visualViewport.clientWidth * outputPixelRatio)),
-        height: Math.max(1, Math.round(visualViewport.clientHeight * outputPixelRatio)),
+        width: Math.max(1, Math.round(visualViewport.clientWidth)),
+        height: Math.max(1, Math.round(visualViewport.clientHeight)),
       };
       const result = await client.send('Page.captureScreenshot', {
         captureBeyondViewport: false,
-        clip: {
-          x: visualViewport.pageX,
-          y: visualViewport.pageY,
-          width: visualViewport.clientWidth,
-          height: visualViewport.clientHeight,
-          scale: outputPixelRatio,
-        },
         format,
         fromSurface: true,
         optimizeForSpeed: true,
@@ -5927,42 +5914,14 @@ export class BrowserSession {
       });
       pushOutputFrame(result.data, outputViewport, metadata);
     };
-    const requestScaledOutputFrame = (
-      metadata?: { deviceHeight?: number; deviceWidth?: number },
-    ) => {
-      latestNativeMetadata = metadata;
-      scaledCapturePending = true;
-      if (scaledCapturePromise || scaledCaptureTimer || stopped) return;
-      const delay = Math.max(0, nextScaledCaptureAt - Date.now());
-      if (delay) {
-        scaledCaptureTimer = setTimeout(() => {
-          scaledCaptureTimer = undefined;
-          requestScaledOutputFrame(latestNativeMetadata);
-        }, delay);
-        scaledCaptureTimer.unref?.();
-        return;
-      }
-      scaledCapturePending = false;
-      scaledCapturePromise = captureScaledOutputFrame(latestNativeMetadata).catch((error) => {
-        if (!stopped) options.onError?.(error);
-      }).finally(() => {
-        scaledCapturePromise = undefined;
-        nextScaledCaptureAt = Date.now() + currentFrameIntervalMs();
-        if (scaledCapturePending && !stopped) requestScaledOutputFrame(latestNativeMetadata);
-      });
-    };
     const stopScreencast = async (notifyPageChanged: boolean) => {
       if (stopPromise) return stopPromise;
       stopped = true;
-      scaledCapturePending = false;
-      if (scaledCaptureTimer) clearTimeout(scaledCaptureTimer);
-      scaledCaptureTimer = undefined;
       resolveInitialFrame?.();
       resolveInitialFrame = undefined;
       client.off('Page.screencastFrame', onNativeFrame);
       stopPromise = (async () => {
         await client.send('Page.stopScreencast').catch(() => undefined);
-        await scaledCapturePromise?.catch(() => undefined);
         await framePump.stop();
         await client.detach().catch(() => undefined);
         if (notifyPageChanged) await options.onActivePageChanged?.();
@@ -5980,10 +5939,6 @@ export class BrowserSession {
       if (stopped || !event.data) return;
       if (page.isClosed() || activePreviewPage() !== page) {
         void stopScreencast(true);
-        return;
-      }
-      if (outputPixelRatio !== 1) {
-        requestScaledOutputFrame(event.metadata);
         return;
       }
       const width = Math.max(1, Math.floor(Number(event.metadata?.deviceWidth) || viewport.width));
@@ -6005,18 +5960,8 @@ export class BrowserSession {
         }),
       ]);
       if (initialWaitTimer) clearTimeout(initialWaitTimer);
-      if (!receivedOutputFrame && scaledCapturePromise) {
-        let scaledCaptureWaitTimer: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([
-          initialFrameReady,
-          new Promise<void>((resolve) => {
-            scaledCaptureWaitTimer = setTimeout(resolve, 1_000);
-          }),
-        ]);
-        if (scaledCaptureWaitTimer) clearTimeout(scaledCaptureWaitTimer);
-      }
       if (!receivedOutputFrame && !stopped && !page.isClosed() && activePreviewPage() === page) {
-        await captureScaledOutputFrame(latestNativeMetadata);
+        await captureFallbackFrame();
       }
       if (!stopped) await framePump.flushLatest();
     } catch (error) {

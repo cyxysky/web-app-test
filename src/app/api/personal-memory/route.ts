@@ -5,13 +5,14 @@ import {
   savePersonalMemoryItem,
 } from '@/server/ai/personal-memory';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { normalizeApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
   const url = new URL(request.url);
-  return String(body?.userId ?? body?.qzUserId ?? url.searchParams.get('userId') ?? url.searchParams.get('qzUserId') ?? '').trim() || '0';
+  return normalizeApplicationUserId(body?.userId ?? body?.qzUserId ?? url.searchParams.get('userId') ?? url.searchParams.get('qzUserId') ?? '');
 }
 
 export async function GET(request: NextRequest) {

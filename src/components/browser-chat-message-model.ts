@@ -8,6 +8,7 @@ export type BrowserChatMessageLike = {
   createdAt?: string;
   id: string;
   role: 'user' | 'assistant';
+  status?: string;
   stepIndexes?: number[];
   updatedAt?: string;
 };
@@ -162,6 +163,11 @@ export function buildBrowserChatMessageRenderEntries<TMessage extends BrowserCha
     const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
     const emptyAssistantMessage = item.role === 'assistant' && !assistantMessageHasVisibleText(item, itemLogs);
     if (emptyAssistantMessage) {
+      if (item.status === 'running') {
+        flushExecutedGroup();
+        entries.push({ item, kind: 'message' });
+        continue;
+      }
       if (assistantMessageHasExecutedTool(item)) pendingExecutedGroup.push(item);
       continue;
     }

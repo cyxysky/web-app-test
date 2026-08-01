@@ -67,6 +67,18 @@ type PersonalMemoryConversationMessage = {
   content: string;
 };
 
+type PersonalMemoryDurabilitySignal =
+  | 'explicit_preference'
+  | 'explicit_workflow'
+  | 'explicit_alias'
+  | 'explicit_remember'
+  | 'repeated_user_behavior';
+
+type PersonalMemoryExtractionDraft = PersonalMemoryDraft & {
+  evidence?: unknown;
+  durability?: unknown;
+};
+
 const memoryTypes: PersonalMemoryType[] = ['alias', 'preference', 'workflow', 'domain_fact'];
 const memoryScopes: PersonalMemoryScope[] = ['global', 'domain'];
 const memoryStatuses: PersonalMemoryStatus[] = ['active', 'disabled'];
@@ -510,18 +522,68 @@ function extractJsonObject(text: string) {
   }
 }
 
-function parseExtractionItems(text: string): PersonalMemoryDraft[] {
+const personalMemoryDurabilitySignals = new Set<PersonalMemoryDurabilitySignal>([
+  'explicit_preference',
+  'explicit_workflow',
+  'explicit_alias',
+  'explicit_remember',
+  'repeated_user_behavior',
+]);
+
+function normalizedEvidenceText(value: unknown) {
+  return textFromUnknown(value).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function normalizedEvidenceTexts(value: unknown) {
+  const values = Array.isArray(value) ? value : [value];
+  return Array.from(new Set(values.map(normalizedEvidenceText).filter((evidence) => evidence.length >= 2)));
+}
+
+function hasExplicitDurabilityCue(text: string, signal: PersonalMemoryDurabilitySignal) {
+  const durableCue = /(?:记住|记下来|以后|下次|今后|从现在|总是|一直|每次|默认|习惯|偏好|我喜欢|我不喜欢|不要|别再|必须|务必|都要|remember|from now on|in the future|always|never|every time|by default|i prefer|my preference)/i;
+  const aliasCue = /(?:我说.{1,40}(?:指|就是|表示|意思是)|(?:叫|称为).{1,40}(?:指|就是|表示|意思是)|when i say.{1,80}(?:mean|refer)|.{1,60}\bmeans\b.{1,80})/i;
+  if (signal === 'explicit_alias') return aliasCue.test(text) || durableCue.test(text);
+  return durableCue.test(text);
+}
+
+export function filterDurablePersonalMemoryDrafts(
+  items: PersonalMemoryExtractionDraft[],
+  userMessages: string[],
+): PersonalMemoryDraft[] {
+  const normalizedUserMessages = userMessages.map(normalizedEvidenceText).filter(Boolean);
+  return items.filter((item) => {
+    const evidence = normalizedEvidenceTexts(item.evidence);
+    const signal = textFromUnknown(item.durability).trim() as PersonalMemoryDurabilitySignal;
+    if (!evidence.length || !personalMemoryDurabilitySignals.has(signal)) return false;
+    const sourceMessageIndexes = new Set(evidence.map((quote) => (
+      normalizedUserMessages.findIndex((message) => message.includes(quote))
+    )).filter((index) => index >= 0));
+    if (signal === 'repeated_user_behavior') {
+      if (evidence.length < 2 || sourceMessageIndexes.size < 2) return false;
+    } else {
+      const hasDurableUserEvidence = Array.from(sourceMessageIndexes).some((index) => (
+        hasExplicitDurabilityCue(normalizedUserMessages[index], signal)
+      ));
+      if (!hasDurableUserEvidence) return false;
+    }
+    const type = normalizeType(item.type);
+    if (type === 'domain_fact' && signal !== 'explicit_remember' && signal !== 'explicit_alias') return false;
+    return true;
+  });
+}
+
+function parseExtractionItems(text: string, userMessages: string[]): PersonalMemoryDraft[] {
   const parsed = extractJsonObject(text);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
   const items = (parsed as { items?: unknown }).items;
-  return Array.isArray(items) ? items.filter((item): item is PersonalMemoryDraft => Boolean(item && typeof item === 'object' && !Array.isArray(item))) : [];
+  const drafts = Array.isArray(items)
+    ? items.filter((item): item is PersonalMemoryExtractionDraft => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+    : [];
+  return filterDurablePersonalMemoryDrafts(drafts, userMessages);
 }
 
 function compactConversationForMemory(messages: PersonalMemoryConversationMessage[]) {
-  return messages.map((message) => ({
-    role: message.role,
-    content: compactText(message.content, 1400),
-  }));
+  return messages.map((message) => ({ role: message.role, content: compactText(message.content, 1400) }));
 }
 
 function buildExtractionPrompt(input: {
@@ -535,14 +597,20 @@ function buildExtractionPrompt(input: {
   steps: StepExecutionResult[];
   existingItems: PersonalMemoryItem[];
 }) {
+  const conversation = compactConversationForMemory(input.conversation);
   const source = {
     currentDomain: input.currentDomain,
     currentUrl: input.currentUrl,
     targetUrl: input.targetUrl,
-    latestUserMessage: input.userMessage,
-    assistantReply: input.assistantReply,
-    conversation: compactConversationForMemory(input.conversation),
-    browserSteps: input.steps.map(summarizeStep),
+    primaryUserEvidence: {
+      latestUserMessage: input.userMessage,
+      userMessages: conversation.filter((message) => message.role === 'user').map((message) => message.content),
+    },
+    supplementaryAssistantContext: {
+      assistantMessages: conversation.filter((message) => message.role === 'assistant').map((message) => message.content),
+      latestAssistantReply: input.assistantReply,
+      browserSteps: input.steps.map(summarizeStep),
+    },
     existingMemory: input.existingItems.map((item) => ({
       id: item.id,
       scope: item.scope,
@@ -566,9 +634,17 @@ function buildExtractionPrompt(input: {
     '- aliases: short alternative phrases',
     '- value: one concise fact, at most 160 Chinese characters or 220 English characters',
     '- confidence: number from 0 to 1',
+    '- evidence: an array of exact, short quotes copied only from user messages',
+    '- durability: "explicit_preference", "explicit_workflow", "explicit_alias", "explicit_remember", or "repeated_user_behavior"',
     '',
-    'Use the complete conversation, current URL/target URL, browser steps, and existingMemory together. Do not decide from the latest message alone.',
-    'Write an item only when the conversation reveals a stable user habit, phrase meaning, site-specific fact, or workflow preference that can help future turns.',
+    'User-authored messages are the primary and only authoritative evidence of personal memory. Assistant messages and browser steps are supplementary context only: they may clarify the target or outcome, but they can never establish a user habit by themselves.',
+    'Use all user messages, not only the latest one. The default is {"items":[]}. Write an item when the user explicitly states a lasting preference/workflow, explicitly defines a reusable phrase, explicitly asks you to remember something, or independently demonstrates the same reusable behavior in at least two different user messages.',
+    'For an explicit durability signal, evidence must contain at least one exact user quote. For repeated_user_behavior, evidence must contain at least two exact quotes from two different user messages. Never use assistant text as evidence.',
+    'Assistant discoveries, public page content, successful one-off instructions, and descriptions of which control the user meant only in the current task are not personal memory.',
+    'Domain facts require an explicit remember request or an explicit reusable alias definition from the user. Never memorize documentation examples, page order, current UI layout, search results, or facts merely observed by the assistant.',
+    'Examples that MUST return no items: "点击第一个选择器", "打开带 icon 的滑块", "查一下 YYF 的直播间", or a completed workflow the user did not say should be reused.',
+    'Examples that may produce one item: "以后我说第一个选择器，是指基本示例里的那个"; "记住 YYF 的直播间是 9999"; "以后不要截图，默认用 DOM".',
+    'Return up to 8 independent items from one completed conversation. Do not merge separate preferences, aliases, or workflows into one broad memory.',
     'Before returning an item, compare against every existing global item and every existing item for currentDomain. If the fact already exists, return no duplicate. If it should be updated, return the same scope/domain/type/key shape so the store updates it.',
     'Do not store secrets, passwords, tokens, OTPs, private credentials, temporary IDs, one-off task data, raw page content, or long summaries.',
     'Do not invent facts. If nothing durable is learned, return {"items":[]}.',
@@ -679,7 +755,10 @@ export async function extractPersonalMemoryFromTurn(input: {
       sourceSessionId: input.sourceSessionId,
       sourceMessageIds: input.sourceMessageIds,
       sourceUrl: input.currentUrl || input.targetUrl || '',
-      items: parseExtractionItems(result.text || ''),
+      items: parseExtractionItems(result.text || '', [
+        ...(input.conversation || []).filter((message) => message.role === 'user').map((message) => message.content),
+        input.userMessage,
+      ]),
     });
     return { items, rawText: result.text || '', skipped: false };
   } finally {

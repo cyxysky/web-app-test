@@ -5,6 +5,7 @@ import {
   listLoginAccounts,
 } from '@/server/credentials/login-account-vault';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { normalizeApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -22,13 +23,13 @@ const createSchema = z.object({
 }).strict();
 
 function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
-  return String(
+  return normalizeApplicationUserId(
     body?.userId
     ?? body?.qzUserId
     ?? request.nextUrl.searchParams.get('userId')
     ?? request.nextUrl.searchParams.get('qzUserId')
     ?? '',
-  ).trim() || '0';
+  );
 }
 
 function publicError(error: unknown) {

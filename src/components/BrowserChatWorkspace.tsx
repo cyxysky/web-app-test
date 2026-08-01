@@ -475,7 +475,6 @@ type EmbeddedBrowserState = EmbeddedBrowserBridgeResult & {
   groups?: EmbeddedBrowserGroup[];
   libraryPanel?: 'library';
   tabs?: EmbeddedBrowserTab[];
-  zoomFactor?: number;
 };
 
 type EmbeddedBrowserBridge = {
@@ -6506,15 +6505,17 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
 });
 
 export function BrowserChatWorkspace({
+  defaultUserId,
   initialView = 'chat',
   initialSettings,
 }: {
+  defaultUserId: string;
   initialView?: BrowserChatView;
   initialSettings?: EnvironmentSettingsInitialData;
 }) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const queryUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || '0';
+  const queryUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || defaultUserId.trim() || '0';
   const querySessionId = searchParams.get('sessionId')?.trim() || '';
   const queryTargetUrl = searchParams.get('targetUrl')?.trim() || '';
   const mountedIdentityRef = useRef<{ sessionId: string; targetUrl: string; userId: string } | null>(null);
@@ -6524,7 +6525,7 @@ export function BrowserChatWorkspace({
   const requestUserId = mountedIdentityRef.current?.userId || queryUserId;
   const requestedSessionId = mountedIdentityRef.current?.sessionId || querySessionId;
   const requestedTargetUrl = mountedIdentityRef.current?.targetUrl || queryTargetUrl;
-  const visibleSettingsTabs = environmentSettingsTabsForUser(requestUserId);
+  const visibleSettingsTabs = environmentSettingsTabsForUser(requestUserId, defaultUserId);
   const browserChatApiUrl = useCallback((path: string) => (
     `${withWebPilotBasePath(path)}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(requestUserId)}`
   ), [requestUserId]);
@@ -6536,6 +6537,7 @@ export function BrowserChatWorkspace({
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const embeddedWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const sessionActivationSequenceRef = useRef(0);
   const mountedSessionActivationRef = useRef('');
   const sessionVersionsRef = useRef(new Map<string, number>());
   const sessionRefreshTimersRef = useRef(new Map<string, number>());
@@ -6963,10 +6965,10 @@ export function BrowserChatWorkspace({
     return normalized;
   }, []);
 
-  const refreshSession = useCallback(async (sessionId: string, options: { activate?: boolean } = {}) => {
+  const refreshSession = useCallback(async (sessionId: string, options: { activate?: boolean; activateIf?: () => boolean } = {}) => {
     const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}`), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载对话失败');
-    const shouldActivate = options.activate ?? activeSessionIdRef.current === sessionId;
+    const shouldActivate = options.activateIf?.() ?? options.activate ?? activeSessionIdRef.current === sessionId;
     const loadedSession = upsertSession(data.session as BrowserChatSession, { activate: shouldActivate });
     if (shouldActivate) {
       setMode(normalizeMode(loadedSession.mode));
@@ -6983,13 +6985,19 @@ export function BrowserChatWorkspace({
 
   const activateSession = useCallback(async (sessionId: string) => {
     if (loadingSessionRef.current === sessionId) return undefined;
+    const activationSequence = ++sessionActivationSequenceRef.current;
     loadingSessionRef.current = sessionId;
     activeSessionIdRef.current = sessionId;
     setLoadingSessionId(sessionId);
     try {
-      return await refreshSession(sessionId, { activate: true });
+      return await refreshSession(sessionId, {
+        activateIf: () => (
+          sessionActivationSequenceRef.current === activationSequence
+          && activeSessionIdRef.current === sessionId
+        ),
+      });
     } finally {
-      if (loadingSessionRef.current === sessionId) {
+      if (sessionActivationSequenceRef.current === activationSequence) {
         loadingSessionRef.current = null;
         setLoadingSessionId(null);
       }
@@ -7801,6 +7809,7 @@ export function BrowserChatWorkspace({
           <div className="browser-chat-settings-pane">
             <EnvironmentSettings
               activeTab={activeSettingsTab}
+              defaultUserId={defaultUserId}
               embedded
               initialData={initialSettings}
               showTabs={false}
@@ -7932,6 +7941,7 @@ export function BrowserChatWorkspace({
 
       {webPreviewRuntime && webPreviewOpen && session ? (
         <BrowserChatWebPreviewModal
+          key={`${session.userId || requestUserId}:${session.id}`}
           onClose={() => setWebPreviewOpen(false)}
           sessionId={session.id}
           userId={session.userId || requestUserId}

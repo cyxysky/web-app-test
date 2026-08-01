@@ -18,6 +18,7 @@ import {
 } from '@/server/ai/personal-memory';
 import { store } from '@/server/db/store';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
+import { normalizeApplicationUserId } from '@/server/auth/user-context';
 
 export type PortableDataKind = 'credentials' | 'skills' | 'memory' | 'model';
 type SecretDataKind = 'credentials' | 'model';
@@ -244,7 +245,7 @@ export function exportPortableData(input: {
     };
   }
   if (input.kind === 'skills') {
-    const ownerUserId = String(input.userId ?? '').trim() || '0';
+    const ownerUserId = normalizeApplicationUserId(input.userId);
     const items = z.array(skillItemSchema).parse(store.listSkills(undefined, ownerUserId)
       .filter((skill) => skill.userId === ownerUserId)
       .map((skill) => ({
@@ -263,7 +264,7 @@ export function exportPortableData(input: {
       count: items.length,
     };
   }
-  const ownerUserId = String(input.userId ?? '').trim() || '0';
+  const ownerUserId = normalizeApplicationUserId(input.userId);
   const items = z.array(memoryItemSchema).parse(listPersonalMemoryItems({
     userId: ownerUserId,
     includeDisabled: true,
@@ -303,7 +304,7 @@ function importCredentials(items: CredentialItem[], userId: unknown) {
 }
 
 function importSkills(items: SkillItem[], userId: unknown) {
-  const normalizedUserId = String(userId ?? '').trim() || '0';
+  const normalizedUserId = normalizeApplicationUserId(userId);
   const existingSkills = store.listSkills(undefined, normalizedUserId)
     .filter((skill) => skill.userId === normalizedUserId);
   const byId = new Map(existingSkills.map((skill) => [skill.id, skill]));
@@ -335,7 +336,7 @@ function importSkills(items: SkillItem[], userId: unknown) {
 }
 
 function importMemory(items: MemoryItem[], userId: unknown) {
-  const normalizedUserId = String(userId ?? '').trim() || '0';
+  const normalizedUserId = normalizeApplicationUserId(userId);
   const existing = listPersonalMemoryItems({ userId: normalizedUserId, includeDisabled: true })
     .filter((item) => item.userId === normalizedUserId);
   const identities = new Set(existing.map((item) => [

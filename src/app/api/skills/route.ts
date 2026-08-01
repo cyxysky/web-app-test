@@ -1,18 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { store } from '@/server/db/store';
 import { parseSkillContent } from '@/server/ai/schemas/runtime.schema';
+import { normalizeApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
-  return String(
+  return normalizeApplicationUserId(
     body?.userId
     ?? body?.qzUserId
     ?? request.nextUrl.searchParams.get('userId')
     ?? request.nextUrl.searchParams.get('qzUserId')
     ?? '',
-  ).trim() || '0';
+  );
 }
 
 export async function GET(request: NextRequest) {

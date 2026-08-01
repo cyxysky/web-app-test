@@ -71,6 +71,18 @@ test('drops an empty assistant message when it has no executed tool', () => {
   assert.equal(entries[0].item.id, 'a2');
 });
 
+test('keeps an empty running assistant message so the loading animation remains visible', () => {
+  const running = { content: '', id: 'a1', role: 'assistant' as const, status: 'running' };
+  const entries = buildBrowserChatMessageRenderEntries(
+    [running],
+    buildBrowserChatLogIndex([]),
+    (message, logs) => browserChatAssistantMessageHasVisibleText(message, logs, () => []),
+    () => false,
+  );
+
+  assert.deepEqual(entries, [{ item: running, kind: 'message' }]);
+});
+
 test('reads message logs only from the direct message id', () => {
   const logIndex = buildBrowserChatLogIndex([
     { id: 'step', stepIndex: 2 },

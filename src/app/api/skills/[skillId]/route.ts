@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
 
@@ -15,13 +16,13 @@ function normalizeStatus(value: unknown): SkillRecord['status'] {
 }
 
 function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
-  return String(
+  return normalizeApplicationUserId(
     body?.userId
     ?? body?.qzUserId
     ?? request.nextUrl.searchParams.get('userId')
     ?? request.nextUrl.searchParams.get('qzUserId')
     ?? '',
-  ).trim() || '0';
+  );
 }
 
 export async function GET(request: NextRequest, context: RouteContext) {

@@ -40,14 +40,14 @@ let embeddedBrowserNextBookmarkId = 1;
 let embeddedBrowserNextHistoryId = 1;
 const embeddedBrowserRecentlyClosedTabs = [];
 let embeddedBrowserBounds = { x: 0, y: 0, width: 0, height: 0 };
-let embeddedBrowserFitTimer;
-let embeddedBrowserFitAllowZoomIn = false;
 let runtimeDatabasePath = '';
 let electronStateDatabase;
 let embeddedBrowserPersistenceTimer;
 let embeddedBrowserPersistenceStopped = false;
 let embeddedBrowserPersistenceRestoring = false;
 let embeddedBrowserStateChangeTimer;
+const htmlFullscreenWebContentsIds = new Set();
+let htmlFullscreenWindowState;
 const EMBEDDED_BROWSER_ROUTE_LOADING_MS = 1200;
 const EMBEDDED_BROWSER_PERSISTENCE_VERSION = 2;
 const EMBEDDED_BROWSER_STATE_KEY = 'embedded-browser';
@@ -265,6 +265,7 @@ function ensureEmbeddedBrowserLibraryView() {
     },
   });
   view.setBackgroundColor('#00000000');
+  installHtmlFullscreenRecovery(view.webContents);
   view.setBorderRadius(0);
   view.setVisible(false);
   view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -1359,13 +1360,9 @@ function handleEmbeddedBrowserShortcut(event, input, sourceTab) {
   return true;
 }
 
-function scheduleEmbeddedBrowserFitForTab(tab, delayMs = 180, options = {}) {
-  if (activeEmbeddedBrowserTab()?.id !== tab?.id) return;
-  scheduleEmbeddedBrowserFitToWidth(delayMs, options);
-}
-
 function installEmbeddedBrowserTabHandlers(tab) {
   const { view } = tab;
+  installHtmlFullscreenRecovery(view.webContents);
   view.webContents.on('before-input-event', (event, input) => {
     handleEmbeddedBrowserShortcut(event, input, tab);
   });
@@ -1391,15 +1388,11 @@ function installEmbeddedBrowserTabHandlers(tab) {
       setActiveEmbeddedBrowserTab(popupTab);
     }
     ensureEmbeddedBrowserTabReady(popupTab)
-      .then(() => {
-        scheduleEmbeddedBrowserFitForTab(popupTab, 180, { allowZoomIn: true });
-      })
       .catch((error) => appendLog(`Embedded browser popup navigation failed: ${error.message}`));
     return { action: 'deny' };
   });
   view.webContents.on('dom-ready', () => {
     void markEmbeddedBrowserSession(tab);
-    scheduleEmbeddedBrowserFitForTab(tab, 140, { allowZoomIn: true });
   });
   view.webContents.on('did-start-navigation', (_event, url, isInPlace, isMainFrame) => {
     if (!isMainFrame || isInPlace) return;
@@ -1419,7 +1412,6 @@ function installEmbeddedBrowserTabHandlers(tab) {
     tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
     tab.lastKnownTitle = embeddedBrowserRecordTitle(embeddedBrowserTabTitle(view.webContents), tab.lastKnownTitle);
     void markEmbeddedBrowserSession(tab);
-    scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
     scheduleEmbeddedBrowserPersistence();
     notifyEmbeddedBrowserStateChange();
     recordEmbeddedBrowserHistory(tab);
@@ -1430,14 +1422,12 @@ function installEmbeddedBrowserTabHandlers(tab) {
     tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
     tab.lastKnownTitle = embeddedBrowserRecordTitle(embeddedBrowserTabTitle(view.webContents), tab.lastKnownTitle);
     void markEmbeddedBrowserSession(tab);
-    scheduleEmbeddedBrowserFitForTab(tab, 240, { allowZoomIn: true });
     scheduleEmbeddedBrowserPersistence();
     notifyEmbeddedBrowserStateChange();
   });
   view.webContents.on('did-navigate', () => {
     tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
     void markEmbeddedBrowserSession(tab);
-    scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
     scheduleEmbeddedBrowserPersistence();
     notifyEmbeddedBrowserStateChange();
     recordEmbeddedBrowserHistory(tab);
@@ -1451,7 +1441,6 @@ function installEmbeddedBrowserTabHandlers(tab) {
     tab.lastKnownUrl = view.webContents.getURL() || tab.lastKnownUrl || '';
     tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
     void markEmbeddedBrowserSession(tab);
-    scheduleEmbeddedBrowserFitForTab(tab, 220, { allowZoomIn: true });
     scheduleEmbeddedBrowserPersistence();
     notifyEmbeddedBrowserStateChange();
     recordEmbeddedBrowserHistory(tab);
@@ -1507,6 +1496,40 @@ function installEmbeddedBrowserTabHandlers(tab) {
   });
 }
 
+function installHtmlFullscreenRecovery(webContents) {
+  if (!webContents || webContents.__webPilotHtmlFullscreenRecoveryInstalled) return;
+  webContents.__webPilotHtmlFullscreenRecoveryInstalled = true;
+  webContents.on('enter-html-full-screen', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    htmlFullscreenWebContentsIds.add(webContents.id);
+    htmlFullscreenWindowState ??= { maximized: mainWindow.isMaximized() };
+  });
+  webContents.on('leave-html-full-screen', () => {
+    htmlFullscreenWebContentsIds.delete(webContents.id);
+    if (htmlFullscreenWebContentsIds.size || !mainWindow || mainWindow.isDestroyed()) return;
+    const windowState = htmlFullscreenWindowState;
+    htmlFullscreenWindowState = undefined;
+    // Chromium occasionally leaves a Windows BrowserWindow in native fullscreen
+    // after an HTML5 video has already exited. Explicitly restoring the native
+    // window brings both the application chrome and the Windows taskbar back.
+    if (mainWindow.isFullScreen()) mainWindow.setFullScreen(false);
+    if (windowState?.maximized && !mainWindow.isMaximized()) mainWindow.maximize();
+    mainWindow.setMenuBarVisibility(false);
+    mainWindow.show();
+    mainWindow.focus();
+    const tab = activeEmbeddedBrowserTab();
+    if (embeddedBrowserVisible && tab && ensureEmbeddedBrowserTabAttached(tab)) {
+      tab.view.setBounds(embeddedBrowserBounds);
+    }
+    if (embeddedBrowserLibraryPanel) attachEmbeddedBrowserLibraryView();
+    notifyEmbeddedBrowserStateChange();
+  });
+  webContents.once('destroyed', () => {
+    htmlFullscreenWebContentsIds.delete(webContents.id);
+    if (!htmlFullscreenWebContentsIds.size) htmlFullscreenWindowState = undefined;
+  });
+}
+
 function createEmbeddedBrowserTab(input = {}) {
   if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Main window is not ready.');
   if (!WebContentsView) throw new Error('Electron WebContentsView is not available.');
@@ -1545,7 +1568,6 @@ function createEmbeddedBrowserTab(input = {}) {
     userId,
     view,
   };
-  view.webContents.setZoomFactor(1);
   applyEmbeddedBrowserTabAudioPolicy(tab);
   view.webContents.setUserAgent(embeddedBrowserUserAgent());
   embeddedBrowserTabs.set(tab.id, tab);
@@ -1669,7 +1691,6 @@ function attachEmbeddedBrowserView(input = {}) {
   }
   attachEmbeddedBrowserLibraryView();
   void markEmbeddedBrowserSession(tab);
-  scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   return tab.view;
 }
 
@@ -1683,101 +1704,13 @@ function detachEmbeddedBrowserView() {
 }
 
 function setEmbeddedBrowserBounds(bounds) {
-  const previousBounds = embeddedBrowserBounds;
   embeddedBrowserBounds = sanitizeEmbeddedBounds(bounds);
-  const boundsChanged = previousBounds.x !== embeddedBrowserBounds.x
-    || previousBounds.y !== embeddedBrowserBounds.y
-    || previousBounds.width !== embeddedBrowserBounds.width
-    || previousBounds.height !== embeddedBrowserBounds.height;
   const tab = activeEmbeddedBrowserTab();
   if (embeddedBrowserVisible && tab && ensureEmbeddedBrowserTabAttached(tab)) {
     tab.view.setBounds(embeddedBrowserBounds);
-    if (boundsChanged) scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   }
   if (embeddedBrowserLibraryPanel) attachEmbeddedBrowserLibraryView();
   return embeddedBrowserBounds;
-}
-
-function embeddedBrowserMinZoomFactor() {
-  const configured = Number(process.env.ELECTRON_EMBEDDED_BROWSER_MIN_ZOOM || '');
-  return Number.isFinite(configured) && configured > 0 && configured <= 1 ? configured : 0.2;
-}
-
-function embeddedBrowserAutoZoomEnabled() {
-  return process.env.ELECTRON_EMBEDDED_BROWSER_AUTO_ZOOM === 'true';
-}
-
-function clearEmbeddedBrowserFitTimer() {
-  if (!embeddedBrowserFitTimer) return;
-  clearTimeout(embeddedBrowserFitTimer);
-  embeddedBrowserFitTimer = undefined;
-}
-
-function scheduleEmbeddedBrowserFitToWidth(delayMs = 180, options = {}) {
-  if (!embeddedBrowserAutoZoomEnabled()) return;
-  embeddedBrowserFitAllowZoomIn = embeddedBrowserFitAllowZoomIn || Boolean(options.allowZoomIn);
-  clearEmbeddedBrowserFitTimer();
-  embeddedBrowserFitTimer = setTimeout(() => {
-    embeddedBrowserFitTimer = undefined;
-    const allowZoomIn = embeddedBrowserFitAllowZoomIn;
-    embeddedBrowserFitAllowZoomIn = false;
-    void fitEmbeddedBrowserToWidth(allowZoomIn);
-  }, delayMs);
-}
-
-function clampEmbeddedBrowserZoom(value) {
-  const minZoom = embeddedBrowserMinZoomFactor();
-  return Math.max(minZoom, Math.min(1, Number(value) || 1));
-}
-
-async function fitEmbeddedBrowserToWidth(allowZoomIn = false) {
-  const tab = activeEmbeddedBrowserTab();
-  if (!tab || tab.view.webContents.isDestroyed()) return;
-  const webContents = tab.view.webContents;
-  const width = Math.max(1, Number(embeddedBrowserBounds.width) || 1);
-  if (width < 80 || webContents.isLoading()) return;
-
-  try {
-    const metrics = await webContents.executeJavaScript(`
-      (() => {
-        const doc = document.documentElement;
-        const body = document.body;
-        const scrollWidth = Math.max(
-          doc ? doc.scrollWidth : 0,
-          body ? body.scrollWidth : 0,
-          window.innerWidth || 0
-        );
-        const clientWidth = Math.max(
-          doc ? doc.clientWidth : 0,
-          body ? body.clientWidth : 0,
-          window.innerWidth || 0,
-          1
-        );
-        return { clientWidth, scrollWidth };
-      })()
-    `, true);
-    const scrollWidth = Math.max(1, Number(metrics?.scrollWidth) || width);
-    const clientWidth = Math.max(1, Number(metrics?.clientWidth) || width);
-    const currentZoom = webContents.getZoomFactor();
-    const overflowRatio = scrollWidth / clientWidth;
-    let targetZoom = currentZoom;
-
-    if (overflowRatio > 1.012) {
-      targetZoom = currentZoom / overflowRatio;
-    } else if (allowZoomIn && currentZoom < 0.995) {
-      const spareRatio = clientWidth / Math.max(1, scrollWidth);
-      if (spareRatio > 1.08) {
-        targetZoom = currentZoom * Math.min(spareRatio, 1.35);
-      }
-    }
-
-    targetZoom = Math.round(clampEmbeddedBrowserZoom(targetZoom) * 1000) / 1000;
-    if (Math.abs(currentZoom - targetZoom) > 0.025) {
-      webContents.setZoomFactor(targetZoom);
-    }
-  } catch (error) {
-    appendLog(`Embedded browser width fit failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
 }
 
 function embeddedBrowserNavigationState(tab) {
@@ -1828,7 +1761,6 @@ async function navigateEmbeddedBrowserHistory(direction) {
     }
   }
   tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
-  scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   return embeddedBrowserState();
 }
 
@@ -1837,7 +1769,6 @@ function reloadEmbeddedBrowserTab() {
   if (!tab || tab.view.webContents.isDestroyed()) return embeddedBrowserState();
   tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
   tab.view.webContents.reload();
-  scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   notifyEmbeddedBrowserStateChange();
   return embeddedBrowserState();
 }
@@ -1927,7 +1858,6 @@ function embeddedBrowserState() {
     groups,
     history: embeddedBrowserHistory,
     libraryPanel: embeddedBrowserLibraryPanel || undefined,
-    zoomFactor: active?.view.webContents.isDestroyed() ? undefined : active?.view.webContents.getZoomFactor(),
     tabs,
   };
 }
@@ -2185,9 +2115,7 @@ async function createManualEmbeddedBrowserTab(input = {}) {
   if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id: tab.id });
   else setActiveEmbeddedBrowserTab(tab);
   ensureEmbeddedBrowserTabReady(tab)
-    .then(() => scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true }))
     .catch((error) => appendLog(`Embedded browser tab ready failed: ${error instanceof Error ? error.message : String(error)}`));
-  scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
   return embeddedBrowserState();
 }
 
@@ -2237,12 +2165,6 @@ function showEmbeddedBrowserTabContextMenu(input = {}) {
 }
 
 function registerEmbeddedBrowserIpc() {
-  ipcMain.on('webpilot:embedded-browser:content-resized', (event) => {
-    const tab = activeEmbeddedBrowserTab();
-    if (!tab || event.sender !== tab.view.webContents) return;
-    scheduleEmbeddedBrowserFitForTab(tab, 420);
-  });
-
   ipcMain.on('webpilot:embedded-browser:client-navigation', (event, payload = {}) => {
     const tab = embeddedBrowserTabForWebContents(event.sender);
     if (!tab) return;
@@ -2256,7 +2178,6 @@ function registerEmbeddedBrowserIpc() {
     if (tab.clientNavigation.url) tab.lastKnownUrl = tab.clientNavigation.url;
     tab.restorePending = false;
     tab.routeLoadingUntil = Date.now() + EMBEDDED_BROWSER_ROUTE_LOADING_MS;
-    scheduleEmbeddedBrowserFitForTab(tab, 180, { allowZoomIn: true });
     recordEmbeddedBrowserHistory(tab);
     notifyEmbeddedBrowserStateChange();
   });
@@ -2374,7 +2295,6 @@ function registerEmbeddedBrowserIpc() {
         if (typeof input.url === 'string' && input.url.trim()) {
           if (!tab) throw new Error('Embedded browser tab is not ready.');
           await loadEmbeddedBrowserTabUrl(tab, input.url.trim());
-          scheduleEmbeddedBrowserFitToWidth(180, { allowZoomIn: true });
         } else if (tab) {
           void ensureEmbeddedBrowserTabReady(tab);
         }
@@ -2408,7 +2328,6 @@ function registerEmbeddedBrowserIpc() {
       const tab = activeEmbeddedBrowserTab();
       if (!tab) throw new Error('Embedded browser tab is not ready.');
       await loadEmbeddedBrowserTabUrl(tab, url);
-      scheduleEmbeddedBrowserFitToWidth(180, { allowZoomIn: true });
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -2504,7 +2423,6 @@ function registerEmbeddedBrowserIpc() {
       const tab = activeEmbeddedBrowserTab();
       if (!tab) throw new Error('Embedded browser tab is not ready.');
       await loadEmbeddedBrowserTabUrl(tab, embeddedBrowserPlaceholderUrl());
-      scheduleEmbeddedBrowserFitToWidth(180, { allowZoomIn: true });
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -2692,6 +2610,7 @@ function createWindow() {
     },
   });
   installNativeDownloadHandler(mainWindow.webContents.session);
+  installHtmlFullscreenRecovery(mainWindow.webContents);
   mainWindow.setMenuBarVisibility(false);
   mainWindow.webContents.on('before-input-event', (event, input) => {
     handleEmbeddedBrowserShortcut(event, input);

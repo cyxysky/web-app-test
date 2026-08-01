@@ -109,8 +109,8 @@ export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> 
 
 const administratorOnlySettingsTabs = new Set<SettingsTab>(['model', 'browser', 'runtime', 'debug']);
 
-export function environmentSettingsTabsForUser(userId?: string) {
-  if ((userId || '').trim() === '0') return environmentSettingsTabs;
+export function environmentSettingsTabsForUser(userId?: string, defaultUserId = '0') {
+  if ((userId || '').trim() === defaultUserId.trim()) return environmentSettingsTabs;
   return environmentSettingsTabs.filter((tab) => !administratorOnlySettingsTabs.has(tab.id));
 }
 
@@ -232,6 +232,7 @@ function isSecret(item: EnvRow) {
 
 export function EnvironmentSettings({
   activeTab: controlledActiveTab,
+  defaultUserId = '0',
   embedded = false,
   initialData,
   onActiveTabChange,
@@ -242,6 +243,7 @@ export function EnvironmentSettings({
   userId,
 }: {
   activeTab?: SettingsTab;
+  defaultUserId?: string;
   embedded?: boolean;
   initialData?: EnvironmentSettingsInitialData;
   onActiveTabChange?: (tab: SettingsTab) => void;
@@ -277,8 +279,9 @@ export function EnvironmentSettings({
   const [deletePersonalMemoryTarget, setDeletePersonalMemoryTarget] = useState<PersonalMemoryItem | null>(null);
   const [deletePersonalMemoryError, setDeletePersonalMemoryError] = useState('');
   const [hasDirectoryPicker, setHasDirectoryPicker] = useState(false);
-  const normalizedUserId = userId?.trim() || '0';
-  const visibleSettingsTabs = environmentSettingsTabsForUser(normalizedUserId);
+  const normalizedDefaultUserId = defaultUserId.trim() || '0';
+  const normalizedUserId = userId?.trim() || normalizedDefaultUserId;
+  const visibleSettingsTabs = environmentSettingsTabsForUser(normalizedUserId, normalizedDefaultUserId);
   const requestedActiveTab = controlledActiveTab || internalActiveTab;
   const activeTab = visibleSettingsTabs.some((tab) => tab.id === requestedActiveTab) ? requestedActiveTab : 'general';
   const selectTab = (tab: SettingsTab) => {
