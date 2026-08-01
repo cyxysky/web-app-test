@@ -85,7 +85,7 @@ const DEFAULT_BROWSER_WAIT_FOR_PAGE_STABLE_MS = 250;
 const DEFAULT_BROWSER_NAVIGATION_DOM_QUIET_MS = 250;
 const DEFAULT_BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = 1000;
 const BROWSER_NAVIGATION_DOM_STABILITY_POLL_MS = 50;
-const AI_DOM_RUNTIME_VERSION = 21;
+const AI_DOM_RUNTIME_VERSION = 26;
 
 function fixedBrowserViewportFromEnv() {
   if (process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase() !== 'fixed') return undefined;
@@ -171,7 +171,7 @@ export type BrowserActiveSurface = {
   kind: 'dialog' | 'popover' | 'menu' | 'listbox' | 'panel' | 'overlay';
   label: string;
   modal: boolean;
-  blocking: boolean;
+  likelyOverlay: boolean;
   focusedInside: boolean;
   zIndex: number;
   rect: {
@@ -183,7 +183,11 @@ export type BrowserActiveSurface = {
     width: number;
   };
   signals: string[];
+  selector?: string;
   framePath?: string;
+  parentId?: string;
+  depth: number;
+  activationOrder: number;
 };
 
 export type BrowserPageObservation = {
@@ -195,6 +199,9 @@ export type BrowserPageObservation = {
     label: string;
   };
   activeSurface?: BrowserActiveSurface;
+  surfaces: BrowserActiveSurface[];
+  surfaceStack: BrowserActiveSurface[];
+  topSurfaceIds: string[];
   surfaceTransition: 'initial' | 'unchanged' | 'opened' | 'closed' | 'changed';
 };
 
@@ -234,16 +241,6 @@ export type BrowserActionResult = {
     overflow: boolean;
     observation?: BrowserPageObservation;
   };
-};
-
-type BrowserPageConsoleEntry = {
-  sequence: number;
-  level: string;
-  text: string;
-  timestamp: string;
-  url: string;
-  lineNumber?: number;
-  columnNumber?: number;
 };
 
 export type BrowserClickTiming = {
@@ -442,6 +439,7 @@ type DomNodeReference = {
   searchText: string;
   semanticRoles: string[];
   state: string;
+  surfaceId?: string;
   tag: string;
   viewportClip?: BrowserUseViewportClip;
 };
@@ -574,6 +572,7 @@ type BrowserUseVisibleDomSnapshot = {
     ref: string;
     signals: string[];
     state: string;
+    surfaceId?: string;
     tag: string;
     text: string;
   }>;
@@ -650,6 +649,8 @@ type AiDomRuntime = {
   version: number;
   mutationState: () => AiDomMutationStateSnapshot;
   pageObservation: () => BrowserPageObservation;
+  activeSurfaceElement: () => Element | undefined;
+  markSurfaceInteraction: (element: Element) => void;
   actionability: (
     element: Element,
     options?: { action?: string },
@@ -658,6 +659,7 @@ type AiDomRuntime = {
     reason: string;
     descriptor: string;
     coveredBy?: string;
+    failureKind?: 'occluded';
   };
   isOverlay: (element: Element) => boolean;
   isTraversable: (element: Element) => boolean;
@@ -1790,6 +1792,8 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
     const tag = visibleDomElementName(element);
     return element.getAttribute('aria-hidden') === 'true'
       || element.hasAttribute('hidden')
+      || (element as HTMLElement).inert
+      || element.hasAttribute('inert')
       || (tag === 'input' && element.getAttribute('type') === 'hidden');
   }
 
@@ -1807,6 +1811,7 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
     return style.display === 'none'
       || style.visibility === 'hidden'
       || style.visibility === 'collapse'
+      || style.contentVisibility === 'hidden'
       || Number(style.opacity || '1') <= 0.01;
   }
 
@@ -2339,6 +2344,8 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
   function visibleDomItem(element: Element, ref: string, signals: string[] = []) {
     const tag = visibleDomElementName(element);
     const attrs = [`node_id=${ref}`];
+    const surfaceId = surfaceIdForElement(element);
+    if (surfaceId) attrs.push(`surface="${escapeVisibleDomText(surfaceId)}"`);
     for (const name of visibleDomRenderedAttributes) {
       const value = visibleDomAttributeValue(element, name);
       if (value) attrs.push(`${name}="${escapeVisibleDomText(value)}"`);
@@ -2412,6 +2419,7 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
       rect,
       signals,
       state: interactive ? visibleDomInteractiveStateForElement(element, signals) : '',
+      surfaceId,
       tag,
       text: textEntry,
     };
@@ -3107,12 +3115,36 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
     };
   }
 
-  function pageObservation(): BrowserPageObservation {
+  let cachedSurfaceEpoch = -1;
+  let cachedSurfaceFocus: Element | null = null;
+  let surfaceActivationSequence = 0;
+  let previousVisibleSurfaceElements = new Set<Element>();
+  let surfaceBaselineEstablished = false;
+  const recognizedDynamicOverlayElements = new WeakSet<Element>();
+  let pendingSurfaceParent: { element: Element; at: number } | undefined;
+  const surfaceActivationOrder = new WeakMap<Element, number>();
+  const inferredSurfaceParents = new WeakMap<Element, Element>();
+  let cachedSurfaceState: {
+    activeEntry?: { element: Element; order: number; score: number; surface: BrowserActiveSurface };
+    entries: Array<{ element: Element; order: number; score: number; surface: BrowserActiveSurface }>;
+    focused?: Element;
+    scopeEntries: Array<{ element: Element; order: number; score: number; surface: BrowserActiveSurface }>;
+    surfaceStack: BrowserActiveSurface[];
+  } | undefined;
+
+  function resolveSurfaceState() {
     const focused = document.activeElement instanceof Element && document.activeElement !== document.body
       ? document.activeElement
       : undefined;
+    if (
+      cachedSurfaceState
+      && cachedSurfaceEpoch === mutationState.epoch
+      && cachedSurfaceFocus === (focused || null)
+    ) return cachedSurfaceState;
     const candidates = new Set<Element>();
     const controlledCandidates = new Set<Element>();
+    const interactiveSurfaceCandidates = new Set<Element>();
+    const surfaceControllers = new Map<Element, Element[]>();
     const explicitSurfaceSelector = [
       'dialog[open]',
       '[aria-modal="true"]',
@@ -3135,10 +3167,47 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
         if (!controlled) continue;
         candidates.add(controlled);
         controlledCandidates.add(controlled);
+        surfaceControllers.set(controlled, [...(surfaceControllers.get(controlled) || []), controller]);
       }
     }
 
-    const all = Array.from(document.body?.querySelectorAll('*') || []).slice(0, 6000);
+    const interactiveSurfaceItemSelector = [
+      '[role="menuitem"]',
+      '[role="menuitemcheckbox"]',
+      '[role="menuitemradio"]',
+      '[role="option"]',
+      '[role="treeitem"]',
+      'button',
+      'input',
+      'select',
+      'textarea',
+      'a[href]',
+      '[tabindex]',
+      '[contenteditable="true"]',
+    ].join(',');
+    for (const item of Array.from(document.querySelectorAll(interactiveSurfaceItemSelector))) {
+      let current: Element | undefined = item;
+      for (let guard = 0; current && guard < 16; guard += 1) {
+        const style = visibleDomStyle(current);
+        const zIndex = Number.parseInt(style?.zIndex || '', 10);
+        if (
+          style
+          && ['absolute', 'fixed'].includes(style.position)
+          && Number.isFinite(zIndex)
+          && zIndex >= 500
+        ) {
+          candidates.add(current);
+          interactiveSurfaceCandidates.add(current);
+          break;
+        }
+        current = flatParentElement(current);
+      }
+    }
+
+    const allElements = Array.from(document.body?.querySelectorAll('*') || []);
+    const all = allElements.length <= 6000
+      ? allElements
+      : [...allElements.slice(0, 3000), ...allElements.slice(-3000)];
     for (const element of all) {
       if (isOverlay(element) || isVisibleDomSubtreeHidden(element)) continue;
       const style = visibleDomStyle(element);
@@ -3159,7 +3228,16 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
         && rect.height >= window.innerHeight * 0.72
         && rect.width <= window.innerWidth * 0.32
       );
-      const edgeChrome = horizontalChrome || verticalChrome;
+      const peripheralChrome = (
+        (rect.left <= window.innerWidth * 0.05 || rect.right >= window.innerWidth * 0.95)
+        && rect.height >= window.innerHeight * 0.25
+        && rect.width <= window.innerWidth * 0.32
+      ) || (
+        (rect.top <= window.innerHeight * 0.05 || rect.bottom >= window.innerHeight * 0.95)
+        && rect.width >= window.innerWidth * 0.45
+        && rect.height <= window.innerHeight * 0.28
+      );
+      const edgeChrome = horizontalChrome || verticalChrome || peripheralChrome;
       const backdropSized = areaRatio >= 0.35;
       if (
         (Number.isFinite(zIndex) && zIndex > 0 || focusedInside || areaRatio >= 0.03)
@@ -3189,13 +3267,6 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
       const style = visibleDomStyle(element);
       if (!style || style.pointerEvents === 'none') return [];
       const rect = element.getBoundingClientRect();
-      const left = Math.max(0, rect.left);
-      const top = Math.max(0, rect.top);
-      const right = Math.min(window.innerWidth, rect.right);
-      const bottom = Math.min(window.innerHeight, rect.bottom);
-      const width = right - left;
-      const height = bottom - top;
-      if (width <= 2 || height <= 2) return [];
       const role = normalize(element.getAttribute('role')).toLowerCase();
       const modal = element.getAttribute('aria-modal') === 'true'
         || element instanceof HTMLDialogElement && element.open;
@@ -3206,14 +3277,58 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
           return false;
         }
       })();
+      const semanticSurface = modal
+        || popover
+        || ['dialog', 'alertdialog', 'menu', 'listbox', 'tree'].includes(role);
+      const clippedLeft = Math.max(0, rect.left);
+      const clippedTop = Math.max(0, rect.top);
+      const clippedRight = Math.min(window.innerWidth, rect.right);
+      const clippedBottom = Math.min(window.innerHeight, rect.bottom);
+      const clippedWidth = clippedRight - clippedLeft;
+      const clippedHeight = clippedBottom - clippedTop;
+      const useRawRect = semanticSurface && (clippedWidth <= 2 || clippedHeight <= 2);
+      const left = useRawRect ? rect.left : clippedLeft;
+      const top = useRawRect ? rect.top : clippedTop;
+      const right = useRawRect ? rect.right : clippedRight;
+      const bottom = useRawRect ? rect.bottom : clippedBottom;
+      const width = right - left;
+      const height = bottom - top;
+      if (width <= 2 || height <= 2) return [];
       const controlled = controlledCandidates.has(element);
+      const interactiveSurface = interactiveSurfaceCandidates.has(element);
       const focusedInside = Boolean(focused && composedContains(element, focused));
       const zIndex = Number.parseInt(style.zIndex, 10);
       const normalizedZIndex = Number.isFinite(zIndex) ? zIndex : 0;
+      const zIndexOutlier = normalizedZIndex >= 500;
       const viewportArea = Math.max(1, window.innerWidth * window.innerHeight);
       const areaRatio = Math.min(1, width * height / viewportArea);
       const surfaceRole = ['dialog', 'alertdialog', 'menu', 'listbox', 'tree'].includes(role);
       const positioned = ['absolute', 'fixed', 'sticky'].includes(style.position);
+      const persistentLandmark = element.matches(
+        'header, nav, footer, aside, [role="banner"], [role="navigation"], [role="contentinfo"], [role="complementary"]',
+      );
+      if (
+        persistentLandmark
+        && !modal
+        && !popover
+        && !controlled
+        && !surfaceRole
+        && !focusedInside
+      ) {
+        return [];
+      }
+      if (
+        positioned
+        && !modal
+        && !popover
+        && !controlled
+        && !surfaceRole
+        && !focusedInside
+        && !interactiveSurface
+        && areaRatio < 0.015
+      ) {
+        return [];
+      }
       const horizontalChrome = (
         (rect.top <= 2 || rect.bottom >= window.innerHeight - 2)
         && width >= window.innerWidth * 0.72
@@ -3224,7 +3339,16 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
         && height >= window.innerHeight * 0.72
         && width <= window.innerWidth * 0.32
       );
-      const edgeChrome = horizontalChrome || verticalChrome;
+      const peripheralChrome = (
+        (rect.left <= window.innerWidth * 0.05 || rect.right >= window.innerWidth * 0.95)
+        && height >= window.innerHeight * 0.25
+        && width <= window.innerWidth * 0.32
+      ) || (
+        (rect.top <= window.innerHeight * 0.05 || rect.bottom >= window.innerHeight * 0.95)
+        && width >= window.innerWidth * 0.45
+        && height <= window.innerHeight * 0.28
+      );
+      const edgeChrome = horizontalChrome || verticalChrome || peripheralChrome;
       const backdropSized = areaRatio >= 0.35;
       if (!modal && !popover && !controlled && !surfaceRole && !positioned) return [];
       if (
@@ -3235,6 +3359,7 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
         && !controlled
         && !surfaceRole
         && !focusedInside
+        && !interactiveSurface
       ) {
         return [];
       }
@@ -3252,6 +3377,7 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
       if (modal) score += 2000;
       if (popover) score += 1700;
       if (controlled) score += 1400;
+      if (interactiveSurface) score += 900;
       if (role === 'dialog' || role === 'alertdialog') score += 1200;
       else if (['menu', 'listbox', 'tree'].includes(role)) score += 1000;
       else if (role === 'grid') score += 500;
@@ -3273,9 +3399,11 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
         ...(modal ? ['modal'] : []),
         ...(popover ? ['popover'] : []),
         ...(controlled ? ['aria-controls'] : []),
+        ...(interactiveSurface ? ['interactive-descendant'] : []),
         ...(focusedInside ? ['focus-inside'] : []),
         ...(positioned ? [`position:${style.position}`] : []),
         ...(normalizedZIndex ? [`z-index:${normalizedZIndex}`] : []),
+        ...(zIndexOutlier ? ['z-index-outlier'] : []),
         ...(topAtCenterInside ? ['topmost'] : []),
       ];
       const label = normalize(
@@ -3294,34 +3422,149 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
               : controlled
                 ? 'panel'
                 : 'overlay';
-      const blocking = modal
-        || ['dialog', 'alertdialog', 'menu', 'listbox'].includes(role)
+      const likelyOverlay = modal
         || popover
         || (controlled && !edgeChrome)
-        || backdropSized
-        || (topAtCenterInside && normalizedZIndex > 0 && !edgeChrome);
-      const id = `${pathOf(element) || descriptor(element)}|${kind}|${label.slice(0, 80)}`;
-      return [{
-        score,
-        order,
-        surface: {
+        || (zIndexOutlier && topAtCenterInside && !edgeChrome);
+      const id = `surface-${visibleDomState().instanceId}-${visibleDomRef(element)}`;
+      const surface: BrowserActiveSurface = {
           id,
           descriptor: descriptor(element),
           kind,
           label,
           modal,
-          blocking,
+          likelyOverlay,
           focusedInside,
           zIndex: normalizedZIndex,
           rect: { bottom, height, left, right, top, width },
           signals,
-        } satisfies BrowserActiveSurface,
-      }];
+          ...(element.id ? { selector: `#${CSS.escape(element.id)}` } : {}),
+          depth: 0,
+          activationOrder: 0,
+        };
+      return [{ element, score, order, surface }];
     }).sort((left, right) => right.score - left.score || right.order - left.order);
-    const activeSurface = scored[0]?.surface;
-    const signature = activeSurface
-      ? `${activeSurface.id}|${Math.round(activeSurface.rect.left)}:${Math.round(activeSurface.rect.top)}:${Math.round(activeSurface.rect.width)}:${Math.round(activeSurface.rect.height)}`
-      : '';
+    const visibleSurfaceElements = new Set(scored.map((entry) => entry.element));
+    const newlyVisibleEntries = surfaceBaselineEstablished
+      ? scored.filter((entry) => !previousVisibleSurfaceElements.has(entry.element))
+      : [];
+    const newlyVisibleSurfaceElements = new Set(newlyVisibleEntries.map((entry) => entry.element));
+    for (const entry of newlyVisibleEntries) {
+      if (entry.surface.likelyOverlay) recognizedDynamicOverlayElements.add(entry.element);
+    }
+    for (const entry of scored) {
+      let activationOrder = surfaceActivationOrder.get(entry.element);
+      if (activationOrder === undefined) {
+        activationOrder = ++surfaceActivationSequence;
+        surfaceActivationOrder.set(entry.element, activationOrder);
+      }
+      entry.surface.activationOrder = activationOrder;
+    }
+    let consumedPendingParent = false;
+    if (
+      pendingSurfaceParent
+      && performance.now() - pendingSurfaceParent.at <= 2500
+      && visibleSurfaceElements.has(pendingSurfaceParent.element)
+    ) {
+      const pendingParentEntry = scored.find((entry) => entry.element === pendingSurfaceParent?.element);
+      for (const entry of newlyVisibleEntries) {
+        if (
+          entry.element !== pendingSurfaceParent.element
+          && entry.surface.likelyOverlay
+          && entry.surface.kind !== 'overlay'
+          && (
+            entry.surface.modal && pendingParentEntry?.surface.modal
+            || ['popover', 'menu', 'listbox'].includes(entry.surface.kind)
+          )
+        ) {
+          inferredSurfaceParents.set(entry.element, pendingSurfaceParent.element);
+          entry.surface.signals.push('source-surface');
+          consumedPendingParent = true;
+        }
+      }
+    }
+    if (consumedPendingParent || pendingSurfaceParent && performance.now() - pendingSurfaceParent.at > 2500) {
+      pendingSurfaceParent = undefined;
+    }
+    previousVisibleSurfaceElements = visibleSurfaceElements;
+    surfaceBaselineEstablished = true;
+    for (const entry of scored) {
+      const controllers = surfaceControllers.get(entry.element) || [];
+      const inferredParent = inferredSurfaceParents.get(entry.element);
+      const parent = scored
+        .filter((candidate) => candidate !== entry && composedContains(candidate.element, entry.element))
+        .sort((left, right) => (
+          left.surface.rect.width * left.surface.rect.height
+          - right.surface.rect.width * right.surface.rect.height
+        ))[0] || scored
+        .filter((candidate) => candidate !== entry && controllers.some((controller) => composedContains(candidate.element, controller)))
+        .sort((left, right) => right.score - left.score)[0]
+        || scored.find((candidate) => candidate.element === inferredParent);
+      if (parent) entry.surface.parentId = parent.surface.id;
+    }
+    const depthOf = (entry: typeof scored[number], seen = new Set<string>()): number => {
+      if (!entry.surface.parentId || seen.has(entry.surface.id)) return 0;
+      const parent = scored.find((candidate) => candidate.surface.id === entry.surface.parentId);
+      if (!parent) return 0;
+      seen.add(entry.surface.id);
+      return 1 + depthOf(parent, seen);
+    };
+    for (const entry of scored) entry.surface.depth = depthOf(entry);
+    const leafEntries = scored.filter((entry) => !scored.some((candidate) => candidate.surface.parentId === entry.surface.id));
+    const likelyOverlayLeafEntries = leafEntries.filter((entry) => entry.surface.likelyOverlay);
+    const strongOverlayLeafEntries = likelyOverlayLeafEntries.filter((entry) => (
+      entry.surface.modal
+      || entry.surface.kind !== 'overlay'
+      || entry.surface.signals.includes('popover')
+      || entry.surface.signals.includes('aria-controls')
+      || entry.surface.signals.includes('focus-inside')
+      || entry.surface.signals.includes('source-surface')
+      || newlyVisibleSurfaceElements.has(entry.element)
+      || recognizedDynamicOverlayElements.has(entry.element)
+    ));
+    const scopeEntries = strongOverlayLeafEntries;
+    const activeCandidates = scopeEntries;
+    const activeEntry = [...activeCandidates].sort((left, right) => (
+      Number(right.surface.likelyOverlay) - Number(left.surface.likelyOverlay)
+      || Number(right.surface.focusedInside) - Number(left.surface.focusedInside)
+      || right.surface.activationOrder - left.surface.activationOrder
+      || right.surface.depth - left.surface.depth
+      || right.score - left.score
+      || right.surface.zIndex - left.surface.zIndex
+      || right.order - left.order
+    ))[0];
+    const surfaceStack: BrowserActiveSurface[] = [];
+    let stackEntry: typeof scored[number] | undefined = activeEntry;
+    const seenStackIds = new Set<string>();
+    while (stackEntry && !seenStackIds.has(stackEntry.surface.id)) {
+      seenStackIds.add(stackEntry.surface.id);
+      surfaceStack.unshift(stackEntry.surface);
+      stackEntry = stackEntry.surface.parentId
+        ? scored.find((candidate) => candidate.surface.id === stackEntry!.surface.parentId)
+        : undefined;
+    }
+    cachedSurfaceEpoch = mutationState.epoch;
+    cachedSurfaceFocus = focused || null;
+    cachedSurfaceState = { activeEntry, entries: scored, focused, scopeEntries, surfaceStack };
+    return cachedSurfaceState;
+  }
+
+  function surfaceIdForElement(element: Element) {
+    return resolveSurfaceState().entries
+      .filter((entry) => composedContains(entry.element, element))
+      .sort((left, right) => right.surface.depth - left.surface.depth || right.score - left.score)[0]
+      ?.surface.id;
+  }
+
+  function pageObservation(): BrowserPageObservation {
+    const { activeEntry, entries, focused, scopeEntries, surfaceStack } = resolveSurfaceState();
+    const activeSurface = activeEntry?.surface;
+    const topSurfaceIds = scopeEntries.map((entry) => entry.surface.id);
+    const signature = !topSurfaceIds.length && !activeSurface
+      ? ''
+      : `${topSurfaceIds.join(',')}|${activeSurface
+        ? `${activeSurface.id}:${Math.round(activeSurface.rect.left)}:${Math.round(activeSurface.rect.top)}:${Math.round(activeSurface.rect.width)}:${Math.round(activeSurface.rect.height)}`
+        : ''}`;
     const previousSignature = mutationState.activeSurfaceSignature;
     const surfaceTransition: BrowserPageObservation['surfaceTransition'] = previousSignature === undefined
       ? 'initial'
@@ -3353,8 +3596,21 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
         },
       } : {}),
       ...(activeSurface ? { activeSurface } : {}),
+      surfaces: entries.map((entry) => entry.surface),
+      surfaceStack,
+      topSurfaceIds,
       surfaceTransition,
     };
+  }
+
+  function rememberSurfaceSource(element: Element) {
+    const entry = resolveSurfaceState().entries
+      .filter((candidate) => composedContains(candidate.element, element))
+      .sort((left, right) => right.surface.depth - left.surface.depth || right.score - left.score)[0];
+    if (!entry) return;
+    surfaceActivationOrder.set(entry.element, ++surfaceActivationSequence);
+    pendingSurfaceParent = { element: entry.element, at: performance.now() };
+    cachedSurfaceEpoch = -1;
   }
 
   function actionability(element: Element, options: { action?: string } = {}) {
@@ -3365,6 +3621,9 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
     }
     const fileInputAction = action === 'setinputfiles';
     const pointerAction = /^(click|dblclick|hover|tap|check|uncheck|setchecked|dragto|draganddrop)$/.test(action);
+    if (action && !/^(screenshot|ariaSnapshot|innerText|textContent|getAttribute|inputValue|count)$/.test(action)) {
+      rememberSurfaceSource(element);
+    }
     const targetStyle = visibleDomStyle(element);
     if (pointerAction && targetStyle?.pointerEvents === 'none') {
       return { ok: false, reason: `${targetDescriptor} has computed pointer-events:none`, descriptor: targetDescriptor };
@@ -3416,6 +3675,13 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
           && renderedRect.bottom > 0
           && renderedRect.left < window.innerWidth
           && renderedRect.top < window.innerHeight;
+        if (!intersectsViewport && targetStyle?.position === 'fixed') {
+          return {
+            ok: false,
+            reason: `${targetDescriptor} is fixed outside the viewport`,
+            descriptor: targetDescriptor,
+          };
+        }
         if (intersectsViewport && !visiblePointForElement(element, { requirePointerEvents: true })) {
           const centerX = Math.min(window.innerWidth - 1, Math.max(0, renderedRect.left + renderedRect.width / 2));
           const centerY = Math.min(window.innerHeight - 1, Math.max(0, renderedRect.top + renderedRect.height / 2));
@@ -3424,6 +3690,7 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
             ok: false,
             reason: `${targetDescriptor} has no unobstructed actionable point`,
             descriptor: targetDescriptor,
+            failureKind: 'occluded' as const,
             ...(coveredBy ? { coveredBy: descriptor(coveredBy) } : {}),
           };
         }
@@ -3472,10 +3739,38 @@ function installAiBrowserPageRuntime(runtimeVersion: number) {
     };
   }
 
+  const surfaceEntryForEvent = (event: Event) => {
+    const target = event.composedPath().find((item): item is Element => item instanceof Element);
+    if (!target) return undefined;
+    const state = resolveSurfaceState();
+    return state.entries
+      .filter((entry) => composedContains(entry.element, target))
+      .sort((left, right) => right.surface.depth - left.surface.depth || right.score - left.score)[0];
+  };
+  const rememberSurfaceInteraction = (event: Event) => {
+    const entry = surfaceEntryForEvent(event);
+    if (!entry) return;
+    const target = event.composedPath().find((item): item is Element => item instanceof Element);
+    if (target) rememberSurfaceSource(target);
+  };
+  const rememberSurfaceFocus = (event: Event) => {
+    const entry = surfaceEntryForEvent(event);
+    if (!entry) return;
+    surfaceActivationOrder.set(entry.element, ++surfaceActivationSequence);
+    cachedSurfaceEpoch = -1;
+  };
+  document.addEventListener('pointerdown', rememberSurfaceInteraction, true);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') rememberSurfaceInteraction(event);
+  }, true);
+  document.addEventListener('focusin', rememberSurfaceFocus, true);
+
   win.__aiDomRuntime = {
     version: runtimeVersion,
     mutationState: () => ({ epoch: mutationState.epoch, lastMutationAt: mutationState.lastMutationAt }),
     pageObservation,
+    activeSurfaceElement: () => resolveSurfaceState().activeEntry?.element,
+    markSurfaceInteraction: rememberSurfaceSource,
     actionability,
     isOverlay,
     isTraversable,
@@ -4541,11 +4836,9 @@ export class BrowserSession {
   private browserCodeKernelRevision?: number;
   private context?: BrowserContext;
   private page?: Page;
-  private consoleErrors: string[] = [];
-  private pageConsoleEntries: BrowserPageConsoleEntry[] = [];
-  private pageConsoleSequence = 0;
   private networkErrors: string[] = [];
   private domChangeErrors: string[] = [];
+  private domChangeErrorFingerprintsByPage = new WeakMap<Page, Set<string>>();
   private attachedPages = new WeakSet<Page>();
   private httpRequestsByPage = new WeakMap<Page, HttpRequestRecord[]>();
   private httpRequestByRequest = new WeakMap<Request, HttpRequestRecord>();
@@ -5306,6 +5599,14 @@ export class BrowserSession {
       const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
       return {
         ...observation,
+        surfaces: observation.surfaces.map((surface) => ({
+          ...surface,
+          ...(framePath ? { framePath } : {}),
+        })),
+        surfaceStack: observation.surfaceStack.map((surface) => ({
+          ...surface,
+          ...(framePath ? { framePath } : {}),
+        })),
         ...(observation.activeSurface ? {
           activeSurface: {
             ...observation.activeSurface,
@@ -5319,8 +5620,9 @@ export class BrowserSession {
     const selectedSurface = available
       .flatMap((item) => item.activeSurface ? [{ observation: item, surface: item.activeSurface }] : [])
       .sort((left, right) => (
-        Number(right.surface.blocking) - Number(left.surface.blocking)
+        Number(right.surface.likelyOverlay) - Number(left.surface.likelyOverlay)
         || Number(right.surface.modal) - Number(left.surface.modal)
+        || right.surface.activationOrder - left.surface.activationOrder
         || right.surface.zIndex - left.surface.zIndex
       ))[0];
     return {
@@ -5329,6 +5631,9 @@ export class BrowserSession {
       title: main?.title || await page.title().catch(() => ''),
       ...(main?.focusedElement ? { focusedElement: main.focusedElement } : {}),
       ...(selectedSurface ? { activeSurface: selectedSurface.surface } : {}),
+      surfaces: available.flatMap((item) => item.surfaces),
+      surfaceStack: selectedSurface?.observation.surfaceStack || main?.surfaceStack || [],
+      topSurfaceIds: available.flatMap((item) => item.topSurfaceIds),
       surfaceTransition: selectedSurface?.observation.surfaceTransition || main?.surfaceTransition || 'initial',
     };
   }
@@ -5871,24 +6176,11 @@ export class BrowserSession {
   }
 
   // 绑定 console 和网络失败监听，只记录会影响测试判断的关键异常。
-  private recordPageConsoleEntry(
-    page: Page,
-    level: string,
-    text: string,
-    location?: { url?: string; lineNumber?: number; columnNumber?: number },
-  ) {
-    this.pageConsoleEntries.push({
-      sequence: ++this.pageConsoleSequence,
-      level,
-      text: text.slice(0, 4_000),
-      timestamp: new Date().toISOString(),
-      url: location?.url || page.url(),
-      lineNumber: location?.lineNumber,
-      columnNumber: location?.columnNumber,
-    });
-    if (this.pageConsoleEntries.length > 500) {
-      this.pageConsoleEntries.splice(0, this.pageConsoleEntries.length - 500);
-    }
+  // Keep a no-op target for console listeners installed by an older dev-server
+  // module before page-console collection was removed. Those listeners can
+  // outlive a hot reload while the controlled browser session stays open.
+  private recordPageConsoleEntry(...legacyArguments: unknown[]) {
+    void legacyArguments;
   }
 
   private attachPageListeners(page: Page) {
@@ -5901,6 +6193,7 @@ export class BrowserSession {
       this.browserRuntimeRevisionByFrame.set(frame, (this.browserRuntimeRevisionByFrame.get(frame) || 0) + 1);
       this.rememberVisitedOrigin(frame.url());
       if (frame !== page.mainFrame()) return;
+      this.domChangeErrorFingerprintsByPage.set(page, new Set());
       this.navigationSequenceByPage.set(page, (this.navigationSequenceByPage.get(page) || 0) + 1);
     });
     page.on('domcontentloaded', () => {
@@ -5909,16 +6202,13 @@ export class BrowserSession {
     });
     page.on('console', (message) => {
       const text = message.text();
-      this.recordPageConsoleEntry(page, message.type(), text, message.location());
       if (message.type() === 'error' && !shouldIgnoreConsoleError(text)) {
-        this.consoleErrors.push(text);
-        this.recordDomChangeError('console', text);
+        this.recordDomChangeError(page, 'console', text);
       }
     });
     page.on('pageerror', (error) => {
       const text = unknownErrorMessage(error);
-      this.recordPageConsoleEntry(page, 'pageerror', text);
-      this.recordDomChangeError('page', text);
+      this.recordDomChangeError(page, 'page', text);
     });
     page.on('dialog', (dialog: Dialog) => {
       // Playwright's automatic close path leaves a rejected promise behind when
@@ -5927,8 +6217,7 @@ export class BrowserSession {
       void dialog.dismiss().catch((error) => {
         if (isAlreadyHandledJavaScriptDialogError(error)) return;
         const message = `Could not dismiss JavaScript dialog: ${unknownErrorMessage(error)}`;
-        this.consoleErrors.push(message);
-        this.recordDomChangeError('dialog', message);
+        this.recordDomChangeError(page, 'dialog', message);
       });
     });
     page.on('request', (request) => {
@@ -5949,7 +6238,7 @@ export class BrowserSession {
       if (shouldIgnoreNetworkFailure(request.url(), errorText)) return;
       const message = `${request.method()} ${request.url()} ${errorText}`;
       this.networkErrors.push(message);
-      this.recordDomChangeError('network', message);
+      this.recordDomChangeError(page, 'network', message);
     });
   }
 
@@ -5962,10 +6251,16 @@ export class BrowserSession {
     }
   }
 
-  private recordDomChangeError(source: 'console' | 'page' | 'dialog' | 'network', message: string) {
+  private recordDomChangeError(page: Page, source: 'console' | 'page' | 'dialog' | 'network', message: string) {
     const normalized = String(message || '').trim();
     if (!normalized) return;
-    this.domChangeErrors.push(`[${source}] ${normalized}`);
+    const entry = `[${source}] ${normalized}`;
+    const fingerprints = this.domChangeErrorFingerprintsByPage.get(page) || new Set<string>();
+    if (fingerprints.has(entry)) return;
+    if (fingerprints.size >= 500) fingerprints.clear();
+    fingerprints.add(entry);
+    this.domChangeErrorFingerprintsByPage.set(page, fingerprints);
+    this.domChangeErrors.push(entry);
     if (this.domChangeErrors.length > 100) this.domChangeErrors.splice(0, this.domChangeErrors.length - 100);
   }
 
@@ -6928,7 +7223,6 @@ export class BrowserSession {
       return { ok: false, actual: 'browserCode has no direct Playwright connection for this browser session.' };
     }
 
-    const pageConsoleSequenceBefore = this.pageConsoleSequence;
     const page = this.activePage;
     await this.ensurePageGroup(page);
     await this.ensureBrowserPageRuntime(page);
@@ -7023,17 +7317,6 @@ export class BrowserSession {
         await this.resetInterActionChangeJournal().catch(() => undefined);
       }
     }
-    const pageConsole = this.pageConsoleEntries
-      .filter((entry) => entry.sequence > pageConsoleSequenceBefore)
-      .slice(-100)
-      .map((entry) => ({
-        level: entry.level,
-        text: entry.text,
-        timestamp: entry.timestamp,
-        url: entry.url,
-        lineNumber: entry.lineNumber,
-        columnNumber: entry.columnNumber,
-      }));
     const emittedImagePaths: string[] = [];
     const emittedImageErrors: string[] = [];
     if (execution.images?.length) {
@@ -7064,10 +7347,6 @@ export class BrowserSession {
         finalPage: { url: finalUrl, title: finalTitle },
         ...(inferredActivity.verification ? { verification: inferredActivity.verification } : {}),
         ...(actualDomChanges ? { domChanges: actualDomChanges } : {}),
-        console: {
-          code: execution.logs,
-          page: pageConsole,
-        },
         images: emittedImagePaths.map((filePath) => ({ fileName: path.basename(filePath) })),
         imageErrors: emittedImageErrors,
       }, null, 2),
@@ -7087,11 +7366,6 @@ export class BrowserSession {
         ? '已暂停自动操作：页面需要人工完成验证。请在浏览器中完成验证码、登录/安全验证或其他需要本人确认的步骤；完成后点击对话中的“校验完成，继续执行”。'
         : '已暂停自动操作，等待您检查浏览器并完成可能需要的人工验证；完成后点击对话中的“校验完成，继续执行”。',
     };
-  }
-
-  // 返回本次会话采集到的关键 console 错误。
-  getConsoleErrors() {
-    return this.consoleErrors;
   }
 
   // 返回本次会话采集到的关键网络失败。
@@ -9600,6 +9874,21 @@ export class BrowserSession {
     clickTimings.popupListenerSetupMs = Date.now() - popupSetupStartedAt;
     try {
       throwIfAborted();
+      if (fromLocator) {
+        await fromLocator.evaluate((element) => {
+          (window as WindowWithAiDomRuntime).__aiDomRuntime?.markSurfaceInteraction(element);
+        }).catch(() => undefined);
+      } else if (fromDomHandle) {
+        await fromDomHandle.evaluate((element) => {
+          (window as WindowWithAiDomRuntime).__aiDomRuntime?.markSurfaceInteraction(element);
+        }).catch(() => undefined);
+      } else {
+        await page.evaluate(({ x, y }) => {
+          const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+          const target = runtime?.topmostRenderableAt(x, y, { requirePointerEvents: true });
+          if (target) runtime?.markSurfaceInteraction(target);
+        }, { x: fromPoint.x, y: fromPoint.y }).catch(() => undefined);
+      }
       await this.showAiMouseCursor(page, fromPoint.x, fromPoint.y, clickCount > 1 ? 'double' : button === 'right' ? 'right' : 'click');
       await timeBrowserClickStage(clickTimings, 'clickDispatchMs', () => (
         playwrightClickTarget
@@ -9790,7 +10079,8 @@ export class BrowserSession {
     const previousGeneration = this.snapshotGeneration;
     let targetLocator: Locator | undefined;
     let targetHandle: ElementHandle<Element> | undefined;
-    if (input.target || input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
+    const hasExplicitTarget = Boolean(input.target || input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined);
+    if (hasExplicitTarget) {
       const target = await this.unifiedActionPoint(input, true);
       if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
       if (target.point.coveredBy) {
@@ -10368,6 +10658,7 @@ export class BrowserSession {
       frameUrl,
       descriptor: item.descriptor,
       state: item.state,
+      surfaceId: item.surfaceId,
       tag: item.tag,
       viewportClip,
     });
@@ -10600,8 +10891,33 @@ export class BrowserSession {
       const { delta, frame, framePath } = entry;
       epoch = Math.max(epoch, delta.epoch);
       overflow ||= delta.overflow;
+      const activeSurfaceIds = new Set([
+        ...delta.observation.topSurfaceIds,
+        ...delta.observation.surfaceStack.map((surface) => surface.id),
+      ]);
+      const prioritizedItems = (items: BrowserUseVisibleDomSnapshot['items'], maxItems = 60) => {
+        const ordered = [...items].sort((left, right) => (
+          Number(Boolean(right.surfaceId && activeSurfaceIds.has(right.surfaceId)))
+          - Number(Boolean(left.surfaceId && activeSurfaceIds.has(left.surfaceId)))
+          || right.priority - left.priority
+        ));
+        if (ordered.length > maxItems) overflow = true;
+        return ordered.slice(0, maxItems);
+      };
+      const deltaAdded = prioritizedItems(delta.added);
+      const deltaUpdated = prioritizedItems(delta.updated);
+      const deltaExtraAdded = prioritizedItems(delta.extra.added, 40);
+      const deltaExtraUpdated = prioritizedItems(delta.extra.updated, 40);
       observations.push({
         ...delta.observation,
+        surfaces: delta.observation.surfaces.map((surface) => ({
+          ...surface,
+          ...(framePath ? { framePath } : {}),
+        })),
+        surfaceStack: delta.observation.surfaceStack.map((surface) => ({
+          ...surface,
+          ...(framePath ? { framePath } : {}),
+        })),
         ...(delta.observation.activeSurface ? {
           activeSurface: {
             ...delta.observation.activeSurface,
@@ -10614,7 +10930,7 @@ export class BrowserSession {
         const uid = this.removeDomVisibleReference(delta.stateKey, localRef);
         if (uid) removed.push(uid);
       }
-      for (const item of delta.added) {
+      for (const item of deltaAdded) {
         const reference = this.domObservationReference(delta.stateKey, item, framePath, frameUrl);
         this.lastDomNodeReferences.set(reference.id, reference);
         this.domVisibleExposedReferenceIds.add(reference.id);
@@ -10622,7 +10938,7 @@ export class BrowserSession {
         const validationError = this.domObservationValidationError(reference.line);
         if (validationError) validationErrors.add(validationError);
       }
-      for (const item of delta.updated) {
+      for (const item of deltaUpdated) {
         const reference = this.domObservationReference(delta.stateKey, item, framePath, frameUrl);
         this.lastDomNodeReferences.set(reference.id, reference);
         this.domVisibleExposedReferenceIds.add(reference.id);
@@ -10630,13 +10946,13 @@ export class BrowserSession {
         const validationError = this.domObservationValidationError(reference.line);
         if (validationError) validationErrors.add(validationError);
       }
-      for (const item of delta.extra.added) {
+      for (const item of deltaExtraAdded) {
         const line = this.domObservationExtraLine(item);
         extraAdded.push(line);
         const validationError = this.domObservationValidationError(line);
         if (validationError) validationErrors.add(validationError);
       }
-      for (const item of delta.extra.updated) {
+      for (const item of deltaExtraUpdated) {
         const line = this.domObservationExtraLine(item);
         extraUpdated.push(line);
         const validationError = this.domObservationValidationError(line);
@@ -10648,8 +10964,9 @@ export class BrowserSession {
     const selectedSurface = observations
       .flatMap((item) => item.activeSurface ? [{ observation: item, surface: item.activeSurface }] : [])
       .sort((left, right) => (
-        Number(right.surface.blocking) - Number(left.surface.blocking)
+        Number(right.surface.likelyOverlay) - Number(left.surface.likelyOverlay)
         || Number(right.surface.modal) - Number(left.surface.modal)
+        || right.surface.activationOrder - left.surface.activationOrder
         || right.surface.zIndex - left.surface.zIndex
       ))[0];
     const observation: BrowserPageObservation = {
@@ -10658,6 +10975,9 @@ export class BrowserSession {
       title: mainObservation?.title || await this.activePage.title().catch(() => ''),
       ...(mainObservation?.focusedElement ? { focusedElement: mainObservation.focusedElement } : {}),
       ...(selectedSurface ? { activeSurface: selectedSurface.surface } : {}),
+      surfaces: observations.flatMap((item) => item.surfaces),
+      surfaceStack: selectedSurface?.observation.surfaceStack || mainObservation?.surfaceStack || [],
+      topSurfaceIds: observations.flatMap((item) => item.topSurfaceIds),
       surfaceTransition: selectedSurface?.observation.surfaceTransition || mainObservation?.surfaceTransition || 'initial',
     };
 

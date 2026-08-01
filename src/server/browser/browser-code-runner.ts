@@ -31,7 +31,7 @@ type BrowserCodePageObservation = {
     kind: 'dialog' | 'popover' | 'menu' | 'listbox' | 'panel' | 'overlay';
     label: string;
     modal: boolean;
-    blocking: boolean;
+    likelyOverlay: boolean;
     focusedInside: boolean;
     zIndex: number;
     rect: {
@@ -43,8 +43,47 @@ type BrowserCodePageObservation = {
       width: number;
     };
     signals: string[];
+    selector?: string;
     framePath?: string;
+    parentId?: string;
+    depth: number;
+    activationOrder: number;
   };
+  surfaces: Array<{
+    id: string;
+    descriptor: string;
+    kind: 'dialog' | 'popover' | 'menu' | 'listbox' | 'panel' | 'overlay';
+    label: string;
+    modal: boolean;
+    likelyOverlay: boolean;
+    focusedInside: boolean;
+    zIndex: number;
+    rect: { bottom: number; height: number; left: number; right: number; top: number; width: number };
+    signals: string[];
+    selector?: string;
+    framePath?: string;
+    parentId?: string;
+    depth: number;
+    activationOrder: number;
+  }>;
+  surfaceStack: Array<{
+    id: string;
+    descriptor: string;
+    kind: 'dialog' | 'popover' | 'menu' | 'listbox' | 'panel' | 'overlay';
+    label: string;
+    modal: boolean;
+    likelyOverlay: boolean;
+    focusedInside: boolean;
+    zIndex: number;
+    rect: { bottom: number; height: number; left: number; right: number; top: number; width: number };
+    signals: string[];
+    selector?: string;
+    framePath?: string;
+    parentId?: string;
+    depth: number;
+    activationOrder: number;
+  }>;
+  topSurfaceIds: string[];
   surfaceTransition: 'initial' | 'unchanged' | 'opened' | 'closed' | 'changed';
 };
 
@@ -75,6 +114,63 @@ export type BrowserCodeRisk = {
   reasons: string[];
 };
 
+function evaluateCallContainsDomClick(code: string) {
+  const evaluatePattern = /\.evaluate(?:All|Handle)?\s*\(/g;
+  let match: RegExpExecArray | null;
+  while ((match = evaluatePattern.exec(code))) {
+    const openingParen = code.indexOf('(', match.index);
+    let depth = 0;
+    let quote = '';
+    let escaped = false;
+    let lineComment = false;
+    let blockComment = false;
+    for (let index = openingParen; index < code.length; index += 1) {
+      const character = code[index];
+      const next = code[index + 1];
+      if (lineComment) {
+        if (character === '\n' || character === '\r') lineComment = false;
+        continue;
+      }
+      if (blockComment) {
+        if (character === '*' && next === '/') {
+          blockComment = false;
+          index += 1;
+        }
+        continue;
+      }
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (character === '\\') escaped = true;
+        else if (character === quote) quote = '';
+        continue;
+      }
+      if (character === '/' && next === '/') {
+        lineComment = true;
+        index += 1;
+        continue;
+      }
+      if (character === '/' && next === '*') {
+        blockComment = true;
+        index += 1;
+        continue;
+      }
+      if (character === '"' || character === "'" || character === '`') {
+        quote = character;
+        continue;
+      }
+      if (character === '(') depth += 1;
+      if (character !== ')') continue;
+      depth -= 1;
+      if (depth > 0) continue;
+      const evaluateCall = code.slice(openingParen + 1, index);
+      if (/\.click\s*\(/i.test(evaluateCall)) return true;
+      evaluatePattern.lastIndex = index + 1;
+      break;
+    }
+  }
+  return false;
+}
+
 export function browserCodePolicyViolation(code: string) {
   if (/(?:\bforce\b|['"]force['"])\s*:\s*true\b/i.test(code)) {
     return 'browserCode forbids Playwright force: true. Refresh the page snapshot and resolve overlays, loading state, stale locators, or asynchronous redraws instead.';
@@ -82,8 +178,7 @@ export function browserCodePolicyViolation(code: string) {
   if (/\.dispatchEvent\s*\(\s*(?:[^,()]+,\s*)?['"]click['"]/i.test(code)) {
     return 'browserCode forbids dispatchEvent("click") because it bypasses Playwright actionability. Refresh the DOM evidence and use one unique visible Playwright locator.';
   }
-  if (/\.evaluate(?:All|Handle)?\s*\([\s\S]{0,300}?=>\s*\{[\s\S]{0,3000}?\.click\s*\(/i.test(code)
-    || /\.evaluate(?:All|Handle)?\s*\([\s\S]{0,300}?=>\s*(?!\{)[^;\r\n]{0,1000}?\.click\s*\(/i.test(code)) {
+  if (evaluateCallContainsDomClick(code)) {
     return 'browserCode forbids DOM element.click() inside evaluate callbacks because it bypasses Playwright actionability. Refresh the DOM evidence and use one unique visible Playwright locator.';
   }
   return undefined;
@@ -121,7 +216,7 @@ const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 13;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 19;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -393,7 +488,13 @@ function browserCodeKernelMain() {
         const shared = browserWindow.__aiDomRuntime?.pageObservation?.();
         if (shared) return shared;
         const visible = (element: Element) => {
-          if (!element.isConnected || element.hasAttribute('hidden') || element.getAttribute('aria-hidden') === 'true') return false;
+          if (
+            !element.isConnected
+            || element.hasAttribute('hidden')
+            || element.getAttribute('aria-hidden') === 'true'
+            || (element as HTMLElement).inert
+            || element.hasAttribute('inert')
+          ) return false;
           let current: Element | null = element;
           while (current) {
             const style = getComputedStyle(current);
@@ -401,6 +502,7 @@ function browserCodeKernelMain() {
               style.display === 'none'
               || style.visibility === 'hidden'
               || style.visibility === 'collapse'
+              || style.contentVisibility === 'hidden'
               || Number(style.opacity || '1') <= 0.01
             ) return false;
             current = current.parentElement;
@@ -408,12 +510,13 @@ function browserCodeKernelMain() {
           const rect = element.getBoundingClientRect();
           return rect.width > 2 && rect.height > 2;
         };
-        const surface = Array.from(document.querySelectorAll(
+        const surfaceElements = Array.from(document.querySelectorAll(
           'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]',
-        )).filter(visible).at(-1);
-        const rect = surface?.getBoundingClientRect();
+        )).filter(visible);
         const descriptor = (element: Element) => `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ''}`;
-        const activeSurface = surface && rect ? {
+        const surfaces = surfaceElements.map((surface, index) => {
+          const rect = surface.getBoundingClientRect();
+          return {
           id: `${descriptor(surface)}|${String(surface.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80)}`,
           descriptor: descriptor(surface),
           kind: surface.getAttribute('role') === 'menu'
@@ -421,7 +524,7 @@ function browserCodeKernelMain() {
             : surface.getAttribute('role') === 'listbox' ? 'listbox' : 'dialog',
           label: String(surface.getAttribute('aria-label') || surface.getAttribute('title') || surface.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
           modal: surface.getAttribute('aria-modal') === 'true' || surface instanceof HTMLDialogElement,
-          blocking: true,
+          likelyOverlay: true,
           focusedInside: Boolean(document.activeElement && surface.contains(document.activeElement)),
           zIndex: Number.parseInt(getComputedStyle(surface).zIndex, 10) || 0,
           rect: {
@@ -433,7 +536,12 @@ function browserCodeKernelMain() {
             width: rect.width,
           },
           signals: ['fallback-semantic-surface'],
-        } : undefined;
+          ...(surface.id ? { selector: `#${CSS.escape(surface.id)}` } : {}),
+          depth: 0,
+          activationOrder: index + 1,
+        };
+        });
+        const activeSurface = surfaces.at(-1);
         const focused = document.activeElement instanceof Element && document.activeElement !== document.body
           ? document.activeElement
           : undefined;
@@ -459,12 +567,23 @@ function browserCodeKernelMain() {
             },
           } : {}),
           ...(activeSurface ? { activeSurface } : {}),
+          surfaces,
+          surfaceStack: activeSurface ? [activeSurface] : [],
+          topSurfaceIds: surfaces.map((surface) => surface.id),
           surfaceTransition: 'initial' as const,
         };
       }).catch(() => undefined);
       if (!observation) return undefined;
       return {
         ...observation,
+        surfaces: observation.surfaces.map((surface) => ({
+          ...surface,
+          ...(frame !== mainFrame ? { framePath: frame.url() || 'iframe' } : {}),
+        })),
+        surfaceStack: observation.surfaceStack.map((surface) => ({
+          ...surface,
+          ...(frame !== mainFrame ? { framePath: frame.url() || 'iframe' } : {}),
+        })),
         ...(observation.activeSurface && frame !== mainFrame ? {
           activeSurface: {
             ...observation.activeSurface,
@@ -478,8 +597,9 @@ function browserCodeKernelMain() {
     const selectedSurface = available
       .flatMap((item) => item.activeSurface ? [{ observation: item, surface: item.activeSurface }] : [])
       .sort((left, right) => (
-        Number(right.surface.blocking) - Number(left.surface.blocking)
+        Number(right.surface.likelyOverlay) - Number(left.surface.likelyOverlay)
         || Number(right.surface.modal) - Number(left.surface.modal)
+        || right.surface.activationOrder - left.surface.activationOrder
         || right.surface.zIndex - left.surface.zIndex
       ))[0];
     return {
@@ -488,6 +608,9 @@ function browserCodeKernelMain() {
       title: main?.title || await page.title().catch(() => ''),
       ...(main?.focusedElement ? { focusedElement: main.focusedElement } : {}),
       ...(selectedSurface ? { activeSurface: selectedSurface.surface } : {}),
+      surfaces: available.flatMap((item) => item.surfaces),
+      surfaceStack: selectedSurface?.observation.surfaceStack || main?.surfaceStack || [],
+      topSurfaceIds: available.flatMap((item) => item.topSurfaceIds),
       surfaceTransition: selectedSurface?.observation.surfaceTransition || main?.surfaceTransition || 'initial',
     };
   };
@@ -546,16 +669,24 @@ function browserCodeKernelMain() {
           actionability?: (
             target: Element,
             options?: { action?: string },
-          ) => { ok: boolean; reason: string; descriptor: string; coveredBy?: string };
+          ) => {
+            ok: boolean;
+            reason: string;
+            descriptor: string;
+            coveredBy?: string;
+            failureKind?: 'occluded';
+          };
         };
       };
+      const runtime = browserWindow.__aiDomRuntime;
       return elements.map((element): {
         ok: boolean;
         reason: string;
         descriptor: string;
         coveredBy?: string;
+        failureKind?: 'occluded';
       } => {
-        const shared = browserWindow.__aiDomRuntime?.actionability?.(element, { action: operation });
+        const shared = runtime?.actionability?.(element, { action: operation });
         if (shared) return shared;
         const descriptor = `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ''}`;
         if (!element.isConnected) {
@@ -590,6 +721,13 @@ function browserCodeKernelMain() {
         if (!fileInputAction) {
           const rect = Array.from(element.getClientRects()).find((item) => item.width > 0 && item.height > 0);
           if (!rect) return { ok: false, reason: `${descriptor} has no rendered client rectangle`, descriptor };
+          if (
+            pointerAction
+            && targetStyle.position === 'fixed'
+            && (rect.right <= 0 || rect.bottom <= 0 || rect.left >= innerWidth || rect.top >= innerHeight)
+          ) {
+            return { ok: false, reason: `${descriptor} is fixed outside the viewport`, descriptor };
+          }
         }
         if (/^(fill|type|clear|presssequentially)$/.test(operation.toLowerCase())) {
           const field = element as HTMLInputElement | HTMLTextAreaElement;
@@ -618,6 +756,12 @@ function browserCodeKernelMain() {
       const nativeTrialAction = nativeLocatorActions.get(trialMethod);
       const trialResults: typeof results = [];
       for (const [index, result] of results.entries()) {
+        const supplementalOcclusion = result.failureKind === 'occluded'
+          || /no unobstructed actionable point/i.test(result.reason);
+        if (!result.ok && !supplementalOcclusion) {
+          trialResults.push(result);
+          continue;
+        }
         if (!nativeTrialAction) {
           trialResults.push({
             ...result,
@@ -628,15 +772,18 @@ function browserCodeKernelMain() {
         }
         try {
           await Reflect.apply(nativeTrialAction, candidateSet.nth(index), [{
-            timeout: result.ok ? browserCodeActionTimeoutMs : browserCodePointerLookupTimeoutMs,
+            timeout: supplementalOcclusion || results.length > 1
+              ? browserCodePointerLookupTimeoutMs
+              : browserCodeActionTimeoutMs,
             trial: true,
           }]);
           trialResults.push({
             ...result,
-            ok: result.ok,
+            ok: true,
             reason: result.ok
               ? `Playwright ${trialMethod} trial passed`
-              : `${result.reason}; Playwright ${trialMethod} trial passed`,
+              : `${result.reason}; Playwright ${trialMethod} trial passed and is authoritative`,
+            coveredBy: undefined,
           });
         } catch (error) {
           const detail = (error instanceof Error ? error.message : String(error))
@@ -658,10 +805,13 @@ function browserCodeKernelMain() {
       const visibilityStage = skipVisibleFilter
         ? `${results.length} candidates entered the file-input exception path`
         : `${results.length} passed automatic visible filtering`;
-      const diagnostics = results.slice(0, 8).map((result, index) => (
-        `#${index + 1} ${result.descriptor}: ${result.ok ? 'actionable' : result.reason}`
-        + (result.coveredBy ? `; covered by ${result.coveredBy}` : '')
-      )).join(' | ');
+      const diagnostics = results
+        .map((result, index) => ({ index, result }))
+        .slice(0, 12)
+        .map(({ index, result }) => (
+          `#${index + 1} ${result.descriptor}: ${result.ok ? 'actionable' : result.reason}`
+          + (result.coveredBy ? `; covered by ${result.coveredBy}` : '')
+        )).join(' | ');
       throw new Error(
         `ACTIONABILITY_FAILED: ${action} matched ${originalCount} elements; ${visibilityStage}; `
         + `${actionableIndices.length} passed full actionability. Exactly one candidate must pass both stages.`
@@ -912,7 +1062,7 @@ function browserCodeKernelMain() {
           configurable: true,
           value: async function pointerVisualizedLocatorAction(this: object, ...args: unknown[]) {
             if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
-              throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
+              throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the current page state.');
             }
             const normalizedArgs = actionArgsWithMinimumTimeout(
               args,
@@ -1035,7 +1185,7 @@ function browserCodeKernelMain() {
           configurable: true,
           value: async (...args: unknown[]) => {
             if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
-              throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the blocking page state.');
+              throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the current page state.');
             }
             const normalizedArgs = actionArgsWithMinimumTimeout(args, optionsIndex);
             const targetLocators = new Map<number, import('playwright').Locator>();
@@ -1439,7 +1589,8 @@ function browserCodeKernelMain() {
     const existing = tabWrappers.get(page);
     if (existing) return existing;
     const extendedPage = page as import('playwright').Page & {
-      domSnapshot?: () => Promise<string>;
+      domSnapshot?: (options?: { scope?: 'active' | 'all' }) => Promise<string>;
+      activeSurface?: () => Promise<Pick<KernelPageObservation, 'activeSurface' | 'surfaces' | 'surfaceStack' | 'topSurfaceIds'>>;
       verifyState?: (input: BrowserCodeVerifyStateInput) => Promise<unknown>;
       expectNavigation?: <T>(action: () => Promise<T>, options?: { timeoutMs?: number; url?: string | RegExp; waitUntil?: NonNullable<Parameters<import('playwright').Page['waitForURL']>[1]>['waitUntil'] }) => Promise<T>;
     };
@@ -1447,9 +1598,41 @@ function browserCodeKernelMain() {
       Object.defineProperty(extendedPage, 'domSnapshot', {
         configurable: false,
         enumerable: false,
+        value: async (options: { scope?: 'active' | 'all' } = {}) => {
+          const observation = await readUnifiedPageObservation(page);
+          const scope = options.scope || 'active';
+          const targetFrame = observation.activeSurface?.framePath
+            ? page.frames().find((frame) => frame.url() === observation.activeSurface?.framePath) || page.mainFrame()
+            : page.mainFrame();
+          let snapshot: string;
+          if (scope === 'active' && observation.activeSurface) {
+            const semanticSurfaceSelector = 'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
+            const selectedSurface = observation.activeSurface.selector
+              ? targetFrame.locator(observation.activeSurface.selector).filter({ visible: true })
+              : targetFrame.locator(semanticSurfaceSelector).filter({ visible: true }).last();
+            snapshot = await selectedSurface.count()
+              ? await selectedSurface.first().ariaSnapshot({ timeout: browserCodeActionTimeoutMs })
+              : await targetFrame.locator('body').ariaSnapshot({ timeout: browserCodeActionTimeoutMs });
+          } else {
+            snapshot = await page.locator('body').ariaSnapshot({ timeout: browserCodeActionTimeoutMs });
+          }
+          return `[page-state] ${JSON.stringify(observation)}\n[ax-tree scope=${scope}]\n${snapshot}`;
+        },
+        writable: false,
+      });
+    }
+    if (typeof extendedPage.activeSurface !== 'function') {
+      Object.defineProperty(extendedPage, 'activeSurface', {
+        configurable: false,
+        enumerable: false,
         value: async () => {
-          const snapshot = await page.locator('body').ariaSnapshot({ timeout: browserCodeActionTimeoutMs });
-          return `[ax-tree]\n${snapshot}`;
+          const observation = await readUnifiedPageObservation(page);
+          return {
+            activeSurface: observation.activeSurface,
+            surfaces: observation.surfaces,
+            surfaceStack: observation.surfaceStack,
+            topSurfaceIds: observation.topSurfaceIds,
+          };
         },
         writable: false,
       });
@@ -1536,8 +1719,8 @@ function browserCodeKernelMain() {
     capabilities: Object.freeze({ cua: true, images: true, playwright: true, tabLifecycle: true }),
     documentation: async () => [
       'browserCode exposes one controlled browser runtime in ordinary JavaScript.',
-      'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.verifyState(), page.expectNavigation(), and nodeRepl.emitImage().',
-      'page.domSnapshot() is a read-only Playwright AX-tree capture. browser.user.openTabs() reports active-tab and tab-group metadata.',
+      'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.verifyState(), page.expectNavigation(), and nodeRepl.emitImage().',
+      'page.domSnapshot() returns page-state plus a read-only Playwright AX tree scoped to the active surface by default; pass { scope: "all" } only for background context. browser.user.openTabs() reports active-tab and tab-group metadata.',
       'Page and Locator factory methods expose only currently rendered matches: hidden descendants and zero-rectangle nodes are excluded before count() and positional selection. Element actions then validate target computed style and hit testing, run an action-specific Playwright trial for every remaining pointer candidate, and execute only the unique candidate that passes all stages; CSS-hidden file inputs used by setInputFiles are recovered only at that action boundary.',
       'page.verifyState() is an optional read-only assertion helper; it never gates later actions or successful cell completion.',
       `Playwright action timeout: ${browserCodeActionTimeoutMs}ms; navigation timeout: ${browserCodeNavigationTimeoutMs}ms.`,

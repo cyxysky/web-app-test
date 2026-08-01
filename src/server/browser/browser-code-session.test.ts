@@ -37,7 +37,7 @@ test('BrowserSession executes browserCode against the controlled Playwright page
           <option value="admin">Admin</option>
         </select>
       </label>
-      <button type="button" onclick="console.log('apply-clicked'); document.body.dataset.applied = 'yes'; document.getElementById('status').textContent = 'Applied'">Apply</button>
+      <button type="button" onclick="console.error('apply-clicked'); document.body.dataset.applied = 'yes'; document.getElementById('status').textContent = 'Applied'">Apply</button>
       <p id="status">Pending</p>
     </body></html>
   `)}`);
@@ -110,7 +110,6 @@ test('BrowserSession executes browserCode against the controlled Playwright page
 
   const screenshotAction = await session.executeBrowserCode({
     code: `
-      console.info('session-cell-started');
       var button = page.getByRole('button', { name: 'Apply' }).filter({ visible: true });
       var buttonLabel = await button.evaluate((element, suffix) => element.textContent + suffix, '!');
       var buttonBox = await button.boundingBox();
@@ -125,10 +124,8 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.equal(screenshotAction.ok, true, screenshotAction.actual);
   assert.equal(screenshotAction.referenceImagePaths?.length, 1);
   assert.equal((await readFile(screenshotAction.referenceImagePaths?.[0] || '')).subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
-  const screenshotResult = JSON.parse(screenshotAction.actual) as {
-    console?: { code?: Array<{ level?: string; text?: string }> };
-  };
-  assert.ok(screenshotResult.console?.code?.some((entry) => entry.level === 'info' && entry.text === 'session-cell-started'));
+  const screenshotResult = JSON.parse(screenshotAction.actual) as { console?: unknown };
+  assert.equal('console' in screenshotResult, false);
 
   const action = await session.executeBrowserCode({
     code: `
@@ -176,13 +173,10 @@ test('BrowserSession executes browserCode against the controlled Playwright page
     domChanges?: {
       added?: string[];
       updated?: string[];
-      extra?: { added?: string[]; updated?: string[] };
+      extra?: { added?: string[]; updated?: string[]; errors?: string[] };
     };
     axTree?: string;
-    console?: {
-      code?: Array<{ level?: string; text?: string }>;
-      page?: Array<{ level?: string; text?: string }>;
-    };
+    console?: unknown;
   };
   assert.deepEqual(result.result?.state, { name: 'Alice', role: 'admin', applied: 'yes', status: 'Applied' });
   assert.equal(result.result?.buttonLabel, 'Apply!');
@@ -197,8 +191,8 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.equal(result.axTree, undefined);
   assert.equal('postActionObservation' in result, false);
   assert.equal('domSnapshot' in result, false);
-  assert.deepEqual(result.console?.code, []);
-  assert.ok(result.console?.page?.some((entry) => entry.level === 'log' && entry.text === 'apply-clicked'));
+  assert.ok(result.domChanges?.extra?.errors?.some((entry) => entry === '[console] apply-clicked'));
+  assert.equal('console' in result, false);
   assert.deepEqual(action.referenceImagePaths, []);
   assert.equal(await page.getByLabel('Name').inputValue(), 'Alice');
   assert.equal(await page.getByLabel('Role').inputValue(), 'admin');

@@ -84,7 +84,8 @@ test('browserCode sandbox executes ordinary Playwright code directly', async () 
   const firstValue = result.value as Record<string, unknown>;
   assert.equal(firstValue.title, 'Editor');
   assert.equal(firstValue.text, 'Save');
-  assert.match(String(firstValue.snapshot), /^\[ax-tree\]\n/);
+  assert.match(String(firstValue.snapshot), /^\[page-state\] /);
+  assert.match(String(firstValue.snapshot), /\[ax-tree scope=active\]/);
   assert.match(String(firstValue.snapshot), /- button "Save"/);
   assert.equal(firstValue.url, 'about:blank');
   assert.equal(firstValue.uidType, 'undefined');
@@ -923,6 +924,16 @@ test('browserCode policy rejects scripted clicks that bypass actionability', () 
   );
   assert.equal(
     browserCodePolicyViolation(`await page.evaluate(() => document.title); await page.getByRole('button', { name: 'Save' }).click()`),
+    undefined,
+  );
+  assert.equal(
+    browserCodePolicyViolation(`
+      var observedFields = await page.evaluate(() => ({
+        title: document.title,
+        buttons: Array.from(document.querySelectorAll('button')).map((button) => button.textContent),
+      }));
+      await page.getByRole('button', { name: 'Save' }).click();
+    `),
     undefined,
   );
 });
