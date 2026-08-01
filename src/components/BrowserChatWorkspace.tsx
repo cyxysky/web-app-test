@@ -337,6 +337,30 @@ function interruptBrowserChatSessionOptimistically(session: BrowserChatSession, 
   };
 }
 
+type BrowserChatInterruptGuard = {
+  assistantMessageIds: Set<string>;
+  timestamp: string;
+};
+
+function applyBrowserChatInterruptGuard(
+  session: BrowserChatSession,
+  guard: BrowserChatInterruptGuard | undefined,
+) {
+  if (!guard) return { release: false, session };
+  const runningAssistantIds = session.messages
+    .filter((message) => message.role === 'assistant' && message.status === 'running')
+    .map((message) => message.id);
+  if (runningAssistantIds.some((messageId) => !guard.assistantMessageIds.has(messageId))) {
+    return { release: true, session };
+  }
+  return {
+    release: false,
+    session: isBrowserChatSessionRunning(session)
+      ? interruptBrowserChatSessionOptimistically(session, guard.timestamp)
+      : session,
+  };
+}
+
 type BrowserChatToolDetail = {
   stepIndex: number;
   step: StepExecutionResult;
@@ -561,7 +585,7 @@ function embeddedBrowserGroupIconColor(groupId?: string) {
 
 function embeddedGroupIdForSession(sessionId?: string) {
   const normalized = (sessionId || '').trim();
-  return normalized ? `session:${normalized}` : 'default';
+  return normalized ? `session:${normalized}` : '';
 }
 
 function embeddedSessionIdFromGroupId(groupId?: string) {
@@ -4979,6 +5003,25 @@ type BrowserChatPreviewFrame = {
   viewport: { width: number; height: number };
 };
 
+type BrowserChatPreviewServerMetrics = {
+  activeCaptures?: number;
+  backpressureDrops?: number;
+  captureDurationMs?: number;
+  captureDurationMsAverage?: number;
+  captureFps?: number;
+  imageFormat?: 'jpeg' | 'png';
+  imageQuality?: number;
+  maxConcurrentCaptures?: number;
+  pendingClientFrames?: number;
+  sendFps?: number;
+  targetFps?: number;
+};
+
+type BrowserChatPreviewDisplayMetrics = BrowserChatPreviewServerMetrics & {
+  displayedFps: number;
+  receivedFps: number;
+};
+
 type BrowserChatPreviewInput =
   | { kind: 'tab'; tabId: string }
   | { kind: 'move'; xRatio: number; yRatio: number }
@@ -5002,7 +5045,17 @@ function BrowserChatWebPreviewModal({
   const previewImageRef = useRef<HTMLImageElement | null>(null);
   const pendingFrameRef = useRef<BrowserChatPreviewFrame | null>(null);
   const frameObjectUrlRef = useRef('');
-  const frameRenderRequestRef = useRef<number | undefined>(undefined);
+  const staleFrameObjectUrlRef = useRef('');
+  const decodingFrameObjectUrlRef = useRef('');
+  const frameDecodeActiveRef = useRef(false);
+  const framePipelineDisposedRef = useRef(false);
+  const frameCountersRef = useRef({
+    displayed: 0,
+    received: 0,
+    sampledAt: Date.now(),
+    sampledDisplayed: 0,
+    sampledReceived: 0,
+  });
   const pendingMoveRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'move' }> | null>(null);
   const pointerGestureRef = useRef<{
     button: 'left' | 'middle';
@@ -5021,6 +5074,60 @@ function BrowserChatWebPreviewModal({
   const [status, setStatus] = useState<'connecting' | 'live' | 'reconnecting' | 'unavailable'>('connecting');
   const [streamError, setStreamError] = useState('');
   const [inputError, setInputError] = useState('');
+  const [previewMetrics, setPreviewMetrics] = useState<BrowserChatPreviewDisplayMetrics | null>(null);
+
+  const commitPendingPreviewFrame = useCallback(async function commitPendingPreviewFrame() {
+    if (framePipelineDisposedRef.current || frameDecodeActiveRef.current) return;
+    const nextFrame = pendingFrameRef.current;
+    if (!nextFrame) return;
+    pendingFrameRef.current = null;
+    frameDecodeActiveRef.current = true;
+    decodingFrameObjectUrlRef.current = nextFrame.imageUrl;
+    let committed = false;
+    try {
+      const decodedImage = new Image();
+      decodedImage.decoding = 'async';
+      decodedImage.src = nextFrame.imageUrl;
+      await decodedImage.decode();
+      if (framePipelineDisposedRef.current) return;
+
+      if (staleFrameObjectUrlRef.current.startsWith('blob:')) {
+        URL.revokeObjectURL(staleFrameObjectUrlRef.current);
+      }
+      staleFrameObjectUrlRef.current = frameObjectUrlRef.current;
+      frameObjectUrlRef.current = nextFrame.imageUrl;
+      decodingFrameObjectUrlRef.current = '';
+      committed = true;
+      frameCountersRef.current.displayed += 1;
+      setFrame(nextFrame);
+      setStatus('live');
+      setStreamError('');
+    } catch {
+      // A newer frame remains queued and will be decoded below.
+    } finally {
+      if (!committed && nextFrame.imageUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(nextFrame.imageUrl);
+      }
+      if (decodingFrameObjectUrlRef.current === nextFrame.imageUrl) {
+        decodingFrameObjectUrlRef.current = '';
+      }
+      frameDecodeActiveRef.current = false;
+      if (!framePipelineDisposedRef.current && pendingFrameRef.current) {
+        void commitPendingPreviewFrame();
+      }
+    }
+  }, []);
+
+  const queuePreviewFrame = useCallback((nextFrame: BrowserChatPreviewFrame) => {
+    if (framePipelineDisposedRef.current) {
+      if (nextFrame.imageUrl.startsWith('blob:')) URL.revokeObjectURL(nextFrame.imageUrl);
+      return;
+    }
+    const previousPending = pendingFrameRef.current?.imageUrl;
+    if (previousPending?.startsWith('blob:')) URL.revokeObjectURL(previousPending);
+    pendingFrameRef.current = nextFrame;
+    void commitPendingPreviewFrame();
+  }, [commitPendingPreviewFrame]);
 
   useEffect(() => {
     let disposed = false;
@@ -5038,7 +5145,14 @@ function BrowserChatWebPreviewModal({
         const stream = new WebSocket(url);
         stream.binaryType = 'arraybuffer';
         streamRef.current = stream;
-        stream.onopen = () => setStreamError('');
+        stream.onopen = () => {
+          const counters = frameCountersRef.current;
+          counters.sampledAt = Date.now();
+          counters.sampledDisplayed = counters.displayed;
+          counters.sampledReceived = counters.received;
+          setPreviewMetrics(null);
+          setStreamError('');
+        };
         stream.onmessage = (event) => {
           try {
             if (event.data instanceof ArrayBuffer) {
@@ -5047,46 +5161,38 @@ function BrowserChatWebPreviewModal({
               const metadataLength = new DataView(event.data).getUint32(0, false);
               if (metadataLength <= 0 || metadataLength + 4 > bytes.byteLength) throw new Error('Invalid binary metadata');
               const metadata = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + metadataLength))) as Omit<BrowserChatPreviewFrame, 'imageUrl'>;
+              frameCountersRef.current.received += 1;
               const imageUrl = URL.createObjectURL(new Blob(
                 [bytes.slice(4 + metadataLength)],
                 { type: metadata.contentType },
               ));
-              const previousPending = pendingFrameRef.current?.imageUrl;
-              if (previousPending?.startsWith('blob:')) URL.revokeObjectURL(previousPending);
-              pendingFrameRef.current = { ...metadata, imageUrl };
-              if (frameRenderRequestRef.current === undefined) {
-                frameRenderRequestRef.current = window.requestAnimationFrame(() => {
-                  frameRenderRequestRef.current = undefined;
-                  const nextFrame = pendingFrameRef.current;
-                  pendingFrameRef.current = null;
-                  if (!nextFrame) return;
-                  if (frameObjectUrlRef.current) URL.revokeObjectURL(frameObjectUrlRef.current);
-                  frameObjectUrlRef.current = nextFrame.imageUrl;
-                  setFrame(nextFrame);
-                  setStatus('live');
-                  setStreamError('');
-                });
-              }
+              queuePreviewFrame({ ...metadata, imageUrl });
               return;
             }
-            const message = JSON.parse(String(event.data)) as BrowserChatPreviewFrame & { error?: string; type?: string };
+            const message = JSON.parse(String(event.data)) as BrowserChatPreviewFrame & {
+              error?: string;
+              metrics?: BrowserChatPreviewServerMetrics;
+              type?: string;
+            };
             if (message.type === 'frame') {
               const legacyMessage = message as BrowserChatPreviewFrame & { data?: string };
-              pendingFrameRef.current = {
+              frameCountersRef.current.received += 1;
+              queuePreviewFrame({
                 ...message,
                 imageUrl: legacyMessage.imageUrl || `data:${message.contentType};base64,${legacyMessage.data || ''}`,
-              };
-              if (frameRenderRequestRef.current === undefined) {
-                frameRenderRequestRef.current = window.requestAnimationFrame(() => {
-                  frameRenderRequestRef.current = undefined;
-                  const nextFrame = pendingFrameRef.current;
-                  pendingFrameRef.current = null;
-                  if (!nextFrame) return;
-                  setFrame(nextFrame);
-                  setStatus('live');
-                  setStreamError('');
-                });
-              }
+              });
+            } else if (message.type === 'frameHeartbeat' && message.metrics) {
+              const counters = frameCountersRef.current;
+              const sampledAt = Date.now();
+              const sampleSeconds = Math.max(0.001, (sampledAt - counters.sampledAt) / 1_000);
+              setPreviewMetrics({
+                ...message.metrics,
+                displayedFps: (counters.displayed - counters.sampledDisplayed) / sampleSeconds,
+                receivedFps: (counters.received - counters.sampledReceived) / sampleSeconds,
+              });
+              counters.sampledAt = sampledAt;
+              counters.sampledDisplayed = counters.displayed;
+              counters.sampledReceived = counters.received;
             } else if (message.type === 'activeTabChanged') {
               setStatus('reconnecting');
             } else if (message.type === 'ready') {
@@ -5127,7 +5233,7 @@ function BrowserChatWebPreviewModal({
       streamRef.current = null;
       stream?.close();
     };
-  }, [sessionId, userId]);
+  }, [queuePreviewFrame, sessionId, userId]);
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -5137,17 +5243,26 @@ function BrowserChatWebPreviewModal({
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [onClose]);
 
-  useEffect(() => () => {
-    if (frameObjectUrlRef.current) URL.revokeObjectURL(frameObjectUrlRef.current);
-    const pendingUrl = pendingFrameRef.current?.imageUrl;
-    if (pendingUrl?.startsWith('blob:')) URL.revokeObjectURL(pendingUrl);
-    frameObjectUrlRef.current = '';
-    pendingFrameRef.current = null;
-    pendingMoveRef.current = null;
-    pointerGestureRef.current = null;
-    if (frameRenderRequestRef.current !== undefined) window.cancelAnimationFrame(frameRenderRequestRef.current);
-    if (moveFlushTimerRef.current !== undefined) window.clearTimeout(moveFlushTimerRef.current);
-    if (scrollFlushTimerRef.current !== undefined) window.clearTimeout(scrollFlushTimerRef.current);
+  useEffect(() => {
+    // React Strict Mode mounts effects again after a simulated cleanup. Reset
+    // this flag on every setup so the remounted preview continues accepting frames.
+    framePipelineDisposedRef.current = false;
+    return () => {
+      framePipelineDisposedRef.current = true;
+      if (frameObjectUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(frameObjectUrlRef.current);
+      if (staleFrameObjectUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(staleFrameObjectUrlRef.current);
+      if (decodingFrameObjectUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(decodingFrameObjectUrlRef.current);
+      const pendingUrl = pendingFrameRef.current?.imageUrl;
+      if (pendingUrl?.startsWith('blob:')) URL.revokeObjectURL(pendingUrl);
+      frameObjectUrlRef.current = '';
+      staleFrameObjectUrlRef.current = '';
+      decodingFrameObjectUrlRef.current = '';
+      pendingFrameRef.current = null;
+      pendingMoveRef.current = null;
+      pointerGestureRef.current = null;
+      if (moveFlushTimerRef.current !== undefined) window.clearTimeout(moveFlushTimerRef.current);
+      if (scrollFlushTimerRef.current !== undefined) window.clearTimeout(scrollFlushTimerRef.current);
+    };
   }, []);
 
   const postInput = useCallback((input: BrowserChatPreviewInput, reportError: boolean) => {
@@ -5331,6 +5446,19 @@ function BrowserChatWebPreviewModal({
       : status === 'unavailable'
         ? '浏览器未运行'
         : '正在连接';
+  const previewMetricsLabel = previewMetrics
+    ? `目标 ${Math.round(previewMetrics.targetFps || 0)} · 截图 ${(previewMetrics.captureFps || 0).toFixed(1)} · 发送 ${(previewMetrics.sendFps || 0).toFixed(1)} · 接收 ${previewMetrics.receivedFps.toFixed(1)} · 显示 ${previewMetrics.displayedFps.toFixed(1)} FPS`
+    : '';
+  const previewMetricsTitle = previewMetrics
+    ? [
+        previewMetrics.imageFormat === 'jpeg' ? `JPEG 质量：${previewMetrics.imageQuality ?? '-'}` : 'PNG',
+        `最近一次截图耗时：${(previewMetrics.captureDurationMs || 0).toFixed(1)} ms`,
+        `平均截图耗时：${(previewMetrics.captureDurationMsAverage || 0).toFixed(1)} ms`,
+        `在途截图：${previewMetrics.activeCaptures || 0}/${previewMetrics.maxConcurrentCaptures || 1}`,
+        `网络背压丢帧：${previewMetrics.backpressureDrops || 0}`,
+        `待发送客户端帧：${previewMetrics.pendingClientFrames || 0}`,
+      ].join('\n')
+    : '';
 
   return (
     <div className="ui-modal-overlay browser-chat-web-preview-overlay" onClick={onClose} role="presentation">
@@ -5349,6 +5477,11 @@ function BrowserChatWebPreviewModal({
                 <span />
                 {statusLabel}
               </span>
+              {previewMetricsLabel ? (
+                <span className="browser-chat-web-preview-metrics" title={previewMetricsTitle}>
+                  {previewMetricsLabel}
+                </span>
+              ) : null}
               <span className="browser-chat-web-preview-url" title={frame?.url || ''}>
                 {frame?.url || '等待会话浏览器启动'}
               </span>
@@ -5436,7 +5569,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const tabListRef = useRef<HTMLDivElement | null>(null);
   const addressInputRef = useRef<HTMLInputElement | null>(null);
-  const embeddedBrowserSyncRef = useRef({ boundsKey: '', groupId: '', sessionId: '', visible: false });
+  const embeddedBrowserSyncRef = useRef({ boundsKey: '', groupId: '', hiddenConfirmed: false, sessionId: '', visible: false });
   const addressFocusedRef = useRef(false);
   const tabDragCommitTargetRef = useRef<EmbeddedBrowserTabDropTarget | null>(null);
   const tabDragCurrentGroupRef = useRef('');
@@ -5462,9 +5595,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [newGroupName, setNewGroupName] = useState('新建标签组');
   const [creatingNewGroup, setCreatingNewGroup] = useState(false);
   const [runtimeActivatedSessionId, setRuntimeActivatedSessionId] = useState('');
-  const requestedGroupId = browserGroupId
-    || (!sessionId && activeGroupId)
-    || embeddedGroupIdForSession(sessionId);
+  const requestedGroupId = browserGroupId || embeddedGroupIdForSession(sessionId);
   const requestedGroupAvailable = useMemo(() => (
     browserGroups.some((group) => group.id === requestedGroupId && group.tabs.length > 0)
     || browserTabs.some((tab) => (
@@ -5478,9 +5609,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   // the runtime gate only for creating a missing group; otherwise selecting a
   // historical conversation detaches the native WebContentsView and leaves the
   // React-rendered tab strip above an empty browser surface.
-  const runtimeAuthorized = !sessionId
-    || requestedGroupAvailable
-    || runtimeActivatedSessionId === sessionId;
+  const runtimeAuthorized = Boolean(sessionId) && (
+    requestedGroupAvailable
+    || runtimeActivatedSessionId === sessionId
+  );
 
   useEffect(() => {
     if (!sessionId) {
@@ -5544,7 +5676,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const bridge = window.webPilotEmbeddedBrowser;
     const viewport = viewportRef.current;
     const canCreateRequestedGroup = Boolean(activationRequestId && runtimeAuthorized);
-    const visible = enabled && active && Boolean(viewport) && runtimeAuthorized
+    const visible = enabled && active && Boolean(viewport) && Boolean(requestedGroupId) && runtimeAuthorized
       && (requestedGroupAvailable || canCreateRequestedGroup);
     const groupId = requestedGroupId;
     const bounds = visible && viewport
@@ -5556,8 +5688,14 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     if (!bridge) return;
     try {
       if (!visible) {
-        if (!previous.visible) return;
-        embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
+        if (!previous.visible && previous.hiddenConfirmed) return;
+        embeddedBrowserSyncRef.current = {
+          boundsKey: '',
+          groupId: '',
+          hiddenConfirmed: true,
+          sessionId: '',
+          visible: false,
+        };
         const result = await bridge.setVisible({ visible: false });
         setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
         if (result.ok) applyEmbeddedBrowserState(result);
@@ -5565,7 +5703,13 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       }
 
       if (options.forceAttach || !previous.visible || previous.groupId !== groupId || previous.sessionId !== (sessionId || '')) {
-        embeddedBrowserSyncRef.current = { boundsKey, groupId, sessionId: sessionId || '', visible: true };
+        embeddedBrowserSyncRef.current = {
+          boundsKey,
+          groupId,
+          hiddenConfirmed: false,
+          sessionId: sessionId || '',
+          visible: true,
+        };
         const result = await bridge.setVisible({
           bounds,
           createIfMissing: canCreateRequestedGroup && !requestedGroupAvailable,
@@ -5580,7 +5724,13 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       }
 
       if (bounds && previous.boundsKey !== boundsKey) {
-        embeddedBrowserSyncRef.current = { boundsKey, groupId, sessionId: sessionId || '', visible: true };
+        embeddedBrowserSyncRef.current = {
+          boundsKey,
+          groupId,
+          hiddenConfirmed: false,
+          sessionId: sessionId || '',
+          visible: true,
+        };
         const result = await bridge.setBounds(bounds);
         setBridgeError(result.ok ? '' : result.error || '嵌入浏览器不可用');
       }
@@ -5626,7 +5776,13 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   }, [active, enabled, syncEmbeddedBrowser]);
 
   useEffect(() => () => {
-    embeddedBrowserSyncRef.current = { boundsKey: '', groupId: '', sessionId: '', visible: false };
+    embeddedBrowserSyncRef.current = {
+      boundsKey: '',
+      groupId: '',
+      hiddenConfirmed: true,
+      sessionId: '',
+      visible: false,
+    };
     void window.webPilotEmbeddedBrowser?.setVisible({ visible: false }).catch(() => undefined);
   }, []);
 
@@ -5882,10 +6038,14 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const bridge = window.webPilotEmbeddedBrowser;
     const url = normalizeEmbeddedBrowserAddress(addressValue);
     if (!bridge || !url) return;
-    const groupId = activeEmbeddedTab?.groupId || activeGroupId || browserGroupId || undefined;
+    const groupId = activeEmbeddedTab?.groupId || requestedGroupId || undefined;
+    if (!groupId) {
+      setBridgeError('当前对话的浏览器标签组尚未创建');
+      return;
+    }
     const targetSessionId = activeEmbeddedTab?.sessionId
       || (groupId?.startsWith('session:') ? embeddedSessionIdFromGroupId(groupId) : undefined)
-      || (groupId === browserGroupId ? sessionId : undefined);
+      || sessionId;
     const result = await bridge.navigate({
       groupId,
       id: activeEmbeddedTab?.id,
@@ -5917,6 +6077,18 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
 
   const selectedGroupId = browserGroupId || embeddedGroupIdForSession(sessionId);
   const visibleGroups = useMemo<EmbeddedBrowserGroup[]>(() => {
+    if (!selectedGroupId) return [];
+    if (!requestedGroupAvailable) {
+      if (!sessionId || closedGroupIds.includes(selectedGroupId)) return [];
+      const selectedGroup = browserGroups.find((group) => group.id === selectedGroupId);
+      return [{
+        ...selectedGroup,
+        active: true,
+        id: selectedGroupId,
+        sessionId: selectedGroup?.sessionId || sessionId,
+        tabs: [],
+      }];
+    }
     const groupsById = new Map<string, EmbeddedBrowserGroup>();
     const orderedIds: string[] = [];
     const resolvedActiveGroupId = activeGroupId || browserGroups.find((group) => group.active)?.id || selectedGroupId;
@@ -5965,7 +6137,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     }
 
     return orderedIds.map((id) => groupsById.get(id)!).filter(Boolean);
-  }, [activeGroupId, activeTabId, browserGroups, browserTabs, closedGroupIds, selectedGroupId, sessionId]);
+  }, [activeGroupId, activeTabId, browserGroups, browserTabs, closedGroupIds, requestedGroupAvailable, selectedGroupId, sessionId]);
 
   const visibleGroupIconColors = useMemo(() => {
     return new Map(visibleGroups.map((group) => [group.id, embeddedBrowserGroupIconColor(group.id)]));
@@ -6008,8 +6180,8 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         || groupedTabs.find((tab) => tab.id === activeTabId);
     }
     if (activeGroup) return activeGroupTabs[0];
-    return browserTabs[activeTabIndex] || groupedTabs[activeTabIndex] || groupedTabs[0];
-  }, [activeGroupId, activeTabId, activeTabIndex, browserTabs, visibleGroups]);
+    return groupedTabs[activeTabIndex] || groupedTabs[0];
+  }, [activeGroupId, activeTabId, activeTabIndex, visibleGroups]);
   const isEmbeddedBrowserLoading = Boolean(activeEmbeddedTab?.loading);
   const draggedEmbeddedTab = useMemo(() => (
     draggingTabId
@@ -6543,6 +6715,7 @@ export function BrowserChatWorkspace({
   const sessionRefreshTimersRef = useRef(new Map<string, number>());
   const sessionListRefreshTimerRef = useRef<number | undefined>(undefined);
   const interruptRequestSequenceRef = useRef(0);
+  const interruptGuardsRef = useRef(new Map<string, BrowserChatInterruptGuard>());
   const activeView = browserChatViewForPathname(pathname, initialView);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
@@ -6942,7 +7115,10 @@ export function BrowserChatWorkspace({
   }, [session?.id]);
 
   const upsertSession = useCallback((nextSession: BrowserChatSession, options: { activate?: boolean; version?: number } = {}) => {
-    const normalized = normalizeSession(nextSession);
+    let normalized = normalizeSession(nextSession);
+    const guarded = applyBrowserChatInterruptGuard(normalized, interruptGuardsRef.current.get(normalized.id));
+    if (guarded.release) interruptGuardsRef.current.delete(normalized.id);
+    normalized = guarded.session;
     const lastVersion = sessionVersionsRef.current.get(normalized.id) || 0;
     if (typeof options.version === 'number') {
       if (options.version < lastVersion) return normalized;
@@ -7007,7 +7183,12 @@ export function BrowserChatWorkspace({
   const loadSessions = useCallback(async () => {
     const response = await fetch(browserChatApiUrl('/api/browser-chat'), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载对话历史失败');
-    const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => normalizeSession(item)) : [];
+    const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => {
+      const normalized = normalizeSession(item);
+      const guarded = applyBrowserChatInterruptGuard(normalized, interruptGuardsRef.current.get(normalized.id));
+      if (guarded.release) interruptGuardsRef.current.delete(normalized.id);
+      return guarded.session;
+    }) : [];
     setSessions(nextSessions);
     await loadRequestedBrowserChatSessionDetail(nextSessions, requestedSessionId, async (requestedSession) => {
       if (mountedSessionActivationRef.current === requestedSession.id) return;
@@ -7082,6 +7263,7 @@ export function BrowserChatWorkspace({
       if (event.version < lastVersion) return;
       sessionVersionsRef.current.set(event.id, event.version);
       if (event.deleted) {
+        interruptGuardsRef.current.delete(event.id);
         setSessions((current) => current.filter((item) => item.id !== event.id));
         if (activeSessionIdRef.current === event.id) {
           activeSessionIdRef.current = null;
@@ -7103,9 +7285,13 @@ export function BrowserChatWorkspace({
         }
       }
       if (activeSessionIdRef.current === event.id) {
-        setSession((current) => current?.id === event.id
-          ? mergeBrowserChatSessionRealtimePatch(current, patch)
-          : current);
+        setSession((current) => {
+          if (current?.id !== event.id) return current;
+          const merged = mergeBrowserChatSessionRealtimePatch(current, patch);
+          const guarded = applyBrowserChatInterruptGuard(merged, interruptGuardsRef.current.get(event.id));
+          if (guarded.release) interruptGuardsRef.current.delete(event.id);
+          return guarded.session;
+        });
       }
       setSessions((current) => {
         const existing = current.find((item) => item.id === event.id);
@@ -7115,7 +7301,9 @@ export function BrowserChatWorkspace({
             ? mergeBrowserChatSessionRealtimePatch(existing, patch)
             : undefined;
         if (!nextSummary) return current;
-        return [nextSummary, ...current.filter((item) => item.id !== event.id)]
+        const guarded = applyBrowserChatInterruptGuard(nextSummary, interruptGuardsRef.current.get(event.id));
+        if (guarded.release) interruptGuardsRef.current.delete(event.id);
+        return [guarded.session, ...current.filter((item) => item.id !== event.id)]
           .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
       });
     }, { onStatus: setRealtimeConnected });
@@ -7244,6 +7432,13 @@ export function BrowserChatWorkspace({
     setInterrupting(true);
     setError('');
     const timestamp = new Date().toISOString();
+    const targetSession = session?.id === targetId ? session : sessions.find((item) => item.id === targetId);
+    interruptGuardsRef.current.set(targetId, {
+      assistantMessageIds: new Set((targetSession?.messages || [])
+        .filter((message) => message.role === 'assistant' && message.status === 'running')
+        .map((message) => message.id)),
+      timestamp,
+    });
     setBusy(false);
     setPendingMessageSessionId((current) => current === targetId ? null : current);
     setSession((current) => current?.id === targetId
@@ -7256,7 +7451,6 @@ export function BrowserChatWorkspace({
     const releaseInterrupting = () => {
       if (interruptRequestSequenceRef.current === interruptRequestSequence) setInterrupting(false);
     };
-    const releaseLoadingTimer = window.setTimeout(releaseInterrupting, 400);
     const requestController = new AbortController();
     const requestTimeout = window.setTimeout(() => requestController.abort(), 30000);
     try {
@@ -7270,12 +7464,12 @@ export function BrowserChatWorkspace({
       setBusy(false);
       setPendingMessageSessionId((current) => current === targetId ? null : current);
     } catch (interruptError) {
+      interruptGuardsRef.current.delete(targetId);
       if (!requestController.signal.aborted) {
         setError(interruptError instanceof Error ? interruptError.message : '中断对话失败');
       }
       await refreshSession(targetId, { activate: activeSessionIdRef.current === targetId }).catch(() => undefined);
     } finally {
-      window.clearTimeout(releaseLoadingTimer);
       window.clearTimeout(requestTimeout);
       releaseInterrupting();
     }

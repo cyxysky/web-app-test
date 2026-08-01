@@ -14,7 +14,9 @@ test('browser preview defaults to twenty frames per second and allows low rates'
 
 test('browser preview accepts faster rates up to sixty frames per second', () => {
   assert.equal(browserPreviewFramesPerSecond(24), 24);
+  assert.equal(browserPreviewFramesPerSecond(30), 30);
   assert.equal(browserPreviewFramesPerSecond(60), 60);
   assert.equal(browserPreviewFramesPerSecond(120), 60);
+  assert.equal(browserPreviewFrameIntervalMs(30), 34);
   assert.equal(browserPreviewFrameIntervalMs(60), 17);
 });

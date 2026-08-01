@@ -201,6 +201,7 @@ export type BrowserCodeExecutionInput = {
 export type BrowserCodeKernelOptions = {
   executionTimeoutMs?: number;
   readyTimeoutMs?: number;
+  sessionGroupId?: string;
 };
 
 type PendingExecution = {
@@ -216,7 +217,7 @@ const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 19;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 20;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -278,6 +279,7 @@ function browserCodeKernelMain() {
   );
   let browser: import('playwright').Browser | undefined;
   let replServer: import('node:repl').REPLServer | undefined;
+  let sessionGroupId = '';
   let activeExecution: {
     actions: string[];
     logs: BrowserCodeExecutionLog[];
@@ -1715,12 +1717,21 @@ function browserCodeKernelMain() {
     ? browser.contexts().flatMap((candidateContext) => candidateContext.pages()).filter((candidatePage) => !candidatePage.isClosed())
     : [];
 
+  const currentSessionTabEntries = async () => {
+    const entries = await Promise.all(currentPages().map(async (candidatePage) => ({
+      info: await tabInfo(candidatePage),
+      page: candidatePage,
+    })));
+    if (!sessionGroupId) return entries;
+    return entries.filter((entry) => entry.info.groupId === sessionGroupId);
+  };
+
   const browserRuntime = Object.freeze({
     capabilities: Object.freeze({ cua: true, images: true, playwright: true, tabLifecycle: true }),
     documentation: async () => [
       'browserCode exposes one controlled browser runtime in ordinary JavaScript.',
       'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.verifyState(), page.expectNavigation(), and nodeRepl.emitImage().',
-      'page.domSnapshot() returns page-state plus a read-only Playwright AX tree scoped to the active surface by default; pass { scope: "all" } only for background context. browser.user.openTabs() reports active-tab and tab-group metadata.',
+      'page.domSnapshot() returns page-state plus a read-only Playwright AX tree scoped to the active surface by default; pass { scope: "all" } only for background context. browser.user.openTabs() reports only tabs owned by the current conversation group, with active-tab and tab-group metadata.',
       'Page and Locator factory methods expose only currently rendered matches: hidden descendants and zero-rectangle nodes are excluded before count() and positional selection. Element actions then validate target computed style and hit testing, run an action-specific Playwright trial for every remaining pointer candidate, and execute only the unique candidate that passes all stages; CSS-hidden file inputs used by setInputFiles are recovered only at that action boundary.',
       'page.verifyState() is an optional read-only assertion helper; it never gates later actions or successful cell completion.',
       `Playwright action timeout: ${browserCodeActionTimeoutMs}ms; navigation timeout: ${browserCodeNavigationTimeoutMs}ms.`,
@@ -1739,7 +1750,7 @@ function browserCodeKernelMain() {
         }
         return Promise.all([...keepPages].filter(Boolean).map((candidatePage) => tabInfo(candidatePage!)));
       },
-      list: async () => currentPages().map(tabForPage),
+      list: async () => (await currentSessionTabEntries()).map((entry) => tabForPage(entry.page)),
       new: async (options: { url?: string } = {}) => {
         recordAction('tabs.new');
         const selected = replServer?.context.context as import('playwright').BrowserContext | undefined;
@@ -1760,10 +1771,16 @@ function browserCodeKernelMain() {
           ? currentPage && !currentPage.isClosed() ? currentPage : currentPages().at(-1)
           : pageFromTab(value);
         if (!claimedPage) throw new Error('The requested browser tab is no longer available.');
+        if (sessionGroupId) {
+          const claimedTabInfo = await tabInfo(claimedPage);
+          if (claimedTabInfo.groupId !== sessionGroupId) {
+            throw new Error('The requested browser tab does not belong to the current conversation tab group.');
+          }
+        }
         selectPage(claimedPage);
         return tabForPage(claimedPage);
       },
-      openTabs: async () => Promise.all(currentPages().map(tabInfo)),
+      openTabs: async () => (await currentSessionTabEntries()).map((entry) => entry.info),
     }),
   });
 
@@ -1799,8 +1816,9 @@ function browserCodeKernelMain() {
     });
   });
 
-  const initialize = async (input: { connection: BrowserCodeConnection }) => {
+  const initialize = async (input: { connection: BrowserCodeConnection; sessionGroupId?: string }) => {
     if (browser || replServer) return;
+    sessionGroupId = String(input.sessionGroupId || '').trim();
     const { chromium } = childRequire('playwright') as typeof import('playwright');
     browser = input.connection.protocol === 'cdp'
       ? await chromium.connectOverCDP(input.connection.endpoint)
@@ -1963,7 +1981,7 @@ function browserCodeKernelMain() {
     const input = rawInput as Record<string, unknown>;
     chain = chain.then(async () => {
       if (input.type === 'init') {
-        await initialize(input as { connection: BrowserCodeConnection });
+        await initialize(input as { connection: BrowserCodeConnection; sessionGroupId?: string });
         return;
       }
       if (input.type === 'execute') {
@@ -2215,7 +2233,11 @@ export class BrowserCodeKernel {
       this.rejectReady(error);
       this.stopChild();
     }, readyTimeoutMs);
-    child.send({ type: 'init', connection: this.connection }, (error) => {
+    child.send({
+      type: 'init',
+      connection: this.connection,
+      sessionGroupId: String(this.options.sessionGroupId || '').trim(),
+    }, (error) => {
       if (!error) return;
       this.rejectReady(error);
       this.stopChild();

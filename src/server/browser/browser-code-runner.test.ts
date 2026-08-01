@@ -647,6 +647,57 @@ test('browserCode exposes browser and tab lifecycle as JavaScript APIs', async (
   });
 });
 
+test('browserCode session runtime excludes ungrouped and other-group tabs', async () => {
+  const sessionGroupId = 'chat_scoped-runtime-test';
+  const groupedPage = await browserContext.newPage();
+  await groupedPage.setContent('<title>Scoped tab</title><main>Scoped tab</main>');
+  await groupedPage.evaluate((groupId) => {
+    document.documentElement.setAttribute('data-ai-web-test-session-group-id', groupId);
+    document.documentElement.setAttribute('data-ai-web-test-session-group-title', 'Scoped group');
+  }, sessionGroupId);
+  const otherGroupPage = await browserContext.newPage();
+  await otherGroupPage.setContent('<title>Other group tab</title><main>Other group tab</main>');
+  await otherGroupPage.evaluate(() => {
+    document.documentElement.setAttribute('data-ai-web-test-session-group-id', 'chat_other-group');
+    document.documentElement.setAttribute('data-ai-web-test-session-group-title', 'Other group');
+  });
+  const scopedKernel = new BrowserCodeKernel(
+    { protocol: 'cdp', endpoint: cdpEndpoint },
+    { sessionGroupId },
+  );
+  try {
+    const executionId = randomUUID();
+    await groupedPage.evaluate((id) => {
+      Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
+        configurable: true,
+        value: id,
+      });
+    }, executionId);
+    const result = await scopedKernel.execute({
+      code: `
+        var scopedOpenTabs = await browser.user.openTabs();
+        var scopedSessionTabs = await browser.tabs.list();
+        nodeRepl.write({ listedCount: scopedSessionTabs.length, openTabs: scopedOpenTabs });
+      `,
+      executionId,
+    });
+    assert.equal(result.ok, true, result.error);
+    const value = result.value as {
+      listedCount?: number;
+      openTabs?: Array<{ groupId?: string; title?: string }>;
+    };
+    assert.equal(value.listedCount, 1);
+    assert.deepEqual(value.openTabs?.map((tab) => ({ groupId: tab.groupId, title: tab.title })), [{
+      groupId: sessionGroupId,
+      title: 'Scoped tab',
+    }]);
+  } finally {
+    await scopedKernel.close();
+    await groupedPage.close().catch(() => undefined);
+    await otherGroupPage.close().catch(() => undefined);
+  }
+});
+
 test('browserCode allows normal constructor and prototype DOM code without exposing direct Node globals', async () => {
   const result = await run(`
     // Axure prototypes usually render their content inside generated containers.

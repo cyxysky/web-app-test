@@ -2284,6 +2284,15 @@ function registerEmbeddedBrowserIpc() {
     try {
       if (input.bounds) setEmbeddedBrowserBounds(input.bounds);
       if (input.visible) {
+        const hasRequestedBrowserTarget = Boolean(
+          String(input.groupId || '').trim()
+          || String(input.id || '').trim()
+          || normalizeEmbeddedBrowserSessionId(input.sessionId)
+        );
+        if (!hasRequestedBrowserTarget) {
+          detachEmbeddedBrowserView();
+          return embeddedBrowserState();
+        }
         attachEmbeddedBrowserView({
           createIfMissing: input.createIfMissing === true,
           groupId: input.groupId,

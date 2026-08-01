@@ -9,7 +9,7 @@ import {
   resolveBrowserPreviewImageFormat,
 } from '@/config/browser-output-settings';
 import { artifactPath } from '@/server/storage/paths';
-import { browserPreviewFrameIntervalMs } from './browser-preview-cadence';
+import { browserPreviewFrameIntervalMs, browserPreviewFramesPerSecond } from './browser-preview-cadence';
 import {
   BrowserPreviewFramePump,
   type BrowserPreviewFramePumpMetrics,
@@ -5007,6 +5007,9 @@ export class BrowserSession {
         windowSizeArg,
         fullscreen ? '--start-maximized' : '',
         ignoreHTTPSErrors ? '--ignore-certificate-errors' : '',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
         '--high-dpi-support=1',
         '--no-first-run',
         '--no-default-browser-check',
@@ -5163,12 +5166,6 @@ export class BrowserSession {
       return reclaimed;
     }
 
-    const embeddedPage = await this.findElectronEmbeddedBrowserPage(context);
-    if (embeddedPage && this.claimPage(embeddedPage, { allowSteal: true })) {
-      await embeddedPage.bringToFront().catch(() => undefined);
-      return embeddedPage;
-    }
-
     const nativeGroup = await this.reclaimPagesFromNativeTabGroup(context);
     const nativeGroupPage = this.chooseInitialPage(nativeGroup.pages);
     if (nativeGroupPage) {
@@ -5179,29 +5176,6 @@ export class BrowserSession {
       const page = await context.newPage();
       this.claimPage(page);
       return page;
-    }
-
-    if (this.options.preferExistingPage) {
-      const unmarkedPages: Page[] = [];
-      for (const page of context.pages()) {
-        if (page.isClosed() || isBlankPage(page)) continue;
-        if (await this.isElectronAppShellPage(page)) continue;
-        if (sharedPageOwners.has(page)) continue;
-        const groupId = await this.readPageGroupId(page);
-        if (groupId) continue;
-        unmarkedPages.push(page);
-      }
-      const existingPage = unmarkedPages.at(-1);
-      if (existingPage && this.claimPage(existingPage)) return existingPage;
-    }
-
-    for (const page of context.pages()) {
-      if (page.isClosed() || !isBlankPage(page)) continue;
-      if (await this.isElectronAppShellPage(page)) continue;
-      if (sharedPageOwners.has(page)) continue;
-      const groupId = await this.readPageGroupId(page);
-      if (groupId) continue;
-      if (this.claimPage(page)) return page;
     }
 
     const page = await context.newPage();
@@ -5232,24 +5206,6 @@ export class BrowserSession {
       return String(window.name || '').match(/^AI_WEB_TEST_SESSION_GROUP:([^;]+);/)?.[1] || '';
     }).catch(() => '');
     return sessionId === this.options.runId || normalizePageGroupId(sessionId) === this.pageGroupId;
-  }
-
-  private async isElectronAppShellPage(page: Page) {
-    if (this.browserSurface !== 'electron-embedded' || page.isClosed()) return false;
-    return page.evaluate(() => {
-      const win = window as Window & { __webPilotAppShell?: unknown };
-      return win.__webPilotAppShell === true
-        || document.documentElement?.getAttribute('data-webpilot-app-shell') === 'true';
-    }).catch(() => false);
-  }
-
-  private async findElectronEmbeddedBrowserPage(context: BrowserContext) {
-    if (this.browserSurface !== 'electron-embedded') return undefined;
-    for (const page of [...context.pages()].reverse()) {
-      if (page.isClosed()) continue;
-      if (await this.isElectronEmbeddedBrowserPage(page)) return page;
-    }
-    return undefined;
   }
 
   private async findInitialElectronEmbeddedBrowserPages(context: BrowserContext) {
@@ -5842,43 +5798,51 @@ export class BrowserSession {
   }): Promise<BrowserScreencastHandle> {
     this.ensureLivePreviewState();
     await this.refreshSessionGroupPages({ forceNativeRefresh: true });
-    const page = this.activePage;
-    const client = await page.context().newCDPSession(page);
     const format = resolveBrowserPreviewImageFormat(process.env.BROWSER_SCREENCAST_FORMAT);
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
-    const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 100);
-    const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 100)));
+    const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 90);
+    const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 90)));
     const currentFrameIntervalMs = () => browserPreviewFrameIntervalMs(process.env.BROWSER_PREVIEW_FPS);
     let stopped = false;
     let stopPromise: Promise<void> | undefined;
-    const cssViewport = await this.getViewportMetrics().catch(() => ({
-      ...(page.viewportSize() || { width: 1280, height: 720 }),
-      devicePixelRatio: 1,
-    }));
-    let viewport = {
-      width: Math.max(1, Math.round(cssViewport.width)),
-      height: Math.max(1, Math.round(cssViewport.height)),
+    let page: Page | undefined;
+    let client: import('playwright').CDPSession | undefined;
+    let pageBindingPromise: Promise<{ client: import('playwright').CDPSession; page: Page }> | undefined;
+    let viewport = { width: 1280, height: 720 };
+    const capturePromises = new Set<Promise<void>>();
+    let captureTimer: ReturnType<typeof setTimeout> | undefined;
+    let captureSequence = 0;
+    let pushedCaptureSequence = 0;
+    let nextCaptureAt = Date.now();
+    let nextPageRefreshAt = 0;
+    let pageRefreshPromise: Promise<void> | undefined;
+    let nextViewportRefreshAt = 0;
+    let captureDurationMs = 0;
+    let captureDurationTotalMs = 0;
+    let captureSamples = 0;
+    const maxConcurrentCaptures = () => {
+      const averageCaptureDurationMs = captureSamples ? captureDurationTotalMs / captureSamples : 0;
+      // A fixed-rate poller must allow more than one request in flight when a
+      // screenshot takes longer than the frame interval. Keep it tightly
+      // bounded so a slow page cannot build an unbounded CDP command queue.
+      return Math.min(3, Math.max(1, Math.ceil(averageCaptureDurationMs / currentFrameIntervalMs())));
     };
-    let receivedOutputFrame = false;
-    let resolveInitialFrame: (() => void) | undefined;
-    const initialFrameReady = new Promise<void>((resolve) => {
-      resolveInitialFrame = resolve;
-    });
     const framePump = new BrowserPreviewFramePump<BrowserScreencastFrame>({
-      intervalMs: currentFrameIntervalMs,
+      // Frame production is already paced below. Keep this pump focused on
+      // serialization/coalescing so it does not add a second FPS interval.
+      intervalMs: () => 1,
       onError: options.onError,
       onFrame: options.onFrame,
     });
 
-    const activePreviewPage = () => (this.page && !this.page.isClosed() ? this.page : this.sessionPages()[0]);
     const pushOutputFrame = (
+      capturedPage: Page,
       data: string,
       outputViewport: { width: number; height: number },
       metadata?: { deviceHeight?: number; deviceWidth?: number },
     ) => {
-      if (stopped || page.isClosed() || activePreviewPage() !== page) return;
+      if (stopped || capturedPage.isClosed() || this.activePage !== capturedPage) return;
       viewport = outputViewport;
-      receivedOutputFrame = true;
       framePump.push({
         capturedAt: new Date().toISOString(),
         contentType,
@@ -5889,87 +5853,151 @@ export class BrowserSession {
           deviceWidth: outputViewport.width,
         } : undefined,
         tabs: this.getTabsSnapshot(),
-        url: page.url(),
+        url: capturedPage.url(),
         viewport: outputViewport,
       });
-      resolveInitialFrame?.();
-      resolveInitialFrame = undefined;
     };
-    const captureFallbackFrame = async (
-      metadata?: { deviceHeight?: number; deviceWidth?: number },
-    ) => {
-      if (stopped || page.isClosed() || activePreviewPage() !== page) return;
-      const layoutMetrics = await client.send('Page.getLayoutMetrics');
-      const visualViewport = layoutMetrics.cssVisualViewport;
-      const outputViewport = {
-        width: Math.max(1, Math.round(visualViewport.clientWidth)),
-        height: Math.max(1, Math.round(visualViewport.clientHeight)),
-      };
-      const result = await client.send('Page.captureScreenshot', {
+    const refreshActivePageInBackground = () => {
+      const currentTime = Date.now();
+      if (pageRefreshPromise || currentTime < nextPageRefreshAt) return;
+      nextPageRefreshAt = currentTime + 250;
+      pageRefreshPromise = this.refreshSessionGroupPages()
+        .then(() => undefined)
+        .catch((error) => {
+          if (!stopped) options.onError?.(error);
+        })
+        .finally(() => {
+          pageRefreshPromise = undefined;
+        });
+    };
+    const bindActivePage = async () => {
+      refreshActivePageInBackground();
+      const activePage = this.activePage;
+      if (page === activePage && client && !activePage.isClosed()) return { client, page: activePage };
+      if (pageBindingPromise) return pageBindingPromise;
+
+      pageBindingPromise = (async () => {
+        const nextActivePage = this.activePage;
+        if (page === nextActivePage && client && !nextActivePage.isClosed()) {
+          return { client, page: nextActivePage };
+        }
+        await client?.detach().catch(() => undefined);
+        await nextActivePage.bringToFront().catch(() => undefined);
+        const nextClient = await nextActivePage.context().newCDPSession(nextActivePage);
+        page = nextActivePage;
+        client = nextClient;
+        await Promise.all([
+          nextClient.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => undefined),
+          nextClient.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => undefined),
+        ]);
+        const cssViewport = await this.getViewportMetrics().catch(() => ({
+          ...(nextActivePage.viewportSize() || { width: 1280, height: 720 }),
+          devicePixelRatio: 1,
+        }));
+        viewport = {
+          width: Math.max(1, Math.round(cssViewport.width)),
+          height: Math.max(1, Math.round(cssViewport.height)),
+        };
+        nextViewportRefreshAt = 0;
+        return { client: nextClient, page: nextActivePage };
+      })();
+      try {
+        return await pageBindingPromise;
+      } finally {
+        pageBindingPromise = undefined;
+      }
+    };
+    const capturePreviewFrame = async (sequence: number) => {
+      if (stopped) return;
+      const captureStartedAt = performance.now();
+      const binding = await bindActivePage();
+      if (stopped) return;
+      const capturedPage = binding.page;
+      const captureClient = binding.client;
+      const currentTime = Date.now();
+      if (currentTime >= nextViewportRefreshAt) {
+        nextViewportRefreshAt = currentTime + 1_000;
+        const layoutMetrics = await captureClient.send('Page.getLayoutMetrics');
+        const visualViewport = layoutMetrics.cssVisualViewport;
+        viewport = {
+          width: Math.max(1, Math.round(visualViewport.clientWidth)),
+          height: Math.max(1, Math.round(visualViewport.clientHeight)),
+        };
+      }
+      const outputViewport = { ...viewport };
+      const result = await captureClient.send('Page.captureScreenshot', {
         captureBeyondViewport: false,
         format,
         fromSurface: true,
         optimizeForSpeed: true,
         ...(format === 'jpeg' ? { quality } : {}),
       });
-      pushOutputFrame(result.data, outputViewport, metadata);
+      captureDurationMs = performance.now() - captureStartedAt;
+      captureDurationTotalMs += captureDurationMs;
+      captureSamples += 1;
+      if (sequence <= pushedCaptureSequence) return;
+      pushedCaptureSequence = sequence;
+      pushOutputFrame(capturedPage, result.data, outputViewport);
+    };
+    const launchCapture = () => {
+      const sequence = ++captureSequence;
+      const capturePromise = capturePreviewFrame(sequence).catch((error) => {
+        if (!stopped) options.onError?.(error);
+      }).finally(() => {
+        capturePromises.delete(capturePromise);
+      });
+      capturePromises.add(capturePromise);
+    };
+    const scheduleCapture = () => {
+      if (stopped || captureTimer) return;
+      const delay = Math.max(0, nextCaptureAt - Date.now());
+      captureTimer = setTimeout(() => {
+        captureTimer = undefined;
+        if (stopped) return;
+        const scheduledAt = nextCaptureAt;
+        const intervalMs = currentFrameIntervalMs();
+        nextCaptureAt = Math.max(scheduledAt + intervalMs, Date.now());
+        if (capturePromises.size < maxConcurrentCaptures()) launchCapture();
+        scheduleCapture();
+      }, delay);
+      captureTimer.unref?.();
     };
     const stopScreencast = async (notifyPageChanged: boolean) => {
       if (stopPromise) return stopPromise;
       stopped = true;
-      resolveInitialFrame?.();
-      resolveInitialFrame = undefined;
-      client.off('Page.screencastFrame', onNativeFrame);
+      if (captureTimer) clearTimeout(captureTimer);
+      captureTimer = undefined;
       stopPromise = (async () => {
-        await client.send('Page.stopScreencast').catch(() => undefined);
+        await Promise.allSettled([...capturePromises]);
+        await pageRefreshPromise?.catch(() => undefined);
         await framePump.stop();
-        await client.detach().catch(() => undefined);
+        await client?.detach().catch(() => undefined);
+        client = undefined;
+        page = undefined;
         if (notifyPageChanged) await options.onActivePageChanged?.();
       })();
       return stopPromise;
     };
-    const onNativeFrame = (event: {
-      data?: string;
-      metadata?: { deviceHeight?: number; deviceWidth?: number };
-      sessionId?: number;
-    }) => {
-      if (event.sessionId !== undefined) {
-        void client.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
-      }
-      if (stopped || !event.data) return;
-      if (page.isClosed() || activePreviewPage() !== page) {
-        void stopScreencast(true);
-        return;
-      }
-      const width = Math.max(1, Math.floor(Number(event.metadata?.deviceWidth) || viewport.width));
-      const height = Math.max(1, Math.floor(Number(event.metadata?.deviceHeight) || viewport.height));
-      pushOutputFrame(event.data, { width, height }, event.metadata);
-    };
-    client.on('Page.screencastFrame', onNativeFrame);
     try {
-      await client.send('Page.startScreencast', {
-        everyNthFrame: 1,
-        format,
-        ...(format === 'jpeg' ? { quality } : {}),
-      });
-      let initialWaitTimer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        initialFrameReady,
-        new Promise<void>((resolve) => {
-          initialWaitTimer = setTimeout(resolve, 250);
-        }),
-      ]);
-      if (initialWaitTimer) clearTimeout(initialWaitTimer);
-      if (!receivedOutputFrame && !stopped && !page.isClosed() && activePreviewPage() === page) {
-        await captureFallbackFrame();
-      }
+      await capturePreviewFrame(++captureSequence);
       if (!stopped) await framePump.flushLatest();
+      nextCaptureAt = Date.now() + currentFrameIntervalMs();
+      scheduleCapture();
     } catch (error) {
       await stopScreencast(false);
       throw error;
     }
     return {
-      metrics: () => framePump.metrics(),
+      metrics: () => ({
+        ...framePump.metrics(),
+        activeCaptures: capturePromises.size,
+        captureDurationMs,
+        captureDurationMsAverage: captureSamples ? captureDurationTotalMs / captureSamples : 0,
+        imageFormat: format,
+        ...(format === 'jpeg' ? { imageQuality: quality } : {}),
+        maxConcurrentCaptures: maxConcurrentCaptures(),
+        targetFps: browserPreviewFramesPerSecond(process.env.BROWSER_PREVIEW_FPS),
+      }),
       stop: async () => {
         await stopScreencast(false);
       },
@@ -7191,7 +7219,9 @@ export class BrowserSession {
       await this.browserCodeKernel.close();
       this.browserCodeKernel = undefined;
     }
-    const kernel = this.browserCodeKernel ||= new BrowserCodeKernel(this.browserCodeConnection);
+    const kernel = this.browserCodeKernel ||= new BrowserCodeKernel(this.browserCodeConnection, {
+      sessionGroupId: this.pageGroupId,
+    });
     this.browserCodeKernelRevision = BROWSER_CODE_KERNEL_RUNTIME_REVISION;
     const executionContext = this.context;
     const pagesBeforeExecution = new Set(executionContext?.pages() || []);

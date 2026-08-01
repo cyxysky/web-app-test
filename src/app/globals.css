@@ -9542,6 +9542,15 @@ body.is-dragging-embedded-tab * {
   white-space: nowrap;
 }
 
+.browser-chat-web-preview-metrics {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .browser-chat-web-preview-status {
   align-items: center;
   color: var(--muted);

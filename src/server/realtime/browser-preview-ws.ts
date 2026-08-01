@@ -51,7 +51,7 @@ type BrowserPreviewWebSocketState = {
   streams: Map<string, BrowserPreviewStream>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 11;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 16;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
@@ -197,8 +197,20 @@ function stopStreamMetrics(stream: BrowserPreviewStream) {
 function startStreamMetrics(stream: BrowserPreviewStream, metrics: () => BrowserPreviewFramePumpMetrics) {
   stopStreamMetrics(stream);
   stream.metrics = metrics;
+  const initialMetrics = metrics();
+  let previousSample = {
+    at: performance.now(),
+    backpressureDrops: stream.backpressureDrops,
+    nativeFrames: initialMetrics.nativeFrames,
+    networkBytes: stream.networkBytes,
+    transmittedFrames: initialMetrics.transmittedFrames,
+    wireFrames: stream.wireFrames,
+  };
   stream.metricsTimer = setInterval(() => {
     const pumpMetrics = stream.metrics?.();
+    if (!pumpMetrics) return;
+    const sampledAt = performance.now();
+    const sampleSeconds = Math.max(0.001, (sampledAt - previousSample.at) / 1_000);
     const elapsedSeconds = Math.max(0.001, pumpMetrics?.elapsedSeconds || 0.001);
     broadcastText(stream, {
       type: 'frameHeartbeat',
@@ -207,15 +219,28 @@ function startStreamMetrics(stream: BrowserPreviewStream, metrics: () => Browser
       metrics: {
         ...pumpMetrics,
         backpressureDrops: stream.backpressureDrops,
+        backpressureDropsPerSecond: (stream.backpressureDrops - previousSample.backpressureDrops) / sampleSeconds,
+        captureFps: (pumpMetrics.nativeFrames - previousSample.nativeFrames) / sampleSeconds,
         duplicateFrames: 0,
         networkBytes: stream.networkBytes,
         networkBytesPerSecond: stream.networkBytes / elapsedSeconds,
+        recentNetworkBytesPerSecond: (stream.networkBytes - previousSample.networkBytes) / sampleSeconds,
         payloadBuildMs: stream.payloadBuildMs,
         payloadBuildMsPerFrame: stream.wireFrames ? stream.payloadBuildMs / stream.wireFrames : 0,
         pendingClientFrames: [...stream.clients].filter((client) => client.pendingFrame !== undefined).length,
+        sendFps: (stream.wireFrames - previousSample.wireFrames) / sampleSeconds,
+        transmittedFpsRecent: (pumpMetrics.transmittedFrames - previousSample.transmittedFrames) / sampleSeconds,
         wireFrames: stream.wireFrames,
       },
     });
+    previousSample = {
+      at: sampledAt,
+      backpressureDrops: stream.backpressureDrops,
+      nativeFrames: pumpMetrics.nativeFrames,
+      networkBytes: stream.networkBytes,
+      transmittedFrames: pumpMetrics.transmittedFrames,
+      wireFrames: stream.wireFrames,
+    };
   }, 1_000);
   stream.metricsTimer.unref?.();
 }

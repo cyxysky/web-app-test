@@ -1,13 +1,20 @@
 export type BrowserPreviewFramePumpMetrics = {
+  activeCaptures?: number;
+  captureDurationMs?: number;
+  captureDurationMsAverage?: number;
   coalescedFrames: number;
   coalescedRatio: number;
   elapsedSeconds: number;
   failedFrames: number;
+  imageFormat?: 'jpeg' | 'png';
+  imageQuality?: number;
   lastCapturedAt?: string;
   lastTransmittedAt?: string;
+  maxConcurrentCaptures?: number;
   nativeFrames: number;
   nativeFps: number;
   startedAt: string;
+  targetFps?: number;
   transmittedFrames: number;
   transmittedFps: number;
 };

@@ -129,9 +129,10 @@ const boolOptions = [
 ];
 
 export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
-  { key: 'BROWSER_PREVIEW_FPS', label: '实时预览帧率', description: '实时预览新画面的最大发送帧率；可设置 1–60 FPS。页面静止时不会重复发送相同图片，只保留轻量心跳。', tab: 'browser', defaultValue: '20', control: 'number', min: 1, max: 60, step: 1 },
-  { key: 'BROWSER_OUTPUT_PIXEL_RATIO', label: '输出像素倍率', description: '在不改变网页 CSS 视口和布局的前提下，提高实时预览与系统截图的输出像素密度；倍率越高，编码、内存和网络压力越大。', tab: 'browser', defaultValue: '1.5', control: 'number', min: 1, max: 2, step: 0.25 },
+  { key: 'BROWSER_PREVIEW_FPS', label: '实时预览帧率', description: '实时预览轮询截图并发送的目标帧率；可设置 1–60 FPS。静态页面也会按该频率持续发送画面。', tab: 'browser', defaultValue: '20', control: 'number', min: 1, max: 60, step: 1 },
+  { key: 'BROWSER_OUTPUT_PIXEL_RATIO', label: '截图输出像素倍率', description: '在不改变网页 CSS 视口和布局的前提下，提高系统截图的输出像素密度；实时预览始终使用原始倍率。', tab: 'browser', defaultValue: '1.5', control: 'number', min: 1, max: 2, step: 0.25 },
   { key: 'BROWSER_SCREENCAST_FORMAT', label: '实时预览图片格式', description: 'JPEG 体积较小，适合高帧率；PNG 无损且文字更清晰，但会显著增加编码与网络压力。', tab: 'browser', defaultValue: 'jpeg', control: 'select', options: [{ label: 'JPEG（高帧率推荐）', value: 'jpeg' }, { label: 'PNG（无损）', value: 'png' }] },
+  { key: 'BROWSER_SCREENCAST_QUALITY', label: '实时预览 JPEG 质量', description: '仅对 JPEG 生效。数值越高画质越好，但编码和传输压力越大；30 FPS 推荐 85–90。', tab: 'browser', defaultValue: '90', control: 'number', min: 40, max: 100, step: 1 },
   { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
   { key: 'AI_BROWSER_MODE', label: '浏览器控制模式', description: '全局配置，对所有用户和会话生效。代码模式让 Agent 执行受限 Playwright 代码；DOM 模式通过结构化 inspect/interact 工具操作页面。正在执行的对话完成后，下一轮使用最新保存模式。', tab: 'browser', defaultValue: 'code', control: 'select', options: [{ label: '代码模式', value: 'code' }, { label: 'DOM 模式', value: 'dom' }] },
   { key: 'BROWSER_CDP_ENDPOINT', label: '现有浏览器 CDP 地址', description: '连接已开启远程调试的 Chrome/Edge，例如 http://127.0.0.1:9222；可复用登录态。留空则启动新浏览器。', tab: 'browser', defaultValue: '', control: 'text' },

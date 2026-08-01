@@ -298,7 +298,7 @@ test('browserCode-created tabs are owned and group-marked before preview starts'
   assert.equal(new Set(markerStates.map((marker) => marker.groupTitle)).size, 1);
 });
 
-test('live preview follows a clicked popup and emits an initial frame after tab switching', async (context) => {
+test('live preview polling follows a clicked popup and tab switching without reconnecting', async (context) => {
   const session = new BrowserSession('dom', {
     headless: true,
     isolated: true,
@@ -330,9 +330,7 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
   assert.equal(initialTabs.length, 1);
   const originalTabId = initialTabs[0].id;
   const initialFrames: Array<{ capturedAt: string; url: string }> = [];
-  let activePageChanged = false;
   const firstHandle = await session.startScreencast({
-    onActivePageChanged: () => { activePageChanged = true; },
     onFrame: (frame) => { initialFrames.push({ capturedAt: frame.capturedAt, url: frame.url }); },
   });
   assert.ok(initialFrames.length >= 1, 'screencast attach should emit an initial frame');
@@ -356,8 +354,7 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
     popupTabs = await session.refreshTabsSnapshot();
     return popupTabs.length === 2 && popupTabs.some((tab) => tab.active && tab.url.endsWith('#detail'));
   });
-  await waitForCondition(() => activePageChanged);
-  await firstHandle.stop();
+  await waitForCondition(() => initialFrames.some((frame) => frame.url.endsWith('#detail')));
 
   const switchResult = await session.switchLivePreviewTab(originalTabId);
   assert.equal(switchResult.ok, true, switchResult.actual);
@@ -369,13 +366,52 @@ test('live preview follows a clicked popup and emits an initial frame after tab 
     `original tab should remain selected after refresh: ${JSON.stringify(switchedTabs)}`,
   );
 
-  const switchedFrames: Array<{ url: string }> = [];
-  const switchedHandle = await session.startScreencast({
-    onFrame: (frame) => { switchedFrames.push({ url: frame.url }); },
+  await waitForCondition(() => initialFrames.at(-1)?.url === page.url());
+  const navigatedUrl = `data:text/html,${encodeURIComponent('<title>Updated preview</title><main>Updated preview</main>')}`;
+  await page.goto(navigatedUrl);
+  await waitForCondition(() => initialFrames.at(-1)?.url === navigatedUrl);
+  await firstHandle.stop();
+});
+
+test('live preview repeatedly polls and sends a static page at the configured frame rate', async (context) => {
+  const previousFps = process.env.BROWSER_PREVIEW_FPS;
+  process.env.BROWSER_PREVIEW_FPS = '30';
+  const session = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-live-preview-cadence-test',
   });
-  assert.ok(switchedFrames.length >= 1, 'switched static tab should emit a frame immediately');
-  assert.equal(switchedFrames.at(-1)?.url, page.url());
-  await switchedHandle.stop();
+  context.after(async () => {
+    await session.close();
+    if (previousFps === undefined) delete process.env.BROWSER_PREVIEW_FPS;
+    else process.env.BROWSER_PREVIEW_FPS = previousFps;
+  });
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent('<!doctype html><html><body><main>Static preview</main></body></html>');
+  const mutableSession = session as unknown as {
+    refreshSessionGroupPages: (options?: { forceNativeRefresh?: boolean }) => Promise<Page[]>;
+  };
+  const refreshSessionGroupPages = mutableSession.refreshSessionGroupPages.bind(session);
+  let refreshCalls = 0;
+  mutableSession.refreshSessionGroupPages = async (options) => {
+    refreshCalls += 1;
+    if (refreshCalls > 1) await new Promise((resolve) => setTimeout(resolve, 500));
+    return refreshSessionGroupPages(options);
+  };
+
+  const capturedAt: number[] = [];
+  const handle = await session.startScreencast({
+    onFrame: (frame) => { capturedAt.push(Date.parse(frame.capturedAt)); },
+  });
+  await waitForCondition(() => capturedAt.length >= 6, 1_500);
+  await handle.stop();
+
+  assert.ok(capturedAt.length >= 6, 'static pages must continue producing preview frames');
+  assert.ok(
+    capturedAt[5] - capturedAt[0] < 750,
+    `30 FPS polling should not degrade to multi-second updates: ${JSON.stringify(capturedAt)}`,
+  );
 });
 
 test('live preview supports drag and does not drive the AI cursor', async (context) => {
