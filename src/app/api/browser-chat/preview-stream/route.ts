@@ -1,4 +1,4 @@
-import { ensureBrowserPreviewWebSocketServer } from '@/server/realtime/browser-preview-ws';
+import { browserPreviewPreferredTransport, ensureBrowserPreviewWebSocketServer } from '@/server/realtime/browser-preview-ws';
 import { browserReachableUrl } from '@/server/realtime/browser-preview-url';
 import { noStoreJson } from '@/server/http/no-store-response';
 
@@ -10,6 +10,7 @@ export async function GET(request: Request) {
     const info = await ensureBrowserPreviewWebSocketServer();
     return noStoreJson({
       port: info.port,
+      transport: browserPreviewPreferredTransport(),
       url: browserReachableUrl(request, info.port),
     });
   } catch (error) {

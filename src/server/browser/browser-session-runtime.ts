@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { appDataRoot } from '@/server/storage/paths';
 
@@ -86,6 +87,56 @@ export function normalizePageGroupId(value?: string) {
 
 export function sessionTabGrouperProfileDir(profileKey: string) {
   return path.join(appDataRoot(), '.data', 'browser-profiles', 'tab-groups', normalizePageGroupId(profileKey));
+}
+
+export function managedBrowserProfilesRoot() {
+  return path.resolve(appDataRoot(), '.data', 'browser-profiles');
+}
+
+function isPathInside(parent: string, candidate: string) {
+  const relative = path.relative(parent, candidate);
+  return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+}
+
+export async function clearManagedBrowserProfileCaches(profileDir: string) {
+  if (process.env.BROWSER_PROFILE_CLEAR_CACHE_ON_CLOSE === 'false' || !profileDir) return 0;
+  const root = managedBrowserProfilesRoot();
+  const resolvedProfileDir = path.resolve(profileDir);
+  if (!isPathInside(root, resolvedProfileDir)) return 0;
+
+  const cacheDirectoryNames = new Set([
+    'Cache',
+    'Code Cache',
+    'GPUCache',
+    'DawnGraphiteCache',
+    'DawnWebGPUCache',
+  ]);
+  const targets: string[] = [];
+  const rootEntries = await readdir(resolvedProfileDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of rootEntries) {
+    if (!entry.isDirectory()) continue;
+    const entryPath = path.join(resolvedProfileDir, entry.name);
+    if (cacheDirectoryNames.has(entry.name) || /^Dawn.*Cache$/i.test(entry.name)) targets.push(entryPath);
+    if (!/^(Default|Profile \d+|Guest Profile)$/i.test(entry.name)) continue;
+    const profileEntries = await readdir(entryPath, { withFileTypes: true }).catch(() => []);
+    for (const profileEntry of profileEntries) {
+      if (!profileEntry.isDirectory()) continue;
+      if (!cacheDirectoryNames.has(profileEntry.name) && !/^Dawn.*Cache$/i.test(profileEntry.name)) continue;
+      targets.push(path.join(entryPath, profileEntry.name));
+    }
+  }
+  const removed = await Promise.all(targets.map(async (target) => {
+    try {
+      await rm(target, { force: true, recursive: true, maxRetries: 2, retryDelay: 100 });
+      return true;
+    } catch {
+      // A browser helper can keep a cache file locked briefly on Windows.
+      // Cache cleanup is best-effort and must not turn session shutdown into
+      // an error or touch persistent site data as a fallback.
+      return false;
+    }
+  }));
+  return removed.filter(Boolean).length;
 }
 
 export function sessionTabGrouperDebugPort(profileKey: string) {

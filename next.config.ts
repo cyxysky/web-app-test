@@ -12,6 +12,12 @@ const nextConfig: NextConfig = {
     NEXT_PUBLIC_WEBPILOT_BASE_PATH: basePath,
   },
   output: 'standalone',
+  outputFileTracingIncludes: {
+    '/*': [
+      './node_modules/ffmpeg-static/ffmpeg*',
+      './node_modules/ffmpeg-static/package.json',
+    ],
+  },
   outputFileTracingRoot: currentDir,
   eslint: {
     ignoreDuringBuilds: true,
@@ -23,6 +29,7 @@ const nextConfig: NextConfig = {
     '@google/gemini-cli-core',
     'tree-sitter-bash',
     'web-tree-sitter',
+    'ffmpeg-static',
   ],
 };
 

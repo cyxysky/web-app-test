@@ -593,12 +593,6 @@ function embeddedSessionIdFromGroupId(groupId?: string) {
   return normalized.startsWith('session:') ? normalized.slice('session:'.length) : '';
 }
 
-function embeddedGroupIdForTab(tab: EmbeddedBrowserTab, fallbackGroupId: string) {
-  if (tab.groupId) return tab.groupId;
-  if (tab.sessionId) return embeddedGroupIdForSession(tab.sessionId);
-  return fallbackGroupId;
-}
-
 function parseJsonObjectText(value?: string) {
   const text = (value || '').trim();
   if (!text || !text.startsWith('{') || !text.endsWith('}')) return undefined;
@@ -1787,17 +1781,6 @@ function isOlderSessionSnapshot(incoming: BrowserChatSession, existing?: Browser
 function sessionDisplayTitle(session: BrowserChatSession) {
   return compactText(session.title || '新对话', 38);
 }
-
-function formatLogTime(value: string) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '';
-  return date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-
-function messageUpdateTime(message: BrowserChatMessage) {
-  return message.updatedAt || message.createdAt;
-}
-
 
 const BROWSER_CHAT_DOWNLOAD_EXTENSIONS = new Set([
   '.7z',
@@ -5006,21 +4989,30 @@ type BrowserChatPreviewFrame = {
 type BrowserChatPreviewServerMetrics = {
   activeCaptures?: number;
   backpressureDrops?: number;
+  bitrateKbps?: number;
   captureDurationMs?: number;
   captureDurationMsAverage?: number;
   captureFps?: number;
+  height?: number;
+  h264Level?: string;
+  h264Profile?: string;
   imageFormat?: 'jpeg' | 'png';
   imageQuality?: number;
   maxConcurrentCaptures?: number;
+  mimeType?: string;
   pendingClientFrames?: number;
   sendFps?: number;
   targetFps?: number;
+  transport?: 'image' | 'video';
+  width?: number;
 };
 
 type BrowserChatPreviewDisplayMetrics = BrowserChatPreviewServerMetrics & {
   displayedFps: number;
   receivedFps: number;
 };
+
+const BROWSER_CHAT_PREVIEW_VIDEO_MIME_TYPE = 'video/mp4; codecs="avc1.42C029"';
 
 type BrowserChatPreviewInput =
   | { kind: 'tab'; tabId: string }
@@ -5043,6 +5035,13 @@ function BrowserChatWebPreviewModal({
   const streamRef = useRef<WebSocket | null>(null);
   const reconnectEnabledRef = useRef(true);
   const previewImageRef = useRef<HTMLImageElement | null>(null);
+  const previewVideoRef = useRef<HTMLVideoElement | null>(null);
+  const mediaSourceRef = useRef<MediaSource | null>(null);
+  const sourceBufferRef = useRef<SourceBuffer | null>(null);
+  const videoChunkQueueRef = useRef<Uint8Array[]>([]);
+  const videoObjectUrlRef = useRef('');
+  const forceImageTransportRef = useRef(false);
+  const pumpVideoChunksRef = useRef<() => void>(() => undefined);
   const pendingFrameRef = useRef<BrowserChatPreviewFrame | null>(null);
   const frameObjectUrlRef = useRef('');
   const staleFrameObjectUrlRef = useRef('');
@@ -5055,6 +5054,11 @@ function BrowserChatWebPreviewModal({
     sampledAt: Date.now(),
     sampledDisplayed: 0,
     sampledReceived: 0,
+  });
+  const frameStateRef = useRef<Pick<BrowserChatPreviewFrame, 'tabs' | 'url' | 'viewport'>>({
+    tabs: [],
+    url: '',
+    viewport: { height: 720, width: 1280 },
   });
   const pendingMoveRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'move' }> | null>(null);
   const pointerGestureRef = useRef<{
@@ -5071,10 +5075,113 @@ function BrowserChatWebPreviewModal({
   const pendingScrollRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'scroll' }> | null>(null);
   const scrollFlushTimerRef = useRef<number | undefined>(undefined);
   const [frame, setFrame] = useState<BrowserChatPreviewFrame | null>(null);
+  const [previewTransport, setPreviewTransport] = useState<'image' | 'video'>('video');
+  const [videoObjectUrl, setVideoObjectUrl] = useState('');
   const [status, setStatus] = useState<'connecting' | 'live' | 'reconnecting' | 'unavailable'>('connecting');
   const [streamError, setStreamError] = useState('');
   const [inputError, setInputError] = useState('');
   const [previewMetrics, setPreviewMetrics] = useState<BrowserChatPreviewDisplayMetrics | null>(null);
+  const videoPipelineErrorRef = useRef<(message: string) => void>(() => undefined);
+
+  const disposeVideoPipeline = useCallback((updateState = true) => {
+    const sourceBuffer = sourceBufferRef.current;
+    sourceBufferRef.current = null;
+    videoChunkQueueRef.current = [];
+    if (sourceBuffer?.updating) {
+      try { sourceBuffer.abort(); } catch { /* MediaSource may already be closed. */ }
+    }
+    const mediaSource = mediaSourceRef.current;
+    mediaSourceRef.current = null;
+    if (mediaSource?.readyState === 'open') {
+      try { mediaSource.endOfStream(); } catch { /* Decoder teardown is best-effort. */ }
+    }
+    if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
+    videoObjectUrlRef.current = '';
+    if (updateState) setVideoObjectUrl('');
+  }, []);
+
+  const pumpVideoChunks = useCallback(() => {
+    const sourceBuffer = sourceBufferRef.current;
+    if (!sourceBuffer || sourceBuffer.updating) return;
+    const next = videoChunkQueueRef.current.shift();
+    if (next) {
+      try {
+        const copy = new Uint8Array(next.byteLength);
+        copy.set(next);
+        sourceBuffer.appendBuffer(copy.buffer);
+      } catch (error) {
+        videoPipelineErrorRef.current(error instanceof Error ? error.message : '视频缓冲区写入失败');
+      }
+      return;
+    }
+    const video = previewVideoRef.current;
+    if (!video || !sourceBuffer.buffered.length) return;
+    const lastRange = sourceBuffer.buffered.length - 1;
+    const start = sourceBuffer.buffered.start(0);
+    const end = sourceBuffer.buffered.end(lastRange);
+    if (end - video.currentTime > 0.6) video.currentTime = Math.max(start, end - 0.12);
+    if (end - start > 8) {
+      try { sourceBuffer.remove(0, Math.max(0, end - 3)); } catch { /* A later update trims again. */ }
+    }
+    void video.play().catch(() => undefined);
+  }, []);
+  pumpVideoChunksRef.current = pumpVideoChunks;
+
+  const beginVideoPipeline = useCallback((contentType: string, initialization: Uint8Array) => {
+    disposeVideoPipeline();
+    if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported(contentType)) return false;
+    const mediaSource = new MediaSource();
+    const objectUrl = URL.createObjectURL(mediaSource);
+    mediaSourceRef.current = mediaSource;
+    videoObjectUrlRef.current = objectUrl;
+    videoChunkQueueRef.current = [initialization];
+    mediaSource.addEventListener('sourceopen', () => {
+      if (mediaSourceRef.current !== mediaSource) return;
+      try {
+        const sourceBuffer = mediaSource.addSourceBuffer(contentType);
+        sourceBuffer.mode = 'segments';
+        sourceBufferRef.current = sourceBuffer;
+        sourceBuffer.addEventListener('updateend', () => {
+          if (sourceBufferRef.current === sourceBuffer) pumpVideoChunksRef.current();
+        });
+        sourceBuffer.addEventListener('error', () => {
+          if (sourceBufferRef.current === sourceBuffer) videoPipelineErrorRef.current('H.264 视频解码失败');
+        });
+        pumpVideoChunksRef.current();
+      } catch (error) {
+        videoPipelineErrorRef.current(error instanceof Error ? error.message : '无法创建 H.264 视频缓冲区');
+      }
+    }, { once: true });
+    setVideoObjectUrl(objectUrl);
+    setPreviewTransport('video');
+    setFrame((current) => current || {
+      ...frameStateRef.current,
+      capturedAt: new Date().toISOString(),
+      contentType: 'image/jpeg',
+      imageUrl: '',
+    });
+    return true;
+  }, [disposeVideoPipeline]);
+
+  const enqueueVideoChunk = useCallback((chunk: Uint8Array) => {
+    if (!mediaSourceRef.current) return;
+    if (videoChunkQueueRef.current.length >= 240) {
+      videoPipelineErrorRef.current('视频缓冲积压过多，正在回退到图片预览');
+      return;
+    }
+    videoChunkQueueRef.current.push(chunk);
+    pumpVideoChunksRef.current();
+  }, []);
+
+  const fallbackToImagePreview = useCallback((message: string) => {
+    forceImageTransportRef.current = true;
+    setPreviewTransport('image');
+    disposeVideoPipeline();
+    setStreamError(message);
+    const stream = streamRef.current;
+    if (stream?.readyState === WebSocket.OPEN || stream?.readyState === WebSocket.CONNECTING) stream.close();
+  }, [disposeVideoPipeline]);
+  videoPipelineErrorRef.current = fallbackToImagePreview;
 
   const commitPendingPreviewFrame = useCallback(async function commitPendingPreviewFrame() {
     if (framePipelineDisposedRef.current || frameDecodeActiveRef.current) return;
@@ -5136,11 +5243,19 @@ function BrowserChatWebPreviewModal({
     const connect = async () => {
       try {
         const response = await fetch(withWebPilotBasePath('/api/browser-chat/preview-stream'), { cache: 'no-store' });
-        const data = await response.json() as { error?: string; url?: string };
+        const data = await response.json() as { error?: string; transport?: 'image' | 'video'; url?: string };
         if (!response.ok || !data.url) throw new Error(data.error || '实时界面连接失败');
         if (disposed) return;
+        const videoSupported = typeof MediaSource !== 'undefined'
+          && MediaSource.isTypeSupported(BROWSER_CHAT_PREVIEW_VIDEO_MIME_TYPE);
+        const requestedTransport = data.transport === 'image' || forceImageTransportRef.current || !videoSupported
+          ? 'image'
+          : 'video';
+        setPreviewTransport(requestedTransport);
+        disposeVideoPipeline();
         const url = new URL(data.url);
         url.searchParams.set('sessionId', sessionId);
+        url.searchParams.set('transport', requestedTransport);
         url.searchParams.set('userId', userId);
         const stream = new WebSocket(url);
         stream.binaryType = 'arraybuffer';
@@ -5150,6 +5265,7 @@ function BrowserChatWebPreviewModal({
           counters.sampledAt = Date.now();
           counters.sampledDisplayed = counters.displayed;
           counters.sampledReceived = counters.received;
+          frameStateRef.current = { tabs: [], url: '', viewport: { height: 720, width: 1280 } };
           setPreviewMetrics(null);
           setStreamError('');
         };
@@ -5160,18 +5276,45 @@ function BrowserChatWebPreviewModal({
               if (bytes.byteLength < 4) throw new Error('Invalid binary frame');
               const metadataLength = new DataView(event.data).getUint32(0, false);
               if (metadataLength <= 0 || metadataLength + 4 > bytes.byteLength) throw new Error('Invalid binary metadata');
-              const metadata = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + metadataLength))) as Omit<BrowserChatPreviewFrame, 'imageUrl'>;
+              const metadata = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + metadataLength))) as {
+                capturedAt?: string;
+                contentType?: string;
+                sequence?: number;
+                type?: 'frame' | 'videoChunk' | 'videoInit';
+              };
+              const payload = bytes.slice(4 + metadataLength);
+              if (metadata.type === 'videoInit') {
+                if (!metadata.contentType || !beginVideoPipeline(metadata.contentType, payload)) {
+                  fallbackToImagePreview('当前客户端不支持该 H.264 视频流，正在回退到图片预览');
+                }
+                return;
+              }
+              if (metadata.type === 'videoChunk') {
+                frameCountersRef.current.received += 1;
+                enqueueVideoChunk(payload);
+                return;
+              }
+              if (metadata.type !== 'frame' || (metadata.contentType !== 'image/jpeg' && metadata.contentType !== 'image/png')) {
+                throw new Error('Unknown binary preview payload');
+              }
               frameCountersRef.current.received += 1;
               const imageUrl = URL.createObjectURL(new Blob(
-                [bytes.slice(4 + metadataLength)],
+                [payload],
                 { type: metadata.contentType },
               ));
-              queuePreviewFrame({ ...metadata, imageUrl });
+              queuePreviewFrame({
+                ...frameStateRef.current,
+                capturedAt: metadata.capturedAt || new Date().toISOString(),
+                contentType: metadata.contentType,
+                imageUrl,
+                sequence: metadata.sequence,
+              });
               return;
             }
             const message = JSON.parse(String(event.data)) as BrowserChatPreviewFrame & {
               error?: string;
               metrics?: BrowserChatPreviewServerMetrics;
+              transport?: 'image' | 'video';
               type?: string;
             };
             if (message.type === 'frame') {
@@ -5181,6 +5324,16 @@ function BrowserChatWebPreviewModal({
                 ...message,
                 imageUrl: legacyMessage.imageUrl || `data:${message.contentType};base64,${legacyMessage.data || ''}`,
               });
+              frameStateRef.current = { tabs: message.tabs, url: message.url, viewport: message.viewport };
+            } else if (message.type === 'tabsChanged' && Array.isArray(message.tabs)) {
+              frameStateRef.current = { ...frameStateRef.current, tabs: message.tabs };
+              setFrame((current) => current ? { ...current, tabs: message.tabs } : current);
+            } else if (message.type === 'navigationChanged' && typeof message.url === 'string') {
+              frameStateRef.current = { ...frameStateRef.current, url: message.url };
+              setFrame((current) => current ? { ...current, url: message.url } : current);
+            } else if (message.type === 'viewportChanged' && message.viewport) {
+              frameStateRef.current = { ...frameStateRef.current, viewport: message.viewport };
+              setFrame((current) => current ? { ...current, viewport: message.viewport } : current);
             } else if (message.type === 'frameHeartbeat' && message.metrics) {
               const counters = frameCountersRef.current;
               const sampledAt = Date.now();
@@ -5193,6 +5346,13 @@ function BrowserChatWebPreviewModal({
               counters.sampledAt = sampledAt;
               counters.sampledDisplayed = counters.displayed;
               counters.sampledReceived = counters.received;
+            } else if (message.type === 'transportChanged' && message.transport) {
+              setPreviewTransport(message.transport);
+              if (message.transport === 'image') {
+                forceImageTransportRef.current = true;
+                disposeVideoPipeline();
+                if (message.error) setStreamError(message.error);
+              }
             } else if (message.type === 'activeTabChanged') {
               setStatus('reconnecting');
             } else if (message.type === 'ready') {
@@ -5214,6 +5374,7 @@ function BrowserChatWebPreviewModal({
         stream.onerror = () => setStreamError((current) => current || '实时界面连接中断，正在重连');
         stream.onclose = () => {
           if (streamRef.current === stream) streamRef.current = null;
+          disposeVideoPipeline();
           if (disposed || !reconnectEnabledRef.current) return;
           setStatus('reconnecting');
           reconnectTimer = window.setTimeout(() => void connect(), 600);
@@ -5233,7 +5394,7 @@ function BrowserChatWebPreviewModal({
       streamRef.current = null;
       stream?.close();
     };
-  }, [queuePreviewFrame, sessionId, userId]);
+  }, [beginVideoPipeline, disposeVideoPipeline, enqueueVideoChunk, fallbackToImagePreview, queuePreviewFrame, sessionId, userId]);
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -5262,8 +5423,35 @@ function BrowserChatWebPreviewModal({
       pointerGestureRef.current = null;
       if (moveFlushTimerRef.current !== undefined) window.clearTimeout(moveFlushTimerRef.current);
       if (scrollFlushTimerRef.current !== undefined) window.clearTimeout(scrollFlushTimerRef.current);
+      disposeVideoPipeline(false);
     };
-  }, []);
+  }, [disposeVideoPipeline]);
+
+  useEffect(() => {
+    const video = previewVideoRef.current;
+    if (!videoObjectUrl || !video) return undefined;
+    let stopped = false;
+    let callbackId = 0;
+    const markLive = () => {
+      if (stopped) return;
+      setStatus('live');
+      setStreamError('');
+    };
+    const frameCallback = () => {
+      if (stopped) return;
+      frameCountersRef.current.displayed += 1;
+      markLive();
+      callbackId = video.requestVideoFrameCallback(frameCallback);
+    };
+    video.addEventListener('playing', markLive);
+    callbackId = video.requestVideoFrameCallback(frameCallback);
+    void video.play().catch(() => undefined);
+    return () => {
+      stopped = true;
+      video.removeEventListener('playing', markLive);
+      if (callbackId) video.cancelVideoFrameCallback(callbackId);
+    };
+  }, [videoObjectUrl]);
 
   const postInput = useCallback((input: BrowserChatPreviewInput, reportError: boolean) => {
     const stream = streamRef.current;
@@ -5282,7 +5470,9 @@ function BrowserChatWebPreviewModal({
 
   const relativePoint = useCallback((clientX: number, clientY: number, element: HTMLElement, clamp = false) => {
     if (!frame) return undefined;
-    const rect = previewImageRef.current?.getBoundingClientRect() || element.getBoundingClientRect();
+    const rect = previewVideoRef.current?.getBoundingClientRect()
+      || previewImageRef.current?.getBoundingClientRect()
+      || element.getBoundingClientRect();
     if (!rect.width || !rect.height) return undefined;
     if (!clamp && (
       clientX < rect.left
@@ -5447,11 +5637,17 @@ function BrowserChatWebPreviewModal({
         ? '浏览器未运行'
         : '正在连接';
   const previewMetricsLabel = previewMetrics
-    ? `目标 ${Math.round(previewMetrics.targetFps || 0)} · 截图 ${(previewMetrics.captureFps || 0).toFixed(1)} · 发送 ${(previewMetrics.sendFps || 0).toFixed(1)} · 接收 ${previewMetrics.receivedFps.toFixed(1)} · 显示 ${previewMetrics.displayedFps.toFixed(1)} FPS`
+    ? `${previewTransport === 'video' ? 'H.264' : '图片'} · 目标 ${Math.round(previewMetrics.targetFps || 0)} · 截图 ${(previewMetrics.captureFps || 0).toFixed(1)} · 发送 ${(previewMetrics.sendFps || 0).toFixed(1)} · 接收 ${previewMetrics.receivedFps.toFixed(1)} · 显示 ${previewMetrics.displayedFps.toFixed(1)} FPS`
     : '';
   const previewMetricsTitle = previewMetrics
     ? [
-        previewMetrics.imageFormat === 'jpeg' ? `JPEG 质量：${previewMetrics.imageQuality ?? '-'}` : 'PNG',
+        previewTransport === 'video'
+          ? '传输：H.264 fragmented MP4'
+          : previewMetrics.imageFormat === 'jpeg' ? `JPEG 质量：${previewMetrics.imageQuality ?? '-'}` : 'PNG',
+        ...(previewTransport === 'video' ? [
+          `编码：${previewMetrics.h264Profile || '-'} / Level ${previewMetrics.h264Level || '-'} / ${previewMetrics.mimeType || '-'}`,
+          `视频：${previewMetrics.width || '-'}×${previewMetrics.height || '-'} / ${previewMetrics.bitrateKbps || '-'} Kbps`,
+        ] : []),
         `最近一次截图耗时：${(previewMetrics.captureDurationMs || 0).toFixed(1)} ms`,
         `平均截图耗时：${(previewMetrics.captureDurationMsAverage || 0).toFixed(1)} ms`,
         `在途截图：${previewMetrics.activeCaptures || 0}/${previewMetrics.maxConcurrentCaptures || 1}`,
@@ -5459,6 +5655,7 @@ function BrowserChatWebPreviewModal({
         `待发送客户端帧：${previewMetrics.pendingClientFrames || 0}`,
       ].join('\n')
     : '';
+  const hasPreviewVisual = Boolean(videoObjectUrl || frame?.imageUrl);
 
   return (
     <div className="ui-modal-overlay browser-chat-web-preview-overlay" onClick={onClose} role="presentation">
@@ -5512,7 +5709,7 @@ function BrowserChatWebPreviewModal({
         <div className="browser-chat-web-preview-body">
           <div
             aria-label="可操作的浏览器实时画面"
-            className={frame ? 'browser-chat-web-preview-stage has-frame' : 'browser-chat-web-preview-stage'}
+            className={hasPreviewVisual ? 'browser-chat-web-preview-stage has-frame' : 'browser-chat-web-preview-stage'}
             onContextMenu={openPreviewContextMenu}
             onKeyDown={pressPreviewKey}
             onPaste={pastePreviewText}
@@ -5524,7 +5721,16 @@ function BrowserChatWebPreviewModal({
             role="application"
             tabIndex={0}
           >
-            {frame ? (
+            {videoObjectUrl ? (
+              <video
+                autoPlay
+                disablePictureInPicture
+                muted
+                playsInline
+                ref={previewVideoRef}
+                src={videoObjectUrl}
+              />
+            ) : frame?.imageUrl ? (
               <img alt="浏览器实时画面" draggable={false} ref={previewImageRef} src={frame.imageUrl} />
             ) : (
               <div className="browser-chat-web-preview-empty">
@@ -5534,7 +5740,7 @@ function BrowserChatWebPreviewModal({
               </div>
             )}
           </div>
-          {streamError && frame ? <div className="browser-chat-web-preview-alert">{streamError}</div> : null}
+          {streamError && hasPreviewVisual ? <div className="browser-chat-web-preview-alert">{streamError}</div> : null}
           {inputError ? <div className="browser-chat-web-preview-alert">{inputError}</div> : null}
         </div>
 
@@ -5578,8 +5784,6 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [bridgeError, setBridgeError] = useState('');
   const [browserGroups, setBrowserGroups] = useState<EmbeddedBrowserGroup[]>([]);
   const [browserTabs, setBrowserTabs] = useState<EmbeddedBrowserTab[]>([]);
-  const [activeGroupId, setActiveGroupId] = useState('');
-  const [activeTabIndex, setActiveTabIndex] = useState(0);
   const [activeTabId, setActiveTabId] = useState('');
   const [addressValue, setAddressValue] = useState('');
   const [canGoBack, setCanGoBack] = useState(false);
@@ -5597,12 +5801,15 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [runtimeActivatedSessionId, setRuntimeActivatedSessionId] = useState('');
   const requestedGroupId = browserGroupId || embeddedGroupIdForSession(sessionId);
   const requestedGroupAvailable = useMemo(() => (
-    browserGroups.some((group) => group.id === requestedGroupId && group.tabs.length > 0)
-    || browserTabs.some((tab) => (
-      tab.groupId === requestedGroupId
-      || (!tab.groupId && tab.sessionId && embeddedGroupIdForSession(tab.sessionId) === requestedGroupId)
-      || (!tab.groupId && !tab.sessionId && requestedGroupId === 'default')
-    ))
+    Boolean(requestedGroupId) && (
+      browserGroups.some((group) => (
+        group.id === requestedGroupId
+        && group.tabs.some((tab) => tab.groupId === requestedGroupId)
+      ))
+      || browserTabs.some((tab) => (
+        Boolean(tab.groupId) && tab.groupId === requestedGroupId
+      ))
+    )
   ), [browserGroups, browserTabs, requestedGroupId]);
   // Historical conversations do not have a fresh browser:start/browser:reuse
   // log entry, but their persisted tab group is still safe to reattach. Keep
@@ -5638,15 +5845,21 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       return;
     }
     setBridgeError('');
-    setBrowserGroups(Array.isArray(result.groups) ? result.groups : []);
-    setBrowserTabs(Array.isArray(result.tabs) ? result.tabs : []);
+    const scopedGroups = requestedGroupId ? (Array.isArray(result.groups) ? result.groups : [])
+      .filter((group) => Boolean(group.id) && group.id === requestedGroupId) : [];
+    const scopedTabs = requestedGroupId ? (Array.isArray(result.tabs) ? result.tabs : [])
+      .filter((tab) => Boolean(tab.groupId) && tab.groupId === requestedGroupId) : [];
+    const scopedTabIds = new Set([
+      ...scopedTabs.map((tab) => tab.id),
+      ...scopedGroups.flatMap((group) => group.tabs.map((tab) => tab.id)),
+    ]);
+    setBrowserGroups(scopedGroups);
+    setBrowserTabs(scopedTabs);
     setLibraryPanel(result.libraryPanel === 'library' ? result.libraryPanel : null);
-    setActiveGroupId(result.activeGroupId || '');
-    setActiveTabIndex(typeof result.activeIndex === 'number' && result.activeIndex >= 0 ? result.activeIndex : 0);
-    setActiveTabId(result.activeTabId || '');
+    setActiveTabId(scopedTabIds.has(result.activeTabId || '') ? result.activeTabId || '' : '');
     setCanGoBack(Boolean(result.canGoBack));
     setCanGoForward(Boolean(result.canGoForward));
-  }, []);
+  }, [requestedGroupId]);
 
   const loadEmbeddedBrowserState = useCallback(async () => {
     const bridge = window.webPilotEmbeddedBrowser;
@@ -5654,8 +5867,6 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     if (!bridge) {
       setBrowserGroups([]);
       setBrowserTabs([]);
-      setActiveGroupId('');
-      setActiveTabIndex(0);
       setActiveTabId('');
       setAddressValue('');
       setCanGoBack(false);
@@ -6078,9 +6289,9 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const selectedGroupId = browserGroupId || embeddedGroupIdForSession(sessionId);
   const visibleGroups = useMemo<EmbeddedBrowserGroup[]>(() => {
     if (!selectedGroupId) return [];
+    const selectedGroup = browserGroups.find((group) => group.id === selectedGroupId);
     if (!requestedGroupAvailable) {
       if (!sessionId || closedGroupIds.includes(selectedGroupId)) return [];
-      const selectedGroup = browserGroups.find((group) => group.id === selectedGroupId);
       return [{
         ...selectedGroup,
         active: true,
@@ -6089,55 +6300,24 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         tabs: [],
       }];
     }
-    const groupsById = new Map<string, EmbeddedBrowserGroup>();
-    const orderedIds: string[] = [];
-    const resolvedActiveGroupId = activeGroupId || browserGroups.find((group) => group.active)?.id || selectedGroupId;
-
-    function ensureGroup(id: string, input: Partial<EmbeddedBrowserGroup> = {}) {
-      const normalizedId = id || selectedGroupId;
-      let group = groupsById.get(normalizedId);
-      if (!group) {
-        group = {
-          active: normalizedId === resolvedActiveGroupId,
-          activeTabId: input.activeTabId,
-          collapsed: Boolean(input.collapsed),
-          id: normalizedId,
-          label: input.label,
-          sessionId: input.sessionId,
-          tabs: [],
-        };
-        groupsById.set(normalizedId, group);
-        orderedIds.push(normalizedId);
-      }
-      group.active = Boolean(group.active || input.active || normalizedId === resolvedActiveGroupId);
-      group.activeTabId = group.activeTabId || input.activeTabId;
-      group.label = group.label || input.label;
-      group.sessionId = group.sessionId || input.sessionId;
-      return group;
+    const tabsById = new Map<string, EmbeddedBrowserTab>();
+    for (const tab of selectedGroup?.tabs || []) {
+      if (tab.groupId === selectedGroupId) tabsById.set(tab.id, tab);
     }
-
-    for (const group of browserGroups) {
-      const hydrated = ensureGroup(group.id, group);
-      for (const tab of Array.isArray(group.tabs) ? group.tabs : []) {
-        if (!hydrated.tabs.some((item) => item.id === tab.id)) hydrated.tabs.push(tab);
-      }
-    }
-
     for (const tab of browserTabs) {
-      const groupId = embeddedGroupIdForTab(tab, resolvedActiveGroupId || selectedGroupId);
-      const hydrated = ensureGroup(groupId, {
-        active: groupId === resolvedActiveGroupId || tab.id === activeTabId,
-        sessionId: tab.sessionId || (groupId.startsWith('session:') ? groupId.slice('session:'.length) : undefined),
-      });
-      if (!hydrated.tabs.some((item) => item.id === tab.id)) hydrated.tabs.push(tab);
+      if (!tab.groupId || tab.groupId !== selectedGroupId) continue;
+      tabsById.set(tab.id, tab);
     }
-
-    if (sessionId && (!groupsById.size || !groupsById.has(selectedGroupId)) && !closedGroupIds.includes(selectedGroupId)) {
-      ensureGroup(selectedGroupId, { active: true, sessionId });
-    }
-
-    return orderedIds.map((id) => groupsById.get(id)!).filter(Boolean);
-  }, [activeGroupId, activeTabId, browserGroups, browserTabs, closedGroupIds, requestedGroupAvailable, selectedGroupId, sessionId]);
+    return [{
+      active: true,
+      activeTabId: selectedGroup?.activeTabId,
+      collapsed: Boolean(selectedGroup?.collapsed),
+      id: selectedGroupId,
+      label: selectedGroup?.label,
+      sessionId: selectedGroup?.sessionId || sessionId,
+      tabs: [...tabsById.values()],
+    }];
+  }, [browserGroups, browserTabs, closedGroupIds, requestedGroupAvailable, selectedGroupId, sessionId]);
 
   const visibleGroupIconColors = useMemo(() => {
     return new Map(visibleGroups.map((group) => [group.id, embeddedBrowserGroupIconColor(group.id)]));
@@ -6171,17 +6351,12 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   }, [renderedVisibleGroups, tabListWidth]);
 
   const activeEmbeddedTab = useMemo(() => {
-    const groupedTabs = visibleGroups.flatMap((group) => group.tabs);
-    const activeGroup = visibleGroups.find((group) => group.id === activeGroupId)
-      || visibleGroups.find((group) => group.active);
+    const activeGroup = visibleGroups[0];
     const activeGroupTabs = activeGroup?.tabs || [];
-    if (activeTabId) {
-      return activeGroupTabs.find((tab) => tab.id === activeTabId)
-        || groupedTabs.find((tab) => tab.id === activeTabId);
-    }
-    if (activeGroup) return activeGroupTabs[0];
-    return groupedTabs[activeTabIndex] || groupedTabs[0];
-  }, [activeGroupId, activeTabId, activeTabIndex, visibleGroups]);
+    const scopedActiveTabId = activeGroup?.activeTabId
+      || (activeGroupTabs.some((tab) => tab.id === activeTabId) ? activeTabId : '');
+    return activeGroupTabs.find((tab) => tab.id === scopedActiveTabId) || activeGroupTabs[0];
+  }, [activeTabId, visibleGroups]);
   const isEmbeddedBrowserLoading = Boolean(activeEmbeddedTab?.loading);
   const draggedEmbeddedTab = useMemo(() => (
     draggingTabId
@@ -6479,7 +6654,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                       <div className="browser-chat-embedded-tab-stack">
                         {group.tabs.map((tab) => {
                           const tabIndex = browserTabs.findIndex((item) => item.id === tab.id);
-                          const isActiveTab = activeTabId ? tab.id === activeTabId : tabIndex === activeTabIndex;
+                          const isActiveTab = tab.id === activeEmbeddedTab?.id;
                           return (
                             <EmbeddedBrowserSortableTab
                               active={isActiveTab}
@@ -6765,6 +6940,7 @@ export function BrowserChatWorkspace({
   const [embeddedBrowserDialogOpen, setEmbeddedBrowserDialogOpen] = useState(false);
   const [webPreviewRuntime, setWebPreviewRuntime] = useState(false);
   const [webPreviewOpen, setWebPreviewOpen] = useState(false);
+  const sessionUiKey = `${session?.userId || requestUserId}:${session?.id || 'new'}`;
   const selectedSessionRunning = isBrowserChatSessionRunning(session);
   const selectedRunningSession = selectedSessionRunning ? session : undefined;
   const currentBusy = busy || selectedSessionRunning || interrupting;
@@ -6831,6 +7007,10 @@ export function BrowserChatWorkspace({
 
   useEffect(() => {
     setWebPreviewOpen(false);
+    setToolDialog(null);
+    setLogDialogMessageId(null);
+    setImagePreview(null);
+    setBrowserGroupPickerOpen(false);
   }, [session?.id]);
 
   useEffect(() => {
@@ -7889,6 +8069,7 @@ export function BrowserChatWorkspace({
 
       {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages ? (
         <BrowserChatMessageList
+          key={`messages:${sessionUiKey}`}
           availableSkills={skills}
           generatingSkillMessageId={generatingSkillMessageId}
           historyHasMore={Boolean(session?.history && (
@@ -7919,6 +8100,7 @@ export function BrowserChatWorkspace({
       <div className="browser-chat-composer-shell">
         {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
         <BrowserChatComposer
+          key={`composer:${sessionUiKey}`}
           attachments={attachments}
           availableSkills={skills}
           busy={busy}
@@ -8025,6 +8207,7 @@ export function BrowserChatWorkspace({
               activationRequestId={browserActivationRequestId}
               browserGroupId={session?.browserGroupId}
               enabled={embeddedBrowserEnabled}
+              key={`${session?.userId || requestUserId}:${session?.id || 'new'}`}
               onAddTabReference={addTabReference}
               onDialogOpenChange={setEmbeddedBrowserDialogOpen}
               onSelectSession={(nextSessionId) => {
@@ -8073,6 +8256,7 @@ export function BrowserChatWorkspace({
 
             {loadingSessionId ? <BrowserChatSessionLoading label={t('正在加载对话')} /> : hasMessages ? (
               <BrowserChatMessageList
+                key={`messages:${sessionUiKey}`}
                 availableSkills={skills}
                 generatingSkillMessageId={generatingSkillMessageId}
                 historyHasMore={Boolean(session?.history && (
@@ -8103,6 +8287,7 @@ export function BrowserChatWorkspace({
             <div className="browser-chat-composer-shell">
               {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
               <BrowserChatComposer
+                key={`composer:${sessionUiKey}`}
                 attachments={attachments}
                 availableSkills={skills}
                 busy={busy}

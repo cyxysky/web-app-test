@@ -13,6 +13,44 @@ function backupRetentionCount() {
   return Number.isFinite(value) ? Math.max(1, Math.min(30, Math.floor(value))) : 7;
 }
 
+function sqliteCompactionFreeRatio() {
+  const value = Number(process.env.SQLITE_COMPACTION_FREE_RATIO || 0.3);
+  return Number.isFinite(value) ? Math.max(0.1, Math.min(0.9, value)) : 0.3;
+}
+
+function sqliteCompactionMinimumFreePages() {
+  const value = Number(process.env.SQLITE_COMPACTION_MIN_FREE_PAGES || 1024);
+  return Number.isFinite(value) ? Math.max(128, Math.floor(value)) : 1024;
+}
+
+function pragmaNumber(name: 'freelist_count' | 'page_count' | 'page_size') {
+  const row = getSqliteDatabase().prepare(`PRAGMA ${name}`).get() as Record<string, number> | undefined;
+  return Number(row?.[name] || 0);
+}
+
+export function compactSqliteDatabaseIfNeeded() {
+  const database = getSqliteDatabase();
+  database.prepare('PRAGMA wal_checkpoint(TRUNCATE)').all();
+  const pageCountBefore = pragmaNumber('page_count');
+  const freePagesBefore = pragmaNumber('freelist_count');
+  const pageSize = pragmaNumber('page_size');
+  const freeRatioBefore = pageCountBefore ? freePagesBefore / pageCountBefore : 0;
+  const shouldCompact = process.env.SQLITE_AUTO_COMPACT_ENABLED !== 'false'
+    && freePagesBefore >= sqliteCompactionMinimumFreePages()
+    && freeRatioBefore >= sqliteCompactionFreeRatio();
+  if (shouldCompact) database.exec('VACUUM');
+  database.exec('PRAGMA optimize');
+  const pageCountAfter = pragmaNumber('page_count');
+  return {
+    compacted: shouldCompact,
+    freePagesBefore,
+    freeRatioBefore,
+    pageCountAfter,
+    pageCountBefore,
+    reclaimedBytes: Math.max(0, pageCountBefore - pageCountAfter) * pageSize,
+  };
+}
+
 export function verifySqliteIntegrity() {
   const rows = getSqliteDatabase().prepare('PRAGMA quick_check').all() as Array<{ quick_check?: string }>;
   const results = rows.map((row) => row.quick_check || '').filter(Boolean);
@@ -40,7 +78,9 @@ export function scheduleSqliteMaintenance() {
   if (process.env.SQLITE_MAINTENANCE_ENABLED === 'false' || runtimeState.timer) return;
   const run = () => {
     if (runtimeState.running) return;
-    runtimeState.running = createSqliteBackup()
+    runtimeState.running = Promise.resolve()
+      .then(() => compactSqliteDatabaseIfNeeded())
+      .then(() => createSqliteBackup())
       .then(() => undefined)
       .catch((error) => console.warn('[sqlite] scheduled backup failed', error))
       .finally(() => { runtimeState.running = undefined; });

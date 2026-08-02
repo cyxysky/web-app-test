@@ -13,6 +13,9 @@ test('sqlite maintenance verifies integrity and creates a consistent backup', as
   try {
     databaseModule.getSqliteDatabase();
     assert.equal(maintenance.verifySqliteIntegrity(), true);
+    const compaction = maintenance.compactSqliteDatabaseIfNeeded();
+    assert.equal(typeof compaction.compacted, 'boolean');
+    assert.ok(compaction.pageCountAfter > 0);
     const backup = await maintenance.createSqliteBackup();
     await new Promise<void>((resolve, reject) => access(backup, (error) => error ? reject(error) : resolve()));
   } finally {

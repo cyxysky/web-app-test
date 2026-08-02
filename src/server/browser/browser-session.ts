@@ -10,6 +10,7 @@ import {
 } from '@/config/browser-output-settings';
 import { artifactPath } from '@/server/storage/paths';
 import { browserPreviewFrameIntervalMs, browserPreviewFramesPerSecond } from './browser-preview-cadence';
+import { browserPreviewVideoCaptureGeometry } from './browser-preview-video-settings';
 import {
   BrowserPreviewFramePump,
   type BrowserPreviewFramePumpMetrics,
@@ -22,6 +23,7 @@ import {
   cdpPortFromEndpoint,
   electronEmbeddedBrowserCdpEndpoint,
   electronEmbeddedBrowserEnabled,
+  clearManagedBrowserProfileCaches,
   normalizePageGroupId,
   numericLimitFromEnv,
   positiveIntegerEnv,
@@ -1086,10 +1088,11 @@ export type BrowserScreencastFrame = {
   contentType: 'image/jpeg' | 'image/png';
   capturedAt: string;
   url: string;
-  tabs: BrowserTabSnapshot[];
   viewport: { width: number; height: number };
   metadata?: unknown;
 };
+
+type BrowserLivePreviewStateListener = (tabs: BrowserTabSnapshot[]) => void;
 
 export type BrowserScreencastHandle = {
   metrics: () => BrowserPreviewFramePumpMetrics;
@@ -1127,6 +1130,31 @@ type SharedBrowserLease = {
 
 const preparedContextInitScripts = new WeakSet<BrowserContext>();
 const sharedPageOwners = new WeakMap<Page, string>();
+const livePreviewVisibilityRuntime = ((globalThis as typeof globalThis & {
+  __webPilotLivePreviewVisibilityRuntime?: {
+    bindingPages: WeakSet<Page>;
+    owners: WeakMap<Page, (visible: boolean) => void>;
+  };
+}).__webPilotLivePreviewVisibilityRuntime ??= {
+  bindingPages: new WeakSet<Page>(),
+  owners: new WeakMap<Page, (visible: boolean) => void>(),
+});
+const livePreviewVisibilityBindingPages = livePreviewVisibilityRuntime.bindingPages;
+const livePreviewVisibilityOwners = livePreviewVisibilityRuntime.owners;
+
+function installLivePreviewVisibilityReporter() {
+  const win = window as Window & {
+    __webPilotLivePreviewVisibilityInstalled?: boolean;
+    __webPilotReportPageVisibility?: (visible: boolean) => Promise<unknown>;
+  };
+  if (win.__webPilotLivePreviewVisibilityInstalled) return;
+  win.__webPilotLivePreviewVisibilityInstalled = true;
+  const report = () => {
+    void Promise.resolve(win.__webPilotReportPageVisibility?.(document.visibilityState === 'visible')).catch(() => undefined);
+  };
+  document.addEventListener('visibilitychange', report, { passive: true });
+  report();
+}
 type SharedBrowserState = {
   key?: string;
   browser?: Browser;
@@ -1142,6 +1170,8 @@ type SharedBrowserState = {
     context: BrowserContext;
     ownership: SharedBrowserOwnership;
   }>;
+  idleTimer?: ReturnType<typeof setTimeout>;
+  managedProfileDir?: string;
 };
 const sharedBrowserStates = new Map<string, SharedBrowserState>();
 
@@ -4693,22 +4723,46 @@ function isPersistentProfileAlreadyOpenError(error: unknown) {
 }
 
 async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: SharedBrowserState, force = false) {
-  if (sharedBrowserState.refCount > 0) return;
-  const shouldClose = force || process.env.BROWSER_CLOSE_SHARED_WHEN_IDLE === 'true';
-  if (!shouldClose) return;
+  if (sharedBrowserState.refCount > 0) {
+    if (sharedBrowserState.idleTimer) clearTimeout(sharedBrowserState.idleTimer);
+    sharedBrowserState.idleTimer = undefined;
+    return;
+  }
+  const closeImmediately = force || process.env.BROWSER_CLOSE_SHARED_WHEN_IDLE === 'true';
+  if (!closeImmediately) {
+    if (!sharedBrowserState.idleTimer) {
+      const configured = Number(process.env.BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS || 10 * 60 * 1000);
+      const timeoutMs = Number.isFinite(configured)
+        ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
+        : 10 * 60 * 1000;
+      sharedBrowserState.idleTimer = setTimeout(() => {
+        sharedBrowserState.idleTimer = undefined;
+        void closeIdleSharedBrowser(runtimeKey, sharedBrowserState, true);
+      }, timeoutMs);
+      sharedBrowserState.idleTimer.unref?.();
+    }
+    return;
+  }
+
+  if (sharedBrowserState.idleTimer) clearTimeout(sharedBrowserState.idleTimer);
+  sharedBrowserState.idleTimer = undefined;
 
   const { browser, browserServer, context, ownership } = sharedBrowserState;
+  const managedProfileDir = sharedBrowserState.managedProfileDir;
+  let managedProfileBrowserClosed = false;
   if (ownership === 'persistent') {
     await context?.close().catch(() => undefined);
+    managedProfileBrowserClosed = true;
   } else if (ownership === 'launched') {
     await browser?.close().catch(() => undefined);
+    managedProfileBrowserClosed = true;
   } else if (ownership === 'connected' && (force || process.env.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true')) {
     if (force && browser) {
       const client = await browser.newBrowserCDPSession().catch(() => undefined);
       if (client) {
-        await Promise.race([
-          client.send('Browser.close').catch(() => undefined),
-          sleep(1000),
+        managedProfileBrowserClosed = await Promise.race([
+          client.send('Browser.close').then(() => true).catch(() => false),
+          sleep(1000).then(() => false),
         ]);
         await Promise.race([
           client.detach().catch(() => undefined),
@@ -4726,6 +4780,8 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
   sharedBrowserState.ownership = undefined;
   sharedBrowserState.initPromise = undefined;
   sharedBrowserState.key = undefined;
+  sharedBrowserState.managedProfileDir = undefined;
+  if (managedProfileDir && managedProfileBrowserClosed) await clearManagedBrowserProfileCaches(managedProfileDir);
 }
 
 async function acquireSharedBrowser(input: {
@@ -4736,9 +4792,12 @@ async function acquireSharedBrowser(input: {
   userDataDir: string;
   launchOptions: LaunchOptions;
   contextOptions: BrowserContextOptions;
+  managedProfileDir?: string;
 }): Promise<SharedBrowserLease> {
   const runtimeKey = input.runtimeKey?.trim() || 'global';
   const sharedBrowserState = sharedBrowserStateFor(runtimeKey);
+  if (sharedBrowserState.idleTimer) clearTimeout(sharedBrowserState.idleTimer);
+  sharedBrowserState.idleTimer = undefined;
   const key = input.runtimeKey ? `runtime:${runtimeKey}` : sharedBrowserKey(input);
   if (sharedBrowserState.key && sharedBrowserState.key !== key && sharedBrowserState.refCount > 0) {
     throw new Error('A shared browser is already running with different launch settings. Stop active runs or set BROWSER_SHARED_TABS=false.');
@@ -4750,6 +4809,7 @@ async function acquireSharedBrowser(input: {
   const browserStillConnected = !sharedBrowserState.browser || sharedBrowserState.browser.isConnected();
   if (!sharedBrowserState.initPromise || sharedBrowserState.key !== key || !browserStillConnected || !sharedBrowserState.context) {
     sharedBrowserState.key = key;
+    sharedBrowserState.managedProfileDir = input.managedProfileDir;
     sharedBrowserState.initPromise = (async () => {
       if (input.cdpEndpoint) {
         const browser = await input.chromium.connectOverCDP(input.cdpEndpoint);
@@ -4866,6 +4926,9 @@ export class BrowserSession {
   private ownedPages = new Set<Page>();
   private browserOwnership: BrowserOwnership = 'launched';
   private releaseSharedBrowser?: (force?: boolean) => Promise<void>;
+  private managedProfileDir?: string;
+  private livePreviewStateListeners = new Set<BrowserLivePreviewStateListener>();
+  private livePreviewTabsNotifyScheduled = false;
   private pageDiscoveryListener?: (page: Page) => void;
   private pageGroupInitScriptPages = new WeakSet<Page>();
   private navigationSequenceByPage = new WeakMap<Page, number>();
@@ -4996,6 +5059,7 @@ export class BrowserSession {
       : undefined;
     const autoTabGroupCdpEndpoint = cdpEndpointForPort(autoTabGroupDebugPort);
     const userDataDir = requestedUserDataDir || autoTabGroupProfileDir;
+    this.managedProfileDir = autoTabGroupProfileDir || undefined;
     if (userDataDir) await mkdir(userDataDir, { recursive: true });
     const launchOptions: LaunchOptions = {
       headless,
@@ -5033,6 +5097,7 @@ export class BrowserSession {
         userDataDir,
         launchOptions,
         contextOptions,
+        managedProfileDir: this.managedProfileDir,
       });
       this.browserOwnership = 'shared';
       this.browser = lease.browser;
@@ -5399,8 +5464,22 @@ export class BrowserSession {
         selectionSequence === this.livePreviewExplicitPageSelectionSequence
         && !page.isClosed()
         && this.ownedPages.has(page)
-      ) this.page = page;
+      ) {
+        this.page = page;
+        this.notifyLivePreviewTabsChanged();
+      }
     }
+  }
+
+  private notifyLivePreviewTabsChanged() {
+    if (!this.livePreviewStateListeners.size || this.livePreviewTabsNotifyScheduled) return;
+    this.livePreviewTabsNotifyScheduled = true;
+    queueMicrotask(() => {
+      this.livePreviewTabsNotifyScheduled = false;
+      if (!this.livePreviewStateListeners.size) return;
+      const tabs = this.getTabsSnapshot();
+      for (const listener of this.livePreviewStateListeners) listener(tabs);
+    });
   }
 
   async startTrace(runId: string) {
@@ -5433,19 +5512,41 @@ export class BrowserSession {
     }
     const alreadyOwned = this.ownedPages.has(page);
     this.ownedPages.add(page);
+    livePreviewVisibilityOwners.set(page, (visible) => this.handleLivePreviewVisibility(page, visible));
+    if (!livePreviewVisibilityBindingPages.has(page)) {
+      livePreviewVisibilityBindingPages.add(page);
+      void page.exposeBinding('__webPilotReportPageVisibility', (source, visible) => {
+        if (source.page) livePreviewVisibilityOwners.get(source.page)?.(Boolean(visible));
+      }).then(async () => {
+        await page.addInitScript(installLivePreviewVisibilityReporter);
+        await page.evaluate(installLivePreviewVisibilityReporter).catch(() => undefined);
+      }).catch(() => undefined);
+    }
     this.attachPageListeners(page);
     if (!alreadyOwned) {
       void this.markPageGroup(page);
+      this.notifyLivePreviewTabsChanged();
       page.once('close', () => {
         this.ownedPages.delete(page);
+        livePreviewVisibilityOwners.delete(page);
         if (sharedPageOwners.get(page) === this.pageGroupId) sharedPageOwners.delete(page);
         if (this.page === page) {
           this.page = this.sessionPages()[0];
         }
+        this.notifyLivePreviewTabsChanged();
       });
     }
     if (options.makeActive !== false) this.page = page;
     return true;
+  }
+
+  private handleLivePreviewVisibility(page: Page, visible: boolean) {
+    if (!visible || page.isClosed() || !this.ownedPages.has(page)) return;
+    if (Date.now() - this.livePreviewExplicitPageSelectionAt < 1_000) return;
+    if (this.page !== page) {
+      this.page = page;
+      this.notifyLivePreviewTabsChanged();
+    }
   }
 
   private sessionPages() {
@@ -5719,7 +5820,10 @@ export class BrowserSession {
     // multiple pages as visible, so always taking the first visible page can
     // undo a live-preview tab switch and reattach the old screencast forever.
     const explicitSelectionSettling = now - this.livePreviewExplicitPageSelectionAt < 1_000;
-    if (!explicitSelectionSettling && !currentPageVisible && visiblePage && visiblePage !== this.page) this.page = visiblePage;
+    if (!explicitSelectionSettling && !currentPageVisible && visiblePage && visiblePage !== this.page) {
+      this.page = visiblePage;
+      this.notifyLivePreviewTabsChanged();
+    }
     return pages;
   }
 
@@ -5742,6 +5846,7 @@ export class BrowserSession {
     this.page = page;
     this.livePreviewExplicitPageSelectionAt = Date.now();
     this.livePreviewExplicitPageSelectionSequence += 1;
+    this.notifyLivePreviewTabsChanged();
   }
 
   private async applyConfiguredViewport(page: Page) {
@@ -5795,10 +5900,14 @@ export class BrowserSession {
     onActivePageChanged?: () => void;
     onError?: (error: unknown) => void;
     onFrame: (frame: BrowserScreencastFrame) => void | Promise<void>;
+    onTabsChanged?: (tabs: BrowserTabSnapshot[]) => void;
+    video?: boolean;
   }): Promise<BrowserScreencastHandle> {
     this.ensureLivePreviewState();
     await this.refreshSessionGroupPages({ forceNativeRefresh: true });
-    const format = resolveBrowserPreviewImageFormat(process.env.BROWSER_SCREENCAST_FORMAT);
+    const format = options.video
+      ? resolveBrowserPreviewImageFormat(process.env.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT || 'png')
+      : resolveBrowserPreviewImageFormat(process.env.BROWSER_SCREENCAST_FORMAT);
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
     const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 90);
     const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 90)));
@@ -5809,6 +5918,7 @@ export class BrowserSession {
     let client: import('playwright').CDPSession | undefined;
     let pageBindingPromise: Promise<{ client: import('playwright').CDPSession; page: Page }> | undefined;
     let viewport = { width: 1280, height: 720 };
+    let viewportOrigin = { x: 0, y: 0 };
     const capturePromises = new Set<Promise<void>>();
     let captureTimer: ReturnType<typeof setTimeout> | undefined;
     let captureSequence = 0;
@@ -5834,6 +5944,11 @@ export class BrowserSession {
       onError: options.onError,
       onFrame: options.onFrame,
     });
+    const tabsListener = options.onTabsChanged;
+    if (tabsListener) {
+      this.livePreviewStateListeners.add(tabsListener);
+      tabsListener(this.getTabsSnapshot());
+    }
 
     const pushOutputFrame = (
       capturedPage: Page,
@@ -5852,7 +5967,6 @@ export class BrowserSession {
           deviceHeight: outputViewport.height,
           deviceWidth: outputViewport.width,
         } : undefined,
-        tabs: this.getTabsSnapshot(),
         url: capturedPage.url(),
         viewport: outputViewport,
       });
@@ -5860,7 +5974,10 @@ export class BrowserSession {
     const refreshActivePageInBackground = () => {
       const currentTime = Date.now();
       if (pageRefreshPromise || currentTime < nextPageRefreshAt) return;
-      nextPageRefreshAt = currentTime + 250;
+      // Page visibility changes are delivered by the page binding installed
+      // in claimPage(). Keep only a low-frequency reconciliation fallback for
+      // browser/extension implementations that suppress visibility events.
+      nextPageRefreshAt = currentTime + 2_000;
       pageRefreshPromise = this.refreshSessionGroupPages()
         .then(() => undefined)
         .catch((error) => {
@@ -5923,10 +6040,29 @@ export class BrowserSession {
           width: Math.max(1, Math.round(visualViewport.clientWidth)),
           height: Math.max(1, Math.round(visualViewport.clientHeight)),
         };
+        viewportOrigin = {
+          x: visualViewport.pageX,
+          y: visualViewport.pageY,
+        };
       }
-      const outputViewport = { ...viewport };
+      const captureGeometry = options.video
+        ? browserPreviewVideoCaptureGeometry(viewport)
+        : { ...viewport, scale: 1 };
+      const outputViewport = {
+        width: captureGeometry.width,
+        height: captureGeometry.height,
+      };
       const result = await captureClient.send('Page.captureScreenshot', {
         captureBeyondViewport: false,
+        ...(options.video ? {
+          clip: {
+            x: viewportOrigin.x,
+            y: viewportOrigin.y,
+            width: viewport.width,
+            height: viewport.height,
+            scale: captureGeometry.scale,
+          },
+        } : {}),
         format,
         fromSurface: true,
         optimizeForSpeed: true,
@@ -5968,6 +6104,7 @@ export class BrowserSession {
       if (captureTimer) clearTimeout(captureTimer);
       captureTimer = undefined;
       stopPromise = (async () => {
+        if (tabsListener) this.livePreviewStateListeners.delete(tabsListener);
         await Promise.allSettled([...capturePromises]);
         await pageRefreshPromise?.catch(() => undefined);
         await framePump.stop();
@@ -5984,6 +6121,7 @@ export class BrowserSession {
       nextCaptureAt = Date.now() + currentFrameIntervalMs();
       scheduleCapture();
     } catch (error) {
+      if (tabsListener) this.livePreviewStateListeners.delete(tabsListener);
       await stopScreencast(false);
       throw error;
     }
@@ -6168,6 +6306,7 @@ export class BrowserSession {
       if (frame !== page.mainFrame()) return;
       this.domChangeErrorFingerprintsByPage.set(page, new Set());
       this.navigationSequenceByPage.set(page, (this.navigationSequenceByPage.get(page) || 0) + 1);
+      this.notifyLivePreviewTabsChanged();
     });
     page.on('domcontentloaded', () => {
       const frame = page.mainFrame();
@@ -6269,6 +6408,7 @@ export class BrowserSession {
       const replacement = this.sessionPages()[0];
       if (!replacement) throw new Error('Active browser page has been closed and no replacement page is available.');
       this.page = replacement;
+      this.notifyLivePreviewTabsChanged();
       this.attachPageListeners(replacement);
     }
     return this.page;
@@ -7270,7 +7410,10 @@ export class BrowserSession {
       }
     }
     const finalPage = selectedPage || (!page.isClosed() ? page : this.sessionPages().find((candidate) => !candidate.isClosed())) || page;
-    if (!finalPage.isClosed()) this.page = finalPage;
+    if (!finalPage.isClosed() && this.page !== finalPage) {
+      this.page = finalPage;
+      this.notifyLivePreviewTabsChanged();
+    }
     const finalUrl = finalPage.isClosed() ? '' : finalPage.url();
     const finalTitle = finalPage.isClosed() ? '' : await finalPage.title().catch(() => '');
     const inferredActivity: BrowserCodeActivity = {
@@ -7349,10 +7492,11 @@ export class BrowserSession {
   }
 
   // 关闭浏览器；调试场景可选择保留窗口。
-  async close(options: { keepOpen?: boolean; force?: boolean } = {}) {
+  async close(options: { closePages?: boolean; force?: boolean; keepOpen?: boolean; preservePages?: boolean } = {}) {
     const shouldKeepOpen = !options.force && (
       options.keepOpen === true
     );
+    let disposeLocalState = false;
     await this.browserCodeKernel?.close();
     this.browserCodeKernel = undefined;
     this.browserCodeKernelRevision = undefined;
@@ -7362,11 +7506,12 @@ export class BrowserSession {
         this.pageDiscoveryListener = undefined;
       }
       if (this.browserOwnership === 'shared') {
-        if (this.browserSurface !== 'electron-embedded' && !shouldKeepOpen) {
+        if (this.browserSurface !== 'electron-embedded' && !shouldKeepOpen && !options.preservePages) {
           await this.closeOwnedPages();
         }
         await this.releaseSharedBrowser?.(options.force);
         this.releaseSharedBrowser = undefined;
+        disposeLocalState = true;
         return;
       }
       if (shouldKeepOpen) return;
@@ -7376,12 +7521,14 @@ export class BrowserSession {
           await this.closeOwnedPages();
           return;
         }
+        if (options.closePages) await this.closeOwnedPages();
+        let managedProfileBrowserClosed = false;
         if (options.force && this.browser) {
           const client = await this.browser.newBrowserCDPSession().catch(() => undefined);
           if (client) {
-            await Promise.race([
-              client.send('Browser.close').catch(() => undefined),
-              sleep(1000),
+            managedProfileBrowserClosed = await Promise.race([
+              client.send('Browser.close').then(() => true).catch(() => false),
+              sleep(1000).then(() => false),
             ]);
             await Promise.race([
               client.detach().catch(() => undefined),
@@ -7390,16 +7537,18 @@ export class BrowserSession {
           }
         }
         await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
+        if (managedProfileBrowserClosed && this.managedProfileDir) await clearManagedBrowserProfileCaches(this.managedProfileDir);
         return;
       }
       if (this.browserOwnership === 'persistent') {
         await this.context?.close().catch(() => undefined);
+        if (this.managedProfileDir) await clearManagedBrowserProfileCaches(this.managedProfileDir);
         return;
       }
       await this.browser?.close().catch(() => undefined);
       await this.browserServer?.close().catch(() => undefined);
     } finally {
-      if (!shouldKeepOpen) {
+      if (!shouldKeepOpen || disposeLocalState) {
         browserSessionProcessState.sessions.delete(this);
         this.page = undefined;
         this.context = undefined;
@@ -7408,6 +7557,7 @@ export class BrowserSession {
         this.browserCodeConnection = undefined;
         this.browserCodeKernel = undefined;
         this.browserCodeKernelRevision = undefined;
+        this.managedProfileDir = undefined;
         this.ownedPages.clear();
       }
     }
@@ -7520,6 +7670,7 @@ export class BrowserSession {
         const replacement = this.sessionPages()[0];
         if (!replacement) throw error;
         this.page = replacement;
+        this.notifyLivePreviewTabsChanged();
         this.attachPageListeners(replacement);
       }
     }
@@ -8005,7 +8156,10 @@ export class BrowserSession {
       selectionSequence === this.livePreviewExplicitPageSelectionSequence
       && !newPage.isClosed()
       && this.ownedPages.has(newPage)
-    ) this.page = newPage;
+    ) {
+      this.page = newPage;
+      this.notifyLivePreviewTabsChanged();
+    }
     return newPage;
   }
 

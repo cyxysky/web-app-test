@@ -19,6 +19,36 @@ test('browser preview FPS setting is a bounded integer input', () => {
   assert.equal(normalizeRuntimeEnvValue(definition, ''), '20');
 });
 
+test('browser preview exposes H.264 video transport with 2K and 4K encoder settings', () => {
+  const transport = runtimeEnvDefinition('BROWSER_PREVIEW_TRANSPORT');
+  assert.equal(transport?.control, 'select');
+  assert.equal(transport?.defaultValue, 'video');
+  assert.deepEqual(transport?.options?.map((option) => option.value), ['video', 'image']);
+
+  const bitrate = runtimeEnvDefinition('BROWSER_PREVIEW_VIDEO_BITRATE_KBPS');
+  assert.equal(bitrate?.defaultValue, '');
+  assert.equal(bitrate?.min, 500);
+  assert.equal(bitrate?.max, undefined);
+  assert.equal(normalizeRuntimeEnvValue(bitrate!, '100'), '500');
+  assert.equal(normalizeRuntimeEnvValue(bitrate!, '120000'), '120000');
+
+  const videoSourceFormat = runtimeEnvDefinition('BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT');
+  assert.equal(videoSourceFormat?.defaultValue, 'png');
+  assert.deepEqual(videoSourceFormat?.options?.map((option) => option.value), ['png', 'jpeg']);
+
+  assert.equal(runtimeEnvDefinition('BROWSER_PREVIEW_VIDEO_MAX_WIDTH')?.max, 4096);
+  assert.equal(runtimeEnvDefinition('BROWSER_PREVIEW_VIDEO_MAX_HEIGHT')?.max, 2160);
+  assert.equal(runtimeEnvDefinition('BROWSER_PROFILE_DISK_CACHE_MB'), undefined);
+  assert.equal(runtimeEnvDefinition('BROWSER_PROFILE_MEDIA_CACHE_MB'), undefined);
+
+  const idleTimeout = runtimeEnvDefinition('BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS');
+  assert.equal(idleTimeout?.defaultValue, '600000');
+  assert.equal(idleTimeout?.min, 60000);
+  assert.equal(idleTimeout?.max, 86400000);
+
+  assert.equal(runtimeEnvDefinition('FFMPEG_PATH')?.control, 'text');
+});
+
 test('browser viewport size and output quality are configured independently', () => {
   const maximize = runtimeEnvDefinition('BROWSER_FULLSCREEN');
   assert.equal(maximize?.label, '浏览器启动时最大化');

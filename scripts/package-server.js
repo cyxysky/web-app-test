@@ -24,6 +24,14 @@ function copyInto(source, target) {
   fs.cpSync(source, target, { recursive: true });
 }
 
+function copyFfmpegStatic() {
+  const source = path.join(root, 'node_modules', 'ffmpeg-static');
+  if (!fs.existsSync(source)) {
+    throw new Error('ffmpeg-static was not found. Run npm install before packaging the server.');
+  }
+  copyInto(source, path.join(serverRoot, 'node_modules', 'ffmpeg-static'));
+}
+
 function findBrowserRevisionDir(executablePath) {
   let dir = path.dirname(executablePath);
   while (dir && dir !== path.dirname(dir)) {
@@ -89,6 +97,7 @@ fs.rmSync(outputRoot, { recursive: true, force: true });
 copyDir(path.join(root, '.next', 'standalone'), serverRoot);
 copyInto(path.join(root, '.next', 'static'), path.join(serverRoot, '.next', 'static'));
 copyInto(path.join(root, 'public'), path.join(serverRoot, 'public'));
+copyFfmpegStatic();
 copyPlaywrightChromium();
 
 if (!fs.existsSync(path.join(serverRoot, 'server.js'))) {

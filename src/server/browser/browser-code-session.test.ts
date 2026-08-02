@@ -463,11 +463,17 @@ test('browser viewport size and output pixel ratio are independent', async () =>
   const previousHeight = process.env.BROWSER_VIEWPORT_HEIGHT;
   const previousPixelRatio = process.env.BROWSER_OUTPUT_PIXEL_RATIO;
   const previousFormat = process.env.BROWSER_SCREENCAST_FORMAT;
+  const previousVideoSourceFormat = process.env.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT;
+  const previousVideoMaxWidth = process.env.BROWSER_PREVIEW_VIDEO_MAX_WIDTH;
+  const previousVideoMaxHeight = process.env.BROWSER_PREVIEW_VIDEO_MAX_HEIGHT;
   process.env.BROWSER_VIEWPORT_MODE = 'fixed';
   process.env.BROWSER_VIEWPORT_WIDTH = '800';
   process.env.BROWSER_VIEWPORT_HEIGHT = '600';
   process.env.BROWSER_OUTPUT_PIXEL_RATIO = '2';
   process.env.BROWSER_SCREENCAST_FORMAT = 'png';
+  process.env.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT = 'png';
+  process.env.BROWSER_PREVIEW_VIDEO_MAX_WIDTH = '1600';
+  process.env.BROWSER_PREVIEW_VIDEO_MAX_HEIGHT = '1200';
   const session = new BrowserSession('code', {
     headless: true,
     isolated: true,
@@ -503,6 +509,7 @@ test('browser viewport size and output pixel ratio are independent', async () =>
     const frames: Array<{ contentType: string; data: string; viewport: { width: number; height: number } }> = [];
     const handle = await session.startScreencast({
       onFrame: (frame) => { frames.push(frame); },
+      video: true,
     });
     assert.ok(frames.length >= 1, 'screencast should emit an initial frame');
     assert.equal(frames[0].contentType, 'image/png');
@@ -542,6 +549,12 @@ test('browser viewport size and output pixel ratio are independent', async () =>
     else process.env.BROWSER_OUTPUT_PIXEL_RATIO = previousPixelRatio;
     if (previousFormat === undefined) delete process.env.BROWSER_SCREENCAST_FORMAT;
     else process.env.BROWSER_SCREENCAST_FORMAT = previousFormat;
+    if (previousVideoSourceFormat === undefined) delete process.env.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT;
+    else process.env.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT = previousVideoSourceFormat;
+    if (previousVideoMaxWidth === undefined) delete process.env.BROWSER_PREVIEW_VIDEO_MAX_WIDTH;
+    else process.env.BROWSER_PREVIEW_VIDEO_MAX_WIDTH = previousVideoMaxWidth;
+    if (previousVideoMaxHeight === undefined) delete process.env.BROWSER_PREVIEW_VIDEO_MAX_HEIGHT;
+    else process.env.BROWSER_PREVIEW_VIDEO_MAX_HEIGHT = previousVideoMaxHeight;
   }
 });
 
