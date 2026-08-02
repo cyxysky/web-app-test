@@ -10,7 +10,6 @@ import { createDeepSeek } from '@ai-sdk/deepseek';
 import { createFireworks } from '@ai-sdk/fireworks';
 import { createGateway } from '@ai-sdk/gateway';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import { createVertex } from '@ai-sdk/google-vertex';
 import { createGroq } from '@ai-sdk/groq';
 import { createHuggingFace } from '@ai-sdk/huggingface';
 import { createMistral } from '@ai-sdk/mistral';
@@ -23,7 +22,6 @@ import { createXai } from '@ai-sdk/xai';
 import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import type { generateText } from 'ai';
 import { createCodexAppServer, createCodexCli, type ReasoningEffort } from 'ai-sdk-provider-codex-cli';
-
 
 type GenerateTextModel = Parameters<typeof generateText>[0]['model'];
 type AiProvider =
@@ -39,7 +37,6 @@ type AiProvider =
   | 'deepseek'
   | 'fireworks'
   | 'google'
-  | 'google-vertex'
   | 'groq'
   | 'huggingface'
   | 'llama-cpp'
@@ -106,10 +103,6 @@ export function getModel(): GenerateTextModel {
   })(model) as unknown as GenerateTextModel;
   if (provider === 'google') return createGoogleGenerativeAI({
     apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GOOGLE_API_KEY || '',
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'google-vertex') return createVertex({
-    apiKey: process.env.GOOGLE_VERTEX_API_KEY || undefined,
-    baseURL: process.env.GOOGLE_VERTEX_BASE_URL || undefined,
   })(model) as unknown as GenerateTextModel;
   if (provider === 'groq') return createGroq({
     apiKey: process.env.GROQ_API_KEY || '',
@@ -183,7 +176,6 @@ export function getModelSettings() {
     deepseek: 'deepseek-v4-flash',
     fireworks: 'accounts/fireworks/models/llama-v3p1-70b-instruct',
     google: 'gemini-3-flash-preview',
-    'google-vertex': 'gemini-2.5-flash',
     groq: 'llama-3.3-70b-versatile',
     huggingface: 'meta-llama/Llama-3.1-8B-Instruct',
     'llama-cpp': 'local-model',
@@ -254,7 +246,6 @@ function normalizeProvider(value: string | undefined): AiProvider {
   if (provider === 'deepseek') return 'deepseek';
   if (provider === 'fireworks' || provider === 'fireworks-ai') return 'fireworks';
   if (provider === 'gemini' || provider === 'gemini-cli' || provider === 'google') return 'google';
-  if (provider === 'google-vertex' || provider === 'vertex' || provider === 'vertex-ai') return 'google-vertex';
   if (provider === 'groq') return 'groq';
   if (provider === 'huggingface' || provider === 'hugging-face') return 'huggingface';
   if (provider === 'llama-cpp' || provider === 'llamacpp' || provider === 'llama.cpp') return 'llama-cpp';

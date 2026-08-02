@@ -2,19 +2,24 @@
   align-items: flex-start;
   background: transparent;
   display: flex;
-  height: 100vh;
+  height: 100dvh;
   justify-content: flex-end;
   overflow: hidden;
-  padding: 12px;
+  padding:
+    max(12px, env(safe-area-inset-top))
+    max(12px, env(safe-area-inset-right))
+    max(12px, env(safe-area-inset-bottom))
+    max(12px, env(safe-area-inset-left));
   width: 100%;
 }
 
 .card {
-  background: color-mix(in srgb, var(--panel) 97%, #f4f7fb);
-  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel-elevated) 97%, var(--panel-soft));
+  border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+  border-radius: var(--modal-radius);
   box-shadow:
-    0 24px 64px rgba(15, 23, 42, 0.3),
-    inset 0 0 0 1px color-mix(in srgb, var(--border) 86%, transparent);
+    var(--shadow-lg),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 32%, transparent);
   color: var(--foreground);
   display: flex;
   flex-direction: column;
@@ -34,7 +39,7 @@
 .header>strong {
   flex: 1 1 auto;
   font-size: 18px;
-  font-weight: 740;
+  font-weight: 600;
   letter-spacing: -0.02em;
 }
 
@@ -64,10 +69,14 @@
 
 .headerActions button:hover,
 .searchBar button:hover,
-.removeItem:hover,
-.activeAction {
-  background: color-mix(in srgb, var(--foreground) 8%, transparent) !important;
+.removeItem:hover {
+  background: transparent !important;
   color: var(--foreground) !important;
+}
+
+.activeAction {
+  background: transparent !important;
+  color: var(--accent-strong) !important;
 }
 
 .headerActions button:active,
@@ -174,7 +183,7 @@
 .sectionHeading strong {
   color: var(--foreground);
   font-size: 13px;
-  font-weight: 670;
+  font-weight: 600;
 }
 
 .sectionHeading>span {
@@ -203,7 +212,7 @@
   align-items: center;
   background: transparent;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--radius-sm);
   color: var(--foreground);
   cursor: pointer;
   display: grid;
@@ -254,7 +263,7 @@
 
 .itemCopy strong {
   font-size: 13px;
-  font-weight: 580;
+  font-weight: 500;
 }
 
 .itemCopy>span {
@@ -308,7 +317,7 @@
 .empty strong {
   color: var(--foreground);
   font-size: 15px;
-  font-weight: 680;
+  font-weight: 600;
 }
 
 .empty p {
@@ -346,10 +355,56 @@
 }
 
 :global(:root[data-theme='dark']) .card {
-  background: var(--panel);
+  background: var(--panel-elevated);
   box-shadow:
     0 26px 70px rgba(0, 0, 0, 0.48),
     inset 0 0 0 1px rgba(255, 255, 255, 0.11);
+}
+
+@media (hover: none), (pointer: coarse) {
+  .headerActions button,
+  .searchBar button,
+  .removeItem,
+  .sectionHeading {
+    min-height: 44px;
+  }
+
+  .headerActions button,
+  .removeItem {
+    width: 44px;
+  }
+
+  .removeItem {
+    opacity: 1;
+  }
+
+  .openItem {
+    min-height: 52px;
+  }
+}
+
+@media (max-width: 620px) {
+  .overlay {
+    padding: 0;
+  }
+
+  .card {
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 0;
+    border-right: 0;
+    height: 100dvh;
+    width: 100%;
+  }
+
+  .header {
+    min-height: calc(58px + env(safe-area-inset-top));
+    padding: env(safe-area-inset-top) 8px 0 16px;
+  }
+
+  .content {
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
 }
 
 :global(:root[data-theme='dark']) .itemIcon {

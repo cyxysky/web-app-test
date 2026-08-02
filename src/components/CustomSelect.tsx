@@ -53,6 +53,7 @@ export function CustomSelect({
   id,
   onChange,
   options,
+  searchable = false,
   searchPlaceholder,
   title,
   value,
@@ -78,7 +79,7 @@ export function CustomSelect({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const closeTimerRef = useRef<number | undefined>(undefined);
-  const searchEnabled = true;
+  const searchEnabled = searchable;
   const normalizedQuery = searchQuery.trim().toLocaleLowerCase();
   const filteredOptions = useMemo(() => options
     .map((option, index) => ({ option, index }))

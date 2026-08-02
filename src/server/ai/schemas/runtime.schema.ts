@@ -202,7 +202,6 @@ export type ModelProvider =
   | 'deepseek'
   | 'fireworks'
   | 'google'
-  | 'google-vertex'
   | 'groq'
   | 'huggingface'
   | 'lmstudio'

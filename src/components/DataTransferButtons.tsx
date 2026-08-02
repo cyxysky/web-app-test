@@ -174,11 +174,11 @@ export function DataTransferButtons({
   return (
     <>
       <div className="data-transfer-buttons">
-        <button className="ui-button ui-icon-button" disabled={disabled || busy} onClick={beginExport} type="button">
+        <button className="ui-button ui-button--neutral" disabled={disabled || busy} onClick={beginExport} type="button">
           {busyOperation === 'export' ? <Loader2 className="spin" size={15} /> : <Download size={15} />}
           {t('导出')}
         </button>
-        <button className="ui-button ui-icon-button" disabled={disabled || busy} onClick={beginImport} type="button">
+        <button className="ui-button ui-button--neutral" disabled={disabled || busy} onClick={beginImport} type="button">
           {busyOperation === 'import' ? <Loader2 className="spin" size={15} /> : <Upload size={15} />}
           {t('导入')}
         </button>

@@ -49,7 +49,7 @@ function stringifyPayloadForDisplay(value: unknown) {
 }
 
 export function formatToolPayload(value: unknown) {
-  if (value === undefined || value === null || value === '') return 'None';
+  if (value === undefined || value === null || value === '') return '';
   if (typeof value === 'string') return stripAnsiControlCodes(value);
   try {
     return stripAnsiControlCodes(stringifyPayloadForDisplay(value));
@@ -65,10 +65,10 @@ export function formatLogTime(value: string) {
 }
 
 export function phaseLabel(phase: string) {
-  if (phase.startsWith('browser:')) return 'Browser';
+  if (phase.startsWith('browser:')) return '浏览器';
   if (phase.startsWith('ai:')) return 'AI';
-  if (phase.startsWith('chat:')) return 'Chat';
-  if (phase.startsWith('target:')) return 'Target';
-  if (phase.startsWith('perf:')) return 'Perf';
+  if (phase.startsWith('chat:')) return '对话';
+  if (phase.startsWith('target:')) return '目标';
+  if (phase.startsWith('perf:')) return '性能';
   return phase;
 }

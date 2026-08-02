@@ -32,7 +32,6 @@
     "@ai-sdk/fireworks": "^2.0.56",
     "@ai-sdk/gateway": "^3.0.131",
     "@ai-sdk/google": "^3.0.80",
-    "@ai-sdk/google-vertex": "^4.0.145",
     "@ai-sdk/groq": "^3.0.41",
     "@ai-sdk/huggingface": "^1.0.52",
     "@ai-sdk/mistral": "^3.0.39",

@@ -1,6 +1,6 @@
 'use client';
 
-import { animate, createScope, stagger } from 'animejs';
+import { animate, createScope } from 'animejs';
 import { usePathname } from 'next/navigation';
 import { useEffect, useRef } from 'react';
 
@@ -13,38 +13,14 @@ const PAGE_SELECTOR = [
   '.settings-layout',
 ].join(',');
 
-const NAV_SELECTOR = [
-  '.browser-chat-sidebar',
-  '.browser-chat-sub-sidebar',
-  '.browser-chat-recent-header',
-  '.group-sidebar-head',
-].join(',');
-
 const PANEL_SELECTOR = [
   '.browser-chat-settings-pane .settings-content > section',
   '.browser-chat-cases-pane .dashboard-folder-layout',
   '.browser-chat-chat-pane',
   '.browser-chat-target-model-bar',
   '.browser-chat-composer-shell',
-  '.settings-card',
-  '.skills-manager-list',
   '.case-main-panel',
   '.run-execution-panel',
-].join(',');
-
-const LIST_SELECTOR = [
-  '.dashboard-v2-metrics > div',
-  '.browser-chat-recent-item',
-  '.browser-chat-subnav button',
-  '.browser-chat-embedded-tab',
-  '.browser-chat-step',
-  '.browser-chat-message > div:last-child',
-  '.settings-row',
-  '.settings-model-list-row',
-  '.personal-memory-item',
-  '.skills-manager-item',
-  '.skills-manager-section',
-  '.tool-call-list li',
 ].join(',');
 
 function matchingElements(root: ParentNode, selector: string) {
@@ -79,7 +55,7 @@ export function InterfaceMotion() {
     }).add((self) => {
       if (self?.matches.reduceMotion) return undefined;
 
-      const run = (elements: HTMLElement[], type: 'list' | 'nav' | 'page' | 'panel') => {
+      const run = (elements: HTMLElement[], type: 'page' | 'panel') => {
         const fresh = elements.filter((element) => {
           // The workspace sidebar persists while its URL-controlled content view changes.
           // Replaying entrance motion here makes the stable navigation look like it reloaded.
@@ -88,17 +64,16 @@ export function InterfaceMotion() {
           animated.add(element);
           return element.getClientRects().length > 0;
         });
-        const targets = fresh.slice(0, 36);
+        const targets = fresh.slice(0, 6);
         if (!targets.length) return;
 
         targets.forEach((element) => element.style.setProperty('will-change', 'transform, opacity'));
-        const distance = type === 'page' ? 10 : type === 'panel' ? 8 : 5;
+        const distance = type === 'page' ? 8 : 5;
         animate(targets, {
           opacity: [0, 1],
-          ...(type === 'nav' ? { x: [-7, 0] } : { y: [distance, 0] }),
-          scale: type === 'list' ? [0.995, 1] : [0.998, 1],
-          delay: type === 'list' ? stagger(16) : stagger(24),
-          duration: type === 'page' ? 380 : type === 'panel' ? 320 : 270,
+          y: [distance, 0],
+          scale: [0.998, 1],
+          duration: type === 'page' ? 260 : 220,
           ease: 'out(5)',
           onComplete: () => clearMotionStyles(targets),
         });
@@ -106,36 +81,13 @@ export function InterfaceMotion() {
 
       const animateWithin = (root: ParentNode) => {
         run(matchingElements(root, PAGE_SELECTOR), 'page');
-        run(matchingElements(root, NAV_SELECTOR), 'nav');
         run(matchingElements(root, PANEL_SELECTOR), 'panel');
-        run(matchingElements(root, LIST_SELECTOR), 'list');
       };
 
-      // The initial DOM is server-rendered and may still contain client-component
-      // hydration boundaries when this parent effect runs. Mutating it here causes
-      // React hydration mismatches, so reserve full-page entrance motion for real
-      // client-side navigations. Newly inserted client-side nodes still animate via
-      // the observer below.
+      // Keep motion at the page/panel level. Animating every inserted row makes
+      // dense workspaces feel busy and keeps a costly global observer alive.
       if (isNavigation) animateWithin(document.body);
-      const pendingRoots = new Set<HTMLElement>();
-      let animationFrame = 0;
-      const observer = new MutationObserver((records) => {
-        records.flatMap((record) => Array.from(record.addedNodes))
-          .filter((node): node is HTMLElement => node instanceof HTMLElement)
-          .forEach((element) => pendingRoots.add(element));
-        if (!pendingRoots.size || animationFrame) return;
-        animationFrame = requestAnimationFrame(() => {
-          animationFrame = 0;
-          const roots = [...pendingRoots];
-          pendingRoots.clear();
-          roots.filter((element) => element.isConnected).forEach(animateWithin);
-        });
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
-      return () => {
-        observer.disconnect();
-        if (animationFrame) cancelAnimationFrame(animationFrame);
-      };
+      return undefined;
     });
 
     return () => scope.revert();

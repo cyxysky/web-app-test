@@ -2,6 +2,7 @@
 
 import { ChevronDown, Globe2, History, Search, Star, Trash2, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useI18n } from '@/i18n/I18nProvider';
 import styles from './EmbeddedBrowserLibraryOverlay.module.css';
 
 type BookmarkItem = {
@@ -50,9 +51,9 @@ function hostnameForUrl(value: string): string {
   }
 }
 
-function historyTime(value: number): string {
+function historyTime(value: number, locale: string): string {
   if (!Number.isFinite(value) || value <= 0) return '';
-  return new Intl.DateTimeFormat('zh-CN', {
+  return new Intl.DateTimeFormat(locale, {
     hour: '2-digit',
     minute: '2-digit',
     month: 'numeric',
@@ -91,6 +92,7 @@ function LibraryFavicon({ faviconUrl, pageUrl }: { faviconUrl?: string; pageUrl:
 }
 
 export function EmbeddedBrowserLibraryOverlay() {
+  const { language, t } = useI18n();
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [bookmarks, setBookmarks] = useState<BookmarkItem[]>([]);
   const [bookmarksExpanded, setBookmarksExpanded] = useState(true);
@@ -185,23 +187,23 @@ export function EmbeddedBrowserLibraryOverlay() {
     >
       <section className={styles.card} onMouseDown={(event) => event.stopPropagation()}>
         <header className={styles.header}>
-          <strong>收藏与历史记录</strong>
+          <strong>{t('收藏与历史记录')}</strong>
           <div className={styles.headerActions}>
             <button
-              aria-label="搜索"
+              aria-label={t('搜索')}
               className={searchVisible ? styles.activeAction : undefined}
               onClick={() => setSearchVisible((current) => !current)}
-              title="搜索"
+              title={t('搜索')}
               type="button"
             >
               <Search size={18} />
             </button>
             {historyItems.length ? (
-              <button aria-label="清空历史记录" onClick={() => void clearHistory()} title="清空历史记录" type="button">
+              <button aria-label={t('清空历史记录')} onClick={() => void clearHistory()} title={t('清空历史记录')} type="button">
                 <Trash2 size={17} />
               </button>
             ) : null}
-            <button aria-label="关闭" onClick={() => void closePanel()} title="关闭" type="button">
+            <button aria-label={t('关闭')} onClick={() => void closePanel()} title={t('关闭')} type="button">
               <X size={19} />
             </button>
           </div>
@@ -211,14 +213,14 @@ export function EmbeddedBrowserLibraryOverlay() {
           <div className={styles.searchBar}>
             <Search aria-hidden="true" size={16} />
             <input
-              aria-label="搜索收藏与历史记录"
+              aria-label={t('搜索收藏与历史记录')}
               onChange={(event) => setQuery(event.currentTarget.value)}
-              placeholder="搜索收藏与历史记录"
+              placeholder={t('搜索收藏与历史记录')}
               ref={searchInputRef}
               value={query}
             />
             {query ? (
-              <button aria-label="清除搜索" onClick={() => setQuery('')} title="清除" type="button">
+              <button aria-label={t('清除搜索')} onClick={() => setQuery('')} title={t('清除')} type="button">
                 <X size={14} />
               </button>
             ) : null}
@@ -226,7 +228,7 @@ export function EmbeddedBrowserLibraryOverlay() {
         ) : null}
 
         <section className={`${styles.content} ${styles.combinedContent}`}>
-          {error ? <div className={styles.error}>{error}</div> : null}
+          {error ? <div className={styles.error}>{t(error)}</div> : null}
 
           <section className={styles.librarySection}>
             <button
@@ -237,7 +239,7 @@ export function EmbeddedBrowserLibraryOverlay() {
             >
               <ChevronDown className={bookmarksExpanded ? styles.expandedChevron : undefined} size={15} />
               <Star size={16} />
-              <strong>收藏夹</strong>
+              <strong>{t('收藏夹')}</strong>
               <span>{bookmarks.length}</span>
             </button>
 
@@ -254,7 +256,7 @@ export function EmbeddedBrowserLibraryOverlay() {
                         <span>{hostnameForUrl(item.url)}</span>
                       </span>
                     </button>
-                    <button aria-label="移除收藏" className={styles.removeItem} onClick={() => void removeBookmark(item.url)} title="移除收藏" type="button">
+                    <button aria-label={t('移除收藏')} className={styles.removeItem} onClick={() => void removeBookmark(item.url)} title={t('移除收藏')} type="button">
                       <X size={15} />
                     </button>
                   </article>
@@ -263,7 +265,7 @@ export function EmbeddedBrowserLibraryOverlay() {
             ) : bookmarksExpanded ? (
               <div className={styles.sectionEmpty}>
                 <Star size={18} />
-                <span>{query ? '没有匹配的收藏' : '暂无收藏'}</span>
+                <span>{query ? t('没有匹配的收藏') : t('暂无收藏')}</span>
               </div>
             ) : null}
           </section>
@@ -277,14 +279,14 @@ export function EmbeddedBrowserLibraryOverlay() {
             >
               <ChevronDown className={historyExpanded ? styles.expandedChevron : undefined} size={15} />
               <History size={16} />
-              <strong>最近访问</strong>
+              <strong>{t('最近访问')}</strong>
               <span>{historyItems.length}</span>
             </button>
 
             {historyExpanded && filteredHistory.length ? (
               <div className={styles.list}>
                 {filteredHistory.map((item) => {
-                  const visitedAt = historyTime(item.lastVisitedAt);
+                  const visitedAt = historyTime(item.lastVisitedAt, language === 'en' ? 'en-US' : 'zh-CN');
                   return (
                     <article className={styles.item} key={item.id}>
                       <button className={styles.openItem} onClick={() => void openUrl(item.url)} title={item.url} type="button">
@@ -303,7 +305,7 @@ export function EmbeddedBrowserLibraryOverlay() {
             ) : historyExpanded ? (
               <div className={styles.sectionEmpty}>
                 <History size={18} />
-                <span>{query ? '没有匹配的历史记录' : '暂无浏览历史'}</span>
+                <span>{query ? t('没有匹配的历史记录') : t('暂无浏览历史')}</span>
               </div>
             ) : null}
           </section>

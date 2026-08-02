@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 8;
+const currentSchemaVersion = 9;
 const defaultApplicationUserId = '0';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -332,6 +332,88 @@ function applyVersionEightMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionNineMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 9').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS automation_case (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        source_session_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        target_url TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS automation_case_user_updated_at_idx
+        ON automation_case(user_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS automation_case_source_session_idx
+        ON automation_case(source_session_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS automation_schedule (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        case_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        recurrence TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        next_run_at TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (case_id) REFERENCES automation_case(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS automation_schedule_user_updated_at_idx
+        ON automation_schedule(user_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS automation_schedule_case_idx
+        ON automation_schedule(case_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS automation_schedule_due_idx
+        ON automation_schedule(enabled, next_run_at ASC);
+
+      CREATE TABLE IF NOT EXISTS automation_run (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        case_id TEXT NOT NULL,
+        schedule_id TEXT,
+        occurrence_key TEXT,
+        trigger TEXT NOT NULL,
+        status TEXT NOT NULL,
+        lease_expires_at TEXT,
+        record_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (case_id) REFERENCES automation_case(id) ON DELETE CASCADE,
+        FOREIGN KEY (schedule_id) REFERENCES automation_schedule(id) ON DELETE SET NULL
+      );
+      CREATE INDEX IF NOT EXISTS automation_run_user_created_at_idx
+        ON automation_run(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS automation_run_case_created_at_idx
+        ON automation_run(case_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS automation_run_schedule_created_at_idx
+        ON automation_run(schedule_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS automation_run_status_created_at_idx
+        ON automation_run(status, created_at ASC);
+      CREATE INDEX IF NOT EXISTS automation_run_lease_idx
+        ON automation_run(status, lease_expires_at ASC);
+      CREATE UNIQUE INDEX IF NOT EXISTS automation_run_occurrence_idx
+        ON automation_run(schedule_id, occurrence_key)
+        WHERE schedule_id IS NOT NULL AND occurrence_key IS NOT NULL;
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (9, 'automation-cases-runs-and-schedules', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -476,6 +558,7 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionSixMigration(database);
   applyVersionSevenMigration(database);
   applyVersionEightMigration(database);
+  applyVersionNineMigration(database);
 }
 
 export function getSqliteDatabase() {

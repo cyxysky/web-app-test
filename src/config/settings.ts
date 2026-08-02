@@ -71,7 +71,6 @@ export const modelProviderDefinitions: ModelProviderDefinition[] = [
   { value: 'mistral', label: 'Mistral AI', defaultModel: 'mistral-large-latest', keyLabel: 'Mistral 访问密钥', baseUrlLabel: 'Mistral 服务地址' },
   { value: 'alibaba', label: 'Alibaba Cloud', defaultModel: 'qwen-plus', keyLabel: 'Alibaba 访问密钥', baseUrlLabel: 'Alibaba 服务地址' },
   { value: 'ai-gateway', label: 'Vercel AI Gateway', defaultModel: 'openai/gpt-5.5', keyLabel: 'AI Gateway 访问密钥', baseUrlLabel: 'AI Gateway 服务地址' },
-  { value: 'google-vertex', label: 'Google Vertex AI', defaultModel: 'gemini-2.5-flash', keyLabel: 'Google Vertex 访问密钥', baseUrlLabel: 'Google Vertex 服务地址' },
   { value: 'perplexity', label: 'Perplexity', defaultModel: 'sonar', keyLabel: 'Perplexity 访问密钥', baseUrlLabel: 'Perplexity 服务地址' },
   { value: 'cohere', label: 'Cohere', defaultModel: 'command-a-03-2025', keyLabel: 'Cohere 访问密钥', baseUrlLabel: 'Cohere 服务地址' },
   { value: 'togetherai', label: 'Together.ai', defaultModel: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', keyLabel: 'Together.ai 访问密钥', baseUrlLabel: 'Together.ai 服务地址' },

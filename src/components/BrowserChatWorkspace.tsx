@@ -68,6 +68,7 @@ import {
   RefreshCw,
   Route,
   ScanSearch,
+  Search,
   ScrollText,
   SendHorizontal,
   Settings,
@@ -988,13 +989,15 @@ function toolInputValue(record: Record<string, unknown> | undefined, keys: strin
   return '';
 }
 
-function summarizeToolFields(fields: unknown) {
+function summarizeToolFields(fields: unknown, t: (value: string, params?: Record<string, string | number>) => string) {
   if (!Array.isArray(fields) || !fields.length) return '';
   const textValues = fields
     .map((field) => toolInputValue(asRecord(field), ['text', 'value', 'content']))
     .filter(Boolean);
-  if (fields.length === 1) return textValues[0] || '1 项';
-  return `${fields.length} 项${textValues[0] ? `，${textValues[0]}` : ''}`;
+  if (fields.length === 1) return textValues[0] || t('{count} 项', { count: 1 });
+  return textValues[0]
+    ? t('{count} 项，{text}', { count: fields.length, text: textValues[0] })
+    : t('{count} 项', { count: fields.length });
 }
 
 function browserChatToolLabel(name: string, t: (value: string) => string) {
@@ -1022,7 +1025,7 @@ function browserChatToolLabel(name: string, t: (value: string) => string) {
   return name;
 }
 
-function browserChatToolMeta(name: string, input: unknown) {
+function browserChatToolMeta(name: string, input: unknown, t: (value: string, params?: Record<string, string | number>) => string) {
   const record = asRecord(input);
   if (!record) return toolStringValue(input);
 
@@ -1030,9 +1033,9 @@ function browserChatToolMeta(name: string, input: unknown) {
   if (name === 'browserCode') return toolInputValue(record, ['reason']) || 'Playwright';
   if (name === 'readSubagent') return toolInputValue(record, ['uuid']);
   if (name === 'waitForHumanVerification') return toolInputValue(record, ['maxMs']);
-  if (name === 'spawnSubagents') return Array.isArray(record.tasks) ? `${record.tasks.length} 个任务` : '';
+  if (name === 'spawnSubagents') return Array.isArray(record.tasks) ? t('{count} 个任务', { count: record.tasks.length }) : '';
   if (name === 'reportState') return toolInputValue(record, ['action', 'actual', 'status']);
-  if (lower.includes('fill')) return summarizeToolFields(record.fields) || toolInputValue(record, ['text', 'content', 'value']);
+  if (lower.includes('fill')) return summarizeToolFields(record.fields, t) || toolInputValue(record, ['text', 'content', 'value']);
   if (lower.includes('click') || lower.includes('hover') || lower.includes('drag')) {
     return toolInputValue(record, ['text', 'targetVisual', 'targetText', 'id', 'fromId']);
   }
@@ -1901,6 +1904,7 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
   onRemove: (id: string) => void;
   onToggle: () => void;
 }) {
+  const { t } = useI18n();
   const activeCount = downloads.filter((download) => download.status === 'selecting' || download.status === 'pending' || download.status === 'downloading').length;
   const recentDownloads = downloads.slice(0, 12);
   const [downloadDirectory, setDownloadDirectory] = useState('');
@@ -1950,7 +1954,7 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
     const bridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
     if (!bridge?.removeDownload || removingDownloadIds.has(id)) return;
     const download = downloads.find((item) => item.id === id);
-    if (!window.confirm(`确定删除“${download?.fileName || '该文件'}”吗？文件将移入回收站。`)) return;
+    if (!window.confirm(t('确定删除“{name}”吗？文件将移入回收站。', { name: download?.fileName || t('该文件') }))) return;
     setDownloadActionError('');
     setRemovingDownloadIds((current) => new Set(current).add(id));
     try {
@@ -1987,37 +1991,37 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
     <div className="browser-chat-download-center">
       <button
         aria-expanded={open}
-        aria-label="下载"
+        aria-label={t('下载')}
         className={activeCount ? 'ui-icon-button browser-chat-download-button active' : 'ui-icon-button browser-chat-download-button'}
         onClick={onToggle}
-        title="下载"
+        title={t('下载')}
         type="button"
       >
         <Download size={17} />
         {activeCount ? <span className="browser-chat-download-badge">{activeCount}</span> : null}
       </button>
       {open ? (
-        <div className="browser-chat-download-popover" role="dialog" aria-label="下载进度">
+        <div className="browser-chat-download-popover" role="dialog" aria-label={t('下载进度')}>
           <header>
-            <strong>下载</strong>
+            <strong>{t('下载')}</strong>
             <div className="browser-chat-download-header-actions">
               <button
-                aria-label="设置下载位置"
+                aria-label={t('设置下载位置')}
                 className="ui-icon-button"
                 disabled={selectingDownloadDirectory}
                 onClick={() => void chooseDownloadLocation()}
-                title={downloadDirectory ? `下载位置：${downloadDirectory}` : '设置下载位置'}
+                title={downloadDirectory ? t('下载位置：{path}', { path: downloadDirectory }) : t('设置下载位置')}
                 type="button"
               >
                 {selectingDownloadDirectory ? <Loader2 className="spin" size={15} /> : <Settings size={15} />}
               </button>
-              <button className="ui-icon-button" onClick={onClose} type="button" aria-label="关闭下载面板" title="关闭">
+              <button className="ui-icon-button" onClick={onClose} type="button" aria-label={t('关闭下载面板')} title={t('关闭')}>
                 <X size={15} />
               </button>
             </div>
           </header>
-          {downloadDirectoryError ? <div className="browser-chat-download-location-error">{downloadDirectoryError}</div> : null}
-          {downloadActionError ? <div className="browser-chat-download-location-error">{downloadActionError}</div> : null}
+          {downloadDirectoryError ? <div className="browser-chat-download-location-error">{t(downloadDirectoryError)}</div> : null}
+          {downloadActionError ? <div className="browser-chat-download-location-error">{t(downloadActionError)}</div> : null}
           {recentDownloads.length ? (
             <ol className="browser-chat-download-list">
               {recentDownloads.map((download) => {
@@ -2027,7 +2031,7 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
                 const progressWidth = percent === undefined ? (download.status === 'downloading' ? 18 : 0) : percent;
                 const sizeLabel = total ? `${received || '0 B'} / ${total}` : received;
                 const statusLine = [
-                  browserChatDownloadStatusLabel(download.status),
+                  t(browserChatDownloadStatusLabel(download.status)),
                   percent !== undefined ? `${percent}%` : '',
                   sizeLabel,
                 ].filter(Boolean).join(' · ');
@@ -2044,10 +2048,10 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
                         <div className="browser-chat-download-actions">
                           {revealable ? (
                             <button
-                              aria-label="在文件夹中显示"
+                              aria-label={t('在文件夹中显示')}
                               className="browser-chat-download-item-action browser-chat-download-reveal"
                               onClick={() => void showDownloadInFolder(download.id)}
-                              title="在文件夹中显示"
+                              title={t('在文件夹中显示')}
                               type="button"
                             >
                               <FolderOpen size={14} />
@@ -2055,11 +2059,11 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
                           ) : null}
                           {removable ? (
                             <button
-                              aria-label="删除下载文件"
+                              aria-label={t('删除下载文件')}
                               className="browser-chat-download-item-action browser-chat-download-remove"
                               disabled={removingDownloadIds.has(download.id)}
                               onClick={() => void removeDownload(download.id)}
-                              title="删除文件"
+                              title={t('删除文件')}
                               type="button"
                             >
                               {removingDownloadIds.has(download.id) ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
@@ -2071,13 +2075,13 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
                     <div className="browser-chat-download-progress" aria-hidden="true">
                       <span style={{ width: `${progressWidth}%` }} />
                     </div>
-                    {download.error ? <div className="browser-chat-download-error">{download.error}</div> : null}
+                    {download.error ? <div className="browser-chat-download-error">{t(download.error)}</div> : null}
                   </li>
                 );
               })}
             </ol>
           ) : (
-            <div className="browser-chat-download-empty">暂无下载</div>
+            <div className="browser-chat-download-empty">{t('暂无下载')}</div>
           )}
         </div>
       ) : null}
@@ -2100,6 +2104,7 @@ const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCente
   onToggle: () => void;
   open: boolean;
 }) {
+  const { t } = useI18n();
   const [groups, setGroups] = useState<EmbeddedBrowserGroup[]>([]);
   const [error, setError] = useState('');
   const [pendingGroupId, setPendingGroupId] = useState('');
@@ -2142,25 +2147,25 @@ const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCente
     <div className="browser-chat-group-binding-center">
       <button
         aria-expanded={open}
-        aria-label="绑定浏览器标签组"
+        aria-label={t('绑定浏览器标签组')}
         className="ui-icon-button browser-chat-group-binding-button"
         disabled={disabled}
         onClick={onToggle}
         style={{ '--browser-chat-bound-group-color': embeddedBrowserGroupIconColor(displayedGroupId) } as CSSProperties}
-        title="绑定浏览器标签组"
+        title={t('绑定浏览器标签组')}
         type="button"
       >
         {pendingGroupId ? <Loader2 className="spin" size={17} /> : <Folder size={17} />}
       </button>
       {open ? (
-        <div className="browser-chat-group-binding-popover" role="dialog" aria-label="选择浏览器标签组">
+        <div className="browser-chat-group-binding-popover" role="dialog" aria-label={t('选择浏览器标签组')}>
           <header>
-            <strong>绑定标签组</strong>
-            <button className="ui-icon-button" onClick={onClose} type="button" aria-label="关闭标签组面板">
+            <strong>{t('绑定标签组')}</strong>
+            <button className="ui-icon-button" onClick={onClose} type="button" aria-label={t('关闭标签组面板')}>
               <X size={15} />
             </button>
           </header>
-          {error ? <p className="browser-chat-group-binding-error">{error}</p> : null}
+          {error ? <p className="browser-chat-group-binding-error">{t(error)}</p> : null}
           {groups.length ? (
             <ol className="browser-chat-group-binding-list">
               {groups.map((group) => {
@@ -2185,7 +2190,7 @@ const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCente
               })}
             </ol>
           ) : (
-            <div className="browser-chat-group-binding-empty">暂无可绑定的标签组</div>
+            <div className="browser-chat-group-binding-empty">{t('暂无可绑定的标签组')}</div>
           )}
         </div>
       ) : null}
@@ -2294,8 +2299,9 @@ const BrowserChatReferenceChip = memo(function BrowserChatReferenceChip({
   className?: string;
   onPreview: (attachment: BrowserChatAttachment) => void;
 }) {
+  const { t } = useI18n();
   const kind = browserChatAttachmentKind(attachment);
-  const label = browserChatReferenceLabel(kind);
+  const label = t(browserChatReferenceLabel(kind));
   const children = (
     <>
       <span className={`browser-chat-reference-icon ${kind}`}>
@@ -2305,10 +2311,10 @@ const BrowserChatReferenceChip = memo(function BrowserChatReferenceChip({
     </>
   );
   return (
-    <span className={`browser-chat-reference-chip ${kind}${className ? ` ${className}` : ''}`} title={browserChatReferenceMeta(attachment, kind)}>
+    <span className={`browser-chat-reference-chip ${kind}${className ? ` ${className}` : ''}`} title={t(browserChatReferenceMeta(attachment, kind))}>
       {kind === 'image' ? (
         <button
-          aria-label={`放大查看 ${attachment.name}`}
+          aria-label={t('放大查看 {name}', { name: attachment.name })}
           className="browser-chat-reference-main"
           onClick={() => onPreview(attachment)}
           type="button"
@@ -2427,8 +2433,9 @@ function toolUserActionForTool(logs: BrowserChatLogRecord[], stepIndex: number |
 }
 
 function BrowserChatToolUserActionTag({ action }: { action?: ReturnType<typeof toolUserActionForTool> }) {
+  const { t } = useI18n();
   if (!action) return null;
-  return <span className={`browser-chat-tool-user-action-tag ${action.className}`}>{action.label}</span>;
+  return <span className={`browser-chat-tool-user-action-tag ${action.className}`}>{t(action.label)}</span>;
 }
 
 const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirmationActions({
@@ -2442,12 +2449,13 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
   resolvingConfirmationId?: string | null;
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
 }) {
+  const { t } = useI18n();
   if (!pending || !onResolveToolConfirmation) return null;
   const resolving = resolvingConfirmationId === pending.id;
   const resolvingConfirm = resolving && resolvingConfirmationAction === 'confirm';
   const resolvingCancel = resolving && resolvingConfirmationAction === 'cancel';
   return (
-    <div className="browser-chat-tool-confirmation" role="group" aria-label="工具调用确认">
+    <div className="browser-chat-tool-confirmation" role="group" aria-label={t('工具调用确认')}>
       <span>{pending.prompt}</span>
       <div className="browser-chat-tool-confirmation-actions">
         <button
@@ -2457,7 +2465,7 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
           type="button"
         >
           {resolvingConfirm ? <Loader2 className="spin" size={13} /> : <BadgeCheck size={13} />}
-          {resolvingConfirm ? '确认中' : '确认'}
+          {resolvingConfirm ? t('确认中') : t('确认')}
         </button>
         <button
           className="browser-chat-tool-cancel"
@@ -2466,7 +2474,7 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
           type="button"
         >
           {resolvingCancel ? <Loader2 className="spin" size={13} /> : <X size={13} />}
-          {resolvingCancel ? '取消中' : '取消'}
+          {resolvingCancel ? t('取消中') : t('取消')}
         </button>
       </div>
     </div>
@@ -2571,9 +2579,9 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
         </span>
         <span className="browser-chat-tool-content">
           <span className="browser-chat-tool-label">
-            <span className="browser-chat-tool-name">准备工具</span>
+            <span className="browser-chat-tool-name">{t('准备工具')}</span>
           </span>
-          <small className="browser-chat-tool-meta">正在选择下一步浏览器动作</small>
+          <small className="browser-chat-tool-meta">{t('正在选择下一步浏览器动作')}</small>
         </span>
       </div>
     );
@@ -2583,10 +2591,11 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
     <>
       {toolCalls.map(({ tool, toolIndex }) => {
         const label = browserChatToolLabel(tool.name, t);
-        const meta = compactText(browserChatToolMeta(tool.name, tool.input), 56);
+        const meta = compactText(browserChatToolMeta(tool.name, tool.input, t), 56);
         const displayText = `${label}${meta ? `: ${meta}` : ''}`;
         const presentation = browserChatToolPresentation(tool, step, running);
         const { isActive: isActiveTool, stateClass, status } = presentation;
+        const translatedStatus = t(status);
         const pendingConfirmation = pendingConfirmationForTool({
           pending: pendingToolConfirmation,
           stepIndex: step.index,
@@ -2627,16 +2636,16 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                 onSelectTool={onSelectTool}
                 resuming={resumingHumanVerification}
                 running={running}
-                title={`${displayText} · ${status}`}
+                title={`${displayText} · ${translatedStatus}`}
                 toolInput={tool.input}
                 toolResult={tool.rawResult ?? tool.result}
               />
             ) : (
               <button
-                aria-label={`${displayText}，${status}`}
+                aria-label={`${displayText}，${translatedStatus}`}
                 className={`browser-chat-tool-card${stateClass}`}
                 onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
-                title={`${displayText} · ${status}`}
+                title={`${displayText} · ${translatedStatus}`}
                 type="button"
               >
                 <span className="browser-chat-tool-icon" aria-hidden="true">
@@ -2691,6 +2700,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
+  const { t } = useI18n();
   const { output } = cycle;
   const orderedParts: Array<
     | { kind: 'reasoning'; part: BrowserChatAiOutputPart; text: string }
@@ -2721,7 +2731,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
             <details className="browser-chat-ai-line-collapse" key={`reasoning-${entry.part.index}-${orderedIndex}`}>
               <summary className="browser-chat-ai-collapse-summary">
                 <Sparkles size={14} />
-                <span>思维链</span>
+                <span>{t('思维链')}</span>
                 <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
               </summary>
               <div className="browser-chat-ai-reasoning-text"><p>{entry.text}</p></div>
@@ -2736,8 +2746,8 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
           );
         }
         const { tool, toolDetail } = entry;
-        const label = browserChatToolLabel(tool.name, (value) => value);
-        const meta = browserChatToolMeta(tool.name, tool.input) || tool.reason;
+        const label = browserChatToolLabel(tool.name, t);
+        const meta = browserChatToolMeta(tool.name, tool.input, t) || tool.reason;
         const presentation = browserChatToolPresentation(toolDetail.tool, toolDetail.step, running);
         const { isActive, stateClass } = presentation;
         const pendingConfirmation = pendingConfirmationForTool({
@@ -2772,7 +2782,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
           >
             <summary className="browser-chat-ai-collapse-summary" title={compactText([label, meta].filter(Boolean).join(': '), 160)}>
               <SquareTerminal size={14} />
-              <span>执行一个工具</span>
+              <span>{t('执行一个工具')}</span>
               <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
             </summary>
             <div className="browser-chat-ai-cycle-tools">
@@ -2843,6 +2853,7 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
   toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
+  const { t } = useI18n();
   const toolCount = cycles.reduce((count, cycle) => (
     count + cycle.output.tools.filter((_tool, index) => toolDetails.has(aiCycleToolKey(cycle.id, index))).length
   ), 0);
@@ -2861,15 +2872,15 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
     })
   ));
   const meta = [
-    toolCount ? `${toolCount} 个工具` : '',
-    reasoningCount ? `${reasoningCount} 条思维链` : '',
+    toolCount ? t('{count} 个工具', { count: toolCount }) : '',
+    reasoningCount ? t('{count} 条思维链', { count: reasoningCount }) : '',
   ].filter(Boolean).join(' · ');
 
   return (
     <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={hasPendingConfirmation || undefined}>
       <summary className="browser-chat-ai-collapse-summary" title={meta || undefined}>
         <SquareTerminal size={14} />
-        <span>已执行</span>
+        <span>{t('已执行')}</span>
         {meta ? <small>{meta}</small> : null}
         <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
       </summary>
@@ -2911,17 +2922,18 @@ const BrowserChatManualVerificationCard = memo(function BrowserChatManualVerific
   onResume?: () => void | Promise<void>;
   resuming?: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <section className="browser-chat-manual-verification" role="status">
       <span aria-hidden="true" className="browser-chat-manual-verification-icon"><Lock size={18} /></span>
       <div>
-        <strong>需要人工完成验证</strong>
-        <p>请在浏览器中完成验证码、登录/安全验证或其他需要本人确认的步骤。</p>
-        <small>完成后点击按钮，AI 会从当前浏览器和当前对话回合继续执行。</small>
+        <strong>{t('需要人工完成验证')}</strong>
+        <p>{t('请在浏览器中完成验证码、登录/安全验证或其他需要本人确认的步骤。')}</p>
+        <small>{t('完成后点击按钮，AI 会从当前浏览器和当前对话回合继续执行。')}</small>
         {onResume ? (
           <button className="primary-button browser-chat-verification-resume" disabled={resuming} onClick={() => void onResume()} type="button">
             {resuming ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />}
-            {resuming ? '正在继续' : '校验完成，继续执行'}
+            {resuming ? t('正在继续') : t('校验完成，继续执行')}
           </button>
         ) : null}
       </div>
@@ -3145,6 +3157,7 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
   subagents?: BrowserChatSubagentView[];
   toolInput: unknown;
 }) {
+  const { t } = useI18n();
   const derivedSubagents = useMemo(() => browserChatSubagentsFromLogs(logs, toolInput), [logs, toolInput]);
   const subagents = providedSubagents || derivedSubagents;
   if (!subagents.length) return null;
@@ -3181,7 +3194,7 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
               <span className="browser-chat-tool-content">
                 <span className="browser-chat-tool-label">
                   <span className="browser-chat-tool-name">{subagent.title}</span>
-                  <small className="browser-chat-tool-meta">{statusLabel} · {subagent.toolCount} 个工具</small>
+                  <small className="browser-chat-tool-meta">{t(statusLabel)} · {t('{count} 个工具', { count: subagent.toolCount })}</small>
                 </span>
               </span>
               <ChevronDown className="browser-chat-ai-tool-chevron" size={13} />
@@ -3219,7 +3232,7 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
               {subagent.status === 'blocked' && subagent.resumable && onResume ? (
                 <button className="primary-button browser-chat-verification-resume" disabled={running || resuming} onClick={() => void onResume()} type="button">
                   {resuming ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />}
-                  {resuming ? '正在继续' : '校验完成，继续执行'}
+                  {resuming ? t('正在继续') : t('校验完成，继续执行')}
                 </button>
               ) : null}
             </div>
@@ -3336,6 +3349,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   steps: StepExecutionResult[];
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
+  const { t } = useI18n();
   const finalText = stringFromUnknown(message.content);
   const normalizedFinalText = finalText.replace(/\s+/g, ' ').trim();
   const aiOutputCycles = useMemo(() => aiOutputCyclesFromLogs(logs)
@@ -3425,14 +3439,14 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const hasProcessContent = aiOutputCycleEntries.length > 0 || shouldShowStepTimeline || running;
   const processAutoOpen = running || hasPendingConfirmation || message.status === 'blocked';
   const processLabel = running
-    ? '处理中'
+    ? t('处理中')
     : message.status === 'blocked'
-      ? '等待处理'
+      ? t('等待处理')
       : message.status === 'failed'
-        ? '处理失败'
+        ? t('处理失败')
         : message.status === 'interrupted'
-          ? '已中止'
-          : '已处理';
+          ? t('已中止')
+          : t('已处理');
 
   return (
     <div className="browser-chat-agent-timeline">
@@ -3496,8 +3510,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
             <div aria-live="polite" className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
               <span aria-hidden="true" className="browser-chat-agent-thinking-mark"><i /><i /><i /></span>
               <span className="browser-chat-agent-thinking-copy">
-                <strong>AI 正在处理当前请求<span className="browser-chat-agent-thinking-ellipsis">...</span></strong>
-                <small>正在分析页面状态并准备下一步操作</small>
+                <strong>{t('AI 正在处理当前请求')}<span className="browser-chat-agent-thinking-ellipsis">...</span></strong>
+                <small>{t('正在分析页面状态并准备下一步操作')}</small>
               </span>
             </div>
           ) : null}
@@ -3511,19 +3525,21 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       ) : null}
       {hasFinalText && !hideManualVerificationStatusText ? <BrowserChatMarkdown markdown={finalText} /> : null}
       {!hasFinalText && !hasProcessContent && !manualVerificationPaused ? (
-        <p className="browser-chat-agent-empty">AI 已完成本轮操作，未返回额外文本。</p>
+        <p className="browser-chat-agent-empty">{t('AI 已完成本轮操作，未返回额外文本。')}</p>
       ) : null}
     </div>
   );
 });
 
 const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
+  generatingAutomationMessageId,
   skillsById,
   generatingSkillMessageId,
   item,
   itemLogs,
   itemSteps,
   lastAssistantMessageId,
+  onGenerateAutomationCase,
   onGenerateSkill,
   onPreviewImage,
   onResolveToolConfirmation,
@@ -3537,11 +3553,13 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   sessionBusy,
   totalStepCount,
 }: {
+  generatingAutomationMessageId: string | null;
   generatingSkillMessageId: string | null;
   item: BrowserChatMessage;
   itemLogs: BrowserChatLogRecord[];
   itemSteps: StepExecutionResult[];
   lastAssistantMessageId?: string;
+  onGenerateAutomationCase: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
@@ -3556,9 +3574,11 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   skillsById: Map<string, SkillRecord>;
   totalStepCount: number;
 }) {
+  const { t } = useI18n();
   const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
   const canGenerateSkill = item.role === 'assistant' && item.status !== 'running' && (itemSteps.length > 0 || totalStepCount > 0);
-  const actionDisabled = Boolean(generatingSkillMessageId);
+  const canGenerateAutomationCase = canGenerateSkill;
+  const actionDisabled = Boolean(generatingSkillMessageId || generatingAutomationMessageId);
   const messageSkills = useMemo(() => {
     return Array.from(new Set(item.skillIds || [])).map((skillId) => {
       const skill = skillsById.get(skillId);
@@ -3605,7 +3625,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
             {itemLogs.length ? (
               <button className="browser-chat-log-button" onClick={() => onShowLogs(item.id)} type="button">
                 <ScrollText size={14} />
-                查看日志
+                {t('查看日志')}
               </button>
             ) : null}
             {canGenerateSkill ? (
@@ -3616,7 +3636,18 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
                 type="button"
               >
                 {generatingSkillMessageId === item.id ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
-                生成 Skill
+                {t('生成 Skill')}
+              </button>
+            ) : null}
+            {canGenerateAutomationCase ? (
+              <button
+                className="browser-chat-log-button"
+                disabled={actionDisabled}
+                onClick={() => void onGenerateAutomationCase(item.id)}
+                type="button"
+              >
+                {generatingAutomationMessageId === item.id ? <Loader2 className="spin" size={14} /> : <Workflow size={14} />}
+                {t('生成用例')}
               </button>
             ) : null}
           </div>
@@ -3661,6 +3692,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   sessionBusy: boolean;
   stepsByIndex: Map<number, StepExecutionResult>;
 }) {
+  const { t } = useI18n();
   const itemViews = items.map((item) => {
     const steps = (item.stepIndexes || [])
       .map((stepIndex) => stepsByIndex.get(stepIndex))
@@ -3677,7 +3709,9 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   const toolCount = itemViews.reduce((count, item) => (
     count + item.steps.reduce((stepCount, step) => stepCount + (step.tools || []).length, 0)
   ), 0);
-  const summaryMeta = toolCount ? `${toolCount} 个工具` : `${items.length} 轮`;
+  const summaryMeta = toolCount
+    ? t('{count} 个工具', { count: toolCount })
+    : t('{count} 轮', { count: items.length });
 
   return (
     <article className="browser-chat-message assistant browser-chat-executed-message">
@@ -3685,7 +3719,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
         <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={groupRunning || groupHasPendingConfirmation || undefined}>
           <summary className="browser-chat-ai-collapse-summary">
             <SquareTerminal size={14} />
-            <span>已执行</span>
+            <span>{t('已执行')}</span>
             <small>{summaryMeta}</small>
             <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
           </summary>
@@ -3716,12 +3750,14 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
 
 const BrowserChatMessageList = memo(function BrowserChatMessageList({
   availableSkills,
+  generatingAutomationMessageId,
   generatingSkillMessageId,
   historyHasMore,
   historyLoading,
   lastAssistantMessageId,
   logIndex,
   messages,
+  onGenerateAutomationCase,
   onGenerateSkill,
   onLoadEarlier,
   onPreviewImage,
@@ -3739,12 +3775,14 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   totalStepCount,
 }: {
   availableSkills: SkillRecord[];
+  generatingAutomationMessageId: string | null;
   generatingSkillMessageId: string | null;
   historyHasMore?: boolean;
   historyLoading?: boolean;
   lastAssistantMessageId?: string;
   logIndex: BrowserChatLogIndex;
   messages: BrowserChatMessage[];
+  onGenerateAutomationCase: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
   onLoadEarlier?: () => void | Promise<void>;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
@@ -3919,12 +3957,14 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
         return (
           <BrowserChatMessageItem
+            generatingAutomationMessageId={generatingAutomationMessageId}
             generatingSkillMessageId={generatingSkillMessageId}
             item={item}
             itemLogs={itemLogs}
             itemSteps={itemSteps}
             key={item.id}
             lastAssistantMessageId={lastAssistantMessageId}
+            onGenerateAutomationCase={onGenerateAutomationCase}
             onGenerateSkill={onGenerateSkill}
             onPreviewImage={onPreviewImage}
             onResolveToolConfirmation={onResolveToolConfirmation}
@@ -3991,11 +4031,11 @@ function BrowserChatModeSelector({
   }, [open]);
 
   return (
-    <div className="browser-chat-mode-selector" ref={rootRef}>
+    <div className="browser-chat-mode-selector" data-i18n-skip ref={rootRef}>
       <button
         aria-expanded={open}
         aria-haspopup="dialog"
-        aria-label={`执行权限：${safetyLabel}`}
+        aria-label={t('执行权限：{mode}', { mode: safetyLabel })}
         className="browser-chat-mode-selector-trigger"
         disabled={disabled}
         onClick={() => setOpen((current) => !current)}
@@ -4006,10 +4046,10 @@ function BrowserChatModeSelector({
       </button>
 
       {open ? (
-        <div aria-label="执行权限" className="browser-chat-mode-selector-menu" role="dialog">
+        <div aria-label={t('执行权限')} className="browser-chat-mode-selector-menu" role="dialog">
           <section className="browser-chat-mode-selector-section">
             <header>
-              <strong>执行权限</strong>
+              <strong>{t('执行权限')}</strong>
             </header>
             <div aria-label={t('安全性')} className="browser-chat-mode-selector-options" role="radiogroup">
               <button
@@ -4503,9 +4543,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     token.dataset.attachmentId = attachment.id;
     token.dataset.attachmentJson = JSON.stringify(attachment);
     token.dataset.attachmentKind = kind;
-    token.title = `${browserChatReferenceLabel(kind)}: ${attachment.name}`;
+    token.title = `${t(browserChatReferenceLabel(kind))}: ${attachment.name}`;
     token.innerHTML = `<span class="browser-chat-inline-reference-icon">${inlineReferenceIconSvg(kind)}</span><span class="browser-chat-inline-reference-title"></span>`;
-    token.querySelector('.browser-chat-inline-reference-title')!.textContent = attachment.name || browserChatReferenceLabel(kind);
+    token.querySelector('.browser-chat-inline-reference-title')!.textContent = attachment.name || t(browserChatReferenceLabel(kind));
 
     range.insertNode(token);
     const trailingText = document.createTextNode('\u00A0');
@@ -4556,7 +4596,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             </button>
           )) : (
             <div className="browser-chat-skill-empty">
-              {availableSkills.some((skill) => skill.status === 'ready') ? '没有匹配的 Skills' : '暂无可用 Skills'}
+              {availableSkills.some((skill) => skill.status === 'ready') ? t('没有匹配的 Skills') : t('暂无可用 Skills')}
             </div>
           )}
         </div>
@@ -4617,7 +4657,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                   </button>
                 )) : (
                   <div className="browser-chat-skill-empty">
-                    {availableSkills.some((skill) => skill.status === 'ready') ? '没有匹配的 Skills' : '暂无可用 Skills'}
+                    {availableSkills.some((skill) => skill.status === 'ready') ? t('没有匹配的 Skills') : t('暂无可用 Skills')}
                   </div>
                 )}
               </div>
@@ -4628,7 +4668,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           ref={editorRef}
           className="browser-chat-inline-editor"
           contentEditable={!currentBusy && !loading}
-          data-placeholder="有问题，尽管问；需要时可并行调用子 Agent"
+          data-placeholder={t('有问题，尽管问；需要时可并行调用子 Agent')}
           onInput={() => syncEditorState({ scrollToBottom: true })}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
@@ -4704,11 +4744,11 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
         <div className="browser-chat-compose-actions">
           <div className="browser-chat-compose-tools">
             <button
-              aria-label="上传文件"
+              aria-label={t('上传文件')}
               className="browser-chat-attach"
               disabled={currentBusy || uploadingImage || attachments.length >= BROWSER_CHAT_MAX_REFERENCES}
               onClick={() => imageInputRef.current?.click()}
-              title="上传文件"
+              title={t('上传文件')}
               type="button"
             >
               {uploadingImage ? <Loader2 className="spin" size={17} /> : <Plus size={19} />}
@@ -4812,17 +4852,18 @@ function EmbeddedBrowserTabFavicon({ faviconUrl }: { faviconUrl?: string }) {
 }
 
 function EmbeddedBrowserTabContent({ tab }: { tab: EmbeddedBrowserTab }) {
+  const { t } = useI18n();
   return (
     <>
       <span className="browser-chat-embedded-tab-icon">
         <EmbeddedBrowserTabFavicon faviconUrl={tab.faviconUrl} />
       </span>
-      {tab.pinned ? <Pin aria-label="已固定" className="browser-chat-embedded-tab-pin" size={11} /> : null}
+      {tab.pinned ? <Pin aria-label={t('已固定')} className="browser-chat-embedded-tab-pin" size={11} /> : null}
       <span className="browser-chat-embedded-tab-text">
-        <strong>{compactText(tab.title || tab.url || '新建标签页', 56)}</strong>
+        <strong>{compactText(tab.title || tab.url || t('新建标签页'), 56)}</strong>
       </span>
       {tab.loading ? (
-        <span className="browser-chat-embedded-tab-loading" aria-label="页面加载中">
+        <span className="browser-chat-embedded-tab-loading" aria-label={t('页面加载中')}>
           <Loader2 className="spin" size={12} />
         </span>
       ) : null}
@@ -4849,6 +4890,7 @@ function EmbeddedBrowserSortableTab({
   onToggleMute: () => void;
   tab: EmbeddedBrowserTab;
 }) {
+  const { t } = useI18n();
   const {
     attributes,
     isDragging,
@@ -4903,27 +4945,27 @@ function EmbeddedBrowserSortableTab({
     >
       <EmbeddedBrowserTabContent tab={tab} />
       <button
-        aria-label={tab.audioMuted ? '取消静音标签页' : '静音标签页'}
+        aria-label={tab.audioMuted ? t('取消静音标签页') : t('静音标签页')}
         className={tab.audioMuted ? 'browser-chat-embedded-tab-mute is-muted' : 'browser-chat-embedded-tab-mute'}
         onClick={(event) => {
           event.stopPropagation();
           onToggleMute();
         }}
         onPointerDown={(event) => event.stopPropagation()}
-        title={tab.audioMuted ? '取消静音' : '静音'}
+        title={tab.audioMuted ? t('取消静音') : t('静音')}
         type="button"
       >
         {tab.audioMuted ? <VolumeX size={13} /> : <Volume2 size={13} />}
       </button>
       <button
-        aria-label="关闭当前标签页"
+        aria-label={t('关闭当前标签页')}
         className="browser-chat-embedded-tab-close"
         onClick={(event) => {
           event.stopPropagation();
           onClose();
         }}
         onPointerDown={(event) => event.stopPropagation()}
-        title="关闭当前标签页"
+        title={t('关闭当前标签页')}
         type="button"
       >
         <X size={13} />
@@ -5032,6 +5074,7 @@ function BrowserChatWebPreviewModal({
   sessionId: string;
   userId: string;
 }) {
+  const { t } = useI18n();
   const streamRef = useRef<WebSocket | null>(null);
   const reconnectEnabledRef = useRef(true);
   const previewImageRef = useRef<HTMLImageElement | null>(null);
@@ -5313,9 +5356,11 @@ function BrowserChatWebPreviewModal({
             }
             const message = JSON.parse(String(event.data)) as BrowserChatPreviewFrame & {
               error?: string;
+              height?: number;
               metrics?: BrowserChatPreviewServerMetrics;
               transport?: 'image' | 'video';
               type?: string;
+              width?: number;
             };
             if (message.type === 'frame') {
               const legacyMessage = message as BrowserChatPreviewFrame & { data?: string };
@@ -5334,6 +5379,15 @@ function BrowserChatWebPreviewModal({
             } else if (message.type === 'viewportChanged' && message.viewport) {
               frameStateRef.current = { ...frameStateRef.current, viewport: message.viewport };
               setFrame((current) => current ? { ...current, viewport: message.viewport } : current);
+            } else if (
+              message.type === 'videoReady'
+              && typeof message.width === 'number'
+              && typeof message.height === 'number'
+            ) {
+              frameStateRef.current = {
+                ...frameStateRef.current,
+                viewport: { width: message.width, height: message.height },
+              };
             } else if (message.type === 'frameHeartbeat' && message.metrics) {
               const counters = frameCountersRef.current;
               const sampledAt = Date.now();
@@ -5374,7 +5428,6 @@ function BrowserChatWebPreviewModal({
         stream.onerror = () => setStreamError((current) => current || '实时界面连接中断，正在重连');
         stream.onclose = () => {
           if (streamRef.current === stream) streamRef.current = null;
-          disposeVideoPipeline();
           if (disposed || !reconnectEnabledRef.current) return;
           setStatus('reconnecting');
           reconnectTimer = window.setTimeout(() => void connect(), 600);
@@ -5470,10 +5523,24 @@ function BrowserChatWebPreviewModal({
 
   const relativePoint = useCallback((clientX: number, clientY: number, element: HTMLElement, clamp = false) => {
     if (!frame) return undefined;
-    const rect = previewVideoRef.current?.getBoundingClientRect()
+    const mediaRect = previewVideoRef.current?.getBoundingClientRect()
       || previewImageRef.current?.getBoundingClientRect()
       || element.getBoundingClientRect();
-    if (!rect.width || !rect.height) return undefined;
+    if (!mediaRect.width || !mediaRect.height) return undefined;
+    const sourceWidth = Math.max(1, frame.viewport.width);
+    const sourceHeight = Math.max(1, frame.viewport.height);
+    const sourceRatio = sourceWidth / sourceHeight;
+    const mediaRatio = mediaRect.width / mediaRect.height;
+    const contentWidth = mediaRatio > sourceRatio ? mediaRect.height * sourceRatio : mediaRect.width;
+    const contentHeight = mediaRatio > sourceRatio ? mediaRect.height : mediaRect.width / sourceRatio;
+    const rect = {
+      bottom: mediaRect.top + (mediaRect.height + contentHeight) / 2,
+      height: contentHeight,
+      left: mediaRect.left + (mediaRect.width - contentWidth) / 2,
+      right: mediaRect.left + (mediaRect.width + contentWidth) / 2,
+      top: mediaRect.top + (mediaRect.height - contentHeight) / 2,
+      width: contentWidth,
+    };
     if (!clamp && (
       clientX < rect.left
       || clientX > rect.right
@@ -5629,30 +5696,38 @@ function BrowserChatWebPreviewModal({
     sendInput({ kind: 'tab', tabId });
   }, [sendInput]);
 
-  const statusLabel = status === 'live'
+  const statusLabelSource = status === 'live'
     ? '实时'
     : status === 'reconnecting'
       ? '正在重连'
       : status === 'unavailable'
         ? '浏览器未运行'
         : '正在连接';
+  const statusLabel = t(statusLabelSource);
   const previewMetricsLabel = previewMetrics
-    ? `${previewTransport === 'video' ? 'H.264' : '图片'} · 目标 ${Math.round(previewMetrics.targetFps || 0)} · 截图 ${(previewMetrics.captureFps || 0).toFixed(1)} · 发送 ${(previewMetrics.sendFps || 0).toFixed(1)} · 接收 ${previewMetrics.receivedFps.toFixed(1)} · 显示 ${previewMetrics.displayedFps.toFixed(1)} FPS`
+    ? t('{transport} · 目标 {target} · 截图 {capture} · 发送 {send} · 接收 {received} · 显示 {displayed} FPS', {
+        transport: previewTransport === 'video' ? 'H.264' : t('图片'),
+        target: Math.round(previewMetrics.targetFps || 0),
+        capture: (previewMetrics.captureFps || 0).toFixed(1),
+        send: (previewMetrics.sendFps || 0).toFixed(1),
+        received: previewMetrics.receivedFps.toFixed(1),
+        displayed: previewMetrics.displayedFps.toFixed(1),
+      })
     : '';
   const previewMetricsTitle = previewMetrics
     ? [
         previewTransport === 'video'
-          ? '传输：H.264 fragmented MP4'
-          : previewMetrics.imageFormat === 'jpeg' ? `JPEG 质量：${previewMetrics.imageQuality ?? '-'}` : 'PNG',
+          ? t('传输：H.264 fragmented MP4')
+          : previewMetrics.imageFormat === 'jpeg' ? t('JPEG 质量：{quality}', { quality: previewMetrics.imageQuality ?? '-' }) : 'PNG',
         ...(previewTransport === 'video' ? [
-          `编码：${previewMetrics.h264Profile || '-'} / Level ${previewMetrics.h264Level || '-'} / ${previewMetrics.mimeType || '-'}`,
-          `视频：${previewMetrics.width || '-'}×${previewMetrics.height || '-'} / ${previewMetrics.bitrateKbps || '-'} Kbps`,
+          t('编码：{profile} / Level {level} / {mime}', { profile: previewMetrics.h264Profile || '-', level: previewMetrics.h264Level || '-', mime: previewMetrics.mimeType || '-' }),
+          t('视频：{width}×{height} / {bitrate} Kbps', { width: previewMetrics.width || '-', height: previewMetrics.height || '-', bitrate: previewMetrics.bitrateKbps || '-' }),
         ] : []),
-        `最近一次截图耗时：${(previewMetrics.captureDurationMs || 0).toFixed(1)} ms`,
-        `平均截图耗时：${(previewMetrics.captureDurationMsAverage || 0).toFixed(1)} ms`,
-        `在途截图：${previewMetrics.activeCaptures || 0}/${previewMetrics.maxConcurrentCaptures || 1}`,
-        `网络背压丢帧：${previewMetrics.backpressureDrops || 0}`,
-        `待发送客户端帧：${previewMetrics.pendingClientFrames || 0}`,
+        t('最近一次截图耗时：{time} ms', { time: (previewMetrics.captureDurationMs || 0).toFixed(1) }),
+        t('平均截图耗时：{time} ms', { time: (previewMetrics.captureDurationMsAverage || 0).toFixed(1) }),
+        t('在途截图：{active}/{maximum}', { active: previewMetrics.activeCaptures || 0, maximum: previewMetrics.maxConcurrentCaptures || 1 }),
+        t('网络背压丢帧：{count}', { count: previewMetrics.backpressureDrops || 0 }),
+        t('待发送客户端帧：{count}', { count: previewMetrics.pendingClientFrames || 0 }),
       ].join('\n')
     : '';
   const hasPreviewVisual = Boolean(videoObjectUrl || frame?.imageUrl);
@@ -5660,7 +5735,7 @@ function BrowserChatWebPreviewModal({
   return (
     <div className="ui-modal-overlay browser-chat-web-preview-overlay" onClick={onClose} role="presentation">
       <div
-        aria-label="实时界面"
+        aria-label={t('实时界面')}
         aria-modal="true"
         className="ui-modal browser-chat-web-preview-modal"
         onClick={(event) => event.stopPropagation()}
@@ -5669,7 +5744,7 @@ function BrowserChatWebPreviewModal({
         <header className="ui-modal-header browser-chat-web-preview-header" style={{ padding: '0px 16px'}}>
           <div className="ui-modal-heading">
             <div className="browser-chat-web-preview-title-row">
-              <h2 className="ui-modal-title">实时界面</h2>
+              <h2 className="ui-modal-title">{t('实时界面')}</h2>
               <span className={`browser-chat-web-preview-status is-${status}`}>
                 <span />
                 {statusLabel}
@@ -5680,11 +5755,11 @@ function BrowserChatWebPreviewModal({
                 </span>
               ) : null}
               <span className="browser-chat-web-preview-url" title={frame?.url || ''}>
-                {frame?.url || '等待会话浏览器启动'}
+                {frame?.url || t('等待会话浏览器启动')}
               </span>
             </div>
           </div>
-          <button aria-label="关闭实时界面" className="ui-icon-button ui-modal-close" onClick={onClose} title="关闭" type="button">
+          <button aria-label={t('关闭实时界面')} className="ui-icon-button ui-modal-close" onClick={onClose} title={t('关闭')} type="button">
             <X size={18} />
           </button>
         </header>
@@ -5700,7 +5775,7 @@ function BrowserChatWebPreviewModal({
                 type="button"
               >
                 <Globe size={13} />
-                <span>{tab.url || `标签页 ${tab.index + 1}`}</span>
+                <span>{tab.url || t('标签页 {index}', { index: tab.index + 1 })}</span>
               </button>
             ))}
           </div>
@@ -5708,7 +5783,7 @@ function BrowserChatWebPreviewModal({
 
         <div className="browser-chat-web-preview-body">
           <div
-            aria-label="可操作的浏览器实时画面"
+            aria-label={t('可操作的浏览器实时画面')}
             className={hasPreviewVisual ? 'browser-chat-web-preview-stage has-frame' : 'browser-chat-web-preview-stage'}
             onContextMenu={openPreviewContextMenu}
             onKeyDown={pressPreviewKey}
@@ -5725,23 +5800,32 @@ function BrowserChatWebPreviewModal({
               <video
                 autoPlay
                 disablePictureInPicture
+                height={frame?.viewport.height || 720}
                 muted
                 playsInline
                 ref={previewVideoRef}
                 src={videoObjectUrl}
+                width={frame?.viewport.width || 1280}
               />
             ) : frame?.imageUrl ? (
-              <img alt="浏览器实时画面" draggable={false} ref={previewImageRef} src={frame.imageUrl} />
+              <img
+                alt={t('浏览器实时画面')}
+                draggable={false}
+                height={frame.viewport.height}
+                ref={previewImageRef}
+                src={frame.imageUrl}
+                width={frame.viewport.width}
+              />
             ) : (
               <div className="browser-chat-web-preview-empty">
                 <Loader2 className="spin" size={22} />
-                <strong>{streamError || '正在等待浏览器画面'}</strong>
-                <span>发送一条需要访问网页的消息后，画面会自动出现。</span>
+                <strong>{streamError ? t(streamError) : t('正在等待浏览器画面')}</strong>
+                <span>{t('发送一条需要访问网页的消息后，画面会自动出现。')}</span>
               </div>
             )}
           </div>
-          {streamError && hasPreviewVisual ? <div className="browser-chat-web-preview-alert">{streamError}</div> : null}
-          {inputError ? <div className="browser-chat-web-preview-alert">{inputError}</div> : null}
+          {streamError && hasPreviewVisual ? <div className="browser-chat-web-preview-alert">{t(streamError)}</div> : null}
+          {inputError ? <div className="browser-chat-web-preview-alert">{t(inputError)}</div> : null}
         </div>
 
       </div>
@@ -5772,6 +5856,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   sessionId?: string;
   userId?: string;
 }) {
+  const { t } = useI18n();
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const tabListRef = useRef<HTMLDivElement | null>(null);
   const addressInputRef = useRef<HTMLInputElement | null>(null);
@@ -5796,7 +5881,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [tabListWidth, setTabListWidth] = useState(0);
   const [libraryPanel, setLibraryPanel] = useState<'library' | null>(null);
   const [newGroupDialogOpen, setNewGroupDialogOpen] = useState(false);
-  const [newGroupName, setNewGroupName] = useState('新建标签组');
+  const [newGroupName, setNewGroupName] = useState('');
   const [creatingNewGroup, setCreatingNewGroup] = useState(false);
   const [runtimeActivatedSessionId, setRuntimeActivatedSessionId] = useState('');
   const requestedGroupId = browserGroupId || embeddedGroupIdForSession(sessionId);
@@ -6186,7 +6271,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   async function createEmbeddedBrowserGroup() {
     const bridge = window.webPilotEmbeddedBrowser;
     if (!bridge) return;
-    const label = newGroupName.trim() || '新建标签组';
+    const label = newGroupName.trim() || t('新建标签组');
     if (!label) return;
     setCreatingNewGroup(true);
     try {
@@ -6198,7 +6283,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       if (!result.ok) return;
       setNewGroupDialogOpen(false);
       onDialogOpenChange?.(false);
-      setNewGroupName('新建标签组');
+      setNewGroupName('');
     } finally {
       setCreatingNewGroup(false);
     }
@@ -6346,7 +6431,9 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const requestedWidth = tabListWidth > 0 && tabCount > 0
       ? Math.floor((tabListWidth - fixedWidth) / tabCount)
       : 210;
-    const tabWidth = Math.min(210, Math.max(0, requestedWidth));
+    // Keep crowded tabs identifiable and let the strip scroll instead of
+    // collapsing tabs to zero-width slivers.
+    const tabWidth = Math.min(210, Math.max(88, requestedWidth));
     return { '--embedded-tab-width': `${tabWidth}px` } as CSSProperties;
   }, [renderedVisibleGroups, tabListWidth]);
 
@@ -6570,7 +6657,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         'browser-chat-embedded-browser',
         isEmbeddedBrowserLoading ? 'loading' : '',
       ].filter(Boolean).join(' ')}
-      aria-label="嵌入浏览器"
+      aria-label={t('嵌入浏览器')}
     >
       <header className="browser-chat-embedded-chrome">
         <div className="browser-chat-embedded-tab-strip">
@@ -6588,7 +6675,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
               onWheel={handleEmbeddedTabListWheel}
               ref={tabListRef}
               role="tablist"
-              aria-label="Embedded browser tabs"
+              aria-label={t('嵌入浏览器标签页')}
               style={embeddedTabLayoutStyle}
             >
               {renderedVisibleGroups.map((group) => {
@@ -6617,31 +6704,34 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                         aria-expanded={!isCollapsedGroup}
                         className="browser-chat-embedded-tab-group-label"
                         onClick={() => void toggleEmbeddedBrowserGroupCollapsed(group)}
-                        title={`${isCollapsedGroup ? '展开' : '收起'} ${groupLabel} 标签组`}
+                        title={isCollapsedGroup
+                          ? t('展开 {name} 标签组', { name: groupLabel })
+                          : t('收起 {name} 标签组', { name: groupLabel })}
                         type="button"
                       >
                         {isCollapsedGroup ? <Folder size={16} /> : <FolderOpen size={16} />}
+                        <span>{groupLabel}</span>
                       </button>
                       <button
-                        aria-label={`关闭 ${groupLabel} 标签组`}
+                        aria-label={t('关闭 {name} 标签组', { name: groupLabel })}
                         className="browser-chat-embedded-tab-group-action browser-chat-embedded-tab-group-close"
                         onClick={(event) => {
                           event.stopPropagation();
                           void closeEmbeddedBrowserGroup(group);
                         }}
-                        title={`关闭 ${groupLabel} 标签组`}
+                        title={t('关闭 {name} 标签组', { name: groupLabel })}
                         type="button"
                       >
                         <X size={13} />
                       </button>
                       <button
-                        aria-label={`在 ${groupLabel} 中新建标签页`}
+                        aria-label={t('在 {name} 中新建标签页', { name: groupLabel })}
                         className="browser-chat-embedded-tab-group-action browser-chat-embedded-tab-group-add"
                         onClick={(event) => {
                           event.stopPropagation();
                           void createEmbeddedBrowserTab(group);
                         }}
-                        title={`在 ${groupLabel} 中新建标签页`}
+                        title={t('在 {name} 中新建标签页', { name: groupLabel })}
                         type="button"
                       >
                         <Plus size={14} />
@@ -6701,13 +6791,13 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
             ) : null}
           </DndContext>
           <button
-            aria-label="新建标签组"
+            aria-label={t('新建标签组')}
             className="browser-chat-embedded-new-group"
             onClick={() => {
               setNewGroupDialogOpen(true);
               onDialogOpenChange?.(true);
             }}
-            title="新建标签组"
+            title={t('新建标签组')}
             type="button"
           >
             <Plus size={15} />
@@ -6715,18 +6805,18 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         </div>
         <div className="browser-chat-embedded-toolbar">
           <div className="browser-chat-embedded-nav-controls">
-            <button className="browser-chat-embedded-tool-button" disabled={!canGoBack} onClick={() => void goEmbeddedBrowserBack()} title="Back" type="button" aria-label="Back">
+            <button className="browser-chat-embedded-tool-button" disabled={!canGoBack} onClick={() => void goEmbeddedBrowserBack()} title={t('后退')} type="button" aria-label={t('后退')}>
               <ArrowLeft size={16} />
             </button>
-            <button className="browser-chat-embedded-tool-button" disabled={!canGoForward} onClick={() => void goEmbeddedBrowserForward()} title="Forward" type="button" aria-label="Forward">
+            <button className="browser-chat-embedded-tool-button" disabled={!canGoForward} onClick={() => void goEmbeddedBrowserForward()} title={t('前进')} type="button" aria-label={t('前进')}>
               <ArrowRight size={16} />
             </button>
             <button
-              aria-label={isEmbeddedBrowserLoading ? '停止加载' : '重新加载'}
+              aria-label={isEmbeddedBrowserLoading ? t('停止加载') : t('重新加载')}
               className={isEmbeddedBrowserLoading ? 'browser-chat-embedded-tool-button is-stop' : 'browser-chat-embedded-tool-button'}
               disabled={!activeEmbeddedTab}
               onClick={() => void (isEmbeddedBrowserLoading ? stopEmbeddedBrowserLoading() : reloadEmbeddedBrowser())}
-              title={isEmbeddedBrowserLoading ? '停止加载' : '重新加载'}
+              title={isEmbeddedBrowserLoading ? t('停止加载') : t('重新加载')}
               type="button"
             >
               {isEmbeddedBrowserLoading ? <X size={16} /> : <RefreshCw size={15} />}
@@ -6738,7 +6828,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
             </span>
             <input
               ref={addressInputRef}
-              aria-label="Address"
+              aria-label={t('地址')}
               disabled={!bridgeAvailable}
               onBlur={() => {
                 addressFocusedRef.current = false;
@@ -6752,11 +6842,11 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
               value={addressValue}
             />
             <button
-              aria-label={activeEmbeddedTab?.bookmarked ? '取消收藏当前页面' : '收藏当前页面'}
+              aria-label={activeEmbeddedTab?.bookmarked ? t('取消收藏当前页面') : t('收藏当前页面')}
               className={activeEmbeddedTab?.bookmarked ? 'browser-chat-embedded-address-action active' : 'browser-chat-embedded-address-action'}
               disabled={!activeEmbeddedTab}
               onClick={() => void toggleEmbeddedBrowserBookmark()}
-              title={activeEmbeddedTab?.bookmarked ? '取消收藏' : '收藏此页面'}
+              title={activeEmbeddedTab?.bookmarked ? t('取消收藏') : t('收藏此页面')}
               type="button"
             >
               <Star fill={activeEmbeddedTab?.bookmarked ? 'currentColor' : 'none'} size={18} />
@@ -6765,10 +6855,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
           <div className="browser-chat-embedded-library-actions">
             <button
               aria-expanded={libraryPanel === 'library'}
-              aria-label="收藏与历史记录"
+              aria-label={t('收藏与历史记录')}
               className={libraryPanel === 'library' ? 'browser-chat-embedded-tool-button active' : 'browser-chat-embedded-tool-button'}
               onClick={() => void toggleEmbeddedBrowserLibraryPanel()}
-              title="收藏与历史记录"
+              title={t('收藏与历史记录')}
               type="button"
             >
               <Library size={18} />
@@ -6780,14 +6870,14 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         {!bridgeAvailable ? (
           <div className="browser-chat-embedded-state">
             <AppWindow size={24} />
-            <strong>仅桌面端可用</strong>
-            <span>请使用 Electron 开发壳或桌面版打开。</span>
+            <strong>{t('仅桌面端可用')}</strong>
+            <span>{t('请使用 Electron 开发壳或桌面版打开。')}</span>
           </div>
         ) : bridgeError ? (
           <div className="browser-chat-embedded-state">
             <Bug size={24} />
-            <strong>嵌入浏览器未就绪</strong>
-            <span>{bridgeError}</span>
+            <strong>{t('嵌入浏览器未就绪')}</strong>
+            <span>{t(bridgeError)}</span>
           </div>
         ) : null}
       </div>
@@ -6806,15 +6896,15 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
             void createEmbeddedBrowserGroup();
           }}
           role="dialog"
-          aria-label="新建浏览器标签组"
+          aria-label={t('新建浏览器标签组')}
         >
           <header className="ui-modal-header">
             <div className="ui-modal-heading">
-              <h2 className="ui-modal-title">新建标签组</h2>
-              <p className="ui-modal-subtitle">标签组可在对话工具栏中单独绑定。</p>
+              <h2 className="ui-modal-title">{t('新建标签组')}</h2>
+              <p className="ui-modal-subtitle">{t('标签组可在对话工具栏中单独绑定。')}</p>
             </div>
             <button
-              aria-label="关闭"
+              aria-label={t('关闭')}
               className="ui-icon-button ui-modal-close"
               disabled={creatingNewGroup}
               onClick={() => {
@@ -6828,12 +6918,13 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
           </header>
           <div className="ui-modal-body">
             <label className="modal-field">
-              标签组名称
+              {t('标签组名称')}
               <input
                 autoFocus
                 className="input"
                 disabled={creatingNewGroup}
                 onChange={(event) => setNewGroupName(event.target.value)}
+                placeholder={t('新建标签组')}
                 value={newGroupName}
               />
             </label>
@@ -6841,7 +6932,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
           <footer className="ui-modal-footer">
             <button className="ui-button ui-button--primary" disabled={creatingNewGroup} type="submit">
               {creatingNewGroup ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
-              {creatingNewGroup ? '创建中…' : '创建并绑定'}
+              {creatingNewGroup ? t('创建中…') : t('创建并绑定')}
             </button>
           </footer>
         </form>
@@ -6915,13 +7006,14 @@ export function BrowserChatWorkspace({
   const [showReasoning, setShowReasoning] = useState(false);
   const [embeddedChatWidth, setEmbeddedChatWidth] = useState(420);
   const [embeddedChatCollapsed, setEmbeddedChatCollapsed] = useState(false);
-  const [, setEmbeddedChatResizing] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
   const [deletingSessionIds, setDeletingSessionIds] = useState<Set<string>>(() => new Set());
   const deletingSessionIdsRef = useRef(new Set<string>());
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
   const [recentSelectionMode, setRecentSelectionMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
+  const [historyFilter, setHistoryFilter] = useState('');
+  const [generatingAutomationMessageId, setGeneratingAutomationMessageId] = useState<string | null>(null);
   const [generatingSkillMessageId, setGeneratingSkillMessageId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [loadingEarlierHistory, setLoadingEarlierHistory] = useState(false);
@@ -7153,19 +7245,24 @@ export function BrowserChatWorkspace({
       setLoadingEarlierHistory(false);
     }
   }, [browserChatApiUrl, loadingEarlierHistory, session]);
-  const recentSessions = useMemo(() => {
+  const sidebarSessions = useMemo(() => {
     const merged = new Map<string, BrowserChatSession>();
     for (const item of sessions) merged.set(item.id, item);
     if (session) merged.set(session.id, session);
     return [...merged.values()]
       .filter((item) => item.messages.length || item.id === session?.id)
-      .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)))
-      .slice(0, 14);
+      .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
   }, [session, sessions]);
+  const recentSessions = useMemo(() => sidebarSessions.slice(0, 14), [sidebarSessions]);
+  const filteredRecentSessions = useMemo(() => {
+    const query = historyFilter.trim().toLocaleLowerCase();
+    if (!query) return recentSessions;
+    return sidebarSessions.filter((item) => sessionDisplayTitle(item).toLocaleLowerCase().includes(query));
+  }, [historyFilter, recentSessions, sidebarSessions]);
   const selectedSessionIdSet = useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
   const selectableRecentSessionIds = useMemo(
-    () => recentSessions.filter((item) => !item.busy).map((item) => item.id),
-    [recentSessions],
+    () => filteredRecentSessions.filter((item) => !item.busy).map((item) => item.id),
+    [filteredRecentSessions],
   );
   const selectableRecentSessionIdSet = useMemo(() => new Set(selectableRecentSessionIds), [selectableRecentSessionIds]);
   const selectedDeletableSessionIds = useMemo(
@@ -7260,25 +7357,41 @@ export function BrowserChatWorkspace({
   const beginEmbeddedChatResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const workspace = embeddedWorkspaceRef.current;
     if (!workspace) return;
+    const resizeWorkspace: HTMLDivElement = workspace;
     event.preventDefault();
+    window.getSelection()?.removeAllRanges();
     event.currentTarget.setPointerCapture?.(event.pointerId);
-    const rect = workspace.getBoundingClientRect();
+    const rect = resizeWorkspace.getBoundingClientRect();
     const minChatWidth = 320;
     const minBrowserWidth = 380;
     const maxChatWidth = Math.max(minChatWidth, Math.min(760, rect.width - minBrowserWidth - 8));
-    setEmbeddedChatResizing(true);
+    let pendingWidth = embeddedChatWidth;
+    let resizeFrame = 0;
 
     function nextWidth(clientX: number) {
       return Math.round(Math.max(minChatWidth, Math.min(maxChatWidth, rect.right - clientX)));
     }
 
-    setEmbeddedChatWidth(nextWidth(event.clientX));
+    function applyPendingWidth() {
+      resizeFrame = 0;
+      resizeWorkspace.style.setProperty('--embedded-chat-width', `${pendingWidth}px`);
+    }
+
+    function queueWidth(clientX: number) {
+      pendingWidth = nextWidth(clientX);
+      if (!resizeFrame) resizeFrame = window.requestAnimationFrame(applyPendingWidth);
+    }
+
+    queueWidth(event.clientX);
     const onPointerMove = (moveEvent: PointerEvent) => {
       moveEvent.preventDefault();
-      setEmbeddedChatWidth(nextWidth(moveEvent.clientX));
+      queueWidth(moveEvent.clientX);
     };
-    const onPointerUp = () => {
-      setEmbeddedChatResizing(false);
+    const onPointerUp = (upEvent: PointerEvent) => {
+      if (upEvent.type === 'pointerup') pendingWidth = nextWidth(upEvent.clientX);
+      if (resizeFrame) window.cancelAnimationFrame(resizeFrame);
+      applyPendingWidth();
+      setEmbeddedChatWidth(pendingWidth);
       document.body.classList.remove('browser-chat-resizing');
       document.removeEventListener('pointermove', onPointerMove, true);
       document.removeEventListener('pointerup', onPointerUp, true);
@@ -7288,7 +7401,7 @@ export function BrowserChatWorkspace({
     document.addEventListener('pointermove', onPointerMove, true);
     document.addEventListener('pointerup', onPointerUp, true);
     document.addEventListener('pointercancel', onPointerUp, true);
-  }, []);
+  }, [embeddedChatWidth]);
 
   useEffect(() => {
     activeSessionIdRef.current = session?.id || null;
@@ -7805,22 +7918,46 @@ export function BrowserChatWorkspace({
     if (!sessionId || generatingSkillMessageId) return;
     setGeneratingSkillMessageId(messageId);
     setError('');
-    startGlobalLoading('正在生成 Skill');
+    startGlobalLoading(t('正在生成 Skill'));
     try {
       const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/skills`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageId }),
       });
-      await readApiJson<Record<string, unknown>>(response, '生成 Skill 失败');
+      await readApiJson<Record<string, unknown>>(response, t('生成 Skill 失败'));
       await loadSkills();
     } catch (skillError) {
-      setError(skillError instanceof Error ? skillError.message : '生成 Skill 失败');
+      setError(skillError instanceof Error ? skillError.message : t('生成 Skill 失败'));
     } finally {
       setGeneratingSkillMessageId(null);
       stopGlobalLoading();
     }
-  }, [browserChatApiUrl, generatingSkillMessageId, loadSkills, session?.id]);
+  }, [browserChatApiUrl, generatingSkillMessageId, loadSkills, session?.id, t]);
+
+  const generateMessageAutomationCase = useCallback(async (messageId: string) => {
+    const sessionId = session?.id;
+    if (!sessionId || generatingAutomationMessageId) return;
+    setGeneratingAutomationMessageId(messageId);
+    setError('');
+    startGlobalLoading(t('正在生成测试用例'));
+    try {
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/automation-cases`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageId, userId: requestUserId }),
+      });
+      const data = await readApiJson<{ automationCase?: { id?: string }; case?: { id?: string } }>(response, t('生成测试用例失败'));
+      const caseId = data.automationCase?.id || data.case?.id || '';
+      const search = new URLSearchParams({ userId: requestUserId });
+      if (caseId) search.set('caseId', caseId);
+      window.location.assign(`${withWebPilotBasePath('/automation')}?${search.toString()}`);
+    } catch (automationError) {
+      setError(automationError instanceof Error ? automationError.message : t('生成测试用例失败'));
+      setGeneratingAutomationMessageId(null);
+      stopGlobalLoading();
+    }
+  }, [browserChatApiUrl, generatingAutomationMessageId, requestUserId, session?.id, t]);
 
   async function startNewConversation() {
     if (loadingSessionId) return;
@@ -7867,7 +8004,7 @@ export function BrowserChatWorkspace({
     return (
       <section className="browser-chat-sidebar-section browser-chat-recent-section">
         <div className="browser-chat-recent-header">
-          <h2>对话</h2>
+          <h2>{t('对话')}</h2>
           <div className="browser-chat-recent-header-actions">
             <button
               aria-label={t('新建对话')}
@@ -7881,18 +8018,20 @@ export function BrowserChatWorkspace({
             </button>
             {recentSelectionMode ? (
               <button
-                aria-label={`删除已选对话（${selectedDeletableSessionIds.length}）`}
+                aria-label={t('删除已选对话（{count}）', { count: selectedDeletableSessionIds.length })}
                 className="ui-icon-button ui-icon-button--danger browser-chat-section-create"
                 disabled={!selectedDeletableSessionIds.length || deletingSelectedSessions}
                 onClick={() => void deleteSelectedSessionHistory()}
-                title={selectedDeletableSessionIds.length ? `删除已选对话（${selectedDeletableSessionIds.length}）` : '请选择要删除的对话'}
+                title={selectedDeletableSessionIds.length
+                  ? t('删除已选对话（{count}）', { count: selectedDeletableSessionIds.length })
+                  : t('请选择要删除的对话')}
                 type="button"
               >
                 {deletingSelectedSessions ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
               </button>
             ) : null}
             <details className="browser-chat-overflow browser-chat-recent-actions">
-              <summary aria-label="对话操作" title="对话操作">
+              <summary aria-label={t('对话操作')} title={t('对话操作')}>
                 <MoreHorizontal size={16} />
               </summary>
               <div className="browser-chat-overflow-menu">
@@ -7906,7 +8045,7 @@ export function BrowserChatWorkspace({
                     type="button"
                   >
                     <Square size={14} />
-                    <span>{recentSelectionMode ? '退出选择' : '选择对话'}</span>
+                    <span>{recentSelectionMode ? t('退出选择') : t('选择对话')}</span>
                   </button>
                 ) : null}
                 {recentSelectionMode ? (
@@ -7918,7 +8057,7 @@ export function BrowserChatWorkspace({
                     type="button"
                   >
                     <CheckCircle2 size={15} />
-                    <span>{allSelectableRecentSessionsSelected ? '取消全选' : '全选'}</span>
+                    <span>{allSelectableRecentSessionsSelected ? t('取消全选') : t('全选')}</span>
                   </button>
                 ) : null}
               </div>
@@ -7936,16 +8075,37 @@ export function BrowserChatWorkspace({
           <Plus size={16} />
           <span>{t('新建对话')}</span>
         </button>
-        {recentSessions.length ? (
+        <label className="domain-list-search browser-chat-history-filter">
+          <Search aria-hidden="true" size={16} />
+          <input
+            aria-label={t('筛选对话历史')}
+            className="domain-list-search-input"
+            onChange={(event) => setHistoryFilter(event.currentTarget.value)}
+            placeholder={t('筛选对话')}
+            type="search"
+            value={historyFilter}
+          />
+          {historyFilter ? (
+            <button
+              aria-label={t('清空对话筛选')}
+              onClick={() => setHistoryFilter('')}
+              title={t('清空筛选')}
+              type="button"
+            >
+              <X size={14} />
+            </button>
+          ) : null}
+        </label>
+        {filteredRecentSessions.length ? (
           <ol className="browser-chat-recent-list">
-            {recentSessions.map((item) => (
+            {filteredRecentSessions.map((item) => (
               <li key={item.id}>
                 <div
                   className={`${session?.id === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}${recentSelectionMode ? ' selecting' : ''}`}
                 >
                   {recentSelectionMode ? (
                     <input
-                      aria-label={`选择 ${sessionDisplayTitle(item)}`}
+                      aria-label={t('选择 {name}', { name: sessionDisplayTitle(item) })}
                       checked={selectedSessionIdSet.has(item.id)}
                       className="browser-chat-recent-check"
                       disabled={item.busy || deletingSelectedSessions}
@@ -7967,7 +8127,7 @@ export function BrowserChatWorkspace({
                     <span>{sessionDisplayTitle(item)}</span>
                   </button>
                   <details className="browser-chat-overflow browser-chat-recent-row-menu">
-                    <summary aria-label={`${sessionDisplayTitle(item)} 操作`} title="更多操作">
+                    <summary aria-label={t('{name} 操作', { name: sessionDisplayTitle(item) })} title={t('更多操作')}>
                       {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
                     </summary>
                     <div className="browser-chat-overflow-menu">
@@ -7981,7 +8141,7 @@ export function BrowserChatWorkspace({
                         type="button"
                       >
                         <Trash2 size={15} />
-                        <span>{item.busy ? '执行中，无法删除' : '删除对话'}</span>
+                        <span>{item.busy ? t('执行中，无法删除') : t('删除对话')}</span>
                       </button>
                     </div>
                   </details>
@@ -7989,9 +8149,9 @@ export function BrowserChatWorkspace({
               </li>
             ))}
           </ol>
-        ) : (
-          <p>{t('暂无记录')}</p>
-        )}
+        ) : recentSessions.length ? (
+          <p className="browser-chat-history-filter-empty">{t('没有匹配的对话')}</p>
+        ) : null}
       </section>
     );
   }
@@ -8023,18 +8183,18 @@ export function BrowserChatWorkspace({
     <div className="browser-chat-pane-actions">
       {webPreviewRuntime && session ? (
         <button
-          aria-label="打开实时界面"
+          aria-label={t('打开实时界面')}
           className="browser-chat-web-preview-button"
           disabled={session.status === 'closed'}
           onClick={() => setWebPreviewOpen(true)}
-          title={session.status === 'closed' ? '当前对话已结束' : '打开实时界面'}
+          title={session.status === 'closed' ? t('当前对话已结束') : t('打开实时界面')}
           type="button"
         >
           <AppWindow size={17} />
         </button>
       ) : null}
       {session ? (
-        <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title="结束会话" type="button">
+        <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title={t('结束会话')} type="button">
           <Power size={17} />
         </button>
       ) : null}
@@ -8071,6 +8231,7 @@ export function BrowserChatWorkspace({
         <BrowserChatMessageList
           key={`messages:${sessionUiKey}`}
           availableSkills={skills}
+          generatingAutomationMessageId={generatingAutomationMessageId}
           generatingSkillMessageId={generatingSkillMessageId}
           historyHasMore={Boolean(session?.history && (
             session.history.messages.hasMore || session.history.steps.hasMore || session.history.logs.hasMore
@@ -8079,6 +8240,7 @@ export function BrowserChatWorkspace({
           lastAssistantMessageId={lastAssistantMessageId}
           logIndex={logIndex}
           messages={visibleMessages}
+          onGenerateAutomationCase={generateMessageAutomationCase}
           onGenerateSkill={generateMessageSkill}
           onLoadEarlier={loadEarlierHistory}
           onPreviewImage={previewAttachment}
@@ -8098,7 +8260,7 @@ export function BrowserChatWorkspace({
       ) : null}
 
       <div className="browser-chat-composer-shell">
-        {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
+        {error || session?.error ? <div className="error">{t(stripAnsiControlCodes(error || session?.error || ''))}</div> : null}
         <BrowserChatComposer
           key={`composer:${sessionUiKey}`}
           attachments={attachments}
@@ -8139,15 +8301,15 @@ export function BrowserChatWorkspace({
           <button
             className="ui-icon-button"
             onClick={toggleSidebarCollapsed}
-            title={sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'}
+            title={sidebarCollapsed ? t('展开侧边栏') : t('折叠侧边栏')}
             type="button"
-            aria-label={sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'}
+            aria-label={sidebarCollapsed ? t('展开侧边栏') : t('折叠侧边栏')}
           >
             <PanelLeft size={17} />
           </button>
         </div>
 
-        <nav className="browser-chat-nav" aria-label="工作模式">
+        <nav className="browser-chat-nav" aria-label={t('工作模式')}>
           <button
             aria-current={activeView === 'chat' ? 'page' : undefined}
             aria-label={t('对话模式')}
@@ -8159,9 +8321,19 @@ export function BrowserChatWorkspace({
             <MessageSquare size={17} />
             <span>{t('对话模式')}</span>
           </button>
-          <button aria-current={activeView === 'settings' ? 'page' : undefined} aria-label="设置" className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => navigateBrowserChatView('/settings')} title="设置" type="button">
+          <button
+            aria-label={t('自动化')}
+            className="browser-chat-nav-item"
+            onClick={() => window.location.assign(`${withWebPilotBasePath('/automation')}?userId=${encodeURIComponent(requestUserId)}`)}
+            title={t('自动化')}
+            type="button"
+          >
+            <Workflow size={17} />
+            <span>{t('自动化')}</span>
+          </button>
+          <button aria-current={activeView === 'settings' ? 'page' : undefined} aria-label={t('设置')} className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => navigateBrowserChatView('/settings')} title={t('设置')} type="button">
             <Settings size={17} />
-            <span>设置</span>
+            <span>{t('设置')}</span>
           </button>
         </nav>
 
@@ -8169,10 +8341,10 @@ export function BrowserChatWorkspace({
 
         <div className="browser-chat-sidebar-footer">
           <button
-            aria-label={themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式'}
+            aria-label={themeMode === 'dark' ? t('切换到浅色模式') : t('切换到深色模式')}
             className="browser-chat-theme-toggle"
             onClick={toggleMode}
-            title={themeMode === 'dark' ? '浅色模式' : '深色模式'}
+            title={themeMode === 'dark' ? t('浅色模式') : t('深色模式')}
             type="button"
           >
             {themeMode === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
@@ -8258,6 +8430,7 @@ export function BrowserChatWorkspace({
               <BrowserChatMessageList
                 key={`messages:${sessionUiKey}`}
                 availableSkills={skills}
+                generatingAutomationMessageId={generatingAutomationMessageId}
                 generatingSkillMessageId={generatingSkillMessageId}
                 historyHasMore={Boolean(session?.history && (
                   session.history.messages.hasMore || session.history.steps.hasMore || session.history.logs.hasMore
@@ -8266,6 +8439,7 @@ export function BrowserChatWorkspace({
                 lastAssistantMessageId={lastAssistantMessageId}
                 logIndex={logIndex}
                 messages={visibleMessages}
+                onGenerateAutomationCase={generateMessageAutomationCase}
                 onGenerateSkill={generateMessageSkill}
                 onLoadEarlier={loadEarlierHistory}
                 onPreviewImage={previewAttachment}
@@ -8285,7 +8459,7 @@ export function BrowserChatWorkspace({
             ) : null}
 
             <div className="browser-chat-composer-shell">
-              {error || session?.error ? <div className="error">{stripAnsiControlCodes(error || session?.error || '')}</div> : null}
+              {error || session?.error ? <div className="error">{t(stripAnsiControlCodes(error || session?.error || ''))}</div> : null}
               <BrowserChatComposer
                 key={`composer:${sessionUiKey}`}
                 attachments={attachments}
@@ -8347,7 +8521,7 @@ export function BrowserChatWorkspace({
         <div className="fullscreen-image-viewer" onClick={() => setImagePreview(null)} role="presentation">
           <div className="image-viewer-toolbar" onClick={(event) => event.stopPropagation()}>
             <strong>{imagePreview.name}</strong>
-            <button className="ui-icon-button" onClick={() => setImagePreview(null)} type="button" aria-label="关闭">
+            <button className="ui-icon-button" onClick={() => setImagePreview(null)} type="button" aria-label={t('关闭')}>
               <X size={18} />
             </button>
           </div>

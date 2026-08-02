@@ -6783,7 +6783,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .ui-button--primary {
   background: var(--button-primary-bg);
   border-color: var(--button-primary-bg);
-  color: #ffffff;
+  color: var(--button-primary-foreground);
 }
 
 .ui-button--danger {
@@ -6806,28 +6806,6 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   background: var(--button-danger-bg);
   border-color: var(--button-danger-bg);
   box-shadow: var(--shadow-tight);
-}
-
-.ui-modal-footer .ui-button {
-  background: transparent !important;
-  border-color: transparent !important;
-  box-shadow: none !important;
-  color: var(--foreground);
-}
-
-.ui-modal-footer .ui-button--primary {
-  color: var(--accent-strong);
-}
-
-.ui-modal-footer .ui-button--danger {
-  color: var(--danger);
-}
-
-.ui-modal-footer .ui-button:not(:disabled):hover {
-  background: transparent !important;
-  border-color: transparent !important;
-  box-shadow: none !important;
-  opacity: 0.72;
 }
 
 :where(.ui-button, .ui-icon-button):disabled {
@@ -9344,6 +9322,17 @@ body.is-dragging-embedded-tab * {
   user-select: none;
 }
 
+.browser-chat-resizing *,
+.browser-chat-resizing *::before,
+.browser-chat-resizing *::after {
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+
+.browser-chat-resizing .browser-chat-embedded-workspace {
+  transition: none !important;
+}
+
 .browser-chat-resizing .browser-chat-embedded-browser,
 .browser-chat-resizing .browser-chat-embedded-chat-column {
   pointer-events: none;
@@ -9482,12 +9471,16 @@ body.is-dragging-embedded-tab * {
   opacity: 0.42;
 }
 
-.browser-chat-web-preview-overlay {
+.ui-modal-overlay.browser-chat-web-preview-overlay {
+  animation: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
   overflow: hidden;
   padding: 0;
 }
 
 .ui-modal.browser-chat-web-preview-modal {
+  animation: none;
   border: 0;
   border-radius: 0;
   box-shadow: none;
@@ -9660,11 +9653,13 @@ body.is-dragging-embedded-tab * {
 .browser-chat-web-preview-stage img,
 .browser-chat-web-preview-stage video {
   background: #111318;
-  height: auto;
-  max-height: 100%;
-  max-width: 100%;
+  contain: paint;
+  display: block;
+  height: 100%;
+  object-fit: contain;
+  object-position: center;
   pointer-events: none;
-  width: auto;
+  width: 100%;
 }
 
 .browser-chat-web-preview-stage img {

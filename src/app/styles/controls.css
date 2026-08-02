@@ -51,17 +51,19 @@ input[type="checkbox"]:disabled {
   cursor: pointer;
   display: inline-flex;
   font-family: inherit;
-  font-size: 14px;
-  font-weight: 850;
+  font-size: 13px;
+  font-weight: 600;
   gap: 7px;
   justify-content: center;
   min-height: 36px;
   padding: 0;
   transition:
-    background 0.16s ease,
-    border-color 0.16s ease,
-    color 0.16s ease,
-    opacity 0.16s ease;
+    background-color var(--motion-fast) ease,
+    border-color var(--motion-fast) ease,
+    box-shadow var(--motion-fast) ease,
+    color var(--motion-fast) ease,
+    opacity var(--motion-fast) ease,
+    transform var(--motion-fast) var(--ease-standard);
 }
 
 .ui-button {
@@ -72,13 +74,16 @@ input[type="checkbox"]:disabled {
 
 .ui-button--neutral {
   background: var(--button-neutral-bg);
+  border-color: var(--button-neutral-border);
+  box-shadow: var(--shadow-xs);
   color: var(--foreground);
 }
 
 .ui-button--primary {
   background: var(--button-primary-bg);
   border-color: var(--button-primary-bg);
-  color: #ffffff;
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  color: var(--button-primary-foreground);
 }
 
 .ui-button--danger {
@@ -91,6 +96,12 @@ input[type="checkbox"]:disabled {
   color: var(--danger);
 }
 
+.ui-icon-button {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
 .ui-button--neutral:not(:disabled):hover {
   background: var(--control-hover-bg);
   color: var(--foreground);
@@ -100,7 +111,7 @@ input[type="checkbox"]:disabled {
   background: transparent;
   border-color: transparent;
   box-shadow: none;
-  color: var(--accent-strong);
+  color: var(--foreground);
 }
 
 .ui-button--primary:not(:disabled):hover {
@@ -117,7 +128,7 @@ input[type="checkbox"]:disabled {
   background: transparent;
   border-color: transparent;
   box-shadow: none;
-  color: var(--accent-strong);
+  color: var(--danger);
 }
 
 .ui-button:disabled,

@@ -182,7 +182,7 @@ export function LoginAccountModal({
             <KeyRound aria-hidden="true" size={14} />
             <span>{t('密码加密保存在本机后台；规划模型只会看到域名和用户名，登录时只使用短期安全引用。')}</span>
           </div>
-          {error ? <p className="login-account-modal-error wide" role="alert">{error}</p> : null}
+          {error ? <p className="login-account-modal-error wide" role="alert">{t(error)}</p> : null}
         </div>
 
         <footer className="ui-modal-footer">

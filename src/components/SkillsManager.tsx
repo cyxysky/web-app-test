@@ -247,7 +247,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
         </div>
         <div className="personal-memory-head-actions">
           <DataTransferButtons kind="skills" onImported={loadSkills} userId={normalizedUserId} />
-          <button className="ui-button ui-icon-button" onClick={openCreateSkill} type="button">
+          <button className="ui-button ui-button--primary" onClick={openCreateSkill} type="button">
             <Plus size={15} />
             {t('新建 Skill')}
           </button>

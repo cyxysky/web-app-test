@@ -6,7 +6,11 @@ import { z } from 'zod';
 import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
-import { BrowserSession, type BrowserActionResult, type BrowserSessionMode } from '@/server/browser/browser-session';
+import {
+  BrowserSession,
+  type BrowserActionResult,
+  type BrowserSessionMode,
+} from '@/server/browser/browser-session';
 import { analyzeBrowserCodeRisk, type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
 import { browserElementTargetSchema, browserInteractToolDescription, browserInteractToolShape, refineBrowserInteractTarget } from './browser-input-tool-schema';
 import { richTextToPlainText } from '@/lib/rich-text';
@@ -3060,15 +3064,28 @@ function flowInput(input: unknown) {
   return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
 }
 
-async function runRecordedTool(
+export type RecordedBrowserOperationExecutionOptions = {
+  runId?: string;
+  targetUrl?: string;
+  abortSignal?: AbortSignal;
+  credentialBindings?: BrowserCodeCredentialBinding[];
+};
+
+/**
+ * Execute one previously recorded browser-chat tool against an existing browser
+ * session. This is intentionally a low-level dispatcher: callers own ordering,
+ * retries, repair, and final verification.
+ */
+export async function executeRecordedBrowserOperation(
   session: BrowserSession,
   flow: BrowserOperationRecord,
-  runId?: string,
-  abortSignal?: AbortSignal,
-  credentialBindings?: BrowserCodeCredentialBinding[],
+  options: RecordedBrowserOperationExecutionOptions = {},
 ): Promise<BrowserActionResult> {
   const input = flowInput(flow.input);
   const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
+  const runId = options.runId;
+  const abortSignal = options.abortSignal;
+  const credentialBindings = options.credentialBindings;
 
   switch (flow.name) {
     case 'browserCode':
@@ -3080,6 +3097,108 @@ async function runRecordedTool(
         stepIndex: flow.index,
         abortSignal,
       });
+    case 'takeScreenshot': {
+      const capture = input.capture === 'fullPage' ? 'fullPage' : 'viewport';
+      const path = await session.takeScreenshot(runId || 'automation', flow.index, 'manual', { capture });
+      return { ok: true, actual: `Captured ${capture} screenshot.`, referenceImagePath: path };
+    }
+    case 'browser': {
+      if (input.action === 'wait') {
+        return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
+      }
+      if (input.action === 'listTabs') return session.listTabs();
+      if (input.action === 'switchTab') {
+        return session.switchTab(typeof input.index === 'number' ? input.index : 0);
+      }
+      if (input.action !== 'open') {
+        return { ok: false, actual: `Unsupported recorded browser action: ${String(input.action || '')}.${reason}` };
+      }
+      const url = typeof input.url === 'string' && input.url.trim()
+        ? input.url
+        : options.targetUrl || '';
+      if (!url) return { ok: false, actual: `Recorded browser open requires a URL.${reason}` };
+      return input.target === 'new' ? session.openInNewTab(url) : session.open(url);
+    }
+    case 'interact': {
+      const parsed = z.object(browserInteractToolShape)
+        .superRefine(refineBrowserInteractTarget)
+        .safeParse(input);
+      if (!parsed.success) {
+        return { ok: false, actual: `Invalid recorded interact input: ${parsed.error.message}.${reason}` };
+      }
+      const action = parsed.data;
+      if (['click', 'move', 'drag', 'scroll', 'scrollIntoView'].includes(action.action)) {
+        return session.mouse({
+          action: action.action as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
+          abortSignal,
+          target: action.target,
+          xThousandth: action.x_thousandth,
+          yThousandth: action.y_thousandth,
+          toTarget: action.toTarget,
+          toXThousandth: action.toX_thousandth,
+          toYThousandth: action.toY_thousandth,
+          button: action.button,
+          clickCount: action.clickCount,
+          force: action.force,
+          deltaX: action.deltaX,
+          deltaY: action.deltaY,
+        });
+      }
+      if (action.action === 'selectOption') {
+        return session.selectOption({
+          target: action.target,
+          value: action.value,
+          label: action.label,
+          abortSignal,
+        });
+      }
+      const credential = action.credentialRef
+        ? credentialBindings?.find((item) => item.ref === action.credentialRef)
+        : undefined;
+      if (action.credentialRef && (!credential || action.action !== 'type' || !action.target)) {
+        return { ok: false, actual: 'Credential entry requires a valid runtime reference and a current backend-bound field target.' };
+      }
+      return session.keyboard({
+        action: action.action as 'type' | 'press' | 'shortcut',
+        target: action.target,
+        xThousandth: action.x_thousandth,
+        yThousandth: action.y_thousandth,
+        text: credential ? credential.value : action.text,
+        key: action.key,
+        keys: action.keys,
+        replace: action.replace,
+        followByEnter: action.followByEnter,
+        allowedOrigins: credential?.allowedOrigins,
+      });
+    }
+    case 'inspect': {
+      if (input.action === 'httpRequests') {
+        const ids = Array.isArray(input.ids)
+          ? input.ids.filter((item): item is string => typeof item === 'string')
+          : undefined;
+        return session.getCurrentTabHttpRequests({ ids });
+      }
+      if (input.action === 'search') {
+        return session.searchSnapshot({
+          query: typeof input.query === 'string' ? input.query : undefined,
+          tag: typeof input.tag === 'string' ? input.tag : undefined,
+          roles: Array.isArray(input.roles)
+            ? input.roles.filter((item): item is string => typeof item === 'string')
+            : undefined,
+          limit: typeof input.limit === 'number' ? input.limit : undefined,
+        });
+      }
+      const mode = input.mode === 'text' || input.mode === 'changes' ? input.mode : 'full';
+      const snapshot = await session.readDomObservationSnapshot({
+        cursor: typeof input.cursor === 'string' ? input.cursor : undefined,
+        mode,
+      });
+      return {
+        ok: true,
+        actual: [snapshot.pageSummary, snapshot.content].filter(Boolean).join('\n'),
+        nextCursor: snapshot.nextCursor,
+      };
+    }
     case 'waitForHumanVerification':
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
     case 'downloadFile':
@@ -3193,7 +3312,11 @@ async function executeCodexRuntimeObject(input: {
         offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
       });
     }
-    return runRecordedTool(session, flow, runId, abortSignal, credentialBindings);
+    return executeRecordedBrowserOperation(session, flow, {
+      runId,
+      abortSignal,
+      credentialBindings,
+    });
   };
 
   const result = await executeTracedBrowserAction({

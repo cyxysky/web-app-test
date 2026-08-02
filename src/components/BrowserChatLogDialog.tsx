@@ -11,6 +11,9 @@ import {
   summarizeBrowserChatLogs,
 } from '@/components/browser-chat-log-model';
 import { formatLogTime, formatToolPayload, parseJsonObjectText, phaseLabel } from '@/components/browser-chat-format';
+import { useI18n } from '@/i18n/I18nProvider';
+
+type Translator = ReturnType<typeof useI18n>['t'];
 
 export type BrowserChatLogDialogRecord = {
   details?: string;
@@ -85,7 +88,7 @@ function formatPostprocessTimings(value: unknown) {
     .join('，');
 }
 
-function aiLogTimingInline(log: BrowserChatLogDialogRecord) {
+function aiLogTimingInline(log: BrowserChatLogDialogRecord, t: Translator) {
   if (log.phase !== 'ai:runtime:response' && log.phase !== 'ai:runtime:object') return '';
   const parsed = parseJsonObjectText(log.details);
   const timings = aiLogTimings(parsed);
@@ -96,31 +99,31 @@ function aiLogTimingInline(log: BrowserChatLogDialogRecord) {
   const total = formatElapsedMs(timings.totalElapsedMs);
   return [
     ai ? `AI ${ai}` : '',
-    tool ? `工具 ${tool}` : '',
-    overhead && overhead !== '0ms' ? `后处理 ${overhead}` : '',
-    total ? `总 ${total}` : '',
+    tool ? t('工具 {time}', { time: tool }) : '',
+    overhead && overhead !== '0ms' ? t('后处理 {time}', { time: overhead }) : '',
+    total ? t('总计 {time}', { time: total }) : '',
   ].filter(Boolean).join(' · ');
 }
 
-function aiLogTimingPayload(details?: Record<string, unknown>) {
+function aiLogTimingPayload(details: Record<string, unknown> | undefined, t: Translator) {
   const timings = aiLogTimings(details);
   if (!timings) return '';
   const lines: string[] = [];
   const total = formatElapsedMs(timings.totalElapsedMs);
-  if (total) lines.push(`总耗时: ${total}`);
+  if (total) lines.push(t('总耗时：{time}', { time: total }));
   const ai = formatElapsedMs(timings.aiRequestElapsedMs);
-  if (ai) lines.push(`AI 请求耗时: ${ai}`);
+  if (ai) lines.push(t('AI 请求耗时：{time}', { time: ai }));
   const tool = formatElapsedMs(timings.toolElapsedMs);
-  if (tool) lines.push(`工具动作耗时: ${tool}`);
+  if (tool) lines.push(t('工具动作耗时：{time}', { time: tool }));
   const overhead = formatElapsedMs(timings.toolOverheadElapsedMs);
-  if (overhead && overhead !== '0ms') lines.push(`工具后处理耗时: ${overhead}`);
+  if (overhead && overhead !== '0ms') lines.push(t('工具后处理耗时：{time}', { time: overhead }));
   const other = formatElapsedMs(timings.otherElapsedMs);
-  if (other && other !== '0ms') lines.push(`其他耗时: ${other}`);
+  if (other && other !== '0ms') lines.push(t('其他耗时：{time}', { time: other }));
   const toolCount = finiteNumber(timings.toolCount);
-  if (toolCount !== undefined) lines.push(`工具数量: ${toolCount}`);
+  if (toolCount !== undefined) lines.push(t('工具数量：{count}', { count: toolCount }));
   const tools = Array.isArray(timings.tools) ? timings.tools : [];
   if (tools.length) {
-    lines.push('工具明细:');
+    lines.push(t('工具明细：'));
     tools.forEach((toolItem, index) => {
       const record = asRecord(toolItem);
       if (!record) return;
@@ -128,11 +131,11 @@ function aiLogTimingPayload(details?: Record<string, unknown>) {
       const action = formatElapsedMs(record.actionElapsedMs) || formatElapsedMs(record.elapsedMs) || '-';
       const overhead = formatElapsedMs(record.overheadElapsedMs);
       const total = formatElapsedMs(record.traceElapsedMs);
-      const parts = [`动作 ${action}`];
-      if (overhead && overhead !== '0ms') parts.push(`后处理 ${overhead}`);
-      if (total && total !== action) parts.push(`总计 ${total}`);
+      const parts = [t('动作 {time}', { time: action })];
+      if (overhead && overhead !== '0ms') parts.push(t('后处理 {time}', { time: overhead }));
+      if (total && total !== action) parts.push(t('总计 {time}', { time: total }));
       const postprocess = formatPostprocessTimings(record.postprocessTimings);
-      if (postprocess) parts.push(`明细 ${postprocess}`);
+      if (postprocess) parts.push(t('明细 {details}', { details: postprocess }));
       lines.push(`  ${index + 1}. ${name}: ${parts.join('，')}`);
     });
   }
@@ -196,6 +199,7 @@ function screenshotPerformancePayload(details: Record<string, unknown>) {
 }
 
 function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLogDialogRecord; nextAiInputTokens?: number }) {
+  const { t } = useI18n();
   if (!log.details) return null;
   const parsed = parseJsonObjectText(log.details);
   const isAiRequestLog = log.phase.endsWith('ai:runtime:request');
@@ -228,24 +232,28 @@ function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLog
           context: parsed.context,
         })
       : '';
-  const timingPayload = isAiResponseLog ? aiLogTimingPayload(payloadDetails) : '';
+  const timingPayload = isAiResponseLog ? aiLogTimingPayload(payloadDetails, t) : '';
   const errorPayload = isAiFailureLog ? formatToolPayload(parsed) : '';
   const performancePayload = isBrowserChatScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
   const requestTokens = isAiRequestLog ? finiteNumber(asRecord(payloadDetails.aiInputTokens)?.estimatedTextTokens) : undefined;
   if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload) return null;
   return (
     <div className="browser-chat-log-details">
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" payload={timingPayload} title="耗时明细" />
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block" payload={requestPayload} title="AI input JSON" />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" payload={timingPayload} title={t('耗时明细')} />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block" payload={requestPayload} title={t('AI 输入 JSON')} />
       {isAiRequestLog ? (
-        <p className="browser-chat-log-token-count">此次发送给 AI 的文本：{requestTokens === undefined ? '无法估算' : `约 ${Math.round(requestTokens).toLocaleString()} tokens`}</p>
+        <p className="browser-chat-log-token-count">{t('此次发送给 AI 的文本：{tokens}', {
+          tokens: requestTokens === undefined ? t('无法估算') : t('约 {count} tokens', { count: Math.round(requestTokens).toLocaleString() }),
+        })}</p>
       ) : null}
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-response" payload={responsePayload} title="AI output JSON" />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-response" payload={responsePayload} title={t('AI 输出 JSON')} />
       {isAiResponseLog ? (
-        <p className="browser-chat-log-token-count">下次发送给 AI 的内容：{nextAiInputTokens === undefined ? '尚未生成' : `约 ${Math.round(nextAiInputTokens).toLocaleString()} tokens`}</p>
+        <p className="browser-chat-log-token-count">{t('下次发送给 AI 的内容：{tokens}', {
+          tokens: nextAiInputTokens === undefined ? t('尚未生成') : t('约 {count} tokens', { count: Math.round(nextAiInputTokens).toLocaleString() }),
+        })}</p>
       ) : null}
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-error" payload={errorPayload} title="错误详情" />
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-performance" payload={performancePayload} title="Screenshot performance" />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-error" payload={errorPayload} title={t('错误详情')} />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-performance" payload={performancePayload} title={t('截图性能')} />
     </div>
   );
 }
@@ -265,8 +273,9 @@ function BrowserChatLogEntry({
   virtualIndex?: number;
   nextAiInputTokens?: number;
 }) {
+  const { t } = useI18n();
   const compressionLabel = contextCompressionLabel(log);
-  const timingLabel = aiLogTimingInline(log);
+  const timingLabel = aiLogTimingInline(log, t);
   return (
     <li
       className={compressionLabel ? 'has-context-compression' : ''}
@@ -277,17 +286,17 @@ function BrowserChatLogEntry({
       {compressionLabel ? (
         <div className="browser-chat-context-compression-marker">
           <span>--------------------------</span>
-          <strong>{compressionLabel}</strong>
+          <strong>{t(compressionLabel)}</strong>
           <span>--------------------------</span>
         </div>
       ) : null}
-      <span>{phaseLabel(log.phase)}</span>
+      <span>{t(phaseLabel(log.phase))}</span>
       <div>
-        <strong>{log.message}</strong>
+        <strong>{t(log.message)}</strong>
         <small>
           {formatLogTime(log.time)}
-          {log.stepIndex ? ` · 步骤 ${log.stepIndex}` : ''}
-          {timingLabel ? ` ? ${timingLabel}` : typeof log.elapsedMs === 'number' ? ` ? ${log.elapsedMs}ms` : ''}
+          {log.stepIndex ? ` · ${t('步骤 {index}', { index: log.stepIndex })}` : ''}
+          {timingLabel ? ` · ${timingLabel}` : typeof log.elapsedMs === 'number' ? ` · ${log.elapsedMs}ms` : ''}
         </small>
         <BrowserChatLogDetails log={log} nextAiInputTokens={nextAiInputTokens} />
       </div>
@@ -354,32 +363,33 @@ export function BrowserChatLogDialog({
   messageContent?: string;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const summary = summarizeBrowserChatLogs(entries);
   return (
     <div className="ui-modal-overlay" onClick={onClose} role="presentation">
-      <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="执行日志">
+      <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('执行日志')}>
         <header className="ui-modal-header">
           <div className="ui-modal-heading">
-            <h2 className="ui-modal-title">执行日志</h2>
-            <p className="ui-modal-subtitle">{messageContent || '当前 AI 消息'}</p>
+            <h2 className="ui-modal-title">{t('执行日志')}</h2>
+            <p className="ui-modal-subtitle">{messageContent || t('当前 AI 消息')}</p>
           </div>
-          <button className="ui-icon-button ui-modal-close" onClick={onClose} type="button" aria-label="关闭">
+          <button className="ui-icon-button ui-modal-close" onClick={onClose} type="button" aria-label={t('关闭')}>
             <X size={18} />
           </button>
         </header>
         <div className="ui-modal-body browser-chat-log-modal-body">
         {entries.length ? (
-          <div className="browser-chat-log-summary" aria-label="log summary">
+          <div className="browser-chat-log-summary" aria-label={t('日志摘要')}>
             <span>AI {summary.ai}</span>
-            <span>Context {summary.context}</span>
-            <span>Screenshot {summary.screenshot}</span>
-            <span>Total {summary.total}</span>
+            <span>{t('上下文')} {summary.context}</span>
+            <span>{t('截图')} {summary.screenshot}</span>
+            <span>{t('总计')} {summary.total}</span>
           </div>
         ) : null}
         {entries.length ? (
           <BrowserChatVirtualLogList entries={entries} />
         ) : (
-          <p className="browser-chat-log-empty">暂无日志</p>
+          <p className="browser-chat-log-empty">{t('暂无日志')}</p>
         )}
         </div>
       </section>

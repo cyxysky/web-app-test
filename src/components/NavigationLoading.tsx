@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
+import { useI18n } from '@/i18n/I18nProvider';
 import { withoutWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 function isInternalNavigationLink(anchor: HTMLAnchorElement) {
@@ -22,11 +23,13 @@ function isWorkspaceViewPathname(pathname: string) {
 }
 
 function LoadingOverlay({ label }: { label: string }) {
+  const { t } = useI18n();
+  const translatedLabel = t(label);
   return (
-    <div className="navigation-loading-overlay" role="status" aria-live="polite" aria-label={label}>
+    <div className="navigation-loading-overlay" role="status" aria-live="polite" aria-label={translatedLabel}>
       <div className="navigation-loading-content">
         <LiquidGlassLoader />
-        <p>{label}</p>
+        <p>{translatedLabel}</p>
       </div>
     </div>
   );
@@ -37,13 +40,18 @@ export function NavigationLoading() {
   const [visible, setVisible] = useState(false);
   const [label, setLabel] = useState('正在切换界面');
   const pendingRef = useRef(0);
+  const showTimeoutRef = useRef<number | undefined>(undefined);
   const timeoutRef = useRef<number | undefined>(undefined);
 
   function start(nextLabel = '正在处理') {
     window.clearTimeout(timeoutRef.current);
+    const wasIdle = pendingRef.current === 0;
     pendingRef.current += 1;
     setLabel(nextLabel);
-    setVisible(true);
+    if (wasIdle) {
+      window.clearTimeout(showTimeoutRef.current);
+      showTimeoutRef.current = window.setTimeout(() => setVisible(true), 160);
+    }
     timeoutRef.current = window.setTimeout(() => {
       pendingRef.current = 0;
       setVisible(false);
@@ -54,6 +62,7 @@ export function NavigationLoading() {
     window.clearTimeout(timeoutRef.current);
     pendingRef.current = force ? 0 : Math.max(0, pendingRef.current - 1);
     if (pendingRef.current > 0) return;
+    window.clearTimeout(showTimeoutRef.current);
     timeoutRef.current = window.setTimeout(() => setVisible(false), 180);
   }
 
@@ -87,6 +96,7 @@ export function NavigationLoading() {
       window.removeEventListener('popstate', onPopState);
       window.removeEventListener('navigation-loading:start', onManualStart);
       window.removeEventListener('navigation-loading:stop', onManualStop);
+      window.clearTimeout(showTimeoutRef.current);
       window.clearTimeout(timeoutRef.current);
     };
   }, []);

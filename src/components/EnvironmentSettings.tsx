@@ -348,7 +348,7 @@ export function EnvironmentSettings({
     if (result.ok && result.path) {
       update(index, { value: result.path });
     } else if (!result.ok && result.error) {
-      window.alert(result.error);
+      window.alert(t(result.error));
     }
   }
 
@@ -576,7 +576,7 @@ export function EnvironmentSettings({
       setLoginAccounts((current) => current.filter((item) => item.id !== account.id));
       setDeleteLoginAccountTarget(null);
     } catch (error) {
-      setDeleteLoginAccountError(error instanceof Error ? error.message : t('删除登录账号失败'));
+      setDeleteLoginAccountError(error instanceof Error ? t(error.message) : t('删除登录账号失败'));
     } finally {
       setDeletingLoginAccountId('');
       stopGlobalLoading();
@@ -667,7 +667,7 @@ export function EnvironmentSettings({
       if (personalMemoryDraft.id === item.id) closePersonalMemoryEditor();
       setDeletePersonalMemoryTarget(null);
     } catch (error) {
-      setDeletePersonalMemoryError(error instanceof Error ? error.message : t('删除个性化记忆失败'));
+      setDeletePersonalMemoryError(error instanceof Error ? t(error.message) : t('删除个性化记忆失败'));
     } finally {
       setDeletingPersonalMemoryId('');
       stopGlobalLoading();
@@ -955,11 +955,11 @@ export function EnvironmentSettings({
           </div>
           <div className="personal-memory-head-actions">
             <DataTransferButtons kind="memory" onImported={loadPersonalMemoryItems} userId={normalizedUserId} />
-            <button className="ui-button ui-icon-button" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">
+            <button className="ui-button ui-button--neutral" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">
               <RefreshCw size={15} />
               {t('刷新')}
             </button>
-            <button className="ui-button ui-icon-button" onClick={openCreatePersonalMemory} type="button">
+            <button className="ui-button ui-button--primary" onClick={openCreatePersonalMemory} type="button">
               <Plus size={15} />
               {t('新增记忆')}
             </button>
@@ -1069,11 +1069,11 @@ export function EnvironmentSettings({
           </div>
           <div className="personal-memory-head-actions">
             <DataTransferButtons kind="credentials" onImported={loadLoginAccounts} userId={normalizedUserId} />
-            <button className="ui-button ui-icon-button" disabled={loadingLoginAccounts} onClick={() => void loadLoginAccounts()} type="button">
+            <button className="ui-button ui-button--neutral" disabled={loadingLoginAccounts} onClick={() => void loadLoginAccounts()} type="button">
               <RefreshCw size={15} />
               {t('刷新')}
             </button>
-            <button className="ui-button ui-icon-button" onClick={() => setLoginAccountEditor('create')} type="button">
+            <button className="ui-button ui-button--primary" onClick={() => setLoginAccountEditor('create')} type="button">
               <Plus size={15} />
               {t('新增账号')}
             </button>
@@ -1225,14 +1225,14 @@ export function EnvironmentSettings({
                 </div>
                 <div className="settings-row">
                   <div>
-                    <strong>{language === 'en' ? 'Theme color' : '主题色'}</strong>
-                    <span>{language === 'en' ? 'Adjust the theme color used by buttons, scrollbars, and highlighted states.' : '调整按钮、滚动条和高亮状态使用的主题色。'}</span>
+                    <strong>{t('主题色')}</strong>
+                    <span>{t('调整按钮、滚动条和高亮状态使用的主题色。')}</span>
                   </div>
                   <div className="theme-color-picker">
                     <label>
                       <span style={{ backgroundColor: currentColor.accent }} />
                       <input
-                        aria-label={language === 'en' ? 'Theme color' : '主题色'}
+                        aria-label={t('主题色')}
                         type="color"
                         value={color}
                         onChange={(event) => setColor(event.target.value)}
@@ -1243,14 +1243,14 @@ export function EnvironmentSettings({
                 </div>
                 <div className="settings-row">
                   <div>
-                    <strong>{language === 'en' ? 'Scrollbar thumb color' : '滚动条滑块颜色'}</strong>
-                    <span>{language === 'en' ? 'Choose a custom color for scrollbar thumbs.' : '自定义全局滚动条滑块颜色。'}</span>
+                    <strong>{t('滚动条滑块颜色')}</strong>
+                    <span>{t('自定义全局滚动条滑块颜色。')}</span>
                   </div>
                   <div className="theme-color-picker">
                     <label>
                       <span style={{ backgroundColor: scrollbarColor }} />
                       <input
-                        aria-label={language === 'en' ? 'Scrollbar thumb color' : '滚动条滑块颜色'}
+                        aria-label={t('滚动条滑块颜色')}
                         type="color"
                         value={scrollbarColor}
                         onChange={(event) => setScrollbarColor(event.target.value)}
@@ -1272,7 +1272,7 @@ export function EnvironmentSettings({
                 </div>
                 <div className="personal-memory-head-actions">
                   <DataTransferButtons disabled={savingModel || loading} kind="model" onImported={reloadModelConfigAfterImport} userId={normalizedUserId} />
-                  <button className="ui-button ui-icon-button" disabled={savingModel || loading} onClick={saveModel} type="button">
+                  <button className="ui-button ui-button--primary" disabled={savingModel || loading} onClick={saveModel} type="button">
                     {savingModel ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
                     {t('保存')}
                   </button>
@@ -1387,7 +1387,7 @@ export function EnvironmentSettings({
                   <h2>{t(environmentSettingsTabs.find((tab) => tab.id === activeTab)?.label || '')}</h2>
                   <span>{t('{count} 项网页配置', { count: visibleEnvItems.length })}</span>
                 </div>
-                <button className="ui-button ui-icon-button" disabled={savingEnv || loading} onClick={saveEnv} type="button">
+                <button className="ui-button ui-button--primary" disabled={savingEnv || loading} onClick={saveEnv} type="button">
                   {savingEnv ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
                   {t('保存')}
                 </button>
