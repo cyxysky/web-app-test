@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { summarizeBrowserChatLogs, visibleBrowserChatExecutionLogs } from './browser-chat-log-model';
+import {
+  summarizeBrowserChatExecutionTotals,
+  summarizeBrowserChatLogs,
+  visibleBrowserChatExecutionLogs,
+} from './browser-chat-log-model';
 
 test('visibleBrowserChatExecutionLogs keeps ai, context, and screenshot logs', () => {
   const logs = [
@@ -34,5 +38,65 @@ test('summarizeBrowserChatLogs counts visible log categories', () => {
     context: 1,
     screenshot: 1,
     total: 4,
+  });
+});
+
+test('summarizeBrowserChatExecutionTotals sums top-level and subagent runtime timings', () => {
+  const totals = summarizeBrowserChatExecutionTotals([
+    {
+      phase: 'ai:runtime:response',
+      details: JSON.stringify({
+        aiOutput: {
+          timings: {
+            aiRequestElapsedMs: 1200,
+            toolCount: 2,
+            toolElapsedMs: 800,
+            toolOverheadElapsedMs: 150,
+          },
+        },
+      }),
+    },
+    {
+      phase: 'subagent:research:ai:runtime:object',
+      details: JSON.stringify({
+        event: {
+          aiOutput: {
+            timings: {
+              aiRequestElapsedMs: 450,
+              toolCount: 1,
+              toolElapsedMs: 300,
+              toolOverheadElapsedMs: 25,
+            },
+          },
+        },
+      }),
+    },
+    { phase: 'ai:runtime:request', details: '{"aiInput":{}}' },
+  ]);
+
+  assert.deepEqual(totals, {
+    aiRequestElapsedMs: 1650,
+    toolCallCount: 3,
+    toolElapsedMs: 1275,
+  });
+});
+
+test('summarizeBrowserChatExecutionTotals falls back to tool detail durations', () => {
+  const totals = summarizeBrowserChatExecutionTotals([{
+    phase: 'ai:runtime:response',
+    details: {
+      aiOutput: {
+        timings: {
+          aiRequestElapsedMs: 90,
+          tools: [{ elapsedMs: 40 }, { elapsedMs: 60 }],
+        },
+      },
+    },
+  }]);
+
+  assert.deepEqual(totals, {
+    aiRequestElapsedMs: 90,
+    toolCallCount: 2,
+    toolElapsedMs: 100,
   });
 });

@@ -3,6 +3,7 @@ import { defaultModelByProvider, defaultModelForProvider, modelListForProvider, 
 import { store } from '@/server/db/store';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
 import { readModelSettingsState } from '@/server/settings/settings-snapshot';
+import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';
 
 const providers = new Set<ModelProvider>(modelProviderValues);
 const noStoreHeaders = { 'Cache-Control': 'no-store, max-age=0' };
@@ -48,11 +49,17 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
   return result;
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  if (!requestHasAdminSettingsAccess(request)) {
+    return NextResponse.json({ error: '请先输入管理员设置密码。' }, { status: 401, headers: noStoreHeaders });
+  }
   return NextResponse.json(readModelSettingsState(), { headers: noStoreHeaders });
 }
 
 export async function POST(request: NextRequest) {
+  if (!requestHasAdminSettingsAccess(request)) {
+    return NextResponse.json({ error: '请先输入管理员设置密码。' }, { status: 401, headers: noStoreHeaders });
+  }
   try {
     const body = await request.json();
     const provider = normalizeProvider(body.provider);

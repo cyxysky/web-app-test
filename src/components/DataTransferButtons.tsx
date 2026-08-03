@@ -41,11 +41,13 @@ function downloadJson(fileName: string, value: unknown) {
 }
 
 export function DataTransferButtons({
+  authorizationToken,
   disabled = false,
   kind,
   onImported,
   userId,
 }: {
+  authorizationToken?: string;
   disabled?: boolean;
   kind: DataTransferKind;
   onImported?: () => Promise<void> | void;
@@ -67,7 +69,10 @@ export function DataTransferButtons({
   async function requestTransfer(body: Record<string, unknown>) {
     const response = await fetch(withWebPilotBasePath('/api/data-transfer'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authorizationToken ? { Authorization: `Bearer ${authorizationToken}` } : {}),
+      },
       body: JSON.stringify({ ...body, kind, userId }),
     });
     return response;

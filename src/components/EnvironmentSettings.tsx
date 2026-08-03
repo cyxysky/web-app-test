@@ -109,6 +109,10 @@ export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> 
 
 const administratorOnlySettingsTabs = new Set<SettingsTab>(['model', 'browser', 'runtime', 'debug']);
 
+export function isAdministratorOnlySettingsTab(tab: SettingsTab) {
+  return administratorOnlySettingsTabs.has(tab);
+}
+
 export function environmentSettingsTabsForUser(userId?: string, defaultUserId = '0') {
   if ((userId || '').trim() === defaultUserId.trim()) return environmentSettingsTabs;
   return environmentSettingsTabs.filter((tab) => !administratorOnlySettingsTabs.has(tab.id));
@@ -232,6 +236,8 @@ function isSecret(item: EnvRow) {
 
 export function EnvironmentSettings({
   activeTab: controlledActiveTab,
+  adminSettingsAccessToken = '',
+  adminSettingsPasswordRequired = false,
   defaultUserId = '0',
   embedded = false,
   initialData,
@@ -243,6 +249,8 @@ export function EnvironmentSettings({
   userId,
 }: {
   activeTab?: SettingsTab;
+  adminSettingsAccessToken?: string;
+  adminSettingsPasswordRequired?: boolean;
   defaultUserId?: string;
   embedded?: boolean;
   initialData?: EnvironmentSettingsInitialData;
@@ -269,7 +277,7 @@ export function EnvironmentSettings({
   const [deleteLoginAccountTarget, setDeleteLoginAccountTarget] = useState<LoginAccountMetadata | null>(null);
   const [deleteLoginAccountError, setDeleteLoginAccountError] = useState('');
   const [portalReady, setPortalReady] = useState(false);
-  const [loading, setLoading] = useState(!initialData);
+  const [loading, setLoading] = useState(!initialData && (!adminSettingsPasswordRequired || Boolean(adminSettingsAccessToken)));
   const [savingEnv, setSavingEnv] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
   const [loadingPersonalMemory, setLoadingPersonalMemory] = useState(false);
@@ -284,6 +292,9 @@ export function EnvironmentSettings({
   const visibleSettingsTabs = environmentSettingsTabsForUser(normalizedUserId, normalizedDefaultUserId);
   const requestedActiveTab = controlledActiveTab || internalActiveTab;
   const activeTab = visibleSettingsTabs.some((tab) => tab.id === requestedActiveTab) ? requestedActiveTab : 'general';
+  const adminSettingsAuthorizationHeaders: Record<string, string> = adminSettingsAccessToken
+    ? { Authorization: `Bearer ${adminSettingsAccessToken}` }
+    : {};
   const selectTab = (tab: SettingsTab) => {
     if (!visibleSettingsTabs.some((item) => item.id === tab)) return;
     (onActiveTabChange || setInternalActiveTab)(tab);
@@ -296,10 +307,11 @@ export function EnvironmentSettings({
 
   useEffect(() => {
     setHasDirectoryPicker(typeof window !== 'undefined' && Boolean(window.webPilotSystem?.selectDirectory));
-    if (!initialData) void load();
+    if (!initialData && (!adminSettingsPasswordRequired || adminSettingsAccessToken)) void load();
+    else setLoading(false);
   // The server snapshot is immutable for this component instance; saves update local state directly.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [adminSettingsAccessToken, adminSettingsPasswordRequired]);
 
   useEffect(() => {
     setPortalReady(true);
@@ -323,11 +335,11 @@ export function EnvironmentSettings({
     setLoading(true);
     try {
       const [envResponse, modelResponse] = await Promise.all([
-        fetch(withWebPilotBasePath('/api/settings/env'), { cache: 'no-store' }),
-        fetch(withWebPilotBasePath('/api/settings/model'), { cache: 'no-store' }),
+        fetch(withWebPilotBasePath('/api/settings/env'), { cache: 'no-store', headers: adminSettingsAuthorizationHeaders }),
+        fetch(withWebPilotBasePath('/api/settings/model'), { cache: 'no-store', headers: adminSettingsAuthorizationHeaders }),
       ]);
-      const envData = await envResponse.json();
-      const modelData = await modelResponse.json();
+      const envData = await readApiJson<{ saved?: EnvRow[] }>(envResponse, t('读取环境配置失败'));
+      const modelData = await readApiJson<{ config?: Partial<ModelConfig> }>(modelResponse, t('读取模型配置失败'));
       const nextModel = createModelConfig(modelData.config);
       setItems(envData.saved || []);
       setModelConfig(nextModel);
@@ -358,7 +370,7 @@ export function EnvironmentSettings({
     try {
       const response = await fetch(withWebPilotBasePath('/api/settings/env'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...adminSettingsAuthorizationHeaders },
         body: JSON.stringify({ items: items.map((item) => ({ ...item, enabled: true, secret: isSecret(item) })) }),
       });
       const data = await readApiJson<{ saved?: EnvRow[] }>(response, t('保存环境配置失败'));
@@ -458,7 +470,7 @@ export function EnvironmentSettings({
     try {
       const response = await fetch(withWebPilotBasePath('/api/settings/model'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...adminSettingsAuthorizationHeaders },
         body: JSON.stringify(payload),
       });
       const data = await readApiJson<{ config?: Partial<ModelConfig> }>(response, t('保存模型配置失败'));
@@ -473,7 +485,10 @@ export function EnvironmentSettings({
   }
 
   async function reloadModelConfigAfterImport() {
-    const response = await fetch(withWebPilotBasePath('/api/settings/model'), { cache: 'no-store' });
+    const response = await fetch(withWebPilotBasePath('/api/settings/model'), {
+      cache: 'no-store',
+      headers: adminSettingsAuthorizationHeaders,
+    });
     const data = await readApiJson<{ config?: Partial<ModelConfig> }>(response, t('读取模型配置失败'));
     const nextModel = createModelConfig(data.config);
     setModelConfig(nextModel);
@@ -1271,7 +1286,13 @@ export function EnvironmentSettings({
                   <span>{t('每个服务商独立保存模型、Key 和 Base URL，切换服务商不会串用密钥。')}</span>
                 </div>
                 <div className="personal-memory-head-actions">
-                  <DataTransferButtons disabled={savingModel || loading} kind="model" onImported={reloadModelConfigAfterImport} userId={normalizedUserId} />
+                  <DataTransferButtons
+                    authorizationToken={adminSettingsAccessToken}
+                    disabled={savingModel || loading}
+                    kind="model"
+                    onImported={reloadModelConfigAfterImport}
+                    userId={normalizedUserId}
+                  />
                   <button className="ui-button ui-button--primary" disabled={savingModel || loading} onClick={saveModel} type="button">
                     {savingModel ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
                     {t('保存')}

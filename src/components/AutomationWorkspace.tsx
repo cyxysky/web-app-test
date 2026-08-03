@@ -934,7 +934,7 @@ export function AutomationWorkspace({
           <Link
             aria-label={t('对话模式')}
             className="browser-chat-nav-item"
-            href={withWebPilotBasePath(`/browser-chat?userId=${encodeURIComponent(userId)}`)}
+            href={`/browser-chat?userId=${encodeURIComponent(userId)}`}
             title={t('对话模式')}
           >
             <MessageSquare size={17} />
@@ -944,7 +944,7 @@ export function AutomationWorkspace({
             aria-current="page"
             aria-label={t('自动化')}
             className="browser-chat-nav-item active"
-            href={withWebPilotBasePath(`/automation?userId=${encodeURIComponent(userId)}`)}
+            href={`/automation?userId=${encodeURIComponent(userId)}`}
             title={t('自动化')}
           >
             <Workflow size={17} />
@@ -953,7 +953,7 @@ export function AutomationWorkspace({
           <Link
             aria-label={t('设置')}
             className="browser-chat-nav-item"
-            href={withWebPilotBasePath(`/settings?userId=${encodeURIComponent(userId)}`)}
+            href={`/settings?userId=${encodeURIComponent(userId)}`}
             title={t('设置')}
           >
             <Settings size={17} />
@@ -1267,7 +1267,7 @@ export function AutomationWorkspace({
                                         <Link
                                           aria-label={t('打开关联对话')}
                                           className="automation-icon-action"
-                                          href={withWebPilotBasePath(`/browser-chat?userId=${encodeURIComponent(userId)}&sessionId=${encodeURIComponent(run.sessionId)}`)}
+                                          href={`/browser-chat?userId=${encodeURIComponent(userId)}&sessionId=${encodeURIComponent(run.sessionId)}`}
                                           title={t('打开关联对话')}
                                         >
                                           <ExternalLink size={15} />

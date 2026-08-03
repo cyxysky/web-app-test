@@ -2,15 +2,22 @@ import { NextRequest, NextResponse } from 'next/server';
 import { normalizeRuntimeEnvValue, runtimeEnvDefinitions } from '@/config/settings';
 import { store } from '@/server/db/store';
 import { readRuntimeSettingsItems } from '@/server/settings/settings-snapshot';
+import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';
 
 const allowedKeys = new Set(runtimeEnvDefinitions.map((item) => item.key));
 const noStoreHeaders = { 'Cache-Control': 'no-store, max-age=0' };
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  if (!requestHasAdminSettingsAccess(request)) {
+    return NextResponse.json({ error: '请先输入管理员设置密码。' }, { status: 401, headers: noStoreHeaders });
+  }
   return NextResponse.json({ saved: readRuntimeSettingsItems() }, { headers: noStoreHeaders });
 }
 
 export async function POST(request: NextRequest) {
+  if (!requestHasAdminSettingsAccess(request)) {
+    return NextResponse.json({ error: '请先输入管理员设置密码。' }, { status: 401, headers: noStoreHeaders });
+  }
   try {
     const body = await request.json();
     const incoming = Array.isArray(body.items) ? body.items as Array<Record<string, unknown>> : [];

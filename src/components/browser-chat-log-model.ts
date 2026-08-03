@@ -1,4 +1,5 @@
 export type BrowserChatLogRecordLike = {
+  details?: unknown;
   phase: string;
 };
 
@@ -8,6 +9,55 @@ export type BrowserChatLogSummary = {
   screenshot: number;
   total: number;
 };
+
+export type BrowserChatExecutionTotals = {
+  aiRequestElapsedMs: number;
+  toolCallCount: number;
+  toolElapsedMs: number;
+};
+
+function asRecord(value: unknown) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function finiteNumber(value: unknown) {
+  const numberValue = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numberValue) ? numberValue : undefined;
+}
+
+function parsedLogDetails(details: unknown) {
+  if (typeof details !== 'string') return asRecord(details);
+  try {
+    return asRecord(JSON.parse(details));
+  } catch {
+    return undefined;
+  }
+}
+
+function runtimeLogTimings(log: BrowserChatLogRecordLike) {
+  if (!log.phase.endsWith('ai:runtime:response') && !log.phase.endsWith('ai:runtime:object')) return undefined;
+  const details = parsedLogDetails(log.details);
+  const payload = asRecord(details?.event) || details;
+  return asRecord(asRecord(payload?.aiOutput)?.timings);
+}
+
+export function summarizeBrowserChatExecutionTotals(logs: BrowserChatLogRecordLike[]): BrowserChatExecutionTotals {
+  return logs.reduce<BrowserChatExecutionTotals>((summary, log) => {
+    const timings = runtimeLogTimings(log);
+    if (!timings) return summary;
+    const tools = Array.isArray(timings.tools) ? timings.tools : [];
+    const toolElapsedMs = finiteNumber(timings.toolElapsedMs)
+      ?? tools.reduce((total, tool) => total + (finiteNumber(asRecord(tool)?.elapsedMs) || 0), 0);
+    const toolOverheadElapsedMs = finiteNumber(timings.toolOverheadElapsedMs) || 0;
+    return {
+      aiRequestElapsedMs: summary.aiRequestElapsedMs + (finiteNumber(timings.aiRequestElapsedMs) || 0),
+      toolCallCount: summary.toolCallCount + (finiteNumber(timings.toolCount) ?? tools.length),
+      toolElapsedMs: summary.toolElapsedMs + toolElapsedMs + toolOverheadElapsedMs,
+    };
+  }, { aiRequestElapsedMs: 0, toolCallCount: 0, toolElapsedMs: 0 });
+}
 
 export function isBrowserChatAiInputOutputLog(log: BrowserChatLogRecordLike) {
   return log.phase === 'ai:runtime:request'

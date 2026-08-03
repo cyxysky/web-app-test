@@ -8,6 +8,7 @@ import {
   isBrowserChatAiFailureLog,
   isBrowserChatContextCompressionLog,
   isBrowserChatScreenshotPerformanceLog,
+  summarizeBrowserChatExecutionTotals,
   summarizeBrowserChatLogs,
 } from '@/components/browser-chat-log-model';
 import { formatLogTime, formatToolPayload, parseJsonObjectText, phaseLabel } from '@/components/browser-chat-format';
@@ -66,6 +67,15 @@ function aiLogTimings(details?: Record<string, unknown>) {
 function formatElapsedMs(value: unknown) {
   const elapsedMs = finiteNumber(value);
   return elapsedMs === undefined ? undefined : `${Math.round(elapsedMs)}ms`;
+}
+
+function formatTotalElapsedMs(value: number) {
+  if (value < 1_000) return `${Math.round(value)}ms`;
+  if (value < 60_000) return `${(value / 1_000).toFixed(value < 10_000 ? 2 : 1).replace(/\.0+$/, '')}s`;
+  const totalSeconds = Math.round(value / 1_000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds}s`;
 }
 
 function formatPostprocessTimings(value: unknown) {
@@ -358,13 +368,16 @@ export function BrowserChatLogDialog({
   entries,
   messageContent,
   onClose,
+  summaryEntries,
 }: {
   entries: BrowserChatLogDialogRecord[];
   messageContent?: string;
   onClose: () => void;
+  summaryEntries: BrowserChatLogDialogRecord[];
 }) {
   const { t } = useI18n();
   const summary = summarizeBrowserChatLogs(entries);
+  const totals = summarizeBrowserChatExecutionTotals(summaryEntries);
   return (
     <div className="ui-modal-overlay" onClick={onClose} role="presentation">
       <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('执行日志')}>
@@ -378,6 +391,20 @@ export function BrowserChatLogDialog({
           </button>
         </header>
         <div className="ui-modal-body browser-chat-log-modal-body">
+        <div className="browser-chat-log-totals" aria-label={t('执行总计')}>
+          <div>
+            <span>{t('工具调用总计')}</span>
+            <strong>{t('{count} 次调用', { count: totals.toolCallCount })}</strong>
+          </div>
+          <div>
+            <span>{t('工具调用总耗时')}</span>
+            <strong>{formatTotalElapsedMs(totals.toolElapsedMs)}</strong>
+          </div>
+          <div>
+            <span>{t('AI 请求总耗时')}</span>
+            <strong>{formatTotalElapsedMs(totals.aiRequestElapsedMs)}</strong>
+          </div>
+        </div>
         {entries.length ? (
           <div className="browser-chat-log-summary" aria-label={t('日志摘要')}>
             <span>AI {summary.ai}</span>

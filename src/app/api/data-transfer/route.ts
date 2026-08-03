@@ -5,6 +5,7 @@ import {
   importPortableData,
 } from '@/server/settings/portable-data';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -21,6 +22,9 @@ const requestSchema = z.object({
 export async function POST(request: NextRequest) {
   try {
     const body = requestSchema.parse(await request.json());
+    if (body.kind === 'model' && !requestHasAdminSettingsAccess(request)) {
+      return noStoreJson({ error: '请先输入管理员设置密码。' }, { status: 401 });
+    }
     const userId = body.userId ?? body.qzUserId;
     if (body.operation === 'export') {
       return noStoreJson(exportPortableData({

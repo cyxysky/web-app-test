@@ -64,6 +64,12 @@ body {
   z-index: 2147483000;
 }
 
+.navigation-loading-overlay--workspace {
+  bottom: auto;
+  inset: auto;
+  right: auto;
+}
+
 .navigation-loading-content {
   align-items: center;
   animation: ui-loading-content-in 0.2s ease both;
@@ -8242,6 +8248,51 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-subnav button:hover {
   background: color-mix(in srgb, var(--foreground) 5%, transparent);
   color: var(--foreground);
+}
+
+.browser-chat-settings-tab-lock {
+  color: var(--muted);
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-settings-tab-lock {
+  display: none;
+}
+
+.admin-settings-password-form,
+.admin-settings-password-form label {
+  display: grid;
+  gap: 8px;
+}
+
+.admin-settings-password-form label > span {
+  color: var(--muted-strong);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.admin-settings-password-input {
+  align-items: center;
+  display: flex;
+  position: relative;
+}
+
+.admin-settings-password-input > svg {
+  color: var(--muted);
+  left: 13px;
+  pointer-events: none;
+  position: absolute;
+  z-index: 1;
+}
+
+.admin-settings-password-input .input {
+  padding-left: 40px;
+  width: 100%;
+}
+
+.admin-settings-password-form .error {
+  margin: 2px 0 0;
 }
 
 .browser-chat-layout.sidebar-collapsed .browser-chat-settings-section h2,

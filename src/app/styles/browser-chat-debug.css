@@ -164,6 +164,40 @@
   padding: 0;
 }
 
+.browser-chat-log-totals {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.browser-chat-log-totals > div {
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 12px 14px;
+}
+
+.browser-chat-log-totals span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.browser-chat-log-totals strong {
+  color: var(--foreground);
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+@media (max-width: 680px) {
+  .browser-chat-log-totals {
+    grid-template-columns: 1fr;
+  }
+}
+
 .browser-chat-log-summary {
   align-items: center;
   display: flex;

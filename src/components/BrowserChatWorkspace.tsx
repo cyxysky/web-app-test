@@ -25,6 +25,7 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS as DndCss } from '@dnd-kit/utilities';
 import { createPortal } from 'react-dom';
+import Link from 'next/link';
 import {
   AppWindow,
   ArrowLeft,
@@ -105,7 +106,12 @@ import {
   type BrowserChatHistoryState,
 } from '@/components/browser-chat-history-controller';
 import { normalizeBrowserChatMarkdown } from '@/components/browser-chat-markdown';
-import { EnvironmentSettings, environmentSettingsTabsForUser, type EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
+import {
+  EnvironmentSettings,
+  environmentSettingsTabsForUser,
+  isAdministratorOnlySettingsTab,
+  type EnvironmentSettingsInitialData,
+} from '@/components/EnvironmentSettings';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import {
   browserChatMessageElapsedMs,
@@ -6943,10 +6949,12 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
 });
 
 export function BrowserChatWorkspace({
+  adminSettingsPasswordRequired = false,
   defaultUserId,
   initialView = 'chat',
   initialSettings,
 }: {
+  adminSettingsPasswordRequired?: boolean;
   defaultUserId: string;
   initialView?: BrowserChatView;
   initialSettings?: EnvironmentSettingsInitialData;
@@ -6994,7 +7002,13 @@ export function BrowserChatWorkspace({
   const [modelId, setModelId] = useState(() => initialModelSelection.model);
   const [modelConfig, setModelConfig] = useState<BrowserChatModelConfig | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
+  const [adminSettingsAccessToken, setAdminSettingsAccessToken] = useState('');
+  const [adminSettingsPassword, setAdminSettingsPassword] = useState('');
+  const [adminSettingsPasswordError, setAdminSettingsPasswordError] = useState('');
+  const [adminSettingsPasswordSubmitting, setAdminSettingsPasswordSubmitting] = useState(false);
+  const [pendingAdminSettingsTab, setPendingAdminSettingsTab] = useState<SettingsTab | null>(null);
   const activeSettingsTab = visibleSettingsTabs.some((tab) => tab.id === settingsTab) ? settingsTab : 'general';
+  const adminSettingsLocked = adminSettingsPasswordRequired && !adminSettingsAccessToken;
   const [attachments, setAttachments] = useState<BrowserChatAttachment[]>([]);
   const attachmentsRef = useRef<BrowserChatAttachment[]>([]);
   const [composerResetToken, setComposerResetToken] = useState(0);
@@ -7098,6 +7112,16 @@ export function BrowserChatWorkspace({
   }, []);
 
   useEffect(() => {
+    if (activeView === 'settings') return;
+    setAdminSettingsAccessToken('');
+    setAdminSettingsPassword('');
+    setAdminSettingsPasswordError('');
+    setAdminSettingsPasswordSubmitting(false);
+    setPendingAdminSettingsTab(null);
+    setSettingsTab('general');
+  }, [activeView]);
+
+  useEffect(() => {
     setWebPreviewOpen(false);
     setToolDialog(null);
     setLogDialogMessageId(null);
@@ -7161,6 +7185,10 @@ export function BrowserChatWorkspace({
     if (!logDialogMessage) return [];
     return visibleBrowserChatExecutionLogs(browserChatLogsForMessage(logDialogMessage, logIndex));
   }, [logDialogMessage, logIndex]);
+  const logDialogSummaryEntries = useMemo(() => {
+    if (!logDialogMessage) return [];
+    return browserChatLogsForMessage(logDialogMessage, logIndex);
+  }, [logDialogMessage, logIndex]);
   const previewAttachment = useCallback((attachment: BrowserChatAttachment) => {
     setImagePreview(attachment);
   }, []);
@@ -7204,20 +7232,31 @@ export function BrowserChatWorkspace({
     const key = `${sessionId || ''}\u0000${messageId}`;
     if (!sessionId || loadedLogMessageKeysRef.current.has(key)) return;
     loadedLogMessageKeysRef.current.add(key);
-    void fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/logs?messageId=${encodeURIComponent(messageId)}&limit=500`), { cache: 'no-store' })
-      .then((response) => readApiJson<{ logs?: BrowserChatLogRecord[] }>(response, '加载对话日志失败'))
-      .then((data) => {
-        if (!Array.isArray(data.logs)) return;
-        setSession((current) => {
-          if (current?.id !== sessionId) return current;
-          const logs = new Map(current.logs.map((log) => [log.id, log]));
-          for (const log of data.logs || []) logs.set(log.id, log);
-          return { ...current, logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')) };
-        });
-      })
-      .catch(() => {
+    void (async () => {
+      try {
+        let cursor = '';
+        do {
+          const params = new URLSearchParams({ limit: '500', messageId });
+          if (cursor) params.set('cursor', cursor);
+          const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/logs?${params}`), { cache: 'no-store' });
+          const data = await readApiJson<{
+            history?: { cursor?: string; hasMore?: boolean };
+            logs?: BrowserChatLogRecord[];
+          }>(response, '加载对话日志失败');
+          if (Array.isArray(data.logs)) {
+            setSession((current) => {
+              if (current?.id !== sessionId) return current;
+              const logs = new Map(current.logs.map((log) => [log.id, log]));
+              for (const log of data.logs || []) logs.set(log.id, log);
+              return { ...current, logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')) };
+            });
+          }
+          cursor = data.history?.hasMore && data.history.cursor ? data.history.cursor : '';
+        } while (cursor);
+      } catch {
         loadedLogMessageKeysRef.current.delete(key);
-      });
+      }
+    })();
   }, [browserChatApiUrl]);
   const loadEarlierHistory = useCallback(async () => {
     const current = session;
@@ -7314,10 +7353,10 @@ export function BrowserChatWorkspace({
       },
     };
     setModelConfig(nextConfig);
-    void fetch(withWebPilotBasePath('/api/settings/model'), {
+    void fetch(withWebPilotBasePath('/api/settings/model-selection'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: nextConfig.provider, providers: nextConfig.providers }),
+      body: JSON.stringify({ provider: next.provider, model: next.model }),
     })
       .then(async (response) => {
         const data = await readApiJson<Record<string, unknown>>(response, '保存模型选择失败');
@@ -7328,7 +7367,7 @@ export function BrowserChatWorkspace({
   }, [modelConfig]);
 
   const loadBrowserRuntimeSettings = useCallback(async () => {
-    const response = await fetch(withWebPilotBasePath('/api/settings/env'), { cache: 'no-store' });
+    const response = await fetch(withWebPilotBasePath('/api/settings/browser-runtime'), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载浏览器配置失败');
     const saved = Array.isArray(data.saved) ? data.saved as Array<{ key?: string; value?: string }> : [];
     const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
@@ -7348,7 +7387,7 @@ export function BrowserChatWorkspace({
   }, [browserChatApiUrl]);
 
   const loadModelConfig = useCallback(async () => {
-    const response = await fetch(withWebPilotBasePath('/api/settings/model'), { cache: 'no-store' });
+    const response = await fetch(withWebPilotBasePath('/api/settings/model-selection'), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载模型配置失败');
     const config = normalizeRuntimeModelConfig(data.config as Partial<BrowserChatModelConfig> | undefined);
     if (config) setModelConfig(config);
@@ -7984,6 +8023,49 @@ export function BrowserChatWorkspace({
     }
   }
 
+  function closeAdminSettingsPasswordDialog() {
+    if (adminSettingsPasswordSubmitting) return;
+    setPendingAdminSettingsTab(null);
+    setAdminSettingsPassword('');
+    setAdminSettingsPasswordError('');
+  }
+
+  function selectSettingsTab(tab: SettingsTab) {
+    if (!visibleSettingsTabs.some((item) => item.id === tab)) return;
+    if (adminSettingsLocked && isAdministratorOnlySettingsTab(tab)) {
+      setPendingAdminSettingsTab(tab);
+      setAdminSettingsPassword('');
+      setAdminSettingsPasswordError('');
+      return;
+    }
+    setSettingsTab(tab);
+  }
+
+  async function submitAdminSettingsPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!pendingAdminSettingsTab || adminSettingsPasswordSubmitting) return;
+    setAdminSettingsPasswordSubmitting(true);
+    setAdminSettingsPasswordError('');
+    try {
+      const response = await fetch(withWebPilotBasePath('/api/settings/admin-access'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: adminSettingsPassword }),
+      });
+      const data = await readApiJson<{ token?: string }>(response, t('管理员设置密码验证失败'));
+      if (!data.token) throw new Error(t('管理员设置访问令牌无效'));
+      const nextTab = pendingAdminSettingsTab;
+      setAdminSettingsAccessToken(data.token);
+      setSettingsTab(nextTab);
+      setPendingAdminSettingsTab(null);
+      setAdminSettingsPassword('');
+    } catch (accessError) {
+      setAdminSettingsPasswordError(accessError instanceof Error ? accessError.message : t('管理员设置密码验证失败'));
+    } finally {
+      setAdminSettingsPasswordSubmitting(false);
+    }
+  }
+
   function renderSidebarDetail() {
     if (activeView === 'settings') {
       return (
@@ -7991,9 +8073,10 @@ export function BrowserChatWorkspace({
           <h2>{t('设置')}</h2>
           <nav className="browser-chat-subnav" aria-label={t('环境配置分类')}>
             {visibleSettingsTabs.map((tab) => (
-              <button aria-label={t(tab.label)} className={activeSettingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => setSettingsTab(tab.id)} title={t(tab.label)} type="button">
+              <button aria-label={t(tab.label)} className={activeSettingsTab === tab.id ? 'active' : undefined} key={tab.id} onClick={() => selectSettingsTab(tab.id)} title={t(tab.label)} type="button">
                 <SettingsTabIcon tab={tab.id} />
                 <span>{t(tab.label)}</span>
+                {adminSettingsLocked && isAdministratorOnlySettingsTab(tab.id) ? <Lock className="browser-chat-settings-tab-lock" size={13} /> : null}
               </button>
             ))}
           </nav>
@@ -8321,16 +8404,15 @@ export function BrowserChatWorkspace({
             <MessageSquare size={17} />
             <span>{t('对话模式')}</span>
           </button>
-          <button
+          <Link
             aria-label={t('自动化')}
             className="browser-chat-nav-item"
-            onClick={() => window.location.assign(`${withWebPilotBasePath('/automation')}?userId=${encodeURIComponent(requestUserId)}`)}
+            href={`/automation?userId=${encodeURIComponent(requestUserId)}`}
             title={t('自动化')}
-            type="button"
           >
             <Workflow size={17} />
             <span>{t('自动化')}</span>
-          </button>
+          </Link>
           <button aria-current={activeView === 'settings' ? 'page' : undefined} aria-label={t('设置')} className={activeView === 'settings' ? 'browser-chat-nav-item active' : 'browser-chat-nav-item'} onClick={() => navigateBrowserChatView('/settings')} title={t('设置')} type="button">
             <Settings size={17} />
             <span>{t('设置')}</span>
@@ -8357,9 +8439,12 @@ export function BrowserChatWorkspace({
           <div className="browser-chat-settings-pane">
             <EnvironmentSettings
               activeTab={activeSettingsTab}
+              adminSettingsAccessToken={adminSettingsAccessToken}
+              adminSettingsPasswordRequired={adminSettingsPasswordRequired}
               defaultUserId={defaultUserId}
               embedded
               initialData={initialSettings}
+              key={adminSettingsAccessToken || 'admin-settings-locked'}
               showTabs={false}
               onActiveTabChange={setSettingsTab}
               onModelSaved={() => void loadModelConfig()}
@@ -8514,6 +8599,7 @@ export function BrowserChatWorkspace({
           entries={logDialogEntries}
           messageContent={logDialogMessage ? compactText(logDialogMessage.content, 80) : undefined}
           onClose={() => setLogDialogMessageId(null)}
+          summaryEntries={logDialogSummaryEntries}
         />
       ) : null}
 
@@ -8530,6 +8616,63 @@ export function BrowserChatWorkspace({
           </div>
         </div>
       ) : null}
+
+      {pendingAdminSettingsTab ? createPortal((
+        <div className="ui-modal-overlay" onMouseDown={closeAdminSettingsPasswordDialog}>
+          <form
+            aria-labelledby="admin-settings-password-title"
+            aria-modal="true"
+            className="ui-modal ui-modal--compact admin-settings-password-dialog"
+            onMouseDown={(event) => event.stopPropagation()}
+            onSubmit={(event) => void submitAdminSettingsPassword(event)}
+            role="dialog"
+          >
+            <header className="ui-modal-header">
+              <div className="ui-modal-heading">
+                <h2 className="ui-modal-title" id="admin-settings-password-title">{t('管理员设置验证')}</h2>
+                <p className="ui-modal-subtitle">{t('这些配置仅供管理员使用。本次进入设置界面需要先输入密码。')}</p>
+              </div>
+              <button
+                aria-label={t('关闭')}
+                className="ui-icon-button ui-modal-close"
+                disabled={adminSettingsPasswordSubmitting}
+                onClick={closeAdminSettingsPasswordDialog}
+                type="button"
+              >
+                <X size={16} />
+              </button>
+            </header>
+            <div className="ui-modal-body admin-settings-password-form">
+              <label>
+                <span>{t('管理员密码')}</span>
+                <div className="admin-settings-password-input">
+                  <KeyRound aria-hidden="true" size={16} />
+                  <input
+                    autoComplete="current-password"
+                    autoFocus
+                    className="input"
+                    disabled={adminSettingsPasswordSubmitting}
+                    maxLength={1_024}
+                    onChange={(event) => setAdminSettingsPassword(event.target.value)}
+                    type="password"
+                    value={adminSettingsPassword}
+                  />
+                </div>
+              </label>
+              {adminSettingsPasswordError ? <div className="error" role="alert">{adminSettingsPasswordError}</div> : null}
+            </div>
+            <footer className="ui-modal-footer">
+              <button className="ui-button ui-button--neutral" disabled={adminSettingsPasswordSubmitting} onClick={closeAdminSettingsPasswordDialog} type="button">
+                {t('取消')}
+              </button>
+              <button className="ui-button ui-button--primary" disabled={adminSettingsPasswordSubmitting || !adminSettingsPassword} type="submit">
+                {adminSettingsPasswordSubmitting ? <Loader2 className="spin" size={15} /> : <Lock size={15} />}
+                {adminSettingsPasswordSubmitting ? t('正在验证') : t('解锁管理员设置')}
+              </button>
+            </footer>
+          </form>
+        </div>
+      ), document.body) : null}
 
     </section>
     </BrowserChatReasoningVisibilityContext.Provider>
