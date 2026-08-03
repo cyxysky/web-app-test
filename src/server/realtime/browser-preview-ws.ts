@@ -1,10 +1,17 @@
-import { createHash } from 'node:crypto';
 import http from 'node:http';
 import type { Socket } from 'node:net';
 import { dispatchBrowserChatPreviewInput, startBrowserChatScreencast } from '@/server/ai/agents/browser-chat.service';
 import type { BrowserLiveInput, BrowserScreencastFrame, BrowserTabSnapshot } from '@/server/browser/browser-session';
 import { browserPreviewFramesPerSecond } from '@/server/browser/browser-preview-cadence';
 import type { BrowserPreviewFramePumpMetrics } from '@/server/browser/browser-preview-frame-pump';
+import {
+  acceptWebSocketUpgrade,
+  consumeWebSocketFrames,
+  encodeWebSocketBinary,
+  encodeWebSocketControl,
+  encodeWebSocketText,
+  listenWebSocketServer,
+} from '@/server/realtime/websocket-transport';
 import {
   BrowserPreviewVideoEncoder,
   browserPreviewVideoDimensions,
@@ -38,6 +45,7 @@ type BrowserPreviewStream = {
   key: string;
   lastTabs?: BrowserTabSnapshot[];
   lastTabsKey?: string;
+  lastFrame?: BrowserScreencastFrame;
   lastUrl?: string;
   lastViewport?: BrowserScreencastFrame['viewport'];
   lastViewportKey?: string;
@@ -68,7 +76,7 @@ type BrowserPreviewWebSocketState = {
   streams: Map<string, BrowserPreviewStream>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 19;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 21;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
@@ -88,49 +96,6 @@ function state() {
 function previewWebSocketPortStart() {
   const raw = Number(process.env.BROWSER_CHAT_PREVIEW_WS_PORT || 18021);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 18021;
-}
-
-function websocketAcceptKey(key: string) {
-  return createHash('sha1')
-    .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-    .digest('base64');
-}
-
-function encodeWebSocketText(payload: string) {
-  const data = Buffer.from(payload);
-  if (data.length < 126) return Buffer.concat([Buffer.from([0x81, data.length]), data]);
-  if (data.length <= 0xffff) {
-    const header = Buffer.alloc(4);
-    header[0] = 0x81;
-    header[1] = 126;
-    header.writeUInt16BE(data.length, 2);
-    return Buffer.concat([header, data]);
-  }
-  const header = Buffer.alloc(10);
-  header[0] = 0x81;
-  header[1] = 127;
-  header.writeBigUInt64BE(BigInt(data.length), 2);
-  return Buffer.concat([header, data]);
-}
-
-function encodeWebSocketBinary(payload: Buffer) {
-  if (payload.length < 126) return Buffer.concat([Buffer.from([0x82, payload.length]), payload]);
-  if (payload.length <= 0xffff) {
-    const header = Buffer.alloc(4);
-    header[0] = 0x82;
-    header[1] = 126;
-    header.writeUInt16BE(payload.length, 2);
-    return Buffer.concat([header, payload]);
-  }
-  const header = Buffer.alloc(10);
-  header[0] = 0x82;
-  header[1] = 127;
-  header.writeBigUInt64BE(BigInt(payload.length), 2);
-  return Buffer.concat([header, payload]);
-}
-
-function encodeControlFrame(opcode: number, payload = Buffer.alloc(0)) {
-  return Buffer.concat([Buffer.from([0x80 | opcode, payload.length]), payload]);
 }
 
 function sendToClient(client: BrowserPreviewClient, payload: unknown) {
@@ -235,6 +200,9 @@ function sendLatestFrameState(client: BrowserPreviewClient, stream: BrowserPrevi
   if (stream.lastTabs) sendToClient(client, { type: 'tabsChanged', tabs: stream.lastTabs, sequence: stream.sequence });
   if (stream.lastUrl !== undefined) sendToClient(client, { type: 'navigationChanged', url: stream.lastUrl, sequence: stream.sequence });
   if (stream.lastViewport) sendToClient(client, { type: 'viewportChanged', viewport: stream.lastViewport, sequence: stream.sequence });
+  if (stream.lastFrame) {
+    sendFrameToClient(client, binaryFramePayload(stream.lastFrame, ++stream.sequence));
+  }
   if (stream.transport === 'video' && stream.videoInitialization && stream.videoMimeType) {
     const payload = binaryVideoPayload('videoInit', stream.videoInitialization, ++stream.sequence, stream.videoMimeType);
     const result = sendVideoToClient(client, payload);
@@ -313,7 +281,14 @@ function fallbackStreamToImages(stream: BrowserPreviewStream, error: unknown) {
 function pushVideoFrame(stream: BrowserPreviewStream, frame: BrowserScreencastFrame) {
   broadcastFrameStateChanges(stream, frame);
   if (!stream.videoEncoder) {
-    const dimensions = browserPreviewVideoDimensions(frame.viewport);
+    // Show the captured page immediately while FFmpeg is still producing the
+    // fragmented-MP4 initialization segment. This removes the blank startup
+    // interval without changing the selected video transport.
+    broadcastFrame(stream, frame);
+    const dimensions = browserPreviewVideoDimensions({
+      height: frame.metadata?.deviceHeight || frame.viewport.height,
+      width: frame.metadata?.deviceWidth || frame.viewport.width,
+    });
     let encoder!: BrowserPreviewVideoEncoder;
     try {
       encoder = new BrowserPreviewVideoEncoder({
@@ -356,6 +331,7 @@ function pushVideoFrame(stream: BrowserPreviewStream, frame: BrowserScreencastFr
 }
 
 function handlePreviewFrame(stream: BrowserPreviewStream, frame: BrowserScreencastFrame) {
+  stream.lastFrame = frame;
   if (stream.transport === 'video') pushVideoFrame(stream, frame);
   else broadcastFrame(stream, frame);
 }
@@ -531,71 +507,12 @@ function handleClientMessage(client: BrowserPreviewClient, text: string) {
 }
 
 function handleClientData(client: BrowserPreviewClient, chunk: Buffer) {
-  client.buffer = Buffer.concat([client.buffer, chunk]);
-  while (client.buffer.length >= 2) {
-    const first = client.buffer[0];
-    const second = client.buffer[1];
-    const opcode = first & 0x0f;
-    const masked = Boolean(second & 0x80);
-    let length = second & 0x7f;
-    let offset = 2;
-    if (length === 126) {
-      if (client.buffer.length < offset + 2) return;
-      length = client.buffer.readUInt16BE(offset);
-      offset += 2;
-    } else if (length === 127) {
-      if (client.buffer.length < offset + 8) return;
-      const bigLength = client.buffer.readBigUInt64BE(offset);
-      if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
-        void removeClient(client);
-        return;
-      }
-      length = Number(bigLength);
-      offset += 8;
-    }
-    const maskOffset = offset;
-    if (masked) offset += 4;
-    if (client.buffer.length < offset + length) return;
-    const payload = client.buffer.subarray(offset, offset + length);
-    const unmasked = masked
-      ? Buffer.from(payload.map((byte, index) => byte ^ client.buffer[maskOffset + (index % 4)]))
-      : Buffer.from(payload);
-    client.buffer = client.buffer.subarray(offset + length);
-
-    if (opcode === 0x8) {
-      void removeClient(client);
-      return;
-    }
-    if (opcode === 0x9) {
-      client.socket.write(encodeControlFrame(0xA, unmasked.subarray(0, 125)));
-      continue;
-    }
-    if (opcode === 0x1) handleClientMessage(client, unmasked.toString('utf8'));
-  }
-}
-
-function listen(server: http.Server, port: number): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const cleanup = () => {
-      server.off('error', onError);
-      server.off('listening', onListening);
-    };
-    const onListening = () => {
-      cleanup();
-      resolve(port);
-    };
-    const onError = (error: NodeJS.ErrnoException) => {
-      cleanup();
-      if (error.code === 'EADDRINUSE') {
-        reject(new Error(`Browser preview WebSocket port ${port} is already in use. Set BROWSER_CHAT_PREVIEW_WS_PORT to the fixed port forwarded by Nginx.`));
-        return;
-      }
-      reject(error);
-    };
-    server.once('error', onError);
-    server.once('listening', onListening);
-    server.listen(port, '0.0.0.0');
-  });
+  client.buffer = Buffer.from(consumeWebSocketFrames(client.buffer, chunk, {
+    onClose: () => void removeClient(client),
+    onProtocolError: () => void removeClient(client),
+    onPing: (payload) => client.socket.write(encodeWebSocketControl(0xA, payload)),
+    onText: (payload) => handleClientMessage(client, payload),
+  }));
 }
 
 async function attachStream(stream: BrowserPreviewStream) {
@@ -723,19 +640,10 @@ function createBrowserPreviewServer() {
       netSocket.destroy();
       return;
     }
-    const key = String(request.headers['sec-websocket-key'] || '');
-    if (!key) {
+    if (!acceptWebSocketUpgrade(request, netSocket)) {
       netSocket.destroy();
       return;
     }
-    netSocket.write([
-      'HTTP/1.1 101 Switching Protocols',
-      'Upgrade: websocket',
-      'Connection: Upgrade',
-      `Sec-WebSocket-Accept: ${websocketAcceptKey(key)}`,
-      '',
-      '',
-    ].join('\r\n'));
 
     const client: BrowserPreviewClient = {
       actionChain: Promise.resolve(),
@@ -789,7 +697,10 @@ export async function ensureBrowserPreviewWebSocketServer(): Promise<BrowserPrev
   current.starting = (async () => {
     await closeOutdatedBrowserPreviewServer(current);
     const server = createBrowserPreviewServer();
-    const port = await listen(server, previewWebSocketPortStart());
+    const port = await listenWebSocketServer(server, previewWebSocketPortStart(), {
+      host: '0.0.0.0',
+      addressInUseMessage: (port) => `Browser preview WebSocket port ${port} is already in use. Set BROWSER_CHAT_PREVIEW_WS_PORT to the fixed port forwarded by Nginx.`,
+    });
     current.server = server;
     current.port = port;
     current.implementationVersion = BROWSER_PREVIEW_IMPLEMENTATION_VERSION;

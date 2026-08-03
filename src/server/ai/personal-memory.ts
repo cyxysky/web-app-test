@@ -98,6 +98,10 @@ function compactText(value: unknown, max = 180) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
+export function normalizePersonalMemoryValue(value: unknown) {
+  return textFromUnknown(value).replace(/\r\n?/g, '\n').trim();
+}
+
 export function normalizePersonalMemoryUserId(value: unknown) {
   return normalizeApplicationUserId(value);
 }
@@ -113,6 +117,11 @@ function personalMemoryExtractionEnabled() {
 function personalMemoryPromptLimit() {
   const raw = Number(process.env.AI_PERSONAL_MEMORY_PROMPT_LIMIT || 6);
   return Number.isFinite(raw) ? Math.min(Math.max(Math.floor(raw), 0), 20) : 6;
+}
+
+function personalMemoryPromptMaxChars() {
+  const raw = Number(process.env.AI_PERSONAL_MEMORY_PROMPT_MAX_CHARS || 12000);
+  return Number.isFinite(raw) ? Math.min(Math.max(Math.floor(raw), 1000), 120000) : 12000;
 }
 
 function personalMemoryExtractionInputLimit() {
@@ -206,7 +215,7 @@ function normalizeMemoryDraft(input: PersonalMemoryDraft, defaults: {
   const scope = normalizeScope(input.scope, rawDomain);
   const domain = scope === 'domain' ? rawDomain : '';
   const key = normalizeKey(input.key);
-  const value = compactText(input.value, 260);
+  const value = normalizePersonalMemoryValue(input.value);
   if (!key || !value) return undefined;
   const type = normalizeType(input.type);
   const aliases = normalizeAliases(input.aliases, key);
@@ -470,15 +479,23 @@ export function markPersonalMemoryItemsUsed(ids: string[]) {
 export function formatPersonalMemoryForPrompt(results: PersonalMemorySearchResult[] | PersonalMemoryItem[]) {
   const items = results.map((entry) => 'item' in entry ? entry.item : entry).filter((item) => item.status === 'active');
   if (!items.length) return '';
-  return [
+  const prompt = [
     'Personal short memory:',
     'Use these concise user/domain facts when relevant. If the latest user message contradicts a memory, follow the latest user message.',
     ...items.map((item, index) => {
       const scope = item.scope === 'domain' && item.domain ? `[${item.domain}]` : '[global]';
       const aliases = item.aliases.length ? ` aliases=${item.aliases.join(', ')}` : '';
-      return `${index + 1}. ${scope} ${item.type} ${item.key}: ${item.value}${aliases}`;
+      const value = normalizePersonalMemoryValue(item.value)
+        .split('\n')
+        .map((line) => `   ${line}`)
+        .join('\n');
+      return `${index + 1}. ${scope} ${item.type} ${item.key}${aliases}:\n${value}`;
     }),
   ].join('\n');
+  const maxChars = personalMemoryPromptMaxChars();
+  if (prompt.length <= maxChars) return prompt;
+  const suffix = '\n[Personal memory truncated only for this prompt; the stored memory remains complete.]';
+  return `${prompt.slice(0, Math.max(0, maxChars - suffix.length)).trimEnd()}${suffix}`;
 }
 
 function safeJson(value: unknown) {
@@ -771,6 +788,7 @@ export function personalMemoryDiagnostics() {
     enabled: personalMemoryEnabled(),
     extractionEnabled: personalMemoryExtractionEnabled(),
     promptLimit: personalMemoryPromptLimit(),
+    promptMaxChars: personalMemoryPromptMaxChars(),
     provider: getModelSettings().provider,
     model: getModelSettings().model,
   };

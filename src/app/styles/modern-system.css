@@ -639,10 +639,16 @@ input[type="checkbox"]:focus-visible {
 .browser-chat-settings-pane .settings-section-copy,
 .browser-chat-settings-pane .settings-row span,
 .browser-chat-settings-pane .env-name span,
-.settings-workspace :where(.skills-manager-item-description, .personal-memory-copy p) {
+.settings-workspace .skills-manager-item-description {
   overflow: visible;
   text-overflow: clip;
   white-space: normal;
+}
+
+.settings-workspace .personal-memory-copy p {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: pre-wrap;
 }
 
 .browser-chat-settings-pane .settings-card {

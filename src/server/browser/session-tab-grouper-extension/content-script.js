@@ -14,10 +14,7 @@ function markerFromDocument() {
   const root = document.documentElement;
   const sessionId = cleanMarkerText(root?.getAttribute(SESSION_ID_ATTRIBUTE));
   if (!sessionId) return undefined;
-  return {
-    sessionId,
-    groupTitle: cleanMarkerText(root?.getAttribute(SESSION_TITLE_ATTRIBUTE)) || sessionId,
-  };
+  return { sessionId };
 }
 
 function markGrouped(sessionId) {
@@ -26,10 +23,10 @@ function markGrouped(sessionId) {
   }
 }
 
-function groupCurrentTab(sessionId, groupTitle) {
+function groupCurrentTab(sessionId) {
   const cleanSessionId = cleanMarkerText(sessionId);
   if (!cleanSessionId) return Promise.resolve(false);
-  const cleanGroupTitle = cleanMarkerText(groupTitle) || cleanSessionId;
+  const cleanGroupTitle = aiWebTestSessionGroupTitle(cleanSessionId);
   const key = `${cleanSessionId}:${cleanGroupTitle}`;
   if (groupedKey === key) {
     markGrouped(cleanSessionId);
@@ -56,10 +53,10 @@ function groupCurrentTab(sessionId, groupTitle) {
   return pendingGroupPromise;
 }
 
-function injectSessionMarker(sessionId, groupTitle) {
+function injectSessionMarker(sessionId) {
   const cleanSessionId = cleanMarkerText(sessionId);
   if (!cleanSessionId) return;
-  const cleanGroupTitle = cleanMarkerText(groupTitle) || cleanSessionId;
+  const cleanGroupTitle = aiWebTestSessionGroupTitle(cleanSessionId);
   if (document.documentElement?.getAttribute(SESSION_ID_ATTRIBUTE) !== cleanSessionId) {
     document.documentElement?.setAttribute(SESSION_ID_ATTRIBUTE, cleanSessionId);
   }
@@ -83,17 +80,17 @@ function injectSessionMarker(sessionId, groupTitle) {
   `;
   const parent = document.documentElement || document.head || document.body;
   if (!parent) {
-    window.addEventListener('DOMContentLoaded', () => injectSessionMarker(cleanSessionId, cleanGroupTitle), { once: true });
+    window.addEventListener('DOMContentLoaded', () => injectSessionMarker(cleanSessionId), { once: true });
   } else {
     parent.appendChild(script);
     script.remove();
   }
-  void groupCurrentTab(cleanSessionId, cleanGroupTitle);
+  void groupCurrentTab(cleanSessionId);
 }
 
 function groupFromDocumentMarker() {
   const marker = markerFromDocument();
-  if (marker) void groupCurrentTab(marker.sessionId, marker.groupTitle);
+  if (marker) void groupCurrentTab(marker.sessionId);
 }
 
 function requestStoredSessionMarker() {
@@ -102,7 +99,7 @@ function requestStoredSessionMarker() {
     if (response && typeof response.then === 'function') {
       response.then((result) => {
         const record = result?.record;
-        injectSessionMarker(record?.sessionId, record?.groupTitle);
+        injectSessionMarker(record?.sessionId);
       }).catch(() => undefined);
     }
   } catch {
@@ -129,7 +126,7 @@ requestStoredSessionMarker();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type !== 'apply-tab-session-marker') return false;
-  injectSessionMarker(message.sessionId, message.groupTitle);
+  injectSessionMarker(message.sessionId);
   sendResponse({ ok: true });
   return false;
 });
@@ -139,5 +136,5 @@ window.addEventListener('message', (event) => {
   const message = event.data;
   if (!message || message.source !== 'AI_WEB_TEST_SESSION_TAB_GROUP') return;
   if (message.type !== 'group-tab') return;
-  injectSessionMarker(message.sessionId, message.groupTitle);
+  injectSessionMarker(message.sessionId);
 });

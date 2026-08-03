@@ -97,6 +97,51 @@ test('browserCode sandbox executes ordinary Playwright code directly', async () 
   assert.equal(result.activity ? 'observation' in result.activity : false, false);
 });
 
+test('browserCode inserts text at exact anchors in textareas and rich-text frames', async () => {
+  await page.setContent(`
+    <title>Insertion editor</title>
+    <label>Notes<textarea>alpha gamma</textarea></label>
+    <div aria-label="Rich editor" contenteditable="true"><strong>first </strong><em>third</em></div>
+    <iframe title="Frame editor" srcdoc="<!doctype html><body contenteditable='true' aria-label='Frame editor'>left right</body>"></iframe>
+  `);
+  try {
+    const textareaResult = await run(`
+      var insertionTextarea = page.getByLabel('Notes');
+      var textareaInsertion = await page.insertTextAt(insertionTextarea, { text: 'beta ', afterText: 'alpha ' });
+      nodeRepl.write(textareaInsertion);
+    `);
+    assert.equal(textareaResult.ok, true, textareaResult.error);
+
+    const richResult = await run(`
+      var insertionRichEditor = page.locator('[contenteditable="true"][aria-label="Rich editor"]');
+      var richInsertion = await page.insertTextAt(insertionRichEditor, { text: 'second ', beforeText: 'third' });
+      nodeRepl.write(richInsertion);
+    `);
+    assert.equal(richResult.ok, true, richResult.error);
+
+    const frameResult = await run(`
+      var insertionFrameEditor = page.frameLocator('iframe[title="Frame editor"]').locator('body[contenteditable="true"]');
+      var frameInsertion = await page.insertTextAt(insertionFrameEditor, { text: 'middle ', afterText: 'left ' });
+      nodeRepl.write(frameInsertion);
+    `);
+    assert.equal(frameResult.ok, true, frameResult.error);
+    assert.equal((textareaResult.value as { verified?: boolean }).verified, true, JSON.stringify(textareaResult.value));
+    assert.equal((richResult.value as { verified?: boolean }).verified, true, JSON.stringify({ result: richResult.value, text: await page.locator('[contenteditable="true"][aria-label="Rich editor"]').textContent() }));
+    assert.equal((frameResult.value as { verified?: boolean }).verified, true, JSON.stringify({ result: frameResult.value, text: await page.frameLocator('iframe[title="Frame editor"]').locator('body').textContent() }));
+    assert.equal(await page.getByLabel('Notes').inputValue(), 'alpha beta gamma');
+    assert.equal(
+      (await page.locator('[contenteditable="true"][aria-label="Rich editor"]').textContent())?.replace(/\u00a0/g, ' '),
+      'first second third',
+    );
+    assert.equal(
+      await page.frameLocator('iframe[title="Frame editor"]').locator('body').textContent(),
+      'left middle right',
+    );
+  } finally {
+    await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
+  }
+});
+
 test('browserCode keeps JavaScript bindings across cells like the Codex kernel', async () => {
   const result = await run(`nodeRepl.write({ persistedTitle: editorTitle });`);
   assert.equal(result.ok, true, result.error);
@@ -936,9 +981,13 @@ test('browserCode fills credential references only on an allowed origin without 
   }
 });
 
-test('browserCode risk analysis flags external effects and sensitive data', () => {
+test('browserCode risk analysis confirms committed effects instead of preparatory credential entry', () => {
+  assert.equal(analyzeBrowserCodeRisk(`await page.goto('https://example.test/login')`).requiresConfirmation, false);
+  assert.equal(analyzeBrowserCodeRisk(`// 点击登录按钮\nconst buttons = await page.locator('button').allTextContents()`).requiresConfirmation, false);
   assert.equal(analyzeBrowserCodeRisk(`await page.getByRole('button', { name: '删除' }).click()`).requiresConfirmation, true);
-  assert.equal(analyzeBrowserCodeRisk(`await page.getByLabel('验证码').fill('123456')`).requiresConfirmation, true);
+  assert.equal(analyzeBrowserCodeRisk(`await page.getByLabel('Password').fill('secret')`).requiresConfirmation, false);
+  assert.equal(analyzeBrowserCodeRisk(`await page.getByRole('button', { name: 'Login' }).click()`).requiresConfirmation, true);
+  assert.equal(analyzeBrowserCodeRisk(`await fetch('/api/update', { method: 'POST' })`).requiresConfirmation, true);
   assert.equal(analyzeBrowserCodeRisk(`return await page.getByRole('heading').innerText()`).requiresConfirmation, false);
 });
 

@@ -1,3 +1,5 @@
+importScripts('group-title.js');
+
 const sessionGroups = new Map();
 const TAB_GROUP_ID_NONE = -1;
 const TAB_SESSION_STORAGE_KEY = 'aiWebTestTabSessions';
@@ -69,9 +71,9 @@ async function storedTabSession(tab) {
   return undefined;
 }
 
-async function groupTab(tab, sessionId, groupTitle) {
+async function groupTab(tab, sessionId) {
   if (!tab?.id || !tab.windowId || !sessionId) return false;
-  const title = cleanText(groupTitle, `AI Session ${sessionId}`);
+  const title = aiWebTestSessionGroupTitle(sessionId);
   const key = `${tab.windowId}:${sessionId}`;
   let groupId = sessionGroups.get(key);
 
@@ -124,7 +126,7 @@ async function applySessionMarkerToTab(tab, sessionId, groupTitle) {
 
 async function findSessionGroupTabs(input) {
   const sessionId = cleanText(input?.sessionId, '');
-  const groupTitle = cleanText(input?.groupTitle, sessionId ? `AI Session ${sessionId}` : 'AI Session');
+  const groupTitle = aiWebTestSessionGroupTitle(sessionId);
   if (!sessionId) return { found: false, tabs: [] };
 
   const groups = await findExistingGroups(groupTitle);
@@ -155,7 +157,7 @@ async function activateSessionGroupTab(input) {
   if (tab) await applySessionMarkerToTab(
     tab,
     cleanText(input?.sessionId, ''),
-    cleanText(input?.groupTitle, ''),
+    aiWebTestSessionGroupTitle(input?.sessionId),
   );
   return { ok: Boolean(tab), tab: tab ? tabSnapshot(tab) : target, lookup };
 }
@@ -175,8 +177,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type !== 'group-tab') return false;
   const sessionId = cleanText(message.sessionId, '');
-  const groupTitle = cleanText(message.groupTitle, sessionId ? `AI Session ${sessionId}` : 'AI Session');
-  groupTab(tab, sessionId, groupTitle)
+  groupTab(tab, sessionId)
     .then((grouped) => sendResponse({ ok: grouped }))
     .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
   return true;

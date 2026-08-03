@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { generateBrowserChatMessagesSkill, generateBrowserChatMessageSkill } from '@/server/ai/agents/browser-chat.service';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -13,10 +14,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
     const body = await request.json().catch(() => ({}));
-    const userId = body.userId
-      ?? body.qzUserId
-      ?? request.nextUrl.searchParams.get('userId')
-      ?? request.nextUrl.searchParams.get('qzUserId');
+    const userId = requestApplicationUserId(request);
     const messageIds = Array.isArray(body.messageIds)
       ? body.messageIds.filter((item: unknown): item is string => typeof item === 'string')
       : [];

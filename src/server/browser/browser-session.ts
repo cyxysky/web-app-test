@@ -8,9 +8,9 @@ import {
   resolveBrowserOutputPixelRatio,
   resolveBrowserPreviewImageFormat,
 } from '@/config/browser-output-settings';
+import { browserSessionGroupLabel } from '@/lib/browser-session-group';
 import { artifactPath } from '@/server/storage/paths';
 import { browserPreviewFrameIntervalMs, browserPreviewFramesPerSecond } from './browser-preview-cadence';
-import { browserPreviewVideoCaptureGeometry } from './browser-preview-video-settings';
 import {
   BrowserPreviewFramePump,
   type BrowserPreviewFramePumpMetrics,
@@ -52,28 +52,22 @@ import {
   type BrowserCodeCredentialBinding,
 } from './browser-code-runner';
 import { resolveBrowserSessionSurface, type BrowserSessionSurface } from './browser-session-surface';
-
-function shouldIgnoreNetworkFailure(url: string, errorText?: string) {
-  if (errorText === 'net::ERR_ABORTED' && /analytics|collector|apm|beacon|log|track/i.test(url)) return true;
-  return /zhihu-web-analytics|datahub\.zhihu|apm\.zhihu|local\.adspower|118\.89\.204\.198/i.test(url);
-}
-
-function snapshotFrameUrl(value?: string) {
-  try {
-    const url = new URL(value || '');
-    url.hash = '';
-    return url.href;
-  } catch {
-    return String(value || '').split('#', 1)[0];
-  }
-}
-
-function shouldIgnoreConsoleError(text: string) {
-  return (
-    /zhihu-web-analytics|datahub\.zhihu|apm\.zhihu|local\.adspower|118\.89\.204\.198/i.test(text) ||
-    /collector|analytics|beacon|mixed content|cors policy|failed to load resource/i.test(text)
-  );
-}
+import {
+  compactDiagnosticText,
+  isAlreadyHandledJavaScriptDialogError,
+  shouldIgnoreConsoleError,
+  shouldIgnoreNetworkFailure,
+  snapshotFrameUrl,
+  stringifyDiagnosticValue,
+  unknownErrorMessage,
+} from './browser-session-diagnostics';
+import { isBlankBrowserUrlLike, isBlankPage } from './browser-session-page-policy';
+import {
+  closeManagedBrowserSessions,
+  installBrowserSessionShutdownHooks,
+  registerBrowserSession,
+  unregisterBrowserSession,
+} from './browser-session-lifecycle';
 
 
 const DEFAULT_SCREENSHOT_TIMEOUT_MS = 15000;
@@ -100,28 +94,6 @@ function browserOutputPixelRatioFromEnv() {
   return resolveBrowserOutputPixelRatio(process.env.BROWSER_OUTPUT_PIXEL_RATIO);
 }
 
-function compactDiagnosticText(value: string, maxLength: number) {
-  const normalized = value.replace(/\s+/g, ' ').trim();
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, maxLength)}...`;
-}
-
-function unknownErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isAlreadyHandledJavaScriptDialogError(error: unknown) {
-  return /(?:no dialog is showing|dialog which is already handled)/i.test(unknownErrorMessage(error));
-}
-
-function stringifyDiagnosticValue(value: unknown) {
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
 
 export type BrowserSessionMode = 'code' | 'dom';
 
@@ -911,13 +883,17 @@ export type BrowserMouseAction = {
 };
 
 export type BrowserKeyboardAction = {
-  action: 'type' | 'press' | 'shortcut';
+  action: 'type' | 'press' | 'shortcut' | 'insertTextAt';
   target?: BrowserElementTarget;
   /** Internal direct-call shorthand; model-facing tools use target. */
   uid?: string;
   xThousandth?: number;
   yThousandth?: number;
   text?: string;
+  offset?: number;
+  afterText?: string;
+  beforeText?: string;
+  occurrence?: number;
   key?: string;
   keys?: string[];
   replace?: boolean;
@@ -1089,7 +1065,7 @@ export type BrowserScreencastFrame = {
   capturedAt: string;
   url: string;
   viewport: { width: number; height: number };
-  metadata?: unknown;
+  metadata?: { deviceHeight?: number; deviceWidth?: number };
 };
 
 type BrowserLivePreviewStateListener = (tabs: BrowserTabSnapshot[]) => void;
@@ -1175,20 +1151,6 @@ type SharedBrowserState = {
 };
 const sharedBrowserStates = new Map<string, SharedBrowserState>();
 
-type BrowserSessionProcessState = {
-  sessions: Set<BrowserSession>;
-  shutdownHooksInstalled: boolean;
-  shuttingDown?: Promise<void>;
-};
-
-const browserSessionProcessState = ((globalThis as typeof globalThis & {
-  __webPilotBrowserSessionProcessState?: BrowserSessionProcessState;
-}).__webPilotBrowserSessionProcessState ??= {
-  sessions: new Set<BrowserSession>(),
-  shutdownHooksInstalled: false,
-});
-browserSessionProcessState.sessions ??= new Set<BrowserSession>();
-
 function sharedBrowserStateFor(runtimeKey: string) {
   let state = sharedBrowserStates.get(runtimeKey);
   if (!state) {
@@ -1228,21 +1190,6 @@ async function timedBrowserStep<T>(
   }
 }
 
-
-function isBlankPage(page: Page) {
-  const url = page.url();
-  return isBlankBrowserUrlLike(url);
-}
-
-function isBlankBrowserUrlLike(url: string) {
-  return !url
-    || url === 'about:blank'
-    || /^(about:newtab|chrome:\/\/new-tab-page|edge:\/\/newtab)/i.test(url)
-    || (
-      /^data:text\/html/i.test(url)
-      && /data-webpilot-embedded-browser|WebPilot(?:%20|\+)Embedded(?:%20|\+)Browser|WebPilot embedded browser/i.test(url)
-    );
-}
 
 function installAccessibilitySnapshotExportControl() {
   if (window.top !== window) return;
@@ -4962,7 +4909,7 @@ export class BrowserSession {
     private readonly options: BrowserSessionOptions = {},
   ) {
     this.pageGroupId = normalizePageGroupId(options.runId);
-    browserSessionProcessState.sessions.add(this);
+    registerBrowserSession(this);
   }
 
   isUsable() {
@@ -5580,13 +5527,8 @@ export class BrowserSession {
     return page;
   }
 
-  private tabGroupShortId() {
-    const parts = this.pageGroupId.split('_');
-    return (parts.at(-1) || this.pageGroupId).slice(-6).toLowerCase();
-  }
-
   private tabGroupLabel() {
-    return `ai-${this.tabGroupShortId()}`;
+    return browserSessionGroupLabel(this.pageGroupId);
   }
 
   private tabTitlePrefix() {
@@ -5916,30 +5858,28 @@ export class BrowserSession {
     let stopPromise: Promise<void> | undefined;
     let page: Page | undefined;
     let client: import('playwright').CDPSession | undefined;
+    let nativeFrameListener: ((event: {
+      data: string;
+      metadata?: { deviceHeight?: number; deviceWidth?: number };
+      sessionId: number;
+    }) => void) | undefined;
     let pageBindingPromise: Promise<{ client: import('playwright').CDPSession; page: Page }> | undefined;
     let viewport = { width: 1280, height: 720 };
-    let viewportOrigin = { x: 0, y: 0 };
-    const capturePromises = new Set<Promise<void>>();
-    let captureTimer: ReturnType<typeof setTimeout> | undefined;
-    let captureSequence = 0;
-    let pushedCaptureSequence = 0;
-    let nextCaptureAt = Date.now();
+    let latestNativeFrame: {
+      capturedPage: Page;
+      cssViewport: { width: number; height: number };
+      data: string;
+      metadata?: { deviceHeight?: number; deviceWidth?: number };
+      outputViewport: { width: number; height: number };
+    } | undefined;
+    let outputTimer: ReturnType<typeof setTimeout> | undefined;
+    let nextOutputAt = Date.now();
     let nextPageRefreshAt = 0;
     let pageRefreshPromise: Promise<void> | undefined;
-    let nextViewportRefreshAt = 0;
-    let captureDurationMs = 0;
-    let captureDurationTotalMs = 0;
-    let captureSamples = 0;
-    const maxConcurrentCaptures = () => {
-      const averageCaptureDurationMs = captureSamples ? captureDurationTotalMs / captureSamples : 0;
-      // A fixed-rate poller must allow more than one request in flight when a
-      // screenshot takes longer than the frame interval. Keep it tightly
-      // bounded so a slow page cannot build an unbounded CDP command queue.
-      return Math.min(3, Math.max(1, Math.ceil(averageCaptureDurationMs / currentFrameIntervalMs())));
-    };
+    let nativeFrames = 0;
+    let resolveInitialFrame: (() => void) | undefined;
+    const initialFrameReady = new Promise<void>((resolve) => { resolveInitialFrame = resolve; });
     const framePump = new BrowserPreviewFramePump<BrowserScreencastFrame>({
-      // Frame production is already paced below. Keep this pump focused on
-      // serialization/coalescing so it does not add a second FPS interval.
       intervalMs: () => 1,
       onError: options.onError,
       onFrame: options.onFrame,
@@ -5953,11 +5893,11 @@ export class BrowserSession {
     const pushOutputFrame = (
       capturedPage: Page,
       data: string,
+      cssViewport: { width: number; height: number },
       outputViewport: { width: number; height: number },
       metadata?: { deviceHeight?: number; deviceWidth?: number },
     ) => {
       if (stopped || capturedPage.isClosed() || this.activePage !== capturedPage) return;
-      viewport = outputViewport;
       framePump.push({
         capturedAt: new Date().toISOString(),
         contentType,
@@ -5968,8 +5908,32 @@ export class BrowserSession {
           deviceWidth: outputViewport.width,
         } : undefined,
         url: capturedPage.url(),
-        viewport: outputViewport,
+        // Keep interaction/layout coordinates tied to the real CSS viewport.
+        // The encoded pixel size belongs in metadata and must never feed the
+        // next Page.captureScreenshot clip, otherwise frames alternate between
+        // the full page and a cropped/zoomed top-left region.
+        viewport: cssViewport,
       });
+    };
+    const acceptNativeFrame = (
+      capturedPage: Page,
+      data: string,
+      metadata?: { deviceHeight?: number; deviceWidth?: number },
+    ) => {
+      if (stopped || capturedPage.isClosed() || this.activePage !== capturedPage || !data) return;
+      nativeFrames += 1;
+      latestNativeFrame = {
+        capturedPage,
+        cssViewport: { ...viewport },
+        data,
+        metadata,
+        outputViewport: {
+          height: Math.max(1, Math.floor(Number(metadata?.deviceHeight) || viewport.height)),
+          width: Math.max(1, Math.floor(Number(metadata?.deviceWidth) || viewport.width)),
+        },
+      };
+      resolveInitialFrame?.();
+      resolveInitialFrame = undefined;
     };
     const refreshActivePageInBackground = () => {
       const currentTime = Date.now();
@@ -5987,6 +5951,16 @@ export class BrowserSession {
           pageRefreshPromise = undefined;
         });
     };
+    const detachCurrentPage = async () => {
+      const currentClient = client;
+      const currentListener = nativeFrameListener;
+      client = undefined;
+      nativeFrameListener = undefined;
+      if (!currentClient) return;
+      if (currentListener) currentClient.off('Page.screencastFrame', currentListener);
+      await currentClient.send('Page.stopScreencast').catch(() => undefined);
+      await currentClient.detach().catch(() => undefined);
+    };
     const bindActivePage = async () => {
       refreshActivePageInBackground();
       const activePage = this.activePage;
@@ -5998,7 +5972,7 @@ export class BrowserSession {
         if (page === nextActivePage && client && !nextActivePage.isClosed()) {
           return { client, page: nextActivePage };
         }
-        await client?.detach().catch(() => undefined);
+        await detachCurrentPage();
         await nextActivePage.bringToFront().catch(() => undefined);
         const nextClient = await nextActivePage.context().newCDPSession(nextActivePage);
         page = nextActivePage;
@@ -6015,7 +5989,23 @@ export class BrowserSession {
           width: Math.max(1, Math.round(cssViewport.width)),
           height: Math.max(1, Math.round(cssViewport.height)),
         };
-        nextViewportRefreshAt = 0;
+        latestNativeFrame = undefined;
+        const listener = (event: {
+          data: string;
+          metadata?: { deviceHeight?: number; deviceWidth?: number };
+          sessionId: number;
+        }) => {
+          void nextClient.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
+          if (client !== nextClient || page !== nextActivePage) return;
+          acceptNativeFrame(nextActivePage, event.data, event.metadata);
+        };
+        nativeFrameListener = listener;
+        nextClient.on('Page.screencastFrame', listener);
+        await nextClient.send('Page.startScreencast', {
+          everyNthFrame: 1,
+          format,
+          ...(format === 'jpeg' ? { quality } : {}),
+        });
         return { client: nextClient, page: nextActivePage };
       })();
       try {
@@ -6024,118 +6014,97 @@ export class BrowserSession {
         pageBindingPromise = undefined;
       }
     };
-    const capturePreviewFrame = async (sequence: number) => {
-      if (stopped) return;
-      const captureStartedAt = performance.now();
-      const binding = await bindActivePage();
-      if (stopped) return;
-      const capturedPage = binding.page;
-      const captureClient = binding.client;
-      const currentTime = Date.now();
-      if (currentTime >= nextViewportRefreshAt) {
-        nextViewportRefreshAt = currentTime + 1_000;
-        const layoutMetrics = await captureClient.send('Page.getLayoutMetrics');
-        const visualViewport = layoutMetrics.cssVisualViewport;
-        viewport = {
-          width: Math.max(1, Math.round(visualViewport.clientWidth)),
-          height: Math.max(1, Math.round(visualViewport.clientHeight)),
-        };
-        viewportOrigin = {
-          x: visualViewport.pageX,
-          y: visualViewport.pageY,
-        };
-      }
-      const captureGeometry = options.video
-        ? browserPreviewVideoCaptureGeometry(viewport)
-        : { ...viewport, scale: 1 };
-      const outputViewport = {
-        width: captureGeometry.width,
-        height: captureGeometry.height,
-      };
-      const result = await captureClient.send('Page.captureScreenshot', {
-        captureBeyondViewport: false,
-        ...(options.video ? {
-          clip: {
-            x: viewportOrigin.x,
-            y: viewportOrigin.y,
-            width: viewport.width,
-            height: viewport.height,
-            scale: captureGeometry.scale,
-          },
-        } : {}),
-        format,
-        fromSurface: true,
-        optimizeForSpeed: true,
-        ...(format === 'jpeg' ? { quality } : {}),
-      });
-      captureDurationMs = performance.now() - captureStartedAt;
-      captureDurationTotalMs += captureDurationMs;
-      captureSamples += 1;
-      if (sequence <= pushedCaptureSequence) return;
-      pushedCaptureSequence = sequence;
-      pushOutputFrame(capturedPage, result.data, outputViewport);
+    const emitLatestFrame = () => {
+      const latest = latestNativeFrame;
+      if (!latest || latest.capturedPage.isClosed() || this.activePage !== latest.capturedPage) return;
+      pushOutputFrame(
+        latest.capturedPage,
+        latest.data,
+        latest.cssViewport,
+        latest.outputViewport,
+        latest.metadata,
+      );
     };
-    const launchCapture = () => {
-      const sequence = ++captureSequence;
-      const capturePromise = capturePreviewFrame(sequence).catch((error) => {
-        if (!stopped) options.onError?.(error);
-      }).finally(() => {
-        capturePromises.delete(capturePromise);
-      });
-      capturePromises.add(capturePromise);
-    };
-    const scheduleCapture = () => {
-      if (stopped || captureTimer) return;
-      const delay = Math.max(0, nextCaptureAt - Date.now());
-      captureTimer = setTimeout(() => {
-        captureTimer = undefined;
+    const scheduleOutput = () => {
+      if (stopped || outputTimer) return;
+      const delay = Math.max(0, nextOutputAt - Date.now());
+      outputTimer = setTimeout(() => {
+        outputTimer = undefined;
         if (stopped) return;
-        const scheduledAt = nextCaptureAt;
+        const scheduledAt = nextOutputAt;
         const intervalMs = currentFrameIntervalMs();
-        nextCaptureAt = Math.max(scheduledAt + intervalMs, Date.now());
-        if (capturePromises.size < maxConcurrentCaptures()) launchCapture();
-        scheduleCapture();
+        nextOutputAt = Math.max(scheduledAt + intervalMs, Date.now());
+        void bindActivePage()
+          .then(() => emitLatestFrame())
+          .catch((error) => {
+            if (!stopped) options.onError?.(error);
+          })
+          .finally(() => scheduleOutput());
       }, delay);
-      captureTimer.unref?.();
+      outputTimer.unref?.();
     };
     const stopScreencast = async (notifyPageChanged: boolean) => {
       if (stopPromise) return stopPromise;
       stopped = true;
-      if (captureTimer) clearTimeout(captureTimer);
-      captureTimer = undefined;
+      resolveInitialFrame?.();
+      resolveInitialFrame = undefined;
+      if (outputTimer) clearTimeout(outputTimer);
+      outputTimer = undefined;
       stopPromise = (async () => {
         if (tabsListener) this.livePreviewStateListeners.delete(tabsListener);
-        await Promise.allSettled([...capturePromises]);
         await pageRefreshPromise?.catch(() => undefined);
         await framePump.stop();
-        await client?.detach().catch(() => undefined);
-        client = undefined;
+        await detachCurrentPage();
         page = undefined;
+        latestNativeFrame = undefined;
         if (notifyPageChanged) await options.onActivePageChanged?.();
       })();
       return stopPromise;
     };
     try {
-      await capturePreviewFrame(++captureSequence);
+      const binding = await bindActivePage();
+      let initialWaitTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        initialFrameReady,
+        new Promise<void>((resolve) => {
+          initialWaitTimer = setTimeout(resolve, 1_000);
+          initialWaitTimer.unref?.();
+        }),
+      ]);
+      if (initialWaitTimer) clearTimeout(initialWaitTimer);
+      if (!latestNativeFrame && !stopped && !binding.page.isClosed()) {
+        const result = await binding.client.send('Page.captureScreenshot', {
+          captureBeyondViewport: false,
+          format,
+          fromSurface: true,
+          optimizeForSpeed: true,
+          ...(format === 'jpeg' ? { quality } : {}),
+        });
+        acceptNativeFrame(binding.page, result.data);
+      }
+      emitLatestFrame();
       if (!stopped) await framePump.flushLatest();
-      nextCaptureAt = Date.now() + currentFrameIntervalMs();
-      scheduleCapture();
+      nextOutputAt = Date.now() + currentFrameIntervalMs();
+      scheduleOutput();
     } catch (error) {
       if (tabsListener) this.livePreviewStateListeners.delete(tabsListener);
       await stopScreencast(false);
       throw error;
     }
     return {
-      metrics: () => ({
-        ...framePump.metrics(),
-        activeCaptures: capturePromises.size,
-        captureDurationMs,
-        captureDurationMsAverage: captureSamples ? captureDurationTotalMs / captureSamples : 0,
-        imageFormat: format,
-        ...(format === 'jpeg' ? { imageQuality: quality } : {}),
-        maxConcurrentCaptures: maxConcurrentCaptures(),
-        targetFps: browserPreviewFramesPerSecond(process.env.BROWSER_PREVIEW_FPS),
-      }),
+      metrics: () => {
+        const metrics = framePump.metrics();
+        return {
+          ...metrics,
+          activeCaptures: 0,
+          imageFormat: format,
+          ...(format === 'jpeg' ? { imageQuality: quality } : {}),
+          maxConcurrentCaptures: 1,
+          nativeFrames,
+          nativeFps: nativeFrames / Math.max(0.001, metrics.elapsedSeconds),
+          targetFps: browserPreviewFramesPerSecond(process.env.BROWSER_PREVIEW_FPS),
+        };
+      },
       stop: async () => {
         await stopScreencast(false);
       },
@@ -7549,7 +7518,7 @@ export class BrowserSession {
       await this.browserServer?.close().catch(() => undefined);
     } finally {
       if (!shouldKeepOpen || disposeLocalState) {
-        browserSessionProcessState.sessions.delete(this);
+        unregisterBrowserSession(this);
         this.page = undefined;
         this.context = undefined;
         this.browser = undefined;
@@ -9145,6 +9114,89 @@ export class BrowserSession {
     return undefined;
   }
 
+  private async setEditableInsertionSelection(
+    locator: Locator | undefined,
+    handle: ElementHandle<Element> | undefined,
+    input: Pick<BrowserKeyboardAction, 'offset' | 'afterText' | 'beforeText' | 'occurrence'>,
+  ) {
+    const select = (element: Element, options: {
+      offset?: number;
+      afterText?: string;
+      beforeText?: string;
+      occurrence: number;
+    }) => {
+      const inputElement = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
+        ? element
+        : undefined;
+      const editable = inputElement
+        ? inputElement
+        : element instanceof HTMLElement && element.isContentEditable
+          ? element.closest('[contenteditable=""], [contenteditable="true"]') || element
+          : undefined;
+      if (!editable) throw new Error('Target is not an editable input, textarea, or contenteditable element.');
+      const before = inputElement ? inputElement.value : editable.textContent || '';
+      let insertionOffset: number;
+      if (options.offset !== undefined) {
+        insertionOffset = options.offset;
+      } else {
+        const anchor = options.afterText ?? options.beforeText ?? '';
+        let anchorOffset = -1;
+        let searchFrom = 0;
+        for (let index = 0; index < options.occurrence; index += 1) {
+          anchorOffset = before.indexOf(anchor, searchFrom);
+          if (anchorOffset < 0) break;
+          searchFrom = anchorOffset + anchor.length;
+        }
+        if (anchorOffset < 0) {
+          throw new Error(`Insertion anchor occurrence ${options.occurrence} was not found in the editable text.`);
+        }
+        insertionOffset = options.afterText !== undefined ? anchorOffset + anchor.length : anchorOffset;
+      }
+      if (insertionOffset > before.length) {
+        throw new Error(`Insertion offset ${insertionOffset} exceeds editable text length ${before.length}.`);
+      }
+      if (inputElement) {
+        inputElement.setSelectionRange(insertionOffset, insertionOffset);
+      } else {
+        const range = document.createRange();
+        const walker = document.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
+        let traversed = 0;
+        let selected = false;
+        let textNode = walker.nextNode();
+        while (textNode) {
+          const nodeLength = textNode.textContent?.length || 0;
+          if (insertionOffset <= traversed + nodeLength) {
+            range.setStart(textNode, insertionOffset - traversed);
+            selected = true;
+            break;
+          }
+          traversed += nodeLength;
+          textNode = walker.nextNode();
+        }
+        if (!selected) {
+          range.selectNodeContents(editable);
+          range.collapse(false);
+        } else {
+          range.collapse(true);
+        }
+        const selection = editable.ownerDocument.defaultView?.getSelection();
+        if (!selection) throw new Error('The editable document does not expose a text selection.');
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      return { before, insertionOffset };
+    };
+    const options = {
+      afterText: input.afterText,
+      beforeText: input.beforeText,
+      occurrence: input.occurrence ?? 1,
+      offset: input.offset,
+    };
+    if (handle) return handle.evaluate(select, options);
+    if (locator) return locator.evaluate(select, options);
+    throw new Error('The editable target no longer resolves to a live element.');
+  }
+
   private async hasFocusedNativeSelect() {
     for (const frame of this.activePage.frames()) {
       const focused = await frame.evaluate(() => document.activeElement instanceof HTMLSelectElement).catch(() => false);
@@ -10206,6 +10258,9 @@ export class BrowserSession {
   async keyboard(input: BrowserKeyboardAction): Promise<BrowserActionResult> {
     const page = this.activePage;
     const previousGeneration = this.snapshotGeneration;
+    if (input.action === 'insertTextAt' && !input.target && !input.uid) {
+      return { ok: false, actual: 'insertTextAt requires a fresh snapshot-bound editable target.' };
+    }
     let targetLocator: Locator | undefined;
     let targetHandle: ElementHandle<Element> | undefined;
     const hasExplicitTarget = Boolean(input.target || input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined);
@@ -10294,6 +10349,57 @@ export class BrowserSession {
     }
     if (await this.hasFocusedNativeSelect()) {
       return { ok: false, actual: 'Keyboard operation rejected because a native <select> is focused. Use selectOption with the select UID from takeSnapshot and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
+    }
+    if (input.action === 'insertTextAt') {
+      if (typeof input.text !== 'string' || !input.text) {
+        return { ok: false, actual: 'insertTextAt requires non-empty text.' };
+      }
+      const anchors = Number(input.offset !== undefined)
+        + Number(input.afterText !== undefined)
+        + Number(input.beforeText !== undefined);
+      if (anchors !== 1) {
+        return { ok: false, actual: 'insertTextAt requires exactly one insertion anchor: offset, afterText, or beforeText.' };
+      }
+      if (input.offset !== undefined && (!Number.isInteger(input.offset) || input.offset < 0)) {
+        return { ok: false, actual: 'insertTextAt offset must be a non-negative integer.' };
+      }
+      const anchorText = input.afterText ?? input.beforeText;
+      if (anchorText !== undefined && !anchorText.length) {
+        return { ok: false, actual: 'insertTextAt text anchors cannot be empty.' };
+      }
+      if (input.occurrence !== undefined && (!Number.isInteger(input.occurrence) || input.occurrence < 1)) {
+        return { ok: false, actual: 'insertTextAt occurrence must be a positive integer.' };
+      }
+      if (input.occurrence !== undefined && input.offset !== undefined) {
+        return { ok: false, actual: 'insertTextAt occurrence is available only with afterText or beforeText.' };
+      }
+      const selection = await this.setEditableInsertionSelection(targetLocator, targetHandle, input).catch((error) => ({
+        error: error instanceof Error ? error.message : String(error),
+      }));
+      if ('error' in selection) return { ok: false, actual: `insertTextAt could not establish the caret: ${selection.error}` };
+      const eventsBefore = await this.readInteractionCounts();
+      const urlBefore = page.url();
+      const navigationSequenceBefore = this.navigationSequenceByPage.get(page) || 0;
+      await page.keyboard.insertText(input.text);
+      return this.completeVerifiedAction(
+        `Inserted ${input.text.length} characters at editable offset ${selection.insertionOffset}.`,
+        previousGeneration,
+        async () => {
+          const eventsAfter = await this.readInteractionCounts();
+          const inputEvents = this.interactionDelta(eventsBefore, eventsAfter, 'input');
+          const navigated = page.url() !== urlBefore
+            || (this.navigationSequenceByPage.get(page) || 0) !== navigationSequenceBefore;
+          const valueAfter = navigated ? undefined : await this.editableValue(targetLocator, targetHandle);
+          const expected = `${selection.before.slice(0, selection.insertionOffset)}${input.text}${selection.before.slice(selection.insertionOffset)}`;
+          const normalizeEditableWhitespace = (value: string) => value.replace(/\u00a0/g, ' ');
+          const verified = valueAfter !== undefined
+            && normalizeEditableWhitespace(valueAfter) === normalizeEditableWhitespace(expected);
+          return {
+            ok: navigated || verified,
+            detail: `${inputEvents} input event(s) observed; insertedAt=${selection.insertionOffset}; verified=${verified}; navigation=${navigated}.`,
+          };
+        },
+      );
     }
     if (input.action === 'type') {
       if (typeof input.text !== 'string') return { ok: false, actual: 'Keyboard type requires text.' };
@@ -11941,36 +12047,7 @@ export class BrowserSession {
 }
 
 export async function closeAllBrowserSessions() {
-  if (browserSessionProcessState.shuttingDown) return browserSessionProcessState.shuttingDown;
-  browserSessionProcessState.shuttingDown = (async () => {
-    const sessions = [...browserSessionProcessState.sessions];
-    await Promise.allSettled(sessions.map(async (session) => {
-      if (Object.getPrototypeOf(session) !== BrowserSession.prototype) {
-        Object.setPrototypeOf(session, BrowserSession.prototype);
-      }
-      await session.close({ force: true });
-    }));
-    browserSessionProcessState.sessions.clear();
-  })().finally(() => {
-    browserSessionProcessState.shuttingDown = undefined;
-  });
-  return browserSessionProcessState.shuttingDown;
+  return closeManagedBrowserSessions();
 }
 
-function installBrowserSessionProcessShutdownHooks() {
-  if (browserSessionProcessState.shutdownHooksInstalled) return;
-  browserSessionProcessState.shutdownHooksInstalled = true;
-  const shutdown = () => {
-    const forceExitTimer = setTimeout(() => process.exit(1), 8_000);
-    forceExitTimer.unref?.();
-    void closeAllBrowserSessions().finally(() => {
-      clearTimeout(forceExitTimer);
-      process.exit(0);
-    });
-  };
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
-  if (process.platform !== 'win32') process.once('SIGHUP', shutdown);
-}
-
-installBrowserSessionProcessShutdownHooks();
+installBrowserSessionShutdownHooks();

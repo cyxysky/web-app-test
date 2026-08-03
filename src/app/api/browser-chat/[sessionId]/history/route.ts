@@ -1,5 +1,6 @@
 import { getBrowserChatSessionHistory } from '@/server/ai/agents/browser-chat.service';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -9,8 +10,7 @@ type RouteContext = {
 };
 
 function requestUserId(request: Request) {
-  const url = new URL(request.url);
-  return (url.searchParams.get('userId') || url.searchParams.get('qzUserId') || '').trim();
+  return requestApplicationUserId(request);
 }
 
 export async function GET(request: Request, context: RouteContext) {

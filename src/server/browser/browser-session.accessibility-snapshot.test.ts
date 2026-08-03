@@ -1187,3 +1187,43 @@ test('snapshot UID mappings evict identities outside the retention window', asyn
   const mappings = Reflect.get(session, 'snapshotUidByIdentity') as Map<string, { uid: string }>;
   assert.equal([...mappings.values()].some((entry) => entry.uid === expiredUid), false);
 });
+
+test('DOM mode inserts text at exact anchors in textareas and rich-text iframes', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-insert-text-at-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.goto(`data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html><html><body>
+    <textarea aria-label="Notes">alpha alpha gamma</textarea>
+    <iframe title="Rich editor" srcdoc="<!doctype html><body contenteditable='true' aria-label='Rich editor'>left right</body>"></iframe>
+  </body></html>`)}`);
+
+  const full = await session.readDomObservationSnapshot({ mode: 'full' });
+  const textareaUid = full.content.match(/<textarea\s+uid=(dom-\S+)[^>]*aria-label="Notes"/)?.[1];
+  const iframeUid = full.content.match(/<iframe\s+uid=(dom-\S+)[^>]*title="Rich editor"/)?.[1];
+  assert.ok(textareaUid, full.content);
+  assert.ok(iframeUid, full.content);
+
+  const textareaInsertion = await session.keyboard({
+    action: 'insertTextAt',
+    uid: textareaUid,
+    text: 'beta ',
+    afterText: 'alpha ',
+    occurrence: 2,
+  });
+  assert.equal(textareaInsertion.ok, true, textareaInsertion.actual);
+  assert.equal(await page.getByLabel('Notes').inputValue(), 'alpha alpha beta gamma');
+
+  const richInsertion = await session.keyboard({
+    action: 'insertTextAt',
+    uid: iframeUid,
+    text: 'middle ',
+    afterText: 'left ',
+  });
+  assert.equal(richInsertion.ok, true, richInsertion.actual);
+  const richTextFrame = page.frames().find((frame) => frame !== page.mainFrame());
+  assert.equal(
+    (await richTextFrame?.locator('body').textContent())?.replace(/\u00a0/g, ' '),
+    'left middle right',
+  );
+});

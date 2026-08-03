@@ -26,6 +26,7 @@ import {
 import { CSS as DndCss } from '@dnd-kit/utilities';
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
+import dynamic from 'next/dynamic';
 import {
   AppWindow,
   ArrowLeft,
@@ -91,8 +92,6 @@ import { usePathname, useSearchParams } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CustomSelect } from '@/components/CustomSelect';
-import { BrowserChatLogDialog } from '@/components/BrowserChatLogDialog';
-import { BrowserChatToolDialog } from '@/components/BrowserChatToolDialog';
 import {
   browserChatDownloadPercent,
   browserChatDownloadStatusLabel,
@@ -106,12 +105,11 @@ import {
   type BrowserChatHistoryState,
 } from '@/components/browser-chat-history-controller';
 import { normalizeBrowserChatMarkdown } from '@/components/browser-chat-markdown';
+import type { EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
 import {
-  EnvironmentSettings,
   environmentSettingsTabsForUser,
   isAdministratorOnlySettingsTab,
-  type EnvironmentSettingsInitialData,
-} from '@/components/EnvironmentSettings';
+} from '@/components/environment-settings-model';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import {
   browserChatMessageElapsedMs,
@@ -123,13 +121,19 @@ import {
   formatBrowserChatElapsedTime,
   type BrowserChatLogIndex as BrowserChatLogIndexModel,
 } from '@/components/browser-chat-message-model';
-import { browserChatViewNavigationHref, loadRequestedBrowserChatSessionDetail } from '@/components/browser-chat-session-selection';
+import {
+  browserChatSessionNavigationHref,
+  browserChatViewNavigationHref,
+  loadRequestedBrowserChatSessionDetail,
+  shouldActivateRequestedBrowserChatSession,
+} from '@/components/browser-chat-session-selection';
 import {
   visibleBrowserChatExecutionLogs,
 } from '@/components/browser-chat-log-model';
 import { type SettingsTab } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
+import { browserSessionGroupLabel } from '@/lib/browser-session-group';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import {
   modelSelectionDiagnosticLabel,
@@ -259,7 +263,9 @@ type BrowserChatSession = {
 };
 
 type BrowserChatSessionRealtimePatch = {
-  session?: Omit<BrowserChatSession, 'logs' | 'messages' | 'steps'>;
+  session: Omit<BrowserChatSession, 'logs' | 'messages' | 'pendingToolConfirmation' | 'steps'> & {
+    pendingToolConfirmation: BrowserChatToolConfirmation | null;
+  };
   summary?: BrowserChatSession;
   logs?: BrowserChatLogRecord[];
   messages?: BrowserChatMessage[];
@@ -274,6 +280,19 @@ type BrowserChatMode = 'code' | 'dom';
 type BrowserChatSafetyMode = 'strict' | 'full';
 type BrowserChatModelConfig = RuntimeModelConfig;
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
+
+const EnvironmentSettings = dynamic(
+  () => import('@/components/EnvironmentSettings').then((module) => module.EnvironmentSettings),
+  { ssr: false },
+);
+const BrowserChatLogDialog = dynamic(
+  () => import('@/components/BrowserChatLogDialog').then((module) => module.BrowserChatLogDialog),
+  { ssr: false },
+);
+const BrowserChatToolDialog = dynamic(
+  () => import('@/components/BrowserChatToolDialog').then((module) => module.BrowserChatToolDialog),
+  { ssr: false },
+);
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'webpilotqa.sidebarCollapsed';
 const EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY = 'webpilotqa.embeddedChatCollapsed';
@@ -569,13 +588,7 @@ function compactText(value?: unknown, max = 160) {
 }
 
 function embeddedSessionGroupLabel(sessionId?: string) {
-  const normalized = (sessionId || 'browser-session')
-    .trim()
-    .replace(/[^a-zA-Z0-9_-]+/g, '_')
-    .replace(/^_+|_+$/g, '');
-  const parts = normalized.split('_');
-  const shortId = (parts.at(-1) || normalized || 'session').slice(-6).toLowerCase();
-  return `ai-${shortId}`;
+  return browserSessionGroupLabel(sessionId);
 }
 
 const EMBEDDED_BROWSER_GROUP_ICON_COLORS = ['#10a37f', '#4f8cff', '#9b6fe8', '#e38b2d', '#d85b7d', '#27a9b2', '#7aa83e', '#c65ed0', '#e05b45', '#3978c5'];
@@ -1702,7 +1715,9 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
     modelProvider: modelSelection.provider,
     model: modelSelection.model,
     networkErrors: session.networkErrors || [],
-    pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
+    pendingToolConfirmation: session.busy && session.status === 'running'
+      ? normalizeToolConfirmation(session.pendingToolConfirmation)
+      : undefined,
     steps: session.steps || [],
   };
 }
@@ -1758,9 +1773,11 @@ function mergeBrowserChatSessionRealtimePatch(
   );
   for (const log of patch.logs || []) logs.set(log.id, log);
 
+  const { pendingToolConfirmation, ...sessionPatch } = patch.session;
   return normalizeSession({
     ...current,
-    ...patch.session,
+    ...sessionPatch,
+    pendingToolConfirmation: normalizeToolConfirmation(pendingToolConfirmation ?? undefined),
     messages: [...messages.values()].sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')),
     steps: [...steps.values()].sort((a, b) => a.index - b.index),
     logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
@@ -2462,7 +2479,14 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
   const resolvingCancel = resolving && resolvingConfirmationAction === 'cancel';
   return (
     <div className="browser-chat-tool-confirmation" role="group" aria-label={t('工具调用确认')}>
-      <span>{pending.prompt}</span>
+      <span aria-hidden="true" className="browser-chat-tool-confirmation-icon">
+        <svg viewBox="0 0 16 16">
+          <circle cx="8" cy="8" r="7" />
+          <path d="M8 4.25v4.5" />
+          <circle className="browser-chat-tool-confirmation-icon-dot" cx="8" cy="11.35" r="0.8" />
+        </svg>
+      </span>
+      <span className="browser-chat-tool-confirmation-message">{pending.prompt}</span>
       <div className="browser-chat-tool-confirmation-actions">
         <button
           className="browser-chat-tool-confirm"
@@ -3443,6 +3467,9 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const hasFinalText = Boolean(finalText.trim());
   const hideManualVerificationStatusText = manualVerificationPaused && isManualVerificationStatusText(finalText);
   const hasProcessContent = aiOutputCycleEntries.length > 0 || shouldShowStepTimeline || running;
+  const runningActivityLabel = message.activity?.label?.trim()
+    ? t(message.activity.label)
+    : t('正在分析页面状态并准备下一步操作');
   const processAutoOpen = running || hasPendingConfirmation || message.status === 'blocked';
   const processLabel = running
     ? t('处理中')
@@ -3512,12 +3539,16 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
               ))}
             </div>
           ) : null}
-          {!aiOutputCycleEntries.length && !shouldShowStepTimeline && running ? (
-            <div aria-live="polite" className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
+          {running ? (
+            <div
+              aria-live="polite"
+              className={`browser-chat-agent-empty browser-chat-agent-thinking${aiOutputCycleEntries.length || shouldShowStepTimeline ? ' is-continuation' : ''}`}
+              role="status"
+            >
               <span aria-hidden="true" className="browser-chat-agent-thinking-mark"><i /><i /><i /></span>
               <span className="browser-chat-agent-thinking-copy">
                 <strong>{t('AI 正在处理当前请求')}<span className="browser-chat-agent-thinking-ellipsis">...</span></strong>
-                <small>{t('正在分析页面状态并准备下一步操作')}</small>
+                <small>{runningActivityLabel}</small>
               </span>
             </div>
           ) : null}
@@ -3722,7 +3753,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   return (
     <article className="browser-chat-message assistant browser-chat-executed-message">
       <div>
-        <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={groupRunning || groupHasPendingConfirmation || undefined}>
+        <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={groupRunning || groupHasPendingConfirmation}>
           <summary className="browser-chat-ai-collapse-summary">
             <SquareTerminal size={14} />
             <span>{t('已执行')}</span>
@@ -5126,6 +5157,7 @@ function BrowserChatWebPreviewModal({
   const [frame, setFrame] = useState<BrowserChatPreviewFrame | null>(null);
   const [previewTransport, setPreviewTransport] = useState<'image' | 'video'>('video');
   const [videoObjectUrl, setVideoObjectUrl] = useState('');
+  const [videoDisplayReady, setVideoDisplayReady] = useState(false);
   const [status, setStatus] = useState<'connecting' | 'live' | 'reconnecting' | 'unavailable'>('connecting');
   const [streamError, setStreamError] = useState('');
   const [inputError, setInputError] = useState('');
@@ -5146,7 +5178,10 @@ function BrowserChatWebPreviewModal({
     }
     if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
     videoObjectUrlRef.current = '';
-    if (updateState) setVideoObjectUrl('');
+    if (updateState) {
+      setVideoObjectUrl('');
+      setVideoDisplayReady(false);
+    }
   }, []);
 
   const pumpVideoChunks = useCallback(() => {
@@ -5179,6 +5214,7 @@ function BrowserChatWebPreviewModal({
   const beginVideoPipeline = useCallback((contentType: string, initialization: Uint8Array) => {
     disposeVideoPipeline();
     if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported(contentType)) return false;
+    setVideoDisplayReady(false);
     const mediaSource = new MediaSource();
     const objectUrl = URL.createObjectURL(mediaSource);
     mediaSourceRef.current = mediaSource;
@@ -5203,12 +5239,6 @@ function BrowserChatWebPreviewModal({
     }, { once: true });
     setVideoObjectUrl(objectUrl);
     setPreviewTransport('video');
-    setFrame((current) => current || {
-      ...frameStateRef.current,
-      capturedAt: new Date().toISOString(),
-      contentType: 'image/jpeg',
-      imageUrl: '',
-    });
     return true;
   }, [disposeVideoPipeline]);
 
@@ -5291,7 +5321,10 @@ function BrowserChatWebPreviewModal({
     reconnectEnabledRef.current = true;
     const connect = async () => {
       try {
-        const response = await fetch(withWebPilotBasePath('/api/browser-chat/preview-stream'), { cache: 'no-store' });
+        const response = await fetch(
+          `${withWebPilotBasePath('/api/browser-chat/preview-stream')}?userId=${encodeURIComponent(userId)}`,
+          { cache: 'no-store' },
+        );
         const data = await response.json() as { error?: string; transport?: 'image' | 'video'; url?: string };
         if (!response.ok || !data.url) throw new Error(data.error || '实时界面连接失败');
         if (disposed) return;
@@ -5316,6 +5349,7 @@ function BrowserChatWebPreviewModal({
           counters.sampledReceived = counters.received;
           frameStateRef.current = { tabs: [], url: '', viewport: { height: 720, width: 1280 } };
           setPreviewMetrics(null);
+          setStatus('connecting');
           setStreamError('');
         };
         stream.onmessage = (event) => {
@@ -5416,7 +5450,7 @@ function BrowserChatWebPreviewModal({
             } else if (message.type === 'activeTabChanged') {
               setStatus('reconnecting');
             } else if (message.type === 'ready') {
-              setStatus((current) => current === 'reconnecting' ? 'connecting' : current);
+              setStatus('live');
               setStreamError('');
             } else if (message.type === 'inputError') {
               setInputError(message.error || '实时界面操作失败');
@@ -5736,7 +5770,7 @@ function BrowserChatWebPreviewModal({
         t('待发送客户端帧：{count}', { count: previewMetrics.pendingClientFrames || 0 }),
       ].join('\n')
     : '';
-  const hasPreviewVisual = Boolean(videoObjectUrl || frame?.imageUrl);
+  const hasPreviewVisual = videoDisplayReady || Boolean(frame?.imageUrl);
 
   return (
     <div className="ui-modal-overlay browser-chat-web-preview-overlay" onClick={onClose} role="presentation">
@@ -5802,18 +5836,7 @@ function BrowserChatWebPreviewModal({
             role="application"
             tabIndex={0}
           >
-            {videoObjectUrl ? (
-              <video
-                autoPlay
-                disablePictureInPicture
-                height={frame?.viewport.height || 720}
-                muted
-                playsInline
-                ref={previewVideoRef}
-                src={videoObjectUrl}
-                width={frame?.viewport.width || 1280}
-              />
-            ) : frame?.imageUrl ? (
+            {frame?.imageUrl && !videoDisplayReady ? (
               <img
                 alt={t('浏览器实时画面')}
                 draggable={false}
@@ -5822,13 +5845,32 @@ function BrowserChatWebPreviewModal({
                 src={frame.imageUrl}
                 width={frame.viewport.width}
               />
-            ) : (
+            ) : null}
+            {videoObjectUrl ? (
+              <video
+                autoPlay
+                className={videoDisplayReady ? 'is-ready' : 'is-loading'}
+                disablePictureInPicture
+                height={frame?.viewport.height || 720}
+                muted
+                onLoadedData={() => {
+                  setVideoDisplayReady(true);
+                  setStatus('live');
+                  setStreamError('');
+                }}
+                playsInline
+                ref={previewVideoRef}
+                src={videoObjectUrl}
+                width={frame?.viewport.width || 1280}
+              />
+            ) : null}
+            {!hasPreviewVisual ? (
               <div className="browser-chat-web-preview-empty">
                 <Loader2 className="spin" size={22} />
                 <strong>{streamError ? t(streamError) : t('正在等待浏览器画面')}</strong>
                 <span>{t('发送一条需要访问网页的消息后，画面会自动出现。')}</span>
               </div>
-            )}
+            ) : null}
           </div>
           {streamError && hasPreviewVisual ? <div className="browser-chat-web-preview-alert">{t(streamError)}</div> : null}
           {inputError ? <div className="browser-chat-web-preview-alert">{t(inputError)}</div> : null}
@@ -6984,10 +7026,9 @@ export function BrowserChatWorkspace({
   const embeddedWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
   const sessionActivationSequenceRef = useRef(0);
+  const sessionSelectionIntentRef = useRef(0);
   const mountedSessionActivationRef = useRef('');
   const sessionVersionsRef = useRef(new Map<string, number>());
-  const sessionRefreshTimersRef = useRef(new Map<string, number>());
-  const sessionListRefreshTimerRef = useRef<number | undefined>(undefined);
   const interruptRequestSequenceRef = useRef(0);
   const interruptGuardsRef = useRef(new Map<string, BrowserChatInterruptGuard>());
   const activeView = browserChatViewForPathname(pathname, initialView);
@@ -7015,7 +7056,6 @@ export function BrowserChatWorkspace({
   const [busy, setBusy] = useState(false);
   const [pendingMessageSessionId, setPendingMessageSessionId] = useState<string | null>(null);
   const [uploadingImage, setUploadingImage] = useState(false);
-  const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [embeddedBrowserEnabled, setEmbeddedBrowserEnabled] = useState(false);
   const [showReasoning, setShowReasoning] = useState(false);
   const [embeddedChatWidth, setEmbeddedChatWidth] = useState(420);
@@ -7118,7 +7158,7 @@ export function BrowserChatWorkspace({
     setAdminSettingsPasswordError('');
     setAdminSettingsPasswordSubmitting(false);
     setPendingAdminSettingsTab(null);
-    setSettingsTab('general');
+    setSettingsTab((current) => isAdministratorOnlySettingsTab(current) ? 'general' : current);
   }, [activeView]);
 
   useEffect(() => {
@@ -7513,6 +7553,7 @@ export function BrowserChatWorkspace({
   }, [refreshSession]);
 
   const loadSessions = useCallback(async () => {
+    const selectionIntent = sessionSelectionIntentRef.current;
     const response = await fetch(browserChatApiUrl('/api/browser-chat'), { cache: 'no-store' });
     const data = await readApiJson<Record<string, unknown>>(response, '加载对话历史失败');
     const nextSessions = Array.isArray(data.sessions) ? data.sessions.map((item: BrowserChatSession) => {
@@ -7522,7 +7563,14 @@ export function BrowserChatWorkspace({
       return guarded.session;
     }) : [];
     setSessions(nextSessions);
+    if (sessionSelectionIntentRef.current !== selectionIntent) return;
     await loadRequestedBrowserChatSessionDetail(nextSessions, requestedSessionId, async (requestedSession) => {
+      if (!shouldActivateRequestedBrowserChatSession({
+        activeSessionId: activeSessionIdRef.current,
+        currentSelectionIntent: sessionSelectionIntentRef.current,
+        requestedSessionId: requestedSession.id,
+        selectionIntent,
+      })) return undefined;
       if (mountedSessionActivationRef.current === requestedSession.id) return;
       mountedSessionActivationRef.current = requestedSession.id;
       try {
@@ -7533,31 +7581,6 @@ export function BrowserChatWorkspace({
       }
     });
   }, [activateSession, browserChatApiUrl, requestedSessionId]);
-
-  const scheduleLoadSessions = useCallback((delay = 80) => {
-    if (sessionListRefreshTimerRef.current) window.clearTimeout(sessionListRefreshTimerRef.current);
-    sessionListRefreshTimerRef.current = window.setTimeout(() => {
-      sessionListRefreshTimerRef.current = undefined;
-      void loadSessions().catch((loadError) => {
-        setError(loadError instanceof Error ? loadError.message : '加载对话历史失败');
-      });
-    }, delay);
-  }, [loadSessions]);
-
-  const scheduleSessionRefresh = useCallback((sessionId: string, delay = 30) => {
-    const timers = sessionRefreshTimersRef.current;
-    const existing = timers.get(sessionId);
-    if (existing) window.clearTimeout(existing);
-    const timer = window.setTimeout(() => {
-      timers.delete(sessionId);
-      void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch((refreshError) => {
-        if (activeSessionIdRef.current === sessionId) {
-          setError(refreshError instanceof Error ? refreshError.message : '加载对话失败');
-        }
-      });
-    }, delay);
-    timers.set(sessionId, timer);
-  }, [refreshSession]);
 
   useEffect(() => {
     void loadSessions().catch((loadError) => {
@@ -7606,11 +7629,7 @@ export function BrowserChatWorkspace({
         return;
       }
       const patch = browserChatRealtimePatch(event.patch);
-      if (!patch) {
-        if (activeSessionIdRef.current === event.id) scheduleSessionRefresh(event.id);
-        else scheduleLoadSessions();
-        return;
-      }
+      if (!patch) return;
       if (patch.logs?.length || patch.removedLogIds?.length) {
         for (const key of loadedLogMessageKeysRef.current) {
           if (key.startsWith(`${event.id}\u0000`)) loadedLogMessageKeysRef.current.delete(key);
@@ -7638,35 +7657,23 @@ export function BrowserChatWorkspace({
         return [guarded.session, ...current.filter((item) => item.id !== event.id)]
           .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
       });
-    }, { onStatus: setRealtimeConnected });
-  }, [scheduleLoadSessions, scheduleSessionRefresh]);
-
-  useEffect(() => () => {
-    for (const timer of sessionRefreshTimersRef.current.values()) {
-      window.clearTimeout(timer);
-    }
-    sessionRefreshTimersRef.current.clear();
-    if (sessionListRefreshTimerRef.current) window.clearTimeout(sessionListRefreshTimerRef.current);
-  }, []);
-
-  useEffect(() => {
-    if (!session?.id || !selectedSessionRunning || realtimeConnected) return undefined;
-    const sessionId = session.id;
-    const timer = window.setInterval(() => {
-      void refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch(() => undefined);
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [realtimeConnected, refreshSession, selectedSessionRunning, session?.id]);
+    }, { userId: requestUserId });
+  }, [requestUserId]);
 
   async function createSession() {
+    sessionSelectionIntentRef.current += 1;
     const response = await fetch(browserChatApiUrl('/api/browser-chat'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ safetyMode, modelProvider, model: modelId, targetUrl: requestedTargetUrl, userId: requestUserId }),
+      body: JSON.stringify({ safetyMode, modelProvider, model: modelId, targetUrl: requestedTargetUrl }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '创建对话会话失败');
     const created = upsertSession(data.session as BrowserChatSession, { activate: true });
     activeSessionIdRef.current = created.id;
+    mountedSessionActivationRef.current = created.id;
+    if (!mountedIdentityRef.current) {
+      window.history.replaceState(null, '', browserChatSessionNavigationHref(window.location.href, created.id));
+    }
     return created;
   }
 
@@ -7679,7 +7686,7 @@ export function BrowserChatWorkspace({
     const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/message`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds, userId: requestUserId }),
+      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '发送消息失败');
     return data.session as BrowserChatSession;
@@ -7817,11 +7824,9 @@ export function BrowserChatWorkspace({
       const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/tool-confirmation`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, confirmationId, userId: requestUserId }),
+        body: JSON.stringify({ action, confirmationId }),
       });
-      const data = await readApiJson<Record<string, unknown>>(response, '工具确认失败');
-      upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === sessionId });
-      scheduleSessionRefresh(sessionId, 120);
+      await readApiJson<Record<string, unknown>>(response, '工具确认失败');
     } catch (resolveError) {
       setError(resolveError instanceof Error ? resolveError.message : '工具确认失败');
     } finally {
@@ -7837,9 +7842,7 @@ export function BrowserChatWorkspace({
     setError('');
     try {
       const response = await fetch(browserChatApiUrl(`/api/browser-chat/${active.id}/resume-verification`), { method: 'POST' });
-      const data = await readApiJson<{ session: BrowserChatSession }>(response, '继续人工校验回合失败');
-      upsertSession(data.session, { activate: true });
-      scheduleSessionRefresh(active.id, 120);
+      await readApiJson<{ session: BrowserChatSession }>(response, '继续人工校验回合失败');
     } catch (resumeError) {
       setError(resumeError instanceof Error ? resumeError.message : '继续人工校验回合失败');
     } finally {
@@ -7928,7 +7931,7 @@ export function BrowserChatWorkspace({
       const response = await fetch(browserChatApiUrl('/api/browser-chat/delete'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: deletingIds, userId: requestUserId }),
+        body: JSON.stringify({ ids: deletingIds }),
       });
       await readApiJson<Record<string, unknown>>(response, '批量删除历史对话失败');
       setSessions((current) => current.filter((item) => !deletingIdSet.has(item.id)));
@@ -7984,7 +7987,7 @@ export function BrowserChatWorkspace({
       const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/automation-cases`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messageId, userId: requestUserId }),
+        body: JSON.stringify({ messageId }),
       });
       const data = await readApiJson<{ automationCase?: { id?: string }; case?: { id?: string } }>(response, t('生成测试用例失败'));
       const caseId = data.automationCase?.id || data.case?.id || '';
@@ -8000,6 +8003,10 @@ export function BrowserChatWorkspace({
 
   async function startNewConversation() {
     if (loadingSessionId) return;
+    sessionSelectionIntentRef.current += 1;
+    sessionActivationSequenceRef.current += 1;
+    loadingSessionRef.current = null;
+    mountedSessionActivationRef.current = '';
     setError('');
     setComposerResetToken((current) => current + 1);
     attachmentsRef.current = [];
@@ -8007,10 +8014,18 @@ export function BrowserChatWorkspace({
     activeSessionIdRef.current = null;
     setMode(defaultModeRef.current);
     setSession(null);
+    if (!mountedIdentityRef.current) {
+      window.history.replaceState(null, '', browserChatSessionNavigationHref(window.location.href));
+    }
   }
 
   async function loadSession(sessionId: string) {
     if (loadingSessionRef.current === sessionId) return;
+    sessionSelectionIntentRef.current += 1;
+    mountedSessionActivationRef.current = sessionId;
+    if (!mountedIdentityRef.current) {
+      window.history.replaceState(null, '', browserChatSessionNavigationHref(window.location.href, sessionId));
+    }
     setError('');
     setComposerResetToken((current) => current + 1);
     attachmentsRef.current = [];

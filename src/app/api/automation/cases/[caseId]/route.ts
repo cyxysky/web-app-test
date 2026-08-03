@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 import { noStoreJson } from '@/server/http/no-store-response';
 import {
   deleteAutomationCase,
@@ -14,10 +14,7 @@ type RouteContext = {
 };
 
 function requestUserId(request: NextRequest) {
-  return normalizeApplicationUserId(
-    request.nextUrl.searchParams.get('userId')
-    ?? request.nextUrl.searchParams.get('qzUserId'),
-  );
+  return requestApplicationUserId(request);
 }
 
 export async function GET(request: NextRequest, context: RouteContext) {

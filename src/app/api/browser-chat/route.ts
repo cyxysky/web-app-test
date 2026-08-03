@@ -2,13 +2,13 @@ import { NextRequest } from 'next/server';
 import { createBrowserChatSession, listBrowserChatSessions } from '@/server/ai/agents/browser-chat.service';
 import { createBrowserChatSessionRequestSchema, type CreateBrowserChatSessionRequest } from '@/server/http/browser-chat-request.schema';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function requestUserId(request: NextRequest, body?: Pick<CreateBrowserChatSessionRequest, 'userId' | 'qzUserId'>) {
-  const value = body?.userId ?? body?.qzUserId ?? request.nextUrl.searchParams.get('userId') ?? request.nextUrl.searchParams.get('qzUserId');
-  return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+function requestUserId(request: NextRequest, _body?: Pick<CreateBrowserChatSessionRequest, 'userId' | 'qzUserId'>) {
+  return requestApplicationUserId(request, _body);
 }
 
 export async function GET(request: NextRequest) {

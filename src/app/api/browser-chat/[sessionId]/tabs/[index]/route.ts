@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { switchBrowserChatTab } from '@/server/ai/agents/browser-chat.service';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -10,10 +11,7 @@ type RouteContext = {
 };
 
 function requestUserId(request: NextRequest) {
-  const value = request.nextUrl.searchParams.get('userId')
-    || request.nextUrl.searchParams.get('qzUserId')
-    || '';
-  return typeof value === 'string' ? value.trim() : '';
+  return requestApplicationUserId(request);
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {

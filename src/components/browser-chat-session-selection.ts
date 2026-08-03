@@ -17,9 +17,33 @@ export async function loadRequestedBrowserChatSessionDetail<TSession extends { i
   return loadDetail(requestedSession);
 }
 
+export function shouldActivateRequestedBrowserChatSession({
+  activeSessionId,
+  currentSelectionIntent,
+  requestedSessionId,
+  selectionIntent,
+}: {
+  activeSessionId: string | null;
+  currentSelectionIntent: number;
+  requestedSessionId: string;
+  selectionIntent: number;
+}) {
+  return selectionIntent === currentSelectionIntent
+    && (!activeSessionId || activeSessionId === requestedSessionId);
+}
+
 export function browserChatViewNavigationHref(targetHref: string, currentHref: string) {
   const current = new URL(currentHref);
   const target = new URL(targetHref, current);
   target.search = current.search;
   return `${target.pathname}${target.search}${target.hash}`;
+}
+
+export function browserChatSessionNavigationHref(currentHref: string, sessionId?: string) {
+  const current = new URL(currentHref);
+  const normalizedSessionId = sessionId?.trim() || '';
+  if (normalizedSessionId) current.searchParams.set('sessionId', normalizedSessionId);
+  else current.searchParams.delete('sessionId');
+  current.searchParams.delete('targetUrl');
+  return `${current.pathname}${current.search}${current.hash}`;
 }

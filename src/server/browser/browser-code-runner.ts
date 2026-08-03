@@ -217,7 +217,7 @@ const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 20;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 21;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -225,17 +225,77 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
   return Math.min(max, Math.max(min, normalized));
 }
 
+function browserCodeWithoutComments(code: string) {
+  let result = '';
+  let quote = '';
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < code.length; index += 1) {
+    const character = code[index];
+    const next = code[index + 1];
+    if (lineComment) {
+      if (character === '\n' || character === '\r') {
+        lineComment = false;
+        result += character;
+      } else {
+        result += ' ';
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (character === '*' && next === '/') {
+        blockComment = false;
+        result += '  ';
+        index += 1;
+      } else {
+        result += character === '\n' || character === '\r' ? character : ' ';
+      }
+      continue;
+    }
+    if (quote) {
+      result += character;
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = '';
+      continue;
+    }
+    if (character === '/' && next === '/') {
+      lineComment = true;
+      result += '  ';
+      index += 1;
+      continue;
+    }
+    if (character === '/' && next === '*') {
+      blockComment = true;
+      result += '  ';
+      index += 1;
+      continue;
+    }
+    if (character === '\'' || character === '"' || character === '`') quote = character;
+    result += character;
+  }
+  return result;
+}
+
+export function browserCodeHasCommittingAction(code: string) {
+  const source = browserCodeWithoutComments(code);
+  return /\.(?:click|dblclick|check|uncheck|press|setInputFiles|selectOption|submit)\s*\(/i.test(source)
+    || /\b(?:fetch|XMLHttpRequest|sendBeacon)\s*\(/i.test(source)
+    || /\b(?:localStorage|sessionStorage)\s*\.\s*(?:setItem|removeItem|clear)\s*\(/i.test(source);
+}
+
 export function analyzeBrowserCodeRisk(code: string): BrowserCodeRisk {
+  const source = browserCodeWithoutComments(code);
+  if (!browserCodeHasCommittingAction(source)) return { requiresConfirmation: false, reasons: [] };
   const reasons: string[] = [];
   const checks: Array<[RegExp, string]> = [
     [/\b(?:submit|publish|send|delete|remove|destroy|approve|authorize|pay|purchase|checkout|order|transfer|upload|download|login|logout)\b/i, '代码包含可能对外产生影响或修改数据的操作'],
     [/(?:提交|发布|发送|删除|移除|确认|批准|授权|支付|购买|下单|转账|上传|下载|登录|退出)/, '代码包含可能对外产生影响或修改数据的操作'],
-    [/\b(?:password|passwd|otp|verification\s*code|credit\s*card|bank\s*account|credential|secret|token)\b/i, '代码涉及凭据、验证或敏感信息'],
-    [/(?:密码|口令|验证码|信用卡|银行卡|银行账户|凭据|密钥|令牌)/, '代码涉及凭据、验证或敏感信息'],
-    [/\.evaluate\s*\([\s\S]{0,3000}\b(?:fetch|XMLHttpRequest|sendBeacon|\.submit\s*\(|\.click\s*\(|localStorage\s*\.\s*setItem|sessionStorage\s*\.\s*setItem)\b/i, '页面代码可能发起请求或修改页面状态'],
+    [/\b(?:fetch|XMLHttpRequest|sendBeacon)\s*\(|\b(?:localStorage|sessionStorage)\s*\.\s*(?:setItem|removeItem|clear)\s*\(/i, '页面代码可能发起请求或修改页面状态'],
   ];
   for (const [pattern, reason] of checks) {
-    if (pattern.test(code)) reasons.push(reason);
+    if (pattern.test(source)) reasons.push(reason);
   }
   return { requiresConfirmation: reasons.length > 0, reasons };
 }
@@ -1438,6 +1498,14 @@ function browserCodeKernelMain() {
     activeSurface?: 'opened' | 'closed' | 'changed' | 'present' | 'absent';
   };
 
+  type BrowserCodeInsertTextAtInput = {
+    text: string;
+    offset?: number;
+    afterText?: string;
+    beforeText?: string;
+    occurrence?: number;
+  };
+
   const verifyPageState = async (
     page: import('playwright').Page,
     input: BrowserCodeVerifyStateInput,
@@ -1586,6 +1654,137 @@ function browserCodeKernelMain() {
     };
   };
 
+  const insertTextAt = async (
+    page: import('playwright').Page,
+    locatorInput: import('playwright').Locator,
+    input: BrowserCodeInsertTextAtInput,
+  ) => {
+    if (!activeExecution) throw new Error('page.insertTextAt() is only available while browserCode is executing.');
+    if (
+      !locatorInput
+      || typeof locatorInput !== 'object'
+      || typeof Reflect.get(locatorInput, 'evaluate') !== 'function'
+      || locatorPage(locatorInput) !== page
+    ) {
+      throw new Error('page.insertTextAt() requires a real Playwright Locator from the active page, including a locator inside one of its frames.');
+    }
+    const text = typeof input?.text === 'string' ? input.text : '';
+    if (!text) throw new Error('page.insertTextAt() requires non-empty text.');
+    const hasOffset = input?.offset !== undefined;
+    const hasAfterText = input?.afterText !== undefined;
+    const hasBeforeText = input?.beforeText !== undefined;
+    if (Number(hasOffset) + Number(hasAfterText) + Number(hasBeforeText) !== 1) {
+      throw new Error('page.insertTextAt() requires exactly one insertion anchor: offset, afterText, or beforeText.');
+    }
+    if (hasOffset && (!Number.isInteger(input.offset) || Number(input.offset) < 0)) {
+      throw new Error('page.insertTextAt() offset must be a non-negative integer.');
+    }
+    const anchorText = hasAfterText ? input.afterText : hasBeforeText ? input.beforeText : undefined;
+    if (anchorText !== undefined && !anchorText.length) {
+      throw new Error('page.insertTextAt() text anchors cannot be empty.');
+    }
+    const occurrence = input.occurrence ?? 1;
+    if (!Number.isInteger(occurrence) || occurrence < 1) {
+      throw new Error('page.insertTextAt() occurrence must be a positive integer.');
+    }
+    if (input.occurrence !== undefined && hasOffset) {
+      throw new Error('page.insertTextAt() occurrence is available only with afterText or beforeText.');
+    }
+
+    const actionableLocator = await resolveActionableLocator(locatorInput, 'focus');
+    await actionableLocator.focus();
+    const selection = await actionableLocator.evaluate((element, options) => {
+      const inputElement = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
+        ? element
+        : undefined;
+      const editable = inputElement
+        ? inputElement
+        : element instanceof HTMLElement && element.isContentEditable
+          ? element.closest('[contenteditable=""], [contenteditable="true"]') || element
+          : undefined;
+      if (!editable) {
+        throw new Error('Target is not an editable input, textarea, or contenteditable element.');
+      }
+      const before = inputElement ? inputElement.value : editable.textContent || '';
+      let insertionOffset: number;
+      if (options.offset !== undefined) {
+        insertionOffset = options.offset;
+      } else {
+        const anchor = options.afterText ?? options.beforeText ?? '';
+        let anchorOffset = -1;
+        let searchFrom = 0;
+        for (let index = 0; index < options.occurrence; index += 1) {
+          anchorOffset = before.indexOf(anchor, searchFrom);
+          if (anchorOffset < 0) break;
+          searchFrom = anchorOffset + anchor.length;
+        }
+        if (anchorOffset < 0) {
+          throw new Error(`Insertion anchor occurrence ${options.occurrence} was not found in the editable text.`);
+        }
+        insertionOffset = options.afterText !== undefined ? anchorOffset + anchor.length : anchorOffset;
+      }
+      if (insertionOffset > before.length) {
+        throw new Error(`Insertion offset ${insertionOffset} exceeds editable text length ${before.length}.`);
+      }
+
+      if (inputElement) {
+        inputElement.setSelectionRange(insertionOffset, insertionOffset);
+      } else {
+        const range = document.createRange();
+        const walker = document.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
+        let traversed = 0;
+        let selected = false;
+        let textNode = walker.nextNode();
+        while (textNode) {
+          const nodeLength = textNode.textContent?.length || 0;
+          if (insertionOffset <= traversed + nodeLength) {
+            range.setStart(textNode, insertionOffset - traversed);
+            selected = true;
+            break;
+          }
+          traversed += nodeLength;
+          textNode = walker.nextNode();
+        }
+        if (!selected) {
+          range.selectNodeContents(editable);
+          range.collapse(false);
+        } else {
+          range.collapse(true);
+        }
+        const selection = editable.ownerDocument.defaultView?.getSelection();
+        if (!selection) throw new Error('The editable document does not expose a text selection.');
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      return { beforeLength: before.length, insertionOffset };
+    }, {
+      afterText: input.afterText,
+      beforeText: input.beforeText,
+      occurrence,
+      offset: input.offset,
+    });
+
+    await page.keyboard.insertText(text);
+    await page.waitForTimeout(0);
+    const after = await actionableLocator.evaluate((element) => {
+      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return element.value;
+      if (element instanceof HTMLElement && element.isContentEditable) {
+        const editable = element.closest('[contenteditable=""], [contenteditable="true"]') || element;
+        return editable.textContent || '';
+      }
+      return '';
+    });
+    return {
+      afterLength: after.length,
+      beforeLength: selection.beforeLength,
+      insertedAt: selection.insertionOffset,
+      textLength: text.length,
+      verified: after
+        .slice(selection.insertionOffset, selection.insertionOffset + text.length)
+        .replace(/\u00a0/g, ' ') === text.replace(/\u00a0/g, ' '),
+    };
+  };
+
   function tabForPage(page: import('playwright').Page) {
     decoratePage(page);
     const existing = tabWrappers.get(page);
@@ -1593,6 +1792,7 @@ function browserCodeKernelMain() {
     const extendedPage = page as import('playwright').Page & {
       domSnapshot?: (options?: { scope?: 'active' | 'all' }) => Promise<string>;
       activeSurface?: () => Promise<Pick<KernelPageObservation, 'activeSurface' | 'surfaces' | 'surfaceStack' | 'topSurfaceIds'>>;
+      insertTextAt?: (locator: import('playwright').Locator, input: BrowserCodeInsertTextAtInput) => Promise<unknown>;
       verifyState?: (input: BrowserCodeVerifyStateInput) => Promise<unknown>;
       expectNavigation?: <T>(action: () => Promise<T>, options?: { timeoutMs?: number; url?: string | RegExp; waitUntil?: NonNullable<Parameters<import('playwright').Page['waitForURL']>[1]>['waitUntil'] }) => Promise<T>;
     };
@@ -1636,6 +1836,14 @@ function browserCodeKernelMain() {
             topSurfaceIds: observation.topSurfaceIds,
           };
         },
+        writable: false,
+      });
+    }
+    if (typeof extendedPage.insertTextAt !== 'function') {
+      Object.defineProperty(extendedPage, 'insertTextAt', {
+        configurable: false,
+        enumerable: false,
+        value: (locator: import('playwright').Locator, input: BrowserCodeInsertTextAtInput) => insertTextAt(page, locator, input),
         writable: false,
       });
     }
@@ -1730,10 +1938,11 @@ function browserCodeKernelMain() {
     capabilities: Object.freeze({ cua: true, images: true, playwright: true, tabLifecycle: true }),
     documentation: async () => [
       'browserCode exposes one controlled browser runtime in ordinary JavaScript.',
-      'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.verifyState(), page.expectNavigation(), and nodeRepl.emitImage().',
+      'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.insertTextAt(), page.verifyState(), page.expectNavigation(), and nodeRepl.emitImage().',
       'page.domSnapshot() returns page-state plus a read-only Playwright AX tree scoped to the active surface by default; pass { scope: "all" } only for background context. browser.user.openTabs() reports only tabs owned by the current conversation group, with active-tab and tab-group metadata.',
       'Page and Locator factory methods expose only currently rendered matches: hidden descendants and zero-rectangle nodes are excluded before count() and positional selection. Element actions then validate target computed style and hit testing, run an action-specific Playwright trial for every remaining pointer candidate, and execute only the unique candidate that passes all stages; CSS-hidden file inputs used by setInputFiles are recovered only at that action boundary.',
       'page.verifyState() is an optional read-only assertion helper; it never gates later actions or successful cell completion.',
+      'page.insertTextAt(locator, { text, afterText | beforeText | offset, occurrence? }) places a real caret in an input, textarea, or contenteditable (including frame locators) and inserts text through the keyboard.',
       `Playwright action timeout: ${browserCodeActionTimeoutMs}ms; navigation timeout: ${browserCodeNavigationTimeoutMs}ms.`,
     ].join('\n'),
     id: 'current',

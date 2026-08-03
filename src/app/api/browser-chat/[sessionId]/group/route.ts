@@ -1,5 +1,6 @@
 import { setBrowserChatSessionGroup } from '@/server/ai/agents/browser-chat.service';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -13,8 +14,7 @@ export async function PUT(request: Request, context: RouteContext) {
   try {
     const body = await request.json() as { groupId?: unknown; userId?: unknown; qzUserId?: unknown };
     const groupId = typeof body.groupId === 'string' ? body.groupId : '';
-    const userId = body.userId ?? body.qzUserId ?? new URL(request.url).searchParams.get('userId') ?? new URL(request.url).searchParams.get('qzUserId');
-    const session = setBrowserChatSessionGroup(sessionId, groupId, typeof userId === 'string' || typeof userId === 'number' ? userId : undefined);
+    const session = setBrowserChatSessionGroup(sessionId, groupId, requestApplicationUserId(request));
     if (!session) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
     return noStoreJson({ session });
   } catch (error) {

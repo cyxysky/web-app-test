@@ -1,13 +1,13 @@
 import { NextRequest } from 'next/server';
 import { deleteBrowserChatSessions } from '@/server/ai/agents/browser-chat.service';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
-  const value = body?.userId ?? body?.qzUserId ?? request.nextUrl.searchParams.get('userId') ?? request.nextUrl.searchParams.get('qzUserId');
-  return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
+  return requestApplicationUserId(request, _body);
 }
 
 export async function POST(request: NextRequest) {

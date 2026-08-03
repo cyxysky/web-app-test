@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 9;
+const currentSchemaVersion = 10;
 const defaultApplicationUserId = '0';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -499,6 +499,22 @@ function initializeSchema(database: DatabaseSync) {
     );
     CREATE INDEX IF NOT EXISTS browser_chat_log_session_time_idx ON browser_chat_log(session_id, time);
 
+    CREATE TABLE IF NOT EXISTS browser_chat_realtime_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      delivered_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS browser_chat_realtime_outbox_pending_idx
+      ON browser_chat_realtime_outbox(delivered_at, id);
+    CREATE INDEX IF NOT EXISTS browser_chat_realtime_outbox_session_idx
+      ON browser_chat_realtime_outbox(session_id, id);
+
     CREATE TABLE IF NOT EXISTS personal_memory_item (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -559,6 +575,10 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionSevenMigration(database);
   applyVersionEightMigration(database);
   applyVersionNineMigration(database);
+  database.prepare(`
+    INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
+    VALUES (10, 'browser-chat-realtime-outbox', ?)
+  `).run(new Date().toISOString());
 }
 
 export function getSqliteDatabase() {

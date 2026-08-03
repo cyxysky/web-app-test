@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { automationRunStatusSchema } from '@/server/automation/automation.schema';
-import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 import { noStoreJson } from '@/server/http/no-store-response';
 import { listAutomationRuns } from '@/server/storage/automation-store';
 
@@ -8,10 +8,7 @@ export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 function requestUserId(request: NextRequest) {
-  return normalizeApplicationUserId(
-    request.nextUrl.searchParams.get('userId')
-    ?? request.nextUrl.searchParams.get('qzUserId'),
-  );
+  return requestApplicationUserId(request);
 }
 
 export async function GET(request: NextRequest) {

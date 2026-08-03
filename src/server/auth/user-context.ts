@@ -17,3 +17,16 @@ export function applicationUserRuntimeKey(value: unknown) {
   return `user:${normalizeApplicationUserId(value)}`;
 }
 
+export function requestApplicationUserId(request: Pick<Request, 'url'>, claimedIdentity?: unknown) {
+  const claimed = claimedIdentity && typeof claimedIdentity === 'object'
+    ? claimedIdentity as { qzUserId?: unknown; userId?: unknown }
+    : undefined;
+  const url = new URL(request.url);
+  return normalizeApplicationUserId(
+    claimed?.userId
+    ?? claimed?.qzUserId
+    ?? url.searchParams.get('userId')
+    ?? url.searchParams.get('qzUserId'),
+  );
+}
+

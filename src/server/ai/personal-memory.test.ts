@@ -1,6 +1,51 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { filterDurablePersonalMemoryDrafts } from './personal-memory';
+import {
+  filterDurablePersonalMemoryDrafts,
+  formatPersonalMemoryForPrompt,
+  normalizePersonalMemoryValue,
+  type PersonalMemoryItem,
+} from './personal-memory';
+
+test('keeps complete personal memory text and normalizes line endings without collapsing lines', () => {
+  const longLine = '长'.repeat(400);
+  assert.equal(
+    normalizePersonalMemoryValue(`\r\n第一行\r\n\r\n第二行 ${longLine}\r\n`),
+    `第一行\n\n第二行 ${longLine}`,
+  );
+});
+
+test('formats multiline personal memory for prompts and applies only a prompt-time budget', () => {
+  const previousLimit = process.env.AI_PERSONAL_MEMORY_PROMPT_MAX_CHARS;
+  const item: PersonalMemoryItem = {
+    id: 'memory_multiline',
+    userId: '0',
+    shared: false,
+    scope: 'global',
+    domain: '',
+    type: 'workflow',
+    key: '发布步骤',
+    aliases: [],
+    value: `第一行\n第二行\n${'长'.repeat(1200)}`,
+    text: '',
+    confidence: 0.9,
+    createdAt: '2026-08-03T00:00:00.000Z',
+    updatedAt: '2026-08-03T00:00:00.000Z',
+    useCount: 0,
+    status: 'active',
+  };
+  try {
+    process.env.AI_PERSONAL_MEMORY_PROMPT_MAX_CHARS = '1000';
+    const prompt = formatPersonalMemoryForPrompt([item]);
+    assert.match(prompt, /第一行\n   第二行/);
+    assert.match(prompt, /stored memory remains complete/);
+    assert.ok(prompt.length <= 1000);
+    assert.equal(normalizePersonalMemoryValue(item.value), item.value);
+  } finally {
+    if (previousLimit === undefined) delete process.env.AI_PERSONAL_MEMORY_PROMPT_MAX_CHARS;
+    else process.env.AI_PERSONAL_MEMORY_PROMPT_MAX_CHARS = previousLimit;
+  }
+});
 
 test('rejects one-off page references even when the extractor labels them as confident memory', () => {
   const items = filterDurablePersonalMemoryDrafts([{

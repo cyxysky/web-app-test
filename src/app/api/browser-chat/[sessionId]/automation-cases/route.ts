@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
 import { compileConversationCase } from '@/server/automation/conversation-case-compiler';
-import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 import { noStoreJson } from '@/server/http/no-store-response';
 import { createAutomationCase, listAutomationCases } from '@/server/storage/automation-store';
 
@@ -22,13 +22,8 @@ function text(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
-function requestUserId(request: NextRequest, body: RequestBody = {}) {
-  return normalizeApplicationUserId(
-    body.userId
-    ?? body.qzUserId
-    ?? request.nextUrl.searchParams.get('userId')
-    ?? request.nextUrl.searchParams.get('qzUserId'),
-  );
+function requestUserId(request: NextRequest, _body: RequestBody = {}) {
+  return requestApplicationUserId(request, _body);
 }
 
 export async function GET(request: NextRequest, context: RouteContext) {

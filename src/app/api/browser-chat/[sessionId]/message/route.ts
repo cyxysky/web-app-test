@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { sendBrowserChatMessage } from '@/server/ai/agents/browser-chat.service';
 import { sendBrowserChatMessageRequestSchema, type SendBrowserChatMessageRequest } from '@/server/http/browser-chat-request.schema';
 import { noStoreJson } from '@/server/http/no-store-response';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -10,9 +11,8 @@ type RouteContext = {
   params: Promise<{ sessionId: string }>;
 };
 
-function requestUserId(request: NextRequest, body?: Pick<SendBrowserChatMessageRequest, 'userId' | 'qzUserId'>) {
-  const value = body?.userId ?? body?.qzUserId ?? request.nextUrl.searchParams.get('userId') ?? request.nextUrl.searchParams.get('qzUserId');
-  return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+function requestUserId(request: NextRequest, _body?: Pick<SendBrowserChatMessageRequest, 'userId' | 'qzUserId'>) {
+  return requestApplicationUserId(request, _body);
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {

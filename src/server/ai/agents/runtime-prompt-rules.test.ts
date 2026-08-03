@@ -30,6 +30,7 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /default to 5000ms/);
   assert.match(rules, /navigation defaults to 30000ms/);
   assert.match(rules, /nodeRepl\.emitImage/);
+  assert.match(rules, /page\.insertTextAt/);
   assert.match(rules, /browser\.tabs\.list/);
   assert.match(rules, /credentialVault\.fill/);
   assert.match(rules, /never read the filled field value/);
@@ -165,6 +166,8 @@ test('DOM mode requests screenshots explicitly instead of receiving automatic ca
   assert.doesNotMatch(visualRules, /inactive-by|current-surface membership/);
   assert.match(visualRules, /virtualized="possible"/);
   assert.match(visualRules, /backend scans the virtual list/);
+  assert.match(visualRules, /action="insertTextAt"/);
+  assert.match(visualRules, /afterText, beforeText, or offset/);
   assert.doesNotMatch(visualRules, /kind="semantic"/);
   assert.doesNotMatch(browserChatDomRules(false).join('\n'), /takeScreenshot/);
 });

@@ -25,6 +25,16 @@ import { LoginAccountModal, type LoginAccountMetadata } from '@/components/Login
 import { DataTransferButtons } from '@/components/DataTransferButtons';
 import { DomainGroupedAccordion } from '@/components/DomainGroupedAccordion';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
+import {
+  environmentSettingsTabs,
+  environmentSettingsTabsForUser,
+} from '@/components/environment-settings-model';
+
+export {
+  environmentSettingsTabs,
+  environmentSettingsTabsForUser,
+  isAdministratorOnlySettingsTab,
+} from '@/components/environment-settings-model';
 
 export type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'> & {
   hasValue?: boolean;
@@ -94,28 +104,6 @@ declare global {
   interface Window {
     webPilotSystem?: SystemBridge;
   }
-}
-
-export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> = [
-  { id: 'skills', label: 'Skills 管理' },
-  { id: 'general', label: '通用设置' },
-  { id: 'model', label: '模型配置' },
-  { id: 'browser', label: '浏览器与截图' },
-  { id: 'runtime', label: '运行控制' },
-  { id: 'memory', label: '个性化记忆' },
-  { id: 'accounts', label: '登录账号' },
-  { id: 'debug', label: '调试与高级' },
-];
-
-const administratorOnlySettingsTabs = new Set<SettingsTab>(['model', 'browser', 'runtime', 'debug']);
-
-export function isAdministratorOnlySettingsTab(tab: SettingsTab) {
-  return administratorOnlySettingsTabs.has(tab);
-}
-
-export function environmentSettingsTabsForUser(userId?: string, defaultUserId = '0') {
-  if ((userId || '').trim() === defaultUserId.trim()) return environmentSettingsTabs;
-  return environmentSettingsTabs.filter((tab) => !administratorOnlySettingsTabs.has(tab.id));
 }
 
 const personalMemoryScopeOptions: Array<{ label: string; value: PersonalMemoryScope }> = [

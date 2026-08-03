@@ -5,7 +5,7 @@ import {
   updatePersonalMemoryItem,
 } from '@/server/ai/personal-memory';
 import { noStoreJson } from '@/server/http/no-store-response';
-import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -14,9 +14,8 @@ type RouteContext = {
   params: Promise<{ id: string }>;
 };
 
-function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
-  const url = new URL(request.url);
-  return normalizeApplicationUserId(body?.userId ?? body?.qzUserId ?? url.searchParams.get('userId') ?? url.searchParams.get('qzUserId') ?? '');
+function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
+  return requestApplicationUserId(request, _body);
 }
 
 export async function PATCH(request: NextRequest, context: RouteContext) {

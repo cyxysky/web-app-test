@@ -6,7 +6,7 @@ import {
   updateLoginAccount,
 } from '@/server/credentials/login-account-vault';
 import { noStoreJson } from '@/server/http/no-store-response';
-import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -33,14 +33,8 @@ const updateSchema = z.object({
   || body.shared !== undefined
 ), { message: '没有可更新的账号字段' });
 
-function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
-  return normalizeApplicationUserId(
-    body?.userId
-    ?? body?.qzUserId
-    ?? request.nextUrl.searchParams.get('userId')
-    ?? request.nextUrl.searchParams.get('qzUserId')
-    ?? '',
-  );
+function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
+  return requestApplicationUserId(request, _body);
 }
 
 function publicError(error: unknown) {

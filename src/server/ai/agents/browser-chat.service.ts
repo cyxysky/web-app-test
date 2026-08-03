@@ -40,6 +40,7 @@ import {
   runtimeSnapshotIsNewer,
   type RegisteredBrowserChatTurn,
 } from '@/server/ai/agents/browser-chat-interrupt-state';
+import { transitionBrowserChatSession } from '@/server/ai/agents/browser-chat-session-state';
 import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl } from '@/server/ai/agents/skill-context';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
 import {
@@ -53,7 +54,10 @@ import {
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
 import type { ModelProvider, SkillRecord, StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
-import { publishRefreshEvent } from '@/server/realtime/ws-refresh';
+import {
+  flushBrowserChatRealtimeOutbox,
+  scheduleBrowserChatRealtimeOutboxFlush,
+} from '@/server/realtime/browser-chat-outbox';
 import {
   deleteBrowserChatSessionRecord,
   readBrowserChatSessionRecord,
@@ -201,7 +205,9 @@ type BrowserChatDirtyRecords = {
 };
 
 export type BrowserChatSessionRealtimePatch = {
-  session: Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'>;
+  session: Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'pendingToolConfirmation' | 'steps'> & {
+    pendingToolConfirmation: BrowserChatToolConfirmation | null;
+  };
   summary: BrowserChatSessionSnapshot;
   logs?: BrowserChatLogRecord[];
   messages?: BrowserChatMessage[];
@@ -716,13 +722,8 @@ function id(prefix: string) {
   return `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
 }
 
-function notifySessionUpdate(sessionId: string, patch?: BrowserChatSessionRealtimePatch) {
-  const session = sessions.get(sessionId);
-  if (session) {
-    publishRefreshEvent({ entityType: 'browserChatSession', id: sessionId, updatedAt: session.updatedAt, patch });
-  } else {
-    publishRefreshEvent({ entityType: 'browserChatSession', id: sessionId, deleted: true });
-  }
+function schedulePersistedSessionEvents() {
+  scheduleBrowserChatRealtimeOutboxFlush();
 }
 
 function elapsedMs(startedAt: number) {
@@ -1768,20 +1769,13 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
   delete sessionRecord.steps;
   delete sessionRecord.logs;
   const session = sessionRecord as Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'>;
+  const realtimeSession: BrowserChatSessionRealtimePatch['session'] = {
+    ...session,
+    pendingToolConfirmation: session.pendingToolConfirmation ?? null,
+  };
   const summary = summaryFromSnapshot(persistedItem);
-  writeBrowserChatSessionDelta(
-    { ...session, messages: [], steps: [], logs: [] },
-    summary,
-    delta,
-  );
-  if (dirtyRecords.has(item.id)) {
-    advancePersistenceCursor(persistedItem, delta);
-    dirtyRecords.delete(item.id);
-  } else {
-    seedPersistenceCursor(persistedItem);
-  }
-  return {
-    session,
+  const patch: BrowserChatSessionRealtimePatch = {
+    session: realtimeSession,
     summary,
     ...(delta.messages.length ? { messages: delta.messages } : {}),
     ...(delta.steps.length ? { steps: delta.steps.map(compactStepForClient) } : {}),
@@ -1790,10 +1784,35 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
     ...(delta.removedStepIndexes.length ? { removedStepIndexes: delta.removedStepIndexes } : {}),
     ...(delta.removedLogIds.length ? { removedLogIds: delta.removedLogIds } : {}),
   };
+  writeBrowserChatSessionDelta(
+    { ...session, messages: [], steps: [], logs: [] },
+    summary,
+    delta,
+    {
+      entityType: 'browserChatSession',
+      id: item.id,
+      updatedAt: item.updatedAt,
+      userId: normalizeApplicationUserId(item.userId),
+      patch,
+    },
+  );
+  if (dirtyRecords.has(item.id)) {
+    advancePersistenceCursor(persistedItem, delta);
+    dirtyRecords.delete(item.id);
+  } else {
+    seedPersistenceCursor(persistedItem);
+  }
+  return patch;
 }
 
-function deleteSessionSnapshot(sessionId: string) {
-  deleteBrowserChatSessionRecord(sessionId);
+function deleteSessionSnapshot(sessionId: string, userId: string) {
+  deleteBrowserChatSessionRecord(sessionId, {
+    entityType: 'browserChatSession',
+    id: sessionId,
+    updatedAt: now(),
+    userId: normalizeApplicationUserId(userId),
+    deleted: true,
+  });
   persistenceCursors.delete(sessionId);
   dirtyRecords.delete(sessionId);
 }
@@ -1978,12 +1997,13 @@ function hydrateSession(sessionId: string) {
   return session;
 }
 
-function persistSession(sessionId: string, options: { mergePersisted?: boolean } = {}): BrowserChatSessionRealtimePatch | true | false {
+function persistSession(sessionId: string, options: { deletedUserId?: string; mergePersisted?: boolean } = {}): BrowserChatSessionRealtimePatch | true | false {
   try {
     const currentSession = sessions.get(sessionId);
     const incoming = currentSession ? snapshot(currentSession, { fullSteps: true }) : undefined;
     if (!incoming) {
-      deleteSessionSnapshot(sessionId);
+      if (!options.deletedUserId) return false;
+      deleteSessionSnapshot(sessionId, options.deletedUserId);
       return true;
     }
     const shouldMergePersisted = options.mergePersisted === true;
@@ -2025,23 +2045,35 @@ function persistInterruptedSessionInBackground(sessionId: string) {
   }, 0);
 }
 
-function persistAndNotify(sessionId: string, options: { defer?: boolean; mergePersisted?: boolean } = {}) {
+function persistAndNotify(sessionId: string, options: { defer?: boolean; deletedUserId?: string; mergePersisted?: boolean } = {}) {
   if (options.defer) {
     schedulePersistAndNotify(sessionId);
     return true;
   }
   clearPendingPersist(sessionId);
-  const persisted = persistSession(sessionId, { mergePersisted: options.mergePersisted });
+  const persisted = persistSession(sessionId, {
+    deletedUserId: options.deletedUserId,
+    mergePersisted: options.mergePersisted,
+  });
   if (!persisted) return false;
-  notifySessionUpdate(sessionId, persisted === true ? undefined : persisted);
+  schedulePersistedSessionEvents();
   return true;
 }
 
-function persistDeletedSessions(sessionIds: string[]) {
+async function persistAndNotifyTerminal(sessionId: string) {
+  clearPendingPersist(sessionId);
+  const persisted = persistSession(sessionId);
+  if (!persisted) return false;
+  await flushBrowserChatRealtimeOutbox();
+  return true;
+}
+
+function persistDeletedSessions(items: Array<{ id: string; userId: string }>) {
   try {
-    for (const sessionId of new Set(sessionIds.filter(Boolean))) {
-      deleteSessionSnapshot(sessionId);
+    for (const item of items) {
+      deleteSessionSnapshot(item.id, item.userId);
     }
+    scheduleBrowserChatRealtimeOutboxFlush();
     return true;
   } catch (error) {
     warnPersistFailure(error);
@@ -2162,7 +2194,6 @@ function isDeadBrowserSessionError(error: unknown) {
 
 type BrowserChatTurnGuard = () => void;
 type BrowserChatStartOptions = {
-  markSessionRunning?: boolean;
   preferExistingPage?: boolean;
 };
 
@@ -2253,7 +2284,6 @@ async function ensureStartedNow(
   const hasPriorConversation = session.steps.length > 0
     || session.messages.some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
   session.browser = browser;
-  if (options.markSessionRunning !== false) session.status = 'running';
   session.updatedAt = now();
   persistAndNotify(session.id);
   try {
@@ -2291,8 +2321,8 @@ async function ensureStartedNow(
   } else if (url) {
     session.targetUrl = url;
   }
-  session.status = 'idle';
-  session.updatedAt = now();
+  if (!session.busy) transitionBrowserChatSession(session, { type: 'sessionRecovered', at: now() });
+  else session.updatedAt = now();
   persistAndNotify(session.id);
   return browser;
 }
@@ -2485,8 +2515,7 @@ async function stopBrowserChatRuntime(
 
   // Block new preview/message work before waiting for a browser launch that is
   // already in flight. The completed launch is then closed below as well.
-  session.status = 'closed';
-  session.busy = false;
+  transitionBrowserChatSession(session, { type: 'sessionClosed', at: now() });
 
   const browsers = new Set<BrowserSession>();
   const rememberBrowser = (browser?: BrowserSession) => {
@@ -2503,10 +2532,6 @@ async function stopBrowserChatRuntime(
 
   session.browser = undefined;
   session.started = false;
-  session.activeAbortController = undefined;
-  session.activeAssistantMessageId = undefined;
-  session.pendingToolConfirmation = undefined;
-
   await Promise.all([...browsers].map((browser) => (
     browser.close({ closePages: true, force: options.forceBrowser }).catch(() => undefined)
   )));
@@ -2542,7 +2567,7 @@ export async function deleteBrowserChatSession(sessionId: string, userId?: strin
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
   const removed = await deleteBrowserChatSessionFromMemory(sessionId);
   if (!removed) return undefined;
-  if (!persistAndNotify(sessionId)) {
+  if (!persistAndNotify(sessionId, { deletedUserId: normalizeApplicationUserId(removed.session.userId) })) {
     sessions.set(sessionId, removed.session);
     throw new Error('Browser chat session was removed from memory, but the database could not be updated.');
   }
@@ -2570,9 +2595,7 @@ export async function switchBrowserChatTab(sessionId: string, tabId: string, use
   session.targetUrl = exportableTargetUrl(browser.currentUrl()) || session.targetUrl;
   session.updatedAt = now();
   session.error = undefined;
-  if (!session.busy) {
-    session.status = 'idle';
-  }
+  if (!session.busy) transitionBrowserChatSession(session, { type: 'sessionRecovered', at: session.updatedAt });
   persistAndNotify(session.id);
   return snapshot(session);
 }
@@ -2688,13 +2711,15 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
     }
   }
   if (removed.length) {
-    const persisted = persistDeletedSessions(removed.map((item) => item.deleted.id));
+    const persisted = persistDeletedSessions(removed.map((item) => ({
+      id: item.deleted.id,
+      userId: normalizeApplicationUserId(item.session.userId),
+    })));
     if (!persisted) {
       for (const item of removed) sessions.set(item.deleted.id, item.session);
       throw new Error('Browser chat sessions were removed from memory, but the database could not be updated.');
     }
     await Promise.all(removed.map((item) => deleteBrowserChatArtifacts(item.deleted.id).catch((error) => warnPersistFailure(error))));
-    for (const item of removed) notifySessionUpdate(item.deleted.id);
   }
   return { deleted, requested: uniqueIds.length };
 }
@@ -2807,7 +2832,7 @@ export async function sendBrowserChatMessage(
   session.mode = configuredBrowserChatMode();
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);
-  session.pendingToolConfirmation = undefined;
+  transitionBrowserChatSession(session, { type: 'confirmationCleared' });
   session.safetyMode = normalizeSafetyMode(safetyMode ?? session.safetyMode);
   const modelSettings = browserChatModelSettings(modelProvider ?? session.modelProvider, model ?? session.model);
   session.modelProvider = modelSettings.provider;
@@ -2841,18 +2866,18 @@ export async function sendBrowserChatMessage(
   session.messages.push(assistantMessage);
   markMessageDirty(session, userMessage);
   markMessageDirty(session, assistantMessage);
-  session.activeAssistantMessageId = assistantMessage.id;
   const abortController = new AbortController();
-  session.activeAbortController = abortController;
   registerBrowserChatTurn(activeTurns, session.id, {
     session,
     assistantMessageId: assistantMessage.id,
     abortController,
   });
-  session.busy = true;
-  session.status = 'running';
-  session.error = undefined;
-  session.updatedAt = timestamp;
+  transitionBrowserChatSession(session, {
+    type: 'turnStarted',
+    assistantMessageId: assistantMessage.id,
+    abortController,
+    at: timestamp,
+  });
   assistantMessage.activity = {
     phase: 'chat:queued',
     label: '已收到消息，准备执行对话与浏览器操作',
@@ -2912,16 +2937,17 @@ export function resumeBrowserChatHumanVerification(sessionId: string, userId?: s
   const timestamp = now();
   const abortController = new AbortController();
   interruptedAssistantMessageIds.delete(paused.message.id);
-  session.activeAssistantMessageId = paused.message.id;
-  session.activeAbortController = abortController;
   registerBrowserChatTurn(activeTurns, session.id, {
     session,
     assistantMessageId: paused.message.id,
     abortController,
   });
-  session.busy = true;
-  session.status = 'running';
-  session.error = undefined;
+  transitionBrowserChatSession(session, {
+    type: 'turnStarted',
+    assistantMessageId: paused.message.id,
+    abortController,
+    at: timestamp,
+  });
   updateAssistantMessage(session, paused.message.id, (message) => ({
     ...message,
     content: '',
@@ -2932,7 +2958,6 @@ export function resumeBrowserChatHumanVerification(sessionId: string, userId?: s
   appendLog(session, 'chat:verification:resume', '用户点击“校验完成”，继续当前 AI 执行回合', {
     messageId: paused.message.id,
   });
-  session.updatedAt = timestamp;
   persistAndNotify(session.id);
 
   const instruction = [
@@ -3115,6 +3140,64 @@ function toolConfirmationInputSignature(value: unknown) {
   }
 }
 
+function browserChatToolConfirmationScope(
+  session: BrowserChatSessionRecord,
+  request: BrowserToolConfirmationRequest,
+) {
+  let inputText = '';
+  try {
+    inputText = JSON.stringify(request.input) || '';
+  } catch {
+    inputText = '';
+  }
+  const text = `${request.prompt}\n${request.reason || ''}\n${inputText}`.toLowerCase();
+  const operations: Array<[string, RegExp]> = [
+    ['delete', /\b(?:delete|remove|destroy)\b|删除|移除|清空/],
+    ['payment', /\b(?:pay|purchase|checkout|order|transfer)\b|支付|购买|下单|转账/],
+    ['publish', /\b(?:publish|send|approve|authorize)\b|发布|发送|批准|授权/],
+    ['logout', /\blogout\b|退出登录|登出/],
+    ['login', /\blogin\b|登录/],
+    ['submit', /\bsubmit\b|提交|确认/],
+  ];
+  const operation = operations.find(([, pattern]) => pattern.test(text))?.[0];
+  if (!operation) return undefined;
+  const currentUrl = session.browser?.currentUrl() || session.targetUrl;
+  let origin = currentUrl;
+  try {
+    origin = new URL(currentUrl).origin;
+  } catch {
+    origin = currentUrl || 'unknown-origin';
+  }
+  return `${request.toolName}:${operation}:${origin}`;
+}
+
+function createBrowserChatTurnToolConfirmation(
+  session: BrowserChatSessionRecord,
+  assistantMessageId: string,
+  abortSignal: AbortSignal,
+) {
+  const confirmedScopes = new Set<string>();
+  return async (request: BrowserToolConfirmationRequest): Promise<BrowserToolConfirmationDecision> => {
+    const scope = browserChatToolConfirmationScope(session, request);
+    if (scope && confirmedScopes.has(scope)) {
+      appendLog(session, 'tool:confirmation:reused', `已复用本轮用户对 ${request.prompt} 的确认。`, {
+        stepIndex: request.stepIndex,
+        messageId: assistantMessageId,
+        details: { scope, toolName: request.toolName },
+      });
+      return 'confirmed';
+    }
+    const decision = await requestBrowserChatToolConfirmation(
+      session,
+      assistantMessageId,
+      request,
+      abortSignal,
+    );
+    if (decision === 'confirmed' && scope) confirmedScopes.add(scope);
+    return decision;
+  };
+}
+
 function cancelPendingToolConfirmation(session: BrowserChatSessionRecord) {
   const pending = session.pendingToolConfirmation;
   if (!pending) return false;
@@ -3122,7 +3205,7 @@ function cancelPendingToolConfirmation(session: BrowserChatSessionRecord) {
   if (resolver) {
     resolver.resolve('cancelled');
   } else {
-    session.pendingToolConfirmation = undefined;
+    transitionBrowserChatSession(session, { type: 'confirmationCleared' });
   }
   return true;
 }
@@ -3181,7 +3264,7 @@ function requestBrowserChatToolConfirmation(
       toolConfirmations.delete(confirmationId);
       abortSignal?.removeEventListener('abort', onAbort);
       if (session.pendingToolConfirmation?.id === confirmationId) {
-        session.pendingToolConfirmation = undefined;
+        transitionBrowserChatSession(session, { type: 'confirmationCleared' });
         const log = toolConfirmationLog(decision);
         appendLog(session, log.phase, log.message, {
           stepIndex: pending.stepIndex,
@@ -3192,7 +3275,11 @@ function requestBrowserChatToolConfirmation(
       resolve(decision);
     };
     onAbort = () => finish('cancelled');
-    session.pendingToolConfirmation = pending;
+    transitionBrowserChatSession(session, {
+      type: 'confirmationPending',
+      confirmation: pending,
+      at: requestedAt,
+    });
     appendLog(session, 'tool:confirmation:pending', `工具 ${request.toolName} 等待用户确认。`, {
       stepIndex: request.stepIndex,
       messageId: assistantMessageId,
@@ -3221,7 +3308,7 @@ export function resolveBrowserChatToolConfirmation(
   }
   const resolver = toolConfirmations.get(normalizedConfirmationId);
   if (!resolver || resolver.sessionId !== sessionId) {
-    session.pendingToolConfirmation = undefined;
+    transitionBrowserChatSession(session, { type: 'confirmationCleared', at: now() });
     const abortController = session.activeAbortController;
     if (abortController && !abortController.signal.aborted) {
       abortController.abort(new Error('Tool confirmation resolver was not available when the user responded.'));
@@ -3763,12 +3850,8 @@ async function resumeBlockedBrowserChatSubagent(input: {
         activity: undefined,
         updatedAt: timestamp,
       }));
-      session.status = 'idle';
-      session.busy = false;
       clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
-      session.activeAssistantMessageId = undefined;
-      session.activeAbortController = undefined;
-      session.updatedAt = timestamp;
+      transitionBrowserChatSession(session, { type: 'turnBlocked', at: timestamp });
       persistAndNotify(session.id);
       return;
     }
@@ -3807,13 +3890,8 @@ async function resumeBlockedBrowserChatSubagent(input: {
       activity: undefined,
       updatedAt: timestamp,
     }));
-    session.error = message;
-    session.status = 'error';
-    session.busy = false;
     clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
-    session.activeAssistantMessageId = undefined;
-    session.activeAbortController = undefined;
-    session.updatedAt = timestamp;
+    transitionBrowserChatSession(session, { type: 'turnFinished', at: timestamp, error: message });
     persistAndNotify(session.id);
   }
 }
@@ -3852,6 +3930,9 @@ async function runBrowserChatMessage(
       const initialRuntimeContext = getRuntimeOperationalContext();
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
       const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
+      const requestTurnToolConfirmation = session.safetyMode === 'strict'
+        ? createBrowserChatTurnToolConfirmation(session, assistantMessageId, abortController.signal)
+        : undefined;
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
@@ -3869,9 +3950,7 @@ async function runBrowserChatMessage(
         getRuntimeOperationalContext,
         abortSignal: abortController.signal,
         shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
-        requestToolConfirmation: session.safetyMode === 'strict'
-          ? (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal)
-          : undefined,
+        requestToolConfirmation: requestTurnToolConfirmation,
         ensureBrowserStarted: async () => {
           assertTurnActive();
           const startedBrowser = await ensureStarted(session, assertTurnActive);
@@ -3950,13 +4029,8 @@ async function runBrowserChatMessage(
       } else if (!browserWasStarted && session.browser === browser) {
         session.browser = undefined;
       }
-      session.status = 'idle';
-      session.busy = false;
-      session.pendingToolConfirmation = undefined;
       clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
-      session.activeAssistantMessageId = undefined;
-      session.activeAbortController = undefined;
-      session.updatedAt = completedAt;
+      transitionBrowserChatSession(session, { type: 'turnFinished', at: completedAt });
       replaceSessionLogs(session, [
         ...(session.logs || []),
         {
@@ -3973,7 +4047,7 @@ async function runBrowserChatMessage(
           messageId: assistantMessageId,
         },
       ]);
-      persistAndNotify(session.id);
+      await persistAndNotifyTerminal(session.id);
       scheduleBrowserChatUserIdleClose(session.userId);
       void enforceBrowserChatArtifactQuota(session.id).catch((error) => warnPersistFailure(error));
       void ensureConversationContextWithinThreshold(session).catch(() => undefined);
@@ -3994,11 +4068,12 @@ async function runBrowserChatMessage(
         interrupted ? '用户主动中断了本轮对话。' : `本轮对话异常：${message}`,
         { details, deferPersist: true },
       );
-      session.error = interrupted ? undefined : message;
-      session.status = interrupted ? 'idle' : 'error';
-      session.busy = false;
-      session.pendingToolConfirmation = undefined;
-      session.updatedAt = now();
+      transitionBrowserChatSession(session, {
+        type: 'turnFinished',
+        at: now(),
+        error: message,
+        interrupted,
+      });
       updateAssistantMessage(session, assistantMessageId, (item) => ({
         ...item,
         content: interrupted ? '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。' : `执行异常：${message}`,
@@ -4007,17 +4082,19 @@ async function runBrowserChatMessage(
         activity: undefined,
       }));
       clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
-      session.activeAssistantMessageId = undefined;
-      session.activeAbortController = undefined;
-      persistAndNotify(session.id);
+      await persistAndNotifyTerminal(session.id);
       scheduleBrowserChatUserIdleClose(session.userId);
     } finally {
       clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
       if (session.pendingToolConfirmation?.messageId === assistantMessageId) {
         cancelPendingToolConfirmation(session);
-        session.pendingToolConfirmation = undefined;
+        transitionBrowserChatSession(session, { type: 'confirmationCleared' });
       }
-      if (session.activeAbortController === abortController) session.activeAbortController = undefined;
+      transitionBrowserChatSession(session, {
+        type: 'turnRuntimeReleased',
+        assistantMessageId,
+        abortController,
+      });
     }
   });
 }

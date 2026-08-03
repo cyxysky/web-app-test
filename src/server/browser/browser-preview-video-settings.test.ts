@@ -1,9 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
-  browserPreviewVideoCaptureGeometry,
-  browserPreviewVideoDimensions,
-} from './browser-preview-video-settings';
+import { browserPreviewVideoDimensions } from './browser-preview-video-settings';
 
 function withVideoDimensions(width: string, height: string, action: () => void) {
   const previousWidth = process.env.BROWSER_PREVIEW_VIDEO_MAX_WIDTH;
@@ -20,27 +17,17 @@ function withVideoDimensions(width: string, height: string, action: () => void) 
   }
 }
 
-test('video capture produces true 2K pixels without changing the CSS viewport', () => {
+test('video dimensions do not upscale the browser capture surface', () => {
   withVideoDimensions('2560', '1440', () => {
-    assert.deepEqual(browserPreviewVideoCaptureGeometry({ width: 1920, height: 1080 }), {
-      width: 2560,
-      height: 1440,
-      scale: 4 / 3,
-    });
-    assert.deepEqual(browserPreviewVideoDimensions({ width: 2560, height: 1440 }), {
-      width: 2560,
-      height: 1440,
+    assert.deepEqual(browserPreviewVideoDimensions({ width: 1920, height: 1080 }), {
+      width: 1920,
+      height: 1080,
     });
   });
 });
 
-test('video capture preserves aspect ratio and never exceeds the configured 4K box', () => {
+test('video output preserves aspect ratio and never exceeds the configured 4K box', () => {
   withVideoDimensions('3840', '2160', () => {
-    assert.deepEqual(browserPreviewVideoCaptureGeometry({ width: 1280, height: 800 }), {
-      width: 3456,
-      height: 2160,
-      scale: 2.7,
-    });
     assert.deepEqual(browserPreviewVideoDimensions({ width: 5120, height: 2880 }), {
       width: 3840,
       height: 2160,

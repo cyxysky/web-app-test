@@ -287,7 +287,7 @@ test('browserCode-created tabs are owned and group-marked before preview starts'
   assert.equal(inventoryResult.result?.length, 3);
   assert.equal(inventoryResult.result?.filter((tab) => tab.active).length, 1);
   assert.ok(inventoryResult.result?.every((tab) => tab.groupId === groupId));
-  assert.ok(inventoryResult.result?.every((tab) => Boolean(tab.groupTitle)));
+  assert.ok(inventoryResult.result?.every((tab) => tab.groupTitle === 'ai-p-test'));
   const ownedPages = Array.from(Reflect.get(session, 'ownedPages') as Set<Page>);
   assert.equal(ownedPages.length, 3);
   const markerStates = await Promise.all(ownedPages.map((page) => page.evaluate(() => ({
@@ -295,10 +295,10 @@ test('browserCode-created tabs are owned and group-marked before preview starts'
     groupTitle: document.documentElement.getAttribute('data-ai-web-test-session-group-title'),
   }))));
   assert.ok(markerStates.every((marker) => marker.groupId === groupId));
-  assert.equal(new Set(markerStates.map((marker) => marker.groupTitle)).size, 1);
+  assert.deepEqual(new Set(markerStates.map((marker) => marker.groupTitle)), new Set(['ai-p-test']));
 });
 
-test('live preview polling follows a clicked popup and tab switching without reconnecting', async (context) => {
+test('live preview screencast follows a clicked popup and tab switching without reconnecting', async (context) => {
   const session = new BrowserSession('dom', {
     headless: true,
     isolated: true,
@@ -373,7 +373,7 @@ test('live preview polling follows a clicked popup and tab switching without rec
   await firstHandle.stop();
 });
 
-test('live preview repeatedly polls and sends a static page at the configured frame rate', async (context) => {
+test('live preview repeats the latest native frame at the configured output rate', async (context) => {
   const previousFps = process.env.BROWSER_PREVIEW_FPS;
   process.env.BROWSER_PREVIEW_FPS = '30';
   const session = new BrowserSession('dom', {
@@ -410,7 +410,7 @@ test('live preview repeatedly polls and sends a static page at the configured fr
   assert.ok(capturedAt.length >= 6, 'static pages must continue producing preview frames');
   assert.ok(
     capturedAt[5] - capturedAt[0] < 750,
-    `30 FPS polling should not degrade to multi-second updates: ${JSON.stringify(capturedAt)}`,
+    `30 FPS output should not degrade to multi-second updates: ${JSON.stringify(capturedAt)}`,
   );
 });
 
@@ -497,11 +497,16 @@ test('browser viewport size and output pixel ratio are independent', async () =>
     const browserContext = page.context();
     const originalNewCdpSession = browserContext.newCDPSession.bind(browserContext);
     const previewCdpMethods: string[] = [];
+    const previewCaptureClips: Array<{ height?: number; scale?: number; width?: number }> = [];
     Reflect.set(browserContext, 'newCDPSession', async (target: Page) => {
       const cdpSession = await originalNewCdpSession(target);
       const originalSend = cdpSession.send.bind(cdpSession) as (method: string, params?: object) => Promise<unknown>;
       Reflect.set(cdpSession, 'send', (method: string, params?: object) => {
         previewCdpMethods.push(method);
+        if (method === 'Page.captureScreenshot') {
+          const clip = (params as { clip?: { height?: number; scale?: number; width?: number } } | undefined)?.clip;
+          if (clip) previewCaptureClips.push(clip);
+        }
         return originalSend(method, params);
       });
       return cdpSession;
@@ -513,8 +518,15 @@ test('browser viewport size and output pixel ratio are independent', async () =>
     });
     assert.ok(frames.length >= 1, 'screencast should emit an initial frame');
     assert.equal(frames[0].contentType, 'image/png');
-    assert.deepEqual(readPngDimensions(Buffer.from(frames[0].data, 'base64')), { width: 1600, height: 1200 });
-    assert.deepEqual(frames[0].viewport, { width: 1600, height: 1200 });
+    assert.deepEqual(readPngDimensions(Buffer.from(frames[0].data, 'base64')), { width: 800, height: 600 });
+    assert.deepEqual(frames[0].viewport, { width: 800, height: 600 });
+    const frameDeadline = Date.now() + 1_000;
+    while (frames.length < 3 && Date.now() < frameDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(frames.length >= 3, 'screencast should continue emitting frames');
+    assert.equal(previewCdpMethods.includes('Page.startScreencast'), true, 'video preview must use the native CDP screencast stream');
+    assert.deepEqual(previewCaptureClips, [], 'opening video preview must not request a scaled compositor clip');
     assert.equal(previewCdpMethods.includes('Emulation.setDeviceMetricsOverride'), false, 'preview must not mutate page device metrics');
     assert.deepEqual(await page.evaluate(() => ({
       devicePixelRatio: window.devicePixelRatio,

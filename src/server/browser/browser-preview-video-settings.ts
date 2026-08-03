@@ -25,18 +25,3 @@ export function browserPreviewVideoDimensions(viewport: { height: number; width:
     width: evenDimension(sourceWidth * scale, 1280),
   };
 }
-
-export function browserPreviewVideoCaptureGeometry(viewport: { height: number; width: number }) {
-  const maximum = browserPreviewVideoMaximumDimensions();
-  const sourceWidth = Math.max(1, Math.floor(viewport.width));
-  const sourceHeight = Math.max(1, Math.floor(viewport.height));
-  const scale = Math.min(4, Math.max(0.1, Math.min(
-    maximum.width / sourceWidth,
-    maximum.height / sourceHeight,
-  )));
-  return {
-    height: evenDimension(sourceHeight * scale, sourceHeight),
-    scale,
-    width: evenDimension(sourceWidth * scale, sourceWidth),
-  };
-}

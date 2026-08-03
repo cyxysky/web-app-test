@@ -11,8 +11,8 @@ import {
   type BrowserActionResult,
   type BrowserSessionMode,
 } from '@/server/browser/browser-session';
-import { analyzeBrowserCodeRisk, type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
-import { browserElementTargetSchema, browserInteractToolDescription, browserInteractToolShape, refineBrowserInteractTarget } from './browser-input-tool-schema';
+import { analyzeBrowserCodeRisk, browserCodeHasCommittingAction, type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
+import { browserElementTargetSchema, browserInteractTextInsertionDescription, browserInteractToolDescription, browserInteractToolShape, refineBrowserInteractTarget } from './browser-input-tool-schema';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { aiSdkFinishMessage, aiSdkFinishState } from './ai-sdk-finish-state';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
@@ -479,6 +479,7 @@ function splitToolInputAndReason(input: unknown) {
 function toolConfirmationFromInput(toolName: string, input: unknown) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
   const record = input as Record<string, unknown>;
+  if (toolName === 'interact' && record.action === 'type') return undefined;
   if (record.requiresConfirmation !== true) return undefined;
   const reason = typeof record.reason === 'string' ? trimDebugText(record.reason.trim(), 300) : undefined;
   const explicit = typeof record.confirmationMessage === 'string' ? record.confirmationMessage.trim() : '';
@@ -492,7 +493,15 @@ function toolConfirmationFromInput(toolName: string, input: unknown) {
 function browserCodeInputWithRisk<T extends Record<string, unknown>>(input: T, strictSafety: boolean) {
   if (!strictSafety || typeof input.code !== 'string') return input;
   const risk = analyzeBrowserCodeRisk(input.code);
-  if (!risk.requiresConfirmation || input.requiresConfirmation === true) return input;
+  const explicitCommittingConfirmation = input.requiresConfirmation === true
+    && browserCodeHasCommittingAction(input.code);
+  if (!risk.requiresConfirmation && !explicitCommittingConfirmation) {
+    const safeInput = { ...input };
+    delete safeInput.requiresConfirmation;
+    delete safeInput.confirmationMessage;
+    return safeInput;
+  }
+  if (input.requiresConfirmation === true) return input;
   return {
     ...input,
     requiresConfirmation: true,
@@ -1209,7 +1218,7 @@ function makeBrowserTools(
   const sharedTools = {
     ...(mode === 'code' ? {
     browserCode: tool({
-      description: 'Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() returns one string containing page-state surfaces/topSurfaceIds/surfaceStack plus an AX tree scoped to the most recently active top-level surface by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Surface data is informational evidence of likely overlays, never an action permission boundary. Treat each newly opened nonmodal surface as a bounded transaction: verify it closed before targeting outside it, otherwise close it with an observed control, trigger, or Escape and verify with page.activeSurface(). Before claiming completion, read business success and page.activeSurface(), resolve or disclose residual top surfaces, and report every failed tool call. Operation/navigation/tab-change results include final page identity and direct incremental domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(value), not console.log, to return compact code results. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or attribute must appear verbatim in the latest explicit read or direct domChanges; if it does not, run a targeted read-only inspection instead of trying a plausible selector. An explicit ARIA role overrides the native tag for role locators. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. After a zero-match, timeout, or actionability failure, preserve the failed locator and actual count/error, inspect fresh evidence, and do not call it transient or omit it from the final report merely because a retry succeeds. Page and Locator factory methods automatically remove matches hidden by themselves or an ancestor and matches without a non-empty rendered rectangle before count() or positional selection. Runtime applies target-style and a supplemental hit test followed by authoritative action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate; that selected locator still receives normal actionability validation. Hidden file inputs used by setInputFiles are the sole rendered-existence exception at the action boundary; an ancestor pointer-events:none alone does not reject a target. Use nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. force:true and scripted DOM clicks are forbidden.',
+      description: 'Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() returns one string containing page-state surfaces/topSurfaceIds/surfaceStack plus an AX tree scoped to the most recently active top-level surface by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Surface data is informational evidence of likely overlays, never an action permission boundary. Treat each newly opened nonmodal surface as a bounded transaction: verify it closed before targeting outside it, otherwise close it with an observed control, trigger, or Escape and verify with page.activeSurface(). Before claiming completion, read business success and page.activeSurface(), resolve or disclose residual top surfaces, and report every failed tool call. Operation/navigation/tab-change results include final page identity and direct incremental domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(value), not console.log, to return compact code results. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or attribute must appear verbatim in the latest explicit read or direct domChanges; if it does not, run a targeted read-only inspection instead of trying a plausible selector. An explicit ARIA role overrides the native tag for role locators. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. After a zero-match, timeout, or actionability failure, preserve the failed locator and actual count/error, inspect fresh evidence, and do not call it transient or omit it from the final report merely because a retry succeeds. Page and Locator factory methods automatically remove matches hidden by themselves or an ancestor and matches without a non-empty rendered rectangle before count() or positional selection. Runtime applies target-style and a supplemental hit test followed by authoritative action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate; that selected locator still receives normal actionability validation. Hidden file inputs used by setInputFiles are the sole rendered-existence exception at the action boundary; an ancestor pointer-events:none alone does not reject a target. For exact middle insertion in input, textarea, or contenteditable, including frame locators, use page.insertTextAt(locator, { text, afterText | beforeText | offset, occurrence? }) and verify the resulting text. Use nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. force:true and scripted DOM clicks are forbidden.',
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
         maxOutputChars: z.number().int().min(1_000).max(50_000).optional().describe('Maximum serialized return size. Defaults to 20000 characters.'),
@@ -1266,7 +1275,7 @@ function makeBrowserTools(
         }),
       }),
       interact: tool({
-        description: browserInteractToolDescription,
+        description: `${browserInteractToolDescription} ${browserInteractTextInsertionDescription}`,
         inputSchema: browserToolInput(browserInteractToolShape).superRefine(refineBrowserInteractTarget),
         execute: (input) => record('interact', input, async (abortSignal) => {
           if (['click', 'move', 'drag', 'scroll', 'scrollIntoView'].includes(input.action)) {
@@ -1288,6 +1297,17 @@ function makeBrowserTools(
           }
           if (input.action === 'selectOption') {
             return session.selectOption({ target: input.target, value: input.value, label: input.label, abortSignal });
+          }
+          if (input.action === 'insertTextAt') {
+            return session.keyboard({
+              action: 'insertTextAt',
+              target: input.target,
+              text: input.text,
+              offset: input.offset,
+              afterText: input.afterText,
+              beforeText: input.beforeText,
+              occurrence: input.occurrence,
+            });
           }
           const binding = credentialBinding(input.credentialRef);
           if (input.credentialRef && (!binding || input.action !== 'type' || !input.target)) {
@@ -2671,6 +2691,7 @@ function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
     'Safety mode: strict.',
     '- Before executing an operation you judge important, irreversible, externally visible, data-changing, privacy-sensitive, or costly, call the intended browser tool with requiresConfirmation=true and a concise Chinese confirmationMessage.',
     '- Important operations can include submit/publish/send/delete/modify records, payment/order/authorization, login/security actions, file upload/download/export, or similar actions based on page context.',
+    '- Ask once for one bounded user-intended operation. Preparatory field entry, including filling a username or password for an explicitly requested login, must not request separate confirmation; confirm only the final submit/login action.',
     '- The backend will pause this same browser-chat turn and show Confirm/Cancel buttons on that tool before executing it.',
     '- Do not ask for this confirmation in plain text and do not end the turn just to ask the user to type confirm.',
   ].join('\n');
@@ -3150,6 +3171,17 @@ export async function executeRecordedBrowserOperation(
           value: action.value,
           label: action.label,
           abortSignal,
+        });
+      }
+      if (action.action === 'insertTextAt') {
+        return session.keyboard({
+          action: 'insertTextAt',
+          target: action.target,
+          text: action.text,
+          offset: action.offset,
+          afterText: action.afterText,
+          beforeText: action.beforeText,
+          occurrence: action.occurrence,
         });
       }
       const credential = action.credentialRef

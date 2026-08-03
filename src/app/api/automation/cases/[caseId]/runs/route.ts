@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { enqueueAutomationCaseRun } from '@/server/automation/automation-runner';
-import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 import { noStoreJson } from '@/server/http/no-store-response';
 
 export const dynamic = 'force-dynamic';
@@ -12,13 +12,8 @@ type RouteContext = {
 
 type RequestBody = Record<string, unknown>;
 
-function requestUserId(request: NextRequest, body: RequestBody) {
-  return normalizeApplicationUserId(
-    body.userId
-    ?? body.qzUserId
-    ?? request.nextUrl.searchParams.get('userId')
-    ?? request.nextUrl.searchParams.get('qzUserId'),
-  );
+function requestUserId(request: NextRequest, _body: RequestBody) {
+  return requestApplicationUserId(request, _body);
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {

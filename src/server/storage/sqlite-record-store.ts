@@ -136,6 +136,37 @@ type BrowserChatSessionFields = {
   updatedAt: string;
 };
 
+export type BrowserChatRealtimeOutboxEvent = {
+  entityType: 'browserChatSession';
+  id: string;
+  updatedAt: string;
+  userId: string;
+  deleted?: boolean;
+  patch?: unknown;
+};
+
+export type BrowserChatRealtimeOutboxRecord = {
+  id: number;
+  sessionId: string;
+  userId: string;
+  eventType: 'browserChatSession';
+  payload: BrowserChatRealtimeOutboxEvent;
+  createdAt: string;
+  attempts: number;
+};
+
+function insertBrowserChatRealtimeOutboxEvent(
+  database: DatabaseSync,
+  event: BrowserChatRealtimeOutboxEvent,
+) {
+  const result = database.prepare(`
+    INSERT INTO browser_chat_realtime_outbox (
+      session_id, user_id, event_type, payload_json, created_at
+    ) VALUES (?, ?, 'browserChatSession', ?, ?)
+  `).run(event.id, event.userId, JSON.stringify(event), now());
+  return Number(result.lastInsertRowid);
+}
+
 export function readBrowserChatLogs<T>(sessionId: string) {
   const rows = getSqliteDatabase().prepare(`
     SELECT record_json FROM browser_chat_log WHERE session_id = ? ORDER BY time ASC
@@ -262,8 +293,9 @@ export function writeBrowserChatSessionDelta<
     removedStepIndexes?: number[];
     removedLogIds?: string[];
   },
+  outboxEvent: BrowserChatRealtimeOutboxEvent,
 ) {
-  runSqliteTransaction((database) => {
+  return runSqliteTransaction((database) => {
     database.prepare(`
       INSERT INTO browser_chat_session (
         id, user_id, title, status, revision, snapshot_json, summary_json, created_at, updated_at
@@ -313,6 +345,7 @@ export function writeBrowserChatSessionDelta<
     for (const stepIndex of delta.removedStepIndexes || []) deleteStep.run(snapshot.id, stepIndex);
     const deleteLog = database.prepare('DELETE FROM browser_chat_log WHERE session_id = ? AND id = ?');
     for (const logId of delta.removedLogIds || []) deleteLog.run(snapshot.id, logId);
+    return insertBrowserChatRealtimeOutboxEvent(database, outboxEvent);
   });
 }
 
@@ -332,6 +365,70 @@ function pruneBrowserChatRows(
     .run(sessionId, ...retainedKeys);
 }
 
-export function deleteBrowserChatSessionRecord(sessionId: string) {
-  getSqliteDatabase().prepare('DELETE FROM browser_chat_session WHERE id = ?').run(sessionId);
+export function deleteBrowserChatSessionRecord(sessionId: string, outboxEvent: BrowserChatRealtimeOutboxEvent) {
+  return runSqliteTransaction((database) => {
+    database.prepare('DELETE FROM browser_chat_session WHERE id = ?').run(sessionId);
+    return insertBrowserChatRealtimeOutboxEvent(database, outboxEvent);
+  });
+}
+
+export function readPendingBrowserChatRealtimeOutbox(limit = 100): BrowserChatRealtimeOutboxRecord[] {
+  const rows = getSqliteDatabase().prepare(`
+    SELECT id, session_id, user_id, event_type, payload_json, created_at, attempts
+    FROM browser_chat_realtime_outbox
+    WHERE delivered_at IS NULL
+    ORDER BY id ASC
+    LIMIT ?
+  `).all(Math.max(1, Math.min(500, Math.floor(limit)))) as Array<{
+    id: number;
+    session_id: string;
+    user_id: string;
+    event_type: 'browserChatSession';
+    payload_json: string;
+    created_at: string;
+    attempts: number;
+  }>;
+  return rows.map((row) => ({
+    id: row.id,
+    sessionId: row.session_id,
+    userId: row.user_id,
+    eventType: row.event_type,
+    payload: parseSqliteJson<BrowserChatRealtimeOutboxEvent>(row.payload_json, {
+      entityType: 'browserChatSession',
+      id: row.session_id,
+      updatedAt: row.created_at,
+      userId: row.user_id,
+    }),
+    createdAt: row.created_at,
+    attempts: row.attempts,
+  }));
+}
+
+export function markBrowserChatRealtimeOutboxDelivered(id: number) {
+  getSqliteDatabase().prepare(`
+    UPDATE browser_chat_realtime_outbox
+    SET delivered_at = ?, attempts = attempts + 1, last_error = NULL
+    WHERE id = ? AND delivered_at IS NULL
+  `).run(now(), id);
+}
+
+export function markBrowserChatRealtimeOutboxFailed(id: number, error: string) {
+  getSqliteDatabase().prepare(`
+    UPDATE browser_chat_realtime_outbox
+    SET attempts = attempts + 1, last_error = ?
+    WHERE id = ? AND delivered_at IS NULL
+  `).run(error.slice(0, 1000), id);
+}
+
+export function pruneDeliveredBrowserChatRealtimeOutbox(retain = 1_000) {
+  getSqliteDatabase().prepare(`
+    DELETE FROM browser_chat_realtime_outbox
+    WHERE delivered_at IS NOT NULL
+      AND id NOT IN (
+        SELECT id FROM browser_chat_realtime_outbox
+        WHERE delivered_at IS NOT NULL
+        ORDER BY id DESC
+        LIMIT ?
+      )
+  `).run(Math.max(100, Math.floor(retain)));
 }

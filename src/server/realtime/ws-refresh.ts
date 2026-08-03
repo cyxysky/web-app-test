@@ -1,6 +1,12 @@
-import { createHash } from 'node:crypto';
 import http from 'node:http';
 import type { Socket } from 'node:net';
+import {
+  acceptWebSocketUpgrade,
+  consumeWebSocketFrames,
+  encodeWebSocketControl,
+  encodeWebSocketText,
+  listenWebSocketServer,
+} from '@/server/realtime/websocket-transport';
 
 export type RefreshEntityType = 'browserChatSession';
 
@@ -10,6 +16,7 @@ export type RefreshWebSocketEvent = {
   id: string;
   updatedAt: string;
   version: number;
+  userId: string;
   deleted?: boolean;
   patch?: unknown;
 };
@@ -22,6 +29,7 @@ type RefreshWebSocketInfo = {
 type RefreshClient = {
   buffer: Buffer;
   socket: Socket;
+  userId: string;
 };
 
 type RefreshWebSocketState = {
@@ -29,56 +37,49 @@ type RefreshWebSocketState = {
   heartbeat?: ReturnType<typeof setInterval>;
   pending: RefreshWebSocketEvent[];
   port?: number;
+  publishQueues?: Map<string, Promise<void>>;
+  relayPort?: number;
   server?: http.Server;
+  serviceVersion: number;
   starting?: Promise<RefreshWebSocketInfo>;
   versions: Map<string, number>;
 };
+
+const REFRESH_STATE_VERSION = 2;
+const REFRESH_RELAY_PATH = '/publish';
+const REFRESH_SERVICE_NAME = 'webpilot-refresh-websocket';
+const REFRESH_SERVICE_HEADER = 'x-webpilot-refresh-service';
+const MAX_RELAY_BODY_BYTES = 8 * 1024 * 1024;
 
 declare global {
   var __aiWebTestRefreshWebSocketState: RefreshWebSocketState | undefined;
 }
 
 function state() {
-  if (!globalThis.__aiWebTestRefreshWebSocketState) {
-    globalThis.__aiWebTestRefreshWebSocketState = {
+  const existing = globalThis.__aiWebTestRefreshWebSocketState;
+  if (!existing || existing.serviceVersion !== REFRESH_STATE_VERSION) {
+    if (existing) {
+      if (existing.heartbeat) clearInterval(existing.heartbeat);
+      for (const client of existing.clients || []) client.socket.destroy();
+      existing.server?.close();
+    }
+    const initialized: RefreshWebSocketState = {
       clients: new Set<RefreshClient>(),
       pending: [],
+      publishQueues: new Map<string, Promise<void>>(),
+      serviceVersion: REFRESH_STATE_VERSION,
       versions: new Map<string, number>(),
     };
+    globalThis.__aiWebTestRefreshWebSocketState = initialized;
+    return initialized;
   }
-  return globalThis.__aiWebTestRefreshWebSocketState;
+  existing.publishQueues ||= new Map<string, Promise<void>>();
+  return existing;
 }
 
 function refreshWebSocketPortStart() {
   const raw = Number(process.env.AI_REFRESH_WS_PORT || process.env.AI_WEB_TEST_REFRESH_WS_PORT || 17991);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 17991;
-}
-
-function websocketAcceptKey(key: string) {
-  return createHash('sha1')
-    .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-    .digest('base64');
-}
-
-function encodeWebSocketText(payload: string) {
-  const data = Buffer.from(payload);
-  if (data.length < 126) return Buffer.concat([Buffer.from([0x81, data.length]), data]);
-  if (data.length <= 0xffff) {
-    const header = Buffer.alloc(4);
-    header[0] = 0x81;
-    header[1] = 126;
-    header.writeUInt16BE(data.length, 2);
-    return Buffer.concat([header, data]);
-  }
-  const header = Buffer.alloc(10);
-  header[0] = 0x81;
-  header[1] = 127;
-  header.writeBigUInt64BE(BigInt(data.length), 2);
-  return Buffer.concat([header, data]);
-}
-
-function encodeControlFrame(opcode: number, payload = Buffer.alloc(0)) {
-  return Buffer.concat([Buffer.from([0x80 | opcode, payload.length]), payload]);
 }
 
 function sendToClient(client: RefreshClient, payload: unknown) {
@@ -92,9 +93,10 @@ function sendToClient(client: RefreshClient, payload: unknown) {
   }
 }
 
-function broadcast(payload: unknown) {
+function broadcast(payload: unknown, userId?: string) {
   const current = state();
   for (const client of [...current.clients]) {
+    if (userId && client.userId !== userId) continue;
     if (!sendToClient(client, payload)) current.clients.delete(client);
   }
 }
@@ -102,8 +104,108 @@ function broadcast(payload: unknown) {
 function flushPendingRefreshEvents() {
   const current = state();
   if (!current.clients.size || !current.pending.length) return;
-  const events = current.pending.splice(0);
-  for (const event of events) broadcast(event);
+  const connectedUsers = new Set([...current.clients].map((client) => client.userId));
+  const events = current.pending.filter((event) => connectedUsers.has(event.userId));
+  current.pending = current.pending.filter((event) => !connectedUsers.has(event.userId));
+  for (const event of events) broadcast(event, event.userId);
+}
+
+function enqueueRefreshEvent(event: RefreshWebSocketEvent) {
+  const current = state();
+  current.pending.push(event);
+  if (current.pending.length > 500) current.pending = current.pending.slice(-500);
+  flushPendingRefreshEvents();
+}
+
+function refreshEventFromUnknown(value: unknown): RefreshWebSocketEvent | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const candidate = value as Partial<RefreshWebSocketEvent>;
+  if (
+    candidate.type !== 'refresh'
+    || candidate.entityType !== 'browserChatSession'
+    || typeof candidate.id !== 'string'
+    || !candidate.id
+    || typeof candidate.updatedAt !== 'string'
+    || typeof candidate.version !== 'number'
+    || !Number.isFinite(candidate.version)
+    || typeof candidate.userId !== 'string'
+    || !candidate.userId
+  ) return undefined;
+  return candidate as RefreshWebSocketEvent;
+}
+
+function readRequestBody(request: http.IncomingMessage) {
+  return new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    request.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_RELAY_BODY_BYTES) {
+        reject(new Error('Refresh relay payload is too large'));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    request.on('error', reject);
+  });
+}
+
+function relayRefreshEvent(event: RefreshWebSocketEvent, port = refreshWebSocketPortStart()) {
+  return new Promise<void>((resolve, reject) => {
+    const body = JSON.stringify(event);
+    const request = http.request({
+      host: '127.0.0.1',
+      port,
+      path: REFRESH_RELAY_PATH,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (response) => {
+      response.resume();
+      if (
+        response.statusCode
+        && response.statusCode >= 200
+        && response.statusCode < 300
+        && response.headers[REFRESH_SERVICE_HEADER] === REFRESH_SERVICE_NAME
+      ) {
+        resolve();
+        return;
+      }
+      reject(new Error(`Refresh relay returned ${response.statusCode || 0}`));
+    });
+    request.setTimeout(3_000, () => {
+      request.destroy(new Error('Refresh relay request timed out'));
+    });
+    request.once('error', reject);
+    request.end(body);
+  });
+}
+
+function discoverRefreshWebSocketServerAtPort(port: number) {
+  return new Promise<RefreshWebSocketInfo | undefined>((resolve) => {
+    const request = http.get({ host: '127.0.0.1', port, path: '/' }, (response) => {
+      response.resume();
+      if (response.headers[REFRESH_SERVICE_HEADER] === REFRESH_SERVICE_NAME) {
+        resolve({ port, url: `ws://127.0.0.1:${port}/refresh` });
+        return;
+      }
+      resolve(undefined);
+    });
+    request.setTimeout(500, () => request.destroy());
+    request.once('error', () => resolve(undefined));
+  });
+}
+
+async function discoverRefreshWebSocketServer() {
+  const firstPort = refreshWebSocketPortStart();
+  const candidates = await Promise.all(
+    Array.from({ length: 20 }, (_, index) => discoverRefreshWebSocketServerAtPort(firstPort + index)),
+  );
+  return candidates.find((candidate) => candidate !== undefined);
 }
 
 function removeClient(client: RefreshClient) {
@@ -112,75 +214,47 @@ function removeClient(client: RefreshClient) {
 }
 
 function handleClientData(client: RefreshClient, chunk: Buffer) {
-  client.buffer = Buffer.concat([client.buffer, chunk]);
-  while (client.buffer.length >= 2) {
-    const first = client.buffer[0];
-    const second = client.buffer[1];
-    const opcode = first & 0x0f;
-    const masked = Boolean(second & 0x80);
-    let length = second & 0x7f;
-    let offset = 2;
-    if (length === 126) {
-      if (client.buffer.length < offset + 2) return;
-      length = client.buffer.readUInt16BE(offset);
-      offset += 2;
-    } else if (length === 127) {
-      if (client.buffer.length < offset + 8) return;
-      const bigLength = client.buffer.readBigUInt64BE(offset);
-      if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
-        removeClient(client);
-        return;
-      }
-      length = Number(bigLength);
-      offset += 8;
-    }
-    const maskOffset = offset;
-    if (masked) offset += 4;
-    if (client.buffer.length < offset + length) return;
-    const payload = client.buffer.subarray(offset, offset + length);
-    const unmasked = masked
-      ? Buffer.from(payload.map((byte, index) => byte ^ client.buffer[maskOffset + (index % 4)]))
-      : Buffer.from(payload);
-    client.buffer = client.buffer.subarray(offset + length);
-
-    if (opcode === 0x8) {
-      removeClient(client);
-      return;
-    }
-    if (opcode === 0x9) {
-      client.socket.write(encodeControlFrame(0xA, unmasked.subarray(0, 125)));
-    }
-  }
-}
-
-function listen(server: http.Server, port: number): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const cleanup = () => {
-      server.off('error', onError);
-      server.off('listening', onListening);
-    };
-    const onListening = () => {
-      cleanup();
-      resolve(port);
-    };
-    const onError = (error: NodeJS.ErrnoException) => {
-      cleanup();
-      if (error.code === 'EADDRINUSE') {
-        listen(server, port + 1).then(resolve, reject);
-        return;
-      }
-      reject(error);
-    };
-    server.once('error', onError);
-    server.once('listening', onListening);
-    server.listen(port, '127.0.0.1');
-  });
+  client.buffer = Buffer.from(consumeWebSocketFrames(client.buffer, chunk, {
+    onClose: () => removeClient(client),
+    onProtocolError: () => removeClient(client),
+    onPing: (payload) => client.socket.write(encodeWebSocketControl(0xA, payload)),
+  }));
 }
 
 function createRefreshServer() {
-  const server = http.createServer((_request, response) => {
-    response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    response.end(JSON.stringify({ ok: true }));
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url || '/', 'http://127.0.0.1');
+    if (request.method === 'POST' && url.pathname === REFRESH_RELAY_PATH) {
+      void readRequestBody(request).then((body) => {
+        const event = refreshEventFromUnknown(JSON.parse(body));
+        if (!event) {
+          response.writeHead(400, {
+            'Content-Type': 'application/json; charset=utf-8',
+            [REFRESH_SERVICE_HEADER]: REFRESH_SERVICE_NAME,
+          });
+          response.end(JSON.stringify({ error: 'Invalid refresh event' }));
+          return;
+        }
+        enqueueRefreshEvent(event);
+        response.writeHead(202, {
+          'Content-Type': 'application/json; charset=utf-8',
+          [REFRESH_SERVICE_HEADER]: REFRESH_SERVICE_NAME,
+        });
+        response.end(JSON.stringify({ ok: true }));
+      }).catch((error) => {
+        response.writeHead(400, {
+          'Content-Type': 'application/json; charset=utf-8',
+          [REFRESH_SERVICE_HEADER]: REFRESH_SERVICE_NAME,
+        });
+        response.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Invalid refresh event' }));
+      });
+      return;
+    }
+    response.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      [REFRESH_SERVICE_HEADER]: REFRESH_SERVICE_NAME,
+    });
+    response.end(JSON.stringify({ ok: true, service: REFRESH_SERVICE_NAME }));
   });
 
   server.on('upgrade', (request, socket) => {
@@ -190,21 +264,13 @@ function createRefreshServer() {
       netSocket.destroy();
       return;
     }
-    const key = String(request.headers['sec-websocket-key'] || '');
-    if (!key) {
+    const userId = (url.searchParams.get('userId') || url.searchParams.get('qzUserId') || '').trim() || '0';
+    if (!acceptWebSocketUpgrade(request, netSocket)) {
       netSocket.destroy();
       return;
     }
-    netSocket.write([
-      'HTTP/1.1 101 Switching Protocols',
-      'Upgrade: websocket',
-      'Connection: Upgrade',
-      `Sec-WebSocket-Accept: ${websocketAcceptKey(key)}`,
-      '',
-      '',
-    ].join('\r\n'));
 
-    const client: RefreshClient = { buffer: Buffer.alloc(0), socket: netSocket };
+    const client: RefreshClient = { buffer: Buffer.alloc(0), socket: netSocket, userId };
     state().clients.add(client);
     netSocket.setNoDelay(true);
     netSocket.on('data', (chunk) => handleClientData(client, chunk));
@@ -222,13 +288,26 @@ export async function ensureRefreshWebSocketServer(): Promise<RefreshWebSocketIn
   if (current.server && current.port) {
     return { port: current.port, url: `ws://127.0.0.1:${current.port}/refresh` };
   }
+  if (current.relayPort) {
+    return { port: current.relayPort, url: `ws://127.0.0.1:${current.relayPort}/refresh` };
+  }
   if (current.starting) return current.starting;
 
   current.starting = (async () => {
+    const requestedPort = refreshWebSocketPortStart();
+    const existing = await discoverRefreshWebSocketServer();
+    if (existing) {
+      current.relayPort = existing.port;
+      return existing;
+    }
     const server = createRefreshServer();
-    const port = await listen(server, refreshWebSocketPortStart());
+    const port = await listenWebSocketServer(server, requestedPort, {
+      host: '127.0.0.1',
+      nextPortOnAddressInUse: true,
+    });
     current.server = server;
     current.port = port;
+    current.relayPort = port;
     current.heartbeat = setInterval(() => {
       broadcast({ type: 'heartbeat', time: new Date().toISOString() });
     }, 25_000);
@@ -242,14 +321,15 @@ export async function ensureRefreshWebSocketServer(): Promise<RefreshWebSocketIn
   return current.starting;
 }
 
-export function publishRefreshEvent(input: {
+export function publishBrowserChatRefreshEvent(input: {
   deleted?: boolean;
   entityType: RefreshEntityType;
   id: string;
   patch?: unknown;
   updatedAt?: string;
+  userId: string;
 }) {
-  if (!input.id) return;
+  if (!input.id) return Promise.resolve();
   const current = state();
   const key = `${input.entityType}:${input.id}`;
   const version = Math.max((current.versions.get(key) || 0) + 1, Date.now());
@@ -260,16 +340,31 @@ export function publishRefreshEvent(input: {
     id: input.id,
     updatedAt: input.updatedAt || new Date().toISOString(),
     version,
+    userId: input.userId,
     ...(input.deleted ? { deleted: true } : {}),
     ...(input.patch === undefined ? {} : { patch: input.patch }),
   };
-  current.pending.push(event);
-  if (current.pending.length > 500) current.pending = current.pending.slice(-500);
-  if (current.server && current.port) {
-    flushPendingRefreshEvents();
-    return;
-  }
-  void ensureRefreshWebSocketServer().catch((error) => {
-    console.warn('[realtime] Failed to start refresh WebSocket server.', error);
+  const publishQueues = current.publishQueues || (current.publishQueues = new Map<string, Promise<void>>());
+  const previous = publishQueues.get(key) || Promise.resolve();
+  const delivery = previous.catch(() => undefined).then(async () => {
+    try {
+      let info = await ensureRefreshWebSocketServer();
+      try {
+        await relayRefreshEvent(event, info.port);
+      } catch {
+        const retryState = state();
+        if (!retryState.server) retryState.relayPort = undefined;
+        info = await ensureRefreshWebSocketServer();
+        await relayRefreshEvent(event, info.port);
+      }
+    } catch (error) {
+      console.warn('[realtime] Failed to publish refresh WebSocket event.', error);
+      throw error;
+    }
   });
+  publishQueues.set(key, delivery);
+  void delivery.finally(() => {
+    if (publishQueues.get(key) === delivery) publishQueues.delete(key);
+  });
+  return delivery;
 }

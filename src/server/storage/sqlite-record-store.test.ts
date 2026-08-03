@@ -68,6 +68,7 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
         steps: [{ index: 3, value: 'delta' }],
         logs: [{ id: 'l3', time, value: 'delta' }],
       },
+      { entityType: 'browserChatSession', id: snapshot.id, updatedAt: time, userId: '0' },
     );
     const deltaAdded = recordStore.readBrowserChatSessionRecord<{
       messages: Array<{ content: string }>;
@@ -82,6 +83,7 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
       { ...snapshot, updatedAt: new Date().toISOString() },
       { id: snapshot.id },
       { removedMessageIds: ['m2'], removedStepIndexes: [2], removedLogIds: ['l2'] },
+      { entityType: 'browserChatSession', id: snapshot.id, updatedAt: time, userId: '0' },
     );
     const deltaRemoved = recordStore.readBrowserChatSessionRecord<{
       messages: Array<{ content: string }>;
@@ -91,6 +93,16 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
     assert.deepEqual(deltaRemoved?.messages.map((item) => item.content), ['delta']);
     assert.deepEqual(deltaRemoved?.steps.map((item) => item.value), ['delta']);
     assert.deepEqual(deltaRemoved?.logs.map((item) => item.value), ['delta']);
+
+    const outbox = recordStore.readPendingBrowserChatRealtimeOutbox();
+    assert.equal(outbox.length, 2);
+    assert.deepEqual(outbox.map((item) => item.payload.id), [snapshot.id, snapshot.id]);
+    assert.ok(outbox[0].id < outbox[1].id);
+    recordStore.markBrowserChatRealtimeOutboxDelivered(outbox[0].id);
+    assert.deepEqual(
+      recordStore.readPendingBrowserChatRealtimeOutbox().map((item) => item.id),
+      [outbox[1].id],
+    );
 
     const retiredTables = databaseModule.getSqliteDatabase().prepare(`
       SELECT name FROM sqlite_master

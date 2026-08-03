@@ -5,7 +5,7 @@ import {
   automationScheduleRecurrenceSchema,
 } from '@/server/automation/automation.schema';
 import { nextAutomationOccurrence } from '@/server/automation/automation-scheduler';
-import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 import { noStoreJson } from '@/server/http/no-store-response';
 import {
   createAutomationSchedule,
@@ -26,13 +26,8 @@ function text(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
-function requestUserId(request: NextRequest, body: RequestBody = {}) {
-  return normalizeApplicationUserId(
-    body.userId
-    ?? body.qzUserId
-    ?? request.nextUrl.searchParams.get('userId')
-    ?? request.nextUrl.searchParams.get('qzUserId'),
-  );
+function requestUserId(request: NextRequest, _body: RequestBody = {}) {
+  return requestApplicationUserId(request, _body);
 }
 
 function normalizedTimezone(value: unknown) {
