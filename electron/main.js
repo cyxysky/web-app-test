@@ -2544,8 +2544,8 @@ async function startServer(appDataDir) {
   const port = await findAvailablePort(Number(process.env.AI_WEB_TEST_PORT || DEFAULT_PORT));
   const serverDir = serverDirectory();
   const serverScript = app.isPackaged
-    ? path.join(serverDir, 'server.js')
-    : path.join(process.cwd(), 'node_modules', 'next', 'dist', 'bin', 'next');
+    ? path.join(serverDir, 'webpilot-server.js')
+    : path.join(process.cwd(), 'server', 'webpilot-server.js');
   const browserProfileDir = ensureDir(path.join(appDataDir, 'browser-profile'));
   const env = {
     ...process.env,
@@ -2563,9 +2563,11 @@ async function startServer(appDataDir) {
     PORT: String(port),
     WEBPILOT_ELECTRON_CDP_PORT: String(EMBEDDED_BROWSER_CDP_PORT),
     WEBPILOT_INTERNAL_SHUTDOWN_TOKEN: serverShutdownToken,
+    WEBPILOT_DEFAULT_USER_ID: process.env.WEBPILOT_DEFAULT_USER_ID || '1',
+    WEBPILOT_REQUIRE_MOUNT_USER_ID: 'false',
   };
 
-  const args = app.isPackaged ? [serverScript] : [serverScript, 'start', '-p', String(port), '-H', '127.0.0.1'];
+  const args = [serverScript];
   if (app.isPackaged) {
     env.ELECTRON_RUN_AS_NODE = '1';
     env.PLAYWRIGHT_BROWSERS_PATH = path.join(process.resourcesPath, 'ms-playwright');
@@ -2598,7 +2600,6 @@ async function startServer(appDataDir) {
   const url = `http://127.0.0.1:${port}`;
   localServerUrl = url;
   await waitForHttp(`${url}/dashboard`, 60_000, 3);
-  await waitForHttp(`${url}/api/browser-chat?userId=0`, 30_000, 2);
   return url;
 }
 

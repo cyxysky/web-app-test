@@ -1,6 +1,6 @@
 'use client';
 
-import { type CSSProperties, useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { useI18n } from '@/i18n/I18nProvider';
@@ -27,12 +27,36 @@ function isWorkspaceViewPathname(pathname: string) {
 
 type NavigationLoadingScope = 'viewport' | 'workspace';
 
-function workspaceContentBounds(): CSSProperties | undefined {
+type WorkspaceContentBounds = {
+  height: number;
+  left: number;
+  top: number;
+  width: number;
+};
+
+function workspaceContentBounds(): WorkspaceContentBounds | undefined {
   if (typeof document === 'undefined') return undefined;
+  const layouts = [...document.querySelectorAll<HTMLElement>('.browser-chat-layout')];
+  const layout = layouts.reverse().find((candidate) => {
+    const bounds = candidate.getBoundingClientRect();
+    return bounds.width > 0 && bounds.height > 0;
+  });
+  const sidebar = layout?.querySelector<HTMLElement>(':scope > .browser-chat-sidebar');
+  if (layout && sidebar) {
+    const layoutBounds = layout.getBoundingClientRect();
+    const sidebarBounds = sidebar.getBoundingClientRect();
+    const left = Math.max(layoutBounds.left, Math.min(sidebarBounds.right, layoutBounds.right));
+    return {
+      height: layoutBounds.height,
+      left,
+      top: layoutBounds.top,
+      width: Math.max(0, layoutBounds.right - left),
+    };
+  }
+
   const content = document.querySelector<HTMLElement>('.browser-chat-main');
-  if (!content) return undefined;
-  const bounds = content.getBoundingClientRect();
-  if (bounds.width <= 0 || bounds.height <= 0) return undefined;
+  const bounds = content?.getBoundingClientRect();
+  if (!bounds || bounds.width <= 0 || bounds.height <= 0) return undefined;
   return {
     height: bounds.height,
     left: bounds.left,
@@ -44,7 +68,26 @@ function workspaceContentBounds(): CSSProperties | undefined {
 function LoadingOverlay({ label, scope }: { label: string; scope: NavigationLoadingScope }) {
   const { t } = useI18n();
   const translatedLabel = t(label);
-  const contentBounds = scope === 'workspace' ? workspaceContentBounds() : undefined;
+  const [contentBounds, setContentBounds] = useState<WorkspaceContentBounds | undefined>(() => (
+    scope === 'workspace' ? workspaceContentBounds() : undefined
+  ));
+
+  useLayoutEffect(() => {
+    if (scope !== 'workspace') {
+      setContentBounds(undefined);
+      return;
+    }
+    const updateBounds = () => setContentBounds(workspaceContentBounds());
+    updateBounds();
+    const observer = new ResizeObserver(updateBounds);
+    document.querySelectorAll<HTMLElement>('.browser-chat-layout, .browser-chat-sidebar').forEach((element) => observer.observe(element));
+    window.addEventListener('resize', updateBounds);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', updateBounds);
+    };
+  }, [scope]);
+
   return (
     <div
       className={contentBounds ? 'navigation-loading-overlay navigation-loading-overlay--workspace' : 'navigation-loading-overlay'}

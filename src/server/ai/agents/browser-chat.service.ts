@@ -353,8 +353,7 @@ function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'u
   return template
     .replace(/\{sessionId\}/g, encodedSessionId)
     .replace(/\{id\}/g, encodedSessionId)
-    .replace(/\{userId\}/g, encodedUserId)
-    .replace(/\{qzUserId\}/g, encodedUserId);
+    .replace(/\{userId\}/g, encodedUserId);
 }
 
 function browserChatBrowserProfileKey(session: Pick<BrowserChatSessionSnapshot, 'userId'>) {
@@ -993,7 +992,7 @@ function uploadedAttachmentAbsolutePath(attachment: BrowserChatAttachment) {
 function artifactAttachmentForSession(session: BrowserChatSessionRecord, artifactId: string): BrowserChatAttachment | undefined {
   const segments = artifactId.replace(/\\/g, '/').split('/').filter(Boolean);
   if (segments.some((segment) => segment === '.' || segment === '..')) return undefined;
-  if (segments.length < 3 || segments[0] !== session.id || !['downloads', 'markdown'].includes(segments[1])) return undefined;
+  if (segments.length < 3 || segments[0] !== session.id || !['downloads', 'generated'].includes(segments[1])) return undefined;
   const name = segments.at(-1) || 'artifact';
   return {
     id: `artifact:${segments.join('/')}`,
@@ -1021,7 +1020,7 @@ async function readFileForSession(
   if (!attachment) {
     return {
       ok: false,
-      actual: '未找到可读取文件。请使用对话附件的 attachmentId，或 downloadFile/generateMarkdownFile 返回的 Artifact ID。',
+      actual: '未找到可读取文件。请使用对话附件的 attachmentId，或 downloadFile/generateFile 返回的 Artifact ID。',
     };
   }
   const result = await readBrowserChatAttachment({

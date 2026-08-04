@@ -12,7 +12,7 @@ type RouteContext = {
 export async function PUT(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
-    const body = await request.json() as { groupId?: unknown; userId?: unknown; qzUserId?: unknown };
+    const body = await request.json() as { groupId?: unknown };
     const groupId = typeof body.groupId === 'string' ? body.groupId : '';
     const session = setBrowserChatSessionGroup(sessionId, groupId, requestApplicationUserId(request));
     if (!session) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });

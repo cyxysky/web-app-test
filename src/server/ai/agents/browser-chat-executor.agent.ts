@@ -16,13 +16,19 @@ import { browserElementTargetSchema, browserInteractTextInsertionDescription, br
 import { richTextToPlainText } from '@/lib/rich-text';
 import { aiSdkFinishMessage, aiSdkFinishState } from './ai-sdk-finish-state';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
+import { browserCodeServiceFileDeliveryViolation } from './browser-chat-file-delivery';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
   BROWSER_CHAT_FILE_READ_MIN_CHARS,
   normalizeBrowserChatFileReadLimit,
 } from './browser-chat-file-read';
-import { downloadFileArtifact, formatFileArtifactResult, generateMarkdownArtifact } from './file-artifact-tools';
+import {
+  appendMissingFileArtifactDownloadLinks,
+  downloadFileArtifact,
+  formatFileArtifactResult,
+  generateFileArtifact,
+} from './file-artifact-tools';
 import { browserChatCodeRules, browserChatDomRules } from './runtime-prompt-rules';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
@@ -35,6 +41,7 @@ import {
   type RuntimeExecutionIdentity,
   type RuntimeRetryDecision,
 } from './runtime-retry-policy';
+
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
 import { compactOlderBrowserToolResults } from './browser-code-tool-history';
 import {
@@ -52,6 +59,17 @@ import {
   notifyRuntimeToolTrace,
   runtimeToolTraceId,
 } from './runtime-tool-trace';
+
+const generatedFileCellSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+const generatedFileSheetsSchema = z.array(z.object({
+  name: z.string().max(31).optional(),
+  rows: z.array(z.array(generatedFileCellSchema).max(100)).min(1).max(5_000),
+})).min(1).max(20);
+const generatedFileSlidesSchema = z.array(z.object({
+  title: z.string().max(300).optional(),
+  content: z.string().max(20_000).optional(),
+  bullets: z.array(z.string().max(2_000)).max(100).optional(),
+})).min(1).max(100);
 
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type RuntimeModelMessage = ModelMessage;
@@ -432,7 +450,7 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, _max =
   void _max;
   if (!result) return undefined;
   if (!result.ok && providerToolSchemaError(result.actual)) return userFacingInfrastructureError(result.actual);
-  if (name === 'downloadFile' || name === 'generateMarkdownFile') return formatFileArtifactResult(name, result.actual);
+  if (name === 'downloadFile' || name === 'generateFile') return formatFileArtifactResult(name, result.actual);
   return result.actual;
 }
 
@@ -1225,14 +1243,18 @@ function makeBrowserTools(
       }),
       execute: (input) => {
         const normalizedInput = browserCodeInputWithRisk(input, Boolean(referenceOptions?.requestToolConfirmation));
-        return record('browserCode', normalizedInput, (abortSignal) => session.executeBrowserCode({
-          code: normalizedInput.code,
-          maxOutputChars: normalizedInput.maxOutputChars,
-          credentials: referenceOptions?.getCredentialBindings?.() || referenceOptions?.credentialBindings,
-          runId: referenceOptions?.runId || 'browser-code',
-          stepIndex: referenceOptions?.stepIndex || 0,
-          abortSignal,
-        }));
+        return record('browserCode', normalizedInput, (abortSignal) => {
+          const violation = browserCodeServiceFileDeliveryViolation(normalizedInput.code);
+          if (violation) return Promise.resolve({ ok: false, actual: violation });
+          return session.executeBrowserCode({
+            code: normalizedInput.code,
+            maxOutputChars: normalizedInput.maxOutputChars,
+            credentials: referenceOptions?.getCredentialBindings?.() || referenceOptions?.credentialBindings,
+            runId: referenceOptions?.runId || 'browser-code',
+            stepIndex: referenceOptions?.stepIndex || 0,
+            abortSignal,
+          });
+        });
       },
     }),
     } : {
@@ -1389,7 +1411,7 @@ function makeBrowserTools(
         description: 'Read one registered file on demand. User attachments are listed with attachmentId; downloaded/generated artifacts return an Artifact ID. Use exactly one of attachmentId or artifactId. On the first read, omit offset and limit to read the first 20000 characters. Every text read returns at least 20000 characters. Continue only from the exact next offset returned by the previous read. Supports text, PDF, Word, Excel, PowerPoint, OpenDocument, ZIP listings, images, and extensible format detection. For an image, the tool attaches it to the next model request for visual understanding instead of returning image bytes as text.',
         inputSchema: browserToolInput({
           attachmentId: z.string().min(1).max(160).optional().describe('One uploaded-file ID listed in the conversation metadata.'),
-          artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by downloadFile or generateMarkdownFile.'),
+          artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by downloadFile or generateFile.'),
           offset: z.number().int().min(0).optional().describe('Zero-based character offset. Omit for the first segment.'),
           limit: z.number().int().min(BROWSER_CHAT_FILE_READ_MIN_CHARS).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional().describe('Returned character count, from 20000 to 40000. Omit to read 20000 characters.'),
         }).refine((input) => Boolean(input.attachmentId) !== Boolean(input.artifactId), { message: 'Provide exactly one of attachmentId or artifactId.' }),
@@ -1409,14 +1431,16 @@ function makeBrowserTools(
       }),
       execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
     }),
-    generateMarkdownFile: tool({
-      description: 'Create a Markdown .md file in the configured local output directory or this run artifacts from complete Markdown content written by the AI. Use this when the user asks to generate/export/save a Markdown file, then include the returned Markdown download link exactly as a clickable Markdown link in the final answer.',
+    generateFile: tool({
+      description: 'Generate a real downloadable file from AI-authored content. Supported outputs: text/code/data formats selected by fileName extension, PDF .pdf, Word .docx, Excel .xlsx, and PowerPoint .pptx. PDF and Word use Markdown-like content; Excel requires sheets with rows; PowerPoint prefers slides and can fall back to Markdown-like content. Always include the returned download link in the final answer. Do not use this to download an existing remote file.',
       inputSchema: browserToolInput({
-        fileName: z.string().optional().describe('Optional Markdown file name. The .md extension is added when missing.'),
-        title: z.string().optional().describe('Optional title used as fallback file name.'),
-        content: z.string().min(1).describe('Complete Markdown file content to save.'),
+        fileName: z.string().min(1).max(180).describe('Required file name with output extension, for example report.pdf, plan.docx, data.xlsx, slides.pptx, notes.md, result.json, or export.csv.'),
+        title: z.string().max(300).optional().describe('Optional document or presentation title.'),
+        content: z.string().min(1).max(4 * 1024 * 1024).optional().describe('Complete text or Markdown-like content. Required for text, PDF, and Word; optional fallback for PowerPoint.'),
+        sheets: generatedFileSheetsSchema.optional().describe('Excel worksheets. Required for .xlsx. Each sheet contains a two-dimensional rows array of string, number, boolean, or null cells.'),
+        slides: generatedFileSlidesSchema.optional().describe('PowerPoint slide definitions. Each slide has a title plus content and/or bullet strings.'),
       }),
-      execute: (input) => record('generateMarkdownFile', input, () => generateMarkdownArtifact({ ...input, runId: referenceOptions?.runId })),
+      execute: (input) => record('generateFile', input, () => generateFileArtifact({ ...input, runId: referenceOptions?.runId })),
     }),
     reportState: tool({
       description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or a short textual status update is enough. This tool does not change the browser.',
@@ -1487,13 +1511,14 @@ function runtimePrompt(input: {
       : '- Every DOM-mode browser change follows a strict closed loop: observe the current page and activeSurface, execute one operation, then re-observe. Never infer control type, editability, interaction sequence, or completion state from a label, appearance, or prior experience. Use exact current attributes and newly mounted structure, and decide from returned evidence whether a targeted read-only business-state check is needed.',
     `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. In ${input.mode === 'code' ? 'Code mode, operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default and the model may instead write targeted Playwright or DOM reads' : 'DOM mode, a fresh inspect is the mandatory pre-action observation and the interact verification result is a hard condition'}.${input.mode === 'dom' ? ' The shared [page-state].surfaces/topSurfaceIds/surfaceStack are informational hints about likely nested and parallel overlays; normal Playwright actionability decides whether a target can be operated.' : ''}`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
+    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is generated/downloaded for the user only when generateFile or downloadFile succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
     '- Only for multi-document requirement analysis, inspect/search the root links, spawn one parallel subagent batch for independent URLs, keep dependent end-to-end work in the main Agent, and read one completed child result per later model step.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
     input.mode === 'code'
-      ? '- For downloads, call downloadFile with the known URL. For Markdown export, call generateMarkdownFile with the complete content.'
-      : '- Use file action="download" for known URLs, action="writeMarkdown" for Markdown output, and action="read" for registered files.',
+      ? '- For existing remote files, call downloadFile with the known URL. To create a new text, PDF, Word, Excel, or PowerPoint file, call generateFile with the complete content or structured sheets/slides.'
+      : '- Use downloadFile for existing remote files, generateFile for new text/PDF/Office files, and readFile for registered files.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     input.operationalContext
       ? `Relevant memory and secure capabilities supplied by the runtime:\n${input.operationalContext}`
@@ -1515,7 +1540,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'readSubagent',
     'readFile',
     'downloadFile',
-    'generateMarkdownFile',
+    'generateFile',
     'reportState',
   ];
 }
@@ -2935,6 +2960,14 @@ export async function executeInteractiveBrowserTurn(input: {
 
   if (!endedWithFinalAnswer) reply = '';
 
+  reply = appendMissingFileArtifactDownloadLinks(
+    reply,
+    newSteps.flatMap((step) => (step.tools || []).map((toolCall) => ({
+      name: toolCall.name,
+      result: toolCall.rawResult,
+    }))),
+  );
+
   ensureActive();
   return {
     status: finalStatus,
@@ -3109,15 +3142,19 @@ export async function executeRecordedBrowserOperation(
   const credentialBindings = options.credentialBindings;
 
   switch (flow.name) {
-    case 'browserCode':
+    case 'browserCode': {
+      const code = typeof input.code === 'string' ? input.code : '';
+      const violation = browserCodeServiceFileDeliveryViolation(code);
+      if (violation) return { ok: false, actual: violation };
       return session.executeBrowserCode({
-        code: typeof input.code === 'string' ? input.code : '',
+        code,
         maxOutputChars: typeof input.maxOutputChars === 'number' ? input.maxOutputChars : undefined,
         credentials: credentialBindings,
         runId: runId || 'browser-code',
         stepIndex: flow.index,
         abortSignal,
       });
+    }
     case 'takeScreenshot': {
       const capture = input.capture === 'fullPage' ? 'fullPage' : 'viewport';
       const path = await session.takeScreenshot(runId || 'automation', flow.index, 'manual', { capture });
@@ -3242,12 +3279,14 @@ export async function executeRecordedBrowserOperation(
         sourcePageUrl: session.currentUrl(),
         fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
       });
-    case 'generateMarkdownFile':
-      return generateMarkdownArtifact({
+    case 'generateFile':
+      return generateFileArtifact({
         runId,
         fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
         title: typeof input.title === 'string' ? input.title : undefined,
         content: typeof input.content === 'string' ? input.content : typeof input.text === 'string' ? input.text : undefined,
+        sheets: generatedFileSheetsSchema.safeParse(input.sheets).data,
+        slides: generatedFileSlidesSchema.safeParse(input.slides).data,
       });
     case 'reportState':
       return { ok: true, actual: `Reported state without browser action: ${String(input.actual || input.reason || '')}` };

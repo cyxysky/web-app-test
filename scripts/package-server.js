@@ -1,6 +1,10 @@
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const {
+  assertCompleteNextRuntime,
+  copyCompleteNextRuntime,
+} = require('./standalone-next-runtime');
 
 const root = path.resolve(__dirname, '..');
 const packageName = 'WebPilot-Server';
@@ -54,12 +58,12 @@ function copyPlaywrightChromium() {
 }
 
 function writeStartScript() {
-  const startScript = `@echo off\r\nsetlocal\r\n\r\nset "WEBPILOT_SERVER_ROOT=%~dp0"\r\nif not defined APP_DATA_DIR set "APP_DATA_DIR=%WEBPILOT_SERVER_ROOT%runtime"\r\nif not defined ARTIFACTS_DIR set "ARTIFACTS_DIR=%APP_DATA_DIR%\\artifacts"\r\nif not defined PLAYWRIGHT_BROWSERS_PATH set "PLAYWRIGHT_BROWSERS_PATH=%WEBPILOT_SERVER_ROOT%ms-playwright"\r\nif not defined HOSTNAME set "HOSTNAME=0.0.0.0"\r\nif not defined PORT set "PORT=17890"\r\nif not defined NODE_ENV set "NODE_ENV=production"\r\nif not defined HEADLESS_BROWSER set "HEADLESS_BROWSER=true"\r\n\r\nif not exist "%APP_DATA_DIR%" mkdir "%APP_DATA_DIR%"\r\nif not exist "%ARTIFACTS_DIR%" mkdir "%ARTIFACTS_DIR%"\r\n\r\npushd "%WEBPILOT_SERVER_ROOT%server"\r\nnode server.js\r\nset "WEBPILOT_SERVER_EXIT_CODE=%ERRORLEVEL%"\r\npopd\r\nexit /b %WEBPILOT_SERVER_EXIT_CODE%\r\n`;
+  const startScript = `@echo off\r\nsetlocal\r\n\r\nset "WEBPILOT_SERVER_ROOT=%~dp0"\r\nif not defined APP_DATA_DIR set "APP_DATA_DIR=%WEBPILOT_SERVER_ROOT%runtime"\r\nif not defined ARTIFACTS_DIR set "ARTIFACTS_DIR=%APP_DATA_DIR%\\artifacts"\r\nif not defined PLAYWRIGHT_BROWSERS_PATH set "PLAYWRIGHT_BROWSERS_PATH=%WEBPILOT_SERVER_ROOT%ms-playwright"\r\nif not defined HOSTNAME set "HOSTNAME=0.0.0.0"\r\nif not defined PORT set "PORT=17890"\r\nif not defined NODE_ENV set "NODE_ENV=production"\r\nif not defined HEADLESS_BROWSER set "HEADLESS_BROWSER=true"\r\n\r\nif not exist "%APP_DATA_DIR%" mkdir "%APP_DATA_DIR%"\r\nif not exist "%ARTIFACTS_DIR%" mkdir "%ARTIFACTS_DIR%"\r\n\r\npushd "%WEBPILOT_SERVER_ROOT%server"\r\nnode webpilot-server.js\r\nset "WEBPILOT_SERVER_EXIT_CODE=%ERRORLEVEL%"\r\npopd\r\nexit /b %WEBPILOT_SERVER_EXIT_CODE%\r\n`;
   fs.writeFileSync(path.join(distributionRoot, 'start.cmd'), startScript.replace('PORT=17890', 'PORT=3000'), 'utf8');
 }
 
 function writeReadme() {
-  const readme = `# WebPilot HTTP Server\n\nRequirements: Node.js 22.13 or later. No npm install is required.\n\n1. Extract this directory.\n2. Run start.cmd.\n3. Open http://127.0.0.1:17890.\n\nThe service listens on all network interfaces by default. To change the port, run \`set PORT=3000 && start.cmd\` from Command Prompt, or set \`$env:PORT = '3000'; .\\start.cmd\` in PowerShell.\n\nRuntime data, artifacts, and browser profiles are written under the runtime directory unless APP_DATA_DIR or ARTIFACTS_DIR is set. Playwright Chromium is included in this package.\n`;
+  const readme = `# WebPilot HTTP Server\n\nRequirements: Node.js 22.16 or later. No npm install is required.\n\n1. Extract this directory.\n2. Run start.cmd.\n3. Open http://127.0.0.1:17890.\n\nLocal direct access uses WEBPILOT_DEFAULT_USER_ID (default: 1). For an online mounted deployment, set WEBPILOT_REQUIRE_MOUNT_USER_ID=true and pass userId to WebPilotQA.mount().\n\nThe service listens on all network interfaces by default. To change the port, run \`set PORT=3000 && start.cmd\` from Command Prompt, or set \`$env:PORT = '3000'; .\\start.cmd\` in PowerShell. HTTP and WebSocket traffic share this one public port.\n\nRuntime data, artifacts, and browser profiles are written under the runtime directory unless APP_DATA_DIR or ARTIFACTS_DIR is set. Playwright Chromium is included in this package.\n`;
   const packagedReadme = readme
     .replace('http://127.0.0.1:17890', 'http://127.0.0.1:3000')
     .replace('set PORT=3000 && start.cmd', 'set PORT=17890 && start.cmd')
@@ -93,16 +97,58 @@ function createArchive() {
   }
 }
 
-fs.rmSync(outputRoot, { recursive: true, force: true });
+function removePackageEntry(entryPath) {
+  try {
+    fs.rmSync(entryPath, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 200,
+    });
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? error.code : '';
+    if (code === 'EBUSY' || code === 'EPERM') {
+      throw new Error(`Unable to replace the existing server package because a file is in use: ${entryPath}. Stop the packaged server and try again.`, { cause: error });
+    }
+    throw error;
+  }
+}
+
+function prepareOutputDirectory() {
+  fs.mkdirSync(outputRoot, { recursive: true });
+  for (const entry of fs.readdirSync(outputRoot, { withFileTypes: true })) {
+    const entryPath = path.join(outputRoot, entry.name);
+    if (entry.name !== packageName) removePackageEntry(entryPath);
+  }
+
+  // Keep the package directory itself. On Windows, the calling PowerShell may
+  // still use this directory as its current location, which makes deleting the
+  // directory fail with EPERM even when no packaged server process is running.
+  fs.mkdirSync(distributionRoot, { recursive: true });
+  for (const entry of fs.readdirSync(distributionRoot, { withFileTypes: true })) {
+    removePackageEntry(path.join(distributionRoot, entry.name));
+  }
+}
+
+prepareOutputDirectory();
 copyDir(path.join(root, '.next', 'standalone'), serverRoot);
+copyCompleteNextRuntime(root, serverRoot);
 copyInto(path.join(root, '.next', 'static'), path.join(serverRoot, '.next', 'static'));
 copyInto(path.join(root, 'public'), path.join(serverRoot, 'public'));
+copyInto(path.join(root, 'server', 'webpilot-server.js'), path.join(serverRoot, 'webpilot-server.js'));
+copyInto(path.join(root, 'server', 'webpilot-identity.js'), path.join(serverRoot, 'webpilot-identity.js'));
 copyFfmpegStatic();
 copyPlaywrightChromium();
 
-if (!fs.existsSync(path.join(serverRoot, 'server.js'))) {
-  throw new Error('Next standalone server was not found. Run "npm run build" before packaging.');
+if (
+  !fs.existsSync(path.join(serverRoot, 'server.js'))
+  || !fs.existsSync(path.join(serverRoot, 'webpilot-server.js'))
+  || !fs.existsSync(path.join(serverRoot, 'webpilot-identity.js'))
+  || !fs.existsSync(path.join(serverRoot, 'node_modules', 'next', 'package.json'))
+) {
+  throw new Error('The standalone Next runtime required by the WebPilot custom server was not found. Run "npm run build" before packaging.');
 }
+assertCompleteNextRuntime(path.join(serverRoot, 'node_modules', 'next'), 'Packaged Next runtime');
 
 writeStartScript();
 writeReadme();

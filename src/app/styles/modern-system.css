@@ -4112,6 +4112,79 @@ input[type="checkbox"]:focus-visible {
   width: 36px;
 }
 
+.browser-chat-layout.sidebar-collapsed .automation-case-history-icon {
+  color: var(--muted-strong);
+  flex: 0 0 auto;
+}
+
+.browser-chat-layout.sidebar-collapsed .automation-case-history-icon.is-enabled,
+.browser-chat-layout.sidebar-collapsed .automation-case-history-item.active .automation-case-history-icon {
+  color: var(--accent-strong);
+}
+
+.browser-chat-layout.sidebar-collapsed .automation-case-history-icon.is-running {
+  color: var(--accent);
+}
+
+@media (min-width: 1025px) {
+  .browser-chat-layout.sidebar-collapsed :is(
+    .browser-chat-recent-list,
+    .automation-case-history-list
+  ) {
+    box-sizing: border-box;
+    justify-items: start;
+    margin-right: -10px;
+    padding: 10px 10px 0 0;
+    width: calc(100% + 10px);
+  }
+
+  .browser-chat-layout.sidebar-collapsed :is(
+    .browser-chat-recent-item,
+    .automation-case-history-item
+  ) {
+    isolation: isolate;
+    overflow: visible;
+    position: relative;
+  }
+
+  .browser-chat-layout.sidebar-collapsed .browser-chat-collapsed-delete {
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    box-shadow: 0 2px 7px color-mix(in srgb, var(--foreground) 14%, transparent);
+    color: var(--danger);
+    display: inline-flex;
+    height: 19px;
+    justify-content: center;
+    min-height: 19px;
+    opacity: 0;
+    padding: 0;
+    pointer-events: none;
+    position: absolute;
+    right: 0;
+    top: 0;
+    transform: translate(50%, -50%) scale(0.82);
+    transition: opacity var(--motion-fast) ease, transform var(--motion-fast) ease;
+    width: 19px;
+    z-index: 3;
+  }
+
+  .browser-chat-layout.sidebar-collapsed :is(
+    .browser-chat-recent-item,
+    .automation-case-history-item
+  ):is(:hover, :focus-within) > .browser-chat-collapsed-delete {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translate(50%, -50%) scale(1);
+  }
+
+  .browser-chat-layout.sidebar-collapsed .browser-chat-collapsed-delete:not(:disabled):hover {
+    background: color-mix(in srgb, var(--danger) 9%, var(--panel));
+    color: var(--danger);
+  }
+}
+
 @media (max-width: 1024px) {
   .browser-chat-recent-section,
   .browser-chat-layout.sidebar-collapsed .browser-chat-recent-section {

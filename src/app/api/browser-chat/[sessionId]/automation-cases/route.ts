@@ -22,8 +22,8 @@ function text(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
-function requestUserId(request: NextRequest, _body: RequestBody = {}) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function GET(request: NextRequest, context: RouteContext) {
@@ -38,7 +38,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
     const body = bodyRecord(await request.json().catch(() => ({})));
-    const userId = requestUserId(request, body);
+    const userId = requestUserId(request);
     const session = getBrowserChatSession(sessionId, userId);
     if (!session) return noStoreJson({ error: 'Browser chat session not found.' }, { status: 404 });
     const assistantMessageId = text(body.assistantMessageId ?? body.messageId);

@@ -26,8 +26,8 @@ function text(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
-function requestUserId(request: NextRequest, _body: RequestBody = {}) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 function normalizedTimezone(value: unknown) {
@@ -64,7 +64,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = bodyRecord(await request.json().catch(() => ({})));
-    const userId = requestUserId(request, body);
+    const userId = requestUserId(request);
     const recurrence = automationScheduleRecurrenceSchema.parse(body.recurrence ?? body.frequency);
     const time = text(body.time);
     if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)) {
@@ -111,7 +111,7 @@ export async function DELETE(request: NextRequest) {
     ?? request.nextUrl.searchParams.get('scheduleId'),
   );
   if (!scheduleId) return noStoreJson({ error: 'Schedule id is required.' }, { status: 400 });
-  const userId = requestUserId(request, body);
+  const userId = requestUserId(request);
   if (!deleteAutomationSchedule(scheduleId, userId)) {
     return noStoreJson({ error: 'Automation schedule not found.' }, { status: 404 });
   }

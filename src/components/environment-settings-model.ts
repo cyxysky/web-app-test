@@ -17,7 +17,7 @@ export function isAdministratorOnlySettingsTab(tab: SettingsTab) {
   return administratorOnlySettingsTabs.has(tab);
 }
 
-export function environmentSettingsTabsForUser(userId?: string, defaultUserId = '0') {
+export function environmentSettingsTabsForUser(userId?: string, defaultUserId = '1') {
   if ((userId || '').trim() === defaultUserId.trim()) return environmentSettingsTabs;
   return environmentSettingsTabs.filter((tab) => !administratorOnlySettingsTabs.has(tab.id));
 }

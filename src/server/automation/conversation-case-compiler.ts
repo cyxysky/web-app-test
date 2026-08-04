@@ -108,7 +108,7 @@ export function compileConversationCase(input: ConversationCaseCompilerInput): C
   const selectedTitle = text(input.title) || text(input.session.title) || instruction.slice(0, 80);
   const sourceMessageIds = [userMessage?.id, assistantMessage.id].filter((id): id is string => Boolean(id));
   return {
-    userId: idText(input.userId) || idText(input.session.userId) || '0',
+    userId: idText(input.userId) || idText(input.session.userId) || '1',
     title: selectedTitle,
     description: text(input.description) || undefined,
     sourceSessionId: input.session.id,

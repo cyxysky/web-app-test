@@ -14,15 +14,15 @@ type RouteContext = {
   params: Promise<{ id: string }>;
 };
 
-function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function PATCH(request: NextRequest, context: RouteContext) {
   try {
     const { id } = await context.params;
     const body = await request.json();
-    const userId = requestUserId(request, body);
+    const userId = requestUserId(request);
     const visibleItem = getPersonalMemoryItem(id, userId);
     if (visibleItem && visibleItem.userId !== userId) return noStoreJson({ error: 'Only the memory creator can edit this shared memory' }, { status: 403 });
     const item = updatePersonalMemoryItem(id, body && typeof body === 'object' && !Array.isArray(body) ? body : {}, userId);

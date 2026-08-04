@@ -168,13 +168,15 @@ function internalServerOrigin() {
 
 function launchRun(runId: string, userId: string) {
   const pathname = withWebPilotBasePath(
-    `/api/automation/runs/${encodeURIComponent(runId)}?userId=${encodeURIComponent(userId)}`,
+    `/api/automation/runs/${encodeURIComponent(runId)}`,
     WEBPILOT_BASE_PATH,
   );
   void fetch(new URL(pathname, internalServerOrigin()), {
     method: 'POST',
     headers: {
       'x-webpilot-automation-scheduler': '1',
+      'x-webpilot-internal-token': String(process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN || ''),
+      'x-webpilot-internal-user-id': userId,
     },
     cache: 'no-store',
   }).then(async (response) => {

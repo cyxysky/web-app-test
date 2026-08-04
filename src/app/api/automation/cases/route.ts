@@ -16,8 +16,8 @@ function text(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
-function requestUserId(request: NextRequest, _body: RequestBody = {}) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 function requestLimit(request: NextRequest) {
@@ -41,7 +41,7 @@ export async function POST(request: NextRequest) {
     const instruction = text(body.instruction ?? body.prompt);
     if (!title) throw new Error('Automation case title is required.');
     if (!instruction) throw new Error('Automation case instruction is required.');
-    const userId = requestUserId(request, body);
+    const userId = requestUserId(request);
     const automationCase = createAutomationCase({
       userId,
       title,

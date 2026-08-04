@@ -76,7 +76,7 @@ function now() {
 }
 
 function userId(value: string | number | undefined) {
-  return String(value ?? '').trim() || '0';
+  return String(value ?? '').trim() || '1';
 }
 
 function errorMessage(error: unknown) {

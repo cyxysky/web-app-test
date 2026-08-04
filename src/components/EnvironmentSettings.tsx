@@ -166,15 +166,13 @@ function sortPersonalMemoryItems(items: PersonalMemoryItem[]) {
   return [...items].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-function personalMemoryItemApiPath(item: Pick<PersonalMemoryItem, 'id' | 'userId'>, userId: string) {
-  const query = userId ? `?userId=${encodeURIComponent(userId)}` : '';
-  return withWebPilotBasePath(`/api/personal-memory/${encodeURIComponent(item.id)}${query}`);
+function personalMemoryItemApiPath(item: Pick<PersonalMemoryItem, 'id'>) {
+  return withWebPilotBasePath(`/api/personal-memory/${encodeURIComponent(item.id)}`);
 }
 
-function personalMemoryDraftApiPath(draft: PersonalMemoryDraft, userId: string) {
+function personalMemoryDraftApiPath(draft: PersonalMemoryDraft) {
   if (!draft.id) return withWebPilotBasePath('/api/personal-memory');
-  const query = userId ? `?userId=${encodeURIComponent(userId)}` : '';
-  return withWebPilotBasePath(`/api/personal-memory/${encodeURIComponent(draft.id)}${query}`);
+  return withWebPilotBasePath(`/api/personal-memory/${encodeURIComponent(draft.id)}`);
 }
 
 function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
@@ -226,7 +224,7 @@ export function EnvironmentSettings({
   activeTab: controlledActiveTab,
   adminSettingsAccessToken = '',
   adminSettingsPasswordRequired = false,
-  defaultUserId = '0',
+  defaultUserId = '1',
   embedded = false,
   initialData,
   onActiveTabChange,
@@ -275,7 +273,7 @@ export function EnvironmentSettings({
   const [deletePersonalMemoryTarget, setDeletePersonalMemoryTarget] = useState<PersonalMemoryItem | null>(null);
   const [deletePersonalMemoryError, setDeletePersonalMemoryError] = useState('');
   const [hasDirectoryPicker, setHasDirectoryPicker] = useState(false);
-  const normalizedDefaultUserId = defaultUserId.trim() || '0';
+  const normalizedDefaultUserId = defaultUserId.trim() || '1';
   const normalizedUserId = userId?.trim() || normalizedDefaultUserId;
   const visibleSettingsTabs = environmentSettingsTabsForUser(normalizedUserId, normalizedDefaultUserId);
   const requestedActiveTab = controlledActiveTab || internalActiveTab;
@@ -520,13 +518,13 @@ export function EnvironmentSettings({
   const loadPersonalMemoryItems = useCallback(async () => {
     setLoadingPersonalMemory(true);
     try {
-      const response = await fetch(withWebPilotBasePath(`/api/personal-memory?includeDisabled=true&userId=${encodeURIComponent(normalizedUserId)}`), { cache: 'no-store' });
+      const response = await fetch(withWebPilotBasePath('/api/personal-memory?includeDisabled=true'), { cache: 'no-store' });
       const data = await readApiJson<{ items?: PersonalMemoryItem[] }>(response, t('读取个性化记忆失败'));
       setPersonalMemoryItems(sortPersonalMemoryItems(Array.isArray(data.items) ? data.items : []));
     } finally {
       setLoadingPersonalMemory(false);
     }
-  }, [normalizedUserId, t]);
+  }, [t]);
 
   useEffect(() => {
     if (activeTab !== 'memory') return;
@@ -536,13 +534,13 @@ export function EnvironmentSettings({
   const loadLoginAccounts = useCallback(async () => {
     setLoadingLoginAccounts(true);
     try {
-      const response = await fetch(withWebPilotBasePath(`/api/login-accounts?userId=${encodeURIComponent(normalizedUserId)}`), { cache: 'no-store' });
+      const response = await fetch(withWebPilotBasePath('/api/login-accounts'), { cache: 'no-store' });
       const data = await readApiJson<{ accounts?: LoginAccountMetadata[] }>(response, t('读取登录账号失败'));
       setLoginAccounts(Array.isArray(data.accounts) ? data.accounts : []);
     } finally {
       setLoadingLoginAccounts(false);
     }
-  }, [normalizedUserId, t]);
+  }, [t]);
 
   useEffect(() => {
     if (activeTab !== 'accounts') return;
@@ -573,8 +571,7 @@ export function EnvironmentSettings({
     setDeleteLoginAccountError('');
     startGlobalLoading(t('正在删除登录账号'));
     try {
-      const query = `?userId=${encodeURIComponent(normalizedUserId)}`;
-      const response = await fetch(withWebPilotBasePath(`/api/login-accounts/${encodeURIComponent(account.id)}${query}`), { method: 'DELETE' });
+      const response = await fetch(withWebPilotBasePath(`/api/login-accounts/${encodeURIComponent(account.id)}`), { method: 'DELETE' });
       await readApiJson(response, t('删除登录账号失败'));
       setLoginAccounts((current) => current.filter((item) => item.id !== account.id));
       setDeleteLoginAccountTarget(null);
@@ -588,7 +585,6 @@ export function EnvironmentSettings({
 
   function personalMemoryPayload() {
     return {
-      userId: normalizedUserId,
       shared: personalMemoryDraft.shared,
       scope: personalMemoryDraft.scope,
       domain: personalMemoryDraft.scope === 'domain' ? personalMemoryDraft.domain.trim() : '',
@@ -614,7 +610,7 @@ export function EnvironmentSettings({
     setSavingPersonalMemory(true);
     startGlobalLoading(t(personalMemoryDraft.id ? '正在保存记忆' : '正在新增记忆'));
     try {
-      const response = await fetch(personalMemoryDraftApiPath(personalMemoryDraft, normalizedUserId), {
+      const response = await fetch(personalMemoryDraftApiPath(personalMemoryDraft), {
         method: personalMemoryDraft.id ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -633,7 +629,7 @@ export function EnvironmentSettings({
     if (item.userId !== normalizedUserId) return;
     setUpdatingPersonalMemoryId(item.id);
     try {
-      const response = await fetch(personalMemoryItemApiPath(item, normalizedUserId), {
+      const response = await fetch(personalMemoryItemApiPath(item), {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: item.status === 'active' ? 'disabled' : 'active' }),
@@ -664,7 +660,7 @@ export function EnvironmentSettings({
     setDeletePersonalMemoryError('');
     startGlobalLoading(t('正在删除记忆'));
     try {
-      const response = await fetch(personalMemoryItemApiPath(item, normalizedUserId), { method: 'DELETE' });
+      const response = await fetch(personalMemoryItemApiPath(item), { method: 'DELETE' });
       await readApiJson(response, t('删除个性化记忆失败'));
       setPersonalMemoryItems((current) => current.filter((entry) => entry.id !== item.id));
       if (personalMemoryDraft.id === item.id) closePersonalMemoryEditor();
@@ -957,7 +953,7 @@ export function EnvironmentSettings({
             <span>{t('{count} 条记录，存储于本地数据库', { count: personalMemoryItems.length })}</span>
           </div>
           <div className="personal-memory-head-actions">
-            <DataTransferButtons kind="memory" onImported={loadPersonalMemoryItems} userId={normalizedUserId} />
+            <DataTransferButtons kind="memory" onImported={loadPersonalMemoryItems} />
             <button className="ui-button ui-button--neutral" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">
               <RefreshCw size={15} />
               {t('刷新')}
@@ -1071,7 +1067,7 @@ export function EnvironmentSettings({
             <span>{t('{count} 个按域名保存的账号；密码只在后台解密并通过短期安全引用使用', { count: loginAccounts.length })}</span>
           </div>
           <div className="personal-memory-head-actions">
-            <DataTransferButtons kind="credentials" onImported={loadLoginAccounts} userId={normalizedUserId} />
+            <DataTransferButtons kind="credentials" onImported={loadLoginAccounts} />
             <button className="ui-button ui-button--neutral" disabled={loadingLoginAccounts} onClick={() => void loadLoginAccounts()} type="button">
               <RefreshCw size={15} />
               {t('刷新')}
@@ -1148,7 +1144,6 @@ export function EnvironmentSettings({
           onClose={() => setLoginAccountEditor(null)}
           onSaved={replaceLoginAccount}
           open={Boolean(loginAccountEditor)}
-          userId={normalizedUserId}
         />
         {renderDeleteLoginAccountModal()}
       </section>
@@ -1279,7 +1274,6 @@ export function EnvironmentSettings({
                     disabled={savingModel || loading}
                     kind="model"
                     onImported={reloadModelConfigAfterImport}
-                    userId={normalizedUserId}
                   />
                   <button className="ui-button ui-button--primary" disabled={savingModel || loading} onClick={saveModel} type="button">
                     {savingModel ? <Loader2 className="spin" size={15} /> : <Save size={15} />}

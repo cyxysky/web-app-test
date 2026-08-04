@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react';
 import {
   CalendarDays,
   CheckCircle2,
@@ -12,6 +12,7 @@ import {
   ExternalLink,
   Globe2,
   History,
+  ListChecks,
   Loader2,
   MessageSquare,
   Moon,
@@ -35,6 +36,10 @@ import { useI18n } from '@/i18n/I18nProvider';
 import type { Language } from '@/i18n/translations';
 import { readApiJson } from '@/lib/api-client';
 import { artifactApiUrl } from '@/lib/artifacts';
+import {
+  readSidebarCollapsedPreference,
+  writeSidebarCollapsedPreference,
+} from '@/lib/sidebar-collapse';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { useTheme } from '@/theme/ThemeProvider';
 
@@ -111,8 +116,6 @@ type ScheduleDraft = {
   weekday: string;
   timezone: string;
 };
-
-const SIDEBAR_COLLAPSED_STORAGE_KEY = 'webpilotqa.sidebarCollapsed';
 
 const emptyCaseDraft: CaseDraft = {
   name: '',
@@ -282,9 +285,10 @@ function normalizeRun(value: unknown, t: Translate): AutomationRun | undefined {
   };
 }
 
-function apiUrl(path: string, userId: string, params: Record<string, string> = {}) {
-  const search = new URLSearchParams({ userId, ...params });
-  return `${withWebPilotBasePath(path)}?${search.toString()}`;
+function apiUrl(path: string, _userId: string, params: Record<string, string> = {}) {
+  const search = new URLSearchParams(params);
+  const query = search.toString();
+  return `${withWebPilotBasePath(path)}${query ? `?${query}` : ''}`;
 }
 
 async function fetchCollection<T>(
@@ -529,16 +533,18 @@ function RunTimeline({ language, steps, t }: { language: Language; steps: Automa
 }
 
 export function AutomationWorkspace({
-  defaultUserId = '0',
+  defaultUserId = '1',
   initialCaseId = '',
+  initialSidebarCollapsed = false,
 }: {
   defaultUserId?: string;
   initialCaseId?: string;
+  initialSidebarCollapsed?: boolean;
 }) {
-  const userId = defaultUserId.trim() || '0';
+  const userId = defaultUserId.trim() || '1';
   const { mode: themeMode, toggleMode } = useTheme();
   const { language, t } = useI18n();
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(initialSidebarCollapsed);
   const [cases, setCases] = useState<AutomationCase[]>([]);
   const [schedules, setSchedules] = useState<AutomationSchedule[]>([]);
   const [runs, setRuns] = useState<AutomationRun[]>([]);
@@ -587,13 +593,11 @@ export function AutomationWorkspace({
     }
   }, [t, userId]);
 
-  useEffect(() => {
-    try {
-      setSidebarCollapsed(window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true');
-    } catch {
-      setSidebarCollapsed(false);
-    }
-  }, []);
+  useLayoutEffect(() => {
+    const storedSidebarCollapsed = readSidebarCollapsedPreference(initialSidebarCollapsed);
+    setSidebarCollapsed(storedSidebarCollapsed);
+    writeSidebarCollapsedPreference(storedSidebarCollapsed);
+  }, [initialSidebarCollapsed]);
 
   useEffect(() => {
     void loadAll();
@@ -669,11 +673,7 @@ export function AutomationWorkspace({
   function toggleSidebar() {
     setSidebarCollapsed((current) => {
       const next = !current;
-      try {
-        window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(next));
-      } catch {
-        // The workspace still works when browser storage is unavailable.
-      }
+      writeSidebarCollapsedPreference(next);
       return next;
     });
   }
@@ -733,7 +733,6 @@ export function AutomationWorkspace({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          userId,
           title: name,
           description: caseDraft.description.trim(),
           targetUrl,
@@ -762,7 +761,7 @@ export function AutomationWorkspace({
       const response = await fetch(apiUrl(`/api/automation/cases/${encodeURIComponent(item.id)}/runs`, userId), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId }),
+        body: JSON.stringify({}),
       });
       const payload = await readApiJson<unknown>(response, t('启动自动化用例失败'));
       const payloadRecord = asRecord(payload);
@@ -820,7 +819,6 @@ export function AutomationWorkspace({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          userId,
           title: name,
           caseId: scheduleDraft.caseId,
           recurrence: scheduleDraft.frequency,
@@ -934,7 +932,7 @@ export function AutomationWorkspace({
           <Link
             aria-label={t('对话模式')}
             className="browser-chat-nav-item"
-            href={`/browser-chat?userId=${encodeURIComponent(userId)}`}
+            href="/browser-chat"
             title={t('对话模式')}
           >
             <MessageSquare size={17} />
@@ -944,7 +942,7 @@ export function AutomationWorkspace({
             aria-current="page"
             aria-label={t('自动化')}
             className="browser-chat-nav-item active"
-            href={`/automation?userId=${encodeURIComponent(userId)}`}
+            href="/automation"
             title={t('自动化')}
           >
             <Workflow size={17} />
@@ -953,7 +951,7 @@ export function AutomationWorkspace({
           <Link
             aria-label={t('设置')}
             className="browser-chat-nav-item"
-            href={`/settings?userId=${encodeURIComponent(userId)}`}
+            href="/settings"
             title={t('设置')}
           >
             <Settings size={17} />
@@ -1010,10 +1008,22 @@ export function AutomationWorkspace({
                         title={item.name}
                         type="button"
                       >
-                        <span
-                          aria-hidden="true"
-                          className={itemActiveRuns.length ? 'automation-state-dot is-running' : item.enabled ? 'automation-state-dot is-enabled' : 'automation-state-dot'}
-                        />
+                        {sidebarCollapsed ? (
+                          <ListChecks
+                            aria-hidden="true"
+                            className={itemActiveRuns.length
+                              ? 'automation-case-history-icon is-running'
+                              : item.enabled
+                                ? 'automation-case-history-icon is-enabled'
+                                : 'automation-case-history-icon'}
+                            size={17}
+                          />
+                        ) : (
+                          <span
+                            aria-hidden="true"
+                            className={itemActiveRuns.length ? 'automation-state-dot is-running' : item.enabled ? 'automation-state-dot is-enabled' : 'automation-state-dot'}
+                          />
+                        )}
                         <span className="automation-case-history-copy">
                           <strong>{item.name}</strong>
                           <small>
@@ -1031,13 +1041,13 @@ export function AutomationWorkspace({
                       <span aria-label={t('{count} 次运行', { count: itemRuns.length })} className="automation-case-history-count">{itemRuns.length}</span>
                       <button
                         aria-label={t('删除用例“{name}”', { name: item.name })}
-                        className="ui-icon-button ui-icon-button--danger automation-case-history-delete"
+                        className="ui-icon-button ui-icon-button--danger automation-case-history-delete browser-chat-collapsed-delete"
                         disabled={Boolean(deletingCaseId)}
                         onClick={() => openDeleteCaseDialog(item)}
                         title={t('删除用例')}
                         type="button"
                       >
-                        <Trash2 size={14} />
+                        {sidebarCollapsed ? <X size={12} /> : <Trash2 size={14} />}
                       </button>
                     </div>
                   </li>
@@ -1267,7 +1277,7 @@ export function AutomationWorkspace({
                                         <Link
                                           aria-label={t('打开关联对话')}
                                           className="automation-icon-action"
-                                          href={`/browser-chat?userId=${encodeURIComponent(userId)}&sessionId=${encodeURIComponent(run.sessionId)}`}
+                                          href={`/browser-chat?sessionId=${encodeURIComponent(run.sessionId)}`}
                                           title={t('打开关联对话')}
                                         >
                                           <ExternalLink size={15} />

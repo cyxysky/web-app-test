@@ -10082,7 +10082,6 @@ body.is-dragging-embedded-tab * {
   font-weight: 550;
   max-width: min(200px, 100%);
   padding: 0px 4px;
-  vertical-align: middle;
 }
 
 .browser-chat-message-skill svg {

@@ -4,6 +4,10 @@ import path from 'node:path';
 import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
 import type { BrowserActionResult } from '@/server/browser/browser-session';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
+import {
+  generateFileBuffer,
+  type GeneratedFileInput,
+} from './document-artifact-generators';
 
 const FILE_DOWNLOAD_TIMEOUT_MS = 30000;
 const FILE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
@@ -17,11 +21,9 @@ type DownloadArtifactInput = {
   fileName?: string | null;
 };
 
-type MarkdownArtifactInput = {
+type GenerateArtifactInput = Omit<GeneratedFileInput, 'fileName'> & {
   runId?: string;
   fileName?: string | null;
-  title?: string | null;
-  content?: string | null;
 };
 
 type ArtifactToolPayload = {
@@ -33,6 +35,17 @@ type ArtifactToolPayload = {
   downloadUrl?: string;
   bytes?: number;
   sourceUrl?: string;
+};
+
+export type FileArtifactToolResult = {
+  name: string;
+  result?: unknown;
+};
+
+export type FileArtifactDownload = {
+  artifactId: string;
+  downloadUrl: string;
+  fileName: string;
 };
 
 function escapeMarkdownLinkLabel(value: string) {
@@ -49,13 +62,7 @@ function sanitizeFileName(value: string | undefined | null, fallback: string) {
   return cleaned || fallback;
 }
 
-function ensureMarkdownExtension(fileName: string) {
-  if (path.extname(fileName).toLowerCase() === '.md') return fileName;
-  const parsed = path.parse(fileName);
-  return `${parsed.name || fileName}.md`;
-}
-
-function artifactDir(runId: string | undefined, kind: 'downloads' | 'markdown') {
+function artifactDir(runId: string | undefined, kind: 'downloads' | 'generated') {
   return artifactPath(sanitizeFileName(runId, 'adhoc'), kind);
 }
 
@@ -81,7 +88,7 @@ function artifactResultPayload(input: {
   fileName: string;
   bytes: number;
   sourceUrl?: string;
-  kind: 'download' | 'markdown';
+  kind: 'download' | 'generated';
 }) {
   const root = artifactsRoot();
   const relative = path.relative(root, input.filePath).replace(/\\/g, '/');
@@ -101,10 +108,10 @@ function artifactResultPayload(input: {
 }
 
 export function formatFileArtifactResult(toolName: string, actual?: string) {
-  if (toolName !== 'downloadFile' && toolName !== 'generateMarkdownFile') return undefined;
+  if (toolName !== 'downloadFile' && toolName !== 'generateFile') return undefined;
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
-    const label = toolName === 'downloadFile' ? 'File downloaded' : 'Markdown file generated';
+    const label = toolName === 'downloadFile' ? 'File downloaded' : 'File generated';
     const fileName = payload.fileName || 'artifact';
     const target = payload.downloadUrl || payload.url || payload.path || '';
     const targetLine = target
@@ -216,30 +223,82 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
   }
 }
 
-export async function generateMarkdownArtifact(input: MarkdownArtifactInput): Promise<BrowserActionResult> {
+export async function generateFileArtifact(input: GenerateArtifactInput): Promise<BrowserActionResult> {
   try {
-    const body = String(input.content || '').trim();
-    if (!body) return { ok: false, actual: 'generateMarkdownFile failed: content is empty.' };
-
-    const requestedName = ensureMarkdownExtension(
-      sanitizeFileName(input.fileName || input.title || `markdown-${Date.now()}`, `markdown-${Date.now()}`),
+    if (!String(input.fileName || '').trim()) {
+      return { ok: false, actual: 'generateFile failed: fileName with a supported extension is required.' };
+    }
+    const requestedName = sanitizeFileName(
+      input.fileName,
+      `document-${Date.now()}.md`,
     );
-    const content = `${body}\n`;
-    const dir = artifactDir(input.runId, 'markdown');
+    const generated = await generateFileBuffer({
+      content: input.content,
+      fileName: requestedName,
+      sheets: input.sheets,
+      slides: input.slides,
+      title: input.title,
+    });
+    const dir = artifactDir(input.runId, 'generated');
     await mkdir(dir, { recursive: true });
     const target = await uniqueArtifactPath(dir, requestedName);
-    await writeFile(target.filePath, content, 'utf8');
+    await writeFile(target.filePath, generated.buffer);
 
     return {
       ok: true,
       actual: JSON.stringify(artifactResultPayload({
-        kind: 'markdown',
+        kind: 'generated',
         fileName: target.fileName,
         filePath: target.filePath,
-        bytes: Buffer.byteLength(content, 'utf8'),
+        bytes: generated.buffer.byteLength,
       })),
     };
   } catch (error) {
-    return { ok: false, actual: `generateMarkdownFile failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `generateFile failed: ${error instanceof Error ? error.message : String(error)}` };
   }
+}
+
+function verifiedArtifactDownloadUrl(value: unknown) {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  try {
+    const url = new URL(value, 'http://webpilot.local');
+    if (!url.pathname.includes('/api/artifacts/') || url.searchParams.get('download') !== '1') return undefined;
+    return value.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+export function fileArtifactDownloadFromToolResult(tool: FileArtifactToolResult): FileArtifactDownload | undefined {
+  if (tool.name !== 'downloadFile' && tool.name !== 'generateFile') return undefined;
+  if (!tool.result || typeof tool.result !== 'object' || !('ok' in tool.result) || tool.result.ok !== true) return undefined;
+  try {
+    const actual = 'actual' in tool.result && typeof tool.result.actual === 'string'
+      ? tool.result.actual
+      : '{}';
+    const payload = JSON.parse(actual) as ArtifactToolPayload;
+    const artifactId = String(payload.artifactId || '').trim();
+    const fileName = String(payload.fileName || '').trim();
+    const downloadUrl = verifiedArtifactDownloadUrl(payload.downloadUrl);
+    if (
+      !artifactId
+      || !fileName
+      || !downloadUrl
+      || artifactId.split('/').some((segment) => !segment || segment === '.' || segment === '..')
+    ) return undefined;
+    return { artifactId, downloadUrl, fileName };
+  } catch {
+    return undefined;
+  }
+}
+
+export function appendMissingFileArtifactDownloadLinks(reply: string, tools: FileArtifactToolResult[]) {
+  const downloads = tools
+    .map(fileArtifactDownloadFromToolResult)
+    .filter((item): item is FileArtifactDownload => Boolean(item));
+  const unique = [...new Map(downloads.map((item) => [item.artifactId, item])).values()];
+  const missing = unique.filter((item) => !reply.includes(item.downloadUrl));
+  if (!missing.length) return reply;
+  const links = missing.map((item) => `- [${escapeMarkdownLinkLabel(item.fileName)}](${item.downloadUrl})`).join('\n');
+  return [reply.trim(), `## 文件下载\n\n${links}`].filter(Boolean).join('\n\n');
 }

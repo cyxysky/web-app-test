@@ -2,7 +2,7 @@ export const WEBPILOT_EMBED_SDK = String.raw`
 (function () {
   'use strict';
 
-  var VERSION = '0.3.0';
+  var VERSION = '0.4.0';
   var ELEMENT_NAME = 'webpilot-browser-chat';
   var currentScript = document.currentScript;
 
@@ -60,7 +60,6 @@ export const WEBPILOT_EMBED_SDK = String.raw`
       var frameUrl = new URL(joinUrl(next.apiBaseUrl, '/browser-chat'));
       frameUrl.searchParams.set('webpilotEmbed', '1');
       if (next.sessionId) frameUrl.searchParams.set('sessionId', next.sessionId);
-      if (next.userId) frameUrl.searchParams.set('userId', next.userId);
       if (next.targetUrl) frameUrl.searchParams.set('targetUrl', next.targetUrl);
       next.iframeUrl = frameUrl.toString();
     }
@@ -137,6 +136,9 @@ export const WEBPILOT_EMBED_SDK = String.raw`
 
   function init(options) {
     options = Object.assign({ targetUrl: window.location.href }, options || {});
+    if (!String(options.userId || '').trim()) {
+      return Promise.reject(new Error('WebPilot mount requires userId.'));
+    }
     var apiBaseUrl = normalizeBaseUrl(options.apiBaseUrl);
     return fetch(joinUrl(apiBaseUrl, '/api/embed/browser-chat/init'), {
       method: 'POST',
@@ -202,7 +204,7 @@ export const WEBPILOT_EMBED_SDK = String.raw`
   if (currentScript && currentScript.dataset && currentScript.dataset.mount) {
     mount(currentScript.dataset.mount, {
       apiBaseUrl: currentScript.dataset.apiBaseUrl || defaultBaseUrl,
-      userId: currentScript.dataset.userId || currentScript.dataset.qzUserId || '',
+      userId: currentScript.dataset.userId || '',
       targetUrl: currentScript.dataset.targetUrl || window.location.href
     }).catch(function (error) {
       console.error('[WebPilotQA] auto mount failed:', error);

@@ -2,7 +2,6 @@ import { z } from 'zod';
 
 const text = (max: number) => z.string().trim().max(max);
 const optionalText = (max: number) => text(max).optional();
-const userId = z.union([z.string().trim().min(1).max(120), z.number().finite()]).optional();
 
 export const browserChatAttachmentSchema = z.object({
   id: text(120),
@@ -24,8 +23,6 @@ const browserChatSettingsSchema = z.object({
 export const createBrowserChatSessionRequestSchema = browserChatSettingsSchema.extend({
   targetUrl: text(4_000).default(''),
   title: optionalText(240),
-  userId,
-  qzUserId: userId,
 }).strict();
 
 export const sendBrowserChatMessageRequestSchema = browserChatSettingsSchema.extend({
@@ -33,8 +30,6 @@ export const sendBrowserChatMessageRequestSchema = browserChatSettingsSchema.ext
   clientMessageId: optionalText(120),
   attachments: z.array(browserChatAttachmentSchema).max(100).default([]),
   skillIds: z.array(text(120)).max(100).default([]),
-  userId,
-  qzUserId: userId,
 }).strict();
 
 export type CreateBrowserChatSessionRequest = z.infer<typeof createBrowserChatSessionRequestSchema>;

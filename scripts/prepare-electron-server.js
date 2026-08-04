@@ -1,5 +1,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const {
+  assertCompleteNextRuntime,
+  copyCompleteNextRuntime,
+} = require('./standalone-next-runtime');
 
 const root = path.resolve(__dirname, '..');
 const outputRoot = path.join(root, 'dist-desktop');
@@ -28,12 +32,21 @@ function copyFfmpegStatic() {
 
 fs.rmSync(outputRoot, { recursive: true, force: true });
 copyDir(path.join(root, '.next', 'standalone'), serverOutput);
+copyCompleteNextRuntime(root, serverOutput);
 copyInto(path.join(root, '.next', 'static'), path.join(serverOutput, '.next', 'static'));
 copyInto(path.join(root, 'public'), path.join(serverOutput, 'public'));
+copyInto(path.join(root, 'server', 'webpilot-server.js'), path.join(serverOutput, 'webpilot-server.js'));
+copyInto(path.join(root, 'server', 'webpilot-identity.js'), path.join(serverOutput, 'webpilot-identity.js'));
 copyFfmpegStatic();
 
-if (!fs.existsSync(path.join(serverOutput, 'server.js'))) {
-  throw new Error('Next standalone server was not found. Run next build with output: "standalone" first.');
+if (
+  !fs.existsSync(path.join(serverOutput, 'server.js'))
+  || !fs.existsSync(path.join(serverOutput, 'webpilot-server.js'))
+  || !fs.existsSync(path.join(serverOutput, 'webpilot-identity.js'))
+  || !fs.existsSync(path.join(serverOutput, 'node_modules', 'next', 'package.json'))
+) {
+  throw new Error('The standalone Next runtime required by the WebPilot custom server was not found. Run next build with output: "standalone" first.');
 }
+assertCompleteNextRuntime(path.join(serverOutput, 'node_modules', 'next'), 'Packaged Next runtime');
 
 console.log(`Prepared desktop server at ${serverOutput}`);

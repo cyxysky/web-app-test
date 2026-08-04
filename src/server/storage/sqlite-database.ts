@@ -11,8 +11,8 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 10;
-const defaultApplicationUserId = '0';
+const currentSchemaVersion = 12;
+const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
   'RUN_MEMORY_TIMELINE_LIMIT',
@@ -420,6 +420,10 @@ export function sqliteDatabasePath() {
 
 function initializeSchema(database: DatabaseSync) {
   database.exec(`
+    PRAGMA foreign_keys = OFF;
+    DROP TABLE IF EXISTS websocket_ticket;
+  `);
+  database.exec(`
     PRAGMA foreign_keys = ON;
     PRAGMA busy_timeout = 5000;
     PRAGMA journal_mode = WAL;
@@ -558,6 +562,20 @@ function initializeSchema(database: DatabaseSync) {
       value_json TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS websocket_ticket (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      user_id TEXT NOT NULL,
+      session_id TEXT,
+      scope TEXT NOT NULL,
+      origin TEXT,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      consumed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS websocket_ticket_token_idx
+      ON websocket_ticket(token_hash, expires_at);
   `);
 
   database.prepare(`
@@ -578,6 +596,11 @@ function initializeSchema(database: DatabaseSync) {
   database.prepare(`
     INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
     VALUES (10, 'browser-chat-realtime-outbox', ?)
+  `).run(new Date().toISOString());
+  database.prepare('DELETE FROM schema_migration WHERE version = 11').run();
+  database.prepare(`
+    INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
+    VALUES (12, 'mounted-identity-and-websocket-tickets', ?)
   `).run(new Date().toISOString());
 }
 
@@ -601,6 +624,13 @@ export function getSqliteDatabase() {
   runtimeState.databasePath = databasePath;
   runtimeState.schemaVersion = currentSchemaVersion;
   return database;
+}
+
+export function closeSqliteDatabase() {
+  runtimeState.database?.close();
+  runtimeState.database = undefined;
+  runtimeState.databasePath = undefined;
+  runtimeState.schemaVersion = undefined;
 }
 
 export function runSqliteTransaction<T>(operation: (database: DatabaseSync) => T): T {

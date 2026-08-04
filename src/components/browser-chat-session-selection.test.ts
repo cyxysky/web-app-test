@@ -8,14 +8,14 @@ import {
   shouldActivateRequestedBrowserChatSession,
 } from './browser-chat-session-selection';
 
-test('updates the selected conversation without discarding the user identity query', () => {
+test('updates the selected conversation and drops client-declared identity', () => {
   assert.equal(
     browserChatSessionNavigationHref('https://example.com/webpilot/browser-chat?userId=42&sessionId=old&targetUrl=https%3A%2F%2Fexample.com', 'chat-new'),
-    '/webpilot/browser-chat?userId=42&sessionId=chat-new',
+    '/webpilot/browser-chat?sessionId=chat-new',
   );
   assert.equal(
     browserChatSessionNavigationHref('https://example.com/webpilot/browser-chat?userId=42&sessionId=old', ''),
-    '/webpilot/browser-chat?userId=42',
+    '/webpilot/browser-chat',
   );
 });
 
@@ -25,10 +25,10 @@ test('selects the session requested by the mounted browser-chat URL', () => {
   assert.equal(findRequestedBrowserChatSession(sessions, ' chat-mounted '), sessions[1]);
 });
 
-test('preserves mounted identity when navigating between chat and settings', () => {
+test('preserves mounted view state without carrying client-declared identity', () => {
   assert.equal(
     browserChatViewNavigationHref('/webpilot/settings', 'https://example.com/webpilot/browser-chat?webpilotEmbed=1&userId=42&sessionId=chat-1'),
-    '/webpilot/settings?webpilotEmbed=1&userId=42&sessionId=chat-1',
+    '/webpilot/settings?webpilotEmbed=1&sessionId=chat-1',
   );
 });
 

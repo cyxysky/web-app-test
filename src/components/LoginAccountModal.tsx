@@ -42,7 +42,6 @@ export function LoginAccountModal({
   onClose,
   onSaved,
   open,
-  userId,
 }: {
   account?: LoginAccountMetadata;
   initialDomain?: string;
@@ -52,7 +51,6 @@ export function LoginAccountModal({
   onClose: () => void;
   onSaved: (account: LoginAccountMetadata) => void;
   open: boolean;
-  userId?: string;
 }) {
   const { t } = useI18n();
   const [portalReady, setPortalReady] = useState(false);
@@ -108,8 +106,6 @@ export function LoginAccountModal({
         shared,
       };
       if (password) body.password = password;
-      const effectiveUserId = userId || account?.userId;
-      if (effectiveUserId) body.userId = effectiveUserId;
       const response = await fetch(withWebPilotBasePath(account ? `/api/login-accounts/${encodeURIComponent(account.id)}` : '/api/login-accounts'), {
         method: account ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -172,7 +168,7 @@ export function LoginAccountModal({
           <div className="resource-sharing-field wide">
             <div>
               <strong>{t('所有 ID 共享')}</strong>
-              <small>{t('其他 ID 可以调用此账号，但只有创建 ID {id} 可以编辑或删除', { id: account?.userId || userId || '0' })}</small>
+              <small>{t('其他 ID 可以调用此账号，但只有创建 ID {id} 可以编辑或删除', { id: account?.userId || '当前用户' })}</small>
             </div>
             <button aria-pressed={shared} className={`settings-toggle${shared ? ' on' : ''}`} disabled={saving} onClick={() => setShared((value) => !value)} type="button">
               <span />

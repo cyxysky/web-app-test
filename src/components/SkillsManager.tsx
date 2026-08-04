@@ -79,12 +79,10 @@ function statusLabel(status: SkillRecord['status']) {
   return '可用';
 }
 
-export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => void; userId?: string } = {}) {
+export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => void; userId?: string } = {}) {
   const { t } = useI18n();
-  const normalizedUserId = userId.trim() || '0';
-  const skillsApiUrl = useCallback((path: string) => (
-    `${withWebPilotBasePath(path)}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(normalizedUserId)}`
-  ), [normalizedUserId]);
+  const normalizedUserId = userId.trim() || '1';
+  const skillsApiUrl = useCallback((path: string) => withWebPilotBasePath(path), []);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [expandedSkillIds, setExpandedSkillIds] = useState<string[]>([]);
   const [portalReady, setPortalReady] = useState(false);
@@ -198,7 +196,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
       const response = await fetch(skillsApiUrl(skillId ? `/api/skills/${skillId}` : '/api/skills'), {
         method: skillId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...payload, userId: normalizedUserId }),
+        body: JSON.stringify(payload),
       });
       const data = await readApiJson<SkillMutationResponse>(response, t('保存 Skill 失败'));
       if (!data.skill) throw new Error(t('保存 Skill 失败'));
@@ -246,7 +244,7 @@ export function SkillsManager({ onChanged, userId = '0' }: { onChanged?: () => v
           <h2>{t('Skills 管理')}</h2>
         </div>
         <div className="personal-memory-head-actions">
-          <DataTransferButtons kind="skills" onImported={loadSkills} userId={normalizedUserId} />
+          <DataTransferButtons kind="skills" onImported={loadSkills} />
           <button className="ui-button ui-button--primary" onClick={openCreateSkill} type="button">
             <Plus size={15} />
             {t('新建 Skill')}

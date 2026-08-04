@@ -14,6 +14,7 @@ export function browserCodeRules() {
     '- The code runtime also exposes browser/tab: browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, and tab.cua. browser.user.openTabs() returns only tabs owned by the current conversation group, including tab id, active state, URL, title, groupId, and groupTitle; ungrouped and other-group tabs are excluded. These are JavaScript APIs inside the same browserCode tool.',
     '- To insert text at an exact middle position in an input, textarea, or contenteditable, use await page.insertTextAt(locator, { text, afterText }) or beforeText/offset. It supports locators inside frames, establishes the caret without changing content through DOM script, and performs the insertion through the real keyboard. Use occurrence for a repeated anchor and verify the resulting value/text afterward.',
     '- DOM code belongs inside page.evaluate. The surrounding JavaScript module runs in an isolated Node process.',
+    '- The page/Playwright browser runs on the backend. Never create user files with page.evaluate Blob/object URLs, window.open, an HTML download attribute, or a page download click, and never treat those actions as user delivery. Use generateFile for new files or downloadFile for an existing HTTP(S) resource; only the returned current-session Artifact download URL proves delivery.',
     '- Do not import modules or access Node globals, local files, environment variables, cookies, browser storage, or raw credential values. When the prompt supplies a credential reference, use only await credentialVault.fill(locator, ref); never read the filled field value or write credentials/references to outputs or logs.',
   ];
 }
@@ -30,6 +31,7 @@ export function browserChatCodeRules(screenshotAvailable = true) {
       ? '- For a Playwright-indescribable visual control only, emit a fresh viewport image with nodeRepl.emitImage(await page.screenshot({fullPage:false})) and end the cell; after the model sees that image, one coordinate/CUA action may be performed in the next cell. Full-page images are read-only, and navigation, viewport change, or DOM redraw invalidates the image.'
       : '- Image and coordinate targeting are unavailable; use Playwright locators or DOM evidence.',
     '- For tabs/windows, use context.pages() or the available browser.tabs/browser.user/tab.playwright/tab.cua APIs. browser.user.openTabs() exposes active and group metadata for continuation. When given a credential reference, use credentialVault.fill(locator, ref) only; never read or output credential values or references.',
+    '- File delivery is outside the backend test page. Do not use Blob/object URLs, window.open, HTML download attributes, or page download clicks to generate or claim a user file. Call generateFile for new content or downloadFile for an existing HTTP(S) resource, and report success only with the returned current-session Artifact download URL.',
   ];
 }
 

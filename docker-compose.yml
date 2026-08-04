@@ -7,7 +7,6 @@ services:
     image: webpilot-qa:latest
     ports:
       - "3000:3000"
-      - "${BROWSER_CHAT_PREVIEW_WS_PORT:-18021}:${BROWSER_CHAT_PREVIEW_WS_PORT:-18021}"
     env_file:
       - .env
     environment:
@@ -16,6 +15,8 @@ services:
       HOSTNAME: 0.0.0.0
       PORT: "3000"
       BROWSER_CHAT_PREVIEW_WS_PORT: "${BROWSER_CHAT_PREVIEW_WS_PORT:-18021}"
+      WEBPILOT_DEFAULT_USER_ID: "${WEBPILOT_DEFAULT_USER_ID:-1}"
+      WEBPILOT_REQUIRE_MOUNT_USER_ID: "${WEBPILOT_REQUIRE_MOUNT_USER_ID:-true}"
     volumes:
       - ./.data:/app/.data
       - ./artifacts:/app/artifacts

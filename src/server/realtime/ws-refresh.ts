@@ -7,6 +7,7 @@ import {
   encodeWebSocketText,
   listenWebSocketServer,
 } from '@/server/realtime/websocket-transport';
+import { consumeWebSocketTicket } from '@/server/auth/websocket-ticket';
 
 export type RefreshEntityType = 'browserChatSession';
 
@@ -45,7 +46,7 @@ type RefreshWebSocketState = {
   versions: Map<string, number>;
 };
 
-const REFRESH_STATE_VERSION = 2;
+const REFRESH_STATE_VERSION = 3;
 const REFRESH_RELAY_PATH = '/publish';
 const REFRESH_SERVICE_NAME = 'webpilot-refresh-websocket';
 const REFRESH_SERVICE_HEADER = 'x-webpilot-refresh-service';
@@ -202,10 +203,7 @@ function discoverRefreshWebSocketServerAtPort(port: number) {
 
 async function discoverRefreshWebSocketServer() {
   const firstPort = refreshWebSocketPortStart();
-  const candidates = await Promise.all(
-    Array.from({ length: 20 }, (_, index) => discoverRefreshWebSocketServerAtPort(firstPort + index)),
-  );
-  return candidates.find((candidate) => candidate !== undefined);
+  return discoverRefreshWebSocketServerAtPort(firstPort);
 }
 
 function removeClient(client: RefreshClient) {
@@ -264,13 +262,21 @@ function createRefreshServer() {
       netSocket.destroy();
       return;
     }
-    const userId = (url.searchParams.get('userId') || url.searchParams.get('qzUserId') || '').trim() || '0';
+    const auth = consumeWebSocketTicket({
+      origin: String(request.headers.origin || '').trim(),
+      scope: 'realtime-refresh',
+      ticket: (url.searchParams.get('ticket') || '').trim(),
+    });
+    if (!auth) {
+      netSocket.destroy();
+      return;
+    }
     if (!acceptWebSocketUpgrade(request, netSocket)) {
       netSocket.destroy();
       return;
     }
 
-    const client: RefreshClient = { buffer: Buffer.alloc(0), socket: netSocket, userId };
+    const client: RefreshClient = { buffer: Buffer.alloc(0), socket: netSocket, userId: auth.userId };
     state().clients.add(client);
     netSocket.setNoDelay(true);
     netSocket.on('data', (chunk) => handleClientData(client, chunk));
@@ -303,7 +309,7 @@ export async function ensureRefreshWebSocketServer(): Promise<RefreshWebSocketIn
     const server = createRefreshServer();
     const port = await listenWebSocketServer(server, requestedPort, {
       host: '127.0.0.1',
-      nextPortOnAddressInUse: true,
+      nextPortOnAddressInUse: false,
     });
     current.server = server;
     current.port = port;

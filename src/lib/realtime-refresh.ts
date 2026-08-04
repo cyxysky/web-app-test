@@ -25,7 +25,6 @@ let socket: WebSocket | undefined;
 let reconnectTimer: number | undefined;
 let reconnectDelay = 800;
 let connecting = false;
-let currentUserId = '0';
 
 function scheduleReconnect() {
   if (reconnectTimer || !listeners.size) return;
@@ -37,8 +36,8 @@ function scheduleReconnect() {
 }
 
 async function refreshWebSocketUrl() {
-  const endpoint = `${withWebPilotBasePath('/api/realtime/ws')}?userId=${encodeURIComponent(currentUserId)}`;
-  const response = await fetch(endpoint, { cache: 'no-store' });
+  const endpoint = withWebPilotBasePath('/api/realtime/ws');
+  const response = await fetch(endpoint, { cache: 'no-store', method: 'POST' });
   const data = await response.json();
   if (!response.ok || typeof data.url !== 'string') throw new Error(data.error || 'Realtime WebSocket is unavailable');
   return data.url as string;
@@ -91,12 +90,7 @@ function closeIfIdle() {
   socket = undefined;
 }
 
-export function subscribeRealtimeRefresh(
-  listener: RefreshListener,
-  options: { userId?: string } = {},
-) {
-  const nextUserId = options.userId?.trim() || '0';
-  if (!listeners.size) currentUserId = nextUserId;
+export function subscribeRealtimeRefresh(listener: RefreshListener) {
   listeners.add(listener);
   void connectRefreshWebSocket();
   return () => {

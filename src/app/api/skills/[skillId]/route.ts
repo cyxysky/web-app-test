@@ -15,8 +15,8 @@ function normalizeStatus(value: unknown): SkillRecord['status'] {
   return status === 'draft' || status === 'ready' || status === 'disabled' ? status as SkillRecord['status'] : 'ready';
 }
 
-function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function GET(request: NextRequest, context: RouteContext) {
@@ -30,7 +30,7 @@ export async function PUT(request: NextRequest, context: RouteContext) {
   const { skillId } = await context.params;
   try {
     const body = await request.json();
-    const userId = requestUserId(request, body);
+    const userId = requestUserId(request);
     const current = store.getSkill(skillId, userId);
     if (!current) return NextResponse.json({ error: 'Skill not found' }, { status: 404 });
     if (current.userId !== userId) return NextResponse.json({ error: 'Only the Skill creator can edit this shared Skill' }, { status: 403 });

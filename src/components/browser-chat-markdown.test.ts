@@ -22,6 +22,26 @@ test('keeps valid Markdown and code spans intact', () => {
   assert.equal(normalizeBrowserChatMarkdown(markdown), markdown);
 });
 
+test('keeps a hash table header and artifact links as one GFM table', () => {
+  const markdown = [
+    '## 文件下载',
+    '',
+    '| # | 格式 | 文件名 | 下载 |',
+    '|---|---|---|---|',
+    '| 1 | **MD** | `report.md` | [下载](/api/artifacts/chat_1/generated/report.md?download=1) |',
+    '| 2 | **Word** | `report.docx` | [下载](/api/artifacts/chat_1/generated/report.docx?download=1) |',
+  ].join('\n');
+  const normalized = normalizeBrowserChatMarkdown(markdown);
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    remarkPlugins: [remarkGfm],
+  }, normalized));
+
+  assert.equal(normalized, markdown);
+  assert.match(html, /<table>/);
+  assert.match(html, /<th>#<\/th>/);
+  assert.match(html, /report\.docx/);
+});
+
 test('renders emphasized URLs correctly before Chinese punctuation', () => {
   const messages = [
     '已为您打开 **https://10.10.0.90**。需要继续操作吗？',

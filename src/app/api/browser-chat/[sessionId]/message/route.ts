@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { sendBrowserChatMessage } from '@/server/ai/agents/browser-chat.service';
-import { sendBrowserChatMessageRequestSchema, type SendBrowserChatMessageRequest } from '@/server/http/browser-chat-request.schema';
+import { sendBrowserChatMessageRequestSchema } from '@/server/http/browser-chat-request.schema';
 import { noStoreJson } from '@/server/http/no-store-response';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
@@ -11,8 +11,8 @@ type RouteContext = {
   params: Promise<{ sessionId: string }>;
 };
 
-function requestUserId(request: NextRequest, _body?: Pick<SendBrowserChatMessageRequest, 'userId' | 'qzUserId'>) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {
@@ -28,7 +28,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
       body.clientMessageId,
       body.attachments,
       body.skillIds,
-      requestUserId(request, body),
+      requestUserId(request),
     );
     return noStoreJson({ session });
   } catch (error) {

@@ -11,8 +11,6 @@ export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 const createSchema = z.object({
-  userId: z.union([z.string(), z.number()]).optional(),
-  qzUserId: z.union([z.string(), z.number()]).optional(),
   domain: z.string().trim().min(1).max(1_000),
   username: z.string().trim().min(1).max(500),
   password: z.string().min(1).max(4_000),
@@ -22,8 +20,8 @@ const createSchema = z.object({
   shared: z.boolean().optional(),
 }).strict();
 
-function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 function publicError(error: unknown) {
@@ -49,7 +47,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = createSchema.parse(await request.json());
     const account = createLoginAccount({
-      userId: requestUserId(request, body),
+      userId: requestUserId(request),
       domain: body.domain,
       username: body.username,
       password: body.password,

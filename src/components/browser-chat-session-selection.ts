@@ -36,6 +36,8 @@ export function browserChatViewNavigationHref(targetHref: string, currentHref: s
   const current = new URL(currentHref);
   const target = new URL(targetHref, current);
   target.search = current.search;
+  target.searchParams.delete('userId');
+  target.searchParams.delete('qzUserId');
   return `${target.pathname}${target.search}${target.hash}`;
 }
 
@@ -45,5 +47,7 @@ export function browserChatSessionNavigationHref(currentHref: string, sessionId?
   if (normalizedSessionId) current.searchParams.set('sessionId', normalizedSessionId);
   else current.searchParams.delete('sessionId');
   current.searchParams.delete('targetUrl');
+  current.searchParams.delete('userId');
+  current.searchParams.delete('qzUserId');
   return `${current.pathname}${current.search}${current.hash}`;
 }

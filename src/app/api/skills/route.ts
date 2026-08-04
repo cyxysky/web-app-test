@@ -6,8 +6,8 @@ import { requestApplicationUserId } from '@/server/auth/user-context';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function GET(request: NextRequest) {
@@ -30,7 +30,7 @@ export async function POST(request: NextRequest) {
       sourceSessionId: typeof body.sourceSessionId === 'string' ? body.sourceSessionId : undefined,
       status: ['draft', 'ready', 'disabled'].includes(String(body.status)) ? body.status : 'ready',
       shared: body.shared === true,
-      userId: requestUserId(request, body),
+      userId: requestUserId(request),
     });
     return NextResponse.json({ skill });
   } catch (error) {

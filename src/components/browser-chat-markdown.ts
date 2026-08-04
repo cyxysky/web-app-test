@@ -1,7 +1,7 @@
 function restoreCollapsedMarkdownBlocks(value: string) {
   return value
     .replace(/[ \t]+---[ \t]+/g, '\n\n---\n\n')
-    .replace(/([^\n])[ \t]+(?=#{1,6}[ \t]+)/g, '$1\n\n')
+    .replace(/([^\n|])[ \t]+(?=#{1,6}[ \t]+[^|\n])/g, '$1\n\n')
     .replace(/\|[ \t]+\|/g, '|\n|')
     .replace(/(^|\n)([^\n|]*\S)[ \t]+(?=\|[^\n]+\|\n\|[ \t]*:?-{3,})/g, '$1$2\n\n')
     .replace(/\|[ \t]+(?=\*\*[^*\n]{1,80}\*\*[ \t]*[:：])/g, '|\n\n');

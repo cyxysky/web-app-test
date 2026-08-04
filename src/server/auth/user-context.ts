@@ -1,4 +1,6 @@
-const FALLBACK_APPLICATION_USER_ID = '0';
+import { timingSafeEqual } from 'node:crypto';
+
+const FALLBACK_APPLICATION_USER_ID = '1';
 
 export function defaultApplicationUserId(env: NodeJS.ProcessEnv | { WEBPILOT_DEFAULT_USER_ID?: string } = process.env) {
   return String(env.WEBPILOT_DEFAULT_USER_ID || '').trim() || FALLBACK_APPLICATION_USER_ID;
@@ -17,16 +19,37 @@ export function applicationUserRuntimeKey(value: unknown) {
   return `user:${normalizeApplicationUserId(value)}`;
 }
 
-export function requestApplicationUserId(request: Pick<Request, 'url'>, claimedIdentity?: unknown) {
-  const claimed = claimedIdentity && typeof claimedIdentity === 'object'
-    ? claimedIdentity as { qzUserId?: unknown; userId?: unknown }
-    : undefined;
-  const url = new URL(request.url);
-  return normalizeApplicationUserId(
-    claimed?.userId
-    ?? claimed?.qzUserId
-    ?? url.searchParams.get('userId')
-    ?? url.searchParams.get('qzUserId'),
-  );
+export type ApplicationPrincipal = {
+  roles: string[];
+  userId: string;
+  username: string;
+};
+
+function trustedAuthenticationHeaders(request: Pick<Request, 'headers'>) {
+  const expected = String(process.env.WEBPILOT_IDENTITY_HEADER_SECRET || '');
+  const supplied = String(request.headers.get('x-webpilot-identity-proof') || '');
+  if (!expected || !supplied) return false;
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  const suppliedBuffer = Buffer.from(supplied, 'utf8');
+  return expectedBuffer.length === suppliedBuffer.length && timingSafeEqual(expectedBuffer, suppliedBuffer);
+}
+
+export function requestApplicationPrincipal(request: Pick<Request, 'headers'>): ApplicationPrincipal {
+  if (!trustedAuthenticationHeaders(request)) throw new Error('Authentication required');
+  const userId = String(request.headers.get('x-webpilot-identity-user-id') || '').trim();
+  const username = String(request.headers.get('x-webpilot-identity-username') || '').trim();
+  if (!userId || !username) throw new Error('Authentication required');
+  return {
+    userId: normalizeApplicationUserId(userId),
+    username,
+    roles: String(request.headers.get('x-webpilot-identity-roles') || '')
+      .split(',')
+      .map((role) => role.trim())
+      .filter(Boolean),
+  };
+}
+
+export function requestApplicationUserId(request: Pick<Request, 'headers'>) {
+  return requestApplicationPrincipal(request).userId;
 }
 

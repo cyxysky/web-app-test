@@ -45,13 +45,11 @@ export function DataTransferButtons({
   disabled = false,
   kind,
   onImported,
-  userId,
 }: {
   authorizationToken?: string;
   disabled?: boolean;
   kind: DataTransferKind;
   onImported?: () => Promise<void> | void;
-  userId: string;
 }) {
   const { t } = useI18n();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -73,7 +71,7 @@ export function DataTransferButtons({
         'Content-Type': 'application/json',
         ...(authorizationToken ? { Authorization: `Bearer ${authorizationToken}` } : {}),
       },
-      body: JSON.stringify({ ...body, kind, userId }),
+      body: JSON.stringify({ ...body, kind }),
     });
     return response;
   }

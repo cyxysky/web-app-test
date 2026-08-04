@@ -6,22 +6,20 @@ import { requestApplicationUserId } from '@/server/auth/user-context';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json().catch((): { ids?: unknown; userId?: unknown; qzUserId?: unknown } => ({})) as {
+    const body = await request.json().catch((): { ids?: unknown } => ({})) as {
       ids?: unknown;
-      userId?: unknown;
-      qzUserId?: unknown;
     };
     const ids = Array.isArray(body.ids)
       ? body.ids.filter((item: unknown): item is string => typeof item === 'string')
       : [];
     if (!ids.length) return noStoreJson({ error: 'No browser chat sessions selected' }, { status: 400 });
-    const result = await deleteBrowserChatSessions(ids, requestUserId(request, body));
+    const result = await deleteBrowserChatSessions(ids, requestUserId(request));
     return noStoreJson({ ok: true, ...result });
   } catch (error) {
     return noStoreJson(

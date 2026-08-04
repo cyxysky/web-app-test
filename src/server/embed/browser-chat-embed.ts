@@ -197,13 +197,6 @@ export function publicBaseUrl(request: NextRequest | Request) {
   return joinWebPilotUrl(publicOrigin, WEBPILOT_BASE_PATH).replace(/\/+$/g, '');
 }
 
-export function requestUserId(request: NextRequest, body?: { userId?: unknown; qzUserId?: unknown }) {
-  return normalizeString(body?.userId)
-    || normalizeString(body?.qzUserId)
-    || normalizeString(request.nextUrl.searchParams.get('userId'))
-    || normalizeString(request.nextUrl.searchParams.get('qzUserId'));
-}
-
 export function requestOrigin(request: NextRequest | Request) {
   return normalizeString(request.headers.get('origin'));
 }

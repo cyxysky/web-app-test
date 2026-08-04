@@ -10,22 +10,16 @@ type RouteContext = {
   params: Promise<{ caseId: string }>;
 };
 
-type RequestBody = Record<string, unknown>;
-
-function requestUserId(request: NextRequest, _body: RequestBody) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {
   const { caseId } = await context.params;
   try {
-    const parsed = await request.json().catch(() => ({}));
-    const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as RequestBody
-      : {};
     const run = enqueueAutomationCaseRun({
       caseId,
-      userId: requestUserId(request, body),
+      userId: requestUserId(request),
       trigger: 'manual',
     });
     return noStoreJson({ ok: true, run }, { status: 202 });

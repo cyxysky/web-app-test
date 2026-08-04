@@ -105,6 +105,10 @@ import {
   type BrowserChatHistoryState,
 } from '@/components/browser-chat-history-controller';
 import { normalizeBrowserChatMarkdown } from '@/components/browser-chat-markdown';
+import {
+  readSidebarCollapsedPreference,
+  writeSidebarCollapsedPreference,
+} from '@/lib/sidebar-collapse';
 import type { EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
 import {
   environmentSettingsTabsForUser,
@@ -294,7 +298,6 @@ const BrowserChatToolDialog = dynamic(
   { ssr: false },
 );
 
-const SIDEBAR_COLLAPSED_STORAGE_KEY = 'webpilotqa.sidebarCollapsed';
 const EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY = 'webpilotqa.embeddedChatCollapsed';
 
 function browserChatViewForPathname(pathname: string, fallback: BrowserChatView): BrowserChatView {
@@ -310,16 +313,6 @@ function navigateBrowserChatView(href: string) {
   const nextHref = browserChatViewNavigationHref(targetHref, window.location.href);
   if (`${window.location.pathname}${window.location.search}${window.location.hash}` === nextHref) return;
   window.history.pushState(null, '', nextHref);
-}
-
-function readStoredSidebarCollapsed() {
-  if (typeof window === 'undefined') return false;
-  return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true';
-}
-
-function writeStoredSidebarCollapsed(collapsed: boolean) {
-  if (typeof window === 'undefined') return;
-  window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, collapsed ? 'true' : 'false');
 }
 
 function readStoredEmbeddedChatCollapsed() {
@@ -2365,7 +2358,7 @@ const BrowserChatReferenceChip = memo(function BrowserChatReferenceChip({
 function BrowserChatSkillChip({ skill }: { skill: { description: string; id: string; title: string } }) {
   return (
     <span className="browser-chat-message-skill" title={skill.description}>
-      <Braces size={13} />
+      <Braces size={16} />
       <span>{skill.title}</span>
     </span>
   );
@@ -5322,8 +5315,8 @@ function BrowserChatWebPreviewModal({
     const connect = async () => {
       try {
         const response = await fetch(
-          `${withWebPilotBasePath('/api/browser-chat/preview-stream')}?userId=${encodeURIComponent(userId)}`,
-          { cache: 'no-store' },
+          `${withWebPilotBasePath('/api/browser-chat/preview-stream')}?sessionId=${encodeURIComponent(sessionId)}`,
+          { cache: 'no-store', method: 'POST' },
         );
         const data = await response.json() as { error?: string; transport?: 'image' | 'video'; url?: string };
         if (!response.ok || !data.url) throw new Error(data.error || '实时界面连接失败');
@@ -5338,7 +5331,6 @@ function BrowserChatWebPreviewModal({
         const url = new URL(data.url);
         url.searchParams.set('sessionId', sessionId);
         url.searchParams.set('transport', requestedTransport);
-        url.searchParams.set('userId', userId);
         const stream = new WebSocket(url);
         stream.binaryType = 'arraybuffer';
         streamRef.current = stream;
@@ -6993,17 +6985,19 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
 export function BrowserChatWorkspace({
   adminSettingsPasswordRequired = false,
   defaultUserId,
+  initialSidebarCollapsed = false,
   initialView = 'chat',
   initialSettings,
 }: {
   adminSettingsPasswordRequired?: boolean;
   defaultUserId: string;
+  initialSidebarCollapsed?: boolean;
   initialView?: BrowserChatView;
   initialSettings?: EnvironmentSettingsInitialData;
 }) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const queryUserId = searchParams.get('userId')?.trim() || searchParams.get('qzUserId')?.trim() || defaultUserId.trim() || '0';
+  const queryUserId = defaultUserId.trim() || '1';
   const querySessionId = searchParams.get('sessionId')?.trim() || '';
   const queryTargetUrl = searchParams.get('targetUrl')?.trim() || '';
   const mountedIdentityRef = useRef<{ sessionId: string; targetUrl: string; userId: string } | null>(null);
@@ -7014,9 +7008,7 @@ export function BrowserChatWorkspace({
   const requestedSessionId = mountedIdentityRef.current?.sessionId || querySessionId;
   const requestedTargetUrl = mountedIdentityRef.current?.targetUrl || queryTargetUrl;
   const visibleSettingsTabs = environmentSettingsTabsForUser(requestUserId, defaultUserId);
-  const browserChatApiUrl = useCallback((path: string) => (
-    `${withWebPilotBasePath(path)}${path.includes('?') ? '&' : '?'}userId=${encodeURIComponent(requestUserId)}`
-  ), [requestUserId]);
+  const browserChatApiUrl = useCallback((path: string) => withWebPilotBasePath(path), []);
   const { t } = useI18n();
   const { mode: themeMode, toggleMode } = useTheme();
   const initialModelSelection = resolveRuntimeModelSelection(null);
@@ -7032,7 +7024,7 @@ export function BrowserChatWorkspace({
   const interruptRequestSequenceRef = useRef(0);
   const interruptGuardsRef = useRef(new Map<string, BrowserChatInterruptGuard>());
   const activeView = browserChatViewForPathname(pathname, initialView);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(initialSidebarCollapsed);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
   const [sessions, setSessions] = useState<BrowserChatSession[]>([]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
@@ -7132,7 +7124,7 @@ export function BrowserChatWorkspace({
   const toggleSidebarCollapsed = useCallback(() => {
     setSidebarCollapsed((current) => {
       const next = !current;
-      writeStoredSidebarCollapsed(next);
+      writeSidebarCollapsedPreference(next);
       return next;
     });
   }, []);
@@ -7145,11 +7137,13 @@ export function BrowserChatWorkspace({
     });
   }, []);
 
-  useEffect(() => {
-    setSidebarCollapsed(readStoredSidebarCollapsed());
+  useLayoutEffect(() => {
+    const storedSidebarCollapsed = readSidebarCollapsedPreference(initialSidebarCollapsed);
+    setSidebarCollapsed(storedSidebarCollapsed);
+    writeSidebarCollapsedPreference(storedSidebarCollapsed);
     setEmbeddedChatCollapsed(readStoredEmbeddedChatCollapsed());
     setWebPreviewRuntime(!window.webPilotEmbeddedBrowser);
-  }, []);
+  }, [initialSidebarCollapsed]);
 
   useEffect(() => {
     if (activeView === 'settings') return;
@@ -7657,8 +7651,8 @@ export function BrowserChatWorkspace({
         return [guarded.session, ...current.filter((item) => item.id !== event.id)]
           .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
       });
-    }, { userId: requestUserId });
-  }, [requestUserId]);
+    });
+  }, []);
 
   async function createSession() {
     sessionSelectionIntentRef.current += 1;
@@ -7991,15 +7985,16 @@ export function BrowserChatWorkspace({
       });
       const data = await readApiJson<{ automationCase?: { id?: string }; case?: { id?: string } }>(response, t('生成测试用例失败'));
       const caseId = data.automationCase?.id || data.case?.id || '';
-      const search = new URLSearchParams({ userId: requestUserId });
+      const search = new URLSearchParams();
       if (caseId) search.set('caseId', caseId);
-      window.location.assign(`${withWebPilotBasePath('/automation')}?${search.toString()}`);
+      const query = search.toString();
+      window.location.assign(`${withWebPilotBasePath('/automation')}${query ? `?${query}` : ''}`);
     } catch (automationError) {
       setError(automationError instanceof Error ? automationError.message : t('生成测试用例失败'));
       setGeneratingAutomationMessageId(null);
       stopGlobalLoading();
     }
-  }, [browserChatApiUrl, generatingAutomationMessageId, requestUserId, session?.id, t]);
+  }, [browserChatApiUrl, generatingAutomationMessageId, session?.id, t]);
 
   async function startNewConversation() {
     if (loadingSessionId) return;
@@ -8224,6 +8219,18 @@ export function BrowserChatWorkspace({
                     {sidebarCollapsed ? <MessageSquare className="browser-chat-recent-icon" size={17} /> : null}
                     <span>{sessionDisplayTitle(item)}</span>
                   </button>
+                  {sidebarCollapsed ? (
+                    <button
+                      aria-label={t('删除对话“{name}”', { name: sessionDisplayTitle(item) })}
+                      className="browser-chat-recent-delete browser-chat-collapsed-delete"
+                      disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
+                      onClick={() => void deleteSessionHistory(item.id)}
+                      title={item.busy ? t('执行中，无法删除') : t('删除对话')}
+                      type="button"
+                    >
+                      {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={11} /> : <X size={12} />}
+                    </button>
+                  ) : null}
                   <details className="browser-chat-overflow browser-chat-recent-row-menu">
                     <summary aria-label={t('{name} 操作', { name: sessionDisplayTitle(item) })} title={t('更多操作')}>
                       {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
@@ -8422,7 +8429,7 @@ export function BrowserChatWorkspace({
           <Link
             aria-label={t('自动化')}
             className="browser-chat-nav-item"
-            href={`/automation?userId=${encodeURIComponent(requestUserId)}`}
+            href="/automation"
             title={t('自动化')}
           >
             <Workflow size={17} />

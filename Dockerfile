@@ -25,9 +25,10 @@ COPY --from=build /app/package*.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/.next ./.next
 COPY --from=build /app/next.config.ts ./next.config.ts
+COPY --from=build /app/server/webpilot-server.js /app/server/webpilot-identity.js ./server/
 
 RUN mkdir -p .data artifacts
 
 EXPOSE 3000
 
-CMD ["npm", "run", "start"]
+CMD ["node", "server/webpilot-server.js"]

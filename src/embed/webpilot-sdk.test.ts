@@ -57,6 +57,11 @@ test('derives the public base URL from a prefixed SDK script URL', () => {
 
 test('resolves a relative apiBaseUrl and keeps its prefix for init', async () => {
   const { requestedUrls, sdk } = loadSdk('https://angular.example/webpilot/embed/webpilot.js');
-  await sdk.init({ apiBaseUrl: '/webpilot' });
+  await sdk.init({ apiBaseUrl: '/webpilot', userId: 'mounted-1' });
   assert.deepEqual(requestedUrls, ['https://angular.example/webpilot/api/embed/browser-chat/init']);
+});
+
+test('requires a mounted user id before initialization', async () => {
+  const { sdk } = loadSdk('https://angular.example/webpilot/embed/webpilot.js');
+  await assert.rejects(() => sdk.init({ apiBaseUrl: '/webpilot' }), /requires userId/);
 });

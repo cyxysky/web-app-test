@@ -4,6 +4,17 @@ AI browser workspace built with Next.js, AI SDK, and Playwright.
 
 The project is focused on persistent browser conversations, live browser control, reusable domain skills, personal memory, credentials, and observable Agent execution.
 
+## Generated conversation files
+
+Browser chat can create new downloadable files with the `generateFile` tool:
+
+- UTF-8 text/code/data files selected by a supported extension, including Markdown, TXT, CSV, JSON, YAML, XML, HTML, and common source-code formats.
+- PDF (`.pdf`) and Word (`.docx`) from complete Markdown-like content.
+- Excel (`.xlsx`) from structured worksheets and rows.
+- PowerPoint (`.pptx`) from structured slides or Markdown-like content.
+
+These are real PDF and Office files, not renamed text files. `downloadFile` remains a separate tool for saving an existing remote file. PDF generation automatically uses an available CJK font on supported Windows and Linux images; set `WEBPILOT_DOCUMENT_FONT` and optionally `WEBPILOT_DOCUMENT_FONT_FAMILY` when a custom deployment stores its font elsewhere.
+
 ## Run
 
 ```bash
@@ -11,7 +22,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. Create a `.env.local` file for local development; for Docker, create `.env` in the project root.
+Open `http://localhost:3000`. Local direct access uses user ID `1` by default; set `WEBPILOT_DEFAULT_USER_ID` in `.env.local` to switch the development identity. There is no application login or local account initialization. For Docker, create `.env` in the project root.
 
 The app uses DeepSeek by default:
 
@@ -24,16 +35,30 @@ AI_MODEL=deepseek-v4-flash
 You can override `AI_PROVIDER`, `AI_MODEL`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` in `.env.local`. For the internal TLS forwarding endpoint, keep the hostname and configure `DEEPSEEK_BASE_URL=https://api.deepseek.com:8802` after mapping `api.deepseek.com` to the forwarding IP in the local hosts file.
 Browser execution accepts `http` and `https` target URLs. Configure its operation mode, browser connection, safety policy, and runtime limits on the settings page.
 
-## Embed behind one Nginx path
+## User initialization and same-port WebSockets
 
-WebPilot can be published below one path so the host application does not need to proxy every API separately. The path is part of the Next.js build, so set it before starting development or building a package:
+`npm run dev` and `npm start` use WebPilot's custom server. It serves Next.js and both WebSocket upgrade paths on the same public port (`3000` by default). Nginx is not required and the internal WebSocket ports must not be exposed.
+
+There are two user ID sources:
+
+- Local direct access: `WEBPILOT_DEFAULT_USER_ID`, defaulting to `1`.
+- Online embedding: the `userId` passed once to `WebPilotQA.mount()`.
+
+The mount endpoint converts the supplied ID into a signed, short-lived initialization ticket. The iframe consumes that ticket and receives an `HttpOnly` identity session cookie; ordinary APIs cannot submit or switch user IDs. Before opening a WebSocket, the frontend requests a short-lived, one-time ticket bound to the initialized user, purpose, public origin, and—for browser preview—the browser-chat session.
+
+For online deployment, require the mounted ID:
+
+```bash
+WEBPILOT_REQUIRE_MOUNT_USER_ID=true
+```
+
+For a cross-site iframe over HTTPS, also set `WEBPILOT_CROSS_SITE_MOUNT=true`; this changes the identity cookie to `SameSite=None; Secure`.
+
+WebPilot can also be published below one path. The path is part of the Next.js build, so set it before starting development or building a package:
 
 ```bash
 WEBPILOT_BASE_PATH=/webpilot
-WEBPILOT_PUBLIC_BASE_URL=http://localhost:8080/webpilot
 ```
-
-`WEBPILOT_PUBLIC_BASE_URL` is the browser-visible URL. It is optional when Nginx forwards `Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto` correctly, but setting it explicitly avoids ambiguity.
 
 Docker Compose passes `WEBPILOT_BASE_PATH` from `.env` into the image build. After changing it, recreate the image instead of only restarting the existing container:
 
@@ -48,52 +73,7 @@ For a direct Docker build, pass the same value explicitly:
 docker build --build-arg WEBPILOT_BASE_PATH=/webpilot -t webpilot-qa:latest .
 ```
 
-The important Nginx detail is that `proxy_pass` has no trailing `/`; WebPilot's `/webpilot` prefix must reach Next.js unchanged:
-
-```nginx
-server {
-    listen 8080;
-
-    location = /webpilot {
-        return 308 /webpilot/;
-    }
-
-    # Browser preview is a separate WebSocket server. This exact location must
-    # be declared before the general Next.js proxy and must use the same fixed
-    # port as BROWSER_CHAT_PREVIEW_WS_PORT (18021 by default).
-    location = /webpilot/browser-preview {
-        proxy_pass http://127.0.0.1:18021/browser-preview;
-        proxy_http_version 1.1;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Forwarded-Host $http_host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 86400s;
-        proxy_send_timeout 86400s;
-        proxy_buffering off;
-    }
-
-    location /webpilot/ {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Forwarded-Host $http_host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_buffering off;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:4300;
-    }
-}
-```
-
-The general `/webpilot/` HTTP proxy is not sufficient for live browser preview because Next.js listens on port `3000` while the preview WebSocket server listens on `BROWSER_CHAT_PREVIEW_WS_PORT` (`18021` by default). When Nginx runs on another host or outside the WebPilot container, expose that port and replace `127.0.0.1` with the reachable WebPilot service address.
-
-Open the Angular application through Nginx at `http://localhost:8080`, not through its original port. The Angular template can then use one same-origin prefix:
+The host page initializes the online user ID while mounting:
 
 ```html
 <div id="web-app-xxxx"></div>
@@ -108,6 +88,8 @@ Open the Angular application through Nginx at `http://localhost:8080`, not throu
 ```
 
 The SDK also derives `/webpilot` from its own script URL, so `apiBaseUrl` may be omitted when the script and API use the same public path.
+
+If a reverse proxy is added later for TLS or routing, proxy only the single public application port and preserve WebSocket upgrades. Set `WEBPILOT_TRUST_PROXY=true` only when requests can reach WebPilot exclusively through that trusted proxy; otherwise forwarded headers are deliberately discarded.
 
 ## Personal Memory
 
@@ -126,7 +108,7 @@ Runtime controls:
 
 Minimal management API:
 
-- `GET /api/personal-memory?userId=...&domain=...&includeDisabled=true`
+- `GET /api/personal-memory?domain=...&includeDisabled=true`
 - `POST /api/personal-memory`
 - `PATCH /api/personal-memory/{id}`
 - `DELETE /api/personal-memory/{id}`
@@ -158,7 +140,7 @@ During Agent execution, `getHttpRequests` is available as a read-only diagnostic
 
 Docker is available for packaged runs because the app depends on Playwright and a Chromium runtime.
 
-1. Create `.env` and fill the provider key you want to use.
+1. Create `.env`, set the mounted/default user ID policy, and fill the provider key you want to use.
 2. Build and start:
 
 ```bash
@@ -183,7 +165,7 @@ To distribute the backend without Electron, create a self-contained service arch
 npm run server:package
 ```
 
-This produces `dist-server/WebPilot-Server-<version>.zip`. The target machine only needs Node.js 22.13 or later: extract the archive and run `start.cmd`. It includes all traced Node dependencies and the Playwright Chromium binary, so the target machine does not need `npm install` or `npx playwright install chromium`.
+This produces `dist-server/WebPilot-Server-<version>.zip`. The target machine only needs Node.js 22.16 or later: extract the archive and run `start.cmd`. It includes all traced Node dependencies and the Playwright Chromium binary, so the target machine does not need `npm install` or `npx playwright install chromium`.
 
 By default it listens on all network interfaces at port `3000` (locally: `http://127.0.0.1:3000`), stores application data under `runtime/`, and runs the browser headlessly. Set `PORT`, `APP_DATA_DIR`, `ARTIFACTS_DIR`, or `HEADLESS_BROWSER` before `start.cmd` to override those defaults.
 

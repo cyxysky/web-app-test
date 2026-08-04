@@ -3,6 +3,7 @@ import { getBrowserChatSession, listBrowserChatSessions } from '@/server/ai/agen
 import { store } from '@/server/db/store';
 import { joinWebPilotUrl } from '@/lib/webpilot-base-path';
 import { selectEmbeddedBrowserChatSessionId } from '@/server/embed/browser-chat-init';
+import { createMountIdentityTicket } from '@/server/auth/mount-identity';
 import {
   createEmbedToken,
   embedErrorJson,
@@ -12,7 +13,6 @@ import {
   normalizeString,
   publicBaseUrl,
   requestOrigin,
-  requestUserId,
 } from '@/server/embed/browser-chat-embed';
 
 export const dynamic = 'force-dynamic';
@@ -27,7 +27,11 @@ export async function POST(request: NextRequest) {
     const body = await request.json().catch(() => ({}));
     store.applyRuntimeEnv();
 
-    const userId = requestUserId(request, body);
+    const mountedIdentity = createMountIdentityTicket({
+      origin: requestOrigin(request),
+      userId: body.userId,
+    });
+    const userId = mountedIdentity.userId;
     const requestedSessionId = normalizeString(body.sessionId);
     const initialSessionId = selectEmbeddedBrowserChatSessionId(
       listBrowserChatSessions({ userId }),
@@ -47,14 +51,14 @@ export async function POST(request: NextRequest) {
     const baseUrl = publicBaseUrl(request);
     const iframeUrl = new URL(joinWebPilotUrl(baseUrl, '/browser-chat'));
     iframeUrl.searchParams.set('webpilotEmbed', '1');
+    iframeUrl.searchParams.set('identityTicket', mountedIdentity.ticket);
     if (session) iframeUrl.searchParams.set('sessionId', session.id);
-    if (userId) iframeUrl.searchParams.set('userId', userId);
     const targetUrl = session?.targetUrl || normalizeString(body.targetUrl);
     if (targetUrl) iframeUrl.searchParams.set('targetUrl', targetUrl);
 
     return embedJson({
       ok: true,
-      version: 1,
+      version: 2,
       elementName: 'webpilot-browser-chat',
       entryUrl: joinWebPilotUrl(baseUrl, '/embed/webpilot.js'),
       iframeUrl: iframeUrl.toString(),

@@ -1,14 +1,14 @@
 import { NextRequest } from 'next/server';
 import { createBrowserChatSession, listBrowserChatSessions } from '@/server/ai/agents/browser-chat.service';
-import { createBrowserChatSessionRequestSchema, type CreateBrowserChatSessionRequest } from '@/server/http/browser-chat-request.schema';
+import { createBrowserChatSessionRequestSchema } from '@/server/http/browser-chat-request.schema';
 import { noStoreJson } from '@/server/http/no-store-response';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function requestUserId(request: NextRequest, _body?: Pick<CreateBrowserChatSessionRequest, 'userId' | 'qzUserId'>) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function GET(request: NextRequest) {
@@ -24,7 +24,7 @@ export async function POST(request: NextRequest) {
       modelProvider: body.modelProvider,
       model: body.model,
       title: body.title,
-      userId: requestUserId(request, body),
+      userId: requestUserId(request),
     });
     return noStoreJson({ session });
   } catch (error) {

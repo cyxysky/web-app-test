@@ -10,14 +10,22 @@ type RouteContext = {
 const contentTypes: Record<string, string> = {
   '.apng': 'image/apng',
   '.gif': 'image/gif',
+  '.csv': 'text/csv; charset=utf-8',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.json': 'application/json; charset=utf-8',
   '.md': 'text/markdown; charset=utf-8',
   '.pdf': 'application/pdf',
   '.png': 'image/png',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.tsv': 'text/tab-separated-values; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
   '.webp': 'image/webp',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.xml': 'application/xml; charset=utf-8',
+  '.yaml': 'application/yaml; charset=utf-8',
+  '.yml': 'application/yaml; charset=utf-8',
   '.zip': 'application/zip',
 };
 

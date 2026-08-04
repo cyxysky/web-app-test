@@ -8,16 +8,16 @@ import {
   requestApplicationUserId,
 } from './user-context';
 
-test('missing application user ids normalize to user 0', () => {
-  assert.equal(DEFAULT_APPLICATION_USER_ID, '0');
-  assert.equal(normalizeApplicationUserId(undefined), '0');
-  assert.equal(normalizeApplicationUserId(''), '0');
-  assert.equal(normalizeApplicationUserId('   '), '0');
+test('missing application user ids normalize to user 1', () => {
+  assert.equal(DEFAULT_APPLICATION_USER_ID, '1');
+  assert.equal(normalizeApplicationUserId(undefined), '1');
+  assert.equal(normalizeApplicationUserId(''), '1');
+  assert.equal(normalizeApplicationUserId('   '), '1');
 });
 
 test('reads the default application user id from the environment', () => {
   assert.equal(defaultApplicationUserId({ WEBPILOT_DEFAULT_USER_ID: ' 42 ' }), '42');
-  assert.equal(defaultApplicationUserId({ WEBPILOT_DEFAULT_USER_ID: '' }), '0');
+  assert.equal(defaultApplicationUserId({ WEBPILOT_DEFAULT_USER_ID: '' }), '1');
 });
 
 test('application user ids are stable strings and runtime keys stay isolated', () => {
@@ -28,15 +28,44 @@ test('application user ids are stable strings and runtime keys stay isolated', (
   assert.notEqual(applicationUserRuntimeKey('42'), applicationUserRuntimeKey('43'));
 });
 
-test('request user ids prefer body values and fall back to query values', () => {
-  const request = new Request('http://localhost/api/browser-chat?userId=7');
-  assert.equal(requestApplicationUserId(request), '7');
-  assert.equal(requestApplicationUserId(request, { userId: '9' }), '9');
-  assert.equal(requestApplicationUserId(request, { qzUserId: '11' }), '11');
+test('request user ids only use the principal injected by the custom server', () => {
+  const previousSecret = process.env.WEBPILOT_IDENTITY_HEADER_SECRET;
+  process.env.WEBPILOT_IDENTITY_HEADER_SECRET = 'test-header-secret';
+  const request = new Request('http://localhost/api/browser-chat?userId=7', {
+    headers: {
+      'x-webpilot-identity-proof': 'test-header-secret',
+      'x-webpilot-identity-user-id': '42',
+      'x-webpilot-identity-username': 'alice',
+    },
+  });
+  try {
+    assert.equal(requestApplicationUserId(request), '42');
+  } finally {
+    if (previousSecret === undefined) delete process.env.WEBPILOT_IDENTITY_HEADER_SECRET;
+    else process.env.WEBPILOT_IDENTITY_HEADER_SECRET = previousSecret;
+  }
 });
 
-test('missing request user ids fall back to the default user', () => {
+test('requests without an injected principal are rejected', () => {
   const request = new Request('http://localhost/api/browser-chat');
-  assert.equal(requestApplicationUserId(request), DEFAULT_APPLICATION_USER_ID);
+  assert.throws(() => requestApplicationUserId(request), /Authentication required/);
+});
+
+test('spoofed identity headers without the custom-server proof are rejected', () => {
+  const previousSecret = process.env.WEBPILOT_IDENTITY_HEADER_SECRET;
+  process.env.WEBPILOT_IDENTITY_HEADER_SECRET = 'real-secret';
+  try {
+    const request = new Request('http://localhost/api/browser-chat', {
+      headers: {
+        'x-webpilot-identity-proof': 'forged-secret',
+        'x-webpilot-identity-user-id': 'admin',
+        'x-webpilot-identity-username': 'admin',
+      },
+    });
+    assert.throws(() => requestApplicationUserId(request), /Authentication required/);
+  } finally {
+    if (previousSecret === undefined) delete process.env.WEBPILOT_IDENTITY_HEADER_SECRET;
+    else process.env.WEBPILOT_IDENTITY_HEADER_SECRET = previousSecret;
+  }
 });
 

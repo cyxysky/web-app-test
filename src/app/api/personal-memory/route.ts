@@ -10,8 +10,8 @@ import { requestApplicationUserId } from '@/server/auth/user-context';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function GET(request: NextRequest) {
@@ -30,7 +30,7 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const item = savePersonalMemoryItem({
       ...(body && typeof body === 'object' && !Array.isArray(body) ? body : {}),
-      userId: requestUserId(request, body),
+      userId: requestUserId(request),
     });
     return noStoreJson({ item });
   } catch (error) {

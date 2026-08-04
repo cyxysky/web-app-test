@@ -14,8 +14,6 @@ export const revalidate = 0;
 type RouteContext = { params: Promise<{ id: string }> };
 
 const updateSchema = z.object({
-  userId: z.union([z.string(), z.number()]).optional(),
-  qzUserId: z.union([z.string(), z.number()]).optional(),
   domain: z.string().trim().min(1).max(1_000).optional(),
   username: z.string().trim().min(1).max(500).optional(),
   password: z.string().max(4_000).optional(),
@@ -33,8 +31,8 @@ const updateSchema = z.object({
   || body.shared !== undefined
 ), { message: '没有可更新的账号字段' });
 
-function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 function publicError(error: unknown) {
@@ -46,7 +44,7 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
   try {
     const { id } = await context.params;
     const body = updateSchema.parse(await request.json());
-    const userId = requestUserId(request, body);
+    const userId = requestUserId(request);
     const visibleAccount = getLoginAccountById(id, userId);
     if (visibleAccount && visibleAccount.userId !== userId) return noStoreJson({ error: 'Only the account creator can edit this shared account' }, { status: 403 });
     const account = updateLoginAccount(id, {

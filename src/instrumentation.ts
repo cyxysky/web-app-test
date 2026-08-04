@@ -28,6 +28,9 @@ function scheduleBootstrapAttempt(state: SchedulerBootstrapState, delay: number)
     void fetch(schedulerBootstrapUrl(), {
       method: 'POST',
       cache: 'no-store',
+      headers: {
+        'x-webpilot-internal-token': String(process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN || ''),
+      },
     }).then((response) => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       state.started = true;

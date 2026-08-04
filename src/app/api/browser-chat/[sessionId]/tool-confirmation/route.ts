@@ -10,8 +10,8 @@ type RouteContext = {
   params: Promise<{ sessionId: string }>;
 };
 
-function requestUserId(request: NextRequest, _body?: { userId?: unknown; qzUserId?: unknown }) {
-  return requestApplicationUserId(request, _body);
+function requestUserId(request: NextRequest) {
+  return requestApplicationUserId(request);
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {
@@ -21,7 +21,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const confirmationId = typeof body.confirmationId === 'string' ? body.confirmationId : '';
     const action = body.action === 'confirm' ? 'confirm' : body.action === 'cancel' ? 'cancel' : undefined;
     if (!confirmationId || !action) throw new Error('Invalid tool confirmation request');
-    const session = resolveBrowserChatToolConfirmation(sessionId, confirmationId, action, requestUserId(request, body));
+    const session = resolveBrowserChatToolConfirmation(sessionId, confirmationId, action, requestUserId(request));
     return noStoreJson({ session });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to resolve tool confirmation';

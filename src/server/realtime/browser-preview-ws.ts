@@ -16,6 +16,7 @@ import {
   BrowserPreviewVideoEncoder,
   browserPreviewVideoDimensions,
 } from './browser-preview-video-encoder';
+import { consumeWebSocketTicket } from '@/server/auth/websocket-ticket';
 
 type BrowserPreviewTransport = 'image' | 'video';
 
@@ -76,7 +77,7 @@ type BrowserPreviewWebSocketState = {
   streams: Map<string, BrowserPreviewStream>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 21;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 22;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
@@ -640,6 +641,17 @@ function createBrowserPreviewServer() {
       netSocket.destroy();
       return;
     }
+    const sessionId = (url.searchParams.get('sessionId') || '').trim();
+    const auth = consumeWebSocketTicket({
+      origin: String(request.headers.origin || '').trim(),
+      scope: 'browser-preview',
+      sessionId,
+      ticket: (url.searchParams.get('ticket') || '').trim(),
+    });
+    if (!auth) {
+      netSocket.destroy();
+      return;
+    }
     if (!acceptWebSocketUpgrade(request, netSocket)) {
       netSocket.destroy();
       return;
@@ -650,11 +662,11 @@ function createBrowserPreviewServer() {
       buffer: Buffer.alloc(0),
       frameBlocked: false,
       moveActive: false,
-      sessionId: (url.searchParams.get('sessionId') || '').trim(),
+      sessionId,
       socket: netSocket,
       streamKey: '',
       transport: browserPreviewPreferredTransport(url.searchParams.get('transport') || undefined),
-      userId: (url.searchParams.get('userId') || url.searchParams.get('qzUserId') || '').trim(),
+      userId: auth.userId,
     };
     client.streamKey = `${client.userId}\u0000${client.sessionId}\u0000${client.transport}`;
     state().clients.add(client);
@@ -698,8 +710,8 @@ export async function ensureBrowserPreviewWebSocketServer(): Promise<BrowserPrev
     await closeOutdatedBrowserPreviewServer(current);
     const server = createBrowserPreviewServer();
     const port = await listenWebSocketServer(server, previewWebSocketPortStart(), {
-      host: '0.0.0.0',
-      addressInUseMessage: (port) => `Browser preview WebSocket port ${port} is already in use. Set BROWSER_CHAT_PREVIEW_WS_PORT to the fixed port forwarded by Nginx.`,
+      host: '127.0.0.1',
+      addressInUseMessage: (port) => `Browser preview WebSocket port ${port} is already in use. Set BROWSER_CHAT_PREVIEW_WS_PORT to an available internal port.`,
     });
     current.server = server;
     current.port = port;
