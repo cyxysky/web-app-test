@@ -666,3 +666,44 @@ test('application shutdown closes every registered test browser', async () => {
     ]);
   }
 });
+
+test('browserCode returns structured dependency failures from its request window', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-dependency-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.context().route('https://dependency.test/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/itr/service/problem/version') {
+      await route.fulfill({
+        body: JSON.stringify({ error: 'upstream unavailable' }),
+        contentType: 'application/json',
+        status: 502,
+      });
+      return;
+    }
+    await route.fulfill({ body: '<!doctype html><title>Dependency form</title>', contentType: 'text/html', status: 200 });
+  });
+  await page.goto('https://dependency.test/form');
+
+  const result = await session.executeBrowserCode({
+    code: `
+      var dependencyResponse = await page.evaluate(async () => {
+        var response = await fetch('/itr/service/problem/version?productIdEquals=12');
+        return { status: response.status };
+      });
+      nodeRepl.write(dependencyResponse);
+    `,
+    runId: 'browser-code-dependency-test',
+    stepIndex: 1,
+  });
+
+  assert.equal(result.ok, true, result.actual);
+  assert.deepEqual(result.dependencyFailures, [{
+    category: 'external_service',
+    key: 'GET:/itr/service/problem/version',
+    method: 'GET',
+    status: 502,
+    url: '/itr/service/problem/version?productIdEquals=12',
+  }]);
+});

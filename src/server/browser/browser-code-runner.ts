@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import type { BrowserTextSelectionSpec } from './editable-text-selection';
 
 export type BrowserCodeConnection = {
   protocol: 'playwright' | 'cdp';
@@ -214,7 +215,7 @@ const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 22;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 23;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -1477,14 +1478,6 @@ function browserCodeKernelMain() {
     activeSurface?: 'opened' | 'closed' | 'changed' | 'present' | 'absent';
   };
 
-  type BrowserCodeInsertTextAtInput = {
-    text: string;
-    offset?: number;
-    afterText?: string;
-    beforeText?: string;
-    occurrence?: number;
-  };
-
   const verifyPageState = async (
     page: import('playwright').Page,
     input: BrowserCodeVerifyStateInput,
@@ -1633,46 +1626,80 @@ function browserCodeKernelMain() {
     };
   };
 
-  const insertTextAt = async (
+  const setTextSelection = async (
     page: import('playwright').Page,
     locatorInput: import('playwright').Locator,
-    input: BrowserCodeInsertTextAtInput,
+    input: BrowserTextSelectionSpec,
   ) => {
-    if (!activeExecution) throw new Error('page.insertTextAt() is only available while browserCode is executing.');
+    if (!activeExecution) throw new Error('page.setTextSelection() is only available while browserCode is executing.');
     if (
       !locatorInput
       || typeof locatorInput !== 'object'
       || typeof Reflect.get(locatorInput, 'evaluate') !== 'function'
       || locatorPage(locatorInput) !== page
     ) {
-      throw new Error('page.insertTextAt() requires a real Playwright Locator from the active page, including a locator inside one of its frames.');
+      throw new Error('page.setTextSelection() requires a real Playwright Locator from the active page, including a locator inside one of its frames.');
     }
-    const text = typeof input?.text === 'string' ? input.text : '';
-    if (!text) throw new Error('page.insertTextAt() requires non-empty text.');
-    const hasOffset = input?.offset !== undefined;
-    const hasAfterText = input?.afterText !== undefined;
-    const hasBeforeText = input?.beforeText !== undefined;
-    if (Number(hasOffset) + Number(hasAfterText) + Number(hasBeforeText) !== 1) {
-      throw new Error('page.insertTextAt() requires exactly one insertion anchor: offset, afterText, or beforeText.');
-    }
-    if (hasOffset && (!Number.isInteger(input.offset) || Number(input.offset) < 0)) {
-      throw new Error('page.insertTextAt() offset must be a non-negative integer.');
-    }
-    const anchorText = hasAfterText ? input.afterText : hasBeforeText ? input.beforeText : undefined;
-    if (anchorText !== undefined && !anchorText.length) {
-      throw new Error('page.insertTextAt() text anchors cannot be empty.');
-    }
-    const occurrence = input.occurrence ?? 1;
-    if (!Number.isInteger(occurrence) || occurrence < 1) {
-      throw new Error('page.insertTextAt() occurrence must be a positive integer.');
-    }
-    if (input.occurrence !== undefined && hasOffset) {
-      throw new Error('page.insertTextAt() occurrence is available only with afterText or beforeText.');
-    }
-
     const actionableLocator = await resolveActionableLocator(locatorInput, 'focus');
     await actionableLocator.focus();
-    const selection = await actionableLocator.evaluate((element, options) => {
+    const before = await actionableLocator.evaluate((element) => {
+      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return element.value;
+      if (element instanceof HTMLElement && element.isContentEditable) {
+        const editable = element.closest('[contenteditable=""], [contenteditable="true"]') || element;
+        return editable.textContent || '';
+      }
+      throw new Error('Target is not an editable input, textarea, or contenteditable element.');
+    });
+    const occurrenceOffset = (needle: string, occurrenceValue: unknown, label: string) => {
+      if (!needle) throw new Error(`${label} text cannot be empty.`);
+      const occurrence = occurrenceValue === undefined ? 1 : Number(occurrenceValue);
+      if (!Number.isInteger(occurrence) || occurrence < 1) throw new Error(`${label} occurrence must be a positive integer.`);
+      let offset = -1;
+      let searchFrom = 0;
+      for (let index = 0; index < occurrence; index += 1) {
+        offset = before.indexOf(needle, searchFrom);
+        if (offset < 0) break;
+        searchFrom = offset + needle.length;
+      }
+      if (offset < 0) throw new Error(`${label} occurrence ${occurrence} was not found in the editable text.`);
+      return offset;
+    };
+    const anchorOffset = (anchor: { offset?: number; afterText?: string; beforeText?: string; occurrence?: number }, label: string) => {
+      const hasOffset = anchor?.offset !== undefined;
+      const hasAfterText = anchor?.afterText !== undefined;
+      const hasBeforeText = anchor?.beforeText !== undefined;
+      if (Number(hasOffset) + Number(hasAfterText) + Number(hasBeforeText) !== 1) {
+        throw new Error(`${label} requires exactly one of offset, afterText, or beforeText.`);
+      }
+      if (hasOffset) {
+        if (!Number.isInteger(anchor.offset) || Number(anchor.offset) < 0) throw new Error(`${label} offset must be a non-negative integer.`);
+        if (anchor.occurrence !== undefined) throw new Error(`${label} occurrence is available only with afterText or beforeText.`);
+        return Number(anchor.offset);
+      }
+      const needle = hasAfterText ? String(anchor.afterText) : String(anchor.beforeText);
+      const found = occurrenceOffset(needle, anchor.occurrence, label);
+      return hasAfterText ? found + needle.length : found;
+    };
+    let start: number;
+    let end: number;
+    if ('exactText' in input) {
+      start = occurrenceOffset(input.exactText, input.occurrence, 'Selection text');
+      end = start + input.exactText.length;
+    } else {
+      start = anchorOffset(input.start, 'Selection start');
+      end = input.end ? anchorOffset(input.end, 'Selection end') : start;
+    }
+    if (start > before.length || end > before.length) throw new Error(`Selection range ${start}-${end} exceeds editable text length ${before.length}.`);
+    if (end < start) throw new Error(`Selection end ${end} cannot precede start ${start}.`);
+    const selection = {
+      before,
+      collapsed: start === end,
+      direction: input.direction === 'backward' ? 'backward' as const : 'forward' as const,
+      end,
+      selectedText: before.slice(start, end),
+      start,
+    };
+    await actionableLocator.evaluate((element, range) => {
       const inputElement = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
         ? element
         : undefined;
@@ -1681,86 +1708,67 @@ function browserCodeKernelMain() {
         : element instanceof HTMLElement && element.isContentEditable
           ? element.closest('[contenteditable=""], [contenteditable="true"]') || element
           : undefined;
-      if (!editable) {
-        throw new Error('Target is not an editable input, textarea, or contenteditable element.');
-      }
-      const before = inputElement ? inputElement.value : editable.textContent || '';
-      let insertionOffset: number;
-      if (options.offset !== undefined) {
-        insertionOffset = options.offset;
-      } else {
-        const anchor = options.afterText ?? options.beforeText ?? '';
-        let anchorOffset = -1;
-        let searchFrom = 0;
-        for (let index = 0; index < options.occurrence; index += 1) {
-          anchorOffset = before.indexOf(anchor, searchFrom);
-          if (anchorOffset < 0) break;
-          searchFrom = anchorOffset + anchor.length;
-        }
-        if (anchorOffset < 0) {
-          throw new Error(`Insertion anchor occurrence ${options.occurrence} was not found in the editable text.`);
-        }
-        insertionOffset = options.afterText !== undefined ? anchorOffset + anchor.length : anchorOffset;
-      }
-      if (insertionOffset > before.length) {
-        throw new Error(`Insertion offset ${insertionOffset} exceeds editable text length ${before.length}.`);
-      }
-
+      if (!editable) throw new Error('Target is not an editable input, textarea, or contenteditable element.');
       if (inputElement) {
-        inputElement.setSelectionRange(insertionOffset, insertionOffset);
+        inputElement.setSelectionRange(range.start, range.end, range.direction);
+        return;
+      }
+      const startWalker = editable.ownerDocument.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
+      let startTraversed = 0;
+      let startNode: Node = editable;
+      let startOffset = editable.childNodes.length;
+      let startMapped = range.start === 0 && !startWalker.currentNode.textContent;
+      let startTextNode = startWalker.nextNode();
+      while (startTextNode) {
+        const nodeLength = startTextNode.textContent?.length || 0;
+        if (range.start <= startTraversed + nodeLength) {
+          startNode = startTextNode;
+          startOffset = range.start - startTraversed;
+          startMapped = true;
+          break;
+        }
+        startTraversed += nodeLength;
+        startTextNode = startWalker.nextNode();
+      }
+      if (!startMapped && range.start !== startTraversed) throw new Error(`Selection offset ${range.start} could not be mapped to the editable DOM.`);
+      const endWalker = editable.ownerDocument.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
+      let endTraversed = 0;
+      let endNode: Node = editable;
+      let endOffset = editable.childNodes.length;
+      let endMapped = range.end === 0 && !endWalker.currentNode.textContent;
+      let endTextNode = endWalker.nextNode();
+      while (endTextNode) {
+        const nodeLength = endTextNode.textContent?.length || 0;
+        if (range.end <= endTraversed + nodeLength) {
+          endNode = endTextNode;
+          endOffset = range.end - endTraversed;
+          endMapped = true;
+          break;
+        }
+        endTraversed += nodeLength;
+        endTextNode = endWalker.nextNode();
+      }
+      if (!endMapped && range.end !== endTraversed) throw new Error(`Selection offset ${range.end} could not be mapped to the editable DOM.`);
+      const browserSelection = editable.ownerDocument.defaultView?.getSelection();
+      if (!browserSelection) throw new Error('The editable document does not expose a text selection.');
+      browserSelection.removeAllRanges();
+      if (range.direction === 'backward' && typeof browserSelection.setBaseAndExtent === 'function') {
+        browserSelection.setBaseAndExtent(endNode, endOffset, startNode, startOffset);
       } else {
-        const range = document.createRange();
-        const walker = document.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
-        let traversed = 0;
-        let selected = false;
-        let textNode = walker.nextNode();
-        while (textNode) {
-          const nodeLength = textNode.textContent?.length || 0;
-          if (insertionOffset <= traversed + nodeLength) {
-            range.setStart(textNode, insertionOffset - traversed);
-            selected = true;
-            break;
-          }
-          traversed += nodeLength;
-          textNode = walker.nextNode();
-        }
-        if (!selected) {
-          range.selectNodeContents(editable);
-          range.collapse(false);
-        } else {
-          range.collapse(true);
-        }
-        const selection = editable.ownerDocument.defaultView?.getSelection();
-        if (!selection) throw new Error('The editable document does not expose a text selection.');
-        selection.removeAllRanges();
-        selection.addRange(range);
+        const domRange = editable.ownerDocument.createRange();
+        domRange.setStart(startNode, startOffset);
+        domRange.setEnd(endNode, endOffset);
+        browserSelection.addRange(domRange);
       }
-      return { beforeLength: before.length, insertionOffset };
-    }, {
-      afterText: input.afterText,
-      beforeText: input.beforeText,
-      occurrence,
-      offset: input.offset,
-    });
-
-    await page.keyboard.insertText(text);
-    await page.waitForTimeout(0);
-    const after = await actionableLocator.evaluate((element) => {
-      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return element.value;
-      if (element instanceof HTMLElement && element.isContentEditable) {
-        const editable = element.closest('[contenteditable=""], [contenteditable="true"]') || element;
-        return editable.textContent || '';
-      }
-      return '';
-    });
+    }, { direction: selection.direction, end: selection.end, start: selection.start });
     return {
-      afterLength: after.length,
-      beforeLength: selection.beforeLength,
-      insertedAt: selection.insertionOffset,
-      textLength: text.length,
-      verified: after
-        .slice(selection.insertionOffset, selection.insertionOffset + text.length)
-        .replace(/\u00a0/g, ' ') === text.replace(/\u00a0/g, ' '),
+      collapsed: selection.collapsed,
+      direction: selection.direction,
+      editableTextLength: selection.before.length,
+      end: selection.end,
+      selectedText: selection.selectedText,
+      start: selection.start,
+      verified: true,
     };
   };
 
@@ -1771,7 +1779,7 @@ function browserCodeKernelMain() {
     const extendedPage = page as import('playwright').Page & {
       domSnapshot?: (options?: { scope?: 'active' | 'all' }) => Promise<string>;
       activeSurface?: () => Promise<Pick<KernelPageObservation, 'activeSurface' | 'surfaces' | 'surfaceStack' | 'topSurfaceIds'>>;
-      insertTextAt?: (locator: import('playwright').Locator, input: BrowserCodeInsertTextAtInput) => Promise<unknown>;
+      setTextSelection?: (locator: import('playwright').Locator, input: BrowserTextSelectionSpec) => Promise<unknown>;
       verifyState?: (input: BrowserCodeVerifyStateInput) => Promise<unknown>;
       expectNavigation?: <T>(action: () => Promise<T>, options?: { timeoutMs?: number; url?: string | RegExp; waitUntil?: NonNullable<Parameters<import('playwright').Page['waitForURL']>[1]>['waitUntil'] }) => Promise<T>;
     };
@@ -1818,11 +1826,11 @@ function browserCodeKernelMain() {
         writable: false,
       });
     }
-    if (typeof extendedPage.insertTextAt !== 'function') {
-      Object.defineProperty(extendedPage, 'insertTextAt', {
+    if (typeof extendedPage.setTextSelection !== 'function') {
+      Object.defineProperty(extendedPage, 'setTextSelection', {
         configurable: false,
         enumerable: false,
-        value: (locator: import('playwright').Locator, input: BrowserCodeInsertTextAtInput) => insertTextAt(page, locator, input),
+        value: (locator: import('playwright').Locator, input: BrowserTextSelectionSpec) => setTextSelection(page, locator, input),
         writable: false,
       });
     }
@@ -1917,11 +1925,11 @@ function browserCodeKernelMain() {
     capabilities: Object.freeze({ cua: true, images: true, playwright: true, tabLifecycle: true }),
     documentation: async () => [
       'browserCode exposes one controlled browser runtime in ordinary JavaScript.',
-      'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.insertTextAt(), page.verifyState(), page.expectNavigation(), and nodeRepl.emitImage().',
+      'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.setTextSelection(), page.verifyState(), page.expectNavigation(), and nodeRepl.emitImage().',
       'page.domSnapshot() returns page-state plus a read-only Playwright AX tree scoped to the active surface by default; pass { scope: "all" } only for background context. browser.user.openTabs() reports only tabs owned by the current conversation group, with active-tab and tab-group metadata.',
       'Page and Locator factory methods expose only currently rendered matches: hidden descendants and zero-rectangle nodes are excluded before count() and positional selection. Element actions then validate target computed style and hit testing, run an action-specific Playwright trial for every remaining pointer candidate, and execute only the unique candidate that passes all stages; CSS-hidden file inputs used by setInputFiles are recovered only at that action boundary.',
       'page.verifyState() is an optional read-only assertion helper; it never gates later actions or successful cell completion.',
-      'page.insertTextAt(locator, { text, afterText | beforeText | offset, occurrence? }) places a real caret in an input, textarea, or contenteditable (including frame locators) and inserts text through the keyboard.',
+      'page.setTextSelection(locator, spec) establishes a caret or text range in an input, textarea, or contenteditable (including frame locators) without changing content. Then use page.keyboard.insertText()/press() in the same cell to insert, replace, or delete through the real keyboard.',
       `Playwright action timeout: ${browserCodeActionTimeoutMs}ms; navigation timeout: ${browserCodeNavigationTimeoutMs}ms.`,
     ].join('\n'),
     id: 'current',

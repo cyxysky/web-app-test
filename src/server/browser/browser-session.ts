@@ -63,6 +63,10 @@ import {
 } from './browser-session-diagnostics';
 import { isBlankBrowserUrlLike, isBlankPage } from './browser-session-page-policy';
 import {
+  resolveEditableTextSelection,
+  type BrowserTextSelectionSpec,
+} from './editable-text-selection';
+import {
   closeManagedBrowserSessions,
   installBrowserSessionShutdownHooks,
   registerBrowserSession,
@@ -182,6 +186,8 @@ export type BrowserPageObservation = {
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** Failed page dependencies observed during this exact browser tool execution. */
+  dependencyFailures?: BrowserDependencyFailure[];
   /** Snapshot/observation that owns any DOM refs returned with this result. */
   snapshotId?: string;
   /** Click-specific timing breakdown for diagnosing browser action latency. */
@@ -215,6 +221,15 @@ export type BrowserActionResult = {
     overflow: boolean;
     observation?: BrowserPageObservation;
   };
+};
+
+export type BrowserDependencyFailure = {
+  category: 'external_service' | 'network_error';
+  key: string;
+  method: string;
+  status?: number;
+  errorText?: string;
+  url: string;
 };
 
 export type BrowserClickTiming = {
@@ -883,17 +898,15 @@ export type BrowserMouseAction = {
 };
 
 export type BrowserKeyboardAction = {
-  action: 'type' | 'press' | 'shortcut' | 'insertTextAt';
+  action: 'type' | 'press' | 'shortcut' | 'editText';
   target?: BrowserElementTarget;
   /** Internal direct-call shorthand; model-facing tools use target. */
   uid?: string;
   xThousandth?: number;
   yThousandth?: number;
   text?: string;
-  offset?: number;
-  afterText?: string;
-  beforeText?: string;
-  occurrence?: number;
+  selection?: BrowserTextSelectionSpec;
+  operation?: 'setSelection' | 'insert' | 'delete' | 'replace';
   key?: string;
   keys?: string[];
   replace?: boolean;
@@ -7306,6 +7319,7 @@ export class BrowserSession {
     }
 
     const page = this.activePage;
+    const requestStartSequence = this.httpRequestSequence;
     await this.ensurePageGroup(page);
     await this.ensureBrowserPageRuntime(page);
     await this.resetInterActionChangeJournal().catch(() => undefined);
@@ -7423,6 +7437,12 @@ export class BrowserSession {
     const actualDomChanges = domChanges
       ? { ...domChanges, observation: undefined }
       : undefined;
+    const dependencyFailures = this.dependencyFailuresSince(requestStartSequence, new Set([
+      page,
+      finalPage,
+      ...pagesBeforeExecution,
+      ...(executionContext?.pages() || []),
+    ]));
     const result: BrowserActionResult = {
       ok: execution.ok,
       actual: JSON.stringify({
@@ -7440,6 +7460,7 @@ export class BrowserSession {
       referenceImagePath: emittedImagePaths[0],
       referenceImagePaths: emittedImagePaths,
       verification: inferredActivity.verification,
+      ...(dependencyFailures.length ? { dependencyFailures } : {}),
     };
     return result;
   }
@@ -9114,17 +9135,60 @@ export class BrowserSession {
     return undefined;
   }
 
-  private async setEditableInsertionSelection(
+  private dependencyFailuresSince(sequence: number, pages: Iterable<Page>): BrowserDependencyFailure[] {
+    const failures = Array.from(pages)
+      .flatMap((page) => this.httpRequestsByPage.get(page) || [])
+      .filter((record) => record.sequence > sequence && (
+        record.failed === true
+        || record.status !== undefined && record.status >= 500 && record.status <= 599
+      ))
+      .map((record): BrowserDependencyFailure => {
+        let url = record.url;
+        let path = record.url;
+        try {
+          const parsed = new URL(record.url);
+          url = `${parsed.pathname}${parsed.search}`;
+          path = parsed.pathname;
+        } catch {
+          path = record.url.split('?')[0] || record.url;
+        }
+        return {
+          category: record.failed ? 'network_error' : 'external_service',
+          key: `${record.method.toUpperCase()}:${path}`,
+          method: record.method.toUpperCase(),
+          ...(record.status !== undefined ? { status: record.status } : {}),
+          ...(record.errorText ? { errorText: record.errorText } : {}),
+          url,
+        };
+      });
+    const unique = new Map<string, BrowserDependencyFailure>();
+    for (const failure of failures) {
+      unique.set(`${failure.key}:${failure.status || failure.errorText || failure.category}:${failure.url}`, failure);
+    }
+    return [...unique.values()];
+  }
+
+  private async setEditableTextSelection(
     locator: Locator | undefined,
     handle: ElementHandle<Element> | undefined,
-    input: Pick<BrowserKeyboardAction, 'offset' | 'afterText' | 'beforeText' | 'occurrence'>,
+    spec: BrowserTextSelectionSpec,
   ) {
-    const select = (element: Element, options: {
-      offset?: number;
-      afterText?: string;
-      beforeText?: string;
-      occurrence: number;
-    }) => {
+    const read = (element: Element) => {
+      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return element.value;
+      if (element instanceof HTMLElement && element.isContentEditable) {
+        const editable = element.closest('[contenteditable=""], [contenteditable="true"]') || element;
+        return editable.textContent || '';
+      }
+      throw new Error('Target is not an editable input, textarea, or contenteditable element.');
+    };
+    const before = handle
+      ? await handle.evaluate(read)
+      : locator
+        ? await locator.evaluate(read)
+        : undefined;
+    if (before === undefined) throw new Error('The editable target no longer resolves to a live element.');
+    const selection = resolveEditableTextSelection(before, spec);
+    const apply = (element: Element, range: { direction: 'forward' | 'backward'; end: number; start: number }) => {
       const inputElement = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
         ? element
         : undefined;
@@ -9134,67 +9198,62 @@ export class BrowserSession {
           ? element.closest('[contenteditable=""], [contenteditable="true"]') || element
           : undefined;
       if (!editable) throw new Error('Target is not an editable input, textarea, or contenteditable element.');
-      const before = inputElement ? inputElement.value : editable.textContent || '';
-      let insertionOffset: number;
-      if (options.offset !== undefined) {
-        insertionOffset = options.offset;
-      } else {
-        const anchor = options.afterText ?? options.beforeText ?? '';
-        let anchorOffset = -1;
-        let searchFrom = 0;
-        for (let index = 0; index < options.occurrence; index += 1) {
-          anchorOffset = before.indexOf(anchor, searchFrom);
-          if (anchorOffset < 0) break;
-          searchFrom = anchorOffset + anchor.length;
-        }
-        if (anchorOffset < 0) {
-          throw new Error(`Insertion anchor occurrence ${options.occurrence} was not found in the editable text.`);
-        }
-        insertionOffset = options.afterText !== undefined ? anchorOffset + anchor.length : anchorOffset;
-      }
-      if (insertionOffset > before.length) {
-        throw new Error(`Insertion offset ${insertionOffset} exceeds editable text length ${before.length}.`);
-      }
       if (inputElement) {
-        inputElement.setSelectionRange(insertionOffset, insertionOffset);
-      } else {
-        const range = document.createRange();
-        const walker = document.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
-        let traversed = 0;
-        let selected = false;
-        let textNode = walker.nextNode();
-        while (textNode) {
-          const nodeLength = textNode.textContent?.length || 0;
-          if (insertionOffset <= traversed + nodeLength) {
-            range.setStart(textNode, insertionOffset - traversed);
-            selected = true;
-            break;
-          }
-          traversed += nodeLength;
-          textNode = walker.nextNode();
-        }
-        if (!selected) {
-          range.selectNodeContents(editable);
-          range.collapse(false);
-        } else {
-          range.collapse(true);
-        }
-        const selection = editable.ownerDocument.defaultView?.getSelection();
-        if (!selection) throw new Error('The editable document does not expose a text selection.');
-        selection.removeAllRanges();
-        selection.addRange(range);
+        inputElement.setSelectionRange(range.start, range.end, range.direction);
+        return;
       }
-      return { before, insertionOffset };
+      const startWalker = editable.ownerDocument.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
+      let startTraversed = 0;
+      let startNode: Node = editable;
+      let startOffset = editable.childNodes.length;
+      let startMapped = range.start === 0 && !startWalker.currentNode.textContent;
+      let startTextNode = startWalker.nextNode();
+      while (startTextNode) {
+        const nodeLength = startTextNode.textContent?.length || 0;
+        if (range.start <= startTraversed + nodeLength) {
+          startNode = startTextNode;
+          startOffset = range.start - startTraversed;
+          startMapped = true;
+          break;
+        }
+        startTraversed += nodeLength;
+        startTextNode = startWalker.nextNode();
+      }
+      if (!startMapped && range.start !== startTraversed) throw new Error(`Selection offset ${range.start} could not be mapped to the editable DOM.`);
+      const endWalker = editable.ownerDocument.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
+      let endTraversed = 0;
+      let endNode: Node = editable;
+      let endOffset = editable.childNodes.length;
+      let endMapped = range.end === 0 && !endWalker.currentNode.textContent;
+      let endTextNode = endWalker.nextNode();
+      while (endTextNode) {
+        const nodeLength = endTextNode.textContent?.length || 0;
+        if (range.end <= endTraversed + nodeLength) {
+          endNode = endTextNode;
+          endOffset = range.end - endTraversed;
+          endMapped = true;
+          break;
+        }
+        endTraversed += nodeLength;
+        endTextNode = endWalker.nextNode();
+      }
+      if (!endMapped && range.end !== endTraversed) throw new Error(`Selection offset ${range.end} could not be mapped to the editable DOM.`);
+      const browserSelection = editable.ownerDocument.defaultView?.getSelection();
+      if (!browserSelection) throw new Error('The editable document does not expose a text selection.');
+      browserSelection.removeAllRanges();
+      if (range.direction === 'backward' && typeof browserSelection.setBaseAndExtent === 'function') {
+        browserSelection.setBaseAndExtent(endNode, endOffset, startNode, startOffset);
+      } else {
+        const domRange = editable.ownerDocument.createRange();
+        domRange.setStart(startNode, startOffset);
+        domRange.setEnd(endNode, endOffset);
+        browserSelection.addRange(domRange);
+      }
     };
-    const options = {
-      afterText: input.afterText,
-      beforeText: input.beforeText,
-      occurrence: input.occurrence ?? 1,
-      offset: input.offset,
-    };
-    if (handle) return handle.evaluate(select, options);
-    if (locator) return locator.evaluate(select, options);
-    throw new Error('The editable target no longer resolves to a live element.');
+    const range = { direction: selection.direction, end: selection.end, start: selection.start };
+    if (handle) await handle.evaluate(apply, range);
+    else if (locator) await locator.evaluate(apply, range);
+    return selection;
   }
 
   private async hasFocusedNativeSelect() {
@@ -10258,8 +10317,8 @@ export class BrowserSession {
   async keyboard(input: BrowserKeyboardAction): Promise<BrowserActionResult> {
     const page = this.activePage;
     const previousGeneration = this.snapshotGeneration;
-    if (input.action === 'insertTextAt' && !input.target && !input.uid) {
-      return { ok: false, actual: 'insertTextAt requires a fresh snapshot-bound editable target.' };
+    if (input.action === 'editText' && !input.target && !input.uid) {
+      return { ok: false, actual: 'editText requires a fresh snapshot-bound editable target.' };
     }
     let targetLocator: Locator | undefined;
     let targetHandle: ElementHandle<Element> | undefined;
@@ -10350,39 +10409,46 @@ export class BrowserSession {
     if (await this.hasFocusedNativeSelect()) {
       return { ok: false, actual: 'Keyboard operation rejected because a native <select> is focused. Use selectOption with the select UID from takeSnapshot and an exact option value or full label; do not use letters, ArrowUp/ArrowDown, or Enter.' };
     }
-    if (input.action === 'insertTextAt') {
-      if (typeof input.text !== 'string' || !input.text) {
-        return { ok: false, actual: 'insertTextAt requires non-empty text.' };
-      }
-      const anchors = Number(input.offset !== undefined)
-        + Number(input.afterText !== undefined)
-        + Number(input.beforeText !== undefined);
-      if (anchors !== 1) {
-        return { ok: false, actual: 'insertTextAt requires exactly one insertion anchor: offset, afterText, or beforeText.' };
-      }
-      if (input.offset !== undefined && (!Number.isInteger(input.offset) || input.offset < 0)) {
-        return { ok: false, actual: 'insertTextAt offset must be a non-negative integer.' };
-      }
-      const anchorText = input.afterText ?? input.beforeText;
-      if (anchorText !== undefined && !anchorText.length) {
-        return { ok: false, actual: 'insertTextAt text anchors cannot be empty.' };
-      }
-      if (input.occurrence !== undefined && (!Number.isInteger(input.occurrence) || input.occurrence < 1)) {
-        return { ok: false, actual: 'insertTextAt occurrence must be a positive integer.' };
-      }
-      if (input.occurrence !== undefined && input.offset !== undefined) {
-        return { ok: false, actual: 'insertTextAt occurrence is available only with afterText or beforeText.' };
-      }
-      const selection = await this.setEditableInsertionSelection(targetLocator, targetHandle, input).catch((error) => ({
+    if (input.action === 'editText') {
+      if (!input.selection) return { ok: false, actual: 'editText requires a caret or text selection.' };
+      if (!input.operation) return { ok: false, actual: 'editText requires an operation.' };
+      const selection = await this.setEditableTextSelection(targetLocator, targetHandle, input.selection).catch((error) => ({
         error: error instanceof Error ? error.message : String(error),
       }));
-      if ('error' in selection) return { ok: false, actual: `insertTextAt could not establish the caret: ${selection.error}` };
+      if ('error' in selection) return { ok: false, actual: `editText could not establish the selection: ${selection.error}` };
+      if (input.operation === 'setSelection') {
+        return {
+          ok: true,
+          actual: selection.collapsed
+            ? `Established an editable caret at offset ${selection.start}.`
+            : `Selected editable text range ${selection.start}-${selection.end}: ${JSON.stringify(selection.selectedText)}.`,
+          verification: {
+            status: 'passed',
+            detail: `selection=${selection.start}-${selection.end}; collapsed=${selection.collapsed}.`,
+          },
+        };
+      }
+      if (input.operation === 'insert' && !selection.collapsed) {
+        return { ok: false, actual: 'editText insert requires a collapsed caret.' };
+      }
+      if ((input.operation === 'delete' || input.operation === 'replace') && selection.collapsed) {
+        return { ok: false, actual: `editText ${input.operation} requires a non-collapsed text range.` };
+      }
+      if ((input.operation === 'insert' || input.operation === 'replace') && !input.text) {
+        return { ok: false, actual: `editText ${input.operation} requires non-empty text.` };
+      }
       const eventsBefore = await this.readInteractionCounts();
       const urlBefore = page.url();
       const navigationSequenceBefore = this.navigationSequenceByPage.get(page) || 0;
-      await page.keyboard.insertText(input.text);
+      const replacement = input.operation === 'delete' ? '' : input.text || '';
+      if (input.operation === 'delete') await page.keyboard.press('Backspace');
+      else await page.keyboard.insertText(replacement);
       return this.completeVerifiedAction(
-        `Inserted ${input.text.length} characters at editable offset ${selection.insertionOffset}.`,
+        input.operation === 'insert'
+          ? `Inserted ${replacement.length} characters at editable offset ${selection.start}.`
+          : input.operation === 'delete'
+            ? `Deleted editable text range ${selection.start}-${selection.end}.`
+            : `Replaced editable text range ${selection.start}-${selection.end} with ${replacement.length} characters.`,
         previousGeneration,
         async () => {
           const eventsAfter = await this.readInteractionCounts();
@@ -10390,13 +10456,13 @@ export class BrowserSession {
           const navigated = page.url() !== urlBefore
             || (this.navigationSequenceByPage.get(page) || 0) !== navigationSequenceBefore;
           const valueAfter = navigated ? undefined : await this.editableValue(targetLocator, targetHandle);
-          const expected = `${selection.before.slice(0, selection.insertionOffset)}${input.text}${selection.before.slice(selection.insertionOffset)}`;
+          const expected = `${selection.before.slice(0, selection.start)}${replacement}${selection.before.slice(selection.end)}`;
           const normalizeEditableWhitespace = (value: string) => value.replace(/\u00a0/g, ' ');
           const verified = valueAfter !== undefined
             && normalizeEditableWhitespace(valueAfter) === normalizeEditableWhitespace(expected);
           return {
             ok: navigated || verified,
-            detail: `${inputEvents} input event(s) observed; insertedAt=${selection.insertionOffset}; verified=${verified}; navigation=${navigated}.`,
+            detail: `${inputEvents} input event(s) observed; selection=${selection.start}-${selection.end}; operation=${input.operation}; verified=${verified}; navigation=${navigated}.`,
           };
         },
       );

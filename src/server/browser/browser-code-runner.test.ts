@@ -97,7 +97,7 @@ test('browserCode sandbox executes ordinary Playwright code directly', async () 
   assert.equal(result.activity ? 'observation' in result.activity : false, false);
 });
 
-test('browserCode inserts text at exact anchors in textareas and rich-text frames', async () => {
+test('browserCode establishes caret and ranges for keyboard editing in textareas and rich-text frames', async () => {
   await page.setContent(`
     <title>Insertion editor</title>
     <label>Notes<textarea>alpha gamma</textarea></label>
@@ -107,27 +107,31 @@ test('browserCode inserts text at exact anchors in textareas and rich-text frame
   try {
     const textareaResult = await run(`
       var insertionTextarea = page.getByLabel('Notes');
-      var textareaInsertion = await page.insertTextAt(insertionTextarea, { text: 'beta ', afterText: 'alpha ' });
-      nodeRepl.write(textareaInsertion);
+      var textareaSelection = await page.setTextSelection(insertionTextarea, { start: { afterText: 'alpha ' } });
+      await page.keyboard.insertText('beta ');
+      nodeRepl.write(textareaSelection);
     `);
     assert.equal(textareaResult.ok, true, textareaResult.error);
 
     const richResult = await run(`
       var insertionRichEditor = page.locator('[contenteditable="true"][aria-label="Rich editor"]');
-      var richInsertion = await page.insertTextAt(insertionRichEditor, { text: 'second ', beforeText: 'third' });
-      nodeRepl.write(richInsertion);
+      var richSelection = await page.setTextSelection(insertionRichEditor, { exactText: 'third' });
+      await page.keyboard.insertText('second third');
+      nodeRepl.write(richSelection);
     `);
     assert.equal(richResult.ok, true, richResult.error);
 
     const frameResult = await run(`
       var insertionFrameEditor = page.frameLocator('iframe[title="Frame editor"]').locator('body[contenteditable="true"]');
-      var frameInsertion = await page.insertTextAt(insertionFrameEditor, { text: 'middle ', afterText: 'left ' });
-      nodeRepl.write(frameInsertion);
+      var frameSelection = await page.setTextSelection(insertionFrameEditor, { exactText: 'right' });
+      await page.keyboard.press('Backspace');
+      await page.keyboard.insertText('middle right');
+      nodeRepl.write({ frameSelection });
     `);
     assert.equal(frameResult.ok, true, frameResult.error);
     assert.equal((textareaResult.value as { verified?: boolean }).verified, true, JSON.stringify(textareaResult.value));
     assert.equal((richResult.value as { verified?: boolean }).verified, true, JSON.stringify({ result: richResult.value, text: await page.locator('[contenteditable="true"][aria-label="Rich editor"]').textContent() }));
-    assert.equal((frameResult.value as { verified?: boolean }).verified, true, JSON.stringify({ result: frameResult.value, text: await page.frameLocator('iframe[title="Frame editor"]').locator('body').textContent() }));
+    assert.equal((frameResult.value as { frameSelection?: { verified?: boolean } }).frameSelection?.verified, true, JSON.stringify({ result: frameResult.value, text: await page.frameLocator('iframe[title="Frame editor"]').locator('body').textContent() }));
     assert.equal(await page.getByLabel('Notes').inputValue(), 'alpha beta gamma');
     assert.equal(
       (await page.locator('[contenteditable="true"][aria-label="Rich editor"]').textContent())?.replace(/\u00a0/g, ' '),

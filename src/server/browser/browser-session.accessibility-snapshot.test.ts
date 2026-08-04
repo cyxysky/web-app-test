@@ -1188,7 +1188,7 @@ test('snapshot UID mappings evict identities outside the retention window', asyn
   assert.equal([...mappings.values()].some((entry) => entry.uid === expiredUid), false);
 });
 
-test('DOM mode inserts text at exact anchors in textareas and rich-text iframes', async (context) => {
+test('DOM mode atomically inserts and replaces selected text in textareas and rich-text iframes', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-insert-text-at-test' });
   context.after(async () => session.close());
   await session.start();
@@ -1205,20 +1205,21 @@ test('DOM mode inserts text at exact anchors in textareas and rich-text iframes'
   assert.ok(iframeUid, full.content);
 
   const textareaInsertion = await session.keyboard({
-    action: 'insertTextAt',
+    action: 'editText',
     uid: textareaUid,
     text: 'beta ',
-    afterText: 'alpha ',
-    occurrence: 2,
+    selection: { start: { afterText: 'alpha ', occurrence: 2 } },
+    operation: 'insert',
   });
   assert.equal(textareaInsertion.ok, true, textareaInsertion.actual);
   assert.equal(await page.getByLabel('Notes').inputValue(), 'alpha alpha beta gamma');
 
   const richInsertion = await session.keyboard({
-    action: 'insertTextAt',
+    action: 'editText',
     uid: iframeUid,
-    text: 'middle ',
-    afterText: 'left ',
+    text: 'middle right',
+    selection: { exactText: 'right' },
+    operation: 'replace',
   });
   assert.equal(richInsertion.ok, true, richInsertion.actual);
   const richTextFrame = page.frames().find((frame) => frame !== page.mainFrame());
