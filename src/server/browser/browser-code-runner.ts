@@ -172,9 +172,6 @@ function evaluateCallContainsDomClick(code: string) {
 }
 
 export function browserCodePolicyViolation(code: string) {
-  if (/(?:\bforce\b|['"]force['"])\s*:\s*true\b/i.test(code)) {
-    return 'browserCode forbids Playwright force: true. Refresh the page snapshot and resolve overlays, loading state, stale locators, or asynchronous redraws instead.';
-  }
   if (/\.dispatchEvent\s*\(\s*(?:[^,()]+,\s*)?['"]click['"]/i.test(code)) {
     return 'browserCode forbids dispatchEvent("click") because it bypasses Playwright actionability. Refresh the DOM evidence and use one unique visible Playwright locator.';
   }
@@ -217,7 +214,7 @@ const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 21;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 22;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -322,7 +319,8 @@ function browserCodeKernelMain() {
     documentId: string;
     height: number;
     page: import('playwright').Page;
-    revision: number;
+    scrollX: number;
+    scrollY: number;
     url: string;
     width: number;
   };
@@ -907,43 +905,21 @@ function browserCodeKernelMain() {
       devicePixelRatio: number;
       documentId: string;
       height: number;
-      revision: number;
+      scrollX: number;
+      scrollY: number;
       url: string;
       width: number;
     }>(`(() => {
       const browserWindow = window;
-      if (!browserWindow.__aiCoordinateEvidenceObserver) {
+      if (!browserWindow.__aiCoordinateEvidenceDocumentId) {
         browserWindow.__aiCoordinateEvidenceDocumentId = Date.now() + '-' + Math.random();
-        browserWindow.__aiCoordinateEvidenceRevision = 0;
-        const overlaySelector = '#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__';
-        const belongsToRuntimeOverlay = function (node) {
-          const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
-          return Boolean(element && (element.matches(overlaySelector) || element.closest(overlaySelector)));
-        };
-        browserWindow.__aiCoordinateEvidenceObserver = new MutationObserver(function (records) {
-          const hasPageMutation = records.some(function (record) {
-            if (record.type !== 'childList') return !belongsToRuntimeOverlay(record.target);
-            const changedNodes = Array.from(record.addedNodes).concat(Array.from(record.removedNodes));
-            return changedNodes.length
-              ? changedNodes.some(function (node) { return !belongsToRuntimeOverlay(node); })
-              : !belongsToRuntimeOverlay(record.target);
-          });
-          if (hasPageMutation) {
-            browserWindow.__aiCoordinateEvidenceRevision = (browserWindow.__aiCoordinateEvidenceRevision || 0) + 1;
-          }
-        });
-        browserWindow.__aiCoordinateEvidenceObserver.observe(document.documentElement, {
-          attributes: true,
-          characterData: true,
-          childList: true,
-          subtree: true,
-        });
       }
       return {
         devicePixelRatio: window.devicePixelRatio,
         documentId: browserWindow.__aiCoordinateEvidenceDocumentId || '',
         height: window.innerHeight,
-        revision: browserWindow.__aiCoordinateEvidenceRevision || 0,
+        scrollX: window.scrollX,
+        scrollY: window.scrollY,
         url: window.location.href,
         width: window.innerWidth,
       };
@@ -961,7 +937,8 @@ function browserCodeKernelMain() {
     && evidence.width === current.width
     && evidence.height === current.height
     && evidence.devicePixelRatio === current.devicePixelRatio
-    && evidence.revision === current.revision
+    && evidence.scrollX === current.scrollX
+    && evidence.scrollY === current.scrollY
   );
 
   const consumeCoordinateClickEvidence = async (page: import('playwright').Page) => {
@@ -974,7 +951,7 @@ function browserCodeKernelMain() {
     }
     coordinateClickEvidenceByDocument.delete(current.documentId);
     if (Date.now() - evidence.capturedAt > 5 * 60_000 || !sameCoordinateClickState(evidence, current)) {
-      throw new Error('The previously emitted viewport screenshot is stale because the page URL, viewport, or DOM changed. Emit and review a new screenshot in a separate browserCode cell.');
+      throw new Error('The previously emitted viewport screenshot is stale because the page document, URL, viewport, zoom, or scroll position changed. Emit and review a new screenshot in a separate browserCode cell.');
     }
   };
 
@@ -1123,9 +1100,7 @@ function browserCodeKernelMain() {
         Object.defineProperty(prototype, name, {
           configurable: true,
           value: async function pointerVisualizedLocatorAction(this: object, ...args: unknown[]) {
-            if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
-              throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the current page state.');
-            }
+            const forced = args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true);
             const normalizedArgs = actionArgsWithMinimumTimeout(
               args,
               name === 'dragTo' || name === 'setChecked' ? 1 : 0,
@@ -1134,9 +1109,13 @@ function browserCodeKernelMain() {
             let actionableLocator = this as import('playwright').Locator;
             const executionArgs = [...normalizedArgs];
             if (targetPage && activeExecution) {
-              actionableLocator = await resolveActionableLocator(this, name);
+              actionableLocator = forced
+                ? this as import('playwright').Locator
+                : await resolveActionableLocator(this, name);
               if (name === 'dragTo' && normalizedArgs[0] && typeof normalizedArgs[0] === 'object') {
-                executionArgs[0] = await resolveActionableLocator(normalizedArgs[0], name);
+                executionArgs[0] = forced
+                  ? normalizedArgs[0]
+                  : await resolveActionableLocator(normalizedArgs[0], name);
               }
               if (changesState) prepareStateChangingAction(targetPage, `locator.${name}`);
               await moveVisibleAiPointer(targetPage, await locatorCenter(actionableLocator), kind);
@@ -1246,9 +1225,7 @@ function browserCodeKernelMain() {
         Object.defineProperty(pageRecord, name, {
           configurable: true,
           value: async (...args: unknown[]) => {
-            if (args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true)) {
-              throw new Error('browserCode forbids Playwright force: true. Inspect the fresh page snapshot and resolve the current page state.');
-            }
+            const forced = args.some((arg) => arg && typeof arg === 'object' && Reflect.get(arg, 'force') === true);
             const normalizedArgs = actionArgsWithMinimumTimeout(args, optionsIndex);
             const targetLocators = new Map<number, import('playwright').Locator>();
             if (activeExecution) {
@@ -1260,7 +1237,9 @@ function browserCodeKernelMain() {
                   : locator;
                 targetLocators.set(
                   targetIndex,
-                  await resolveActionableLocator(locatorToResolve, name === 'dragAndDrop' ? 'dragTo' : name),
+                  forced
+                    ? locatorToResolve
+                    : await resolveActionableLocator(locatorToResolve, name === 'dragAndDrop' ? 'dragTo' : name),
                 );
               }
               if (changesState) prepareStateChangingAction(page, `page.${name}`);

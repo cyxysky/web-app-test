@@ -574,10 +574,6 @@ test('browserCode leaves post-action verification to the model without blocking 
 });
 
 test('browserCode requires coordinate screenshots to be reviewed in a previous cell', async () => {
-  const forced = await run(`await page.getByRole('button', { name: 'Save' }).click({ force: true });`);
-  assert.equal(forced.ok, false);
-  assert.match(forced.error || '', /forbids Playwright force: true/);
-
   const unobservedCoordinate = await run(`await page.mouse.click(10, 10);`);
   assert.equal(unobservedCoordinate.ok, false);
   assert.match(unobservedCoordinate.error || '', /viewport screenshot/);
@@ -613,7 +609,7 @@ test('browserCode requires coordinate screenshots to be reviewed in a previous c
   assert.deepEqual(reviewedCoordinate.value, { clicked: true });
 });
 
-test('browserCode invalidates coordinate evidence after a DOM redraw', async () => {
+test('browserCode keeps coordinate evidence across unrelated DOM mutations', async () => {
   const screenshot = await run(`
     await nodeRepl.emitImage(await page.screenshot({ fullPage: false }));
   `);
@@ -622,9 +618,37 @@ test('browserCode invalidates coordinate evidence after a DOM redraw', async () 
   await page.evaluate(() => {
     document.body.dataset.redrawn = String(Date.now());
   });
-  const staleCoordinate = await run(`await page.mouse.click(10, 10);`);
-  assert.equal(staleCoordinate.ok, false);
-  assert.match(staleCoordinate.error || '', /screenshot is stale/);
+  const coordinate = await run(`await page.mouse.click(10, 10);`);
+  assert.equal(coordinate.ok, true, coordinate.error);
+});
+
+test('browserCode allows a unique rendered overlay target to use Playwright force', async () => {
+  await page.evaluate(() => {
+    const overlay = document.createElement('div');
+    overlay.id = 'blocking-overlay';
+    overlay.setAttribute('aria-hidden', 'true');
+    overlay.addEventListener('click', () => {
+      document.body.dataset.forcedOverlayClick = 'true';
+    });
+    Object.assign(overlay.style, {
+      background: 'rgba(0, 0, 0, 0.1)',
+      inset: '0',
+      position: 'fixed',
+      zIndex: '9999',
+    });
+    document.body.append(overlay);
+    delete document.body.dataset.forcedOverlayClick;
+  });
+  try {
+    const forced = await run(`
+      await page.locator('#blocking-overlay').click({ force: true, position: { x: 5, y: 5 } });
+      nodeRepl.write(await page.locator('body').getAttribute('data-forced-overlay-click'));
+    `);
+    assert.equal(forced.ok, true, forced.error);
+    assert.equal(forced.value, 'true');
+  } finally {
+    await page.locator('#blocking-overlay').evaluate((element) => element.remove()).catch(() => undefined);
+  }
 });
 
 test('browserCode emits screenshots from the same JavaScript cell', async () => {
@@ -991,8 +1015,8 @@ test('browserCode risk analysis confirms committed effects instead of preparator
   assert.equal(analyzeBrowserCodeRisk(`return await page.getByRole('heading').innerText()`).requiresConfirmation, false);
 });
 
-test('browserCode policy rejects literal force clicks before execution', () => {
-  assert.match(browserCodePolicyViolation(`await locator.click({ force: true })`) || '', /forbids Playwright force: true/);
+test('browserCode policy allows Playwright force while retaining script-click protections', () => {
+  assert.equal(browserCodePolicyViolation(`await locator.click({ force: true })`), undefined);
   assert.equal(browserCodePolicyViolation(`await locator.click()`), undefined);
 });
 

@@ -4,7 +4,31 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { closeSqliteDatabase, getSqliteDatabase } from '@/server/storage/sqlite-database';
-import { consumeWebSocketTicket, createWebSocketTicket } from './websocket-ticket';
+import { consumeWebSocketTicket, createWebSocketTicket, requestPublicOrigin } from './websocket-ticket';
+
+test('uses the browser origin for reverse-proxied WebSocket tickets', () => {
+  const request = new Request('http://127.0.0.1:3000/webpilot/api/realtime/ws', {
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:3000',
+      origin: 'https://10.10.0.90',
+    },
+  });
+
+  assert.equal(requestPublicOrigin(request), 'https://10.10.0.90');
+});
+
+test('falls back to trusted forwarded origin outside a browser request', () => {
+  const request = new Request('http://127.0.0.1:3000/webpilot/api/realtime/ws', {
+    method: 'POST',
+    headers: {
+      'x-forwarded-host': '10.10.0.90',
+      'x-forwarded-proto': 'https',
+    },
+  });
+
+  assert.equal(requestPublicOrigin(request), 'https://10.10.0.90');
+});
 
 test('websocket tickets are short-lived, scoped, origin-bound, and one-time', () => {
   const dataRoot = mkdtempSync(path.join(tmpdir(), 'webpilot-ticket-'));

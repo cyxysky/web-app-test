@@ -23,6 +23,19 @@ test('uses the application port when the application has no base path', () => {
   );
 });
 
+test('uses the browser HTTPS origin when proxy headers are unavailable', () => {
+  const request = new Request('http://10.10.0.90/webpilot/api/browser-chat/preview-stream', {
+    method: 'POST',
+    headers: {
+      origin: 'https://10.10.0.90',
+    },
+  });
+  assert.equal(
+    browserReachableUrl(request, 18021, '/webpilot'),
+    'wss://10.10.0.90/webpilot/browser-preview',
+  );
+});
+
 test('uses the application port for a local base-path build', () => {
   const request = new Request('http://localhost:3000/webpilot/api/browser-chat/preview-stream');
   assert.equal(

@@ -69,9 +69,15 @@ function normalizedOrigin(value) {
 
 function unsafeCrossOriginRequest(request) {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(String(request.method || '').toUpperCase())) return false;
+  const fetchSite = String(request.headers['sec-fetch-site'] || '').trim().toLowerCase();
+  // Fetch Metadata is calculated by the browser from the public page and
+  // request origins. It remains accurate when a reverse proxy rewrites the
+  // upstream Host or protocol, unlike reconstructing the public origin from
+  // the Node-facing request alone.
+  if (fetchSite === 'same-origin') return false;
   const origin = String(request.headers.origin || '').trim();
   if (origin) return !normalizedOrigin(origin) || normalizedOrigin(origin) !== normalizedOrigin(publicRequestOrigin(request));
-  return String(request.headers['sec-fetch-site'] || '').trim().toLowerCase() === 'cross-site';
+  return fetchSite === 'cross-site';
 }
 
 function rejectCrossOrigin(response) {
@@ -300,5 +306,6 @@ module.exports = {
   loadStandaloneNextConfig,
   normalizeBasePath,
   stripBasePath,
+  unsafeCrossOriginRequest,
   webSocketUpgradeTarget,
 };

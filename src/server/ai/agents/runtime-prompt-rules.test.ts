@@ -61,7 +61,8 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /explicit ARIA role overrides the native tag/i);
   assert.match(rules, /<button role="treeitem"> is a treeitem, not a button/i);
   assert.match(rules, /never infer a control type, interaction sequence, or completion state/i);
-  assert.match(rules, /force: true is forbidden/);
+  assert.match(rules, /unique Locator with force:true/i);
+  assert.match(rules, /Never force an ambiguous, hidden, detached, disabled, or unobserved target/i);
   assert.match(rules, /factory methods automatically exclude matches that do not currently exist as rendered elements/);
   assert.match(rules, /full actionability checks on every remaining candidate/);
   assert.match(rules, /exactly one candidate passes/);
@@ -72,13 +73,13 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /first\(\), last\(\), and nth\(\) are allowed/);
   assert.doesNotMatch(rules, /clickByUid/);
   assert.match(rules, /no UID-click tool/);
-  assert.match(rules, /do not retry or fall back to CUA/i);
+  assert.match(rules, /never fall back to DOM element\.click\(\), dispatchEvent\(\), or script click/i);
   assert.match(rules, /record the failed locator and actual count/i);
   assert.match(rules, /do not (?:describe|call) (?:a )?failure as transient/i);
   assert.match(rules, /do not omit the failed tool call from the final report/i);
   assert.match(rules, /two separate model steps/);
   assert.match(rules, /Same-cell screenshot-and-click is forbidden/);
-  assert.match(rules, /DOM redraw/);
+  assert.match(rules, /document, URL, viewport, zoom, or scroll-position change/i);
   assert.match(rules, /Playwright delivery alone does not prove business success/);
   assert.match(rules, /newly opened nonmodal surface as a bounded interaction transaction/);
   assert.match(rules, /final read-only check of both business success and page\.activeSurface/);
@@ -102,7 +103,7 @@ test('screenshot guidance stays inside browserCode', () => {
 
 test('browser chat keeps browserCode capabilities in a compact non-duplicated rule set', () => {
   const rules = browserChatCodeRules(true).join('\n');
-  assert.equal(browserChatCodeRules(true).length, 8);
+  assert.equal(browserChatCodeRules(true).length, 9);
   assert.match(rules, /real Playwright page\/context/);
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
   assert.match(rules, /incremental domChanges/);
@@ -128,6 +129,7 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.doesNotMatch(rules, /clickByUid/);
   assert.match(rules, /no UID-click tool/);
   assert.match(rules, /force:true/);
+  assert.match(rules, /overlay or backdrop/i);
   assert.match(rules, /explicitly run page\.domSnapshot\(\)\/targeted Playwright reads/);
   assert.match(rules, /do not describe a failure as transient/i);
   assert.match(rules, /do not omit the failed tool call from the final report/i);

@@ -7,6 +7,7 @@ const test = require('node:test');
 const {
   loadStandaloneNextConfig,
   normalizeBasePath,
+  unsafeCrossOriginRequest,
   webSocketUpgradeTarget,
 } = require('./webpilot-server');
 
@@ -30,6 +31,30 @@ test('does not route a prefixed upgrade when the custom server missed the base p
 test('rejects upgrade requests without a valid short-lived ticket', () => {
   const requestUrl = new URL('http://localhost:3000/webpilot/refresh?ticket=invalid');
   assert.equal(webSocketUpgradeTarget(requestUrl, '/webpilot'), undefined);
+});
+
+test('accepts browser-confirmed same-origin writes behind an origin-rewriting proxy', () => {
+  assert.equal(unsafeCrossOriginRequest({
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:3000',
+      origin: 'https://10.10.0.90',
+      'sec-fetch-site': 'same-origin',
+    },
+    socket: {},
+  }), false);
+});
+
+test('continues to reject browser-confirmed cross-site writes', () => {
+  assert.equal(unsafeCrossOriginRequest({
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:3000',
+      origin: 'https://attacker.example',
+      'sec-fetch-site': 'cross-site',
+    },
+    socket: {},
+  }), true);
 });
 
 test('loads the compiled configuration required by a standalone Next runtime', () => {

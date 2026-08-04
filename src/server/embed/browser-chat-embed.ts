@@ -191,6 +191,20 @@ export function publicBaseUrl(request: NextRequest | Request) {
   const requestUrl = new URL(request.url);
   const forwardedHost = normalizeString(request.headers.get('x-forwarded-host')).split(',')[0];
   const forwardedProto = normalizeString(request.headers.get('x-forwarded-proto')).split(',')[0];
+  const requestHost = normalizeString(request.headers.get('host')) || requestUrl.host;
+  const publicHost = forwardedHost || requestHost;
+  const browserOrigin = normalizeString(request.headers.get('origin'));
+  if (browserOrigin && publicHost) {
+    try {
+      const originUrl = new URL(browserOrigin);
+      const normalizedPublicHost = new URL(`${originUrl.protocol}//${publicHost}`).host;
+      if (originUrl.host === normalizedPublicHost) {
+        return joinWebPilotUrl(originUrl.origin, WEBPILOT_BASE_PATH).replace(/\/+$/g, '');
+      }
+    } catch {
+      // Fall through to trusted proxy/request URL inference.
+    }
+  }
   const publicOrigin = forwardedHost
     ? `${forwardedProto || requestUrl.protocol.replace(/:$/, '')}://${forwardedHost}`
     : requestUrl.origin;

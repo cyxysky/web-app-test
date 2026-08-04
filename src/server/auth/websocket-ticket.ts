@@ -38,6 +38,12 @@ function ticketLifetimeMs() {
 }
 
 export function requestPublicOrigin(request: Request) {
+  // A browser POST carries the exact origin that it will also send during the
+  // subsequent WebSocket handshake. Prefer it over proxy-derived values so a
+  // TLS-terminating reverse proxy cannot accidentally mint an http-bound
+  // ticket for an https page when trusted proxy headers are unavailable.
+  const browserOrigin = normalizedOrigin(String(request.headers.get('origin') || '').trim());
+  if (browserOrigin) return browserOrigin;
   const url = new URL(request.url);
   const forwardedHost = String(request.headers.get('x-forwarded-host') || '').split(',')[0].trim();
   const forwardedProto = String(request.headers.get('x-forwarded-proto') || '').split(',')[0].trim();
