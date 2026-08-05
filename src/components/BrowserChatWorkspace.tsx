@@ -3768,11 +3768,13 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
               />
             )
           ))}
-          <BrowserChatStreamingAnswer
-            hidden={hideManualVerificationStatusText}
-            running={running}
-            text={finalText}
-          />
+          {running ? (
+            <BrowserChatStreamingAnswer
+              hidden={hideManualVerificationStatusText}
+              running
+              text={finalText}
+            />
+          ) : null}
           {currentTimelineEntries.length ? (
             <div className="browser-chat-tool-stack browser-chat-current-tool-stack">
               {currentTimelineEntries.map(({ step, visibleToolIndexes }) => (
@@ -3809,17 +3811,18 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
             </div>
           ) : null}
         </BrowserChatProcessDisclosure>
-      ) : (
-        <BrowserChatStreamingAnswer
-          hidden={hideManualVerificationStatusText}
-          running={running}
-          text={finalText}
-        />
-      )}
+      ) : null}
       {manualVerificationPaused ? (
         <BrowserChatManualVerificationCard
           onResume={!running && message.status === 'blocked' ? onResumeHumanVerification : undefined}
           resuming={resumingHumanVerification}
+        />
+      ) : null}
+      {!running && hasFinalText ? (
+        <BrowserChatStreamingAnswer
+          hidden={hideManualVerificationStatusText}
+          running={false}
+          text={finalText}
         />
       ) : null}
       {!hasFinalText && !hasProcessContent && !manualVerificationPaused ? (
