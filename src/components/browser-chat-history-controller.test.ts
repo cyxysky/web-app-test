@@ -1,10 +1,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  browserChatHasEarlierMessages,
   mergeBrowserChatHistoryChunkData,
   mergeBrowserChatSessionWindowData,
   type BrowserChatHistoryState,
 } from './browser-chat-history-controller';
+
+test('does not expose message history loading for remaining logs or steps alone', () => {
+  assert.equal(browserChatHasEarlierMessages({
+    messages: { hasMore: false },
+    steps: { cursor: 'older-steps', hasMore: true },
+    logs: { cursor: 'older-logs', hasMore: true },
+  }), false);
+  assert.equal(browserChatHasEarlierMessages({
+    messages: { cursor: 'older-messages', hasMore: true },
+    steps: { hasMore: false },
+    logs: { hasMore: false },
+  }), true);
+});
 
 test('window refresh keeps already loaded older records while accepting current records', () => {
   const history = {

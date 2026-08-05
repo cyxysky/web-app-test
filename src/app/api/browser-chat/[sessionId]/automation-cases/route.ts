@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { getBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
-import { compileConversationCase } from '@/server/automation/conversation-case-compiler';
+import { compileConversationMessagesCase } from '@/server/automation/conversation-case-compiler';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { noStoreJson } from '@/server/http/no-store-response';
 import { createAutomationCase, listAutomationCases } from '@/server/storage/automation-store';
@@ -41,11 +41,14 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const userId = requestUserId(request);
     const session = getBrowserChatSession(sessionId, userId);
     if (!session) return noStoreJson({ error: 'Browser chat session not found.' }, { status: 404 });
-    const assistantMessageId = text(body.assistantMessageId ?? body.messageId);
-    if (!assistantMessageId) throw new Error('Assistant message id is required.');
-    const compiled = compileConversationCase({
+    const messageIds = Array.isArray(body.messageIds)
+      ? body.messageIds.filter((item): item is string => typeof item === 'string')
+      : [];
+    const assistantMessageIds = messageIds;
+    if (!assistantMessageIds.length) throw new Error('At least one assistant message id is required.');
+    const compiled = compileConversationMessagesCase({
       session,
-      assistantMessageId,
+      assistantMessageIds,
       userId,
       title: text(body.title ?? body.name) || undefined,
       description: text(body.description) || undefined,
@@ -55,6 +58,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
       ok: true,
       case: automationCase,
       automationCase,
+      sourceMessageIds: assistantMessageIds,
       cases: listAutomationCases({ userId, sourceSessionId: sessionId }),
     }, { status: 201 });
   } catch (error) {

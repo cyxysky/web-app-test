@@ -52,6 +52,7 @@ import {
   searchPersonalMemory,
 } from '@/server/ai/personal-memory';
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
+import { compactBrowserChatLogsForClient } from '@/server/ai/agents/browser-chat-log-client';
 import type { ModelProvider, SkillRecord, StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
 import {
@@ -2392,7 +2393,7 @@ export function getBrowserChatSessionPage(sessionId: string, userId?: string | n
       ...base,
       messages: live?.messages.slice(-80) || [],
       steps: live?.steps.slice(-120).map(compactStepForClient) || [],
-      logs: live?.logs.slice(-200) || [],
+      logs: compactBrowserChatLogsForClient(live?.logs.slice(-200) || []),
       history: {
         messages: { hasMore: false },
         steps: { hasMore: false },
@@ -2404,7 +2405,7 @@ export function getBrowserChatSessionPage(sessionId: string, userId?: string | n
     ...base,
     messages: persisted.messages,
     steps: persisted.steps.map(compactStepForClient),
-    logs: persisted.logs,
+    logs: compactBrowserChatLogsForClient(persisted.logs),
     history: persisted.history,
   } satisfies BrowserChatSessionPage;
 }
@@ -2445,7 +2446,7 @@ export function getBrowserChatSessionHistory(
   return {
     ...(messages ? { messages: messages.items } : {}),
     ...(steps ? { steps: steps.items.map(compactStepForClient) } : {}),
-    ...(logs ? { logs: logs.items } : {}),
+    ...(logs ? { logs: compactBrowserChatLogsForClient(logs.items) } : {}),
     history: {
       ...(messages ? { messages: { cursor: messages.cursor, hasMore: messages.hasMore } } : {}),
       ...(steps ? { steps: { cursor: steps.cursor, hasMore: steps.hasMore } } : {}),
@@ -2723,7 +2724,12 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
   return { deleted, requested: uniqueIds.length };
 }
 
-export async function generateBrowserChatMessagesSkill(sessionId: string, messageIds: string[], userId?: string | number) {
+export async function generateBrowserChatMessagesSkill(
+  sessionId: string,
+  messageIds: string[],
+  userId: string | number | undefined,
+  summaryDirection: string,
+) {
   const session = hydrateSession(sessionId);
   if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   const uniqueMessageIds = Array.from(new Set(messageIds.map((item) => item.trim()).filter(Boolean)));
@@ -2742,7 +2748,7 @@ export async function generateBrowserChatMessagesSkill(sessionId: string, messag
   }
 
   const selectedSteps = session.steps
-    .filter((step) => selectedStepIndexSet.size ? selectedStepIndexSet.has(step.index) : step.index > 0)
+    .filter((step) => selectedIdSet.has(step.messageId || '') || selectedStepIndexSet.has(step.index))
     .sort((a, b) => a.index - b.index)
     .map((step, index): StepExecutionResult => ({
       ...step,
@@ -2768,6 +2774,7 @@ export async function generateBrowserChatMessagesSkill(sessionId: string, messag
   const generated = await generateSkillFromBrowserHistory({
     browserMode: session.mode,
     consoleErrors: session.consoleErrors,
+    constraints: `Skill 总结方向（必须优先遵循）：${compactText(summaryDirection, 2_000)}`,
     goal: turnDescriptions.join('\n\n') || titleSeed,
     networkErrors: session.networkErrors,
     sourceId: session.id,
@@ -2788,11 +2795,6 @@ export async function generateBrowserChatMessagesSkill(sessionId: string, messag
   });
   return { skill, sourceMessageIds: uniqueMessageIds };
 }
-
-export async function generateBrowserChatMessageSkill(sessionId: string, messageId: string, userId?: string | number) {
-  return generateBrowserChatMessagesSkill(sessionId, [messageId], userId);
-}
-
 
 export async function sendBrowserChatMessage(
   sessionId: string,

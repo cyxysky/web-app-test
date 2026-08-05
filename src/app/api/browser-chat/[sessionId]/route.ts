@@ -1,4 +1,4 @@
-import { closeBrowserChatSession, getBrowserChatSessionPage } from '@/server/ai/agents/browser-chat.service';
+import { readBrowserChatSessionPage } from '@/server/ai/agents/browser-chat-read.service';
 import { noStoreJson } from '@/server/http/no-store-response';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
@@ -15,14 +15,7 @@ function requestUserId(request: Request) {
 
 export async function GET(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
-  const session = getBrowserChatSessionPage(sessionId, requestUserId(request));
-  if (!session) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
-  return noStoreJson({ session });
-}
-
-export async function DELETE(request: Request, context: RouteContext) {
-  const { sessionId } = await context.params;
-  const session = await closeBrowserChatSession(sessionId, requestUserId(request));
+  const session = readBrowserChatSessionPage(sessionId, requestUserId(request));
   if (!session) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
   return noStoreJson({ session });
 }

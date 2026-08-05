@@ -1,4 +1,4 @@
-import { getBrowserChatSessionLogs } from '@/server/ai/agents/browser-chat.service';
+import { readBrowserChatSessionLogs } from '@/server/ai/agents/browser-chat-read.service';
 import { noStoreJson } from '@/server/http/no-store-response';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
@@ -16,7 +16,7 @@ function requestUserId(request: Request) {
 export async function GET(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
   const url = new URL(request.url);
-  const result = getBrowserChatSessionLogs(sessionId, requestUserId(request), {
+  const result = readBrowserChatSessionLogs(sessionId, requestUserId(request), {
     cursor: url.searchParams.get('cursor') || undefined,
     limit: Number(url.searchParams.get('limit') || 500),
     messageId: url.searchParams.get('messageId') || undefined,

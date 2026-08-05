@@ -1,4 +1,4 @@
-import { getBrowserChatSessionHistory } from '@/server/ai/agents/browser-chat.service';
+import { readBrowserChatSessionHistoryPage } from '@/server/ai/agents/browser-chat-read.service';
 import { noStoreJson } from '@/server/http/no-store-response';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
@@ -16,7 +16,7 @@ function requestUserId(request: Request) {
 export async function GET(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
   const url = new URL(request.url);
-  const result = getBrowserChatSessionHistory(sessionId, requestUserId(request), {
+  const result = readBrowserChatSessionHistoryPage(sessionId, requestUserId(request), {
     messageCursor: url.searchParams.get('messageCursor') || undefined,
     messageLimit: Number(url.searchParams.get('messageLimit') || 80),
     stepCursor: url.searchParams.get('stepCursor') || undefined,

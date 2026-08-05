@@ -29,6 +29,10 @@ export function normalizeBrowserChatHistory(value: BrowserChatHistoryState | und
   } satisfies BrowserChatHistoryState;
 }
 
+export function browserChatHasEarlierMessages(value: BrowserChatHistoryState | undefined) {
+  return Boolean(value?.messages.hasMore && value.messages.cursor);
+}
+
 export function mergeBrowserChatSessionWindowData<
   TMessage extends MessageLike,
   TStep extends StepLike,

@@ -1,4 +1,4 @@
-import { generateObject } from 'ai';
+import { generateText } from 'ai';
 import { z } from 'zod';
 import { getModel } from '@/server/ai/model';
 import { skillContentSchema, type SkillRecord, type StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
@@ -12,6 +12,32 @@ const generatedSkillSchema = z.object({
     details: z.string().min(20).max(8_000),
   }),
 });
+
+function extractGeneratedSkillJson(text: string) {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  const candidate = fenced || trimmed;
+  try {
+    return JSON.parse(candidate) as unknown;
+  } catch {
+    const start = candidate.indexOf('{');
+    const end = candidate.lastIndexOf('}');
+    if (start >= 0 && end > start) return JSON.parse(candidate.slice(start, end + 1)) as unknown;
+    throw new Error('Skill model response did not contain a JSON object.');
+  }
+}
+
+export function parseGeneratedSkillText(text: string) {
+  const parsed = generatedSkillSchema.safeParse(extractGeneratedSkillJson(text));
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .slice(0, 4)
+      .map((issue) => `${issue.path.join('.') || 'root'}: ${issue.message}`)
+      .join('; ');
+    throw new Error(`Skill model response is invalid: ${detail}`);
+  }
+  return parsed.data;
+}
 
 function compactText(value: unknown, max = 800) {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
@@ -106,9 +132,8 @@ export async function generateSkillFromBrowserHistory(input: {
       ...(input.networkErrors || []).slice(-6),
     ], 6);
 
-  const result = await generateObject({
+  const result = await generateText({
     model: getModel(),
-    schema: generatedSkillSchema,
     temperature: 0.2,
     prompt: [
       'You are converting a completed browser test execution record into a reusable application Skill.',
@@ -117,6 +142,7 @@ export async function generateSkillFromBrowserHistory(input: {
       'Rules:',
       '- Write the skill in Chinese if the source requirement is Chinese; otherwise use the source language.',
       '- Description: one sentence that combines capability and precise usage scope. Do not repeat it elsewhere.',
+      '- Treat the supplied constraints as the user requested summarization direction. Use them to decide which workflow, decisions, and reusable details are central.',
       '- Trigger phrases: specific user intents that should activate this Skill. Avoid broad phrases such as "open website" or "search".',
       '- Details: write the complete reusable operating guidance as one structured Markdown block. Include page recognition, stable locator hints, ordered actions, useful branches, and observable success conditions where they matter.',
       '- Keep every fact in exactly one output field. Remove paraphrases and near-duplicates across fields.',
@@ -124,6 +150,8 @@ export async function generateSkillFromBrowserHistory(input: {
       '- Do NOT include passwords, cookies, tokens, one-time codes, personal accounts, or secrets. Replace them with generic placeholders.',
       '- Avoid describing this as a report. It is a reusable operating skill for later AI browser runs.',
       '- Keep the details actionable but semantic: describe what to find/click/check, not old ids or exact pixels.',
+      '- Return exactly one JSON object. Do not use Markdown fences or add explanatory text.',
+      '- JSON shape: {"title":"...","description":"...","triggerPhrases":["..."],"content":{"details":"..."}}.',
       '',
       `Reusable source JSON:\n${safeJson({
         title: input.title,
@@ -137,13 +165,14 @@ export async function generateSkillFromBrowserHistory(input: {
       }, 10000)}`,
     ].join('\n'),
   });
+  const generated = parseGeneratedSkillText(result.text);
   return {
-    title: result.object.title,
-    description: result.object.description,
+    title: generated.title,
+    description: generated.description,
     domains: [normalizeSkillDomain(input.targetUrl)].filter(Boolean),
-    triggerPhrases: distinctText(result.object.triggerPhrases, 8),
+    triggerPhrases: distinctText(generated.triggerPhrases, 8),
     content: {
-      details: result.object.content.details.trim(),
+      details: generated.content.details.trim(),
     },
     sourceSessionId: input.sourceId,
   };
