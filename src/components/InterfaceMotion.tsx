@@ -9,16 +9,10 @@ const PAGE_SELECTOR = [
   '.dashboard-v2',
   '.case-workspace',
   '.redesigned-run-shell',
-  '.browser-chat-main',
-  '.settings-layout',
 ].join(',');
 
 const PANEL_SELECTOR = [
-  '.browser-chat-settings-pane .settings-content > section',
   '.browser-chat-cases-pane .dashboard-folder-layout',
-  '.browser-chat-chat-pane',
-  '.browser-chat-target-model-bar',
-  '.browser-chat-composer-shell',
   '.case-main-panel',
   '.run-execution-panel',
 ].join(',');

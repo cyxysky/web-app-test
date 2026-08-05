@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ChevronDown, Clock3, Edit3, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -10,6 +10,7 @@ import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import { waitForMinimumLoading } from '@/lib/minimum-loading';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import type { SkillRecord } from '@/server/ai/schemas/runtime.schema';
 
@@ -91,10 +92,13 @@ export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => v
   const [deleteTarget, setDeleteTarget] = useState<SkillRecord | null>(null);
   const [draft, setDraft] = useState<SkillDraft>(emptyDraft);
   const [loading, setLoading] = useState(true);
+  const loadSequenceRef = useRef(0);
   const [saving, setSaving] = useState(false);
   const [deletingSkillId, setDeletingSkillId] = useState<string | null>(null);
 
   const loadSkills = useCallback(async () => {
+    const loadingSequence = ++loadSequenceRef.current;
+    const loadingStartedAt = Date.now();
     setLoading(true);
     try {
       const response = await fetch(skillsApiUrl('/api/skills'), { cache: 'no-store' });
@@ -103,7 +107,8 @@ export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => v
     } catch (error) {
       window.alert(error instanceof Error ? error.message : t('加载 Skills 失败'));
     } finally {
-      setLoading(false);
+      await waitForMinimumLoading(loadingStartedAt);
+      if (loadSequenceRef.current === loadingSequence) setLoading(false);
     }
   }, [skillsApiUrl, t]);
 

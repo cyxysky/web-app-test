@@ -24,9 +24,6 @@ export default function nextConfig(phase: string): NextConfig {
       ],
     },
     outputFileTracingRoot: currentDir,
-    eslint: {
-      ignoreDuringBuilds: true,
-    },
     serverExternalPackages: [
       'playwright',
       'docx',

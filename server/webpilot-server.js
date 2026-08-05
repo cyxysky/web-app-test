@@ -108,6 +108,11 @@ function webSocketUpgradeTarget(requestUrl, basePath) {
   return undefined;
 }
 
+function nextDevelopmentUpgrade(requestUrl, basePath, dev) {
+  if (!dev) return false;
+  return requestUrl.pathname === `${normalizeBasePath(basePath)}/_next/hmr`;
+}
+
 function internalRequestAuthorized(request, pathname) {
   if (pathname === '/api/system/shutdown') {
     const expected = String(process.env.WEBPILOT_INTERNAL_SHUTDOWN_TOKEN || '');
@@ -210,6 +215,7 @@ async function main() {
   });
   const handle = application.getRequestHandler();
   await application.prepare();
+  const handleNextUpgrade = dev ? application.getUpgradeHandler() : undefined;
 
   // Next loads the project's .env files during prepare(). Read every setting
   // used by the custom server only after that point. Otherwise Next can serve
@@ -266,6 +272,13 @@ async function main() {
     const requestUrl = new URL(request.url || '/', `http://${request.headers.host || `${hostname}:${port}`}`);
     const target = webSocketUpgradeTarget(requestUrl, basePath);
     if (!target) {
+      if (handleNextUpgrade && nextDevelopmentUpgrade(requestUrl, basePath, dev)) {
+        void Promise.resolve(handleNextUpgrade(request, socket, head)).catch((error) => {
+          console.error('[webpilot-server] Next.js development WebSocket upgrade failed.', error);
+          socket.destroy();
+        });
+        return;
+      }
       socket.destroy();
       return;
     }
@@ -304,6 +317,7 @@ if (require.main === module) {
 
 module.exports = {
   loadStandaloneNextConfig,
+  nextDevelopmentUpgrade,
   normalizeBasePath,
   stripBasePath,
   unsafeCrossOriginRequest,

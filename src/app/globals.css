@@ -6452,37 +6452,37 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   width: 100%;
 }
 
-.settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading) {
+.settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) {
   height: 100vh;
   height: 100dvh;
 }
 
-.settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading) .settings-layout {
+.settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) .settings-layout {
   align-items: stretch;
   flex: 1 1 auto;
   min-height: 0;
 }
 
-.settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading) .settings-content {
+.settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) .settings-content {
   height: 100%;
   min-height: 0;
 }
 
 .skills-manager.is-loading,
-.personal-memory-settings.is-loading {
+.personal-memory-settings.is-loading,
+.login-account-settings.is-loading {
   grid-template-rows: auto minmax(0, 1fr);
   height: 100%;
   min-height: 100%;
 }
 
-.skills-manager.is-loading .skills-manager-layout {
-  display: grid;
-  min-height: 0;
-}
-
+.skills-manager.is-loading .skills-manager-layout,
 .skills-manager.is-loading .skills-manager-list,
 .skills-manager.is-loading .skills-manager-list-body {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
+  min-height: 0;
 }
 
 .skills-manager-item {
@@ -7482,6 +7482,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   display: grid;
   height: 100%;
   min-height: 100%;
+  overflow: hidden;
   padding: 0;
   width: 100%;
 }
@@ -8214,6 +8215,37 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   padding: 0;
 }
 
+.browser-chat-history-stage {
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.browser-chat-history-stage > .browser-chat-recent-list {
+  height: 100%;
+}
+
+.browser-chat-history-stage > .automation-case-history-list {
+  height: 100%;
+}
+
+.browser-chat-history-loading {
+  align-content: start;
+  align-items: center;
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  display: grid;
+  font-size: 12px;
+  gap: 8px;
+  grid-template-columns: auto auto;
+  inset: 0;
+  justify-content: center;
+  padding: 14px 4px;
+  position: absolute;
+  z-index: 2;
+}
+
 .browser-chat-step-mini li {
   align-items: center;
   border-radius: 8px;
@@ -8367,7 +8399,8 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-check,
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-delete,
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-open>span,
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-open small {
+.browser-chat-layout.sidebar-collapsed .browser-chat-recent-open small,
+.browser-chat-layout.sidebar-collapsed .browser-chat-history-loading span {
   display: none;
 }
 
@@ -8672,9 +8705,26 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   overflow: auto;
   overflow-x: hidden;
   min-width: 0;
+  scrollbar-gutter: stable;
+}
+
+.browser-chat-main:has(> .browser-chat-chat-pane) {
+  overflow: hidden;
+}
+
+.browser-chat-main:has(> .browser-chat-settings-pane .settings-loading-panel),
+.automation-main:has(.automation-loading-state) {
+  overflow: hidden;
+  scrollbar-gutter: auto;
 }
 
 .browser-chat-main.is-positioning-chat {
+  overflow: hidden;
+}
+
+.browser-chat-main.is-positioning-chat > .browser-chat-chat-pane {
+  height: 100%;
+  min-height: 100%;
   overflow: hidden;
 }
 
@@ -9777,6 +9827,7 @@ body.is-dragging-embedded-tab * {
 }
 
 .browser-chat-chat-pane {
+  --browser-chat-pane-inline-padding: 24px;
   display: flex;
   flex-direction: column;
   height: auto;
@@ -9784,6 +9835,12 @@ body.is-dragging-embedded-tab * {
   min-width: 0;
   padding: 28px 24px 32px;
   position: relative;
+}
+
+.browser-chat-chat-pane:not(.embedded-chat) {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .browser-chat-chat-pane.embedded-chat {
@@ -10207,29 +10264,42 @@ body.is-dragging-embedded-tab * {
 .browser-chat-message-list {
   align-content: start;
   box-sizing: border-box;
-  display: grid;
+  display: block;
   flex: 1;
-  gap: 18px;
-  margin: 0 auto;
-  max-width: 920px;
+  margin: 0;
+  max-width: none;
   min-width: 0;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 52px 4px 8px;
+  padding: 52px 0 8px;
   overflow-anchor: none;
   position: relative;
   scrollbar-gutter: stable;
-  width: min(100%, 920px);
+  width: 100%;
 }
 
 .browser-chat-chat-pane:not(.embedded-chat) .browser-chat-message-list {
-  flex: 0 0 auto;
-  overflow-y: visible;
-  scrollbar-gutter: auto;
+  align-self: stretch;
+  flex: 1 1 auto;
+  margin-inline: calc(0px - var(--browser-chat-pane-inline-padding));
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  width: calc(100% + var(--browser-chat-pane-inline-padding) + var(--browser-chat-pane-inline-padding));
 }
 
-.browser-chat-message-list > * {
+.browser-chat-message-list-content {
+  align-content: start;
+  display: grid;
+  gap: 18px;
+  margin: 0 auto;
+  max-width: 920px;
+  min-width: 0;
+  padding: 0 4px;
+  width: min(100%, 920px);
+}
+
+.browser-chat-message-list-content > * {
   min-width: 0;
   max-width: 100%;
 }
@@ -11637,6 +11707,12 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   position: sticky;
   bottom: 32px;
   z-index: 20;
+}
+
+.browser-chat-chat-pane:not(.embedded-chat) .browser-chat-composer-shell {
+  bottom: auto;
+  flex: 0 0 auto;
+  position: relative;
 }
 
 .browser-chat-composer-shell>.browser-chat-skill-chips {
@@ -13412,9 +13488,19 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   min-height: 0;
 }
 
-.browser-chat-settings-pane .settings-workspace.embedded:has(.skills-manager.is-loading, .personal-memory-settings.is-loading) {
-  height: calc(100vh - 116px);
-  height: calc(100dvh - 116px);
+.browser-chat-settings-pane .settings-workspace.embedded:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) {
+  height: 100%;
+}
+
+.browser-chat-settings-pane:has(.settings-loading-panel) {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.browser-chat-settings-pane:has(.settings-loading-panel) .settings-workspace.embedded {
+  height: 100%;
+  min-height: 0;
 }
 
 .browser-chat-settings-pane .settings-layout.no-tabs {
@@ -13859,6 +13945,7 @@ body {
   }
 
   .browser-chat-chat-pane {
+    --browser-chat-pane-inline-padding: 16px;
     height: auto;
     min-height: calc(100vh - 210px);
     overflow: visible;

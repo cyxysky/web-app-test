@@ -32,6 +32,28 @@ export function shouldActivateRequestedBrowserChatSession({
     && (!activeSessionId || activeSessionId === requestedSessionId);
 }
 
+export function shouldAcceptBrowserChatViewportPosition({
+  activeSessionId,
+  positionedSessionId,
+}: {
+  activeSessionId: string | null;
+  positionedSessionId?: string;
+}) {
+  return Boolean(positionedSessionId && activeSessionId === positionedSessionId);
+}
+
+export function shouldFinishBrowserChatSessionLoading({
+  loadingSessionId,
+  minimumLoadingElapsed,
+  viewportReady,
+}: {
+  loadingSessionId: string | null;
+  minimumLoadingElapsed: boolean;
+  viewportReady: boolean;
+}) {
+  return Boolean(loadingSessionId && minimumLoadingElapsed && viewportReady);
+}
+
 export function browserChatViewNavigationHref(targetHref: string, currentHref: string) {
   const current = new URL(currentHref);
   const target = new URL(targetHref, current);

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, FolderOpen, KeyRound, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
@@ -18,6 +18,7 @@ import { useI18n } from '@/i18n/I18nProvider';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { languageOptions } from '@/i18n/translations';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
+import { waitForMinimumLoading } from '@/lib/minimum-loading';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/runtime.schema';
 import { useTheme } from '@/theme/ThemeProvider';
 import { readApiJson } from '@/lib/api-client';
@@ -259,6 +260,7 @@ export function EnvironmentSettings({
   const [loginAccounts, setLoginAccounts] = useState<LoginAccountMetadata[]>([]);
   const [loginAccountEditor, setLoginAccountEditor] = useState<LoginAccountMetadata | 'create' | null>(null);
   const [loadingLoginAccounts, setLoadingLoginAccounts] = useState(false);
+  const loginAccountsLoadSequenceRef = useRef(0);
   const [deletingLoginAccountId, setDeletingLoginAccountId] = useState('');
   const [deleteLoginAccountTarget, setDeleteLoginAccountTarget] = useState<LoginAccountMetadata | null>(null);
   const [deleteLoginAccountError, setDeleteLoginAccountError] = useState('');
@@ -267,6 +269,7 @@ export function EnvironmentSettings({
   const [savingEnv, setSavingEnv] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
   const [loadingPersonalMemory, setLoadingPersonalMemory] = useState(false);
+  const personalMemoryLoadSequenceRef = useRef(0);
   const [savingPersonalMemory, setSavingPersonalMemory] = useState(false);
   const [updatingPersonalMemoryId, setUpdatingPersonalMemoryId] = useState('');
   const [deletingPersonalMemoryId, setDeletingPersonalMemoryId] = useState('');
@@ -516,33 +519,39 @@ export function EnvironmentSettings({
   }
 
   const loadPersonalMemoryItems = useCallback(async () => {
+    const loadingSequence = ++personalMemoryLoadSequenceRef.current;
+    const loadingStartedAt = Date.now();
     setLoadingPersonalMemory(true);
     try {
       const response = await fetch(withWebPilotBasePath('/api/personal-memory?includeDisabled=true'), { cache: 'no-store' });
       const data = await readApiJson<{ items?: PersonalMemoryItem[] }>(response, t('读取个性化记忆失败'));
       setPersonalMemoryItems(sortPersonalMemoryItems(Array.isArray(data.items) ? data.items : []));
     } finally {
-      setLoadingPersonalMemory(false);
+      await waitForMinimumLoading(loadingStartedAt);
+      if (personalMemoryLoadSequenceRef.current === loadingSequence) setLoadingPersonalMemory(false);
     }
   }, [t]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (activeTab !== 'memory') return;
     void loadPersonalMemoryItems().catch(() => undefined);
   }, [activeTab, loadPersonalMemoryItems]);
 
   const loadLoginAccounts = useCallback(async () => {
+    const loadingSequence = ++loginAccountsLoadSequenceRef.current;
+    const loadingStartedAt = Date.now();
     setLoadingLoginAccounts(true);
     try {
       const response = await fetch(withWebPilotBasePath('/api/login-accounts'), { cache: 'no-store' });
       const data = await readApiJson<{ accounts?: LoginAccountMetadata[] }>(response, t('读取登录账号失败'));
       setLoginAccounts(Array.isArray(data.accounts) ? data.accounts : []);
     } finally {
-      setLoadingLoginAccounts(false);
+      await waitForMinimumLoading(loadingStartedAt);
+      if (loginAccountsLoadSequenceRef.current === loadingSequence) setLoadingLoginAccounts(false);
     }
   }, [t]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (activeTab !== 'accounts') return;
     void loadLoginAccounts().catch(() => undefined);
   }, [activeTab, loadLoginAccounts]);
@@ -1060,7 +1069,7 @@ export function EnvironmentSettings({
 
   function renderLoginAccountsPanel() {
     return (
-      <section className="login-account-settings">
+      <section className={loadingLoginAccounts ? 'login-account-settings is-loading' : 'login-account-settings'}>
         <div className="settings-section-head">
           <div>
             <h2>{t('登录账号')}</h2>

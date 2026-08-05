@@ -6,6 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 const {
   loadStandaloneNextConfig,
+  nextDevelopmentUpgrade,
   normalizeBasePath,
   unsafeCrossOriginRequest,
   webSocketUpgradeTarget,
@@ -31,6 +32,13 @@ test('does not route a prefixed upgrade when the custom server missed the base p
 test('rejects upgrade requests without a valid short-lived ticket', () => {
   const requestUrl = new URL('http://localhost:3000/webpilot/refresh?ticket=invalid');
   assert.equal(webSocketUpgradeTarget(requestUrl, '/webpilot'), undefined);
+});
+
+test('delegates the base-path-prefixed Next.js HMR socket only in development', () => {
+  const requestUrl = new URL('http://localhost:3000/webpilot/_next/hmr?id=dev-client');
+  assert.equal(nextDevelopmentUpgrade(requestUrl, '/webpilot', true), true);
+  assert.equal(nextDevelopmentUpgrade(requestUrl, '/webpilot', false), false);
+  assert.equal(nextDevelopmentUpgrade(new URL('http://localhost:3000/_next/hmr?id=dev-client'), '/webpilot', true), false);
 });
 
 test('accepts browser-confirmed same-origin writes behind an origin-rewriting proxy', () => {

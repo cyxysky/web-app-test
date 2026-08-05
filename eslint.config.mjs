@@ -1,37 +1,36 @@
-import { dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { FlatCompat } from '@eslint/eslintrc';
+import { defineConfig, globalIgnores } from 'eslint/config';
+import nextVitals from 'eslint-config-next/core-web-vitals';
+import nextTypescript from 'eslint-config-next/typescript';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const compat = new FlatCompat({
-  baseDirectory: __dirname,
-});
-
-const eslintConfig = [
-  ...compat.extends('next/core-web-vitals', 'next/typescript'),
-  {
-    ignores: [
-      '.next/**',
-      'artifacts/**',
-      'dist-desktop/**',
-      'dist-electron/**',
-      'dist-server/**',
-      'electron/**',
-      'next-env.d.ts',
-      'node_modules/**',
-      'scripts/electron-after-pack.js',
-      'scripts/package-server.js',
-      'scripts/prepare-electron-server.js',
-      'scripts/__pycache__/**',
-    ],
-  },
+const eslintConfig = defineConfig([
+  ...nextVitals,
+  ...nextTypescript,
+  globalIgnores([
+    '.next/**',
+    '.next-dev/**',
+    'artifacts/**',
+    'dist-desktop/**',
+    'dist-electron/**',
+    'dist-server/**',
+    'electron/**',
+    'next-env.d.ts',
+    'node_modules/**',
+    'scripts/electron-after-pack.js',
+    'scripts/package-server.js',
+    'scripts/prepare-electron-server.js',
+    'scripts/__pycache__/**',
+  ]),
   {
     rules: {
       '@next/next/no-img-element': 'off',
+      'react-hooks/immutability': 'off',
+      'react-hooks/incompatible-library': 'off',
+      'react-hooks/preserve-manual-memoization': 'off',
+      'react-hooks/purity': 'off',
+      'react-hooks/refs': 'off',
+      'react-hooks/set-state-in-effect': 'off',
     },
   },
-];
+]);
 
 export default eslintConfig;

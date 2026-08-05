@@ -5,7 +5,9 @@ import {
   browserChatViewNavigationHref,
   findRequestedBrowserChatSession,
   loadRequestedBrowserChatSessionDetail,
+  shouldAcceptBrowserChatViewportPosition,
   shouldActivateRequestedBrowserChatSession,
+  shouldFinishBrowserChatSessionLoading,
 } from './browser-chat-session-selection';
 
 test('updates the selected conversation and drops client-declared identity', () => {
@@ -51,6 +53,35 @@ test('does not let a stale route request replace the conversation selected by th
     currentSelectionIntent: 2,
     requestedSessionId: 'chat-selected',
     selectionIntent: 2,
+  }), true);
+});
+
+test('ignores a viewport-ready callback emitted by the previous conversation', () => {
+  assert.equal(shouldAcceptBrowserChatViewportPosition({
+    activeSessionId: 'chat-new',
+    positionedSessionId: 'chat-old',
+  }), false);
+  assert.equal(shouldAcceptBrowserChatViewportPosition({
+    activeSessionId: 'chat-new',
+    positionedSessionId: 'chat-new',
+  }), true);
+});
+
+test('keeps session loading visible until time and viewport gates are both ready', () => {
+  assert.equal(shouldFinishBrowserChatSessionLoading({
+    loadingSessionId: 'chat-new',
+    minimumLoadingElapsed: false,
+    viewportReady: true,
+  }), false);
+  assert.equal(shouldFinishBrowserChatSessionLoading({
+    loadingSessionId: 'chat-new',
+    minimumLoadingElapsed: true,
+    viewportReady: false,
+  }), false);
+  assert.equal(shouldFinishBrowserChatSessionLoading({
+    loadingSessionId: 'chat-new',
+    minimumLoadingElapsed: true,
+    viewportReady: true,
   }), true);
 });
 

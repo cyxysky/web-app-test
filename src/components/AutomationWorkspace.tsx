@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   CalendarDays,
   CheckCircle2,
@@ -36,6 +36,7 @@ import { useI18n } from '@/i18n/I18nProvider';
 import type { Language } from '@/i18n/translations';
 import { readApiJson } from '@/lib/api-client';
 import { artifactApiUrl } from '@/lib/artifacts';
+import { waitForMinimumLoading } from '@/lib/minimum-loading';
 import {
   readSidebarCollapsedPreference,
   writeSidebarCollapsedPreference,
@@ -562,6 +563,7 @@ export function AutomationWorkspace({
   const [openRunIds, setOpenRunIds] = useState<string[]>([]);
   const [dialog, setDialog] = useState<AutomationDialog>(null);
   const [loading, setLoading] = useState(true);
+  const loadSequenceRef = useRef(0);
   const [savingCase, setSavingCase] = useState(false);
   const [savingSchedule, setSavingSchedule] = useState(false);
   const [runningCaseId, setRunningCaseId] = useState<string | null>(null);
@@ -575,6 +577,8 @@ export function AutomationWorkspace({
   const [notice, setNotice] = useState('');
 
   const loadAll = useCallback(async (silent = false) => {
+    const loadingSequence = silent ? 0 : ++loadSequenceRef.current;
+    const loadingStartedAt = Date.now();
     if (!silent) setLoading(true);
     try {
       const [nextCases, nextSchedules, nextRuns] = await Promise.all([
@@ -589,7 +593,10 @@ export function AutomationWorkspace({
     } catch (loadError) {
       if (!silent) setError(loadError instanceof Error ? t(loadError.message) : t('加载自动化数据失败'));
     } finally {
-      if (!silent) setLoading(false);
+      if (!silent) {
+        await waitForMinimumLoading(loadingStartedAt);
+        if (loadSequenceRef.current === loadingSequence) setLoading(false);
+      }
     }
   }, [t, userId]);
 
@@ -971,6 +978,7 @@ export function AutomationWorkspace({
             <input
               aria-label={t('筛选用例历史')}
               className="domain-list-search-input"
+              disabled={loading}
               onChange={(event) => setCaseFilter(event.currentTarget.value)}
               placeholder={t('筛选用例')}
               type="search"
@@ -987,8 +995,14 @@ export function AutomationWorkspace({
               </button>
             ) : null}
           </label>
-          {filteredCases.length ? (
-            <ol className="automation-case-history-list">
+          <div className={loading ? 'browser-chat-history-stage is-loading' : 'browser-chat-history-stage'} aria-busy={loading}>
+            {loading ? (
+              <div className="browser-chat-history-loading" role="status" aria-live="polite" aria-label={t('正在加载用例')}>
+                <Loader2 className="spin" size={16} />
+                <span>{t('正在加载用例')}</span>
+              </div>
+            ) : filteredCases.length ? (
+              <ol className="automation-case-history-list">
               {filteredCases.map((item) => {
                 const itemRuns = runsByCase.get(item.id) || [];
                 const itemLatestRun = itemRuns[0];
@@ -1053,12 +1067,13 @@ export function AutomationWorkspace({
                   </li>
                 );
               })}
-            </ol>
-          ) : cases.length ? (
-            <p className="browser-chat-history-filter-empty">{t('没有匹配的用例')}</p>
-          ) : (
-            <p className="browser-chat-history-filter-empty">{t('暂无用例')}</p>
-          )}
+              </ol>
+            ) : cases.length ? (
+              <p className="browser-chat-history-filter-empty">{t('没有匹配的用例')}</p>
+            ) : (
+              <p className="browser-chat-history-filter-empty">{t('暂无用例')}</p>
+            )}
+          </div>
         </section>
 
         <div className="browser-chat-sidebar-footer">
