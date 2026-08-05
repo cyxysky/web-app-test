@@ -10619,6 +10619,10 @@ body.is-dragging-embedded-tab * {
   margin-top: 10px;
 }
 
+.browser-chat-answer + .browser-chat-process-disclosure {
+  margin-top: 10px;
+}
+
 .browser-chat-ai-cycle {
   display: grid;
   max-width: 100%;
@@ -10982,11 +10986,17 @@ body.is-dragging-embedded-tab * {
   to { width: 1.15em; }
 }
 
+@keyframes browser-chat-streaming-caret {
+  0%, 45% { opacity: 1; }
+  46%, 100% { opacity: 0.18; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .browser-chat-tool-card.is-running,
   .browser-chat-agent-thinking-mark,
   .browser-chat-agent-thinking-mark i,
-  .browser-chat-agent-thinking-ellipsis {
+  .browser-chat-agent-thinking-ellipsis,
+  .browser-chat-answer.is-streaming .browser-chat-agent-markdown > :last-child::after {
     animation: none;
   }
 
@@ -11103,6 +11113,18 @@ body.is-dragging-embedded-tab * {
   gap: 8px;
   max-width: 100%;
   min-width: 0;
+}
+
+.browser-chat-answer.is-streaming .browser-chat-agent-markdown > :last-child::after {
+  animation: browser-chat-streaming-caret 0.9s steps(1, end) infinite;
+  background: var(--accent-strong);
+  border-radius: 999px;
+  content: '';
+  display: inline-block;
+  height: 1em;
+  margin-left: 4px;
+  transform: translateY(0.12em);
+  width: 2px;
 }
 
 .browser-chat-agent-markdown :where(h1, h2, h3, p, ul, ol, pre, blockquote) {

@@ -365,6 +365,8 @@ function isBrowserChatSessionRunning(session?: BrowserChatSession | null) {
   return Boolean(session && (session.busy || session.status === 'running' || hasRunningAssistantMessage(session)));
 }
 
+const browserChatInterruptedReply = '本轮对话已由用户中止。已保留中止前已执行的工具和页面记录。';
+
 function interruptBrowserChatSessionOptimistically(session: BrowserChatSession, timestamp: string): BrowserChatSession {
   return {
     ...session,
@@ -376,7 +378,13 @@ function interruptBrowserChatSessionOptimistically(session: BrowserChatSession, 
     updatedAt: session.updatedAt,
     messages: session.messages.map((message) => (
       message.role === 'assistant' && message.status === 'running'
-        ? { ...message, activity: undefined, status: 'interrupted', updatedAt: timestamp }
+        ? {
+            ...message,
+            activity: undefined,
+            content: browserChatInterruptedReply,
+            status: 'interrupted',
+            updatedAt: timestamp,
+          }
         : message
     )),
     steps: session.steps.map((step) => (
@@ -1730,7 +1738,9 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
     messages: (session.messages || []).map((message) => ({
       ...message,
       attachments: message.attachments || [],
-      content: stringFromUnknown(message.content),
+      content: message.role === 'assistant' && message.status === 'interrupted'
+        ? browserChatInterruptedReply
+        : stringFromUnknown(message.content),
       role: message.role === 'assistant' ? 'assistant' : 'user',
       stepIndexes: Array.isArray(message.stepIndexes) ? message.stepIndexes : [],
     })),
@@ -1779,7 +1789,12 @@ function mergeBrowserChatSessionRealtimePatch(
       .filter((message) => !removedMessageIds.has(message.id))
       .map((message) => [message.id, message]),
   );
-  for (const message of patch.messages || []) messages.set(message.id, message);
+  for (const message of patch.messages || []) {
+    const existing = messages.get(message.id);
+    const existingTime = existing?.updatedAt || existing?.createdAt || '';
+    const incomingTime = message.updatedAt || message.createdAt || '';
+    if (!existing || incomingTime >= existingTime) messages.set(message.id, message);
+  }
 
   const removedStepIndexes = new Set(patch.removedStepIndexes || []);
   const steps = new Map(
@@ -1798,10 +1813,15 @@ function mergeBrowserChatSessionRealtimePatch(
   for (const log of patch.logs || []) logs.set(log.id, log);
 
   const { pendingToolConfirmation, ...sessionPatch } = patch.session;
+  const applySessionPatch = !sessionPatch.updatedAt
+    || !current.updatedAt
+    || sessionPatch.updatedAt >= current.updatedAt;
   return normalizeSession({
     ...current,
-    ...sessionPatch,
-    pendingToolConfirmation: normalizeToolConfirmation(pendingToolConfirmation ?? undefined),
+    ...(applySessionPatch ? sessionPatch : {}),
+    pendingToolConfirmation: applySessionPatch
+      ? normalizeToolConfirmation(pendingToolConfirmation ?? undefined)
+      : current.pendingToolConfirmation,
     messages: [...messages.values()].sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')),
     steps: [...steps.values()].sort((a, b) => a.index - b.index),
     logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
@@ -2776,6 +2796,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
     const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, part.index));
     if (tool && toolDetail) orderedParts.push({ kind: 'tool', part, tool, toolDetail });
   }
+  orderedParts.sort((left, right) => Number(left.kind === 'tool') - Number(right.kind === 'tool'));
   if (!orderedParts.length) return null;
   return (
     <div className="browser-chat-ai-cycle">
@@ -3377,6 +3398,123 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
   );
 });
 
+function advanceTextByCodePoints(text: string, start: number, count: number) {
+  let index = start;
+  for (let consumed = 0; consumed < count && index < text.length; consumed += 1) {
+    const codePoint = text.codePointAt(index);
+    index += codePoint !== undefined && codePoint > 0xffff ? 2 : 1;
+  }
+  return index;
+}
+
+function sharedTextPrefixLength(left: string, right: string) {
+  const limit = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < limit && left[index] === right[index]) index += 1;
+  if (index > 0) {
+    const previous = left.charCodeAt(index - 1);
+    if (previous >= 0xd800 && previous <= 0xdbff) index -= 1;
+  }
+  return index;
+}
+
+function smoothStreamingCharactersPerSecond(remaining: number, running: boolean) {
+  if (!running) return Math.min(240, 90 + remaining * 1.5);
+  if (remaining <= 24) return 60;
+  if (remaining <= 96) return 90;
+  return Math.min(180, 105 + remaining * 0.3);
+}
+
+function useSmoothStreamingText(targetText: string, running: boolean) {
+  const initialText = running ? '' : targetText;
+  const [displayedText, setDisplayedText] = useState(initialText);
+  const displayedTextRef = useRef(initialText);
+  const targetTextRef = useRef(targetText);
+  const runningRef = useRef(running);
+  const frameRef = useRef(0);
+  const characterBudgetRef = useRef(0);
+  const holdUntilRef = useRef(0);
+
+  const startAnimation = useCallback(() => {
+    if (frameRef.current) return;
+    let previousFrameAt = performance.now();
+    const animate = (frameAt: number) => {
+      frameRef.current = 0;
+      const target = targetTextRef.current;
+      const isRunning = runningRef.current;
+      let current = displayedTextRef.current;
+
+      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        current = target;
+        characterBudgetRef.current = 0;
+      } else if (!target.startsWith(current)) {
+        const prefixLength = isRunning ? sharedTextPrefixLength(current, target) : target.length;
+        current = target.slice(0, prefixLength);
+        characterBudgetRef.current = 0;
+        holdUntilRef.current = isRunning ? frameAt + 72 : 0;
+      } else if (current !== target && frameAt >= holdUntilRef.current) {
+        const elapsedMs = Math.min(Math.max(frameAt - previousFrameAt, 0), 64);
+        const remaining = target.length - current.length;
+        characterBudgetRef.current += elapsedMs
+          * smoothStreamingCharactersPerSecond(remaining, isRunning)
+          / 1_000;
+        const characterCount = Math.min(isRunning ? 3 : 4, Math.floor(characterBudgetRef.current));
+        if (characterCount > 0) {
+          characterBudgetRef.current -= characterCount;
+          const nextIndex = advanceTextByCodePoints(target, current.length, characterCount);
+          current = target.slice(0, nextIndex);
+        }
+      }
+
+      previousFrameAt = frameAt;
+      if (current !== displayedTextRef.current) {
+        displayedTextRef.current = current;
+        setDisplayedText(current);
+      }
+      if (current !== targetTextRef.current) frameRef.current = requestAnimationFrame(animate);
+    };
+    frameRef.current = requestAnimationFrame(animate);
+  }, []);
+
+  useLayoutEffect(() => {
+    const previousTarget = targetTextRef.current;
+    targetTextRef.current = targetText;
+    runningRef.current = running;
+    if (running && !previousTarget && targetText && !displayedTextRef.current) {
+      holdUntilRef.current = performance.now() + 72;
+    } else if (!running) {
+      holdUntilRef.current = 0;
+    }
+    startAnimation();
+  }, [running, startAnimation, targetText]);
+
+  useEffect(() => () => {
+    if (frameRef.current) cancelAnimationFrame(frameRef.current);
+  }, []);
+
+  if (targetText.startsWith(displayedText)) return displayedText;
+  if (!running) return targetText;
+  return targetText.slice(0, sharedTextPrefixLength(displayedText, targetText));
+}
+
+const BrowserChatStreamingAnswer = memo(function BrowserChatStreamingAnswer({
+  hidden,
+  running,
+  text,
+}: {
+  hidden: boolean;
+  running: boolean;
+  text: string;
+}) {
+  const displayedText = useSmoothStreamingText(text, running);
+  if (hidden || !displayedText.trim()) return null;
+  return (
+    <div className={`browser-chat-answer${running ? ' is-streaming' : ''}`}>
+      <BrowserChatMarkdown markdown={displayedText} />
+    </div>
+  );
+});
+
 const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
   logs,
   message,
@@ -3434,15 +3572,38 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       };
     });
   }, [aiOutputCycles, normalizedFinalText]);
-  const aiCycleToolDetails = useMemo(() => buildAiCycleToolDetailMap(processAiOutputCycles, steps), [processAiOutputCycles, steps]);
-  const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(
-    processAiOutputCycles,
-    (cycle) => cycle.output.tools.some((_tool, index) => aiCycleToolDetails.has(aiCycleToolKey(cycle.id, index))),
-  ), [aiCycleToolDetails, processAiOutputCycles]);
-  const aiCycleRepresentedToolKeys = new Set([...aiCycleToolDetails.values()].map((detail) => (
+  const pairedAiOutputCycles = useMemo(() => processAiOutputCycles.flatMap((cycle) => {
+    const hasVisibleNarrative = cycle.output.parts.some((part) => {
+      if (part.kind === 'text') return Boolean(cycle.output.texts[part.index]?.trim());
+      if (part.kind === 'reasoning') return Boolean(cycle.output.reasoning[part.index]?.trim());
+      return false;
+    });
+    const toolParts = cycle.output.parts.filter((part) => part.kind === 'tool');
+    if (hasVisibleNarrative || !toolParts.length) return [cycle];
+    return toolParts.flatMap((part, partOrder) => {
+      const tool = cycle.output.tools[part.index];
+      if (!tool) return [];
+      const reason = tool.reason?.trim() || '';
+      return [{
+        ...cycle,
+        id: `${cycle.id}:tool-${part.index}-${partOrder}`,
+        output: {
+          parts: reason
+            ? [{ index: 0, kind: 'text' as const }, { index: 0, kind: 'tool' as const }]
+            : [{ index: 0, kind: 'tool' as const }],
+          reasoning: [],
+          texts: reason ? [reason] : [],
+          tools: [tool],
+        },
+      }];
+    });
+  }), [processAiOutputCycles]);
+  const matchedAiCycleToolDetails = useMemo(() => (
+    buildAiCycleToolDetailMap(pairedAiOutputCycles, steps)
+  ), [pairedAiOutputCycles, steps]);
+  const aiCycleRepresentedToolKeys = new Set([...matchedAiCycleToolDetails.values()].map((detail) => (
     `${detail.stepIndex}:${detail.toolIndex}`
   )));
-  const toolCount = steps.reduce((count, step) => count + (step.tools || []).length, 0);
   const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
   const timelineSteps = steps.filter((step) => (step.tools || []).length || (running && step.status === 'running'));
   // Persisted step traces are the source of truth. Keep every trace that could not
@@ -3456,9 +3617,9 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     return [];
   });
   const hasPendingConfirmation = Boolean(pendingToolConfirmation);
-  const aiCyclesContainPendingConfirmation = hasPendingConfirmation && aiOutputCycles.some((cycle) => (
+  const aiCyclesContainPendingConfirmation = hasPendingConfirmation && pairedAiOutputCycles.some((cycle) => (
     cycle.output.tools.some((tool, index) => {
-      const toolDetail = aiCycleToolDetails.get(aiCycleToolKey(cycle.id, index));
+      const toolDetail = matchedAiCycleToolDetails.get(aiCycleToolKey(cycle.id, index));
       return Boolean(pendingConfirmationForTool({
         pending: pendingToolConfirmation,
         stepIndex: toolDetail?.stepIndex ?? cycle.stepIndex,
@@ -3468,29 +3629,94 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       }));
     })
   ));
-  const pendingTimelineEntries: BrowserChatTimelineStepEntry[] = hasPendingConfirmation
-    ? steps.filter((step) => (step.tools || []).some((tool) => pendingConfirmationForTool({
-      pending: pendingToolConfirmation,
-      stepIndex: step.index,
-      toolName: tool.name,
-      toolInput: tool.input,
-      toolOk: tool.ok,
-    }))).map((step) => ({ step }))
-    : [];
   const showPendingTimelineFallback = hasPendingConfirmation && !aiCyclesContainPendingConfirmation;
-  const timelineEntriesToRender: BrowserChatTimelineStepEntry[] = showPendingTimelineFallback
-    ? pendingTimelineEntries
-    : processAiOutputCycles.length
-      ? unrepresentedTimelineEntries
-      : timelineSteps.map((step) => ({ step }));
-  const shouldShowStepTimeline = (!processAiOutputCycles.length && (toolCount > 0 || waitingForTool))
-    || unrepresentedTimelineEntries.length > 0
-    || (showPendingTimelineFallback && pendingTimelineEntries.length > 0);
+  const splitTimelineEntries = unrepresentedTimelineEntries.map(({ step, visibleToolIndexes }) => {
+    const currentToolIndexes: number[] = [];
+    const historicalToolIndexes: number[] = [];
+    for (const toolIndex of visibleToolIndexes || []) {
+      const tool = step.tools?.[toolIndex];
+      if (!tool) continue;
+      const pendingConfirmation = showPendingTimelineFallback && pendingConfirmationForTool({
+        pending: pendingToolConfirmation,
+        stepIndex: step.index,
+        toolName: tool.name,
+        toolInput: tool.input,
+        toolOk: tool.ok,
+      });
+      if ((running && step.status === 'running') || pendingConfirmation) currentToolIndexes.push(toolIndex);
+      else historicalToolIndexes.push(toolIndex);
+    }
+    return { currentToolIndexes, historicalToolIndexes, step };
+  });
+  const currentTimelineEntries: BrowserChatTimelineStepEntry[] = splitTimelineEntries.flatMap((entry) => (
+    entry.currentToolIndexes.length
+      ? [{ step: entry.step, visibleToolIndexes: entry.currentToolIndexes }]
+      : []
+  ));
+  const historicalTimelineEntries: BrowserChatTimelineStepEntry[] = splitTimelineEntries.flatMap((entry) => (
+    entry.historicalToolIndexes.length
+      ? [{ step: entry.step, visibleToolIndexes: entry.historicalToolIndexes }]
+      : []
+  ));
+  const syntheticHistoricalOutput = useMemo(() => {
+    const cycles: BrowserChatAiOutputCycle[] = [];
+    const toolDetails: Array<[string, BrowserChatToolDetail]> = [];
+    for (const { step, visibleToolIndexes } of historicalTimelineEntries) {
+      for (const toolIndex of visibleToolIndexes || []) {
+        const tool = step.tools?.[toolIndex];
+        if (!tool) continue;
+        const cycleId = `persisted-step-${message.id}-${step.index}-${toolIndex}`;
+        const reason = tool.reason?.trim() || '';
+        const output: BrowserChatAiOutputView = {
+          parts: reason
+            ? [{ index: 0, kind: 'text' }, { index: 0, kind: 'tool' }]
+            : [{ index: 0, kind: 'tool' }],
+          reasoning: [],
+          texts: reason ? [reason] : [],
+          tools: [{
+            id: tool.id || cycleId,
+            input: tool.input,
+            name: tool.name,
+          }],
+        };
+        cycles.push({ id: cycleId, output, stepIndex: step.index });
+        toolDetails.push([
+          aiCycleToolKey(cycleId, 0),
+          { step, stepIndex: step.index, tool, toolIndex },
+        ]);
+      }
+    }
+    return { cycles, toolDetails };
+  }, [historicalTimelineEntries, message.id]);
+  const aiCycleToolDetails = useMemo(() => new Map<string, BrowserChatToolDetail>([
+    ...matchedAiCycleToolDetails,
+    ...syntheticHistoricalOutput.toolDetails,
+  ]), [matchedAiCycleToolDetails, syntheticHistoricalOutput.toolDetails]);
+  const renderAiOutputCycles = useMemo(() => {
+    const cycleToolIndex = (cycle: BrowserChatAiOutputCycle) => cycle.output.tools.reduce((lowest, _tool, index) => {
+      const detail = aiCycleToolDetails.get(aiCycleToolKey(cycle.id, index));
+      return detail ? Math.min(lowest, detail.toolIndex) : lowest;
+    }, Number.MAX_SAFE_INTEGER);
+    return [
+      ...pairedAiOutputCycles,
+      ...syntheticHistoricalOutput.cycles,
+    ].sort((left, right) => {
+      const stepOrder = (left.stepIndex ?? Number.MAX_SAFE_INTEGER) - (right.stepIndex ?? Number.MAX_SAFE_INTEGER);
+      if (stepOrder) return stepOrder;
+      return cycleToolIndex(left) - cycleToolIndex(right);
+    });
+  }, [aiCycleToolDetails, pairedAiOutputCycles, syntheticHistoricalOutput.cycles]);
+  const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(
+    renderAiOutputCycles,
+    (cycle) => cycle.output.tools.some((_tool, index) => aiCycleToolDetails.has(aiCycleToolKey(cycle.id, index))),
+  ), [aiCycleToolDetails, renderAiOutputCycles]);
+  const shouldShowStepTimeline = currentTimelineEntries.length > 0 || waitingForTool;
   const manualVerificationPaused = steps.some((step) => (step.tools || []).some((tool) => tool.name === 'waitForHumanVerification'))
-    || processAiOutputCycles.some((cycle) => cycle.output.tools.some((tool) => tool.name === 'waitForHumanVerification'));
+    || pairedAiOutputCycles.some((cycle) => cycle.output.tools.some((tool) => tool.name === 'waitForHumanVerification'));
   const hasFinalText = Boolean(finalText.trim());
   const hideManualVerificationStatusText = manualVerificationPaused && isManualVerificationStatusText(finalText);
-  const hasProcessContent = aiOutputCycleEntries.length > 0 || shouldShowStepTimeline || running;
+  const hasHistoricalAiOutput = aiOutputCycleEntries.length > 0;
+  const hasProcessContent = hasHistoricalAiOutput || shouldShowStepTimeline || running;
   const runningActivityLabel = message.activity?.label?.trim()
     ? t(message.activity.label)
     : t('正在分析页面状态并准备下一步操作');
@@ -3542,9 +3768,14 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
               />
             )
           ))}
-          {shouldShowStepTimeline ? (
-            <div className="browser-chat-tool-stack">
-              {timelineEntriesToRender.map(({ step, visibleToolIndexes }) => (
+          <BrowserChatStreamingAnswer
+            hidden={hideManualVerificationStatusText}
+            running={running}
+            text={finalText}
+          />
+          {currentTimelineEntries.length ? (
+            <div className="browser-chat-tool-stack browser-chat-current-tool-stack">
+              {currentTimelineEntries.map(({ step, visibleToolIndexes }) => (
                 <div className={`browser-chat-agent-step${running && step.status === 'running' ? ' is-running' : ''}`} key={step.index}>
                   <BrowserChatStepToolCards
                     logs={logs}
@@ -3555,6 +3786,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                     pendingToolConfirmation={pendingToolConfirmation}
                     resolvingConfirmationAction={resolvingConfirmationAction}
                     resolvingConfirmationId={resolvingConfirmationId}
+                    resumingHumanVerification={resumingHumanVerification}
                     running={running && step.status === 'running'}
                     step={step}
                     visibleToolIndexes={visibleToolIndexes}
@@ -3566,7 +3798,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
           {running ? (
             <div
               aria-live="polite"
-              className={`browser-chat-agent-empty browser-chat-agent-thinking${aiOutputCycleEntries.length || shouldShowStepTimeline ? ' is-continuation' : ''}`}
+              className={`browser-chat-agent-empty browser-chat-agent-thinking${hasHistoricalAiOutput || shouldShowStepTimeline ? ' is-continuation' : ''}`}
               role="status"
             >
               <span aria-hidden="true" className="browser-chat-agent-thinking-mark"><i /><i /><i /></span>
@@ -3577,14 +3809,19 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
             </div>
           ) : null}
         </BrowserChatProcessDisclosure>
-      ) : null}
+      ) : (
+        <BrowserChatStreamingAnswer
+          hidden={hideManualVerificationStatusText}
+          running={running}
+          text={finalText}
+        />
+      )}
       {manualVerificationPaused ? (
         <BrowserChatManualVerificationCard
           onResume={!running && message.status === 'blocked' ? onResumeHumanVerification : undefined}
           resuming={resumingHumanVerification}
         />
       ) : null}
-      {hasFinalText && !hideManualVerificationStatusText ? <BrowserChatMarkdown markdown={finalText} /> : null}
       {!hasFinalText && !hasProcessContent && !manualVerificationPaused ? (
         <p className="browser-chat-agent-empty">{t('AI 已完成本轮操作，未返回额外文本。')}</p>
       ) : null}
@@ -3863,6 +4100,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   const followLatestRef = useRef(true);
   const earlierLoadInFlightRef = useRef(false);
   const earlierLoadArmedRef = useRef(false);
+  const previousRunStateRef = useRef({ sessionBusy, sessionId });
   const pendingHistoryAnchorRef = useRef<{
     element: HTMLElement;
     firstMessageId: string;
@@ -3971,6 +4209,38 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     followLatestRef.current = distanceFromBottom <= 16;
   }, [getScrollContainer]);
+
+  useLayoutEffect(() => {
+    const previous = previousRunStateRef.current;
+    previousRunStateRef.current = { sessionBusy, sessionId };
+    const turnCompleted = previous.sessionId === sessionId && previous.sessionBusy && !sessionBusy;
+    if (!turnCompleted || !followLatestRef.current) return undefined;
+    const container = getScrollContainer();
+    if (!container) return undefined;
+
+    let frame = 0;
+    let cancelled = false;
+    const startedAt = performance.now();
+    const cancelPinning = () => { cancelled = true; };
+    const pinToBottom = () => {
+      if (cancelled) return;
+      container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      followLatestRef.current = true;
+      if (performance.now() - startedAt < 420) frame = requestAnimationFrame(pinToBottom);
+    };
+
+    container.addEventListener('pointerdown', cancelPinning, { passive: true });
+    container.addEventListener('touchstart', cancelPinning, { passive: true });
+    container.addEventListener('wheel', cancelPinning, { passive: true });
+    pinToBottom();
+    return () => {
+      cancelled = true;
+      if (frame) cancelAnimationFrame(frame);
+      container.removeEventListener('pointerdown', cancelPinning);
+      container.removeEventListener('touchstart', cancelPinning);
+      container.removeEventListener('wheel', cancelPinning);
+    };
+  }, [getScrollContainer, sessionBusy, sessionId]);
 
   useLayoutEffect(() => {
     const pending = pendingHistoryAnchorRef.current;
@@ -7852,7 +8122,11 @@ export function BrowserChatWorkspace({
       }
       setSessions((current) => {
         const existing = current.find((item) => item.id === event.id);
-        const nextSummary = patch.summary
+        const summaryIsCurrent = patch.summary && (!existing
+          || !existing.updatedAt
+          || !patch.summary.updatedAt
+          || patch.summary.updatedAt >= existing.updatedAt);
+        const nextSummary = summaryIsCurrent && patch.summary
           ? normalizeSession(patch.summary)
           : existing
             ? mergeBrowserChatSessionRealtimePatch(existing, patch)

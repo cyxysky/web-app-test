@@ -59,6 +59,7 @@ import {
   flushBrowserChatRealtimeOutbox,
   scheduleBrowserChatRealtimeOutboxFlush,
 } from '@/server/realtime/browser-chat-outbox';
+import { publishBrowserChatRefreshEvent } from '@/server/realtime/ws-refresh';
 import {
   deleteBrowserChatSessionRecord,
   readBrowserChatSessionRecord,
@@ -209,7 +210,7 @@ export type BrowserChatSessionRealtimePatch = {
   session: Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'pendingToolConfirmation' | 'steps'> & {
     pendingToolConfirmation: BrowserChatToolConfirmation | null;
   };
-  summary: BrowserChatSessionSnapshot;
+  summary?: BrowserChatSessionSnapshot;
   logs?: BrowserChatLogRecord[];
   messages?: BrowserChatMessage[];
   steps?: StepExecutionResult[];
@@ -269,6 +270,7 @@ type BrowserChatRuntimeState = {
     promise: Promise<BrowserToolConfirmationDecision>;
   }>;
   pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
+  pendingStreamPublishTimers: Map<string, ReturnType<typeof setTimeout>>;
   persistenceCursors: Map<string, BrowserChatPersistenceCursor>;
   dirtyRecords: Map<string, BrowserChatDirtyRecords>;
   memoryExtractionActive: number;
@@ -296,6 +298,7 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
     promise: Promise<BrowserToolConfirmationDecision>;
   }>(),
   pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
+  pendingStreamPublishTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   persistenceCursors: new Map<string, BrowserChatPersistenceCursor>(),
   dirtyRecords: new Map<string, BrowserChatDirtyRecords>(),
   memoryExtractionActive: 0,
@@ -315,6 +318,7 @@ browserChatRuntimeState.subagentResults ??= new Map();
 browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
+browserChatRuntimeState.pendingStreamPublishTimers ??= new Map();
 browserChatRuntimeState.persistenceCursors ??= new Map();
 browserChatRuntimeState.dirtyRecords ??= new Map();
 browserChatRuntimeState.memoryExtractionActive ??= 0;
@@ -333,6 +337,7 @@ const subagentResults = browserChatRuntimeState.subagentResults;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
+const pendingStreamPublishTimers = browserChatRuntimeState.pendingStreamPublishTimers;
 const persistenceCursors = browserChatRuntimeState.persistenceCursors;
 const dirtyRecords = browserChatRuntimeState.dirtyRecords;
 const browserIdleEpochs = browserChatRuntimeState.browserIdleEpochs;
@@ -430,6 +435,12 @@ function browserChatProgressPersistDelayMs() {
   const raw = Number(process.env.BROWSER_CHAT_PROGRESS_PERSIST_DELAY_MS || 600);
   const normalized = Number.isFinite(raw) ? Math.floor(raw) : 100;
   return Math.min(Math.max(normalized, 0), 1000);
+}
+
+function browserChatStreamPublishDelayMs() {
+  const raw = Number(process.env.BROWSER_CHAT_STREAM_PUBLISH_DELAY_MS || 32);
+  const normalized = Number.isFinite(raw) ? Math.floor(raw) : 32;
+  return Math.min(Math.max(normalized, 16), 160);
 }
 
 function trimBrowserChatLogs(logs: BrowserChatLogRecord[]) {
@@ -1529,11 +1540,13 @@ function markAssistantMessageInterrupted(assistantMessageId?: string) {
   if (oldest) interruptedAssistantMessageIds.delete(oldest);
 }
 
+const browserChatInterruptedReply = '本轮对话已由用户中止。已保留中止前已执行的工具和页面记录。';
+
 function preserveInterruptedTurn(session: BrowserChatSessionRecord, assistantMessageId: string | undefined, timestamp: string) {
   if (assistantMessageId) {
     updateAssistantMessage(session, assistantMessageId, (message) => ({
       ...message,
-      content: message.content || '本轮对话已由用户中止。已保留中止前已执行的工具和页面记录。',
+      content: browserChatInterruptedReply,
       status: 'interrupted',
       activity: undefined,
       updatedAt: timestamp,
@@ -1588,7 +1601,9 @@ function recordFromSnapshot(
     const safeMessage: BrowserChatMessage = {
       ...rawMessage,
       role: rawMessage.role === 'assistant' ? 'assistant' : 'user',
-      content: textFromUnknown(rawMessage.content),
+      content: rawMessage.role === 'assistant' && rawMessage.status === 'interrupted'
+        ? browserChatInterruptedReply
+        : textFromUnknown(rawMessage.content),
       attachments: Array.isArray(rawMessage.attachments) ? rawMessage.attachments : [],
       stepIndexes: Array.isArray(rawMessage.stepIndexes) ? rawMessage.stepIndexes : [],
     };
@@ -1803,6 +1818,37 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
     seedPersistenceCursor(persistedItem);
   }
   return patch;
+}
+
+function scheduleBrowserChatTextStreamPublish(sessionId: string, assistantMessageId: string) {
+  if (pendingStreamPublishTimers.has(sessionId)) return;
+  const timer = setTimeout(() => {
+    pendingStreamPublishTimers.delete(sessionId);
+    const session = sessions.get(sessionId);
+    const message = session?.messages.find((item) => item.id === assistantMessageId);
+    if (!session || !message || message.role !== 'assistant') return;
+    const header = sessionSnapshotHeader(session);
+    const patch: BrowserChatSessionRealtimePatch = {
+      session: {
+        ...header,
+        pendingToolConfirmation: header.pendingToolConfirmation ?? null,
+      },
+      messages: [{
+        ...message,
+        attachments: message.attachments ? [...message.attachments] : undefined,
+        stepIndexes: message.stepIndexes ? [...message.stepIndexes] : undefined,
+      }],
+    };
+    void publishBrowserChatRefreshEvent({
+      entityType: 'browserChatSession',
+      id: session.id,
+      updatedAt: session.updatedAt,
+      userId: normalizeApplicationUserId(session.userId),
+      patch,
+    }).catch(() => undefined);
+  }, browserChatStreamPublishDelayMs());
+  timer.unref?.();
+  pendingStreamPublishTimers.set(sessionId, timer);
 }
 
 function deleteSessionSnapshot(sessionId: string, userId: string) {
@@ -3961,6 +4007,24 @@ async function runBrowserChatMessage(
         runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
         readSubagent: readBrowserChatSubagent(session.id),
         readFile: (input) => readFileForSession(session, input),
+        onTextStream: ({ text: streamedText }) => {
+          if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+          const timestamp = now();
+          updateAssistantMessage(session, assistantMessageId, (message) => ({
+            ...message,
+            content: streamedText,
+            activity: {
+              phase: 'ai:text:streaming',
+              label: 'AI 正在生成回复',
+              updatedAt: timestamp,
+            },
+            status: 'running',
+            updatedAt: timestamp,
+          }));
+          session.updatedAt = timestamp;
+          scheduleBrowserChatTextStreamPublish(session.id, assistantMessageId);
+          persistAndNotify(session.id, { defer: true, mergePersisted: false });
+        },
         onProgress: (step) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           const ownedStep = { ...step, messageId: assistantMessageId };
@@ -4077,7 +4141,7 @@ async function runBrowserChatMessage(
       });
       updateAssistantMessage(session, assistantMessageId, (item) => ({
         ...item,
-        content: interrupted ? '已中断本轮对话操作。浏览器保持当前状态，可以继续发送下一条消息。' : `执行异常：${message}`,
+        content: interrupted ? browserChatInterruptedReply : `执行异常：${message}`,
         updatedAt: session.updatedAt,
         status: interrupted ? 'interrupted' : 'failed',
         activity: undefined,

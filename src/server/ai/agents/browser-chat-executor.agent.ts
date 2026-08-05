@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { generateText, hasToolCall, tool, type ModelMessage } from 'ai';
+import { generateText, hasToolCall, streamText, tool, type ModelMessage } from 'ai';
 import sharp from 'sharp';
 import { z } from 'zod';
 import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
@@ -74,6 +74,12 @@ const generatedFileSlidesSchema = z.array(z.object({
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type RuntimeModelMessage = ModelMessage;
 type RuntimeRetryState = RuntimeRetryStateBase<RuntimeModelMessage>;
+
+export type BrowserChatTextStreamUpdate = {
+  delta: string;
+  stepNumber: number;
+  text: string;
+};
 
 type ToolTrace = {
   id?: string;
@@ -1930,6 +1936,7 @@ async function executeRuntimeStep(input: {
   shouldContinue?: () => boolean;
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
+  onTextStream?: (update: BrowserChatTextStreamUpdate) => void | Promise<void>;
   getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   allowedToolTypes?: string[];
@@ -1948,6 +1955,7 @@ async function executeRuntimeStep(input: {
     abortSignal,
     onDebug,
     onToolTrace,
+    onTextStream,
   } = input;
   const mode = input.mode;
   const screenshotInputEnabled = false;
@@ -2491,7 +2499,9 @@ async function executeRuntimeStep(input: {
     });
     const toolsForRequest = nativeToolsRef.current;
     try {
-      const result = await generateTextWithTimeout({
+      let streamedStepNumber = 0;
+      let streamedStepText = '';
+      const result = streamText({
         model: getModel(),
         messages: initialMessages,
         tools: toolsForRequest,
@@ -2505,6 +2515,8 @@ async function executeRuntimeStep(input: {
           toolExecutionGate.executed = false;
           stepTraceStarts.set(stepNumber, traces.length);
           stepStartedAt.set(stepNumber, Date.now());
+          streamedStepNumber = stepNumber;
+          streamedStepText = '';
           await onAttemptDebug?.({
             phase: 'ai:runtime:request',
             stepIndex,
@@ -2517,6 +2529,18 @@ async function executeRuntimeStep(input: {
             }, prepared.modelMessagesForLog),
           });
           return { system: prepared.system, messages: prepared.messages };
+        },
+        onChunk: async ({ chunk }) => {
+          if (chunk.type !== 'text-delta' || !chunk.text) return;
+          ensureActive();
+          streamedStepText += chunk.text;
+          latestText = streamedStepText;
+          await onTextStream?.({
+            delta: chunk.text,
+            stepNumber: streamedStepNumber,
+            text: streamedStepText,
+          });
+          ensureActive();
         },
         onStepFinish: async (event) => {
           ensureActive();
@@ -2551,12 +2575,13 @@ async function executeRuntimeStep(input: {
         temperature: 0.1,
         maxRetries: 0,
         abortSignal,
-      }, input.agentLoopTimeoutMs);
-      const finishState = aiSdkFinishState(result.finishReason);
+      });
+      const [resultText, resultFinishReason] = await Promise.all([result.text, result.finishReason]);
+      const finishState = aiSdkFinishState(resultFinishReason);
       ensureActive();
       latestText = finishState.terminatesTurn
-        ? cleanFinalDisplayText(result.text || latestText) || ''
-        : toolConsistentAssistantText(result.text || latestText, traces.at(-1)?.name);
+        ? cleanFinalDisplayText(resultText || latestText) || ''
+        : toolConsistentAssistantText(resultText || latestText, traces.at(-1)?.name);
       if (finishState.retryRequest) {
         throw new Error(`AI SDK returned retryable finish reason "${finishState.finishReason}".`);
       }
@@ -2759,6 +2784,7 @@ export async function executeInteractiveBrowserTurn(input: {
   referenceImagePaths?: string[];
   getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
   onProgress?: (step: StepExecutionResult) => void | Promise<void>;
+  onTextStream?: (update: BrowserChatTextStreamUpdate) => void | Promise<void>;
   onDebug?: ExecutionDebug;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
@@ -2823,6 +2849,7 @@ export async function executeInteractiveBrowserTurn(input: {
         credentialBindings: input.credentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
         agentLoopTimeoutMs: input.agentLoopTimeoutMs,
+        onTextStream: input.onTextStream,
         onDebug: input.onDebug,
         onToolTrace: async (trace, progress) => {
           ensureActive();
