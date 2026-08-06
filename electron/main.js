@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const { app, BrowserWindow, Menu, WebContentsView, dialog, ipcMain, nativeTheme, session: electronSession, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const { createHash, randomUUID } = require('node:crypto');
@@ -6,6 +7,7 @@ const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
+const { compiledServerBasePath, serverRouteUrl, withServerBasePath } = require('./server-url');
 
 const APP_NAME = 'WebPilot';
 const APP_TITLE = APP_NAME;
@@ -237,7 +239,11 @@ function embeddedBrowserLibraryRouteUrl() {
   try {
     const current = new URL(mainWindow.webContents.getURL());
     if (!['http:', 'https:'].includes(current.protocol)) return '';
-    return new URL('/embedded-browser-library', current.origin).toString();
+    return serverRouteUrl(
+      current.origin,
+      compiledServerBasePath(serverDirectory(), process.env.WEBPILOT_BASE_PATH),
+      '/embedded-browser-library',
+    );
   } catch {
     return '';
   }
@@ -2597,9 +2603,13 @@ async function startServer(appDataDir) {
     serverProcess = undefined;
   });
 
-  const url = `http://127.0.0.1:${port}`;
+  const basePath = compiledServerBasePath(serverDir, env.WEBPILOT_BASE_PATH);
+  const url = withServerBasePath(
+    `http://127.0.0.1:${port}`,
+    basePath,
+  );
   localServerUrl = url;
-  await waitForHttp(`${url}/dashboard`, 60_000, 3);
+  await waitForHttp(serverRouteUrl(url, basePath, '/browser-chat'), 60_000, 3);
   return url;
 }
 
@@ -2893,17 +2903,26 @@ async function boot() {
 
   try {
     const externalServerUrl = String(process.env.WEBPILOT_ELECTRON_SERVER_URL || '').trim().replace(/\/+$/, '');
+    const basePath = compiledServerBasePath(serverDirectory(), process.env.WEBPILOT_BASE_PATH);
     await updateStartupScreen({ message: externalServerUrl ? '正在连接本地服务…' : '正在启动本地服务…', progress: 36 });
-    const url = externalServerUrl || await startServer(appDataDir);
+    const url = externalServerUrl
+      ? withServerBasePath(externalServerUrl, basePath)
+      : await startServer(appDataDir);
+    const applicationUrl = serverRouteUrl(
+      url,
+      basePath,
+      '/browser-chat',
+    );
     await updateStartupScreen({ message: '服务已就绪，正在加载界面…', progress: 82 });
     if (externalServerUrl) {
-      await waitForHttp(`${url}/dashboard`, 60_000, 2);
+      await waitForHttp(applicationUrl, 60_000, 2);
     }
     clearTimeout(slowStartupTimer);
     await updateStartupScreen({ message: '工作区已准备完成', progress: 100 });
     await mainWindow.webContents.executeJavaScript('window.__webPilotStartup?.complete()').catch(() => undefined);
     await new Promise((resolve) => setTimeout(resolve, 180));
-    await mainWindow.loadURL(url);
+    appendLog(`Loading application: ${applicationUrl}`);
+    await mainWindow.loadURL(applicationUrl);
     // Restoring WebContentsViews before this navigation makes Electron destroy
     // them when the startup document is replaced by the application shell.
     if (restoreEmbeddedBrowserPersistence()) appendLog('Embedded browser tabs restored from local cache.');

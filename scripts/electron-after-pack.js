@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { createRequire } = require('node:module');
 
 function findBrowserRevisionDir(executablePath) {
   let dir = path.dirname(executablePath);
@@ -32,6 +33,21 @@ function copyPlaywrightChromium(context) {
   }
 }
 
+function assertPackagedServerRuntime(serverRoot) {
+  const runtimeRequire = createRequire(path.join(serverRoot, 'webpilot-server.js'));
+  const packageRoot = path.join(serverRoot, 'node_modules') + path.sep;
+  for (const dependency of ['next', 'playwright']) {
+    try {
+      const resolved = runtimeRequire.resolve(dependency);
+      if (!resolved.startsWith(packageRoot)) {
+        throw new Error(`resolved outside the packaged server: ${resolved}`);
+      }
+    } catch (error) {
+      throw new Error(`The packaged server cannot resolve "${dependency}" from ${serverRoot}.`, { cause: error });
+    }
+  }
+}
+
 exports.default = async function afterPack(context) {
   const projectRoot = context.packager.projectDir;
   const source = path.join(projectRoot, 'dist-desktop', 'server', 'node_modules');
@@ -45,12 +61,7 @@ exports.default = async function afterPack(context) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.cpSync(source, target, { recursive: true });
 
-  for (const dependency of ['next', 'playwright']) {
-    const dependencyPath = path.join(target, dependency);
-    if (!fs.existsSync(dependencyPath)) {
-      throw new Error(`Packaged server dependency is missing: ${dependencyPath}`);
-    }
-  }
+  assertPackagedServerRuntime(path.join(context.appOutDir, 'resources', 'server'));
 
   copyPlaywrightChromium(context);
 };

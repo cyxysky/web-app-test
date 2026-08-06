@@ -3,7 +3,7 @@ import { PHASE_DEVELOPMENT_SERVER } from 'next/constants';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const currentDir = dirname(fileURLToPath(import.meta.url));
+const projectRoot = dirname(fileURLToPath(import.meta.url));
 const configuredBasePath = String(process.env.WEBPILOT_BASE_PATH || '').trim().replace(/^\/+|\/+$/g, '');
 const basePath = configuredBasePath ? `/${configuredBasePath}` : '';
 
@@ -16,14 +16,11 @@ export default function nextConfig(phase: string): NextConfig {
     env: {
       NEXT_PUBLIC_WEBPILOT_BASE_PATH: basePath,
     },
-    output: 'standalone',
-    outputFileTracingIncludes: {
-      '/*': [
-        './node_modules/ffmpeg-static/ffmpeg*',
-        './node_modules/ffmpeg-static/package.json',
-      ],
+    // Do not let Turbopack walk out to an unrelated package-lock.json in a
+    // parent directory (for example, the Windows user profile directory).
+    turbopack: {
+      root: projectRoot,
     },
-    outputFileTracingRoot: currentDir,
     serverExternalPackages: [
       'playwright',
       'docx',

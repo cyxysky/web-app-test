@@ -186,25 +186,20 @@ export function normalizeSafetyMode(value: unknown) {
 }
 
 export function publicBaseUrl(request: NextRequest | Request) {
-  const configuredUrl = normalizeString(process.env.WEBPILOT_PUBLIC_BASE_URL);
-  if (configuredUrl) return configuredUrl.replace(/\/+$/g, '');
   const requestUrl = new URL(request.url);
-  const forwardedHost = normalizeString(request.headers.get('x-forwarded-host')).split(',')[0];
-  const forwardedProto = normalizeString(request.headers.get('x-forwarded-proto')).split(',')[0];
-  const requestHost = normalizeString(request.headers.get('host')) || requestUrl.host;
-  const publicHost = forwardedHost || requestHost;
   const browserOrigin = normalizeString(request.headers.get('origin'));
-  if (browserOrigin && publicHost) {
+  if (browserOrigin) {
     try {
       const originUrl = new URL(browserOrigin);
-      const normalizedPublicHost = new URL(`${originUrl.protocol}//${publicHost}`).host;
-      if (originUrl.host === normalizedPublicHost) {
+      if (originUrl.protocol === 'http:' || originUrl.protocol === 'https:') {
         return joinWebPilotUrl(originUrl.origin, WEBPILOT_BASE_PATH).replace(/\/+$/g, '');
       }
     } catch {
-      // Fall through to trusted proxy/request URL inference.
+      // Fall through to proxy/request URL inference.
     }
   }
+  const forwardedHost = normalizeString(request.headers.get('x-forwarded-host')).split(',')[0];
+  const forwardedProto = normalizeString(request.headers.get('x-forwarded-proto')).split(',')[0];
   const publicOrigin = forwardedHost
     ? `${forwardedProto || requestUrl.protocol.replace(/:$/, '')}://${forwardedHost}`
     : requestUrl.origin;

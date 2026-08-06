@@ -1,18 +1,13 @@
-const { spawnSync } = require('node:child_process');
+/* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require('node:fs');
 const path = require('node:path');
-const {
-  assertCompleteNextRuntime,
-  copyCompleteNextRuntime,
-} = require('./standalone-next-runtime');
+const { copyProductionRuntime } = require('./server-package-layout');
 
 const root = path.resolve(__dirname, '..');
 const packageName = 'WebPilot-Server';
 const outputRoot = path.join(root, 'dist-server');
 const distributionRoot = path.join(outputRoot, packageName);
 const serverRoot = path.join(distributionRoot, 'server');
-const packageVersion = require(path.join(root, 'package.json')).version;
-const archivePath = path.join(outputRoot, `${packageName}-${packageVersion}.zip`);
 
 function copyDir(source, target) {
   if (!fs.existsSync(source)) {
@@ -26,14 +21,6 @@ function copyInto(source, target) {
   if (!fs.existsSync(source)) return;
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.cpSync(source, target, { recursive: true });
-}
-
-function copyFfmpegStatic() {
-  const source = path.join(root, 'node_modules', 'ffmpeg-static');
-  if (!fs.existsSync(source)) {
-    throw new Error('ffmpeg-static was not found. Run npm install before packaging the server.');
-  }
-  copyInto(source, path.join(serverRoot, 'node_modules', 'ffmpeg-static'));
 }
 
 function findBrowserRevisionDir(executablePath) {
@@ -71,30 +58,11 @@ function writeReadme() {
   fs.writeFileSync(path.join(distributionRoot, 'README.md'), packagedReadme, 'utf8');
 }
 
-function createArchive() {
-  const result = spawnSync(
-    'powershell.exe',
-    [
-      '-NoProfile',
-      '-NonInteractive',
-      '-ExecutionPolicy', 'Bypass',
-      '-Command',
-      '$items = Get-ChildItem -LiteralPath $env:WEBPILOT_SERVER_PACKAGE_ROOT -Force; Compress-Archive -LiteralPath $items.FullName -DestinationPath $env:WEBPILOT_SERVER_PACKAGE_ARCHIVE -Force',
-    ],
-    {
-      cwd: root,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        WEBPILOT_SERVER_PACKAGE_ROOT: distributionRoot,
-        WEBPILOT_SERVER_PACKAGE_ARCHIVE: archivePath,
-      },
-    },
+function copyBrowserSessionExtension() {
+  copyDir(
+    path.join(root, 'src', 'server', 'browser', 'session-tab-grouper-extension'),
+    path.join(serverRoot, 'src', 'server', 'browser', 'session-tab-grouper-extension'),
   );
-
-  if (result.status !== 0) {
-    throw new Error(`Failed to create ZIP archive: ${result.stderr || result.stdout || 'unknown error'}`);
-  }
 }
 
 function removePackageEntry(entryPath) {
@@ -116,14 +84,6 @@ function removePackageEntry(entryPath) {
 
 function prepareOutputDirectory() {
   fs.mkdirSync(outputRoot, { recursive: true });
-  for (const entry of fs.readdirSync(outputRoot, { withFileTypes: true })) {
-    const entryPath = path.join(outputRoot, entry.name);
-    if (entry.name !== packageName) removePackageEntry(entryPath);
-  }
-
-  // Keep the package directory itself. On Windows, the calling PowerShell may
-  // still use this directory as its current location, which makes deleting the
-  // directory fail with EPERM even when no packaged server process is running.
   fs.mkdirSync(distributionRoot, { recursive: true });
   for (const entry of fs.readdirSync(distributionRoot, { withFileTypes: true })) {
     removePackageEntry(path.join(distributionRoot, entry.name));
@@ -131,27 +91,24 @@ function prepareOutputDirectory() {
 }
 
 prepareOutputDirectory();
-copyDir(path.join(root, '.next', 'standalone'), serverRoot);
-copyCompleteNextRuntime(root, serverRoot);
-copyInto(path.join(root, '.next', 'static'), path.join(serverRoot, '.next', 'static'));
+const productionPackagePaths = copyProductionRuntime(root, serverRoot);
 copyInto(path.join(root, 'public'), path.join(serverRoot, 'public'));
 copyInto(path.join(root, 'server', 'webpilot-server.js'), path.join(serverRoot, 'webpilot-server.js'));
 copyInto(path.join(root, 'server', 'webpilot-identity.js'), path.join(serverRoot, 'webpilot-identity.js'));
-copyFfmpegStatic();
+copyBrowserSessionExtension();
 copyPlaywrightChromium();
 
 if (
-  !fs.existsSync(path.join(serverRoot, 'server.js'))
+  !fs.existsSync(path.join(serverRoot, '.next', 'BUILD_ID'))
+  || !fs.existsSync(path.join(serverRoot, '.next', 'required-server-files.json'))
   || !fs.existsSync(path.join(serverRoot, 'webpilot-server.js'))
   || !fs.existsSync(path.join(serverRoot, 'webpilot-identity.js'))
   || !fs.existsSync(path.join(serverRoot, 'node_modules', 'next', 'package.json'))
 ) {
-  throw new Error('The standalone Next runtime required by the WebPilot custom server was not found. Run "npm run build" before packaging.');
+  throw new Error('The complete production runtime required by the WebPilot custom server was not found. Run "npm run build" before packaging.');
 }
-assertCompleteNextRuntime(path.join(serverRoot, 'node_modules', 'next'), 'Packaged Next runtime');
 
 writeStartScript();
 writeReadme();
-createArchive();
 
-console.log(`Standalone server package created:\n  ${distributionRoot}\n  ${archivePath}`);
+console.log(`Production server package created with ${productionPackagePaths.length} package directories:\n  ${distributionRoot}`);

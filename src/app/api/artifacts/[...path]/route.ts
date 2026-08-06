@@ -51,12 +51,12 @@ export async function GET(request: NextRequest, context: RouteContext) {
   }
 
   try {
-    const fileStat = await stat(filePath);
+    const fileStat = await stat(/*turbopackIgnore: true*/ filePath);
     if (!fileStat.isFile()) {
       return NextResponse.json({ error: 'Artifact not found' }, { status: 404 });
     }
 
-    const body = await readFile(filePath);
+    const body = await readFile(/*turbopackIgnore: true*/ filePath);
     const contentType = contentTypes[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
 
     const headers: Record<string, string> = {

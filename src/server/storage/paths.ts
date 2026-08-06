@@ -1,11 +1,13 @@
 import path from 'node:path';
 
 export function appDataRoot() {
-  return path.resolve(process.env.APP_DATA_DIR || process.cwd());
+  // Runtime data is external to the build and must never make Turbopack trace
+  // the workspace. The packaged launcher supplies APP_DATA_DIR explicitly.
+  return path.resolve(/*turbopackIgnore: true*/ process.env.APP_DATA_DIR || path.join(process.cwd(), 'runtime'));
 }
 
 export function artifactsRoot() {
-  return path.resolve(process.env.ARTIFACTS_DIR || path.join(appDataRoot(), 'artifacts'));
+  return path.resolve(/*turbopackIgnore: true*/ process.env.ARTIFACTS_DIR || path.join(appDataRoot(), 'artifacts'));
 }
 
 export function artifactPath(...segments: string[]) {

@@ -3,6 +3,7 @@ const http = require('node:http');
 const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
+const { createRequire } = require('node:module');
 const { randomBytes } = require('node:crypto');
 const {
   identityCookie,
@@ -15,16 +16,45 @@ function normalizeBasePath(value) {
   return normalized ? `/${normalized}` : '';
 }
 
-function loadStandaloneNextConfig(appDir) {
+function loadCompiledNextConfig(appDir) {
   const manifestPath = path.join(appDir, '.next', 'required-server-files.json');
   if (!fs.existsSync(manifestPath)) {
-    throw new Error(`The standalone Next configuration is missing: ${manifestPath}`);
+    throw new Error(`The compiled Next configuration is missing: ${manifestPath}`);
   }
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   if (!manifest || typeof manifest !== 'object' || !manifest.config || typeof manifest.config !== 'object') {
-    throw new Error(`The standalone Next configuration is invalid: ${manifestPath}`);
+    throw new Error(`The compiled Next configuration is invalid: ${manifestPath}`);
   }
   return manifest.config;
+}
+
+function requireRuntimeDependency(appDir, dependency) {
+  const runtimeRequire = createRequire(path.join(appDir, 'package.json'));
+  try {
+    return runtimeRequire(dependency);
+  } catch (error) {
+    const expectedPath = path.join(appDir, 'node_modules', dependency);
+    throw new Error(
+      `The packaged server dependency "${dependency}" could not be resolved from ${appDir}. Expected: ${expectedPath}.`,
+      { cause: error },
+    );
+  }
+}
+
+function configureCompiledNextRuntime(compiledConfig, environment = process.env) {
+  if (!compiledConfig) return;
+  // Next reads this complete build-time configuration while initializing its
+  // runtime. `conf` alone is insufficient in some packaged deployments: the
+  // server can otherwise fall back to default routing despite route manifests
+  // compiled with a basePath.
+  environment.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(compiledConfig);
+}
+
+function applicationBasePath(dev, compiledConfig, environment = process.env) {
+  // Next.js emits basePath into the route and client manifests at build time.
+  // Production request and WebSocket routing must use that same value rather
+  // than a possibly edited runtime .env file.
+  return normalizeBasePath(dev ? environment.WEBPILOT_BASE_PATH : compiledConfig?.basePath);
 }
 
 function stripBasePath(pathname, basePath) {
@@ -194,34 +224,31 @@ async function main() {
   const hostname = String(process.env.HOSTNAME || '127.0.0.1');
   const port = Math.max(1, Math.floor(Number(process.env.PORT || 3000)));
   const appDir = path.resolve(process.env.WEBPILOT_APP_DIR || process.cwd());
-  const standaloneConfig = dev ? undefined : loadStandaloneNextConfig(appDir);
+  const compiledConfig = dev ? undefined : loadCompiledNextConfig(appDir);
 
-  // Next standalone embeds its complete build configuration in the generated
-  // server.js and exposes it through this private runtime variable. Loading the
-  // standalone output through a custom HTTP server must do the same; otherwise
-  // Next can silently fall back to default routing and return 404 for a compiled
-  // basePath even though the route manifests and bundles are present.
-  if (standaloneConfig) {
-    process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(standaloneConfig);
-  }
-  const next = require('next');
+  // Load the complete build-time configuration before loading Next itself.
+  // This applies to the packaged runtime regardless of whether the build uses
+  // output: 'standalone'.
+  configureCompiledNextRuntime(compiledConfig);
+  // Electron starts this file with its bundled Node runtime. Resolve Next from
+  // the external server directory explicitly instead of relying on Electron's
+  // process-level NODE_PATH initialization.
+  const next = requireRuntimeDependency(appDir, 'next');
 
   const application = next({
     dev,
     dir: appDir,
     hostname,
     port,
-    ...(standaloneConfig ? { conf: standaloneConfig } : {}),
+    ...(compiledConfig ? { conf: compiledConfig } : {}),
   });
   const handle = application.getRequestHandler();
   await application.prepare();
   const handleNextUpgrade = dev ? application.getUpgradeHandler() : undefined;
 
-  // Next loads the project's .env files during prepare(). Read every setting
-  // used by the custom server only after that point. Otherwise Next can serve
-  // under WEBPILOT_BASE_PATH while the upgrade router still compares against
-  // an empty base path and rejects every public WebSocket connection.
-  const basePath = normalizeBasePath(process.env.WEBPILOT_BASE_PATH);
+  // In development, Next has now loaded .env. In production the build
+  // manifest is the sole source of truth for basePath.
+  const basePath = applicationBasePath(dev, compiledConfig);
   process.env.WEBPILOT_IDENTITY_HEADER_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_IDENTITY_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN ||= randomBytes(32).toString('base64url');
@@ -316,9 +343,12 @@ if (require.main === module) {
 }
 
 module.exports = {
-  loadStandaloneNextConfig,
+  applicationBasePath,
+  configureCompiledNextRuntime,
+  loadCompiledNextConfig,
   nextDevelopmentUpgrade,
   normalizeBasePath,
+  requireRuntimeDependency,
   stripBasePath,
   unsafeCrossOriginRequest,
   webSocketUpgradeTarget,

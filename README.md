@@ -60,14 +60,14 @@ WebPilot can also be published below one path. The path is part of the Next.js b
 WEBPILOT_BASE_PATH=/webpilot
 ```
 
-Docker Compose passes `WEBPILOT_BASE_PATH` from `.env` into the image build. After changing it, recreate the image instead of only restarting the existing container:
+Docker images include the project `.env`, so set `WEBPILOT_BASE_PATH` there before building. After changing it, recreate the image instead of only restarting the existing container:
 
 ```bash
 docker compose build --no-cache webpilot-qa
 docker compose up -d webpilot-qa
 ```
 
-For a direct Docker build, pass the same value explicitly:
+For a direct Docker build, the `.env` value is used by default. You can override it explicitly when needed:
 
 ```bash
 docker build --build-arg WEBPILOT_BASE_PATH=/webpilot -t webpilot-qa:latest .
@@ -157,7 +157,7 @@ The compose setup keeps runtime data outside the image:
 
 For unattended browser tasks, keep `HEADLESS_BROWSER=true`. For account-based interaction or manual verification, prefer a visible or CDP-connected browser.
 
-## Package a standalone HTTP server for Windows
+## Package a Windows HTTP server
 
 To distribute the backend without Electron, create a self-contained service archive on the build machine:
 
@@ -165,7 +165,7 @@ To distribute the backend without Electron, create a self-contained service arch
 npm run server:package
 ```
 
-This produces `dist-server/WebPilot-Server-<version>.zip`. The target machine only needs Node.js 22.16 or later: extract the archive and run `start.cmd`. It includes all traced Node dependencies and the Playwright Chromium binary, so the target machine does not need `npm install` or `npx playwright install chromium`.
+This produces `dist-server/WebPilot-Server`. The target machine only needs Node.js 22.16 or later: copy this directory and run `start.cmd`. It includes the complete production dependency tree and the Playwright Chromium binary, so the target machine does not need `npm install` or `npx playwright install chromium`.
 
 By default it listens on all network interfaces at port `3000` (locally: `http://127.0.0.1:3000`), stores application data under `runtime/`, and runs the browser headlessly. Set `PORT`, `APP_DATA_DIR`, `ARTIFACTS_DIR`, or `HEADLESS_BROWSER` before `start.cmd` to override those defaults.
 

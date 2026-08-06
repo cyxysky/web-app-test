@@ -5,9 +5,12 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
-  loadStandaloneNextConfig,
+  applicationBasePath,
+  configureCompiledNextRuntime,
+  loadCompiledNextConfig,
   nextDevelopmentUpgrade,
   normalizeBasePath,
+  requireRuntimeDependency,
   unsafeCrossOriginRequest,
   webSocketUpgradeTarget,
 } = require('./webpilot-server');
@@ -22,6 +25,26 @@ test('routes realtime upgrades through the configured public base path', () => {
     kind: 'refresh',
     target: `/refresh?ticket=${ticket}`,
   });
+});
+
+test('uses the compiled base path for every production request route', () => {
+  assert.equal(
+    applicationBasePath(false, { basePath: '/webpilot' }, { WEBPILOT_BASE_PATH: '' }),
+    '/webpilot',
+  );
+  assert.equal(
+    applicationBasePath(false, { basePath: '/webpilot' }, { WEBPILOT_BASE_PATH: '/wrong-runtime-value' }),
+    '/webpilot',
+  );
+});
+
+test('loads the complete compiled configuration before Next initializes', () => {
+  const environment = {};
+  const compiledConfig = { basePath: '/webpilot', assetPrefix: '/webpilot' };
+
+  configureCompiledNextRuntime(compiledConfig, environment);
+
+  assert.deepEqual(JSON.parse(environment.__NEXT_PRIVATE_STANDALONE_CONFIG), compiledConfig);
 });
 
 test('does not route a prefixed upgrade when the custom server missed the base path', () => {
@@ -65,27 +88,44 @@ test('continues to reject browser-confirmed cross-site writes', () => {
   }), true);
 });
 
-test('loads the compiled configuration required by a standalone Next runtime', () => {
-  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webpilot-standalone-config-'));
+test('loads the compiled configuration required by a packaged Next runtime', () => {
+  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webpilot-compiled-config-'));
   try {
     const manifestDir = path.join(appDir, '.next');
     fs.mkdirSync(manifestDir, { recursive: true });
     fs.writeFileSync(path.join(manifestDir, 'required-server-files.json'), JSON.stringify({
-      config: { basePath: '/webpilot', output: 'standalone' },
+      config: { basePath: '/webpilot' },
     }));
-    assert.deepEqual(loadStandaloneNextConfig(appDir), {
+    assert.deepEqual(loadCompiledNextConfig(appDir), {
       basePath: '/webpilot',
-      output: 'standalone',
     });
   } finally {
     fs.rmSync(appDir, { force: true, recursive: true });
   }
 });
 
-test('fails clearly when a production package has no standalone configuration', () => {
+test('fails clearly when a production package has no compiled configuration', () => {
   const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webpilot-missing-config-'));
   try {
-    assert.throws(() => loadStandaloneNextConfig(appDir), /standalone Next configuration is missing/);
+    assert.throws(() => loadCompiledNextConfig(appDir), /compiled Next configuration is missing/);
+  } finally {
+    fs.rmSync(appDir, { force: true, recursive: true });
+  }
+});
+
+test('resolves runtime dependencies from the packaged server directory', () => {
+  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webpilot-runtime-dependency-'));
+  try {
+    const dependencyDir = path.join(appDir, 'node_modules', 'runtime-fixture');
+    fs.mkdirSync(dependencyDir, { recursive: true });
+    fs.writeFileSync(path.join(appDir, 'package.json'), '{}');
+    fs.writeFileSync(path.join(dependencyDir, 'index.js'), 'module.exports = { packaged: true };');
+
+    assert.deepEqual(requireRuntimeDependency(appDir, 'runtime-fixture'), { packaged: true });
+    assert.throws(
+      () => requireRuntimeDependency(appDir, 'missing-runtime-fixture'),
+      /could not be resolved from .*Expected:/,
+    );
   } finally {
     fs.rmSync(appDir, { force: true, recursive: true });
   }
