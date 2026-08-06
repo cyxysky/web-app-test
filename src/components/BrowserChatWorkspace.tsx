@@ -472,6 +472,8 @@ type EmbeddedBrowserTabDndData = {
   type: 'embedded-browser-tab';
 };
 
+type EmbeddedBrowserTabDensity = 'close-only' | 'compact' | 'full' | 'icon-only';
+
 type EmbeddedBrowserGroupDndData = {
   groupId: string;
   type: 'embedded-browser-group';
@@ -5294,8 +5296,54 @@ function EmbeddedBrowserTabContent({ tab }: { tab: EmbeddedBrowserTab }) {
   );
 }
 
+function EmbeddedBrowserTabActions({
+  onClose,
+  onToggleMute,
+  tab,
+}: {
+  onClose?: () => void;
+  onToggleMute?: () => void;
+  tab: EmbeddedBrowserTab;
+}) {
+  const { t } = useI18n();
+  const interactive = Boolean(onClose || onToggleMute);
+  return (
+    <>
+      <button
+        aria-label={tab.audioMuted ? t('取消静音标签页') : t('静音标签页')}
+        className={tab.audioMuted ? 'browser-chat-embedded-tab-mute is-muted' : 'browser-chat-embedded-tab-mute'}
+        onClick={(event) => {
+          event.stopPropagation();
+          onToggleMute?.();
+        }}
+        onPointerDown={(event) => event.stopPropagation()}
+        tabIndex={interactive ? undefined : -1}
+        title={tab.audioMuted ? t('取消静音') : t('静音')}
+        type="button"
+      >
+        {tab.audioMuted ? <VolumeX size={13} /> : <Volume2 size={13} />}
+      </button>
+      <button
+        aria-label={t('关闭当前标签页')}
+        className="browser-chat-embedded-tab-close"
+        onClick={(event) => {
+          event.stopPropagation();
+          onClose?.();
+        }}
+        onPointerDown={(event) => event.stopPropagation()}
+        tabIndex={interactive ? undefined : -1}
+        title={t('关闭当前标签页')}
+        type="button"
+      >
+        <X size={13} />
+      </button>
+    </>
+  );
+}
+
 function EmbeddedBrowserSortableTab({
   active,
+  density,
   dragging,
   groupId,
   onActivate,
@@ -5305,6 +5353,7 @@ function EmbeddedBrowserSortableTab({
   tab,
 }: {
   active: boolean;
+  density: EmbeddedBrowserTabDensity;
   dragging: boolean;
   groupId: string;
   onActivate: () => void;
@@ -5313,7 +5362,6 @@ function EmbeddedBrowserSortableTab({
   onToggleMute: () => void;
   tab: EmbeddedBrowserTab;
 }) {
-  const { t } = useI18n();
   const {
     attributes,
     isDragging,
@@ -5353,6 +5401,7 @@ function EmbeddedBrowserSortableTab({
       aria-selected={active}
       className={[
         'browser-chat-embedded-tab',
+        `browser-chat-embedded-tab--${density}`,
         active ? 'active' : '',
         tab.pinned ? 'pinned' : '',
         tab.loading ? 'loading' : '',
@@ -5367,32 +5416,7 @@ function EmbeddedBrowserSortableTab({
       title={tab.url || tab.title}
     >
       <EmbeddedBrowserTabContent tab={tab} />
-      <button
-        aria-label={tab.audioMuted ? t('取消静音标签页') : t('静音标签页')}
-        className={tab.audioMuted ? 'browser-chat-embedded-tab-mute is-muted' : 'browser-chat-embedded-tab-mute'}
-        onClick={(event) => {
-          event.stopPropagation();
-          onToggleMute();
-        }}
-        onPointerDown={(event) => event.stopPropagation()}
-        title={tab.audioMuted ? t('取消静音') : t('静音')}
-        type="button"
-      >
-        {tab.audioMuted ? <VolumeX size={13} /> : <Volume2 size={13} />}
-      </button>
-      <button
-        aria-label={t('关闭当前标签页')}
-        className="browser-chat-embedded-tab-close"
-        onClick={(event) => {
-          event.stopPropagation();
-          onClose();
-        }}
-        onPointerDown={(event) => event.stopPropagation()}
-        title={t('关闭当前标签页')}
-        type="button"
-      >
-        <X size={13} />
-      </button>
+      <EmbeddedBrowserTabActions onClose={onClose} onToggleMute={onToggleMute} tab={tab} />
     </div>
   );
 }
@@ -6308,6 +6332,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [canGoForward, setCanGoForward] = useState(false);
   const [closedGroupIds, setClosedGroupIds] = useState<string[]>([]);
   const [draggingTabId, setDraggingTabId] = useState('');
+  const [draggingTabSize, setDraggingTabSize] = useState<{ height: number; width: number } | null>(null);
   const [dragDropGroupId, setDragDropGroupId] = useState('');
   const [tabDragPreview, setTabDragPreview] = useState<EmbeddedBrowserTabDragPreview | null>(null);
   const [tabDragPortalTarget, setTabDragPortalTarget] = useState<HTMLElement | null>(null);
@@ -6533,27 +6558,6 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const observer = new ResizeObserver(updateWidth);
     observer.observe(tabList);
     return () => observer.disconnect();
-  }, []);
-
-  const handleEmbeddedTabListWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
-    const tabList = event.currentTarget;
-    if (tabList.scrollWidth <= tabList.clientWidth) return;
-
-    const rawDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
-      ? event.deltaX
-      : event.deltaY;
-    if (!rawDelta) return;
-
-    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? tabList.clientWidth : 1;
-    const maximumScrollLeft = tabList.scrollWidth - tabList.clientWidth;
-    const nextScrollLeft = Math.min(
-      maximumScrollLeft,
-      Math.max(0, tabList.scrollLeft + rawDelta * unit),
-    );
-    if (nextScrollLeft === tabList.scrollLeft) return;
-
-    tabList.scrollLeft = nextScrollLeft;
-    event.preventDefault();
   }, []);
 
   useEffect(() => {
@@ -6800,6 +6804,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     tabDragCurrentGroupRef.current = '';
     tabDragSourceGroupRef.current = '';
     setDraggingTabId('');
+    setDraggingTabSize(null);
     setDragDropGroupId('');
     if (!keepPreview) setTabDragPreview(null);
   }
@@ -6850,13 +6855,13 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
         .filter((tab): tab is EmbeddedBrowserTab => Boolean(tab)),
     }));
   }, [tabDragPreview, visibleGroups]);
-  const embeddedTabLayoutStyle = useMemo(() => {
+  const embeddedTabLayout = useMemo(() => {
     const expandedGroups = renderedVisibleGroups.filter((group) => !group.collapsed);
     const tabCount = expandedGroups.reduce((total, group) => total + group.tabs.length, 0);
     const groupCount = renderedVisibleGroups.length;
-    const groupGapWidth = Math.max(0, groupCount - 1) * 4;
-    const tagToTabGapWidth = expandedGroups.length * 4;
-    const tabGapWidth = expandedGroups.reduce((total, group) => total + Math.max(0, group.tabs.length - 1) * 6, 0);
+    const groupGapWidth = Math.max(0, groupCount - 1) * 5;
+    const tagToTabGapWidth = expandedGroups.filter((group) => group.tabs.length > 0).length * 4;
+    const tabGapWidth = expandedGroups.reduce((total, group) => total + Math.max(0, group.tabs.length - 1) * 4, 0);
     const fixedWidth = groupCount * 36
       + groupGapWidth
       + tagToTabGapWidth
@@ -6864,10 +6869,18 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const requestedWidth = tabListWidth > 0 && tabCount > 0
       ? Math.floor((tabListWidth - fixedWidth) / tabCount)
       : 210;
-    // Keep crowded tabs identifiable and let the strip scroll instead of
-    // collapsing tabs to zero-width slivers.
-    const tabWidth = Math.min(210, Math.max(88, requestedWidth));
-    return { '--embedded-tab-width': `${tabWidth}px` } as CSSProperties;
+    const tabWidth = Math.min(210, Math.max(0, requestedWidth));
+    const density: EmbeddedBrowserTabDensity = tabWidth >= 136
+      ? 'full'
+      : tabWidth >= 64
+        ? 'compact'
+        : tabWidth >= 48
+          ? 'icon-only'
+          : 'close-only';
+    return {
+      density,
+      style: { '--embedded-tab-width': `${tabWidth}px` } as CSSProperties,
+    };
   }, [renderedVisibleGroups, tabListWidth]);
 
   const activeEmbeddedTab = useMemo(() => {
@@ -6967,6 +6980,8 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     tabDragCurrentGroupRef.current = dragData.groupId;
     tabDragSourceGroupRef.current = dragData.groupId;
     setDraggingTabId(dragData.tabId);
+    const sourceRect = event.active.rect.current.initial;
+    setDraggingTabSize(sourceRect ? { height: sourceRect.height, width: sourceRect.width } : null);
     setDragDropGroupId(dragData.groupId);
     setTabDragPreview(Object.fromEntries(visibleGroups.map((group) => [group.id, group.tabs.map((tab) => tab.id)])));
   }
@@ -6981,10 +6996,6 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       return;
     }
     tabDragCommitTargetRef.current = target;
-    const sourceGroupId = tabDragSourceGroupRef.current || dragData.groupId;
-    const previewCrossGroupMove = target.groupId !== sourceGroupId
-      || tabDragCurrentGroupRef.current !== sourceGroupId;
-    if (previewCrossGroupMove) previewEmbeddedBrowserTabMove(dragData.tabId, target);
     tabDragCurrentGroupRef.current = target.groupId;
     setDragDropGroupId(target.groupId);
   }
@@ -7105,11 +7116,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
           >
             <div
               className="browser-chat-embedded-tab-list"
-              onWheel={handleEmbeddedTabListWheel}
               ref={tabListRef}
               role="tablist"
               aria-label={t('嵌入浏览器标签页')}
-              style={embeddedTabLayoutStyle}
+              style={embeddedTabLayout.style}
             >
               {renderedVisibleGroups.map((group) => {
                 const groupSessionId = group.sessionId
@@ -7181,6 +7191,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                           return (
                             <EmbeddedBrowserSortableTab
                               active={isActiveTab}
+                              density={embeddedTabLayout.density}
                               dragging={draggingTabId === tab.id}
                               groupId={group.id}
                               key={tab.id || `${tab.url}-${tabIndex}`}
@@ -7203,6 +7214,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                 adjustScale={false}
                 dropAnimation={null}
                 modifiers={embeddedBrowserTabModifiers}
+                style={draggingTabSize ? {
+                  height: `${draggingTabSize.height}px`,
+                  width: `${draggingTabSize.width}px`,
+                } : undefined}
                 zIndex={1200}
               >
                 {draggedEmbeddedTab ? (
@@ -7211,12 +7226,21 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                     className={[
                       'browser-chat-embedded-tab',
                       'browser-chat-embedded-tab-drag-overlay',
-                      draggedEmbeddedTab.id === activeTabId ? 'active' : '',
+                      `browser-chat-embedded-tab--${embeddedTabLayout.density}`,
+                      draggedEmbeddedTab.id === activeEmbeddedTab?.id ? 'active' : 'source-hovered',
                       draggedEmbeddedTab.pinned ? 'pinned' : '',
                       draggedEmbeddedTab.loading ? 'loading' : '',
                     ].filter(Boolean).join(' ')}
+                    style={draggingTabSize ? {
+                      flex: `0 0 ${draggingTabSize.width}px`,
+                      height: `${draggingTabSize.height}px`,
+                      maxWidth: `${draggingTabSize.width}px`,
+                      minWidth: `${draggingTabSize.width}px`,
+                      width: `${draggingTabSize.width}px`,
+                    } : undefined}
                   >
                     <EmbeddedBrowserTabContent tab={draggedEmbeddedTab} />
+                    <EmbeddedBrowserTabActions tab={draggedEmbeddedTab} />
                   </div>
                 ) : null}
               </DragOverlay>,

@@ -1,6 +1,6 @@
-[2026-07-21T14:17:40.795Z] App starting. packaged=false
-[2026-07-21T14:17:40.795Z] APP_DATA_DIR=C:\Users\18367\Desktop\test\web-app-test
-[2026-07-21T14:17:40.795Z] resourcesPath=C:\Users\18367\Desktop\test\web-app-test\node_modules\electron\dist\resources
-[2026-07-21T14:17:40.796Z] WEBPILOT_ELECTRON_CDP_PORT=19333
-[2026-07-21T14:17:44.321Z] Embedded browser detach failed: Object has been destroyed
-[2026-07-21T14:17:45.594Z] Embedded browser tabs restored from local cache.
+[2026-08-06T10:36:45.046Z] App starting. packaged=false
+[2026-08-06T10:36:45.047Z] APP_DATA_DIR=C:\Users\chenjf\Desktop\test2\web-app-test
+[2026-08-06T10:36:45.047Z] resourcesPath=C:\Users\chenjf\Desktop\test2\web-app-test\node_modules\electron\dist\resources
+[2026-08-06T10:36:45.048Z] WEBPILOT_ELECTRON_CDP_PORT=19333
+[2026-08-06T10:36:46.061Z] Loading application: http://127.0.0.1:3000/webpilot/browser-chat
+[2026-08-06T10:36:51.403Z] Embedded browser tabs restored from local cache.

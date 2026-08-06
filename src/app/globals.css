@@ -8823,8 +8823,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   height: 34px;
   min-width: 0;
   -ms-overflow-style: none;
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: hidden;
   padding: 0;
   scrollbar-width: none;
 }
@@ -8836,7 +8835,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-embedded-tab-group-shell {
   align-items: flex-end;
   display: inline-flex;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   gap: 4px;
   height: 34px;
   min-width: 0;
@@ -8857,7 +8856,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-embedded-tab-group-shell.collapsed {
-  flex: 0 0 auto;
+  flex: 0 0 36px;
 }
 
 .browser-chat-embedded-tab-group-shell.empty>.browser-chat-embedded-tab-stack {
@@ -9136,11 +9135,12 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 
 .browser-chat-embedded-tab-stack {
   align-items: flex-end;
-  display: inline-flex;
-  flex: 0 0 auto;
-  gap: 6px;
+  display: flex;
+  flex: 0 1 auto;
+  gap: 4px;
   height: 34px;
   min-width: 0;
+  overflow: hidden;
 }
 
 .browser-chat-embedded-tab-group-shell.collapsed .browser-chat-embedded-tab-stack {
@@ -9157,16 +9157,15 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   box-shadow: none;
   color: #101820;
   cursor: grab;
-  container-type: inline-size;
   display: inline-flex;
-  flex: 0 0 var(--embedded-tab-width, 210px);
+  flex: 0 1 var(--embedded-tab-width, 210px);
   gap: 8px;
   height: 34px;
   isolation: isolate;
   max-width: 210px;
   min-width: 0;
   overflow: hidden;
-  padding: 0 52px 0 11px;
+  padding: 0;
   position: relative;
   touch-action: none;
   transition:
@@ -9178,6 +9177,65 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
   user-select: none;
   will-change: transform;
   width: var(--embedded-tab-width, 210px);
+}
+
+.browser-chat-embedded-tab--full {
+  padding: 0 52px 0 11px;
+}
+
+.browser-chat-embedded-tab--compact {
+  gap: 6px;
+  padding: 0 30px 0 8px;
+}
+
+.browser-chat-embedded-tab--compact .browser-chat-embedded-tab-mute {
+  display: none;
+}
+
+.browser-chat-embedded-tab--icon-only {
+  gap: 0;
+  justify-content: flex-start;
+  padding: 0 22px 0 2px;
+}
+
+.browser-chat-embedded-tab--icon-only :is(
+  .browser-chat-embedded-tab-text,
+  .browser-chat-embedded-tab-pin,
+  .browser-chat-embedded-tab-loading,
+  .browser-chat-embedded-tab-mute
+) {
+  display: none;
+}
+
+.browser-chat-embedded-tab--icon-only .browser-chat-embedded-tab-close {
+  display: inline-flex;
+  opacity: 0.72;
+  pointer-events: auto;
+  right: 2px;
+}
+
+.browser-chat-embedded-tab--close-only {
+  gap: 0;
+  padding: 0;
+}
+
+.browser-chat-embedded-tab--close-only :is(
+  .browser-chat-embedded-tab-icon,
+  .browser-chat-embedded-tab-text,
+  .browser-chat-embedded-tab-pin,
+  .browser-chat-embedded-tab-loading,
+  .browser-chat-embedded-tab-mute
+) {
+  display: none;
+}
+
+.browser-chat-embedded-tab--close-only .browser-chat-embedded-tab-close {
+  display: inline-flex;
+  left: 50%;
+  opacity: 0.72;
+  pointer-events: auto;
+  right: auto;
+  transform: translate(-50%, -50%);
 }
 
 .browser-chat-embedded-tab:active {
@@ -9216,25 +9274,21 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 }
 
 .browser-chat-embedded-tab.browser-chat-embedded-tab-drag-overlay {
-  --embedded-toolbar-bg: #ffffff;
-  background: var(--embedded-toolbar-bg);
-  border: 1px solid rgba(92, 105, 124, 0.16);
-  border-bottom-width: 1px;
-  border-color: rgba(92, 105, 124, 0.18);
-  border-radius: 10px;
-  box-shadow:
-    0 6px 16px rgba(18, 31, 48, 0.15),
-    0 1px 3px rgba(18, 31, 48, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.9);
   cursor: grabbing;
-  height: 34px;
-  isolation: isolate;
   opacity: 1;
-  padding: 0 16px 0 11px;
   pointer-events: none;
-  transform: translateY(-2px) scale(1.008);
   transition: none;
-  will-change: transform;
+}
+
+.browser-chat-embedded-tab.browser-chat-embedded-tab-drag-overlay.source-hovered {
+  background: rgba(255, 255, 255, 0.56);
+  border-color: rgba(92, 105, 124, 0.12);
+  color: #07131f;
+}
+
+.browser-chat-embedded-tab-drag-overlay .browser-chat-embedded-tab-close,
+.browser-chat-embedded-tab-drag-overlay .browser-chat-embedded-tab-mute {
+  opacity: 0.88;
 }
 
 body.is-dragging-embedded-tab,
@@ -9408,15 +9462,21 @@ body.is-dragging-embedded-tab * {
 .browser-chat-embedded-toolbar {
   align-items: center;
   background: var(--embedded-toolbar-bg);
-  border-top: 1px solid var(--embedded-row-divider);
+  border-top: 0;
+  box-shadow: inset 0 1px 0 var(--embedded-row-divider);
   display: grid;
   gap: 10px;
   grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
   height: 42px;
   min-width: 0;
-  padding: 4px 12px;
+  padding: 0 12px;
   position: relative;
   width: 100%;
+}
+
+.browser-chat-embedded-browser>header>.browser-chat-embedded-toolbar {
+  display: grid;
 }
 
 .browser-chat-embedded-toolbar::before {
@@ -9482,6 +9542,7 @@ body.is-dragging-embedded-tab * {
   height: 34px;
   min-width: 0;
   padding: 0;
+  justify-self: start;
 }
 
 .browser-chat-embedded-address-bar {
@@ -9496,12 +9557,14 @@ body.is-dragging-embedded-tab * {
   gap: 8px;
   height: 32px;
   justify-self: stretch;
+  margin-block: 0;
   min-width: 0;
   padding: 0 12px;
   transition:
     background 0.16s ease,
     border-color 0.16s ease,
     box-shadow 0.16s ease;
+  transform: none;
   width: 100%;
 }
 
@@ -9580,6 +9643,7 @@ body.is-dragging-embedded-tab * {
   display: inline-flex;
   flex: 0 0 auto;
   gap: 3px;
+  justify-self: end;
 }
 
 .browser-chat-embedded-library-actions .browser-chat-embedded-tool-button {
@@ -9648,33 +9712,6 @@ body.is-dragging-embedded-tab * {
 
   .browser-chat-embedded-tab-group-label {
     padding: 0;
-  }
-}
-
-@container (max-width: 116px) {
-  .browser-chat-embedded-tab {
-    gap: 0;
-    justify-content: center;
-    padding: 0 28px 0 4px;
-  }
-
-  .browser-chat-embedded-tab-text,
-  .browser-chat-embedded-tab-pin,
-  .browser-chat-embedded-tab-loading,
-  .browser-chat-embedded-tab-mute {
-    display: none;
-  }
-
-  .browser-chat-embedded-tab-icon {
-    width: 20px;
-  }
-
-  .browser-chat-embedded-tab-close {
-    display: inline-flex;
-    opacity: 0.72;
-    pointer-events: auto;
-    right: 4px;
-    transform: translateY(-50%);
   }
 }
 
@@ -13245,14 +13282,6 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-tab.browser-chat-embedded-tab-drag-overlay {
-  --embedded-toolbar-bg: #10161e;
-  background: var(--embedded-toolbar-bg);
-  border-color: rgba(255, 255, 255, 0.12);
-  box-shadow:
-    0 6px 16px rgba(0, 0, 0, 0.3),
-    0 1px 3px rgba(0, 0, 0, 0.2),
-    inset 0 1px 0 rgba(255, 255, 255, 0.12);
-  color: var(--foreground);
   opacity: 1;
 }
 

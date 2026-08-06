@@ -1503,28 +1503,42 @@ input[type="checkbox"]:focus-visible {
 
 .browser-chat-embedded-tab-list {
   gap: 5px;
-  scrollbar-width: thin;
+  overflow: hidden;
+  scrollbar-width: none;
 }
 
 .browser-chat-embedded-tab-group-tag {
-  background: color-mix(in srgb, var(--panel) 62%, transparent);
+  background: var(--embedded-tab-strip-bg);
   border-color: color-mix(in srgb, var(--border) 78%, transparent);
   box-shadow: none;
-  flex-basis: 116px;
-  max-width: 116px;
-  min-width: 116px;
+  flex: 0 0 36px;
+  max-width: 84px;
+  min-width: 36px;
   transition:
     background-color var(--motion-fast) ease,
     border-color var(--motion-fast) ease,
-    color var(--motion-fast) ease;
+    color var(--motion-fast) ease,
+    flex-basis 180ms var(--ease-standard);
+  will-change: flex-basis;
 }
 
-.browser-chat-embedded-tab-group-tag:hover {
-  background: color-mix(in srgb, var(--panel) 88%, transparent);
-  border-color: var(--border);
-  flex-basis: 116px;
-  max-width: 116px;
-  min-width: 116px;
+.browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag {
+  background: var(--embedded-tab-strip-bg);
+  border-color: color-mix(in srgb, var(--border) 78%, transparent);
+  box-shadow: none;
+}
+
+.browser-chat-embedded-tab-group-tag:hover,
+.browser-chat-embedded-tab-group-tag:focus-within {
+  background: color-mix(in srgb, var(--accent) 8%, var(--embedded-tab-strip-bg));
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
+  flex-basis: 84px;
+}
+
+.browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag:hover,
+.browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag:focus-within {
+  background: color-mix(in srgb, var(--accent) 8%, var(--embedded-tab-strip-bg));
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
 }
 
 .browser-chat-embedded-tab-group-label {
@@ -1535,25 +1549,24 @@ input[type="checkbox"]:focus-visible {
 }
 
 .browser-chat-embedded-tab-group-label span {
-  display: block;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: none;
 }
 
-.browser-chat-embedded-tab-group-action,
-.browser-chat-embedded-tab-group-tag:hover .browser-chat-embedded-tab-group-action {
+.browser-chat-embedded-tab-group-action {
   background: transparent;
   border-color: transparent;
-  flex-basis: 20px;
-  opacity: 0.68;
-  pointer-events: auto;
-  width: 20px;
 }
 
 .browser-chat-embedded-tab-group-action:last-child {
   margin-right: 4px;
+}
+
+.browser-chat-embedded-tab-group-tag:hover .browser-chat-embedded-tab-group-action,
+.browser-chat-embedded-tab-group-tag:focus-within .browser-chat-embedded-tab-group-action {
+  flex-basis: 20px;
+  opacity: 0.68;
+  pointer-events: auto;
+  width: 20px;
 }
 
 .browser-chat-embedded-tab {
@@ -1565,6 +1578,12 @@ input[type="checkbox"]:focus-visible {
 }
 
 .browser-chat-embedded-tab:hover {
+  background: color-mix(in srgb, var(--panel) 76%, transparent);
+  border-color: var(--border);
+  color: var(--foreground);
+}
+
+.browser-chat-embedded-tab.browser-chat-embedded-tab-drag-overlay.source-hovered {
   background: color-mix(in srgb, var(--panel) 76%, transparent);
   border-color: var(--border);
   color: var(--foreground);
@@ -1595,10 +1614,11 @@ input[type="checkbox"]:focus-visible {
 
 .browser-chat-embedded-toolbar {
   background: var(--embedded-toolbar-bg);
-  border-top-color: var(--embedded-row-divider);
+  border-top: 0;
+  box-shadow: inset 0 1px 0 var(--embedded-row-divider);
   gap: 8px;
-  height: 44px;
-  padding: 5px 10px;
+  height: 42px;
+  padding: 0 10px;
 }
 
 .browser-chat-embedded-tool-button {
@@ -1624,7 +1644,8 @@ input[type="checkbox"]:focus-visible {
   border-color: transparent;
   border-radius: var(--radius-md);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent);
-  min-height: 34px;
+  height: 32px;
+  min-height: 32px;
 }
 
 .browser-chat-embedded-address-bar:focus-within {
@@ -2310,16 +2331,6 @@ input[type="checkbox"]:focus-visible {
     width: 100%;
   }
 
-  .browser-chat-embedded-tab-group-tag,
-  .browser-chat-embedded-tab-group-tag:hover {
-    flex-basis: 72px;
-    max-width: 72px;
-    min-width: 72px;
-  }
-
-  .browser-chat-embedded-tab-group-label span {
-    display: none;
-  }
 }
 
 @media (hover: none), (pointer: coarse) {
