@@ -7,12 +7,12 @@ import {
   type BrowserChatHistoryState,
 } from './browser-chat-history-controller';
 
-test('does not expose message history loading for remaining logs or steps alone', () => {
+test('continues loading while logs or steps still have earlier pages', () => {
   assert.equal(browserChatHasEarlierMessages({
     messages: { hasMore: false },
     steps: { cursor: 'older-steps', hasMore: true },
     logs: { cursor: 'older-logs', hasMore: true },
-  }), false);
+  }), true);
   assert.equal(browserChatHasEarlierMessages({
     messages: { cursor: 'older-messages', hasMore: true },
     steps: { hasMore: false },

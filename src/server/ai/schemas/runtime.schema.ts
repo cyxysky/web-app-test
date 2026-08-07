@@ -181,6 +181,48 @@ export type StepToolCall = {
   }>;
 };
 
+export type BrowserChatAiOutputTool = {
+  id: string;
+  input?: unknown;
+  name: string;
+  reason?: string;
+};
+
+export type BrowserChatAiOutputPart =
+  | { index: number; kind: 'reasoning' }
+  | { index: number; kind: 'text' }
+  | { index: number; kind: 'tool' };
+
+export type BrowserChatAiOutputView = {
+  parts: BrowserChatAiOutputPart[];
+  reasoning: string[];
+  texts: string[];
+  tools: BrowserChatAiOutputTool[];
+};
+
+export type BrowserChatAiOutputCycle = {
+  id: string;
+  messageId?: string;
+  output: BrowserChatAiOutputView;
+  stepIndex?: number;
+  subagentId?: string;
+  batchId?: string;
+};
+
+export type BrowserChatSubagentRecord = {
+  id: string;
+  messageId: string;
+  batchId: string;
+  index: number;
+  title: string;
+  status: 'running' | 'passed' | 'blocked' | 'failed';
+  summary?: string;
+  resumable: boolean;
+  toolCount: number;
+  steps: StepExecutionResult[];
+  error?: string;
+};
+
 export type RuntimeEnvRecord = {
   key: string;
   value: string;

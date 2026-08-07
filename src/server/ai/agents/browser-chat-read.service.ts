@@ -84,6 +84,8 @@ export function readBrowserChatSessionHistoryPage(
       })
     : undefined;
   return {
+    outputCycles: session.outputCycles || [],
+    subagents: session.subagents || [],
     ...(messages ? { messages: messages.items } : {}),
     ...(steps ? { steps: steps.items.map(compactStepForClient) } : {}),
     ...(logs ? { logs: compactBrowserChatLogsForClient(logs.items) } : {}),

@@ -18,6 +18,8 @@ type HistorySession<TMessage extends MessageLike, TStep extends StepLike, TLog e
   logs: TLog[];
   messages: TMessage[];
   steps: TStep[];
+  outputCycles?: unknown[];
+  subagents?: unknown[];
 };
 
 export function normalizeBrowserChatHistory(value: BrowserChatHistoryState | undefined) {
@@ -30,7 +32,11 @@ export function normalizeBrowserChatHistory(value: BrowserChatHistoryState | und
 }
 
 export function browserChatHasEarlierMessages(value: BrowserChatHistoryState | undefined) {
-  return Boolean(value?.messages.hasMore && value.messages.cursor);
+  return Boolean(
+    (value?.messages.hasMore && value.messages.cursor)
+    || (value?.steps.hasMore && value.steps.cursor)
+    || (value?.logs.hasMore && value.logs.cursor),
+  );
 }
 
 export function mergeBrowserChatSessionWindowData<
@@ -51,6 +57,8 @@ export function mergeBrowserChatSessionWindowData<
     messages: [...messages.values()].sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')),
     steps: [...steps.values()].sort((a, b) => a.index - b.index),
     logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
+    outputCycles: incoming.outputCycles || existing.outputCycles || [],
+    subagents: incoming.subagents || existing.subagents || [],
     history: existing.history || incoming.history,
   };
 }
@@ -67,6 +75,8 @@ export function mergeBrowserChatHistoryChunkData<
     logs?: TLog[];
     messages?: TMessage[];
     steps?: TStep[];
+    outputCycles?: unknown[];
+    subagents?: unknown[];
   },
 ): TSession {
   const messages = new Map(current.messages.map((message) => [message.id, message]));
@@ -85,6 +95,8 @@ export function mergeBrowserChatHistoryChunkData<
     messages: [...messages.values()].sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')),
     steps: [...steps.values()].sort((a, b) => a.index - b.index),
     logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
+    outputCycles: chunk.outputCycles || current.outputCycles || [],
+    subagents: chunk.subagents || current.subagents || [],
     history: {
       messages: chunk.history?.messages || previousHistory.messages,
       steps: chunk.history?.steps || previousHistory.steps,

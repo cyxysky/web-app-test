@@ -22,6 +22,8 @@ function sessionFixture(): BrowserChatSessionSnapshot {
     consoleErrors: [],
     networkErrors: [],
     logs: [],
+    outputCycles: [],
+    subagents: [],
     messages: [
       { id: 'user-1', role: 'user', content: '创建需求', createdAt: '2026-08-04T00:00:00.000Z' },
       { id: 'assistant-1', role: 'assistant', content: '已创建', createdAt: '2026-08-04T00:00:01.000Z', status: 'passed', stepIndexes: [1] },

@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webpilot-config
+data:
+  NODE_ENV: production
+  PORT: "3000"
+  HOSTNAME: "0.0.0.0"
+  HEADLESS_BROWSER: "true"
+  PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+  WEBPILOT_BASE_PATH: /webpilot
+  # The application now derives its browser-visible public URL from Nginx's
+  # X-Forwarded-* headers. Do not configure WEBPILOT_PUBLIC_BASE_URL.
+  WEBPILOT_TRUST_PROXY: "true"
+  # Production is mounted by the host application. Set false only for standalone direct access.
+  WEBPILOT_REQUIRE_MOUNT_USER_ID: "true"
+  WEBPILOT_DEFAULT_USER_ID: "1"
+  BROWSER_USER_DATA_DIR: /app/.data/browser-profile
+  AI_WEB_TEST_BROWSER_PROFILE_DIR: /app/.data/browser-profile
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webpilot
+spec:
+  # Browser sessions, SQLite data, and local browser profiles are pod-local.
+  # Keep this at one replica unless those states are moved to shared services.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: webpilot
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: webpilot
+    spec:
+      # hostPath is local to one node. Keep the workload on the same worker
+      # so SQLite data and browser profiles remain available after restarts.
+      nodeName: k8sworker02
+      containers:
+        - name: webpilot
+          image: cyxysky/webpilot-qa:latest
+          # Allows an image imported directly on k8sworker01 to be used offline.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: webpilot-config
+          volumeMounts:
+            - name: data
+              mountPath: /app/.data
+            - name: artifacts
+              mountPath: /app/artifacts
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            tcpSocket:
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+      volumes:
+        - name: data
+          hostPath:
+            path: /opt/webpilot/data
+            type: DirectoryOrCreate
+        - name: artifacts
+          hostPath:
+            path: /opt/webpilot/artifacts
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webpilot
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: webpilot
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http

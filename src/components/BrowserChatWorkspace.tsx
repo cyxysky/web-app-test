@@ -156,6 +156,11 @@ import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import { withWebPilotBasePath, withoutWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { useTheme } from '@/theme/ThemeProvider';
 import type {
+  BrowserChatAiOutputCycle,
+  BrowserChatAiOutputPart,
+  BrowserChatAiOutputTool,
+  BrowserChatAiOutputView,
+  BrowserChatSubagentRecord,
   ModelProvider,
   SkillRecord,
   StepExecutionResult,
@@ -269,6 +274,8 @@ type BrowserChatSession = {
   closedAt?: string;
   messages: BrowserChatMessage[];
   steps: StepExecutionResult[];
+  outputCycles: BrowserChatAiOutputCycle[];
+  subagents: BrowserChatSubagentRecord[];
   consoleErrors: string[];
   networkErrors: string[];
   logs: BrowserChatLogRecord[];
@@ -680,31 +687,6 @@ function asRecord(value: unknown) {
     : undefined;
 }
 
-type BrowserChatAiOutputTool = {
-  id: string;
-  input?: unknown;
-  name: string;
-  reason?: string;
-};
-
-type BrowserChatAiOutputPart =
-  | { index: number; kind: 'reasoning' }
-  | { index: number; kind: 'text' }
-  | { index: number; kind: 'tool' };
-
-type BrowserChatAiOutputView = {
-  parts: BrowserChatAiOutputPart[];
-  reasoning: string[];
-  texts: string[];
-  tools: BrowserChatAiOutputTool[];
-};
-
-type BrowserChatAiOutputCycle = {
-  id: string;
-  output: BrowserChatAiOutputView;
-  stepIndex?: number;
-};
-
 const BrowserChatReasoningVisibilityContext = createContext(false);
 
 function stringFromUnknown(value: unknown): string {
@@ -889,33 +871,6 @@ async function discardEmbeddedBrowserDataForSessions(
   for (const groupId of groupIds) {
     await bridge.discardGroup({ clearStorage: true, id: groupId }).catch(() => undefined);
   }
-}
-
-function aiOutputCyclesFromLogs(logs: BrowserChatLogRecord[]): BrowserChatAiOutputCycle[] {
-  const cycles: BrowserChatAiOutputCycle[] = [];
-  logs.forEach((log, index) => {
-    if (log.phase.startsWith('subagent:')) return;
-    if (log.phase !== 'ai:runtime:response' && log.phase !== 'ai:runtime:object') return;
-    const parsed = parseJsonObjectText(log.details);
-    const aiOutput = asRecord(parsed?.aiOutput);
-    if (!aiOutput) return;
-    const output = aiOutputViewFromResponse(aiOutput.response);
-    const fallbackText = stringFromUnknown(aiOutput.text);
-    if (fallbackText) mergeAiOutputView(output, normalizeAiContentPart({ type: 'text', text: fallbackText }));
-    if (log.phase === 'ai:runtime:object') {
-      output.parts = output.parts.filter((part) => (
-        part.kind !== 'text' || !isCodexRuntimeObjectEnvelope(output.texts[part.index] || '')
-      ));
-    }
-    const compacted = compactAiOutputView(output);
-    if (!hasAiOutputView(compacted)) return;
-    cycles.push({
-      id: log.id || `${log.phase}-${log.stepIndex || 0}-${index}`,
-      output: compacted,
-      stepIndex: log.stepIndex,
-    });
-  });
-  return cycles;
 }
 
 function aiOutputTextSetFromCycles(cycles: BrowserChatAiOutputCycle[]) {
@@ -1751,10 +1706,12 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
     modelProvider: modelSelection.provider,
     model: modelSelection.model,
     networkErrors: session.networkErrors || [],
+    outputCycles: session.outputCycles || [],
     pendingToolConfirmation: session.busy && session.status === 'running'
       ? normalizeToolConfirmation(session.pendingToolConfirmation)
       : undefined,
     steps: session.steps || [],
+    subagents: session.subagents || [],
   };
 }
 
@@ -1769,6 +1726,8 @@ function mergeBrowserChatHistoryChunk(
     logs?: BrowserChatLogRecord[];
     messages?: BrowserChatMessage[];
     steps?: StepExecutionResult[];
+    outputCycles?: BrowserChatAiOutputCycle[];
+    subagents?: BrowserChatSubagentRecord[];
   },
 ) {
   return normalizeSession(mergeBrowserChatHistoryChunkData(current, chunk));
@@ -1847,7 +1806,9 @@ function isOlderSessionSnapshot(incoming: BrowserChatSession, existing?: Browser
   if (incomingTime > existingTime) return false;
   return (incoming.messages?.length || 0) < (existing.messages?.length || 0)
     || (incoming.steps?.length || 0) < (existing.steps?.length || 0)
-    || (incoming.logs?.length || 0) < (existing.logs?.length || 0);
+    || (incoming.logs?.length || 0) < (existing.logs?.length || 0)
+    || (incoming.outputCycles?.length || 0) < (existing.outputCycles?.length || 0)
+    || (incoming.subagents?.length || 0) < (existing.subagents?.length || 0);
 }
 
 function sessionDisplayTitle(session: BrowserChatSession) {
@@ -2562,10 +2523,13 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
   className,
   isActive,
   logs,
+  onLoadSubagentRecords,
+  outputCycles,
   onResume,
   onSelectTool,
   resuming,
   running,
+  structuredSubagents,
   title,
   toolInput,
   toolResult,
@@ -2574,30 +2538,58 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
   className: string;
   isActive: boolean;
   logs: BrowserChatLogRecord[];
+  onLoadSubagentRecords?: () => void;
+  outputCycles?: BrowserChatAiOutputCycle[];
   onResume?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   resuming?: boolean;
   running: boolean;
+  structuredSubagents?: BrowserChatSubagentRecord[];
   title: string;
   toolInput: unknown;
   toolResult?: unknown;
 }) {
-  const subagents = useMemo(() => browserChatSubagentsFromLogs(logs, toolInput, toolResult), [logs, toolInput, toolResult]);
+  const [loadingRecords, setLoadingRecords] = useState(false);
+  const loadSubagentRecords = useCallback(async () => {
+    if (!onLoadSubagentRecords || loadingRecords) return;
+    setLoadingRecords(true);
+    try {
+      await onLoadSubagentRecords();
+    } finally {
+      setLoadingRecords(false);
+    }
+  }, [loadingRecords, onLoadSubagentRecords]);
+  const subagents = useMemo(
+    () => mergeBrowserChatSubagentViews(
+      browserChatSubagentsFromLogs(logs, toolInput, toolResult),
+      browserChatSubagentViewsFromRecords(structuredSubagents || [], toolResult),
+    ),
+    [logs, structuredSubagents, toolInput, toolResult],
+  );
   const hasProblem = subagents.some((subagent) => subagent.status === 'failed' || subagent.status === 'blocked');
   return (
-    <details className="browser-chat-ai-line-collapse browser-chat-subagent-tool" open={isActive || hasProblem || undefined}>
+    <details
+      className="browser-chat-ai-line-collapse browser-chat-subagent-tool"
+      onToggle={(event) => {
+        if ((event.currentTarget as HTMLDetailsElement).open) void loadSubagentRecords();
+      }}
+      open={isActive || hasProblem || undefined}
+    >
       <summary aria-label={title} className={`browser-chat-tool-card browser-chat-ai-tool-summary-card${className}`} title={title}>
         {cardContent}
+        {loadingRecords ? <Loader2 className="spin" size={13} /> : null}
         <ChevronDown className="browser-chat-ai-tool-chevron" size={13} />
         {isActive ? <BrowserChatToolTailParticles /> : null}
       </summary>
       <BrowserChatSubagentList
         logs={logs}
+        loadingRecords={loadingRecords}
         onResume={onResume}
         onSelectTool={onSelectTool}
         resuming={resuming}
         running={running}
         subagents={subagents}
+        outputCycles={outputCycles}
         toolInput={toolInput}
       />
     </details>
@@ -2606,6 +2598,8 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
 
 const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   logs,
+  onLoadSubagentRecords,
+  outputCycles,
   onSelectTool,
   onResumeHumanVerification,
   onResolveToolConfirmation,
@@ -2616,9 +2610,12 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   resumingHumanVerification,
   running,
   step,
+  structuredSubagents,
   visibleToolIndexes,
 }: {
   logs: BrowserChatLogRecord[];
+  onLoadSubagentRecords?: () => void;
+  outputCycles?: BrowserChatAiOutputCycle[];
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onResumeHumanVerification?: () => void | Promise<void>;
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
@@ -2629,6 +2626,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   resumingHumanVerification?: boolean;
   running: boolean;
   step: StepExecutionResult;
+  structuredSubagents?: BrowserChatSubagentRecord[];
   visibleToolIndexes?: readonly number[];
 }) {
   const { t } = useI18n();
@@ -2708,10 +2706,13 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                 className={stateClass}
                 isActive={isActiveTool}
                 logs={logs}
+                onLoadSubagentRecords={onLoadSubagentRecords}
+                outputCycles={outputCycles}
                 onResume={onResumeHumanVerification}
                 onSelectTool={onSelectTool}
                 resuming={resumingHumanVerification}
                 running={running}
+                structuredSubagents={structuredSubagents}
                 title={`${displayText} · ${translatedStatus}`}
                 toolInput={tool.input}
                 toolResult={tool.rawResult ?? tool.result}
@@ -2753,6 +2754,8 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
 const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   cycle,
   logs,
+  onLoadSubagentRecords,
+  outputCycles,
   onResolveToolConfirmation,
   onResumeHumanVerification,
   onSelectTool,
@@ -2761,10 +2764,13 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   resolvingConfirmationId,
   resumingHumanVerification,
   running,
+  structuredSubagents,
   toolDetails,
 }: {
   cycle: BrowserChatAiOutputCycle;
   logs: BrowserChatLogRecord[];
+  onLoadSubagentRecords?: () => void;
+  outputCycles?: BrowserChatAiOutputCycle[];
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onResumeHumanVerification?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
@@ -2773,6 +2779,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   resolvingConfirmationId?: string | null;
   resumingHumanVerification?: boolean;
   running: boolean;
+  structuredSubagents?: BrowserChatSubagentRecord[];
   toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
@@ -2870,10 +2877,13 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                     className={stateClass}
                     isActive={isActive}
                     logs={logs}
+                    onLoadSubagentRecords={onLoadSubagentRecords}
+                    outputCycles={outputCycles}
                     onResume={onResumeHumanVerification}
                     onSelectTool={onSelectTool}
                     resuming={resumingHumanVerification}
                     running={running}
+                    structuredSubagents={structuredSubagents}
                     title={`${label}${meta ? ` - ${meta}` : ''}`}
                     toolInput={toolDetail.tool.input}
                     toolResult={toolDetail.tool.rawResult ?? toolDetail.tool.result}
@@ -2907,6 +2917,8 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
 const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGroup({
   cycles,
   logs,
+  onLoadSubagentRecords,
+  outputCycles,
   onResolveToolConfirmation,
   onResumeHumanVerification,
   onSelectTool,
@@ -2915,10 +2927,13 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
   resolvingConfirmationId,
   resumingHumanVerification,
   running,
+  structuredSubagents,
   toolDetails,
 }: {
   cycles: BrowserChatAiOutputCycle[];
   logs: BrowserChatLogRecord[];
+  onLoadSubagentRecords?: () => void;
+  outputCycles?: BrowserChatAiOutputCycle[];
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onResumeHumanVerification?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
@@ -2927,6 +2942,7 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
   resolvingConfirmationId?: string | null;
   resumingHumanVerification?: boolean;
   running: boolean;
+  structuredSubagents?: BrowserChatSubagentRecord[];
   toolDetails: Map<string, BrowserChatToolDetail>;
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
@@ -2967,6 +2983,8 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
             <BrowserChatAiCycleLine
               cycle={cycle}
               logs={logs}
+              onLoadSubagentRecords={onLoadSubagentRecords}
+              outputCycles={outputCycles}
               onResolveToolConfirmation={onResolveToolConfirmation}
               onResumeHumanVerification={onResumeHumanVerification}
               onSelectTool={onSelectTool}
@@ -2975,6 +2993,7 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
               resolvingConfirmationId={resolvingConfirmationId}
               resumingHumanVerification={resumingHumanVerification}
               running={running}
+              structuredSubagents={structuredSubagents}
               toolDetails={toolDetails}
             />
           </div>
@@ -3054,6 +3073,49 @@ function browserChatSubagentBatchIdFromToolResult(value: unknown) {
   return stringFromUnknown(browserChatSubagentToolResultRecord(value)?.batchId).trim();
 }
 
+function browserChatSubagentViewsFromRecords(records: BrowserChatSubagentRecord[], toolResult?: unknown): BrowserChatSubagentView[] {
+  const batchId = browserChatSubagentBatchIdFromToolResult(toolResult);
+  return records
+    .filter((record) => !batchId || record.batchId === batchId)
+    .map((record) => ({
+      id: record.id,
+      title: record.title,
+      status: record.status,
+      summary: record.summary,
+      resumable: record.resumable,
+      toolCount: record.toolCount,
+      logs: [],
+      steps: record.steps,
+      taskKey: '',
+    }));
+}
+
+function mergeBrowserChatSubagentViews(
+  fromLogs: BrowserChatSubagentView[],
+  fromRecords: BrowserChatSubagentView[],
+) {
+  const merged = new Map<string, BrowserChatSubagentView>(fromLogs.map((item) => [item.id, item]));
+  for (const record of fromRecords) {
+    const existing = merged.get(record.id);
+    if (!existing) {
+      merged.set(record.id, record);
+      continue;
+    }
+    const steps = existing.steps.length ? existing.steps : record.steps;
+    merged.set(record.id, {
+      ...record,
+      title: record.title || existing.title,
+      summary: record.summary || existing.summary,
+      resumable: record.resumable || existing.resumable,
+      toolCount: steps.reduce((sum, step) => sum + (step.tools || []).length, 0),
+      logs: existing.logs,
+      steps,
+      taskKey: existing.taskKey,
+    });
+  }
+  return [...merged.values()];
+}
+
 function browserChatNestedLogDetails(value: unknown) {
   if (typeof value === 'string') return value;
   try {
@@ -3084,10 +3146,10 @@ function browserChatSubagentsFromLogs(logs: BrowserChatLogRecord[], toolInput: u
     matchedBatchStart = true;
     break;
   }
-  const tasks = matchedBatchStart ? loggedTasks : toolTasks;
+  const tasks = matchedBatchStart && loggedTasks.length ? loggedTasks : toolTasks;
   const taskKeys = tasks.map(browserChatSubagentTaskKey).filter(Boolean);
-  if (!taskKeys.length) return [];
   const taskKeySet = new Set(taskKeys);
+  const useTaskKeyFilter = taskKeySet.size > 0;
   const runs = new Map<string, MutableSubagentView>();
   for (const log of logs) {
     const match = /^subagent:([^:]+):(.+)$/.exec(log.phase);
@@ -3098,7 +3160,7 @@ function browserChatSubagentsFromLogs(logs: BrowserChatLogRecord[], toolInput: u
     const explicitTitle = stringFromUnknown(details?.title);
     const eventTaskKey = browserChatSubagentTaskKey(details);
     const detailIndex = Number(details?.index);
-    const taskIndex = Number.isInteger(detailIndex) && detailIndex >= 0 && detailIndex < taskKeys.length
+    const taskIndex = Number.isInteger(detailIndex) && detailIndex >= 0 && (!taskKeys.length || detailIndex < taskKeys.length)
       ? detailIndex
       : undefined;
     const indexedTaskKey = taskIndex === undefined ? '' : taskKeys[taskIndex];
@@ -3172,7 +3234,7 @@ function browserChatSubagentsFromLogs(logs: BrowserChatLogRecord[], toolInput: u
     runs.set(id, current);
   }
   const loggedViews = [...runs.values()]
-    .filter((item) => taskKeySet.has(item.taskKey) || item.taskIndex !== undefined)
+    .filter((item) => !useTaskKeyFilter || taskKeySet.has(item.taskKey) || item.taskIndex !== undefined)
     .sort((left, right) => (
       (taskKeys.indexOf(left.taskKey) >= 0 ? taskKeys.indexOf(left.taskKey) : left.taskIndex ?? Number.MAX_SAFE_INTEGER)
       - (taskKeys.indexOf(right.taskKey) >= 0 ? taskKeys.indexOf(right.taskKey) : right.taskIndex ?? Number.MAX_SAFE_INTEGER)
@@ -3219,6 +3281,8 @@ function browserChatSubagentsFromLogs(logs: BrowserChatLogRecord[], toolInput: u
 
 const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
   logs,
+  loadingRecords,
+  outputCycles,
   onResume,
   onSelectTool,
   resuming,
@@ -3227,6 +3291,8 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
   toolInput,
 }: {
   logs: BrowserChatLogRecord[];
+  loadingRecords?: boolean;
+  outputCycles?: BrowserChatAiOutputCycle[];
   onResume?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   resuming?: boolean;
@@ -3236,12 +3302,18 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
 }) {
   const { t } = useI18n();
   const derivedSubagents = useMemo(() => browserChatSubagentsFromLogs(logs, toolInput), [logs, toolInput]);
-  const subagents = providedSubagents || derivedSubagents;
-  if (!subagents.length) return null;
+  const subagents = providedSubagents?.length ? providedSubagents : derivedSubagents;
+  if (!subagents.length && !loadingRecords) return null;
   return (
     <div className="browser-chat-executed-body browser-chat-subagent-list">
+      {loadingRecords && !subagents.length ? (
+        <div className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
+          <Loader2 className="spin" size={14} />
+          <span>{t('正在加载子 Agent 工具记录')}</span>
+        </div>
+      ) : null}
       {subagents.map((subagent) => {
-        const cycles = aiOutputCyclesFromLogs(subagent.logs);
+        const cycles = (outputCycles || []).filter((cycle) => cycle.subagentId === subagent.id);
         const toolDetails = buildAiCycleToolDetailMap(cycles, subagent.steps);
         const representedTools = new Set([...toolDetails.values()].map((detail) => `${detail.stepIndex}:${detail.toolIndex}`));
         const remainingSteps = subagent.steps.flatMap((step) => {
@@ -3266,11 +3338,12 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
           >
             <summary className="browser-chat-ai-collapse-summary">
               <span className={`browser-chat-tool-icon ${statusClass}`} aria-hidden="true">
-                {subagent.status === 'running' ? <Loader2 className="spin" size={13} /> : subagent.status === 'passed' ? <CheckCircle2 size={13} /> : <CircleAlert size={13} />}
+                {loadingRecords || subagent.status === 'running' ? <Loader2 className="spin" size={13} /> : subagent.status === 'passed' ? <CheckCircle2 size={13} /> : <CircleAlert size={13} />}
               </span>
               <span className="browser-chat-tool-content">
                 <span className="browser-chat-tool-label">
                   <span className="browser-chat-tool-name">{subagent.title}</span>
+                  {loadingRecords ? <small className="browser-chat-tool-meta">{t('正在加载工具记录')}</small> : null}
                   <small className="browser-chat-tool-meta">{t(statusLabel)} · {t('{count} 个工具', { count: subagent.toolCount })}</small>
                 </span>
               </span>
@@ -3289,18 +3362,41 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
                   />
                 </div>
               ))}
-              {remainingSteps.map(({ step, visibleToolIndexes }) => (
-                <div className="browser-chat-executed-entry" key={step.index}>
-                  <BrowserChatStepToolCards
-                    logs={subagent.logs}
-                    onSelectTool={onSelectTool}
-                    resumingHumanVerification={resuming}
-                    running={subagent.status === 'running' && step.status === 'running'}
-                    step={step}
-                    visibleToolIndexes={visibleToolIndexes}
-                  />
-                </div>
-              ))}
+              {remainingSteps.flatMap(({ step, visibleToolIndexes }) => visibleToolIndexes.flatMap((toolIndex) => {
+                const tool = step.tools?.[toolIndex];
+                if (!tool) return [];
+                const cycleId = `subagent-step-${subagent.id}-${step.index}-${toolIndex}`;
+                const reason = tool.reason?.trim() || '';
+                const cycle: BrowserChatAiOutputCycle = {
+                  id: cycleId,
+                  stepIndex: step.index,
+                  subagentId: subagent.id,
+                  output: {
+                    parts: reason
+                      ? [{ index: 0, kind: 'text' }, { index: 0, kind: 'tool' }]
+                      : [{ index: 0, kind: 'tool' }],
+                    reasoning: [],
+                    texts: reason ? [reason] : [],
+                    tools: [{ id: tool.id || cycleId, input: tool.input, name: tool.name }],
+                  },
+                };
+                const syntheticToolDetails = new Map<string, BrowserChatToolDetail>([[
+                  aiCycleToolKey(cycleId, 0),
+                  { step, stepIndex: step.index, tool, toolIndex },
+                ]]);
+                return (
+                  <div className="browser-chat-executed-entry" key={cycleId}>
+                    <BrowserChatAiCycleLine
+                      cycle={cycle}
+                      logs={subagent.logs}
+                      onSelectTool={onSelectTool}
+                      resumingHumanVerification={resuming}
+                      running={subagent.status === 'running' && step.status === 'running'}
+                      toolDetails={syntheticToolDetails}
+                    />
+                  </div>
+                );
+              }))}
               {subagent.summary && (!normalizedSummary || !renderedText.has(normalizedSummary)) ? (
                 <div className="browser-chat-executed-entry">
                   <BrowserChatMarkdown markdown={subagent.summary} />
@@ -3520,6 +3616,8 @@ const BrowserChatStreamingAnswer = memo(function BrowserChatStreamingAnswer({
 const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
   logs,
   message,
+  onLoadSubagentRecords,
+  outputCycles,
   onResolveToolConfirmation,
   onResumeHumanVerification,
   onSelectTool,
@@ -3529,9 +3627,12 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   resumingHumanVerification,
   running,
   steps,
+  subagents,
 }: {
   logs: BrowserChatLogRecord[];
   message: BrowserChatMessage;
+  onLoadSubagentRecords?: () => void;
+  outputCycles: BrowserChatAiOutputCycle[];
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onResumeHumanVerification?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
@@ -3541,12 +3642,13 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   resumingHumanVerification?: boolean;
   running: boolean;
   steps: StepExecutionResult[];
+  subagents: BrowserChatSubagentRecord[];
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
   const { t } = useI18n();
   const finalText = stringFromUnknown(message.content);
   const normalizedFinalText = finalText.replace(/\s+/g, ' ').trim();
-  const aiOutputCycles = useMemo(() => aiOutputCyclesFromLogs(logs)
+  const aiOutputCycles = useMemo(() => outputCycles.filter((cycle) => !cycle.subagentId)
     .map((cycle) => (showReasoning ? cycle : {
       ...cycle,
       output: {
@@ -3555,7 +3657,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
         reasoning: [],
       },
     }))
-    .filter((cycle) => hasAiOutputView(cycle.output)), [logs, showReasoning]);
+    .filter((cycle) => hasAiOutputView(cycle.output)), [outputCycles, showReasoning]);
   const processAiOutputCycles = useMemo(() => {
     if (!normalizedFinalText) return aiOutputCycles;
     return aiOutputCycles.map((cycle) => {
@@ -3743,6 +3845,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                 cycles={entry.cycles}
                 key={entry.id}
                 logs={logs}
+                onLoadSubagentRecords={onLoadSubagentRecords}
+                outputCycles={outputCycles}
                 onResolveToolConfirmation={onResolveToolConfirmation}
                 onResumeHumanVerification={onResumeHumanVerification}
                 onSelectTool={onSelectTool}
@@ -3751,6 +3855,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                 resolvingConfirmationId={resolvingConfirmationId}
                 resumingHumanVerification={resumingHumanVerification}
                 running={running}
+                structuredSubagents={subagents}
                 toolDetails={aiCycleToolDetails}
               />
             ) : (
@@ -3758,6 +3863,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                 cycle={entry.cycle}
                 key={entry.cycle.id}
                 logs={logs}
+                onLoadSubagentRecords={onLoadSubagentRecords}
+                outputCycles={outputCycles}
                 onResolveToolConfirmation={onResolveToolConfirmation}
                 onResumeHumanVerification={onResumeHumanVerification}
                 onSelectTool={onSelectTool}
@@ -3766,6 +3873,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                 resolvingConfirmationId={resolvingConfirmationId}
                 resumingHumanVerification={resumingHumanVerification}
                 running={running}
+                structuredSubagents={subagents}
                 toolDetails={aiCycleToolDetails}
               />
             )
@@ -3783,6 +3891,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                 <div className={`browser-chat-agent-step${running && step.status === 'running' ? ' is-running' : ''}`} key={step.index}>
                   <BrowserChatStepToolCards
                     logs={logs}
+                    onLoadSubagentRecords={onLoadSubagentRecords}
+                    outputCycles={outputCycles}
                     onResolveToolConfirmation={onResolveToolConfirmation}
                     onResumeHumanVerification={onResumeHumanVerification}
                     onSelectTool={onSelectTool}
@@ -3792,6 +3902,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                     resolvingConfirmationId={resolvingConfirmationId}
                     resumingHumanVerification={resumingHumanVerification}
                     running={running && step.status === 'running'}
+                    structuredSubagents={subagents}
                     step={step}
                     visibleToolIndexes={visibleToolIndexes}
                   />
@@ -3840,10 +3951,13 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   generatingSkillMessageId,
   item,
   itemLogs,
+  itemOutputCycles,
+  itemSubagents,
   itemSteps,
   lastAssistantMessageId,
   onGenerateAutomationCase,
   onGenerateSkill,
+  onLoadMessageLogs,
   onPreviewImage,
   onResolveToolConfirmation,
   onResumeHumanVerification,
@@ -3859,10 +3973,13 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   generatingSkillMessageId: string | null;
   item: BrowserChatMessage;
   itemLogs: BrowserChatLogRecord[];
+  itemOutputCycles: BrowserChatAiOutputCycle[];
+  itemSubagents: BrowserChatSubagentRecord[];
   itemSteps: StepExecutionResult[];
   lastAssistantMessageId?: string;
   onGenerateAutomationCase: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
+  onLoadMessageLogs: (messageId: string) => Promise<void> | void;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onResumeHumanVerification?: () => void | Promise<void>;
@@ -3898,6 +4015,8 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
           <BrowserChatAssistantTimeline
             logs={itemLogs}
             message={item}
+            onLoadSubagentRecords={() => onLoadMessageLogs(item.id)}
+            outputCycles={itemOutputCycles}
             onResolveToolConfirmation={onResolveToolConfirmation}
             onResumeHumanVerification={onResumeHumanVerification}
             onSelectTool={onSelectTool}
@@ -3907,6 +4026,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
             resumingHumanVerification={resumingHumanVerification}
             running={operationRunning}
             steps={itemSteps}
+            subagents={itemSubagents}
           />
         ) : (
           <>
@@ -3958,11 +4078,11 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   );
 });
 
-function browserChatAssistantMessageHasVisibleText(message: BrowserChatMessage, logs: BrowserChatLogRecord[]) {
+function browserChatAssistantMessageHasVisibleText(message: BrowserChatMessage, outputCycles: BrowserChatAiOutputCycle[]) {
   return modelBrowserChatAssistantMessageHasVisibleText(
     message,
-    logs,
-    (sourceLogs) => aiOutputCyclesFromLogs(sourceLogs).flatMap((cycle) => cycle.output.texts),
+    [],
+    () => outputCycles.flatMap((cycle) => cycle.output.texts),
   );
 }
 
@@ -3970,6 +4090,9 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   items,
   lastAssistantMessageId,
   logIndex,
+  onLoadMessageLogs,
+  onShowLogs,
+  outputCycles,
   onResolveToolConfirmation,
   onResumeHumanVerification,
   onSelectTool,
@@ -3978,11 +4101,15 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   resolvingConfirmationId,
   resumingHumanVerification,
   sessionBusy,
+  subagents,
   stepsByIndex,
 }: {
   items: BrowserChatMessage[];
   lastAssistantMessageId?: string;
   logIndex: BrowserChatLogIndex;
+  onLoadMessageLogs: (messageId: string) => Promise<void> | void;
+  onShowLogs: (messageId: string) => void;
+  outputCycles: BrowserChatAiOutputCycle[];
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onResumeHumanVerification?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
@@ -3991,6 +4118,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   resolvingConfirmationId?: string | null;
   resumingHumanVerification?: boolean;
   sessionBusy: boolean;
+  subagents: BrowserChatSubagentRecord[];
   stepsByIndex: Map<number, StepExecutionResult>;
 }) {
   const { t } = useI18n();
@@ -4001,7 +4129,9 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
     return {
       item,
       logs: browserChatLogsForMessage(item, logIndex),
+      outputCycles: outputCycles.filter((cycle) => cycle.messageId === item.id),
       running: item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId),
+      subagents: subagents.filter((subagent) => subagent.messageId === item.id),
       steps,
     };
   });
@@ -4025,11 +4155,13 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
             <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
           </summary>
           <div className="browser-chat-executed-body">
-            {itemViews.map(({ item, logs, running, steps }) => (
+            {itemViews.map(({ item, logs, outputCycles: itemOutputCycles, running, steps, subagents: itemSubagents }) => (
               <div className="browser-chat-executed-entry" key={item.id}>
                 <BrowserChatAssistantTimeline
                   logs={logs}
                   message={item}
+                  onLoadSubagentRecords={() => onLoadMessageLogs(item.id)}
+                  outputCycles={itemOutputCycles}
                   onResolveToolConfirmation={onResolveToolConfirmation}
                   onResumeHumanVerification={onResumeHumanVerification}
                   onSelectTool={onSelectTool}
@@ -4039,6 +4171,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
                   resumingHumanVerification={resumingHumanVerification}
                   running={running}
                   steps={steps}
+                  subagents={itemSubagents}
                 />
               </div>
             ))}
@@ -4058,8 +4191,10 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   lastAssistantMessageId,
   logIndex,
   messages,
+  outputCycles,
   onGenerateAutomationCase,
   onGenerateSkill,
+  onLoadMessageLogs,
   onLoadEarlier,
   onInitialPositioned,
   onPreviewImage,
@@ -4073,6 +4208,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   resumingHumanVerification,
   sessionId,
   sessionBusy,
+  subagents,
   stepsByIndex,
 }: {
   availableSkills: SkillRecord[];
@@ -4083,8 +4219,10 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   lastAssistantMessageId?: string;
   logIndex: BrowserChatLogIndex;
   messages: BrowserChatMessage[];
+  outputCycles: BrowserChatAiOutputCycle[];
   onGenerateAutomationCase: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
+  onLoadMessageLogs: (messageId: string) => Promise<void> | void;
   onLoadEarlier?: () => void | Promise<void>;
   onInitialPositioned?: (sessionId?: string) => void;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
@@ -4098,6 +4236,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   resumingHumanVerification?: boolean;
   sessionId?: string;
   sessionBusy: boolean;
+  subagents: BrowserChatSubagentRecord[];
   stepsByIndex: Map<number, StepExecutionResult>;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -4121,13 +4260,16 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     () => buildBrowserChatMessageRenderEntries(
       messages,
       logIndex,
-      browserChatAssistantMessageHasVisibleText,
+      (message) => browserChatAssistantMessageHasVisibleText(
+        message,
+        outputCycles.filter((cycle) => cycle.messageId === message.id && !cycle.subagentId),
+      ),
       (message) => (message.stepIndexes || []).some((stepIndex) => {
         const step = stepsByIndex.get(stepIndex);
         return step?.messageId === message.id && Boolean(step.tools?.length);
       }),
     ),
-    [logIndex, messages, stepsByIndex],
+    [logIndex, messages, outputCycles, stepsByIndex],
   );
   const scrollKey = [
     sessionId || '',
@@ -4360,7 +4502,10 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
               key={entry.id}
               lastAssistantMessageId={lastAssistantMessageId}
               logIndex={logIndex}
+              onLoadMessageLogs={onLoadMessageLogs}
+              onShowLogs={onShowLogs}
               onResolveToolConfirmation={onResolveToolConfirmation}
+              outputCycles={outputCycles}
               onResumeHumanVerification={onResumeHumanVerification}
               onSelectTool={onSelectTool}
               pendingToolConfirmation={pendingToolConfirmation}
@@ -4368,6 +4513,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
               resolvingConfirmationId={resolvingConfirmationId}
               resumingHumanVerification={resumingHumanVerification}
               sessionBusy={sessionBusy}
+              subagents={subagents}
               stepsByIndex={stepsByIndex}
             />
           );
@@ -4380,17 +4526,22 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             .filter((step): step is StepExecutionResult => Boolean(step))
           : [...stepsByIndex.values()].filter((step) => step.messageId === item.id);
         const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
+        const itemOutputCycles = outputCycles.filter((cycle) => cycle.messageId === item.id);
+        const itemSubagents = subagents.filter((subagent) => subagent.messageId === item.id);
         return (
           <BrowserChatMessageItem
             generatingAutomationMessageId={generatingAutomationMessageId}
             generatingSkillMessageId={generatingSkillMessageId}
             item={item}
             itemLogs={itemLogs}
+            itemOutputCycles={itemOutputCycles}
+            itemSubagents={itemSubagents}
             itemSteps={itemSteps}
             key={item.id}
             lastAssistantMessageId={lastAssistantMessageId}
             onGenerateAutomationCase={onGenerateAutomationCase}
             onGenerateSkill={onGenerateSkill}
+            onLoadMessageLogs={onLoadMessageLogs}
             onPreviewImage={onPreviewImage}
             onResolveToolConfirmation={onResolveToolConfirmation}
             onResumeHumanVerification={onResumeHumanVerification}
@@ -7488,6 +7639,7 @@ export function BrowserChatWorkspace({
   const [sessionMinimumLoadingElapsed, setSessionMinimumLoadingElapsed] = useState(false);
   const [loadingSessionHistory, setLoadingSessionHistory] = useState(true);
   const [messageViewportReady, setMessageViewportReady] = useState(false);
+  const [messageViewportGeneration, setMessageViewportGeneration] = useState(0);
   const [loadingEarlierHistory, setLoadingEarlierHistory] = useState(false);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
   const loadedLogMessageKeysRef = useRef(new Set<string>());
@@ -7722,13 +7874,12 @@ export function BrowserChatWorkspace({
   const addTabReference = useCallback((reference: BrowserChatAttachment) => {
     addReferenceAttachments([reference]);
   }, [addReferenceAttachments]);
-  const showMessageLogs = useCallback((messageId: string) => {
-    setLogDialogMessageId(messageId);
+  const loadMessageLogs = useCallback((messageId: string) => {
     const sessionId = activeSessionIdRef.current;
     const key = `${sessionId || ''}\u0000${messageId}`;
     if (!sessionId || loadedLogMessageKeysRef.current.has(key)) return;
     loadedLogMessageKeysRef.current.add(key);
-    void (async () => {
+    return (async () => {
       try {
         let cursor = '';
         do {
@@ -7754,13 +7905,18 @@ export function BrowserChatWorkspace({
       }
     })();
   }, [browserChatApiUrl]);
+  const showMessageLogs = useCallback((messageId: string) => {
+    setLogDialogMessageId(messageId);
+    void loadMessageLogs(messageId);
+  }, [loadMessageLogs]);
   const loadEarlierHistory = useCallback(async () => {
     const current = session;
-    if (!current?.history?.messages.hasMore || !current.history.messages.cursor || loadingEarlierHistory) return;
+    const history = current?.history;
+    if (!current || !history || !browserChatHasEarlierMessages(history) || loadingEarlierHistory) return;
     const params = new URLSearchParams();
-    params.set('messageCursor', current.history.messages.cursor);
-    if (current.history.steps.hasMore && current.history.steps.cursor) params.set('stepCursor', current.history.steps.cursor);
-    if (current.history.logs.hasMore && current.history.logs.cursor) params.set('logCursor', current.history.logs.cursor);
+    if (history.messages.hasMore && history.messages.cursor) params.set('messageCursor', history.messages.cursor);
+    if (history.steps.hasMore && history.steps.cursor) params.set('stepCursor', history.steps.cursor);
+    if (history.logs.hasMore && history.logs.cursor) params.set('logCursor', history.logs.cursor);
     if (!params.size) return;
     const loadingStartedAt = Date.now();
     setLoadingEarlierHistory(true);
@@ -8007,6 +8163,7 @@ export function BrowserChatWorkspace({
     setLoadingSessionId(sessionId);
     setSessionMinimumLoadingElapsed(false);
     setMessageViewportReady(false);
+    setMessageViewportGeneration((current) => current + 1);
     await waitForBrowserPaint();
     try {
       const loadedSession = await refreshSession(sessionId, {
@@ -8910,7 +9067,7 @@ export function BrowserChatWorkspace({
 
       {hasMessages ? (
         <BrowserChatMessageList
-          key={`messages:${sessionUiKey}`}
+          key={`messages:${sessionUiKey}:${messageViewportGeneration}`}
           availableSkills={skills}
           generatingAutomationMessageId={generatingAutomationMessageId}
           generatingSkillMessageId={generatingSkillMessageId}
@@ -8919,8 +9076,10 @@ export function BrowserChatWorkspace({
           lastAssistantMessageId={lastAssistantMessageId}
           logIndex={logIndex}
           messages={visibleMessages}
+          outputCycles={session?.outputCycles || []}
           onGenerateAutomationCase={generateMessageAutomationCase}
           onGenerateSkill={generateMessageSkill}
+          onLoadMessageLogs={loadMessageLogs}
           onLoadEarlier={loadEarlierHistory}
           onInitialPositioned={markMessageViewportReady}
           onPreviewImage={previewAttachment}
@@ -8934,6 +9093,7 @@ export function BrowserChatWorkspace({
           resumingHumanVerification={resumingHumanVerification}
           sessionId={session?.id}
           sessionBusy={selectedSessionRunning}
+          subagents={session?.subagents || []}
           stepsByIndex={stepsByIndex}
         />
       ) : null}
@@ -9114,7 +9274,7 @@ export function BrowserChatWorkspace({
 
             {hasMessages ? (
               <BrowserChatMessageList
-                key={`messages:${sessionUiKey}`}
+                key={`messages:${sessionUiKey}:${messageViewportGeneration}`}
                 availableSkills={skills}
                 generatingAutomationMessageId={generatingAutomationMessageId}
                 generatingSkillMessageId={generatingSkillMessageId}
@@ -9123,8 +9283,10 @@ export function BrowserChatWorkspace({
                 lastAssistantMessageId={lastAssistantMessageId}
                 logIndex={logIndex}
                 messages={visibleMessages}
+                outputCycles={session?.outputCycles || []}
                 onGenerateAutomationCase={generateMessageAutomationCase}
                 onGenerateSkill={generateMessageSkill}
+                onLoadMessageLogs={loadMessageLogs}
                 onLoadEarlier={loadEarlierHistory}
                 onInitialPositioned={markMessageViewportReady}
                 onPreviewImage={previewAttachment}
@@ -9138,6 +9300,7 @@ export function BrowserChatWorkspace({
                 resumingHumanVerification={resumingHumanVerification}
                 sessionId={session?.id}
                 sessionBusy={selectedSessionRunning}
+                subagents={session?.subagents || []}
                 stepsByIndex={stepsByIndex}
               />
             ) : null}

@@ -53,7 +53,14 @@ import {
 } from '@/server/ai/personal-memory';
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
 import { compactBrowserChatLogsForClient } from '@/server/ai/agents/browser-chat-log-client';
-import type { ModelProvider, SkillRecord, StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
+import { browserChatAiOutputCycleFromDebugEvent } from '@/lib/browser-chat-output-cycles';
+import type {
+  BrowserChatAiOutputCycle,
+  BrowserChatSubagentRecord,
+  ModelProvider,
+  SkillRecord,
+  StepExecutionResult,
+} from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
 import {
   flushBrowserChatRealtimeOutbox,
@@ -173,6 +180,8 @@ export type BrowserChatSessionSnapshot = {
   error?: string;
   messages: BrowserChatMessage[];
   steps: StepExecutionResult[];
+  outputCycles: BrowserChatAiOutputCycle[];
+  subagents: BrowserChatSubagentRecord[];
   consoleErrors: string[];
   networkErrors: string[];
   logs: BrowserChatLogRecord[];
@@ -1368,6 +1377,8 @@ function summaryFromSnapshot(session: BrowserChatSessionSnapshot): BrowserChatSe
     userId: normalizeUserId(session.userId),
     messages: previewMessages(session),
     steps: [],
+    outputCycles: [],
+    subagents: [],
     consoleErrors: [],
     networkErrors: [],
     logs: [],
@@ -1407,6 +1418,8 @@ function sessionSnapshotHeader(
     error: session.error,
     consoleErrors: [...session.consoleErrors],
     networkErrors: [...session.networkErrors],
+    outputCycles: [...session.outputCycles],
+    subagents: [...session.subagents],
     conversationContext: normalizeConversationContext(session.conversationContext),
     pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
   };
@@ -1417,6 +1430,8 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     ...sessionSnapshotHeader(session),
     messages: [...session.messages],
     steps: options.fullSteps ? [...session.steps] : session.steps.map(compactStepForClient),
+    outputCycles: [...session.outputCycles],
+    subagents: [...session.subagents],
     logs: [...(session.logs || [])],
   };
 }
@@ -1426,6 +1441,8 @@ function summarySnapshot(session: BrowserChatSessionRecord): BrowserChatSessionS
     ...sessionSnapshotHeader(session),
     messages: [...session.messages],
     steps: [],
+    outputCycles: [...session.outputCycles],
+    subagents: [...session.subagents],
     consoleErrors: [],
     networkErrors: [],
     logs: [...(session.logs || [])],
@@ -1639,6 +1656,8 @@ function recordFromSnapshot(
     model: modelSettings.model,
     messages,
     steps,
+    outputCycles: session.outputCycles || [],
+    subagents: session.subagents || [],
     conversationContext: normalizeConversationContext(session.conversationContext),
     pendingToolConfirmation: preserveRecentRunningState ? normalizeToolConfirmation(session.pendingToolConfirmation) : undefined,
     status,
@@ -1955,6 +1974,25 @@ function mergePersistedLogs(existing: BrowserChatLogRecord[] = [], incoming: Bro
     .slice(-browserChatLogLimit());
 }
 
+function mergePersistedOutputCycles(existing: BrowserChatAiOutputCycle[] = [], incoming: BrowserChatAiOutputCycle[] = []) {
+  const byId = new Map<string, BrowserChatAiOutputCycle>();
+  for (const cycle of existing) byId.set(cycle.id, cycle);
+  for (const cycle of incoming) byId.set(cycle.id, cycle);
+  return [...byId.values()];
+}
+
+function mergePersistedSubagents(existing: BrowserChatSubagentRecord[] = [], incoming: BrowserChatSubagentRecord[] = []) {
+  const byId = new Map<string, BrowserChatSubagentRecord>();
+  for (const subagent of existing) byId.set(subagent.id, subagent);
+  for (const subagent of incoming) {
+    const previous = byId.get(subagent.id);
+    byId.set(subagent.id, previous
+      ? { ...previous, ...subagent, steps: mergePersistedSteps(previous.steps, subagent.steps) }
+      : subagent);
+  }
+  return [...byId.values()].sort((left, right) => left.index - right.index);
+}
+
 function mergePersistedConversationContext(
   existing?: BrowserChatConversationContext,
   incoming?: BrowserChatConversationContext,
@@ -1982,6 +2020,8 @@ function mergePersistedSessionSnapshot(
     ...base,
     messages: alignBrowserChatMessageStepIndexes(mergePersistedMessages(existing.messages, incoming.messages), steps),
     steps,
+    outputCycles: mergePersistedOutputCycles(existing.outputCycles, incoming.outputCycles),
+    subagents: mergePersistedSubagents(existing.subagents, incoming.subagents),
     consoleErrors: mergeStringLists(existing.consoleErrors, incoming.consoleErrors),
     networkErrors: mergeStringLists(existing.networkErrors, incoming.networkErrors),
     logs,
@@ -2001,6 +2041,8 @@ function mergeRuntimeSessionState(fromDisk: BrowserChatSessionRecord, existing: 
     ...fromDisk,
     messages: mergePersistedMessages(fromDisk.messages, existing.messages),
     steps: mergePersistedSteps(fromDisk.steps, existing.steps),
+    outputCycles: mergePersistedOutputCycles(fromDisk.outputCycles, existing.outputCycles),
+    subagents: mergePersistedSubagents(fromDisk.subagents, existing.subagents),
     consoleErrors: mergeStringLists(fromDisk.consoleErrors, existing.consoleErrors),
     networkErrors: mergeStringLists(fromDisk.networkErrors, existing.networkErrors),
     logs: mergePersistedLogs(fromDisk.logs, existing.logs),
@@ -2402,6 +2444,8 @@ export function createBrowserChatSession(input: {
     updatedAt: timestamp,
     messages: [],
     steps: [],
+    outputCycles: [],
+    subagents: [],
     consoleErrors: [],
     networkErrors: [],
     logs: [],
@@ -2490,6 +2534,8 @@ export function getBrowserChatSessionHistory(
       })
     : undefined;
   return {
+    outputCycles: session.outputCycles || [],
+    subagents: session.subagents || [],
     ...(messages ? { messages: messages.items } : {}),
     ...(steps ? { steps: steps.items.map(compactStepForClient) } : {}),
     ...(logs ? { logs: compactBrowserChatLogsForClient(logs.items) } : {}),
@@ -3052,6 +3098,23 @@ function updateAssistantMessage(
   markMessageDirty(session, session.messages[index]);
 }
 
+function appendBrowserChatOutputCycle(session: BrowserChatSessionRecord, cycle: BrowserChatAiOutputCycle) {
+  session.outputCycles = [...(session.outputCycles || []), cycle];
+  session.updatedAt = now();
+}
+
+function upsertBrowserChatSubagent(session: BrowserChatSessionRecord, record: BrowserChatSubagentRecord) {
+  const current = session.subagents || [];
+  const index = current.findIndex((item) => item.id === record.id);
+  if (index < 0) session.subagents = [...current, record].sort((left, right) => left.index - right.index);
+  else {
+    const next = [...current];
+    next[index] = record;
+    session.subagents = next;
+  }
+  session.updatedAt = now();
+}
+
 function stringifyJsonSafe(value: unknown, space?: number) {
   const seen = new WeakSet<object>();
   return JSON.stringify(value, (_key, item) => {
@@ -3473,6 +3536,22 @@ function updateBrowserChatStoredSubagent(
   const record = browserChatSubagentSessionRegistry(sessionId).get(uuid);
   if (!record) return;
   Object.assign(record, update, { updatedAt: now() });
+  const session = sessions.get(sessionId);
+  if (session) {
+    upsertBrowserChatSubagent(session, {
+      id: record.uuid,
+      messageId: record.assistantMessageId,
+      batchId: record.batchId,
+      index: record.index,
+      title: record.title,
+      status: record.status,
+      summary: record.summary || undefined,
+      resumable: blockedSubagents.has(record.uuid),
+      toolCount: record.steps.reduce((count: number, step: StepExecutionResult) => count + (step.tools || []).length, 0),
+      steps: [...record.steps],
+      error: record.error,
+    });
+  }
 }
 
 function readBrowserChatSubagent(sessionId: string): BrowserChatSubagentReader {
@@ -3549,6 +3628,17 @@ async function executeBrowserChatSubagentBatch(input: {
       events: [],
       createdAt,
       updatedAt: createdAt,
+    });
+    upsertBrowserChatSubagent(session, {
+      id: task.id,
+      messageId: assistantMessageId,
+      batchId,
+      index,
+      title: task.title,
+      status: 'running',
+      resumable: false,
+      toolCount: 0,
+      steps: [],
     });
   });
   appendLog(session, 'subagents:start', `正在并行执行 ${tasks.length} 个子 Agent；单个分支失败不会中止其他分支`, {
@@ -3654,6 +3744,16 @@ async function executeBrowserChatSubagentBatch(input: {
         onDebug: (event) => {
           if (!ownsTurn()) return;
           const eventDetails = unwrapLogDetails(event.details).value;
+          const outputCycle = browserChatAiOutputCycleFromDebugEvent({
+            details: event.details,
+            id: id('cycle'),
+            messageId: assistantMessageId,
+            phase: event.phase,
+            stepIndex: event.stepIndex,
+            subagentId: task.id,
+            batchId,
+          });
+          if (outputCycle) appendBrowserChatOutputCycle(session, outputCycle);
           if (event.phase === 'ai:runtime:response' || event.phase === 'ai:runtime:object') {
             const eventRecord = eventDetails && typeof eventDetails === 'object' && !Array.isArray(eventDetails)
               ? eventDetails as Record<string, unknown>
@@ -3855,6 +3955,12 @@ async function resumeBlockedBrowserChatSubagent(input: {
         : undefined,
       onProgress: (step) => {
         if (!ownsTurn()) return;
+        const nextSteps = [...binding.steps.filter((item) => item.index !== step.index), step].sort((left, right) => left.index - right.index);
+        binding.steps = nextSteps;
+        updateBrowserChatStoredSubagent(session.id, binding.id, {
+          status: step.status === 'queued' ? 'running' : step.status,
+          steps: nextSteps,
+        });
         appendLog(session, `subagent:${binding.id}:progress`, `${binding.title}：${step.action || '正在继续'}`, {
           details: { id: binding.id, title: binding.title, status: step.status, step },
           messageId: assistantMessageId,
@@ -3863,6 +3969,15 @@ async function resumeBlockedBrowserChatSubagent(input: {
       },
       onDebug: (event) => {
         if (!ownsTurn()) return;
+        const outputCycle = browserChatAiOutputCycleFromDebugEvent({
+          details: event.details,
+          id: id('cycle'),
+          messageId: assistantMessageId,
+          phase: event.phase,
+          stepIndex: event.stepIndex,
+          subagentId: binding.id,
+        });
+        if (outputCycle) appendBrowserChatOutputCycle(session, outputCycle);
         const eventDetails = unwrapLogDetails(event.details).value;
         appendLog(session, `subagent:${binding.id}:${event.phase}`, event.message, {
           elapsedMs: elapsedFromDetails(eventDetails),
@@ -3888,6 +4003,12 @@ async function resumeBlockedBrowserChatSubagent(input: {
       messageId: assistantMessageId,
     });
     binding.steps = result.steps;
+    updateBrowserChatStoredSubagent(session.id, binding.id, {
+      status: result.status,
+      summary,
+      steps: result.steps,
+      error: undefined,
+    });
     if (result.status === 'blocked') {
       const timestamp = now();
       updateAssistantMessage(session, assistantMessageId, (message) => ({
@@ -4051,6 +4172,14 @@ async function runBrowserChatMessage(
         },
         onDebug: (event) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+          const outputCycle = browserChatAiOutputCycleFromDebugEvent({
+            details: event.details,
+            id: id('cycle'),
+            messageId: assistantMessageId,
+            phase: event.phase,
+            stepIndex: event.stepIndex,
+          });
+          if (outputCycle) appendBrowserChatOutputCycle(session, outputCycle);
           const persistImmediately = event.phase === 'ai:runtime:request'
             || event.phase === 'ai:runtime:response'
             || event.phase === 'ai:tool';
