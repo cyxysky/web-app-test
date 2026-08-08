@@ -1,3 +1,5 @@
+import { asRecord, finiteNumber } from '@/lib/unknown-value';
+
 export type BrowserChatLogRecordLike = {
   details?: unknown;
   phase: string;
@@ -15,17 +17,6 @@ export type BrowserChatExecutionTotals = {
   toolCallCount: number;
   toolElapsedMs: number;
 };
-
-function asRecord(value: unknown) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function finiteNumber(value: unknown) {
-  const numberValue = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(numberValue) ? numberValue : undefined;
-}
 
 function parsedLogDetails(details: unknown) {
   if (typeof details !== 'string') return asRecord(details);

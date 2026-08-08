@@ -4,6 +4,7 @@ import { NavigationLoading } from '@/components/NavigationLoading';
 import { I18nProvider } from '@/i18n/I18nProvider';
 import { ThemeProvider } from '@/theme/ThemeProvider';
 import './globals.css';
+import './styles/modern-system.css';
 
 export const metadata: Metadata = {
   title: 'WebPilot',

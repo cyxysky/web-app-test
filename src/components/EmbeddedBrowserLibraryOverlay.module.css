@@ -291,42 +291,6 @@
   color: var(--danger) !important;
 }
 
-.empty {
-  align-content: center;
-  color: var(--muted);
-  display: grid;
-  flex: 1 1 auto;
-  gap: 8px;
-  justify-items: center;
-  padding: 24px;
-  text-align: center;
-}
-
-.empty>span {
-  align-items: center;
-  background: color-mix(in srgb, var(--foreground) 7%, transparent);
-  border-radius: 13px;
-  color: var(--muted-strong);
-  display: inline-flex;
-  height: 48px;
-  justify-content: center;
-  margin-bottom: 3px;
-  width: 48px;
-}
-
-.empty strong {
-  color: var(--foreground);
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.empty p {
-  font-size: 12px;
-  line-height: 1.6;
-  margin: 0;
-  max-width: 220px;
-}
-
 .sectionEmpty {
   align-items: center;
   color: var(--muted);
@@ -363,14 +327,14 @@
 
 @media (hover: none), (pointer: coarse) {
   .headerActions button,
-  .searchBar button,
-  .removeItem,
-  .sectionHeading {
+.searchBar button,
+.removeItem,
+.sectionHeading {
     min-height: 44px;
   }
 
   .headerActions button,
-  .removeItem {
+.removeItem {
     width: 44px;
   }
 
@@ -417,9 +381,9 @@
 
 @media (prefers-reduced-motion: reduce) {
   .card,
-  .headerActions button,
-  .searchBar button,
-  .removeItem {
+.headerActions button,
+.searchBar button,
+.removeItem {
     transition: none;
   }
 }

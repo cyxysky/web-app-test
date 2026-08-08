@@ -9,7 +9,6 @@ import {
   SIDEBAR_COLLAPSED_COOKIE_NAME,
   sidebarCollapsedFromCookie,
 } from '@/lib/sidebar-collapse';
-import '../styles/modern-system.css';
 import '../styles/browser-chat-debug.css';
 
 export const dynamic = 'force-dynamic';

@@ -2,12 +2,7 @@ import type {
   BrowserChatAiOutputCycle,
   BrowserChatAiOutputView,
 } from '@/server/ai/schemas/runtime.schema';
-
-function asRecord(value: unknown) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
+import { asRecord } from '@/lib/unknown-value';
 
 function stripAnsiControlCodes(value: string) {
   return value.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');

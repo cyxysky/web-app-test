@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ChevronDown, Clock3, Edit3, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
+import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { CustomSelect } from '@/components/CustomSelect';
 import { DataTransferButtons } from '@/components/DataTransferButtons';
 import { DomainGroupedAccordion } from '@/components/DomainGroupedAccordion';
@@ -456,41 +457,18 @@ export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => v
         </div>
       ), document.body) : null}
 
-      {deleteTarget && portalReady ? createPortal((
-        <div className="ui-modal-overlay" onMouseDown={closeDeleteModal}>
-          <section
-            aria-labelledby="skills-manager-delete-title"
-            aria-modal="true"
-            className="ui-modal ui-modal--compact"
-            onMouseDown={(event) => event.stopPropagation()}
-            role="dialog"
-          >
-            <header className="ui-modal-header">
-              <h2 className="ui-modal-title" id="skills-manager-delete-title">{t('删除 Skill')}</h2>
-              <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" onClick={closeDeleteModal} type="button">
-                <X size={16} />
-              </button>
-            </header>
-            <div className="ui-modal-body skills-manager-delete-body">
-              <div className="skills-manager-delete-icon">
-                <Trash2 size={20} />
-              </div>
-              <h3>{deleteTarget.title}</h3>
-              <p>{t('确定删除这个 Skill 吗？')}</p>
-            </div>
-            <footer className="ui-modal-footer">
-              <button className="ui-button ui-button--neutral" disabled={Boolean(deletingSkillId)} onClick={closeDeleteModal} type="button">
-                <X size={15} />
-                {t('取消')}
-              </button>
-              <button className="ui-button ui-button--danger" disabled={Boolean(deletingSkillId)} onClick={() => void confirmDeleteSkill()} type="button">
-                {deletingSkillId ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-                {t('删除')}
-              </button>
-            </footer>
-          </section>
-        </div>
-      ), document.body) : null}
+      {deleteTarget && portalReady ? (
+        <ConfirmDeleteModal
+          deleting={Boolean(deletingSkillId)}
+          description={t('确定删除这个 Skill 吗？')}
+          icon={<div className="skills-manager-delete-icon"><Trash2 size={20} /></div>}
+          id="skills-manager-delete-title"
+          itemTitle={deleteTarget.title}
+          onClose={closeDeleteModal}
+          onConfirm={confirmDeleteSkill}
+          title={t('删除 Skill')}
+        />
+      ) : null}
     </section>
   );
 }

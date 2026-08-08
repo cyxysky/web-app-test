@@ -13,6 +13,7 @@ import {
 } from '@/components/browser-chat-log-model';
 import { formatLogTime, formatToolPayload, parseJsonObjectText, phaseLabel } from '@/components/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
+import { asRecord, finiteNumber } from '@/lib/unknown-value';
 
 type Translator = ReturnType<typeof useI18n>['t'];
 
@@ -25,17 +26,6 @@ export type BrowserChatLogDialogRecord = {
   stepIndex?: number;
   time: string;
 };
-
-function asRecord(value: unknown) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function finiteNumber(value: unknown) {
-  const numberValue = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(numberValue) ? numberValue : undefined;
-}
 
 function stringValue(value: unknown) {
   return typeof value === 'string' ? value.trim() : '';

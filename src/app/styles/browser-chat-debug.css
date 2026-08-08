@@ -1,4 +1,6 @@
 .browser-chat-tool-modal-body {
+  max-width: 100%;
+  overflow-x: hidden;
   display: grid;
   gap: 14px;
 }

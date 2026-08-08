@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, FolderOpen, KeyRound, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
+import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { SkillsManager } from '@/components/SkillsManager';
 import {
   defaultModelForProvider,
@@ -880,77 +881,35 @@ export function EnvironmentSettings({
   function renderDeletePersonalMemoryModal() {
     if (!deletePersonalMemoryTarget || !portalReady) return null;
     const deleting = deletingPersonalMemoryId === deletePersonalMemoryTarget.id;
-    return createPortal((
-      <div className="ui-modal-overlay" onMouseDown={closeDeletePersonalMemoryModal}>
-        <section
-          aria-labelledby="personal-memory-delete-title"
-          aria-modal="true"
-          className="ui-modal ui-modal--compact"
-          onMouseDown={(event) => event.stopPropagation()}
-          role="dialog"
-        >
-          <header className="ui-modal-header">
-            <h2 className="ui-modal-title" id="personal-memory-delete-title">{t('删除记忆')}</h2>
-            <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={deleting} onClick={closeDeletePersonalMemoryModal} type="button">
-              <X size={16} />
-            </button>
-          </header>
-          <div className="ui-modal-body skills-manager-delete-body">
-            <h3>{deletePersonalMemoryTarget.key}</h3>
-            <p>{t('确认删除这条记忆？')}</p>
-            {deletePersonalMemoryError ? <p className="personal-memory-delete-error">{deletePersonalMemoryError}</p> : null}
-          </div>
-          <footer className="ui-modal-footer">
-            <button className="ui-button ui-button--neutral" disabled={deleting} onClick={closeDeletePersonalMemoryModal} type="button">
-              <X size={15} />
-              {t('取消')}
-            </button>
-            <button className="ui-button ui-button--danger" disabled={deleting} onClick={() => void confirmDeletePersonalMemory()} type="button">
-              {deleting ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-              {t('删除')}
-            </button>
-          </footer>
-        </section>
-      </div>
-    ), document.body);
+    return (
+      <ConfirmDeleteModal
+        deleting={deleting}
+        description={t('确认删除这条记忆？')}
+        error={deletePersonalMemoryError}
+        id="personal-memory-delete-title"
+        itemTitle={deletePersonalMemoryTarget.key}
+        onClose={closeDeletePersonalMemoryModal}
+        onConfirm={confirmDeletePersonalMemory}
+        title={t('删除记忆')}
+      />
+    );
   }
 
   function renderDeleteLoginAccountModal() {
     if (!deleteLoginAccountTarget || !portalReady) return null;
     const deleting = deletingLoginAccountId === deleteLoginAccountTarget.id;
-    return createPortal((
-      <div className="ui-modal-overlay" onMouseDown={closeDeleteLoginAccountModal}>
-        <section
-          aria-labelledby="login-account-delete-title"
-          aria-modal="true"
-          className="ui-modal ui-modal--compact"
-          onMouseDown={(event) => event.stopPropagation()}
-          role="dialog"
-        >
-          <header className="ui-modal-header">
-            <h2 className="ui-modal-title" id="login-account-delete-title">{t('删除登录账号')}</h2>
-            <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={deleting} onClick={closeDeleteLoginAccountModal} type="button">
-              <X size={16} />
-            </button>
-          </header>
-          <div className="ui-modal-body skills-manager-delete-body">
-            <h3>{deleteLoginAccountTarget.label || deleteLoginAccountTarget.username}</h3>
-            <p>{t('确认删除这个登录账号？')}</p>
-            {deleteLoginAccountError ? <p className="personal-memory-delete-error">{deleteLoginAccountError}</p> : null}
-          </div>
-          <footer className="ui-modal-footer">
-            <button className="ui-button ui-button--neutral" disabled={deleting} onClick={closeDeleteLoginAccountModal} type="button">
-              <X size={15} />
-              {t('取消')}
-            </button>
-            <button className="ui-button ui-button--danger" disabled={deleting} onClick={() => void confirmDeleteLoginAccount()} type="button">
-              {deleting ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-              {t('删除')}
-            </button>
-          </footer>
-        </section>
-      </div>
-    ), document.body);
+    return (
+      <ConfirmDeleteModal
+        deleting={deleting}
+        description={t('确认删除这个登录账号？')}
+        error={deleteLoginAccountError}
+        id="login-account-delete-title"
+        itemTitle={deleteLoginAccountTarget.label || deleteLoginAccountTarget.username}
+        onClose={closeDeleteLoginAccountModal}
+        onConfirm={confirmDeleteLoginAccount}
+        title={t('删除登录账号')}
+      />
+    );
   }
 
   function renderPersonalMemoryPanel() {

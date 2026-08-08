@@ -15,8 +15,6 @@ import {
   ListChecks,
   Loader2,
   MessageSquare,
-  Moon,
-  PanelLeft,
   Play,
   Plus,
   RefreshCw,
@@ -24,7 +22,6 @@ import {
   Settings,
   Sparkles,
   StopCircle,
-  Sun,
   Trash2,
   Workflow,
   X,
@@ -32,11 +29,13 @@ import {
 } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
+import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import { useI18n } from '@/i18n/I18nProvider';
 import type { Language } from '@/i18n/translations';
 import { readApiJson } from '@/lib/api-client';
 import { artifactApiUrl } from '@/lib/artifacts';
 import { waitForMinimumLoading } from '@/lib/minimum-loading';
+import { asRecord } from '@/lib/unknown-value';
 import {
   readSidebarCollapsedPreference,
   writeSidebarCollapsedPreference,
@@ -136,12 +135,6 @@ const weekdayOptions = [
 ];
 
 const activeRunStatuses = new Set<AutomationRunStatus>(['queued', 'running']);
-
-function asRecord(value: unknown) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
 
 function textValue(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
@@ -921,49 +914,21 @@ export function AutomationWorkspace({
 
   return (
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed automation-layout' : 'browser-chat-layout automation-layout'}>
-      <aside className="browser-chat-sidebar automation-sidebar">
-        <div className="browser-chat-brand">
-          <strong>WebPilot</strong>
-          <button
-            aria-label={t(sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏')}
-            className="ui-icon-button"
-            onClick={toggleSidebar}
-            title={t(sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏')}
-            type="button"
-          >
-            <PanelLeft size={17} />
-          </button>
-        </div>
+      <WorkspaceSidebar
+        className="automation-sidebar"
+        collapseLabel={t(sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏')}
+        onToggleCollapse={toggleSidebar}
+        onToggleTheme={toggleMode}
+        showThemeLabel
+        themeMode={themeMode}
+        themeToggleLabel={t(themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式')}
+        themeToggleTitle={t(themeMode === 'dark' ? '浅色模式' : '深色模式')}
+      >
 
         <nav className="browser-chat-nav" aria-label={t('工作模式')}>
-          <Link
-            aria-label={t('对话模式')}
-            className="browser-chat-nav-item"
-            href="/browser-chat"
-            title={t('对话模式')}
-          >
-            <MessageSquare size={17} />
-            <span>{t('对话模式')}</span>
-          </Link>
-          <Link
-            aria-current="page"
-            aria-label={t('自动化')}
-            className="browser-chat-nav-item active"
-            href="/automation"
-            title={t('自动化')}
-          >
-            <Workflow size={17} />
-            <span>{t('自动化')}</span>
-          </Link>
-          <Link
-            aria-label={t('设置')}
-            className="browser-chat-nav-item"
-            href="/settings"
-            title={t('设置')}
-          >
-            <Settings size={17} />
-            <span>{t('设置')}</span>
-          </Link>
+          <WorkspaceNavItem href="/browser-chat" icon={<MessageSquare size={17} />} label={t('对话模式')} />
+          <WorkspaceNavItem active href="/automation" icon={<Workflow size={17} />} label={t('自动化')} />
+          <WorkspaceNavItem href="/settings" icon={<Settings size={17} />} label={t('设置')} />
         </nav>
 
         <section className="browser-chat-sidebar-section browser-chat-recent-section automation-case-history">
@@ -1076,19 +1041,7 @@ export function AutomationWorkspace({
           </div>
         </section>
 
-        <div className="browser-chat-sidebar-footer">
-          <button
-            aria-label={t(themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式')}
-            className="browser-chat-theme-toggle"
-            onClick={toggleMode}
-            title={t(themeMode === 'dark' ? '浅色模式' : '深色模式')}
-            type="button"
-          >
-            {themeMode === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
-            <span>{t(themeMode === 'dark' ? '浅色模式' : '深色模式')}</span>
-          </button>
-        </div>
-      </aside>
+      </WorkspaceSidebar>
 
       <main className="browser-chat-main automation-main">
         <div className="automation-content" aria-busy={loading}>
