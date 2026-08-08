@@ -5993,7 +5993,6 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
 
 .browser-chat-cases-pane,
 .browser-chat-settings-pane {
-  min-height: 100vh;
   min-width: 0;
   overflow: auto;
   padding: 26px 32px 48px;
