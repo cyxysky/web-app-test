@@ -8715,7 +8715,7 @@ body.is-resizing-case-panel .dashboard-detail-shell> :not(.dashboard-detail-resi
 .browser-chat-main:has(> .browser-chat-settings-pane .settings-loading-panel),
 .automation-main:has(.automation-loading-state) {
   overflow: hidden;
-  scrollbar-gutter: auto;
+  scrollbar-gutter: stable;
 }
 
 .browser-chat-main.is-positioning-chat {

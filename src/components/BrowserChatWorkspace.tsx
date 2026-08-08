@@ -8535,6 +8535,7 @@ export function BrowserChatWorkspace({
 
   async function deleteSessionHistory(sessionId: string) {
     if (deletingSessionIdsRef.current.has(sessionId) || deletingSelectedSessions) return;
+    const deletingActiveSession = activeSessionIdRef.current === sessionId || session?.id === sessionId;
     deletingSessionIdsRef.current.add(sessionId);
     setDeletingSessionIds((current) => new Set(current).add(sessionId));
     setError('');
@@ -8545,13 +8546,22 @@ export function BrowserChatWorkspace({
       await readApiJson<Record<string, unknown>>(response, '删除历史对话失败');
       setSessions((current) => current.filter((item) => item.id !== sessionId));
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
-      if (session?.id === sessionId) {
+      if (deletingActiveSession) {
+        sessionSelectionIntentRef.current += 1;
+        sessionActivationSequenceRef.current += 1;
+        loadingSessionRef.current = null;
+        mountedSessionActivationRef.current = '';
         activeSessionIdRef.current = null;
+        setLoadingSessionId(null);
+        setSessionMinimumLoadingElapsed(true);
+        setMessageViewportReady(true);
         setMode(defaultModeRef.current);
         setSession(null);
+        if (!mountedIdentityRef.current) {
+          window.history.replaceState(null, '', browserChatSessionNavigationHref(window.location.href));
+        }
       }
       if (deletedSession) await discardEmbeddedBrowserDataForSessions([deletedSession]);
-      await loadSessions().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '删除历史对话失败');
     } finally {
@@ -8589,6 +8599,11 @@ export function BrowserChatWorkspace({
     if (!selectedDeletableSessionIds.length || deletingSelectedSessions) return;
     const deletingIds = selectedDeletableSessionIds;
     const deletingIdSet = new Set(deletingIds);
+    const activeSessionId = activeSessionIdRef.current;
+    const deletingActiveSession = Boolean(
+      (activeSessionId && deletingIdSet.has(activeSessionId))
+      || (session?.id && deletingIdSet.has(session.id)),
+    );
     const deletedSessions = sessions.filter((item) => deletingIdSet.has(item.id));
     setDeletingSelectedSessions(true);
     setError('');
@@ -8601,13 +8616,22 @@ export function BrowserChatWorkspace({
       await readApiJson<Record<string, unknown>>(response, '批量删除历史对话失败');
       setSessions((current) => current.filter((item) => !deletingIdSet.has(item.id)));
       setSelectedSessionIds((current) => current.filter((id) => !deletingIdSet.has(id)));
-      if (session?.id && deletingIdSet.has(session.id)) {
+      if (deletingActiveSession) {
+        sessionSelectionIntentRef.current += 1;
+        sessionActivationSequenceRef.current += 1;
+        loadingSessionRef.current = null;
+        mountedSessionActivationRef.current = '';
         activeSessionIdRef.current = null;
+        setLoadingSessionId(null);
+        setSessionMinimumLoadingElapsed(true);
+        setMessageViewportReady(true);
         setMode(defaultModeRef.current);
         setSession(null);
+        if (!mountedIdentityRef.current) {
+          window.history.replaceState(null, '', browserChatSessionNavigationHref(window.location.href));
+        }
       }
       await discardEmbeddedBrowserDataForSessions(deletedSessions);
-      await loadSessions().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '批量删除历史对话失败');
     } finally {
