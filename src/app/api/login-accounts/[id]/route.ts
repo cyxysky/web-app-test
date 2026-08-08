@@ -1,12 +1,9 @@
 import { NextRequest } from 'next/server';
 import { z } from 'zod';
-import {
-  deleteLoginAccount,
-  getLoginAccountById,
-  updateLoginAccount,
-} from '@/server/credentials/login-account-vault';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { deleteLoginAccount, getLoginAccountById, updateLoginAccount } from '@/server/credentials/login-account-vault';
 import { requestApplicationUserId } from '@/server/auth/user-context';
+import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
+import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -21,62 +18,64 @@ const updateSchema = z.object({
   loginUrl: z.string().trim().max(4_000).optional(),
   status: z.enum(['active', 'disabled']).optional(),
   shared: z.boolean().optional(),
-}).strict().refine((body) => (
-  body.domain !== undefined
-  || body.username !== undefined
-  || body.password !== undefined
-  || body.label !== undefined
-  || body.loginUrl !== undefined
-  || body.status !== undefined
-  || body.shared !== undefined
-), { message: '没有可更新的账号字段' });
+}).strict().refine((body) => Object.values(body).some((value) => value !== undefined), {
+  message: '没有可更新的账号字段',
+});
 
-function requestUserId(request: NextRequest) {
-  return requestApplicationUserId(request);
+function accountError(error: unknown) {
+  if (error instanceof ApiRequestError) return error;
+  const message = error instanceof Error ? error.message : '登录账号操作失败';
+  return new ApiRequestError(message, {
+    code: /已存在|already exists/i.test(message) ? 'account_already_exists' : 'account_operation_failed',
+    status: /已存在|already exists/i.test(message) ? 409 : 400,
+  });
 }
 
-function publicError(error: unknown) {
-  if (error instanceof z.ZodError) return '账号信息格式无效';
-  return error instanceof Error ? error.message : '登录账号操作失败';
+function editableAccount(id: string, userId: string) {
+  const account = getLoginAccountById(id, userId);
+  if (!account) throw new ApiRequestError('登录账号不存在', { code: 'not_found', status: 404 });
+  if (account.userId !== userId) {
+    throw new ApiRequestError('只有账号创建者可以修改或删除共享账号', { code: 'forbidden', status: 403 });
+  }
+  return account;
 }
 
 export async function PATCH(request: NextRequest, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const body = updateSchema.parse(await request.json());
-    const userId = requestUserId(request);
-    const visibleAccount = getLoginAccountById(id, userId);
-    if (visibleAccount && visibleAccount.userId !== userId) return noStoreJson({ error: 'Only the account creator can edit this shared account' }, { status: 403 });
-    const account = updateLoginAccount(id, {
-      domain: body.domain,
-      username: body.username,
-      password: body.password,
-      label: body.label,
-      loginUrl: body.loginUrl,
-      status: body.status,
-      shared: body.shared,
-    }, userId);
-    if (!account) return noStoreJson({ error: '登录账号不存在' }, { status: 404 });
-    return noStoreJson({ account });
+    const body = await parseJsonRequest(request, updateSchema, { maxBytes: 16 * 1024 });
+    const userId = requestApplicationUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint({ id, ...body }),
+      scope: 'login_account.update',
+      userId,
+    }, () => {
+      editableAccount(id, userId);
+      const account = updateLoginAccount(id, body, userId);
+      if (!account) throw new ApiRequestError('登录账号不存在', { code: 'not_found', status: 404 });
+      return apiJson(request, { account });
+    });
   } catch (error) {
-    const message = publicError(error);
-    return noStoreJson(
-      { error: message },
-      { status: /已经存在/.test(message) ? 409 : 400 },
-    );
+    return apiError(request, accountError(error), { fallback: '更新登录账号失败' });
   }
 }
 
 export async function DELETE(request: NextRequest, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const userId = requestUserId(request);
-    const visibleAccount = getLoginAccountById(id, userId);
-    if (visibleAccount && visibleAccount.userId !== userId) return noStoreJson({ error: 'Only the account creator can delete this shared account' }, { status: 403 });
-    const deleted = deleteLoginAccount(id, userId);
-    if (!deleted) return noStoreJson({ error: '登录账号不存在' }, { status: 404 });
-    return noStoreJson({ ok: true });
+    const userId = requestApplicationUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint({ id }),
+      scope: 'login_account.delete',
+      userId,
+    }, () => {
+      editableAccount(id, userId);
+      if (!deleteLoginAccount(id, userId)) {
+        throw new ApiRequestError('登录账号不存在', { code: 'not_found', status: 404 });
+      }
+      return apiJson(request, { ok: true });
+    });
   } catch (error) {
-    return noStoreJson({ error: publicError(error) }, { status: 400 });
+    return apiError(request, accountError(error), { fallback: '删除登录账号失败' });
   }
 }

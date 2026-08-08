@@ -1,33 +1,30 @@
 import { NextRequest } from 'next/server';
 import { enqueueAutomationCaseRun } from '@/server/automation/automation-runner';
 import { requestApplicationUserId } from '@/server/auth/user-context';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
+import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-type RouteContext = {
-  params: Promise<{ caseId: string }>;
-};
-
-function requestUserId(request: NextRequest) {
-  return requestApplicationUserId(request);
-}
+type RouteContext = { params: Promise<{ caseId: string }> };
 
 export async function POST(request: NextRequest, context: RouteContext) {
-  const { caseId } = await context.params;
   try {
-    const run = enqueueAutomationCaseRun({
-      caseId,
-      userId: requestUserId(request),
-      trigger: 'manual',
-    });
-    return noStoreJson({ ok: true, run }, { status: 202 });
+    const { caseId } = await context.params;
+    const userId = requestApplicationUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint({ caseId }),
+      scope: 'automation_run.enqueue',
+      userId,
+    }, () => apiJson(request, {
+      ok: true,
+      run: enqueueAutomationCaseRun({ caseId, userId, trigger: 'manual' }),
+    }, { status: 202 }));
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Failed to start automation run.';
-    return noStoreJson(
-      { error: message },
-      { status: /not found/i.test(message) ? 404 : 400 },
-    );
+    const message = error instanceof Error ? error.message : '';
+    return apiError(request, /not found/i.test(message)
+      ? new ApiRequestError('自动化用例不存在', { code: 'not_found', status: 404 })
+      : error, { fallback: '启动自动化运行失败' });
   }
 }

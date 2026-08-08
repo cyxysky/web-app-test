@@ -1,5 +1,5 @@
 import { deleteBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
@@ -17,12 +17,9 @@ export async function POST(request: Request, context: RouteContext) {
   try {
     const { sessionId } = await context.params;
     const deleted = await deleteBrowserChatSession(sessionId, requestUserId(request));
-    if (!deleted) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
-    return noStoreJson({ ok: true, deleted });
+    if (!deleted) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
+    return apiJson(request, { ok: true, deleted });
   } catch (error) {
-    return noStoreJson(
-      { error: error instanceof Error ? error.message : 'Failed to delete browser chat session' },
-      { status: 400 },
-    );
+    return apiError(request, error, { fallback: 'Failed to delete browser chat session' });
   }
 }

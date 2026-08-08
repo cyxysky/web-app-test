@@ -27,7 +27,7 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
   try {
     recordStore.writeBrowserChatSessionRecord(
       snapshot,
-      { id: snapshot.id },
+      { id: snapshot.id, userId: snapshot.userId },
       [
         { id: 'm1', createdAt: time, content: 'one' },
         { id: 'm2', createdAt: time, content: 'two' },
@@ -46,7 +46,7 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
 
     recordStore.writeBrowserChatSessionRecord(
       { ...snapshot, updatedAt: new Date().toISOString() },
-      { id: snapshot.id },
+      { id: snapshot.id, userId: snapshot.userId },
       [{ id: 'm2', createdAt: time, content: 'updated' }],
       [{ index: 2, value: 'updated' }],
       [{ id: 'l2', time, value: 'updated' }],
@@ -62,7 +62,7 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
 
     recordStore.writeBrowserChatSessionDelta(
       { ...snapshot, updatedAt: new Date().toISOString() },
-      { id: snapshot.id },
+      { id: snapshot.id, userId: snapshot.userId },
       {
         messages: [{ id: 'm3', createdAt: time, content: 'delta' }],
         steps: [{ index: 3, value: 'delta' }],
@@ -81,7 +81,7 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
 
     recordStore.writeBrowserChatSessionDelta(
       { ...snapshot, updatedAt: new Date().toISOString() },
-      { id: snapshot.id },
+      { id: snapshot.id, userId: snapshot.userId },
       { removedMessageIds: ['m2'], removedStepIndexes: [2], removedLogIds: ['l2'] },
       { entityType: 'browserChatSession', id: snapshot.id, updatedAt: time, userId: '0' },
     );
@@ -103,6 +103,84 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
       recordStore.readPendingBrowserChatRealtimeOutbox().map((item) => item.id),
       [outbox[1].id],
     );
+
+    const memoryBase = {
+      shared: false,
+      scope: 'global',
+      domain: '',
+      type: 'preference',
+      status: 'active',
+      createdAt: time,
+      updatedAt: time,
+    };
+    recordStore.writePersonalMemoryRecords([{
+      ...memoryBase,
+      id: 'memory-owner',
+      userId: 'owner',
+      key: 'theme',
+      value: 'dark',
+    }, {
+      ...memoryBase,
+      id: 'memory-other',
+      userId: 'other',
+      key: 'language',
+      value: 'Chinese',
+    }]);
+    recordStore.writePersonalMemoryRecord({
+      ...memoryBase,
+      id: 'memory-owner',
+      userId: 'owner',
+      key: 'theme',
+      value: 'light',
+      updatedAt: new Date(Date.parse(time) + 1_000).toISOString(),
+    });
+    const ownerMemories = recordStore.readPersonalMemoryRecords<{ id: string; value: string }>({
+      userId: 'owner',
+      includeShared: false,
+    });
+    assert.deepEqual(ownerMemories.map((item) => item.id), ['memory-owner']);
+    assert.equal(ownerMemories[0]?.value, 'light');
+    assert.equal(
+      recordStore.readPersonalMemoryRecords<{ id: string; value: string }>({ ids: ['memory-other'] })[0]?.value,
+      'Chinese',
+    );
+
+    for (const [id, userId, updatedAt] of [
+      ['session-page-a', '17', '2026-08-08T00:00:01.000Z'],
+      ['session-page-b', '17', '2026-08-08T00:00:02.000Z'],
+      ['session-page-other', '18', '2026-08-08T00:00:03.000Z'],
+    ] as const) {
+      recordStore.writeBrowserChatSessionRecord(
+        { ...snapshot, id, userId, updatedAt },
+        { id, userId, updatedAt },
+        [],
+        [],
+        [],
+      );
+    }
+    const userPage = recordStore.readBrowserChatSessionSummaries<{ id: string; userId: string }>({ userId: '17', limit: 2 });
+    assert.equal(userPage.length, 2);
+    assert.equal(userPage.every((item) => item.userId === '17'), true);
+    assert.equal(userPage.some((item) => item.id === 'session-page-other'), false);
+
+    await recordStore.writeBrowserChatSessionDeltaQueued(
+      { ...snapshot, id: 'session-worker', updatedAt: new Date().toISOString() },
+      { id: 'session-worker', userId: snapshot.userId },
+      {
+        messages: [{ id: 'worker-message', createdAt: time, content: 'written off the request thread' }],
+        steps: [{ index: 1, value: 'worker-step' }],
+        logs: [{ id: 'worker-log', time, value: 'worker-log' }],
+      },
+      { entityType: 'browserChatSession', id: 'session-worker', updatedAt: time, userId: snapshot.userId },
+    );
+    const workerWritten = recordStore.readBrowserChatSessionRecord<{
+      messages: Array<{ content: string }>;
+      steps: Array<{ value: string }>;
+      logs: Array<{ value: string }>;
+    }>('session-worker');
+    assert.equal(workerWritten?.messages[0]?.content, 'written off the request thread');
+    assert.equal(workerWritten?.steps[0]?.value, 'worker-step');
+    assert.equal(workerWritten?.logs[0]?.value, 'worker-log');
 
     const retiredTables = databaseModule.getSqliteDatabase().prepare(`
       SELECT name FROM sqlite_master

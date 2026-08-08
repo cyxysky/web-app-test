@@ -1,5 +1,6 @@
 import { WEBPILOT_BASE_PATH, withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import type { AutomationScheduleRecord } from '@/server/automation/automation.schema';
+import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
 import {
   createAutomationScheduleOccurrence,
   listAutomationRuns,
@@ -184,7 +185,8 @@ function launchRun(runId: string, userId: string) {
     const detail = (await response.text().catch(() => '')).trim();
     throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
   }).catch((error: unknown) => {
-    console.warn(`[automation-scheduler] Failed to launch run ${runId}.`, error);
+    incrementMetric('automation_scheduler_errors_total', { phase: 'launch' });
+    structuredLog({ event: 'automation.scheduler.launch_failed', level: 'warn', runId, error });
   });
 }
 
@@ -225,7 +227,8 @@ export async function runAutomationSchedulerTick(
     result.recovered = recoverDurableRuns(tickTime);
   } catch (error) {
     result.errors += 1;
-    console.warn('[automation-scheduler] Failed to recover durable runs.', error);
+    incrementMetric('automation_scheduler_errors_total', { phase: 'recovery' });
+    structuredLog({ event: 'automation.scheduler.recovery_failed', level: 'warn', error });
   }
 
   const schedules = listDueAutomationSchedules({
@@ -271,7 +274,8 @@ export async function runAutomationSchedulerTick(
       }
     } catch (error) {
       result.errors += 1;
-      console.warn(`[automation-scheduler] Failed to process schedule ${schedule.id}.`, error);
+      incrementMetric('automation_scheduler_errors_total', { phase: 'schedule' });
+      structuredLog({ event: 'automation.scheduler.schedule_failed', level: 'warn', scheduleId: schedule.id, error });
     }
   }
 
@@ -307,7 +311,8 @@ export function startAutomationScheduler() {
     if (!state.running) return;
     state.tick = runAutomationSchedulerTick()
       .catch((error: unknown) => {
-        console.warn('[automation-scheduler] Scheduler tick failed.', error);
+        incrementMetric('automation_scheduler_errors_total', { phase: 'tick' });
+        structuredLog({ event: 'automation.scheduler.tick_failed', level: 'error', error });
       })
       .then(() => undefined)
       .finally(() => {

@@ -18,6 +18,7 @@ import {
 import {
   boundedNonNegativeIntegerEnv,
   boundedPositiveIntegerEnv,
+  browserHeadlessEnabled,
   browserTabTitlePrefixEnabled,
   cdpEndpointForPort,
   cdpPortFromEndpoint,
@@ -4958,7 +4959,7 @@ export class BrowserSession {
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
     const { chromium } = await import('playwright');
-    const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
+    const headless = browserHeadlessEnabled(this.options);
     const isolated = this.options.isolated === true;
     this.browserSurface = resolveBrowserSessionSurface(this.options, electronEmbeddedBrowserEnabled());
     const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';

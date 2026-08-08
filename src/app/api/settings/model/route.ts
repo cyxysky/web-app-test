@@ -1,12 +1,29 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { defaultModelByProvider, defaultModelForProvider, modelListForProvider, modelProviderDefinitions, modelProviderValues, modelProviderDefinition } from '@/config/settings';
-import { store } from '@/server/db/store';
+import { NextRequest } from 'next/server';
+import { z } from 'zod';
+import {
+  defaultModelByProvider,
+  defaultModelForProvider,
+  modelListForProvider,
+  modelProviderDefinitions,
+  modelProviderDefinition,
+  modelProviderValues,
+} from '@/config/settings';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
-import { readModelSettingsState } from '@/server/settings/settings-snapshot';
+import { requestApplicationUserId } from '@/server/auth/user-context';
+import { store } from '@/server/db/store';
+import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
+import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';
+import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 
 const providers = new Set<ModelProvider>(modelProviderValues);
-const noStoreHeaders = { 'Cache-Control': 'no-store, max-age=0' };
+const modelBodySchema = z.record(z.string(), z.unknown());
+
+function requireAdmin(request: NextRequest) {
+  if (!requestHasAdminSettingsAccess(request)) {
+    throw new ApiRequestError('请先输入管理员设置密码。', { code: 'admin_access_required', status: 401 });
+  }
+}
 
 function normalizeProvider(value: unknown): ModelProvider {
   const provider = String(value || 'openrouter').trim().toLowerCase();
@@ -50,43 +67,44 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
 }
 
 export async function GET(request: NextRequest) {
-  if (!requestHasAdminSettingsAccess(request)) {
-    return NextResponse.json({ error: '请先输入管理员设置密码。' }, { status: 401, headers: noStoreHeaders });
+  try {
+    requireAdmin(request);
+    return apiJson(request, readModelSettingsState());
+  } catch (error) {
+    return apiError(request, error, { fallback: '读取模型配置失败' });
   }
-  return NextResponse.json(readModelSettingsState(), { headers: noStoreHeaders });
 }
 
 export async function POST(request: NextRequest) {
-  if (!requestHasAdminSettingsAccess(request)) {
-    return NextResponse.json({ error: '请先输入管理员设置密码。' }, { status: 401, headers: noStoreHeaders });
-  }
   try {
-    const body = await request.json();
-    const provider = normalizeProvider(body.provider);
-    const providersInput = readProviderSettings(body.providers);
-    if (!Object.keys(providersInput).length) {
-      const definition = modelProviderDefinition(provider);
-      const bodyModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultModelByProvider[provider];
-      const models = modelListForProvider(definition, { model: bodyModel });
-      const model = defaultModelForProvider(definition, { models, model: bodyModel });
-      providersInput[provider] = {
-        defaultModel: model,
-        model,
-        models,
-        ...(typeof body.apiKey === 'string' && body.apiKey.trim() ? { apiKey: body.apiKey } : {}),
-        baseURL: typeof body.baseURL === 'string' ? body.baseURL : modelProviderDefinition(provider).defaultBaseURL || '',
-      };
-    }
-    store.saveModelConfig({
-      provider,
-      providers: providersInput,
+    requireAdmin(request);
+    const body = await parseJsonRequest(request, modelBodySchema, { maxBytes: 512 * 1024 });
+    const userId = requestApplicationUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint(body),
+      scope: 'settings.model',
+      userId,
+    }, () => {
+      const provider = normalizeProvider(body.provider);
+      const providersInput = readProviderSettings(body.providers);
+      if (!Object.keys(providersInput).length) {
+        const definition = modelProviderDefinition(provider);
+        const bodyModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultModelByProvider[provider];
+        const models = modelListForProvider(definition, { model: bodyModel });
+        const model = defaultModelForProvider(definition, { models, model: bodyModel });
+        providersInput[provider] = {
+          defaultModel: model,
+          model,
+          models,
+          ...(typeof body.apiKey === 'string' && body.apiKey.trim() ? { apiKey: body.apiKey } : {}),
+          baseURL: typeof body.baseURL === 'string' ? body.baseURL : definition.defaultBaseURL || '',
+        };
+      }
+      store.saveModelConfig({ provider, providers: providersInput });
+      store.applyRuntimeEnv();
+      return apiJson(request, { ok: true, ...readModelSettingsState() });
     });
-    store.applyRuntimeEnv();
-    return NextResponse.json({ ok: true, ...readModelSettingsState() }, { headers: noStoreHeaders });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : '保存模型配置失败' },
-      { status: 400, headers: noStoreHeaders },
-    );
+    return apiError(request, error, { fallback: '保存模型配置失败' });
   }
 }

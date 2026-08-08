@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { z } from 'zod';
+import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
 import {
   adminSettingsPasswordConfigured,
   adminSettingsPasswordEnabled,
@@ -10,21 +11,23 @@ import {
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
+const passwordSchema = z.object({ password: z.string().min(1).max(4_000) }).strict();
+
 export async function POST(request: NextRequest) {
-  if (!adminSettingsPasswordEnabled()) return noStoreJson({ ok: true, token: '' });
-  if (!adminSettingsPasswordConfigured()) {
-    return noStoreJson(
-      { error: '管理员设置密码尚未配置，请设置 WEBPILOT_ADMIN_SETTINGS_PASSWORD。' },
-      { status: 503 },
-    );
-  }
   try {
-    const body = await request.json() as { password?: unknown };
-    if (!verifyAdminSettingsPassword(body.password)) {
-      return noStoreJson({ error: '密码错误，请重新输入。' }, { status: 401 });
+    if (!adminSettingsPasswordEnabled()) return apiJson(request, { ok: true, token: '' });
+    if (!adminSettingsPasswordConfigured()) {
+      throw new ApiRequestError('管理员设置密码尚未配置，请设置 WEBPILOT_ADMIN_SETTINGS_PASSWORD。', {
+        code: 'admin_password_not_configured',
+        status: 503,
+      });
     }
-    return noStoreJson({ ok: true, token: createAdminSettingsAccessToken() });
-  } catch {
-    return noStoreJson({ error: '请输入管理员设置密码。' }, { status: 400 });
+    const body = await parseJsonRequest(request, passwordSchema, { maxBytes: 8 * 1024 });
+    if (!verifyAdminSettingsPassword(body.password)) {
+      throw new ApiRequestError('密码错误，请重新输入。', { code: 'invalid_admin_password', status: 401 });
+    }
+    return apiJson(request, { ok: true, token: createAdminSettingsAccessToken() });
+  } catch (error) {
+    return apiError(request, error, { fallback: '请输入管理员设置密码。' });
   }
 }

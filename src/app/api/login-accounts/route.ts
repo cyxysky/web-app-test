@@ -1,11 +1,9 @@
 import { NextRequest } from 'next/server';
 import { z } from 'zod';
-import {
-  createLoginAccount,
-  listLoginAccounts,
-} from '@/server/credentials/login-account-vault';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { createLoginAccount, listLoginAccounts } from '@/server/credentials/login-account-vault';
 import { requestApplicationUserId } from '@/server/auth/user-context';
+import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
+import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -20,48 +18,41 @@ const createSchema = z.object({
   shared: z.boolean().optional(),
 }).strict();
 
-function requestUserId(request: NextRequest) {
-  return requestApplicationUserId(request);
-}
-
-function publicError(error: unknown) {
-  if (error instanceof z.ZodError) return '账号信息格式无效';
-  return error instanceof Error ? error.message : '登录账号操作失败';
+function accountError(error: unknown) {
+  if (error instanceof ApiRequestError) return error;
+  const message = error instanceof Error ? error.message : '登录账号操作失败';
+  return new ApiRequestError(message, {
+    code: /已存在|already exists/i.test(message) ? 'account_already_exists' : 'account_operation_failed',
+    status: /已存在|already exists/i.test(message) ? 409 : 400,
+  });
 }
 
 export async function GET(request: NextRequest) {
   try {
-    const domain = request.nextUrl.searchParams.get('domain') || '';
-    return noStoreJson({
+    return apiJson(request, {
       accounts: listLoginAccounts({
-        userId: requestUserId(request),
-        domain,
+        userId: requestApplicationUserId(request),
+        domain: request.nextUrl.searchParams.get('domain') || '',
       }),
     });
   } catch (error) {
-    return noStoreJson({ error: publicError(error) }, { status: 400 });
+    return apiError(request, accountError(error), { fallback: '读取登录账号失败' });
   }
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const body = createSchema.parse(await request.json());
-    const account = createLoginAccount({
-      userId: requestUserId(request),
-      domain: body.domain,
-      username: body.username,
-      password: body.password,
-      label: body.label,
-      loginUrl: body.loginUrl,
-      status: body.status,
-      shared: body.shared,
+    const body = await parseJsonRequest(request, createSchema, { maxBytes: 16 * 1024 });
+    const userId = requestApplicationUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint(body),
+      scope: 'login_account.create',
+      userId,
+    }, () => {
+      const account = createLoginAccount({ userId, ...body });
+      return apiJson(request, { account }, { status: 201 });
     });
-    return noStoreJson({ account }, { status: 201 });
   } catch (error) {
-    const message = publicError(error);
-    return noStoreJson(
-      { error: message },
-      { status: /已经存在/.test(message) ? 409 : 400 },
-    );
+    return apiError(request, accountError(error), { fallback: '保存登录账号失败' });
   }
 }

@@ -30,10 +30,14 @@ function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
   return compacted;
 }
 
-export function listBrowserChatSessionSummaries(userId?: string | number) {
-  return readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>()
-    .filter((session) => session?.id && session.messages?.length && belongsToUser(session, userId))
-    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+export function listBrowserChatSessionSummaries(
+  userId?: string | number,
+  input: { beforeId?: string; beforeUpdatedAt?: string; limit?: number } = {},
+) {
+  return readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>({
+    ...input,
+    userId: normalizeApplicationUserId(userId),
+  }).filter((session) => session?.id && session.messages?.length && belongsToUser(session, userId));
 }
 
 export function readBrowserChatSessionPage(sessionId: string, userId?: string | number) {

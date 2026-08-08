@@ -4,6 +4,32 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+test('browser launch falls back to headless on Linux without a display server', async () => {
+  const { browserHeadlessEnabled } = await import('./browser-session-runtime');
+
+  assert.equal(browserHeadlessEnabled({}, {
+    env: { HEADLESS_BROWSER: 'false' },
+    platform: 'linux',
+  }), true);
+  assert.equal(browserHeadlessEnabled({}, {
+    env: { DISPLAY: ':99', HEADLESS_BROWSER: 'false' },
+    platform: 'linux',
+  }), false);
+  assert.equal(browserHeadlessEnabled({}, {
+    env: { HEADLESS_BROWSER: 'false', WAYLAND_DISPLAY: 'wayland-0' },
+    platform: 'linux',
+  }), false);
+});
+
+test('explicit browser launch options take precedence over automatic headless detection', async () => {
+  const { browserHeadlessEnabled } = await import('./browser-session-runtime');
+  const linuxWithoutDisplay = { env: {}, platform: 'linux' as const };
+
+  assert.equal(browserHeadlessEnabled({ headless: false }, linuxWithoutDisplay), false);
+  assert.equal(browserHeadlessEnabled({ headless: true }, linuxWithoutDisplay), true);
+  assert.equal(browserHeadlessEnabled({ debugDevtools: true, headless: true }, linuxWithoutDisplay), false);
+});
+
 test('managed profile cleanup removes only transient browser caches', async () => {
   const previousDataRoot = process.env.APP_DATA_DIR;
   const dataRoot = mkdtempSync(path.join(tmpdir(), 'webpilot-browser-profile-'));

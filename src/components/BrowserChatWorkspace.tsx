@@ -8319,7 +8319,7 @@ export function BrowserChatWorkspace({
   async function postMessageToSession(sessionId: string, content: string, clientMessageId: string, nextAttachments: BrowserChatAttachment[], skillIds: string[]) {
     const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/message`), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientMessageId },
       body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds }),
     });
     const data = await readApiJson<Record<string, unknown>>(response, '发送消息失败');
@@ -8335,9 +8335,15 @@ export function BrowserChatWorkspace({
     try {
       const uploaded: BrowserChatAttachment[] = [];
       for (const file of selectedFiles.slice(0, remainingSlots)) {
-        const form = new FormData();
-        form.append('file', file);
-        const response = await fetch(withWebPilotBasePath('/api/uploads'), { method: 'POST', body: form });
+        const response = await fetch(withWebPilotBasePath('/api/uploads'), {
+          method: 'POST',
+          headers: {
+            'Content-Type': file.type || 'application/octet-stream',
+            'x-webpilot-file-name': encodeURIComponent(file.name),
+            'x-webpilot-upload': 'raw',
+          },
+          body: file,
+        });
         const data = await readApiJson<Record<string, unknown>>(response, '文件上传失败');
         const fileId = String(data.fileId || data.imageId || temporaryId(file.type.startsWith('image/') ? 'image' : 'file'));
         const kind: BrowserChatAttachmentKind = String(data.type || file.type || '').startsWith('image/') ? 'image' : 'file';
@@ -8821,7 +8827,7 @@ export function BrowserChatWorkspace({
     }
 
     return (
-      <section className="browser-chat-sidebar-section browser-chat-recent-section">
+      <section className="browser-chat-sidebar-section browser-chat-recent-section browser-chat-conversation-history">
         <div className="browser-chat-mobile-history-bar">
           <button
             aria-controls="browser-chat-mobile-history-panel"

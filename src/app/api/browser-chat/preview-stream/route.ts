@@ -1,6 +1,6 @@
 import { browserPreviewPreferredTransport, ensureBrowserPreviewWebSocketServer } from '@/server/realtime/browser-preview-ws';
 import { browserReachableUrl } from '@/server/realtime/browser-preview-url';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { createWebSocketTicket, requestPublicOrigin } from '@/server/auth/websocket-ticket';
 import { getBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
@@ -13,7 +13,7 @@ export async function POST(request: Request) {
     const userId = requestApplicationUserId(request);
     const sessionId = new URL(request.url).searchParams.get('sessionId')?.trim() || '';
     if (!sessionId || !getBrowserChatSession(sessionId, userId)) {
-      return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
+      throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     }
     const info = await ensureBrowserPreviewWebSocketServer();
     const auth = createWebSocketTicket({
@@ -24,16 +24,13 @@ export async function POST(request: Request) {
     });
     const url = new URL(browserReachableUrl(request, info.port));
     url.searchParams.set('ticket', auth.ticket);
-    return noStoreJson({
+    return apiJson(request, {
       expiresAt: auth.expiresAt,
       port: info.port,
       transport: browserPreviewPreferredTransport(),
       url: url.toString(),
     });
   } catch (error) {
-    return noStoreJson(
-      { error: error instanceof Error ? error.message : 'Failed to start browser preview stream' },
-      { status: 503 },
-    );
+    return apiError(request, error, { fallback: 'Failed to start browser preview stream', status: 503 });
   }
 }

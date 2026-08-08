@@ -1,7 +1,8 @@
 import { NextRequest } from 'next/server';
 import { resolveBrowserChatToolConfirmation } from '@/server/ai/agents/browser-chat.service';
-import { noStoreJson } from '@/server/http/no-store-response';
 import { requestApplicationUserId } from '@/server/auth/user-context';
+import { browserChatToolConfirmationRequestSchema } from '@/server/http/browser-chat-request.schema';
+import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -17,17 +18,14 @@ function requestUserId(request: NextRequest) {
 export async function POST(request: NextRequest, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
-    const body = await request.json();
-    const confirmationId = typeof body.confirmationId === 'string' ? body.confirmationId : '';
-    const action = body.action === 'confirm' ? 'confirm' : body.action === 'cancel' ? 'cancel' : undefined;
-    if (!confirmationId || !action) throw new Error('Invalid tool confirmation request');
-    const session = resolveBrowserChatToolConfirmation(sessionId, confirmationId, action, requestUserId(request));
-    return noStoreJson({ session });
+    const body = await parseJsonRequest(request, browserChatToolConfirmationRequestSchema, { maxBytes: 16 * 1024 });
+    const session = resolveBrowserChatToolConfirmation(sessionId, body.confirmationId, body.action, requestUserId(request));
+    return apiJson(request, { session });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to resolve tool confirmation';
-    return noStoreJson(
-      { error: message },
-      { status: /Browser chat session not found/i.test(message) ? 404 : 400 },
-    );
+    const normalizedError = /Browser chat session not found/i.test(message)
+      ? new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 })
+      : error;
+    return apiError(request, normalizedError, { fallback: 'Failed to resolve tool confirmation' });
   }
 }

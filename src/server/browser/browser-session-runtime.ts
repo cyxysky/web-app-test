@@ -35,6 +35,27 @@ export function sharedBrowserTabsEnabled() {
   return process.env.BROWSER_SHARED_TABS !== 'false';
 }
 
+type BrowserHeadlessEnvironment = Partial<Record<
+  'DISPLAY' | 'HEADLESS_BROWSER' | 'WAYLAND_DISPLAY',
+  string
+>>;
+
+export function browserHeadlessEnabled(
+  options: { debugDevtools?: boolean; headless?: boolean } = {},
+  runtime: { env?: BrowserHeadlessEnvironment; platform?: NodeJS.Platform } = {},
+) {
+  if (options.debugDevtools) return false;
+  if (options.headless !== undefined) return options.headless;
+
+  const env = runtime.env || process.env;
+  const platform = runtime.platform || process.platform;
+  const configuredHeadless = env.HEADLESS_BROWSER?.trim().toLowerCase() === 'true';
+  const linuxWithoutDisplay = platform === 'linux'
+    && !env.DISPLAY?.trim()
+    && !env.WAYLAND_DISPLAY?.trim();
+  return configuredHeadless || linuxWithoutDisplay;
+}
+
 export function nativeBrowserTabGroupsEnabled(headless: boolean) {
   return !headless && process.env.BROWSER_NATIVE_TAB_GROUPS !== 'false';
 }

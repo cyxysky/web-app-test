@@ -12,7 +12,7 @@ test('readFile defaults to 20000 characters and clamps smaller requested limits'
   assert.equal(normalizeBrowserChatFileReadLimit(30_000), 30_000);
 });
 
-test('readFile returns at least 20000 characters when a smaller limit is requested', async () => {
+test('readFile parses text in the CPU worker and returns the requested range', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-read-file-'));
   const filePath = path.join(directory, 'large.md');
   const content = 'x'.repeat(BROWSER_CHAT_FILE_READ_MIN_CHARS + 5_000);

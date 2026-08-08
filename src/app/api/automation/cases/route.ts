@@ -1,68 +1,69 @@
 import { NextRequest } from 'next/server';
+import { z } from 'zod';
 import { requestApplicationUserId } from '@/server/auth/user-context';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { ApiRequestError, apiError, apiJson, boundedQueryInteger, parseJsonRequest } from '@/server/http/api-request';
+import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 import { createAutomationCase, listAutomationCases } from '@/server/storage/automation-store';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-type RequestBody = Record<string, unknown>;
-
-function bodyRecord(value: unknown): RequestBody {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as RequestBody : {};
-}
+const createCaseSchema = z.object({
+  title: z.union([z.string(), z.number()]).optional(),
+  name: z.union([z.string(), z.number()]).optional(),
+  instruction: z.union([z.string(), z.number()]).optional(),
+  prompt: z.union([z.string(), z.number()]).optional(),
+  description: z.union([z.string(), z.number()]).optional(),
+  targetUrl: z.union([z.string(), z.number()]).optional(),
+  url: z.union([z.string(), z.number()]).optional(),
+}).strict();
 
 function text(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
-function requestUserId(request: NextRequest) {
-  return requestApplicationUserId(request);
-}
-
-function requestLimit(request: NextRequest) {
-  const value = Number(request.nextUrl.searchParams.get('limit'));
-  return Number.isFinite(value) ? value : undefined;
-}
-
 export async function GET(request: NextRequest) {
-  const cases = listAutomationCases({
-    userId: requestUserId(request),
-    sourceSessionId: request.nextUrl.searchParams.get('sourceSessionId')?.trim() || undefined,
-    limit: requestLimit(request),
+  return apiJson(request, {
+    cases: listAutomationCases({
+      userId: requestApplicationUserId(request),
+      sourceSessionId: request.nextUrl.searchParams.get('sourceSessionId')?.trim() || undefined,
+      limit: boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 100, max: 500 }),
+    }),
   });
-  return noStoreJson({ cases });
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const body = bodyRecord(await request.json().catch(() => ({})));
+    const body = await parseJsonRequest(request, createCaseSchema, { maxBytes: 64 * 1024 });
     const title = text(body.title ?? body.name);
     const instruction = text(body.instruction ?? body.prompt);
-    if (!title) throw new Error('Automation case title is required.');
-    if (!instruction) throw new Error('Automation case instruction is required.');
-    const userId = requestUserId(request);
-    const automationCase = createAutomationCase({
+    if (!title) throw new ApiRequestError('自动化用例标题不能为空', { code: 'title_required' });
+    if (!instruction) throw new ApiRequestError('自动化用例指令不能为空', { code: 'instruction_required' });
+    const userId = requestApplicationUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint(body),
+      scope: 'automation_case.create',
       userId,
-      title,
-      description: text(body.description) || undefined,
-      sourceSessionId: 'manual',
-      sourceMessageIds: [],
-      targetUrl: text(body.targetUrl ?? body.url) || 'about:blank',
-      instruction,
-      mode: 'code',
-      operations: [],
+    }, () => {
+      const automationCase = createAutomationCase({
+        userId,
+        title,
+        description: text(body.description) || undefined,
+        sourceSessionId: 'manual',
+        sourceMessageIds: [],
+        targetUrl: text(body.targetUrl ?? body.url) || 'about:blank',
+        instruction,
+        mode: 'code',
+        operations: [],
+      });
+      return apiJson(request, {
+        ok: true,
+        case: automationCase,
+        automationCase,
+        cases: listAutomationCases({ userId }),
+      }, { status: 201 });
     });
-    return noStoreJson({
-      ok: true,
-      case: automationCase,
-      automationCase,
-      cases: listAutomationCases({ userId }),
-    }, { status: 201 });
   } catch (error) {
-    return noStoreJson(
-      { error: error instanceof Error ? error.message : 'Failed to create automation case.' },
-      { status: 400 },
-    );
+    return apiError(request, error, { fallback: '创建自动化用例失败' });
   }
 }

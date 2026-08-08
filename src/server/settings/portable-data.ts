@@ -2,19 +2,18 @@ import {
   createCipheriv,
   createDecipheriv,
   randomBytes,
-  scryptSync,
+  randomUUID,
+  scrypt,
 } from 'node:crypto';
 import { z } from 'zod';
 import { modelProviderDefinitions, modelProviderValues } from '@/config/settings';
 import {
-  createLoginAccount,
   exportLoginAccountCredentials,
-  findLoginAccountByDomainUsername,
-  updateLoginAccount,
+  importLoginAccountsQueued,
 } from '@/server/credentials/login-account-vault';
 import {
   listPersonalMemoryItems,
-  savePersonalMemoryItem,
+  savePersonalMemoryItems,
 } from '@/server/ai/personal-memory';
 import { store } from '@/server/db/store';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
@@ -129,12 +128,17 @@ function decodeBase64(value: string, expectedLength: number) {
   return decoded;
 }
 
-function secretKey(passphrase: string, salt: Buffer) {
-  return scryptSync(passphrase, salt, 32, {
-    N: 16_384,
-    r: 8,
-    p: 1,
-    maxmem: 64 * 1024 * 1024,
+async function secretKey(passphrase: string, salt: Buffer) {
+  return new Promise<Buffer>((resolve, reject) => {
+    scrypt(passphrase, salt, 32, {
+      N: 16_384,
+      r: 8,
+      p: 1,
+      maxmem: 64 * 1024 * 1024,
+    }, (error, key) => {
+      if (error) reject(error);
+      else resolve(key);
+    });
   });
 }
 
@@ -142,11 +146,11 @@ function secretAad(kind: SecretDataKind) {
   return `${portableFormat}:${kind}:${portableVersion}`;
 }
 
-function encryptSecretPayload(kind: SecretDataKind, payload: unknown, passphraseValue: unknown, exportedAt: string) {
+async function encryptSecretPayload(kind: SecretDataKind, payload: unknown, passphraseValue: unknown, exportedAt: string) {
   const passphrase = requirePassphrase(passphraseValue);
   const salt = randomBytes(16);
   const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', secretKey(passphrase, salt), iv);
+  const cipher = createCipheriv('aes-256-gcm', await secretKey(passphrase, salt), iv);
   cipher.setAAD(Buffer.from(secretAad(kind), 'utf8'));
   const ciphertext = Buffer.concat([
     cipher.update(JSON.stringify(payload), 'utf8'),
@@ -168,7 +172,7 @@ function encryptSecretPayload(kind: SecretDataKind, payload: unknown, passphrase
   };
 }
 
-function decryptSecretPayload(bundleValue: unknown, kind: SecretDataKind, passphraseValue: unknown) {
+async function decryptSecretPayload(bundleValue: unknown, kind: SecretDataKind, passphraseValue: unknown) {
   const bundle = encryptedBundleSchema.parse(bundleValue);
   if (bundle.kind !== kind) throw new Error('导入文件类型与当前设置项不一致');
   const passphrase = requirePassphrase(passphraseValue);
@@ -176,7 +180,7 @@ function decryptSecretPayload(bundleValue: unknown, kind: SecretDataKind, passph
     const salt = decodeBase64(bundle.encryption.salt, 16);
     const iv = decodeBase64(bundle.encryption.iv, 12);
     const tag = decodeBase64(bundle.encryption.tag, 16);
-    const decipher = createDecipheriv('aes-256-gcm', secretKey(passphrase, salt), iv);
+    const decipher = createDecipheriv('aes-256-gcm', await secretKey(passphrase, salt), iv);
     decipher.setAAD(Buffer.from(secretAad(kind), 'utf8'));
     decipher.setAuthTag(tag);
     const plaintext = Buffer.concat([
@@ -208,18 +212,18 @@ function skillIdentity(item: Pick<SkillItem, 'title' | 'domains'>) {
   return `${item.title.trim().toLowerCase()}\u0001${[...item.domains].map((domain) => domain.trim().toLowerCase()).sort().join(',')}`;
 }
 
-export function exportPortableData(input: {
+export async function exportPortableData(input: {
   kind: PortableDataKind;
   userId?: unknown;
   passphrase?: unknown;
-}): PortableDataExport {
+}): Promise<PortableDataExport> {
   const exportedAt = new Date().toISOString();
   const suffix = fileTimestamp(exportedAt);
   if (input.kind === 'credentials') {
     const items = z.array(credentialItemSchema).parse(exportLoginAccountCredentials(input.userId));
     return {
       fileName: `webpilot-credentials-${suffix}.json`,
-      bundle: encryptSecretPayload('credentials', { items }, input.passphrase, exportedAt),
+      bundle: await encryptSecretPayload('credentials', { items }, input.passphrase, exportedAt),
       count: items.length,
     };
   }
@@ -240,7 +244,7 @@ export function exportPortableData(input: {
     const config = parseModelConfig({ provider: saved.provider, providers });
     return {
       fileName: `webpilot-model-config-${suffix}.json`,
-      bundle: encryptSecretPayload('model', { config }, input.passphrase, exportedAt),
+      bundle: await encryptSecretPayload('model', { config }, input.passphrase, exportedAt),
       count: Object.keys(config.providers).length,
     };
   }
@@ -288,36 +292,27 @@ export function exportPortableData(input: {
 }
 
 function importCredentials(items: CredentialItem[], userId: unknown) {
-  let created = 0;
-  let updated = 0;
-  for (const item of items) {
-    const existing = findLoginAccountByDomainUsername({ userId, domain: item.domain, username: item.username });
-    if (existing) {
-      updateLoginAccount(existing.id, item, userId);
-      updated += 1;
-    } else {
-      createLoginAccount({ ...item, userId });
-      created += 1;
-    }
-  }
-  return { created, updated };
+  return importLoginAccountsQueued(items.map((item) => ({ ...item, userId })), userId);
 }
 
-function importSkills(items: SkillItem[], userId: unknown) {
+async function importSkills(items: SkillItem[], userId: unknown) {
   const normalizedUserId = normalizeApplicationUserId(userId);
   const existingSkills = store.listSkills(undefined, normalizedUserId)
     .filter((skill) => skill.userId === normalizedUserId);
   const byId = new Map(existingSkills.map((skill) => [skill.id, skill]));
-  const byIdentity = new Map(existingSkills.map((skill) => [skillIdentity({
+  const targetIdByIdentity = new Map(existingSkills.map((skill) => [skillIdentity({
     title: skill.title,
     domains: skill.domains || [],
-  }), skill]));
+  }), skill.id]));
+  const batch: Parameters<typeof store.upsertSkillsBatch>[0] = [];
   let created = 0;
   let updated = 0;
   for (const item of items) {
-    const existing = byId.get(item.id) || byIdentity.get(skillIdentity(item));
-    const saved = store.upsertSkill({
-      id: existing?.id,
+    const identity = skillIdentity(item);
+    const targetId = byId.get(item.id)?.id || targetIdByIdentity.get(identity);
+    const id = targetId || `skl_${randomUUID()}`;
+    batch.push({
+      id,
       title: item.title,
       description: item.description,
       domains: item.domains,
@@ -327,52 +322,34 @@ function importSkills(items: SkillItem[], userId: unknown) {
       shared: item.shared,
       userId: normalizedUserId,
     });
-    if (existing) updated += 1;
+    if (targetId) updated += 1;
     else created += 1;
-    byId.set(saved.id, saved);
-    byIdentity.set(skillIdentity({ title: saved.title, domains: saved.domains || [] }), saved);
+    targetIdByIdentity.set(identity, id);
   }
+  await store.upsertSkillsBatch(batch, { queued: true });
   return { created, updated };
 }
 
-function importMemory(items: MemoryItem[], userId: unknown) {
+async function importMemory(items: MemoryItem[], userId: unknown) {
   const normalizedUserId = normalizeApplicationUserId(userId);
-  const existing = listPersonalMemoryItems({ userId: normalizedUserId, includeDisabled: true })
-    .filter((item) => item.userId === normalizedUserId);
-  const identities = new Set(existing.map((item) => [
-    item.scope,
-    item.domain,
-    item.type,
-    item.key.toLowerCase(),
-  ].join('\u0001')));
-  let created = 0;
-  let updated = 0;
-  for (const item of items) {
-    const identity = [item.scope, item.domain, item.type, item.key.toLowerCase()].join('\u0001');
-    savePersonalMemoryItem({ ...item, userId: normalizedUserId });
-    if (identities.has(identity)) updated += 1;
-    else {
-      identities.add(identity);
-      created += 1;
-    }
-  }
-  return { created, updated };
+  const result = await savePersonalMemoryItems(items, normalizedUserId, { queued: true });
+  return { created: result.created, updated: result.updated };
 }
 
-export function importPortableData(input: {
+export async function importPortableData(input: {
   kind: PortableDataKind;
   userId?: unknown;
   passphrase?: unknown;
   bundle: unknown;
-}): PortableDataImportResult {
+}): Promise<PortableDataImportResult> {
   let counts: { created: number; updated: number };
   if (input.kind === 'credentials') {
     const payload = z.object({ items: z.array(credentialItemSchema).max(5_000) }).strict()
-      .parse(decryptSecretPayload(input.bundle, 'credentials', input.passphrase));
-    counts = importCredentials(payload.items, input.userId);
+      .parse(await decryptSecretPayload(input.bundle, 'credentials', input.passphrase));
+    counts = await importCredentials(payload.items, input.userId);
   } else if (input.kind === 'model') {
     const payload = z.object({ config: z.unknown() }).strict()
-      .parse(decryptSecretPayload(input.bundle, 'model', input.passphrase));
+      .parse(await decryptSecretPayload(input.bundle, 'model', input.passphrase));
     const existing = Boolean(store.getModelConfig());
     const config = parseModelConfig(payload.config);
     store.saveModelConfig(config);
@@ -381,9 +358,9 @@ export function importPortableData(input: {
     const bundle = plainBundleSchema.parse(input.bundle);
     if (bundle.kind !== input.kind) throw new Error('导入文件类型与当前设置项不一致');
     if (input.kind === 'skills') {
-      counts = importSkills(z.array(skillItemSchema).parse(bundle.items), input.userId);
+      counts = await importSkills(z.array(skillItemSchema).parse(bundle.items), input.userId);
     } else {
-      counts = importMemory(z.array(memoryItemSchema).parse(bundle.items), input.userId);
+      counts = await importMemory(z.array(memoryItemSchema).parse(bundle.items), input.userId);
     }
   }
   return {

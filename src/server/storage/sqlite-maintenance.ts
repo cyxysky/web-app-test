@@ -3,6 +3,7 @@ import path from 'node:path';
 import { backup } from 'node:sqlite';
 import { appDataRoot } from './paths';
 import { getSqliteDatabase } from './sqlite-database';
+import { structuredLog } from '@/server/observability/runtime-observability';
 
 const runtimeState = ((globalThis as typeof globalThis & {
   __sqliteMaintenanceState?: { running?: Promise<void>; timer?: ReturnType<typeof setInterval> };
@@ -82,7 +83,7 @@ export function scheduleSqliteMaintenance() {
       .then(() => compactSqliteDatabaseIfNeeded())
       .then(() => createSqliteBackup())
       .then(() => undefined)
-      .catch((error) => console.warn('[sqlite] scheduled backup failed', error))
+      .catch((error) => structuredLog({ event: 'sqlite.backup.failed', level: 'warn', error }))
       .finally(() => { runtimeState.running = undefined; });
   };
   const first = setTimeout(run, 5 * 60_000);

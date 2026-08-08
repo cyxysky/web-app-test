@@ -1,9 +1,9 @@
 ﻿import { randomUUID } from 'node:crypto';
-import path from 'node:path';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import type { BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
 import { applicationUserRuntimeKey, normalizeApplicationUserId } from '@/server/auth/user-context';
+import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
 import {
   executeInteractiveBrowserTurn,
   type BrowserToolConfirmationDecision,
@@ -15,6 +15,11 @@ import {
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromBrowserHistory } from '@/server/ai/agents/skill-generator.agent';
 import { browserChatAttachmentMetadata, isBrowserChatImageAttachment, readBrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachment-reader';
+import {
+  normalizeBrowserChatAttachments,
+  uploadedBrowserChatAttachmentPath,
+  type BrowserChatAttachment,
+} from '@/server/ai/agents/browser-chat-attachments';
 import { browserChatFirstMessageTitle } from '@/server/ai/agents/browser-chat-message-title';
 import {
   estimateRuntimeTextTokens,
@@ -68,10 +73,10 @@ import {
 } from '@/server/realtime/browser-chat-outbox';
 import { publishBrowserChatRefreshEvent } from '@/server/realtime/ws-refresh';
 import {
-  deleteBrowserChatSessionRecord,
+  deleteBrowserChatSessionRecordQueued,
   readBrowserChatSessionRecord,
   readBrowserChatSessionSummaries,
-  writeBrowserChatSessionDelta,
+  writeBrowserChatSessionDeltaQueued,
 } from '@/server/storage/sqlite-record-store';
 import {
   browserChatHistoryLimit,
@@ -82,14 +87,13 @@ import {
   readBrowserChatStepsPage,
   type BrowserChatHistoryState,
 } from '@/server/storage/browser-chat-history-store';
-import { artifactPath as resolveArtifactPath } from '@/server/storage/paths';
 import {
   deleteBrowserChatArtifacts,
   enforceBrowserChatArtifactQuota,
   scheduleBrowserChatArtifactMaintenance,
 } from '@/server/storage/browser-chat-artifact-lifecycle';
 import { scheduleSqliteMaintenance } from '@/server/storage/sqlite-maintenance';
-import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
+import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 import {
   listLoginAccounts,
@@ -97,16 +101,7 @@ import {
   type LoginAccountMetadata,
 } from '@/server/credentials/login-account-vault';
 
-export type BrowserChatAttachment = {
-  id: string;
-  name: string;
-  type: string;
-  size?: number;
-  path: string;
-  url: string;
-  kind?: 'image' | 'file' | 'tab';
-  sourceUrl?: string;
-};
+export type { BrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachments';
 
 export type BrowserChatMessage = {
   id: string;
@@ -280,6 +275,8 @@ type BrowserChatRuntimeState = {
   }>;
   pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
   pendingStreamPublishTimers: Map<string, ReturnType<typeof setTimeout>>;
+  pendingSqliteWrites: Map<string, Promise<boolean>>;
+  sessionEvictionTimers: Map<string, ReturnType<typeof setTimeout>>;
   persistenceCursors: Map<string, BrowserChatPersistenceCursor>;
   dirtyRecords: Map<string, BrowserChatDirtyRecords>;
   memoryExtractionActive: number;
@@ -308,6 +305,8 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
   }>(),
   pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   pendingStreamPublishTimers: new Map<string, ReturnType<typeof setTimeout>>(),
+  pendingSqliteWrites: new Map<string, Promise<boolean>>(),
+  sessionEvictionTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   persistenceCursors: new Map<string, BrowserChatPersistenceCursor>(),
   dirtyRecords: new Map<string, BrowserChatDirtyRecords>(),
   memoryExtractionActive: 0,
@@ -328,6 +327,8 @@ browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
 browserChatRuntimeState.pendingStreamPublishTimers ??= new Map();
+browserChatRuntimeState.pendingSqliteWrites ??= new Map();
+browserChatRuntimeState.sessionEvictionTimers ??= new Map();
 browserChatRuntimeState.persistenceCursors ??= new Map();
 browserChatRuntimeState.dirtyRecords ??= new Map();
 browserChatRuntimeState.memoryExtractionActive ??= 0;
@@ -347,6 +348,8 @@ const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssist
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
 const pendingStreamPublishTimers = browserChatRuntimeState.pendingStreamPublishTimers;
+const pendingSqliteWrites = browserChatRuntimeState.pendingSqliteWrites;
+const sessionEvictionTimers = browserChatRuntimeState.sessionEvictionTimers;
 const persistenceCursors = browserChatRuntimeState.persistenceCursors;
 const dirtyRecords = browserChatRuntimeState.dirtyRecords;
 const browserIdleEpochs = browserChatRuntimeState.browserIdleEpochs;
@@ -384,6 +387,52 @@ function browserChatUserBrowserIdleTimeoutMs() {
   return Number.isFinite(configured)
     ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
     : 10 * 60 * 1000;
+}
+
+function browserChatSessionMemoryTtlMs() {
+  const configured = Number(process.env.BROWSER_CHAT_SESSION_MEMORY_TTL_MS || 15 * 60 * 1000);
+  return Number.isFinite(configured)
+    ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
+    : 15 * 60 * 1000;
+}
+
+function cancelBrowserChatSessionEviction(sessionId: string) {
+  const timer = sessionEvictionTimers.get(sessionId);
+  if (timer) clearTimeout(timer);
+  sessionEvictionTimers.delete(sessionId);
+}
+
+function browserChatSessionHasRuntimeWork(session: BrowserChatSessionRecord) {
+  if (session.busy || session.status === 'running' || session.browser || session.pendingToolConfirmation) return true;
+  if (activeTurns.has(session.id) || browserStartPromises.has(session.id)) return true;
+  if ((browserPreviewCounts.get(browserChatUserRuntimeKey(session.userId)) || 0) > 0) return true;
+  return [...blockedSubagents.values()].some((binding) => binding.sessionId === session.id);
+}
+
+function evictBrowserChatSessionRuntime(sessionId: string) {
+  const session = sessions.get(sessionId);
+  if (!session || browserChatSessionHasRuntimeWork(session) || pendingPersistTimers.has(sessionId) || pendingSqliteWrites.has(sessionId)) return false;
+  const streamTimer = pendingStreamPublishTimers.get(sessionId);
+  if (streamTimer) clearTimeout(streamTimer);
+  pendingStreamPublishTimers.delete(sessionId);
+  sessions.delete(sessionId);
+  persistenceCursors.delete(sessionId);
+  dirtyRecords.delete(sessionId);
+  subagentResults.delete(sessionId);
+  interruptedAssistantMessageIds.delete(session.activeAssistantMessageId || '');
+  return true;
+}
+
+function scheduleBrowserChatSessionEviction(sessionId: string) {
+  cancelBrowserChatSessionEviction(sessionId);
+  const session = sessions.get(sessionId);
+  if (!session || browserChatSessionHasRuntimeWork(session)) return;
+  const timer = setTimeout(() => {
+    sessionEvictionTimers.delete(sessionId);
+    if (!evictBrowserChatSessionRuntime(sessionId)) scheduleBrowserChatSessionEviction(sessionId);
+  }, browserChatSessionMemoryTtlMs());
+  timer.unref?.();
+  sessionEvictionTimers.set(sessionId, timer);
 }
 
 function browserChatUserHasActiveWork(userKey: string) {
@@ -943,46 +992,8 @@ function normalizeConversationContext(value: unknown): BrowserChatConversationCo
   };
 }
 
-function normalizeAttachmentPath(value: unknown) {
-  const raw = typeof value === 'string' ? value.trim().replace(/\\/g, '/') : '';
-  if (!raw || raw.startsWith('/') || raw.includes('..')) return undefined;
-  if (!raw.startsWith('uploads/')) return undefined;
-  return raw.split('/').filter(Boolean).join('/');
-}
-
-function normalizeAttachments(value: unknown): BrowserChatAttachment[] {
-  if (!Array.isArray(value)) return [];
-  const attachments: BrowserChatAttachment[] = [];
-  for (const item of value.slice(0, 8)) {
-    if (!item || typeof item !== 'object') continue;
-    const record = item as Record<string, unknown>;
-    const rawType = typeof record.type === 'string' && record.type.trim() ? record.type.trim().slice(0, 160) : 'application/octet-stream';
-    const requestedKind = record.kind === 'tab' || record.kind === 'file' || record.kind === 'image' ? record.kind : undefined;
-    const isTabReference = requestedKind === 'tab' || rawType === 'application/x-webpilot-tab';
-    const pathValue = isTabReference ? '' : normalizeAttachmentPath(record.path);
-    if (!isTabReference && !pathValue) continue;
-    const attachmentPath = pathValue || '';
-    const type = isTabReference ? 'application/x-webpilot-tab' : rawType;
-    const kind = isTabReference ? 'tab' : (type.startsWith('image/') ? 'image' : 'file');
-    const sourceUrl = typeof record.sourceUrl === 'string' ? record.sourceUrl.trim().slice(0, 2000) : '';
-    const urlValue = typeof record.url === 'string' ? record.url.trim().slice(0, 2000) : '';
-    const idValue = typeof record.id === 'string' && record.id.trim() ? record.id.trim().slice(0, 160) : (attachmentPath ? path.basename(attachmentPath) : randomUUID());
-    const nameValue = typeof record.name === 'string' && record.name.trim() ? record.name.trim().slice(0, 180) : (attachmentPath ? path.basename(attachmentPath) : sourceUrl || urlValue || '新建标签页');
-    const sizeValue = typeof record.size === 'number' && Number.isFinite(record.size) ? Math.max(0, Math.floor(record.size)) : undefined;
-    attachments.push({
-      id: idValue,
-      kind,
-      name: nameValue,
-      type,
-      size: sizeValue,
-      path: attachmentPath,
-      sourceUrl: isTabReference ? sourceUrl || urlValue : undefined,
-      url: isTabReference
-        ? sourceUrl || urlValue
-        : (artifactApiUrl(typeof record.url === 'string' ? record.url : undefined) || artifactApiUrlFromRelative(attachmentPath)),
-    });
-  }
-  return attachments;
+function normalizeAttachments(value: unknown, userId?: unknown): BrowserChatAttachment[] {
+  return normalizeBrowserChatAttachments(value, userId);
 }
 
 function normalizeSkillIds(value: unknown) {
@@ -991,23 +1002,6 @@ function normalizeSkillIds(value: unknown) {
     .map((item) => typeof item === 'string' ? item.trim() : '')
     .filter(Boolean)))
     .slice(0, 8);
-}
-
-function attachmentAbsolutePath(attachment: BrowserChatAttachment) {
-  if (attachment.kind === 'tab' || !attachment.type.startsWith('image/')) return undefined;
-  const relativePath = normalizeAttachmentPath(attachment.path);
-  if (!relativePath) return undefined;
-  return resolveArtifactPath(...relativePath.split('/'));
-}
-
-function uploadedAttachmentAbsolutePath(attachment: BrowserChatAttachment) {
-  if (attachment.kind === 'tab') return undefined;
-  const relativePath = normalizeAttachmentPath(attachment.path);
-  if (relativePath) return resolveArtifactPath(...relativePath.split('/'));
-  if (!attachment.id.startsWith('artifact:')) return undefined;
-  const artifactSegments = attachment.path.replace(/\\/g, '/').split('/').filter(Boolean);
-  if (!artifactSegments.length || artifactSegments.some((segment) => segment === '.' || segment === '..')) return undefined;
-  return resolveArtifactPath(...artifactSegments);
 }
 
 function artifactAttachmentForSession(session: BrowserChatSessionRecord, artifactId: string): BrowserChatAttachment | undefined {
@@ -1046,12 +1040,12 @@ async function readFileForSession(
   }
   const result = await readBrowserChatAttachment({
     attachment,
-    absolutePath: uploadedAttachmentAbsolutePath(attachment),
+    absolutePath: uploadedBrowserChatAttachmentPath(attachment, session.userId),
     limit: input.limit,
     offset: input.offset,
   });
   return isBrowserChatImageAttachment(attachment) && result.ok
-    ? { ...result, referenceImagePath: uploadedAttachmentAbsolutePath(attachment) }
+    ? { ...result, referenceImagePath: uploadedBrowserChatAttachmentPath(attachment, session.userId) }
     : result;
 }
 
@@ -1718,8 +1712,10 @@ function appendLog(
   persistAndNotify(session.id, { defer: input.deferPersist === true });
 }
 
-function readSessionSummaries(): BrowserChatSessionSnapshot[] {
-  return readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>()
+function readSessionSummaries(userId?: string | number): BrowserChatSessionSnapshot[] {
+  return readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>({
+    userId: userId === undefined ? undefined : normalizeApplicationUserId(userId),
+  })
     .filter(isBrowserChatSessionSnapshot);
 }
 
@@ -1794,6 +1790,25 @@ function seedPersistenceCursor(
   });
 }
 
+function trackSessionSqliteWrite(sessionId: string, operation: Promise<void>) {
+  const tracked: Promise<boolean> = operation
+    .then(() => {
+      schedulePersistedSessionEvents();
+      return true;
+    })
+    .catch((error) => {
+      persistenceCursors.delete(sessionId);
+      dirtyRecords.delete(sessionId);
+      warnPersistFailure(error);
+      return false;
+    })
+    .finally(() => {
+      if (pendingSqliteWrites.get(sessionId) === tracked) pendingSqliteWrites.delete(sessionId);
+    });
+  pendingSqliteWrites.set(sessionId, tracked);
+  return tracked;
+}
+
 function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSessionRealtimePatch {
   const storedLogs = item.logs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(item.logs) : item.logs;
   const persistedItem = storedLogs === item.logs ? item : { ...item, logs: storedLogs };
@@ -1818,7 +1833,7 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
     ...(delta.removedStepIndexes.length ? { removedStepIndexes: delta.removedStepIndexes } : {}),
     ...(delta.removedLogIds.length ? { removedLogIds: delta.removedLogIds } : {}),
   };
-  writeBrowserChatSessionDelta(
+  trackSessionSqliteWrite(item.id, writeBrowserChatSessionDeltaQueued(
     { ...session, messages: [], steps: [], logs: [] },
     summary,
     delta,
@@ -1829,7 +1844,7 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
       userId: normalizeApplicationUserId(item.userId),
       patch,
     },
-  );
+  ));
   if (dirtyRecords.has(item.id)) {
     advancePersistenceCursor(persistedItem, delta);
     dirtyRecords.delete(item.id);
@@ -1871,13 +1886,13 @@ function scheduleBrowserChatTextStreamPublish(sessionId: string, assistantMessag
 }
 
 function deleteSessionSnapshot(sessionId: string, userId: string) {
-  deleteBrowserChatSessionRecord(sessionId, {
+  trackSessionSqliteWrite(sessionId, deleteBrowserChatSessionRecordQueued(sessionId, {
     entityType: 'browserChatSession',
     id: sessionId,
     updatedAt: now(),
     userId: normalizeApplicationUserId(userId),
     deleted: true,
-  });
+  }));
   persistenceCursors.delete(sessionId);
   dirtyRecords.delete(sessionId);
 }
@@ -2082,6 +2097,7 @@ function hydrateSession(sessionId: string) {
   const session = sessions.get(sessionId);
   if (session && persisted && applied) seedPersistenceCursor(session, persisted);
   else if (persisted && !persistenceCursors.has(sessionId)) seedPersistenceCursor(persisted);
+  if (session) scheduleBrowserChatSessionEviction(sessionId);
   return session;
 }
 
@@ -2145,6 +2161,7 @@ function persistAndNotify(sessionId: string, options: { defer?: boolean; deleted
   });
   if (!persisted) return false;
   schedulePersistedSessionEvents();
+  scheduleBrowserChatSessionEviction(sessionId);
   return true;
 }
 
@@ -2152,7 +2169,10 @@ async function persistAndNotifyTerminal(sessionId: string) {
   clearPendingPersist(sessionId);
   const persisted = persistSession(sessionId);
   if (!persisted) return false;
+  const pendingWrite = pendingSqliteWrites.get(sessionId);
+  if (pendingWrite && !(await pendingWrite)) return false;
   await flushBrowserChatRealtimeOutbox();
+  scheduleBrowserChatSessionEviction(sessionId);
   return true;
 }
 
@@ -2574,7 +2594,7 @@ export function getBrowserChatSessionLogs(
 }
 
 export function listBrowserChatSessions(input: { userId?: string | number } = {}) {
-  const summaries = new Map(readSessionSummaries().map((session) => [session.id, session]));
+  const summaries = new Map(readSessionSummaries(input.userId).map((session) => [session.id, session]));
   for (const session of sessions.values()) summaries.set(session.id, summarySnapshot(session));
   return [...summaries.values()]
     .filter((session) => session.messages.length > 0 && sessionBelongsToUser(session, input.userId))
@@ -2659,7 +2679,9 @@ export async function deleteBrowserChatSession(sessionId: string, userId?: strin
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
   const removed = await deleteBrowserChatSessionFromMemory(sessionId);
   if (!removed) return undefined;
-  if (!persistAndNotify(sessionId, { deletedUserId: normalizeApplicationUserId(removed.session.userId) })) {
+  const persisted = persistAndNotify(sessionId, { deletedUserId: normalizeApplicationUserId(removed.session.userId) });
+  const pendingWrite = pendingSqliteWrites.get(sessionId);
+  if (!persisted || (pendingWrite && !(await pendingWrite))) {
     sessions.set(sessionId, removed.session);
     throw new Error('Browser chat session was removed from memory, but the database could not be updated.');
   }
@@ -2778,7 +2800,10 @@ async function deleteBrowserChatSessionFromMemory(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   await stopBrowserChatRuntime(session, new Error('Browser chat session deleted by user.'));
+  cancelBrowserChatSessionEviction(sessionId);
   sessions.delete(sessionId);
+  persistenceCursors.delete(sessionId);
+  dirtyRecords.delete(sessionId);
   subagentResults.delete(sessionId);
   return { deleted: { id: sessionId }, session };
 }
@@ -2807,7 +2832,11 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
       id: item.deleted.id,
       userId: normalizeApplicationUserId(item.session.userId),
     })));
-    if (!persisted) {
+    const pendingWrites = removed
+      .map((item) => pendingSqliteWrites.get(item.deleted.id))
+      .filter((item): item is Promise<boolean> => Boolean(item));
+    const writesSucceeded = persisted && (await Promise.all(pendingWrites)).every(Boolean);
+    if (!writesSucceeded) {
       for (const item of removed) sessions.set(item.deleted.id, item.session);
       throw new Error('Browser chat sessions were removed from memory, but the database could not be updated.');
     }
@@ -2904,7 +2933,7 @@ export async function sendBrowserChatMessage(
   if (!sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   if (session.status === 'closed') throw new Error('Browser chat session is closed');
   const text = textFromUnknown(content).trim();
-  const attachments = normalizeAttachments(attachmentsInput);
+  const attachments = normalizeAttachments(attachmentsInput, session.userId);
   const skillIds = normalizeSkillIds(skillIdsInput);
   const selectedSkills = store.getSkills(skillIds, session.userId).filter((skill) => skill.status === 'ready');
   if (!text && !attachments.length && !selectedSkills.length) throw new Error('Message is empty');
@@ -3143,7 +3172,8 @@ function warnPersistFailure(error: unknown) {
   const timestamp = Date.now();
   if (timestamp - browserChatRuntimeState.lastPersistWarningAt < 1000) return;
   browserChatRuntimeState.lastPersistWarningAt = timestamp;
-  console.warn('[browser-chat] Failed to persist sessions; keeping realtime state in memory.', error);
+  incrementMetric('browser_chat_persistence_errors_total');
+  structuredLog({ event: 'browser_chat.persistence_failed', level: 'warn', error });
 }
 
 function runningAssistantActivity(step: StepExecutionResult, timestamp: string) {
@@ -4097,7 +4127,10 @@ async function runBrowserChatMessage(
       });
       const initialRuntimeContext = getRuntimeOperationalContext();
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
-      const referenceImagePaths = attachments.map(attachmentAbsolutePath).filter((item): item is string => Boolean(item));
+      const referenceImagePaths = attachments
+        .filter(isBrowserChatImageAttachment)
+        .map((attachment) => uploadedBrowserChatAttachmentPath(attachment, session.userId))
+        .filter((item): item is string => Boolean(item));
       const requestTurnToolConfirmation = session.safetyMode === 'strict'
         ? createBrowserChatTurnToolConfirmation(session, assistantMessageId, abortController.signal)
         : undefined;

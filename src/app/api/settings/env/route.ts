@@ -1,50 +1,68 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
+import { z } from 'zod';
 import { normalizeRuntimeEnvValue, runtimeEnvDefinitions } from '@/config/settings';
+import { requestApplicationUserId } from '@/server/auth/user-context';
 import { store } from '@/server/db/store';
-import { readRuntimeSettingsItems } from '@/server/settings/settings-snapshot';
+import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
+import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';
+import { readRuntimeSettingsItems } from '@/server/settings/settings-snapshot';
 
 const allowedKeys = new Set(runtimeEnvDefinitions.map((item) => item.key));
-const noStoreHeaders = { 'Cache-Control': 'no-store, max-age=0' };
+const envSchema = z.object({
+  items: z.array(z.object({
+    key: z.string().max(200),
+    value: z.unknown().optional(),
+  }).passthrough()).max(500),
+}).strict();
+
+function requireAdmin(request: NextRequest) {
+  if (!requestHasAdminSettingsAccess(request)) {
+    throw new ApiRequestError('请先输入管理员设置密码。', { code: 'admin_access_required', status: 401 });
+  }
+}
 
 export async function GET(request: NextRequest) {
-  if (!requestHasAdminSettingsAccess(request)) {
-    return NextResponse.json({ error: '请先输入管理员设置密码。' }, { status: 401, headers: noStoreHeaders });
+  try {
+    requireAdmin(request);
+    return apiJson(request, { saved: readRuntimeSettingsItems() });
+  } catch (error) {
+    return apiError(request, error, { fallback: '读取环境配置失败' });
   }
-  return NextResponse.json({ saved: readRuntimeSettingsItems() }, { headers: noStoreHeaders });
 }
 
 export async function POST(request: NextRequest) {
-  if (!requestHasAdminSettingsAccess(request)) {
-    return NextResponse.json({ error: '请先输入管理员设置密码。' }, { status: 401, headers: noStoreHeaders });
-  }
   try {
-    const body = await request.json();
-    const incoming = Array.isArray(body.items) ? body.items as Array<Record<string, unknown>> : [];
-    const incomingByKey = new Map(incoming
-      .filter((item) => item && typeof item.key === 'string' && allowedKeys.has(item.key))
-      .map((item) => [String(item.key), item]));
-    const savedByKey = new Map(store.listRuntimeEnv().map((item) => [item.key, item]));
-    const sanitized = runtimeEnvDefinitions.map((definition) => {
-      const item = incomingByKey.get(definition.key);
-      const secret = Boolean(definition.secret);
-      const submittedValue = typeof item?.value === 'string' ? item.value : '';
-      return {
-        key: definition.key,
-        value: secret && !submittedValue
-          ? savedByKey.get(definition.key)?.value ?? definition.defaultValue
-          : typeof item?.value === 'string' ? normalizeRuntimeEnvValue(definition, submittedValue) : definition.defaultValue,
-        enabled: true,
-        secret,
-      };
+    requireAdmin(request);
+    const body = await parseJsonRequest(request, envSchema, { maxBytes: 256 * 1024 });
+    const userId = requestApplicationUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint(body),
+      scope: 'settings.environment',
+      userId,
+    }, () => {
+      const incomingByKey = new Map(body.items
+        .filter((item) => allowedKeys.has(item.key))
+        .map((item) => [item.key, item]));
+      const savedByKey = new Map(store.listRuntimeEnv().map((item) => [item.key, item]));
+      const sanitized = runtimeEnvDefinitions.map((definition) => {
+        const item = incomingByKey.get(definition.key);
+        const secret = Boolean(definition.secret);
+        const submittedValue = typeof item?.value === 'string' ? item.value : '';
+        return {
+          key: definition.key,
+          value: secret && !submittedValue
+            ? savedByKey.get(definition.key)?.value ?? definition.defaultValue
+            : typeof item?.value === 'string' ? normalizeRuntimeEnvValue(definition, submittedValue) : definition.defaultValue,
+          enabled: true,
+          secret,
+        };
+      });
+      store.saveRuntimeEnv(sanitized);
+      store.applyRuntimeEnv();
+      return apiJson(request, { ok: true, saved: readRuntimeSettingsItems() });
     });
-    store.saveRuntimeEnv(sanitized);
-    store.applyRuntimeEnv();
-    return NextResponse.json({ ok: true, saved: readRuntimeSettingsItems() }, { headers: noStoreHeaders });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : '保存环境配置失败' },
-      { status: 400, headers: noStoreHeaders },
-    );
+    return apiError(request, error, { fallback: '保存环境配置失败' });
   }
 }

@@ -3,7 +3,15 @@ import { generateText } from 'ai';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
-import { readPersonalMemoryRecords, replacePersonalMemoryRecords } from '@/server/storage/sqlite-record-store';
+import {
+  deletePersonalMemoryRecord,
+  markPersonalMemoryRecordsUsed,
+  readPersonalMemoryRecordByIdentity,
+  readPersonalMemoryRecords,
+  writePersonalMemoryRecord,
+  writePersonalMemoryRecords,
+  writePersonalMemoryRecordsQueued,
+} from '@/server/storage/sqlite-record-store';
 
 export type PersonalMemoryScope = 'global' | 'domain';
 export type PersonalMemoryType = 'alias' | 'preference' | 'workflow' | 'domain_fact';
@@ -261,15 +269,17 @@ function normalizeStoreItem(value: unknown): PersonalMemoryItem | undefined {
   };
 }
 
-function readStore(): PersonalMemoryStoreFile {
-  const items = readPersonalMemoryRecords<PersonalMemoryItem>()
+function readStore(input: {
+  domain?: string;
+  includeDisabled?: boolean;
+  includeShared?: boolean;
+  limit?: number;
+  userId?: string;
+} = {}): PersonalMemoryStoreFile {
+  const items = readPersonalMemoryRecords<PersonalMemoryItem>(input)
     .map(normalizeStoreItem)
     .filter((item): item is PersonalMemoryItem => Boolean(item));
   return { version: 1, items };
-}
-
-function writeStore(store: PersonalMemoryStoreFile) {
-  replacePersonalMemoryRecords(store.items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
 }
 
 function memoryIdentity(item: Pick<PersonalMemoryItem, 'userId' | 'scope' | 'domain' | 'type' | 'key'>) {
@@ -286,20 +296,33 @@ export function listPersonalMemoryItems(input: {
   userId?: unknown;
   domain?: unknown;
   includeDisabled?: boolean;
+  limit?: number;
 } = {}) {
   const userId = normalizePersonalMemoryUserId(input.userId);
   const domain = normalizePersonalMemoryDomain(input.domain);
-  return readStore().items.filter((item) => {
+  const limit = Number.isFinite(input.limit) ? Math.max(1, Math.min(500, Math.floor(Number(input.limit)))) : undefined;
+  const items = readStore({
+    domain,
+    userId,
+    includeShared: true,
+    includeDisabled: input.includeDisabled === true,
+    limit,
+  }).items.filter((item) => {
     if (item.userId !== userId && !item.shared) return false;
     if (!input.includeDisabled && item.status !== 'active') return false;
     if (!domain) return true;
     return item.scope === 'global' || domainMatches(item.domain, domain);
   });
+  return limit ? items.slice(0, limit) : items;
 }
 
 export function getPersonalMemoryItem(id: string, userId?: unknown) {
   const normalizedUserId = normalizePersonalMemoryUserId(userId);
-  return readStore().items.find((item) => item.id === id && (item.userId === normalizedUserId || item.shared));
+  return readPersonalMemoryRecords<PersonalMemoryItem>({
+    ids: [id],
+    userId: normalizedUserId,
+    includeShared: true,
+  }).map(normalizeStoreItem).find((item): item is PersonalMemoryItem => Boolean(item));
 }
 
 export function savePersonalMemoryItem(input: PersonalMemoryDraft & {
@@ -317,19 +340,24 @@ export function savePersonalMemoryItem(input: PersonalMemoryDraft & {
     sourceUrl: textFromUnknown(input.sourceUrl),
   });
   if (!draft) throw new Error('Personal memory item requires key and value.');
-  const store = readStore();
   const timestamp = now();
   const requestedId = compactText(input.id, 120);
-  const requestedItem = requestedId ? store.items.find((item) => item.id === requestedId) : undefined;
+  const requestedItem = requestedId
+    ? readPersonalMemoryRecords<PersonalMemoryItem>({ ids: [requestedId] })
+      .map(normalizeStoreItem)
+      .find((item): item is PersonalMemoryItem => Boolean(item))
+    : undefined;
   if (requestedItem && requestedItem.userId !== userId) {
     throw new Error('Only the memory creator can edit this shared memory.');
   }
-  const identity = memoryIdentity(draft);
-  const existingIndex = store.items.findIndex((item) => (
-    (requestedId && item.id === requestedId && item.userId === userId)
-    || memoryIdentity(item) === identity
-  ));
-  const previous = existingIndex >= 0 ? store.items[existingIndex] : undefined;
+  const identityItem = readPersonalMemoryRecordByIdentity<PersonalMemoryItem>({
+    userId,
+    scope: draft.scope,
+    domain: draft.domain,
+    type: draft.type,
+    key: draft.key,
+  });
+  const previous = requestedItem || (identityItem ? normalizeStoreItem(identityItem) : undefined);
   const item: PersonalMemoryItem = {
     ...draft,
     shared: input.shared === undefined ? previous?.shared ?? false : draft.shared,
@@ -340,18 +368,60 @@ export function savePersonalMemoryItem(input: PersonalMemoryDraft & {
     useCount: previous?.useCount || 0,
     status: draft.status,
   };
-  if (existingIndex >= 0) store.items[existingIndex] = item;
-  else store.items.push(item);
-  writeStore(store);
+  writePersonalMemoryRecord(item);
   return item;
+}
+
+export function savePersonalMemoryItems(
+  inputs: Array<PersonalMemoryDraft & { id?: unknown }>,
+  userIdValue?: unknown,
+  options: { queued?: boolean } = {},
+) {
+  const userId = normalizePersonalMemoryUserId(userIdValue);
+  const store = readStore({ userId, includeShared: true });
+  const byIdentity = new Map(store.items.map((item) => [memoryIdentity(item), item]));
+  const timestamp = now();
+  const saved: PersonalMemoryItem[] = [];
+  let created = 0;
+  let updated = 0;
+  for (const input of inputs) {
+    const draft = normalizeMemoryDraft(input, {
+      userId,
+      domain: textFromUnknown(input.domain),
+      sourceUrl: textFromUnknown(input.sourceUrl),
+    });
+    if (!draft) continue;
+    const previous = byIdentity.get(memoryIdentity(draft));
+    if (previous && previous.userId !== userId) continue;
+    const item: PersonalMemoryItem = {
+      ...draft,
+      shared: input.shared === undefined ? previous?.shared ?? false : draft.shared,
+      id: previous?.id || compactText(input.id, 120) || `mem_${randomUUID()}`,
+      createdAt: previous?.createdAt || timestamp,
+      updatedAt: timestamp,
+      lastUsedAt: previous?.lastUsedAt,
+      useCount: previous?.useCount || 0,
+      status: draft.status,
+    };
+    if (previous) updated += 1;
+    else created += 1;
+    byIdentity.set(memoryIdentity(item), item);
+    saved.push(item);
+  }
+  const result = { created, items: saved, updated };
+  if (saved.length && options.queued) return writePersonalMemoryRecordsQueued(saved).then(() => result);
+  if (saved.length) writePersonalMemoryRecords(saved);
+  return result;
 }
 
 export function updatePersonalMemoryItem(id: string, patch: PersonalMemoryDraft, userId?: unknown) {
   const normalizedUserId = normalizePersonalMemoryUserId(userId);
-  const store = readStore();
-  const index = store.items.findIndex((item) => item.id === id && item.userId === normalizedUserId);
-  if (index < 0) return undefined;
-  const previous = store.items[index];
+  const previous = readPersonalMemoryRecords<PersonalMemoryItem>({
+    ids: [id],
+    userId: normalizedUserId,
+    includeShared: false,
+  }).map(normalizeStoreItem).find((item): item is PersonalMemoryItem => Boolean(item));
+  if (!previous) return undefined;
   const draft = normalizeMemoryDraft({
     ...previous,
     ...patch,
@@ -377,19 +447,18 @@ export function updatePersonalMemoryItem(id: string, patch: PersonalMemoryDraft,
     useCount: previous.useCount,
     status: normalizeStatus(patch.status ?? previous.status),
   };
-  store.items[index] = item;
-  writeStore(store);
+  writePersonalMemoryRecord(item);
   return item;
 }
 
 export function deletePersonalMemoryItem(id: string, userId?: unknown) {
   const normalizedUserId = normalizePersonalMemoryUserId(userId);
-  const store = readStore();
-  const before = store.items.length;
-  const deleted = store.items.find((item) => item.id === id && item.userId === normalizedUserId);
-  store.items = store.items.filter((item) => !(item.id === id && item.userId === normalizedUserId));
-  if (store.items.length !== before) writeStore(store);
-  return deleted;
+  const deleted = readPersonalMemoryRecords<PersonalMemoryItem>({
+    ids: [id],
+    userId: normalizedUserId,
+    includeShared: false,
+  }).map(normalizeStoreItem).find((item): item is PersonalMemoryItem => Boolean(item));
+  return deleted && deletePersonalMemoryRecord(id, normalizedUserId) ? deleted : undefined;
 }
 
 function normalizedSearchText(value: unknown) {
@@ -414,7 +483,7 @@ export function searchPersonalMemory(input: {
   const limit = typeof input.limit === 'number' ? input.limit : personalMemoryPromptLimit();
   if (limit <= 0) return [];
   const results: PersonalMemorySearchResult[] = [];
-  for (const item of readStore().items) {
+  for (const item of readStore({ domain, userId, includeShared: true, includeDisabled: false, limit: 2_000 }).items) {
     if ((item.userId !== userId && !item.shared) || item.status !== 'active') continue;
     const reasons: string[] = [];
     let score = 0;
@@ -457,23 +526,7 @@ export function searchPersonalMemory(input: {
 export function markPersonalMemoryItemsUsed(ids: string[]) {
   const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
   if (!uniqueIds.length) return [];
-  const idSet = new Set(uniqueIds);
-  const store = readStore();
-  const timestamp = now();
-  const updated: PersonalMemoryItem[] = [];
-  store.items = store.items.map((item) => {
-    if (!idSet.has(item.id)) return item;
-    const next = {
-      ...item,
-      lastUsedAt: timestamp,
-      useCount: item.useCount + 1,
-      updatedAt: timestamp,
-    };
-    updated.push(next);
-    return next;
-  });
-  if (updated.length) writeStore(store);
-  return updated;
+  return markPersonalMemoryRecordsUsed<PersonalMemoryItem>(uniqueIds, now());
 }
 
 export function formatPersonalMemoryForPrompt(results: PersonalMemorySearchResult[] | PersonalMemoryItem[]) {
@@ -680,7 +733,7 @@ export function upsertExtractedPersonalMemoryItems(input: {
   items: PersonalMemoryDraft[];
 }) {
   const userId = normalizePersonalMemoryUserId(input.userId);
-  const store = readStore();
+  const store = readStore({ userId, includeShared: true });
   const byIdentity = new Map(store.items.map((item, index) => [memoryIdentity(item), index]));
   const timestamp = now();
   const saved: PersonalMemoryItem[] = [];
@@ -725,7 +778,7 @@ export function upsertExtractedPersonalMemoryItems(input: {
       saved.push(item);
     }
   }
-  if (saved.length) writeStore(store);
+  if (saved.length) writePersonalMemoryRecords(saved);
   return saved;
 }
 

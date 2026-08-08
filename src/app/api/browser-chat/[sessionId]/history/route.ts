@@ -1,5 +1,5 @@
 import { readBrowserChatSessionHistoryPage } from '@/server/ai/agents/browser-chat-read.service';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { ApiRequestError, apiError, apiJson, boundedQueryInteger } from '@/server/http/api-request';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
@@ -14,16 +14,20 @@ function requestUserId(request: Request) {
 }
 
 export async function GET(request: Request, context: RouteContext) {
-  const { sessionId } = await context.params;
-  const url = new URL(request.url);
-  const result = readBrowserChatSessionHistoryPage(sessionId, requestUserId(request), {
-    messageCursor: url.searchParams.get('messageCursor') || undefined,
-    messageLimit: Number(url.searchParams.get('messageLimit') || 80),
-    stepCursor: url.searchParams.get('stepCursor') || undefined,
-    stepLimit: Number(url.searchParams.get('stepLimit') || 120),
-    logCursor: url.searchParams.get('logCursor') || undefined,
-    logLimit: Number(url.searchParams.get('logLimit') || 200),
-  });
-  if (!result) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
-  return noStoreJson(result);
+  try {
+    const { sessionId } = await context.params;
+    const url = new URL(request.url);
+    const result = readBrowserChatSessionHistoryPage(sessionId, requestUserId(request), {
+      messageCursor: url.searchParams.get('messageCursor') || undefined,
+      messageLimit: boundedQueryInteger(url.searchParams.get('messageLimit'), { fallback: 80, max: 500 }),
+      stepCursor: url.searchParams.get('stepCursor') || undefined,
+      stepLimit: boundedQueryInteger(url.searchParams.get('stepLimit'), { fallback: 120, max: 500 }),
+      logCursor: url.searchParams.get('logCursor') || undefined,
+      logLimit: boundedQueryInteger(url.searchParams.get('logLimit'), { fallback: 200, max: 1_000 }),
+    });
+    if (!result) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
+    return apiJson(request, result);
+  } catch (error) {
+    return apiError(request, error, { fallback: 'Failed to read browser chat history' });
+  }
 }

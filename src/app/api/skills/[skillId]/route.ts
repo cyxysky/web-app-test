@@ -1,7 +1,9 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { requestApplicationUserId } from '@/server/auth/user-context';
-import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
+import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
+import { skillRequestSchema } from '@/server/http/skill-request.schema';
+import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 
 type RouteContext = {
   params: Promise<{ skillId: string }>;
@@ -10,11 +12,6 @@ type RouteContext = {
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function normalizeStatus(value: unknown): SkillRecord['status'] {
-  const status = String(value || 'ready');
-  return status === 'draft' || status === 'ready' || status === 'disabled' ? status as SkillRecord['status'] : 'ready';
-}
-
 function requestUserId(request: NextRequest) {
   return requestApplicationUserId(request);
 }
@@ -22,46 +19,46 @@ function requestUserId(request: NextRequest) {
 export async function GET(request: NextRequest, context: RouteContext) {
   const { skillId } = await context.params;
   const skill = store.getSkill(skillId, requestUserId(request));
-  if (!skill) return NextResponse.json({ error: 'Skill not found' }, { status: 404 });
-  return NextResponse.json({ skill });
+  if (!skill) return apiError(request, new ApiRequestError('Skill not found', { code: 'not_found', status: 404 }), { fallback: 'Skill not found' });
+  return apiJson(request, { skill });
 }
 
 export async function PUT(request: NextRequest, context: RouteContext) {
   const { skillId } = await context.params;
   try {
-    const body = await request.json();
+    const body = await parseJsonRequest(request, skillRequestSchema.omit({ id: true }), { maxBytes: 256 * 1024 });
     const userId = requestUserId(request);
-    const current = store.getSkill(skillId, userId);
-    if (!current) return NextResponse.json({ error: 'Skill not found' }, { status: 404 });
-    if (current.userId !== userId) return NextResponse.json({ error: 'Only the Skill creator can edit this shared Skill' }, { status: 403 });
-    const content = parseSkillContent(body.content);
-    const skill = store.upsertSkill({
-      id: skillId,
-      title: String(body.title || ''),
-      description: String(body.description || ''),
-      domains: Array.isArray(body.domains) ? body.domains.map(String) : [],
-      triggerPhrases: Array.isArray(body.triggerPhrases) ? body.triggerPhrases.map(String) : [],
-      content,
-      sourceSessionId: typeof body.sourceSessionId === 'string' ? body.sourceSessionId : undefined,
-      status: normalizeStatus(body.status),
-      shared: typeof body.shared === 'boolean' ? body.shared : undefined,
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint({ skillId, ...body }),
+      scope: 'skill.update',
       userId,
+    }, () => {
+      const current = store.getSkill(skillId, userId);
+      if (!current) throw new ApiRequestError('Skill not found', { code: 'not_found', status: 404 });
+      if (current.userId !== userId) throw new ApiRequestError('Only the Skill creator can edit this shared Skill', { code: 'forbidden', status: 403 });
+      const skill = store.upsertSkill({ id: skillId, ...body, userId });
+      return apiJson(request, { skill });
     });
-    return NextResponse.json({ skill });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Invalid skill' },
-      { status: 400 },
-    );
+    return apiError(request, error, { fallback: 'Invalid skill' });
   }
 }
 
 export async function DELETE(request: NextRequest, context: RouteContext) {
-  const { skillId } = await context.params;
-  const userId = requestUserId(request);
-  const current = store.getSkill(skillId, userId);
-  if (current && current.userId !== userId) return NextResponse.json({ error: 'Only the Skill creator can delete this shared Skill' }, { status: 403 });
-  const deleted = store.deleteSkill(skillId, userId);
-  if (!deleted) return NextResponse.json({ error: 'Skill not found' }, { status: 404 });
-  return NextResponse.json({ ok: true });
+  try {
+    const { skillId } = await context.params;
+    const userId = requestUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint({ skillId }),
+      scope: 'skill.delete',
+      userId,
+    }, () => {
+      const current = store.getSkill(skillId, userId);
+      if (current && current.userId !== userId) throw new ApiRequestError('Only the Skill creator can delete this shared Skill', { code: 'forbidden', status: 403 });
+      if (!store.deleteSkill(skillId, userId)) throw new ApiRequestError('Skill not found', { code: 'not_found', status: 404 });
+      return apiJson(request, { ok: true });
+    });
+  } catch (error) {
+    return apiError(request, error, { fallback: 'Unable to delete Skill' });
+  }
 }

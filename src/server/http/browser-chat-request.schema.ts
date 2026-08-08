@@ -28,8 +28,21 @@ export const createBrowserChatSessionRequestSchema = browserChatSettingsSchema.e
 export const sendBrowserChatMessageRequestSchema = browserChatSettingsSchema.extend({
   content: text(100_000).default(''),
   clientMessageId: optionalText(120),
-  attachments: z.array(browserChatAttachmentSchema).max(100).default([]),
-  skillIds: z.array(text(120)).max(100).default([]),
+  attachments: z.array(browserChatAttachmentSchema).max(8).default([]),
+  skillIds: z.array(text(120)).max(8).default([]),
+}).strict();
+
+export const deleteBrowserChatSessionsRequestSchema = z.object({
+  ids: z.array(text(120)).min(1).max(200),
+}).strict();
+
+export const setBrowserChatGroupRequestSchema = z.object({
+  groupId: text(120).default(''),
+}).strict();
+
+export const browserChatToolConfirmationRequestSchema = z.object({
+  confirmationId: text(120).min(1),
+  action: z.enum(['confirm', 'cancel']),
 }).strict();
 
 export type CreateBrowserChatSessionRequest = z.infer<typeof createBrowserChatSessionRequestSchema>;

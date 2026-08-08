@@ -1,5 +1,5 @@
 import { readBrowserChatSessionPage } from '@/server/ai/agents/browser-chat-read.service';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
@@ -14,8 +14,12 @@ function requestUserId(request: Request) {
 }
 
 export async function GET(request: Request, context: RouteContext) {
-  const { sessionId } = await context.params;
-  const session = readBrowserChatSessionPage(sessionId, requestUserId(request));
-  if (!session) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
-  return noStoreJson({ session });
+  try {
+    const { sessionId } = await context.params;
+    const session = readBrowserChatSessionPage(sessionId, requestUserId(request));
+    if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
+    return apiJson(request, { session });
+  } catch (error) {
+    return apiError(request, error, { fallback: 'Failed to read browser chat session' });
+  }
 }

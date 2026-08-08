@@ -1,5 +1,5 @@
 import { interruptBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
@@ -17,10 +17,9 @@ export async function POST(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
     const session = interruptBrowserChatSession(sessionId, requestUserId(request));
-    if (!session) return noStoreJson({ error: 'Browser chat session not found' }, { status: 404 });
-    return noStoreJson({ session });
+    if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
+    return apiJson(request, { session });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error || 'Browser chat interrupt failed');
-    return noStoreJson({ error: message }, { status: 500 });
+    return apiError(request, error, { fallback: 'Browser chat interrupt failed', status: 500 });
   }
 }

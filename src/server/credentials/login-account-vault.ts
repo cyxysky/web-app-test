@@ -15,6 +15,7 @@ import path from 'node:path';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { getSqliteDatabase, runSqliteTransaction, sqliteDatabasePath } from '@/server/storage/sqlite-database';
 import { appDataRoot } from '@/server/storage/paths';
+import { queueSqliteWrite, type SqliteWriteStatement } from '@/server/storage/sqlite-write-queue';
 
 export type LoginAccountStatus = 'active' | 'disabled';
 
@@ -540,6 +541,154 @@ export function updateLoginAccount(id: string, input: UpdateLoginAccountInput, u
     `).get(previous.id, previous.user_id) as LoginAccountRow;
     return metadataFromRow(updated);
   });
+}
+
+export function importLoginAccounts(items: CreateLoginAccountInput[], userId?: unknown) {
+  ensureLoginAccountUserMigration();
+  const normalizedUserId = normalizeLoginAccountUserId(userId);
+  return runSqliteTransaction((database) => {
+    const find = database.prepare(`
+      SELECT * FROM login_account
+      WHERE user_id = ? AND domain = ? AND username = ?
+    `);
+    const insert = database.prepare(`
+      INSERT INTO login_account (
+        id, user_id, shared, domain, username, label, login_url, status,
+        password_envelope, created_at, updated_at, last_used_at, use_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
+    `);
+    const update = database.prepare(`
+      UPDATE login_account
+      SET shared = ?, label = ?, login_url = ?, status = ?, password_envelope = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?
+    `);
+    let created = 0;
+    let updated = 0;
+    for (const input of items) {
+      const domain = normalizeLoginAccountDomain(input.domain);
+      const username = normalizeUsername(input.username);
+      const label = normalizeLabel(input.label, username);
+      const loginUrl = normalizeLoginUrl(input.loginUrl, domain);
+      const status = normalizeStatus(input.status);
+      const shared = input.shared === true;
+      const timestamp = now();
+      const previous = find.get(normalizedUserId, domain, username) as LoginAccountRow | undefined;
+      if (previous) {
+        const passwordEnvelope = encryptPassword(input.password, {
+          id: previous.id,
+          user_id: previous.user_id,
+          domain,
+          username,
+        });
+        update.run(
+          shared ? 1 : 0,
+          label,
+          loginUrl,
+          status,
+          passwordEnvelope,
+          timestamp,
+          previous.id,
+          previous.user_id,
+        );
+        updated += 1;
+        continue;
+      }
+      const id = `account_${randomUUID()}`;
+      const passwordEnvelope = encryptPassword(input.password, {
+        id,
+        user_id: normalizedUserId,
+        domain,
+        username,
+      });
+      insert.run(
+        id,
+        normalizedUserId,
+        shared ? 1 : 0,
+        domain,
+        username,
+        label,
+        loginUrl,
+        status,
+        passwordEnvelope,
+        timestamp,
+        timestamp,
+      );
+      created += 1;
+    }
+    return { created, updated };
+  });
+}
+
+export async function importLoginAccountsQueued(items: CreateLoginAccountInput[], userId?: unknown) {
+  ensureLoginAccountUserMigration();
+  const normalizedUserId = normalizeLoginAccountUserId(userId);
+  const existing = getSqliteDatabase().prepare(`
+    SELECT * FROM login_account WHERE user_id = ?
+  `).all(normalizedUserId) as LoginAccountRow[];
+  const byIdentity = new Map(existing.map((row) => [`${row.domain}\u0001${row.username}`, row]));
+  const statements: SqliteWriteStatement[] = [];
+  let created = 0;
+  let updated = 0;
+  for (const input of items) {
+    const domain = normalizeLoginAccountDomain(input.domain);
+    const username = normalizeUsername(input.username);
+    const identityKey = `${domain}\u0001${username}`;
+    const previous = byIdentity.get(identityKey);
+    const id = previous?.id || `account_${randomUUID()}`;
+    const timestamp = now();
+    const passwordEnvelope = encryptPassword(input.password, {
+      id,
+      user_id: normalizedUserId,
+      domain,
+      username,
+    });
+    statements.push({
+      sql: `
+        INSERT INTO login_account (
+          id, user_id, shared, domain, username, label, login_url, status,
+          password_envelope, created_at, updated_at, last_used_at, use_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
+        ON CONFLICT(user_id, domain, username) DO UPDATE SET
+          shared = excluded.shared,
+          label = excluded.label,
+          login_url = excluded.login_url,
+          status = excluded.status,
+          password_envelope = excluded.password_envelope,
+          updated_at = excluded.updated_at
+      `,
+      params: [
+        id,
+        normalizedUserId,
+        input.shared === true ? 1 : 0,
+        domain,
+        username,
+        normalizeLabel(input.label, username),
+        normalizeLoginUrl(input.loginUrl, domain),
+        normalizeStatus(input.status),
+        passwordEnvelope,
+        previous?.created_at || timestamp,
+        timestamp,
+      ],
+    });
+    if (previous) updated += 1;
+    else created += 1;
+    byIdentity.set(identityKey, {
+      id,
+      user_id: normalizedUserId,
+      shared: input.shared === true ? 1 : 0,
+      domain,
+      username,
+      label: normalizeLabel(input.label, username),
+      login_url: normalizeLoginUrl(input.loginUrl, domain),
+      status: normalizeStatus(input.status),
+      password_envelope: passwordEnvelope,
+      created_at: previous?.created_at || timestamp,
+      updated_at: timestamp,
+      use_count: 0,
+    });
+  }
+  await queueSqliteWrite(statements);
+  return { created, updated };
 }
 
 export function deleteLoginAccount(id: string, userId?: unknown) {

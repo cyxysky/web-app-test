@@ -94,9 +94,9 @@ test('shared Skills, memories, and accounts are usable across IDs but writable o
     assert.equal(accounts.updateLoginAccount(sharedAccount.id, { label: 'Hijacked' }, viewerId), undefined);
     assert.equal(accounts.deleteLoginAccount(sharedAccount.id, viewerId), false);
 
-    assert.equal(portable.exportPortableData({ kind: 'skills', userId: viewerId }).count, 0);
-    assert.equal(portable.exportPortableData({ kind: 'memory', userId: viewerId }).count, 0);
-    assert.equal(portable.exportPortableData({ kind: 'credentials', userId: viewerId, passphrase: 'viewer-export' }).count, 0);
+    assert.equal((await portable.exportPortableData({ kind: 'skills', userId: viewerId })).count, 0);
+    assert.equal((await portable.exportPortableData({ kind: 'memory', userId: viewerId })).count, 0);
+    assert.equal((await portable.exportPortableData({ kind: 'credentials', userId: viewerId, passphrase: 'viewer-export' })).count, 0);
 
     assert.equal(store.deleteSkill(sharedSkill.id, ownerId), true);
     assert.ok(memory.updatePersonalMemoryItem(sharedMemory.id, { shared: false }, ownerId));

@@ -19,9 +19,13 @@ import type {
 import {
   deleteSkillRecord,
   readConfigRecord,
+  readSkillById,
+  readSkillsByIds,
   readSkills,
   writeConfigRecord,
   writeSkillRecord,
+  writeSkillRecords,
+  writeSkillRecordsQueued,
 } from '@/server/storage/sqlite-record-store';
 
 type ConfigStoreData = {
@@ -183,25 +187,18 @@ function writeConfigData(data: ConfigStoreData) {
 }
 
 export const store = {
-  listSkills(query?: string, userId?: string | number) {
-    const normalizedQuery = (query || '').trim().toLowerCase();
-    const skills = readSkills(normalizeApplicationUserId(userId))
-      .map(normalizeSkillRecord)
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    if (!normalizedQuery) return skills;
-    return skills.filter((skill) => [
-      skill.title,
-      skill.description,
-      ...(skill.domains || []),
-      ...skill.triggerPhrases,
-    ].some((value) => value.toLowerCase().includes(normalizedQuery)));
+  listSkills(query?: string, userId?: string | number, limit?: number) {
+    return readSkills(normalizeApplicationUserId(userId), { query, limit })
+      .map(normalizeSkillRecord);
   },
   getSkill(skillId: string, userId?: string | number) {
-    const skill = readSkills(normalizeApplicationUserId(userId)).find((item) => item.id === skillId);
+    const skill = readSkillById(skillId, normalizeApplicationUserId(userId));
     return skill ? normalizeSkillRecord(skill) : undefined;
   },
   getSkills(skillIds: string[] = [], userId?: string | number) {
-    const byId = new Map(this.listSkills(undefined, userId).map((skill) => [skill.id, skill]));
+    const byId = new Map(readSkillsByIds(skillIds, normalizeApplicationUserId(userId))
+      .map(normalizeSkillRecord)
+      .map((skill) => [skill.id, skill]));
     return skillIds.map((skillId) => byId.get(skillId)).filter((item): item is SkillRecord => Boolean(item));
   },
   upsertSkill(input: {
@@ -218,7 +215,7 @@ export const store = {
   }) {
     const userId = normalizeApplicationUserId(input.userId);
     const timestamp = now();
-    const storedExisting = input.id ? readSkills().find((skill) => skill.id === input.id) : undefined;
+    const storedExisting = input.id ? readSkillById(input.id) : undefined;
     if (storedExisting && normalizeApplicationUserId(storedExisting.userId) !== userId) {
       throw new Error('Only the Skill creator can edit this shared Skill.');
     }
@@ -240,6 +237,50 @@ export const store = {
     });
     writeSkillRecord(skill, userId);
     return skill;
+  },
+  upsertSkillsBatch(inputs: Array<{
+    id?: string;
+    title: string;
+    description: string;
+    domains?: string[];
+    triggerPhrases?: string[];
+    content: SkillContent;
+    sourceSessionId?: string;
+    status?: SkillRecord['status'];
+    shared?: boolean;
+    userId?: string | number;
+  }>, options: { queued?: boolean } = {}) {
+    const existingById = new Map(readSkills().map((skill) => [skill.id, normalizeSkillRecord(skill)]));
+    const records = inputs.map((input) => {
+      const userId = normalizeApplicationUserId(input.userId);
+      const existing = input.id ? existingById.get(input.id) : undefined;
+      if (existing && normalizeApplicationUserId(existing.userId) !== userId) {
+        throw new Error('Only the Skill creator can edit this shared Skill.');
+      }
+      const timestamp = now();
+      const skill = normalizeSkillRecord({
+        id: existing?.id || id('skl'),
+        userId,
+        shared: input.shared ?? existing?.shared ?? false,
+        title: input.title.trim() || existing?.title || 'Runtime Skill',
+        description: input.description.trim() || existing?.description || '',
+        domains: input.domains || existing?.domains || [],
+        triggerPhrases: input.triggerPhrases || existing?.triggerPhrases || [],
+        content: normalizeSkillContent(input.content),
+        sourceSessionId: input.sourceSessionId || existing?.sourceSessionId,
+        status: input.status || existing?.status || 'ready',
+        version: existing ? existing.version + 1 : 1,
+        createdAt: existing?.createdAt || timestamp,
+        updatedAt: timestamp,
+      });
+      existingById.set(skill.id, skill);
+      return { skill, userId };
+    });
+    if (options.queued) {
+      return writeSkillRecordsQueued(records).then(() => records.map((item) => item.skill));
+    }
+    writeSkillRecords(records);
+    return records.map((item) => item.skill);
   },
   deleteSkill(skillId: string, userId?: string | number) {
     return deleteSkillRecord(skillId, normalizeApplicationUserId(userId));

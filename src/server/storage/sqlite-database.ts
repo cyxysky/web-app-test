@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 12;
+const currentSchemaVersion = 15;
 const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -414,6 +414,91 @@ function applyVersionNineMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionThirteenMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 13').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      CREATE INDEX IF NOT EXISTS browser_chat_session_user_updated_id_idx
+        ON browser_chat_session(user_id, updated_at DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS browser_chat_message_session_time_id_idx
+        ON browser_chat_message(session_id, time DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS browser_chat_log_session_time_id_idx
+        ON browser_chat_log(session_id, time DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS personal_memory_user_status_updated_idx
+        ON personal_memory_item(user_id, status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS personal_memory_user_domain_updated_idx
+        ON personal_memory_item(user_id, domain, updated_at DESC);
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (13, 'scalable-resource-queries', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function applyVersionFourteenMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 14').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      CREATE INDEX IF NOT EXISTS personal_memory_identity_idx
+        ON personal_memory_item(user_id, scope, domain, type, memory_key COLLATE NOCASE);
+      CREATE INDEX IF NOT EXISTS skill_user_updated_idx
+        ON skill(user_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS skill_shared_updated_idx
+        ON skill(shared, updated_at DESC);
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (14, 'resource-identity-lookups', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function applyVersionFifteenMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 15').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS api_idempotency (
+        user_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        state TEXT NOT NULL,
+        status_code INTEGER,
+        response_json TEXT,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, scope, idempotency_key)
+      );
+      CREATE INDEX IF NOT EXISTS api_idempotency_expires_idx
+        ON api_idempotency(expires_at);
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (15, 'api-idempotency', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -602,6 +687,9 @@ function initializeSchema(database: DatabaseSync) {
     INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
     VALUES (12, 'mounted-identity-and-websocket-tickets', ?)
   `).run(new Date().toISOString());
+  applyVersionThirteenMigration(database);
+  applyVersionFourteenMigration(database);
+  applyVersionFifteenMigration(database);
 }
 
 export function getSqliteDatabase() {

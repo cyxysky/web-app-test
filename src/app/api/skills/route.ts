@@ -1,7 +1,9 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { store } from '@/server/db/store';
-import { parseSkillContent } from '@/server/ai/schemas/runtime.schema';
 import { requestApplicationUserId } from '@/server/auth/user-context';
+import { apiError, apiJson, boundedQueryInteger, parseJsonRequest } from '@/server/http/api-request';
+import { skillRequestSchema } from '@/server/http/skill-request.schema';
+import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -12,31 +14,24 @@ function requestUserId(request: NextRequest) {
 
 export async function GET(request: NextRequest) {
   const query = request.nextUrl.searchParams.get('q') || undefined;
-  const skills = store.listSkills(query, requestUserId(request));
-  return NextResponse.json({ skills });
+  const limit = boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 200, max: 500 });
+  const skills = store.listSkills(query, requestUserId(request), limit);
+  return apiJson(request, { skills });
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json();
-    const content = parseSkillContent(body.content);
-    const skill = store.upsertSkill({
-      id: typeof body.id === 'string' ? body.id : undefined,
-      title: String(body.title || ''),
-      description: String(body.description || ''),
-      domains: Array.isArray(body.domains) ? body.domains.map(String) : [],
-      triggerPhrases: Array.isArray(body.triggerPhrases) ? body.triggerPhrases.map(String) : [],
-      content,
-      sourceSessionId: typeof body.sourceSessionId === 'string' ? body.sourceSessionId : undefined,
-      status: ['draft', 'ready', 'disabled'].includes(String(body.status)) ? body.status : 'ready',
-      shared: body.shared === true,
-      userId: requestUserId(request),
+    const body = await parseJsonRequest(request, skillRequestSchema, { maxBytes: 256 * 1024 });
+    const userId = requestUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint(body),
+      scope: 'skills.create',
+      userId,
+    }, () => {
+      const skill = store.upsertSkill({ ...body, userId });
+      return apiJson(request, { skill });
     });
-    return NextResponse.json({ skill });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Invalid skill' },
-      { status: 400 },
-    );
+    return apiError(request, error, { fallback: 'Invalid skill' });
   }
 }

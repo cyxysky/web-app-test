@@ -38,7 +38,7 @@ export function requestApplicationPrincipal(request: Pick<Request, 'headers'>): 
   if (!trustedAuthenticationHeaders(request)) throw new Error('Authentication required');
   const userId = String(request.headers.get('x-webpilot-identity-user-id') || '').trim();
   const username = String(request.headers.get('x-webpilot-identity-username') || '').trim();
-  if (!userId || !username) throw new Error('Authentication required');
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(userId) || !username) throw new Error('Authentication required');
   return {
     userId: normalizeApplicationUserId(userId),
     username,

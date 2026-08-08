@@ -177,3 +177,18 @@ Start the Next.js server first, then launch Electron in another PowerShell windo
 $env:WEBPILOT_ELECTRON_SERVER_URL="http://127.0.0.1:3000"
 npx electron .
 ```
+
+## Publish a Docker Hub image
+
+Set the Docker Hub namespace before constructing the image tag. An empty namespace produces an invalid tag such as `/webpilot-qa:1.0.0`.
+
+```powershell
+$DockerHubUser = (Read-Host "Docker Hub username").Trim()
+$ImageVersion = "1.0.0"
+if (-not $DockerHubUser) { throw "Docker Hub username is required." }
+
+docker build --build-arg WEBPILOT_BASE_PATH=/webpilot -t "${DockerHubUser}/webpilot-qa:${ImageVersion}" -t "${DockerHubUser}/webpilot-qa:latest" .
+docker login
+docker push "${DockerHubUser}/webpilot-qa:${ImageVersion}"
+docker push "${DockerHubUser}/webpilot-qa:latest"
+```

@@ -1,6 +1,7 @@
 import { readdir, rm, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { artifactsRoot } from './paths';
+import { structuredLog } from '@/server/observability/runtime-observability';
 
 type ArtifactFile = {
   modifiedAt: number;
@@ -90,7 +91,7 @@ export function scheduleBrowserChatArtifactMaintenance(retainedSessionIds: () =>
     if (runtimeState.running) return;
     runtimeState.running = Promise.resolve()
       .then(() => maintainBrowserChatArtifacts(retainedSessionIds()))
-      .catch((error) => console.warn('[browser-chat] artifact maintenance failed', error))
+      .catch((error) => structuredLog({ event: 'browser_chat.artifact_maintenance_failed', level: 'warn', error }))
       .finally(() => { runtimeState.running = undefined; });
   };
   const first = setTimeout(run, 60_000);

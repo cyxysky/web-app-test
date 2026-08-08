@@ -36,6 +36,12 @@ type FloatingLayerProps = {
 
 const floatingInset = 8;
 const floatingGap = 6;
+const hiddenLayoutStyle: CSSProperties = {
+  left: 0,
+  position: 'fixed',
+  top: 0,
+  visibility: 'hidden',
+};
 
 function viewportBounds() {
   const viewport = window.visualViewport;
@@ -67,7 +73,7 @@ export function FloatingLayer({
   const internalLayerRef = useRef<HTMLDivElement | null>(null);
   const dismissRef = useRef(onDismiss);
   const [portalReady, setPortalReady] = useState(false);
-  const [layoutStyle, setLayoutStyle] = useState<CSSProperties>({ visibility: 'hidden' });
+  const [layoutStyle, setLayoutStyle] = useState<CSSProperties>(hiddenLayoutStyle);
   const [resolvedPlacement, setResolvedPlacement] = useState<'bottom' | 'top'>('bottom');
 
   useEffect(() => {
@@ -79,7 +85,7 @@ export function FloatingLayer({
   }, []);
 
   useEffect(() => {
-    if (!present) setLayoutStyle({ visibility: 'hidden' });
+    if (!present) setLayoutStyle(hiddenLayoutStyle);
   }, [present]);
 
   const setLayerNode = useCallback((node: HTMLDivElement | null) => {

@@ -62,14 +62,14 @@ test('credentials, Skills, memory, and model configuration round-trip securely',
       },
     });
 
-    const credentialExport = portableData.exportPortableData({
+    const credentialExport = await portableData.exportPortableData({
       kind: 'credentials',
       userId: sourceUserId,
       passphrase: 'export-password',
     });
-    const skillExport = portableData.exportPortableData({ kind: 'skills', userId: sourceUserId });
-    const memoryExport = portableData.exportPortableData({ kind: 'memory', userId: sourceUserId });
-    const modelExport = portableData.exportPortableData({
+    const skillExport = await portableData.exportPortableData({ kind: 'skills', userId: sourceUserId });
+    const memoryExport = await portableData.exportPortableData({ kind: 'memory', userId: sourceUserId });
+    const modelExport = await portableData.exportPortableData({
       kind: 'model',
       passphrase: 'model-export-password',
     });
@@ -77,30 +77,30 @@ test('credentials, Skills, memory, and model configuration round-trip securely',
     const serializedCredentials = JSON.stringify(credentialExport.bundle);
     assert.doesNotMatch(serializedCredentials, /portable-secret|admin|example\.com/);
     assert.doesNotMatch(JSON.stringify(modelExport.bundle), /model-api-secret|gpt-portable|models\.example/);
-    assert.throws(() => portableData.importPortableData({
+    await assert.rejects(() => portableData.importPortableData({
       kind: 'credentials',
       userId: targetUserId,
       passphrase: 'wrong-password',
       bundle: credentialExport.bundle,
     }), /密码错误|文件已损坏/);
-    assert.throws(() => portableData.importPortableData({
+    await assert.rejects(() => portableData.importPortableData({
       kind: 'model',
       passphrase: 'wrong-password',
       bundle: modelExport.bundle,
     }), /密码错误|文件已损坏/);
 
-    assert.deepEqual(portableData.importPortableData({
+    assert.deepEqual(await portableData.importPortableData({
       kind: 'credentials',
       userId: targetUserId,
       passphrase: 'export-password',
       bundle: credentialExport.bundle,
     }), { kind: 'credentials', created: 1, updated: 0, total: 1 });
-    assert.deepEqual(portableData.importPortableData({
+    assert.deepEqual(await portableData.importPortableData({
       kind: 'skills',
       userId: targetUserId,
       bundle: skillExport.bundle,
     }), { kind: 'skills', created: 1, updated: 0, total: 1 });
-    assert.deepEqual(portableData.importPortableData({
+    assert.deepEqual(await portableData.importPortableData({
       kind: 'memory',
       userId: targetUserId,
       bundle: memoryExport.bundle,
@@ -125,7 +125,7 @@ test('credentials, Skills, memory, and model configuration round-trip securely',
         },
       },
     });
-    assert.deepEqual(portableData.importPortableData({
+    assert.deepEqual(await portableData.importPortableData({
       kind: 'model',
       passphrase: 'model-export-password',
       bundle: modelExport.bundle,
@@ -141,7 +141,7 @@ test('credentials, Skills, memory, and model configuration round-trip securely',
     assert.equal(store.getModelConfig()?.providers.openai?.models?.includes('gpt-portable'), true);
     assert.equal(store.getModelConfig()?.providers.openai?.models?.includes('gpt-backup'), true);
 
-    const secondImport = portableData.importPortableData({
+    const secondImport = await portableData.importPortableData({
       kind: 'credentials',
       userId: targetUserId,
       passphrase: 'export-password',

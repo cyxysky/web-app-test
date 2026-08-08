@@ -1,71 +1,70 @@
 import { NextRequest } from 'next/server';
+import { z } from 'zod';
 import { getBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
 import { compileConversationMessagesCase } from '@/server/automation/conversation-case-compiler';
 import { requestApplicationUserId } from '@/server/auth/user-context';
-import { noStoreJson } from '@/server/http/no-store-response';
+import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
+import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 import { createAutomationCase, listAutomationCases } from '@/server/storage/automation-store';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-type RouteContext = {
-  params: Promise<{ sessionId: string }>;
-};
+type RouteContext = { params: Promise<{ sessionId: string }> };
 
-type RequestBody = Record<string, unknown>;
-
-function bodyRecord(value: unknown): RequestBody {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as RequestBody : {};
-}
+const requestSchema = z.object({
+  messageIds: z.array(z.string().trim().min(1).max(200)).min(1).max(500),
+  title: z.union([z.string(), z.number()]).optional(),
+  name: z.union([z.string(), z.number()]).optional(),
+  description: z.union([z.string(), z.number()]).optional(),
+}).strict();
 
 function text(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
-function requestUserId(request: NextRequest) {
-  return requestApplicationUserId(request);
-}
-
 export async function GET(request: NextRequest, context: RouteContext) {
-  const { sessionId } = await context.params;
-  const userId = requestUserId(request);
-  const session = getBrowserChatSession(sessionId, userId);
-  if (!session) return noStoreJson({ error: 'Browser chat session not found.' }, { status: 404 });
-  return noStoreJson({ cases: listAutomationCases({ userId, sourceSessionId: sessionId }) });
+  try {
+    const { sessionId } = await context.params;
+    const userId = requestApplicationUserId(request);
+    if (!getBrowserChatSession(sessionId, userId)) {
+      throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
+    }
+    return apiJson(request, { cases: listAutomationCases({ userId, sourceSessionId: sessionId }) });
+  } catch (error) {
+    return apiError(request, error, { fallback: 'Failed to read automation cases' });
+  }
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {
-  const { sessionId } = await context.params;
   try {
-    const body = bodyRecord(await request.json().catch(() => ({})));
-    const userId = requestUserId(request);
-    const session = getBrowserChatSession(sessionId, userId);
-    if (!session) return noStoreJson({ error: 'Browser chat session not found.' }, { status: 404 });
-    const messageIds = Array.isArray(body.messageIds)
-      ? body.messageIds.filter((item): item is string => typeof item === 'string')
-      : [];
-    const assistantMessageIds = messageIds;
-    if (!assistantMessageIds.length) throw new Error('At least one assistant message id is required.');
-    const compiled = compileConversationMessagesCase({
-      session,
-      assistantMessageIds,
+    const { sessionId } = await context.params;
+    const body = await parseJsonRequest(request, requestSchema, { maxBytes: 128 * 1024 });
+    const userId = requestApplicationUserId(request);
+    return runIdempotentJson(request, {
+      fingerprint: idempotencyFingerprint({ sessionId, ...body }),
+      scope: 'browser_chat.compile_automation_case',
       userId,
-      title: text(body.title ?? body.name) || undefined,
-      description: text(body.description) || undefined,
+    }, () => {
+      const session = getBrowserChatSession(sessionId, userId);
+      if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
+      const compiled = compileConversationMessagesCase({
+        session,
+        assistantMessageIds: body.messageIds,
+        userId,
+        title: text(body.title ?? body.name) || undefined,
+        description: text(body.description) || undefined,
+      });
+      const automationCase = createAutomationCase(compiled);
+      return apiJson(request, {
+        ok: true,
+        case: automationCase,
+        automationCase,
+        sourceMessageIds: body.messageIds,
+        cases: listAutomationCases({ userId, sourceSessionId: sessionId }),
+      }, { status: 201 });
     });
-    const automationCase = createAutomationCase(compiled);
-    return noStoreJson({
-      ok: true,
-      case: automationCase,
-      automationCase,
-      sourceMessageIds: assistantMessageIds,
-      cases: listAutomationCases({ userId, sourceSessionId: sessionId }),
-    }, { status: 201 });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Failed to compile automation case.';
-    return noStoreJson(
-      { error: message },
-      { status: /not found/i.test(message) ? 404 : 400 },
-    );
+    return apiError(request, error, { fallback: 'Failed to compile automation case' });
   }
 }
