@@ -15,6 +15,7 @@
     "desktop:installer": "npm run desktop:prepare && electron-builder --win nsis",
     "desktop:portable": "npm run desktop:prepare && electron-builder --win portable",
     "start": "node server/webpilot-server.js",
+    "check:responsive": "node scripts/check-responsive-ui.mjs",
     "docker:build": "docker build -t webpilot-qa:latest .",
     "docker:up": "docker compose up -d --build",
     "lint": "eslint .",

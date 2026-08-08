@@ -16,6 +16,7 @@ import {
   type SettingsTab,
 } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
+import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { languageOptions } from '@/i18n/translations';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -307,19 +308,12 @@ export function EnvironmentSettings({
     setPortalReady(true);
   }, []);
 
-  useEffect(() => {
-    if (!personalMemoryEditorMode && !deletePersonalMemoryTarget && !deleteLoginAccountTarget) return undefined;
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key !== 'Escape' || savingPersonalMemory || deletingPersonalMemoryId || deletingLoginAccountId) return;
-      if (personalMemoryEditorMode) closePersonalMemoryEditor();
-      if (deletePersonalMemoryTarget) closeDeletePersonalMemoryModal();
-      if (deleteLoginAccountTarget) closeDeleteLoginAccountModal();
-    }
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  // The close handlers intentionally read the latest editor state when Escape is pressed.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deleteLoginAccountTarget, deletePersonalMemoryTarget, deletingLoginAccountId, deletingPersonalMemoryId, personalMemoryEditorMode, savingPersonalMemory]);
+  useEscapeDismiss(Boolean(personalMemoryEditorMode || deletePersonalMemoryTarget || deleteLoginAccountTarget), () => {
+    if (savingPersonalMemory || deletingPersonalMemoryId || deletingLoginAccountId) return;
+    if (personalMemoryEditorMode) closePersonalMemoryEditor();
+    if (deletePersonalMemoryTarget) closeDeletePersonalMemoryModal();
+    if (deleteLoginAccountTarget) closeDeleteLoginAccountModal();
+  });
 
   async function load() {
     setLoading(true);

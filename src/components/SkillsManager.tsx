@@ -9,6 +9,7 @@ import { DataTransferButtons } from '@/components/DataTransferButtons';
 import { DomainGroupedAccordion } from '@/components/DomainGroupedAccordion';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { useI18n } from '@/i18n/I18nProvider';
+import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { waitForMinimumLoading } from '@/lib/minimum-loading';
@@ -169,6 +170,8 @@ export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => v
     setEditingSkillId(null);
     setDraft(emptyDraft);
   }
+
+  useEscapeDismiss(Boolean(editorMode), closeEditorModal);
 
   function requestDeleteSkill(skill: SkillRecord) {
     if (skill.userId !== normalizedUserId) return;

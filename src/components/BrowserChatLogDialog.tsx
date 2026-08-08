@@ -14,6 +14,7 @@ import {
 import { formatLogTime, formatToolPayload, parseJsonObjectText, phaseLabel } from '@/components/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
 import { asRecord, finiteNumber } from '@/lib/unknown-value';
+import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 
 type Translator = ReturnType<typeof useI18n>['t'];
 
@@ -366,14 +367,15 @@ export function BrowserChatLogDialog({
   summaryEntries: BrowserChatLogDialogRecord[];
 }) {
   const { t } = useI18n();
+  useEscapeDismiss(true, onClose);
   const summary = summarizeBrowserChatLogs(entries);
   const totals = summarizeBrowserChatExecutionTotals(summaryEntries);
   return (
     <div className="ui-modal-overlay" onClick={onClose} role="presentation">
-      <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('执行日志')}>
+      <section aria-labelledby="browser-chat-log-dialog-title" aria-modal="true" className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog">
         <header className="ui-modal-header">
           <div className="ui-modal-heading">
-            <h2 className="ui-modal-title">{t('执行日志')}</h2>
+            <h2 className="ui-modal-title" id="browser-chat-log-dialog-title">{t('执行日志')}</h2>
             <p className="ui-modal-subtitle">{messageContent || t('当前 AI 消息')}</p>
           </div>
           <button className="ui-icon-button ui-modal-close" onClick={onClose} type="button" aria-label={t('关闭')}>

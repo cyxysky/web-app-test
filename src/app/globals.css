@@ -258,21 +258,14 @@ select {
   font-size: 13px;
   font-weight: 400;
   gap: 0;
-  left: 0;
   line-height: 20px;
   max-height: min(360px, var(--custom-select-menu-max-height, 360px));
   overflow: hidden;
   padding: 4px;
-  position: absolute;
-  right: 0;
-  top: calc(100% + 6px);
   transform-origin: top center;
-  z-index: 1200;
 }
 
-.custom-select-menu--up {
-  bottom: calc(100% + 6px);
-  top: auto;
+.custom-select-menu[data-floating-placement="top"] {
   transform-origin: bottom center;
 }
 
@@ -285,11 +278,11 @@ select {
   pointer-events: none;
 }
 
-.custom-select-menu--up.open {
+.custom-select-menu[data-floating-placement="top"].open {
   animation-name: custom-select-open-up;
 }
 
-.custom-select-menu--up.closing {
+.custom-select-menu[data-floating-placement="top"].closing {
   animation-name: custom-select-close-up;
 }
 
@@ -624,19 +617,6 @@ select {
   font-weight: 850;
   gap: 6px;
   padding: 0;
-}
-
-.ui-modal--compact {
-  width: min(92vw, 460px);
-}
-
-.ui-modal--wide {
-  width: min(92vw, 1180px);
-}
-
-.ui-modal--skill {
-  height: calc(100dvh - 48px);
-  width: min(92vw, 1180px);
 }
 
 .ui-modal-header,
@@ -1430,21 +1410,6 @@ select {
   font-weight: 900;
 }
 
-.settings-toggle span {
-  background: #ffffff;
-  box-shadow: 0 2px 8px rgba(13, 13, 13, 0.16);
-  border-radius: 999px;
-  height: 24px;
-  transform: translateX(0);
-  transition: transform 0.16s ease, background 0.16s ease;
-  width: 24px;
-}
-
-.settings-toggle.on span {
-  background: #ffffff;
-  transform: translateX(24px);
-}
-
 .settings-toggle:disabled {
   cursor: not-allowed;
   opacity: 0.55;
@@ -1828,10 +1793,6 @@ select {
 
 .personal-memory-field .custom-select {
   z-index: 1;
-}
-
-.personal-memory-field .custom-select:has(.custom-select-menu.open) {
-  z-index: 80;
 }
 
 .personal-memory-field textarea {
@@ -2639,11 +2600,6 @@ select {
     padding: 12px;
   }
 
-  .ui-modal--skill {
-    height: calc(100dvh - 24px);
-    width: calc(100vw - 24px);
-  }
-
   .skills-manager-form {
     padding: 16px;
   }
@@ -2733,14 +2689,10 @@ select {
   border-radius: 8px;
   box-shadow: var(--shadow-lg);
   color: var(--foreground);
-  margin-top: 10px;
   max-height: min(520px, calc(100vh - 88px));
   overflow: hidden;
-  position: absolute;
-  right: 0;
-  top: 100%;
   transform-origin: top right;
-  width: min(var(--browser-chat-download-panel-width, 380px), calc(100vw - 48px));
+  width: min(380px, calc(100vw - 48px));
 }
 
 .browser-chat-group-binding-popover header {
@@ -2830,15 +2782,11 @@ select {
   color: var(--foreground);
   display: flex;
   flex-direction: column;
-  margin-top: 10px;
   max-height: min(520px, calc(100vh - 88px));
   overflow: hidden;
   pointer-events: auto;
-  position: absolute;
-  right: 0;
-  top: 100%;
   transform-origin: top right;
-  width: min(var(--browser-chat-download-panel-width, 380px), calc(100vw - 48px));
+  width: min(380px, calc(100vw - 48px));
 }
 
 @keyframes browser-chat-download-popover-in {
@@ -3141,16 +3089,6 @@ select {
   position: relative;
 }
 
-.browser-chat-overflow[open] {
-  z-index: 1000;
-}
-
-.browser-chat-recent-header:has(.browser-chat-overflow[open]),
-.browser-chat-recent-list li:has(.browser-chat-overflow[open]) {
-  position: relative;
-  z-index: 1000;
-}
-
 .browser-chat-overflow>summary {
   align-items: center;
   border-radius: 7px;
@@ -3182,11 +3120,6 @@ select {
   gap: 2px;
   min-width: 168px;
   padding: 5px;
-  position: absolute;
-  right: 0;
-  top: calc(100% + 5px);
-  transform-origin: top right;
-  z-index: 1001;
 }
 
 .browser-chat-overflow[open]>.browser-chat-overflow-menu {
@@ -3376,10 +3309,6 @@ select {
 .browser-chat-recent-item.active .browser-chat-recent-row-menu,
 .browser-chat-recent-row-menu[open] {
   opacity: 1;
-}
-
-.browser-chat-recent-row-menu .browser-chat-overflow-menu {
-  top: calc(100% + 2px);
 }
 
 .browser-chat-recent-list small {
@@ -5959,11 +5888,9 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   white-space: nowrap;
 }
 
-.browser-chat-provider-select .custom-select-menu {
-  left: auto;
+.browser-chat-provider-select-menu {
   max-width: min(336px, calc(100vw - 24px));
   min-width: min(336px, calc(100vw - 24px));
-  right: 0;
 }
 
 .browser-chat-stop {
@@ -6176,24 +6103,6 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
 
 :root[data-theme="dark"] .settings-card .settings-row:last-child {
   border-bottom: 0;
-}
-
-:root[data-theme="dark"] .settings-toggle {
-  background: color-mix(in srgb, var(--panel-warm) 84%, #000000);
-  border-color: var(--border-strong);
-}
-
-:root[data-theme="dark"] .settings-toggle span {
-  background: #cbd5e1;
-}
-
-:root[data-theme="dark"] .settings-toggle.on {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-
-:root[data-theme="dark"] .settings-toggle.on span {
-  background: #ffffff;
 }
 
 :root[data-theme="dark"] :where(.badge) {
@@ -6521,7 +6430,7 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   background: rgba(255, 255, 255, 0.18);
 }
 
-:root[data-theme="dark"] :where(.theme-color-picker label>span, .settings-toggle span) {
+:root[data-theme="dark"] .theme-color-picker label>span {
   box-shadow: inset 0 0 0 1px rgba(245, 245, 246, 0.16);
 }
 
@@ -7059,10 +6968,6 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
 .browser-chat-mode-selector-trigger > svg.is-open { transform: rotate(180deg); }
 
 .browser-chat-mode-selector-menu {
-  position: absolute;
-  bottom: calc(100% + 7px);
-  left: 0;
-  z-index: 70;
   box-sizing: border-box;
   width: 226px;
   max-width: calc(100vw - 28px);
@@ -7410,8 +7315,6 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
   animation: ui-check-in var(--motion-normal) var(--ease-spring) both;
 }
 
-.settings-toggle,
-.settings-toggle span,
 .browser-chat-embedded-chat-toggle svg,
 .custom-select-button svg {
   transition:

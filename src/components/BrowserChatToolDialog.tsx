@@ -5,6 +5,7 @@ import { BrowserChatPayloadDetails } from '@/components/BrowserChatPayloadDetail
 import { formatToolPayload } from '@/components/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
 import { artifactApiUrl } from '@/lib/artifacts';
+import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
@@ -50,6 +51,7 @@ export function BrowserChatToolDialog({
   toolLabel: (name: string) => string;
 }) {
   const { t } = useI18n();
+  useEscapeDismiss(true, onClose);
   const toolName = toolLabel(detail.tool.name);
   const status = toolStatusLabel(detail.tool, detail.step);
   const emptyPayloadLabel = t('无');
@@ -62,10 +64,10 @@ export function BrowserChatToolDialog({
 
   return (
     <div className="ui-modal-overlay" onClick={onClose} role="presentation">
-      <section className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-label={t('工具调用详情')}>
+      <section aria-labelledby="browser-chat-tool-dialog-title" aria-modal="true" className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog">
         <header className="ui-modal-header">
           <div className="ui-modal-heading">
-            <h2 className="ui-modal-title" title={detail.tool.name}>{toolName}</h2>
+            <h2 className="ui-modal-title" id="browser-chat-tool-dialog-title" title={detail.tool.name}>{toolName}</h2>
             <p className="ui-modal-subtitle">
               {t('步骤 {step} · 工具调用 {index}', { step: detail.stepIndex, index: detail.toolIndex + 1 })}
             </p>

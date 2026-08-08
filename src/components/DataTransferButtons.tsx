@@ -4,6 +4,7 @@ import { useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Download, Loader2, ShieldCheck, Upload, X } from 'lucide-react';
 import { useI18n } from '@/i18n/I18nProvider';
+import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { readApiJson } from '@/lib/api-client';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
@@ -148,6 +149,8 @@ export function DataTransferButtons({
     setPassphrase('');
     setPassphraseConfirmation('');
   }
+
+  useEscapeDismiss(Boolean(passphraseModal), closePassphraseModal);
 
   async function submitPassphrase() {
     if (!passphraseModal) return;

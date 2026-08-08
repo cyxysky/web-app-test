@@ -5,6 +5,7 @@ import { createPortal } from 'react-dom';
 import { KeyRound, Loader2, Save, ShieldCheck, X } from 'lucide-react';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
+import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 export type LoginAccountMetadata = {
@@ -76,14 +77,9 @@ export function LoginAccountModal({
     setError('');
   }, [account, initialDomain, initialLabel, initialLoginUrl, initialUsername, open]);
 
-  useEffect(() => {
-    if (!open) return undefined;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !saving) onClose();
-    };
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [onClose, open, saving]);
+  useEscapeDismiss(open && portalReady, () => {
+    if (!saving) onClose();
+  });
 
   if (!open || !portalReady) return null;
   const editing = Boolean(account);

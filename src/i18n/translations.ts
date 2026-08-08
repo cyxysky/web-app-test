@@ -1177,6 +1177,8 @@ const en: Record<string, string> = {
   '最近访问': 'Recent visits',
   '最近一次截图耗时：{time} ms': 'Latest capture time: {time} ms',
   '筛选对话历史': 'Filter chat history',
+  '对话历史': 'Chat history',
+  '关闭对话历史': 'Close chat history',
   '筛选对话': 'Filter chats',
   '清空对话筛选': 'Clear chat filter',
   '更多操作': 'More actions',

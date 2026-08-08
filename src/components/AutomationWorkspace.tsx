@@ -31,6 +31,7 @@ import { CustomSelect } from '@/components/CustomSelect';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import { useI18n } from '@/i18n/I18nProvider';
+import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import type { Language } from '@/i18n/translations';
 import { readApiJson } from '@/lib/api-client';
 import { artifactApiUrl } from '@/lib/artifacts';
@@ -697,6 +698,8 @@ export function AutomationWorkspace({
     setFormError('');
   }
 
+  useEscapeDismiss(Boolean(dialog), closeDialog);
+
   function openDeleteCaseDialog(automationCase: AutomationCase) {
     setCasePendingDelete(automationCase);
     setDialog('deleteCase');
@@ -1067,7 +1070,7 @@ export function AutomationWorkspace({
           </div>
 
           {loading && !cases.length ? (
-            <section className="automation-loading-state">
+            <section aria-live="polite" className="automation-loading-state" role="status">
               <LiquidGlassLoader />
               <div>
                 <h2>{t('正在加载自动化任务')}</h2>
@@ -1197,6 +1200,7 @@ export function AutomationWorkspace({
                           <div className="automation-run-list">
                             {selectedCaseRuns.map((run) => {
                               const runExpanded = openRunIds.includes(run.id);
+                              const runTraceId = `automation-run-trace-${run.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
                               const active = activeRunStatuses.has(run.status);
                               const repairedSteps = run.steps.filter((step) => step.status === 'repaired' && step.name !== 'finalVerification').length;
                               const duration = formatDuration(t, run.startedAt, run.finishedAt);
@@ -1204,6 +1208,7 @@ export function AutomationWorkspace({
                                 <article className={`automation-run-item automation-run-state-${run.status}`} key={run.id}>
                                   <div className="automation-run-summary">
                                     <button
+                                      aria-controls={runTraceId}
                                       aria-expanded={runExpanded}
                                       className="automation-run-expand"
                                       onClick={() => setOpenRunIds((current) => current.includes(run.id) ? [] : [run.id])}
@@ -1253,7 +1258,7 @@ export function AutomationWorkspace({
                                     </div>
                                   </div>
                                   {runExpanded ? (
-                                    <div className="automation-run-trace">
+                                    <div className="automation-run-trace" id={runTraceId}>
                                       <div className="automation-trace-heading">
                                         <h4>{t('执行轨迹')}</h4>
                                         <span>{run.finishedAt
