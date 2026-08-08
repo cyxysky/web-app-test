@@ -2525,7 +2525,7 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
       }}
       open={isActive || hasProblem || undefined}
     >
-      <summary aria-label={title} className={`browser-chat-tool-card browser-chat-ai-tool-summary-card${className}`} title={title}>
+      <summary aria-label={title} className={`browser-chat-tool-card browser-chat-ai-tool-summary-card${className}`}>
         {cardContent}
         {loadingRecords ? <Loader2 className="spin" size={13} /> : null}
         <ChevronDown className="browser-chat-ai-tool-chevron" size={13} />
@@ -2661,7 +2661,6 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                 aria-label={`${displayText}，${translatedStatus}`}
                 className={`browser-chat-tool-card${stateClass}`}
                 onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
-                title={`${displayText} · ${translatedStatus}`}
                 type="button"
               >
                 <BrowserChatToolCardContent label={label} meta={meta} name={tool.name} userAction={userAction} />
@@ -2817,9 +2816,9 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                   />
                 ) : (
                   <button
+                    aria-label={`${label}${meta ? ` - ${meta}` : ''}`}
                     className={`browser-chat-tool-card browser-chat-ai-call-card${stateClass}`}
                     onClick={() => onSelectTool(toolDetail)}
-                    title={`${label}${meta ? ` - ${meta}` : ''}`}
                     type="button"
                   >
                     {card}
@@ -3393,10 +3392,6 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
         aria-hidden={!expanded}
         className="browser-chat-process-body-shell"
         inert={!expanded}
-        onTransitionEnd={(event) => {
-          if (event.currentTarget !== event.target || event.propertyName !== 'grid-template-rows') return;
-          if (!desiredExpandedRef.current) setBodyMounted(false);
-        }}
       >
         {bodyMounted ? <div className="browser-chat-process-body">{children}</div> : null}
       </div>

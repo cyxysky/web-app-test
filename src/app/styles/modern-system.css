@@ -15,20 +15,20 @@ html {
 }
 
 :root[data-theme="dark"] {
-  --background: #171715;
-  --foreground: #f3f3ef;
-  --muted: #92928c;
-  --muted-strong: #c6c6bf;
+  --background: #000000;
+  --foreground: #f5f5f5;
+  --muted: #a3a3a3;
+  --muted-strong: #d4d4d4;
   --muted-foreground: var(--muted);
-  --border: #32322f;
-  --border-strong: #474741;
-  --panel: #20201e;
-  --panel-soft: #1b1b19;
-  --panel-warm: #2a2a27;
-  --panel-elevated: #242421;
-  --sidebar: #141412;
-  --sidebar-hover: #242421;
-  --sidebar-active: #2c2c28;
+  --border: #262626;
+  --border-strong: #404040;
+  --panel: #000000;
+  --panel-soft: #0a0a0a;
+  --panel-warm: #171717;
+  --panel-elevated: #0a0a0a;
+  --sidebar: #000000;
+  --sidebar-hover: #171717;
+  --sidebar-active: #222222;
   --accent: #56c7a8;
   --accent-hover: #6bd1b4;
   --accent-strong: #72d7ba;
@@ -36,18 +36,16 @@ html {
   --accent-border: color-mix(in srgb, var(--accent) 34%, var(--border));
   --action-bg: var(--accent-strong);
   --action-bg-hover: color-mix(in srgb, var(--accent-strong) 88%, #ffffff);
-  --focus-ring: #72d7ba;
+  --focus-ring: var(--accent-strong);
   --danger: #f87171;
   --warning: #fbbf24;
   --success: #34d399;
-  --body-gradient:
-    radial-gradient(circle at 50% -18%, rgba(86, 199, 168, 0.05), transparent 36%),
-    linear-gradient(180deg, rgba(38, 38, 35, 0.42), rgba(23, 23, 21, 0) 320px);
+  --body-gradient: linear-gradient(transparent, transparent);
   --overlay: rgba(0, 0, 0, 0.58);
-  --code-panel: #080b11;
-  --code-foreground: #e5e7eb;
-  --inverse-panel: #f5f5f6;
-  --inverse-foreground: #0f1115;
+  --code-panel: #050505;
+  --code-foreground: #f5f5f5;
+  --inverse-panel: #ffffff;
+  --inverse-foreground: #000000;
   --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.28);
   --shadow-sm: 0 6px 18px rgba(0, 0, 0, 0.28);
   --shadow-soft: 0 18px 56px rgba(0, 0, 0, 0.34);
@@ -725,6 +723,15 @@ input[type="checkbox"]:focus-visible {
   box-shadow: var(--modal-shadow);
 }
 
+.ui-modal.admin-settings-password-dialog {
+  width: min(100%, 520px);
+}
+
+.ui-modal.ui-modal--wide,
+.ui-modal.ui-modal--skill {
+  width: min(100%, 1180px);
+}
+
 .ui-modal-header,
 .ui-modal > header,
 .ui-modal-footer {
@@ -922,12 +929,16 @@ input[type="checkbox"]:focus-visible {
   border-radius: 999px;
   cursor: pointer;
   display: inline-flex;
-  height: 32px;
+  flex: 0 0 auto;
+  height: 30px;
+  justify-content: flex-start;
+  overflow: hidden;
   padding: 3px;
-  width: 56px;
+  width: 52px;
   transition:
     background-color var(--motion-normal) ease,
     border-color var(--motion-normal) ease,
+    box-shadow var(--motion-normal) ease,
     color var(--motion-fast) ease,
     transform var(--motion-normal) var(--ease-emphasized);
   background: var(--panel-warm);
@@ -935,9 +946,27 @@ input[type="checkbox"]:focus-visible {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, #ffffff 18%, transparent);
 }
 
+.settings-toggle span {
+  flex: 0 0 22px;
+  height: 22px;
+  transform: translateX(0);
+  width: 22px;
+}
+
 .settings-toggle.on {
   background: var(--action-bg);
   border-color: var(--action-bg);
+}
+
+.settings-toggle.on span {
+  transform: translateX(22px);
+}
+
+.settings-toggle:focus-visible {
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--focus-ring) 18%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, #ffffff 18%, transparent);
+  outline: none;
 }
 
 .skills-manager-list,
@@ -2468,7 +2497,7 @@ input[type="checkbox"]:focus-visible {
 /* Dark theme stays token-driven. */
 :root[data-theme="dark"] .browser-chat-sidebar {
   box-shadow: none;
-  background: color-mix(in srgb, var(--panel-soft) 90%, var(--panel));
+  background: var(--sidebar);
   border-right-color: var(--border);
 }
 
@@ -4662,6 +4691,96 @@ input[type="checkbox"]:focus-visible {
   }
 }
 
+/* Conversation interaction polish. */
+@media (hover: hover) {
+  .browser-chat-message.assistant .browser-chat-message-actions {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(2px);
+    transition: opacity 140ms ease, transform 140ms ease;
+  }
+
+  .browser-chat-message.assistant:hover .browser-chat-message-actions,
+  .browser-chat-message.assistant .browser-chat-message-actions:focus-within {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .browser-chat-message.assistant .browser-chat-message-actions {
+    opacity: 1;
+  }
+}
+
+.browser-chat-tool-card:not(.is-running, .is-failed, .is-waiting):hover,
+.browser-chat-ai-call-card:not(.is-running, .is-failed, .is-waiting):hover {
+  background: var(--panel-soft);
+  border-color: var(--border-strong);
+  box-shadow: none;
+  color: var(--foreground);
+  transform: none;
+}
+
+/* Use one collapse animation path. Avoiding the nested translate and
+ * content-visibility recalculation removes the small hitch at the end. */
+.browser-chat-process-body-shell {
+  overflow: clip;
+  transition:
+    grid-template-rows 190ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 130ms ease,
+    visibility 0s linear 190ms;
+}
+
+.browser-chat-process-disclosure.is-expanded .browser-chat-process-body-shell {
+  transition:
+    grid-template-rows 190ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 150ms ease,
+    visibility 0s linear;
+}
+
+.browser-chat-process-body,
+.browser-chat-process-disclosure.is-expanded .browser-chat-process-body {
+  transform: none;
+  transition: none;
+}
+
+.browser-chat-process-body :is(.browser-chat-agent-step, .browser-chat-executed-entry) {
+  contain-intrinsic-size: none;
+  content-visibility: visible;
+}
+
+/* Theme is always a trailing icon action. */
+.browser-chat-sidebar-footer {
+  align-items: center;
+  display: flex;
+  justify-content: flex-end;
+}
+
+html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-toggle {
+  flex: 0 0 36px;
+  gap: 0;
+  height: 36px;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0;
+  width: 36px;
+}
+
+.browser-chat-theme-toggle span {
+  display: none !important;
+}
+
+@media (hover: none), (pointer: coarse) {
+  html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-toggle {
+    flex-basis: 44px;
+    height: 44px;
+    min-height: 44px;
+    width: 44px;
+  }
+}
+
 /* Scoped Codex-style refinement: application chrome, settings, automation,
  * embedded browser, and their tablet/touch layouts only. */
 
@@ -4773,7 +4892,7 @@ input[type="checkbox"]:focus-visible {
   background: var(--panel);
   border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
   border-radius: 14px;
-  box-shadow: 0 1px 2px rgba(20, 20, 18, 0.025);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.025);
   height: calc(100% - 16px);
   margin: 8px 8px 8px 0;
 }

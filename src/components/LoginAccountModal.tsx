@@ -168,7 +168,7 @@ export function LoginAccountModal({
           <div className="resource-sharing-field wide">
             <div>
               <strong>{t('所有 ID 共享')}</strong>
-              <small>{t('其他 ID 可以调用此账号，但只有创建 ID {id} 可以编辑或删除', { id: account?.userId || '当前用户' })}</small>
+              <small>{t('其他 ID 可以调用此账号，但只有创建 ID {id} 可以编辑或删除', { id: account?.userId || t('当前用户') })}</small>
             </div>
             <button aria-pressed={shared} className={`settings-toggle${shared ? ' on' : ''}`} disabled={saving} onClick={() => setShared((value) => !value)} type="button">
               <span />

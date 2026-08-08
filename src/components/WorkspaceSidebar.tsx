@@ -11,7 +11,6 @@ type WorkspaceSidebarProps = {
   collapseLabel: string;
   onToggleCollapse: () => void;
   onToggleTheme: () => void;
-  showThemeLabel?: boolean;
   themeMode: ThemeMode;
   themeToggleLabel: string;
   themeToggleTitle: string;
@@ -50,7 +49,6 @@ export function WorkspaceSidebar({
   collapseLabel,
   onToggleCollapse,
   onToggleTheme,
-  showThemeLabel = false,
   themeMode,
   themeToggleLabel,
   themeToggleTitle,
@@ -81,7 +79,6 @@ export function WorkspaceSidebar({
           type="button"
         >
           {themeMode === 'dark' ? <Sun aria-hidden="true" size={17} /> : <Moon aria-hidden="true" size={17} />}
-          {showThemeLabel ? <span>{themeToggleTitle}</span> : null}
         </button>
       </div>
     </aside>

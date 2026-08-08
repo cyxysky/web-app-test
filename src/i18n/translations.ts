@@ -1472,6 +1472,23 @@ const en: Record<string, string> = {
   '自动化用例 {id}': 'Automation case {id}',
   '计划 {id}': 'Schedule {id}',
   '自动运行 {id}': 'Scheduled run {id}',
+  '{count} 个步骤': '{count} steps',
+  '从当前对话中选择要提炼的消息': 'Select messages from the current conversation to extract',
+  '读取环境配置失败': 'Failed to load environment settings',
+  '对话消息': 'Conversation messages',
+  '将按消息顺序合并 {count} 条记录': '{count} records will be merged in message order',
+  '例如：总结为需求提交流程，重点保留版本选择、必填字段和异常处理。': 'Example: Summarize the request submission flow, focusing on version selection, required fields, and error handling.',
+  '请填写 Skill 总结方向': 'Enter a summary focus for the Skill',
+  '请至少选择一条包含执行步骤的 AI 消息': 'Select at least one AI message that contains execution steps',
+  '说明希望 Skill 聚焦的任务、关键步骤或判断逻辑': 'Describe the task, key steps, or decision logic the Skill should focus on',
+  '已选 {selected}/{total}': '{selected}/{total} selected',
+  '正在加载工具记录': 'Loading tool records',
+  '正在加载用例': 'Loading cases',
+  '正在加载子 Agent 工具记录': 'Loading sub-agent tool records',
+  '正在定位对话': 'Locating conversation',
+  '正在生成': 'Generating',
+  '总结方向': 'Summary focus',
+  '当前用户': 'current user',
 };
 
 const reverseEn = Object.entries(en).reduce<Record<string, string>>((acc, [source, translated]) => {

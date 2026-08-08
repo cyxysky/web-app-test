@@ -899,7 +899,7 @@ select {
 
 .browser-chat-message-generation-item input {
   appearance: none;
-  background: var(--panel);
+  background-color: var(--panel);
   border: 1px solid color-mix(in srgb, var(--muted) 56%, var(--border));
   border-radius: 5px;
   cursor: pointer;
@@ -910,20 +910,12 @@ select {
 }
 
 .browser-chat-message-generation-item input:checked {
-  background: var(--accent-strong);
+  background-color: var(--accent-strong);
   border-color: var(--accent-strong);
 }
 
 .browser-chat-message-generation-item input:checked::after {
-  border: solid white;
-  border-width: 0 1.5px 1.5px 0;
-  content: '';
-  height: 8px;
-  left: 5px;
-  position: absolute;
-  top: 2px;
-  transform: rotate(45deg);
-  width: 4px;
+  content: none;
 }
 
 .browser-chat-message-generation-content {

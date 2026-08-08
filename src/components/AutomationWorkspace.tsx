@@ -919,7 +919,6 @@ export function AutomationWorkspace({
         collapseLabel={t(sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏')}
         onToggleCollapse={toggleSidebar}
         onToggleTheme={toggleMode}
-        showThemeLabel
         themeMode={themeMode}
         themeToggleLabel={t(themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式')}
         themeToggleTitle={t(themeMode === 'dark' ? '浅色模式' : '深色模式')}
