@@ -132,7 +132,9 @@ Then set:
 BROWSER_CDP_ENDPOINT=http://127.0.0.1:9222
 ```
 
-You can also set `BROWSER_USER_DATA_DIR` to let Playwright launch a persistent browser profile when a CDP endpoint is not configured.
+When CDP is not configured, browser chats automatically use one persistent Chromium profile per application user. Cookies, local storage, and IndexedDB therefore survive the three-minute idle browser recycle in headless mode. You can set `BROWSER_USER_DATA_DIR` to override the profile root.
+
+Open-tab state is restored by the application rather than Chromium's native tab-group/session UI: each conversation persists its URLs, order, active tab, and logical group in SQLite, then rebuilds those tabs when that conversation next starts. Native colored tab groups remain a headed-browser-only enhancement.
 
 During Agent execution, `getHttpRequests` is available as a read-only diagnostic tool for the current tab. The Agent can use it to verify API status codes, failed requests, and missing-resource evidence before deciding the next browser action.
 

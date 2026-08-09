@@ -42,7 +42,7 @@ test('browser preview exposes H.264 video transport with 2K and 4K encoder setti
   assert.equal(runtimeEnvDefinition('BROWSER_PROFILE_MEDIA_CACHE_MB'), undefined);
 
   const idleTimeout = runtimeEnvDefinition('BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS');
-  assert.equal(idleTimeout?.defaultValue, '600000');
+  assert.equal(idleTimeout?.defaultValue, '180000');
   assert.equal(idleTimeout?.min, 60000);
   assert.equal(idleTimeout?.max, 86400000);
 

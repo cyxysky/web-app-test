@@ -1073,6 +1073,14 @@ export type BrowserTabSnapshot = {
   groupId: string;
 };
 
+export type BrowserTabRestoreResult = {
+  attempted: number;
+  created: number;
+  restored: number;
+  failedUrls: string[];
+  tabs: BrowserTabSnapshot[];
+};
+
 export type BrowserScreencastFrame = {
   data: string;
   contentType: 'image/jpeg' | 'image/png';
@@ -4692,10 +4700,10 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
   const closeImmediately = force || process.env.BROWSER_CLOSE_SHARED_WHEN_IDLE === 'true';
   if (!closeImmediately) {
     if (!sharedBrowserState.idleTimer) {
-      const configured = Number(process.env.BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS || 10 * 60 * 1000);
+      const configured = Number(process.env.BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
       const timeoutMs = Number.isFinite(configured)
         ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
-        : 10 * 60 * 1000;
+        : 3 * 60 * 1000;
       sharedBrowserState.idleTimer = setTimeout(() => {
         sharedBrowserState.idleTimer = undefined;
         void closeIdleSharedBrowser(runtimeKey, sharedBrowserState, true);
@@ -5012,15 +5020,22 @@ export class BrowserSession {
     this.usesSessionGroupPageSelection = useSessionGroupPageSelection;
     const restoreLastSession = tabGrouperEnabled && process.env.BROWSER_RESTORE_LAST_SESSION !== 'false';
     const autoTabGroupProfileKey = browserProfileKey || (useSharedBrowserTabs ? 'shared' : this.pageGroupId);
-    const autoTabGroupProfileDir = tabGrouperEnabled && !cdpEndpoint && !requestedUserDataDir
+    // A user-scoped profile must remain persistent in headless runtimes too.
+    // Native tab groups still require a visible browser, but cookies, local
+    // storage, IndexedDB, and the application-level tab snapshot do not.
+    const autoManagedProfileDir = !isolated
+      && !cdpEndpoint
+      && !requestedUserDataDir
+      && (Boolean(browserProfileKey) || tabGrouperEnabled)
       ? sessionTabGrouperProfileDir(autoTabGroupProfileKey)
       : '';
+    const autoTabGroupProfileDir = tabGrouperEnabled ? autoManagedProfileDir : '';
     const autoTabGroupDebugPort = (autoTabGroupProfileDir || (tabGrouperEnabled && browserProfileKey && !cdpEndpoint))
       ? sessionTabGrouperDebugPort(autoTabGroupProfileKey)
       : undefined;
     const autoTabGroupCdpEndpoint = cdpEndpointForPort(autoTabGroupDebugPort);
-    const userDataDir = requestedUserDataDir || autoTabGroupProfileDir;
-    this.managedProfileDir = autoTabGroupProfileDir || undefined;
+    const userDataDir = requestedUserDataDir || autoManagedProfileDir;
+    this.managedProfileDir = autoManagedProfileDir || undefined;
     if (userDataDir) await mkdir(userDataDir, { recursive: true });
     const launchOptions: LaunchOptions = {
       headless,
@@ -5739,6 +5754,82 @@ export class BrowserSession {
       active: page === active,
       groupId: this.pageGroupId,
     }));
+  }
+
+  async restoreTabsFromSnapshot(savedTabs: BrowserTabSnapshot[]): Promise<BrowserTabRestoreResult> {
+    this.ensureLivePreviewState();
+    const context = this.context;
+    if (!context) {
+      return { attempted: 0, created: 0, restored: 0, failedUrls: [], tabs: [] };
+    }
+    const requested = savedTabs
+      .filter((tab) => !tab.groupId || normalizePageGroupId(tab.groupId) === this.pageGroupId)
+      .map((tab, position) => ({
+        ...tab,
+        position,
+        url: String(tab.url || '').trim(),
+      }))
+      .filter((tab) => tab.url && !isBlankBrowserUrlLike(tab.url) && !/^(?:blob|javascript):/i.test(tab.url))
+      .sort((left, right) => left.index - right.index || left.position - right.position);
+    if (!requested.length) {
+      return { attempted: 0, created: 0, restored: 0, failedUrls: [], tabs: this.getTabsSnapshot() };
+    }
+
+    await this.refreshSessionGroupPages({ forceNativeRefresh: true });
+    const availablePages = this.sessionPages();
+    const unusedPages = new Set(availablePages);
+    const restoredPages: Array<Page | undefined> = [];
+    const failedUrls: string[] = [];
+    let created = 0;
+    const navigationTimeoutMs = boundedPositiveIntegerEnv('BROWSER_TAB_RESTORE_TIMEOUT_MS', 15_000, 1_000, 60_000);
+
+    for (const tab of requested) {
+      const matching = [...unusedPages].find((page) => page.url() === tab.url);
+      if (matching) {
+        unusedPages.delete(matching);
+        restoredPages.push(matching);
+        continue;
+      }
+
+      const blank = [...unusedPages].find((page) => isBlankPage(page));
+      const page = blank || await context.newPage();
+      if (blank) unusedPages.delete(blank);
+      else created += 1;
+      this.claimPage(page, { makeActive: false });
+      await this.ensurePageGroup(page);
+      let navigationFailed = false;
+      try {
+        await page.goto(tab.url, { waitUntil: 'commit', timeout: navigationTimeoutMs });
+      } catch {
+        navigationFailed = true;
+        if (isBlankPage(page)) {
+          failedUrls.push(tab.url);
+          restoredPages.push(undefined);
+          continue;
+        }
+      }
+      if (navigationFailed) failedUrls.push(tab.url);
+      await this.ensurePageGroup(page);
+      restoredPages.push(page);
+    }
+
+    await Promise.all(
+      [...unusedPages]
+        .filter((page) => isBlankPage(page))
+        .map((page) => page.close().catch(() => undefined)),
+    );
+
+    const activeIndex = requested.findIndex((tab) => tab.active);
+    const activePage = restoredPages[activeIndex >= 0 ? activeIndex : 0]
+      || restoredPages.find((page): page is Page => Boolean(page));
+    if (activePage) await this.activateSessionPage(activePage).catch(() => undefined);
+    return {
+      attempted: requested.length,
+      created,
+      restored: restoredPages.filter((page): page is Page => Boolean(page)).length,
+      failedUrls,
+      tabs: this.getTabsSnapshot(),
+    };
   }
 
   private async refreshSessionGroupPages(options: { forceNativeRefresh?: boolean } = {}) {

@@ -21,6 +21,8 @@ ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 ENV HEADLESS_BROWSER=true
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV APP_DATA_DIR=/app
+ENV ARTIFACTS_DIR=/app/artifacts
 
 COPY --from=build /app/package*.json ./
 COPY --from=build /app/node_modules ./node_modules

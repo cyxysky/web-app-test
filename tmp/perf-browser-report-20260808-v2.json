@@ -1,0 +1,124 @@
+{
+  "generatedAt": "2026-08-08T14:27:38.814Z",
+  "hardware": {
+    "logicalProcessors": 16,
+    "totalMemoryGiB": 31.43
+  },
+  "workload": {
+    "activeRounds": 6,
+    "conversationsPerUser": 2,
+    "headless": true,
+    "screenshotRounds": 2,
+    "successfulBrowserSessions": 20,
+    "totalConversations": 20,
+    "users": 10
+  },
+  "errors": {
+    "launch": [],
+    "operation": []
+  },
+  "observedProcessNames": [
+    "chrome-headless-shell",
+    "node"
+  ],
+  "phases": {
+    "baseline": {
+      "chromeProcessPeak": 0,
+      "cpuCoreEquivalentMean": 0.012,
+      "cpuCoreEquivalentPeak1s": 0.06,
+      "cpuPercentOfMachineMean": 0.08,
+      "cpuPercentOfMachinePeak1s": 0.38,
+      "privateMemoryAvgMiB": 282.4,
+      "privateMemoryPeakMiB": 297,
+      "processCountPeak": 1,
+      "sampleCount": 7,
+      "workingSetAvgMiB": 268.7,
+      "workingSetP95MiB": 281.9,
+      "workingSetPeakMiB": 281.9
+    },
+    "idle_20_conversations": {
+      "chromeProcessPeak": 0,
+      "cpuCoreEquivalentMean": 0.029,
+      "cpuCoreEquivalentPeak1s": 0.121,
+      "cpuPercentOfMachineMean": 0.18,
+      "cpuPercentOfMachinePeak1s": 0.75,
+      "privateMemoryAvgMiB": 212,
+      "privateMemoryPeakMiB": 217.9,
+      "processCountPeak": 1,
+      "sampleCount": 6,
+      "workingSetAvgMiB": 200,
+      "workingSetP95MiB": 205.9,
+      "workingSetPeakMiB": 205.9
+    },
+    "launch_20_conversations": {
+      "chromeProcessPeak": 73,
+      "cpuCoreEquivalentMean": 2.255,
+      "cpuCoreEquivalentPeak1s": 2.255,
+      "cpuPercentOfMachineMean": 14.09,
+      "cpuPercentOfMachinePeak1s": 14.09,
+      "privateMemoryAvgMiB": 1408.6,
+      "privateMemoryPeakMiB": 1727.3,
+      "processCountPeak": 74,
+      "sampleCount": 2,
+      "workingSetAvgMiB": 2841.4,
+      "workingSetP95MiB": 3570,
+      "workingSetPeakMiB": 3570
+    },
+    "steady_20_open_conversations": {
+      "chromeProcessPeak": 80,
+      "cpuCoreEquivalentMean": 0.037,
+      "cpuCoreEquivalentPeak1s": 0.167,
+      "cpuPercentOfMachineMean": 0.23,
+      "cpuPercentOfMachinePeak1s": 1.04,
+      "privateMemoryAvgMiB": 2202.5,
+      "privateMemoryPeakMiB": 2202.8,
+      "processCountPeak": 81,
+      "sampleCount": 10,
+      "workingSetAvgMiB": 4748,
+      "workingSetP95MiB": 4749.1,
+      "workingSetPeakMiB": 4749.1
+    },
+    "active_dom_and_screenshot": {
+      "chromeProcessPeak": 80,
+      "cpuCoreEquivalentMean": 0.767,
+      "cpuCoreEquivalentPeak1s": 2.541,
+      "cpuPercentOfMachineMean": 4.79,
+      "cpuPercentOfMachinePeak1s": 15.88,
+      "privateMemoryAvgMiB": 2603.4,
+      "privateMemoryPeakMiB": 2706.5,
+      "processCountPeak": 81,
+      "sampleCount": 10,
+      "workingSetAvgMiB": 5448.7,
+      "workingSetP95MiB": 5622.6,
+      "workingSetPeakMiB": 5622.6
+    },
+    "closing": {
+      "chromeProcessPeak": 0,
+      "cpuCoreEquivalentMean": 0,
+      "cpuCoreEquivalentPeak1s": 0,
+      "cpuPercentOfMachineMean": 0,
+      "cpuPercentOfMachinePeak1s": 0,
+      "privateMemoryAvgMiB": 0,
+      "privateMemoryPeakMiB": 0,
+      "processCountPeak": 0,
+      "sampleCount": 0,
+      "workingSetAvgMiB": 0,
+      "workingSetP95MiB": 0,
+      "workingSetPeakMiB": 0
+    },
+    "closed": {
+      "chromeProcessPeak": 30,
+      "cpuCoreEquivalentMean": 0.008,
+      "cpuCoreEquivalentPeak1s": 0.024,
+      "cpuPercentOfMachineMean": 0.05,
+      "cpuPercentOfMachinePeak1s": 0.15,
+      "privateMemoryAvgMiB": 1092.2,
+      "privateMemoryPeakMiB": 1092.5,
+      "processCountPeak": 31,
+      "sampleCount": 7,
+      "workingSetAvgMiB": 1892.9,
+      "workingSetP95MiB": 1893.4,
+      "workingSetPeakMiB": 1893.4
+    }
+  }
+}

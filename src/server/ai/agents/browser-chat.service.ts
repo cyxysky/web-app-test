@@ -1,8 +1,8 @@
-﻿import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { generateText } from 'ai';
 import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import type { BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
-import { applicationUserRuntimeKey, normalizeApplicationUserId } from '@/server/auth/user-context';
+import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
 import {
   executeInteractiveBrowserTurn,
@@ -375,7 +375,13 @@ function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'u
 }
 
 function browserChatBrowserProfileKey(session: Pick<BrowserChatSessionSnapshot, 'userId'>) {
-  return `user_${normalizeUserId(session.userId)}`;
+  const userId = normalizeUserId(session.userId);
+  // Preserve existing paths for common lowercase/numeric IDs. Hash every
+  // other valid ID so path normalization cannot merge two users' profiles.
+  const profileId = /^[a-z0-9_-]{1,64}$/.test(userId)
+    ? userId
+    : createHash('sha256').update(userId).digest('hex').slice(0, 32);
+  return `user_${profileId}`;
 }
 
 function browserChatUserRuntimeKey(userId?: string | number) {
@@ -383,10 +389,10 @@ function browserChatUserRuntimeKey(userId?: string | number) {
 }
 
 function browserChatUserBrowserIdleTimeoutMs() {
-  const configured = Number(process.env.BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS || 10 * 60 * 1000);
+  const configured = Number(process.env.BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
   return Number.isFinite(configured)
     ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
-    : 10 * 60 * 1000;
+    : 3 * 60 * 1000;
 }
 
 function browserChatSessionMemoryTtlMs() {
@@ -464,9 +470,20 @@ function scheduleBrowserChatUserIdleClose(userId?: string | number) {
         browserChatUserRuntimeKey(session.userId) === userKey
         && session.browser
       ));
-      for (const session of userSessions) {
-        if (browserIdleEpochs.get(userKey) !== epoch || browserChatUserHasActiveWork(userKey)) return;
+      const sessionsToClose = userSessions.map((session) => {
         const browser = restoreBrowserSessionPrototype(session.browser);
+        if (browser) {
+          try {
+            session.tabs = browser.getTabsSnapshot();
+            session.targetUrl = exportableTargetUrl(browser.currentUrl()) || session.targetUrl;
+          } catch {
+            // Keep the last application snapshot if the browser died before idle cleanup.
+          }
+        }
+        return { session, browser };
+      });
+      for (const { session, browser } of sessionsToClose) {
+        if (browserIdleEpochs.get(userKey) !== epoch || browserChatUserHasActiveWork(userKey)) return;
         session.browser = undefined;
         session.started = false;
         if (browser) await browser.close({ force: true, preservePages: true }).catch(() => undefined);
@@ -1380,10 +1397,12 @@ function summaryFromSnapshot(session: BrowserChatSessionSnapshot): BrowserChatSe
 }
 
 function browserChatTabs(session: BrowserChatSessionRecord): BrowserTabSnapshot[] {
+  const savedTabs = Array.isArray(session.tabs) ? session.tabs : [];
+  if (!session.browser || !session.started) return savedTabs;
   try {
-    return session.browser?.getTabsSnapshot() || [];
+    return session.browser.getTabsSnapshot();
   } catch {
-    return [];
+    return savedTabs;
   }
 }
 
@@ -2391,6 +2410,9 @@ async function ensureStartedNow(
   appendLog(session, 'browser:start', '正在启动或连接浏览器');
   const hasPriorConversation = session.steps.length > 0
     || session.messages.some((message) => message.role === 'assistant' && message.id !== session.activeAssistantMessageId);
+  const savedTabs = (session.tabs || [])
+    .map((tab) => ({ ...tab, url: exportableTargetUrl(tab.url) }))
+    .filter((tab) => Boolean(tab.url));
   session.browser = browser;
   session.updatedAt = now();
   persistAndNotify(session.id);
@@ -2408,6 +2430,20 @@ async function ensureStartedNow(
     throw error;
   }
   session.started = true;
+  if (savedTabs.length) {
+    try {
+      const restored = await browser.restoreTabsFromSnapshot(savedTabs);
+      session.tabs = restored.tabs;
+      appendLog(
+        session,
+        'browser:restore-tabs',
+        `已恢复 ${restored.restored}/${restored.attempted} 个标签页${restored.failedUrls.length ? `，${restored.failedUrls.length} 个地址加载失败` : ''}`,
+        { details: { attempted: restored.attempted, created: restored.created, restored: restored.restored, failed: restored.failedUrls.length } },
+      );
+    } catch (error) {
+      appendLog(session, 'browser:restore-tabs-failed', `标签页恢复失败，将继续打开会话目标地址：${userFacingErrorMessage(error)}`);
+    }
+  }
   session.updatedAt = now();
   persistAndNotify(session.id);
   appendLog(session, 'browser:ready', `浏览器已就绪，用时 ${elapsedMs(startedAt)}ms`, { elapsedMs: elapsedMs(startedAt) });
@@ -3701,10 +3737,12 @@ async function executeBrowserChatSubagentBatch(input: {
       messageId: assistantMessageId,
     });
     persistAndNotify(session.id);
+    const browserProfileKey = browserChatBrowserProfileKey(session);
     const child = new BrowserSession(session.mode, {
       browserSurface: 'external',
       headless: true,
-      sharedBrowserRuntimeKey: applicationUserRuntimeKey(session.userId),
+      browserProfileKey,
+      sharedBrowserRuntimeKey: browserProfileKey,
       storageState: inheritedStorageState,
       ...browserChatBrowserExecutionOptions(),
       isMarked: true,

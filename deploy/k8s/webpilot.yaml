@@ -8,6 +8,8 @@ data:
   HOSTNAME: "0.0.0.0"
   HEADLESS_BROWSER: "true"
   PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+  APP_DATA_DIR: /app
+  ARTIFACTS_DIR: /app/artifacts
   WEBPILOT_BASE_PATH: /webpilot
   # The application now derives its browser-visible public URL from Nginx's
   # X-Forwarded-* headers. Do not configure WEBPILOT_PUBLIC_BASE_URL.
@@ -58,10 +60,10 @@ spec:
           resources:
             requests:
               cpu: 500m
-              memory: 1Gi
+              memory: 6Gi
             limits:
-              cpu: "2"
-              memory: 2Gi
+              cpu: "4"
+              memory: 10Gi
           startupProbe:
             tcpSocket:
               port: http
