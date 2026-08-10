@@ -15,7 +15,6 @@ type PendingWrite = {
 };
 
 type WriteQueueState = {
-  idleTimer?: ReturnType<typeof setTimeout>;
   idleWaiters: Set<() => void>;
   nextId: number;
   pending: Map<number, PendingWrite>;
@@ -57,10 +56,6 @@ const workerSource = String.raw`
     } catch (error) {
       try { current.exec('ROLLBACK'); } catch {}
       result = { id: job.id, ok: false, error: error instanceof Error ? error.message : String(error) };
-    } finally {
-      try { current.close(); } catch {}
-      database = undefined;
-      databasePath = '';
     }
     parentPort.postMessage(result);
   });
@@ -71,16 +66,6 @@ function updateQueueGauge() {
   if (!state.pending.size) {
     for (const resolve of state.idleWaiters) resolve();
     state.idleWaiters.clear();
-    if (state.worker && !state.idleTimer) {
-      state.idleTimer = setTimeout(() => {
-        state.idleTimer = undefined;
-        if (state.pending.size || !state.worker) return;
-        const current = state.worker;
-        state.worker = undefined;
-        void current.terminate();
-      }, 250);
-      state.idleTimer.unref?.();
-    }
   }
 }
 
@@ -92,11 +77,10 @@ function failPendingWrites(error: Error) {
 
 function worker() {
   if (state.worker) return state.worker;
-  if (state.idleTimer) {
-    clearTimeout(state.idleTimer);
-    state.idleTimer = undefined;
-  }
-  const next = new Worker(workerSource, { eval: true });
+  const next = new Worker(workerSource, {
+    env: { ...process.env, NODE_NO_WARNINGS: '1' },
+    eval: true,
+  });
   next.unref();
   next.on('message', (message: { error?: string; id?: number; ok?: boolean }) => {
     const id = Number(message.id);

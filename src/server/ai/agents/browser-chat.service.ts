@@ -72,7 +72,6 @@ import type {
 } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
 import {
-  flushBrowserChatRealtimeOutbox,
   scheduleBrowserChatRealtimeOutboxFlush,
 } from '@/server/realtime/browser-chat-outbox';
 import { publishRealtimeRefreshEvent } from '@/server/realtime/ws-refresh';
@@ -2177,7 +2176,6 @@ async function persistAndNotifyTerminal(sessionId: string) {
   if (!persisted) return false;
   const pendingWrite = pendingSqliteWrites.get(sessionId);
   if (pendingWrite && !(await pendingWrite)) return false;
-  await flushBrowserChatRealtimeOutbox().catch((error) => warnPersistFailure(error));
   scheduleBrowserChatSessionEviction(sessionId);
   return true;
 }
