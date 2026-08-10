@@ -446,7 +446,7 @@ function browserChatUserHasActiveWork(userKey: string) {
   if ((browserPreviewCounts.get(userKey) || 0) > 0) return true;
   return [...sessions.values()].some((session) => (
     browserChatUserRuntimeKey(session.userId) === userKey
-    && (session.busy || session.status === 'running')
+    && (session.busy || session.status === 'running' || session.turnState === 'awaiting_human')
   ));
 }
 
@@ -1373,6 +1373,19 @@ function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
   return clientStep;
 }
 
+function compactStepForRealtime(step: StepExecutionResult): StepExecutionResult {
+  const clientStep = compactStepForClient(step);
+  if (!clientStep.tools?.length) return clientStep;
+  return {
+    ...clientStep,
+    tools: clientStep.tools.map((tool) => {
+      const realtimeTool = { ...tool };
+      delete realtimeTool.rawResult;
+      return realtimeTool;
+    }),
+  };
+}
+
 function previewMessages(session: Pick<BrowserChatSessionSnapshot, 'messages'>) {
   const firstUserMessage = session.messages.find((message) => message.role === 'user');
   const latestMessage = session.messages.at(-1);
@@ -1818,7 +1831,7 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
     session: realtimeSession,
     summary,
     ...(delta.messages.length ? { messages: delta.messages } : {}),
-    ...(delta.steps.length ? { steps: delta.steps.map(compactStepForClient) } : {}),
+    ...(delta.steps.length ? { steps: delta.steps.map(compactStepForRealtime) } : {}),
     ...(delta.logs.length ? { logs: delta.logs } : {}),
     ...(delta.removedMessageIds.length ? { removedMessageIds: delta.removedMessageIds } : {}),
     ...(delta.removedStepIndexes.length ? { removedStepIndexes: delta.removedStepIndexes } : {}),
@@ -1835,10 +1848,9 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
     { ...session, messages: [], steps: [], logs: [] },
     summary,
     delta,
-    realtimeEvent,
   );
   trackSessionSqliteWrite(item.id, sqliteWrite);
-  void sqliteWrite.catch(() => publishRealtimeRefreshEvent(realtimeEvent).catch(() => undefined));
+  void publishRealtimeRefreshEvent(realtimeEvent).catch(() => undefined);
   if (dirtyRecords.has(item.id)) {
     advancePersistenceCursor(persistedItem, delta);
     dirtyRecords.delete(item.id);
@@ -2165,7 +2177,7 @@ async function persistAndNotifyTerminal(sessionId: string) {
   if (!persisted) return false;
   const pendingWrite = pendingSqliteWrites.get(sessionId);
   if (pendingWrite && !(await pendingWrite)) return false;
-  await flushBrowserChatRealtimeOutbox();
+  await flushBrowserChatRealtimeOutbox().catch((error) => warnPersistFailure(error));
   scheduleBrowserChatSessionEviction(sessionId);
   return true;
 }
@@ -4262,8 +4274,10 @@ async function runBrowserChatMessage(
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       const completedAt = now();
       const browserWasStarted = session.started || browser.isUsable();
-      const keepCompletedBrowser = browserWasStarted && browserChatKeepBrowserOpenAfterTurn() && Boolean(session.browser?.isUsable());
-      const shouldCloseCompletedBrowser = browserWasStarted && !keepCompletedBrowser;
+      const keepCompletedBrowser = browserWasStarted
+        && (result.status === 'blocked' || browserChatKeepBrowserOpenAfterTurn())
+        && Boolean(session.browser?.isUsable());
+      const shouldCloseCompletedBrowser = result.status !== 'blocked' && browserWasStarted && !keepCompletedBrowser;
       if (shouldCloseCompletedBrowser) {
         await session.browser?.close().catch(() => undefined);
         session.browser = undefined;
@@ -4272,14 +4286,20 @@ async function runBrowserChatMessage(
         session.browser = undefined;
       }
       clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
-      transitionBrowserChatSession(session, { type: 'turnFinished', at: completedAt });
+      if (result.status === 'blocked') {
+        transitionBrowserChatSession(session, { type: 'turnBlocked', at: completedAt });
+      } else {
+        transitionBrowserChatSession(session, { type: 'turnFinished', at: completedAt });
+      }
       replaceSessionLogs(session, [
         ...(session.logs || []),
         {
           id: id('log'),
           time: completedAt,
-          phase: 'chat:run:done',
-          message: shouldCloseCompletedBrowser
+          phase: result.status === 'blocked' ? 'chat:run:blocked' : 'chat:run:done',
+          message: result.status === 'blocked'
+            ? '已暂停自动操作，等待用户完成人工验证后继续。'
+            : shouldCloseCompletedBrowser
             ? '本轮对话操作已完成，最终结果已写入，浏览器已自动关闭。'
             : keepCompletedBrowser
               ? '本轮对话操作已完成，最终结果已写入，浏览器已保留供后续对话复用。'
@@ -4290,7 +4310,7 @@ async function runBrowserChatMessage(
         },
       ]);
       await persistAndNotifyTerminal(session.id);
-      scheduleBrowserChatUserIdleClose(session.userId);
+      if (result.status !== 'blocked') scheduleBrowserChatUserIdleClose(session.userId);
       void enforceBrowserChatArtifactQuota(session.id).catch((error) => warnPersistFailure(error));
       void ensureConversationContextWithinThreshold(session).catch(() => undefined);
     } catch (error) {

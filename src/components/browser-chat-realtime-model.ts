@@ -49,7 +49,16 @@ export function mergeBrowserChatRealtimeCollections<
       .filter((step) => !removedStepIndexes.has(step.index))
       .map((step) => [step.index, step]),
   );
-  for (const step of patch.steps || []) steps.set(step.index, step);
+  for (const step of patch.steps || []) {
+    const existing = steps.get(step.index) as (TStep & { status?: string; tools?: unknown[] }) | undefined;
+    const incoming = step as TStep & { status?: string; tools?: unknown[] };
+    const wouldRegressCompletedStep = existing
+      && existing.status !== 'running'
+      && incoming.status === 'running';
+    const wouldLoseToolDetails = existing
+      && (existing.tools?.length || 0) > (incoming.tools?.length || 0);
+    if (!wouldRegressCompletedStep && !wouldLoseToolDetails) steps.set(step.index, step);
+  }
 
   const removedLogIds = new Set(patch.removedLogIds || []);
   const logs = new Map(

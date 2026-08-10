@@ -35,6 +35,7 @@ export function compactBrowserChatLogForClient<TLog extends BrowserChatClientLog
         responseType: aiOutput.responseType,
         text: aiOutput.text,
         response,
+        timings: aiOutput.timings,
       },
     });
     return compactedDetails.length < log.details.length

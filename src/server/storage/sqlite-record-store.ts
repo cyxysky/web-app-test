@@ -630,7 +630,7 @@ export function writeBrowserChatSessionDeltaQueued<
     removedStepIndexes?: number[];
     removedLogIds?: string[];
   },
-  outboxEvent: BrowserChatRealtimeOutboxEvent,
+  outboxEvent?: BrowserChatRealtimeOutboxEvent,
 ) {
   const statements: SqliteWriteStatement[] = [{
     sql: `
@@ -687,14 +687,16 @@ export function writeBrowserChatSessionDeltaQueued<
     sql: 'DELETE FROM browser_chat_log WHERE session_id = ? AND id = ?',
     params: [snapshot.id, id],
   });
-  statements.push({
-    sql: `
-      INSERT INTO browser_chat_realtime_outbox (
-        session_id, user_id, event_type, payload_json, created_at
-      ) VALUES (?, ?, 'browserChatSession', ?, ?)
-    `,
-    params: [outboxEvent.id, outboxEvent.userId, JSON.stringify(outboxEvent), now()],
-  });
+  if (outboxEvent) {
+    statements.push({
+      sql: `
+        INSERT INTO browser_chat_realtime_outbox (
+          session_id, user_id, event_type, payload_json, created_at
+        ) VALUES (?, ?, 'browserChatSession', ?, ?)
+      `,
+      params: [outboxEvent.id, outboxEvent.userId, JSON.stringify(outboxEvent), now()],
+    });
+  }
   return queueSqliteWrite(statements);
 }
 
